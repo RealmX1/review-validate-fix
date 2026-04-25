@@ -114,19 +114,6 @@ def write_user_session(path: Path, session_id: str, message: str) -> None:
     )
 
 
-def prepend_fake_osascript(tmp: Path) -> dict[str, str]:
-    fake_bin = tmp / "fake-bin"
-    fake_bin.mkdir(parents=True, exist_ok=True)
-    fake = fake_bin / "osascript"
-    fake.write_text(
-        "#!/usr/bin/env bash\n"
-        "printf 'tab 1 of window id 12345\\n'\n",
-        encoding="utf-8",
-    )
-    fake.chmod(0o755)
-    return {"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
-
-
 def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
     transcript = tmp / "session.jsonl"
     state = tmp / "state"
@@ -198,30 +185,20 @@ def test_clean_repo_skips(tmp: Path) -> None:
     assert stdout == ""
 
 
-def test_dirty_repo_launches_terminal_fork_by_default(tmp: Path) -> None:
+def test_dirty_repo_continues_in_gui_by_default(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
     payload = parse_json(
         invoke(
             {
                 "cwd": str(dirty),
                 "session_id": "00000000-0000-0000-0000-000000000002",
                 "stop_hook_active": False,
-            },
-            extra_env=prepend_fake_osascript(tmp),
-            state_dir=state,
+            }
         )[0]
     )
-    assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    assert latest["mode"] == "terminal"
-    assert latest["status"] == "terminal-launch-attempted"
-    assert latest["returncode"] == 0
-    assert "tab 1 of window id" in latest["stdout"]
-    assert "$review-validate-fix" in latest["prompt"]
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
+    assert payload["decision"] == "block"
+    assert "$review-validate-fix" in payload["reason"]
+    assert str(dirty) in payload["reason"]
 
 
 def test_dirty_repo_manual_mode_only_prepares_launcher(tmp: Path) -> None:
@@ -234,7 +211,10 @@ def test_dirty_repo_manual_mode_only_prepares_launcher(tmp: Path) -> None:
                 "session_id": "00000000-0000-0000-0000-000000000022",
                 "stop_hook_active": False,
             },
-            extra_env={"CODEX_RVF_FORK_MODE": "manual"},
+            extra_env={
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "manual",
+            },
             state_dir=state,
         )[0]
     )
@@ -258,6 +238,7 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
                 "stop_hook_active": False,
             },
             extra_env={
+                "CODEX_RVF_MODE": "fork",
                 "CODEX_RVF_FORK_MODE": "dry-run",
                 "CODEX_RVF_FORK_REASONING_EFFORT": "high",
             },
@@ -288,7 +269,6 @@ def test_dirty_repo_continuation_mode(tmp: Path) -> None:
                 "session_id": "00000000-0000-0000-0000-000000000004",
                 "stop_hook_active": False,
             },
-            extra_env={"CODEX_RVF_MODE": "continuation"},
         )[0]
     )
     assert payload["decision"] == "block"
@@ -312,14 +292,12 @@ def test_no_git_unique_dirty_trusted_repo_forks_by_default(tmp: Path) -> None:
                 "stop_hook_active": False,
             },
             config=config,
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
             state_dir=state,
         )[0]
     )
-    assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    assert str(dirty) in latest["prompt"]
+    assert payload["decision"] == "block"
+    assert "$review-validate-fix" in payload["reason"]
+    assert str(dirty) in payload["reason"]
 
 
 def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
@@ -419,7 +397,7 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
-        test_dirty_repo_launches_terminal_fork_by_default,
+        test_dirty_repo_continues_in_gui_by_default,
         test_dirty_repo_manual_mode_only_prepares_launcher,
         test_dirty_repo_fork_dry_run,
         test_dirty_repo_continuation_mode,

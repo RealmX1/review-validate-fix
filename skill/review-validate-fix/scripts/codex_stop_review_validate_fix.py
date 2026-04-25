@@ -19,8 +19,8 @@ DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_STATE_DIR = SKILL_DIR / "state" / "fork-experiment"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
-DEFAULT_RVF_MODE = "fork"
-DEFAULT_FORK_LAUNCH_MODE = "terminal"
+DEFAULT_RVF_MODE = "continuation"
+DEFAULT_FORK_LAUNCH_MODE = "manual"
 SUPPRESS_ENV_NAMES = (
     "CODEX_RVF_SUPPRESS",
     "CODEX_RVF_SUPPRESS_STOP_HOOK",
@@ -425,25 +425,15 @@ def run_codex_fork(
             }
         )
     else:
-        osa = (
-            'tell application "Terminal"\n'
-            "activate\n"
-            f"do script {json.dumps(shell_command)}\n"
-            "end tell"
-        )
-        completed = subprocess.run(
-            ["osascript", "-e", osa],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
         result.update(
             {
-                "status": "terminal-launch-attempted",
-                "returncode": completed.returncode,
-                "stdout": completed.stdout[-4000:],
-                "stderr": completed.stderr[-4000:],
+                "status": "terminal-launch-disabled",
+                "returncode": 0,
+                "stdout": "",
+                "stderr": (
+                    "Terminal-based codex fork is disabled because Desktop "
+                    "session ids are not reliably visible to the CLI."
+                ),
             }
         )
 

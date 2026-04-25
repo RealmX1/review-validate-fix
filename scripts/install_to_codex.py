@@ -125,7 +125,7 @@ def configure_stop_hook(skill_dir: Path) -> Path:
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
     command = (
-        "CODEX_RVF_FORK_MODE=terminal python3 "
+        "CODEX_RVF_MODE=continuation python3 "
         f"{skill_dir / 'scripts' / 'codex_stop_review_validate_fix.py'}"
     )
     entry = {
@@ -178,7 +178,7 @@ def main() -> int:
     parser.add_argument(
         "--configure-stop-hook",
         action="store_true",
-        help="更新 ~/.codex/hooks.json，让 Stop hook 以 CODEX_RVF_FORK_MODE=terminal 调用本 skill。",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 以 GUI continuation 调用本 skill。",
     )
     args = parser.parse_args()
 

@@ -57,7 +57,7 @@ plugin 安装会把包装层复制到 `~/plugins/review-validate-fix`，并在 `
 python3 scripts/install_to_codex.py --as skill --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_FORK_MODE=terminal` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=continuation` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal；它通过 Codex Stop hook 的 `decision: "block"` / `reason` 契约，让 Codex GUI 在当前会话中继续执行 `$review-validate-fix`。
 
 ## Setup 相关配置
 
@@ -76,7 +76,7 @@ python3 scripts/install_to_codex.py --as skill --replace-setup-config
 
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
 
-Stop hook 的自动 fork 默认依赖 `CODEX_RVF_FORK_MODE=terminal`，也就是 dirty gate 通过后会实际打开 Terminal 并运行 `codex fork`。`CODEX_RVF_FORK_MODE=manual` 只适合调试，因为 Codex Desktop 可能不会展示 hook 返回的 `systemMessage`，从用户视角会像是空白且没有动作。
+Stop hook 的默认自动路径是 GUI continuation。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。
 
 ## 验证
 
