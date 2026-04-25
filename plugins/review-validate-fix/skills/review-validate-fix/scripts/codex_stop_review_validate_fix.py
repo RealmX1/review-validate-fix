@@ -4,9 +4,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
+import socket
 import subprocess
 import sys
+import time
+import struct
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +19,20 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_STATE_DIR = SKILL_DIR / "state" / "fork-experiment"
+DEFAULT_APP_SERVER_CONTROL_SOCKET = (
+    Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
+)
+DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.sock"
+DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
-DEFAULT_RVF_MODE = "continuation"
-DEFAULT_FORK_LAUNCH_MODE = "manual"
+DEFAULT_RVF_MODE = "fork"
+DEFAULT_FORK_LAUNCH_MODE = "gui"
+APP_SERVER_CLIENT_INFO = {
+    "name": "review-validate-fix-stop-hook",
+    "title": "review-validate-fix Stop hook",
+    "version": "0.1.0",
+}
 SUPPRESS_ENV_NAMES = (
     "CODEX_RVF_SUPPRESS",
     "CODEX_RVF_SUPPRESS_STOP_HOOK",
@@ -39,6 +51,10 @@ class GateResult:
     status: str
     repo: str | None
     output: str
+
+
+class AppServerError(RuntimeError):
+    pass
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -194,6 +210,38 @@ def session_id_from_event(event: dict[str, Any]) -> str | None:
     return None
 
 
+def parent_thread_path_from_event(event: dict[str, Any]) -> Path | None:
+    for path in event_session_paths(event):
+        expanded = path.expanduser()
+        if expanded.exists():
+            return expanded.resolve()
+    return None
+
+
+def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
+    for path in event_session_paths(event):
+        session_id = session_id_from_path(path.expanduser())
+        if session_id:
+            return session_id
+
+    env_value = os.environ.get("CODEX_THREAD_ID")
+    if env_value and env_value.strip():
+        return env_value.strip()
+
+    for key in (
+        "thread_id",
+        "threadId",
+        "conversation_id",
+        "conversationId",
+        "session_id",
+    ):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return session_id_from_event(event)
+
+
 def string_event_value(event: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = event.get(key)
@@ -346,8 +394,9 @@ def run_codex_fork(
     suppress_child_stop_hook: bool = False,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    parent_thread_path: Path | None = None,
 ) -> dict[str, Any]:
-    mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE)
+    mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
 
     sdir = state_dir()
     sdir.mkdir(parents=True, exist_ok=True)
@@ -355,13 +404,12 @@ def run_codex_fork(
     log_path = sdir / f"{timestamp}.{log_prefix}.json"
     latest_path = sdir / "latest.json"
     prompt_path = sdir / f"{timestamp}.{log_prefix}.prompt.txt"
-    launcher_path = sdir / f"{timestamp}.{log_prefix}.sh"
 
     if not parent_session_id:
         payload = {
             "continue": True,
             "systemMessage": (
-                f"{log_prefix} skipped: Stop event did not expose a parent session id."
+                f"{log_prefix} skipped: Stop event did not expose a parent thread id."
             ),
         }
         log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -369,35 +417,16 @@ def run_codex_fork(
         return payload
 
     prompt_path.write_text(prompt, encoding="utf-8")
-    command = ["codex", "fork"]
-    if model:
-        command.extend(["-m", model])
-    if reasoning_effort:
-        command.extend(["-c", f"model_reasoning_effort={json.dumps(reasoning_effort)}"])
-    command.append(parent_session_id)
-    launcher = (
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        f"cd {shlex.quote(cwd or str(Path.home()))}\n"
-    )
-    if suppress_child_stop_hook:
-        launcher += "export CODEX_RVF_SUPPRESS_STOP_HOOK=1\n"
-    launcher += " ".join(shlex.quote(part) for part in command)
-    launcher += f" \"$(cat {shlex.quote(str(prompt_path))})\"\n"
-    launcher_path.write_text(launcher, encoding="utf-8")
-    launcher_path.chmod(0o755)
-    shell_command = "bash " + shlex.quote(str(launcher_path))
 
     result: dict[str, Any] = {
         "timestamp": timestamp,
         "mode": mode,
         "log_prefix": log_prefix,
-        "parent_session_id": parent_session_id,
+        "parent_thread_id": parent_session_id,
+        "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
         "cwd": cwd,
         "prompt": prompt,
         "prompt_path": str(prompt_path),
-        "launcher_path": str(launcher_path),
-        "shell_command": shell_command,
         "suppress_child_stop_hook": suppress_child_stop_hook,
         "model": model,
         "reasoning_effort": reasoning_effort,
@@ -407,32 +436,41 @@ def run_codex_fork(
         result["status"] = "manual-prepared"
     elif mode == "dry-run":
         result["status"] = "dry-run"
-    elif mode == "exec":
-        completed = subprocess.run(
-            shell_command,
-            shell=True,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        result["app_server_requests"] = app_server_fork_requests(
+            parent_thread_id=parent_session_id,
+            parent_thread_path=parent_thread_path,
+            cwd=cwd,
+            prompt=prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
-        result.update(
-            {
-                "status": "exec-finished",
-                "returncode": completed.returncode,
-                "stdout": completed.stdout[-4000:],
-                "stderr": completed.stderr[-4000:],
-            }
-        )
+    elif mode in {"gui", "app-server", "appserver", "auto"}:
+        try:
+            result.update(
+                run_app_server_fork(
+                    parent_thread_id=parent_session_id,
+                    parent_thread_path=parent_thread_path,
+                    cwd=cwd,
+                    prompt=prompt,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    log_path=log_path,
+                )
+            )
+        except Exception as exc:
+            result.update(
+                {
+                    "status": "app-server-failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
     else:
         result.update(
             {
-                "status": "terminal-launch-disabled",
-                "returncode": 0,
-                "stdout": "",
-                "stderr": (
-                    "Terminal-based codex fork is disabled because Desktop "
-                    "session ids are not reliably visible to the CLI."
+                "status": "unsupported-mode",
+                "error": (
+                    f"Unsupported {mode_env_name}={mode!r}. Use gui, dry-run, "
+                    "or manual. Terminal/CLI fork launch is intentionally disabled."
                 ),
             }
         )
@@ -443,14 +481,20 @@ def run_codex_fork(
     status = result.get("status", "unknown")
     if status == "manual-prepared":
         message = (
-            f"{log_prefix} prepared: no Terminal was launched. "
-            f"parent_session_id={parent_session_id}. launcher={launcher_path}. "
+            f"{log_prefix} prepared: no Terminal was launched and no current-chat "
+            f"continuation was submitted. parent_thread_id={parent_session_id}. "
             f"prompt={prompt_path}. log={log_path}"
+        )
+    elif status == "app-server-started":
+        message = (
+            f"{log_prefix} forked in Codex GUI/app-server: "
+            f"fork_thread_id={result.get('fork_thread_id')}; "
+            f"parent_thread_id={parent_session_id}; log={log_path}"
         )
     else:
         message = (
             f"{log_prefix} triggered: "
-            f"{status}. parent_session_id={parent_session_id}. log={log_path}"
+            f"{status}. parent_thread_id={parent_session_id}. log={log_path}"
         )
     return {
         "continue": True,
@@ -458,8 +502,284 @@ def run_codex_fork(
     }
 
 
+def app_server_fork_requests(
+    *,
+    parent_thread_id: str,
+    parent_thread_path: Path | None,
+    cwd: str | None,
+    prompt: str,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> list[dict[str, Any]]:
+    fork_params: dict[str, Any] = {
+        "threadId": parent_thread_id,
+        "cwd": cwd,
+        "excludeTurns": True,
+        "persistExtendedHistory": True,
+    }
+    if parent_thread_path is not None:
+        fork_params["path"] = str(parent_thread_path)
+    if model:
+        fork_params["model"] = model
+
+    turn_params: dict[str, Any] = {
+        "threadId": "<fork_thread_id>",
+        "input": [{"type": "text", "text": prompt, "text_elements": []}],
+        "cwd": cwd,
+        "summary": "auto",
+        "personality": None,
+        "outputSchema": None,
+    }
+    if model:
+        turn_params["model"] = model
+    if reasoning_effort:
+        turn_params["effort"] = reasoning_effort
+
+    return [
+        {"method": "thread/fork", "params": fork_params},
+        {"method": "turn/start", "params": turn_params},
+    ]
+
+
+class AppServerWebSocket:
+    def __init__(self, socket_path: Path) -> None:
+        self.socket_path = socket_path
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(15)
+        self.socket.connect(str(socket_path))
+        self.next_id = 1
+        self.notifications: list[dict[str, Any]] = []
+
+    def close(self) -> None:
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+
+    def send_json(self, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        mask = os.urandom(4)
+        if len(data) < 126:
+            header = bytes([0x81, 0x80 | len(data)])
+        elif len(data) < 65536:
+            header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(data))
+        else:
+            header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", len(data))
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
+        self.socket.sendall(header + mask + masked)
+
+    def recv_exact(self, length: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = length
+        while remaining > 0:
+            chunk = self.socket.recv(remaining)
+            if not chunk:
+                raise AppServerError("app-server websocket closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def recv_json(self) -> dict[str, Any]:
+        first, second = self.recv_exact(2)
+        opcode = first & 0x0F
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self.recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self.recv_exact(8))[0]
+
+        mask = self.recv_exact(4) if second & 0x80 else None
+        payload = self.recv_exact(length)
+        if mask is not None:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+
+        if opcode == 0x8:
+            raise AppServerError("app-server websocket closed")
+        if opcode == 0x9:
+            self.send_pong(payload)
+            return self.recv_json()
+        if opcode != 0x1:
+            raise AppServerError(f"unsupported websocket opcode {opcode}")
+        return json.loads(payload.decode("utf-8"))
+
+    def send_pong(self, payload: bytes) -> None:
+        if len(payload) >= 126:
+            return
+        self.socket.sendall(bytes([0x8A, len(payload)]) + payload)
+
+    def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        request_id = self.next_id
+        self.next_id += 1
+        payload: dict[str, Any] = {"id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self.send_json(payload)
+        while True:
+            response = self.recv_json()
+            if response.get("id") != request_id:
+                self.notifications.append(response)
+                continue
+            error = response.get("error")
+            if error:
+                raise AppServerError(json.dumps(error, ensure_ascii=False))
+            result = response.get("result")
+            return result if isinstance(result, dict) else {}
+
+
+def can_connect_app_server_socket(socket_path: Path) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.5)
+        probe.connect(str(socket_path))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def bridge_socket_path() -> Path:
+    env_value = os.environ.get("CODEX_RVF_BRIDGE_SOCKET")
+    if env_value and env_value.strip():
+        return Path(env_value).expanduser().resolve()
+    return DEFAULT_BRIDGE_SOCKET.resolve()
+
+
+def bridge_log_path() -> Path:
+    env_value = os.environ.get("CODEX_RVF_BRIDGE_LOG")
+    if env_value and env_value.strip():
+        return Path(env_value).expanduser().resolve()
+    return DEFAULT_BRIDGE_LOG.resolve()
+
+
+def select_app_server_socket() -> tuple[Path, str]:
+    explicit = os.environ.get("CODEX_RVF_APP_SERVER_SOCKET")
+    if explicit and explicit.strip():
+        return Path(explicit).expanduser().resolve(), "explicit"
+
+    if DEFAULT_APP_SERVER_CONTROL_SOCKET.exists():
+        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control"
+
+    socket_path = ensure_bridge_app_server()
+    return socket_path, "bridge"
+
+
+def ensure_bridge_app_server() -> Path:
+    socket_path = bridge_socket_path()
+    if socket_path.exists() and can_connect_app_server_socket(socket_path):
+        return socket_path
+
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    if socket_path.exists():
+        socket_path.unlink()
+
+    log_path = bridge_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("ab")
+    codex_bin = os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
+    subprocess.Popen(
+        [
+            codex_bin,
+            "app-server",
+            "--listen",
+            f"unix://{socket_path}",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,
+        start_new_session=True,
+    )
+
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        if socket_path.exists() and can_connect_app_server_socket(socket_path):
+            return socket_path
+        time.sleep(0.1)
+    raise AppServerError(f"app-server bridge socket did not become ready: {socket_path}")
+
+
+def maybe_open_fork_in_codex(fork_thread_id: str) -> bool:
+    if os.environ.get("CODEX_RVF_OPEN_GUI_FORK", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+    if sys.platform != "darwin":
+        return False
+    url = f"codex://local/{fork_thread_id}"
+    try:
+        subprocess.Popen(
+            ["open", url],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def run_app_server_fork(
+    *,
+    parent_thread_id: str,
+    parent_thread_path: Path | None,
+    cwd: str | None,
+    prompt: str,
+    model: str | None,
+    reasoning_effort: str | None,
+    log_path: Path,
+) -> dict[str, Any]:
+    socket_path, socket_source = select_app_server_socket()
+    client = AppServerWebSocket(socket_path)
+    try:
+        client.request(
+            "initialize",
+            {
+                "clientInfo": APP_SERVER_CLIENT_INFO,
+                "capabilities": {
+                    "experimentalApi": True,
+                    "optOutNotificationMethods": [],
+                },
+            },
+        )
+        requests = app_server_fork_requests(
+            parent_thread_id=parent_thread_id,
+            parent_thread_path=parent_thread_path,
+            cwd=cwd,
+            prompt=prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        fork_result = client.request("thread/fork", requests[0]["params"])
+        fork_thread = fork_result.get("thread")
+        if not isinstance(fork_thread, dict) or not isinstance(fork_thread.get("id"), str):
+            raise AppServerError("thread/fork did not return a fork thread id")
+        fork_thread_id = fork_thread["id"]
+        turn_params = dict(requests[1]["params"])
+        turn_params["threadId"] = fork_thread_id
+        turn_result = client.request("turn/start", turn_params)
+        turn = turn_result.get("turn")
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        opened = maybe_open_fork_in_codex(fork_thread_id)
+        return {
+            "status": "app-server-started",
+            "socket_path": str(socket_path),
+            "socket_source": socket_source,
+            "fork_thread_id": fork_thread_id,
+            "turn_id": turn_id,
+            "opened_gui_deeplink": opened,
+            "notifications": client.notifications[-20:],
+        }
+    finally:
+        client.close()
+
+
 def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, Any]:
-    session_id = session_id_from_event(event)
+    session_id = parent_thread_id_from_event(event)
+    session_path = parent_thread_path_from_event(event)
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
     prompt = fork_experiment_prompt(session_id or "", cwd)
@@ -474,6 +794,7 @@ def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, An
         suppress_child_stop_hook=True,
         model=model,
         reasoning_effort=reasoning_effort,
+        parent_thread_path=session_path,
     )
     latest_path = state_dir() / "latest.json"
     try:
@@ -504,7 +825,8 @@ def rvf_mode() -> str:
 
 
 def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]:
-    parent_session_id = session_id_from_event(event) or ""
+    parent_session_id = parent_thread_id_from_event(event) or ""
+    parent_thread_path = parent_thread_path_from_event(event)
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else repo
     prompt = fork_review_validate_fix_prompt(parent_session_id, cwd, repo)
@@ -518,6 +840,7 @@ def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]
         suppress_child_stop_hook=False,
         model=model,
         reasoning_effort=reasoning_effort,
+        parent_thread_path=parent_thread_path,
     )
 
 

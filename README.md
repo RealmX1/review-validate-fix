@@ -57,7 +57,9 @@ plugin 安装会把包装层复制到 `~/plugins/review-validate-fix`，并在 `
 python3 scripts/install_to_codex.py --as skill --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=continuation` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal；它通过 Codex Stop hook 的 `decision: "block"` / `reason` 契约，让 Codex GUI 在当前会话中继续执行 `$review-validate-fix`。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal，也不会在当前 chat session 里 continuation；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这样父会话保留为可 rewind 的稳定 checkpoint。
+
+hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
 
 ## Setup 相关配置
 
@@ -65,7 +67,8 @@ python3 scripts/install_to_codex.py --as skill --configure-stop-hook
 
 - `config/alternative-reviewer.json`
 - `state/`
-- `~/.codex/config.toml` 中的 Stop hook / fork hook 绑定
+- `~/.codex/hooks.json` 中的 Stop hook / fork hook 绑定
+- `~/.codex/app-server-control/rvf-app-server.sock` 和 `~/.codex/app-server-control/rvf-app-server.log` 这类本机 app-server bridge 文件
 - 外部 reviewer 的 CLI/MCP/IDE wrapper 认证状态和环境变量
 
 `scripts/install_to_codex.py` 默认会保留本机已有的 `config/alternative-reviewer.json` 和 `state/`，避免仓库更新覆盖掉已完成的 external reviewer setup。确实要用仓库版本覆盖 setup 配置时，显式加：
@@ -76,7 +79,7 @@ python3 scripts/install_to_codex.py --as skill --replace-setup-config
 
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
 
-Stop hook 的默认自动路径是 GUI continuation。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。
+Stop hook 的默认自动路径是 GUI/app-server fork。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 只保留为显式 fallback，因为它不会产生独立 fork checkpoint。
 
 ## 验证
 

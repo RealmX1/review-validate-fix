@@ -30,14 +30,13 @@ def invoke(
     extra_env: dict[str, str] | None = None,
     state_dir: Path | None = None,
 ) -> tuple[str, str]:
-    env = None
-    if config is not None or extra_env is not None or state_dir is not None:
-        env = os.environ.copy()
+    env = os.environ.copy()
+    env.pop("CODEX_THREAD_ID", None)
     if config is not None:
         env["CODEX_RVF_CONFIG"] = str(config)
     if state_dir is not None:
         env["CODEX_RVF_STATE_DIR"] = str(state_dir)
-    if env is not None and extra_env is not None:
+    if extra_env is not None:
         env.update(extra_env)
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
@@ -185,23 +184,32 @@ def test_clean_repo_skips(tmp: Path) -> None:
     assert stdout == ""
 
 
-def test_dirty_repo_continues_in_gui_by_default(tmp: Path) -> None:
+def test_dirty_repo_forks_in_gui_by_default(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
     payload = parse_json(
         invoke(
             {
                 "cwd": str(dirty),
                 "session_id": "00000000-0000-0000-0000-000000000002",
                 "stop_hook_active": False,
-            }
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
         )[0]
     )
-    assert payload["decision"] == "block"
-    assert "$review-validate-fix" in payload["reason"]
-    assert str(dirty) in payload["reason"]
+    assert "decision" not in payload
+    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "dry-run"
+    assert latest["mode"] == "dry-run"
+    assert latest["app_server_requests"][0]["method"] == "thread/fork"
+    assert latest["app_server_requests"][1]["method"] == "turn/start"
+    assert "$review-validate-fix" in latest["prompt"]
+    assert str(dirty) in latest["prompt"]
 
 
-def test_dirty_repo_manual_mode_only_prepares_launcher(tmp: Path) -> None:
+def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     state = tmp / "state"
     payload = parse_json(
@@ -220,10 +228,10 @@ def test_dirty_repo_manual_mode_only_prepares_launcher(tmp: Path) -> None:
     )
     assert "decision" not in payload
     assert "review-validate-fix-fork prepared" in payload["systemMessage"]
-    assert "launcher=" in payload["systemMessage"]
+    assert "prompt=" in payload["systemMessage"]
     latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     assert latest["status"] == "manual-prepared"
-    assert Path(latest["launcher_path"]).exists()
+    assert Path(latest["prompt_path"]).exists()
 
 
 def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
@@ -254,10 +262,46 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
     assert latest["suppress_child_stop_hook"] is False
     assert latest["model"] == "gpt-test"
     assert latest["reasoning_effort"] == "high"
-    launcher = Path(latest["launcher_path"]).read_text(encoding="utf-8")
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in launcher
-    assert "-m gpt-test" in launcher
-    assert 'model_reasoning_effort="high"' in launcher
+    requests = latest["app_server_requests"]
+    assert requests[0]["method"] == "thread/fork"
+    assert requests[0]["params"]["model"] == "gpt-test"
+    assert requests[1]["method"] == "turn/start"
+    assert requests[1]["params"]["model"] == "gpt-test"
+    assert requests[1]["params"]["effort"] == "high"
+
+
+def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    state = tmp / "state"
+    write_user_session(
+        transcript,
+        "00000000-0000-0000-0000-000000000099",
+        "normal parent prompt",
+    )
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "bad-event-thread-id",
+                "transcript_path": str(transcript),
+                "stop_hook_active": False,
+            },
+            extra_env={
+                "CODEX_THREAD_ID": "bad-env-thread-id",
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "dry-run",
+            },
+            state_dir=state,
+        )[0]
+    )
+    assert "decision" not in payload
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000099"
+    assert latest["parent_thread_path"] == str(transcript.resolve())
+    fork_params = latest["app_server_requests"][0]["params"]
+    assert fork_params["threadId"] == "00000000-0000-0000-0000-000000000099"
+    assert fork_params["path"] == str(transcript.resolve())
 
 
 def test_dirty_repo_continuation_mode(tmp: Path) -> None:
@@ -269,6 +313,7 @@ def test_dirty_repo_continuation_mode(tmp: Path) -> None:
                 "session_id": "00000000-0000-0000-0000-000000000004",
                 "stop_hook_active": False,
             },
+            extra_env={"CODEX_RVF_MODE": "continuation"},
         )[0]
     )
     assert payload["decision"] == "block"
@@ -292,12 +337,16 @@ def test_no_git_unique_dirty_trusted_repo_forks_by_default(tmp: Path) -> None:
                 "stop_hook_active": False,
             },
             config=config,
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
             state_dir=state,
         )[0]
     )
-    assert payload["decision"] == "block"
-    assert "$review-validate-fix" in payload["reason"]
-    assert str(dirty) in payload["reason"]
+    assert "decision" not in payload
+    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "dry-run"
+    assert "$review-validate-fix" in latest["prompt"]
+    assert str(dirty) in latest["prompt"]
 
 
 def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
@@ -397,9 +446,10 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
-        test_dirty_repo_continues_in_gui_by_default,
-        test_dirty_repo_manual_mode_only_prepares_launcher,
+        test_dirty_repo_forks_in_gui_by_default,
+        test_dirty_repo_manual_mode_only_prepares_prompt,
         test_dirty_repo_fork_dry_run,
+        test_stop_event_transcript_path_overrides_bad_env_thread_id,
         test_dirty_repo_continuation_mode,
         test_no_git_unique_dirty_trusted_repo_forks_by_default,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,

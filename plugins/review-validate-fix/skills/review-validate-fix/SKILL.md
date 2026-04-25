@@ -9,7 +9,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 本 skill 只应由用户显式调用，例如 `$review-validate-fix`。`agents/openai.yaml` 将 `policy.allow_implicit_invocation` 设为 `false`，避免 agent 或模型因为相似上下文自动启用它。
 
-例外：如果用户已经配置本 skill 附带的 Codex Stop hook，该 hook 可以在明确的 dirty repo 停止点返回 `decision: "block"` 和以 `$review-validate-fix` 开头的 continuation prompt，让 Codex GUI 在当前会话中继续执行 review loop。这属于用户预配置脚本生成的显式 prompt 边界，不是模型隐式启用 skill，也不改变 `allow_implicit_invocation: false` 的约束。
+例外：如果用户已经配置本 skill 附带的 Codex Stop hook，该 hook 可以在明确的 dirty repo 停止点通过 Codex app-server `thread/fork` + `turn/start` 创建一个新的 GUI fork，并用以 `$review-validate-fix` 开头的新用户 prompt 启动 review loop。这属于用户预配置脚本生成的显式 prompt 边界，不是模型隐式启用 skill，也不改变 `allow_implicit_invocation: false` 的约束。
 
 ## 入口判断
 
@@ -34,19 +34,20 @@ description: Use when the user asks for a post-work code review loop, review val
 
 ## Codex Stop Hook
 
-- hook 脚本为 `scripts/codex_stop_review_validate_fix.py`，只负责判断是否要把 `$review-validate-fix` 作为 Codex GUI continuation prompt 提交；不要在 hook 脚本里直接执行 review/fix。
-- 默认 `CODEX_RVF_MODE=continuation`：dirty gate 通过后，脚本返回 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt，在当前 Codex GUI 会话中继续运行 `$review-validate-fix`。这是 Desktop 的默认自动路径。
-- `CODEX_RVF_MODE=fork` 只保留为显式实验/调试路径。Terminal 启动已禁用，因为 Codex Desktop session id 不一定能被 CLI `codex fork <session-id>` 找到；不要把 Terminal fork 作为自动 Stop hook 行为。
-- `CODEX_RVF_FORK_MODE=manual` 或 `dry-run` 只用于调试 prompt/launcher 生成，不启动 Terminal。
+- hook 脚本为 `scripts/codex_stop_review_validate_fix.py`，只负责判断是否要用 `$review-validate-fix` prompt 创建新的 Codex GUI fork；不要在 hook 脚本里直接执行 review/fix。
+- 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=gui`：dirty gate 通过后，脚本通过 Codex app-server 的 `thread/fork` 与 `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这是 Desktop 的默认自动路径，用来保留可 rewind 的父会话 checkpoint。
+- `CODEX_RVF_MODE=continuation` 只保留为显式 fallback：脚本会返回 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt，在当前会话中继续运行 `$review-validate-fix`。该模式不会产生独立 fork checkpoint。
+- `CODEX_RVF_FORK_MODE=manual` 或 `dry-run` 只用于调试 prompt / app-server request 生成，不启动 Terminal。
 - `CODEX_RVF_MODE=off`：dirty gate 通过也只输出 systemMessage 并跳过自动触发。
 - 如果 `stop_hook_active=true`，必须直接跳过，避免 Stop continuation 或 fork 递归。
-- 如果 Stop 事件来自 Codex subagent，必须直接跳过。post-work review 只能由主会话显式触发；研究、review、validate/fix 等子代理结束时不得被 Stop hook 拖入新的 `$review-validate-fix` continuation。
+- 如果 Stop 事件来自 Codex subagent，必须直接跳过。post-work review 只能由主会话显式触发；研究、review、validate/fix 等子代理结束时不得被 Stop hook 拖入新的 `$review-validate-fix` fork 或 continuation。
 - 如果环境变量 `CODEX_RVF_SUPPRESS=1` 或 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，必须直接跳过；该开关用于 research marathon 等主会话已接管调度的场景。
 - Stop hook matcher 当前不能按 repo 过滤，因此脚本必须先使用 `scripts/review_validate_fix_gate.sh` 做 dirty gate。
 - 如果当前 `cwd` 不在 git repo 中，可以扫描 `~/.codex/config.toml` 中 trust_level 为 `trusted` 的项目；只有唯一 dirty trusted repo 时才自动 fork，多个候选必须 fail-safe 跳过并给出提示。
-- fork prompt 必须包含目标仓库路径、`RVF_FORKED_REVIEW_VALIDATE_FIX`、父 session id 和父 cwd，让新 fork 能在正确仓库执行并在结束时识别自身。
-- 如果使用显式实验 fork 模式，新 fork 会话结束时，如果 Stop 事件的 `last_assistant_message` 已包含 `<handoff-context>`，hook 通过 systemMessage 程序化提示用户复制最终回复中的 handoff block 并粘贴回原始 chat session；不要让 agent 在正文里手写这个提示。默认 continuation 模式不需要这个复制步骤。
-- 实验 fork launcher 会在 Stop 事件提供 `model` 时显式传入 `-m <model>`，并从 Stop 事件、`CODEX_RVF_FORK_REASONING_EFFORT` 或 `~/.codex/config.toml` 的 `model_reasoning_effort` 推出 reasoning effort 后通过 `-c model_reasoning_effort=...` 传入。若父会话使用了 hook 不可见的临时 reasoning override，则无法完全保证继承。
+- fork prompt 必须包含目标仓库路径、`RVF_FORKED_REVIEW_VALIDATE_FIX`、父 thread/session id 和父 cwd，让新 fork 能在正确仓库执行并在结束时识别自身。
+- 如果 Stop 事件提供 `transcript_path` / `session_path` / `conversation_path`，app-server fork 必须优先用该 rollout path 调用 `thread/fork`；Desktop 暴露的环境 thread id 可能不是可由外部 app-server 直接索引的 saved session id。
+- 新 fork 会话结束时，如果 Stop 事件的 `last_assistant_message` 已包含 `<handoff-context>`，hook 通过 systemMessage 程序化提示用户复制最终回复中的 handoff block 并粘贴回原始 chat session；不要让 agent 在正文里手写这个提示。
+- app-server fork 会在 Stop 事件提供 `model` 时显式传入 model，并从 Stop 事件、`CODEX_RVF_FORK_REASONING_EFFORT` 或 `~/.codex/config.toml` 的 `model_reasoning_effort` 推出 reasoning effort 后在 `turn/start` 中传入。若父会话使用了 hook 不可见的临时 reasoning override，则无法完全保证继承。
 
 ## Setup-only 资源
 
