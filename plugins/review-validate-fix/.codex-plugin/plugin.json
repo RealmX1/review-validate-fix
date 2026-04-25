@@ -1,0 +1,42 @@
+{
+  "name": "review-validate-fix",
+  "version": "0.1.0",
+  "description": "Run a post-work double-review, validate/fix, and handoff loop for Codex workspaces.",
+  "author": {
+    "name": "Bomin Zhang",
+    "email": "30303853+RealmX1@users.noreply.github.com",
+    "url": "https://github.com/RealmX1"
+  },
+  "homepage": "https://github.com/RealmX1/review-validate-fix",
+  "repository": "https://github.com/RealmX1/review-validate-fix",
+  "license": "UNLICENSED",
+  "keywords": [
+    "codex",
+    "skill",
+    "plugin",
+    "review",
+    "validation",
+    "handoff"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Review Validate Fix",
+    "shortDescription": "Double-review, validate, fix, and hand off changes",
+    "longDescription": "Adds the review-validate-fix Codex skill as a plugin-packaged workflow for post-work review loops, issue validation, minimal fixes, and handoff generation.",
+    "developerName": "Bomin Zhang",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/RealmX1/review-validate-fix",
+    "defaultPrompt": [
+      "Run $review-validate-fix on my current changes",
+      "Run $review-validate-fix skip review",
+      "Run $review-validate-fix no handoff"
+    ],
+    "brandColor": "#2F6F6D",
+    "screenshots": []
+  }
+}
