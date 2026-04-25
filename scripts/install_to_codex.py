@@ -114,6 +114,49 @@ def update_marketplace(plugin_parent: Path) -> Path:
     return marketplace_path
 
 
+def configure_stop_hook(skill_dir: Path) -> Path:
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    if hooks_path.exists():
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    else:
+        data = {"hooks": {}}
+
+    hooks = data.setdefault("hooks", {})
+    stop_groups = hooks.setdefault("Stop", [])
+    command = (
+        "CODEX_RVF_FORK_MODE=terminal python3 "
+        f"{skill_dir / 'scripts' / 'codex_stop_review_validate_fix.py'}"
+    )
+    entry = {
+        "type": "command",
+        "command": command,
+        "timeout": 30,
+        "statusMessage": "Checking review-validate-fix gate",
+    }
+
+    replaced = False
+    for group in stop_groups:
+        group_hooks = group.setdefault("hooks", [])
+        for index, existing in enumerate(group_hooks):
+            existing_command = existing.get("command")
+            if (
+                isinstance(existing_command, str)
+                and "codex_stop_review_validate_fix.py" in existing_command
+            ):
+                group_hooks[index] = entry
+                replaced = True
+                break
+        if replaced:
+            break
+
+    if not replaced:
+        stop_groups.append({"hooks": [entry]})
+
+    hooks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return hooks_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="把本仓库内容安装到 Codex skill/plugin 本机空间。")
     parser.add_argument("--as", dest="install_as", choices=["skill", "plugin", "both"], default="skill")
@@ -132,6 +175,11 @@ def main() -> int:
         action="store_true",
         help="覆盖本机 setup 相关配置；默认会保留 alternative-reviewer.json 和 state/。",
     )
+    parser.add_argument(
+        "--configure-stop-hook",
+        action="store_true",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 以 CODEX_RVF_FORK_MODE=terminal 调用本 skill。",
+    )
     args = parser.parse_args()
 
     preserve = not args.replace_setup_config
@@ -142,6 +190,9 @@ def main() -> int:
             dst = Path(args.skill_dir).expanduser().resolve()
             copy_tree(SKILL_SRC, dst, PRESERVE_IN_SKILL, preserve)
             installed.append(f"skill: {dst}")
+            installed_skill_dir = dst
+        else:
+            installed_skill_dir = Path(args.skill_dir).expanduser().resolve()
 
         if args.install_as in {"plugin", "both"}:
             parent = Path(args.plugin_parent).expanduser().resolve()
@@ -150,6 +201,10 @@ def main() -> int:
             marketplace = update_marketplace(parent)
             installed.append(f"plugin: {dst}")
             installed.append(f"marketplace: {marketplace}")
+
+        if args.configure_stop_hook:
+            hooks_path = configure_stop_hook(installed_skill_dir)
+            installed.append(f"stop hook: {hooks_path}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2

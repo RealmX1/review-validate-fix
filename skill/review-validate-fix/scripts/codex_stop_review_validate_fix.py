@@ -20,7 +20,7 @@ DEFAULT_STATE_DIR = SKILL_DIR / "state" / "fork-experiment"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 DEFAULT_RVF_MODE = "fork"
-DEFAULT_FORK_LAUNCH_MODE = "manual"
+DEFAULT_FORK_LAUNCH_MODE = "terminal"
 SUPPRESS_ENV_NAMES = (
     "CODEX_RVF_SUPPRESS",
     "CODEX_RVF_SUPPRESS_STOP_HOOK",
@@ -454,7 +454,8 @@ def run_codex_fork(
     if status == "manual-prepared":
         message = (
             f"{log_prefix} prepared: no Terminal was launched. "
-            f"parent_session_id={parent_session_id}. prompt={prompt_path}. log={log_path}"
+            f"parent_session_id={parent_session_id}. launcher={launcher_path}. "
+            f"prompt={prompt_path}. log={log_path}"
         )
     else:
         message = (

@@ -35,8 +35,8 @@ description: Use when the user asks for a post-work code review loop, review val
 ## Codex Stop Fork Hook
 
 - hook 脚本为 `scripts/codex_stop_review_validate_fix.py`，只负责判断是否要把 `$review-validate-fix` 作为新的 Codex fork prompt 提交；不要在 hook 脚本里直接执行 review/fix。
-- 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=manual`：dirty gate 通过后，脚本生成可用于 `codex fork <parent-session-id> <prompt>` 的 prompt、launcher 和日志，但不自动打开 Terminal。当前 Codex CLI 没有已验证的 GUI-only fork 启动接口；自动打开 Terminal 会造成 TUI/GUI 双前端，且某些 Desktop Stop event 的 session id 不能被 CLI `codex fork` 找到。
-- 显式 `CODEX_RVF_FORK_MODE=terminal`：允许脚本用 Terminal 启动 `codex fork`。这是实验/手动确认模式，不应作为默认值。
+- 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=terminal`：dirty gate 通过后，脚本生成 prompt、launcher 和日志，并用 Terminal 启动 `codex fork <parent-session-id> <prompt>`。当前 Codex Desktop 对 Stop hook 的 `systemMessage` 在某些路径上可能不显示，因此默认必须执行可见的 fork action，而不是只准备文件。
+- 显式 `CODEX_RVF_FORK_MODE=manual`：只生成可手动运行的 launcher，不自动打开 Terminal。该模式适合调试，但不应用作依赖自动 post-work review 的默认配置。
 - `CODEX_RVF_FORK_MODE=dry-run`：只测试 fork prompt 和日志生成，不启动 fork。
 - fallback `CODEX_RVF_MODE=continuation`：使用 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt 机制，在同一会话继续运行；该模式不提供独立 fork checkpoint。
 - `CODEX_RVF_MODE=off`：dirty gate 通过也只输出 systemMessage 并跳过自动触发。

@@ -114,6 +114,19 @@ def write_user_session(path: Path, session_id: str, message: str) -> None:
     )
 
 
+def prepend_fake_osascript(tmp: Path) -> dict[str, str]:
+    fake_bin = tmp / "fake-bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    fake = fake_bin / "osascript"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'tab 1 of window id 12345\\n'\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    return {"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+
 def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
     transcript = tmp / "session.jsonl"
     state = tmp / "state"
@@ -185,7 +198,7 @@ def test_clean_repo_skips(tmp: Path) -> None:
     assert stdout == ""
 
 
-def test_dirty_repo_prepares_manual_fork_by_default(tmp: Path) -> None:
+def test_dirty_repo_launches_terminal_fork_by_default(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     state = tmp / "state"
     payload = parse_json(
@@ -195,17 +208,42 @@ def test_dirty_repo_prepares_manual_fork_by_default(tmp: Path) -> None:
                 "session_id": "00000000-0000-0000-0000-000000000002",
                 "stop_hook_active": False,
             },
+            extra_env=prepend_fake_osascript(tmp),
+            state_dir=state,
+        )[0]
+    )
+    assert "decision" not in payload
+    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["mode"] == "terminal"
+    assert latest["status"] == "terminal-launch-attempted"
+    assert latest["returncode"] == 0
+    assert "tab 1 of window id" in latest["stdout"]
+    assert "$review-validate-fix" in latest["prompt"]
+    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
+    assert str(dirty) in latest["prompt"]
+
+
+def test_dirty_repo_manual_mode_only_prepares_launcher(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "00000000-0000-0000-0000-000000000022",
+                "stop_hook_active": False,
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "manual"},
             state_dir=state,
         )[0]
     )
     assert "decision" not in payload
     assert "review-validate-fix-fork prepared" in payload["systemMessage"]
-    assert "no Terminal was launched" in payload["systemMessage"]
+    assert "launcher=" in payload["systemMessage"]
     latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     assert latest["status"] == "manual-prepared"
-    assert "$review-validate-fix" in latest["prompt"]
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
+    assert Path(latest["launcher_path"]).exists()
 
 
 def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
@@ -381,7 +419,8 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
-        test_dirty_repo_prepares_manual_fork_by_default,
+        test_dirty_repo_launches_terminal_fork_by_default,
+        test_dirty_repo_manual_mode_only_prepares_launcher,
         test_dirty_repo_fork_dry_run,
         test_dirty_repo_continuation_mode,
         test_no_git_unique_dirty_trusted_repo_forks_by_default,

@@ -51,6 +51,14 @@ python3 scripts/install_to_codex.py --as both
 
 plugin 安装会把包装层复制到 `~/plugins/review-validate-fix`，并在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry。这个路径遵循 Codex plugin scaffold 的本机 marketplace 约定。
 
+配置 Codex Stop hook：
+
+```bash
+python3 scripts/install_to_codex.py --as skill --configure-stop-hook
+```
+
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_FORK_MODE=terminal` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。
+
 ## Setup 相关配置
 
 有些变化不能简单从仓库覆盖到本机，因为它们绑定机器、凭据或用户选择。当前最典型的是：
@@ -67,6 +75,8 @@ python3 scripts/install_to_codex.py --as skill --replace-setup-config
 ```
 
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
+
+Stop hook 的自动 fork 默认依赖 `CODEX_RVF_FORK_MODE=terminal`，也就是 dirty gate 通过后会实际打开 Terminal 并运行 `codex fork`。`CODEX_RVF_FORK_MODE=manual` 只适合调试，因为 Codex Desktop 可能不会展示 hook 返回的 `systemMessage`，从用户视角会像是空白且没有动作。
 
 ## 验证
 
