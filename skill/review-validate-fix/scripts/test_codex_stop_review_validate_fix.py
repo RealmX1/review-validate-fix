@@ -90,6 +90,10 @@ def write_subagent_session(path: Path) -> None:
 
 
 def write_user_session(path: Path, session_id: str, message: str) -> None:
+    write_user_session_messages(path, session_id, [message])
+
+
+def write_user_session_messages(path: Path, session_id: str, messages: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         {
@@ -98,15 +102,18 @@ def write_user_session(path: Path, session_id: str, message: str) -> None:
                 "id": session_id,
                 "cwd": str(path.parent),
             },
-        },
-        {
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": message,
-            },
-        },
+        }
     ]
+    for message in messages:
+        lines.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": message,
+                },
+            }
+        )
     path.write_text(
         "\n".join(json.dumps(line) for line in lines) + "\n",
         encoding="utf-8",
@@ -450,6 +457,108 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> Non
     assert not (state / "child-session.handoff-advised").exists()
 
 
+def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp: Path) -> None:
+    dirty = init_repo(tmp / "repo", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    fork_prompt = (
+        "$review-validate-fix\n\n"
+        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
+        "RVF_PARENT_SESSION_ID: parent-session\n"
+        f"RVF_PARENT_CWD: {tmp}\n"
+        f"RVF_TARGET_REPO: {dirty}\n"
+    )
+    write_user_session_messages(
+        transcript,
+        "child-session",
+        [
+            fork_prompt,
+            "后续用户消息遮住了最初的 fork marker。",
+        ],
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "child-session",
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+            "last_assistant_message": "尚未生成 handoff。",
+        },
+        state_dir=state,
+    )
+    assert stdout == ""
+    assert not (state / "latest.json").exists()
+
+
+def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> None:
+    dirty = init_repo(tmp / "repo", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    fork_prompt = (
+        "$review-validate-fix\n\n"
+        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
+        "RVF_PARENT_SESSION_ID: parent-session\n"
+        f"RVF_PARENT_CWD: {tmp}\n"
+        f"RVF_TARGET_REPO: {dirty}\n"
+    )
+    write_user_session_messages(
+        transcript,
+        "child-session",
+        [
+            "早先普通讨论里提到了 RVF_FORKED_REVIEW_VALIDATE_FIX，但没有完整 metadata。",
+            fork_prompt,
+            "后续用户消息遮住了最初的 fork marker。",
+        ],
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "child-session",
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+            "last_assistant_message": "尚未生成 handoff。",
+        },
+        state_dir=state,
+    )
+    assert stdout == ""
+    assert not (state / "latest.json").exists()
+
+
+def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path) -> None:
+    dirty = init_repo(tmp / "repo", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session_messages(
+        transcript,
+        "ordinary-session",
+        [
+            "普通讨论里提到了 RVF_FORKED_REVIEW_VALIDATE_FIX，但没有 fork metadata。",
+            "请继续处理当前 dirty repo。",
+        ],
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "ordinary-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+    assert "decision" not in payload
+    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "dry-run"
+    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
+    assert str(dirty) in latest["prompt"]
+
+
 def test_no_git_multiple_dirty_trusted_repos_skips(tmp: Path) -> None:
     plain = tmp / "plain"
     plain.mkdir(parents=True)
@@ -483,6 +592,9 @@ def main() -> int:
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
         test_forked_rvf_session_waits_for_handoff_before_advisory,
         test_forked_rvf_session_waits_when_handoff_message_missing,
+        test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message,
+        test_forked_rvf_marker_scan_skips_incomplete_earlier_marker,
+        test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo,
         test_no_git_multiple_dirty_trusted_repos_skips,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:

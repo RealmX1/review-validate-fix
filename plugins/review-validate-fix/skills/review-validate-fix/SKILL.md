@@ -16,9 +16,11 @@ description: Use when the user asks for a post-work code review loop, review val
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
 2. 如果没有未提交改动，用中文说明没有可审查改动并结束。
 3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件。
-4. Review 前优先用 `scripts/prepare_review_run.py --repo <repo> --session-context <file>` 创建唯一 run 目录；该脚本会生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --output <packet> --metadata-output <metadata>`。packet 必须覆盖 tracked diff、完整 untracked 文件列表，以及可内联的 untracked 文件内容；不要只依赖 `git diff HEAD`。
-5. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
-6. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
+4. Review 前必须先由主会话写一份 session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、已跑验证命令、关键设计取舍和仍不确定的点。不要让 reviewer 只靠 `git diff HEAD` 猜 scope；diff/status 是证据，不是 scope 的唯一来源。
+5. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file>` 创建唯一 run 目录；该脚本会生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --output <packet> --metadata-output <metadata>`。packet 必须覆盖主会话提供的 session context、tracked diff、完整 untracked 文件列表，以及可内联的 untracked 文件内容；不要只依赖 `git diff HEAD`。
+6. 如果无法从当前会话可靠写出 session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
+7. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
+8. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
 
 ## 运行选项
 
@@ -81,7 +83,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
 - Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt 和 session context，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
-- 两个 reviewer 使用同一份 review prompt 和 session context，但彼此不看对方输出。
+- 两个 reviewer 使用同一份 review prompt、同一份 session context 和同一份 review packet，但彼此不看对方输出。session context 是主会话对本 turn 已完成工作的交接说明；reviewer 应结合它判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实，不得只靠 git diff 推断审查范围。
 - 完成态 Review 输出契约必须严格为：
   - 无问题：只输出 `NO_ISSUES`。
   - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。

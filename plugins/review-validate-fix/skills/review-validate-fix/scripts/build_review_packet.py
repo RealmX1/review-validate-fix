@@ -92,12 +92,24 @@ def build_packet(
     max_file_bytes: int,
     primary_files: list[str],
     background_files: list[str],
+    allow_missing_session_context: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
     generated = datetime.now(timezone.utc).isoformat()
     status = run_git(root, ["status", "--short", "-uall"]).rstrip()
     diff = run_git(root, ["diff", "--find-renames", "HEAD", "--"]).rstrip()
     untracked = untracked_files(root)
+    session_context_text = ""
+    if session_context is None:
+        if not allow_missing_session_context:
+            raise ValueError(
+                "session context is required: write a main-agent work summary and pass "
+                "--session-context <file>; use --allow-missing-session-context only for debug"
+            )
+    else:
+        session_context_text = session_context.read_text(encoding="utf-8").strip()
+        if not session_context_text and not allow_missing_session_context:
+            raise ValueError(f"session context file is empty: {session_context}")
     metadata: dict[str, Any] = {
         "generated": generated,
         "repo": str(root),
@@ -105,6 +117,8 @@ def build_packet(
         "status_bytes": len(status.encode("utf-8")),
         "diff_bytes": len(diff.encode("utf-8")),
         "untracked_count": len(untracked),
+        "session_context_provided": bool(session_context_text),
+        "session_context_bytes": len(session_context_text.encode("utf-8")),
         "primary_files": primary_files,
         "background_files": background_files,
         "untracked_files": [],
@@ -130,8 +144,8 @@ def build_packet(
             lines.extend(f"- {path}" for path in background_files)
             lines.append("")
 
-    if session_context is not None:
-        lines.extend(["## Session Context", "", session_context.read_text(encoding="utf-8").strip(), ""])
+    if session_context_text:
+        lines.extend(["## Session Context", "", session_context_text, ""])
 
     lines.extend(
         [
@@ -175,13 +189,18 @@ def build_packet(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build a self-contained review packet for review-validate-fix.")
     parser.add_argument("--repo", required=True, help="Target git repository.")
-    parser.add_argument("--session-context", help="Optional file containing confirmed session context.")
+    parser.add_argument("--session-context", help="Required file containing the main-agent work summary.")
     parser.add_argument("--output", help="Write packet to this file instead of stdout.")
     parser.add_argument("--metadata-output", help="Write packet metadata JSON to this file.")
     parser.add_argument("--max-file-bytes", type=int, default=200_000, help="Max untracked file bytes to inline.")
     parser.add_argument("--max-packet-bytes", type=int, default=0, help="Fail if the generated packet exceeds this many bytes. 0 disables the check.")
     parser.add_argument("--primary-file", action="append", default=[], help="Path known to be primary work for this turn. May be repeated.")
     parser.add_argument("--background-file", action="append", default=[], help="Path known to be pre-existing background WIP. May be repeated.")
+    parser.add_argument(
+        "--allow-missing-session-context",
+        action="store_true",
+        help="Debug-only escape hatch. Normal review runs must pass --session-context.",
+    )
     args = parser.parse_args()
 
     try:
@@ -195,6 +214,7 @@ def main() -> int:
             args.max_file_bytes,
             args.primary_file,
             args.background_file,
+            args.allow_missing_session_context,
         )
         if args.max_packet_bytes and metadata["packet_bytes"] > args.max_packet_bytes:
             raise ValueError(

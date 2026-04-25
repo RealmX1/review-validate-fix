@@ -165,6 +165,35 @@ def latest_user_message(path: Path) -> str | None:
     return latest
 
 
+def user_messages_containing(path: Path, marker: str) -> list[str]:
+    messages: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                text = ""
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    text = message if isinstance(message, str) else ""
+                elif record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+
+                if marker in text:
+                    messages.append(text)
+    except OSError:
+        return []
+    return messages
+
+
 def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
     direct = event.get("last_user_message")
     if isinstance(direct, str) and direct:
@@ -335,11 +364,25 @@ def parse_marker_value(text: str, key: str) -> str | None:
 def rvf_fork_context(latest_user: str | None) -> dict[str, str] | None:
     if not latest_user or RVF_FORK_MARKER not in latest_user:
         return None
+    parent_session_id = parse_marker_value(latest_user, "RVF_PARENT_SESSION_ID")
+    parent_cwd = parse_marker_value(latest_user, "RVF_PARENT_CWD")
+    target_repo = parse_marker_value(latest_user, "RVF_TARGET_REPO")
+    if not parent_session_id or not parent_cwd or not target_repo:
+        return None
     return {
-        "parent_session_id": parse_marker_value(latest_user, "RVF_PARENT_SESSION_ID") or "",
-        "parent_cwd": parse_marker_value(latest_user, "RVF_PARENT_CWD") or "",
-        "target_repo": parse_marker_value(latest_user, "RVF_TARGET_REPO") or "",
+        "parent_session_id": parent_session_id,
+        "parent_cwd": parent_cwd,
+        "target_repo": target_repo,
     }
+
+
+def rvf_fork_context_from_event(event: dict[str, Any]) -> dict[str, str] | None:
+    for path in event_session_paths(event):
+        for message in user_messages_containing(path.expanduser(), RVF_FORK_MARKER):
+            context = rvf_fork_context(message)
+            if context is not None:
+                return context
+    return None
 
 
 def handoff_advisory(event: dict[str, Any], context: dict[str, str]) -> dict[str, Any] | None:
@@ -978,7 +1021,7 @@ def main() -> int:
         return 0
 
     latest_user = latest_user_message_from_event(event)
-    fork_context = rvf_fork_context(latest_user)
+    fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
     if fork_context is not None:
         advisory = handoff_advisory(event, fork_context)
         if advisory is not None:

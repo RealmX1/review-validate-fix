@@ -93,7 +93,12 @@ def test_check_review_output_lock_request() -> None:
 def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
-    context.write_text("## Session context\n- test\n", encoding="utf-8")
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
     packet = tmp / "packet.md"
     metadata = tmp / "packet.json"
     run(
@@ -117,15 +122,40 @@ def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     packet_text = packet.read_text(encoding="utf-8")
     payload = json.loads(metadata.read_text(encoding="utf-8"))
     assert "## Review Scope" in packet_text
+    assert "## Session Context" in packet_text
+    assert payload["session_context_provided"] is True
+    assert payload["session_context_bytes"] > 0
     assert payload["primary_files"] == ["tracked.txt"]
     assert payload["background_files"] == ["new.txt"]
     assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
 
 
+def test_build_packet_requires_session_context(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "session context is required" in completed.stderr
+
+
 def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
-    context.write_text("## Session context\n- test\n", encoding="utf-8")
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：prepared review run\n",
+        encoding="utf-8",
+    )
     result = run(
         [
             sys.executable,
@@ -144,6 +174,8 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert Path(payload["review_packet"]).exists()
     assert Path(payload["review_packet_metadata"]).exists()
     assert Path(payload["before_workspace_snapshot"]).exists()
+    assert payload["session_context"] == str(context.resolve())
+    assert payload["session_context_provided"] is True
 
     locked = run(
         [
@@ -160,6 +192,25 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
         ]
     )
     assert "locked" in locked.stdout
+
+
+def test_prepare_review_run_requires_session_context(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--base-dir",
+            str(tmp / "runs"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "session context is required" in completed.stderr
 
 
 def test_alternative_reviewer_idle_timeout_flag(tmp: Path) -> None:
@@ -302,7 +353,7 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         ["claude", "-p"],
-        idle_timeout_seconds=1.0,
+        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )
@@ -330,6 +381,8 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
     assert "stream-json" in argv
     assert "--include-hook-events" in argv
     assert "--include-partial-messages" in argv
+    assert "--verbose" in argv
+    assert "--disable-slash-commands" in argv
 
 
 def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) -> None:
@@ -355,7 +408,7 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) ->
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         ["claude", "-p", "--output-format", "text"],
-        idle_timeout_seconds=1.0,
+        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )
@@ -405,7 +458,7 @@ def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: P
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         ["claude", "-p", "--output-format=text"],
-        idle_timeout_seconds=1.0,
+        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )
@@ -455,7 +508,7 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-u", str(shim), "--native-stream"],
-        idle_timeout_seconds=1.0,
+        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -485,7 +538,9 @@ def main() -> int:
         root = Path(tmpdir)
         test_check_review_output_lock_request()
         test_build_packet_metadata_and_scope(root / "packet")
+        test_build_packet_requires_session_context(root / "packet-requires-context")
         test_prepare_review_run_and_command_lock(root / "prepare")
+        test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
         test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")

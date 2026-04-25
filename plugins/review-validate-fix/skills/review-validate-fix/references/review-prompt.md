@@ -1,12 +1,15 @@
 # Review Prompt
 
-把可确认的 session context 放在本 prompt 顶部；如果无法确认，就省略，不要编造。
+主会话必须把可确认的 session context 放在本 prompt 顶部，并把同一份内容写入 review packet。它是主会话对本 turn 已完成工作的交接说明；不要让 reviewer 只靠 `git diff HEAD` 猜 scope。
 
 ```markdown
 ## Session context（主会话注入）
 - 用户最初的请求 / 意图：<1-2 句复述>
-- 本 turn 实际由主会话改过的文件：<只列本会话确实改过的 path>
+- 本 turn 主会话实际完成的工作：<按行为概括，而不是复述 diff>
+- 本 turn 实际由主会话改过的文件：<只列本会话确实改过的 path；分不清归属的文件写入“不确定”并说明原因>
+- 已运行的验证命令和结果：<只写确实运行过的命令>
 - 关键设计取舍：<只在明显会被误判时填写>
+- 未完成 / 不确定 / 需要 reviewer 特别核实：<没有就写“无”>
 ```
 
 传给两个独立 review pass 的正文。两个 reviewer 使用相同 prompt，但不要共享彼此输出：
@@ -30,9 +33,9 @@ pass_type: review_only
 - 不要进入 validate/fix，不要修复问题，不要生成 handoff。
 - 不要输出 `<handoff-context>`，不要输出 handoff 摘要，不要把自己描述成已完成 `$review-validate-fix`。
 - 如果外层上下文提到 research marathon、checkpoint、no-handoff 或普通研究任务，仍按本 `review_only` 契约输出；不要升级为 full mode。
-- 如果你收到 self-contained review packet，把它当作审查入口和未跟踪文件索引；仍可读取仓库和运行验证命令来补充判断。
+- 你应收到包含 `## Session Context` 的 self-contained review packet。把 session context 当作审查入口和 scope/intent 线索，把 packet 当作未跟踪文件索引；仍可读取仓库和运行验证命令来补充判断。
 
-如果 prompt 顶部有 `## Session context（主会话注入）` 块：把它当作背景参考，而不是免死金牌。主会话的意图说明可以帮你判断某些看似奇怪的代码其实是有意为之；但你依然要独立 verify。
+`## Session context（主会话注入）` / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。你必须结合 packet、`git status --short -uall`、`git diff HEAD`、文件读取和必要命令独立 verify。也不要只靠 git diff 推断 scope；当 diff 范围和 session context 不一致时，优先核实差异是否是背景 WIP、遗漏交接或真实问题。
 
 输出契约必须严格遵守：
 - 如果改动没问题，原样输出字面字符串：`NO_ISSUES`。不加标点、不加前言、仅这一个词。
@@ -41,7 +44,7 @@ pass_type: review_only
 
 不要概括代码做了什么。不要复述 diff。不要恭维。不要提与 bug 无关的改进。
 
-先看 review packet、`git status --short -uall` 和 `git diff HEAD`，再读具体文件补充 context。未跟踪文件必须来自 `git status --porcelain` / review packet，不能因为 `git diff HEAD` 看不到就忽略。
+先看带有 session context 的 review packet、`git status --short -uall` 和 `git diff HEAD`，再读具体文件补充 context。未跟踪文件必须来自 `git status --porcelain` / review packet，不能因为 `git diff HEAD` 看不到就忽略。
 ```
 
 ## 解析规则
