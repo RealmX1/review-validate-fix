@@ -20,6 +20,9 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
+OUTPUT_FORMAT_TEXT = "text"
+OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
+SUPPORTED_OUTPUT_FORMATS = {OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_CLAUDE_STREAM_JSON}
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -57,6 +60,48 @@ def positive_float(config: dict[str, Any], key: str, default: float) -> float:
 
 def check_command(command: list[str]) -> str | None:
     return shutil.which(command[0])
+
+
+def is_claude_print_command(command: list[str]) -> bool:
+    return bool(command) and Path(command[0]).name == "claude" and any(
+        item in {"-p", "--print"} for item in command
+    )
+
+
+def claude_output_format_arg(command: list[str]) -> str | None:
+    for index, item in enumerate(command):
+        if item.startswith("--output-format="):
+            return item.split("=", 1)[1]
+        if item == "--output-format" and index + 1 < len(command):
+            return command[index + 1]
+    return None
+
+
+def ensure_claude_stream_json_command(command: list[str]) -> list[str]:
+    patched = list(command)
+    equals_index = next(
+        (
+            index
+            for index, item in enumerate(patched)
+            if item.startswith("--output-format=")
+        ),
+        None,
+    )
+    if equals_index is not None:
+        patched[equals_index] = "--output-format=stream-json"
+    elif "--output-format" in patched:
+        index = patched.index("--output-format")
+        if index + 1 < len(patched):
+            patched[index + 1] = "stream-json"
+        else:
+            patched.append("stream-json")
+    else:
+        patched.extend(["--output-format", "stream-json"])
+    if "--include-hook-events" not in patched:
+        patched.append("--include-hook-events")
+    if "--include-partial-messages" not in patched:
+        patched.append("--include-partial-messages")
+    return patched
 
 
 def check_repo(repo: Path) -> None:
@@ -192,6 +237,27 @@ def run_with_activity_timeout(
             )
 
 
+def extract_claude_stream_result(output: str) -> str:
+    """从 Claude Code stream-json stdout 中提取最终 result 文本。"""
+
+    result: str | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") == "result" and isinstance(payload.get("result"), str):
+            result = payload["result"]
+    if result is not None:
+        return result.strip()
+    return output.strip()
+
+
 def normalize_review_output(output: str) -> str:
     return output.strip()
 
@@ -241,6 +307,22 @@ def main() -> int:
             DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS,
         )
         health_timeout = int(positive_float(config, "health_timeout_seconds", 30.0))
+        output_format = config.get("output_format")
+        if output_format is None and is_claude_print_command(command):
+            cli_output_format = claude_output_format_arg(command)
+            if cli_output_format in {None, "stream-json"}:
+                output_format = OUTPUT_FORMAT_CLAUDE_STREAM_JSON
+                command = ensure_claude_stream_json_command(command)
+            else:
+                output_format = OUTPUT_FORMAT_TEXT
+        elif output_format is None:
+            output_format = OUTPUT_FORMAT_TEXT
+        if output_format not in SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError(
+                f"output_format must be one of: {', '.join(sorted(SUPPORTED_OUTPUT_FORMATS))}"
+            )
+        if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
+            command = ensure_claude_stream_json_command(command)
     except Exception as exc:
         return fail(f"alternative reviewer 配置无效: {exc}", 2)
 
@@ -310,6 +392,8 @@ def main() -> int:
     )
 
     stdout = completed.stdout.strip()
+    if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
+        stdout = extract_claude_stream_result(stdout)
     stdout = normalize_review_output(stdout)
     stderr = completed.stderr.strip()
     timed_out = (

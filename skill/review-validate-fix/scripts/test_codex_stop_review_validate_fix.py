@@ -304,6 +304,33 @@ def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> No
     assert fork_params["path"] == str(transcript.resolve())
 
 
+def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    log_path = tmp / "hook.log"
+    log_path.write_text("not a rollout jsonl\n", encoding="utf-8")
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "00000000-0000-0000-0000-000000000100",
+                "log_path": str(log_path),
+                "stop_hook_active": False,
+            },
+            extra_env={
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "dry-run",
+            },
+            state_dir=state,
+        )[0]
+    )
+    assert "decision" not in payload
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000100"
+    assert latest["parent_thread_path"] is None
+    assert "path" not in latest["app_server_requests"][0]["params"]
+
+
 def test_dirty_repo_continuation_mode(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     payload = parse_json(
@@ -450,6 +477,7 @@ def main() -> int:
         test_dirty_repo_manual_mode_only_prepares_prompt,
         test_dirty_repo_fork_dry_run,
         test_stop_event_transcript_path_overrides_bad_env_thread_id,
+        test_stop_event_log_path_is_not_used_as_fork_rollout_path,
         test_dirty_repo_continuation_mode,
         test_no_git_unique_dirty_trusted_repo_forks_by_default,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,

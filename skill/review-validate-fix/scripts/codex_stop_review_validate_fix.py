@@ -213,7 +213,7 @@ def session_id_from_event(event: dict[str, Any]) -> str | None:
 def parent_thread_path_from_event(event: dict[str, Any]) -> Path | None:
     for path in event_session_paths(event):
         expanded = path.expanduser()
-        if expanded.exists():
+        if expanded.exists() and session_id_from_path(expanded) is not None:
             return expanded.resolve()
     return None
 
@@ -657,7 +657,10 @@ def select_app_server_socket() -> tuple[Path, str]:
     if explicit and explicit.strip():
         return Path(explicit).expanduser().resolve(), "explicit"
 
-    if DEFAULT_APP_SERVER_CONTROL_SOCKET.exists():
+    if (
+        DEFAULT_APP_SERVER_CONTROL_SOCKET.exists()
+        and can_connect_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
+    ):
         return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control"
 
     socket_path = ensure_bridge_app_server()
@@ -675,20 +678,20 @@ def ensure_bridge_app_server() -> Path:
 
     log_path = bridge_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open("ab")
     codex_bin = os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
-    subprocess.Popen(
-        [
-            codex_bin,
-            "app-server",
-            "--listen",
-            f"unix://{socket_path}",
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True,
-    )
+    with log_path.open("ab") as log_file:
+        subprocess.Popen(
+            [
+                codex_bin,
+                "app-server",
+                "--listen",
+                f"unix://{socket_path}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
 
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:

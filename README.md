@@ -6,6 +6,12 @@
 
 Codex 可以接受 plugin。这个本机 Codex 环境已经加载了 `GitHub`、`Browser Use`、`Documents`、`Spreadsheets` 等 plugin；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并可以携带 `skills`、MCP server、app manifest、hook、asset 等资源。对这个 workflow 来说，skill 是最小且最稳的交付形态；plugin 更适合需要统一分发、UI 展示、MCP/app/hook 组合安装，或团队 marketplace 管理的时候。
 
+## 核心设计支柱：Stop 后 GUI Fork
+
+`review-validate-fix` 的 Stop hook 自动化必须以“父会话停止，新 GUI fork 会话承载 review checkpoint”为中心设计。父会话触发 Stop hook 后应结束；hook 负责通过 Codex app-server fork 出一个新会话，并像用户手动启动新会话时输入第一个 prompt 一样，在 fork 会话中提交以 `$review-validate-fix` 开头的用户 prompt。
+
+这个新 fork 会话必须保留父会话完整上下文，同时成为 review/validate/fix 的独立可 rewind checkpoint。默认路径不得打开 Terminal，不得运行 `codex fork <session-id>` TUI，也不得用当前 chat continuation 代替 fork。`CODEX_RVF_MODE=continuation` 只保留为显式 fallback，因为它没有产生独立的新会话 checkpoint。
+
 ## Skill 与 Plugin 对比
 
 | 维度 | 作为 skill | 作为 plugin |

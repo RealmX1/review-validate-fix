@@ -34,6 +34,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 ## Codex Stop Hook
 
+- 核心设计支柱：Stop hook 自动化必须让触发 hook 的父会话在 hook 完成后停止，并在新的 Codex GUI fork 会话里留下 review checkpoint。新 fork 会话保留父会话完整上下文，并由 hook 注入一个以 `$review-validate-fix` 开头的首个用户 prompt 来启动本 skill；不要把当前会话 continuation 当作默认自动路径。
 - hook 脚本为 `scripts/codex_stop_review_validate_fix.py`，只负责判断是否要用 `$review-validate-fix` prompt 创建新的 Codex GUI fork；不要在 hook 脚本里直接执行 review/fix。
 - 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=gui`：dirty gate 通过后，脚本通过 Codex app-server 的 `thread/fork` 与 `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这是 Desktop 的默认自动路径，用来保留可 rewind 的父会话 checkpoint。
 - `CODEX_RVF_MODE=continuation` 只保留为显式 fallback：脚本会返回 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt，在当前会话中继续运行 `$review-validate-fix`。该模式不会产生独立 fork checkpoint。
@@ -74,7 +75,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 如果 `config/alternative-reviewer.json` 已配置且 `scripts/run_alternative_reviewer.py --check` 通过，则使用一个 Codex-native reviewer 加一个 `alternative-reviewer:<agent-name>`；需要确认认证/健康状态时优先用 `scripts/run_alternative_reviewer.py --preflight`，它会在配置了 `health_command` 时一并检查。运行 external reviewer 时用 `scripts/run_alternative_reviewer.py --repo <repo> --review-packet <packet> --session-context <file>`，让 reviewer 能结合 packet 与本地测试结果审查。
 - external alternative reviewer 仍允许运行测试、lint、typecheck、build 或复现命令。不要把“可能产生测试缓存/报告/临时文件”误当成禁止运行命令的理由。
 - external alternative reviewer 默认必须自行完成审查；除非本轮 prompt 明确要求等待人工步骤，否则不要期待开发者手动运行命令、提供额外操作或协助它完成 review。
-- external alternative reviewer 的等待机制是可观测活动空闲超时：`scripts/run_alternative_reviewer.py` 从 `config/alternative-reviewer.json` 读取 `idle_timeout_seconds` 与 `activity_check_interval_seconds`，默认每 300 秒检查一次 stdout/stderr 是否有新活动；过去一个检查窗口内有新活动就刷新等待，连续 300 秒没有可观测活动则终止该 reviewer，返回 exit code `124` 并输出 `RVF_EXTERNAL_REVIEWER_TIMEOUT ...`。此时不要合并任何 partial reviewer 输出；除非用户要求 external-only fail-close，否则把本轮 external reviewer 视为不可用并走 Codex-only fallback。
+- external alternative reviewer 的等待机制是可观测活动空闲超时：`scripts/run_alternative_reviewer.py` 从 `config/alternative-reviewer.json` 读取 `idle_timeout_seconds` 与 `activity_check_interval_seconds`，默认每 300 秒检查一次 stdout/stderr 是否有新活动；过去一个检查窗口内有新活动就刷新等待，连续 300 秒没有可观测活动则终止该 reviewer，返回 exit code `124` 并输出 `RVF_EXTERNAL_REVIEWER_TIMEOUT ...`。对支持事件流的外部 CLI，配置层应优先启用事件流输出，并由 runner 提取最终 review 文本，避免“agent 正在使用工具但 text stdout 直到结束才输出”的误超时。此时不要合并任何 partial reviewer 输出；除非用户要求 external-only fail-close，否则把本轮 external reviewer 视为不可用并走 Codex-only fallback。
 - 对可能与主会话或另一个 reviewer 冲突的命令，优先使用 `scripts/command_lock.py --repo <repo> --name <stable-lock-name> -- <command ...>` 做 repo-scoped 锁保护。典型场景包括共享 dev server 端口、会写同一缓存/coverage/report 目录的长测试、包管理器安装/构建、会独占设备或全局资源的命令。
 - 如果 reviewer 判断某个命令需要锁但当前 prompt 或环境没有提供可用锁，它必须输出 `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` 作为唯一响应；这不是完成的 review 结果，主会话应提供锁包装后的命令或更新 prompt 后重试该 reviewer。不要把 `RVF_LOCK_REQUEST` 合并为 bug finding。
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。

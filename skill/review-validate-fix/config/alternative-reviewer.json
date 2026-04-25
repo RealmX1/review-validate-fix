@@ -4,6 +4,10 @@
   "command": [
     "claude",
     "-p",
+    "--output-format",
+    "stream-json",
+    "--include-hook-events",
+    "--include-partial-messages",
     "--no-session-persistence",
     "--permission-mode",
     "dontAsk",
@@ -16,6 +20,7 @@
   "idle_timeout_seconds": 300,
   "activity_check_interval_seconds": 300,
   "health_timeout_seconds": 30,
+  "output_format": "claude_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],

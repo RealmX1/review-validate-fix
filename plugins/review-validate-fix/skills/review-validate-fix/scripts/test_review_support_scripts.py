@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -49,20 +50,21 @@ def write_alternative_reviewer_config(
     *,
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    output_format: str | None = "text",
 ) -> Path:
+    payload = {
+        "enabled": True,
+        "label": "alternative-reviewer:test",
+        "command": command,
+        "allow_repo_cwd": True,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "activity_check_interval_seconds": activity_check_interval_seconds,
+        "env_unset": [],
+    }
+    if output_format is not None:
+        payload["output_format"] = output_format
     path.write_text(
-        json.dumps(
-            {
-                "enabled": True,
-                "label": "alternative-reviewer:test",
-                "command": command,
-                "allow_repo_cwd": True,
-                "idle_timeout_seconds": idle_timeout_seconds,
-                "activity_check_interval_seconds": activity_check_interval_seconds,
-                "env_unset": [],
-            },
-            ensure_ascii=False,
-        ),
+        json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
     return path
@@ -234,6 +236,250 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
+def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import sys, time, json; sys.stdin.read(); "
+                "print(json.dumps({'type':'system','subtype':'init'}), flush=True); "
+                "time.sleep(0.08); "
+                "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}), flush=True); "
+                "time.sleep(0.08); "
+                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=0.12,
+        activity_check_interval_seconds=0.05,
+        output_format="claude_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "claude"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["claude", "-p"],
+        idle_timeout_seconds=1.0,
+        activity_check_interval_seconds=0.05,
+        output_format=None,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert "--output-format" in argv
+    assert "stream-json" in argv
+    assert "--include-hook-events" in argv
+    assert "--include-partial-messages" in argv
+
+
+def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "claude"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "print('NO_ISSUES', flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["claude", "-p", "--output-format", "text"],
+        idle_timeout_seconds=1.0,
+        activity_check_interval_seconds=0.05,
+        output_format=None,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["-p", "--output-format", "text"]
+
+
+def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "claude"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "print('NO_ISSUES', flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["claude", "-p", "--output-format=text"],
+        idle_timeout_seconds=1.0,
+        activity_check_interval_seconds=0.05,
+        output_format=None,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["-p", "--output-format=text"]
+
+
+def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "stream_wrapper"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-u", str(shim), "--native-stream"],
+        idle_timeout_seconds=1.0,
+        activity_check_interval_seconds=0.05,
+        output_format="claude_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    assert json.loads(sink.read_text(encoding="utf-8")) == ["--native-stream"]
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
@@ -242,6 +488,13 @@ def main() -> int:
         test_prepare_review_run_and_command_lock(root / "prepare")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
+        test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")
+        test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config")
+        test_alternative_reviewer_respects_explicit_claude_text_output(root / "alternative-text-config")
+        test_alternative_reviewer_respects_explicit_claude_equals_text_output(
+            root / "alternative-equals-text-config"
+        )
+        test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(root / "alternative-wrapper")
     print("review support script tests OK")
     return 0
 
