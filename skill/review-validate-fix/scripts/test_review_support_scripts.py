@@ -90,6 +90,262 @@ def test_check_review_output_lock_request() -> None:
     assert invalid.returncode != 0
 
 
+def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
+    result = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text=(
+            "1. apps/theseus-mcp/src/tool_registry.ts:1306 task 级上下文先截断 reviewRuns。\n"
+            "`query_checkpoint_context` 随后用截断后的 run 集合过滤 signals，可能漏掉同 task 的较早 run。\n"
+        ),
+    )
+    payload = json.loads(result.stdout)
+    assert payload["valid"] is True
+    assert payload["kind"] == "issues"
+    assert payload["issue_count"] == 1
+    assert payload["continuation_line_count"] == 1
+
+    extensionless_numbered = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. Dockerfile:3 合法 issue 可以引用没有扩展名的文件。\n",
+    )
+    extensionless_payload = json.loads(extensionless_numbered.stdout)
+    assert extensionless_payload["valid"] is True
+    assert extensionless_payload["issue_count"] == 1
+
+    invalid = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. apps/foo.ts 这条缺少行号\n续行不能补足 path:line\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid.returncode != 0
+
+    misplaced_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. 这里先写说明，再引用 skill/review-validate-fix/scripts/check_review_output.py:44\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert misplaced_path_line.returncode != 0
+
+    english_misplaced_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. explanation before skill/review-validate-fix/scripts/check_review_output.py:44\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert english_misplaced_path_line.returncode != 0
+
+    prose_see_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. See skill/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prose_see_path_line.returncode != 0
+
+    prose_in_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. in skill/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prose_in_path_line.returncode != 0
+
+    prose_because_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. Because a.py:1 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prose_because_path_line.returncode != 0
+
+    chinese_because_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. 因为 a.py:1 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert chinese_because_path_line.returncode != 0
+
+    chinese_file_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. 文件 a.py:1 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert chinese_file_path_line.returncode != 0
+
+    prose_note_colon_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. Note: a.py:1 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prose_note_colon_path_line.returncode != 0
+
+    prose_warning_path_line = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. warning a.py:1 misplaced path\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert prose_warning_path_line.returncode != 0
+
+    invalid_extensionless = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input=(
+            "1. skill/review-validate-fix/scripts/check_review_output.py:44 valid issue\n"
+            "Dockerfile:2 missing numbered prefix\n"
+            "Makefile:10 missing numbered prefix\n"
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid_extensionless.returncode != 0
+
+    unnumbered_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nb.py:2 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_issue.returncode != 0
+
+    unnumbered_no_extension_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nMakefile:2 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_no_extension_issue.returncode != 0
+
+    malformed_numbered_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\n2) b.py:2 第二条编号格式错误\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed_numbered_issue.returncode != 0
+
+    malformed_numbered_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\n2) 第二条编号格式错误\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed_numbered_continuation.returncode != 0
+
+    spaced_path = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. slide-versions/claude cowork 1/deck.txt:2 含空格路径仍是合法 path:line。\n",
+    )
+    spaced_payload = json.loads(spaced_path.stdout)
+    assert spaced_payload["valid"] is True
+    assert spaced_payload["issue_count"] == 1
+
+    spaced_root_component = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. my dir/file.py:2 根目录组件含空格仍是合法 path:line。\n",
+    )
+    spaced_root_payload = json.loads(spaced_root_component.stdout)
+    assert spaced_root_payload["valid"] is True
+    assert spaced_root_payload["issue_count"] == 1
+
+    colon_path = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. foo:bar.py:2 路径名含冒号时应使用最后的 :line 作为行号。\n",
+    )
+    colon_payload = json.loads(colon_path.stdout)
+    assert colon_payload["valid"] is True
+    assert colon_payload["issue_count"] == 1
+
+    unicode_root_path = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. 设计 文档.md:3 非 ASCII 根路径也应支持。\n",
+    )
+    unicode_root_payload = json.loads(unicode_root_path.stdout)
+    assert unicode_root_payload["valid"] is True
+    assert unicode_root_payload["issue_count"] == 1
+
+    repeated_path_line = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text="1. a.py:1 causes b.py:2 to fail when both paths are involved.\n",
+    )
+    repeated_payload = json.loads(repeated_path_line.stdout)
+    assert repeated_payload["valid"] is True
+    assert repeated_payload["issue_count"] == 1
+
+    chinese_no_issue_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\n没有问题\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert chinese_no_issue_continuation.returncode != 0
+
+    fix_summary_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\n修复说明：已修改文件\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fix_summary_continuation.returncode != 0
+
+    unnumbered_spaced_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nmy file.py:2 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_spaced_issue.returncode != 0
+
+    unnumbered_spaced_dir_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nmy dir/file.py:2 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_spaced_dir_issue.returncode != 0
+
+    unnumbered_colon_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nfoo:bar.py:2 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_colon_issue.returncode != 0
+
+    unnumbered_unicode_issue = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\n设计 文档.md:3 第二条问题但缺少编号\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unnumbered_unicode_issue.returncode != 0
+
+
 def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
@@ -125,6 +381,7 @@ def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     assert "## Session Context" in packet_text
     assert payload["session_context_provided"] is True
     assert payload["session_context_bytes"] > 0
+    assert payload["scope_of_work_file"] == str(context.resolve())
     assert payload["primary_files"] == ["tracked.txt"]
     assert payload["background_files"] == ["new.txt"]
     assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
@@ -147,6 +404,110 @@ def test_build_packet_requires_session_context(tmp: Path) -> None:
     assert "session context is required" in completed.stderr
 
 
+def test_build_packet_honors_review_validate_fix_ignore(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：prepared ignored artifacts\n",
+        encoding="utf-8",
+    )
+    (repo / ".review-validate-fix-ignore").write_text("slide-versions/\nsecret\n", encoding="utf-8")
+    (repo / "secret.txt").write_text("committed secret contents\n", encoding="utf-8")
+    run(["git", "add", "secret.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add secret"], cwd=repo)
+    ignored = repo / "slide-versions" / "claude cowork 1"
+    ignored.mkdir(parents=True)
+    (ignored / "deck.txt").write_text("ignored deck contents\n", encoding="utf-8")
+    (repo / "secret.txt").write_text("ignored secret contents\n", encoding="utf-8")
+    (repo / "secret-alpha.txt").write_text("ignored secret prefix contents\n", encoding="utf-8")
+    (repo / "kept.txt").write_text("visible contents\n", encoding="utf-8")
+
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["excluded_path_prefixes"] == ["secret", "slide-versions/"]
+    assert payload["untracked_count"] == 3
+    assert "## Excluded Paths" in packet_text
+    assert "- secret" in packet_text
+    assert "- slide-versions/" in packet_text
+    assert "### .review-validate-fix-ignore" in packet_text
+    assert "### kept.txt" in packet_text
+    assert "### new.txt" in packet_text
+    assert "slide-versions/claude cowork 1/deck.txt" not in packet_text
+    assert "ignored deck contents" not in packet_text
+    assert "### secret.txt" not in packet_text
+    assert "secret.txt |" not in packet_text
+    assert "### secret-alpha.txt" not in packet_text
+    assert "committed secret contents" not in packet_text
+    assert "ignored secret contents" not in packet_text
+    assert "ignored secret prefix contents" not in packet_text
+
+
+def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：prepared literal ignore paths\n",
+        encoding="utf-8",
+    )
+    (repo / ".review-validate-fix-ignore").write_text("literal[glob]/\nsecret*.txt\n", encoding="utf-8")
+    literal_dir = repo / "literal[glob]"
+    wildcard_dir = repo / "literalx"
+    literal_dir.mkdir()
+    wildcard_dir.mkdir()
+    (literal_dir / "hidden.txt").write_text("hidden literal dir\n", encoding="utf-8")
+    (wildcard_dir / "visible.txt").write_text("visible wildcard-like dir\n", encoding="utf-8")
+    (repo / "secret*.txt").write_text("hidden literal file\n", encoding="utf-8")
+    (repo / "secret-alpha.txt").write_text("visible wildcard-like file\n", encoding="utf-8")
+
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    assert "literal[glob]/hidden.txt" not in packet_text
+    assert "hidden literal dir" not in packet_text
+    assert "### secret*.txt" not in packet_text
+    assert "hidden literal file" not in packet_text
+    assert "### literalx/visible.txt" in packet_text
+    assert "visible wildcard-like dir" in packet_text
+    assert "### secret-alpha.txt" in packet_text
+    assert "visible wildcard-like file" in packet_text
+
+
 def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
@@ -156,6 +517,7 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
         "- 本 turn 主会话实际完成的工作：prepared review run\n",
         encoding="utf-8",
     )
+    (repo / "secret.txt").write_text("hidden\n", encoding="utf-8")
     result = run(
         [
             sys.executable,
@@ -168,14 +530,26 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
             str(tmp / "runs"),
             "--primary-file",
             "tracked.txt",
+            "--exclude-path-prefix",
+            "secret.txt",
         ]
     )
     payload = json.loads(result.stdout)
     assert Path(payload["review_packet"]).exists()
     assert Path(payload["review_packet_metadata"]).exists()
     assert Path(payload["before_workspace_snapshot"]).exists()
-    assert payload["session_context"] == str(context.resolve())
+    assert Path(payload["scope_of_work_file"]).exists()
+    assert payload["session_context"] == payload["scope_of_work_file"]
+    assert payload["source_session_context"] == str(context.resolve())
     assert payload["session_context_provided"] is True
+    assert payload["excluded_path_prefixes"] == ["secret.txt"]
+    metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
+    packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
+    assert metadata["excluded_path_prefixes"] == ["secret.txt"]
+    assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
+    assert "## Excluded Paths" in packet_text
+    assert "- secret.txt" in packet_text
+    assert "### secret.txt" not in packet_text
 
     locked = run(
         [
@@ -537,8 +911,11 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         test_check_review_output_lock_request()
+        test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
         test_build_packet_requires_session_context(root / "packet-requires-context")
+        test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore")
+        test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
         test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")

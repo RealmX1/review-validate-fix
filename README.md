@@ -67,6 +67,28 @@ python3 scripts/install_to_codex.py --as skill --configure-stop-hook
 
 hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
 
+### 当前 session 开关
+
+如果只想临时管理当前 chat session 的 Stop hook，而不是改全局 `~/.codex/hooks.json`，可以在用户消息中单独放一行：
+
+```text
+RVF_STOP_HOOK: off
+```
+
+这会把当前 session 标记为 disabled，后续 Stop hook 对同一 session 静默跳过。恢复时发送：
+
+```text
+RVF_STOP_HOOK: on
+```
+
+查看当前 session 状态：
+
+```text
+RVF_STOP_HOOK: status
+```
+
+这些状态写入 skill 的 `state/session-hook/`，安装更新时会随 `state/` 一起保留，只影响当前 chat session，不修改全局 hook 配置。
+
 ## Setup 相关配置
 
 有些变化不能简单从仓库覆盖到本机，因为它们绑定机器、凭据或用户选择。当前最典型的是：

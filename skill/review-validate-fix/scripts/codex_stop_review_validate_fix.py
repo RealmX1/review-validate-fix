@@ -24,8 +24,10 @@ DEFAULT_APP_SERVER_CONTROL_SOCKET = (
 )
 DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.sock"
 DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
+DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
+SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "gui"
 APP_SERVER_CLIENT_INFO = {
@@ -65,6 +67,18 @@ def state_dir() -> Path:
     return Path(os.environ.get("CODEX_RVF_STATE_DIR", str(DEFAULT_STATE_DIR)))
 
 
+def session_hook_state_dir() -> Path:
+    explicit = os.environ.get("CODEX_RVF_SESSION_HOOK_STATE_DIR")
+    if explicit and explicit.strip():
+        return Path(explicit).expanduser()
+
+    state_root = os.environ.get("CODEX_RVF_STATE_DIR")
+    if state_root and state_root.strip():
+        return Path(state_root).expanduser() / "session-hook"
+
+    return DEFAULT_SESSION_HOOK_STATE_DIR
+
+
 def read_event() -> dict[str, Any] | None:
     try:
         raw = sys.stdin.read()
@@ -82,6 +96,11 @@ def is_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def safe_state_key(value: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return key[:180] if key else "unknown-session"
 
 
 def source_marks_subagent(source: Any) -> bool:
@@ -269,6 +288,126 @@ def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
             return value.strip()
 
     return session_id_from_event(event)
+
+
+def session_hook_state_path(session_id: str) -> Path:
+    return session_hook_state_dir() / f"{safe_state_key(session_id)}.json"
+
+
+def session_hook_id_from_event(event: dict[str, Any]) -> str | None:
+    return session_id_from_event(event) or parent_thread_id_from_event(event)
+
+
+def parse_session_hook_control(text: str | None) -> str | None:
+    if not text:
+        return None
+    pattern = re.compile(
+        rf"^\s*{re.escape(SESSION_HOOK_CONTROL_KEY)}\s*:\s*([A-Za-z_-]+)\s*$",
+        re.MULTILINE,
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+    value = match.group(1).strip().lower().replace("_", "-")
+    if value in {"off", "disable", "disabled", "skip", "suppress"}:
+        return "off"
+    if value in {"on", "enable", "enabled", "resume"}:
+        return "on"
+    if value in {"status", "state"}:
+        return "status"
+    return None
+
+
+def read_session_hook_state(session_id: str) -> dict[str, Any] | None:
+    path = session_hook_state_path(session_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def session_hook_disabled(session_id: str) -> bool:
+    state = read_session_hook_state(session_id)
+    return state is not None and state.get("enabled") is False
+
+
+def set_session_hook_enabled(
+    *,
+    session_id: str,
+    enabled: bool,
+    latest_user: str | None,
+) -> Path | None:
+    path = session_hook_state_path(session_id)
+    if enabled:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return path
+        return path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "enabled": False,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "control": SESSION_HOOK_CONTROL_KEY,
+                "latest_user_message": latest_user,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def session_hook_control_payload(
+    event: dict[str, Any],
+    latest_user: str | None,
+) -> dict[str, Any] | None:
+    action = parse_session_hook_control(latest_user)
+    if action is None:
+        return None
+
+    session_id = session_hook_id_from_event(event)
+    if not session_id:
+        return {
+            "continue": True,
+            "systemMessage": (
+                "review-validate-fix Stop hook 无法更新当前 chat session 状态："
+                "Stop event 未暴露 session id。"
+            ),
+        }
+
+    if action == "status":
+        status = "disabled" if session_hook_disabled(session_id) else "enabled"
+        return {
+            "continue": True,
+            "systemMessage": (
+                "review-validate-fix Stop hook 当前 chat session 状态："
+                f"{status}。session_id={session_id}"
+            ),
+        }
+
+    enabled = action == "on"
+    state_path = set_session_hook_enabled(
+        session_id=session_id,
+        enabled=enabled,
+        latest_user=latest_user,
+    )
+    status = "enabled" if enabled else "disabled"
+    return {
+        "continue": True,
+        "systemMessage": (
+            "review-validate-fix Stop hook 已为当前 chat session 设置为 "
+            f"{status}。session_id={session_id}; state={state_path}"
+        ),
+    }
 
 
 def string_event_value(event: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -917,6 +1056,12 @@ def should_suppress(event: dict[str, Any]) -> bool:
     return any(session_meta_marks_subagent(path) for path in event_session_paths(event))
 
 
+def event_marks_subagent(event: dict[str, Any]) -> bool:
+    if source_marks_subagent(event.get("source")):
+        return True
+    return any(session_meta_marks_subagent(path) for path in event_session_paths(event))
+
+
 def run_gate(repo: str) -> GateResult:
     gate = Path(os.environ.get("CODEX_RVF_GATE", str(DEFAULT_GATE)))
     try:
@@ -1026,6 +1171,18 @@ def main() -> int:
         advisory = handoff_advisory(event, fork_context)
         if advisory is not None:
             emit(advisory)
+        return 0
+
+    if event_marks_subagent(event):
+        return 0
+
+    session_control = session_hook_control_payload(event, latest_user)
+    if session_control is not None:
+        emit(session_control)
+        return 0
+
+    session_id = session_hook_id_from_event(event)
+    if session_id and session_hook_disabled(session_id):
         return 0
 
     should_experiment, latest_user = should_run_fork_experiment(event)

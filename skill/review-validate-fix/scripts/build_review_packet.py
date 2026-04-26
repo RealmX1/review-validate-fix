@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+IGNORE_FILE = ".review-validate-fix-ignore"
+
 
 def fail(message: str, code: int = 1) -> int:
     print(message, file=sys.stderr)
@@ -33,9 +35,51 @@ def git_root(repo: Path) -> Path:
     return Path(run_git(repo, ["rev-parse", "--show-toplevel"]).strip()).resolve()
 
 
-def untracked_files(repo: Path) -> list[str]:
+def normalize_exclude_prefix(prefix: str) -> str | None:
+    normalized = prefix.strip().replace("\\", "/")
+    if not normalized or normalized.startswith("#"):
+        return None
+    is_directory_prefix = normalized.endswith("/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("/")
+    normalized = normalized.rstrip("/")
+    if not normalized:
+        return None
+    return f"{normalized}/" if is_directory_prefix else normalized
+
+
+def load_exclude_prefixes(repo: Path, extra_prefixes: list[str]) -> list[str]:
+    prefixes: list[str] = []
+    ignore_file = repo / IGNORE_FILE
+    if ignore_file.is_file():
+        for line in ignore_file.read_text(encoding="utf-8").splitlines():
+            normalized = normalize_exclude_prefix(line)
+            if normalized is not None:
+                prefixes.append(normalized)
+    for prefix in extra_prefixes:
+        normalized = normalize_exclude_prefix(prefix)
+        if normalized is not None:
+            prefixes.append(normalized)
+    return sorted(set(prefixes))
+
+
+def exclude_pathspecs(exclude_prefixes: list[str]) -> list[str]:
+    pathspecs: list[str] = []
+    for prefix in exclude_prefixes:
+        escaped = prefix.replace("\\", "\\\\")
+        for char in "*?[]":
+            escaped = escaped.replace(char, f"\\{char}")
+        pathspecs.append(f":(exclude,top,glob){escaped}*")
+    return pathspecs
+
+
+def untracked_files(repo: Path, exclude_prefixes: list[str]) -> list[str]:
+    args = ["git", "ls-files", "--others", "--exclude-standard", "-z"]
+    if exclude_prefixes:
+        args.extend(["--", ".", *exclude_pathspecs(exclude_prefixes)])
     completed = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        args,
         cwd=repo,
         check=False,
         capture_output=True,
@@ -92,18 +136,25 @@ def build_packet(
     max_file_bytes: int,
     primary_files: list[str],
     background_files: list[str],
+    exclude_prefixes: list[str] | None = None,
     allow_missing_session_context: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
+    all_exclude_prefixes = load_exclude_prefixes(root, exclude_prefixes or [])
     generated = datetime.now(timezone.utc).isoformat()
-    status = run_git(root, ["status", "--short", "-uall"]).rstrip()
-    diff = run_git(root, ["diff", "--find-renames", "HEAD", "--"]).rstrip()
-    untracked = untracked_files(root)
+    status_args = ["status", "--short", "-uall"]
+    diff_args = ["diff", "--find-renames", "HEAD", "--"]
+    if all_exclude_prefixes:
+        status_args.extend(["--", ".", *exclude_pathspecs(all_exclude_prefixes)])
+        diff_args.extend([".", *exclude_pathspecs(all_exclude_prefixes)])
+    status = run_git(root, status_args).rstrip()
+    diff = run_git(root, diff_args).rstrip()
+    untracked = untracked_files(root, all_exclude_prefixes)
     session_context_text = ""
     if session_context is None:
         if not allow_missing_session_context:
             raise ValueError(
-                "session context is required: write a main-agent work summary and pass "
+                "session context is required: write a main-agent scope-of-work summary and pass "
                 "--session-context <file>; use --allow-missing-session-context only for debug"
             )
     else:
@@ -114,11 +165,14 @@ def build_packet(
         "generated": generated,
         "repo": str(root),
         "max_file_bytes": max_file_bytes,
+        "ignore_file": IGNORE_FILE,
+        "excluded_path_prefixes": all_exclude_prefixes,
         "status_bytes": len(status.encode("utf-8")),
         "diff_bytes": len(diff.encode("utf-8")),
         "untracked_count": len(untracked),
         "session_context_provided": bool(session_context_text),
         "session_context_bytes": len(session_context_text.encode("utf-8")),
+        "scope_of_work_file": str(session_context) if session_context is not None else None,
         "primary_files": primary_files,
         "background_files": background_files,
         "untracked_files": [],
@@ -129,7 +183,7 @@ def build_packet(
         "",
         f"Generated: {generated}",
         "",
-        "All paths below are relative to the repository root. This packet is the review input; reviewers should not need the original working tree.",
+        "All paths below are relative to the repository root. This packet is the review input; reviewers should use the provided scope-of-work file as the scope anchor and use this packet as evidence.",
         "",
     ]
 
@@ -157,6 +211,14 @@ def build_packet(
             "",
         ]
     )
+    lines.extend(["## Excluded Paths", ""])
+    if all_exclude_prefixes:
+        lines.append(f"Source ignore file: `{IGNORE_FILE}` when present, plus any `--exclude-path-prefix` arguments.")
+        lines.append("")
+        lines.extend(f"- {prefix}" for prefix in all_exclude_prefixes)
+        lines.append("")
+    else:
+        lines.extend(["(none)", ""])
     lines.extend(["## Git Status", "", "```text", status or "(clean)", "```", ""])
     lines.extend(["## Git Diff HEAD", "", "```diff", diff or "(no tracked diff)", "```", ""])
     lines.extend(["## Untracked Files", ""])
@@ -196,6 +258,7 @@ def main() -> int:
     parser.add_argument("--max-packet-bytes", type=int, default=0, help="Fail if the generated packet exceeds this many bytes. 0 disables the check.")
     parser.add_argument("--primary-file", action="append", default=[], help="Path known to be primary work for this turn. May be repeated.")
     parser.add_argument("--background-file", action="append", default=[], help="Path known to be pre-existing background WIP. May be repeated.")
+    parser.add_argument("--exclude-path-prefix", action="append", default=[], help=f"Path prefix to omit from status, diff, and untracked packet sections. May be repeated. {IGNORE_FILE} is also honored when present.")
     parser.add_argument(
         "--allow-missing-session-context",
         action="store_true",
@@ -214,6 +277,7 @@ def main() -> int:
             args.max_file_bytes,
             args.primary_file,
             args.background_file,
+            args.exclude_path_prefix,
             args.allow_missing_session_context,
         )
         if args.max_packet_bytes and metadata["packet_bytes"] > args.max_packet_bytes:

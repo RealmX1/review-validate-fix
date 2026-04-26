@@ -8,7 +8,7 @@
 - `alternative-reviewer:<agent-name>`：用户配置的 santa-method alternative reviewer。它可以来自任意外部 coding agent、MCP server、CLI、IDE agent 或本地 wrapper；不要在 skill 中硬编码 vendor、模型名或命令名。
 - `codex-mimic-reviewer-a` / `codex-mimic-reviewer-b`：alternative reviewer 未配置、配置未完成或无法启动时的默认 Codex-only fallback。
 
-两个 reviewer 应并行运行，使用同一份主会话 session context、同一份 review packet 和 `references/review-prompt.md`，且不要互相读取对方输出。session context 必须说明主会话本 turn 实际完成的工作；review packet/diff/status 用来核实和补足证据，不应成为 reviewer 推断 scope 的唯一来源。
+两个 reviewer 应并行运行，使用同一个主会话 scope-of-work / session context 文件路径、同一份 review packet 和 `references/review-prompt.md`，且不要互相读取对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径交给它们读取即可。scope-of-work 必须说明主会话本 turn 实际完成的工作和逐文件编辑明细，不能只列 created/modified/deleted 文件。reviewer 的默认假设是另一个 reviewer 可能正并行工作；可能冲突的命令按锁规则处理。review packet/diff/status 用来核实和补足证据，不应成为 reviewer 推断 scope 的唯一来源；除非主会话明确要求 full diff review，否则 reviewer 不应把整个 `git diff HEAD` 当作 full-scope analysis 来源。
 
 如果 `config/alternative-reviewer.json` 已配置且 `scripts/run_alternative_reviewer.py --check` 通过，使用 `codex-reviewer` + `alternative-reviewer:<agent-name>`。需要认证/健康状态确认时，可先运行 `scripts/run_alternative_reviewer.py --preflight`。运行 external reviewer 时调用 `scripts/run_alternative_reviewer.py --repo <repo> --review-packet <packet> --session-context <file>`，并按配置中的 `label` 记录来源；reviewer 可以读取仓库并运行测试/lint/build，但不能直接编辑、写入、stage、commit 或执行 validate/fix。external reviewer 应自行完成审查，不要默认等待开发者手动协助。`run_alternative_reviewer.py` 使用可观测活动空闲超时：默认每 300 秒检查一次 stdout/stderr 活动，连续 300 秒没有新活动时返回 `RVF_EXTERNAL_REVIEWER_TIMEOUT` 和 exit code `124`；对 Claude Code 等支持事件流的 CLI，默认配置应使用 stream-json 事件刷新活动时间，并让 runner 只提取最终 review 文本。这种 partial 输出不得并入 issue list。如果 alternative reviewer 未配置、配置未完成、命令不可用、本轮无法启动或空闲超时，默认使用 Codex-only fallback：并行启动两个独立 Codex-native 子代理，provenance 分别标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。这仍然是 double review；不要由主会话单独 review 后伪装成两路结果。
 
@@ -18,11 +18,11 @@
 
 合并前先校验每个 reviewer 的输出：
 
-1. 用 `scripts/check_review_output.py` 或等价严格解析器确认输出是精确 `NO_ISSUES`、编号 `路径:行号` issue list，或纯 `RVF_LOCK_REQUEST ...`。
+1. 用 `scripts/check_review_output.py` 或等价解析器确认输出是精确 `NO_ISSUES`、编号 `路径:行号` issue list，或纯 `RVF_LOCK_REQUEST ...`。同一 issue 的换行续句、缩进续行或前后空白属于可归一化小格式漂移；归属到上一条编号 issue 后继续 merge，不要重试或 fail-close。
 2. 输出中包含 validate/fix verdict、修复说明、handoff、纯 prose 或中文化“没有问题”时，该 reviewer 标记为 `CONTRACT_VIOLATION`。
 3. 如果输出是 `RVF_LOCK_REQUEST ...`，这不是完成态 review；主会话应提供 `scripts/command_lock.py --repo <repo> --name <stable-lock-name> -- <command ...>` 包装命令，或明确驳回该命令并重试 reviewer。锁请求不得进入 merge table。
 4. 如果 reviewer 运行期间 `scripts/workspace_snapshot.py compare` 报告状态变化，标记为 `WORKSPACE_CHANGED_DURING_REVIEW`。这只是状态污染信号，不推断 reviewer 的意图，也不要自动 revert；测试缓存、报告、coverage、临时构建产物等可解释副作用不构成 review 契约违规。
-5. `CONTRACT_VIOLATION` 的输出不得进入合格 provenance。`WORKSPACE_CHANGED_DURING_REVIEW` 需要主会话先检查污染范围；如果只是可解释测试副作用，仍可保留 reviewer provenance；如果出现未授权源文件、lockfile、snapshot 或文档写入，应 fail-close 或询问用户。
+5. `CONTRACT_VIOLATION` 的输出不得进入合格 provenance；可归一化小格式漂移不记为 `CONTRACT_VIOLATION`，可在 provenance 或最终汇总中作为低风险注记一笔带过。`WORKSPACE_CHANGED_DURING_REVIEW` 需要主会话先检查污染范围；如果只是可解释测试副作用，仍可保留 reviewer provenance；如果出现未授权源文件、lockfile、snapshot 或文档写入，应 fail-close 或询问用户。
 
 ## Merge Rules
 

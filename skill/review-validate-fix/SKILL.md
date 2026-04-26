@@ -16,9 +16,9 @@ description: Use when the user asks for a post-work code review loop, review val
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
 2. 如果没有未提交改动，用中文说明没有可审查改动并结束。
 3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件。
-4. Review 前必须先由主会话写一份 session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、已跑验证命令、关键设计取舍和仍不确定的点。不要让 reviewer 只靠 `git diff HEAD` 猜 scope；diff/status 是证据，不是 scope 的唯一来源。
-5. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file>` 创建唯一 run 目录；该脚本会生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --output <packet> --metadata-output <metadata>`。packet 必须覆盖主会话提供的 session context、tracked diff、完整 untracked 文件列表，以及可内联的 untracked 文件内容；不要只依赖 `git diff HEAD`。
-6. 如果无法从当前会话可靠写出 session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
+4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、每个文件中实际做了哪些编辑、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope；diff/status 是证据，不是 scope 的唯一来源。
+5. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file>` 创建唯一 run 目录；该脚本会把主会话写好的 scope-of-work 文件复制为 run 目录内的 `scope-of-work.md`，并生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --output <packet> --metadata-output <metadata>`。packet 必须覆盖主会话提供的 scope-of-work / session context、tracked diff、完整 untracked 文件列表，以及可内联的 untracked 文件内容；不要只依赖 `git diff HEAD`。
+6. 如果无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
 7. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
 8. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
 
@@ -42,6 +42,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - `CODEX_RVF_MODE=continuation` 只保留为显式 fallback：脚本会返回 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt，在当前会话中继续运行 `$review-validate-fix`。该模式不会产生独立 fork checkpoint。
 - `CODEX_RVF_FORK_MODE=manual` 或 `dry-run` 只用于调试 prompt / app-server request 生成，不启动 Terminal。
 - `CODEX_RVF_MODE=off`：dirty gate 通过也只输出 systemMessage 并跳过自动触发。
+- 当前 chat session 可用显式用户消息行管理 hook：`RVF_STOP_HOOK: off` 会把本 session 标记为 disabled，后续 Stop hook 对同一 session 静默跳过；`RVF_STOP_HOOK: on` 会清除该 session 标记并恢复；`RVF_STOP_HOOK: status` 只报告当前 session 状态。这些 session 状态写入 `state/session-hook/`，只影响当前 chat session，不修改全局 `~/.codex/hooks.json`。
 - 如果 `stop_hook_active=true`，必须直接跳过，避免 Stop continuation 或 fork 递归。
 - 如果 Stop 事件来自 Codex subagent，必须直接跳过。post-work review 只能由主会话显式触发；研究、review、validate/fix 等子代理结束时不得被 Stop hook 拖入新的 `$review-validate-fix` fork 或 continuation。
 - 如果环境变量 `CODEX_RVF_SUPPRESS=1` 或 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，必须直接跳过；该开关用于 research marathon 等主会话已接管调度的场景。
@@ -81,16 +82,16 @@ description: Use when the user asks for a post-work code review loop, review val
 - 对可能与主会话或另一个 reviewer 冲突的命令，优先使用 `scripts/command_lock.py --repo <repo> --name <stable-lock-name> -- <command ...>` 做 repo-scoped 锁保护。典型场景包括共享 dev server 端口、会写同一缓存/coverage/report 目录的长测试、包管理器安装/构建、会独占设备或全局资源的命令。
 - 如果 reviewer 判断某个命令需要锁但当前 prompt 或环境没有提供可用锁，它必须输出 `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` 作为唯一响应；这不是完成的 review 结果，主会话应提供锁包装后的命令或更新 prompt 后重试该 reviewer。不要把 `RVF_LOCK_REQUEST` 合并为 bug finding。
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
-- Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt 和 session context，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
+- Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
-- 两个 reviewer 使用同一份 review prompt、同一份 session context 和同一份 review packet，但彼此不看对方输出。session context 是主会话对本 turn 已完成工作的交接说明；reviewer 应结合它判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实，不得只靠 git diff 推断审查范围。
+- 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；reviewer 应结合它判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
 - 完成态 Review 输出契约必须严格为：
   - 无问题：只输出 `NO_ISSUES`。
   - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。
 - 非完成态锁请求契约为：只输出一行或多行 `RVF_LOCK_REQUEST ...`，由主会话提供 `scripts/command_lock.py` 包装命令后重试；锁请求不得与 `NO_ISSUES` 或 issue list 混在同一个输出中。
-- 每个 reviewer 输出必须先用 `scripts/check_review_output.py` 或等价严格解析器校验；中文化“没有问题”、空响应、纯 prose、handoff、validate/fix verdict、修复说明或不可解析列表都不是合格 review 输出。
+- 每个 reviewer 输出必须先用 `scripts/check_review_output.py` 或等价解析器校验；中文化“没有问题”、空响应、纯 prose、handoff、validate/fix verdict、修复说明或无 `路径:行号` 的列表都不是合格 review 输出。只要每条 issue 都以编号 `路径:行号` 开头，同一 issue 的换行续句、缩进续行或前后空白属于可归一化小格式漂移，不应触发重试、fail-close 或重罚。
 - 如果 reviewer 输出 `RVF_LOCK_REQUEST`，先满足或驳回该锁请求，再重试 reviewer；重试后的输出仍必须是完成态契约。锁请求本身不计入合格 double-review 来源。
-- 如果 reviewer 输出契约违规，可用同一 review packet 重试一次并明确指出只允许 `NO_ISSUES`、编号 issue list，或纯 `RVF_LOCK_REQUEST`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。
+- 如果 reviewer 输出存在严重契约违规，可用同一 review packet 重试一次并明确指出只允许 `NO_ISSUES`、编号 issue list，或纯 `RVF_LOCK_REQUEST`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。严重违规不包括可无损归一化的小格式漂移。
 - review 前后可用 `scripts/workspace_snapshot.py capture/compare` 记录状态，尤其是 reviewer 会运行测试/lint/build 时。状态变化只表示 `WORKSPACE_CHANGED_DURING_REVIEW`，不推断 reviewer 主动编辑，也不自动使输出失格；主会话应检查变化是测试缓存/报告等可解释副作用，还是源文件、lockfile、snapshot 等需要人工处理的污染。不要自动 revert 用户或其他进程可能造成的改动。
 - 详细 review prompt 见 `references/review-prompt.md`。
 - 合并两个 reviewer 的输出时读取 `references/review-merge-policy.md`：合并重复项、分组紧密相关 issue，并为每个 processed issue 记录来源 reviewer。
@@ -99,7 +100,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 - `NO_ISSUES` 进入 clean path，handoff 默认仍开启，除非用户显式关闭 handoff。
 - 可解析 issue list 进入 validate/fix。
-- 中文化“没有问题”、空响应、纯 prose 或不可解析列表都 fail-close：用中文询问用户如何处理，不静默当作 0 个问题。
+- 中文化“没有问题”、空响应、纯 prose 或缺少 `路径:行号` 的不可解析列表都 fail-close：用中文询问用户如何处理，不静默当作 0 个问题。仅有换行、缩进或空白问题且能归属到上一条编号 issue 时，归一化后继续 validate/fix。
 - 每条 issue 必须先验证，再决定：
   - `REAL`：真问题且可独立最小修复。
   - `FALSE_POSITIVE`：不成立，不改文件。

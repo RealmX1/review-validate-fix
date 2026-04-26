@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -65,6 +66,16 @@ def write_config(path: Path, projects: list[Path]) -> None:
 def parse_json(stdout: str) -> dict[str, object]:
     assert stdout.strip(), "expected JSON stdout"
     return json.loads(stdout)
+
+
+def load_hook_module():
+    spec = importlib.util.spec_from_file_location("rvf_stop_hook_for_tests", SCRIPT)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def write_subagent_session(path: Path) -> None:
@@ -157,6 +168,255 @@ def test_env_suppression_skips(tmp: Path) -> None:
         extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
     )
     assert stdout == ""
+
+
+def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -> None:
+    old_state = os.environ.pop("CODEX_RVF_STATE_DIR", None)
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    try:
+        module = load_hook_module()
+        expected = SCRIPT.parents[1] / "state" / "session-hook"
+        assert module.session_hook_state_dir() == expected
+    finally:
+        if old_state is not None:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+
+def test_session_hook_state_dir_respects_state_dir_override(tmp: Path) -> None:
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state-root")
+    try:
+        module = load_hook_module()
+        assert module.session_hook_state_dir() == tmp / "state-root" / "session-hook"
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+
+def test_session_hook_control_disables_current_session(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-disabled",
+        "先不要自动 review。\nRVF_STOP_HOOK: off",
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+    assert "decision" not in payload
+    assert "disabled" in payload["systemMessage"]
+    assert (state / "session-hook" / "session-disabled.json").exists()
+    assert not (state / "latest.json").exists()
+
+    write_user_session(
+        transcript,
+        "session-disabled",
+        "这次普通停止也不应触发 hook。",
+    )
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+    assert stdout == ""
+    assert not (state / "latest.json").exists()
+
+
+def test_session_hook_control_status_reports_current_session(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-status",
+        "RVF_STOP_HOOK: off",
+    )
+    invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+
+    write_user_session(
+        transcript,
+        "session-status",
+        "RVF_STOP_HOOK: status",
+    )
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            state_dir=state,
+        )[0]
+    )
+    assert "disabled" in payload["systemMessage"]
+    assert "session-status" in payload["systemMessage"]
+
+
+def test_session_hook_control_status_works_when_env_suppressed(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-status-suppressed",
+        "RVF_STOP_HOOK: status",
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+            state_dir=state,
+        )[0]
+    )
+    assert "enabled" in payload["systemMessage"]
+    assert "session-status-suppressed" in payload["systemMessage"]
+
+
+def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-reenabled",
+        "RVF_STOP_HOOK: off",
+    )
+    invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    assert (state / "session-hook" / "session-reenabled.json").exists()
+
+    write_user_session(
+        transcript,
+        "session-reenabled",
+        "RVF_STOP_HOOK: on",
+    )
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+    assert "enabled" in payload["systemMessage"]
+    assert not (state / "session-hook" / "session-reenabled.json").exists()
+    assert not (state / "latest.json").exists()
+
+    write_user_session(
+        transcript,
+        "session-reenabled",
+        "普通停止现在应恢复触发。",
+    )
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "dry-run"
+
+
+def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-disabled-experiment",
+        "RVF_STOP_HOOK: off",
+    )
+    invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+
+    write_user_session(
+        transcript,
+        "session-disabled-experiment",
+        "RVF_FORK_EXPERIMENT: should not fork while disabled",
+    )
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_FORK_EXPERIMENT_MODE": "dry-run"},
+        state_dir=state,
+    )
+    assert stdout == ""
+    assert not (state / "latest.json").exists()
+
+
+def test_subagent_source_ignores_session_hook_control(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "subagent-control",
+            "stop_hook_active": False,
+            "last_user_message": "RVF_STOP_HOOK: off",
+            "source": {"subagent": {"thread_spawn": {"depth": 1}}},
+        },
+        state_dir=state,
+    )
+    assert stdout == ""
+    assert not (state / "session-hook" / "subagent-control.json").exists()
 
 
 def test_subagent_source_skips(tmp: Path) -> None:
@@ -579,6 +839,14 @@ def main() -> int:
         test_fork_experiment_marker_dry_run,
         test_stop_hook_active_skips,
         test_env_suppression_skips,
+        test_session_hook_default_state_dir_is_skill_state_session_hook,
+        test_session_hook_state_dir_respects_state_dir_override,
+        test_session_hook_control_disables_current_session,
+        test_session_hook_control_status_reports_current_session,
+        test_session_hook_control_status_works_when_env_suppressed,
+        test_session_hook_control_reenables_current_session,
+        test_disabled_session_skips_fork_experiment_marker,
+        test_subagent_source_ignores_session_hook_control,
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
