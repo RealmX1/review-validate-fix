@@ -68,6 +68,14 @@ def parse_json(stdout: str) -> dict[str, object]:
     return json.loads(stdout)
 
 
+def assert_skip_reason(stdout: str, expected: str) -> dict[str, object]:
+    payload = parse_json(stdout)
+    assert "decision" not in payload
+    assert "未创建 fork" in payload["systemMessage"]
+    assert expected in payload["systemMessage"]
+    return payload
+
+
 def load_hook_module():
     spec = importlib.util.spec_from_file_location("rvf_stop_hook_for_tests", SCRIPT)
     assert spec is not None
@@ -158,7 +166,7 @@ def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
 def test_stop_hook_active_skips(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
-    assert stdout == ""
+    assert_skip_reason(stdout, "stop_hook_active=true")
 
 
 def test_env_suppression_skips(tmp: Path) -> None:
@@ -167,7 +175,7 @@ def test_env_suppression_skips(tmp: Path) -> None:
         {"cwd": str(dirty), "stop_hook_active": False},
         extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "suppress")
 
 
 def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -> None:
@@ -198,6 +206,67 @@ def test_session_hook_state_dir_respects_state_dir_override(tmp: Path) -> None:
             os.environ["CODEX_RVF_STATE_DIR"] = old_state
         if old_session_state is not None:
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+
+def test_socket_probe_reports_unavailable_reason(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    missing = tmp / "missing.sock"
+    missing_probe = module.probe_app_server_socket(missing)
+    assert missing_probe["connect_ok"] is False
+    assert missing_probe["reason"] == "missing"
+    assert missing_probe["parent_exists"] is True
+
+    regular = tmp / "regular.sock"
+    regular.write_text("not a socket\n", encoding="utf-8")
+    regular_probe = module.probe_app_server_socket(regular)
+    assert regular_probe["connect_ok"] is False
+    assert regular_probe["reason"] == "not-a-socket"
+    assert regular_probe["exists"] is True
+
+
+def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    desktop_socket = tmp / "missing-control.sock"
+    bridge_socket = tmp / "missing-bridge.sock"
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = module.bridge_socket_path
+    original_ensure_bridge = module.ensure_bridge_app_server
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        module.bridge_socket_path = lambda: bridge_socket
+
+        def fail_bridge():
+            raise module.AppServerError("simulated bridge startup failure")
+
+        module.ensure_bridge_app_server = fail_bridge
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(tmp),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=None,
+        )
+    finally:
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        module.bridge_socket_path = original_bridge_socket_path
+        module.ensure_bridge_app_server = original_ensure_bridge
+
+    assert "desktop_control_unavailable=missing" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "app-server-failed"
+    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
+    assert latest["socket_selection"]["bridge"]["reason"] == "missing"
 
 
 def test_session_hook_control_disables_current_session(tmp: Path) -> None:
@@ -240,7 +309,7 @@ def test_session_hook_control_disables_current_session(tmp: Path) -> None:
         extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已禁用")
     assert not (state / "latest.json").exists()
 
 
@@ -398,7 +467,7 @@ def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
         extra_env={"CODEX_RVF_FORK_EXPERIMENT_MODE": "dry-run"},
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已禁用")
     assert not (state / "latest.json").exists()
 
 
@@ -415,7 +484,7 @@ def test_subagent_source_ignores_session_hook_control(tmp: Path) -> None:
         },
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "subagent")
     assert not (state / "session-hook" / "subagent-control.json").exists()
 
 
@@ -428,7 +497,7 @@ def test_subagent_source_skips(tmp: Path) -> None:
             "source": {"subagent": {"thread_spawn": {"depth": 1}}},
         }
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "subagent")
 
 
 def test_subagent_session_meta_skips(tmp: Path) -> None:
@@ -442,13 +511,13 @@ def test_subagent_session_meta_skips(tmp: Path) -> None:
             "transcript_path": str(transcript),
         }
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "subagent")
 
 
 def test_clean_repo_skips(tmp: Path) -> None:
     clean = init_repo(tmp / "clean", dirty=False)
     stdout, _ = invoke({"cwd": str(clean), "stop_hook_active": False})
-    assert stdout == ""
+    assert_skip_reason(stdout, "clean")
 
 
 def test_dirty_repo_forks_in_gui_by_default(tmp: Path) -> None:
@@ -667,7 +736,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> Non
     assert "parent-session" in payload["systemMessage"]
 
     stdout, _ = invoke(event, state_dir=state)
-    assert stdout == ""
+    assert_skip_reason(stdout, "已是 review-validate-fix fork")
 
 
 def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None:
@@ -690,7 +759,7 @@ def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None
         },
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已是 review-validate-fix fork")
     assert not (state / "child-session.handoff-advised").exists()
 
 
@@ -713,7 +782,7 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> Non
         },
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已是 review-validate-fix fork")
     assert not (state / "child-session.handoff-advised").exists()
 
 
@@ -747,7 +816,7 @@ def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_messag
         },
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已是 review-validate-fix fork")
     assert not (state / "latest.json").exists()
 
 
@@ -782,7 +851,7 @@ def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> No
         },
         state_dir=state,
     )
-    assert stdout == ""
+    assert_skip_reason(stdout, "已是 review-validate-fix fork")
     assert not (state / "latest.json").exists()
 
 
@@ -841,6 +910,8 @@ def main() -> int:
         test_env_suppression_skips,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
+        test_socket_probe_reports_unavailable_reason,
+        test_bridge_failure_preserves_desktop_probe,
         test_session_hook_control_disables_current_session,
         test_session_hook_control_status_reports_current_session,
         test_session_hook_control_status_works_when_env_suppressed,

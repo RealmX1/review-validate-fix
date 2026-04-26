@@ -59,8 +59,21 @@ class AppServerError(RuntimeError):
     pass
 
 
+class AppServerSocketSelectionError(AppServerError):
+    def __init__(self, message: str, socket_selection: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.socket_selection = socket_selection
+
+
 def emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+
+
+def skip_payload(reason: str) -> dict[str, Any]:
+    return {
+        "continue": True,
+        "systemMessage": f"review-validate-fix Stop hook 未创建 fork：{reason}",
+    }
 
 
 def state_dir() -> Path:
@@ -640,12 +653,14 @@ def run_codex_fork(
                 )
             )
         except Exception as exc:
-            result.update(
-                {
-                    "status": "app-server-failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+            failure: dict[str, Any] = {
+                "status": "app-server-failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            socket_selection = getattr(exc, "socket_selection", None)
+            if isinstance(socket_selection, dict):
+                failure["socket_selection"] = socket_selection
+            result.update(failure)
     else:
         result.update(
             {
@@ -668,12 +683,34 @@ def run_codex_fork(
             f"prompt={prompt_path}. log={log_path}"
         )
     elif status == "app-server-started":
+        socket_source = result.get("socket_source")
+        socket_note = f" via {socket_source}" if isinstance(socket_source, str) else ""
+        if socket_source == "bridge":
+            socket_selection = result.get("socket_selection")
+            desktop_probe = (
+                socket_selection.get("desktop_control")
+                if isinstance(socket_selection, dict)
+                else None
+            )
+            if isinstance(desktop_probe, dict):
+                reason = desktop_probe.get("reason") or "unknown"
+                socket_note += f"; desktop_control_unavailable={reason}"
         message = (
-            f"{log_prefix} forked in Codex GUI/app-server: "
+            f"{log_prefix} forked in Codex GUI/app-server{socket_note}: "
             f"fork_thread_id={result.get('fork_thread_id')}; "
             f"parent_thread_id={parent_session_id}; log={log_path}"
         )
     else:
+        if status == "app-server-failed":
+            socket_selection = result.get("socket_selection")
+            desktop_probe = (
+                socket_selection.get("desktop_control")
+                if isinstance(socket_selection, dict)
+                else None
+            )
+            if isinstance(desktop_probe, dict):
+                reason = desktop_probe.get("reason") or "unknown"
+                status = f"{status}; desktop_control_unavailable={reason}"
         message = (
             f"{log_prefix} triggered: "
             f"{status}. parent_thread_id={parent_session_id}. log={log_path}"
@@ -809,13 +846,54 @@ class AppServerWebSocket:
 
 
 def can_connect_app_server_socket(socket_path: Path) -> bool:
+    return bool(probe_app_server_socket(socket_path).get("connect_ok"))
+
+
+def probe_app_server_socket(socket_path: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "path": str(socket_path),
+        "exists": socket_path.exists(),
+        "parent_exists": socket_path.parent.exists(),
+        "is_socket": False,
+        "connect_ok": False,
+        "reason": None,
+    }
+    try:
+        if socket_path.exists():
+            result["is_socket"] = socket_path.is_socket()
+    except OSError as exc:
+        result.update(
+            {
+                "reason": "stat-error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "errno": getattr(exc, "errno", None),
+            }
+        )
+        return result
+
+    if not result["exists"]:
+        result["reason"] = "missing"
+        return result
+    if not result["is_socket"]:
+        result["reason"] = "not-a-socket"
+        return result
+
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         probe.settimeout(0.5)
         probe.connect(str(socket_path))
-        return True
-    except OSError:
-        return False
+        result["connect_ok"] = True
+        result["reason"] = "connect-ok"
+        return result
+    except OSError as exc:
+        result.update(
+            {
+                "reason": "connect-failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "errno": getattr(exc, "errno", None),
+            }
+        )
+        return result
     finally:
         probe.close()
 
@@ -834,19 +912,33 @@ def bridge_log_path() -> Path:
     return DEFAULT_BRIDGE_LOG.resolve()
 
 
-def select_app_server_socket() -> tuple[Path, str]:
+def select_app_server_socket() -> tuple[Path, str, dict[str, Any]]:
     explicit = os.environ.get("CODEX_RVF_APP_SERVER_SOCKET")
     if explicit and explicit.strip():
-        return Path(explicit).expanduser().resolve(), "explicit"
+        socket_path = Path(explicit).expanduser().resolve()
+        return socket_path, "explicit", {"explicit": probe_app_server_socket(socket_path)}
 
-    if (
-        DEFAULT_APP_SERVER_CONTROL_SOCKET.exists()
-        and can_connect_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
-    ):
-        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control"
+    desktop_probe = probe_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
+    if desktop_probe.get("connect_ok"):
+        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control", {
+            "desktop_control": desktop_probe,
+        }
 
-    socket_path = ensure_bridge_app_server()
-    return socket_path, "bridge"
+    try:
+        socket_path = ensure_bridge_app_server()
+    except Exception as exc:
+        socket_selection = {
+            "desktop_control": desktop_probe,
+            "bridge": probe_app_server_socket(bridge_socket_path()),
+        }
+        raise AppServerSocketSelectionError(
+            f"desktop-control unavailable and bridge fallback failed: {exc}",
+            socket_selection,
+        ) from exc
+    return socket_path, "bridge", {
+        "desktop_control": desktop_probe,
+        "bridge": probe_app_server_socket(socket_path),
+    }
 
 
 def ensure_bridge_app_server() -> Path:
@@ -917,7 +1009,7 @@ def run_app_server_fork(
     reasoning_effort: str | None,
     log_path: Path,
 ) -> dict[str, Any]:
-    socket_path, socket_source = select_app_server_socket()
+    socket_path, socket_source, socket_selection = select_app_server_socket()
     client = AppServerWebSocket(socket_path)
     try:
         client.request(
@@ -953,6 +1045,7 @@ def run_app_server_fork(
             "status": "app-server-started",
             "socket_path": str(socket_path),
             "socket_source": socket_source,
+            "socket_selection": socket_selection,
             "fork_thread_id": fork_thread_id,
             "turn_id": turn_id,
             "opened_gui_deeplink": opened,
@@ -1163,6 +1256,7 @@ def main() -> int:
         return 0
 
     if event.get("stop_hook_active") is True:
+        emit(skip_payload("检测到 stop_hook_active=true，为避免递归已跳过。"))
         return 0
 
     latest_user = latest_user_message_from_event(event)
@@ -1171,9 +1265,12 @@ def main() -> int:
         advisory = handoff_advisory(event, fork_context)
         if advisory is not None:
             emit(advisory)
+        else:
+            emit(skip_payload("当前会话已是 review-validate-fix fork，会等待最终 <handoff-context>，不会再次 fork。"))
         return 0
 
     if event_marks_subagent(event):
+        emit(skip_payload("Stop event 来自 Codex subagent，post-work review 只允许主会话触发。"))
         return 0
 
     session_control = session_hook_control_payload(event, latest_user)
@@ -1183,6 +1280,7 @@ def main() -> int:
 
     session_id = session_hook_id_from_event(event)
     if session_id and session_hook_disabled(session_id):
+        emit(skip_payload(f"当前 chat session 已禁用 RVF_STOP_HOOK。session_id={session_id}"))
         return 0
 
     should_experiment, latest_user = should_run_fork_experiment(event)
@@ -1191,9 +1289,11 @@ def main() -> int:
         return 0
 
     if should_suppress(event):
+        emit(skip_payload("检测到 suppress 标记或环境变量。"))
         return 0
 
     cwd = event.get("cwd")
+    cwd_result: GateResult | None = None
     if isinstance(cwd, str) and cwd:
         cwd_result = run_gate(cwd)
         if cwd_result.status == "DIRTY" and cwd_result.repo:
@@ -1202,6 +1302,7 @@ def main() -> int:
                 emit(payload)
             return 0
         if cwd_result.status == "CLEAN":
+            emit(skip_payload(f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}"))
             return 0
 
     dirty_repos, _errors = trusted_dirty_repos()
@@ -1221,6 +1322,14 @@ def main() -> int:
                 ),
             }
         )
+    elif cwd_result is not None:
+        emit(
+            skip_payload(
+                f"当前 cwd gate={cwd_result.status}，且没有唯一 dirty trusted repo。cwd={cwd}"
+            )
+        )
+    else:
+        emit(skip_payload("Stop event 未提供可检查的 cwd，且没有唯一 dirty trusted repo。"))
     return 0
 
 
