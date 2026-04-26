@@ -31,6 +31,8 @@ plugins/review-validate-fix/.codex-plugin/plugin.json
 plugins/review-validate-fix/skills/review-validate-fix/
 scripts/sync_plugin_payload.py             # 从 canonical skill 生成 plugin 内的 skill 副本
 scripts/install_to_codex.py                # 安装到本机 Codex skill/plugin 空间
+skill/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
+                                            # Stop hook 稳定入口：必要时先同步本 repo 到 installed skill
 ```
 
 ## 同步机制
@@ -63,7 +65,16 @@ plugin 安装会把包装层复制到 `~/plugins/review-validate-fix`，并在 `
 python3 scripts/install_to_codex.py --as skill --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui` 调用本 skill 的 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal，也不会在当前 chat session 里 continuation；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这样父会话保留为可 rewind 的稳定 checkpoint。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui` 调用 installed skill 的稳定 dispatcher，并由 dispatcher 在必要同步后转交给 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal，也不会在当前 chat session 里 continuation；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这样父会话保留为可 rewind 的稳定 checkpoint。
+
+实际写入 `~/.codex/hooks.json` 的入口是 installed skill 中的 `scripts/codex_stop_hook_dispatcher.py`，不是直接调用 `codex_stop_review_validate_fix.py`。dispatcher 会在 Stop event 来自本 RVF 源仓库、且不是 subagent 时，先顺序运行：
+
+```bash
+python3 scripts/sync_plugin_payload.py --check-contracts
+python3 scripts/install_to_codex.py --as skill --configure-stop-hook
+```
+
+只有同步和 contract check 成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果同步失败，它会跳过 fork gate 并在 systemMessage 中写出失败原因和日志路径，避免继续使用 stale installed skill。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
 
 hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
 
@@ -89,6 +100,8 @@ RVF_STOP_HOOK: status
 
 这些状态写入 skill 的 `state/session-hook/`，安装更新时会随 `state/` 一起保留，只影响当前 chat session，不修改全局 hook 配置。
 
+这些 `RVF_STOP_HOOK:*` 行是 Stop hook 的会话控制元数据，不是交给主 agent 的代码任务、review issue、research 对象或 scope-of-work 内容。自动 fork / continuation prompt 会显式提醒 fork 会话忽略这类控制行，避免把临时开关误纳入 review 工作。
+
 ## Setup 相关配置
 
 有些变化不能简单从仓库覆盖到本机，因为它们绑定机器、凭据或用户选择。当前最典型的是：
@@ -96,6 +109,7 @@ RVF_STOP_HOOK: status
 - `config/alternative-reviewer.json`
 - `state/`
 - `~/.codex/hooks.json` 中的 Stop hook / fork hook 绑定
+- `~/.codex/hooks.json` 中 `CODEX_RVF_DEV_REPO` 指向的本机源仓库路径
 - `~/.codex/app-server-control/rvf-app-server.sock` 和 `~/.codex/app-server-control/rvf-app-server.log` 这类本机 app-server bridge 文件
 - 外部 reviewer 的 CLI/MCP/IDE wrapper 认证状态和环境变量
 

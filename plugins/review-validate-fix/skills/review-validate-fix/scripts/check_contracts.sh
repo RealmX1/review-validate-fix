@@ -61,7 +61,9 @@ required_files=(
   "scripts/command_lock.py"
   "scripts/prepare_review_run.py"
   "scripts/workspace_snapshot.py"
+  "scripts/codex_stop_hook_dispatcher.py"
   "scripts/codex_stop_review_validate_fix.py"
+  "scripts/test_codex_stop_hook_dispatcher.py"
   "scripts/test_codex_stop_review_validate_fix.py"
   "scripts/test_review_support_scripts.py"
   "scripts/discover_santa_alternative_agents.sh"
@@ -96,11 +98,15 @@ python3 -m py_compile \
   "$skill_dir/scripts/command_lock.py" \
   "$skill_dir/scripts/prepare_review_run.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
+  "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
+  "$skill_dir/scripts/test_codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/test_codex_stop_review_validate_fix.py" \
   "$skill_dir/scripts/test_review_support_scripts.py"
 
 python3 "$skill_dir/scripts/test_review_support_scripts.py"
+python3 "$skill_dir/scripts/test_codex_stop_hook_dispatcher.py"
+python3 "$skill_dir/scripts/test_codex_stop_review_validate_fix.py"
 
 python3 - "$skill_dir/references/handoff-template.md" <<'PY'
 import re
@@ -140,7 +146,13 @@ require_literal "references/handoff-template.md" 'review_status'
 require_literal "references/handoff-template.md" 'user-supplied-skip-review'
 require_literal "agents/openai.yaml" 'skip review'
 require_literal "agents/openai.yaml" 'no handoff'
-require_literal "SKILL.md" 'validate-review 子代理'
+require_literal "SKILL.md" '必须启动至少一个 `pass_type: validate_fix` 子代理'
+require_literal "SKILL.md" '不得因为问题看起来简单'
+require_literal "SKILL.md" '不能把“为了省时间”“问题很小”当成本地执行理由'
+require_literal "references/validate-then-fix-prompt.md" '必须启动至少一个 `pass_type: validate_fix` 子代理'
+require_literal "references/validate-then-fix-prompt.md" '不得因为问题看起来简单'
+require_literal "references/validate-then-fix-prompt.md" '“为了省时间”或“问题很小”不是例外'
+require_literal "references/handoff-template.md" '本地执行：<原因>'
 require_literal "references/legacy-compatibility-notes.md" 'Stop hook 触发点是会话内部自动事件'
 require_literal "SKILL.md" 'santa-method double review'
 require_literal "SKILL.md" 'config/alternative-reviewer.json'

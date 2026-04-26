@@ -24,7 +24,10 @@ DEFAULT_APP_SERVER_CONTROL_SOCKET = (
 )
 DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.sock"
 DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
+DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
+DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = Path.home() / ".codex" / "archived_sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
+DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -502,6 +505,10 @@ def fork_review_validate_fix_prompt(
         "review-validate-fix 会话。请基于完整父会话历史和当前未提交改动运行 "
         "review-validate-fix。\n\n"
         f"目标仓库: {repo}\n\n"
+        "如果父会话历史里出现 `RVF_STOP_HOOK: off`、`RVF_STOP_HOOK: on` "
+        "或 `RVF_STOP_HOOK: status` 这样的行，请只把它们视为 Stop hook "
+        "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
+        "research 对象或 scope-of-work 内容。\n\n"
         "完成后按 skill 规范生成最终汇总和 <handoff-context>。不要在正文里提示"
         "用户复制 handoff；Stop hook 会在本会话结束时用 systemMessage 做程序化提示。"
     )
@@ -695,6 +702,11 @@ def run_codex_fork(
             if isinstance(desktop_probe, dict):
                 reason = desktop_probe.get("reason") or "unknown"
                 socket_note += f"; desktop_control_unavailable={reason}"
+        session_visibility = result.get("session_visibility")
+        if isinstance(session_visibility, dict):
+            location = session_visibility.get("location")
+            if isinstance(location, str) and location != "active":
+                socket_note += f"; session_visibility={location}"
         message = (
             f"{log_prefix} forked in Codex GUI/app-server{socket_note}: "
             f"fork_thread_id={result.get('fork_thread_id')}; "
@@ -999,6 +1011,106 @@ def maybe_open_fork_in_codex(fork_thread_id: str) -> bool:
         return False
 
 
+def fork_visibility_timeout_seconds() -> float:
+    raw = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS
+
+
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def notification_thread_path(
+    notifications: list[dict[str, Any]],
+    thread_id: str,
+) -> str | None:
+    for notification in reversed(notifications):
+        if notification.get("method") != "thread/started":
+            continue
+        params = notification.get("params")
+        thread = params.get("thread") if isinstance(params, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            continue
+        path = thread.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
+def fork_session_visibility(
+    thread_id: str,
+    hinted_path: str | None,
+) -> dict[str, Any]:
+    active_paths: list[str] = []
+    archived_paths: list[str] = []
+    hinted = Path(hinted_path).expanduser() if hinted_path else None
+    hinted_exists = False
+    if hinted is not None:
+        try:
+            hinted_exists = hinted.exists()
+        except OSError:
+            hinted_exists = False
+        if hinted_exists:
+            target = archived_paths if path_is_relative_to(
+                hinted,
+                DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR,
+            ) else active_paths
+            target.append(str(hinted))
+
+    if not active_paths and DEFAULT_CODEX_SESSIONS_DIR.exists():
+        active_paths.extend(
+            str(path)
+            for path in DEFAULT_CODEX_SESSIONS_DIR.rglob(f"*{thread_id}*.jsonl")
+        )
+    if not archived_paths and DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR.exists():
+        archived_paths.extend(
+            str(path)
+            for path in DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR.glob(f"*{thread_id}*.jsonl")
+        )
+
+    location = "missing"
+    if active_paths:
+        location = "active"
+    elif archived_paths:
+        location = "archived"
+
+    return {
+        "thread_id": thread_id,
+        "hinted_path": str(hinted) if hinted is not None else None,
+        "hinted_exists": hinted_exists,
+        "location": location,
+        "active_paths": active_paths,
+        "archived_paths": archived_paths,
+    }
+
+
+def wait_for_fork_session_visibility(
+    thread_id: str,
+    hinted_path: str | None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    timeout = fork_visibility_timeout_seconds() if timeout_seconds is None else timeout_seconds
+    deadline = time.monotonic() + timeout
+    checks = 0
+    while True:
+        checks += 1
+        visibility = fork_session_visibility(thread_id, hinted_path)
+        visibility["checks"] = checks
+        visibility["timeout_seconds"] = timeout
+        if visibility["location"] != "missing" or time.monotonic() >= deadline:
+            return visibility
+        time.sleep(0.1)
+
+
 def run_app_server_fork(
     *,
     parent_thread_id: str,
@@ -1035,11 +1147,19 @@ def run_app_server_fork(
         if not isinstance(fork_thread, dict) or not isinstance(fork_thread.get("id"), str):
             raise AppServerError("thread/fork did not return a fork thread id")
         fork_thread_id = fork_thread["id"]
+        fork_thread_path = (
+            fork_thread.get("path") if isinstance(fork_thread.get("path"), str) else None
+        )
         turn_params = dict(requests[1]["params"])
         turn_params["threadId"] = fork_thread_id
         turn_result = client.request("turn/start", turn_params)
         turn = turn_result.get("turn")
         turn_id = turn.get("id") if isinstance(turn, dict) else None
+        session_hint = fork_thread_path or notification_thread_path(
+            client.notifications,
+            fork_thread_id,
+        )
+        session_visibility = wait_for_fork_session_visibility(fork_thread_id, session_hint)
         opened = maybe_open_fork_in_codex(fork_thread_id)
         return {
             "status": "app-server-started",
@@ -1047,7 +1167,9 @@ def run_app_server_fork(
             "socket_source": socket_source,
             "socket_selection": socket_selection,
             "fork_thread_id": fork_thread_id,
+            "fork_thread_path": fork_thread_path,
             "turn_id": turn_id,
+            "session_visibility": session_visibility,
             "opened_gui_deeplink": opened,
             "notifications": client.notifications[-20:],
         }
@@ -1245,7 +1367,11 @@ def continuation(repo: str) -> dict[str, Any]:
         "这是由已配置的 Codex Stop hook 在上一轮停止后自动提交的 "
         "continuation prompt。请基于完整会话历史和当前未提交改动运行 "
         "review-validate-fix。\n\n"
-        f"目标仓库: {repo}"
+        f"目标仓库: {repo}\n\n"
+        "如果会话历史里出现 `RVF_STOP_HOOK: off`、`RVF_STOP_HOOK: on` "
+        "或 `RVF_STOP_HOOK: status` 这样的行，请只把它们视为 Stop hook "
+        "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
+        "research 对象或 scope-of-work 内容。"
     )
     return {"decision": "block", "reason": reason}
 

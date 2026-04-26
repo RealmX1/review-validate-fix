@@ -1,6 +1,6 @@
 # Validate Then Fix Prompt
 
-传给 validate/fix 子代理，或本地执行 validate/fix 时遵守：
+默认传给 validate/fix 子代理。主会话本地执行 validate/fix 只允许用于 `SKILL.md` 定义的窄例外，并且必须在最终汇总和 handoff 中写明原因。
 
 ```markdown
 pass_type: validate_fix
@@ -23,8 +23,11 @@ pass_type: validate_fix
 
 ## 子代理分配
 
+- 在默认 `full` 流程中，只要 review merge 后存在可解析 issue list，主会话必须启动至少一个 `pass_type: validate_fix` 子代理处理验证包。
+- 不得因为问题看起来简单、修复明显、reviewer 已给出修复方向或主会话已经理解问题，就跳过 validate/fix 子代理。
+- 只有当前运行环境确实没有可用子代理接口、用户本轮明确要求主会话本地执行 validate/fix，或某个 validate/fix 子代理已返回 `REAL` 且只剩主会话可安全完成的机械收尾时，才允许本地执行；“为了省时间”或“问题很小”不是例外。
 - 不强制一条 issue 一个子代理。
-- 如果多条 issue 共享同一根因、同一文件区域、同一测试路径或同一决策前提，应合并为一个验证包交给同一个 validate-review 子代理。
+- 如果多条 issue 共享同一根因、同一文件区域、同一测试路径或同一决策前提，应合并为一个验证包交给同一个 validate/fix 子代理。
 - 验证包 prompt 必须说明：
   - 包含哪些 issue。
   - 为什么这些 issue 需要合并验证。

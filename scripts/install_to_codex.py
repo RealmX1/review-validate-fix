@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -124,34 +125,60 @@ def configure_stop_hook(skill_dir: Path) -> Path:
 
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
+    dispatcher = skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
     command = (
-        "CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui python3 "
-        f"{skill_dir / 'scripts' / 'codex_stop_review_validate_fix.py'}"
+        "CODEX_RVF_MODE=fork "
+        "CODEX_RVF_FORK_MODE=gui "
+        "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=60 "
+        "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=30 "
+        f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))} "
+        f"python3 {shlex.quote(str(dispatcher))}"
     )
     entry = {
         "type": "command",
         "command": command,
-        "timeout": 30,
-        "statusMessage": "Checking review-validate-fix gate",
+        "timeout": 180,
+        "statusMessage": "Syncing/checking review-validate-fix gate",
     }
 
-    replaced = False
+    target_group: dict[str, object] | None = None
+    cleaned_stop_groups: list[dict[str, object]] = []
     for group in stop_groups:
-        group_hooks = group.setdefault("hooks", [])
-        for index, existing in enumerate(group_hooks):
-            existing_command = existing.get("command")
-            if (
-                isinstance(existing_command, str)
-                and "codex_stop_review_validate_fix.py" in existing_command
-            ):
-                group_hooks[index] = entry
-                replaced = True
-                break
-        if replaced:
-            break
+        if not isinstance(group, dict):
+            continue
+        group_hooks = group.get("hooks")
+        if not isinstance(group_hooks, list):
+            group["hooks"] = []
+            cleaned_stop_groups.append(group)
+            continue
 
-    if not replaced:
-        stop_groups.append({"hooks": [entry]})
+        kept_hooks = []
+        removed_rvf_hook = False
+        for existing in group_hooks:
+            command_value = existing.get("command") if isinstance(existing, dict) else None
+            is_rvf_hook = (
+                isinstance(command_value, str)
+                and (
+                    "codex_stop_review_validate_fix.py" in command_value
+                    or "codex_stop_hook_dispatcher.py" in command_value
+                )
+            )
+            if is_rvf_hook:
+                removed_rvf_hook = True
+                if target_group is None:
+                    target_group = group
+                continue
+            kept_hooks.append(existing)
+
+        if removed_rvf_hook and target_group is group:
+            kept_hooks.append(entry)
+        group["hooks"] = kept_hooks
+        if kept_hooks:
+            cleaned_stop_groups.append(group)
+
+    hooks["Stop"] = cleaned_stop_groups
+    if target_group is None:
+        cleaned_stop_groups.append({"hooks": [entry]})
 
     hooks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return hooks_path
@@ -178,7 +205,7 @@ def main() -> int:
     parser.add_argument(
         "--configure-stop-hook",
         action="store_true",
-        help="更新 ~/.codex/hooks.json，让 Stop hook 以 Codex GUI/app-server fork 调用本 skill。",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 dispatcher 同步本 repo，再以 Codex GUI/app-server fork 调用本 skill。",
     )
     args = parser.parse_args()
 

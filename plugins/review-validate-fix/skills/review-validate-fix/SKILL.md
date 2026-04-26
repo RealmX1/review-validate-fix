@@ -5,7 +5,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 # Review Validate Fix
 
-本 skill 用于对当前仓库的未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。
+本 skill 用于对当前对话（目前已经实现的是对整个仓库）的未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。
 
 本 skill 只应由用户显式调用，例如 `$review-validate-fix`。`agents/openai.yaml` 将 `policy.allow_implicit_invocation` 设为 `false`，避免 agent 或模型因为相似上下文自动启用它。
 
@@ -37,12 +37,13 @@ description: Use when the user asks for a post-work code review loop, review val
 ## Codex Stop Hook
 
 - 核心设计支柱：Stop hook 自动化必须让触发 hook 的父会话在 hook 完成后停止，并在新的 Codex GUI fork 会话里留下 review checkpoint。新 fork 会话保留父会话完整上下文，并由 hook 注入一个以 `$review-validate-fix` 开头的首个用户 prompt 来启动本 skill；不要把当前会话 continuation 当作默认自动路径。
-- hook 脚本为 `scripts/codex_stop_review_validate_fix.py`，只负责判断是否要用 `$review-validate-fix` prompt 创建新的 Codex GUI fork；不要在 hook 脚本里直接执行 review/fix。
+- installed Stop hook 入口为 `scripts/codex_stop_hook_dispatcher.py`，它在 RVF 源仓库的主会话 Stop 时先同步本 repo 到 installed skill，再把同一份 Stop event JSON 转交给 `scripts/codex_stop_review_validate_fix.py`。真实 fork gate 逻辑仍只放在 `codex_stop_review_validate_fix.py`；不要在 hook 脚本里直接执行 review/fix。
+- dispatcher 同步只允许在 Stop event 的 git root 等于 `CODEX_RVF_DEV_REPO` 且事件不是 subagent 时运行；同步失败必须 fail-safe 跳过 fork gate 并给出 systemMessage/log path，避免继续使用 stale installed skill。
 - 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=gui`：dirty gate 通过后，脚本通过 Codex app-server 的 `thread/fork` 与 `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这是 Desktop 的默认自动路径，用来保留可 rewind 的父会话 checkpoint。
 - `CODEX_RVF_MODE=continuation` 只保留为显式 fallback：脚本会返回 Codex Stop continuation hook 的 `decision: "block"` / continuation prompt，在当前会话中继续运行 `$review-validate-fix`。该模式不会产生独立 fork checkpoint。
 - `CODEX_RVF_FORK_MODE=manual` 或 `dry-run` 只用于调试 prompt / app-server request 生成，不启动 Terminal。
 - `CODEX_RVF_MODE=off`：dirty gate 通过也只输出 systemMessage 并跳过自动触发。
-- 当前 chat session 可用显式用户消息行管理 hook：`RVF_STOP_HOOK: off` 会把本 session 标记为 disabled，后续 Stop hook 对同一 session 静默跳过；`RVF_STOP_HOOK: on` 会清除该 session 标记并恢复；`RVF_STOP_HOOK: status` 只报告当前 session 状态。这些 session 状态写入 `state/session-hook/`，只影响当前 chat session，不修改全局 `~/.codex/hooks.json`。
+- 当前 chat session 可用显式用户消息行管理 hook：`RVF_STOP_HOOK: off` 会把本 session 标记为 disabled，后续 Stop hook 对同一 session 静默跳过；`RVF_STOP_HOOK: on` 会清除该 session 标记并恢复；`RVF_STOP_HOOK: status` 只报告当前 session 状态。这些 session 状态写入 `state/session-hook/`，只影响当前 chat session，不修改全局 `~/.codex/hooks.json`。这些 `RVF_STOP_HOOK:*` 行只属于 Stop hook 会话控制元数据；除非用户明确申明其诉求与对RVF_STOP_HOOK本身的分析、更新有关，主会话或 fork 会话可以将其忽略。
 - 如果 `stop_hook_active=true`，必须直接跳过，避免 Stop continuation 或 fork 递归。
 - 如果 Stop 事件来自 Codex subagent，必须直接跳过。post-work review 只能由主会话显式触发；研究、review、validate/fix 等子代理结束时不得被 Stop hook 拖入新的 `$review-validate-fix` fork 或 continuation。
 - 如果环境变量 `CODEX_RVF_SUPPRESS=1` 或 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，必须直接跳过；该开关用于 research marathon 等主会话已接管调度的场景。
@@ -105,8 +106,10 @@ description: Use when the user asks for a post-work code review loop, review val
   - `REAL`：真问题且可独立最小修复。
   - `FALSE_POSITIVE`：不成立，不改文件。
   - `ELEVATE`：真问题但需要用户决策，不改文件。
-- 分配 validate-review 子代理时按问题耦合度组织：不必一条 issue 一个 agent。共享根因、同一文件区域、同一测试路径或同一决策前提的问题，应合并成一个验证包交给同一个 validate-review 子代理；验证包仍要逐项输出 verdict。
-- 主会话必须为 validate/fix 分组保留一张审计表，不只把分组信息写进子代理 prompt。每个分组记录 `validation_group_id`、包含的 canonical issue / processed id、分组理由、分配给哪个 validate/fix 子代理或本地执行、以及逐项 verdict 汇总。
+- 在默认 `full` 流程中，只要可解析 issue list 进入 validate/fix，主会话必须启动至少一个 `pass_type: validate_fix` 子代理处理验证包；不得因为问题看起来简单、修复明显、reviewer 已给出修复方向或主会话已经理解问题，就由主会话直接验证和修改文件。
+- 只有在当前运行环境确实没有可用子代理接口、用户本轮明确要求主会话本地执行 validate/fix，或某个 validate/fix 子代理已返回 `REAL` 且只剩主会话可安全完成的机械收尾时，才允许本地执行；最终汇总和 handoff 必须写明本地执行原因。不能把“为了省时间”“问题很小”当成本地执行理由。
+- 分配 validate/fix 子代理时按问题耦合度组织：不必一条 issue 一个 agent。共享根因、同一文件区域、同一测试路径或同一决策前提的问题，应合并成一个验证包交给同一个 validate/fix 子代理；验证包仍要逐项输出 verdict。
+- 主会话必须为 validate/fix 分组保留一张审计表，不只把分组信息写进子代理 prompt。每个分组记录 `validation_group_id`、包含的 canonical issue / processed id、分组理由、分配给哪个 validate/fix 子代理；若触发允许本地执行的窄例外，还必须记录本地执行原因；以及逐项 verdict 汇总。
 - 发给 validate/fix 子代理的 issue context 必须 source-agnostic：不要包含“Codex 发现”“alternative reviewer 发现”“两个 reviewer 都发现”等来源标签，也不要暗示哪个模型或 agent 支持该 issue。来源 provenance 只保留在主会话的合并表 / handoff 中。
 - validate/fix 子代理只处理主会话分配给它的 canonical issue 包；不得自行扩大 review 范围、重新执行 double review、生成 handoff 或处理未分配问题。
 - 所有 validate/fix 子代理完成后，主会话的最终中文汇总必须包含“Validate/fix 分组”小节，说明 reviewer 标记出的 processed issues 是如何被分配成验证包的：每组列出 group id、包含的问题、合并验证原因和结果统计。即使某组只有一条 issue，也要说明它为何独立验证。

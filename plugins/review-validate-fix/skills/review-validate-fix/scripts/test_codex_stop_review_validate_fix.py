@@ -269,6 +269,115 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     assert latest["socket_selection"]["bridge"]["reason"] == "missing"
 
 
+def test_fork_session_visibility_reports_active_and_archived(tmp: Path) -> None:
+    module = load_hook_module()
+    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_archived_dir = module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR
+    try:
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = tmp / "archived_sessions"
+        active_path = (
+            module.DEFAULT_CODEX_SESSIONS_DIR
+            / "2026"
+            / "04"
+            / "26"
+            / "rollout-2026-04-26T21-28-28-fork-visible.jsonl"
+        )
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text("{}\n", encoding="utf-8")
+
+        active = module.fork_session_visibility("fork-visible", str(active_path))
+        assert active["location"] == "active"
+        assert active["hinted_exists"] is True
+        assert str(active_path) in active["active_paths"]
+
+        active_path.unlink()
+        archived_path = (
+            module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR
+            / "rollout-2026-04-26T21-28-28-fork-visible.jsonl"
+        )
+        archived_path.parent.mkdir(parents=True, exist_ok=True)
+        archived_path.write_text("{}\n", encoding="utf-8")
+
+        archived = module.wait_for_fork_session_visibility(
+            "fork-visible",
+            str(active_path),
+            timeout_seconds=0,
+        )
+        assert archived["location"] == "archived"
+        assert str(archived_path) in archived["archived_paths"]
+    finally:
+        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = original_archived_dir
+
+
+def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> None:
+    module = load_hook_module()
+    socket_path = tmp / "app-server.sock"
+    active_path = tmp / "sessions" / "rollout-fork-wait.jsonl"
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, socket: Path) -> None:
+            assert socket == socket_path
+            self.notifications: list[dict[str, object]] = []
+
+        def request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+            if method == "initialize":
+                return {}
+            if method == "thread/fork":
+                return {"thread": {"id": "fork-wait", "path": str(active_path)}}
+            if method == "turn/start":
+                calls.append("turn/start")
+                active_path.parent.mkdir(parents=True, exist_ok=True)
+                active_path.write_text("{}\n", encoding="utf-8")
+                return {"turn": {"id": "turn-wait"}}
+            raise AssertionError(method)
+
+        def close(self) -> None:
+            pass
+
+    original_client = module.AppServerWebSocket
+    original_select = module.select_app_server_socket
+    original_open = module.maybe_open_fork_in_codex
+    original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
+    try:
+        module.AppServerWebSocket = FakeClient
+        module.select_app_server_socket = lambda: (socket_path, "bridge", {})
+
+        def fake_open(thread_id: str) -> bool:
+            calls.append("open")
+            assert thread_id == "fork-wait"
+            assert active_path.exists()
+            return True
+
+        module.maybe_open_fork_in_codex = fake_open
+        os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "1"
+        result = module.run_app_server_fork(
+            parent_thread_id="parent",
+            parent_thread_path=None,
+            cwd=str(tmp),
+            prompt="$review-validate-fix",
+            model=None,
+            reasoning_effort=None,
+            log_path=tmp / "hook.json",
+        )
+    finally:
+        module.AppServerWebSocket = original_client
+        module.select_app_server_socket = original_select
+        module.maybe_open_fork_in_codex = original_open
+        if original_timeout is None:
+            os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = original_timeout
+
+    assert calls == ["turn/start", "open"]
+    assert result["fork_thread_id"] == "fork-wait"
+    assert result["turn_id"] == "turn-wait"
+    assert result["session_visibility"]["location"] == "active"
+    assert result["opened_gui_deeplink"] is True
+
+
 def test_session_hook_control_disables_current_session(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     state = tmp / "state"
@@ -595,6 +704,9 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
     assert "$review-validate-fix" in latest["prompt"]
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
     assert str(dirty) in latest["prompt"]
+    assert "RVF_STOP_HOOK: off" in latest["prompt"]
+    assert "会话控制元数据" in latest["prompt"]
+    assert "不要把它们当成用户分配的代码任务" in latest["prompt"]
     assert latest["suppress_child_stop_hook"] is False
     assert latest["model"] == "gpt-test"
     assert latest["reasoning_effort"] == "high"
@@ -682,6 +794,9 @@ def test_dirty_repo_continuation_mode(tmp: Path) -> None:
     assert payload["decision"] == "block"
     assert "$review-validate-fix" in payload["reason"]
     assert str(dirty) in payload["reason"]
+    assert "RVF_STOP_HOOK: off" in payload["reason"]
+    assert "会话控制元数据" in payload["reason"]
+    assert "不要把它们当成用户分配的代码任务" in payload["reason"]
 
 
 def test_no_git_unique_dirty_trusted_repo_forks_by_default(tmp: Path) -> None:
@@ -912,6 +1027,8 @@ def main() -> int:
         test_session_hook_state_dir_respects_state_dir_override,
         test_socket_probe_reports_unavailable_reason,
         test_bridge_failure_preserves_desktop_probe,
+        test_fork_session_visibility_reports_active_and_archived,
+        test_app_server_fork_waits_for_session_file_before_deeplink,
         test_session_hook_control_disables_current_session,
         test_session_hook_control_status_reports_current_session,
         test_session_hook_control_status_works_when_env_suppressed,

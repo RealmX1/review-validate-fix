@@ -28,7 +28,7 @@ review_status: <COMPLETED / SKIPPED_BY_USER>
 
 - `RVF-G1`：<包含的 processed issue id / path:line 列表>
   - 分组理由：<共享根因、同一文件区域、同一测试路径、同一决策前提，或“单独验证，因为...”>
-  - 执行：<validate/fix 子代理名或本地执行>
+  - 执行：<validate/fix 子代理名；若触发允许本地执行的窄例外，写“本地执行：<原因>”>
   - 结果：<R> REAL / <F> FALSE_POSITIVE / <E> ELEVATE
 
 ## Issue 处理结果
