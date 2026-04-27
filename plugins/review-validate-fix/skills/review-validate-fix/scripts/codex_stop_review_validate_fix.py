@@ -587,22 +587,34 @@ def handoff_advisory(
     session_id = session_id_from_event(event) or "unknown-session"
     sdir = state_dir()
     marker_path = sdir / f"{session_id}.handoff-advised"
-    if marker_path.exists():
-        return None
+    marker_written = False
+    marker_error: dict[str, str] | None = None
+    try:
+        if marker_path.exists():
+            return None
 
-    sdir.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "context": context,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        sdir.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "context": context,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        marker_written = True
+    except OSError as exc:
+        marker_error = {
+            "kind": "log_unavailable",
+            "operation": "handoff_marker",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if ledger is not None:
+            ledger._diagnose("handoff_marker", exc)
 
     parent = context.get("parent_session_id") or "<unknown>"
     parent_cwd = context.get("parent_cwd") or "<unknown>"
@@ -614,12 +626,14 @@ def handoff_advisory(
     if ledger is not None:
         ledger.event(
             phase="handoff",
-            event="advisory_created",
-            status="completed",
-            reason_code="handoff_context_ready",
+            event="advisory_created" if marker_written else "advisory_marker_unavailable",
+            status="completed" if marker_written else "warning",
+            reason_code="handoff_context_ready" if marker_written else "log_unavailable",
+            level="info" if marker_written else "warn",
             session_id=session_id,
             parent_thread_id=parent,
             paths={"marker": str(marker_path)},
+            error=marker_error,
         )
         return ledger.hook_payload(
             status="handoff-advisory",
@@ -629,6 +643,8 @@ def handoff_advisory(
             parent_cwd=parent_cwd,
             target_repo=target_repo,
             marker_path=str(marker_path),
+            marker_written=marker_written,
+            marker_error=marker_error,
         )
     return {
         "continue": True,
