@@ -134,6 +134,30 @@ def test_dev_repo_main_session_syncs_before_running_installed_hook(tmp_path: Pat
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
+def test_session_hook_off_still_syncs_before_running_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "parent-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "last_user_message": "RVF_STOP_HOOK: off",
+    }
+    stdout = invoke(event, dev_repo=repo, hook=hook, state=tmp_path / "state")
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert (marker / "sync-ran").exists()
+    assert (marker / "install-ran").exists()
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
 def test_non_matching_repo_runs_installed_hook_without_sync(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     other = init_repo(tmp_path / "other")
@@ -251,6 +275,7 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
 def main() -> int:
     tests = [
         test_dev_repo_main_session_syncs_before_running_installed_hook,
+        test_session_hook_off_still_syncs_before_running_installed_hook,
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
         test_sync_failure_skips_installed_hook_to_avoid_stale_fork,

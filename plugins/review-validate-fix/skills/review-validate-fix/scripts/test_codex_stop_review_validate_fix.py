@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).with_name("codex_stop_review_validate_fix.py")
+SCRIPT = Path(__file__).resolve().with_name("codex_stop_review_validate_fix.py")
 
 
 def run(cmd: list[str], cwd: Path) -> None:
@@ -232,11 +232,13 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     desktop_socket = tmp / "missing-control.sock"
     bridge_socket = tmp / "missing-bridge.sock"
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
     original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
     original_bridge_socket_path = module.bridge_socket_path
     original_ensure_bridge = module.ensure_bridge_app_server
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "bridge"
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
         module.bridge_socket_path = lambda: bridge_socket
 
@@ -258,6 +260,10 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
             os.environ.pop("CODEX_RVF_STATE_DIR", None)
         else:
             os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+        if original_bridge_policy is None:
+            os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
+        else:
+            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
         module.bridge_socket_path = original_bridge_socket_path
         module.ensure_bridge_app_server = original_ensure_bridge
@@ -269,13 +275,164 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     assert latest["socket_selection"]["bridge"]["reason"] == "missing"
 
 
-def test_fork_session_visibility_reports_active_and_archived(tmp: Path) -> None:
+def test_missing_desktop_control_defaults_to_continuation_not_bridge(tmp: Path) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    desktop_socket = tmp / "missing-control.sock"
+    bridge_socket = tmp / "missing-bridge.sock"
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
+    original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
+    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = module.bridge_socket_path
+    original_ensure_bridge = module.ensure_bridge_app_server
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        module.bridge_socket_path = lambda: bridge_socket
+        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+            AssertionError("bridge should not start by default")
+        )
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(tmp),
+            prompt="fork prompt should not be used",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=None,
+            fallback_continuation_reason="visible continuation",
+        )
+    finally:
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+        if original_bridge_policy is not None:
+            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
+        if original_allow_bridge is not None:
+            os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        module.bridge_socket_path = original_bridge_socket_path
+        module.ensure_bridge_app_server = original_ensure_bridge
+
+    assert payload == {"decision": "block", "reason": "visible continuation"}
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "desktop-control-unavailable-continuation"
+    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
+    assert latest["socket_selection"]["bridge_policy"] == "continuation"
+
+
+def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
+    tmp: Path,
+) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    desktop_socket = tmp / "missing-control.sock"
+    bridge_socket = tmp / "missing-bridge.sock"
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
+    original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
+    original_experiment_mode = os.environ.pop("CODEX_RVF_FORK_EXPERIMENT_MODE", None)
+    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = module.bridge_socket_path
+    original_ensure_bridge = module.ensure_bridge_app_server
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        module.bridge_socket_path = lambda: bridge_socket
+        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+            AssertionError("bridge should not start for fork experiment by default")
+        )
+        payload = module.run_fork_experiment(
+            {"session_id": "parent-thread", "cwd": str(tmp)},
+            "RVF_FORK_EXPERIMENT: diagnose fork behavior",
+        )
+    finally:
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+        if original_bridge_policy is not None:
+            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
+        if original_allow_bridge is not None:
+            os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
+        if original_experiment_mode is not None:
+            os.environ["CODEX_RVF_FORK_EXPERIMENT_MODE"] = original_experiment_mode
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        module.bridge_socket_path = original_bridge_socket_path
+        module.ensure_bridge_app_server = original_ensure_bridge
+
+    assert "decision" not in payload
+    assert payload["continue"] is True
+    assert "fork-experiment prepared" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "manual-prepared"
+    assert latest["desktop_control_unavailable_fallback"] == "manual"
+    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
+    assert latest["socket_selection"]["bridge_policy"] == "continuation"
+    assert latest["marker"] == "RVF_FORK_EXPERIMENT"
+    assert latest["latest_user_message"] == "RVF_FORK_EXPERIMENT: diagnose fork behavior"
+
+
+def test_missing_desktop_control_fail_policy_blocks(tmp: Path) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    desktop_socket = tmp / "missing-control.sock"
+    bridge_socket = tmp / "missing-bridge.sock"
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
+    original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
+    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = module.bridge_socket_path
+    original_ensure_bridge = module.ensure_bridge_app_server
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "fail"
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        module.bridge_socket_path = lambda: bridge_socket
+        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+            AssertionError("bridge should not start when policy=fail")
+        )
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(tmp),
+            prompt="fork prompt should not be used",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=None,
+            fallback_continuation_reason="visible continuation",
+        )
+    finally:
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+        if original_bridge_policy is None:
+            os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
+        else:
+            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
+        if original_allow_bridge is not None:
+            os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        module.bridge_socket_path = original_bridge_socket_path
+        module.ensure_bridge_app_server = original_ensure_bridge
+
+    assert payload["decision"] == "block"
+    assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in payload["reason"]
+    assert "continue" not in payload
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["status"] == "desktop-control-unavailable-fail"
+    assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
+    assert latest["socket_selection"]["bridge_policy"] == "fail"
+
+
+def test_fork_session_visibility_waits_only_for_active_session(tmp: Path) -> None:
     module = load_hook_module()
     original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
-    original_archived_dir = module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR
     try:
         module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
-        module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = tmp / "archived_sessions"
         active_path = (
             module.DEFAULT_CODEX_SESSIONS_DIR
             / "2026"
@@ -292,23 +449,15 @@ def test_fork_session_visibility_reports_active_and_archived(tmp: Path) -> None:
         assert str(active_path) in active["active_paths"]
 
         active_path.unlink()
-        archived_path = (
-            module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR
-            / "rollout-2026-04-26T21-28-28-fork-visible.jsonl"
-        )
-        archived_path.parent.mkdir(parents=True, exist_ok=True)
-        archived_path.write_text("{}\n", encoding="utf-8")
-
-        archived = module.wait_for_fork_session_visibility(
+        missing = module.wait_for_fork_session_visibility(
             "fork-visible",
             str(active_path),
             timeout_seconds=0,
         )
-        assert archived["location"] == "archived"
-        assert str(archived_path) in archived["archived_paths"]
+        assert missing["location"] == "missing"
+        assert missing["active_paths"] == []
     finally:
         module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
-        module.DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = original_archived_dir
 
 
 def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> None:
@@ -332,6 +481,33 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
                 active_path.parent.mkdir(parents=True, exist_ok=True)
                 active_path.write_text("{}\n", encoding="utf-8")
                 return {"turn": {"id": "turn-wait"}}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "fork-wait",
+                        "path": str(active_path),
+                        "cwd": str(tmp),
+                        "source": "vscode",
+                    }
+                }
+            if method == "thread/list":
+                assert params is not None
+                assert params["sortKey"] == "updated_at"
+                assert params["useStateDbOnly"] is False
+                assert params["cwd"] == str(tmp)
+                return {
+                    "data": [
+                        {
+                            "id": "fork-wait",
+                            "path": str(active_path),
+                            "cwd": str(tmp),
+                            "source": "vscode",
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            if method == "thread/loaded/list":
+                return {"data": ["fork-wait"], "nextCursor": None}
             raise AssertionError(method)
 
         def close(self) -> None:
@@ -340,10 +516,16 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
     original_client = module.AppServerWebSocket
     original_select = module.select_app_server_socket
     original_open = module.maybe_open_fork_in_codex
+    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_platform = module.sys.platform
     original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
+    original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
     try:
         module.AppServerWebSocket = FakeClient
         module.select_app_server_socket = lambda: (socket_path, "bridge", {})
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.sys.platform = "darwin"
 
         def fake_open(thread_id: str) -> bool:
             calls.append("open")
@@ -353,6 +535,8 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
 
         module.maybe_open_fork_in_codex = fake_open
         os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "1"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "2"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0"
         result = module.run_app_server_fork(
             parent_thread_id="parent",
             parent_thread_path=None,
@@ -366,16 +550,293 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
         module.AppServerWebSocket = original_client
         module.select_app_server_socket = original_select
         module.maybe_open_fork_in_codex = original_open
+        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        module.sys.platform = original_platform
         if original_timeout is None:
             os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
         else:
             os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = original_timeout
+        if original_open_attempts is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = original_open_attempts
+        if original_open_delay is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = original_open_delay
 
     assert calls == ["turn/start", "open"]
     assert result["fork_thread_id"] == "fork-wait"
     assert result["turn_id"] == "turn-wait"
     assert result["session_visibility"]["location"] == "active"
+    assert result["app_server_visibility"]["thread_read"]["contains_thread"] is True
+    assert result["app_server_visibility"]["thread_list"]["contains_thread"] is True
+    assert result["app_server_visibility"]["thread_loaded_list"]["contains_thread"] is True
+    assert result["gui_visibility"] == "unverified-bridge-only"
     assert result["opened_gui_deeplink"] is True
+    assert len(result["open_gui_deeplink"]["attempts"]) == 1
+
+
+def test_desktop_control_fork_requires_active_session_for_verified_gui(
+    tmp: Path,
+) -> None:
+    module = load_hook_module()
+    socket_path = tmp / "app-server.sock"
+    missing_path = tmp / "sessions" / "rollout-fork-missing.jsonl"
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, socket: Path) -> None:
+            assert socket == socket_path
+            self.notifications: list[dict[str, object]] = []
+
+        def request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+            if method == "initialize":
+                return {}
+            if method == "thread/fork":
+                return {"thread": {"id": "fork-missing", "path": str(missing_path)}}
+            if method == "turn/start":
+                calls.append("turn/start")
+                return {"turn": {"id": "turn-missing"}}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "fork-missing",
+                        "path": str(missing_path),
+                        "cwd": str(tmp),
+                        "source": "vscode",
+                    }
+                }
+            if method == "thread/list":
+                return {
+                    "data": [
+                        {
+                            "id": "fork-missing",
+                            "path": str(missing_path),
+                            "cwd": str(tmp),
+                            "source": "vscode",
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            if method == "thread/loaded/list":
+                return {"data": ["fork-missing"], "nextCursor": None}
+            raise AssertionError(method)
+
+        def close(self) -> None:
+            pass
+
+    original_client = module.AppServerWebSocket
+    original_select = module.select_app_server_socket
+    original_open = module.maybe_open_fork_in_codex
+    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_platform = module.sys.platform
+    original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
+    original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
+    try:
+        module.AppServerWebSocket = FakeClient
+        module.select_app_server_socket = lambda: (socket_path, "desktop-control", {})
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.sys.platform = "darwin"
+
+        def fake_open(thread_id: str) -> bool:
+            calls.append("open")
+            assert thread_id == "fork-missing"
+            assert not missing_path.exists()
+            return True
+
+        module.maybe_open_fork_in_codex = fake_open
+        os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "0"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "1"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0"
+        result = module.run_app_server_fork(
+            parent_thread_id="parent",
+            parent_thread_path=None,
+            cwd=str(tmp),
+            prompt="$review-validate-fix",
+            model=None,
+            reasoning_effort=None,
+            log_path=tmp / "hook.json",
+        )
+    finally:
+        module.AppServerWebSocket = original_client
+        module.select_app_server_socket = original_select
+        module.maybe_open_fork_in_codex = original_open
+        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        module.sys.platform = original_platform
+        if original_timeout is None:
+            os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = original_timeout
+        if original_open_attempts is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = original_open_attempts
+        if original_open_delay is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = original_open_delay
+
+    assert calls == ["turn/start", "open"]
+    assert result["status"] == "app-server-started"
+    assert result["session_visibility"]["location"] == "missing"
+    assert result["gui_visibility"] == "unverified-session-missing"
+
+
+def test_bridge_fork_message_marks_gui_visibility_unverified(tmp: Path) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_run = module.run_app_server_fork
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+
+        def fake_run_app_server_fork(**_: object) -> dict[str, object]:
+            return {
+                "status": "app-server-started",
+                "socket_source": "bridge",
+                "socket_selection": {
+                    "desktop_control": {"reason": "missing"},
+                    "bridge": {"reason": "connect-ok"},
+                },
+                "fork_thread_id": "fork-message",
+                "session_visibility": {"location": "active"},
+                "gui_visibility": "unverified-bridge-only",
+            }
+
+        module.run_app_server_fork = fake_run_app_server_fork
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(tmp),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=None,
+        )
+    finally:
+        module.run_app_server_fork = original_run
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+
+    assert "forked in Codex app-server bridge" in payload["systemMessage"]
+    assert "gui_visibility=unverified-bridge-only" in payload["systemMessage"]
+
+
+def test_open_gui_fork_disabled_skips_retry_sleep(tmp: Path) -> None:
+    module = load_hook_module()
+    calls: list[str] = []
+    original_sleep = module.time.sleep
+    original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
+    original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
+    try:
+        module.time.sleep = lambda delay: calls.append(f"sleep:{delay}")
+        os.environ["CODEX_RVF_OPEN_GUI_FORK"] = "0"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
+
+        result = module.open_fork_in_codex_with_retries("fork-disabled")
+    finally:
+        module.time.sleep = original_sleep
+        if original_open_gui is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK"] = original_open_gui
+        if original_open_attempts is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = original_open_attempts
+        if original_open_delay is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = original_open_delay
+
+    assert result["opened"] is False
+    assert result["skipped_retries_reason"] == "disabled"
+    assert len(result["attempts"]) == 1
+    assert calls == []
+
+
+def test_open_gui_fork_success_stops_retries(tmp: Path) -> None:
+    module = load_hook_module()
+    calls: list[str] = []
+    original_sleep = module.time.sleep
+    original_open = module.maybe_open_fork_in_codex
+    original_platform = module.sys.platform
+    original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
+    original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
+    try:
+        module.time.sleep = lambda delay: calls.append(f"sleep:{delay}")
+        module.sys.platform = "darwin"
+        module.maybe_open_fork_in_codex = lambda thread_id: calls.append(thread_id) or True
+        os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
+
+        result = module.open_fork_in_codex_with_retries("fork-success")
+    finally:
+        module.time.sleep = original_sleep
+        module.maybe_open_fork_in_codex = original_open
+        module.sys.platform = original_platform
+        if original_open_gui is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK"] = original_open_gui
+        if original_open_attempts is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = original_open_attempts
+        if original_open_delay is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = original_open_delay
+
+    assert result["opened"] is True
+    assert len(result["attempts"]) == 1
+    assert calls == ["fork-success"]
+
+
+def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp: Path) -> None:
+    module = load_hook_module()
+    calls: list[str] = []
+    original_sleep = module.time.sleep
+    original_platform = module.sys.platform
+    original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
+    original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
+    try:
+        module.time.sleep = lambda delay: calls.append(f"sleep:{delay}")
+        module.sys.platform = "linux"
+        os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
+
+        result = module.open_fork_in_codex_with_retries("fork-unsupported")
+    finally:
+        module.time.sleep = original_sleep
+        module.sys.platform = original_platform
+        if original_open_gui is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK"] = original_open_gui
+        if original_open_attempts is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = original_open_attempts
+        if original_open_delay is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = original_open_delay
+
+    assert result["opened"] is False
+    assert result["skipped_retries_reason"] == "unsupported-platform"
+    assert len(result["attempts"]) == 1
+    assert calls == []
 
 
 def test_session_hook_control_disables_current_session(tmp: Path) -> None:
@@ -1027,8 +1488,16 @@ def main() -> int:
         test_session_hook_state_dir_respects_state_dir_override,
         test_socket_probe_reports_unavailable_reason,
         test_bridge_failure_preserves_desktop_probe,
-        test_fork_session_visibility_reports_active_and_archived,
+        test_missing_desktop_control_defaults_to_continuation_not_bridge,
+        test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
+        test_missing_desktop_control_fail_policy_blocks,
+        test_fork_session_visibility_waits_only_for_active_session,
         test_app_server_fork_waits_for_session_file_before_deeplink,
+        test_desktop_control_fork_requires_active_session_for_verified_gui,
+        test_bridge_fork_message_marks_gui_visibility_unverified,
+        test_open_gui_fork_disabled_skips_retry_sleep,
+        test_open_gui_fork_success_stops_retries,
+        test_open_gui_fork_unsupported_platform_skips_retry_sleep,
         test_session_hook_control_disables_current_session,
         test_session_hook_control_status_reports_current_session,
         test_session_hook_control_status_works_when_env_suppressed,
