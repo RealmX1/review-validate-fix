@@ -755,7 +755,7 @@ def main() -> int:
         return 0
 
     cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
-    prompt_path = ledger.artifact("reviewer.prompt.txt", prompt)
+    prompt_path = ledger.artifact("reviewer.prompt.txt", prompt, unique=True)
 
     completed = run_with_activity_timeout(
         command,
@@ -774,10 +774,10 @@ def main() -> int:
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
     stdout = normalize_review_output(stdout)
-    normalized_path = ledger.artifact("reviewer.normalized.txt", stdout + ("\n" if stdout else ""))
-    stdout_path = ledger.artifact("reviewer.stdout.txt", raw_stdout)
+    normalized_path = ledger.artifact("reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
+    stdout_path = ledger.artifact("reviewer.stdout.txt", raw_stdout, unique=True)
     stderr = raw_stderr.strip()
-    stderr_path = ledger.artifact("reviewer.stderr.txt", raw_stderr)
+    stderr_path = ledger.artifact("reviewer.stderr.txt", raw_stderr, unique=True)
     timed_out = (
         completed.returncode == EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE
         and EXTERNAL_REVIEWER_TIMEOUT_FLAG in stderr

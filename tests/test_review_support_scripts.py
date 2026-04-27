@@ -1385,6 +1385,55 @@ def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
+def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.read(); print('NO_ISSUES')",
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+    )
+    command = [
+        sys.executable,
+        str(RUN_ALTERNATIVE_REVIEWER),
+        "--config",
+        str(config),
+        "--repo",
+        str(repo),
+        "--review-packet",
+        str(packet),
+        "--rvf-run-id",
+        "repeat-artifact-test",
+        "--rvf-run-dir",
+        str(run_dir),
+    ]
+
+    first = run(command)
+    second = run(command)
+
+    assert first.stdout.strip() == "NO_ISSUES"
+    assert second.stdout.strip() == "NO_ISSUES"
+    artifacts = run_dir / "artifacts"
+    for name in [
+        "reviewer.prompt.txt",
+        "reviewer.prompt.2.txt",
+        "reviewer.stdout.txt",
+        "reviewer.stdout.2.txt",
+        "reviewer.stderr.txt",
+        "reviewer.stderr.2.txt",
+        "reviewer.normalized.txt",
+        "reviewer.normalized.2.txt",
+    ]:
+        assert (artifacts / name).exists()
+
+
 def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
     module = load_alternative_reviewer_module()
     assert module.next_wait_seconds(
@@ -1680,6 +1729,7 @@ def main() -> int:
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
         test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(root / "alternative-bash-tool")
         test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(root / "alternative-split-jsonl")
+        test_alternative_reviewer_repeated_run_keeps_prior_artifacts(root / "alternative-repeat-artifacts")
         test_alternative_reviewer_long_command_wait_uses_check_interval()
         test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")
         test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config")

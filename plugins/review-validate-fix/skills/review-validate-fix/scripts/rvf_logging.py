@@ -158,14 +158,27 @@ class RunLedger:
     def artifact_path(self, name: str) -> Path:
         return self.artifacts_dir / safe_token(name)
 
+    def unique_artifact_path(self, name: str) -> Path:
+        path = self.artifact_path(name)
+        if not path.exists():
+            return path
+        suffix = path.suffix
+        stem = path.name[: -len(suffix)] if suffix else path.name
+        for index in range(2, 10000):
+            candidate = path.with_name(f"{stem}.{index}{suffix}")
+            if not candidate.exists():
+                return candidate
+        return path.with_name(f"{stem}.{secrets.token_hex(4)}{suffix}")
+
     def artifact(
         self,
         name: str,
         content_or_bytes: bytes | str | dict[str, Any] | list[Any],
         max_inline_bytes: int | None = None,
+        unique: bool = False,
     ) -> str | None:
         del max_inline_bytes
-        path = self.artifact_path(name)
+        path = self.unique_artifact_path(name) if unique else self.artifact_path(name)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             if isinstance(content_or_bytes, bytes):
