@@ -6,14 +6,15 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_logging import RunLedger, start_run
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "codex_stop_review_validate_fix.py"
-DEFAULT_STATE_DIR = SKILL_DIR / "state" / "dev-sync"
 SESSION_PATH_KEYS = (
     "transcript_path",
     "session_path",
@@ -47,13 +48,6 @@ def is_truthy(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def state_dir() -> Path:
-    explicit = os.environ.get("CODEX_RVF_DEV_SYNC_STATE_DIR")
-    if explicit and explicit.strip():
-        return Path(explicit).expanduser()
-    return DEFAULT_STATE_DIR
 
 
 def command_timeout() -> float:
@@ -226,61 +220,120 @@ def run_step(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
         }
 
 
-def write_log(record: dict[str, Any]) -> Path | None:
-    try:
-        directory = state_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        path = directory / f"{stamp}.rvf-dev-sync.json"
-        path.write_text(
-            json.dumps(record, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return path
-    except OSError:
-        return None
+def step_summary(result: dict[str, Any], ledger: RunLedger, name: str) -> dict[str, Any]:
+    paths: dict[str, str] = {}
+    stdout = result.get("stdout")
+    stderr = result.get("stderr")
+    if isinstance(stdout, str) and stdout:
+        path = ledger.artifact(f"{name}.stdout.txt", stdout)
+        if path:
+            paths["stdout"] = path
+    if isinstance(stderr, str) and stderr:
+        path = ledger.artifact(f"{name}.stderr.txt", stderr)
+        if path:
+            paths["stderr"] = path
+    return {
+        "cmd": result.get("cmd"),
+        "cwd": result.get("cwd"),
+        "returncode": result.get("returncode"),
+        "duration_seconds": result.get("duration_seconds"),
+        "paths": paths,
+    }
 
 
-def sync_from_dev_repo(repo: Path, event: dict[str, Any]) -> tuple[bool, Path | None, str]:
+def sync_from_dev_repo(
+    repo: Path,
+    event: dict[str, Any],
+    ledger: RunLedger,
+) -> tuple[bool, Path | None, str]:
     python = sys.executable or "python3"
     steps: list[dict[str, Any]] = []
     contract_script = repo / "scripts" / "check_plugin_contracts.py"
     install_script = repo / "scripts" / "install_to_codex.py"
+    ledger.artifact("stop-event.json", event)
+    ledger.event(
+        phase="dev-sync",
+        event="started",
+        status="started",
+        reason_code="matched_dev_repo",
+        repo=str(repo),
+        cwd=str(repo),
+        paths={"stop_event": str(ledger.artifact_path("stop-event.json"))},
+    )
 
-    for script, args in (
-        (contract_script, []),
-        (install_script, ["--configure-stop-hook"]),
+    for name, script, args, component in (
+        ("contract-check", contract_script, [], "contract-check"),
+        ("installer", install_script, ["--configure-stop-hook"], "installer"),
     ):
         if not script.is_file():
-            record = {
-                "status": "failed",
-                "reason": f"missing script: {script}",
-                "repo": str(repo),
-                "event": event_summary(event),
-                "steps": steps,
-            }
-            log_path = write_log(record)
-            return False, log_path, record["reason"]
+            reason = f"missing script: {script}"
+            ledger.event(
+                component=component,
+                phase="dev-sync",
+                event="missing_script",
+                status="failed",
+                reason_code="missing_sync_script",
+                repo=str(repo),
+                cwd=str(repo),
+                script=str(script),
+                steps=steps,
+                error=reason,
+            )
+            ledger.summary(
+                status="failed",
+                reason_code="missing_sync_script",
+                message=reason,
+                repo=str(repo),
+                event=event_summary(event),
+                steps=steps,
+            )
+            return False, ledger.summary_path if ledger.available else None, reason
         result = run_step([python, str(script), *args], cwd=repo)
-        steps.append(result)
+        summary = step_summary(result, ledger, name)
+        steps.append(summary)
+        ledger.event(
+            component=component,
+            phase="dev-sync",
+            event="command_completed",
+            status="completed" if result["returncode"] == 0 else "failed",
+            reason_code="ok" if result["returncode"] == 0 else "sync_command_failed",
+            repo=str(repo),
+            cwd=str(repo),
+            duration_ms=int(float(result["duration_seconds"]) * 1000),
+            paths=summary["paths"],
+            cmd=result["cmd"],
+            returncode=result["returncode"],
+        )
         if result["returncode"] != 0:
-            record = {
-                "status": "failed",
-                "reason": f"command failed: {' '.join(map(str, result['cmd']))}",
-                "repo": str(repo),
-                "event": event_summary(event),
-                "steps": steps,
-            }
-            log_path = write_log(record)
-            return False, log_path, record["reason"]
+            reason = f"command failed: {' '.join(map(str, result['cmd']))}"
+            ledger.summary(
+                status="failed",
+                reason_code="sync_command_failed",
+                message=reason,
+                repo=str(repo),
+                event=event_summary(event),
+                steps=steps,
+            )
+            return False, ledger.summary_path if ledger.available else None, reason
 
-    record = {
-        "status": "synced",
-        "repo": str(repo),
-        "event": event_summary(event),
-        "steps": steps,
-    }
-    return True, write_log(record), "synced"
+    ledger.event(
+        phase="dev-sync",
+        event="completed",
+        status="synced",
+        reason_code="synced",
+        repo=str(repo),
+        cwd=str(repo),
+        steps=steps,
+    )
+    ledger.summary(
+        status="synced",
+        reason_code="synced",
+        message="RVF dev repo synced and installed hook is ready.",
+        repo=str(repo),
+        event=event_summary(event),
+        steps=steps,
+    )
+    return True, ledger.summary_path if ledger.available else None, "synced"
 
 
 def event_summary(event: dict[str, Any]) -> dict[str, Any]:
@@ -299,37 +352,113 @@ def configured_stop_hook() -> Path:
     return DEFAULT_STOP_HOOK
 
 
-def run_installed_stop_hook(raw_input: str) -> int:
+def run_installed_stop_hook(raw_input: str, ledger: RunLedger | None = None) -> int:
     hook = configured_stop_hook()
     python = sys.executable or "python3"
+    env = os.environ.copy()
+    if ledger is not None:
+        env.update(ledger.env())
     try:
+        if ledger is not None:
+            ledger.event(
+                phase="dev-sync",
+                event="installed_hook_started",
+                status="started",
+                reason_code="handoff_to_installed_hook",
+                paths={"hook": str(hook)},
+            )
         completed = subprocess.run(
             [python, str(hook)],
             input=raw_input,
             capture_output=True,
             text=True,
+            env=env,
             timeout=stop_hook_timeout(),
         )
     except subprocess.TimeoutExpired as exc:
+        if ledger is not None:
+            ledger.event(
+                phase="dev-sync",
+                event="installed_hook_timeout",
+                status="failed",
+                reason_code="installed_hook_timeout",
+                error=coerce_text(exc.stderr),
+            )
+            ledger.summary(
+                status="failed",
+                reason_code="installed_hook_timeout",
+                message=f"installed hook timed out after {stop_hook_timeout()} seconds",
+                hook=str(hook),
+            )
         return fail_blocking(
             "review-validate-fix Stop hook dispatcher: installed hook timed "
-            f"out after {stop_hook_timeout()} seconds. stderr={coerce_text(exc.stderr)}",
+            f"out after {stop_hook_timeout()} seconds. stderr={coerce_text(exc.stderr)}"
+            + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
             124,
         )
     except OSError as exc:
+        if ledger is not None:
+            ledger.event(
+                phase="dev-sync",
+                event="installed_hook_exec_failed",
+                status="failed",
+                reason_code="installed_hook_exec_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            ledger.summary(
+                status="failed",
+                reason_code="installed_hook_exec_failed",
+                message=f"failed to run installed hook {hook}: {exc}",
+                hook=str(hook),
+            )
         return fail_blocking(
             "review-validate-fix Stop hook dispatcher: failed to run "
-            f"installed hook {hook}: {exc}",
+            f"installed hook {hook}: {exc}"
+            + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
             127,
         )
 
     if completed.returncode == 0:
+        if ledger is not None:
+            ledger.event(
+                phase="dev-sync",
+                event="installed_hook_completed",
+                status="completed",
+                reason_code="installed_hook_completed",
+            )
         sys.stdout.write(completed.stdout)
         return 0
 
+    if ledger is not None:
+        paths: dict[str, str] = {}
+        if completed.stdout:
+            path = ledger.artifact("installed-hook.stdout.txt", completed.stdout)
+            if path:
+                paths["stdout"] = path
+        if completed.stderr:
+            path = ledger.artifact("installed-hook.stderr.txt", completed.stderr)
+            if path:
+                paths["stderr"] = path
+        ledger.event(
+            phase="dev-sync",
+            event="installed_hook_failed",
+            status="failed",
+            reason_code="installed_hook_failed",
+            paths=paths,
+            returncode=completed.returncode,
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="installed_hook_failed",
+            message=f"installed hook failed with exit code {completed.returncode}",
+            hook=str(hook),
+            returncode=completed.returncode,
+            paths=paths,
+        )
     return fail_blocking(
         "review-validate-fix Stop hook dispatcher: installed hook failed "
-        f"with exit code {completed.returncode}. stderr={completed.stderr.strip()}",
+        f"with exit code {completed.returncode}. stderr={completed.stderr.strip()}"
+        + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
         completed.returncode,
     )
 
@@ -339,21 +468,35 @@ def main() -> int:
     if event is None:
         return run_installed_stop_hook(raw_input)
 
+    cwd = event.get("cwd")
+    ledger = start_run(
+        "dispatcher",
+        repo=str(cwd) if isinstance(cwd, str) else None,
+        cwd=str(cwd) if isinstance(cwd, str) else None,
+    )
+    ledger.artifact("stop-event.json", event)
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
-        return run_installed_stop_hook(raw_input)
+        ledger.event(
+            phase="dev-sync",
+            event="skipped",
+            status="skipped",
+            reason_code="sync_not_needed",
+            message=reason,
+        )
+        return run_installed_stop_hook(raw_input, ledger)
 
     assert repo is not None
-    synced, log_path, sync_reason = sync_from_dev_repo(repo, event)
+    synced, log_path, sync_reason = sync_from_dev_repo(repo, event, ledger)
     if not synced:
-        log_note = f"; log={log_path}" if log_path is not None else ""
+        log_note = f"; summary={log_path}" if log_path is not None else ""
         return fail_blocking(
             "review-validate-fix Stop hook 未运行 fork：RVF dev sync "
             f"失败，已避免使用旧 installed plugin skill。reason={sync_reason}{log_note}",
             2,
         )
 
-    return run_installed_stop_hook(raw_input)
+    return run_installed_stop_hook(raw_input, ledger)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_logging import start_run
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = SKILL_DIR / "config" / "alternative-reviewer.json"
@@ -297,15 +300,59 @@ def main() -> int:
     parser.add_argument("--health", action="store_true", help="Run the configured health command.")
     parser.add_argument("--print-label", action="store_true", help="Print configured provenance label.")
     parser.add_argument("--dry-run", action="store_true", help="Print command and prompt length without invoking reviewer.")
+    parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
+    parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
     args = parser.parse_args()
+    ledger = start_run(
+        "reviewer",
+        repo=args.repo,
+        cwd=args.repo,
+        run_id=args.rvf_run_id,
+        run_dir=Path(args.rvf_run_dir).expanduser().resolve() if args.rvf_run_dir else None,
+    )
+    ledger.event(
+        phase="review",
+        event="started",
+        status="started",
+        reason_code="reviewer_started",
+        repo=args.repo,
+        cwd=args.repo,
+    )
 
     config_path = Path(args.config)
     if not config_path.exists():
+        ledger.event(
+            phase="review",
+            event="config_missing",
+            status="failed",
+            reason_code="reviewer_config_missing",
+            paths={"config": str(config_path)},
+            error=f"missing config: {config_path}",
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_config_missing",
+            message=f"缺少 alternative reviewer 配置: {config_path}",
+            paths={"config": str(config_path)},
+        )
         return fail(f"缺少 alternative reviewer 配置: {config_path}", 2)
 
     try:
         config = load_config(config_path)
         if config.get("enabled") is not True:
+            ledger.event(
+                phase="review",
+                event="config_disabled",
+                status="failed",
+                reason_code="reviewer_config_disabled",
+                paths={"config": str(config_path)},
+            )
+            ledger.summary(
+                status="failed",
+                reason_code="reviewer_config_disabled",
+                message="alternative reviewer 未启用",
+                paths={"config": str(config_path)},
+            )
             return fail("alternative reviewer 未启用", 2)
         label = config.get("label")
         if not isinstance(label, str) or not label.startswith("alternative-reviewer:"):
@@ -346,19 +393,65 @@ def main() -> int:
         if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
             command = ensure_claude_stream_json_command(command)
     except Exception as exc:
+        ledger.event(
+            phase="review",
+            event="config_invalid",
+            status="failed",
+            reason_code="reviewer_config_invalid",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_config_invalid",
+            message=f"alternative reviewer 配置无效: {exc}",
+        )
         return fail(f"alternative reviewer 配置无效: {exc}", 2)
 
     if args.print_label:
+        ledger.event(
+            phase="review",
+            event="print_label",
+            status="completed",
+            reason_code="print_label",
+        )
+        ledger.summary(status="completed", reason_code="print_label", message=label)
         print(label)
         return 0
 
     command_path = check_command(command)
     if command_path is None:
+        ledger.event(
+            phase="review",
+            event="command_missing",
+            status="failed",
+            reason_code="reviewer_command_missing",
+            command=command,
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_command_missing",
+            message=f"找不到 alternative reviewer 命令: {command[0]}",
+            command=command,
+        )
         return fail(f"找不到 alternative reviewer 命令: {command[0]}", 2)
 
     env = scrub_env(env_unset)
 
     if args.check:
+        ledger.event(
+            phase="review",
+            event="check_completed",
+            status="completed",
+            reason_code="reviewer_check_completed",
+            command_path=command_path,
+        )
+        ledger.summary(
+            status="completed",
+            reason_code="reviewer_check_completed",
+            message=f"OK {label} {command_path}",
+            command=command,
+            command_path=command_path,
+        )
         print(f"OK {label} {command_path}")
         return 0
 
@@ -366,13 +459,61 @@ def main() -> int:
         print(f"OK {label} {command_path}")
         health_command = config.get("health_command")
         if health_command is None:
+            ledger.event(
+                phase="review",
+                event="preflight_completed",
+                status="completed",
+                reason_code="reviewer_preflight_completed",
+                command_path=command_path,
+                health_configured=False,
+            )
+            ledger.summary(
+                status="completed",
+                reason_code="reviewer_preflight_completed",
+                message="health command not configured",
+                command=command,
+                command_path=command_path,
+                health_configured=False,
+            )
             print("health command not configured")
             return 0
-        return run_health(string_list(config, "health_command"), env, health_timeout)
+        returncode = run_health(string_list(config, "health_command"), env, health_timeout)
+        ledger.event(
+            phase="review",
+            event="health_completed",
+            status="completed" if returncode == 0 else "failed",
+            reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
+            command=health_command,
+            returncode=returncode,
+        )
+        ledger.summary(
+            status="completed" if returncode == 0 else "failed",
+            reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
+            message="alternative reviewer health command completed",
+            command=health_command,
+            returncode=returncode,
+        )
+        return returncode
 
     if args.health:
         health_command = string_list(config, "health_command")
-        return run_health(health_command, env, health_timeout)
+        returncode = run_health(health_command, env, health_timeout)
+        ledger.event(
+            phase="review",
+            event="health_completed",
+            status="completed" if returncode == 0 else "failed",
+            reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
+            command=health_command,
+            returncode=returncode,
+        )
+        ledger.summary(
+            status="completed" if returncode == 0 else "failed",
+            reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
+            message="alternative reviewer health command completed",
+            command=health_command,
+            returncode=returncode,
+        )
+        return returncode
 
     repo = Path(args.repo).expanduser().resolve() if args.repo else None
     prompt_file = Path(args.prompt_file).expanduser().resolve()
@@ -390,6 +531,18 @@ def main() -> int:
             raise ValueError(f"review packet file not found: {review_packet}")
         prompt = build_prompt(prompt_file, session_context, review_packet, repo)
     except Exception as exc:
+        ledger.event(
+            phase="review",
+            event="input_invalid",
+            status="failed",
+            reason_code="reviewer_input_invalid",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_input_invalid",
+            message=str(exc),
+        )
         return fail(str(exc), 2)
 
     if repo is not None:
@@ -401,10 +554,26 @@ def main() -> int:
 
     if args.dry_run:
         cwd = str(repo) if repo is not None and allow_repo_cwd else str(review_packet.parent if review_packet is not None else SKILL_DIR)
-        print(json.dumps({"label": label, "command": command, "cwd": cwd, "prompt_chars": len(prompt)}, ensure_ascii=False))
+        payload = {"label": label, "command": command, "cwd": cwd, "prompt_chars": len(prompt)}
+        ledger.event(
+            phase="review",
+            event="dry_run",
+            status="completed",
+            reason_code="reviewer_dry_run",
+            cwd=cwd,
+            prompt_chars=len(prompt),
+        )
+        ledger.summary(
+            status="completed",
+            reason_code="reviewer_dry_run",
+            message="alternative reviewer dry run",
+            **payload,
+        )
+        print(json.dumps(payload, ensure_ascii=False))
         return 0
 
     cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
+    prompt_path = ledger.artifact("reviewer.prompt.txt", prompt)
 
     completed = run_with_activity_timeout(
         command,
@@ -415,11 +584,16 @@ def main() -> int:
         activity_check_interval_seconds=activity_check_interval,
     )
 
-    stdout = completed.stdout.strip()
+    raw_stdout = completed.stdout or ""
+    raw_stderr = completed.stderr or ""
+    stdout = raw_stdout.strip()
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
     stdout = normalize_review_output(stdout)
-    stderr = completed.stderr.strip()
+    normalized_path = ledger.artifact("reviewer.normalized.txt", stdout + ("\n" if stdout else ""))
+    stdout_path = ledger.artifact("reviewer.stdout.txt", raw_stdout)
+    stderr = raw_stderr.strip()
+    stderr_path = ledger.artifact("reviewer.stderr.txt", raw_stderr)
     timed_out = (
         completed.returncode == EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE
         and EXTERNAL_REVIEWER_TIMEOUT_FLAG in stderr
@@ -429,6 +603,45 @@ def main() -> int:
         Path(args.output).write_text(output_text, encoding="utf-8")
     else:
         print(stdout)
+
+    paths = {
+        "prompt": prompt_path,
+        "stdout": stdout_path,
+        "stderr": stderr_path,
+        "normalized": normalized_path,
+        "review_packet": str(review_packet) if review_packet is not None else None,
+        "session_context": str(session_context) if session_context is not None else None,
+    }
+    status = "completed" if completed.returncode == 0 else "failed"
+    reason_code = "reviewer_completed"
+    if timed_out:
+        reason_code = "reviewer_timeout"
+    elif completed.returncode != 0:
+        reason_code = "reviewer_failed"
+    ledger.event(
+        phase="review",
+        event="completed" if completed.returncode == 0 else "failed",
+        status=status,
+        reason_code=reason_code,
+        repo=str(repo) if repo is not None else None,
+        cwd=str(cwd),
+        paths={key: value for key, value in paths.items() if value},
+        returncode=completed.returncode,
+        timed_out=timed_out,
+        output_format=output_format,
+    )
+    ledger.summary(
+        status=status,
+        reason_code=reason_code,
+        message="alternative reviewer completed" if completed.returncode == 0 else "alternative reviewer failed",
+        repo=str(repo) if repo is not None else None,
+        cwd=str(cwd),
+        paths={key: value for key, value in paths.items() if value},
+        returncode=completed.returncode,
+        timed_out=timed_out,
+        output_format=output_format,
+        label=label,
+    )
 
     if completed.returncode != 0:
         if stderr:

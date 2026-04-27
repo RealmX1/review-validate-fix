@@ -84,6 +84,17 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
+def remove_legacy_standalone_skill() -> Path | None:
+    legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
+    if not legacy.exists() and not legacy.is_symlink():
+        return None
+    if legacy.is_dir() and not legacy.is_symlink():
+        shutil.rmtree(legacy)
+    else:
+        legacy.unlink()
+    return legacy
+
+
 def update_marketplace(plugin_parent: Path) -> Path:
     marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
     marketplace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +235,7 @@ def main() -> int:
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / SKILL_NAME
+        removed_legacy = remove_legacy_standalone_skill()
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         installed.append(f"plugin: {dst}")
@@ -232,12 +244,17 @@ def main() -> int:
         if args.configure_stop_hook:
             hooks_path = configure_stop_hook(dst / PLUGIN_SKILL_REL)
             installed.append(f"stop hook: {hooks_path}")
+        if removed_legacy is not None:
+            installed.append(f"removed deprecated standalone skill: {removed_legacy}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2
 
     for item in installed:
-        print(f"已安装 {item}")
+        if item.startswith("removed "):
+            print(f"已移除 {item.removeprefix('removed ')}")
+        else:
+            print(f"已安装 {item}")
     if preserve:
         print("已默认保留本机 setup 配置: alternative-reviewer.json 与 state/。")
     return 0

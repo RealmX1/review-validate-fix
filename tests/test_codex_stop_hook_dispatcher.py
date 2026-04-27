@@ -10,7 +10,16 @@ import importlib.util
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().with_name("codex_stop_hook_dispatcher.py")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = (
+    ROOT
+    / "plugins"
+    / "review-validate-fix"
+    / "skills"
+    / "review-validate-fix"
+    / "scripts"
+    / "codex_stop_hook_dispatcher.py"
+)
 
 
 def load_dispatcher_module():
@@ -112,6 +121,7 @@ def invoke_result(
         "CODEX_RVF_DEV_REPO",
         "CODEX_RVF_INSTALLED_STOP_HOOK",
         "CODEX_RVF_DEV_SYNC_STATE_DIR",
+        "CODEX_RVF_LOG_ROOT",
         "CODEX_RVF_DEV_SYNC",
         "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT",
     ):
@@ -119,7 +129,7 @@ def invoke_result(
     if dev_repo is not None:
         env["CODEX_RVF_DEV_REPO"] = str(dev_repo)
     env["CODEX_RVF_INSTALLED_STOP_HOOK"] = str(hook)
-    env["CODEX_RVF_DEV_SYNC_STATE_DIR"] = str(state)
+    env["CODEX_RVF_LOG_ROOT"] = str(state)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -148,6 +158,13 @@ def invoke(
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout
+
+
+def latest_summary(state: Path) -> dict[str, object]:
+    pointer = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert set(pointer) >= {"run_id", "summary_path", "events_path", "status", "reason_code"}
+    assert Path(str(pointer["events_path"])).exists()
+    return json.loads(Path(str(pointer["summary_path"])).read_text(encoding="utf-8"))
 
 
 def test_dev_repo_main_session_syncs_before_running_installed_hook(tmp_path: Path) -> None:
@@ -281,7 +298,9 @@ def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -
     assert (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
-    assert list(state.glob("*.rvf-dev-sync.json"))
+    summary = latest_summary(state)
+    assert summary["status"] == "failed"
+    assert summary["reason_code"] == "sync_command_failed"
 
 
 def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> None:

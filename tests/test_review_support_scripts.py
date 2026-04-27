@@ -10,7 +10,15 @@ import time
 from pathlib import Path
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = (
+    ROOT
+    / "plugins"
+    / "review-validate-fix"
+    / "skills"
+    / "review-validate-fix"
+    / "scripts"
+)
 BUILD_PACKET = SCRIPT_DIR / "build_review_packet.py"
 CHECK_REVIEW_OUTPUT = SCRIPT_DIR / "check_review_output.py"
 COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"

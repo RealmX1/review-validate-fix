@@ -14,11 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_logging import RunLedger, log_root, start_run
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
-DEFAULT_STATE_DIR = SKILL_DIR / "state" / "fork-experiment"
+DEFAULT_STATE_DIR = SKILL_DIR / "state"
 DEFAULT_APP_SERVER_CONTROL_SOCKET = (
     Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
 )
@@ -75,7 +78,26 @@ def emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
-def skip_payload(reason: str) -> dict[str, Any]:
+def skip_payload(
+    reason: str,
+    ledger: RunLedger | None = None,
+    reason_code: str = "skipped",
+    **summary_fields: Any,
+) -> dict[str, Any]:
+    if ledger is not None:
+        ledger.event(
+            phase="gate",
+            event="skipped",
+            status="skipped",
+            reason_code=reason_code,
+            message=reason,
+        )
+        return ledger.hook_payload(
+            status="skipped",
+            reason_code=reason_code,
+            message=reason,
+            **summary_fields,
+        )
     return {
         "continue": True,
         "systemMessage": f"review-validate-fix Stop hook 未创建 fork：{reason}",
@@ -83,7 +105,7 @@ def skip_payload(reason: str) -> dict[str, Any]:
 
 
 def state_dir() -> Path:
-    return Path(os.environ.get("CODEX_RVF_STATE_DIR", str(DEFAULT_STATE_DIR)))
+    return log_root()
 
 
 def session_hook_state_dir() -> Path:
@@ -549,7 +571,11 @@ def rvf_fork_context_from_event(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def handoff_advisory(event: dict[str, Any], context: dict[str, str]) -> dict[str, Any] | None:
+def handoff_advisory(
+    event: dict[str, Any],
+    context: dict[str, str],
+    ledger: RunLedger | None = None,
+) -> dict[str, Any] | None:
     last_assistant_message = event.get("last_assistant_message")
     if (
         not isinstance(last_assistant_message, str)
@@ -581,12 +607,34 @@ def handoff_advisory(event: dict[str, Any], context: dict[str, str]) -> dict[str
     parent = context.get("parent_session_id") or "<unknown>"
     parent_cwd = context.get("parent_cwd") or "<unknown>"
     target_repo = context.get("target_repo") or "<unknown>"
+    message = (
+        "review-validate-fix fork 已结束。请复制本 fork 会话最终回复中的 "
+        "<handoff-context> 块，并粘贴回原始 chat session。"
+    )
+    if ledger is not None:
+        ledger.event(
+            phase="handoff",
+            event="advisory_created",
+            status="completed",
+            reason_code="handoff_context_ready",
+            session_id=session_id,
+            parent_thread_id=parent,
+            paths={"marker": str(marker_path)},
+        )
+        return ledger.hook_payload(
+            status="handoff-advisory",
+            reason_code="handoff_context_ready",
+            message=message,
+            parent_session_id=parent,
+            parent_cwd=parent_cwd,
+            target_repo=target_repo,
+            marker_path=str(marker_path),
+        )
     return {
         "continue": True,
         "systemMessage": (
-            "review-validate-fix fork 已结束。请复制本 fork 会话最终回复中的 "
-            "<handoff-context> 块，并粘贴回原始 chat session。"
-            f" parent_session_id={parent}; parent_cwd={parent_cwd}; target_repo={target_repo}"
+            f"{message} parent_session_id={parent}; parent_cwd={parent_cwd}; "
+            f"target_repo={target_repo}"
         ),
     }
 
@@ -604,26 +652,20 @@ def run_codex_fork(
     parent_thread_path: Path | None = None,
     fallback_failure_reason: str | None = None,
     allow_desktop_unavailable_report: bool = True,
+    ledger: RunLedger | None = None,
+    extra_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
-
-    sdir = state_dir()
-    sdir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = sdir / f"{timestamp}.{log_prefix}.json"
-    latest_path = sdir / "latest.json"
-    prompt_path = sdir / f"{timestamp}.{log_prefix}.prompt.txt"
+    ledger = ledger or start_run("stop-hook", repo=cwd, cwd=cwd)
 
     if not parent_session_id:
-        payload = {
-            "continue": True,
-            "systemMessage": (
-                f"{log_prefix} skipped: Stop event did not expose a parent thread id."
-            ),
-        }
-        log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return payload
+        return skip_payload(
+            "Stop event did not expose a parent thread id.",
+            ledger,
+            "missing_parent_thread_id",
+            log_prefix=log_prefix,
+            cwd=cwd,
+        )
 
     effective_prompt = prompt
     if suppress_child_stop_hook and SUPPRESS_STOP_HOOK_MARKER not in effective_prompt:
@@ -634,28 +676,35 @@ def run_codex_fork(
             "当前 fork 结束时请跳过 review-validate-fix Stop hook。"
         )
 
-    prompt_path.write_text(effective_prompt, encoding="utf-8")
+    prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
+    ledger.event(
+        phase="fork",
+        event="started",
+        status="started",
+        reason_code="fork_started",
+        parent_thread_id=parent_session_id,
+        paths={"prompt": prompt_path} if prompt_path else {},
+        mode=mode,
+        log_prefix=log_prefix,
+    )
 
     result: dict[str, Any] = {
-        "timestamp": timestamp,
         "mode": mode,
         "log_prefix": log_prefix,
         "parent_thread_id": parent_session_id,
         "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
         "cwd": cwd,
-        "prompt": effective_prompt,
-        "prompt_path": str(prompt_path),
+        "prompt_path": prompt_path,
         "suppress_child_stop_hook": suppress_child_stop_hook,
         "model": model,
         "reasoning_effort": reasoning_effort,
     }
-    return_payload: dict[str, Any] | None = None
 
     if mode in {"manual", "prepare", "prepared", "log-only"}:
         result["status"] = "manual-prepared"
     elif mode == "dry-run":
         result["status"] = "dry-run"
-        result["app_server_requests"] = app_server_fork_requests(
+        app_server_requests = app_server_fork_requests(
             parent_thread_id=parent_session_id,
             parent_thread_path=parent_thread_path,
             cwd=cwd,
@@ -663,6 +712,8 @@ def run_codex_fork(
             model=model,
             reasoning_effort=reasoning_effort,
         )
+        request_path = ledger.artifact("app-server-requests.json", app_server_requests)
+        result["app_server_requests_path"] = request_path
     elif mode in {"gui", "app-server", "appserver", "auto"}:
         try:
             result.update(
@@ -673,7 +724,7 @@ def run_codex_fork(
                     prompt=effective_prompt,
                     model=model,
                     reasoning_effort=reasoning_effort,
-                    log_path=log_path,
+                    log_path=ledger.summary_path,
                 )
             )
         except Exception as exc:
@@ -712,72 +763,82 @@ def run_codex_fork(
             }
         )
 
-    log_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    latest_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    if return_payload is not None:
-        return return_payload
-
     status = result.get("status", "unknown")
-    if status == "manual-prepared":
-        message = (
-            f"{log_prefix} prepared: no Terminal was launched and no current-chat "
-            f"continuation was submitted. parent_thread_id={parent_session_id}. "
-            f"prompt={prompt_path}. log={log_path}"
-        )
+    reason_code = str(status).replace("_", "-")
+    if status == "desktop-control-unavailable-report":
+        reason_code = "desktop_control_unavailable_continuation_disabled"
+    elif status == "desktop-control-unavailable-fail":
+        reason_code = "desktop_control_unavailable_fail_policy"
+    elif status == "app-server-failed":
+        reason_code = "app_server_fork_failed"
+    elif status == "manual-prepared":
+        reason_code = "manual_prepared"
+    elif status == "dry-run":
+        reason_code = "dry_run"
     elif status == "app-server-started":
-        socket_source = result.get("socket_source")
-        socket_note = f" via {socket_source}" if isinstance(socket_source, str) else ""
-        target_name = "Codex GUI/app-server"
-        if socket_source == "bridge":
-            target_name = "Codex app-server bridge"
-            socket_selection = result.get("socket_selection")
-            desktop_probe = (
-                socket_selection.get("desktop_control")
-                if isinstance(socket_selection, dict)
-                else None
-            )
-            if isinstance(desktop_probe, dict):
-                reason = desktop_probe.get("reason") or "unknown"
-                socket_note += f"; desktop_control_unavailable={reason}"
-        session_visibility = result.get("session_visibility")
-        if isinstance(session_visibility, dict):
-            location = session_visibility.get("location")
-            if isinstance(location, str) and location != "active":
-                socket_note += f"; session_visibility={location}"
-        gui_visibility = result.get("gui_visibility")
-        if isinstance(gui_visibility, str) and gui_visibility != "verified":
-            socket_note += f"; gui_visibility={gui_visibility}"
-        message = (
-            f"{log_prefix} forked in {target_name}{socket_note}: "
-            f"fork_thread_id={result.get('fork_thread_id')}; "
-            f"parent_thread_id={parent_session_id}; log={log_path}"
+        reason_code = "fork_started"
+
+    event_paths: dict[str, Any] = {}
+    if prompt_path:
+        event_paths["prompt"] = prompt_path
+    if result.get("app_server_requests_path"):
+        event_paths["app_server_requests"] = result["app_server_requests_path"]
+    if status == "app-server-started":
+        ledger.event(
+            phase="fork",
+            event="completed",
+            status=str(status),
+            reason_code=reason_code,
+            parent_thread_id=parent_session_id,
+            fork_thread_id=result.get("fork_thread_id") if isinstance(result.get("fork_thread_id"), str) else None,
+            paths=event_paths,
+            socket_source=result.get("socket_source"),
+            gui_visibility=result.get("gui_visibility"),
         )
-    elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
-        report_reason = result.get("report_reason")
-        reason = report_reason if isinstance(report_reason, str) else "Codex GUI fork unavailable."
-        message = (
-            f"{reason} parent_thread_id={parent_session_id}; log={log_path}"
+    elif status in {"dry-run", "manual-prepared"}:
+        ledger.event(
+            phase="fork",
+            event="prepared",
+            status=str(status),
+            reason_code=reason_code,
+            parent_thread_id=parent_session_id,
+            paths=event_paths,
+            mode=mode,
         )
     else:
-        if status == "app-server-failed":
-            socket_selection = result.get("socket_selection")
-            desktop_probe = (
-                socket_selection.get("desktop_control")
-                if isinstance(socket_selection, dict)
-                else None
-            )
-            if isinstance(desktop_probe, dict):
-                reason = desktop_probe.get("reason") or "unknown"
-                status = f"{status}; desktop_control_unavailable={reason}"
-        message = (
-            f"{log_prefix} triggered: "
-            f"{status}. parent_thread_id={parent_session_id}. log={log_path}"
+        ledger.event(
+            phase="fork",
+            event="failed",
+            status=str(status),
+            reason_code=reason_code,
+            parent_thread_id=parent_session_id,
+            paths=event_paths,
+            error=result.get("error") or result.get("report_reason"),
         )
-    return {
-        "continue": True,
-        "systemMessage": message,
-    }
+
+    if status == "manual-prepared":
+        message = (
+            "manual fork prompt prepared; no Terminal was launched and no "
+            "current-chat continuation was submitted."
+        )
+    elif status == "app-server-started":
+        message = "Codex GUI/app-server fork was started."
+    elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
+        report_reason = result.get("report_reason")
+        message = report_reason if isinstance(report_reason, str) else "Codex GUI fork unavailable."
+    else:
+        message = f"{log_prefix} triggered: {status}."
+
+    summary_fields = dict(result)
+    summary_fields.pop("status", None)
+    if extra_summary:
+        summary_fields.update(extra_summary)
+    return ledger.hook_payload(
+        status=str(status),
+        reason_code=reason_code,
+        message=message,
+        **summary_fields,
+    )
 
 
 def app_server_fork_requests(
@@ -1433,7 +1494,11 @@ def run_app_server_fork(
         client.close()
 
 
-def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, Any]:
+def run_fork_experiment(
+    event: dict[str, Any],
+    latest_user: str,
+    ledger: RunLedger | None = None,
+) -> dict[str, Any]:
     session_id = parent_thread_id_from_event(event)
     session_path = parent_thread_path_from_event(event)
     cwd_value = event.get("cwd")
@@ -1452,15 +1517,16 @@ def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, An
         reasoning_effort=reasoning_effort,
         parent_thread_path=session_path,
         allow_desktop_unavailable_report=False,
+        ledger=ledger,
+        extra_summary={
+            "marker": os.environ.get("CODEX_RVF_FORK_EXPERIMENT_MARKER", FORK_EXPERIMENT_MARKER),
+            "latest_user_message_path": (
+                ledger.artifact("latest-user-message.txt", latest_user)
+                if ledger is not None
+                else None
+            ),
+        },
     )
-    latest_path = state_dir() / "latest.json"
-    try:
-        data = json.loads(latest_path.read_text(encoding="utf-8"))
-        data["marker"] = os.environ.get("CODEX_RVF_FORK_EXPERIMENT_MARKER", FORK_EXPERIMENT_MARKER)
-        data["latest_user_message"] = latest_user
-        latest_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
     return payload
 
 
@@ -1497,7 +1563,11 @@ def fork_cwd_for_event(event: dict[str, Any], repo: str) -> str:
     return repo
 
 
-def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]:
+def fork_review_validate_fix(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger | None = None,
+) -> dict[str, Any]:
     parent_session_id = parent_thread_id_from_event(event) or ""
     parent_thread_path = parent_thread_path_from_event(event)
     cwd = fork_cwd_for_event(event, repo)
@@ -1514,19 +1584,42 @@ def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]
         reasoning_effort=reasoning_effort,
         parent_thread_path=parent_thread_path,
         fallback_failure_reason=fork_failure_report(repo),
+        ledger=ledger,
     )
 
 
-def review_validate_fix_dispatch(event: dict[str, Any], repo: str) -> dict[str, Any] | None:
+def review_validate_fix_dispatch(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger | None = None,
+) -> dict[str, Any] | None:
     mode = rvf_mode()
     if mode == "off":
-        return {
-            "continue": True,
-            "systemMessage": f"review-validate-fix Stop hook 已跳过：CODEX_RVF_MODE=off。repo={repo}",
-        }
+        return skip_payload(
+            "CODEX_RVF_MODE=off",
+            ledger,
+            "mode_off",
+            repo=repo,
+        )
     if mode == "report":
-        return {"continue": True, "systemMessage": fork_failure_report(repo)}
-    return fork_review_validate_fix(event, repo)
+        report = fork_failure_report(repo)
+        if ledger is not None:
+            ledger.event(
+                phase="fork",
+                event="skipped",
+                status="skipped",
+                reason_code="continuation_disabled",
+                repo=repo,
+                message=report,
+            )
+            return ledger.hook_payload(
+                status="skipped",
+                reason_code="continuation_disabled",
+                message=report,
+                repo=repo,
+            )
+        return {"continue": True, "systemMessage": report}
+    return fork_review_validate_fix(event, repo, ledger)
 
 
 def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bool:
@@ -1589,26 +1682,73 @@ def main() -> int:
     if event is None:
         return 0
 
+    cwd_value = event.get("cwd")
+    ledger = start_run(
+        "stop-hook",
+        repo=str(cwd_value) if isinstance(cwd_value, str) else None,
+        cwd=str(cwd_value) if isinstance(cwd_value, str) else None,
+    )
+    stop_event_path = ledger.artifact("stop-event.json", event)
+    ledger.event(
+        phase="gate",
+        event="stop_event_received",
+        status="started",
+        reason_code="stop_event_received",
+        session_id=session_id_from_event(event),
+        paths={"stop_event": stop_event_path} if stop_event_path else {},
+    )
+
     if event.get("stop_hook_active") is True:
-        emit(skip_payload("检测到 stop_hook_active=true，为避免递归已跳过。"))
+        emit(skip_payload("检测到 stop_hook_active=true，为避免递归已跳过。", ledger, "stop_hook_active"))
         return 0
 
     latest_user = latest_user_message_from_event(event)
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
     if fork_context is not None:
-        advisory = handoff_advisory(event, fork_context)
+        advisory = handoff_advisory(event, fork_context, ledger)
         if advisory is not None:
             emit(advisory)
         else:
-            emit(skip_payload("当前会话已是 review-validate-fix fork，会等待最终 <handoff-context>，不会再次 fork。"))
+            emit(
+                skip_payload(
+                    "当前会话已是 review-validate-fix fork，会等待最终 <handoff-context>，不会再次 fork。",
+                    ledger,
+                    "already_rvf_fork",
+                )
+            )
         return 0
 
     if event_marks_subagent(event):
-        emit(skip_payload("Stop event 来自 Codex subagent，post-work review 只允许主会话触发。"))
+        emit(
+            skip_payload(
+                "Stop event 来自 Codex subagent，post-work review 只允许主会话触发。",
+                ledger,
+                "subagent_stop_event",
+            )
+        )
         return 0
 
     session_control = session_hook_control_payload(event, latest_user)
     if session_control is not None:
+        ledger.event(
+            phase="gate",
+            event="session_hook_control",
+            status="completed",
+            reason_code="session_hook_control",
+            session_id=session_hook_id_from_event(event),
+        )
+        ledger.summary(
+            status="session-hook-control",
+            reason_code="session_hook_control",
+            message=session_control.get("systemMessage") if isinstance(session_control.get("systemMessage"), str) else None,
+            session_id=session_hook_id_from_event(event),
+        )
+        session_control = ledger.hook_payload(
+            status="session-hook-control",
+            reason_code="session_hook_control",
+            message=session_control.get("systemMessage") if isinstance(session_control.get("systemMessage"), str) else None,
+            session_id=session_hook_id_from_event(event),
+        )
         emit(session_control)
         return 0
 
@@ -1618,31 +1758,50 @@ def main() -> int:
             skip_payload(
                 "当前 chat session 已禁用 RVF_STOP_HOOK；"
                 "只跳过 RVF fork/continuation/review gate，"
-                f"不控制 dispatcher 的 dev sync。session_id={session_id}"
+                f"不控制 dispatcher 的 dev sync。session_id={session_id}",
+                ledger,
+                "session_hook_disabled",
+                session_id=session_id,
             )
         )
         return 0
 
     should_experiment, latest_user = should_run_fork_experiment(event)
     if should_experiment and latest_user is not None:
-        emit(run_fork_experiment(event, latest_user))
+        emit(run_fork_experiment(event, latest_user, ledger))
         return 0
 
     if should_suppress(event, latest_user):
-        emit(skip_payload("检测到 suppress 标记或环境变量。"))
+        emit(skip_payload("检测到 suppress 标记或环境变量。", ledger, "suppressed"))
         return 0
 
     cwd = event.get("cwd")
     cwd_result: GateResult | None = None
     if isinstance(cwd, str) and cwd:
         cwd_result = run_gate(cwd)
+        ledger.event(
+            phase="gate",
+            event="dirty_gate_completed",
+            status=cwd_result.status.lower(),
+            reason_code=f"gate_{cwd_result.status.lower()}",
+            repo=cwd_result.repo,
+            cwd=cwd,
+            gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
+        )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
-            payload = review_validate_fix_dispatch(event, cwd_result.repo)
+            payload = review_validate_fix_dispatch(event, cwd_result.repo, ledger)
             if payload is not None:
                 emit(payload)
             return 0
         if cwd_result.status == "CLEAN":
-            emit(skip_payload(f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}"))
+            emit(
+                skip_payload(
+                    f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
+                    ledger,
+                    "clean_repo",
+                    repo=cwd_result.repo or cwd,
+                )
+            )
             return 0
 
     if cwd_result is not None:
@@ -1650,14 +1809,20 @@ def main() -> int:
             skip_payload(
                 "当前 cwd 不在 git repo/worktree 内，未自动选择目标仓库。"
                 f"cwd gate={cwd_result.status}; cwd={cwd}。"
-                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。"
+                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
+                ledger,
+                "cwd_not_git_repo",
+                cwd=cwd,
+                gate_status=cwd_result.status,
             )
         )
     else:
         emit(
             skip_payload(
                 "Stop event 未提供可检查的 cwd，未自动选择目标仓库。"
-                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。"
+                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
+                ledger,
+                "missing_cwd",
             )
         )
     return 0

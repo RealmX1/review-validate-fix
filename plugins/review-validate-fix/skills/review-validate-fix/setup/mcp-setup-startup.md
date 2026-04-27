@@ -57,4 +57,4 @@ fallback 行为：
 - 如何手动验证该 setup。
 - 尚未解决的风险或需要用户补充的凭据 / 命令。
 
-运行 `scripts/check_contracts.sh`。如果无法运行，说明原因。
+在源仓库中运行 `scripts/check_plugin_contracts.py`。如果无法运行，说明原因。

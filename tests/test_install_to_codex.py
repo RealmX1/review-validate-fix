@@ -8,7 +8,8 @@ import tempfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().with_name("install_to_codex.py")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "install_to_codex.py"
 
 
 def load_installer_module():
@@ -163,6 +164,9 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
     plugin_parent = home / "plugins"
+    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
+    legacy_skill.mkdir(parents=True)
+    (legacy_skill / "SKILL.md").write_text("legacy standalone\n", encoding="utf-8")
 
     def run_main() -> None:
         def call_main() -> None:
@@ -183,7 +187,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     assert (plugin_skill / "SKILL.md").exists()
     assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
-    assert not (home / ".codex" / "skills" / "review-validate-fix").exists()
+    assert not legacy_skill.exists()
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1

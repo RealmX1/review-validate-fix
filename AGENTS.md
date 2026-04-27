@@ -1,5 +1,5 @@
 目前该项目尚未被分发；一切对于Review-Validate-Fix本身的backward compatibility work都应该在commit前被清理；
-- 如果该工作是通过直接改动主程序达成，那么需要明确注明该backward compatiblity work的改动，并在验证了已完成任务后清理并log入已被gitignore的`dev_backward_compatibility`folder。
+- 如果该工作是通过直接改动主程序达成，那么需要明确注明该backward compatiblity work的改动，并在验证了已完成任务后，在commit前清理并log入已被gitignore的`dev_backward_compatibility`folder。
 
 commit风格应遵循conventional commit
 

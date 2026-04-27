@@ -10,7 +10,16 @@ import tempfile
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().with_name("codex_stop_review_validate_fix.py")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = (
+    ROOT
+    / "plugins"
+    / "review-validate-fix"
+    / "skills"
+    / "review-validate-fix"
+    / "scripts"
+    / "codex_stop_review_validate_fix.py"
+)
 
 
 def run(cmd: list[str], cwd: Path) -> None:
@@ -68,11 +77,64 @@ def parse_json(stdout: str) -> dict[str, object]:
     return json.loads(stdout)
 
 
+def summary_path_from_message(message: str) -> Path:
+    marker = "summary="
+    assert marker in message, message
+    return Path(message.split(marker, 1)[1].split(";", 1)[0].strip())
+
+
+def summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
+    message = payload["systemMessage"]
+    assert isinstance(message, str)
+    return json.loads(summary_path_from_message(message).read_text(encoding="utf-8"))
+
+
+def latest_pointer(state: Path) -> dict[str, object]:
+    return json.loads((state / "latest.json").read_text(encoding="utf-8"))
+
+
+def latest_summary(state: Path) -> dict[str, object]:
+    pointer = latest_pointer(state)
+    assert set(pointer) >= {
+        "run_id",
+        "summary_path",
+        "events_path",
+        "status",
+        "reason_code",
+        "updated_at",
+    }
+    return json.loads(Path(str(pointer["summary_path"])).read_text(encoding="utf-8"))
+
+
+def read_json_artifact(summary: dict[str, object], key: str) -> object:
+    path = summary.get(key)
+    assert isinstance(path, str), f"missing artifact path {key}: {summary}"
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def read_text_artifact(summary: dict[str, object], key: str) -> str:
+    path = summary.get(key)
+    assert isinstance(path, str), f"missing artifact path {key}: {summary}"
+    return Path(path).read_text(encoding="utf-8")
+
+
+def prompt_text(summary: dict[str, object]) -> str:
+    return read_text_artifact(summary, "prompt_path")
+
+
+def app_server_requests(summary: dict[str, object]) -> list[dict[str, object]]:
+    requests = read_json_artifact(summary, "app_server_requests_path")
+    assert isinstance(requests, list)
+    return requests
+
+
 def assert_skip_reason(stdout: str, expected: str) -> dict[str, object]:
     payload = parse_json(stdout)
     assert "decision" not in payload
-    assert "未创建 fork" in payload["systemMessage"]
-    assert expected in payload["systemMessage"]
+    assert str(payload["systemMessage"]).startswith("review-validate-fix: skipped;")
+    summary = summary_from_payload(payload)
+    assert summary["status"] == "skipped"
+    assert expected in str(summary.get("message"))
     return payload
 
 
@@ -160,11 +222,13 @@ def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
     )
     payload = parse_json(stdout)
     assert "decision" not in payload
-    assert "fork-experiment triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["suppress_child_stop_hook"] is True
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in latest["prompt"]
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in latest["app_server_requests"][1]["params"]["input"][0]["text"]
+    prompt = prompt_text(latest)
+    requests = app_server_requests(latest)
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in prompt
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in requests[1]["params"]["input"][0]["text"]
 
 
 def test_stop_hook_active_skips(tmp: Path) -> None:
@@ -290,8 +354,8 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
         module.bridge_socket_path = original_bridge_socket_path
         module.ensure_bridge_app_server = original_ensure_bridge
 
-    assert "desktop_control_unavailable=missing" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "reason=app_server_fork_failed" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "app-server-failed"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
     assert latest["socket_selection"]["bridge"]["reason"] == "missing"
@@ -340,9 +404,9 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "visible fork failure" in payload["systemMessage"]
+    assert "reason=desktop_control_unavailable_continuation_disabled" in payload["systemMessage"]
     assert "$review-validate-fix" not in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    latest = latest_summary(state)
     assert latest["status"] == "desktop-control-unavailable-report"
     assert latest["report_reason"] == "visible fork failure"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
@@ -391,14 +455,13 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "fork-experiment prepared" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "reason=manual_prepared" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "manual-prepared"
     assert latest["desktop_control_unavailable_fallback"] == "manual"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
     assert latest["socket_selection"]["bridge_policy"] == "report"
     assert latest["marker"] == "RVF_FORK_EXPERIMENT"
-    assert latest["latest_user_message"] == "RVF_FORK_EXPERIMENT: diagnose fork behavior"
 
 
 def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
@@ -447,8 +510,8 @@ def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "reason=desktop_control_unavailable_fail_policy" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "desktop-control-unavailable-fail"
     assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in latest["report_reason"]
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
@@ -749,8 +812,10 @@ def test_bridge_fork_message_marks_gui_visibility_unverified(tmp: Path) -> None:
         else:
             os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
 
-    assert "forked in Codex app-server bridge" in payload["systemMessage"]
-    assert "gui_visibility=unverified-bridge-only" in payload["systemMessage"]
+    assert "review-validate-fix: app-server-started; reason=fork_started;" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["socket_source"] == "bridge"
+    assert latest["gui_visibility"] == "unverified-bridge-only"
 
 
 def test_open_gui_fork_disabled_skips_retry_sleep(tmp: Path) -> None:
@@ -888,9 +953,10 @@ def test_session_hook_control_disables_current_session(tmp: Path) -> None:
         )[0]
     )
     assert "decision" not in payload
-    assert "disabled" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "disabled" in str(summary["message"])
     assert (state / "session-hook" / "session-disabled.json").exists()
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "session-hook-control"
 
     write_user_session(
         transcript,
@@ -907,7 +973,7 @@ def test_session_hook_control_disables_current_session(tmp: Path) -> None:
         state_dir=state,
     )
     assert_skip_reason(stdout, "已禁用")
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_session_hook_control_status_reports_current_session(tmp: Path) -> None:
@@ -943,8 +1009,9 @@ def test_session_hook_control_status_reports_current_session(tmp: Path) -> None:
             state_dir=state,
         )[0]
     )
-    assert "disabled" in payload["systemMessage"]
-    assert "session-status" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "disabled" in str(summary["message"])
+    assert "session-status" in str(summary["message"])
 
 
 def test_session_hook_control_status_works_when_env_suppressed(tmp: Path) -> None:
@@ -968,8 +1035,9 @@ def test_session_hook_control_status_works_when_env_suppressed(tmp: Path) -> Non
             state_dir=state,
         )[0]
     )
-    assert "enabled" in payload["systemMessage"]
-    assert "session-status-suppressed" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "enabled" in str(summary["message"])
+    assert "session-status-suppressed" in str(summary["message"])
 
 
 def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
@@ -1007,9 +1075,10 @@ def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
             state_dir=state,
         )[0]
     )
-    assert "enabled" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "enabled" in str(summary["message"])
     assert not (state / "session-hook" / "session-reenabled.json").exists()
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "session-hook-control"
 
     write_user_session(
         transcript,
@@ -1027,8 +1096,8 @@ def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
             state_dir=state,
         )[0]
     )
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "dry-run"
 
 
@@ -1065,7 +1134,7 @@ def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
         state_dir=state,
     )
     assert_skip_reason(stdout, "已禁用")
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_subagent_source_ignores_session_hook_control(tmp: Path) -> None:
@@ -1132,14 +1201,16 @@ def test_dirty_repo_forks_in_gui_by_default(tmp: Path) -> None:
         )[0]
     )
     assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "dry-run"
     assert latest["mode"] == "dry-run"
-    assert latest["app_server_requests"][0]["method"] == "thread/fork"
-    assert latest["app_server_requests"][1]["method"] == "turn/start"
-    assert "$review-validate-fix" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
+    requests = app_server_requests(latest)
+    prompt = prompt_text(latest)
+    assert requests[0]["method"] == "thread/fork"
+    assert requests[1]["method"] == "turn/start"
+    assert "$review-validate-fix" in prompt
+    assert str(dirty) in prompt
 
 
 def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
@@ -1160,9 +1231,8 @@ def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
         )[0]
     )
     assert "decision" not in payload
-    assert "review-validate-fix-fork prepared" in payload["systemMessage"]
-    assert "prompt=" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "review-validate-fix: manual-prepared; reason=manual_prepared;" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "manual-prepared"
     assert Path(latest["prompt_path"]).exists()
 
@@ -1187,18 +1257,19 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
         )[0]
     )
     assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    assert "$review-validate-fix" in latest["prompt"]
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
-    assert "RVF_STOP_HOOK: off" in latest["prompt"]
-    assert "会话控制元数据" in latest["prompt"]
-    assert "不要把它们当成用户分配的代码任务" in latest["prompt"]
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    latest = latest_summary(state)
+    prompt = prompt_text(latest)
+    assert "$review-validate-fix" in prompt
+    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
+    assert str(dirty) in prompt
+    assert "RVF_STOP_HOOK: off" in prompt
+    assert "会话控制元数据" in prompt
+    assert "不要把它们当成用户分配的代码任务" in prompt
     assert latest["suppress_child_stop_hook"] is False
     assert latest["model"] == "gpt-test"
     assert latest["reasoning_effort"] == "high"
-    requests = latest["app_server_requests"]
+    requests = app_server_requests(latest)
     assert requests[0]["method"] == "thread/fork"
     assert requests[0]["params"]["model"] == "gpt-test"
     assert requests[1]["method"] == "turn/start"
@@ -1228,13 +1299,14 @@ def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp: Path) -> None:
     )
 
     assert "decision" not in payload
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    requests = latest["app_server_requests"]
+    latest = latest_summary(state)
+    requests = app_server_requests(latest)
+    prompt = prompt_text(latest)
     assert latest["cwd"] == str(subdir.resolve())
     assert requests[0]["params"]["cwd"] == str(subdir.resolve())
     assert requests[1]["params"]["cwd"] == str(subdir.resolve())
-    assert f"RVF_PARENT_CWD: {subdir.resolve()}" in latest["prompt"]
-    assert f"RVF_TARGET_REPO: {dirty.resolve()}" in latest["prompt"]
+    assert f"RVF_PARENT_CWD: {subdir.resolve()}" in prompt
+    assert f"RVF_TARGET_REPO: {dirty.resolve()}" in prompt
 
 
 def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp: Path) -> None:
@@ -1263,9 +1335,10 @@ def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp: Path) -> None:
 
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "当前 cwd 不在 git repo/worktree 内" in payload["systemMessage"]
-    assert "提供要运行 review-validate-fix 的目标 repo 路径" in payload["systemMessage"]
-    assert not (state / "latest.json").exists()
+    summary = summary_from_payload(payload)
+    assert "当前 cwd 不在 git repo/worktree 内" in str(summary["message"])
+    assert "提供要运行 review-validate-fix 的目标 repo 路径" in str(summary["message"])
+    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> None:
@@ -1294,10 +1367,10 @@ def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> No
         )[0]
     )
     assert "decision" not in payload
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    latest = latest_summary(state)
     assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000099"
     assert latest["parent_thread_path"] == str(transcript.resolve())
-    fork_params = latest["app_server_requests"][0]["params"]
+    fork_params = app_server_requests(latest)[0]["params"]
     assert fork_params["threadId"] == "00000000-0000-0000-0000-000000000099"
     assert fork_params["path"] == str(transcript.resolve())
 
@@ -1323,10 +1396,10 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp: Path) -> None
         )[0]
     )
     assert "decision" not in payload
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    latest = latest_summary(state)
     assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000100"
     assert latest["parent_thread_path"] is None
-    assert "path" not in latest["app_server_requests"][0]["params"]
+    assert "path" not in app_server_requests(latest)[0]["params"]
 
 
 def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> None:
@@ -1343,10 +1416,11 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> Non
     )
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "$review-validate-fix" in payload["systemMessage"]
-    assert str(dirty) in payload["systemMessage"]
-    assert "Stop continuation prompt 已禁用" in payload["systemMessage"]
-    assert "不会创建真正的新用户 prompt" in payload["systemMessage"]
+    assert "reason=continuation_disabled" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "$review-validate-fix" in str(summary["message"])
+    assert str(dirty) in str(summary["message"])
+    assert "Stop continuation prompt 已禁用" in str(summary["message"])
 
 
 def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
@@ -1368,9 +1442,10 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> Non
     }
     payload = parse_json(invoke(event, state_dir=state)[0])
     assert "decision" not in payload
-    assert "<handoff-context>" in payload["systemMessage"]
-    assert "粘贴回原始 chat session" in payload["systemMessage"]
-    assert "parent-session" in payload["systemMessage"]
+    assert "reason=handoff_context_ready" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "粘贴回原始 chat session" in str(summary["message"])
+    assert summary["parent_session_id"] == "parent-session"
 
     stdout, _ = invoke(event, state_dir=state)
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
@@ -1454,7 +1529,7 @@ def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_messag
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> None:
@@ -1489,7 +1564,7 @@ def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> No
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "latest.json").exists()
+    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path) -> None:
@@ -1518,19 +1593,31 @@ def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path
         )[0]
     )
     assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    latest = latest_summary(state)
     assert latest["status"] == "dry-run"
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
+    prompt = prompt_text(latest)
+    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
+    assert str(dirty) in prompt
 
 
 def test_missing_cwd_skips_and_requests_target_repo(tmp: Path) -> None:
     payload = parse_json(invoke({"stop_hook_active": False})[0])
     assert "decision" not in payload
     assert payload["continue"] is True
-    assert "Stop event 未提供可检查的 cwd" in payload["systemMessage"]
-    assert "提供要运行 review-validate-fix 的目标 repo 路径" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "Stop event 未提供可检查的 cwd" in str(summary["message"])
+    assert "提供要运行 review-validate-fix 的目标 repo 路径" in str(summary["message"])
+
+
+def test_log_unavailable_does_not_break_hook_payload(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    state_file = tmp / "state-is-a-file"
+    state_file.write_text("not a directory\n", encoding="utf-8")
+    payload = parse_json(invoke({"stop_hook_active": False}, state_dir=state_file)[0])
+    assert "decision" not in payload
+    assert payload["continue"] is True
+    assert "log_unavailable=true" in payload["systemMessage"]
 
 
 def main() -> int:
@@ -1577,6 +1664,7 @@ def main() -> int:
         test_forked_rvf_marker_scan_skips_incomplete_earlier_marker,
         test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo,
         test_missing_cwd_skips_and_requests_target_repo,
+        test_log_unavailable_does_not_break_hook_payload,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

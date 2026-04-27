@@ -28,11 +28,27 @@ plugins/review-validate-fix/               # Codex plugin 包装层
 plugins/review-validate-fix/.codex-plugin/plugin.json
 plugins/review-validate-fix/skills/review-validate-fix/
                                             # canonical skill 内容，人工修改这里
-scripts/check_plugin_contracts.py          # 运行 plugin skill 契约检查
+scripts/check_plugin_contracts.py          # 仓库级契约检查入口，委托 check_skill_contracts.sh
+scripts/check_skill_contracts.sh           # 覆盖 plugin runtime、安装脚本和 tests/ 的契约检查
 scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间
+tests/                                     # 开发和契约测试；不随 plugin runtime 分发
 plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
 ```
+
+## 开发维护流程
+
+日常改动只应把运行期代码放在 `plugins/review-validate-fix/skills/review-validate-fix/`，把开发测试、仓库级契约检查和安装辅助脚本放在仓库根目录的 `tests/` 与 `scripts/`。plugin runtime 不应携带 `test_*.py`、`*_test.py` 或仓库级契约脚本；`scripts/check_skill_contracts.sh` 会检查这条边界。
+
+推荐维护顺序：
+
+```bash
+bash scripts/check_skill_contracts.sh
+python3 scripts/check_plugin_contracts.py
+python3 scripts/install_to_codex.py --configure-stop-hook
+```
+
+`scripts/check_skill_contracts.sh` 是最完整的本地验证入口，会执行 shell 语法检查、Python 编译检查和仓库级测试。`scripts/check_plugin_contracts.py` 保留为 plugin 契约入口，当前会委托同一套仓库级检查。安装脚本默认保留本机 `alternative-reviewer.json` 和 `state/`，因此不会覆盖机器相关 setup。
 
 ## 安装机制
 
@@ -68,6 +84,20 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
 只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 会以非零状态退出并把失败原因写到 stderr，让 Codex 停在 hook 失败处等待用户介入；它不能把这类 breaking error 降级为 `continue: true` 的 systemMessage，也不能让主 coding agent 带着错误上下文继续工作。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
+
+所有 dispatcher、Stop hook、manual run 和 external reviewer 的排障日志都写入统一 run ledger。入口是 `state/latest.json` 指向的 `state/runs/<run_id>/summary.json` 和 `events.jsonl`；大文本如 Stop event、fork prompt、review packet、stdout/stderr 会作为 `artifacts/` 文件保存。hook stdout 仍只输出 Codex hook payload，用户可见 `systemMessage` 保持短格式：`review-validate-fix: <status>; reason=<reason_code>; summary=<summary_path>`。可用 `CODEX_RVF_LOG_ROOT` 或兼容别名 `CODEX_RVF_STATE_DIR` 覆盖日志根目录，未设置时使用 plugin skill 的 `state/`。
+
+### 日志排障入口
+
+`state/` 是本机运行状态，已被 gitignore，不属于可分发 plugin 内容。排障时先看：
+
+```bash
+cat plugins/review-validate-fix/skills/review-validate-fix/state/latest.json
+cat <summary_path>
+cat <events_path>
+```
+
+`latest.json` 只是 pointer，不是完整状态源；主程序和测试都应读取 `summary.json` 或 `events.jsonl`。如果日志目录不可写，hook payload 仍应可用，并在 `systemMessage` 或 summary diagnostics 中标记 `log_unavailable`。`CODEX_RVF_LOG_MAX_INLINE_BYTES` 和 `CODEX_RVF_LOG_LEVEL` 只用于日志行为调试，不应改变 hook 协议。
 
 hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
 
@@ -161,6 +191,6 @@ Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Termina
 ## 验证
 
 ```bash
-bash plugins/review-validate-fix/skills/review-validate-fix/scripts/check_contracts.sh
+bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 ```

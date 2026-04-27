@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+skill_dir="$repo_root/plugins/review-validate-fix/skills/review-validate-fix"
+tests_dir="$repo_root/tests"
 
 hash_file() {
   local file="$1"
@@ -24,6 +26,14 @@ require_file() {
   fi
 }
 
+require_repo_file() {
+  local file="$1"
+  if [ ! -f "$repo_root/$file" ]; then
+    printf '缺少仓库文件: %s\n' "$file" >&2
+    exit 1
+  fi
+}
+
 require_literal() {
   local file="$1"
   local literal="$2"
@@ -33,10 +43,28 @@ require_literal() {
   fi
 }
 
+require_repo_literal() {
+  local file="$1"
+  local literal="$2"
+  if ! grep -Fq -- "$literal" "$repo_root/$file"; then
+    printf '契约缺失: %s 中找不到 %s\n' "$file" "$literal" >&2
+    exit 1
+  fi
+}
+
 forbid_literal() {
   local file="$1"
   local literal="$2"
   if grep -Fq -- "$literal" "$skill_dir/$file"; then
+    printf '禁止的旧契约仍存在: %s 中不应出现 %s\n' "$file" "$literal" >&2
+    exit 1
+  fi
+}
+
+forbid_repo_literal() {
+  local file="$1"
+  local literal="$2"
+  if grep -Fq -- "$literal" "$repo_root/$file"; then
     printf '禁止的旧契约仍存在: %s 中不应出现 %s\n' "$file" "$literal" >&2
     exit 1
   fi
@@ -60,16 +88,13 @@ required_files=(
   "scripts/check_review_output.py"
   "scripts/command_lock.py"
   "scripts/prepare_review_run.py"
+  "scripts/rvf_logging.py"
   "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
   "scripts/codex_stop_review_validate_fix.py"
-  "scripts/test_codex_stop_hook_dispatcher.py"
-  "scripts/test_codex_stop_review_validate_fix.py"
-  "scripts/test_review_support_scripts.py"
   "scripts/discover_santa_alternative_agents.sh"
   "scripts/read_mcp_setup_once.sh"
-  "scripts/check_contracts.sh"
   "scripts/parse_elevation_detail.py"
   "agents/openai.yaml"
 )
@@ -78,37 +103,72 @@ for file in "${required_files[@]}"; do
   require_file "$file"
 done
 
+repo_required_files=(
+  "scripts/check_plugin_contracts.py"
+  "scripts/check_skill_contracts.sh"
+  "scripts/install_to_codex.py"
+  "tests/test_codex_stop_hook_dispatcher.py"
+  "tests/test_codex_stop_review_validate_fix.py"
+  "tests/test_install_to_codex.py"
+  "tests/test_review_support_scripts.py"
+)
+
+for file in "${repo_required_files[@]}"; do
+  require_repo_file "$file"
+done
+
 if [ -e "$skill_dir/references/mcp-setup-startup.md" ]; then
   printf 'setup-only 文档不应位于运行期 references/: references/mcp-setup-startup.md\n' >&2
   exit 1
 fi
 
+if find "$skill_dir/scripts" -maxdepth 1 -type f \( -name 'test_*.py' -o -name '*_test.py' \) | grep -q .; then
+  printf '测试脚本不应位于 plugin 运行期 scripts/ 目录\n' >&2
+  exit 1
+fi
+
+for script in \
+  "check_contracts.sh" \
+  "check_plugin_contracts.py" \
+  "check_skill_contracts.sh"
+do
+  if [ -e "$skill_dir/scripts/$script" ]; then
+    printf '仓库级契约脚本不应位于 plugin 运行期 scripts/ 目录: scripts/%s\n' "$script" >&2
+    exit 1
+  fi
+done
+
 for script in \
   "scripts/review_validate_fix_gate.sh" \
   "scripts/discover_santa_alternative_agents.sh" \
-  "scripts/read_mcp_setup_once.sh" \
-  "scripts/check_contracts.sh"
+  "scripts/read_mcp_setup_once.sh"
 do
   bash -n "$skill_dir/$script"
 done
+bash -n "$repo_root/scripts/check_skill_contracts.sh"
 
 python3 -m py_compile \
+  "$repo_root/scripts/check_plugin_contracts.py" \
+  "$repo_root/scripts/install_to_codex.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
   "$skill_dir/scripts/check_review_output.py" \
   "$skill_dir/scripts/command_lock.py" \
   "$skill_dir/scripts/prepare_review_run.py" \
+  "$skill_dir/scripts/rvf_logging.py" \
   "$skill_dir/scripts/session_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
-  "$skill_dir/scripts/test_codex_stop_hook_dispatcher.py" \
-  "$skill_dir/scripts/test_codex_stop_review_validate_fix.py" \
-  "$skill_dir/scripts/test_review_support_scripts.py"
+  "$tests_dir/test_codex_stop_hook_dispatcher.py" \
+  "$tests_dir/test_codex_stop_review_validate_fix.py" \
+  "$tests_dir/test_install_to_codex.py" \
+  "$tests_dir/test_review_support_scripts.py"
 
-python3 "$skill_dir/scripts/test_review_support_scripts.py"
-python3 "$skill_dir/scripts/test_codex_stop_hook_dispatcher.py"
-python3 "$skill_dir/scripts/test_codex_stop_review_validate_fix.py"
+python3 "$tests_dir/test_install_to_codex.py"
+python3 "$tests_dir/test_review_support_scripts.py"
+python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
+python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
 
 python3 - "$skill_dir/references/handoff-template.md" <<'PY'
 import re
@@ -184,9 +244,11 @@ require_literal "scripts/run_alternative_reviewer.py" '--preflight'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_COMMAND_LOCK'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_EXTERNAL_REVIEWER_TIMEOUT'
 require_literal "scripts/run_alternative_reviewer.py" 'extract_claude_stream_result'
-require_literal "scripts/test_review_support_scripts.py" 'test_alternative_reviewer_claude_stream_json_extracts_result'
-require_literal "scripts/test_review_support_scripts.py" 'test_alternative_reviewer_legacy_claude_config_gets_stream_json'
-require_literal "scripts/test_review_support_scripts.py" 'test_alternative_reviewer_non_claude_stream_json_command_is_not_patched'
+require_literal "scripts/run_alternative_reviewer.py" '--rvf-run-id'
+require_literal "scripts/run_alternative_reviewer.py" '--rvf-run-dir'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_claude_stream_json_extracts_result'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_legacy_claude_config_gets_stream_json'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_non_claude_stream_json_command_is_not_patched'
 require_literal "scripts/check_review_output.py" 'NO_ISSUES'
 require_literal "scripts/check_review_output.py" 'RVF_LOCK_REQUEST'
 require_literal "scripts/check_review_output.py" 'lock_request'
@@ -195,6 +257,13 @@ require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
 require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
 require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
+require_literal "scripts/prepare_review_run.py" '--rvf-run-id'
+require_literal "scripts/prepare_review_run.py" '--rvf-run-dir'
+require_literal "scripts/rvf_logging.py" 'class RunLedger'
+require_literal "scripts/rvf_logging.py" 'events.jsonl'
+require_literal "scripts/rvf_logging.py" 'summary.json'
+require_literal "scripts/rvf_logging.py" 'reason_code'
+require_literal "scripts/rvf_logging.py" 'log_unavailable'
 require_literal "scripts/session_manifest.py" 'owned_paths'
 require_literal "scripts/session_manifest.py" 'unattributed_dirty_paths'
 require_literal "scripts/build_review_packet.py" 'metadata-output'
@@ -266,17 +335,20 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'review-validate-fix
 require_literal "scripts/codex_stop_review_validate_fix.py" '<handoff-context>'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'last_assistant_message'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'fork'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_fork_experiment_marker_dry_run'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_forks_in_gui_by_default'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_manual_mode_only_prepares_prompt'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_fork_dry_run'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_stop_event_transcript_path_overrides_bad_env_thread_id'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_stop_event_log_path_is_not_used_as_fork_rollout_path'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_continuation_mode_reports_removed_fallback'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_no_git_cwd_skips_even_with_dirty_trusted_repo'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_gets_programmatic_handoff_advisory'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_waits_for_handoff_before_advisory'
-require_literal "scripts/test_codex_stop_review_validate_fix.py" 'test_missing_cwd_skips_and_requests_target_repo'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_fork_experiment_marker_dry_run'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_forks_in_gui_by_default'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_manual_mode_only_prepares_prompt'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_fork_dry_run'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_stop_event_transcript_path_overrides_bad_env_thread_id'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_stop_event_log_path_is_not_used_as_fork_rollout_path'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_continuation_mode_reports_removed_fallback'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_no_git_cwd_skips_even_with_dirty_trusted_repo'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_gets_programmatic_handoff_advisory'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_waits_for_handoff_before_advisory'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_missing_cwd_skips_and_requests_target_repo'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_log_unavailable_does_not_break_hook_payload'
+forbid_repo_literal "scripts/install_to_codex.py" 'legacy skill compatibility copy'
+forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy standalone setup'
 
 printf 'contract check OK\n'
 printf 'hashes:\n'

@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rvf_logging import start_run
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
@@ -62,17 +65,38 @@ def prepare_run(
     background_files: list[str],
     exclude_path_prefixes: list[str],
     allow_missing_session_context: bool = False,
+    rvf_run_id: str | None = None,
+    rvf_run_dir: Path | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
+    ledger = start_run(
+        "prepare-run",
+        repo=str(root),
+        cwd=str(root),
+        run_id=rvf_run_id,
+        run_dir=rvf_run_dir,
+    )
+    ledger.event(
+        phase="prepare",
+        event="started",
+        status="started",
+        reason_code="prepare_started",
+        repo=str(root),
+        cwd=str(root),
+    )
     base_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = Path(tempfile.mkdtemp(prefix=f"{timestamp}-{safe_repo_name(root)}-", dir=base_dir))
+    if ledger.available:
+        artifact_dir = ledger.artifacts_dir
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        artifact_dir = Path(tempfile.mkdtemp(prefix=f"{timestamp}-{safe_repo_name(root)}-", dir=base_dir))
 
-    packet_path = run_dir / "review-packet.md"
-    metadata_path = run_dir / "review-packet.metadata.json"
-    snapshot_path = run_dir / "before-workspace-snapshot.json"
-    scope_of_work_path = run_dir / "scope-of-work.md"
-    session_manifest_path = run_dir / "session-manifest.json"
+    packet_path = artifact_dir / "review-packet.md"
+    metadata_path = artifact_dir / "review-packet.metadata.json"
+    snapshot_path = artifact_dir / "before-workspace-snapshot.json"
+    scope_of_work_path = artifact_dir / "scope-of-work.md"
+    session_manifest_path = artifact_dir / "session-manifest.json"
 
     packet_session_context = session_context
     if session_context is not None:
@@ -145,7 +169,11 @@ def prepare_run(
     result = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "repo": str(root),
-        "run_dir": str(run_dir),
+        "run_id": ledger.run_id,
+        "run_dir": str(ledger.run_dir),
+        "events_path": str(ledger.events_path),
+        "summary_path": str(ledger.summary_path),
+        "artifacts_dir": str(artifact_dir),
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
@@ -168,7 +196,28 @@ def prepare_run(
         "background_files": background_files,
         "excluded_path_prefixes": metadata.get("excluded_path_prefixes"),
     }
-    (run_dir / "run.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    ledger.event(
+        phase="prepare",
+        event="completed",
+        status="completed",
+        reason_code="prepare_completed",
+        repo=str(root),
+        cwd=str(root),
+        paths={
+            "review_packet": str(packet_path),
+            "metadata": str(metadata_path),
+            "snapshot": str(snapshot_path),
+            "scope_of_work": str(scope_of_work_path) if session_context is not None else None,
+            "session_manifest": str(session_manifest_path) if packet_session_manifest is not None else None,
+        },
+        packet_bytes=metadata.get("packet_bytes"),
+    )
+    ledger.summary(
+        status="completed",
+        reason_code="prepare_completed",
+        message="review-validate-fix run prepared",
+        **result,
+    )
     return result
 
 
@@ -180,6 +229,8 @@ def main() -> int:
     parser.add_argument("--transcript", help="Optional Codex JSONL transcript used to build session-manifest.json.")
     parser.add_argument("--base-dir", default=str(default_base_dir()), help="Directory where a unique run directory will be created.")
     parser.add_argument("--output-json", help="Write run metadata JSON to this path. Prints JSON to stdout when omitted.")
+    parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
+    parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
     parser.add_argument("--max-file-bytes", type=int, default=200_000, help="Max untracked file bytes to inline.")
     parser.add_argument("--max-packet-bytes", type=int, default=0, help="Fail if the generated packet exceeds this many bytes. 0 disables the check.")
     parser.add_argument("--primary-file", action="append", default=[], help="Path known to be primary work for this turn. May be repeated.")
@@ -227,6 +278,8 @@ def main() -> int:
             background_files=args.background_file,
             exclude_path_prefixes=args.exclude_path_prefix,
             allow_missing_session_context=args.allow_missing_session_context,
+            rvf_run_id=args.rvf_run_id,
+            rvf_run_dir=Path(args.rvf_run_dir).expanduser().resolve() if args.rvf_run_dir else None,
         )
     except Exception as exc:
         return fail(str(exc), 2)
