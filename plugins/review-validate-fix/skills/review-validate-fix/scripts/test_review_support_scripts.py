@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -929,6 +930,50 @@ def test_alternative_reviewer_idle_timeout_flag(tmp: Path) -> None:
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
 
 
+def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    marker = tmp / "child-survived.txt"
+    child_code = (
+        "import pathlib, time; "
+        "time.sleep(1.0); "
+        f"pathlib.Path({str(marker)!r}).write_text('survived', encoding='utf-8')"
+    )
+    parent_code = (
+        "import subprocess, sys, time; "
+        "sys.stdin.read(); "
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        "time.sleep(10.0)"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", parent_code],
+        idle_timeout_seconds=0.2,
+        activity_check_interval_seconds=0.05,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 124
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
+    time.sleep(1.2)
+    assert not marker.exists()
+
+
 def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -1233,6 +1278,7 @@ def main() -> int:
         test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript")
         test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
+        test_alternative_reviewer_timeout_kills_child_process_group(root / "alternative-timeout-child")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
         test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")
         test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config")

@@ -1,10 +1,10 @@
 # Review Validate Fix
 
-这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。不要再维护或安装 standalone `~/.codex/skills/review-validate-fix`。
+这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。
 
 ## 当前结论
 
-Codex 可以接受 plugin。这个 workflow 现在只通过 plugin 分发；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并携带 `skills/review-validate-fix/` 作为实际运行内容。standalone skill 路径已废弃，安装脚本会默认删除旧的 `~/.codex/skills/review-validate-fix`。
+Codex 可以接受 plugin。这个 workflow 现在只通过 plugin 分发；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并携带 `skills/review-validate-fix/` 作为实际运行内容。安装脚本只安装 plugin，不维护 standalone skill 路径。
 
 ## 核心设计支柱：Stop 后 GUI Fork
 
@@ -28,7 +28,7 @@ plugins/review-validate-fix/               # Codex plugin 包装层
 plugins/review-validate-fix/.codex-plugin/plugin.json
 plugins/review-validate-fix/skills/review-validate-fix/
                                             # canonical skill 内容，人工修改这里
-scripts/sync_plugin_payload.py             # 兼容旧入口；当前只做 plugin skill 契约检查
+scripts/check_plugin_contracts.py          # 运行 plugin skill 契约检查
 scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间
 plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
@@ -39,10 +39,10 @@ plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_d
 日常开发只改 `plugins/review-validate-fix/skills/review-validate-fix/`。改完后运行契约检查：
 
 ```bash
-python3 scripts/sync_plugin_payload.py --check-contracts
+python3 scripts/check_plugin_contracts.py
 ```
 
-这个脚本保留为兼容入口；它不再复制内容，只运行 plugin skill 自带的契约检查。
+这个脚本运行 plugin skill 自带的契约检查，不复制内容。
 
 安装到本机 Codex plugin 空间：
 
@@ -50,7 +50,7 @@ python3 scripts/sync_plugin_payload.py --check-contracts
 python3 scripts/install_to_codex.py
 ```
 
-安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry，并默认删除旧的 standalone `~/.codex/skills/review-validate-fix`。这个路径遵循 Codex plugin scaffold 的本机 marketplace 约定。
+安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry。这个路径遵循 Codex plugin scaffold 的本机 marketplace 约定。
 
 配置 Codex Stop hook：
 
@@ -63,15 +63,55 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_dispatcher.py`，不是直接调用 `codex_stop_review_validate_fix.py`。dispatcher 会在 Stop event 来自本 RVF 源仓库、且不是 subagent 时，先顺序运行：
 
 ```bash
-python3 scripts/sync_plugin_payload.py --check-contracts
+python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查或安装失败，它会跳过 fork gate 并在 systemMessage 中写出失败原因和日志路径，避免继续使用 stale installed plugin skill。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
+只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 会以非零状态退出并把失败原因写到 stderr，让 Codex 停在 hook 失败处等待用户介入；它不能把这类 breaking error 降级为 `continue: true` 的 systemMessage，也不能让主 coding agent 带着错误上下文继续工作。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
 
 hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
 
 如果 Codex Desktop 没有暴露 control app-server socket，hook 默认不会再启动独立 bridge app-server fork，因为该 fork 可能写入 session 文件但不被当前 GUI 立即显示。此时只报告无法创建 GUI fork，并停止自动 review；不会返回 `decision: "block"`，也不会注入 `$review-validate-fix` continuation prompt。需要保留旧 bridge 行为时，显式设置 `CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=bridge` 或 `CODEX_RVF_ALLOW_BRIDGE_APP_SERVER=1`。
+
+### Stop hook 工作流可视化
+
+```mermaid
+flowchart TD
+    Install["安装或更新 plugin\nscripts/install_to_codex.py --configure-stop-hook"] --> Hooks["~/.codex/hooks.json\nStop: codex_stop_hook_dispatcher.py\nCODEX_RVF_MODE=fork\nCODEX_RVF_FORK_MODE=gui"]
+    Hooks --> Stop["Codex 主会话停止\nStop event JSON"]
+    Stop --> Dispatcher["installed dispatcher\ncodex_stop_hook_dispatcher.py"]
+
+    Dispatcher --> DevCheck{"Stop event 是否来自\nRVF dev repo 主会话？"}
+    DevCheck -- "是" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
+    Sync --> SyncOk{"检查和安装成功？"}
+    SyncOk -- "否" --> BlockingFail["stderr + 非零退出\n阻止使用旧 installed plugin"]
+    SyncOk -- "是" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
+    DevCheck -- "否：其他 repo 或 subagent" --> InstalledHook
+
+    InstalledHook --> Recursion{"递归、fork 子会话、subagent\n或 suppress/session off？"}
+    Recursion -- "是" --> Skip["continue: true\nsystemMessage 说明跳过原因"]
+    Recursion -- "否" --> Gate["dirty gate\nreview_validate_fix_gate.sh cwd"]
+    Gate --> GateResult{"cwd repo 状态"}
+    GateResult -- "CLEAN" --> Skip
+    GateResult -- "NO_GIT / NOT_FOUND / 无 cwd" --> AskRepo["continue: true\n提示主会话询问目标 repo"]
+    GateResult -- "DIRTY" --> Mode{"CODEX_RVF_MODE"}
+
+    Mode -- "off" --> Skip
+    Mode -- "continuation / block" --> ReportOnly["continue: true\n报告 GUI fork 不可用\n不注入 continuation prompt"]
+    Mode -- "fork" --> Fork["GUI/app-server fork\nthread/fork + turn/start\n注入 $review-validate-fix prompt"]
+    Fork --> Socket{"Desktop control socket 可用？"}
+    Socket -- "可用" --> Forked["新 GUI fork 会话运行\nreview -> validate/fix -> handoff"]
+    Socket -- "不可用且未显式允许 bridge" --> ReportOnly
+    Socket -- "显式允许 bridge" --> Bridge["bridge app-server fork\nGUI 可见性不保证"]
+    Bridge --> Forked
+
+    Forked --> ForkStop["fork 会话停止"]
+    ForkStop --> Handoff{"最终回复包含\n<handoff-context>？"}
+    Handoff -- "是" --> Advisory["systemMessage 提醒\n把 handoff block 粘回父会话"]
+    Handoff -- "否" --> Skip
+```
+
+这张图里的关键边界是：dispatcher 只负责在本 RVF 源仓库主会话停止时先同步 installed plugin，然后把原始 Stop event 交给 installed hook；真正的 review gate 和 GUI fork 只在 `codex_stop_review_validate_fix.py` 内发生。默认成功路径会创建新的 GUI fork 用户 prompt checkpoint，失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
 
 ### 当前 session 开关
 
@@ -122,5 +162,5 @@ Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Termina
 
 ```bash
 bash plugins/review-validate-fix/skills/review-validate-fix/scripts/check_contracts.sh
-python3 scripts/sync_plugin_payload.py --check-contracts
+python3 scripts/check_plugin_contracts.py
 ```

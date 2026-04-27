@@ -36,14 +36,14 @@ def init_repo(path: Path) -> Path:
 def write_fake_dev_scripts(repo: Path, marker: Path, *, fail_sync: bool = False) -> None:
     scripts = repo / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    sync_body = (
+    contract_body = (
         "#!/usr/bin/env python3\n"
         "import pathlib, sys\n"
         f"pathlib.Path({str(marker / 'sync-ran')!r}).write_text('sync\\n', encoding='utf-8')\n"
     )
     if fail_sync:
-        sync_body += "sys.exit(7)\n"
-    (scripts / "sync_plugin_payload.py").write_text(sync_body, encoding="utf-8")
+        contract_body += "sys.exit(7)\n"
+    (scripts / "check_plugin_contracts.py").write_text(contract_body, encoding="utf-8")
     (scripts / "install_to_codex.py").write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib\n"
@@ -62,7 +62,7 @@ def write_env_check_dev_scripts(repo: Path, marker: Path) -> None:
         "    sys.exit(9)\n"
         f"pathlib.Path({str(marker)!r}).write_text('clean\\n', encoding='utf-8')\n"
     )
-    (scripts / "sync_plugin_payload.py").write_text(body, encoding="utf-8")
+    (scripts / "check_plugin_contracts.py").write_text(body, encoding="utf-8")
     (scripts / "install_to_codex.py").write_text(body, encoding="utf-8")
 
 
@@ -78,20 +78,42 @@ def write_fake_installed_hook(path: Path, marker: Path) -> None:
     )
 
 
-def invoke(
+def write_failing_installed_hook(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "print('boom', file=sys.stderr)\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+
+
+def write_slow_installed_hook(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import time\n"
+        "time.sleep(5)\n",
+        encoding="utf-8",
+    )
+
+
+def invoke_result(
     event: dict[str, object],
     *,
     dev_repo: Path | None,
     hook: Path,
     state: Path,
     extra_env: dict[str, str] | None = None,
-) -> str:
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for key in (
         "CODEX_RVF_DEV_REPO",
         "CODEX_RVF_INSTALLED_STOP_HOOK",
         "CODEX_RVF_DEV_SYNC_STATE_DIR",
         "CODEX_RVF_DEV_SYNC",
+        "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT",
     ):
         env.pop(key, None)
     if dev_repo is not None:
@@ -100,12 +122,29 @@ def invoke(
     env["CODEX_RVF_DEV_SYNC_STATE_DIR"] = str(state)
     if extra_env:
         env.update(extra_env)
-    completed = subprocess.run(
+    return subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
         capture_output=True,
         text=True,
         env=env,
+    )
+
+
+def invoke(
+    event: dict[str, object],
+    *,
+    dev_repo: Path | None,
+    hook: Path,
+    state: Path,
+    extra_env: dict[str, str] | None = None,
+) -> str:
+    completed = invoke_result(
+        event,
+        dev_repo=dev_repo,
+        hook=hook,
+        state=state,
+        extra_env=extra_env,
     )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout
@@ -228,20 +267,77 @@ def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
 
-    stdout = invoke(
+    completed = invoke_result(
         {"cwd": str(repo), "hook_event_name": "Stop"},
         dev_repo=repo,
         hook=hook,
         state=state,
     )
 
-    payload = json.loads(stdout)
-    assert "dev sync" in payload["systemMessage"]
-    assert "失败" in payload["systemMessage"]
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "dev sync" in completed.stderr
+    assert "失败" in completed.stderr
     assert (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
     assert list(state.glob("*.rvf-dev-sync.json"))
+
+
+def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_failing_installed_hook(hook)
+
+    completed = invoke_result(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=None,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    assert completed.returncode == 7
+    assert completed.stdout == ""
+    assert "installed hook failed with exit code 7" in completed.stderr
+    assert "boom" in completed.stderr
+    assert "continue" not in completed.stderr
+
+
+def test_missing_installed_hook_blocks_instead_of_continuing(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    hook = tmp_path / "missing" / "codex_stop_review_validate_fix.py"
+
+    completed = invoke_result(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=None,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout == ""
+    assert "installed hook failed" in completed.stderr
+    assert "No such file" in completed.stderr or "can't open file" in completed.stderr
+    assert "continue" not in completed.stderr
+
+
+def test_installed_hook_timeout_blocks_instead_of_continuing(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_slow_installed_hook(hook)
+
+    completed = invoke_result(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=None,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT": "1"},
+    )
+
+    assert completed.returncode == 124
+    assert completed.stdout == ""
+    assert "installed hook timed out" in completed.stderr
+    assert "continue" not in completed.stderr
 
 
 def test_coerce_text_handles_timeout_bytes() -> None:
@@ -279,6 +375,9 @@ def main() -> int:
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
         test_sync_failure_skips_installed_hook_to_avoid_stale_fork,
+        test_installed_hook_failure_blocks_instead_of_continuing,
+        test_missing_installed_hook_blocks_instead_of_continuing,
+        test_installed_hook_timeout_blocks_instead_of_continuing,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
     ]

@@ -33,6 +33,7 @@ DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "report"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
+SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "gui"
 APP_SERVER_CLIENT_INFO = {
@@ -624,7 +625,16 @@ def run_codex_fork(
         latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return payload
 
-    prompt_path.write_text(prompt, encoding="utf-8")
+    effective_prompt = prompt
+    if suppress_child_stop_hook and SUPPRESS_STOP_HOOK_MARKER not in effective_prompt:
+        effective_prompt = (
+            f"{effective_prompt.rstrip()}\n\n"
+            "Stop hook child-session metadata:\n"
+            f"{SUPPRESS_STOP_HOOK_MARKER}\n"
+            "当前 fork 结束时请跳过 review-validate-fix Stop hook。"
+        )
+
+    prompt_path.write_text(effective_prompt, encoding="utf-8")
 
     result: dict[str, Any] = {
         "timestamp": timestamp,
@@ -633,7 +643,7 @@ def run_codex_fork(
         "parent_thread_id": parent_session_id,
         "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
         "cwd": cwd,
-        "prompt": prompt,
+        "prompt": effective_prompt,
         "prompt_path": str(prompt_path),
         "suppress_child_stop_hook": suppress_child_stop_hook,
         "model": model,
@@ -649,7 +659,7 @@ def run_codex_fork(
             parent_thread_id=parent_session_id,
             parent_thread_path=parent_thread_path,
             cwd=cwd,
-            prompt=prompt,
+            prompt=effective_prompt,
             model=model,
             reasoning_effort=reasoning_effort,
         )
@@ -660,7 +670,7 @@ def run_codex_fork(
                     parent_thread_id=parent_session_id,
                     parent_thread_path=parent_thread_path,
                     cwd=cwd,
-                    prompt=prompt,
+                    prompt=effective_prompt,
                     model=model,
                     reasoning_effort=reasoning_effort,
                     log_path=log_path,
@@ -1519,8 +1529,11 @@ def review_validate_fix_dispatch(event: dict[str, Any], repo: str) -> dict[str, 
     return fork_review_validate_fix(event, repo)
 
 
-def should_suppress(event: dict[str, Any]) -> bool:
+def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bool:
     if any(is_truthy(os.environ.get(name)) for name in SUPPRESS_ENV_NAMES):
+        return True
+
+    if latest_user and SUPPRESS_STOP_HOOK_MARKER in latest_user:
         return True
 
     if event.get("suppress_review_validate_fix") is True:
@@ -1615,7 +1628,7 @@ def main() -> int:
         emit(run_fork_experiment(event, latest_user))
         return 0
 
-    if should_suppress(event):
+    if should_suppress(event, latest_user):
         emit(skip_payload("检测到 suppress 标记或环境变量。"))
         return 0
 

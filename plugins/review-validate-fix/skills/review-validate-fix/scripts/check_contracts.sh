@@ -169,6 +169,7 @@ require_literal "references/review-merge-policy.md" 'scripts/run_alternative_rev
 require_literal "config/alternative-reviewer.json" 'alternative-reviewer:claude-code'
 require_literal "config/alternative-reviewer.json" 'ANTHROPIC_API_KEY'
 require_literal "config/alternative-reviewer.json" 'Bash,Read'
+forbid_literal "config/alternative-reviewer.json" 'dontAsk'
 require_literal "config/alternative-reviewer.json" 'allow_repo_cwd'
 require_literal "config/alternative-reviewer.json" 'no-direct-write'
 require_literal "config/alternative-reviewer.json" 'RVF_LOCK_REQUEST'

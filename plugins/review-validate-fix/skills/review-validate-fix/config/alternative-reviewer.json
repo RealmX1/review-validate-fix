@@ -9,8 +9,6 @@
     "--include-hook-events",
     "--include-partial-messages",
     "--no-session-persistence",
-    "--permission-mode",
-    "dontAsk",
     "--tools",
     "Bash,Read",
     "--append-system-prompt",

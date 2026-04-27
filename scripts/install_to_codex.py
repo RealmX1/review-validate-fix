@@ -84,46 +84,6 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
-def copy_missing_tree(src: Path, dst: Path) -> int:
-    if not src.exists():
-        return 0
-    if dst.exists():
-        if src.is_dir() and not src.is_symlink() and dst.is_dir():
-            copied = 0
-            for child in src.iterdir():
-                if child.name in IGNORE_NAMES or child.name.endswith(".pyc"):
-                    continue
-                copied += copy_missing_tree(child, dst / child.name)
-            return copied
-        return 0
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if src.is_dir() and not src.is_symlink():
-        shutil.copytree(src, dst, ignore=ignore)
-    else:
-        shutil.copy2(src, dst)
-    return 1
-
-
-def migrate_legacy_skill_setup(
-    legacy_skill_dir: Path, plugin_skill_dir: Path, preserve_local_config: bool
-) -> list[str]:
-    if not preserve_local_config or not legacy_skill_dir.exists():
-        return []
-
-    migrated: list[str] = []
-    legacy_config = legacy_skill_dir / "config" / "alternative-reviewer.json"
-    plugin_config = plugin_skill_dir / "config" / "alternative-reviewer.json"
-    if copy_missing_tree(legacy_config, plugin_config):
-        migrated.append(str(Path("config") / "alternative-reviewer.json"))
-
-    legacy_state = legacy_skill_dir / "state"
-    plugin_state = plugin_skill_dir / "state"
-    if copy_missing_tree(legacy_state, plugin_state):
-        migrated.append("state/")
-
-    return migrated
-
-
 def update_marketplace(plugin_parent: Path) -> Path:
     marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
     marketplace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -168,16 +128,6 @@ def update_marketplace(plugin_parent: Path) -> Path:
             file=sys.stderr,
         )
     return marketplace_path
-
-
-def uninstall_standalone_skill(skill_dir: Path) -> bool:
-    if not skill_dir.exists():
-        return False
-    if skill_dir.is_dir() and not skill_dir.is_symlink():
-        shutil.rmtree(skill_dir)
-    else:
-        skill_dir.unlink()
-    return True
 
 
 def configure_stop_hook(plugin_skill_dir: Path) -> Path:
@@ -252,21 +202,9 @@ def configure_stop_hook(plugin_skill_dir: Path) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description="把本仓库 plugin 安装到 Codex 本机 plugin 空间。")
     parser.add_argument(
-        "--as",
-        dest="install_as",
-        choices=["plugin", "skill"],
-        default="plugin",
-        help="兼容旧脚本参数；skill 会作为 plugin-only 安装的旧别名处理。",
-    )
-    parser.add_argument(
         "--plugin-parent",
         default=str(Path.home() / "plugins"),
         help="plugin 父目录；默认符合 ~/.agents/plugins/marketplace.json 的 ./plugins/<name> 约定。",
-    )
-    parser.add_argument(
-        "--installed-skill-dir",
-        default=str(Path.home() / ".codex" / "skills" / SKILL_NAME),
-        help="旧 standalone skill 安装目录；默认安装 plugin 后会删除它。",
     )
     parser.add_argument(
         "--replace-setup-config",
@@ -278,11 +216,6 @@ def main() -> int:
         action="store_true",
         help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 dispatcher 同步本 repo，再以 Codex GUI/app-server fork 调用 plugin skill。",
     )
-    parser.add_argument(
-        "--keep-installed-skill",
-        action="store_true",
-        help="保留旧 ~/.codex/skills/review-validate-fix；默认会卸载 standalone skill。",
-    )
     args = parser.parse_args()
 
     preserve = not args.replace_setup_config
@@ -291,18 +224,10 @@ def main() -> int:
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / SKILL_NAME
-        skill_dir = Path(args.installed_skill_dir).expanduser().resolve()
-        migrated = migrate_legacy_skill_setup(skill_dir, dst / PLUGIN_SKILL_REL, preserve)
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         installed.append(f"plugin: {dst}")
         installed.append(f"marketplace: {marketplace}")
-        if migrated:
-            installed.append(f"migrated legacy standalone setup: {', '.join(migrated)}")
-
-        if not args.keep_installed_skill:
-            if uninstall_standalone_skill(skill_dir):
-                installed.append(f"removed standalone skill: {skill_dir}")
 
         if args.configure_stop_hook:
             hooks_path = configure_stop_hook(dst / PLUGIN_SKILL_REL)

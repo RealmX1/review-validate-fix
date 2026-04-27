@@ -132,17 +132,6 @@ def test_configure_stop_hook_adds_dispatcher_when_missing(tmp_path: Path) -> Non
     assert "python3 /tmp/other.py" in json.dumps(data)
 
 
-def test_uninstall_standalone_skill_removes_existing_dir(tmp_path: Path) -> None:
-    module = load_installer_module()
-    skill_dir = tmp_path / ".codex" / "skills" / "review-validate-fix"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("legacy\n", encoding="utf-8")
-
-    assert module.uninstall_standalone_skill(skill_dir) is True
-    assert not skill_dir.exists()
-    assert module.uninstall_standalone_skill(skill_dir) is False
-
-
 def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     module = load_installer_module()
     src = tmp_path / "src"
@@ -170,60 +159,10 @@ def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     assert not (dst / "old.txt").exists()
 
 
-def test_migrate_legacy_skill_setup_copies_missing_config_and_state(tmp_path: Path) -> None:
-    module = load_installer_module()
-    legacy = tmp_path / "legacy"
-    plugin_skill = tmp_path / "plugin" / "skills" / "review-validate-fix"
-    legacy_config = legacy / "config"
-    legacy_state = legacy / "state" / "session-hook"
-    legacy_config.mkdir(parents=True)
-    legacy_state.mkdir(parents=True)
-    (legacy_config / "alternative-reviewer.json").write_text("legacy config\n", encoding="utf-8")
-    (legacy_state / "thread.json").write_text("legacy state\n", encoding="utf-8")
-
-    migrated = module.migrate_legacy_skill_setup(legacy, plugin_skill, True)
-
-    assert migrated == ["config/alternative-reviewer.json", "state/"]
-    assert (
-        plugin_skill / "config" / "alternative-reviewer.json"
-    ).read_text(encoding="utf-8") == "legacy config\n"
-    assert (
-        plugin_skill / "state" / "session-hook" / "thread.json"
-    ).read_text(encoding="utf-8") == "legacy state\n"
-
-
-def test_migrate_legacy_skill_setup_preserves_existing_plugin_setup(tmp_path: Path) -> None:
-    module = load_installer_module()
-    legacy = tmp_path / "legacy"
-    plugin_skill = tmp_path / "plugin" / "skills" / "review-validate-fix"
-    (legacy / "config").mkdir(parents=True)
-    (legacy / "state").mkdir(parents=True)
-    (legacy / "config" / "alternative-reviewer.json").write_text("legacy config\n", encoding="utf-8")
-    (legacy / "state" / "existing.json").write_text("legacy state\n", encoding="utf-8")
-    (legacy / "state" / "missing.json").write_text("missing state\n", encoding="utf-8")
-    (plugin_skill / "config").mkdir(parents=True)
-    (plugin_skill / "state").mkdir(parents=True)
-    (plugin_skill / "config" / "alternative-reviewer.json").write_text("plugin config\n", encoding="utf-8")
-    (plugin_skill / "state" / "existing.json").write_text("plugin state\n", encoding="utf-8")
-
-    migrated = module.migrate_legacy_skill_setup(legacy, plugin_skill, True)
-
-    assert migrated == ["state/"]
-    assert (
-        plugin_skill / "config" / "alternative-reviewer.json"
-    ).read_text(encoding="utf-8") == "plugin config\n"
-    assert (plugin_skill / "state" / "existing.json").read_text(encoding="utf-8") == "plugin state\n"
-    assert (plugin_skill / "state" / "missing.json").read_text(encoding="utf-8") == "missing state\n"
-
-
-def test_main_accepts_legacy_as_skill_and_migrates_before_uninstall(tmp_path: Path) -> None:
+def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
-    skill_dir = home / ".codex" / "skills" / "review-validate-fix"
-    (skill_dir / "config").mkdir(parents=True)
-    (skill_dir / "state" / "session-hook").mkdir(parents=True)
-    (skill_dir / "config" / "alternative-reviewer.json").write_text("legacy config\n", encoding="utf-8")
-    (skill_dir / "state" / "session-hook" / "thread.json").write_text("legacy state\n", encoding="utf-8")
+    plugin_parent = home / "plugins"
 
     def run_main() -> None:
         def call_main() -> None:
@@ -232,12 +171,8 @@ def test_main_accepts_legacy_as_skill_and_migrates_before_uninstall(tmp_path: Pa
         with_argv(
             [
                 "install_to_codex.py",
-                "--as",
-                "skill",
                 "--plugin-parent",
-                str(home / "plugins"),
-                "--installed-skill-dir",
-                str(skill_dir),
+                str(plugin_parent),
                 "--configure-stop-hook",
             ],
             call_main,
@@ -246,13 +181,9 @@ def test_main_accepts_legacy_as_skill_and_migrates_before_uninstall(tmp_path: Pa
     with_fake_home(module, home, run_main)
 
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
-    assert not skill_dir.exists()
-    assert (
-        plugin_skill / "config" / "alternative-reviewer.json"
-    ).read_text(encoding="utf-8") == "legacy config\n"
-    assert (
-        plugin_skill / "state" / "session-hook" / "thread.json"
-    ).read_text(encoding="utf-8") == "legacy state\n"
+    assert (plugin_skill / "SKILL.md").exists()
+    assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert not (home / ".codex" / "skills" / "review-validate-fix").exists()
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
@@ -263,11 +194,8 @@ def main() -> int:
     tests = [
         test_configure_stop_hook_deduplicates_existing_rvf_hooks,
         test_configure_stop_hook_adds_dispatcher_when_missing,
-        test_uninstall_standalone_skill_removes_existing_dir,
         test_copy_tree_preserves_nested_plugin_setup,
-        test_migrate_legacy_skill_setup_copies_missing_config_and_state,
-        test_migrate_legacy_skill_setup_preserves_existing_plugin_setup,
-        test_main_accepts_legacy_as_skill_and_migrates_before_uninstall,
+        test_main_installs_plugin_and_configures_stop_hook,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

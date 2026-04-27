@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -203,6 +204,7 @@ def run_with_activity_timeout(
         cwd=cwd,
         text=True,
         env=env,
+        start_new_session=True,
     )
     last_activity_at = time.monotonic()
     last_stdout_len = 0
@@ -232,7 +234,7 @@ def run_with_activity_timeout(
             if now - last_activity_at < idle_timeout_seconds:
                 continue
 
-            process.kill()
+            terminate_process_group(process)
             stdout, stderr = process.communicate()
             timeout_line = (
                 f"{EXTERNAL_REVIEWER_TIMEOUT_FLAG} "
@@ -248,6 +250,13 @@ def run_with_activity_timeout(
                 stdout,
                 stderr,
             )
+
+
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except Exception:
+        process.kill()
 
 
 def extract_claude_stream_result(output: str) -> str:

@@ -161,6 +161,10 @@ def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
     payload = parse_json(stdout)
     assert "decision" not in payload
     assert "fork-experiment triggered" in payload["systemMessage"]
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    assert latest["suppress_child_stop_hook"] is True
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in latest["prompt"]
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in latest["app_server_requests"][1]["params"]["input"][0]["text"]
 
 
 def test_stop_hook_active_skips(tmp: Path) -> None:
@@ -174,6 +178,24 @@ def test_env_suppression_skips(tmp: Path) -> None:
     stdout, _ = invoke(
         {"cwd": str(dirty), "stop_hook_active": False},
         extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+    )
+    assert_skip_reason(stdout, "suppress")
+
+
+def test_prompt_suppression_marker_skips(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "00000000-0000-0000-0000-000000000201",
+        "diagnostic fork\n\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+    )
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
     )
     assert_skip_reason(stdout, "suppress")
 
@@ -1516,6 +1538,7 @@ def main() -> int:
         test_fork_experiment_marker_dry_run,
         test_stop_hook_active_skips,
         test_env_suppression_skips,
+        test_prompt_suppression_marker_skips,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
         test_socket_probe_reports_unavailable_reason,

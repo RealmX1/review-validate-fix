@@ -27,6 +27,11 @@ def emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
+def fail_blocking(message: str, code: int = 2) -> int:
+    print(message, file=sys.stderr)
+    return code
+
+
 def read_input() -> tuple[str, dict[str, Any] | None]:
     raw = sys.stdin.read()
     if not raw.strip():
@@ -239,11 +244,11 @@ def write_log(record: dict[str, Any]) -> Path | None:
 def sync_from_dev_repo(repo: Path, event: dict[str, Any]) -> tuple[bool, Path | None, str]:
     python = sys.executable or "python3"
     steps: list[dict[str, Any]] = []
-    sync_script = repo / "scripts" / "sync_plugin_payload.py"
+    contract_script = repo / "scripts" / "check_plugin_contracts.py"
     install_script = repo / "scripts" / "install_to_codex.py"
 
     for script, args in (
-        (sync_script, ["--check-contracts"]),
+        (contract_script, []),
         (install_script, ["--configure-stop-hook"]),
     ):
         if not script.is_file():
@@ -306,42 +311,27 @@ def run_installed_stop_hook(raw_input: str) -> int:
             timeout=stop_hook_timeout(),
         )
     except subprocess.TimeoutExpired as exc:
-        emit(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "review-validate-fix Stop hook dispatcher: installed hook timed "
-                    f"out after {stop_hook_timeout()} seconds. stderr={exc.stderr or ''}"
-                ),
-            }
+        return fail_blocking(
+            "review-validate-fix Stop hook dispatcher: installed hook timed "
+            f"out after {stop_hook_timeout()} seconds. stderr={coerce_text(exc.stderr)}",
+            124,
         )
-        return 0
     except OSError as exc:
-        emit(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "review-validate-fix Stop hook dispatcher: failed to run "
-                    f"installed hook {hook}: {exc}"
-                ),
-            }
+        return fail_blocking(
+            "review-validate-fix Stop hook dispatcher: failed to run "
+            f"installed hook {hook}: {exc}",
+            127,
         )
-        return 0
 
     if completed.returncode == 0:
         sys.stdout.write(completed.stdout)
         return 0
 
-    emit(
-        {
-            "continue": True,
-            "systemMessage": (
-                "review-validate-fix Stop hook dispatcher: installed hook failed "
-                f"with exit code {completed.returncode}. stderr={completed.stderr.strip()}"
-            ),
-        }
+    return fail_blocking(
+        "review-validate-fix Stop hook dispatcher: installed hook failed "
+        f"with exit code {completed.returncode}. stderr={completed.stderr.strip()}",
+        completed.returncode,
     )
-    return 0
 
 
 def main() -> int:
@@ -357,16 +347,11 @@ def main() -> int:
     synced, log_path, sync_reason = sync_from_dev_repo(repo, event)
     if not synced:
         log_note = f"; log={log_path}" if log_path is not None else ""
-        emit(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "review-validate-fix Stop hook 未运行 fork：RVF dev sync "
-                    f"失败，已避免使用旧 installed plugin skill。reason={sync_reason}{log_note}"
-                ),
-            }
+        return fail_blocking(
+            "review-validate-fix Stop hook 未运行 fork：RVF dev sync "
+            f"失败，已避免使用旧 installed plugin skill。reason={sync_reason}{log_note}",
+            2,
         )
-        return 0
 
     return run_installed_stop_hook(raw_input)
 
