@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SRC = ROOT / "plugins" / "review-validate-fix"
 PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
+PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
 
 PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
@@ -95,6 +96,26 @@ def remove_legacy_standalone_skill() -> Path | None:
     return legacy
 
 
+def plugin_version() -> str:
+    data = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+    version = data.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(f"plugin manifest missing version: {PLUGIN_MANIFEST}")
+    return version
+
+
+def marketplace_name() -> str:
+    marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
+    if not marketplace_path.exists():
+        return "local-codex-plugins"
+    try:
+        data = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return "local-codex-plugins"
+    name = data.get("name")
+    return name if isinstance(name, str) and name.strip() else "local-codex-plugins"
+
+
 def update_marketplace(plugin_parent: Path) -> Path:
     marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
     marketplace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +160,20 @@ def update_marketplace(plugin_parent: Path) -> Path:
             file=sys.stderr,
         )
     return marketplace_path
+
+
+def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
+    cache_dir = (
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / marketplace_name()
+        / SKILL_NAME
+        / plugin_version()
+    )
+    copy_tree(PLUGIN_SRC, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
+    return cache_dir
 
 
 def configure_stop_hook(plugin_skill_dir: Path) -> Path:
@@ -238,7 +273,9 @@ def main() -> int:
         removed_legacy = remove_legacy_standalone_skill()
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
+        plugin_cache = sync_codex_plugin_cache(preserve)
         installed.append(f"plugin: {dst}")
+        installed.append(f"plugin cache: {plugin_cache}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:

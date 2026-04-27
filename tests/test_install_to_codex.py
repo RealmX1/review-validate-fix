@@ -167,6 +167,24 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
     legacy_skill.mkdir(parents=True)
     (legacy_skill / "SKILL.md").write_text("legacy standalone\n", encoding="utf-8")
+    cache_skill = (
+        home
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "local-codex-plugins"
+        / "review-validate-fix"
+        / module.plugin_version()
+        / "skills"
+        / "review-validate-fix"
+    )
+    cache_config = cache_skill / "config"
+    cache_state = cache_skill / "state"
+    cache_config.mkdir(parents=True)
+    cache_state.mkdir(parents=True)
+    (cache_skill / "SKILL.md").write_text("stale cached skill\n", encoding="utf-8")
+    (cache_config / "alternative-reviewer.json").write_text("local cache config\n", encoding="utf-8")
+    (cache_state / "run.json").write_text("local cache state\n", encoding="utf-8")
 
     def run_main() -> None:
         def call_main() -> None:
@@ -187,6 +205,12 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     assert (plugin_skill / "SKILL.md").exists()
     assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert (cache_skill / "SKILL.md").read_text(encoding="utf-8") == (
+        module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert (cache_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert (cache_config / "alternative-reviewer.json").read_text(encoding="utf-8") == "local cache config\n"
+    assert (cache_state / "run.json").read_text(encoding="utf-8") == "local cache state\n"
     assert not legacy_skill.exists()
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)

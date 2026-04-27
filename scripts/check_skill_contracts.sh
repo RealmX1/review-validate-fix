@@ -356,6 +356,10 @@ require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_waits_for_handoff_before_advisory'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_missing_cwd_skips_and_requests_target_repo'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_log_unavailable_does_not_break_hook_payload'
+require_repo_literal "scripts/install_to_codex.py" 'sync_codex_plugin_cache'
+require_repo_literal "scripts/install_to_codex.py" '".codex"'
+require_repo_literal "scripts/install_to_codex.py" '"cache"'
+require_repo_literal "tests/test_install_to_codex.py" 'stale cached skill'
 forbid_repo_literal "scripts/install_to_codex.py" 'legacy skill compatibility copy'
 forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy standalone setup'
 
