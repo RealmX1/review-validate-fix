@@ -27,18 +27,28 @@ RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 
 
-def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         cmd,
         cwd=cwd,
         input=input_text,
         capture_output=True,
         text=True,
+        env=env,
         check=False,
     )
     if completed.returncode != 0:
         raise AssertionError(completed.stderr.strip() or completed.stdout.strip() or f"{cmd[0]} failed")
     return completed
+
+
+def read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def init_repo(path: Path) -> Path:
@@ -894,6 +904,173 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert "locked" in locked.stdout
 
 
+def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    state = tmp / "state"
+    run_id = "test-command-lock-lifecycle"
+    env = os.environ.copy()
+    env["CODEX_RVF_LOG_ROOT"] = str(state)
+    env["CODEX_RVF_RUN_ID"] = run_id
+
+    locked = run(
+        [
+            sys.executable,
+            str(COMMAND_LOCK),
+            "--repo",
+            str(repo),
+            "--name",
+            "lifecycle-test",
+            "--",
+            sys.executable,
+            "-c",
+            "print('locked')",
+        ],
+        env=env,
+    )
+
+    assert "locked" in locked.stdout
+    events = read_jsonl(state / "runs" / run_id / "events.jsonl")
+    event_names = [event["event"] for event in events]
+    assert event_names == ["lock_wait_started", "lock_acquired", "lock_released"]
+    assert {event["component"] for event in events} == {"command-lock"}
+    assert all(event["phase"] == "review" for event in events)
+    assert events[1]["lock_name"] == "lifecycle-test"
+    assert events[2]["returncode"] == 0
+
+    summary = json.loads((state / "runs" / run_id / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "completed"
+    assert summary["reason_code"] == "lock_released"
+    assert summary["lock_name"] == "lifecycle-test"
+
+
+def test_command_lock_respects_env_run_dir(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    state = tmp / "state"
+    run_dir = tmp / "custom-run-dir"
+    env = os.environ.copy()
+    env["CODEX_RVF_LOG_ROOT"] = str(state)
+    env["CODEX_RVF_RUN_ID"] = "test-command-lock-custom-dir"
+    env["CODEX_RVF_RUN_DIR"] = str(run_dir)
+
+    run(
+        [
+            sys.executable,
+            str(COMMAND_LOCK),
+            "--repo",
+            str(repo),
+            "--name",
+            "custom-dir-test",
+            "--",
+            sys.executable,
+            "-c",
+            "print('locked')",
+        ],
+        env=env,
+    )
+
+    assert (run_dir / "events.jsonl").exists()
+    assert not (state / "runs" / "test-command-lock-custom-dir" / "events.jsonl").exists()
+    events = read_jsonl(run_dir / "events.jsonl")
+    assert [event["event"] for event in events] == ["lock_wait_started", "lock_acquired", "lock_released"]
+
+
+def test_command_lock_logs_timeout_with_holder_metadata(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    state = tmp / "state"
+    lock_dir = tmp / "locks"
+    holder_env = os.environ.copy()
+    holder_env["CODEX_RVF_LOG_ROOT"] = str(state)
+    holder_env["CODEX_RVF_RUN_ID"] = "test-command-lock-holder"
+    contender_env = os.environ.copy()
+    contender_env["CODEX_RVF_LOG_ROOT"] = str(state)
+    contender_env["CODEX_RVF_RUN_ID"] = "test-command-lock-contender"
+
+    lock_path_result = run(
+        [
+            sys.executable,
+            str(COMMAND_LOCK),
+            "--repo",
+            str(repo),
+            "--name",
+            "contended-test",
+            "--lock-dir",
+            str(lock_dir),
+            "--print-path",
+        ],
+    )
+    metadata_path = Path(lock_path_result.stdout.strip()).with_suffix(".json")
+
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            str(COMMAND_LOCK),
+            "--repo",
+            str(repo),
+            "--name",
+            "contended-test",
+            "--lock-dir",
+            str(lock_dir),
+            "--",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(1)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=holder_env,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not metadata_path.exists():
+            if holder.poll() is not None:
+                stdout, stderr = holder.communicate()
+                raise AssertionError(stderr.strip() or stdout.strip() or "holder exited before acquiring lock")
+            if time.monotonic() >= deadline:
+                raise AssertionError("holder did not acquire lock")
+            time.sleep(0.01)
+
+        contender = subprocess.run(
+            [
+                sys.executable,
+                str(COMMAND_LOCK),
+                "--repo",
+                str(repo),
+                "--name",
+                "contended-test",
+                "--lock-dir",
+                str(lock_dir),
+                "--timeout",
+                "0.05",
+                "--poll-interval",
+                "0.01",
+                "--",
+                sys.executable,
+                "-c",
+                "print('should-not-run')",
+            ],
+            capture_output=True,
+            text=True,
+            env=contender_env,
+            check=False,
+        )
+    finally:
+        if holder.poll() is None:
+            holder.terminate()
+        holder.communicate(timeout=5)
+
+    assert contender.returncode == 75
+    assert "current holder metadata" in contender.stderr
+    events = read_jsonl(state / "runs" / "test-command-lock-contender" / "events.jsonl")
+    event_names = [event["event"] for event in events]
+    assert event_names == ["lock_wait_started", "lock_timeout"]
+    timeout_event = events[-1]
+    assert timeout_event["reason_code"] == "lock_timeout"
+    assert timeout_event["lock_name"] == "contended-test"
+    assert "holder_metadata" in timeout_event
+    assert "contended-test" in str(timeout_event["holder_metadata"])
+
+
 def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
@@ -1329,6 +1506,9 @@ def main() -> int:
         test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore")
         test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
+        test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle")
+        test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir")
+        test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout")
         test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript")
         test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")

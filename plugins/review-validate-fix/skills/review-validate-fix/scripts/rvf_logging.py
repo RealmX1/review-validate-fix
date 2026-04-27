@@ -14,6 +14,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_ROOT = SKILL_DIR / "state"
 DEFAULT_INLINE_BYTES = 2048
 COMPONENTS = {
+    "command-lock",
     "dispatcher",
     "stop-hook",
     "prepare-run",
@@ -115,7 +116,14 @@ class RunLedger:
             or self.run_id
         )
         self.root = log_root()
-        self.run_dir = Path(run_dir).expanduser() if run_dir else self.root / "runs" / self.run_id
+        env_run_dir = os.environ.get("CODEX_RVF_RUN_DIR")
+        self.run_dir = (
+            Path(run_dir).expanduser()
+            if run_dir
+            else Path(env_run_dir).expanduser()
+            if env_run_dir
+            else self.root / "runs" / self.run_id
+        )
         self.events_path = self.run_dir / "events.jsonl"
         self.summary_path = self.run_dir / "summary.json"
         self.artifacts_dir = self.run_dir / "artifacts"
@@ -144,6 +152,7 @@ class RunLedger:
             "CODEX_RVF_RUN_ID": self.run_id,
             "CODEX_RVF_CORRELATION_ID": self.correlation_id,
             "CODEX_RVF_LOG_ROOT": str(self.root),
+            "CODEX_RVF_RUN_DIR": str(self.run_dir),
         }
 
     def artifact_path(self, name: str) -> Path:

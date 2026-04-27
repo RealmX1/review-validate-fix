@@ -436,6 +436,7 @@ def main() -> int:
         return fail(f"找不到 alternative reviewer 命令: {command[0]}", 2)
 
     env = scrub_env(env_unset)
+    env.update(ledger.env())
 
     if args.check:
         ledger.event(
