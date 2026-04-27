@@ -5,7 +5,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 # Review Validate Fix
 
-本 skill 用于对当前对话的 session-scoped 未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。Codex 环境中优先使用 `scripts/session_manifest.py` 从当前 transcript 生成 session ownership manifest；`git diff HEAD` 是证据，不是默认 scope 来源。
+本 skill 默认用于对当前对话的 session-scoped 未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。用户手动调用 `$review-validate-fix` 时，可以显式要求主会话提供自定义 review scope（例如指定文件、目录、commit range、已完成设计或 clean repo 中要审查的实现面）；这种 manual scoped review 不得被 clean repo 阻塞。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。Codex 环境中优先使用 `scripts/session_manifest.py` 从当前 transcript 生成 session ownership manifest；`git diff HEAD` 是证据，不是默认 scope 来源。
 
 本 skill 只应由用户显式调用，例如 `$review-validate-fix`。`agents/openai.yaml` 将 `policy.allow_implicit_invocation` 设为 `false`，避免 agent 或模型因为相似上下文自动启用它。
 
@@ -14,13 +14,13 @@ description: Use when the user asks for a post-work code review loop, review val
 ## 入口判断
 
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
-2. 如果没有未提交改动，用中文说明没有可审查改动并结束。
+2. 如果没有未提交改动，先检查本轮 `$review-validate-fix` prompt 是否明确给出了 manual custom scope，或明确要求主会话按用户提供的范围写 scope-of-work。若没有，才用中文说明没有可审查改动并结束；若有，则继续执行 manual scoped review，并在 scope-of-work 中明确写出“仓库当前 clean；本轮审查范围来自用户显式指定，而不是未提交 diff”。
 3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件；但不要把 whole-repo dirty diff 当成默认 review scope。
-4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、每个文件中实际做了哪些编辑、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope。
+4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作或用户显式指定的 manual review scope、主会话确认改过或需要审查的文件、每个文件中实际做了哪些编辑或本轮要重点审查的代码面、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容或明确的审查目标，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”“clean repo 手动审查 A/B 模块的错误处理路径”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope。
 5. 如果 Stop event、fork prompt 或当前环境提供 Codex JSONL transcript path，先用 `scripts/session_manifest.py --repo <repo> --transcript <jsonl> --output <manifest>` 生成 session ownership manifest。manifest 中的 `owned_paths` / `owned_dirty_paths` 是默认 review scope；`unattributed_dirty_paths` 是背景 WIP，不得主动审查，除非它被 session-owned 改动直接连带影响。
 6. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file> --transcript <jsonl>` 或 `--session-manifest <manifest>` 创建唯一 run 目录；该脚本会把 scope-of-work 和 manifest 复制到 run 目录，并生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --session-manifest <manifest> --output <packet> --metadata-output <metadata>`。
 7. 如果没有 transcript/manifest，仍必须提供可靠 scope-of-work；如果既无法生成 manifest，也无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
-8. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
+8. 如果已知本 turn 的主修改文件、manual custom scope 文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。clean repo 的 manual scoped review 也应把用户指定路径作为 `--primary-file` 传入，让 packet 明确保留 scope anchor。
 9. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
 
 ## 运行选项

@@ -440,6 +440,51 @@ def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
 
 
+def test_build_packet_allows_clean_repo_with_manual_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    run(["git", "add", "tracked.txt", "new.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "settle worktree"], cwd=repo)
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：manual scoped review\n"
+        "- 本 turn 主会话实际完成的工作：仓库当前 clean；本轮审查范围来自用户显式指定\n"
+        "- Scope：审查 tracked.txt 的现有实现面\n",
+        encoding="utf-8",
+    )
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+            "--primary-file",
+            "tracked.txt",
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Review Scope" in packet_text
+    assert "Primary files for this turn:" in packet_text
+    assert "tracked.txt" in packet_text
+    assert "## Git Status\n\n```text\n(clean)\n```" in packet_text
+    assert "## Git Diff HEAD\n\n```diff\n(no tracked diff)\n```" in packet_text
+    assert payload["status_bytes"] == 0
+    assert payload["diff_bytes"] == 0
+    assert payload["primary_files"] == ["tracked.txt"]
+    assert payload["session_context_provided"] is True
+
+
 def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
@@ -1274,6 +1319,7 @@ def main() -> int:
         test_check_review_output_lock_request()
         test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
+        test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope")
         test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest")
         test_session_manifest_resolves_exec_paths_from_command_workdir(root / "session-manifest-workdir")
         test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest")
