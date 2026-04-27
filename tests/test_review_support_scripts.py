@@ -889,6 +889,7 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert Path(payload["before_workspace_snapshot"]).exists()
     assert Path(payload["scope_of_work_file"]).exists()
     assert Path(payload["review_env_file"]).exists()
+    assert Path(payload["review_agent_context_file"]).exists()
     assert payload["session_context"] == payload["scope_of_work_file"]
     assert payload["source_session_context"] == str(context.resolve())
     assert payload["session_context_provided"] is True
@@ -901,6 +902,15 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"' in review_env_text
     assert 'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"' in review_env_text
+    review_agent_context_text = Path(payload["review_agent_context_file"]).read_text(encoding="utf-8")
+    assert payload["review_agent_context"] == review_agent_context_text
+    assert "## RVF Generated Reviewer Context" in review_agent_context_text
+    assert f". {payload['review_env_file']}" in review_agent_context_text
+    assert "- scope-of-work: `$RVF_SCOPE_OF_WORK`" in review_agent_context_text
+    assert "- review packet: `$RVF_REVIEW_PACKET`" in review_agent_context_text
+    assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
+    assert payload["scope_of_work_file"] not in review_agent_context_text
+    assert payload["review_packet"] not in review_agent_context_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
     packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
     assert metadata["excluded_path_prefixes"] == ["secret.txt"]
