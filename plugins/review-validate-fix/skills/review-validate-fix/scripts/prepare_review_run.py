@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
 SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
+COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -50,6 +52,61 @@ def safe_repo_name(repo: Path) -> str:
 
 def default_base_dir() -> Path:
     return Path(tempfile.gettempdir()) / "review-validate-fix-runs"
+
+
+def review_env_exports(
+    *,
+    repo: Path,
+    run_id: str,
+    run_dir: Path,
+    artifacts_dir: Path,
+    scope_of_work_path: Path | None,
+    session_manifest_path: Path | None,
+    packet_path: Path,
+    metadata_path: Path,
+    snapshot_path: Path,
+) -> tuple[dict[str, str], str]:
+    env: dict[str, str] = {
+        "RVF_REPO": str(repo),
+        "RVF_RUN_ID": run_id,
+        "RVF_RUN_DIR": str(run_dir),
+        "RVF_ARTIFACTS_DIR": str(artifacts_dir),
+        "RVF_REVIEW_PACKET": str(packet_path),
+        "RVF_REVIEW_PACKET_METADATA": str(metadata_path),
+        "RVF_BEFORE_WORKSPACE_SNAPSHOT": str(snapshot_path),
+        "RVF_COMMAND_LOCK": str(COMMAND_LOCK),
+    }
+    if scope_of_work_path is not None:
+        env["RVF_SCOPE_OF_WORK"] = str(scope_of_work_path)
+        env["RVF_SESSION_CONTEXT"] = str(scope_of_work_path)
+    if session_manifest_path is not None:
+        env["RVF_SESSION_MANIFEST"] = str(session_manifest_path)
+
+    lines = [
+        "# Source this file in review subprocesses to avoid repeating long RVF paths.",
+        f"export RVF_REPO={shlex.quote(env['RVF_REPO'])}",
+        f"export RVF_RUN_ID={shlex.quote(env['RVF_RUN_ID'])}",
+        f"export RVF_RUN_DIR={shlex.quote(env['RVF_RUN_DIR'])}",
+    ]
+    if artifacts_dir == run_dir / "artifacts":
+        lines.append('export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"')
+    else:
+        lines.append(f"export RVF_ARTIFACTS_DIR={shlex.quote(env['RVF_ARTIFACTS_DIR'])}")
+    if scope_of_work_path is not None:
+        lines.append('export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"')
+        lines.append('export RVF_SESSION_CONTEXT="$RVF_SCOPE_OF_WORK"')
+    if session_manifest_path is not None:
+        lines.append('export RVF_SESSION_MANIFEST="$RVF_ARTIFACTS_DIR/session-manifest.json"')
+    lines.extend(
+        [
+            'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"',
+            'export RVF_REVIEW_PACKET_METADATA="$RVF_ARTIFACTS_DIR/review-packet.metadata.json"',
+            'export RVF_BEFORE_WORKSPACE_SNAPSHOT="$RVF_ARTIFACTS_DIR/before-workspace-snapshot.json"',
+            f"export RVF_COMMAND_LOCK={shlex.quote(env['RVF_COMMAND_LOCK'])}",
+            "",
+        ]
+    )
+    return env, "\n".join(lines)
 
 
 def prepare_run(
@@ -97,6 +154,7 @@ def prepare_run(
     snapshot_path = artifact_dir / "before-workspace-snapshot.json"
     scope_of_work_path = artifact_dir / "scope-of-work.md"
     session_manifest_path = artifact_dir / "session-manifest.json"
+    review_env_path = artifact_dir / "review-env.sh"
 
     packet_session_context = session_context
     if session_context is not None:
@@ -166,6 +224,20 @@ def prepare_run(
     )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    scope_path = scope_of_work_path if session_context is not None else None
+    manifest_path = session_manifest_path if packet_session_manifest is not None else None
+    review_env, review_env_text = review_env_exports(
+        repo=root,
+        run_id=ledger.run_id,
+        run_dir=ledger.run_dir,
+        artifacts_dir=artifact_dir,
+        scope_of_work_path=scope_path,
+        session_manifest_path=manifest_path,
+        packet_path=packet_path,
+        metadata_path=metadata_path,
+        snapshot_path=snapshot_path,
+    )
+    review_env_path.write_text(review_env_text, encoding="utf-8")
     result = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "repo": str(root),
@@ -179,6 +251,8 @@ def prepare_run(
         "before_workspace_snapshot": str(snapshot_path),
         "scope_of_work_file": str(scope_of_work_path) if session_context is not None else None,
         "session_manifest_file": str(session_manifest_path) if packet_session_manifest is not None else None,
+        "review_env_file": str(review_env_path),
+        "review_env": review_env,
         "source_session_context": str(session_context) if session_context is not None else None,
         "source_session_manifest": source_session_manifest,
         "packet_bytes": metadata.get("packet_bytes"),
@@ -209,6 +283,7 @@ def prepare_run(
             "snapshot": str(snapshot_path),
             "scope_of_work": str(scope_of_work_path) if session_context is not None else None,
             "session_manifest": str(session_manifest_path) if packet_session_manifest is not None else None,
+            "review_env": str(review_env_path),
         },
         packet_bytes=metadata.get("packet_bytes"),
     )

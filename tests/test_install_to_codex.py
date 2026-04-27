@@ -216,6 +216,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
     assert str(plugin_skill / "scripts" / "codex_stop_hook_dispatcher.py") in matching[0]["command"]
+    assert matching[0]["statusMessage"] == "Review-Validate-Fix：同步插件并运行停止检查"
 
 
 def main() -> int:

@@ -1715,7 +1715,14 @@ def main() -> int:
     )
 
     if event.get("stop_hook_active") is True:
-        emit(skip_payload("检测到 stop_hook_active=true，为避免递归已跳过。", ledger, "stop_hook_active"))
+        emit(
+            skip_payload(
+                "检测到 stop_hook_active=true，为避免递归已跳过。",
+                ledger,
+                "stop_hook_active",
+                detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
+            )
+        )
         return 0
 
     latest_user = latest_user_message_from_event(event)

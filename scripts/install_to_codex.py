@@ -199,7 +199,7 @@ def configure_stop_hook(plugin_skill_dir: Path) -> Path:
         "type": "command",
         "command": command,
         "timeout": 180,
-        "statusMessage": "Syncing/checking review-validate-fix gate",
+        "statusMessage": "Review-Validate-Fix：同步插件并运行停止检查",
     }
 
     target_group: dict[str, object] | None = None

@@ -304,6 +304,7 @@ class RunLedger:
         reason_code: str,
         continue_: bool = True,
         message: str | None = None,
+        detail: str | None = None,
         **summary_fields: Any,
     ) -> dict[str, Any]:
         summary = self.summary(
@@ -318,8 +319,9 @@ class RunLedger:
                 "log_unavailable=true"
             )
         else:
+            detail_note = f"; detail={detail}" if detail else ""
             system_message = (
-                f"review-validate-fix: {status}; reason={reason_code}; "
+                f"review-validate-fix: {status}; reason={reason_code}{detail_note}; "
                 f"summary={self.summary_path}"
             )
         return {"continue": continue_, "systemMessage": system_message}

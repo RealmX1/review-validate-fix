@@ -142,28 +142,40 @@ def check_repo(repo: Path) -> None:
 
 def build_prompt(prompt_file: Path, session_context: Path | None, review_packet: Path | None, repo: Path | None) -> str:
     parts = []
-    if session_context is not None:
-        parts.append(
-            "\n".join(
-                [
-                    "## Scope of work file",
-                    f"- Path: `{session_context}`",
-                    "- Treat this file as the main agent's scope anchor. Read it before analyzing code.",
-                    "- Do not use the entire git diff as full review scope unless the main agent explicitly requested full diff review.",
-                ]
-            )
-        )
+    env_lines = [
+        "## Review session environment",
+        "- The reviewer process receives short-lived `RVF_*` environment variables for this review session.",
+        "- Use these variables in commands and notes instead of expanding absolute artifact paths.",
+    ]
     if repo is not None:
-        parts.append(
-            "\n".join(
-                [
-                    "## Runtime helpers",
-                    f"- RVF command lock wrapper: `{COMMAND_LOCK}`",
-                    f"- Example: `python3 {COMMAND_LOCK} --repo {repo} --name <stable-lock-name> -- <command ...>`",
-                    "- If a potentially conflicting command needs coordination and no lock is available, output `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` as the only response so the main agent can provide a locked retry.",
-                ]
-            )
+        env_lines.append("- `RVF_REPO`: target repository. Use it as the repo path if `pwd` is not already the repo.")
+    if session_context is not None:
+        env_lines.extend(
+            [
+                "- `RVF_SCOPE_OF_WORK`: main-agent scope anchor. Read it before analyzing code.",
+            ]
         )
+    if review_packet is not None:
+        env_lines.append("- `RVF_REVIEW_PACKET`: self-contained review packet and fallback context.")
+    if session_context is not None or review_packet is not None:
+        read_targets = []
+        if session_context is not None:
+            read_targets.append('"$RVF_SCOPE_OF_WORK"')
+        if review_packet is not None:
+            read_targets.append('"$RVF_REVIEW_PACKET"')
+        env_lines.append(f"- Read entry files with: `sed -n '1,220p' {' '.join(read_targets)}`")
+    if repo is not None:
+        env_lines.extend(
+            [
+                "- `RVF_COMMAND_LOCK`: repo-scoped command lock wrapper.",
+                '- Example: `python3 "$RVF_COMMAND_LOCK" --repo "$RVF_REPO" --name <stable-lock-name> -- <command ...>`',
+                "- If a potentially conflicting command needs coordination and no lock is available, output `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` as the only response so the main agent can provide a locked retry.",
+            ]
+        )
+    if session_context is not None:
+        env_lines.append("- Do not use the entire git diff as full review scope unless the main agent explicitly requested full diff review.")
+    if len(env_lines) > 3:
+        parts.append("\n".join(env_lines))
     parts.append(prompt_file.read_text(encoding="utf-8").strip())
     if review_packet is not None:
         parts.append(review_packet.read_text(encoding="utf-8").strip())

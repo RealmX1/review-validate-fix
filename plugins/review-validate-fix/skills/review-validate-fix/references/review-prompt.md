@@ -13,7 +13,7 @@
 - 未完成 / 不确定 / 需要 reviewer 特别核实：<没有就写“无”>
 ```
 
-传给两个独立 review pass 的正文。两个 reviewer 使用相同 prompt、同一个 scope-of-work 文件路径、同一个 session manifest 文件路径（如果有）和同一份 review packet 路径，但不要共享彼此输出：
+传给两个独立 review pass 的正文。两个 reviewer 使用相同 prompt、同一个 scope-of-work 文件路径、同一个 session manifest 文件路径（如果有）和同一份 review packet 路径，但不要共享彼此输出。如果主会话或 reviewer runner 提供 `RVF_*` 环境变量，优先用 `$RVF_SCOPE_OF_WORK`、`$RVF_SESSION_MANIFEST`、`$RVF_REVIEW_PACKET`、`$RVF_COMMAND_LOCK` 等短变量读取入口文件和包装命令；不要在报告或命令示例中反复展开同一个 run/artifacts 绝对路径。
 
 ```markdown
 pass_type: review_only

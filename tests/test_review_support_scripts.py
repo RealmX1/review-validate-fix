@@ -888,10 +888,19 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert Path(payload["review_packet_metadata"]).exists()
     assert Path(payload["before_workspace_snapshot"]).exists()
     assert Path(payload["scope_of_work_file"]).exists()
+    assert Path(payload["review_env_file"]).exists()
     assert payload["session_context"] == payload["scope_of_work_file"]
     assert payload["source_session_context"] == str(context.resolve())
     assert payload["session_context_provided"] is True
     assert payload["excluded_path_prefixes"] == ["secret.txt"]
+    assert payload["review_env"]["RVF_REPO"] == str(repo.resolve())
+    assert payload["review_env"]["RVF_SCOPE_OF_WORK"] == payload["scope_of_work_file"]
+    assert payload["review_env"]["RVF_REVIEW_PACKET"] == payload["review_packet"]
+    review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
+    assert "export RVF_RUN_DIR=" in review_env_text
+    assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
+    assert 'export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"' in review_env_text
+    assert 'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"' in review_env_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
     packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
     assert metadata["excluded_path_prefixes"] == ["secret.txt"]
@@ -915,6 +924,27 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
         ]
     )
     assert "locked" in locked.stdout
+
+
+def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
+    module = load_alternative_reviewer_module()
+    repo = init_repo(tmp / "repo")
+    prompt_file = tmp / "review-prompt.md"
+    prompt_file.write_text("# Review Prompt\n\nBody\n", encoding="utf-8")
+    context = tmp / "very" / "long" / "artifacts" / "scope-of-work.md"
+    context.parent.mkdir(parents=True)
+    context.write_text("scope\n", encoding="utf-8")
+    packet = tmp / "very" / "long" / "artifacts" / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+
+    prompt = module.build_prompt(prompt_file, context, packet, repo)
+
+    assert "$RVF_SCOPE_OF_WORK" in prompt
+    assert "$RVF_REVIEW_PACKET" in prompt
+    assert "$RVF_COMMAND_LOCK" in prompt
+    assert "$RVF_REPO" in prompt
+    assert str(context) not in prompt
+    assert str(module.COMMAND_LOCK) not in prompt
 
 
 def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
@@ -1639,6 +1669,7 @@ def main() -> int:
         test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore")
         test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
+        test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env")
         test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle")
         test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir")
         test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout")

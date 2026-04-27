@@ -234,7 +234,8 @@ def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
 def test_stop_hook_active_skips(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
-    assert_skip_reason(stdout, "stop_hook_active=true")
+    payload = assert_skip_reason(stdout, "stop_hook_active=true")
+    assert "detail=Codex 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
 
 
 def test_env_suppression_skips(tmp: Path) -> None:

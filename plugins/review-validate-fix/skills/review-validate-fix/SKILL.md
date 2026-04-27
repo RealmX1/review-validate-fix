@@ -18,10 +18,11 @@ description: Use when the user asks for a post-work code review loop, review val
 3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件；但不要把 whole-repo dirty diff 当成默认 review scope。
 4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作或用户显式指定的 manual review scope、主会话确认改过或需要审查的文件、每个文件中实际做了哪些编辑或本轮要重点审查的代码面、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容或明确的审查目标，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”“clean repo 手动审查 A/B 模块的错误处理路径”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope。
 5. 如果 Stop event、fork prompt 或当前环境提供 Codex JSONL transcript path，先用 `scripts/session_manifest.py --repo <repo> --transcript <jsonl> --output <manifest>` 生成 session ownership manifest。manifest 中的 `owned_paths` / `owned_dirty_paths` 是默认 review scope；`unattributed_dirty_paths` 是背景 WIP，不得主动审查，除非它被 session-owned 改动直接连带影响。
-6. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file> --transcript <jsonl>` 或 `--session-manifest <manifest>` 创建唯一 run 目录；该脚本会把 scope-of-work 和 manifest 复制到 run 目录，并生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --session-manifest <manifest> --output <packet> --metadata-output <metadata>`。
-7. 如果没有 transcript/manifest，仍必须提供可靠 scope-of-work；如果既无法生成 manifest，也无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
-8. 如果已知本 turn 的主修改文件、manual custom scope 文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。clean repo 的 manual scoped review 也应把用户指定路径作为 `--primary-file` 传入，让 packet 明确保留 scope anchor。
-9. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
+6. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file> --transcript <jsonl>` 或 `--session-manifest <manifest>` 创建唯一 run 目录；该脚本会把 scope-of-work 和 manifest 复制到 run 目录，并生成 self-contained review packet、packet metadata、review 前 workspace snapshot 和 `review-env.sh`。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --session-manifest <manifest> --output <packet> --metadata-output <metadata>`。
+7. `prepare_review_run.py` 输出中的 `review_env_file` / `review_env` 是本轮 review session 的短期路径上下文。后续 prompt、命令示例和子代理交接应优先使用 `RVF_RUN_DIR`、`RVF_ARTIFACTS_DIR`、`RVF_SCOPE_OF_WORK`、`RVF_SESSION_MANIFEST`、`RVF_REVIEW_PACKET`、`RVF_COMMAND_LOCK` 等变量；不要在同一段 prompt 中反复展开 `state/runs/<run_id>/artifacts/...` 的绝对路径。给 Codex-native reviewer 子代理时，最多提供一次 `RVF_RUN_DIR=<abs>` / `RVF_REPO=<abs>` 的 export block，然后用 `$RVF_ARTIFACTS_DIR/scope-of-work.md`、`$RVF_REVIEW_PACKET` 等变量引用入口文件。
+8. 如果没有 transcript/manifest，仍必须提供可靠 scope-of-work；如果既无法生成 manifest，也无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
+9. 如果已知本 turn 的主修改文件、manual custom scope 文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。clean repo 的 manual scoped review 也应把用户指定路径作为 `--primary-file` 传入，让 packet 明确保留 scope anchor。
+10. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
 
 ## 运行选项
 
@@ -77,6 +78,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - review 阶段优先使用能力隔离，而不是事后追责：
   - Codex-native reviewer 优先用探索型 agent；如果当前 Codex agent API 暴露工具或 capability allowlist，就保留读取、检索、shell/test 能力，不授予直接编辑、patch、文件写入、stage、commit 或 validate/fix 相关能力。
   - 启动 Codex-native reviewer 子代理时，必须继承当前主会话所在 worktree / cwd 和上下文；如果 `spawn_agent` 支持 `fork_context`，必须设为 `true`。reviewer prompt 里要给出目标 repo 的绝对路径，并要求它在该路径下读取文件和运行命令，不得默认落到 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree。
+  - Codex-native reviewer prompt 应使用 `prepare_review_run.py` 生成的 `review_env` 变量作为入口文件引用格式，避免把同一个 artifacts 目录绝对路径复制到 scope、packet、metadata、snapshot、lock wrapper 等每一项上。可以给出一次短 export block；后续一律写 `$RVF_SCOPE_OF_WORK`、`$RVF_REVIEW_PACKET`、`$RVF_COMMAND_LOCK`。
   - 如果当前 Codex `spawn_agent` 接口没有显式 capability allowlist（只有 agent type / model / reasoning 等参数），不要把 prompt 当成硬沙箱；仍可让 reviewer 读取仓库、运行测试/lint/build，但必须在 prompt 中明确禁止直接写文件、修复、stage/commit 和 handoff。
   - external alternative reviewer 应允许读取仓库并运行测试命令；配置层面只剥离直接编辑/写入工具。不要因为 reviewer 需要 shell 或 repo cwd 就降级为 fallback。
 - `alternative reviewer` 可以是用户配置的任意外部 coding agent（例如某个 CLI、MCP 暴露的 agent、IDE agent 或本地 wrapper）。不要在本 skill 中硬编码具体 vendor、模型名或命令名。
@@ -89,7 +91,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
 - Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
-- 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径、同一份 session manifest 文件路径（如果有）和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；session manifest 是机器提取的 ownership anchor；reviewer 应结合它们判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以 session manifest 的 owned paths 和主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
+- 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径、同一份 session manifest 文件路径（如果有）和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径或本轮 `RVF_*` 变量交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；session manifest 是机器提取的 ownership anchor；reviewer 应结合它们判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以 session manifest 的 owned paths 和主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
 - 完成态 Review 输出契约必须严格为：
   - 无问题：只输出 `NO_ISSUES`。
   - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。
