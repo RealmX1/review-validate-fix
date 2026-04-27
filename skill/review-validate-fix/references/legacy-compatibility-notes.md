@@ -27,14 +27,14 @@
 
 新 fork 会话完成 `$review-validate-fix` 后，如果 Stop 事件的 `last_assistant_message` 已包含 `<handoff-context>`，Stop hook 会通过 systemMessage 程序化提示用户复制最终回复里的 handoff block，再粘贴回原始 chat session。这个提示不由 agent 正文生成。
 
-Codex Stop continuation 仍作为 fallback：设置 `CODEX_RVF_MODE=continuation` 时，hook 使用 `decision: "block"` 创建同线程 continuation prompt。该模式能自动提交显式 `$review-validate-fix`，但不会产生独立 fork checkpoint。
+Codex Stop continuation 不再作为 fallback：设置 `CODEX_RVF_MODE=continuation` 时，hook 只报告该 fallback 已禁用和 GUI fork 创建失败，不再使用 `decision: "block"` 创建同线程 continuation prompt。实测该内容不会成为真正的新用户 prompt，只会作为 Stop hook system context 出现在轨迹中，容易误导主会话重复运行流程。
 
 实现约束：
 
 - hook 只做 gate、app-server fork/turn 注入和结束提示，不直接执行 review/fix。
 - `stop_hook_active=true` 时必须跳过，避免递归。
-- 当前 `cwd` 是 dirty git repo 时才直接触发；如果 `cwd` 不是 git repo，只能在唯一 dirty trusted repo 可确定时触发。
-- 多个 dirty trusted repo 时必须 fail-safe 跳过，避免审错仓库。
+- 当前 `cwd` 位于 dirty git repo/worktree 内时才直接触发；如果 `cwd` 不在任何 git repo/worktree 内，必须 fail-safe 跳过并要求主会话询问用户提供目标 repo 路径。
+- 不扫描 `cwd` 子目录、trusted projects 或其他候选 repo 来猜测目标，避免审错仓库。
 - app-server fork 优先使用 Stop event 暴露的 rollout path；只有没有可用 path 时才退回 thread/session id。
 - 正式 review fork 不设置 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，否则结束时无法发出 handoff 复制提示；实验 fork 可以设置该 suppress 标记。
 - `CODEX_RVF_FORK_MODE=gui` 是默认自动路径；`manual` / `dry-run` 只用于调试 prompt 与 app-server request。Terminal/CLI fork 自动启动已禁用。

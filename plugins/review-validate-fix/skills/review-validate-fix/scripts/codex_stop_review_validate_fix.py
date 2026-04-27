@@ -28,8 +28,8 @@ DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
-DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 0.75
-DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "continuation"
+DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
+DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "report"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -601,8 +601,8 @@ def run_codex_fork(
     model: str | None = None,
     reasoning_effort: str | None = None,
     parent_thread_path: Path | None = None,
-    fallback_continuation_reason: str | None = None,
-    allow_fallback_continuation: bool = True,
+    fallback_failure_reason: str | None = None,
+    allow_desktop_unavailable_report: bool = True,
 ) -> dict[str, Any]:
     mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
 
@@ -675,13 +675,13 @@ def run_codex_fork(
             if isinstance(socket_selection, dict):
                 failure["socket_selection"] = socket_selection
                 bridge_policy = socket_selection.get("bridge_policy")
-                if bridge_policy == "continuation":
-                    if allow_fallback_continuation:
-                        failure["status"] = "desktop-control-unavailable-continuation"
-                        return_payload = {
-                            "decision": "block",
-                            "reason": fallback_continuation_reason or prompt,
-                        }
+                if bridge_policy == "report":
+                    if allow_desktop_unavailable_report:
+                        failure["status"] = "desktop-control-unavailable-report"
+                        failure["report_reason"] = (
+                            fallback_failure_reason
+                            or "Codex Desktop control socket unavailable; GUI fork was not created."
+                        )
                     else:
                         failure["status"] = "manual-prepared"
                         failure["desktop_control_unavailable_fallback"] = "manual"
@@ -689,10 +689,7 @@ def run_codex_fork(
                     failure["status"] = "manual-prepared"
                 elif bridge_policy == "fail":
                     failure["status"] = "desktop-control-unavailable-fail"
-                    return_payload = {
-                        "decision": "block",
-                        "reason": failure["error"],
-                    }
+                    failure["report_reason"] = failure["error"]
             result.update(failure)
     else:
         result.update(
@@ -745,6 +742,12 @@ def run_codex_fork(
             f"{log_prefix} forked in {target_name}{socket_note}: "
             f"fork_thread_id={result.get('fork_thread_id')}; "
             f"parent_thread_id={parent_session_id}; log={log_path}"
+        )
+    elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
+        report_reason = result.get("report_reason")
+        reason = report_reason if isinstance(report_reason, str) else "Codex GUI fork unavailable."
+        message = (
+            f"{reason} parent_thread_id={parent_session_id}; log={log_path}"
         )
     else:
         if status == "app-server-failed":
@@ -1015,7 +1018,7 @@ def bridge_gui_unverified_policy() -> str:
         return "manual"
     if value in {"fail", "error"}:
         return "fail"
-    return "continuation"
+    return "report"
 
 
 def ensure_bridge_app_server() -> Path:
@@ -1438,7 +1441,7 @@ def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, An
         model=model,
         reasoning_effort=reasoning_effort,
         parent_thread_path=session_path,
-        allow_fallback_continuation=False,
+        allow_desktop_unavailable_report=False,
     )
     latest_path = state_dir() / "latest.json"
     try:
@@ -1462,30 +1465,45 @@ def should_run_fork_experiment(event: dict[str, Any]) -> tuple[bool, str | None]
 def rvf_mode() -> str:
     mode = os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE).strip().lower()
     if mode in {"continuation", "continue", "block"}:
-        return "continuation"
+        return "report"
     if mode in {"off", "skip", "disabled", "disable"}:
         return "off"
     return "fork"
 
 
+def fork_cwd_for_event(event: dict[str, Any], repo: str) -> str:
+    cwd_value = event.get("cwd")
+    if not isinstance(cwd_value, str) or not cwd_value.strip():
+        return repo
+
+    try:
+        cwd_path = Path(cwd_value).expanduser().resolve()
+        repo_path = Path(repo).expanduser().resolve()
+    except OSError:
+        return repo
+
+    if cwd_path == repo_path or path_is_relative_to(cwd_path, repo_path):
+        return str(cwd_path)
+    return repo
+
+
 def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]:
     parent_session_id = parent_thread_id_from_event(event) or ""
     parent_thread_path = parent_thread_path_from_event(event)
-    cwd_value = event.get("cwd")
-    cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else repo
+    cwd = fork_cwd_for_event(event, repo)
     prompt = fork_review_validate_fix_prompt(parent_session_id, cwd, repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
     return run_codex_fork(
         parent_session_id=parent_session_id,
-        cwd=repo,
+        cwd=cwd,
         prompt=prompt,
         log_prefix="review-validate-fix-fork",
         suppress_child_stop_hook=False,
         model=model,
         reasoning_effort=reasoning_effort,
         parent_thread_path=parent_thread_path,
-        fallback_continuation_reason=continuation_reason(repo),
+        fallback_failure_reason=fork_failure_report(repo),
     )
 
 
@@ -1496,8 +1514,8 @@ def review_validate_fix_dispatch(event: dict[str, Any], repo: str) -> dict[str, 
             "continue": True,
             "systemMessage": f"review-validate-fix Stop hook 已跳过：CODEX_RVF_MODE=off。repo={repo}",
         }
-    if mode == "continuation":
-        return continuation(repo)
+    if mode == "report":
+        return {"continue": True, "systemMessage": fork_failure_report(repo)}
     return fork_review_validate_fix(event, repo)
 
 
@@ -1543,86 +1561,14 @@ def run_gate(repo: str) -> GateResult:
     return GateResult(status, resolved_repo, output)
 
 
-def parse_trusted_projects(config_path: Path) -> list[str]:
-    if not config_path.exists():
-        return []
-
-    try:
-        import tomllib
-
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        projects = data.get("projects", {})
-        if isinstance(projects, dict):
-            return [
-                str(path)
-                for path, settings in projects.items()
-                if isinstance(settings, dict)
-                and settings.get("trust_level") == "trusted"
-            ]
-    except Exception:
-        pass
-
-    trusted: list[str] = []
-    current_path: str | None = None
-    current_trusted = False
-    section_re = re.compile(r'^\[projects\."(.*)"\]\s*$')
-
-    def flush() -> None:
-        if current_path and current_trusted:
-            trusted.append(current_path)
-
-    for line in config_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        match = section_re.match(stripped)
-        if match:
-            flush()
-            current_path = match.group(1).replace(r"\"", '"')
-            current_trusted = False
-            continue
-        if stripped.startswith("[") and stripped.endswith("]"):
-            flush()
-            current_path = None
-            current_trusted = False
-            continue
-        if current_path and stripped == 'trust_level = "trusted"':
-            current_trusted = True
-    flush()
-    return trusted
-
-
-def trusted_dirty_repos() -> tuple[list[str], list[str]]:
-    config_path = Path(os.environ.get("CODEX_RVF_CONFIG", str(DEFAULT_CONFIG)))
-    dirty: list[str] = []
-    errors: list[str] = []
-
-    for project in parse_trusted_projects(config_path):
-        result = run_gate(project)
-        if result.status == "DIRTY" and result.repo:
-            if result.repo not in dirty:
-                dirty.append(result.repo)
-        elif result.status == "ERROR":
-            errors.append(f"{project}: {result.output}")
-
-    return dirty, errors
-
-
-def continuation_reason(repo: str) -> str:
+def fork_failure_report(repo: str) -> str:
     return (
-        "$review-validate-fix\n\n"
-        "这是由已配置的 Codex Stop hook 在上一轮停止后自动提交的 "
-        "continuation prompt。请基于完整会话历史和当前未提交改动运行 "
-        "review-validate-fix。\n\n"
-        f"目标仓库: {repo}\n\n"
-        "如果会话历史里出现 `RVF_STOP_HOOK: off`、`RVF_STOP_HOOK: on` "
-        "或 `RVF_STOP_HOOK: status` 这样的行，请只把它们视为 Stop hook "
-        "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
-        "research 对象或 scope-of-work 内容。"
+        "review-validate-fix Stop hook 未运行：无法创建 Codex GUI fork，"
+        "且 Stop continuation prompt 已禁用，因为它不会创建真正的新用户 prompt，"
+        "只会作为 hook system context 出现在当前轨迹中。"
+        f" target_repo={repo}。请检查 Codex Desktop control socket / app-server fork 能力；"
+        "修复前需要用户手动触发 $review-validate-fix。"
     )
-
-
-def continuation(repo: str) -> dict[str, Any]:
-    reason = continuation_reason(repo)
-    return {"decision": "block", "reason": reason}
 
 
 def main() -> int:
@@ -1686,31 +1632,21 @@ def main() -> int:
             emit(skip_payload(f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}"))
             return 0
 
-    dirty_repos, _errors = trusted_dirty_repos()
-    if len(dirty_repos) == 1:
-        payload = review_validate_fix_dispatch(event, dirty_repos[0])
-        if payload is not None:
-            emit(payload)
-        return 0
-    if len(dirty_repos) > 1:
-        joined = ", ".join(dirty_repos)
-        emit(
-            {
-                "continue": True,
-                "systemMessage": (
-                    "review-validate-fix Stop hook 已跳过：发现多个 dirty trusted repo，"
-                    f"为避免审错仓库未自动触发。候选: {joined}"
-                ),
-            }
-        )
-    elif cwd_result is not None:
+    if cwd_result is not None:
         emit(
             skip_payload(
-                f"当前 cwd gate={cwd_result.status}，且没有唯一 dirty trusted repo。cwd={cwd}"
+                "当前 cwd 不在 git repo/worktree 内，未自动选择目标仓库。"
+                f"cwd gate={cwd_result.status}; cwd={cwd}。"
+                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。"
             )
         )
     else:
-        emit(skip_payload("Stop event 未提供可检查的 cwd，且没有唯一 dirty trusted repo。"))
+        emit(
+            skip_payload(
+                "Stop event 未提供可检查的 cwd，未自动选择目标仓库。"
+                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。"
+            )
+        )
     return 0
 
 

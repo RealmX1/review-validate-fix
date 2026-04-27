@@ -275,7 +275,7 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     assert latest["socket_selection"]["bridge"]["reason"] == "missing"
 
 
-def test_missing_desktop_control_defaults_to_continuation_not_bridge(tmp: Path) -> None:
+def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp: Path) -> None:
     module = load_hook_module()
     state = tmp / "state"
     desktop_socket = tmp / "missing-control.sock"
@@ -301,7 +301,7 @@ def test_missing_desktop_control_defaults_to_continuation_not_bridge(tmp: Path) 
             model=None,
             reasoning_effort=None,
             parent_thread_path=None,
-            fallback_continuation_reason="visible continuation",
+            fallback_failure_reason="visible fork failure",
         )
     finally:
         if original_state_dir is None:
@@ -316,11 +316,15 @@ def test_missing_desktop_control_defaults_to_continuation_not_bridge(tmp: Path) 
         module.bridge_socket_path = original_bridge_socket_path
         module.ensure_bridge_app_server = original_ensure_bridge
 
-    assert payload == {"decision": "block", "reason": "visible continuation"}
+    assert "decision" not in payload
+    assert payload["continue"] is True
+    assert "visible fork failure" in payload["systemMessage"]
+    assert "$review-validate-fix" not in payload["systemMessage"]
     latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    assert latest["status"] == "desktop-control-unavailable-continuation"
+    assert latest["status"] == "desktop-control-unavailable-report"
+    assert latest["report_reason"] == "visible fork failure"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
-    assert latest["socket_selection"]["bridge_policy"] == "continuation"
+    assert latest["socket_selection"]["bridge_policy"] == "report"
 
 
 def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
@@ -370,12 +374,12 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
     assert latest["status"] == "manual-prepared"
     assert latest["desktop_control_unavailable_fallback"] == "manual"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
-    assert latest["socket_selection"]["bridge_policy"] == "continuation"
+    assert latest["socket_selection"]["bridge_policy"] == "report"
     assert latest["marker"] == "RVF_FORK_EXPERIMENT"
     assert latest["latest_user_message"] == "RVF_FORK_EXPERIMENT: diagnose fork behavior"
 
 
-def test_missing_desktop_control_fail_policy_blocks(tmp: Path) -> None:
+def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
     module = load_hook_module()
     state = tmp / "state"
     desktop_socket = tmp / "missing-control.sock"
@@ -402,7 +406,7 @@ def test_missing_desktop_control_fail_policy_blocks(tmp: Path) -> None:
             model=None,
             reasoning_effort=None,
             parent_thread_path=None,
-            fallback_continuation_reason="visible continuation",
+            fallback_failure_reason="visible fork failure",
         )
     finally:
         if original_state_dir is None:
@@ -419,11 +423,12 @@ def test_missing_desktop_control_fail_policy_blocks(tmp: Path) -> None:
         module.bridge_socket_path = original_bridge_socket_path
         module.ensure_bridge_app_server = original_ensure_bridge
 
-    assert payload["decision"] == "block"
-    assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in payload["reason"]
-    assert "continue" not in payload
+    assert "decision" not in payload
+    assert payload["continue"] is True
+    assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in payload["systemMessage"]
     latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
     assert latest["status"] == "desktop-control-unavailable-fail"
+    assert "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=fail" in latest["report_reason"]
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
     assert latest["socket_selection"]["bridge_policy"] == "fail"
 
@@ -1179,6 +1184,68 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
     assert requests[1]["params"]["effort"] == "high"
 
 
+def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    subdir = dirty / "nested"
+    subdir.mkdir()
+    state = tmp / "state"
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(subdir),
+                "session_id": "00000000-0000-0000-0000-000000000103",
+                "stop_hook_active": False,
+            },
+            extra_env={
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "dry-run",
+            },
+            state_dir=state,
+        )[0]
+    )
+
+    assert "decision" not in payload
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    requests = latest["app_server_requests"]
+    assert latest["cwd"] == str(subdir.resolve())
+    assert requests[0]["params"]["cwd"] == str(subdir.resolve())
+    assert requests[1]["params"]["cwd"] == str(subdir.resolve())
+    assert f"RVF_PARENT_CWD: {subdir.resolve()}" in latest["prompt"]
+    assert f"RVF_TARGET_REPO: {dirty.resolve()}" in latest["prompt"]
+
+
+def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp: Path) -> None:
+    plain = tmp / "plain"
+    plain.mkdir(parents=True)
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    config = tmp / "config.toml"
+    state = tmp / "state"
+    write_config(config, [dirty])
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(plain),
+                "session_id": "00000000-0000-0000-0000-000000000104",
+                "stop_hook_active": False,
+            },
+            config=config,
+            extra_env={
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "dry-run",
+            },
+            state_dir=state,
+        )[0]
+    )
+
+    assert "decision" not in payload
+    assert payload["continue"] is True
+    assert "当前 cwd 不在 git repo/worktree 内" in payload["systemMessage"]
+    assert "提供要运行 review-validate-fix 的目标 repo 路径" in payload["systemMessage"]
+    assert not (state / "latest.json").exists()
+
+
 def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
@@ -1240,7 +1307,7 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp: Path) -> None
     assert "path" not in latest["app_server_requests"][0]["params"]
 
 
-def test_dirty_repo_continuation_mode(tmp: Path) -> None:
+def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     payload = parse_json(
         invoke(
@@ -1252,40 +1319,12 @@ def test_dirty_repo_continuation_mode(tmp: Path) -> None:
             extra_env={"CODEX_RVF_MODE": "continuation"},
         )[0]
     )
-    assert payload["decision"] == "block"
-    assert "$review-validate-fix" in payload["reason"]
-    assert str(dirty) in payload["reason"]
-    assert "RVF_STOP_HOOK: off" in payload["reason"]
-    assert "会话控制元数据" in payload["reason"]
-    assert "不要把它们当成用户分配的代码任务" in payload["reason"]
-
-
-def test_no_git_unique_dirty_trusted_repo_forks_by_default(tmp: Path) -> None:
-    plain = tmp / "plain"
-    plain.mkdir(parents=True)
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    config = tmp / "config.toml"
-    state = tmp / "state"
-    write_config(config, [dirty])
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(plain),
-                "session_id": "00000000-0000-0000-0000-000000000005",
-                "stop_hook_active": False,
-            },
-            config=config,
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
     assert "decision" not in payload
-    assert "review-validate-fix-fork triggered" in payload["systemMessage"]
-    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
-    assert latest["status"] == "dry-run"
-    assert "$review-validate-fix" in latest["prompt"]
-    assert str(dirty) in latest["prompt"]
+    assert payload["continue"] is True
+    assert "$review-validate-fix" in payload["systemMessage"]
+    assert str(dirty) in payload["systemMessage"]
+    assert "Stop continuation prompt 已禁用" in payload["systemMessage"]
+    assert "不会创建真正的新用户 prompt" in payload["systemMessage"]
 
 
 def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
@@ -1464,19 +1503,12 @@ def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path
     assert str(dirty) in latest["prompt"]
 
 
-def test_no_git_multiple_dirty_trusted_repos_skips(tmp: Path) -> None:
-    plain = tmp / "plain"
-    plain.mkdir(parents=True)
-    first = init_repo(tmp / "first", dirty=True)
-    second = init_repo(tmp / "second", dirty=True)
-    config = tmp / "config.toml"
-    write_config(config, [first, second])
-
-    payload = parse_json(
-        invoke({"cwd": str(plain), "stop_hook_active": False}, config=config)[0]
-    )
+def test_missing_cwd_skips_and_requests_target_repo(tmp: Path) -> None:
+    payload = parse_json(invoke({"stop_hook_active": False})[0])
     assert "decision" not in payload
-    assert "多个 dirty trusted repo" in payload["systemMessage"]
+    assert payload["continue"] is True
+    assert "Stop event 未提供可检查的 cwd" in payload["systemMessage"]
+    assert "提供要运行 review-validate-fix 的目标 repo 路径" in payload["systemMessage"]
 
 
 def main() -> int:
@@ -1488,9 +1520,9 @@ def main() -> int:
         test_session_hook_state_dir_respects_state_dir_override,
         test_socket_probe_reports_unavailable_reason,
         test_bridge_failure_preserves_desktop_probe,
-        test_missing_desktop_control_defaults_to_continuation_not_bridge,
+        test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
-        test_missing_desktop_control_fail_policy_blocks,
+        test_missing_desktop_control_fail_policy_reports,
         test_fork_session_visibility_waits_only_for_active_session,
         test_app_server_fork_waits_for_session_file_before_deeplink,
         test_desktop_control_fork_requires_active_session_for_verified_gui,
@@ -1510,17 +1542,18 @@ def main() -> int:
         test_dirty_repo_forks_in_gui_by_default,
         test_dirty_repo_manual_mode_only_prepares_prompt,
         test_dirty_repo_fork_dry_run,
+        test_dirty_repo_fork_inherits_parent_cwd_inside_worktree,
+        test_no_git_cwd_skips_even_with_dirty_trusted_repo,
         test_stop_event_transcript_path_overrides_bad_env_thread_id,
         test_stop_event_log_path_is_not_used_as_fork_rollout_path,
-        test_dirty_repo_continuation_mode,
-        test_no_git_unique_dirty_trusted_repo_forks_by_default,
+        test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
         test_forked_rvf_session_waits_for_handoff_before_advisory,
         test_forked_rvf_session_waits_when_handoff_message_missing,
         test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message,
         test_forked_rvf_marker_scan_skips_incomplete_earlier_marker,
         test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo,
-        test_no_git_multiple_dirty_trusted_repos_skips,
+        test_missing_cwd_skips_and_requests_target_repo,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

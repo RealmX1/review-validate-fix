@@ -24,6 +24,8 @@ pass_type: review_only
 
 默认假设另一个独立 reviewer 可能正和你并行审查同一工作；不要依赖“只有你在运行命令”的前提。会争用端口、缓存、coverage/report 目录、包管理器安装/构建或全局资源的命令必须按 RVF command lock 规则协调。
 
+你的审查必须发生在主会话提供的目标 repo / worktree cwd 中。不要默认使用 installed skill 目录、临时目录、另一个 clone 或另一个 git worktree；如果你发现当前工作目录不在目标 repo 内，读取文件和运行命令时必须显式使用目标 repo 路径。
+
 审查范围以主会话提供的 scope-of-work / session context 和 session manifest 为准，而不是整个 `git diff HEAD`。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；只审查 manifest owned paths、scope 内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。diff/status/file read 是核实证据，不是默认扩大范围的授权。
 
 你处于 `pass_type: review_only` / no-direct-write review 阶段。这是终点，不是完整 `$review-validate-fix` 流程：
