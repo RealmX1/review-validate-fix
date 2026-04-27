@@ -60,6 +60,7 @@ required_files=(
   "scripts/check_review_output.py"
   "scripts/command_lock.py"
   "scripts/prepare_review_run.py"
+  "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
   "scripts/codex_stop_review_validate_fix.py"
@@ -97,6 +98,7 @@ python3 -m py_compile \
   "$skill_dir/scripts/check_review_output.py" \
   "$skill_dir/scripts/command_lock.py" \
   "$skill_dir/scripts/prepare_review_run.py" \
+  "$skill_dir/scripts/session_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
@@ -159,6 +161,7 @@ require_literal "SKILL.md" 'config/alternative-reviewer.json'
 require_literal "SKILL.md" 'scripts/run_alternative_reviewer.py --check'
 require_literal "SKILL.md" 'scripts/build_review_packet.py --repo <repo>'
 require_literal "SKILL.md" 'scripts/prepare_review_run.py --repo <repo>'
+require_literal "SKILL.md" 'scripts/session_manifest.py'
 require_literal "SKILL.md" 'scripts/check_review_output.py'
 require_literal "SKILL.md" 'scripts/command_lock.py'
 require_literal "SKILL.md" 'scripts/workspace_snapshot.py capture/compare'
@@ -189,8 +192,12 @@ require_literal "scripts/check_review_output.py" 'lock_request'
 require_literal "scripts/command_lock.py" 'fcntl.flock'
 require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
+require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
 require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
+require_literal "scripts/session_manifest.py" 'owned_paths'
+require_literal "scripts/session_manifest.py" 'unattributed_dirty_paths'
 require_literal "scripts/build_review_packet.py" 'metadata-output'
+require_literal "scripts/build_review_packet.py" 'session-manifest'
 require_literal "scripts/build_review_packet.py" 'primary-file'
 require_literal "scripts/build_review_packet.py" 'max-packet-bytes'
 require_literal "scripts/build_review_packet.py" 'session context is required'

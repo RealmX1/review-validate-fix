@@ -130,9 +130,52 @@ def note_from_info(info: dict[str, Any]) -> str:
     return f"{info['size']} bytes; sha256={info['sha256']}"
 
 
+def load_session_manifest(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"session manifest must be a JSON object: {path}")
+    return payload
+
+
+def string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item.strip()]
+
+
+def session_owned_paths(manifest: dict[str, Any] | None) -> list[str]:
+    if manifest is None:
+        return []
+    return sorted(set(string_list(manifest.get("owned_paths"))) | set(string_list(manifest.get("owned_dirty_paths"))))
+
+
+def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path: Path | None) -> None:
+    if manifest is None:
+        return
+    manifest_repo = manifest.get("repo")
+    if not isinstance(manifest_repo, str) or not manifest_repo.strip():
+        raise ValueError(f"session manifest is missing repo: {path}")
+    if Path(manifest_repo).expanduser().resolve() != root:
+        raise ValueError(f"session manifest repo does not match current repo: {manifest_repo} != {root}")
+    if not string_list(manifest.get("owned_paths")):
+        raise ValueError(f"session manifest has no owned paths; refusing to build empty Session-Owned scope: {path}")
+
+
+def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str]) -> str:
+    if not paths:
+        return ""
+    args = ["diff", "--find-renames", "HEAD", "--", *paths]
+    if exclude_prefixes:
+        args.extend(exclude_pathspecs(exclude_prefixes))
+    return run_git(repo, args).rstrip()
+
+
 def build_packet(
     repo: Path,
     session_context: Path | None,
+    session_manifest_path: Path | None,
     max_file_bytes: int,
     primary_files: list[str],
     background_files: list[str],
@@ -150,6 +193,13 @@ def build_packet(
     status = run_git(root, status_args).rstrip()
     diff = run_git(root, diff_args).rstrip()
     untracked = untracked_files(root, all_exclude_prefixes)
+    session_manifest = load_session_manifest(session_manifest_path)
+    validate_session_manifest(session_manifest, root, session_manifest_path)
+    owned_paths = session_owned_paths(session_manifest)
+    owned_path_set = set(owned_paths)
+    owned_diff = diff_for_paths(root, owned_paths, all_exclude_prefixes) if session_manifest is not None else ""
+    owned_untracked = [path for path in untracked if path in owned_path_set]
+    background_untracked = [path for path in untracked if path not in owned_path_set]
     session_context_text = ""
     if session_context is None:
         if not allow_missing_session_context:
@@ -173,6 +223,15 @@ def build_packet(
         "session_context_provided": bool(session_context_text),
         "session_context_bytes": len(session_context_text.encode("utf-8")),
         "scope_of_work_file": str(session_context) if session_context is not None else None,
+        "session_manifest_file": str(session_manifest_path) if session_manifest_path is not None else None,
+        "session_manifest_provided": session_manifest is not None,
+        "session_manifest_confidence": session_manifest.get("confidence") if session_manifest is not None else None,
+        "session_owned_paths": owned_paths,
+        "session_owned_path_count": len(owned_paths),
+        "session_owned_dirty_paths": string_list(session_manifest.get("owned_dirty_paths")) if session_manifest is not None else [],
+        "unattributed_dirty_paths": string_list(session_manifest.get("unattributed_dirty_paths")) if session_manifest is not None else [],
+        "owned_untracked_count": len(owned_untracked) if session_manifest is not None else len(untracked),
+        "background_untracked_count": len(background_untracked) if session_manifest is not None else 0,
         "primary_files": primary_files,
         "background_files": background_files,
         "untracked_files": [],
@@ -201,12 +260,39 @@ def build_packet(
     if session_context_text:
         lines.extend(["## Session Context", "", session_context_text, ""])
 
+    if session_manifest is not None:
+        lines.extend(
+            [
+                "## Session Manifest",
+                "",
+                "This manifest is the session-scoped ownership anchor. Reviewers must treat owned paths as the default review scope and treat unattributed dirty paths as background WIP unless a session-owned change directly depends on them.",
+                "",
+                f"- manifest file: `{session_manifest_path}`",
+                f"- session id: `{session_manifest.get('session_id') or '(unknown)'}`",
+                f"- confidence: `{session_manifest.get('confidence') or 'unknown'}`",
+                "",
+                "Session-owned paths:",
+            ]
+        )
+        if owned_paths:
+            lines.extend(f"- {path}" for path in owned_paths)
+        else:
+            lines.append("(none)")
+        lines.extend(["", "Unattributed dirty paths (background, not default review scope):"])
+        unattributed = string_list(session_manifest.get("unattributed_dirty_paths"))
+        if unattributed:
+            lines.extend(f"- {path}" for path in unattributed)
+        else:
+            lines.append("(none)")
+        lines.append("")
+
     lines.extend(
         [
             "## Packet Stats",
             "",
             f"- tracked diff bytes: {metadata['diff_bytes']}",
             f"- untracked files: {metadata['untracked_count']}",
+            f"- session-owned paths: {metadata['session_owned_path_count']}",
             f"- max inline file bytes: {max_file_bytes}",
             "",
         ]
@@ -220,13 +306,47 @@ def build_packet(
     else:
         lines.extend(["(none)", ""])
     lines.extend(["## Git Status", "", "```text", status or "(clean)", "```", ""])
-    lines.extend(["## Git Diff HEAD", "", "```diff", diff or "(no tracked diff)", "```", ""])
+    if session_manifest is not None:
+        lines.extend(
+            [
+                "## Session-Owned Git Diff",
+                "",
+                "Path-limited diff for session-owned paths. This is the default code review scope.",
+                "",
+                "```diff",
+                owned_diff or "(no tracked diff for session-owned paths)",
+                "```",
+                "",
+                "## Full Git Diff HEAD (Evidence Only)",
+                "",
+                "This full dirty diff may include other sessions' work. Use it only as supporting evidence for direct dependencies from session-owned changes.",
+                "",
+                "```diff",
+                diff or "(no tracked diff)",
+                "```",
+                "",
+            ]
+        )
+    else:
+        lines.extend(["## Git Diff HEAD", "", "```diff", diff or "(no tracked diff)", "```", ""])
     lines.extend(["## Untracked Files", ""])
 
     if not untracked:
         lines.extend(["(none)", ""])
     else:
-        for rel in untracked:
+        if session_manifest is not None and background_untracked:
+            lines.extend(
+                [
+                    "Background untracked paths below were not attributed to this session and are not inlined:",
+                    "",
+                ]
+            )
+            lines.extend(f"- {path}" for path in background_untracked)
+            lines.append("")
+        inline_untracked = owned_untracked if session_manifest is not None else untracked
+        if session_manifest is not None:
+            lines.extend(["Session-owned untracked file contents:", ""])
+        for rel in inline_untracked:
             path = root / rel
             lines.extend([f"### {rel}", ""])
             if not path.is_file():
@@ -252,6 +372,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a self-contained review packet for review-validate-fix.")
     parser.add_argument("--repo", required=True, help="Target git repository.")
     parser.add_argument("--session-context", help="Required file containing the main-agent work summary.")
+    parser.add_argument("--session-manifest", help="Optional JSON manifest describing paths owned by this Codex session.")
     parser.add_argument("--output", help="Write packet to this file instead of stdout.")
     parser.add_argument("--metadata-output", help="Write packet metadata JSON to this file.")
     parser.add_argument("--max-file-bytes", type=int, default=200_000, help="Max untracked file bytes to inline.")
@@ -271,9 +392,13 @@ def main() -> int:
         session_context = Path(args.session_context).expanduser().resolve() if args.session_context else None
         if session_context is not None and not session_context.exists():
             raise ValueError(f"session context file not found: {session_context}")
+        session_manifest = Path(args.session_manifest).expanduser().resolve() if args.session_manifest else None
+        if session_manifest is not None and not session_manifest.exists():
+            raise ValueError(f"session manifest file not found: {session_manifest}")
         packet, metadata = build_packet(
             repo,
             session_context,
+            session_manifest,
             args.max_file_bytes,
             args.primary_file,
             args.background_file,

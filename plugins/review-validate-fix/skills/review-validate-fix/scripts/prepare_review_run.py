@@ -15,6 +15,7 @@ from typing import Any
 SKILL_DIR = Path(__file__).resolve().parents[1]
 BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
+SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -52,6 +53,8 @@ def prepare_run(
     *,
     repo: Path,
     session_context: Path | None,
+    session_manifest: Path | None,
+    transcript: Path | None,
     base_dir: Path,
     max_file_bytes: int,
     max_packet_bytes: int,
@@ -69,11 +72,34 @@ def prepare_run(
     metadata_path = run_dir / "review-packet.metadata.json"
     snapshot_path = run_dir / "before-workspace-snapshot.json"
     scope_of_work_path = run_dir / "scope-of-work.md"
+    session_manifest_path = run_dir / "session-manifest.json"
 
     packet_session_context = session_context
     if session_context is not None:
         shutil.copyfile(session_context, scope_of_work_path)
         packet_session_context = scope_of_work_path
+
+    packet_session_manifest: Path | None = None
+    source_session_manifest: str | None = None
+    if transcript is not None:
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(root),
+                "--transcript",
+                str(transcript),
+                "--output",
+                str(session_manifest_path),
+            ]
+        )
+        packet_session_manifest = session_manifest_path
+        source_session_manifest = f"transcript:{transcript}"
+    elif session_manifest is not None:
+        shutil.copyfile(session_manifest, session_manifest_path)
+        packet_session_manifest = session_manifest_path
+        source_session_manifest = str(session_manifest)
 
     packet_cmd = [
         sys.executable,
@@ -91,6 +117,8 @@ def prepare_run(
         packet_cmd.extend(["--max-packet-bytes", str(max_packet_bytes)])
     if packet_session_context is not None:
         packet_cmd.extend(["--session-context", str(packet_session_context)])
+    if packet_session_manifest is not None:
+        packet_cmd.extend(["--session-manifest", str(packet_session_manifest)])
     if allow_missing_session_context:
         packet_cmd.append("--allow-missing-session-context")
     for path in primary_files:
@@ -122,7 +150,9 @@ def prepare_run(
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
         "scope_of_work_file": str(scope_of_work_path) if session_context is not None else None,
+        "session_manifest_file": str(session_manifest_path) if packet_session_manifest is not None else None,
         "source_session_context": str(session_context) if session_context is not None else None,
+        "source_session_manifest": source_session_manifest,
         "packet_bytes": metadata.get("packet_bytes"),
         "untracked_count": metadata.get("untracked_count"),
         "inlined_untracked_count": metadata.get("inlined_untracked_count"),
@@ -130,6 +160,10 @@ def prepare_run(
         "session_context": str(scope_of_work_path) if session_context is not None else None,
         "session_context_provided": metadata.get("session_context_provided"),
         "session_context_bytes": metadata.get("session_context_bytes"),
+        "session_manifest": str(session_manifest_path) if packet_session_manifest is not None else None,
+        "session_manifest_provided": metadata.get("session_manifest_provided"),
+        "session_owned_path_count": metadata.get("session_owned_path_count"),
+        "unattributed_dirty_paths": metadata.get("unattributed_dirty_paths"),
         "primary_files": primary_files,
         "background_files": background_files,
         "excluded_path_prefixes": metadata.get("excluded_path_prefixes"),
@@ -142,6 +176,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare an auditable review-validate-fix run directory.")
     parser.add_argument("--repo", required=True, help="Target git repository.")
     parser.add_argument("--session-context", help="Required file containing the main-agent work summary.")
+    parser.add_argument("--session-manifest", help="Optional prebuilt session ownership manifest JSON.")
+    parser.add_argument("--transcript", help="Optional Codex JSONL transcript used to build session-manifest.json.")
     parser.add_argument("--base-dir", default=str(default_base_dir()), help="Directory where a unique run directory will be created.")
     parser.add_argument("--output-json", help="Write run metadata JSON to this path. Prints JSON to stdout when omitted.")
     parser.add_argument("--max-file-bytes", type=int, default=200_000, help="Max untracked file bytes to inline.")
@@ -171,9 +207,19 @@ def main() -> int:
             and not args.allow_missing_session_context
         ):
             raise ValueError(f"session context file is empty: {session_context}")
+        session_manifest = Path(args.session_manifest).expanduser().resolve() if args.session_manifest else None
+        transcript = Path(args.transcript).expanduser().resolve() if args.transcript else None
+        if session_manifest is not None and transcript is not None:
+            raise ValueError("pass either --session-manifest or --transcript, not both")
+        if session_manifest is not None and not session_manifest.exists():
+            raise ValueError(f"session manifest file not found: {session_manifest}")
+        if transcript is not None and not transcript.exists():
+            raise ValueError(f"transcript file not found: {transcript}")
         result = prepare_run(
             repo=Path(args.repo).expanduser().resolve(),
             session_context=session_context,
+            session_manifest=session_manifest,
+            transcript=transcript,
             base_dir=Path(args.base_dir).expanduser().resolve(),
             max_file_bytes=args.max_file_bytes,
             max_packet_bytes=args.max_packet_bytes,

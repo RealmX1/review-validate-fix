@@ -5,7 +5,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 # Review Validate Fix
 
-本 skill 用于对当前对话（目前已经实现的是对整个仓库）的未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。
+本 skill 用于对当前对话的 session-scoped 未提交改动执行一轮 double review -> merge -> validate/fix -> handoff。它替代旧 Claude `/review-validate-fix` slash command 与 Stop hook；不要依赖 Claude Stop hook、`CLAUDE_SESSION_ID`、`.claude/hooks/state`、Claude-only agent 参数，或任何单一 vendor 的 agent 名称。Codex 环境中优先使用 `scripts/session_manifest.py` 从当前 transcript 生成 session ownership manifest；`git diff HEAD` 是证据，不是默认 scope 来源。
 
 本 skill 只应由用户显式调用，例如 `$review-validate-fix`。`agents/openai.yaml` 将 `policy.allow_implicit_invocation` 设为 `false`，避免 agent 或模型因为相似上下文自动启用它。
 
@@ -15,12 +15,13 @@ description: Use when the user asks for a post-work code review loop, review val
 
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
 2. 如果没有未提交改动，用中文说明没有可审查改动并结束。
-3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件。
-4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、每个文件中实际做了哪些编辑、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope；diff/status 是证据，不是 scope 的唯一来源。
-5. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file>` 创建唯一 run 目录；该脚本会把主会话写好的 scope-of-work 文件复制为 run 目录内的 `scope-of-work.md`，并生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --output <packet> --metadata-output <metadata>`。packet 必须覆盖主会话提供的 scope-of-work / session context、tracked diff、完整 untracked 文件列表，以及可内联的 untracked 文件内容；不要只依赖 `git diff HEAD`。
-6. 如果无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
-7. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
-8. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
+3. 如果有改动，先查看 `git status --short -uall`、`git diff HEAD`，再读具体文件；但不要把 whole-repo dirty diff 当成默认 review scope。
+4. Review 前必须先由主会话写一份 scope-of-work / session context 文件，概括用户意图、本 turn 实际完成的工作、主会话确认改过的文件、每个文件中实际做了哪些编辑、已跑验证命令、关键设计取舍和仍不确定的点。它不能只列 created/modified/deleted 文件；必须写明具体编辑内容，例如“在 X 函数新增 Y 分支”“把 Z 调用改为传入 W 参数”。不要让 reviewer 只靠 `git diff HEAD` 猜 scope。
+5. 如果 Stop event、fork prompt 或当前环境提供 Codex JSONL transcript path，先用 `scripts/session_manifest.py --repo <repo> --transcript <jsonl> --output <manifest>` 生成 session ownership manifest。manifest 中的 `owned_paths` / `owned_dirty_paths` 是默认 review scope；`unattributed_dirty_paths` 是背景 WIP，不得主动审查，除非它被 session-owned 改动直接连带影响。
+6. 用 `scripts/prepare_review_run.py --repo <repo> --session-context <file> --transcript <jsonl>` 或 `--session-manifest <manifest>` 创建唯一 run 目录；该脚本会把 scope-of-work 和 manifest 复制到 run 目录，并生成 self-contained review packet、packet metadata 和 review 前 workspace snapshot。需要手动生成 packet 时，可用 `scripts/build_review_packet.py --repo <repo> --session-context <file> --session-manifest <manifest> --output <packet> --metadata-output <metadata>`。
+7. 如果没有 transcript/manifest，仍必须提供可靠 scope-of-work；如果既无法生成 manifest，也无法从当前会话可靠写出 scope-of-work / session context，不要编造，也不要降级为纯 diff review；fail-close，用中文向用户说明缺少本 turn 工作上下文。`--allow-missing-session-context` 只允许调试脚本或迁移排障时显式使用，正常 review loop 禁用。
+8. 如果已知本 turn 的主修改文件或背景 WIP，生成 packet 时用 `--primary-file` / `--background-file` 标注 review scope，避免 reviewer 把历史 WIP 与本 turn 修改混为一谈。
+9. 避免使用固定 `/tmp/theseus-rvf-*` 路径保存 packet、snapshot 或 reviewer 输出；使用 `prepare_review_run.py` 的唯一 run 目录，或至少用 `mktemp -d`。
 
 ## 运行选项
 
@@ -86,7 +87,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
 - Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
-- 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；reviewer 应结合它判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
+- 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径、同一份 session manifest 文件路径（如果有）和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；session manifest 是机器提取的 ownership anchor；reviewer 应结合它们判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以 session manifest 的 owned paths 和主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
 - 完成态 Review 输出契约必须严格为：
   - 无问题：只输出 `NO_ISSUES`。
   - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。
@@ -134,6 +135,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 旧 slash command 原文：`references/legacy-claude-command.md`
 - 旧 Stop hook 原文：`references/legacy-claude-stop-hook.md`
 - 旧 activity hook 原文：`references/legacy-claude-mark-activity.sh`
+- Codex session-scoped tracking 计划：`references/session-scoped-change-tracking-plan.md`
 - 旧 hook handoff 兼容性说明：`references/legacy-compatibility-notes.md`
 - 双 reviewer 合并策略：`references/review-merge-policy.md`
 

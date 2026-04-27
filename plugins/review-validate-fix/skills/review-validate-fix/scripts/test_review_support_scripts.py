@@ -15,6 +15,7 @@ CHECK_REVIEW_OUTPUT = SCRIPT_DIR / "check_review_output.py"
 COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"
 PREPARE_REVIEW_RUN = SCRIPT_DIR / "prepare_review_run.py"
 RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
+SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 
 
 def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -67,6 +68,49 @@ def write_alternative_reviewer_config(
         json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
+    return path
+
+
+def write_codex_transcript(path: Path, repo: Path) -> Path:
+    apply_patch_input = (
+        "*** Begin Patch\n"
+        "*** Update File: tracked.txt\n"
+        "@@\n"
+        "-base\n"
+        "+base edited by session\n"
+        "*** Add File: owned-new.txt\n"
+        "+owned\n"
+        "*** Delete File: removed.txt\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": "session-tracking-test", "cwd": str(repo)},
+        },
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": apply_patch_input,
+                "call_id": "call_patch",
+            },
+        },
+        {
+            "timestamp": "2026-04-27T00:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "printf generated > generated.txt", "workdir": str(repo)}),
+                "call_id": "call_exec",
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
     return path
 
 
@@ -387,6 +431,234 @@ def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
 
 
+def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
+    (repo / "generated.txt").write_text("generated\n", encoding="utf-8")
+    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+        ]
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["session_id"] == "session-tracking-test"
+    assert manifest["confidence"] == "medium"
+    assert "tracked.txt" in manifest["owned_paths"]
+    assert "owned-new.txt" in manifest["owned_paths"]
+    assert "removed.txt" in manifest["owned_paths"]
+    assert "generated.txt" in manifest["owned_paths"]
+    assert "tracked.txt" in manifest["owned_dirty_paths"]
+    assert "generated.txt" in manifest["owned_dirty_paths"]
+    assert "background.txt" in manifest["unattributed_dirty_paths"]
+    assert "new.txt" in manifest["unattributed_dirty_paths"]
+    assert manifest["apply_patch_operations"][0]["operation"] == "update"
+    assert manifest["command_path_candidates"][0]["reason"] == "shell_redirect"
+
+
+def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    docs = repo / "docs"
+    docs.mkdir()
+    (docs / "note.md").write_text("x\n", encoding="utf-8")
+    transcript = tmp / "session.jsonl"
+    records = [
+        {
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": "session-subdir-test", "cwd": str(repo)},
+        },
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "printf x > note.md", "workdir": str(docs)}),
+                "call_id": "call_exec",
+            },
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+    manifest_path = tmp / "manifest.json"
+
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+        ]
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "docs/note.md" in manifest["owned_paths"]
+    assert "note.md" not in manifest["owned_paths"]
+    assert "docs/note.md" in manifest["owned_dirty_paths"]
+    assert "docs/note.md" not in manifest["unattributed_dirty_paths"]
+
+
+def test_build_packet_uses_session_manifest_as_scope_anchor(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
+    (repo / "owned-new.txt").write_text("owned contents\n", encoding="utf-8")
+    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest = tmp / "manifest.json"
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest),
+        ]
+    )
+
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Session Manifest" in packet_text
+    assert "## Session-Owned Git Diff" in packet_text
+    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
+    assert "Session-owned paths:" in packet_text
+    assert "- tracked.txt" in packet_text
+    assert "- background.txt" in packet_text
+    assert "Background untracked paths below were not attributed to this session and are not inlined" in packet_text
+    assert "### owned-new.txt" in packet_text
+    assert "owned contents" in packet_text
+    assert "### background.txt" not in packet_text
+    assert "background contents" not in packet_text
+    assert payload["session_manifest_provided"] is True
+    assert payload["session_owned_path_count"] >= 3
+    assert payload["owned_untracked_count"] == 1
+    assert payload["background_untracked_count"] >= 2
+
+
+def test_build_packet_rejects_session_manifest_for_different_repo(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：reject mismatched manifest\n",
+        encoding="utf-8",
+    )
+    manifest = tmp / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repo": str(tmp / "other-repo"),
+                "owned_paths": ["tracked.txt"],
+                "owned_dirty_paths": ["tracked.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "session manifest repo does not match current repo" in completed.stderr
+
+
+def test_build_packet_rejects_empty_session_owned_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：reject empty manifest scope\n",
+        encoding="utf-8",
+    )
+    manifest = tmp / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repo": str(repo.resolve()),
+                "owned_paths": [],
+                "owned_dirty_paths": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "session manifest has no owned paths" in completed.stderr
+
+
 def test_build_packet_requires_session_context(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     completed = subprocess.run(
@@ -566,6 +838,42 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
         ]
     )
     assert "locked" in locked.stdout
+
+
+def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：prepared transcript-scoped review run\n",
+        encoding="utf-8",
+    )
+    (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
+    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+
+    result = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--transcript",
+            str(transcript),
+            "--base-dir",
+            str(tmp / "runs"),
+        ]
+    )
+    payload = json.loads(result.stdout)
+    assert Path(payload["session_manifest"]).exists()
+    assert payload["session_manifest_provided"] is True
+    assert payload["source_session_manifest"] == f"transcript:{transcript.resolve()}"
+    packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
+    assert "## Session Manifest" in packet_text
+    assert "background contents" not in packet_text
 
 
 def test_prepare_review_run_requires_session_context(tmp: Path) -> None:
@@ -913,10 +1221,16 @@ def main() -> int:
         test_check_review_output_lock_request()
         test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
+        test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest")
+        test_session_manifest_resolves_exec_paths_from_command_workdir(root / "session-manifest-workdir")
+        test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest")
+        test_build_packet_rejects_session_manifest_for_different_repo(root / "packet-manifest-repo")
+        test_build_packet_rejects_empty_session_owned_scope(root / "packet-manifest-empty")
         test_build_packet_requires_session_context(root / "packet-requires-context")
         test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore")
         test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
+        test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript")
         test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
