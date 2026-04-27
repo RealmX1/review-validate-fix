@@ -25,9 +25,11 @@ DEFAULT_APP_SERVER_CONTROL_SOCKET = (
 DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.sock"
 DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
-DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR = Path.home() / ".codex" / "archived_sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
+DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
+DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 0.75
+DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "continuation"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -421,7 +423,9 @@ def session_hook_control_payload(
         "continue": True,
         "systemMessage": (
             "review-validate-fix Stop hook 已为当前 chat session 设置为 "
-            f"{status}。session_id={session_id}; state={state_path}"
+            f"{status}。session_id={session_id}; state={state_path}。"
+            "该开关只控制 RVF fork/continuation/review gate，"
+            "不控制 dispatcher 的 dev sync。"
         ),
     }
 
@@ -597,6 +601,8 @@ def run_codex_fork(
     model: str | None = None,
     reasoning_effort: str | None = None,
     parent_thread_path: Path | None = None,
+    fallback_continuation_reason: str | None = None,
+    allow_fallback_continuation: bool = True,
 ) -> dict[str, Any]:
     mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
 
@@ -633,6 +639,7 @@ def run_codex_fork(
         "model": model,
         "reasoning_effort": reasoning_effort,
     }
+    return_payload: dict[str, Any] | None = None
 
     if mode in {"manual", "prepare", "prepared", "log-only"}:
         result["status"] = "manual-prepared"
@@ -667,6 +674,25 @@ def run_codex_fork(
             socket_selection = getattr(exc, "socket_selection", None)
             if isinstance(socket_selection, dict):
                 failure["socket_selection"] = socket_selection
+                bridge_policy = socket_selection.get("bridge_policy")
+                if bridge_policy == "continuation":
+                    if allow_fallback_continuation:
+                        failure["status"] = "desktop-control-unavailable-continuation"
+                        return_payload = {
+                            "decision": "block",
+                            "reason": fallback_continuation_reason or prompt,
+                        }
+                    else:
+                        failure["status"] = "manual-prepared"
+                        failure["desktop_control_unavailable_fallback"] = "manual"
+                elif bridge_policy == "manual":
+                    failure["status"] = "manual-prepared"
+                elif bridge_policy == "fail":
+                    failure["status"] = "desktop-control-unavailable-fail"
+                    return_payload = {
+                        "decision": "block",
+                        "reason": failure["error"],
+                    }
             result.update(failure)
     else:
         result.update(
@@ -682,6 +708,9 @@ def run_codex_fork(
     log_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     latest_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    if return_payload is not None:
+        return return_payload
+
     status = result.get("status", "unknown")
     if status == "manual-prepared":
         message = (
@@ -692,7 +721,9 @@ def run_codex_fork(
     elif status == "app-server-started":
         socket_source = result.get("socket_source")
         socket_note = f" via {socket_source}" if isinstance(socket_source, str) else ""
+        target_name = "Codex GUI/app-server"
         if socket_source == "bridge":
+            target_name = "Codex app-server bridge"
             socket_selection = result.get("socket_selection")
             desktop_probe = (
                 socket_selection.get("desktop_control")
@@ -707,8 +738,11 @@ def run_codex_fork(
             location = session_visibility.get("location")
             if isinstance(location, str) and location != "active":
                 socket_note += f"; session_visibility={location}"
+        gui_visibility = result.get("gui_visibility")
+        if isinstance(gui_visibility, str) and gui_visibility != "verified":
+            socket_note += f"; gui_visibility={gui_visibility}"
         message = (
-            f"{log_prefix} forked in Codex GUI/app-server{socket_note}: "
+            f"{log_prefix} forked in {target_name}{socket_note}: "
             f"fork_thread_id={result.get('fork_thread_id')}; "
             f"parent_thread_id={parent_session_id}; log={log_path}"
         )
@@ -936,6 +970,19 @@ def select_app_server_socket() -> tuple[Path, str, dict[str, Any]]:
             "desktop_control": desktop_probe,
         }
 
+    bridge_policy = bridge_gui_unverified_policy()
+    if bridge_policy != "bridge":
+        socket_selection = {
+            "desktop_control": desktop_probe,
+            "bridge": probe_app_server_socket(bridge_socket_path()),
+            "bridge_policy": bridge_policy,
+        }
+        raise AppServerSocketSelectionError(
+            "desktop-control unavailable; bridge fallback disabled by "
+            f"CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY={bridge_policy}",
+            socket_selection,
+        )
+
     try:
         socket_path = ensure_bridge_app_server()
     except Exception as exc:
@@ -950,7 +997,25 @@ def select_app_server_socket() -> tuple[Path, str, dict[str, Any]]:
     return socket_path, "bridge", {
         "desktop_control": desktop_probe,
         "bridge": probe_app_server_socket(socket_path),
+        "bridge_policy": bridge_policy,
     }
+
+
+def bridge_gui_unverified_policy() -> str:
+    if is_truthy(os.environ.get("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER")):
+        return "bridge"
+    raw = os.environ.get(
+        "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY",
+        DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY,
+    )
+    value = raw.strip().lower() if raw else DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY
+    if value in {"bridge", "allow", "allowed", "fork", "app-server", "appserver"}:
+        return "bridge"
+    if value in {"manual", "prepare", "prepared", "log-only"}:
+        return "manual"
+    if value in {"fail", "error"}:
+        return "fail"
+    return "continuation"
 
 
 def ensure_bridge_app_server() -> Path:
@@ -1011,6 +1076,80 @@ def maybe_open_fork_in_codex(fork_thread_id: str) -> bool:
         return False
 
 
+def open_gui_fork_unavailable_reason() -> str | None:
+    if os.environ.get("CODEX_RVF_OPEN_GUI_FORK", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return "disabled"
+    if sys.platform != "darwin":
+        return "unsupported-platform"
+    return None
+
+
+def open_gui_fork_attempts() -> int:
+    raw = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
+    if raw is None or not raw.strip():
+        return DEFAULT_OPEN_GUI_FORK_ATTEMPTS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_OPEN_GUI_FORK_ATTEMPTS
+
+
+def open_gui_fork_retry_delay_seconds() -> float:
+    raw = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
+    if raw is None or not raw.strip():
+        return DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS
+
+
+def open_fork_in_codex_with_retries(fork_thread_id: str) -> dict[str, Any]:
+    max_attempts = open_gui_fork_attempts()
+    retry_delay = open_gui_fork_retry_delay_seconds()
+    attempts: list[dict[str, Any]] = []
+    started = time.monotonic()
+    unavailable_reason = open_gui_fork_unavailable_reason()
+    if unavailable_reason is not None:
+        opened = maybe_open_fork_in_codex(fork_thread_id)
+        attempts.append(
+            {
+                "attempt": 1,
+                "opened": opened,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        return {
+            "opened": opened,
+            "attempts": attempts,
+            "retry_delay_seconds": retry_delay,
+            "skipped_retries_reason": unavailable_reason,
+        }
+    for attempt in range(1, max_attempts + 1):
+        opened = maybe_open_fork_in_codex(fork_thread_id)
+        attempts.append(
+            {
+                "attempt": attempt,
+                "opened": opened,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+        )
+        if opened:
+            break
+        if attempt < max_attempts:
+            time.sleep(retry_delay)
+    return {
+        "opened": any(item["opened"] for item in attempts),
+        "attempts": attempts,
+        "retry_delay_seconds": retry_delay,
+    }
+
+
 def fork_visibility_timeout_seconds() -> float:
     raw = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
     if raw is None or not raw.strip():
@@ -1051,7 +1190,6 @@ def fork_session_visibility(
     hinted_path: str | None,
 ) -> dict[str, Any]:
     active_paths: list[str] = []
-    archived_paths: list[str] = []
     hinted = Path(hinted_path).expanduser() if hinted_path else None
     hinted_exists = False
     if hinted is not None:
@@ -1059,29 +1197,16 @@ def fork_session_visibility(
             hinted_exists = hinted.exists()
         except OSError:
             hinted_exists = False
-        if hinted_exists:
-            target = archived_paths if path_is_relative_to(
-                hinted,
-                DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR,
-            ) else active_paths
-            target.append(str(hinted))
+        if hinted_exists and path_is_relative_to(hinted, DEFAULT_CODEX_SESSIONS_DIR):
+            active_paths.append(str(hinted))
 
     if not active_paths and DEFAULT_CODEX_SESSIONS_DIR.exists():
         active_paths.extend(
             str(path)
             for path in DEFAULT_CODEX_SESSIONS_DIR.rglob(f"*{thread_id}*.jsonl")
         )
-    if not archived_paths and DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR.exists():
-        archived_paths.extend(
-            str(path)
-            for path in DEFAULT_CODEX_ARCHIVED_SESSIONS_DIR.glob(f"*{thread_id}*.jsonl")
-        )
 
-    location = "missing"
-    if active_paths:
-        location = "active"
-    elif archived_paths:
-        location = "archived"
+    location = "active" if active_paths else "missing"
 
     return {
         "thread_id": thread_id,
@@ -1089,7 +1214,6 @@ def fork_session_visibility(
         "hinted_exists": hinted_exists,
         "location": location,
         "active_paths": active_paths,
-        "archived_paths": archived_paths,
     }
 
 
@@ -1109,6 +1233,109 @@ def wait_for_fork_session_visibility(
         if visibility["location"] != "missing" or time.monotonic() >= deadline:
             return visibility
         time.sleep(0.1)
+
+
+def compact_app_server_thread(thread: dict[str, Any]) -> dict[str, Any]:
+    status = thread.get("status")
+    return {
+        "id": thread.get("id"),
+        "name": thread.get("name"),
+        "path": thread.get("path"),
+        "cwd": thread.get("cwd"),
+        "source": thread.get("source"),
+        "createdAt": thread.get("createdAt"),
+        "updatedAt": thread.get("updatedAt"),
+        "status": status if isinstance(status, dict) else None,
+    }
+
+
+def request_app_server_diagnostic(
+    client: AppServerWebSocket,
+    method: str,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    try:
+        return {"ok": True, "result": client.request(method, params)}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def app_server_thread_visibility_diagnostics(
+    client: AppServerWebSocket,
+    thread_id: str,
+    cwd: str | None,
+) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {"thread_id": thread_id}
+
+    read_probe = request_app_server_diagnostic(
+        client,
+        "thread/read",
+        {"threadId": thread_id, "includeTurns": False},
+    )
+    if read_probe.get("ok"):
+        result = read_probe.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        read_probe = {
+            "ok": True,
+            "contains_thread": isinstance(thread, dict) and thread.get("id") == thread_id,
+            "thread": compact_app_server_thread(thread) if isinstance(thread, dict) else None,
+        }
+    diagnostics["thread_read"] = read_probe
+
+    list_params: dict[str, Any] = {
+        "limit": 50,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "archived": False,
+        "useStateDbOnly": False,
+    }
+    if cwd:
+        list_params["cwd"] = cwd
+    list_probe = request_app_server_diagnostic(client, "thread/list", list_params)
+    if list_probe.get("ok"):
+        result = list_probe.get("result")
+        data = result.get("data") if isinstance(result, dict) else None
+        threads = data if isinstance(data, list) else []
+        matches = [
+            compact_app_server_thread(thread)
+            for thread in threads
+            if isinstance(thread, dict) and thread.get("id") == thread_id
+        ]
+        list_probe = {
+            "ok": True,
+            "params": list_params,
+            "contains_thread": bool(matches),
+            "matches": matches,
+            "returned": len(threads),
+            "nextCursor": result.get("nextCursor") if isinstance(result, dict) else None,
+        }
+    diagnostics["thread_list"] = list_probe
+
+    loaded_probe = request_app_server_diagnostic(
+        client,
+        "thread/loaded/list",
+        {"limit": 200},
+    )
+    if loaded_probe.get("ok"):
+        result = loaded_probe.get("result")
+        data = result.get("data") if isinstance(result, dict) else None
+        loaded_ids = (
+            [item for item in data if isinstance(item, str)]
+            if isinstance(data, list)
+            else []
+        )
+        loaded_probe = {
+            "ok": True,
+            "contains_thread": thread_id in loaded_ids,
+            "returned": len(loaded_ids),
+            "nextCursor": result.get("nextCursor") if isinstance(result, dict) else None,
+        }
+    diagnostics["thread_loaded_list"] = loaded_probe
+
+    return diagnostics
 
 
 def run_app_server_fork(
@@ -1160,7 +1387,20 @@ def run_app_server_fork(
             fork_thread_id,
         )
         session_visibility = wait_for_fork_session_visibility(fork_thread_id, session_hint)
-        opened = maybe_open_fork_in_codex(fork_thread_id)
+        app_server_visibility = app_server_thread_visibility_diagnostics(
+            client,
+            fork_thread_id,
+            cwd,
+        )
+        open_result = open_fork_in_codex_with_retries(fork_thread_id)
+        session_location = session_visibility.get("location")
+        gui_visibility = "unverified-bridge-only"
+        if socket_source == "desktop-control":
+            gui_visibility = (
+                "verified"
+                if session_location == "active"
+                else f"unverified-session-{session_location or 'unknown'}"
+            )
         return {
             "status": "app-server-started",
             "socket_path": str(socket_path),
@@ -1170,7 +1410,10 @@ def run_app_server_fork(
             "fork_thread_path": fork_thread_path,
             "turn_id": turn_id,
             "session_visibility": session_visibility,
-            "opened_gui_deeplink": opened,
+            "app_server_visibility": app_server_visibility,
+            "gui_visibility": gui_visibility,
+            "opened_gui_deeplink": open_result["opened"],
+            "open_gui_deeplink": open_result,
             "notifications": client.notifications[-20:],
         }
     finally:
@@ -1195,6 +1438,7 @@ def run_fork_experiment(event: dict[str, Any], latest_user: str) -> dict[str, An
         model=model,
         reasoning_effort=reasoning_effort,
         parent_thread_path=session_path,
+        allow_fallback_continuation=False,
     )
     latest_path = state_dir() / "latest.json"
     try:
@@ -1241,6 +1485,7 @@ def fork_review_validate_fix(event: dict[str, Any], repo: str) -> dict[str, Any]
         model=model,
         reasoning_effort=reasoning_effort,
         parent_thread_path=parent_thread_path,
+        fallback_continuation_reason=continuation_reason(repo),
     )
 
 
@@ -1361,8 +1606,8 @@ def trusted_dirty_repos() -> tuple[list[str], list[str]]:
     return dirty, errors
 
 
-def continuation(repo: str) -> dict[str, Any]:
-    reason = (
+def continuation_reason(repo: str) -> str:
+    return (
         "$review-validate-fix\n\n"
         "这是由已配置的 Codex Stop hook 在上一轮停止后自动提交的 "
         "continuation prompt。请基于完整会话历史和当前未提交改动运行 "
@@ -1373,6 +1618,10 @@ def continuation(repo: str) -> dict[str, Any]:
         "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
         "research 对象或 scope-of-work 内容。"
     )
+
+
+def continuation(repo: str) -> dict[str, Any]:
+    reason = continuation_reason(repo)
     return {"decision": "block", "reason": reason}
 
 
@@ -1406,7 +1655,13 @@ def main() -> int:
 
     session_id = session_hook_id_from_event(event)
     if session_id and session_hook_disabled(session_id):
-        emit(skip_payload(f"当前 chat session 已禁用 RVF_STOP_HOOK。session_id={session_id}"))
+        emit(
+            skip_payload(
+                "当前 chat session 已禁用 RVF_STOP_HOOK；"
+                "只跳过 RVF fork/continuation/review gate，"
+                f"不控制 dispatcher 的 dev sync。session_id={session_id}"
+            )
+        )
         return 0
 
     should_experiment, latest_user = should_run_fork_experiment(event)
