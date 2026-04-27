@@ -38,14 +38,14 @@ description: Use when the user asks for a post-work code review loop, review val
 ## Codex Stop Hook
 
 - 核心设计支柱：Stop hook 自动化必须让触发 hook 的父会话在 hook 完成后停止，并在新的 Codex GUI fork 会话里留下 review checkpoint。新 fork 会话保留父会话完整上下文，并由 hook 注入一个以 `$review-validate-fix` 开头的首个用户 prompt 来启动本 skill；不要把当前会话 continuation 当作自动路径。
-- installed Stop hook 入口为 `scripts/codex_stop_hook_dispatcher.py`，它在 RVF 源仓库的主会话 Stop 时先同步本 repo 到 installed skill，再把同一份 Stop event JSON 转交给 `scripts/codex_stop_review_validate_fix.py`。真实 fork gate 逻辑仍只放在 `codex_stop_review_validate_fix.py`；不要在 hook 脚本里直接执行 review/fix。
-- dispatcher 同步只允许在 Stop event 的 git root 等于 `CODEX_RVF_DEV_REPO` 且事件不是 subagent 时运行；同步失败必须 fail-safe 跳过 fork gate 并给出 systemMessage/log path，避免继续使用 stale installed skill。
+- installed Stop hook 入口为 plugin skill 内的 `scripts/codex_stop_hook_dispatcher.py`，它在 RVF 源仓库的主会话 Stop 时先检查并安装本 repo 的 plugin，再把同一份 Stop event JSON 转交给 `scripts/codex_stop_review_validate_fix.py`。真实 fork gate 逻辑仍只放在 `codex_stop_review_validate_fix.py`；不要在 hook 脚本里直接执行 review/fix。
+- dispatcher 同步只允许在 Stop event 的 git root 等于 `CODEX_RVF_DEV_REPO` 且事件不是 subagent 时运行；同步失败必须 fail-safe 跳过 fork gate 并给出 systemMessage/log path，避免继续使用 stale installed plugin skill。
 - 默认 `CODEX_RVF_MODE=fork` 且 `CODEX_RVF_FORK_MODE=gui`：dirty gate 通过后，脚本优先通过 Codex Desktop control app-server 的 `thread/fork` 与 `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这是 Desktop 的默认自动路径，用来保留可 rewind 的父会话 checkpoint。
 - 如果 Desktop control socket 不可用，默认不要启动独立 bridge app-server fork，因为 bridge 创建出的 session 可能不会被当前 Desktop GUI 立即订阅和显示；此时必须通过 `systemMessage` 报告无法创建 GUI fork，并停止自动 review。不要回退为 Stop continuation prompt：它不会创建真正的新用户 prompt，只会作为 hook system context 出现在当前轨迹中，容易误导主会话重新运行流程。只有显式设置 `CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=bridge` 或 `CODEX_RVF_ALLOW_BRIDGE_APP_SERVER=1` 时，才允许使用 bridge fallback。
 - `CODEX_RVF_MODE=continuation` 已废弃：脚本只报告 continuation fallback 已禁用和 GUI fork 创建失败，不再返回 `decision: "block"`，也不再注入 `$review-validate-fix` prompt。
 - `CODEX_RVF_FORK_MODE=manual` 或 `dry-run` 只用于调试 prompt / app-server request 生成，不启动 Terminal。
 - `CODEX_RVF_MODE=off`：dirty gate 通过也只输出 systemMessage 并跳过自动触发。
-- 当前 chat session 可用显式用户消息行管理 hook：`RVF_STOP_HOOK: off` 会把本 session 标记为 disabled，后续 Stop hook 对同一 session 只跳过 RVF fork/review gate；它不阻止 dispatcher 在本 RVF 源仓库主会话 Stop 时先把当前仓库内容同步到 installed Codex skill。`RVF_STOP_HOOK: on` 会清除该 session 标记并恢复；`RVF_STOP_HOOK: status` 只报告当前 session 状态。这些 session 状态写入 `state/session-hook/`，只影响当前 chat session 的 RVF 执行 gate，不修改全局 `~/.codex/hooks.json`。这些 `RVF_STOP_HOOK:*` 行只属于 Stop hook 会话控制元数据；除非用户明确申明其诉求与对RVF_STOP_HOOK本身的分析、更新有关，主会话或 fork 会话可以将其忽略。
+- 当前 chat session 可用显式用户消息行管理 hook：`RVF_STOP_HOOK: off` 会把本 session 标记为 disabled，后续 Stop hook 对同一 session 只跳过 RVF fork/review gate；它不阻止 dispatcher 在本 RVF 源仓库主会话 Stop 时先检查并安装当前 plugin。`RVF_STOP_HOOK: on` 会清除该 session 标记并恢复；`RVF_STOP_HOOK: status` 只报告当前 session 状态。这些 session 状态写入 `state/session-hook/`，只影响当前 chat session 的 RVF 执行 gate，不修改全局 `~/.codex/hooks.json`。这些 `RVF_STOP_HOOK:*` 行只属于 Stop hook 会话控制元数据；除非用户明确申明其诉求与对RVF_STOP_HOOK本身的分析、更新有关，主会话或 fork 会话可以将其忽略。
 - 如果 `stop_hook_active=true`，必须直接跳过，避免 Stop hook 或 fork 递归。
 - 如果 Stop 事件来自 Codex subagent，必须直接跳过。post-work review 只能由主会话显式触发；研究、review、validate/fix 等子代理结束时不得被 Stop hook 拖入新的 `$review-validate-fix` fork。
 - 如果环境变量 `CODEX_RVF_SUPPRESS=1` 或 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，必须直接跳过；该开关用于 research marathon 等主会话已接管调度的场景。
@@ -75,7 +75,7 @@ description: Use when the user asks for a post-work code review loop, review val
   - 最终汇总和 handoff 必须写明 `review_status: SKIPPED_BY_USER`。
 - review 阶段优先使用能力隔离，而不是事后追责：
   - Codex-native reviewer 优先用探索型 agent；如果当前 Codex agent API 暴露工具或 capability allowlist，就保留读取、检索、shell/test 能力，不授予直接编辑、patch、文件写入、stage、commit 或 validate/fix 相关能力。
-  - 启动 Codex-native reviewer 子代理时，必须继承当前主会话所在 worktree / cwd 和上下文；如果 `spawn_agent` 支持 `fork_context`，必须设为 `true`。reviewer prompt 里要给出目标 repo 的绝对路径，并要求它在该路径下读取文件和运行命令，不得默认落到 installed skill 目录、临时目录、另一个 clone 或另一个 git worktree。
+  - 启动 Codex-native reviewer 子代理时，必须继承当前主会话所在 worktree / cwd 和上下文；如果 `spawn_agent` 支持 `fork_context`，必须设为 `true`。reviewer prompt 里要给出目标 repo 的绝对路径，并要求它在该路径下读取文件和运行命令，不得默认落到 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree。
   - 如果当前 Codex `spawn_agent` 接口没有显式 capability allowlist（只有 agent type / model / reasoning 等参数），不要把 prompt 当成硬沙箱；仍可让 reviewer 读取仓库、运行测试/lint/build，但必须在 prompt 中明确禁止直接写文件、修复、stage/commit 和 handoff。
   - external alternative reviewer 应允许读取仓库并运行测试命令；配置层面只剥离直接编辑/写入工具。不要因为 reviewer 需要 shell 或 repo cwd 就降级为 fallback。
 - `alternative reviewer` 可以是用户配置的任意外部 coding agent（例如某个 CLI、MCP 暴露的 agent、IDE agent 或本地 wrapper）。不要在本 skill 中硬编码具体 vendor、模型名或命令名。

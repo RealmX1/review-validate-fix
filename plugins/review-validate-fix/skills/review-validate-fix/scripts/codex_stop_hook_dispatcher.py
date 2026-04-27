@@ -244,7 +244,7 @@ def sync_from_dev_repo(repo: Path, event: dict[str, Any]) -> tuple[bool, Path | 
 
     for script, args in (
         (sync_script, ["--check-contracts"]),
-        (install_script, ["--as", "skill", "--configure-stop-hook"]),
+        (install_script, ["--configure-stop-hook"]),
     ):
         if not script.is_file():
             record = {
@@ -362,7 +362,7 @@ def main() -> int:
                 "continue": True,
                 "systemMessage": (
                     "review-validate-fix Stop hook 未运行 fork：RVF dev sync "
-                    f"失败，已避免使用旧 installed skill。reason={sync_reason}{log_note}"
+                    f"失败，已避免使用旧 installed plugin skill。reason={sync_reason}{log_note}"
                 ),
             }
         )

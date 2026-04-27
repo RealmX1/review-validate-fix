@@ -1,7 +1,0 @@
-interface:
-  display_name: "Review Validate Fix"
-  short_description: "Double-review, validate, fix, and hand off changes"
-  default_prompt: "Use $review-validate-fix to run double review on current uncommitted changes, merge findings, validate/fix real issues, and generate a handoff by default. Add 'skip review' or 'no handoff' to change those defaults."
-
-policy:
-  allow_implicit_invocation: false

@@ -167,7 +167,7 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
 
     misplaced_path_line = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. 这里先写说明，再引用 skill/review-validate-fix/scripts/check_review_output.py:44\n",
+        input="1. 这里先写说明，再引用 plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n",
         capture_output=True,
         text=True,
         check=False,
@@ -176,7 +176,7 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
 
     english_misplaced_path_line = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. explanation before skill/review-validate-fix/scripts/check_review_output.py:44\n",
+        input="1. explanation before plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n",
         capture_output=True,
         text=True,
         check=False,
@@ -185,7 +185,7 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
 
     prose_see_path_line = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. See skill/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
+        input="1. See plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
         capture_output=True,
         text=True,
         check=False,
@@ -194,7 +194,7 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
 
     prose_in_path_line = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. in skill/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
+        input="1. in plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
         capture_output=True,
         text=True,
         check=False,
@@ -249,7 +249,7 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     invalid_extensionless = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
         input=(
-            "1. skill/review-validate-fix/scripts/check_review_output.py:44 valid issue\n"
+            "1. plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 valid issue\n"
             "Dockerfile:2 missing numbered prefix\n"
             "Makefile:10 missing numbered prefix\n"
         ),

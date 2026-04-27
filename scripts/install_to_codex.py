@@ -10,17 +10,13 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL_SRC = ROOT / "skill" / "review-validate-fix"
 PLUGIN_SRC = ROOT / "plugins" / "review-validate-fix"
+PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
 
-PRESERVE_IN_SKILL = {
-    Path("config/alternative-reviewer.json"),
-    Path("state"),
-}
 PRESERVE_IN_PLUGIN = {
-    Path("skills/review-validate-fix/config/alternative-reviewer.json"),
-    Path("skills/review-validate-fix/state"),
+    PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+    PLUGIN_SKILL_REL / "state",
 }
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", "state"}
 
@@ -36,17 +32,47 @@ def is_preserved(path: Path, preserved: set[Path]) -> bool:
     return False
 
 
-def remove_unpreserved(dst: Path, preserved: set[Path]) -> None:
+def contains_preserved(path: Path, preserved: set[Path]) -> bool:
+    for item in preserved:
+        if path == item or path in item.parents:
+            return True
+    return False
+
+
+def remove_unpreserved(dst: Path, preserved: set[Path], base: Path = Path()) -> None:
     if not dst.exists():
         return
     for child in sorted(dst.iterdir(), key=lambda p: len(p.parts), reverse=True):
-        rel = child.relative_to(dst)
+        rel = base / child.name
         if is_preserved(rel, preserved):
+            continue
+        if child.is_dir() and not child.is_symlink() and contains_preserved(rel, preserved):
+            remove_unpreserved(child, preserved, rel)
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
         else:
             child.unlink()
+
+
+def merge_tree(src: Path, dst: Path, preserved: set[Path], base: Path = Path()) -> None:
+    for child in src.iterdir():
+        if child.name in IGNORE_NAMES or child.name.endswith(".pyc"):
+            continue
+        rel = base / child.name
+        target = dst / child.name
+        if is_preserved(rel, preserved) and target.exists():
+            continue
+        if child.is_dir() and not child.is_symlink():
+            if target.exists() and not target.is_dir():
+                target.unlink()
+            if target.exists():
+                merge_tree(child, target, preserved, rel)
+            else:
+                shutil.copytree(child, target, ignore=ignore)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
 
 
 def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config: bool) -> None:
@@ -55,18 +81,47 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     dst.mkdir(parents=True, exist_ok=True)
     effective_preserve = preserved if preserve_local_config else set()
     remove_unpreserved(dst, effective_preserve)
-    for child in src.iterdir():
-        rel = child.relative_to(src)
-        if is_preserved(rel, effective_preserve) and (dst / rel).exists():
-            continue
-        target = dst / rel
-        if child.is_dir() and not child.is_symlink():
-            if target.exists():
-                shutil.rmtree(target)
-            shutil.copytree(child, target, ignore=ignore)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(child, target)
+    merge_tree(src, dst, effective_preserve)
+
+
+def copy_missing_tree(src: Path, dst: Path) -> int:
+    if not src.exists():
+        return 0
+    if dst.exists():
+        if src.is_dir() and not src.is_symlink() and dst.is_dir():
+            copied = 0
+            for child in src.iterdir():
+                if child.name in IGNORE_NAMES or child.name.endswith(".pyc"):
+                    continue
+                copied += copy_missing_tree(child, dst / child.name)
+            return copied
+        return 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_dir() and not src.is_symlink():
+        shutil.copytree(src, dst, ignore=ignore)
+    else:
+        shutil.copy2(src, dst)
+    return 1
+
+
+def migrate_legacy_skill_setup(
+    legacy_skill_dir: Path, plugin_skill_dir: Path, preserve_local_config: bool
+) -> list[str]:
+    if not preserve_local_config or not legacy_skill_dir.exists():
+        return []
+
+    migrated: list[str] = []
+    legacy_config = legacy_skill_dir / "config" / "alternative-reviewer.json"
+    plugin_config = plugin_skill_dir / "config" / "alternative-reviewer.json"
+    if copy_missing_tree(legacy_config, plugin_config):
+        migrated.append(str(Path("config") / "alternative-reviewer.json"))
+
+    legacy_state = legacy_skill_dir / "state"
+    plugin_state = plugin_skill_dir / "state"
+    if copy_missing_tree(legacy_state, plugin_state):
+        migrated.append("state/")
+
+    return migrated
 
 
 def update_marketplace(plugin_parent: Path) -> Path:
@@ -115,7 +170,17 @@ def update_marketplace(plugin_parent: Path) -> Path:
     return marketplace_path
 
 
-def configure_stop_hook(skill_dir: Path) -> Path:
+def uninstall_standalone_skill(skill_dir: Path) -> bool:
+    if not skill_dir.exists():
+        return False
+    if skill_dir.is_dir() and not skill_dir.is_symlink():
+        shutil.rmtree(skill_dir)
+    else:
+        skill_dir.unlink()
+    return True
+
+
+def configure_stop_hook(plugin_skill_dir: Path) -> Path:
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     if hooks_path.exists():
@@ -125,7 +190,7 @@ def configure_stop_hook(skill_dir: Path) -> Path:
 
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
-    dispatcher = skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
+    dispatcher = plugin_skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
     command = (
         "CODEX_RVF_MODE=fork "
         "CODEX_RVF_FORK_MODE=gui "
@@ -185,17 +250,23 @@ def configure_stop_hook(skill_dir: Path) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="把本仓库内容安装到 Codex skill/plugin 本机空间。")
-    parser.add_argument("--as", dest="install_as", choices=["skill", "plugin", "both"], default="skill")
+    parser = argparse.ArgumentParser(description="把本仓库 plugin 安装到 Codex 本机 plugin 空间。")
     parser.add_argument(
-        "--skill-dir",
-        default=str(Path.home() / ".codex" / "skills" / SKILL_NAME),
-        help="skill 安装目标目录。",
+        "--as",
+        dest="install_as",
+        choices=["plugin", "skill"],
+        default="plugin",
+        help="兼容旧脚本参数；skill 会作为 plugin-only 安装的旧别名处理。",
     )
     parser.add_argument(
         "--plugin-parent",
         default=str(Path.home() / "plugins"),
         help="plugin 父目录；默认符合 ~/.agents/plugins/marketplace.json 的 ./plugins/<name> 约定。",
+    )
+    parser.add_argument(
+        "--installed-skill-dir",
+        default=str(Path.home() / ".codex" / "skills" / SKILL_NAME),
+        help="旧 standalone skill 安装目录；默认安装 plugin 后会删除它。",
     )
     parser.add_argument(
         "--replace-setup-config",
@@ -205,7 +276,12 @@ def main() -> int:
     parser.add_argument(
         "--configure-stop-hook",
         action="store_true",
-        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 dispatcher 同步本 repo，再以 Codex GUI/app-server fork 调用本 skill。",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 dispatcher 同步本 repo，再以 Codex GUI/app-server fork 调用 plugin skill。",
+    )
+    parser.add_argument(
+        "--keep-installed-skill",
+        action="store_true",
+        help="保留旧 ~/.codex/skills/review-validate-fix；默认会卸载 standalone skill。",
     )
     args = parser.parse_args()
 
@@ -213,24 +289,23 @@ def main() -> int:
     installed: list[str] = []
 
     try:
-        if args.install_as in {"skill", "both"}:
-            dst = Path(args.skill_dir).expanduser().resolve()
-            copy_tree(SKILL_SRC, dst, PRESERVE_IN_SKILL, preserve)
-            installed.append(f"skill: {dst}")
-            installed_skill_dir = dst
-        else:
-            installed_skill_dir = Path(args.skill_dir).expanduser().resolve()
+        parent = Path(args.plugin_parent).expanduser().resolve()
+        dst = parent / SKILL_NAME
+        skill_dir = Path(args.installed_skill_dir).expanduser().resolve()
+        migrated = migrate_legacy_skill_setup(skill_dir, dst / PLUGIN_SKILL_REL, preserve)
+        copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
+        marketplace = update_marketplace(parent)
+        installed.append(f"plugin: {dst}")
+        installed.append(f"marketplace: {marketplace}")
+        if migrated:
+            installed.append(f"migrated legacy standalone setup: {', '.join(migrated)}")
 
-        if args.install_as in {"plugin", "both"}:
-            parent = Path(args.plugin_parent).expanduser().resolve()
-            dst = parent / SKILL_NAME
-            copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
-            marketplace = update_marketplace(parent)
-            installed.append(f"plugin: {dst}")
-            installed.append(f"marketplace: {marketplace}")
+        if not args.keep_installed_skill:
+            if uninstall_standalone_skill(skill_dir):
+                installed.append(f"removed standalone skill: {skill_dir}")
 
         if args.configure_stop_hook:
-            hooks_path = configure_stop_hook(installed_skill_dir)
+            hooks_path = configure_stop_hook(dst / PLUGIN_SKILL_REL)
             installed.append(f"stop hook: {hooks_path}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
