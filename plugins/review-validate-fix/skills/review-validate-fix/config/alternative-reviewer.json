@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "label": "alternative-reviewer:claude-code",
   "command": [
     "claude",
@@ -16,7 +16,8 @@
   ],
   "allow_repo_cwd": true,
   "idle_timeout_seconds": 300,
-  "activity_check_interval_seconds": 300,
+  "activity_check_interval_seconds": 5,
+  "max_runtime_seconds": null,
   "health_timeout_seconds": 30,
   "output_format": "claude_stream_json",
   "env_unset": [

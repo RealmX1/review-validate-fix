@@ -22,6 +22,7 @@ DEFAULT_PROMPT = SKILL_DIR / "references" / "review-prompt.md"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
+DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 OUTPUT_FORMAT_TEXT = "text"
@@ -59,6 +60,21 @@ def positive_float(config: dict[str, Any], key: str, default: float) -> float:
         raise ValueError(f"{key} must be a positive number") from exc
     if parsed <= 0:
         raise ValueError(f"{key} must be a positive number")
+    return parsed
+
+
+def optional_positive_float(config: dict[str, Any], key: str, default: float | None) -> float | None:
+    if key not in config:
+        return default
+    value = config.get(key)
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive number or null") from exc
+    if parsed <= 0:
+        raise ValueError(f"{key} must be a positive number or null")
     return parsed
 
 
@@ -184,6 +200,88 @@ def _payload_length(payload: bytes | str | None) -> int:
     return len(payload)
 
 
+def _payload_delta(payload: bytes | str | None, start: int) -> str:
+    if payload is None:
+        return ""
+    delta = payload[start:]
+    if isinstance(delta, bytes):
+        return delta.decode("utf-8", errors="replace")
+    return delta
+
+
+class ClaudeStreamActivityMonitor:
+    def __init__(self) -> None:
+        self.active_bash_tool_ids: set[str] = set()
+        self.active_anonymous_bash_tools = 0
+        self._pending_line = ""
+
+    @property
+    def waiting_on_long_command(self) -> bool:
+        return bool(self.active_bash_tool_ids or self.active_anonymous_bash_tools > 0)
+
+    def ingest(self, output: str) -> None:
+        self._pending_line += output
+        lines = self._pending_line.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_line = lines.pop()
+        else:
+            self._pending_line = ""
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            self._ingest_line(line)
+
+    def _ingest_line(self, line: str) -> None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") == "result":
+            self.active_bash_tool_ids.clear()
+            self.active_anonymous_bash_tools = 0
+            return
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "tool_use" and item.get("name") == "Bash":
+                tool_id = item.get("id")
+                if isinstance(tool_id, str) and tool_id:
+                    self.active_bash_tool_ids.add(tool_id)
+                else:
+                    self.active_anonymous_bash_tools += 1
+            elif item_type == "tool_result":
+                tool_id = item.get("tool_use_id")
+                if isinstance(tool_id, str) and tool_id:
+                    self.active_bash_tool_ids.discard(tool_id)
+                elif self.active_anonymous_bash_tools > 0:
+                    self.active_anonymous_bash_tools -= 1
+
+
+def next_wait_seconds(
+    *,
+    activity_check_interval_seconds: float,
+    remaining_idle_seconds: float,
+    max_runtime_remaining_seconds: float | None,
+    waiting_on_long_command: bool,
+) -> float:
+    wait_candidates = [activity_check_interval_seconds]
+    if not waiting_on_long_command:
+        wait_candidates.append(remaining_idle_seconds)
+    if max_runtime_remaining_seconds is not None:
+        wait_candidates.append(max(0.0, max_runtime_remaining_seconds))
+    return max(0.01, min(wait_candidates))
+
+
 def run_with_activity_timeout(
     command: list[str],
     *,
@@ -192,6 +290,8 @@ def run_with_activity_timeout(
     env: dict[str, str],
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    max_runtime_seconds: float | None,
+    output_format: str,
 ) -> subprocess.CompletedProcess[str]:
     """运行外部 reviewer，并按 stdout/stderr 可观测活动刷新空闲超时。
 
@@ -209,16 +309,45 @@ def run_with_activity_timeout(
         env=env,
         start_new_session=True,
     )
+    started_at = time.monotonic()
     last_activity_at = time.monotonic()
     last_stdout_len = 0
     last_stderr_len = 0
     pending_input: str | None = input_text
+    stream_monitor = (
+        ClaudeStreamActivityMonitor()
+        if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON
+        else None
+    )
 
     while True:
         now = time.monotonic()
+        if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
+            return timeout_completed(
+                process,
+                command,
+                idle_timeout_seconds=idle_timeout_seconds,
+                activity_check_interval_seconds=activity_check_interval_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+                reason="max_runtime_exceeded",
+            )
         idle_for = now - last_activity_at
         remaining_idle = max(0.0, idle_timeout_seconds - idle_for)
-        wait_for = max(0.01, min(activity_check_interval_seconds, remaining_idle))
+        max_runtime_remaining = (
+            max_runtime_seconds - (now - started_at)
+            if max_runtime_seconds is not None
+            else None
+        )
+        wait_for = next_wait_seconds(
+            activity_check_interval_seconds=activity_check_interval_seconds,
+            remaining_idle_seconds=remaining_idle,
+            max_runtime_remaining_seconds=max_runtime_remaining,
+            waiting_on_long_command=(
+                stream_monitor.waiting_on_long_command
+                if stream_monitor is not None
+                else False
+            ),
+        )
 
         try:
             stdout, stderr = process.communicate(input=pending_input, timeout=wait_for)
@@ -226,9 +355,20 @@ def run_with_activity_timeout(
         except subprocess.TimeoutExpired as exc:
             pending_input = None
             now = time.monotonic()
+            if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
+                return timeout_completed(
+                    process,
+                    command,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    activity_check_interval_seconds=activity_check_interval_seconds,
+                    max_runtime_seconds=max_runtime_seconds,
+                    reason="max_runtime_exceeded",
+                )
             stdout_len = _payload_length(exc.stdout)
             stderr_len = _payload_length(exc.stderr)
             if stdout_len > last_stdout_len or stderr_len > last_stderr_len:
+                if stream_monitor is not None and stdout_len > last_stdout_len:
+                    stream_monitor.ingest(_payload_delta(exc.stdout, last_stdout_len))
                 last_activity_at = now
                 last_stdout_len = stdout_len
                 last_stderr_len = stderr_len
@@ -236,23 +376,47 @@ def run_with_activity_timeout(
 
             if now - last_activity_at < idle_timeout_seconds:
                 continue
+            if stream_monitor is not None and stream_monitor.waiting_on_long_command:
+                continue
 
-            terminate_process_group(process)
-            stdout, stderr = process.communicate()
-            timeout_line = (
-                f"{EXTERNAL_REVIEWER_TIMEOUT_FLAG} "
-                f"idle_timeout_seconds={idle_timeout_seconds:g} "
-                f"activity_check_interval_seconds={activity_check_interval_seconds:g} "
-                "reason=no_observable_activity"
-            )
-            stderr = (stderr or "").rstrip()
-            stderr = f"{stderr}\n{timeout_line}" if stderr else timeout_line
-            return subprocess.CompletedProcess(
+            return timeout_completed(
+                process,
                 command,
-                EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE,
-                stdout,
-                stderr,
+                idle_timeout_seconds=idle_timeout_seconds,
+                activity_check_interval_seconds=activity_check_interval_seconds,
+                max_runtime_seconds=max_runtime_seconds,
+                reason="no_observable_activity",
             )
+
+
+def timeout_completed(
+    process: subprocess.Popen[str],
+    command: list[str],
+    *,
+    idle_timeout_seconds: float,
+    activity_check_interval_seconds: float,
+    max_runtime_seconds: float | None,
+    reason: str,
+) -> subprocess.CompletedProcess[str]:
+    terminate_process_group(process)
+    stdout, stderr = process.communicate()
+    timeout_parts = [
+        EXTERNAL_REVIEWER_TIMEOUT_FLAG,
+        f"idle_timeout_seconds={idle_timeout_seconds:g}",
+        f"activity_check_interval_seconds={activity_check_interval_seconds:g}",
+    ]
+    if max_runtime_seconds is not None:
+        timeout_parts.append(f"max_runtime_seconds={max_runtime_seconds:g}")
+    timeout_parts.append(f"reason={reason}")
+    timeout_line = " ".join(timeout_parts)
+    stderr = (stderr or "").rstrip()
+    stderr = f"{stderr}\n{timeout_line}" if stderr else timeout_line
+    return subprocess.CompletedProcess(
+        command,
+        EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE,
+        stdout,
+        stderr,
+    )
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -374,6 +538,11 @@ def main() -> int:
             config,
             "activity_check_interval_seconds",
             DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS,
+        )
+        max_runtime = optional_positive_float(
+            config,
+            "max_runtime_seconds",
+            DEFAULT_MAX_RUNTIME_SECONDS,
         )
         health_timeout = int(positive_float(config, "health_timeout_seconds", 30.0))
         output_format = config.get("output_format")
@@ -583,6 +752,8 @@ def main() -> int:
         env=env,
         idle_timeout_seconds=idle_timeout,
         activity_check_interval_seconds=activity_check_interval,
+        max_runtime_seconds=max_runtime,
+        output_format=output_format,
     )
 
     raw_stdout = completed.stdout or ""

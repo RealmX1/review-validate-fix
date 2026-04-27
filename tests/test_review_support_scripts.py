@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -25,6 +26,15 @@ COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"
 PREPARE_REVIEW_RUN = SCRIPT_DIR / "prepare_review_run.py"
 RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
+
+
+def load_alternative_reviewer_module():
+    spec = importlib.util.spec_from_file_location("rvf_run_alternative_reviewer", RUN_ALTERNATIVE_REVIEWER)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load run_alternative_reviewer module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run(
@@ -70,6 +80,7 @@ def write_alternative_reviewer_config(
     *,
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    max_runtime_seconds: float | None = None,
     output_format: str | None = "text",
 ) -> Path:
     payload = {
@@ -81,6 +92,8 @@ def write_alternative_reviewer_config(
         "activity_check_interval_seconds": activity_check_interval_seconds,
         "env_unset": [],
     }
+    if max_runtime_seconds is not None:
+        payload["max_runtime_seconds"] = max_runtime_seconds
     if output_format is not None:
         payload["output_format"] = output_format
     path.write_text(
@@ -1244,6 +1257,126 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
+def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, sys, time; sys.stdin.read(); "
+                "print(json.dumps({'type':'assistant','message':{'content':["
+                "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
+                "]}}), flush=True); "
+                "time.sleep(0.25); "
+                "print(json.dumps({'type':'user','message':{'content':["
+                "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
+                "]}}), flush=True); "
+                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=0.1,
+        activity_check_interval_seconds=0.03,
+        output_format="claude_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES"
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
+
+
+def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, sys, time; sys.stdin.read(); "
+                "event = json.dumps({'type':'assistant','message':{'content':["
+                "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
+                "]}}); "
+                "split_at = len(event) // 2; "
+                "sys.stdout.write(event[:split_at]); sys.stdout.flush(); "
+                "time.sleep(0.04); "
+                "sys.stdout.write(event[split_at:] + '\\n'); sys.stdout.flush(); "
+                "time.sleep(0.25); "
+                "print(json.dumps({'type':'user','message':{'content':["
+                "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
+                "]}}), flush=True); "
+                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=0.1,
+        activity_check_interval_seconds=0.03,
+        output_format="claude_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES"
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
+
+
+def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
+    module = load_alternative_reviewer_module()
+    assert module.next_wait_seconds(
+        activity_check_interval_seconds=5.0,
+        remaining_idle_seconds=0.0,
+        max_runtime_remaining_seconds=None,
+        waiting_on_long_command=True,
+    ) == 5.0
+    assert module.next_wait_seconds(
+        activity_check_interval_seconds=5.0,
+        remaining_idle_seconds=0.0,
+        max_runtime_remaining_seconds=2.0,
+        waiting_on_long_command=True,
+    ) == 2.0
+    assert module.next_wait_seconds(
+        activity_check_interval_seconds=5.0,
+        remaining_idle_seconds=0.0,
+        max_runtime_remaining_seconds=None,
+        waiting_on_long_command=False,
+    ) == 0.01
+
+
 def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -1514,6 +1647,9 @@ def main() -> int:
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
         test_alternative_reviewer_timeout_kills_child_process_group(root / "alternative-timeout-child")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
+        test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(root / "alternative-bash-tool")
+        test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(root / "alternative-split-jsonl")
+        test_alternative_reviewer_long_command_wait_uses_check_interval()
         test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")
         test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config")
         test_alternative_reviewer_respects_explicit_claude_text_output(root / "alternative-text-config")
