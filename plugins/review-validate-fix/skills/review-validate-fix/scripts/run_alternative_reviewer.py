@@ -153,6 +153,7 @@ def build_prompt(prompt_file: Path, session_context: Path | None, review_packet:
         env_lines.extend(
             [
                 "- `RVF_SCOPE_OF_WORK`: main-agent scope anchor. Read it before analyzing code.",
+                "- `RVF_SESSION_CONTEXT`: alias for `RVF_SCOPE_OF_WORK`.",
             ]
         )
     if review_packet is not None:
@@ -731,6 +732,7 @@ def main() -> int:
         env["RVF_REPO"] = str(repo)
     if session_context is not None:
         env["RVF_SCOPE_OF_WORK"] = str(session_context)
+        env["RVF_SESSION_CONTEXT"] = str(session_context)
     if review_packet is not None:
         env["RVF_REVIEW_PACKET"] = str(review_packet)
 

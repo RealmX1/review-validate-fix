@@ -947,6 +947,45 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
     assert str(module.COMMAND_LOCK) not in prompt
 
 
+def test_alternative_reviewer_subprocess_receives_session_context_alias(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "scope-of-work.md"
+    context.write_text("scope\n", encoding="utf-8")
+    packet = tmp / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    reviewer_code = (
+        "import os, sys; "
+        "sys.stdin.read(); "
+        f"expected = {str(context.resolve())!r}; "
+        "assert os.environ['RVF_SCOPE_OF_WORK'] == expected; "
+        "assert os.environ['RVF_SESSION_CONTEXT'] == expected; "
+        "print('NO_ISSUES')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+    )
+
+    completed = run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--review-packet",
+            str(packet),
+        ]
+    )
+
+    assert completed.stdout.strip() == "NO_ISSUES"
+
+
 def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     state = tmp / "state"
@@ -1719,6 +1758,7 @@ def main() -> int:
         test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
         test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env")
+        test_alternative_reviewer_subprocess_receives_session_context_alias(root / "alternative-session-alias")
         test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle")
         test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir")
         test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout")
