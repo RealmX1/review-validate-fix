@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import sys
@@ -176,7 +177,15 @@ def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
     return cache_dir
 
 
-def configure_stop_hook(plugin_skill_dir: Path) -> Path:
+def configure_stop_hook(
+    plugin_skill_dir: Path,
+    fork_mode: str = "gui",
+    vibe_kanban_project_id: str | None = None,
+    vibe_kanban_mcp_cmd: str | None = None,
+    vibe_kanban_start_cmd: str | None = None,
+    vibe_kanban_backend_url: str | None = None,
+    vibe_kanban_management_mode: str | None = None,
+) -> Path:
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     if hooks_path.exists():
@@ -187,18 +196,40 @@ def configure_stop_hook(plugin_skill_dir: Path) -> Path:
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
     dispatcher = plugin_skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
-    command = (
-        "CODEX_RVF_MODE=fork "
-        "CODEX_RVF_FORK_MODE=gui "
-        "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=60 "
-        "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=30 "
-        f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))} "
-        f"python3 {shlex.quote(str(dispatcher))}"
+    env_parts = [
+        "CODEX_RVF_MODE=fork",
+        f"CODEX_RVF_FORK_MODE={shlex.quote(fork_mode)}",
+    ]
+    if fork_mode == "vibe-kanban":
+        management_mode = (vibe_kanban_management_mode or "").strip()
+        if management_mode:
+            env_parts.append(f"CODEX_RVF_VK_MANAGEMENT_MODE={shlex.quote(management_mode)}")
+        project_id = (vibe_kanban_project_id or "").strip()
+        if project_id:
+            env_parts.append(f"CODEX_RVF_VK_PROJECT_ID={shlex.quote(project_id)}")
+        else:
+            env_parts.append("CODEX_RVF_VK_PROJECT_AUTO=1")
+        for name, value in (
+            ("CODEX_RVF_VK_MCP_CMD", vibe_kanban_mcp_cmd),
+            ("CODEX_RVF_VK_START_CMD", vibe_kanban_start_cmd),
+            ("CODEX_RVF_VK_BACKEND_URL", vibe_kanban_backend_url),
+        ):
+            text = (value or "").strip()
+            if text:
+                env_parts.append(f"{name}={shlex.quote(text)}")
+    env_parts.extend(
+        [
+            "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
+            "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
+            f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
+            f"python3 {shlex.quote(str(dispatcher))}",
+        ]
     )
+    command = " ".join(env_parts)
     entry = {
         "type": "command",
         "command": command,
-        "timeout": 180,
+        "timeout": 300,
         "statusMessage": "Review-Validate-Fix：同步插件并运行停止检查",
     }
 
@@ -260,7 +291,44 @@ def main() -> int:
     parser.add_argument(
         "--configure-stop-hook",
         action="store_true",
-        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 dispatcher 同步本 repo，再以 Codex GUI/app-server fork 调用 plugin skill。",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 dispatcher 同步本 repo，再调用 plugin skill。",
+    )
+    parser.add_argument(
+        "--fork-mode",
+        choices=["gui", "vibe-kanban", "manual", "dry-run"],
+        default="gui",
+        help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 gui。",
+    )
+    parser.add_argument(
+        "--vibe-kanban-project-id",
+        default=None,
+        help=(
+            "与 --configure-stop-hook --fork-mode vibe-kanban 配合使用；"
+            "也可用 CODEX_RVF_VK_PROJECT_ID 提供。未提供时 Stop hook 会自动匹配或创建项目。"
+        ),
+    )
+    parser.add_argument(
+        "--vibe-kanban-mcp-cmd",
+        default=None,
+        help="持久写入 CODEX_RVF_VK_MCP_CMD；用于固定 npx 版本或连接 self-host 本地 Cloud。",
+    )
+    parser.add_argument(
+        "--vibe-kanban-start-cmd",
+        default=None,
+        help="持久写入 CODEX_RVF_VK_START_CMD；用于通过 tmux 启动带自定义 env 的 Vibe-Kanban。",
+    )
+    parser.add_argument(
+        "--vibe-kanban-backend-url",
+        default=None,
+        help="持久写入 CODEX_RVF_VK_BACKEND_URL；用于固定已有 Vibe-Kanban app backend。",
+    )
+    parser.add_argument(
+        "--vibe-kanban-management-mode",
+        default=None,
+        help=(
+            "持久写入 CODEX_RVF_VK_MANAGEMENT_MODE；未提供时保持 hook 默认 local-workspace，"
+            "显式 remote-project 会保留旧 project/issue fallback。"
+        ),
     )
     args = parser.parse_args()
 
@@ -279,7 +347,16 @@ def main() -> int:
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:
-            hooks_path = configure_stop_hook(dst / PLUGIN_SKILL_REL)
+            hooks_path = configure_stop_hook(
+                dst / PLUGIN_SKILL_REL,
+                args.fork_mode,
+                args.vibe_kanban_project_id or os.environ.get("CODEX_RVF_VK_PROJECT_ID"),
+                args.vibe_kanban_mcp_cmd or os.environ.get("CODEX_RVF_VK_MCP_CMD"),
+                args.vibe_kanban_start_cmd or os.environ.get("CODEX_RVF_VK_START_CMD"),
+                args.vibe_kanban_backend_url or os.environ.get("CODEX_RVF_VK_BACKEND_URL"),
+                args.vibe_kanban_management_mode
+                or os.environ.get("CODEX_RVF_VK_MANAGEMENT_MODE"),
+            )
             installed.append(f"stop hook: {hooks_path}")
         if removed_legacy is not None:
             installed.append(f"removed deprecated standalone skill: {removed_legacy}")

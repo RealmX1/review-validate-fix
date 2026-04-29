@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -37,6 +38,23 @@ def with_argv(argv: list[str], callback) -> None:
         callback()
     finally:
         sys.argv = original_argv
+
+
+def with_env(updates: dict[str, str | None], callback) -> None:
+    original = {key: os.environ.get(key) for key in updates}
+    for key, value in updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        callback()
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def rvf_hooks(data: dict[str, object]) -> list[dict[str, object]]:
@@ -98,8 +116,9 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     command = matching[0]["command"]
     assert "codex_stop_hook_dispatcher.py" in command
     assert "/plugins/review-validate-fix/skills/review-validate-fix/" in command
-    assert "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=60" in command
-    assert "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=30" in command
+    assert "CODEX_RVF_FORK_MODE=gui" in command
+    assert "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180" in command
+    assert "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60" in command
     assert "python3 /tmp/other.py" in json.dumps(data)
 
 
@@ -131,6 +150,228 @@ def test_configure_stop_hook_adds_dispatcher_when_missing(tmp_path: Path) -> Non
     data = json.loads(hooks_path.read_text(encoding="utf-8"))
     assert len(rvf_hooks(data)) == 1
     assert "python3 /tmp/other.py" in json.dumps(data)
+
+
+def test_configure_stop_hook_can_write_vibe_kanban_mode(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            "vibe-kanban",
+            "project-abc",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    assert "CODEX_RVF_FORK_MODE=vibe-kanban" in matching[0]["command"]
+    assert "CODEX_RVF_VK_PROJECT_ID=project-abc" in matching[0]["command"]
+
+
+def test_configure_stop_hook_can_auto_resolve_vibe_kanban_project(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            "vibe-kanban",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    assert "CODEX_RVF_FORK_MODE=vibe-kanban" in matching[0]["command"]
+    assert "CODEX_RVF_VK_PROJECT_AUTO=1" in matching[0]["command"]
+    assert "CODEX_RVF_VK_PROJECT_ID=" not in matching[0]["command"]
+
+
+def test_configure_stop_hook_can_write_vibe_kanban_connection_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            "vibe-kanban",
+            "project-abc",
+            "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp",
+            "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44",
+            "http://127.0.0.1:50280",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    command = rvf_hooks(data)[0]["command"]
+    assert "CODEX_RVF_VK_MCP_CMD=" in command
+    assert "VK_SHARED_API_BASE=http://localhost:3000" in command
+    assert "CODEX_RVF_VK_START_CMD=" in command
+    assert "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280" in command
+
+
+def test_configure_stop_hook_can_write_vibe_kanban_management_mode(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            "vibe-kanban",
+            "project-abc",
+            vibe_kanban_management_mode="remote-project",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    command = rvf_hooks(
+        json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    )[0]["command"]
+    assert "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project" in command
+
+
+def test_main_persists_vibe_project_id_from_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "vibe-kanban",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env({"CODEX_RVF_VK_PROJECT_ID": "project-from-env"}, run_main),
+    )
+
+    data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    assert "CODEX_RVF_FORK_MODE=vibe-kanban" in matching[0]["command"]
+    assert "CODEX_RVF_VK_PROJECT_ID=project-from-env" in matching[0]["command"]
+
+
+def test_main_persists_vibe_management_mode_from_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "vibe-kanban",
+                "--vibe-kanban-project-id",
+                "project-abc",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env(
+            {"CODEX_RVF_VK_MANAGEMENT_MODE": "remote-project"},
+            run_main,
+        ),
+    )
+
+    command = rvf_hooks(
+        json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    )[0]["command"]
+    assert "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project" in command
+
+
+def test_main_persists_vibe_connection_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "vibe-kanban",
+                "--vibe-kanban-project-id",
+                "project-abc",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env(
+            {
+                "CODEX_RVF_VK_MCP_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp",
+                "CODEX_RVF_VK_START_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44",
+                "CODEX_RVF_VK_BACKEND_URL": "http://127.0.0.1:50280",
+            },
+            run_main,
+        ),
+    )
+
+    command = rvf_hooks(json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8")))[0]["command"]
+    assert "CODEX_RVF_VK_MCP_CMD=" in command
+    assert "CODEX_RVF_VK_START_CMD=" in command
+    assert "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280" in command
+
+
+def test_main_configures_vibe_auto_project_without_project_id(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "vibe-kanban",
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, lambda: with_env({"CODEX_RVF_VK_PROJECT_ID": None}, run_main))
+    data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    assert "CODEX_RVF_VK_PROJECT_AUTO=1" in matching[0]["command"]
 
 
 def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
@@ -223,6 +464,14 @@ def main() -> int:
     tests = [
         test_configure_stop_hook_deduplicates_existing_rvf_hooks,
         test_configure_stop_hook_adds_dispatcher_when_missing,
+        test_configure_stop_hook_can_write_vibe_kanban_mode,
+        test_configure_stop_hook_can_auto_resolve_vibe_kanban_project,
+        test_configure_stop_hook_can_write_vibe_kanban_connection_env,
+        test_configure_stop_hook_can_write_vibe_kanban_management_mode,
+        test_main_persists_vibe_project_id_from_env,
+        test_main_persists_vibe_management_mode_from_env,
+        test_main_persists_vibe_connection_env,
+        test_main_configures_vibe_auto_project_without_project_id,
         test_copy_tree_preserves_nested_plugin_setup,
         test_main_installs_plugin_and_configures_stop_hook,
     ]

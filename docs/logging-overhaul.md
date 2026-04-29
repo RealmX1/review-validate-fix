@@ -29,8 +29,8 @@
 | 统一 helper | 已落地 skill runtime `scripts/rvf_logging.py`，提供 `RunLedger`、`start_run()`、`event()`、`summary()`、`artifact()`、`latest_pointer()`、`hook_payload()` | 新增日志必须经 helper 写入，不直接手写散落 JSON |
 | run 目录 | 已落地 `state/runs/<run_id>/summary.json`、`events.jsonl`、`artifacts/` | 大文本和敏感内容只进入 artifacts，事件流只放摘要和路径 |
 | latest pointer | 已降级为 `run_id`、`summary_path`、`events_path`、`status`、`reason_code`、`updated_at` | 任何主程序逻辑不得把 `latest.json` 当完整状态源 |
-| Stop hook stdout | 保持只输出 Codex hook payload JSON | 诊断信息只能进 `systemMessage` 摘要或 run ledger |
-| dispatcher dev sync | 已接入同一 run ledger，失败时非零退出并在 stderr 给 summary path | 不允许把 stale installed plugin 的继续执行作为 fallback |
+| Stop hook stdout | 保持只输出 Codex hook payload JSON | 诊断信息只能进 `systemMessage` 摘要或 run ledger；dispatcher 失败也不走非零 stderr |
+| dispatcher dev sync | 已接入同一 run ledger，失败时输出 hook payload 并给 summary path | 不允许把 stale installed plugin 的继续执行作为 fallback，也不要让 stderr 变成当前会话 continuation |
 | prepare/reviewer | 已支持 `--rvf-run-id` 和 `--rvf-run-dir` | manual run 和 external reviewer 必须可通过 run ledger 排障 |
 | 日志失败 | helper 返回 `log_unavailable` diagnostics，hook payload 仍可用 | 不得让日志目录不可写破坏 Stop hook 协议 |
 
@@ -208,7 +208,7 @@ state/
 
 - `codex_stop_hook_dispatcher.py` 使用同一 `correlation_id`。
 - dev sync 的每一步命令写入 `events.jsonl`，stdout/stderr 作为 artifact 保存或按大小截断。
-- sync 失败时仍以非零 stderr 阻止 installed hook 继续运行，并在 stderr 中给出 summary path。
+- sync 失败时不运行 installed hook，并通过 stdout hook payload 给出 summary path；不要以非零 stderr 报告，否则 Codex Desktop 可能把失败包装成当前会话 continuation。
 - 删除 `*.rvf-dev-sync.json` 作为主日志；如需兼容，只写一份指向新 run 的短 JSON pointer。
 
 ### 4. 替换 skill run 和 reviewer 输出
@@ -258,6 +258,7 @@ state/
 
 - 不把 Stop hook 改回 continuation prompt。
 - 不在 hook stdout 输出调试文本。
+- 不用非零 stderr 表达 dispatcher dev sync / installed hook failure。
 - 不把完整 review packet、prompt、reviewer stdout 全量塞进主事件 JSON。
 - 不自动删除或回滚 reviewer 运行造成的 workspace 变化。
 - 不做多阶段双写迁移；本项目未分发，日志系统应一次性切换到新结构。

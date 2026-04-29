@@ -19,8 +19,29 @@ COMPONENTS = {
     "stop-hook",
     "prepare-run",
     "reviewer",
+    "vibe-kanban-runner",
     "contract-check",
     "installer",
+}
+PRESERVED_SUMMARY_KEYS = {
+    "log_prefix",
+    "mode",
+    "issue_title",
+    "parent_thread_id",
+    "parent_thread_path",
+    "parent_transcript_path",
+    "prompt_path",
+    "runner_command",
+    "runner_pid",
+    "runner_stderr_path",
+    "runner_stdout_path",
+    "startup_prepare_metadata_path",
+    "suppress_child_stop_hook",
+    "vibe_backend_url",
+    "vibe_issue_id",
+    "vibe_management_mode",
+    "vibe_project_id",
+    "vibe_workspace_id",
 }
 PHASES = {
     "dev-sync",
@@ -89,6 +110,14 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class RunLedger:
@@ -275,6 +304,12 @@ class RunLedger:
             "artifacts_dir": str(self.artifacts_dir),
         }
         payload.update(fields)
+        previous = _read_json_object(self.summary_path)
+        for key in PRESERVED_SUMMARY_KEYS:
+            if key not in payload or payload.get(key) is None:
+                value = previous.get(key)
+                if value is not None:
+                    payload[key] = value
         if self.diagnostics:
             payload["diagnostics"] = self.diagnostics
             payload["log_unavailable"] = True

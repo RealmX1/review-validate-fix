@@ -55,8 +55,9 @@ def write_fake_dev_scripts(repo: Path, marker: Path, *, fail_sync: bool = False)
     (scripts / "check_plugin_contracts.py").write_text(contract_body, encoding="utf-8")
     (scripts / "install_to_codex.py").write_text(
         "#!/usr/bin/env python3\n"
-        "import pathlib\n"
-        f"pathlib.Path({str(marker / 'install-ran')!r}).write_text('install\\n', encoding='utf-8')\n",
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker / 'install-ran')!r}).write_text("
+        "'install ' + ' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n",
         encoding="utf-8",
     )
 
@@ -108,6 +109,61 @@ def write_slow_installed_hook(path: Path) -> None:
     )
 
 
+def write_user_transcript(path: Path, repo: Path, session_id: str = "session") -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": str(repo)},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "status only"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_apply_patch_transcript(path: Path, repo: Path, rel_path: str) -> Path:
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: {rel_path}\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "session-with-edit", "cwd": str(repo)},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "input": patch,
+                    "call_id": "call_patch",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def invoke_result(
     event: dict[str, object],
     *,
@@ -124,6 +180,15 @@ def invoke_result(
         "CODEX_RVF_LOG_ROOT",
         "CODEX_RVF_DEV_SYNC",
         "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT",
+        "CODEX_RVF_CORRELATION_ID",
+        "CODEX_RVF_FORK_MODE",
+        "CODEX_RVF_RUN_DIR",
+        "CODEX_RVF_RUN_ID",
+        "CODEX_RVF_VK_PROJECT_AUTO",
+        "CODEX_RVF_VK_PROJECT_ID",
+        "CODEX_RVF_VK_MANAGEMENT_MODE",
+        "CODEX_RVF_SUPPRESS",
+        "CODEX_RVF_SUPPRESS_STOP_HOOK",
     ):
         env.pop(key, None)
     if dev_repo is not None:
@@ -275,6 +340,36 @@ def test_subagent_stop_runs_installed_hook_without_sync(tmp_path: Path) -> None:
     assert not (marker / "install-ran").exists()
 
 
+def test_suppress_env_skips_before_sync_and_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "session_id": "headless-child",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=suppressed" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+
+
 def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -291,10 +386,11 @@ def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -
         state=state,
     )
 
-    assert completed.returncode == 2
-    assert completed.stdout == ""
-    assert "dev sync" in completed.stderr
-    assert "失败" in completed.stderr
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=sync_command_failed" in payload["systemMessage"]
+    assert completed.stderr == ""
     assert (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
@@ -315,11 +411,11 @@ def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> 
         state=tmp_path / "state",
     )
 
-    assert completed.returncode == 7
-    assert completed.stdout == ""
-    assert "installed hook failed with exit code 7" in completed.stderr
-    assert "boom" in completed.stderr
-    assert "continue" not in completed.stderr
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=installed_hook_failed" in payload["systemMessage"]
+    assert completed.stderr == ""
 
 
 def test_missing_installed_hook_blocks_instead_of_continuing(tmp_path: Path) -> None:
@@ -333,11 +429,11 @@ def test_missing_installed_hook_blocks_instead_of_continuing(tmp_path: Path) -> 
         state=tmp_path / "state",
     )
 
-    assert completed.returncode != 0
-    assert completed.stdout == ""
-    assert "installed hook failed" in completed.stderr
-    assert "No such file" in completed.stderr or "can't open file" in completed.stderr
-    assert "continue" not in completed.stderr
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=installed_hook_failed" in payload["systemMessage"]
+    assert completed.stderr == ""
 
 
 def test_installed_hook_timeout_blocks_instead_of_continuing(tmp_path: Path) -> None:
@@ -353,10 +449,172 @@ def test_installed_hook_timeout_blocks_instead_of_continuing(tmp_path: Path) -> 
         extra_env={"CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT": "1"},
     )
 
-    assert completed.returncode == 124
-    assert completed.stdout == ""
-    assert "installed hook timed out" in completed.stderr
-    assert "continue" not in completed.stderr
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=installed_hook_timeout" in payload["systemMessage"]
+    assert completed.stderr == ""
+
+
+def test_dev_repo_without_session_owned_dirty_skips_sync_and_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    (repo / "background.txt").write_text("background\n", encoding="utf-8")
+    transcript = write_user_transcript(tmp_path / "session.jsonl", repo)
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+
+
+def test_session_hook_control_forwards_without_session_owned_dirty(tmp_path: Path) -> None:
+    for action in ("off", "on", "status"):
+        root = tmp_path / action
+        repo = init_repo(root / "rvf")
+        (repo / "background.txt").write_text("background\n", encoding="utf-8")
+        transcript = write_user_transcript(root / "session.jsonl", repo)
+        marker = root / "marker"
+        marker.mkdir()
+        write_fake_dev_scripts(repo, marker)
+        hook = root / "installed" / "codex_stop_review_validate_fix.py"
+        write_fake_installed_hook(hook, marker)
+        event = {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "session_id": f"session-{action}",
+            "transcript_path": str(transcript),
+            "last_user_message": f"RVF_STOP_HOOK: {action}",
+        }
+
+        stdout = invoke(
+            event,
+            dev_repo=repo,
+            hook=hook,
+            state=root / "state",
+        )
+
+        payload = json.loads(stdout)
+        assert payload["systemMessage"] == "real hook ran"
+        assert not (marker / "sync-ran").exists()
+        assert not (marker / "install-ran").exists()
+        assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_session_manifest_failure_skips_sync_and_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    transcript = tmp_path / "bad-session.jsonl"
+    transcript.write_bytes(b"\xff")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=session_manifest_failed" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "session_manifest_failed"
+
+
+def test_provided_missing_transcript_skips_sync_and_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    missing_transcript = tmp_path / "missing-session.jsonl"
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(missing_transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=transcript_unavailable" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "transcript_unavailable"
+
+
+def test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    (repo / "owned.txt").write_text("new\n", encoding="utf-8")
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo, "owned.txt")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    stdout = invoke(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert (marker / "sync-ran").exists()
+    assert (marker / "install-ran").exists()
+    assert (marker / "hook-input.json").exists()
 
 
 def test_coerce_text_handles_timeout_bytes() -> None:
@@ -387,18 +645,191 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
     assert marker.exists()
 
 
+def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "vibe-kanban",
+            "CODEX_RVF_VK_MANAGEMENT_MODE": "remote-project",
+            "CODEX_RVF_VK_PROJECT_ID": "project-abc",
+            "CODEX_RVF_VK_MCP_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp",
+            "CODEX_RVF_VK_START_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44",
+            "CODEX_RVF_VK_BACKEND_URL": "http://127.0.0.1:50280",
+        },
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    install_args = (marker / "install-ran").read_text(encoding="utf-8")
+    assert "--configure-stop-hook" in install_args
+    assert "--fork-mode vibe-kanban" in install_args
+    assert "--vibe-kanban-management-mode remote-project" in install_args
+    assert "--vibe-kanban-project-id project-abc" in install_args
+    assert "--vibe-kanban-mcp-cmd" in install_args
+    assert "--vibe-kanban-start-cmd" in install_args
+    assert "--vibe-kanban-backend-url http://127.0.0.1:50280" in install_args
+
+
+def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    home = tmp_path / "home"
+    hooks_path = home / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "CODEX_RVF_MODE=fork "
+                                        "CODEX_RVF_FORK_MODE=vibe-kanban "
+                                        "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project "
+                                        "CODEX_RVF_VK_PROJECT_AUTO=1 "
+                                        "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280 "
+                                        f"python3 {SCRIPT}"
+                                    ),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "HOME": str(home),
+            "CODEX_RVF_FORK_MODE": "gui",
+            "CODEX_RVF_VK_PROJECT_ID": "stale-project",
+        },
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    install_args = (marker / "install-ran").read_text(encoding="utf-8")
+    assert "--configure-stop-hook" in install_args
+    assert "--fork-mode vibe-kanban" in install_args
+    assert "--vibe-kanban-management-mode remote-project" in install_args
+    assert "--vibe-kanban-project-id" not in install_args
+    assert "--vibe-kanban-backend-url http://127.0.0.1:50280" in install_args
+    assert "stale-project" not in install_args
+
+
+def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook.parent.mkdir(parents=True)
+    hook.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        f"pathlib.Path({str(marker / 'hook-env.json')!r}).write_text(json.dumps({{'mode': os.environ.get('CODEX_RVF_FORK_MODE'), 'management_mode': os.environ.get('CODEX_RVF_VK_MANAGEMENT_MODE'), 'auto': os.environ.get('CODEX_RVF_VK_PROJECT_AUTO'), 'project_id': os.environ.get('CODEX_RVF_VK_PROJECT_ID'), 'backend': os.environ.get('CODEX_RVF_VK_BACKEND_URL')}}), encoding='utf-8')\n"
+        "print(json.dumps({'continue': True, 'systemMessage': 'real hook ran'}))\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    hooks_path = home / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "CODEX_RVF_MODE=fork "
+                                        "CODEX_RVF_FORK_MODE=vibe-kanban "
+                                        "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project "
+                                        "CODEX_RVF_VK_PROJECT_AUTO=1 "
+                                        "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280 "
+                                        f"python3 {SCRIPT}"
+                                    ),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=None,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "HOME": str(home),
+            "CODEX_RVF_FORK_MODE": "gui",
+            "CODEX_RVF_VK_PROJECT_ID": "stale-project",
+        },
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    hook_env = json.loads((marker / "hook-env.json").read_text(encoding="utf-8"))
+    assert hook_env == {
+        "mode": "vibe-kanban",
+        "management_mode": "remote-project",
+        "auto": "1",
+        "project_id": None,
+        "backend": "http://127.0.0.1:50280",
+    }
+
+
 def main() -> int:
     tests = [
         test_dev_repo_main_session_syncs_before_running_installed_hook,
         test_session_hook_off_still_syncs_before_running_installed_hook,
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
+        test_suppress_env_skips_before_sync_and_installed_hook,
         test_sync_failure_skips_installed_hook_to_avoid_stale_fork,
         test_installed_hook_failure_blocks_instead_of_continuing,
         test_missing_installed_hook_blocks_instead_of_continuing,
         test_installed_hook_timeout_blocks_instead_of_continuing,
+        test_dev_repo_without_session_owned_dirty_skips_sync_and_hook,
+        test_session_hook_control_forwards_without_session_owned_dirty,
+        test_session_manifest_failure_skips_sync_and_installed_hook,
+        test_provided_missing_transcript_skips_sync_and_installed_hook,
+        test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
+        test_dev_sync_preserves_vibe_kanban_installer_args,
+        test_dev_sync_prefers_hooks_json_over_stale_cached_env,
+        test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

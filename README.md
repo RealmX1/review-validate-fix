@@ -76,6 +76,26 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui` 调用 installed plugin skill 的稳定 dispatcher，并由 dispatcher 在必要检查和安装后转交给 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal；正常情况下它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这样父会话保留为可 rewind 的稳定 checkpoint。如果 Codex Desktop control socket 不可用，则默认只报告无法创建 GUI fork，不再回退到 Stop continuation。
 
+如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Vibe-Kanban 管理模式：
+
+```bash
+python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode vibe-kanban
+```
+
+默认 `CODEX_RVF_VK_MANAGEMENT_MODE=local-workspace`。Stop hook 会先确保本地 Vibe-Kanban app/backend 可用：优先使用 `CODEX_RVF_VK_BACKEND_URL`/`VIBE_BACKEND_URL`，否则读取 `vibe-kanban.port`，再从本机 Vibe-Kanban 监听端口中试探可用 backend；如果当前 app/server 没运行，会用 `tmux` session `rvf-vibe-kanban` 启动 `CODEX_RVF_VK_START_CMD`（默认 `npx -y vibe-kanban@0.1.44`）并等待 MCP 可用（默认 `CODEX_RVF_VK_START_TIMEOUT=90`）。随后 hook 通过本地 Vibe API 创建一个 Workspaces 列表里的 RVF 管理记录，并把 run 详情写入该 workspace 的 notes scratch；runner 会把 workspace 名称从 `RVF queued` 更新为 `RVF running`/`RVF completed`/`RVF failed`。这条路径不使用 Vibe 的 `start_workspace`，也不创建 Vibe 管理的独立 worktree。
+
+旧的 remote project/issue 管理路径仍保留为显式 fallback：设置 `CODEX_RVF_VK_MANAGEMENT_MODE=remote-project` 后，可以用 `--vibe-kanban-project-id <vibe_project_id>` 或 `CODEX_RVF_VK_PROJECT_ID=<vibe_project_id>` 固定 project id；未提供 project id 时，hook 会在 `CODEX_RVF_VK_PROJECT_AUTO=1` 下通过 `list_repos`/`list_projects` 匹配当前 repo。注意 Vibe-Kanban 0.1.44 已把 project/kanban UI 改为 export-only，因此该路径主要用于兼容旧 API，不建议作为默认可视化入口。
+
+若使用 self-hosted Vibe-Kanban Cloud，本地桌面/app 仍需带 `VK_SHARED_API_BASE` 启动，并且这些连接参数必须持久写入 Stop hook，否则 dispatcher 自同步会丢失本地 Cloud 配置。`VK_SHARED_API_BASE=http://localhost:3000` 指向 self-hosted Cloud remote-server；`CODEX_RVF_VK_BACKEND_URL`/`--vibe-kanban-backend-url` 只用于固定本地 Vibe app backend（例如 `http://127.0.0.1:<动态端口>`），不要把它设成 Cloud remote-server。installer 支持 `--vibe-kanban-mcp-cmd`、`--vibe-kanban-start-cmd`、`--vibe-kanban-backend-url`，也会从同名 `CODEX_RVF_VK_*` 环境变量读取。例如：
+
+```bash
+python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode vibe-kanban \
+  --vibe-kanban-start-cmd 'env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44' \
+  --vibe-kanban-mcp-cmd 'env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp'
+```
+
+该模式写入 `CODEX_RVF_FORK_MODE=vibe-kanban`。Stop hook 只有在本地 Vibe 管理记录创建成功后才启动后台 `run_vibe_kanban_rvf.py`。实际 review 仍由 `codex exec -C <target_repo>` 在父会话同一 worktree 中执行；runner 会把原 GUI fork prompt 包装成 headless RVF prompt，注入 parent transcript、run id/run dir 和 `prepare_review_run.py --rvf-run-id --rvf-run-dir` 复用要求，再复用同一份 RunLedger：`events.jsonl`、`summary.json`、`review-env.sh`、`review-agent-context.md`、stdout/stderr 与 final message 都写入 `state/runs/<run_id>/artifacts/`。Vibe-Kanban 只作为可视化管理平面，不负责创建独立 workspace 或执行沙箱。
+
 实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_dispatcher.py`，不是直接调用 `codex_stop_review_validate_fix.py`。dispatcher 会在 Stop event 来自本 RVF 源仓库、且不是 subagent 时，先顺序运行：
 
 ```bash
@@ -83,7 +103,11 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 会以非零状态退出并把失败原因写到 stderr，让 Codex 停在 hook 失败处等待用户介入；它不能把这类 breaking error 降级为 `continue: true` 的 systemMessage，也不能让主 coding agent 带着错误上下文继续工作。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
+如果当前 Stop hook command 是 Vibe-Kanban 模式，dispatcher 会在自同步安装时带上 `--fork-mode vibe-kanban --vibe-kanban-project-id <id>`，避免把已配置的管理模式覆盖回默认 `gui`。
+
+如果 Stop event 提供 transcript path，dispatcher 会先生成 session manifest；只有存在当前 chat session 归属的 `owned_dirty_paths` 时，才执行 dev sync 并转交 installed `codex_stop_review_validate_fix.py`。这避免其他 session 或其他 agent 留下的 dirty WIP 触发本 session 的同步、安装或自动 review。没有 transcript 时，dispatcher 仍保留旧行为，按 dev repo 主会话执行 sync。
+
+只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 只通过 stdout 输出一个不会触发模型续跑的 hook payload，并把失败详情写入 run ledger；不要把这类 breaking error 写成非零 stderr，因为 Codex Desktop 可能把 hook stderr 包装成当前会话的 `<hook_prompt>` continuation。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
 
 所有 dispatcher、Stop hook、manual run、external reviewer 和 command lock 的排障日志都写入统一 run ledger。入口是 `state/latest.json` 指向的 `state/runs/<run_id>/summary.json` 和 `events.jsonl`；大文本如 Stop event、fork prompt、review packet、stdout/stderr 会作为 `artifacts/` 文件保存。command lock 会记录 `lock_wait_started`、`lock_acquired`、`lock_timeout` 与 `lock_released` 事件。hook stdout 仍只输出 Codex hook payload，用户可见 `systemMessage` 保持短格式：`review-validate-fix: <status>; reason=<reason_code>; detail=<human_readable_note>; summary=<summary_path>`，其中 `detail` 只在需要解释非错误跳过、递归保护等用户易误解状态时出现。可用 `CODEX_RVF_LOG_ROOT` 或兼容别名 `CODEX_RVF_STATE_DIR` 覆盖日志根目录，未设置时使用 plugin skill 的 `state/`。
 
@@ -112,9 +136,12 @@ flowchart TD
     Stop --> Dispatcher["installed dispatcher\ncodex_stop_hook_dispatcher.py"]
 
     Dispatcher --> DevCheck{"Stop event 是否来自\nRVF dev repo 主会话？"}
-    DevCheck -- "是" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
+    DevCheck -- "是" --> SessionScope{"transcript 是否显示\nsession-owned dirty paths？"}
+    SessionScope -- "否" --> SkipSync["continue: true\nsystemMessage 说明跳过 sync/review"]
+    SessionScope -- "无 transcript" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
+    SessionScope -- "是" --> Sync
     Sync --> SyncOk{"检查和安装成功？"}
-    SyncOk -- "否" --> BlockingFail["stderr + 非零退出\n阻止使用旧 installed plugin"]
+    SyncOk -- "否" --> BlockingFail["continue: true\nsystemMessage + summary\n不运行旧 installed plugin"]
     SyncOk -- "是" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
     DevCheck -- "否：其他 repo 或 subagent" --> InstalledHook
 
@@ -151,7 +178,7 @@ flowchart TD
 RVF_STOP_HOOK: off
 ```
 
-这会把当前 session 标记为 disabled，后续 Stop hook 对同一 session 只跳过 RVF fork/continuation/review gate。它不会关闭 dispatcher 的 dev sync：当 Stop event 来自本 RVF 源仓库主会话时，dispatcher 仍会先检查并安装当前 plugin，然后再由 installed hook 看到该 session disabled 并跳过 RVF 流程。恢复时发送：
+这会把当前 session 标记为 disabled，后续 Stop hook 对同一 session 只跳过 RVF fork/continuation/review gate。dispatcher 仍会在 transcript 显示当前 session 拥有 dirty 改动时先检查并安装当前 plugin，然后再由 installed hook 看到该 session disabled 并跳过 RVF 流程；如果没有 session-owned dirty paths，则 dispatcher 会直接跳过 dev sync 与 installed hook。恢复时发送：
 
 ```text
 RVF_STOP_HOOK: on
@@ -187,6 +214,8 @@ python3 scripts/install_to_codex.py --replace-setup-config
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
 
 Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Desktop control socket 缺失且未显式允许 bridge app-server 时，fork 模式只报告无法创建 GUI fork。
+
+显式 `CODEX_RVF_FORK_MODE=vibe-kanban` 时，fork 模式不调用 Codex GUI fork；默认 `CODEX_RVF_VK_MANAGEMENT_MODE=local-workspace`，hook 会自动确保 Vibe-Kanban app/backend 可用，并通过本地 `/api/workspaces` 创建一个 RVF 管理 workspace，状态写入 workspace 名称，run 详情写入 `WORKSPACE_NOTES` scratch。创建管理记录成功后再启动后台 runner 调用 `CODEX_RVF_CODEX_EXEC_ARGS`（默认 `exec --json --dangerously-bypass-approvals-and-sandbox`）执行 `codex exec -C <target_repo>`。runner 传入 `codex exec` 的不是原始 GUI fork prompt，而是包含 parent transcript path、scope-of-work 生成要求和 `prepare_review_run.py --rvf-run-id --rvf-run-dir` 的 headless prompt。Vibe-Kanban app/backend 不可用、无法创建本地 workspace，或显式 `remote-project` 模式下无法匹配 project 时直接 fail-safe，不启动隐藏 runner。
 
 ## 验证
 

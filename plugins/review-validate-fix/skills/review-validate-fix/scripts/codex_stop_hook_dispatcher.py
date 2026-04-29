@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -11,6 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, start_run
+from session_manifest import build_manifest
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -22,6 +25,11 @@ SESSION_PATH_KEYS = (
     "log_path",
     "session_file",
 )
+SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
+SUPPRESS_ENV_NAMES = (
+    "CODEX_RVF_SUPPRESS",
+    "CODEX_RVF_SUPPRESS_STOP_HOOK",
+)
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -31,6 +39,28 @@ def emit(payload: dict[str, Any]) -> None:
 def fail_blocking(message: str, code: int = 2) -> int:
     print(message, file=sys.stderr)
     return code
+
+
+def emit_terminal_payload(
+    ledger: RunLedger,
+    *,
+    status: str,
+    reason_code: str,
+    message: str,
+    detail: str | None = None,
+    **summary_fields: Any,
+) -> int:
+    emit(
+        ledger.hook_payload(
+            status=status,
+            reason_code=reason_code,
+            continue_=True,
+            message=message,
+            detail=detail,
+            **summary_fields,
+        )
+    )
+    return 0
 
 
 def read_input() -> tuple[str, dict[str, Any] | None]:
@@ -48,6 +78,10 @@ def is_truthy(value: str | None, *, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def suppress_requested() -> bool:
+    return any(is_truthy(os.environ.get(name)) for name in SUPPRESS_ENV_NAMES)
 
 
 def command_timeout() -> float:
@@ -128,7 +162,7 @@ def session_meta_marks_subagent(path: Path) -> bool:
                 return isinstance(payload, dict) and source_marks_subagent(
                     payload.get("source")
                 )
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     return False
 
@@ -140,6 +174,24 @@ def event_session_paths(event: dict[str, Any]) -> list[Path]:
         if isinstance(value, str) and value:
             paths.append(Path(value))
     return paths
+
+
+def first_readable_session_path(event: dict[str, Any]) -> Path | None:
+    for path in event_session_paths(event):
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            with resolved.open("rb"):
+                pass
+        except OSError:
+            continue
+        else:
+            return resolved
+    return None
 
 
 def event_marks_subagent(event: dict[str, Any]) -> bool:
@@ -180,6 +232,89 @@ def should_sync(event: dict[str, Any]) -> tuple[bool, str, Path | None]:
     return True, "matched RVF dev repo main session", repo
 
 
+def should_sync_session_scope(
+    event: dict[str, Any],
+    repo: Path,
+    ledger: RunLedger,
+) -> tuple[bool, str, str]:
+    session_paths = event_session_paths(event)
+    transcript = first_readable_session_path(event)
+    if transcript is None:
+        if session_paths:
+            ledger.event(
+                phase="dev-sync",
+                event="session_scope_unavailable",
+                status="failed",
+                reason_code="transcript_unavailable",
+                repo=str(repo),
+                cwd=str(repo),
+                paths={"transcripts": [str(path) for path in session_paths]},
+            )
+            return (
+                False,
+                "session transcript path was provided but is not readable; skipped RVF dev sync and installed hook",
+                "transcript_unavailable",
+            )
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_unavailable",
+            status="skipped",
+            reason_code="missing_transcript",
+            repo=str(repo),
+            cwd=str(repo),
+        )
+        return (
+            True,
+            "session transcript unavailable; preserving legacy dev sync behavior",
+            "missing_transcript",
+        )
+    try:
+        manifest = build_manifest(repo, transcript)
+    except Exception as exc:
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=str(repo),
+            cwd=str(repo),
+            paths={"transcript": str(transcript)},
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return (
+            False,
+            "session manifest failed; skipped RVF dev sync and installed hook",
+            "session_manifest_failed",
+        )
+
+    manifest_path = ledger.artifact("session-manifest.json", manifest)
+    owned_dirty = manifest.get("owned_dirty_paths")
+    if isinstance(owned_dirty, list) and owned_dirty:
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_detected",
+            status="dirty",
+            reason_code="session_owned_dirty",
+            repo=str(repo),
+            cwd=str(repo),
+            paths={"manifest": manifest_path} if manifest_path else {},
+            owned_dirty_paths=owned_dirty,
+        )
+        return True, "session-owned dirty paths detected", "session_owned_dirty"
+
+    ledger.event(
+        phase="dev-sync",
+        event="session_scope_clean",
+        status="skipped",
+        reason_code="no_session_owned_dirty",
+        repo=str(repo),
+        cwd=str(repo),
+        paths={"manifest": manifest_path} if manifest_path else {},
+        unattributed_dirty_paths=manifest.get("unattributed_dirty_paths"),
+    )
+    return False, "no session-owned dirty paths", "no_session_owned_dirty"
+
+
 def run_step(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
     started = time.monotonic()
     try:
@@ -218,6 +353,207 @@ def run_step(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
             "stderr": str(exc),
             "duration_seconds": round(time.monotonic() - started, 3),
         }
+
+
+def _command_env(command: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return env
+    for token in tokens:
+        if "=" not in token or token.startswith("-"):
+            break
+        name, value = token.split("=", 1)
+        if not name:
+            break
+        env[name] = value
+    return env
+
+
+def _command_targets_current_dispatcher(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    current = Path(__file__).resolve()
+    for token in tokens:
+        if not token.endswith("codex_stop_hook_dispatcher.py"):
+            continue
+        try:
+            return Path(token).expanduser().resolve() == current
+        except OSError:
+            return False
+    return False
+
+
+def _merged_hook_config(hook_env: dict[str, str]) -> dict[str, str]:
+    config = dict(hook_env)
+    auto = config.get("CODEX_RVF_VK_PROJECT_AUTO")
+    project_id = config.get("CODEX_RVF_VK_PROJECT_ID", "").strip()
+    if auto is not None and is_truthy(auto):
+        config.pop("CODEX_RVF_VK_PROJECT_ID", None)
+    elif project_id:
+        config.pop("CODEX_RVF_VK_PROJECT_AUTO", None)
+    return config
+
+
+def hook_config_from_hooks_json() -> dict[str, str]:
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    try:
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    stop_groups = data.get("hooks", {}).get("Stop")
+    if not isinstance(stop_groups, list):
+        return {}
+    for group in stop_groups:
+        if not isinstance(group, dict):
+            continue
+        hooks = group.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        for hook in hooks:
+            command = hook.get("command") if isinstance(hook, dict) else None
+            if not isinstance(command, str):
+                continue
+            if "review-validate-fix" not in command or "codex_stop_hook_dispatcher.py" not in command:
+                continue
+            if not _command_targets_current_dispatcher(command):
+                continue
+            return _merged_hook_config(_command_env(command))
+    return {}
+
+
+def installer_args_from_env() -> list[str]:
+    args = ["--configure-stop-hook"]
+    # Codex Desktop may invoke a cached hook command after hooks.json has been
+    # updated. Prefer the on-disk RVF hook config so dev self-sync does not roll
+    # a newer vibe-kanban hook back to stale gui mode.
+    hook_env = hook_config_from_hooks_json()
+    fork_mode = (
+        hook_env.get("CODEX_RVF_FORK_MODE")
+        or os.environ.get("CODEX_RVF_FORK_MODE", "")
+    ).strip()
+    if not fork_mode:
+        return args
+    args.extend(["--fork-mode", fork_mode])
+    if fork_mode == "vibe-kanban":
+        hook_auto = hook_env.get("CODEX_RVF_VK_PROJECT_AUTO")
+        env_auto = os.environ.get("CODEX_RVF_VK_PROJECT_AUTO")
+        use_auto = (
+            hook_auto is not None
+            and is_truthy(hook_auto)
+            or hook_auto is None
+            and is_truthy(env_auto)
+        )
+        if not use_auto:
+            project_id = (
+                hook_env.get("CODEX_RVF_VK_PROJECT_ID")
+                or os.environ.get("CODEX_RVF_VK_PROJECT_ID", "")
+            ).strip()
+        else:
+            project_id = ""
+        if project_id:
+            args.extend(["--vibe-kanban-project-id", project_id])
+        for env_name, option in (
+            ("CODEX_RVF_VK_MANAGEMENT_MODE", "--vibe-kanban-management-mode"),
+            ("CODEX_RVF_VK_MCP_CMD", "--vibe-kanban-mcp-cmd"),
+            ("CODEX_RVF_VK_START_CMD", "--vibe-kanban-start-cmd"),
+            ("CODEX_RVF_VK_BACKEND_URL", "--vibe-kanban-backend-url"),
+        ):
+            value = (hook_env.get(env_name) or os.environ.get(env_name, "")).strip()
+            if value:
+                args.extend([option, value])
+    return args
+
+
+def latest_user_message(path: Path) -> str | None:
+    latest: str | None = None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        latest = message
+                    continue
+                if record.get("type") != "response_item":
+                    continue
+                if payload.get("type") != "message" or payload.get("role") != "user":
+                    continue
+                content = payload.get("content")
+                if isinstance(content, str):
+                    latest = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get("text"), str):
+                            parts.append(item["text"])
+                    if parts:
+                        latest = "\n".join(parts)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return latest
+
+
+def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
+    direct = event.get("last_user_message")
+    if isinstance(direct, str) and direct:
+        return direct
+    for path in event_session_paths(event):
+        message = latest_user_message(path)
+        if message:
+            return message
+    return None
+
+
+def is_session_hook_control_event(event: dict[str, Any]) -> bool:
+    latest_user = latest_user_message_from_event(event)
+    if not latest_user:
+        return False
+    pattern = re.compile(
+        rf"^\s*{re.escape(SESSION_HOOK_CONTROL_KEY)}\s*:\s*([A-Za-z_-]+)\s*$",
+        re.MULTILINE,
+    )
+    match = pattern.search(latest_user)
+    if not match:
+        return False
+    value = match.group(1).strip().lower().replace("_", "-")
+    return value in {
+        "off",
+        "disable",
+        "disabled",
+        "skip",
+        "suppress",
+        "on",
+        "enable",
+        "enabled",
+        "resume",
+        "status",
+        "state",
+    }
+
+
+def installed_hook_env(ledger: RunLedger | None) -> dict[str, str]:
+    env = os.environ.copy()
+    hook_env = hook_config_from_hooks_json()
+    env.update(hook_env)
+    auto = env.get("CODEX_RVF_VK_PROJECT_AUTO")
+    if auto is not None and is_truthy(auto):
+        env.pop("CODEX_RVF_VK_PROJECT_ID", None)
+    elif env.get("CODEX_RVF_VK_PROJECT_ID", "").strip():
+        env.pop("CODEX_RVF_VK_PROJECT_AUTO", None)
+    if ledger is not None:
+        env.update(ledger.env())
+    return env
 
 
 def step_summary(result: dict[str, Any], ledger: RunLedger, name: str) -> dict[str, Any]:
@@ -263,7 +599,7 @@ def sync_from_dev_repo(
 
     for name, script, args, component in (
         ("contract-check", contract_script, [], "contract-check"),
-        ("installer", install_script, ["--configure-stop-hook"], "installer"),
+        ("installer", install_script, installer_args_from_env(), "installer"),
     ):
         if not script.is_file():
             reason = f"missing script: {script}"
@@ -355,9 +691,7 @@ def configured_stop_hook() -> Path:
 def run_installed_stop_hook(raw_input: str, ledger: RunLedger | None = None) -> int:
     hook = configured_stop_hook()
     python = sys.executable or "python3"
-    env = os.environ.copy()
-    if ledger is not None:
-        env.update(ledger.env())
+    env = installed_hook_env(ledger)
     try:
         if ledger is not None:
             ledger.event(
@@ -390,10 +724,21 @@ def run_installed_stop_hook(raw_input: str, ledger: RunLedger | None = None) -> 
                 message=f"installed hook timed out after {stop_hook_timeout()} seconds",
                 hook=str(hook),
             )
+        message = (
+            "installed hook timed out after "
+            f"{stop_hook_timeout()} seconds. stderr={coerce_text(exc.stderr)}"
+        )
+        if ledger is not None:
+            return emit_terminal_payload(
+                ledger,
+                status="failed",
+                reason_code="installed_hook_timeout",
+                message=message,
+                detail="installed hook timeout",
+                hook=str(hook),
+            )
         return fail_blocking(
-            "review-validate-fix Stop hook dispatcher: installed hook timed "
-            f"out after {stop_hook_timeout()} seconds. stderr={coerce_text(exc.stderr)}"
-            + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
+            "review-validate-fix Stop hook dispatcher: " + message,
             124,
         )
     except OSError as exc:
@@ -411,10 +756,18 @@ def run_installed_stop_hook(raw_input: str, ledger: RunLedger | None = None) -> 
                 message=f"failed to run installed hook {hook}: {exc}",
                 hook=str(hook),
             )
+        message = f"failed to run installed hook {hook}: {exc}"
+        if ledger is not None:
+            return emit_terminal_payload(
+                ledger,
+                status="failed",
+                reason_code="installed_hook_exec_failed",
+                message=message,
+                detail="installed hook exec failed",
+                hook=str(hook),
+            )
         return fail_blocking(
-            "review-validate-fix Stop hook dispatcher: failed to run "
-            f"installed hook {hook}: {exc}"
-            + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
+            "review-validate-fix Stop hook dispatcher: " + message,
             127,
         )
 
@@ -455,10 +808,22 @@ def run_installed_stop_hook(raw_input: str, ledger: RunLedger | None = None) -> 
             returncode=completed.returncode,
             paths=paths,
         )
-    return fail_blocking(
-        "review-validate-fix Stop hook dispatcher: installed hook failed "
+    message = (
+        "installed hook failed "
         f"with exit code {completed.returncode}. stderr={completed.stderr.strip()}"
-        + (f"; summary={ledger.summary_path}" if ledger is not None else ""),
+    )
+    if ledger is not None:
+        return emit_terminal_payload(
+            ledger,
+            status="failed",
+            reason_code="installed_hook_failed",
+            message=message,
+            detail="installed hook failed",
+            hook=str(hook),
+            returncode=completed.returncode,
+        )
+    return fail_blocking(
+        "review-validate-fix Stop hook dispatcher: " + message,
         completed.returncode,
     )
 
@@ -475,6 +840,21 @@ def main() -> int:
         cwd=str(cwd) if isinstance(cwd, str) else None,
     )
     ledger.artifact("stop-event.json", event)
+    if suppress_requested():
+        ledger.event(
+            phase="dev-sync",
+            event="suppressed",
+            status="skipped",
+            reason_code="suppressed",
+            message="CODEX_RVF suppress env requested; skipping dispatcher and installed hook",
+        )
+        return emit_terminal_payload(
+            ledger,
+            status="skipped",
+            reason_code="suppressed",
+            message="CODEX_RVF suppress env requested; skipped dispatcher and installed hook",
+            detail="检测到 suppress 环境变量，已跳过 RVF Stop hook。",
+        )
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
         ledger.event(
@@ -487,13 +867,54 @@ def main() -> int:
         return run_installed_stop_hook(raw_input, ledger)
 
     assert repo is not None
+    session_sync_needed, session_reason, session_reason_code = should_sync_session_scope(
+        event,
+        repo,
+        ledger,
+    )
+    if not session_sync_needed:
+        if (
+            session_reason_code == "no_session_owned_dirty"
+            and is_session_hook_control_event(event)
+        ):
+            ledger.event(
+                phase="dev-sync",
+                event="session_hook_control_handoff",
+                status="skipped",
+                reason_code="session_hook_control",
+                message="forwarding RVF_STOP_HOOK control message to installed hook",
+                repo=str(repo),
+                cwd=str(repo),
+            )
+            return run_installed_stop_hook(raw_input, ledger)
+        return emit_terminal_payload(
+            ledger,
+            status="skipped",
+            reason_code=session_reason_code,
+            message=session_reason,
+            detail=(
+                "session manifest 构建失败，已跳过 RVF dev sync 和 installed hook"
+                if session_reason_code == "session_manifest_failed"
+                else "当前 chat session 没有 session-owned dirty paths，跳过 RVF dev sync 和自动 review"
+            ),
+            repo=str(repo),
+            event=event_summary(event),
+        )
+
     synced, log_path, sync_reason = sync_from_dev_repo(repo, event, ledger)
     if not synced:
-        log_note = f"; summary={log_path}" if log_path is not None else ""
-        return fail_blocking(
-            "review-validate-fix Stop hook 未运行 fork：RVF dev sync "
-            f"失败，已避免使用旧 installed plugin skill。reason={sync_reason}{log_note}",
-            2,
+        return emit_terminal_payload(
+            ledger,
+            status="failed",
+            reason_code="sync_command_failed",
+            message=(
+                "RVF dev sync failed; skipped installed hook to avoid using a stale "
+                f"installed plugin skill. reason={sync_reason}"
+            ),
+            detail="RVF dev sync failed",
+            repo=str(repo),
+            event=event_summary(event),
+            summary_path=str(log_path) if log_path is not None else None,
         )
 
     return run_installed_stop_hook(raw_input, ledger)

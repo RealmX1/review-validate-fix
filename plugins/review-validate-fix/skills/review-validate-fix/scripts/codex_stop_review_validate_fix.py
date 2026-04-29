@@ -16,6 +16,10 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, start_run
+from vibe_kanban_mcp_client import (
+    DEFAULT_START_CMD as DEFAULT_VIBE_KANBAN_START_CMD,
+    DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_VIBE_KANBAN_START_TIMEOUT_SECONDS,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -29,6 +33,11 @@ DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app
 DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
+DEFAULT_VIBE_KANBAN_MCP_CLIENT = SKILL_DIR / "scripts" / "vibe_kanban_mcp_client.py"
+DEFAULT_VIBE_KANBAN_RUNNER = SKILL_DIR / "scripts" / "run_vibe_kanban_rvf.py"
+DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
+DEFAULT_VIBE_KANBAN_MCP_CMD = "npx -y vibe-kanban@0.1.44 --mcp"
+DEFAULT_CODEX_EXEC_ARGS = "exec --json --dangerously-bypass-approvals-and-sandbox"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
 DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
@@ -419,9 +428,10 @@ def session_hook_control_payload(
     if not session_id:
         return {
             "continue": True,
+            "reason_code": "session_hook_gate_unknown_session",
             "systemMessage": (
-                "review-validate-fix Stop hook 无法更新当前 chat session 状态："
-                "Stop event 未暴露 session id。"
+                "review-validate-fix 无法记录当前 chat session 的 RVF 自动触发 gate："
+                "Stop event 未暴露 session id。Stop hook 本身未因此关闭。"
             ),
         }
 
@@ -429,9 +439,14 @@ def session_hook_control_payload(
         status = "disabled" if session_hook_disabled(session_id) else "enabled"
         return {
             "continue": True,
+            "reason_code": "session_hook_gate_status",
+            "control_action": "status",
+            "session_hook_gate_state": status,
             "systemMessage": (
-                "review-validate-fix Stop hook 当前 chat session 状态："
-                f"{status}。session_id={session_id}"
+                "当前 chat session 的 RVF 自动触发 gate 状态为 "
+                f"{status}。这只表示本 session 后续 Stop 是否允许自动启动 RVF "
+                "fork/continuation/review；不表示全局 Stop hook 是否安装或运行。"
+                f"session_id={session_id}"
             ),
         }
 
@@ -442,13 +457,19 @@ def session_hook_control_payload(
         latest_user=latest_user,
     )
     status = "enabled" if enabled else "disabled"
+    reason_code = "session_hook_gate_enabled" if enabled else "session_hook_gate_disabled"
+    action_label = "允许" if enabled else "禁止"
     return {
         "continue": True,
+        "reason_code": reason_code,
+        "control_action": action,
+        "session_hook_gate_state": status,
+        "state_path": str(state_path) if state_path is not None else None,
         "systemMessage": (
-            "review-validate-fix Stop hook 已为当前 chat session 设置为 "
-            f"{status}。session_id={session_id}; state={state_path}。"
-            "该开关只控制 RVF fork/continuation/review gate，"
-            "不控制 dispatcher 的 dev sync。"
+            f"已记录当前 chat session 的 RVF 自动触发 gate 为 {status}，"
+            f"即后续 Stop 将{action_label}自动启动 RVF fork/continuation/review。"
+            "这不是关闭全局 Stop hook：dispatcher 仍会运行，dev sync 仍可能执行。"
+            f"session_id={session_id}; state={state_path}。"
         ),
     }
 
@@ -655,6 +676,517 @@ def handoff_advisory(
     }
 
 
+def vibe_kanban_script_path(env_name: str, default: Path) -> Path:
+    value = os.environ.get(env_name)
+    if value and value.strip():
+        return Path(value).expanduser()
+    return default
+
+
+def vibe_kanban_issue_description(
+    *,
+    status: str,
+    cwd: str | None,
+    parent_session_id: str,
+    parent_thread_path: Path | None,
+    ledger: RunLedger,
+    prompt_path: str | None,
+) -> str:
+    transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
+    lines = [
+        f"status: {status}",
+        f"target repo: {cwd or '<unknown>'}",
+        f"parent session id: {parent_session_id}",
+        f"transcript path: {transcript}",
+        f"run_dir: {ledger.run_dir}",
+        f"events.jsonl: {ledger.events_path}",
+        f"summary.json: {ledger.summary_path}",
+        f"review-env.sh: {ledger.artifacts_dir / 'review-env.sh'}",
+        f"review-agent-context.md: {ledger.artifacts_dir / 'review-agent-context.md'}",
+        f"fork prompt: {prompt_path or '<unavailable>'}",
+        "handoff-context: pending",
+    ]
+    return "\n".join(lines)
+
+
+def startup_scope_text(
+    *,
+    cwd: str,
+    parent_session_id: str,
+    parent_thread_path: Path | None,
+    prompt_path: str,
+    ledger: RunLedger,
+) -> str:
+    transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
+    return (
+        "# Scope of Work: Vibe-Kanban headless RVF startup\n\n"
+        "本文件由 Stop hook 在启动 headless runner 前生成，用于冻结 runner 启动时的 review 输入。\n\n"
+        f"- 目标仓库：`{cwd}`\n"
+        f"- parent session id：`{parent_session_id}`\n"
+        f"- parent transcript path：`{transcript}`\n"
+        f"- run id：`{ledger.run_id}`\n"
+        f"- run dir：`{ledger.run_dir}`\n"
+        f"- fork prompt：`{prompt_path}`\n\n"
+        "headless 子进程必须以本 run artifacts 中已经生成的 review packet、session manifest "
+        "和 workspace snapshot 作为启动时 scope anchor；不要在排队后用实时 worktree 重新定义 scope。"
+    )
+
+
+def freeze_vibe_kanban_startup_artifacts(
+    *,
+    cwd: str,
+    parent_session_id: str,
+    parent_thread_path: Path | None,
+    prompt_path: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    scope_path = ledger.artifact(
+        "headless-startup-scope-of-work.md",
+        startup_scope_text(
+            cwd=cwd,
+            parent_session_id=parent_session_id,
+            parent_thread_path=parent_thread_path,
+            prompt_path=prompt_path,
+            ledger=ledger,
+        ),
+    )
+    if not scope_path:
+        raise RuntimeError("failed to write headless startup scope artifact")
+    command = [
+        sys.executable,
+        str(DEFAULT_PREPARE_REVIEW_RUN),
+        "--repo",
+        cwd,
+        "--session-context",
+        scope_path,
+        "--rvf-run-id",
+        ledger.run_id,
+        "--rvf-run-dir",
+        str(ledger.run_dir),
+    ]
+    if parent_thread_path is not None:
+        command.extend(["--transcript", str(parent_thread_path)])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        "vibe-kanban-startup-prepare-command.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            completed.stderr.strip()
+            or completed.stdout.strip()
+            or "failed to freeze Vibe-Kanban startup review artifacts"
+        )
+    try:
+        metadata = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid startup prepare JSON: {completed.stdout!r}") from exc
+    metadata_path = ledger.artifact("vibe-kanban-startup-prepare.json", metadata)
+    ledger.event(
+        phase="prepare",
+        event="vibe_kanban_startup_artifacts_frozen",
+        status="completed",
+        reason_code="startup_artifacts_frozen",
+        repo=cwd,
+        cwd=cwd,
+        paths={
+            "metadata": metadata_path,
+            "scope_of_work": metadata.get("scope_of_work_file"),
+            "session_manifest": metadata.get("session_manifest_file"),
+            "review_packet": metadata.get("review_packet"),
+            "snapshot": metadata.get("before_workspace_snapshot"),
+            "review_env": metadata.get("review_env_file"),
+            "review_agent_context": metadata.get("review_agent_context_file"),
+        },
+    )
+    return {"metadata_path": metadata_path, "metadata": metadata}
+
+
+def create_vibe_kanban_issue(
+    *,
+    project_id: str,
+    backend_url: str | None,
+    title: str,
+    description: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = vibe_kanban_script_path("CODEX_RVF_VK_MCP_CLIENT", DEFAULT_VIBE_KANBAN_MCP_CLIENT)
+    mcp_cmd = os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_VIBE_KANBAN_MCP_CMD)
+    command = [
+        sys.executable,
+        str(client),
+        "create",
+        "--mcp-cmd",
+        mcp_cmd,
+        "--project-id",
+        project_id,
+        "--title",
+        title,
+        "--description",
+        description,
+    ]
+    if backend_url:
+        command.extend(["--backend-url", backend_url])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        "vibe-kanban-create-issue.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Vibe-Kanban issue creation failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Vibe-Kanban create issue JSON: {completed.stdout!r}") from exc
+    issue_id = payload.get("issue_id") or payload.get("id")
+    if not isinstance(issue_id, str) or not issue_id.strip():
+        raise RuntimeError(f"Vibe-Kanban create issue response did not include issue_id: {payload!r}")
+    return payload
+
+
+def create_vibe_kanban_workspace(
+    *,
+    cwd: str,
+    backend_url: str | None,
+    title: str,
+    description: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = vibe_kanban_script_path("CODEX_RVF_VK_MCP_CLIENT", DEFAULT_VIBE_KANBAN_MCP_CLIENT)
+    mcp_cmd = os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_VIBE_KANBAN_MCP_CMD)
+    start_cmd = os.environ.get("CODEX_RVF_VK_START_CMD", DEFAULT_VIBE_KANBAN_START_CMD)
+    start_timeout = os.environ.get(
+        "CODEX_RVF_VK_START_TIMEOUT",
+        str(DEFAULT_VIBE_KANBAN_START_TIMEOUT_SECONDS),
+    )
+    tmux_session = os.environ.get("CODEX_RVF_VK_TMUX_SESSION", "rvf-vibe-kanban")
+    command = [
+        sys.executable,
+        str(client),
+        "create-workspace",
+        "--mcp-cmd",
+        mcp_cmd,
+        "--start-cmd",
+        start_cmd,
+        "--start-timeout",
+        start_timeout,
+        "--tmux-session",
+        tmux_session,
+        "--repo",
+        cwd,
+        "--start-if-needed",
+        "--title",
+        title,
+        "--description",
+        description,
+        "--status",
+        "queued",
+    ]
+    if backend_url:
+        command.extend(["--backend-url", backend_url])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        "vibe-kanban-create-workspace.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Vibe-Kanban workspace creation failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Vibe-Kanban create workspace JSON: {completed.stdout!r}") from exc
+    workspace_id = payload.get("workspace_id") or payload.get("workspaceId") or payload.get("id")
+    if not isinstance(workspace_id, str) or not workspace_id.strip():
+        raise RuntimeError(f"Vibe-Kanban create workspace response did not include workspace_id: {payload!r}")
+    payload["workspace_id"] = workspace_id
+    return payload
+
+
+def update_vibe_kanban_workspace(
+    *,
+    workspace_id: str,
+    backend_url: str,
+    title: str,
+    description: str,
+    status: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = vibe_kanban_script_path("CODEX_RVF_VK_MCP_CLIENT", DEFAULT_VIBE_KANBAN_MCP_CLIENT)
+    command = [
+        sys.executable,
+        str(client),
+        "update-workspace",
+        "--workspace-id",
+        workspace_id,
+        "--backend-url",
+        backend_url,
+        "--title",
+        title,
+        "--description",
+        description,
+        "--status",
+        status,
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        f"vibe-kanban-update-workspace-{status}.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Vibe-Kanban workspace update failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Vibe-Kanban update workspace JSON: {completed.stdout!r}") from exc
+    payload["workspace_id"] = payload.get("workspace_id") or payload.get("workspaceId") or payload.get("id") or workspace_id
+    return payload
+
+
+def update_vibe_kanban_issue(
+    *,
+    project_id: str,
+    issue_id: str,
+    backend_url: str | None,
+    title: str,
+    description: str,
+    status: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = vibe_kanban_script_path("CODEX_RVF_VK_MCP_CLIENT", DEFAULT_VIBE_KANBAN_MCP_CLIENT)
+    mcp_cmd = os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_VIBE_KANBAN_MCP_CMD)
+    command = [
+        sys.executable,
+        str(client),
+        "update",
+        "--mcp-cmd",
+        mcp_cmd,
+        "--project-id",
+        project_id,
+        "--issue-id",
+        issue_id,
+        "--title",
+        title,
+        "--description",
+        description,
+        "--status",
+        status,
+    ]
+    if backend_url:
+        command.extend(["--backend-url", backend_url])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        f"vibe-kanban-update-issue-{status}.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Vibe-Kanban issue update failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Vibe-Kanban update issue JSON: {completed.stdout!r}") from exc
+    payload["issue_id"] = payload.get("issue_id") or payload.get("id") or issue_id
+    return payload
+
+
+def resolve_vibe_kanban_project(
+    *,
+    cwd: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = vibe_kanban_script_path("CODEX_RVF_VK_MCP_CLIENT", DEFAULT_VIBE_KANBAN_MCP_CLIENT)
+    mcp_cmd = os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_VIBE_KANBAN_MCP_CMD)
+    start_cmd = os.environ.get("CODEX_RVF_VK_START_CMD", DEFAULT_VIBE_KANBAN_START_CMD)
+    start_timeout = os.environ.get(
+        "CODEX_RVF_VK_START_TIMEOUT",
+        str(DEFAULT_VIBE_KANBAN_START_TIMEOUT_SECONDS),
+    )
+    tmux_session = os.environ.get("CODEX_RVF_VK_TMUX_SESSION", "rvf-vibe-kanban")
+    command = [
+        sys.executable,
+        str(client),
+        "resolve-project",
+        "--mcp-cmd",
+        mcp_cmd,
+        "--start-cmd",
+        start_cmd,
+        "--start-timeout",
+        start_timeout,
+        "--tmux-session",
+        tmux_session,
+        "--repo",
+        cwd,
+        "--start-if-needed",
+        "--create-if-missing",
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    ledger.artifact(
+        "vibe-kanban-resolve-project.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Vibe-Kanban project resolution failed")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid Vibe-Kanban resolve project JSON: {completed.stdout!r}") from exc
+    project_id = payload.get("project_id") or payload.get("projectId") or payload.get("id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise RuntimeError(f"Vibe-Kanban project resolution did not include project_id: {payload!r}")
+    payload["project_id"] = project_id
+    return payload
+
+
+def start_vibe_kanban_runner(
+    *,
+    cwd: str,
+    prompt_path: str,
+    parent_session_id: str,
+    parent_thread_path: Path | None,
+    ledger: RunLedger,
+    project_id: str | None,
+    issue_id: str | None,
+    workspace_id: str | None,
+    backend_url: str | None,
+    issue_title: str,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> dict[str, Any]:
+    runner = vibe_kanban_script_path("CODEX_RVF_VK_RUNNER", DEFAULT_VIBE_KANBAN_RUNNER)
+    startup_prepare = freeze_vibe_kanban_startup_artifacts(
+        cwd=cwd,
+        parent_session_id=parent_session_id,
+        parent_thread_path=parent_thread_path,
+        prompt_path=prompt_path,
+        ledger=ledger,
+    )
+    stdout_path = ledger.artifact_path("vibe-kanban-runner.stdout.txt")
+    stderr_path = ledger.artifact_path("vibe-kanban-runner.stderr.txt")
+    mcp_cmd = os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_VIBE_KANBAN_MCP_CMD)
+    codex_exec_args = os.environ.get("CODEX_RVF_CODEX_EXEC_ARGS", DEFAULT_CODEX_EXEC_ARGS)
+    command = [
+        sys.executable,
+        str(runner),
+        "--repo",
+        cwd,
+        "--prompt-file",
+        prompt_path,
+        "--run-id",
+        ledger.run_id,
+        "--run-dir",
+        str(ledger.run_dir),
+        "--parent-session-id",
+        parent_session_id,
+        "--issue-title",
+        issue_title,
+        "--mcp-cmd",
+        mcp_cmd,
+        "--codex-exec-args",
+        codex_exec_args,
+    ]
+    if startup_prepare.get("metadata_path"):
+        command.extend(["--startup-prepare-metadata", str(startup_prepare["metadata_path"])])
+    if project_id:
+        command.extend(["--vibe-project-id", project_id])
+    if issue_id:
+        command.extend(["--vibe-issue-id", issue_id])
+    if workspace_id:
+        command.extend(["--vibe-workspace-id", workspace_id])
+    if backend_url:
+        command.extend(["--backend-url", backend_url])
+    if parent_thread_path is not None:
+        command.extend(["--parent-transcript-path", str(parent_thread_path)])
+    if model:
+        command.extend(["--model", model])
+    if reasoning_effort:
+        command.extend(["--reasoning-effort", reasoning_effort])
+    env = os.environ.copy()
+    env.update(ledger.env())
+    env["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
+    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open("w", encoding="utf-8") as stderr_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            env=env,
+            start_new_session=True,
+        )
+    return {
+        "runner_pid": process.pid,
+        "runner_command": command,
+        "runner_stdout_path": str(stdout_path),
+        "runner_stderr_path": str(stderr_path),
+        "startup_prepare_metadata_path": startup_prepare.get("metadata_path"),
+    }
+
+
 def run_codex_fork(
     *,
     parent_session_id: str,
@@ -730,6 +1262,203 @@ def run_codex_fork(
         )
         request_path = ledger.artifact("app-server-requests.json", app_server_requests)
         result["app_server_requests_path"] = request_path
+    elif mode in {"vibe-kanban", "vibe-kanban-managed", "vk"}:
+        project_id = os.environ.get("CODEX_RVF_VK_PROJECT_ID", "").strip()
+        management_mode = os.environ.get("CODEX_RVF_VK_MANAGEMENT_MODE", "local-workspace").strip().lower()
+        result["vibe_project_id"] = project_id or None
+        result["vibe_management_mode"] = management_mode
+        if not cwd:
+            result.update(
+                {
+                    "status": "vibe-kanban-unconfigured",
+                    "error": "CODEX_RVF_FORK_MODE=vibe-kanban requires a target repo cwd.",
+                }
+            )
+        elif not prompt_path:
+            result.update(
+                {
+                    "status": "vibe-kanban-unavailable",
+                    "error": "fork prompt artifact is unavailable; Vibe-Kanban runner was not started.",
+                }
+            )
+        elif management_mode not in {"local", "local-workspace", "workspace", "remote-project", "remote-issue", "project", "issue"}:
+            result.update(
+                {
+                    "status": "vibe-kanban-unconfigured",
+                    "error": (
+                        f"Unsupported CODEX_RVF_VK_MANAGEMENT_MODE={management_mode!r}. "
+                        "Use local-workspace or remote-project."
+                    ),
+                }
+            )
+        elif (
+            management_mode in {"remote-project", "remote-issue", "project", "issue"}
+            and not project_id
+            and os.environ.get("CODEX_RVF_VK_PROJECT_AUTO", "1").strip().lower()
+            in {"0", "false", "no", "off"}
+        ):
+            result.update(
+                {
+                    "status": "vibe-kanban-unconfigured",
+                    "error": "CODEX_RVF_VK_PROJECT_ID is required when CODEX_RVF_VK_PROJECT_AUTO=0.",
+                }
+            )
+        else:
+            issue_title = f"RVF {Path(cwd).name} {ledger.run_id}"
+            backend_url = os.environ.get("CODEX_RVF_VK_BACKEND_URL") or os.environ.get("VIBE_BACKEND_URL")
+            created_workspace_id: str | None = None
+            created_project_id: str | None = None
+            created_issue_id: str | None = None
+            try:
+                if management_mode in {"local", "local-workspace", "workspace"}:
+                    workspace_payload = create_vibe_kanban_workspace(
+                        cwd=cwd,
+                        backend_url=backend_url,
+                        title=issue_title,
+                        description=vibe_kanban_issue_description(
+                            status="queued",
+                            cwd=cwd,
+                            parent_session_id=parent_session_id,
+                            parent_thread_path=parent_thread_path,
+                            ledger=ledger,
+                            prompt_path=prompt_path,
+                        ),
+                        ledger=ledger,
+                    )
+                    workspace_id = str(workspace_payload["workspace_id"])
+                    created_workspace_id = workspace_id
+                    if isinstance(workspace_payload.get("backend_url"), str):
+                        backend_url = str(workspace_payload["backend_url"])
+                    if backend_url:
+                        result["vibe_backend_url"] = backend_url
+                    runner_payload = start_vibe_kanban_runner(
+                        cwd=cwd,
+                        prompt_path=prompt_path,
+                        parent_session_id=parent_session_id,
+                        parent_thread_path=parent_thread_path,
+                        ledger=ledger,
+                        project_id=None,
+                        issue_id=None,
+                        workspace_id=workspace_id,
+                        backend_url=backend_url,
+                        issue_title=issue_title,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    )
+                    result.update(
+                        {
+                            "status": "vibe-kanban-started",
+                            "issue_title": issue_title,
+                            "vibe_workspace_id": workspace_id,
+                            "vibe_backend_url": backend_url,
+                            "vibe_workspace": workspace_payload,
+                            **runner_payload,
+                        }
+                    )
+                else:
+                    if not project_id:
+                        project_resolution = resolve_vibe_kanban_project(cwd=cwd, ledger=ledger)
+                        project_id = str(project_resolution["project_id"])
+                        bootstrap = project_resolution.get("bootstrap")
+                        if isinstance(bootstrap, dict) and isinstance(bootstrap.get("backend_url"), str):
+                            backend_url = str(bootstrap["backend_url"])
+                        result["vibe_project_id"] = project_id
+                        if backend_url:
+                            result["vibe_backend_url"] = backend_url
+                        result["vibe_project_resolution"] = project_resolution
+                    created_project_id = project_id
+                    issue_payload = create_vibe_kanban_issue(
+                        project_id=project_id,
+                        backend_url=backend_url,
+                        title=issue_title,
+                        description=vibe_kanban_issue_description(
+                            status="queued",
+                            cwd=cwd,
+                            parent_session_id=parent_session_id,
+                            parent_thread_path=parent_thread_path,
+                            ledger=ledger,
+                            prompt_path=prompt_path,
+                        ),
+                        ledger=ledger,
+                    )
+                    issue_id = str(issue_payload["issue_id"])
+                    created_issue_id = issue_id
+                    runner_payload = start_vibe_kanban_runner(
+                        cwd=cwd,
+                        prompt_path=prompt_path,
+                        parent_session_id=parent_session_id,
+                        parent_thread_path=parent_thread_path,
+                        ledger=ledger,
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        workspace_id=None,
+                        backend_url=backend_url,
+                        issue_title=issue_title,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    )
+                    result.update(
+                        {
+                            "status": "vibe-kanban-started",
+                            "issue_title": issue_title,
+                            "vibe_issue_id": issue_id,
+                            "vibe_backend_url": backend_url,
+                            "vibe_issue": issue_payload,
+                            **runner_payload,
+                        }
+                    )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                failure_update: dict[str, Any] = {}
+                failed_description = (
+                    vibe_kanban_issue_description(
+                        status="failed",
+                        cwd=cwd,
+                        parent_session_id=parent_session_id,
+                        parent_thread_path=parent_thread_path,
+                        ledger=ledger,
+                        prompt_path=prompt_path,
+                    )
+                    + f"\nerror: {error}"
+                )
+                if created_workspace_id and backend_url:
+                    failure_update["vibe_workspace_id"] = created_workspace_id
+                    failure_update["vibe_backend_url"] = backend_url
+                    try:
+                        failure_update["vibe_workspace_failed_update"] = update_vibe_kanban_workspace(
+                            workspace_id=created_workspace_id,
+                            backend_url=backend_url,
+                            title=issue_title,
+                            description=failed_description,
+                            status="failed",
+                            ledger=ledger,
+                        )
+                    except Exception as update_exc:
+                        failure_update["vibe_failure_update_error"] = f"{type(update_exc).__name__}: {update_exc}"
+                elif created_project_id and created_issue_id:
+                    failure_update["vibe_project_id"] = created_project_id
+                    failure_update["vibe_issue_id"] = created_issue_id
+                    if backend_url:
+                        failure_update["vibe_backend_url"] = backend_url
+                    try:
+                        failure_update["vibe_issue_failed_update"] = update_vibe_kanban_issue(
+                            project_id=created_project_id,
+                            issue_id=created_issue_id,
+                            backend_url=backend_url,
+                            title=issue_title,
+                            description=failed_description,
+                            status="failed",
+                            ledger=ledger,
+                        )
+                    except Exception as update_exc:
+                        failure_update["vibe_failure_update_error"] = f"{type(update_exc).__name__}: {update_exc}"
+                result.update(
+                    {
+                        "status": "vibe-kanban-unavailable",
+                        "error": error,
+                        **failure_update,
+                    }
+                )
     elif mode in {"gui", "app-server", "appserver", "auto"}:
         try:
             result.update(
@@ -773,7 +1502,7 @@ def run_codex_fork(
             {
                 "status": "unsupported-mode",
                 "error": (
-                    f"Unsupported {mode_env_name}={mode!r}. Use gui, dry-run, "
+                    f"Unsupported {mode_env_name}={mode!r}. Use gui, vibe-kanban, dry-run, "
                     "or manual. Terminal/CLI fork launch is intentionally disabled."
                 ),
             }
@@ -793,12 +1522,22 @@ def run_codex_fork(
         reason_code = "dry_run"
     elif status == "app-server-started":
         reason_code = "fork_started"
+    elif status == "vibe-kanban-started":
+        reason_code = "vibe_kanban_runner_started"
+    elif status == "vibe-kanban-unconfigured":
+        reason_code = "vibe_kanban_unconfigured"
+    elif status == "vibe-kanban-unavailable":
+        reason_code = "vibe_kanban_unavailable"
 
     event_paths: dict[str, Any] = {}
     if prompt_path:
         event_paths["prompt"] = prompt_path
     if result.get("app_server_requests_path"):
         event_paths["app_server_requests"] = result["app_server_requests_path"]
+    if result.get("runner_stdout_path"):
+        event_paths["runner_stdout"] = result["runner_stdout_path"]
+    if result.get("runner_stderr_path"):
+        event_paths["runner_stderr"] = result["runner_stderr_path"]
     if status == "app-server-started":
         ledger.event(
             phase="fork",
@@ -810,6 +1549,21 @@ def run_codex_fork(
             paths=event_paths,
             socket_source=result.get("socket_source"),
             gui_visibility=result.get("gui_visibility"),
+        )
+    elif status == "vibe-kanban-started":
+        ledger.event(
+            phase="fork",
+            event="completed",
+            status=str(status),
+            reason_code=reason_code,
+            parent_thread_id=parent_session_id,
+            paths=event_paths,
+            mode=mode,
+            vibe_management_mode=result.get("vibe_management_mode"),
+            vibe_issue_id=result.get("vibe_issue_id"),
+            vibe_workspace_id=result.get("vibe_workspace_id"),
+            runner_pid=result.get("runner_pid"),
+            runner_command=result.get("runner_command"),
         )
     elif status in {"dry-run", "manual-prepared"}:
         ledger.event(
@@ -839,6 +1593,12 @@ def run_codex_fork(
         )
     elif status == "app-server-started":
         message = "Codex GUI/app-server fork was started."
+    elif status == "vibe-kanban-started":
+        message = "Vibe-Kanban managed RVF runner was started."
+    elif status == "vibe-kanban-unconfigured":
+        message = str(result.get("error") or "Vibe-Kanban RVF mode is not configured.")
+    elif status == "vibe-kanban-unavailable":
+        message = str(result.get("error") or "Vibe-Kanban management plane is unavailable; runner was not started.")
     elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
         report_reason = result.get("report_reason")
         message = report_reason if isinstance(report_reason, str) else "Codex GUI fork unavailable."
@@ -1639,6 +2399,16 @@ def review_validate_fix_dispatch(
 
 
 def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bool:
+    if explicit_suppress_requested(event, latest_user):
+        return True
+
+    if source_marks_subagent(event.get("source")):
+        return True
+
+    return any(session_meta_marks_subagent(path) for path in event_session_paths(event))
+
+
+def explicit_suppress_requested(event: dict[str, Any], latest_user: str | None = None) -> bool:
     if any(is_truthy(os.environ.get(name)) for name in SUPPRESS_ENV_NAMES):
         return True
 
@@ -1650,10 +2420,14 @@ def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bo
     if event.get("review_validate_fix_suppressed") is True:
         return True
 
-    if source_marks_subagent(event.get("source")):
-        return True
+    return False
 
-    return any(session_meta_marks_subagent(path) for path in event_session_paths(event))
+
+def suppressed_without_ledger_payload() -> dict[str, Any]:
+    return {
+        "continue": True,
+        "systemMessage": "review-validate-fix: skipped; reason=suppressed",
+    }
 
 
 def event_marks_subagent(event: dict[str, Any]) -> bool:
@@ -1698,6 +2472,11 @@ def main() -> int:
     if event is None:
         return 0
 
+    latest_user = latest_user_message_from_event(event)
+    if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
+        emit(suppressed_without_ledger_payload())
+        return 0
+
     cwd_value = event.get("cwd")
     ledger = start_run(
         "stop-hook",
@@ -1725,7 +2504,6 @@ def main() -> int:
         )
         return 0
 
-    latest_user = latest_user_message_from_event(event)
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
     if fork_context is not None:
         advisory = handoff_advisory(event, fork_context, ledger)
@@ -1753,24 +2531,43 @@ def main() -> int:
 
     session_control = session_hook_control_payload(event, latest_user)
     if session_control is not None:
+        session_control_reason = (
+            session_control.get("reason_code")
+            if isinstance(session_control.get("reason_code"), str)
+            else "session_hook_control"
+        )
+        session_control_message = (
+            session_control.get("systemMessage")
+            if isinstance(session_control.get("systemMessage"), str)
+            else None
+        )
         ledger.event(
             phase="gate",
             event="session_hook_control",
             status="completed",
-            reason_code="session_hook_control",
+            reason_code=session_control_reason,
             session_id=session_hook_id_from_event(event),
+            control_action=session_control.get("control_action"),
+            session_hook_gate_state=session_control.get("session_hook_gate_state"),
+            state_path=session_control.get("state_path"),
         )
         ledger.summary(
             status="session-hook-control",
-            reason_code="session_hook_control",
-            message=session_control.get("systemMessage") if isinstance(session_control.get("systemMessage"), str) else None,
+            reason_code=session_control_reason,
+            message=session_control_message,
             session_id=session_hook_id_from_event(event),
+            control_action=session_control.get("control_action"),
+            session_hook_gate_state=session_control.get("session_hook_gate_state"),
+            state_path=session_control.get("state_path"),
         )
         session_control = ledger.hook_payload(
             status="session-hook-control",
-            reason_code="session_hook_control",
-            message=session_control.get("systemMessage") if isinstance(session_control.get("systemMessage"), str) else None,
+            reason_code=session_control_reason,
+            message=session_control_message,
             session_id=session_hook_id_from_event(event),
+            control_action=session_control.get("control_action"),
+            session_hook_gate_state=session_control.get("session_hook_gate_state"),
+            state_path=session_control.get("state_path"),
         )
         emit(session_control)
         return 0
