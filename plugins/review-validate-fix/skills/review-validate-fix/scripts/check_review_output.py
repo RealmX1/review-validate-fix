@@ -12,8 +12,46 @@ PATH_LINE_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)\b")
 ISSUE_PREFIX_RE = re.compile(r"^\d+\.\s+")
 NUMBERED_RE = re.compile(r"^\d+\.\s+")
 MALFORMED_NUMBERED_RE = re.compile(r"^\d+\)\s+")
-LOCK_REQUEST_RE = re.compile(r"^RVF_LOCK_REQUEST\b\s+.+")
-FORBIDDEN_RE = re.compile(r"\b(REAL|FALSE_POSITIVE|ELEVATE)\b|</?handoff-context\b[^>]*>")
+REQUEST_SPECS = {
+    "RVF_LOCK_REQUEST": {
+        "kind": "lock_request",
+        "required": ("name", "command", "reason"),
+        "enums": {},
+    },
+    "RVF_STANDARD_REQUEST": {
+        "kind": "standard_request",
+        "required": ("domain", "reason", "scope"),
+        "enums": {"domain": {"simplification", "security", "performance"}},
+    },
+    "RVF_MEASUREMENT_REQUEST": {
+        "kind": "measurement_request",
+        "required": ("metric", "command", "reason"),
+        "enums": {},
+    },
+    "RVF_SUBTASK_REQUEST": {
+        "kind": "subtask_request",
+        "required": ("type", "scope", "reason"),
+        "enums": {
+            "type": {
+                "read_only_investigation",
+                "security_check",
+                "performance_measurement",
+                "simplification_probe",
+            }
+        },
+    },
+    "RVF_CONTEXT_REQUEST": {
+        "kind": "context_request",
+        "required": ("need", "reason"),
+        "enums": {"need": {"file", "manifest", "packet", "prior-output", "test-result"}},
+    },
+}
+REQUEST_PREFIX_RE = re.compile(r"^(?P<prefix>RVF_[A-Z_]+_REQUEST)\b(?P<body>.*)$")
+REQUEST_FIELD_RE = re.compile(r"(?<!\S)(?P<key>[a-z][a-z0-9_-]*)=")
+FORBIDDEN_RE = re.compile(
+    r"\b(REAL|FALSE_POSITIVE|ELEVATE)\b|</?handoff-context\b[^>]*>"
+    r"|(?:^|\n)\s*(?:RVF_HANDOFF_FILE|Reviewers|Validate/fixers)\s*[:：]"
+)
 FORBIDDEN_CONTINUATION_RE = re.compile(
     r"^(没有问题|没问题|無問題|无问题|修复说明|修復說明|已修复|已修復|已修改)\b",
     re.IGNORECASE,
@@ -77,6 +115,34 @@ def is_forbidden_continuation(line: str) -> bool:
     return FORBIDDEN_CONTINUATION_RE.match(line) is not None
 
 
+def parse_request_fields(body: str) -> dict[str, str]:
+    matches = list(REQUEST_FIELD_RE.finditer(body))
+    fields: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        value_start = match.end()
+        value_end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        fields[match.group("key")] = body[value_start:value_end].strip()
+    return fields
+
+
+def request_kind(line: str) -> str | None:
+    prefix_match = REQUEST_PREFIX_RE.match(line)
+    if prefix_match is None:
+        return None
+    prefix = prefix_match.group("prefix")
+    spec = REQUEST_SPECS.get(prefix)
+    if spec is None:
+        return None
+    fields = parse_request_fields(prefix_match.group("body"))
+    for field in spec["required"]:
+        if not fields.get(field):
+            return None
+    for field, allowed_values in spec["enums"].items():
+        if fields[field] not in allowed_values:
+            return None
+    return str(spec["kind"])
+
+
 def classify(text: str) -> dict[str, object]:
     stripped = text.strip()
     if stripped == "NO_ISSUES":
@@ -91,16 +157,31 @@ def classify(text: str) -> dict[str, object]:
         errors.append("review output contains validate/fix or handoff markers")
 
     lines = [line.strip() for line in stripped.splitlines() if line.strip()]
-    lock_request_lines = [line for line in lines if LOCK_REQUEST_RE.match(line)]
-    if lock_request_lines:
-        if len(lock_request_lines) != len(lines):
-            errors.append("lock request output must contain only RVF_LOCK_REQUEST lines")
+    request_lines: list[str] = []
+    request_types: list[str] = []
+    malformed_request_lines: list[str] = []
+    for line in lines:
+        kind = request_kind(line)
+        if kind is not None:
+            request_lines.append(line)
+            request_types.append(kind)
+        elif REQUEST_PREFIX_RE.match(line):
+            malformed_request_lines.append(line)
+    if request_lines or malformed_request_lines:
+        if malformed_request_lines:
+            errors.append("malformed RVF request line")
+        if len(request_lines) + len(malformed_request_lines) != len(lines):
+            errors.append("request output must contain only RVF_*_REQUEST lines")
+        all_lock_requests = request_lines and set(request_types) == {"lock_request"}
         return {
             "valid": not errors,
-            "kind": "lock_request" if not errors else "invalid",
+            "kind": "lock_request" if not errors and all_lock_requests else ("request" if not errors else "invalid"),
             "issue_count": 0,
-            "lock_request_count": len(lock_request_lines) if not errors else 0,
-            "lock_requests": lock_request_lines if not errors else [],
+            "request_count": len(request_lines) if not errors else 0,
+            "request_types": sorted(set(request_types)) if not errors else [],
+            "requests": request_lines if not errors else [],
+            "lock_request_count": len(request_lines) if not errors and all_lock_requests else 0,
+            "lock_requests": request_lines if not errors and all_lock_requests else [],
             "errors": errors,
         }
 

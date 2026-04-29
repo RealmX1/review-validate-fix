@@ -72,6 +72,7 @@ description: Use when the user asks for a post-work code review loop, review val
 ## Review
 
 - review pass 的 `pass_type` 永远是 `review_only`。无论它由 full 流程派生、由用户单独要求只读 review，还是出现在研究马拉松 checkpoint 中，都必须停在 `NO_ISSUES` 或 issue list；不得把自己升级为完整 `$review-validate-fix` 流程。
+- RVF 使用 `references/review-standards/` 中的定制 Review Standards Pack。它提炼 `code-review-and-quality`、`code-simplification`、`security-and-hardening`、`performance-optimization` 的适用子集，但不采用原版 agent-skills 的 report/checklist 输出格式。主会话可读取完整 pack；reviewer 默认读取 `reviewer.md` 和按需专项 subset；validate/fix 默认读取 `validate-fix.md` 和 assigned issue 相关 subset。
 - 默认执行 santa-method double review：始终并行启动两个独立 review pass。
 - 如果用户显式要求跳过 review：
   - 不启动 Codex reviewer、alternative reviewer 或 Codex-only fallback。
@@ -92,6 +93,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - external alternative reviewer 的等待机制是可观测活动空闲超时：`scripts/run_alternative_reviewer.py` 从 `config/alternative-reviewer.json` 读取 `idle_timeout_seconds`、`activity_check_interval_seconds` 与可选 `max_runtime_seconds`；默认配置每 5 秒检查一次 stdout/stderr 是否有新活动，连续 300 秒没有可观测活动则终止该 reviewer，返回 exit code `124` 并输出 `RVF_EXTERNAL_REVIEWER_TIMEOUT ...`。默认不设置总运行时上限；如果本机配置确实需要总上限，应使用宽松的一小时级别限制。对支持事件流的外部 CLI，配置层应优先启用事件流输出，并由 runner 提取最终 review 文本，避免“agent 正在使用工具但 text stdout 直到结束才输出”的误超时；Claude stream-json 中已开始但尚未返回 tool_result 的 Bash 工具调用视为正在等待长命令运行，不按普通静默期超时。此时不要合并任何 partial reviewer 输出；除非用户要求 external-only fail-close，否则把真正超时或不可启动的 external reviewer 视为不可用并走 Codex-only fallback。
 - 对可能与主会话或另一个 reviewer 冲突的命令，优先使用 `scripts/command_lock.py --repo <repo> --name <stable-lock-name> -- <command ...>` 做 repo-scoped 锁保护。典型场景包括共享 dev server 端口、会写同一缓存/coverage/report 目录的长测试、包管理器安装/构建、会独占设备或全局资源的命令。command lock 会通过统一 run ledger 记录 `lock_wait_started`、`lock_acquired`、`lock_timeout` 与 `lock_released` 事件。
 - 如果 reviewer 判断某个命令需要锁但当前 prompt 或环境没有提供可用锁，它必须输出 `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` 作为唯一响应；这不是完成的 review 结果，主会话应提供锁包装后的命令或更新 prompt 后重试该 reviewer。不要把 `RVF_LOCK_REQUEST` 合并为 bug finding。
+- 如果 reviewer 需要专项标准、测量、受控子任务或缺失上下文，它可以输出 `RVF_STANDARD_REQUEST ...`、`RVF_MEASUREMENT_REQUEST ...`、`RVF_SUBTASK_REQUEST ...` 或 `RVF_CONTEXT_REQUEST ...` 作为唯一响应；这些 request 不得与 `NO_ISSUES` 或 issue list 混写。默认由主会话满足、驳回或 spawn 子任务，并记录 run ledger 后让 reviewer 重试。只有平台能继承 run id、scope、manifest、packet 和 no-handoff/no-review-loop 约束时，才允许最多一层 nested subagent。
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
 - Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，彼此不看对方输出，并在 provenance 中标为 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
@@ -99,10 +101,10 @@ description: Use when the user asks for a post-work code review loop, review val
 - 完成态 Review 输出契约必须严格为：
   - 无问题：只输出 `NO_ISSUES`。
   - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。
-- 非完成态锁请求契约为：只输出一行或多行 `RVF_LOCK_REQUEST ...`，由主会话提供 `scripts/command_lock.py` 包装命令后重试；锁请求不得与 `NO_ISSUES` 或 issue list 混在同一个输出中。
+- 非完成态 request 契约为：只输出一行或多行 `RVF_*_REQUEST ...`，由主会话处理后重试；request 不得与 `NO_ISSUES` 或 issue list 混在同一个输出中，也不得进入 merge table。
 - 每个 reviewer 输出必须先用 `scripts/check_review_output.py` 或等价解析器校验；中文化“没有问题”、空响应、纯 prose、handoff、validate/fix verdict、修复说明或无 `路径:行号` 的列表都不是合格 review 输出。只要每条 issue 都以编号 `路径:行号` 开头，同一 issue 的换行续句、缩进续行或前后空白属于可归一化小格式漂移，不应触发重试、fail-close 或重罚。
-- 如果 reviewer 输出 `RVF_LOCK_REQUEST`，先满足或驳回该锁请求，再重试 reviewer；重试后的输出仍必须是完成态契约。锁请求本身不计入合格 double-review 来源。
-- 如果 reviewer 输出存在严重契约违规，可用同一 review packet 重试一次并明确指出只允许 `NO_ISSUES`、编号 issue list，或纯 `RVF_LOCK_REQUEST`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。严重违规不包括可无损归一化的小格式漂移。
+- 如果 reviewer 输出 `RVF_*_REQUEST`，先满足、驳回、spawn 子任务或提供上下文，再重试 reviewer；重试后的输出仍必须是完成态契约。request 本身不计入合格 double-review 来源。
+- 如果 reviewer 输出存在严重契约违规，可用同一 review packet 重试一次并明确指出只允许 `NO_ISSUES`、编号 issue list，或纯 `RVF_*_REQUEST`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。严重违规不包括可无损归一化的小格式漂移。
 - review 前后可用 `scripts/workspace_snapshot.py capture/compare` 记录状态，尤其是 reviewer 会运行测试/lint/build 时。状态变化只表示 `WORKSPACE_CHANGED_DURING_REVIEW`，不推断 reviewer 主动编辑，也不自动使输出失格；主会话应检查变化是测试缓存/报告等可解释副作用，还是源文件、lockfile、snapshot 等需要人工处理的污染。不要自动 revert 用户或其他进程可能造成的改动。
 - 详细 review prompt 见 `references/review-prompt.md`。
 - 合并两个 reviewer 的输出时读取 `references/review-merge-policy.md`：合并重复项、分组紧密相关 issue，并为每个 processed issue 记录来源 reviewer。
@@ -122,6 +124,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 主会话必须为 validate/fix 分组保留一张审计表，不只把分组信息写进子代理 prompt。每个分组记录 `validation_group_id`、包含的 canonical issue / processed id、分组理由、分配给哪个 validate/fix 子代理；若触发允许本地执行的窄例外，还必须记录本地执行原因；以及逐项 verdict 汇总。
 - 发给 validate/fix 子代理的 issue context 必须 source-agnostic：不要包含“Codex 发现”“alternative reviewer 发现”“两个 reviewer 都发现”等来源标签，也不要暗示哪个模型或 agent 支持该 issue。来源 provenance 只保留在主会话的合并表 / handoff 中。
 - validate/fix 子代理只处理主会话分配给它的 canonical issue 包；不得自行扩大 review 范围、重新执行 double review、生成 handoff 或处理未分配问题。
+- validate/fix 子代理可以读取 `references/review-standards/validate-fix.md` 和 assigned issue 相关专项 subset。若缺少标准、测量、受控子任务或上下文，可输出纯 `RVF_*_REQUEST`；主会话处理后重试。request 不是 verdict，不得与 `REAL` / `FALSE_POSITIVE` / `ELEVATE` 混写。
 - 所有 validate/fix 子代理完成后，主会话的最终中文汇总必须包含“Validate/fix 分组”小节，说明 reviewer 标记出的 processed issues 是如何被分配成验证包的：每组列出 group id、包含的问题、合并验证原因和结果统计。即使某组只有一条 issue，也要说明它为何独立验证。
 - 详细 validate/fix prompt 见 `references/validate-then-fix-prompt.md`。
 

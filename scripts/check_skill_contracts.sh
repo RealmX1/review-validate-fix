@@ -78,6 +78,14 @@ required_files=(
   "references/legacy-compatibility-notes.md"
   "references/review-merge-policy.md"
   "references/review-prompt.md"
+  "references/review-standards/index.md"
+  "references/review-standards/main-agent.md"
+  "references/review-standards/reviewer.md"
+  "references/review-standards/validate-fix.md"
+  "references/review-standards/simplification-subset.md"
+  "references/review-standards/security-subset.md"
+  "references/review-standards/performance-subset.md"
+  "references/review-standards/protocol-extensions.md"
   "references/validate-then-fix-prompt.md"
   "references/handoff-template.md"
   "references/cancel-rvf-run.md"
@@ -220,6 +228,10 @@ forbid_literal "config/alternative-reviewer.json" 'dontAsk'
 require_literal "config/alternative-reviewer.json" 'allow_repo_cwd'
 require_literal "config/alternative-reviewer.json" 'no-direct-write'
 require_literal "config/alternative-reviewer.json" 'RVF_LOCK_REQUEST'
+require_literal "config/alternative-reviewer.json" 'RVF_STANDARD_REQUEST'
+require_literal "config/alternative-reviewer.json" 'RVF_MEASUREMENT_REQUEST'
+require_literal "config/alternative-reviewer.json" 'RVF_SUBTASK_REQUEST'
+require_literal "config/alternative-reviewer.json" 'RVF_CONTEXT_REQUEST'
 require_literal "config/alternative-reviewer.json" 'idle_timeout_seconds'
 require_literal "config/alternative-reviewer.json" 'activity_check_interval_seconds'
 require_literal "config/alternative-reviewer.json" 'max_runtime_seconds'
@@ -245,7 +257,13 @@ require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_re
 require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_long_command_wait_uses_check_interval'
 require_literal "scripts/check_review_output.py" 'NO_ISSUES'
 require_literal "scripts/check_review_output.py" 'RVF_LOCK_REQUEST'
+require_literal "scripts/check_review_output.py" 'RVF_STANDARD_REQUEST'
+require_literal "scripts/check_review_output.py" 'RVF_MEASUREMENT_REQUEST'
+require_literal "scripts/check_review_output.py" 'RVF_SUBTASK_REQUEST'
+require_literal "scripts/check_review_output.py" 'RVF_CONTEXT_REQUEST'
 require_literal "scripts/check_review_output.py" 'lock_request'
+require_literal "scripts/check_review_output.py" 'standard_request'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_check_review_output_protocol_extension_requests'
 require_literal "scripts/command_lock.py" 'fcntl.flock'
 require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/command_lock.py" 'lock_acquired'
@@ -280,12 +298,33 @@ require_literal "references/review-merge-policy.md" 'source-agnostic'
 require_literal "references/review-merge-policy.md" 'CONTRACT_VIOLATION'
 require_literal "references/review-merge-policy.md" 'WORKSPACE_CHANGED_DURING_REVIEW'
 require_literal "references/review-merge-policy.md" 'RVF_LOCK_REQUEST'
+require_literal "references/review-merge-policy.md" 'RVF_STANDARD_REQUEST'
+require_literal "references/review-merge-policy.md" 'RVF_MEASUREMENT_REQUEST'
+require_literal "references/review-merge-policy.md" 'RVF_SUBTASK_REQUEST'
+require_literal "references/review-merge-policy.md" 'RVF_CONTEXT_REQUEST'
 require_literal "references/review-prompt.md" 'RVF_LOCK_REQUEST'
+require_literal "references/review-prompt.md" 'RVF_STANDARD_REQUEST'
+require_literal "references/review-prompt.md" 'RVF_MEASUREMENT_REQUEST'
+require_literal "references/review-prompt.md" 'RVF_SUBTASK_REQUEST'
+require_literal "references/review-prompt.md" 'RVF_CONTEXT_REQUEST'
 require_literal "references/review-prompt.md" 'command lock'
+require_literal "references/review-standards/index.md" 'RVF Review Standards Pack'
+require_literal "references/review-standards/main-agent.md" '默认策略：子代理可以请求子任务，但由主会话 spawn'
+require_literal "references/review-standards/reviewer.md" 'RVF_STANDARD_REQUEST'
+require_literal "references/review-standards/validate-fix.md" 'RVF_*_REQUEST'
+require_literal "references/review-standards/simplification-subset.md" "Chesterton's Fence"
+require_literal "references/review-standards/security-subset.md" 'Three-tier boundary system'
+require_literal "references/review-standards/performance-subset.md" 'Measure before optimizing'
+require_literal "references/review-standards/protocol-extensions.md" 'RVF_SUBTASK_REQUEST'
 require_literal "references/review-prompt.md" '不要让 reviewer 只靠 `git diff HEAD` 猜 scope'
 require_literal "SKILL.md" '不要让 reviewer 只靠 `git diff HEAD` 猜 scope'
 require_literal "SKILL.md" '--allow-missing-session-context'
 require_literal "references/validate-then-fix-prompt.md" 'source-agnostic'
+require_literal "references/validate-then-fix-prompt.md" 'RVF_STANDARD_REQUEST'
+require_literal "references/validate-then-fix-prompt.md" 'RVF_MEASUREMENT_REQUEST'
+require_literal "references/validate-then-fix-prompt.md" 'RVF_SUBTASK_REQUEST'
+require_literal "references/validate-then-fix-prompt.md" 'RVF_CONTEXT_REQUEST'
+require_literal "references/validate-then-fix-prompt.md" 'references/review-standards/validate-fix.md'
 require_literal "references/validate-then-fix-prompt.md" '不要生成 handoff'
 require_literal "setup/mcp-setup-startup.md" '先问用户'
 require_literal "setup/mcp-setup-startup.md" '没有可用 alternative reviewer'

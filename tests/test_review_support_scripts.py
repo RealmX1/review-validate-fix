@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHECK_SKILL_CONTRACTS = ROOT / "scripts" / "check_skill_contracts.sh"
 SCRIPT_DIR = (
     ROOT
     / "plugins"
@@ -335,6 +336,124 @@ def test_check_review_output_lock_request() -> None:
     )
     assert invalid.returncode != 0
 
+    malformed_lock = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_LOCK_REQUEST please-lock-npm-test\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed_lock.returncode != 0
+
+    empty_lock_field = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_LOCK_REQUEST name= command=npm test reason=shared-cache\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert empty_lock_field.returncode != 0
+
+
+def test_check_review_output_protocol_extension_requests() -> None:
+    standard = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text=(
+            "RVF_STANDARD_REQUEST domain=security reason=auth-boundary scope=src/auth.py\n"
+        ),
+    )
+    standard_payload = json.loads(standard.stdout)
+    assert standard_payload["valid"] is True
+    assert standard_payload["kind"] == "request"
+    assert standard_payload["request_count"] == 1
+    assert standard_payload["request_types"] == ["standard_request"]
+
+    mixed_requests = run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input_text=(
+            "RVF_MEASUREMENT_REQUEST metric=p95 command=pytest reason=needs-baseline\n"
+            "RVF_CONTEXT_REQUEST need=test-result reason=compare-existing-output\n"
+            "RVF_SUBTASK_REQUEST type=security_check scope=src/auth.py reason=auth-change\n"
+        ),
+    )
+    mixed_payload = json.loads(mixed_requests.stdout)
+    assert mixed_payload["valid"] is True
+    assert mixed_payload["kind"] == "request"
+    assert mixed_payload["request_count"] == 3
+    assert mixed_payload["request_types"] == [
+        "context_request",
+        "measurement_request",
+        "subtask_request",
+    ]
+
+    malformed = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_MEASUREMENT_REQUEST metric=p95 reason=missing-command\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed.returncode != 0
+
+    empty_field = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_STANDARD_REQUEST domain=security reason= scope=src/auth.py\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert empty_field.returncode != 0
+
+    invalid_standard_domain = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_STANDARD_REQUEST domain=privacy reason=auth-boundary scope=src/auth.py\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid_standard_domain.returncode != 0
+
+    invalid_subtask_type = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_SUBTASK_REQUEST type=delete_repo scope=src/auth.py reason=auth-change\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid_subtask_type.returncode != 0
+
+    invalid_context_need = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="RVF_CONTEXT_REQUEST need=secret reason=compare-existing-output\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid_context_need.returncode != 0
+
+    mixed_with_completion = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input=(
+            "RVF_STANDARD_REQUEST domain=performance reason=needs-budget scope=src/app.ts\n"
+            "NO_ISSUES\n"
+        ),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mixed_with_completion.returncode != 0
+
+
+def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
+    script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    for literal in (
+        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_STANDARD_REQUEST'",
+        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_MEASUREMENT_REQUEST'",
+        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_SUBTASK_REQUEST'",
+        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_CONTEXT_REQUEST'",
+    ):
+        assert literal in script
+
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     result = run(
@@ -554,6 +673,33 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
         check=False,
     )
     assert fix_summary_continuation.returncode != 0
+
+    handoff_completion_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nRVF_HANDOFF_FILE: /tmp/rvf-handoff.md\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert handoff_completion_continuation.returncode != 0
+
+    handoff_reviewers_summary_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nReviewers：NO_ISSUES\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert handoff_reviewers_summary_continuation.returncode != 0
+
+    handoff_validate_fixers_summary_continuation = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
+        input="1. a.py:1 第一条问题\nValidate/fixers：REAL fixed\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert handoff_validate_fixers_summary_continuation.returncode != 0
 
     unnumbered_spaced_issue = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
@@ -2774,6 +2920,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         test_check_review_output_lock_request()
+        test_check_review_output_protocol_extension_requests()
+        test_check_skill_contracts_requires_validate_fix_request_literals()
         test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
         test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope")

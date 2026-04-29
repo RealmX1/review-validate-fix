@@ -16,6 +16,10 @@ pass_type: validate_fix
 
 只处理主会话分配给你的 issue。不要重新执行 double review，不要主动寻找未分配问题，不要生成 handoff.md，也不要输出 reviewer provenance。`pass_type: validate_fix` 不是 full mode；即使上下文提到 `$review-validate-fix` 或 research checkpoint，也只返回 verdict 和必要的最小修复说明，不输出 `RVF_HANDOFF_FILE`。
 
+按 issue 类型读取 RVF 定制 standards pack 的相关子集：`references/review-standards/validate-fix.md` 是默认标准；复杂度问题读取 `simplification-subset.md`，安全问题读取 `security-subset.md`，性能问题读取 `performance-subset.md`。这些 standards 只用于验证和最小修复，不允许你扩大 scope 或重新 review。
+
+如果当前只缺主会话可提供的专项标准、测量、受控子任务或上下文，可以先只输出 `RVF_STANDARD_REQUEST ...`、`RVF_MEASUREMENT_REQUEST ...`、`RVF_SUBTASK_REQUEST ...` 或 `RVF_CONTEXT_REQUEST ...`。request 是非完成态，不能和 `REAL` / `FALSE_POSITIVE` / `ELEVATE` 混写；主会话处理后会要求你重试。
+
 返回结构化 verdict：
 
 `[REAL | FALSE_POSITIVE | ELEVATE] <路径:行号> — <你做了什么 / 为何驳回 / 为何升级>`
@@ -34,6 +38,7 @@ pass_type: validate_fix
   - 输出仍要逐项给出 `REAL` / `FALSE_POSITIVE` / `ELEVATE` verdict。
 - 验证包必须 source-agnostic：不要告诉子代理该 issue 来自 Codex、alternative reviewer、两个 reviewer 共同发现，或某个 reviewer 的原始编号。
 - 子代理只接收 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
+- 子代理可以用 `RVF_*_REQUEST` 请求缺失标准、测量、受控子任务或上下文，但 request 本身不是 verdict，不得进入最终结果。
 
 ## ELEVATE 详情
 
