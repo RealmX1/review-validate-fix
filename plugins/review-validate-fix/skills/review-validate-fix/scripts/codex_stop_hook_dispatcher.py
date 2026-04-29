@@ -35,6 +35,10 @@ PLAN_OPERATION_MARKERS = (
     "<proposed_plan>",
     "</proposed_plan>",
 )
+PLAN_OPERATION_TEXT_RE = re.compile(
+    rf"\A\s*{re.escape(PLAN_OPERATION_MARKERS[0])}.*{re.escape(PLAN_OPERATION_MARKERS[1])}\s*\Z",
+    re.DOTALL,
+)
 PLAN_OPERATION_VALUES = {
     "plan",
     "planning",
@@ -590,7 +594,7 @@ def latest_assistant_message_from_event(event: dict[str, Any]) -> str | None:
 
 
 def text_marks_plan_operation(text: str | None) -> bool:
-    return isinstance(text, str) and any(marker in text for marker in PLAN_OPERATION_MARKERS)
+    return isinstance(text, str) and PLAN_OPERATION_TEXT_RE.match(text) is not None
 
 
 def value_marks_plan_operation(value: Any) -> bool:
