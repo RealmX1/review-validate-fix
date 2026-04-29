@@ -17,6 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
+from session_manifest import build_manifest
 from vibe_kanban_mcp_client import (
     DEFAULT_START_CMD as DEFAULT_VIBE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_VIBE_KANBAN_START_TIMEOUT_SECONDS,
@@ -65,6 +66,7 @@ SESSION_PATH_KEYS = (
     "log_path",
     "session_file",
 )
+SESSION_SCOPE_PATH_KEYS = tuple(key for key in SESSION_PATH_KEYS if key != "log_path")
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,32 @@ def event_session_paths(event: dict[str, Any]) -> list[Path]:
         if isinstance(value, str) and value:
             paths.append(Path(value))
     return paths
+
+
+def event_session_scope_paths(event: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for key in SESSION_SCOPE_PATH_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            paths.append(Path(value))
+    return paths
+
+
+def first_readable_session_path(event: dict[str, Any]) -> Path | None:
+    for path in event_session_scope_paths(event):
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            with resolved.open("rb"):
+                pass
+        except OSError:
+            continue
+        return resolved
+    return None
 
 
 def text_from_message_payload(payload: dict[str, Any]) -> str:
@@ -2317,6 +2345,88 @@ def review_validate_fix_dispatch(
     return fork_review_validate_fix(event, repo, ledger)
 
 
+def session_scope_gate_payload(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+) -> dict[str, Any] | None:
+    session_paths = event_session_scope_paths(event)
+    if not session_paths:
+        return None
+
+    transcript = first_readable_session_path(event)
+    if transcript is None:
+        ledger.event(
+            phase="gate",
+            event="session_scope_unavailable",
+            status="skipped",
+            reason_code="transcript_unavailable",
+            repo=repo,
+            cwd=event.get("cwd"),
+            paths={"transcripts": [str(path) for path in session_paths]},
+        )
+        return skip_payload(
+            "session transcript path was provided but is not readable; skipped RVF fork/review.",
+            ledger,
+            "transcript_unavailable",
+            repo=repo,
+        )
+
+    try:
+        manifest = build_manifest(Path(repo).expanduser().resolve(), transcript)
+    except Exception as exc:
+        ledger.event(
+            phase="gate",
+            event="session_scope_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=repo,
+            cwd=event.get("cwd"),
+            paths={"transcript": str(transcript)},
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return skip_payload(
+            "session manifest failed; skipped RVF fork/review.",
+            ledger,
+            "session_manifest_failed",
+            repo=repo,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    manifest_path = ledger.artifact("session-manifest.json", manifest)
+    owned_dirty = manifest.get("owned_dirty_paths")
+    if isinstance(owned_dirty, list) and owned_dirty:
+        ledger.event(
+            phase="gate",
+            event="session_scope_detected",
+            status="dirty",
+            reason_code="session_owned_dirty",
+            repo=repo,
+            cwd=event.get("cwd"),
+            paths={"manifest": manifest_path} if manifest_path else {},
+            owned_dirty_paths=owned_dirty,
+        )
+        return None
+
+    ledger.event(
+        phase="gate",
+        event="session_scope_clean",
+        status="skipped",
+        reason_code="no_session_owned_dirty",
+        repo=repo,
+        cwd=event.get("cwd"),
+        paths={"manifest": manifest_path} if manifest_path else {},
+        unattributed_dirty_paths=manifest.get("unattributed_dirty_paths"),
+    )
+    return skip_payload(
+        "no session-owned dirty paths",
+        ledger,
+        "no_session_owned_dirty",
+        repo=repo,
+        unattributed_dirty_paths=manifest.get("unattributed_dirty_paths"),
+    )
+
+
 def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bool:
     if explicit_suppress_requested(event, latest_user):
         return True
@@ -2530,6 +2640,10 @@ def main() -> int:
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
+            session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
+            if session_scope_payload is not None:
+                emit(session_scope_payload)
+                return 0
             payload = review_validate_fix_dispatch(event, cwd_result.repo, ledger)
             if payload is not None:
                 emit(payload)

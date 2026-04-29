@@ -50,7 +50,12 @@ def init_repo_with_head(path: Path) -> Path:
     return repo
 
 
-def write_apply_patch_transcript(path: Path, repo: Path, rel_path: str = "changed.txt") -> Path:
+def write_apply_patch_transcript(
+    path: Path,
+    repo: Path,
+    rel_path: str = "changed.txt",
+    session_id: str = "parent-thread",
+) -> Path:
     patch = (
         "*** Begin Patch\n"
         f"*** Update File: {rel_path}\n"
@@ -60,7 +65,7 @@ def write_apply_patch_transcript(path: Path, repo: Path, rel_path: str = "change
         "*** End Patch\n"
     )
     path.write_text(
-        json.dumps({"type": "session_meta", "payload": {"id": "parent-thread", "cwd": str(repo)}})
+        json.dumps({"type": "session_meta", "payload": {"id": session_id, "cwd": str(repo)}})
         + "\n"
         + json.dumps(
             {
@@ -351,6 +356,33 @@ def test_prompt_suppression_marker_skips(tmp: Path) -> None:
     payload = parse_json(stdout)
     assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
     assert "summary=" not in payload["systemMessage"]
+
+
+def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    state = tmp / "state"
+    write_user_session(
+        transcript,
+        "session-with-background-dirty",
+        "只是查看状态，没有修改文件。",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = assert_skip_reason(stdout, "no session-owned dirty paths")
+    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "no_session_owned_dirty"
+    assert "app_server_requests_path" not in summary
 
 
 def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -> None:
@@ -1653,11 +1685,7 @@ def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
     assert not (state / "session-hook" / "session-reenabled.json").exists()
     assert latest_pointer(state)["status"] == "session-hook-control"
 
-    write_user_session(
-        transcript,
-        "session-reenabled",
-        "普通停止现在应恢复触发。",
-    )
+    write_apply_patch_transcript(transcript, dirty)
     payload = parse_json(
         invoke(
             {
@@ -1918,10 +1946,10 @@ def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> No
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
     state = tmp / "state"
-    write_user_session(
+    write_apply_patch_transcript(
         transcript,
-        "00000000-0000-0000-0000-000000000099",
-        "normal parent prompt",
+        dirty,
+        session_id="00000000-0000-0000-0000-000000000099",
     )
     payload = parse_json(
         invoke(
@@ -2326,6 +2354,28 @@ def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path
             "请继续处理当前 dirty repo。",
         ],
     )
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "apply_patch",
+                        "input": (
+                            "*** Begin Patch\n"
+                            "*** Update File: changed.txt\n"
+                            "@@\n"
+                            "-old\n"
+                            "+new\n"
+                            "*** End Patch\n"
+                        ),
+                        "call_id": "call_patch",
+                    },
+                }
+            )
+            + "\n"
+        )
 
     payload = parse_json(
         invoke(
@@ -2373,6 +2423,7 @@ def main() -> int:
         test_stop_hook_active_skips,
         test_env_suppression_skips,
         test_prompt_suppression_marker_skips,
+        test_session_without_owned_dirty_skips_fork,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
         test_socket_probe_reports_unavailable_reason,
