@@ -88,6 +88,83 @@ def write_fake_installed_hook(path: Path, marker: Path) -> None:
     )
 
 
+def write_fake_opener(path: Path, marker: Path) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text(sys.argv[-1], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def write_assistant_handoff_transcript(path: Path, handoff: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": f"完成。\nRVF_HANDOFF_FILE: {handoff}",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_assistant_plan_transcript(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "<proposed_plan>\n# Plan\n</proposed_plan>",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_plan_then_normal_transcript(path: Path) -> Path:
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": "<proposed_plan>\n# Plan\n</proposed_plan>",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "execute it"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": "Implementation complete.",
+            },
+        },
+    ]
+    path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_failing_installed_hook(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -189,6 +266,8 @@ def invoke_result(
         "CODEX_RVF_VK_MANAGEMENT_MODE",
         "CODEX_RVF_SUPPRESS",
         "CODEX_RVF_SUPPRESS_STOP_HOOK",
+        "CODEX_RVF_OPEN_HANDOFF",
+        "CODEX_RVF_IDE_OPEN_CMD",
     ):
         env.pop(key, None)
     if dev_repo is not None:
@@ -252,6 +331,114 @@ def test_dev_repo_main_session_syncs_before_running_installed_hook(tmp_path: Pat
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
     assert (marker / "install-ran").exists()
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "child-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+    }
+    stdout = invoke(
+        event,
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+    )
+
+    payload = json.loads(stdout)
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
+    summary = latest_summary(tmp_path / "state")
+    assert summary["handoff_path"] == str(handoff.resolve())
+
+
+def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_assistant_plan_transcript(tmp_path / "session.jsonl")
+    state = tmp_path / "state"
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "session_id": "parent-session",
+            "turn_id": "turn",
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+            "last_assistant_message": "<proposed_plan>\n# Plan\n</proposed_plan>",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=plan_operation" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "plan_operation"
+
+
+def test_prior_plan_output_does_not_suppress_future_turn(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_plan_then_normal_transcript(tmp_path / "session.jsonl")
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "parent-session",
+        "turn_id": "turn-after-plan",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+        "last_assistant_message": "Implementation complete.",
+        "mode": "plan",
+        "source": {"agent_mode": "plan"},
+    }
+    stdout = invoke(
+        event,
+        dev_repo=None,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
@@ -365,6 +552,44 @@ def test_suppress_env_skips_before_sync_and_installed_hook(tmp_path: Path) -> No
     assert payload["continue"] is True
     assert "reason=suppressed" in payload["systemMessage"]
     assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+
+
+def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "session_id": "headless-child",
+            "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
+            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+        },
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=suppressed" in payload["systemMessage"]
+    assert not opener_marker.exists()
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
@@ -665,6 +890,8 @@ def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
             "CODEX_RVF_VK_MCP_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp",
             "CODEX_RVF_VK_START_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44",
             "CODEX_RVF_VK_BACKEND_URL": "http://127.0.0.1:50280",
+            "CODEX_RVF_OPEN_HANDOFF": "0",
+            "CODEX_RVF_IDE_OPEN_CMD": "code -r",
         },
     )
 
@@ -678,6 +905,8 @@ def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
     assert "--vibe-kanban-mcp-cmd" in install_args
     assert "--vibe-kanban-start-cmd" in install_args
     assert "--vibe-kanban-backend-url http://127.0.0.1:50280" in install_args
+    assert "--no-open-handoff" in install_args
+    assert "--ide-open-cmd code -r" in install_args
 
 
 def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> None:
@@ -812,10 +1041,14 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
 def main() -> int:
     tests = [
         test_dev_repo_main_session_syncs_before_running_installed_hook,
+        test_handoff_marker_opens_before_dev_sync_or_installed_hook,
+        test_plan_operation_skips_before_dev_sync_or_installed_hook,
+        test_prior_plan_output_does_not_suppress_future_turn,
         test_session_hook_off_still_syncs_before_running_installed_hook,
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
         test_suppress_env_skips_before_sync_and_installed_hook,
+        test_suppress_env_skips_handoff_marker_before_opening,
         test_sync_failure_skips_installed_hook_to_avoid_stale_fork,
         test_installed_hook_failure_blocks_instead_of_continuing,
         test_missing_installed_hook_blocks_instead_of_continuing,

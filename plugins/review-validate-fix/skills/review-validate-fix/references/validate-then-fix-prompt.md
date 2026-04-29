@@ -14,7 +14,7 @@ pass_type: validate_fix
 3. 不是真问题：不要改任何文件，返回 `FALSE_POSITIVE`，并简短说明为何不成立。
 4. 是真问题但你不应该或不能独立修：不要改任何文件，返回 `ELEVATE`。例如需要架构决策、存在多种等价修复需要开发者拍板、涉及权限或 scope 外改动、原始需求不明确。
 
-只处理主会话分配给你的 issue。不要重新执行 double review，不要主动寻找未分配问题，不要生成 handoff，也不要输出 reviewer provenance。`pass_type: validate_fix` 不是 full mode；即使上下文提到 `$review-validate-fix` 或 research checkpoint，也只返回 verdict 和必要的最小修复说明，不输出 `<handoff-context>`。
+只处理主会话分配给你的 issue。不要重新执行 double review，不要主动寻找未分配问题，不要生成 handoff.md，也不要输出 reviewer provenance。`pass_type: validate_fix` 不是 full mode；即使上下文提到 `$review-validate-fix` 或 research checkpoint，也只返回 verdict 和必要的最小修复说明，不输出 `RVF_HANDOFF_FILE`。
 
 返回结构化 verdict：
 

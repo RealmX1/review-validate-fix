@@ -27,12 +27,12 @@ description: Use when the user asks for a post-work code review loop, review val
 ## 运行选项
 
 - 本 skill 支持显式 `pass_type` / `mode`，默认是 `full`：执行 double review -> merge -> validate/fix -> handoff。只有用户明确写出 `$review-validate-fix` 且没有指定更窄模式时，才进入默认 `full` 流程。
-- `pass_type: review_only` / `mode: review_only` 是只读 reviewer 子 pass：只允许读取、搜索、运行不会主动写回源码的验证命令，并最终只输出精确 `NO_ISSUES` 或编号 issue list。禁止修改文件、禁止 validate/fix、禁止 stage/commit、禁止生成 `<handoff-context>`，也不要输出 handoff 摘要。
-- `pass_type: validate_fix` / `mode: validate_fix` 只处理主会话分配的 canonical issue 包：允许按 `references/validate-then-fix-prompt.md` 对 `REAL` 问题做最小修复，但仍禁止重新执行 double review、扩大审查范围或生成 `<handoff-context>`。
-- `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint` 不是 review loop：只输出用户要求的研究 checkpoint / 汇总，不启动 review、validate/fix 或 handoff。即使上下文中提到 `$review-validate-fix`、review、fix 或 handoff，也不得生成 `<handoff-context>`。
+- `pass_type: review_only` / `mode: review_only` 是只读 reviewer 子 pass：只允许读取、搜索、运行不会主动写回源码的验证命令，并最终只输出精确 `NO_ISSUES` 或编号 issue list。禁止修改文件、禁止 validate/fix、禁止 stage/commit、禁止生成 handoff.md，也不要输出 handoff 摘要。
+- `pass_type: validate_fix` / `mode: validate_fix` 只处理主会话分配的 canonical issue 包：允许按 `references/validate-then-fix-prompt.md` 对 `REAL` 问题做最小修复，但仍禁止重新执行 double review、扩大审查范围或生成 handoff.md。
+- `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint` 不是 review loop：只输出用户要求的研究 checkpoint / 汇总，不启动 review、validate/fix 或 handoff。即使上下文中提到 `$review-validate-fix`、review、fix 或 handoff，也不得生成 handoff.md。
 - 如果本 skill 文本被放进子代理或研究代理上下文，而该代理的当前任务明确是只读 review、普通研究、checkpoint、ledger 维护或 no-handoff 汇总，当前任务的窄模式优先于默认 `full`。不要因为上下文出现 `$review-validate-fix` 叙事就升级为完整流程。
 - 默认开启 review：除非用户在本轮 `$review-validate-fix` prompt 中明确写出 `skip review`、`no review`、`review off`、`handoff only`、`跳过 review` 或等价中文表达，否则必须执行 santa-method double review。
-- 默认开启 handoff：除非用户在本轮明确写出 `no handoff`、`skip handoff`、`handoff off`、`不要 handoff`、`不生成交接` 或等价中文表达，否则最终回复末尾必须生成 `<handoff-context>`。
+- 默认开启 handoff：除非用户在本轮明确写出 `no handoff`、`skip handoff`、`handoff off`、`不要 handoff`、`不生成交接` 或等价中文表达，否则必须在 run artifact 中创建并持续维护 `handoff.md`。最终回复先输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后用 1-3 句极短中文说明 reviewers 做了什么、validate/fixers 做了什么；不要重复 handoff 文件正文。
 - 如果用户同时要求跳过 review 且关闭 handoff，只做入口检查、必要的用户指定 validate/fix 工作和中文结果汇总；不要生成 reviewer provenance 或 handoff blob。
 - 这些开关只影响本轮 skill 调用，不写入持久配置，也不要因为上轮用户偏好自动沿用。
 
@@ -59,7 +59,7 @@ description: Use when the user asks for a post-work code review loop, review val
 - 如果当前 `cwd` 不在任何 git repo/worktree 内，Stop hook 不得扫描 `cwd` 的子目录、`~/.codex/config.toml` trusted projects 或其他候选 repo 来猜目标；必须 fail-safe 跳过，并通过 `systemMessage` 要求主会话询问用户提供目标 repo 路径。
 - fork prompt 必须包含目标仓库路径、`RVF_FORKED_REVIEW_VALIDATE_FIX`、父 thread/session id 和父 cwd，让新 fork 能在正确仓库执行并在结束时识别自身。
 - 如果 Stop 事件提供 `transcript_path` / `session_path` / `conversation_path`，app-server fork 必须优先用该 rollout path 调用 `thread/fork`；Desktop 暴露的环境 thread id 可能不是可由外部 app-server 直接索引的 saved session id。
-- 新 fork 会话结束时，如果 Stop 事件的 `last_assistant_message` 已包含 `<handoff-context>`，hook 通过 systemMessage 程序化提示用户复制最终回复中的 handoff block 并粘贴回原始 chat session；不要让 agent 在正文里手写这个提示。
+- 新 fork 会话或手动 RVF 会话结束时，如果 Stop 事件的 `last_assistant_message` 或 transcript 末尾包含 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，hook 必须在 dev sync gate 和 dirty/fork gate 前把该 markdown 文件作为完成信号处理，默认自动打开它，并停止后续自动 fork。可用 `CODEX_RVF_OPEN_HANDOFF=0` 关闭自动打开；可用 `CODEX_RVF_IDE_OPEN_CMD` 指定 coding agent IDE 打开命令，未设置时使用系统默认打开方式。
 - app-server fork 会在 Stop 事件提供 `model` 时显式传入 model，并从 Stop 事件、`CODEX_RVF_FORK_REASONING_EFFORT` 或 `~/.codex/config.toml` 的 `model_reasoning_effort` 推出 reasoning effort 后在 `turn/start` 中传入。若父会话使用了 hook 不可见的临时 reasoning override，则无法完全保证继承。
 
 ## Setup-only 资源
@@ -133,8 +133,8 @@ description: Use when the user asks for a post-work code review loop, review val
 ## Handoff
 
 - 最终用中文汇总 flag 数、真实修复数、误报数、升级数；如果用户跳过 review，也要汇总 review 状态。若本轮进入 validate/fix，最终汇总还必须包含“Validate/fix 分组”小节，披露主会话如何把 reviewer 标记的问题分组成验证包，以及每组的结果。
-- Handoff 默认开启：成功完成本 skill 时，末尾必须生成一个 fenced markdown code block，opening fence 必须是 ```` ```markdown ````，code block 内包含完整 `<handoff-context>...</handoff-context>` blob，closing fence 必须是 ```` ``` ````；不要把 `<handoff-context>` 作为未包裹的裸标签输出。模板见 `references/handoff-template.md`。
-- 用户明确关闭 handoff、当前是 `pass_type: review_only` / `pass_type: validate_fix` 子 pass，或当前是 `mode: research_checkpoint_no_handoff` 时，最终回复只给当前任务要求的中文结果，不输出 `<handoff-context>`，也不要输出空模板。
+- Handoff 默认开启：成功完成本 skill 时，必须在当前 RVF run 目录的 `artifacts/handoff.md` 创建并持续维护 markdown 交接文件。文件在 prepare/run 初始化后先写 pending 状态，review、merge、validate/fix、最终汇总阶段覆盖更新同一文件；最终回复第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，后面只追加 1-3 句极短中文说明 reviewers 和 validate/fixers 的工作结果，不要重复 handoff 文件正文。模板见 `references/handoff-template.md`。
+- 用户明确关闭 handoff、当前是 `pass_type: review_only` / `pass_type: validate_fix` 子 pass，或当前是 `mode: research_checkpoint_no_handoff` 时，最终回复只给当前任务要求的中文结果，不创建 handoff.md，也不要输出空模板或 `RVF_HANDOFF_FILE`。
 - Handoff 内容只写你能确认的事实；不要把仓库里既有 WIP 或其他 session 的改动混成本 turn 的改动。
 - 不要复用旧 Stop hook 里的“从 hook 触发点 time-travel”假设。当前 Codex fork 方案创建的是停止后的新 fork 用户 prompt checkpoint；它可作为回退边界，但不是聊天中任意内部 Stop 事件的真正 time-travel snapshot。
 

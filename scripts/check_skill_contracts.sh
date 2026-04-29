@@ -173,34 +173,18 @@ python3 "$tests_dir/test_review_support_scripts.py"
 python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
 python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
 
-python3 - "$skill_dir/references/handoff-template.md" <<'PY'
-import re
-import sys
-from pathlib import Path
-
-template = Path(sys.argv[1]).read_text(encoding="utf-8")
-if not re.search(
-    r"```markdown\n<handoff-context>\n[\s\S]*?</handoff-context>\n```",
-    template,
-):
-    print(
-        "契约缺失: handoff-template.md 必须用单个 ```markdown fenced block "
-        "包裹完整 <handoff-context>...</handoff-context>",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-PY
-
 require_literal "references/review-prompt.md" 'NO_ISSUES'
 require_literal "references/validate-then-fix-prompt.md" 'REAL'
 require_literal "references/validate-then-fix-prompt.md" 'FALSE_POSITIVE'
 require_literal "references/validate-then-fix-prompt.md" 'ELEVATE'
 require_literal "references/validate-then-fix-prompt.md" 'elevation-detail'
-require_literal "references/handoff-template.md" '<handoff-context>'
-require_literal "references/handoff-template.md" '</handoff-context>'
-require_literal "references/handoff-template.md" '```markdown'
-require_literal "SKILL.md" 'fenced markdown code block'
-require_literal "SKILL.md" '不要把 `<handoff-context>` 作为未包裹的裸标签输出'
+require_literal "references/handoff-template.md" 'handoff.md'
+require_literal "references/handoff-template.md" 'RVF_HANDOFF_FILE'
+require_literal "references/handoff-template.md" 'Reviewers：'
+require_literal "references/handoff-template.md" 'Validate/fixers：'
+require_literal "SKILL.md" 'handoff.md'
+require_literal "SKILL.md" 'RVF_HANDOFF_FILE'
+require_literal "SKILL.md" 'reviewers 和 validate/fixers'
 require_literal "SKILL.md" '运行选项'
 require_literal "SKILL.md" '默认开启 review'
 require_literal "SKILL.md" '默认开启 handoff'
@@ -401,12 +385,14 @@ require_repo_literal "tests/test_install_to_codex.py" 'test_main_persists_vibe_p
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_persists_vibe_management_mode_from_env'
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_persists_vibe_connection_env'
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_configures_vibe_auto_project_without_project_id'
+require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--vibe-kanban-project-id'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--vibe-kanban-management-mode'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--vibe-kanban-mcp-cmd'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--vibe-kanban-start-cmd'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--vibe-kanban-backend-url'
 require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_dev_sync_preserves_vibe_kanban_installer_args'
+require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_handoff_marker_opens_before_dev_sync_or_installed_hook'
 require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_dev_sync_prefers_hooks_json_over_stale_cached_env'
 require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_installed_hook_receives_hooks_json_mode_over_stale_cached_env'
 forbid_literal "scripts/codex_stop_review_validate_fix.py" 'start_workspace'
@@ -437,8 +423,11 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'turn/start'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'Terminal/CLI fork launch is intentionally disabled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_REASONING_EFFORT'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'review-validate-fix-fork'
-require_literal "scripts/codex_stop_review_validate_fix.py" '<handoff-context>'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'last_assistant_message'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_HANDOFF_FILE'
+require_literal "scripts/codex_stop_hook_dispatcher.py" '--no-open-handoff'
+require_literal "scripts/codex_stop_hook_dispatcher.py" '--ide-open-cmd'
+require_repo_literal "scripts/install_to_codex.py" '--no-open-handoff'
+require_repo_literal "scripts/install_to_codex.py" '--ide-open-cmd'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'fork'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_fork_experiment_marker_dry_run'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_forks_in_gui_by_default'
@@ -465,6 +454,7 @@ require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_stop_e
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_continuation_mode_reports_removed_fallback'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_no_git_cwd_skips_even_with_dirty_trusted_repo'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_gets_programmatic_handoff_advisory'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_handoff_marker_in_dirty_repo_does_not_create_new_fork'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_forked_rvf_session_waits_for_handoff_before_advisory'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_missing_cwd_skips_and_requests_target_repo'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_log_unavailable_does_not_break_hook_payload'

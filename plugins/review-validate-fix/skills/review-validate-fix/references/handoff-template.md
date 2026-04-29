@@ -1,26 +1,57 @@
 # Handoff Template
 
-Handoff 默认开启，但只适用于 `mode: full` 且 handoff 未关闭的完整流程。除非用户明确要求 `no handoff` / `skip handoff` / `不要 handoff`，最终回复先用 2-5 句中文汇总，然后在末尾输出下面的 fenced markdown code block。opening fence 必须是 ```` ```markdown ````，closing fence 必须是 ```` ``` ````；不要把 `<handoff-context>` 作为未包裹的裸标签输出。按真实情况填空；不要编造 session context、文件列表或修复结果。
+Handoff 默认开启，但只适用于 `mode: full` 且 handoff 未关闭的完整流程。除非用户明确要求 `no handoff` / `skip handoff` / `不要 handoff`，主会话必须在当前 RVF run 的 artifacts 目录创建并持续维护 `handoff.md`，最终回复第一行输出 handoff 路径，随后追加 1-3 句极短中文摘要：
 
-如果用户显式关闭 handoff、当前是 `pass_type: review_only` / `pass_type: validate_fix` 子 pass，或当前是 `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint`，不输出下面的 block，也不要输出空模板。只给当前任务要求的中文结果。
+```text
+RVF_HANDOFF_FILE: <handoff.md 绝对路径>
+
+Reviewers：<极短说明 reviewers 检查了什么，发现了几项或没有问题>
+Validate/fixers：<极短说明 validate/fixers 验证/修复/驳回/升级了什么>
+```
+
+不要在最终回复里重复 handoff 文件正文；摘要只服务快速确认，完整细节必须在 `handoff.md`。Stop hook 会在检测到 `RVF_HANDOFF_FILE` 后默认自动打开该 markdown 文件；`CODEX_RVF_OPEN_HANDOFF=0` 可关闭自动打开，`CODEX_RVF_IDE_OPEN_CMD` 可指定 coding agent IDE 打开命令。
+
+如果用户显式关闭 handoff、当前是 `pass_type: review_only` / `pass_type: validate_fix` 子 pass，或当前是 `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint`，不创建 `handoff.md`，不输出 `RVF_HANDOFF_FILE`，也不要输出空模板。只给当前任务要求的中文结果。
+
+## 维护时机
+
+- Prepare/run 初始化后立即创建 `handoff.md`，至少写入 pending 状态、run id、run dir、目标 repo、review scope / scope-of-work 文件路径、review packet / manifest 路径（若有）。
+- Review 阶段后更新 reviewer provenance、review 状态、发现的问题或 `NO_ISSUES`。
+- Merge 与 validate/fix 阶段后更新 canonical issue、Validate/fix 分组、每条 verdict、真实修复 / 误报 / 升级。
+- 最终阶段更新 repo delta、验证命令、继续指引和升级事项；最终回复只给文件路径和极短 reviewers / validate-fixers 摘要。
 
 ## 兼容性边界
 
-这个模板只能作为“继续工作时的上下文压缩 / 交接说明”。不要声称它能让 Claude Code 或 Codex 回到聊天中的任意内部事件位置。
+这个文件只能作为“继续工作时的上下文压缩 / 交接说明”。不要声称它能让 Claude Code 或 Codex 回到聊天中的任意内部事件位置。
 
-旧 Stop hook 曾把 hook 触发点当作 fork 锚点，但这与 Claude Code 和 Codex 的原生交互模型不兼容：用户只能回退到自己输入过的位置，不能回退到 Stop hook 在会话内部自动触发的任意位置。因此，从旧 hook 迁移时，只保留 handoff blob 的上下文表达价值，不保留“任意 hook 触发点 time-travel”的操作假设。
+旧 Stop hook 曾把 hook 触发点当作 fork 锚点，但这与 Claude Code 和 Codex 的原生交互模型不兼容：用户只能回退到自己输入过的位置，不能回退到 Stop hook 在会话内部自动触发的任意位置。因此，从旧 hook 迁移时，只保留 handoff 文件的上下文表达价值，不保留“任意 hook 触发点 time-travel”的操作假设。
+
+## handoff.md 模板
 
 ```markdown
-<handoff-context>
 # Review-validate-fix 交接上下文
 
-## 锚点（fork 起点）
+## 状态
+
+- handoff_status: PENDING / COMPLETED
+- review_status: PENDING / COMPLETED / SKIPPED_BY_USER
+- run id: <RVF run id>
+- run dir: <state/runs/<run_id>>
+- 目标仓库: <绝对路径>
 - Review 开始时的 git HEAD: <sha 或 "未提交工作树">
-- Session 原始任务（review 触发之前）：<1-2 句复述>
+
+## 原始任务
+
+<review 触发之前的用户任务，1-2 句>
+
+## Review scope
+
+- scope-of-work: <路径>
+- session manifest: <路径或 unavailable>
+- review packet: <路径>
+- 主审查文件 / 范围: <列表>
 
 ## 本次 review
-
-review_status: <COMPLETED / SKIPPED_BY_USER>
 
 共 <N> 条，<V> 真实修复 / <F> 误报 / <E> 升级
 
@@ -33,36 +64,35 @@ review_status: <COMPLETED / SKIPPED_BY_USER>
 
 ## Issue 处理结果
 
-- **[REAL]** `路径:行号` — <短标题>
+- **[REAL]** `路径:行号` - <短标题>
   - 来源：<codex-reviewer / alternative-reviewer:<agent-name> / codex-mimic-reviewer-a / codex-mimic-reviewer-b / user-supplied-skip-review / 多个来源；仅 handoff 审计用，未传给 validate/fix 子代理>
   - 问题：<1-2 句说明实际出了什么错>
   - 修复：<1-2 句说明做了什么>
-- **[FALSE POSITIVE]** `路径:行号` — <短标题>
+- **[FALSE POSITIVE]** `路径:行号` - <短标题>
   - 来源：<codex-reviewer / alternative-reviewer:<agent-name> / codex-mimic-reviewer-a / codex-mimic-reviewer-b / user-supplied-skip-review / 多个来源>
   - 驳回：<1-2 句说明为何不成立>
-- **[ELEVATE]** `路径:行号` — <短标题>
+- **[ELEVATE]** `路径:行号` - <短标题>
   - 来源：<codex-reviewer / alternative-reviewer:<agent-name> / codex-mimic-reviewer-a / codex-mimic-reviewer-b / user-supplied-skip-review / 多个来源>
   - 升级原因：<1-2 句说明为何没法自主处理>
 
 ## 相对 fork 起点的 repo delta
+
 - 改动的文件：<列表>
 - 汇总：<2-4 条>
 
+## 验证
+
+- <命令>: <结果>
+
 ## 继续指引（给 fork 出来的 earlier-self）
+
 你的 future-self 手动跑了一轮 post-work review 并应用了上面的修复。
 把仓库视为“修复已经在位”来继续。恢复原始任务：<复述>。不要重新 review。
 若本次有 `[ELEVATE]` 条目，它们尚未修复，请先处理下面的升级详情再继续。
-</handoff-context>
-```
 
-## 升级详情
-
-如果有 `ELEVATE`，先关闭 handoff 的 fenced code block，再在 `</handoff-context>` 之后用普通 markdown 展示：
-
-```markdown
 ## 需要开发者决策的升级事项
 
-### 1. `路径:行号` — 短标题
+### 1. `路径:行号` - 短标题
 
 - **卡在哪**：<为什么不能独立修>
 - **问题现状**：<复述原始问题>

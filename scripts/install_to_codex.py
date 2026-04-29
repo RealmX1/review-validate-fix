@@ -185,6 +185,8 @@ def configure_stop_hook(
     vibe_kanban_start_cmd: str | None = None,
     vibe_kanban_backend_url: str | None = None,
     vibe_kanban_management_mode: str | None = None,
+    open_handoff: bool = True,
+    ide_open_cmd: str | None = None,
 ) -> Path:
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,6 +202,11 @@ def configure_stop_hook(
         "CODEX_RVF_MODE=fork",
         f"CODEX_RVF_FORK_MODE={shlex.quote(fork_mode)}",
     ]
+    if not open_handoff:
+        env_parts.append("CODEX_RVF_OPEN_HANDOFF=0")
+    ide_open_text = (ide_open_cmd or "").strip()
+    if ide_open_text:
+        env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
     if fork_mode == "vibe-kanban":
         management_mode = (vibe_kanban_management_mode or "").strip()
         if management_mode:
@@ -330,6 +337,16 @@ def main() -> int:
             "显式 remote-project 会保留旧 project/issue fallback。"
         ),
     )
+    parser.add_argument(
+        "--no-open-handoff",
+        action="store_true",
+        help="持久写入 CODEX_RVF_OPEN_HANDOFF=0，关闭 RVF 完成时自动打开 handoff.md。",
+    )
+    parser.add_argument(
+        "--ide-open-cmd",
+        default=None,
+        help="持久写入 CODEX_RVF_IDE_OPEN_CMD；用于指定打开 handoff.md 的 coding agent IDE 命令。",
+    )
     args = parser.parse_args()
 
     preserve = not args.replace_setup_config
@@ -356,6 +373,10 @@ def main() -> int:
                 args.vibe_kanban_backend_url or os.environ.get("CODEX_RVF_VK_BACKEND_URL"),
                 args.vibe_kanban_management_mode
                 or os.environ.get("CODEX_RVF_VK_MANAGEMENT_MODE"),
+                not args.no_open_handoff
+                and os.environ.get("CODEX_RVF_OPEN_HANDOFF", "").strip().lower()
+                not in {"0", "false", "no", "n", "off", "disabled"},
+                args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
             )
             installed.append(f"stop hook: {hooks_path}")
         if removed_legacy is not None:

@@ -13,6 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, start_run
+from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from session_manifest import build_manifest
 
 
@@ -30,6 +31,18 @@ SUPPRESS_ENV_NAMES = (
     "CODEX_RVF_SUPPRESS",
     "CODEX_RVF_SUPPRESS_STOP_HOOK",
 )
+PLAN_OPERATION_MARKERS = (
+    "<proposed_plan>",
+    "</proposed_plan>",
+)
+PLAN_OPERATION_VALUES = {
+    "plan",
+    "planning",
+    "plan-operation",
+    "plan_operation",
+    "proposed-plan",
+    "proposed_plan",
+}
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -436,6 +449,20 @@ def installer_args_from_env() -> list[str]:
         or os.environ.get("CODEX_RVF_FORK_MODE", "")
     ).strip()
     if not fork_mode:
+        fork_mode = ""
+    open_handoff = (
+        hook_env.get("CODEX_RVF_OPEN_HANDOFF")
+        or os.environ.get("CODEX_RVF_OPEN_HANDOFF", "")
+    ).strip()
+    if open_handoff and open_handoff.lower() in {"0", "false", "no", "n", "off", "disabled"}:
+        args.append("--no-open-handoff")
+    ide_open_cmd = (
+        hook_env.get("CODEX_RVF_IDE_OPEN_CMD")
+        or os.environ.get("CODEX_RVF_IDE_OPEN_CMD", "")
+    ).strip()
+    if ide_open_cmd:
+        args.extend(["--ide-open-cmd", ide_open_cmd])
+    if not fork_mode:
         return args
     args.extend(["--fork-mode", fork_mode])
     if fork_mode == "vibe-kanban":
@@ -504,6 +531,42 @@ def latest_user_message(path: Path) -> str | None:
     return latest
 
 
+def latest_assistant_message(path: Path) -> str | None:
+    latest: str | None = None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if record.get("type") == "event_msg" and payload.get("type") == "agent_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        latest = message
+                    continue
+                if record.get("type") != "response_item":
+                    continue
+                if payload.get("type") != "message" or payload.get("role") != "assistant":
+                    continue
+                content = payload.get("content")
+                if isinstance(content, str):
+                    latest = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get("text"), str):
+                            parts.append(item["text"])
+                    if parts:
+                        latest = "\n".join(parts)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return latest
+
+
 def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
     direct = event.get("last_user_message")
     if isinstance(direct, str) and direct:
@@ -513,6 +576,52 @@ def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
         if message:
             return message
     return None
+
+
+def latest_assistant_message_from_event(event: dict[str, Any]) -> str | None:
+    direct = event.get("last_assistant_message")
+    if isinstance(direct, str) and direct:
+        return direct
+    for path in event_session_paths(event):
+        message = latest_assistant_message(path)
+        if message:
+            return message
+    return None
+
+
+def text_marks_plan_operation(text: str | None) -> bool:
+    return isinstance(text, str) and any(marker in text for marker in PLAN_OPERATION_MARKERS)
+
+
+def value_marks_plan_operation(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower().replace(" ", "-")
+    return normalized in PLAN_OPERATION_VALUES
+
+
+def metadata_marks_plan_operation(event: dict[str, Any]) -> bool:
+    for key in (
+        "operation",
+        "operation_name",
+        "event",
+        "event_name",
+        "turn_kind",
+        "turn_type",
+        "response_type",
+    ):
+        if value_marks_plan_operation(event.get(key)):
+            return True
+    source = event.get("source")
+    if isinstance(source, dict):
+        return metadata_marks_plan_operation(source)
+    return False
+
+
+def event_marks_plan_operation(event: dict[str, Any]) -> bool:
+    if metadata_marks_plan_operation(event):
+        return True
+    return text_marks_plan_operation(latest_assistant_message_from_event(event))
 
 
 def is_session_hook_control_event(event: dict[str, Any]) -> bool:
@@ -855,6 +964,26 @@ def main() -> int:
             message="CODEX_RVF suppress env requested; skipped dispatcher and installed hook",
             detail="检测到 suppress 环境变量，已跳过 RVF Stop hook。",
         )
+    if event_marks_plan_operation(event):
+        ledger.event(
+            phase="dev-sync",
+            event="plan_operation_skipped",
+            status="skipped",
+            reason_code="plan_operation",
+            message="Codex plan operation completed; skipping RVF Stop hook",
+        )
+        return emit_terminal_payload(
+            ledger,
+            status="skipped",
+            reason_code="plan_operation",
+            message="Codex plan operation completed; skipped RVF Stop hook",
+            detail="检测到 Codex plan operation 结束，已跳过 RVF Stop hook。",
+        )
+    if handoff_path_from_event(event) is not None:
+        payload = handoff_completion_payload(event, ledger)
+        if payload is not None:
+            emit(payload)
+            return 0
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
         ledger.event(

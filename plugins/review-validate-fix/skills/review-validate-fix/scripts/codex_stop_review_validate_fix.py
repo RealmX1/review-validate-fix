@@ -16,6 +16,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, start_run
+from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from vibe_kanban_mcp_client import (
     DEFAULT_START_CMD as DEFAULT_VIBE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_VIBE_KANBAN_START_TIMEOUT_SECONDS,
@@ -557,8 +558,10 @@ def fork_review_validate_fix_prompt(
         "或 `RVF_STOP_HOOK: status` 这样的行，请只把它们视为 Stop hook "
         "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
         "research 对象或 scope-of-work 内容。\n\n"
-        "完成后按 skill 规范生成最终汇总和 <handoff-context>。不要在正文里提示"
-        "用户复制 handoff；Stop hook 会在本会话结束时用 systemMessage 做程序化提示。"
+        "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
+        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
+        "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
+        "handoff 文件内容。Stop hook 会在本会话结束时自动打开该 markdown 文件。"
     )
 
 
@@ -592,90 +595,6 @@ def rvf_fork_context_from_event(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
-def handoff_advisory(
-    event: dict[str, Any],
-    context: dict[str, str],
-    ledger: RunLedger | None = None,
-) -> dict[str, Any] | None:
-    last_assistant_message = event.get("last_assistant_message")
-    if (
-        not isinstance(last_assistant_message, str)
-        or "<handoff-context>" not in last_assistant_message
-        or "</handoff-context>" not in last_assistant_message
-    ):
-        return None
-
-    session_id = session_id_from_event(event) or "unknown-session"
-    sdir = state_dir()
-    marker_path = sdir / f"{session_id}.handoff-advised"
-    marker_written = False
-    marker_error: dict[str, str] | None = None
-    try:
-        if marker_path.exists():
-            return None
-
-        sdir.mkdir(parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps(
-                {
-                    "session_id": session_id,
-                    "context": context,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        marker_written = True
-    except OSError as exc:
-        marker_error = {
-            "kind": "log_unavailable",
-            "operation": "handoff_marker",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-        if ledger is not None:
-            ledger._diagnose("handoff_marker", exc)
-
-    parent = context.get("parent_session_id") or "<unknown>"
-    parent_cwd = context.get("parent_cwd") or "<unknown>"
-    target_repo = context.get("target_repo") or "<unknown>"
-    message = (
-        "review-validate-fix fork 已结束。请复制本 fork 会话最终回复中的 "
-        "<handoff-context> 块，并粘贴回原始 chat session。"
-    )
-    if ledger is not None:
-        ledger.event(
-            phase="handoff",
-            event="advisory_created" if marker_written else "advisory_marker_unavailable",
-            status="completed" if marker_written else "warning",
-            reason_code="handoff_context_ready" if marker_written else "log_unavailable",
-            level="info" if marker_written else "warn",
-            session_id=session_id,
-            parent_thread_id=parent,
-            paths={"marker": str(marker_path)},
-            error=marker_error,
-        )
-        return ledger.hook_payload(
-            status="handoff-advisory",
-            reason_code="handoff_context_ready",
-            message=message,
-            parent_session_id=parent,
-            parent_cwd=parent_cwd,
-            target_repo=target_repo,
-            marker_path=str(marker_path),
-            marker_written=marker_written,
-            marker_error=marker_error,
-        )
-    return {
-        "continue": True,
-        "systemMessage": (
-            f"{message} parent_session_id={parent}; parent_cwd={parent_cwd}; "
-            f"target_repo={target_repo}"
-        ),
-    }
-
-
 def vibe_kanban_script_path(env_name: str, default: Path) -> Path:
     value = os.environ.get(env_name)
     if value and value.strip():
@@ -704,7 +623,7 @@ def vibe_kanban_issue_description(
         f"review-env.sh: {ledger.artifacts_dir / 'review-env.sh'}",
         f"review-agent-context.md: {ledger.artifacts_dir / 'review-agent-context.md'}",
         f"fork prompt: {prompt_path or '<unavailable>'}",
-        "handoff-context: pending",
+        "handoff.md: pending",
     ]
     return "\n".join(lines)
 
@@ -2504,19 +2423,21 @@ def main() -> int:
         )
         return 0
 
+    if handoff_path_from_event(event) is not None:
+        payload = handoff_completion_payload(event, ledger)
+        if payload is not None:
+            emit(payload)
+            return 0
+
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
     if fork_context is not None:
-        advisory = handoff_advisory(event, fork_context, ledger)
-        if advisory is not None:
-            emit(advisory)
-        else:
-            emit(
-                skip_payload(
-                    "当前会话已是 review-validate-fix fork，会等待最终 <handoff-context>，不会再次 fork。",
-                    ledger,
-                    "already_rvf_fork",
-                )
+        emit(
+            skip_payload(
+                "当前会话已是 review-validate-fix fork，会等待最终 RVF_HANDOFF_FILE，不会再次 fork。",
+                ledger,
+                "already_rvf_fork",
             )
+        )
         return 0
 
     if event_marks_subagent(event):

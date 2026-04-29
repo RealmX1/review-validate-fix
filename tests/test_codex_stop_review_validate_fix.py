@@ -79,6 +79,36 @@ def write_apply_patch_transcript(path: Path, repo: Path, rel_path: str = "change
     return path
 
 
+def write_assistant_handoff_transcript(path: Path, handoff: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": f"完成。\nRVF_HANDOFF_FILE: {handoff}",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_fake_opener(path: Path, marker: Path, *, fail: bool = False) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker)!r}).write_text(sys.argv[-1], encoding='utf-8')\n"
+        + ("sys.exit(5)\n" if fail else ""),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 def invoke(
     event: dict[str, object],
     config: Path | None = None,
@@ -1968,6 +1998,11 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> Non
 
 def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
     state = tmp / "state"
+    handoff = tmp / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp / "opened.txt"
+    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
@@ -1981,17 +2016,170 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> Non
         "session_id": "child-session",
         "stop_hook_active": False,
         "last_user_message": fork_prompt,
-        "last_assistant_message": "完成。\n<handoff-context>\n...\n</handoff-context>",
+        "last_assistant_message": f"完成。\nRVF_HANDOFF_FILE: {handoff}",
     }
-    payload = parse_json(invoke(event, state_dir=state)[0])
+    payload = parse_json(
+        invoke(
+            event,
+            state_dir=state,
+            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        )[0]
+    )
     assert "decision" not in payload
-    assert "reason=handoff_context_ready" in payload["systemMessage"]
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
     summary = summary_from_payload(payload)
-    assert "粘贴回原始 chat session" in str(summary["message"])
-    assert summary["parent_session_id"] == "parent-session"
+    assert summary["handoff_path"] == str(handoff.resolve())
+    assert summary["handoff_open_result"]["opened"] is True
+    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
 
-    stdout, _ = invoke(event, state_dir=state)
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
+    stdout, _ = invoke(
+        event,
+        state_dir=state,
+        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+    )
+    payload = parse_json(stdout)
+    summary = summary_from_payload(payload)
+    assert summary["already_advised"] is True
+    assert summary["handoff_open_result"]["reason"] == "already_advised"
+
+
+def test_handoff_advisory_respects_open_disabled(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    state = tmp / "state"
+    handoff = tmp / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp / "opened.txt"
+    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(tmp),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_OPEN_HANDOFF": "0",
+                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+            },
+        )[0]
+    )
+    summary = summary_from_payload(payload)
+    assert summary["handoff_open_enabled"] is False
+    assert summary["handoff_open_result"]["reason"] == "disabled"
+    assert not opener_marker.exists()
+
+
+def test_handoff_advisory_records_open_failure(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    state = tmp / "state"
+    handoff = tmp / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp / "opened.txt"
+    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker, fail=True)
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(tmp),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        )[0]
+    )
+    assert payload["continue"] is True
+    summary = summary_from_payload(payload)
+    assert summary["handoff_open_result"]["opened"] is False
+    assert summary["handoff_open_result"]["reason"] == "command_failed"
+    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
+
+
+def test_suppress_env_skips_handoff_marker_before_advisory(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    state = tmp / "state"
+    handoff = tmp / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp / "opened.txt"
+    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(tmp),
+                "session_id": "headless-child",
+                "stop_hook_active": False,
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
+                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+            },
+        )[0]
+    )
+    assert payload["continue"] is True
+    assert "reason=suppressed" in payload["systemMessage"]
+    assert not opener_marker.exists()
+    assert not (state / "handoff-advised").exists()
+
+
+def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    handoff = tmp / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_marker = tmp / "opened.txt"
+    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "child-session",
+                "stop_hook_active": True,
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        )[0]
+    )
+    assert payload["continue"] is True
+    assert "reason=stop_hook_active" in payload["systemMessage"]
+    assert not opener_marker.exists()
+    assert not (state / "handoff-advised").exists()
+
+
+def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    handoff = tmp / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener = write_fake_opener(tmp / "open_handoff.py", tmp / "opened.txt")
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_MODE": "fork",
+                "CODEX_RVF_FORK_MODE": "dry-run",
+                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+            },
+        )[0]
+    )
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert "app_server_requests_path" not in summary
 
 
 def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None:
@@ -2015,7 +2203,7 @@ def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "child-session.handoff-advised").exists()
+    assert not (state / "handoff-advised").exists()
 
 
 def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> None:
@@ -2038,7 +2226,23 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> Non
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "child-session.handoff-advised").exists()
+    assert not (state / "handoff-advised").exists()
+
+
+def test_invalid_handoff_marker_continues_existing_gate(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    state = tmp / "state"
+    missing = tmp / "missing.md"
+    stdout, _ = invoke(
+        {
+            "cwd": str(tmp),
+            "session_id": "child-session",
+            "stop_hook_active": False,
+            "last_assistant_message": f"RVF_HANDOFF_FILE: {missing}",
+        },
+        state_dir=state,
+    )
+    assert_skip_reason(stdout, "当前 cwd 不在 git repo/worktree 内")
 
 
 def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp: Path) -> None:
@@ -2207,8 +2411,14 @@ def main() -> int:
         test_stop_event_log_path_is_not_used_as_fork_rollout_path,
         test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
+        test_handoff_advisory_respects_open_disabled,
+        test_handoff_advisory_records_open_failure,
+        test_suppress_env_skips_handoff_marker_before_advisory,
+        test_stop_hook_active_skips_handoff_marker_before_advisory,
+        test_handoff_marker_in_dirty_repo_does_not_create_new_fork,
         test_forked_rvf_session_waits_for_handoff_before_advisory,
         test_forked_rvf_session_waits_when_handoff_message_missing,
+        test_invalid_handoff_marker_continues_existing_gate,
         test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message,
         test_forked_rvf_marker_scan_skips_incomplete_earlier_marker,
         test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo,
