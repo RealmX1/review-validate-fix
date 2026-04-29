@@ -56,6 +56,15 @@ def load_vibe_kanban_client_module():
     return module
 
 
+def load_run_vibe_kanban_rvf_module():
+    spec = importlib.util.spec_from_file_location("rvf_run_vibe_kanban_rvf", RUN_VIBE_KANBAN_RVF)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load run_vibe_kanban_rvf module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_cancel_rvf_run_module():
     spec = importlib.util.spec_from_file_location("rvf_cancel_rvf_run", CANCEL_RVF_RUN)
     if spec is None or spec.loader is None:
@@ -2260,7 +2269,7 @@ def test_vibe_kanban_runner_success_updates_summary_and_workspace(tmp: Path) -> 
     env_capture = tmp / "codex-env.json"
     stdin_capture = tmp / "codex-stdin.md"
     fake_codex.write_text(
-        "import json, os, pathlib, sys\n"
+        "import json, os, pathlib, sys, time\n"
         "args = sys.argv[1:]\n"
         "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
         "handoff = final.with_name('handoff.md')\n"
@@ -2278,7 +2287,12 @@ def test_vibe_kanban_runner_success_updates_summary_and_workspace(tmp: Path) -> 
         "    'session_manifest': os.environ.get('RVF_SESSION_MANIFEST'),\n"
         "}\n"
         "pathlib.Path(os.environ['FAKE_CODEX_ENV']).write_text(json.dumps(payload), encoding='utf-8')\n"
-        "print(json.dumps({'event': 'complete'}))\n",
+        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': 'reviewer inspecting scope'}}), flush=True)\n"
+        "print(json.dumps({'type': 'item.started', 'item': {'id': 'item_2', 'type': 'command_execution', 'command': '/bin/zsh -lc \"python3 -m py_compile file.py\"', 'status': 'in_progress', 'exit_code': None}}), flush=True)\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_2', 'type': 'command_execution', 'command': '/bin/zsh -lc \"python3 -m py_compile file.py\"', 'status': 'completed', 'exit_code': 0}}), flush=True)\n"
+        "print('not-json-progress-line', flush=True)\n"
+        "time.sleep(0.05)\n"
+        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_3', 'type': 'agent_message', 'text': f'RVF_HANDOFF_FILE: {handoff}'}}), flush=True)\n",
         encoding="utf-8",
     )
     run_dir = tmp / "state" / "runs" / "rvf-test"
@@ -2366,6 +2380,182 @@ def test_vibe_kanban_runner_success_updates_summary_and_workspace(tmp: Path) -> 
         "RVF running: workspace workspace-1",
         "RVF completed: workspace workspace-1",
     ]
+    stdout_text = (run_dir / "artifacts" / "codex-exec.stdout.jsonl").read_text(encoding="utf-8")
+    assert "reviewer inspecting scope" in stdout_text
+    assert "not-json-progress-line" in stdout_text
+    scratch_updates = [request for request in requests if request["path"] == "/api/scratch/WORKSPACE_NOTES/workspace-1"]
+    scratch_texts = [request["body"]["payload"]["data"]["content"] for request in scratch_updates]
+    assert any("assistant: reviewer inspecting scope" in text for text in scratch_texts)
+    assert any("command started: python3 -m py_compile file.py" in text for text in scratch_texts)
+    assert any("command exited 0: python3 -m py_compile file.py" in text for text in scratch_texts)
+    assert not any("item.completed\n" in text or "- item.completed" in text for text in scratch_texts)
+    assert any("malformed stdout: not-json-progress-line" in text for text in scratch_texts)
+    assert any(
+        "next update:" in text
+        and "next update: disabled" not in text
+        and "next update: none (terminal)" not in text
+        for text in scratch_texts
+    )
+    assert "next update: none (terminal)" in scratch_texts[-1]
+    assert any("handoff.md:" in text and "stdout:" in text and "stderr:" in text for text in scratch_texts)
+
+
+def test_vibe_kanban_runner_can_disable_incremental_progress_updates(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    prompt = tmp / "prompt.txt"
+    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
+    backend_url, api_state, api_server = start_fake_vibe_api()
+    fake_codex = tmp / "fake_codex_progress_disabled.py"
+    fake_codex.write_text(
+        "import json, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'event': 'review started', 'message': 'disabled progress event'}), flush=True)\n"
+        "final.write_text('done\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    run_dir = tmp / "state" / "runs" / "rvf-progress-disabled"
+    env = os.environ.copy()
+    env["CODEX_RVF_VK_PROGRESS_INTERVAL_SECONDS"] = "0"
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_VIBE_KANBAN_RVF),
+                "--repo",
+                str(repo),
+                "--prompt-file",
+                str(prompt),
+                "--run-id",
+                "rvf-progress-disabled",
+                "--run-dir",
+                str(run_dir),
+                "--parent-session-id",
+                "parent-thread",
+                "--vibe-workspace-id",
+                "workspace-1",
+                "--backend-url",
+                backend_url,
+                "--codex-bin",
+                sys.executable,
+                "--codex-exec-args",
+                str(fake_codex),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    finally:
+        api_server.shutdown()
+    assert completed.returncode == 0, completed.stderr
+    requests = api_state["requests"]
+    assert isinstance(requests, list)
+    scratch_updates = [request for request in requests if request["path"] == "/api/scratch/WORKSPACE_NOTES/workspace-1"]
+    assert len(scratch_updates) == 2
+    assert "next update: disabled" in scratch_updates[0]["body"]["payload"]["data"]["content"]
+    assert "next update: none (terminal)" in scratch_updates[-1]["body"]["payload"]["data"]["content"]
+    assert "disabled progress event" in scratch_updates[-1]["body"]["payload"]["data"]["content"]
+
+
+def test_vibe_kanban_runner_progress_updates_remote_issue_description(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    prompt = tmp / "prompt.txt"
+    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
+    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
+    calls = tmp / "calls.jsonl"
+    fake_codex = tmp / "fake_codex_remote_progress.py"
+    fake_codex.write_text(
+        "import json, pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'event': 'review started', 'message': 'remote reviewer event'}), flush=True)\n"
+        "final.write_text('done\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    run_dir = tmp / "state" / "runs" / "rvf-remote-progress"
+    env = os.environ.copy()
+    env["FAKE_MCP_CALLS"] = str(calls)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_VIBE_KANBAN_RVF),
+            "--repo",
+            str(repo),
+            "--prompt-file",
+            str(prompt),
+            "--run-id",
+            "rvf-remote-progress",
+            "--run-dir",
+            str(run_dir),
+            "--parent-session-id",
+            "parent-thread",
+            "--vibe-project-id",
+            "project-1",
+            "--vibe-issue-id",
+            "issue-1",
+            "--mcp-cmd",
+            f"{sys.executable} {fake_server}",
+            "--codex-bin",
+            sys.executable,
+            "--codex-exec-args",
+            str(fake_codex),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    recorded = read_jsonl(calls)
+    issue_updates = [record for record in recorded if record["name"] == "update_issue"]
+    assert len(issue_updates) >= 3
+    descriptions = [record["arguments"]["description"] for record in issue_updates]
+    assert any("remote reviewer event" in description for description in descriptions)
+    assert issue_updates[0]["arguments"]["status"] == "In progress"
+    assert issue_updates[-1]["arguments"]["status"] == "Done"
+
+
+def test_vibe_kanban_runner_processes_buffered_stdout_events_before_exit(tmp: Path) -> None:
+    module = load_run_vibe_kanban_rvf_module()
+    repo = init_repo(tmp / "repo")
+    fake_codex = tmp / "fake_codex_buffered_stdout.py"
+    fake_codex.write_text(
+        "import json, sys, time\n"
+        "sys.stdin.read()\n"
+        "events = [\n"
+        "    {'event': 'review started', 'message': 'review event'},\n"
+        "    {'event': 'handoff ready', 'message': 'handoff event'},\n"
+        "]\n"
+        "sys.stdout.write(''.join(json.dumps(event) + '\\n' for event in events))\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.8)\n",
+        encoding="utf-8",
+    )
+    progress = module.ProgressState(started_monotonic=time.monotonic())
+    updates: list[tuple[float, str]] = []
+    started = time.monotonic()
+
+    def progress_update() -> None:
+        updates.append((time.monotonic() - started, progress.snapshot()["current_activity"]))
+
+    completed = module.run_codex_exec_streaming(
+        command=[sys.executable, str(fake_codex)],
+        repo=repo,
+        prompt="prompt\n",
+        env=os.environ.copy(),
+        stdout_path=tmp / "stdout.jsonl",
+        stderr_path=tmp / "stderr.txt",
+        progress=progress,
+        progress_interval_seconds=30.0,
+        progress_update=progress_update,
+    )
+
+    assert completed.returncode == 0
+    assert any(elapsed < 0.5 and "handoff event" in activity for elapsed, activity in updates)
+    assert "handoff event" in (tmp / "stdout.jsonl").read_text(encoding="utf-8")
 
 
 def test_vibe_kanban_runner_failure_records_returncode(tmp: Path) -> None:
@@ -2631,6 +2821,9 @@ def main() -> int:
         test_vibe_kanban_mcp_client_resolves_project_from_repo(root / "vibe-resolve-project")
         test_vibe_kanban_mcp_client_uses_single_project_fallback(root / "vibe-single-project")
         test_vibe_kanban_runner_success_updates_summary_and_workspace(root / "vibe-runner-success")
+        test_vibe_kanban_runner_can_disable_incremental_progress_updates(root / "vibe-progress-disabled")
+        test_vibe_kanban_runner_progress_updates_remote_issue_description(root / "vibe-remote-progress")
+        test_vibe_kanban_runner_processes_buffered_stdout_events_before_exit(root / "vibe-buffered-progress")
         test_vibe_kanban_runner_failure_records_returncode(root / "vibe-runner-failure")
         test_vibe_kanban_runner_signal_records_cancelled(root / "vibe-runner-cancel")
         test_cancel_rvf_run_marks_cancelled_and_updates_workspace(root / "cancel-rvf-run")

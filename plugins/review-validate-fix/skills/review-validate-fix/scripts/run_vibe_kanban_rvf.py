@@ -2,24 +2,31 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+from collections import deque
 import json
 import os
+import select
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, start_run
-from vibe_kanban_mcp_client import DEFAULT_MCP_CMD, update_issue, update_local_workspace
+from vibe_kanban_mcp_client import DEFAULT_MCP_CMD, update_issue, update_local_workspace, upsert_workspace_notes
 
 
 DEFAULT_CODEX_EXEC_ARGS = "exec --json --dangerously-bypass-approvals-and-sandbox"
 SCRIPT_DIR = Path(__file__).resolve().parent
 HEADLESS_MARKER = "RVF_HEADLESS_REVIEW_VALIDATE_FIX"
 SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
+DEFAULT_PROGRESS_UPDATE_INTERVAL_SECONDS = 30.0
+MAX_PROGRESS_EVENTS = 8
+MAX_PROGRESS_TEXT_CHARS = 180
 
 
 def split_args(value: str) -> list[str]:
@@ -40,6 +47,202 @@ def build_codex_command(args: argparse.Namespace, final_message_path: Path) -> l
     return command
 
 
+def utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def utc_timestamp_after(seconds: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + max(0.0, seconds)))
+
+
+def elapsed_seconds(started_monotonic: float) -> int:
+    return max(0, int(time.monotonic() - started_monotonic))
+
+
+def format_elapsed(seconds: int) -> str:
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def clip_text(value: str, limit: int = MAX_PROGRESS_TEXT_CHARS) -> str:
+    text = " ".join(value.strip().split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)].rstrip()}…"
+
+
+def first_text_value(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        for item in value:
+            found = first_text_value(item)
+            if found:
+                return found
+        return None
+    if isinstance(value, dict):
+        for key in ("message", "content", "text", "summary", "output", "error", "details"):
+            found = first_text_value(value.get(key))
+            if found:
+                return found
+        item = value.get("item")
+        if isinstance(item, dict):
+            found = first_text_value(item)
+            if found:
+                return found
+        payload = value.get("payload")
+        if isinstance(payload, dict):
+            return first_text_value(payload)
+    return None
+
+
+def short_command(command: Any) -> str | None:
+    if not isinstance(command, str) or not command.strip():
+        return None
+    text = command.strip()
+    for prefix in ('/bin/zsh -lc "', "zsh -lc '", "bash -lc '", "sh -lc '"):
+        if text.startswith(prefix) and text.endswith(prefix[-1]):
+            return text[len(prefix) : -1]
+    return text
+
+
+def summarize_codex_item_event(payload: dict[str, Any]) -> str | None:
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return None
+    event_type = str(payload.get("type") or "item")
+    item_type = str(item.get("type") or "item")
+    status = item.get("status")
+    status_text = f" {status}" if isinstance(status, str) and status.strip() else ""
+    if item_type == "agent_message":
+        text = first_text_value(item)
+        if text:
+            return clip_text(f"assistant: {text}")
+    if item_type == "command_execution":
+        command = short_command(item.get("command")) or "<unknown command>"
+        exit_code = item.get("exit_code")
+        if event_type.endswith(".started"):
+            return clip_text(f"command started: {command}")
+        if exit_code is not None:
+            return clip_text(f"command exited {exit_code}: {command}")
+        return clip_text(f"command{status_text}: {command}")
+    if item_type == "collab_tool_call":
+        tool = item.get("tool") or "collab"
+        receivers = item.get("receiver_thread_ids")
+        receiver_count = len(receivers) if isinstance(receivers, list) else 0
+        if event_type.endswith(".started"):
+            return clip_text(f"{tool} started: {receiver_count} agent(s)")
+        return clip_text(f"{tool}{status_text}: {receiver_count} agent(s)")
+    item_id = item.get("id")
+    suffix = f" {item_id}" if isinstance(item_id, str) and item_id.strip() else ""
+    return clip_text(f"{event_type}: {item_type}{status_text}{suffix}")
+
+
+def event_label(payload: dict[str, Any]) -> str:
+    for key in ("event", "type", "status", "name", "role"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        return event_label(nested)
+    return "codex stdout event"
+
+
+def infer_phase(text: str) -> str | None:
+    lowered = text.lower()
+    phase_markers = [
+        ("handoff", ("handoff", "rvf_handoff_file")),
+        ("validate/fix", ("validate/fix", "validate then fix", "fixer", "修复")),
+        ("validate", ("validate", "validation", "验证")),
+        ("review", ("review", "reviewer", "审查", "检查")),
+        ("prepare", ("prepare", "preparing", "scope-of-work", "review packet", "准备")),
+        ("finalizing", ("final", "completed", "complete", "done", "总结")),
+    ]
+    for phase, markers in phase_markers:
+        if any(marker in lowered for marker in markers):
+            return phase
+    return None
+
+
+class ProgressState:
+    def __init__(self, *, started_monotonic: float) -> None:
+        self.started_monotonic = started_monotonic
+        self.last_update_timestamp: str | None = None
+        self.next_update_timestamp = "<unknown>"
+        self.current_phase = "running"
+        self.current_activity = "codex exec started"
+        self.recent_events: deque[str] = deque(maxlen=MAX_PROGRESS_EVENTS)
+        self.stdout_lines = 0
+        self.malformed_lines = 0
+        self.last_raw_event: str | None = None
+
+    def record_line(self, line: str) -> bool:
+        self.stdout_lines += 1
+        text = line.strip()
+        if not text:
+            return False
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            self.malformed_lines += 1
+            summary = f"malformed stdout: {clip_text(text)}"
+            self.current_activity = summary
+            self.recent_events.append(summary)
+            self.last_raw_event = text
+            return False
+        if isinstance(payload, dict):
+            summary = self._summarize_payload(payload)
+        else:
+            summary = clip_text(str(payload))
+        old_phase = self.current_phase
+        phase = infer_phase(summary)
+        if phase:
+            self.current_phase = phase
+        self.current_activity = summary
+        self.recent_events.append(summary)
+        self.last_raw_event = text
+        important = self.current_phase != old_phase
+        lowered = summary.lower()
+        return important or any(marker in lowered for marker in ("error", "failed", "cancelled", "handoff", "final"))
+
+    def _summarize_payload(self, payload: dict[str, Any]) -> str:
+        item_summary = summarize_codex_item_event(payload)
+        if item_summary:
+            return item_summary
+        label = event_label(payload)
+        nested = payload.get("payload")
+        payload_dict = nested if isinstance(nested, dict) else payload
+        name = payload_dict.get("name")
+        role = payload_dict.get("role")
+        text = first_text_value(payload)
+        parts = [str(label)]
+        if isinstance(role, str) and role.strip() and role not in parts:
+            parts.append(role.strip())
+        if isinstance(name, str) and name.strip() and name not in parts:
+            parts.append(name.strip())
+        if text and text not in parts:
+            parts.append(text)
+        return clip_text(": ".join(parts))
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "phase": self.current_phase,
+            "elapsed": format_elapsed(elapsed_seconds(self.started_monotonic)),
+            "last_update": self.last_update_timestamp,
+            "next_update": self.next_update_timestamp,
+            "current_activity": self.current_activity,
+            "recent_events": list(self.recent_events),
+            "stdout_lines": self.stdout_lines,
+            "malformed_stdout_lines": self.malformed_lines,
+        }
+
+
 def issue_description(
     *,
     status: str,
@@ -48,21 +251,41 @@ def issue_description(
     parent_transcript_path: Path | None,
     run_dir: Path,
     final_message_path: Path | None = None,
+    stdout_path: Path | None = None,
+    stderr_path: Path | None = None,
+    progress: ProgressState | None = None,
     returncode: int | None = None,
     error: str | None = None,
 ) -> str:
     transcript = str(parent_transcript_path) if parent_transcript_path is not None else "<unknown>"
+    snapshot = progress.snapshot() if progress is not None else {}
     lines = [
         f"status: {status}",
+        f"phase: {snapshot.get('phase', status)}",
+        f"elapsed: {snapshot.get('elapsed', '<unknown>')}",
+        f"last update: {snapshot.get('last_update') or utc_timestamp()}",
+        f"next update: {snapshot.get('next_update') or '<unknown>'}",
+        f"current activity: {snapshot.get('current_activity') or '<none recorded>'}",
+        "recent events:",
+    ]
+    recent_events = snapshot.get("recent_events")
+    if isinstance(recent_events, list) and recent_events:
+        lines.extend(f"- {event}" for event in recent_events[-MAX_PROGRESS_EVENTS:])
+    else:
+        lines.append("- <none recorded>")
+    lines.extend([
         f"target repo: {repo}",
         f"parent session id: {parent_session_id}",
         f"parent transcript path: {transcript}",
         f"run_dir: {run_dir}",
         f"events.jsonl: {run_dir / 'events.jsonl'}",
         f"summary.json: {run_dir / 'summary.json'}",
+        f"stdout: {stdout_path or run_dir / 'artifacts' / 'codex-exec.stdout.jsonl'}",
+        f"stderr: {stderr_path or run_dir / 'artifacts' / 'codex-exec.stderr.txt'}",
         f"review-env.sh: {run_dir / 'artifacts' / 'review-env.sh'}",
         f"review-agent-context.md: {run_dir / 'artifacts' / 'review-agent-context.md'}",
-    ]
+        f"handoff.md: {run_dir / 'artifacts' / 'handoff.md'}",
+    ])
     if final_message_path is not None:
         lines.append(f"final message: {final_message_path}")
     if returncode is not None:
@@ -308,6 +531,177 @@ def safe_update_management_record(
     )
 
 
+def safe_update_progress_record(
+    *,
+    ledger: RunLedger,
+    mcp_cmd: str,
+    backend_url: str | None,
+    project_id: str | None,
+    issue_id: str | None,
+    workspace_id: str | None,
+    title: str | None,
+    description: str,
+    status: str,
+) -> bool:
+    sent = False
+    errors: list[str] = []
+    if backend_url and workspace_id:
+        try:
+            payload = upsert_workspace_notes(
+                backend_url=backend_url,
+                workspace_id=workspace_id,
+                description=description,
+            )
+            ledger.artifact(f"vibe-kanban-workspace-progress-{status}.json", payload or {}, unique=True)
+            sent = True
+        except Exception as exc:
+            errors.append(f"workspace={type(exc).__name__}: {exc}")
+    if project_id and issue_id:
+        try:
+            payload = update_issue(
+                mcp_cmd=mcp_cmd,
+                backend_url=backend_url,
+                project_id=project_id,
+                issue_id=issue_id,
+                title=title,
+                description=description,
+                status=status,
+            )
+            ledger.artifact(f"vibe-kanban-issue-progress-{status}.json", payload, unique=True)
+            sent = True
+        except Exception as exc:
+            errors.append(f"issue={type(exc).__name__}: {exc}")
+    if errors:
+        ledger.event(
+            phase="fork",
+            event="vibe_kanban_progress_update_failed",
+            status="warn",
+            reason_code="vibe_kanban_progress_update_failed",
+            level="warn",
+            error="; ".join(errors),
+        )
+    if sent:
+        ledger.event(
+            phase="fork",
+            event="vibe_kanban_progress_update_sent",
+            status="running",
+            reason_code="vibe_kanban_progress_update_sent",
+        )
+    return sent
+
+
+def parse_progress_interval(value: str | None) -> float:
+    if value is None or not value.strip():
+        return DEFAULT_PROGRESS_UPDATE_INTERVAL_SECONDS
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return DEFAULT_PROGRESS_UPDATE_INTERVAL_SECONDS
+
+
+def write_prompt(process: subprocess.Popen[bytes], prompt: str) -> None:
+    if process.stdin is None:
+        return
+    try:
+        process.stdin.write(prompt.encode("utf-8"))
+        process.stdin.close()
+    except BrokenPipeError:
+        return
+
+
+def run_codex_exec_streaming(
+    *,
+    command: list[str],
+    repo: Path,
+    prompt: str,
+    env: Mapping[str, str],
+    stdout_path: Path,
+    stderr_path: Path,
+    progress: ProgressState,
+    progress_interval_seconds: float,
+    progress_update: Any,
+) -> subprocess.Popen[bytes]:
+    last_progress_update = time.monotonic()
+    pending_text = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+
+    def handle_stdout_text(text: str, *, final: bool = False) -> bool:
+        nonlocal pending_text
+        important_seen = False
+        pending_text += text
+        lines = pending_text.splitlines(keepends=True)
+        if lines and not final and not lines[-1].endswith(("\n", "\r")):
+            pending_text = lines.pop()
+        else:
+            pending_text = ""
+        for line in lines:
+            stdout_handle.write(line)
+            important_seen = progress.record_line(line) or important_seen
+        if lines:
+            stdout_handle.flush()
+        return important_seen
+
+    def read_available_stdout() -> bool:
+        if process.stdout is None:
+            return False
+        important_seen = False
+        while True:
+            try:
+                chunk = os.read(process.stdout.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            important_seen = handle_stdout_text(decoder.decode(chunk), final=False) or important_seen
+        return important_seen
+
+    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+        "w",
+        encoding="utf-8",
+    ) as stderr_handle:
+        process = subprocess.Popen(
+            command,
+            cwd=repo,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_handle,
+            bufsize=0,
+            env=dict(env),
+        )
+        prompt_writer = threading.Thread(target=write_prompt, args=(process, prompt), daemon=True)
+        prompt_writer.start()
+        if process.stdout is None:
+            process.wait()
+            prompt_writer.join(timeout=1.0)
+            return process
+        os.set_blocking(process.stdout.fileno(), False)
+
+        while True:
+            ready, _, _ = select.select([process.stdout.fileno()], [], [], 1.0)
+            if ready:
+                important = read_available_stdout()
+                if progress_interval_seconds > 0 and (
+                    important or time.monotonic() - last_progress_update >= progress_interval_seconds
+                ):
+                    progress_update()
+                    last_progress_update = time.monotonic()
+                if process.poll() is not None:
+                    break
+            elif process.poll() is not None:
+                break
+            elif progress_interval_seconds > 0 and time.monotonic() - last_progress_update >= progress_interval_seconds:
+                progress_update()
+                last_progress_update = time.monotonic()
+
+        process.wait()
+        read_available_stdout()
+        final_text = decoder.decode(b"", final=True)
+        if final_text or pending_text:
+            handle_stdout_text(final_text, final=True)
+        prompt_writer.join(timeout=1.0)
+        return process
+
+
 def run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).expanduser().resolve()
     prompt_path = Path(args.prompt_file).expanduser().resolve()
@@ -375,6 +769,50 @@ def run(args: argparse.Namespace) -> int:
             "final_message": str(final_message_path),
         },
     )
+    started = time.monotonic()
+    progress = ProgressState(started_monotonic=started)
+    progress_interval_seconds = parse_progress_interval(str(args.progress_update_interval_seconds))
+    progress.last_update_timestamp = utc_timestamp()
+    progress.next_update_timestamp = (
+        utc_timestamp_after(progress_interval_seconds)
+        if progress_interval_seconds > 0
+        else "disabled"
+    )
+
+    def build_description(status: str, *, returncode: int | None = None, error: str | None = None) -> str:
+        return issue_description(
+            status=status,
+            repo=repo,
+            parent_session_id=args.parent_session_id,
+            parent_transcript_path=parent_transcript_path,
+            run_dir=run_dir,
+            final_message_path=final_message_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            progress=progress,
+            returncode=returncode,
+            error=error,
+        )
+
+    def send_progress_update() -> None:
+        progress.last_update_timestamp = utc_timestamp()
+        progress.next_update_timestamp = (
+            utc_timestamp_after(progress_interval_seconds)
+            if progress_interval_seconds > 0
+            else "disabled"
+        )
+        safe_update_progress_record(
+            ledger=ledger,
+            mcp_cmd=args.mcp_cmd,
+            backend_url=args.backend_url,
+            project_id=args.vibe_project_id,
+            issue_id=args.vibe_issue_id,
+            workspace_id=args.vibe_workspace_id,
+            title=args.issue_title,
+            description=build_description("running"),
+            status="running",
+        )
+
     safe_update_management_record(
         ledger=ledger,
         mcp_cmd=args.mcp_cmd,
@@ -383,14 +821,7 @@ def run(args: argparse.Namespace) -> int:
         issue_id=args.vibe_issue_id,
         workspace_id=args.vibe_workspace_id,
         title=args.issue_title,
-        description=issue_description(
-            status="running",
-            repo=repo,
-            parent_session_id=args.parent_session_id,
-            parent_transcript_path=parent_transcript_path,
-            run_dir=run_dir,
-            final_message_path=final_message_path,
-        ),
+        description=build_description("running"),
         status="running",
     )
 
@@ -401,21 +832,17 @@ def run(args: argparse.Namespace) -> int:
         parent_transcript_path=parent_transcript_path,
     )
 
-    started = time.monotonic()
-    with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
-        "w",
-        encoding="utf-8",
-    ) as stderr_handle:
-        completed = subprocess.Popen(
-            command,
-            cwd=repo,
-            stdin=subprocess.PIPE,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            text=True,
-            env=env,
-        )
-        completed.communicate(prompt)
+    completed = run_codex_exec_streaming(
+        command=command,
+        repo=repo,
+        prompt=prompt,
+        env=env,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
+        progress_update=send_progress_update,
+    )
     duration_ms = int((time.monotonic() - started) * 1000)
 
     if completed.returncode == 0:
@@ -471,6 +898,8 @@ def run(args: argparse.Namespace) -> int:
             "final_message": str(final_message_path),
         },
     )
+    progress.last_update_timestamp = utc_timestamp()
+    progress.next_update_timestamp = "none (terminal)"
     safe_update_management_record(
         ledger=ledger,
         mcp_cmd=args.mcp_cmd,
@@ -479,15 +908,7 @@ def run(args: argparse.Namespace) -> int:
         issue_id=args.vibe_issue_id,
         workspace_id=args.vibe_workspace_id,
         title=args.issue_title,
-        description=issue_description(
-            status=status,
-            repo=repo,
-            parent_session_id=args.parent_session_id,
-            parent_transcript_path=parent_transcript_path,
-            run_dir=run_dir,
-            final_message_path=final_message_path,
-            returncode=completed.returncode,
-        ),
+        description=build_description(status, returncode=completed.returncode),
         status=status,
     )
     return completed.returncode
@@ -512,6 +933,11 @@ def main() -> int:
     parser.add_argument(
         "--codex-exec-args",
         default=os.environ.get("CODEX_RVF_CODEX_EXEC_ARGS", DEFAULT_CODEX_EXEC_ARGS),
+    )
+    parser.add_argument(
+        "--progress-update-interval-seconds",
+        type=float,
+        default=parse_progress_interval(os.environ.get("CODEX_RVF_VK_PROGRESS_INTERVAL_SECONDS")),
     )
     parser.add_argument("--model")
     parser.add_argument("--reasoning-effort")
