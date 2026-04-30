@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,8 @@ DEFAULT_PROMPT = SKILL_DIR / "references" / "review-prompt.md"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
+DEFAULT_ACTIVITY_PROBE_TIMEOUT_SECONDS = 10.0
+DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
@@ -52,6 +55,19 @@ def string_list(config: dict[str, Any], key: str) -> list[str]:
     return value
 
 
+def optional_string_list(config: dict[str, Any], key: str) -> list[str] | None:
+    if key not in config:
+        return None
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be a string array or null")
+    if not value:
+        raise ValueError(f"{key} must not be empty when configured")
+    return value
+
+
 def positive_float(config: dict[str, Any], key: str, default: float) -> float:
     value = config.get(key, default)
     try:
@@ -60,6 +76,17 @@ def positive_float(config: dict[str, Any], key: str, default: float) -> float:
         raise ValueError(f"{key} must be a positive number") from exc
     if parsed <= 0:
         raise ValueError(f"{key} must be a positive number")
+    return parsed
+
+
+def positive_int(config: dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key, default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{key} must be a positive integer")
     return parsed
 
 
@@ -140,7 +167,73 @@ def check_repo(repo: Path) -> None:
         raise ValueError(f"not a git repo: {repo}")
 
 
-def build_prompt(prompt_file: Path, session_context: Path | None, review_packet: Path | None, repo: Path | None) -> str:
+def safe_artifact_token(value: str) -> str:
+    token = "".join(char if char.isalnum() or char in "._-" else "-" for char in value.strip())
+    return token.strip("-")[:80] or "reviewer"
+
+
+def reviewer_id_from_label(label: str) -> str:
+    if label.startswith("alternative-reviewer:"):
+        label = label.split(":", 1)[1]
+    return safe_artifact_token(label)
+
+
+def unique_child_path(directory: Path, name: str) -> Path:
+    path = directory / safe_artifact_token(name)
+    if not path.exists():
+        return path
+    suffix = path.suffix
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    for index in range(2, 10000):
+        candidate = directory / f"{stem}.{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return directory / f"{stem}.{os.urandom(4).hex()}{suffix}"
+
+
+def write_child_artifact(
+    directory: Path,
+    name: str,
+    content_or_bytes: bytes | str | dict[str, Any] | list[Any],
+    *,
+    unique: bool = False,
+) -> str:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = unique_child_path(directory, name) if unique else directory / safe_artifact_token(name)
+    if isinstance(content_or_bytes, bytes):
+        path.write_bytes(content_or_bytes)
+    elif isinstance(content_or_bytes, str):
+        path.write_text(content_or_bytes, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(content_or_bytes, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def infer_scope_contract(review_packet: Path | None) -> Path | None:
+    env_value = os.environ.get("RVF_SCOPE_CONTRACT")
+    if env_value and env_value.strip():
+        candidate = Path(env_value).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+    if review_packet is not None:
+        candidates = [
+            review_packet.parent / "scope.contract.json",
+            review_packet.parent / "inputs" / "scope.contract.json",
+            review_packet.parent.parent / "inputs" / "scope.contract.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+    return None
+
+
+def build_prompt(
+    prompt_file: Path,
+    session_context: Path | None,
+    review_packet: Path | None,
+    repo: Path | None,
+    scope_contract: Path | None = None,
+) -> str:
     parts = []
     env_lines = [
         "## Review session environment",
@@ -149,6 +242,8 @@ def build_prompt(prompt_file: Path, session_context: Path | None, review_packet:
     ]
     if repo is not None:
         env_lines.append("- `RVF_REPO`: target repository. Use it as the repo path if `pwd` is not already the repo.")
+    if scope_contract is not None:
+        env_lines.append("- `RVF_SCOPE_CONTRACT`: scope contract. Read it before reviewing and obey its scope boundaries.")
     if session_context is not None:
         env_lines.extend(
             [
@@ -158,8 +253,10 @@ def build_prompt(prompt_file: Path, session_context: Path | None, review_packet:
         )
     if review_packet is not None:
         env_lines.append("- `RVF_REVIEW_PACKET`: self-contained review packet and fallback context.")
-    if session_context is not None or review_packet is not None:
+    if scope_contract is not None or session_context is not None or review_packet is not None:
         read_targets = []
+        if scope_contract is not None:
+            read_targets.append('"$RVF_SCOPE_CONTRACT"')
         if session_context is not None:
             read_targets.append('"$RVF_SCOPE_OF_WORK"')
         if review_packet is not None:
@@ -280,16 +377,125 @@ class ClaudeStreamActivityMonitor:
                     self.active_anonymous_bash_tools -= 1
 
 
+class ReviewerRunResult:
+    def __init__(
+        self,
+        *,
+        args: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        pid: int | None,
+        signal: int | None = None,
+        terminated_signal: int | None = None,
+        timeout_reason: str | None = None,
+        probe_history: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.args = args
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.pid = pid
+        self.signal = signal
+        self.terminated_signal = terminated_signal
+        self.timeout_reason = timeout_reason
+        self.probe_history = probe_history or []
+
+
+def signal_name(signal_number: int | None) -> str | None:
+    if signal_number is None:
+        return None
+    try:
+        return signal.Signals(signal_number).name
+    except ValueError:
+        return str(signal_number)
+
+
+def subprocess_signal(returncode: int | None) -> int | None:
+    if returncode is not None and returncode < 0:
+        return -returncode
+    return None
+
+
+def _timeout_payload_delta(payload: bytes | str | None, start: int) -> str:
+    return _payload_delta(payload, start)
+
+
+def run_activity_probe(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+    started_at: float,
+) -> dict[str, Any]:
+    probe_started_at = time.monotonic()
+    record: dict[str, Any] = {
+        "command": command,
+        "started_after_seconds": round(probe_started_at - started_at, 3),
+        "timeout_seconds": timeout_seconds,
+        "status": "running",
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        record.update(
+            {
+                "status": "completed" if completed.returncode == 0 else "failed",
+                "returncode": completed.returncode,
+                "signal": signal_name(subprocess_signal(completed.returncode)),
+                "stdout": completed.stdout or "",
+                "stderr": completed.stderr or "",
+            }
+        )
+    except subprocess.TimeoutExpired as exc:
+        record.update(
+            {
+                "status": "timeout",
+                "returncode": None,
+                "signal": None,
+                "stdout": _timeout_payload_delta(exc.stdout, 0),
+                "stderr": _timeout_payload_delta(exc.stderr, 0),
+            }
+        )
+    except Exception as exc:
+        record.update(
+            {
+                "status": "error",
+                "returncode": None,
+                "signal": None,
+                "stdout": "",
+                "stderr": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    ended_at = time.monotonic()
+    record["ended_after_seconds"] = round(ended_at - started_at, 3)
+    record["duration_seconds"] = round(ended_at - probe_started_at, 3)
+    return record
+
+
 def next_wait_seconds(
     *,
     activity_check_interval_seconds: float,
     remaining_idle_seconds: float,
     max_runtime_remaining_seconds: float | None,
     waiting_on_long_command: bool,
+    probe_retry_remaining_seconds: float | None = None,
 ) -> float:
     wait_candidates = [activity_check_interval_seconds]
     if not waiting_on_long_command:
-        wait_candidates.append(remaining_idle_seconds)
+        wait_candidates.append(
+            probe_retry_remaining_seconds
+            if probe_retry_remaining_seconds is not None
+            else remaining_idle_seconds
+        )
     if max_runtime_remaining_seconds is not None:
         wait_candidates.append(max(0.0, max_runtime_remaining_seconds))
     return max(0.01, min(wait_candidates))
@@ -303,9 +509,12 @@ def run_with_activity_timeout(
     env: dict[str, str],
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None,
+    activity_probe_timeout_seconds: float,
+    activity_probe_failure_threshold: int,
     max_runtime_seconds: float | None,
     output_format: str,
-) -> subprocess.CompletedProcess[str]:
+) -> ReviewerRunResult:
     """运行外部 reviewer，并按 stdout/stderr 可观测活动刷新空闲超时。
 
     这里刻意不把未来的 reviewer-owned subagent 能力写进 prompt：后续如果允许
@@ -323,9 +532,12 @@ def run_with_activity_timeout(
         start_new_session=True,
     )
     started_at = time.monotonic()
-    last_activity_at = time.monotonic()
+    last_liveness_at = started_at
     last_stdout_len = 0
     last_stderr_len = 0
+    next_probe_at = started_at
+    consecutive_probe_failures = 0
+    probe_history: list[dict[str, Any]] = []
     pending_input: str | None = input_text
     stream_monitor = (
         ClaudeStreamActivityMonitor()
@@ -341,16 +553,27 @@ def run_with_activity_timeout(
                 command,
                 idle_timeout_seconds=idle_timeout_seconds,
                 activity_check_interval_seconds=activity_check_interval_seconds,
+                activity_probe_command=activity_probe_command,
+                activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                activity_probe_failure_threshold=activity_probe_failure_threshold,
                 max_runtime_seconds=max_runtime_seconds,
                 reason="max_runtime_exceeded",
+                probe_history=probe_history,
             )
-        idle_for = now - last_activity_at
+        idle_for = now - last_liveness_at
         remaining_idle = max(0.0, idle_timeout_seconds - idle_for)
         max_runtime_remaining = (
             max_runtime_seconds - (now - started_at)
             if max_runtime_seconds is not None
             else None
         )
+        probe_retry_remaining = None
+        if (
+            activity_probe_command is not None
+            and remaining_idle <= 0.0
+            and next_probe_at > now
+        ):
+            probe_retry_remaining = max(0.0, next_probe_at - now)
         wait_for = next_wait_seconds(
             activity_check_interval_seconds=activity_check_interval_seconds,
             remaining_idle_seconds=remaining_idle,
@@ -360,11 +583,20 @@ def run_with_activity_timeout(
                 if stream_monitor is not None
                 else False
             ),
+            probe_retry_remaining_seconds=probe_retry_remaining,
         )
 
         try:
             stdout, stderr = process.communicate(input=pending_input, timeout=wait_for)
-            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            return ReviewerRunResult(
+                args=command,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                pid=process.pid,
+                signal=subprocess_signal(process.returncode),
+                probe_history=probe_history,
+            )
         except subprocess.TimeoutExpired as exc:
             pending_input = None
             now = time.monotonic()
@@ -374,31 +606,65 @@ def run_with_activity_timeout(
                     command,
                     idle_timeout_seconds=idle_timeout_seconds,
                     activity_check_interval_seconds=activity_check_interval_seconds,
+                    activity_probe_command=activity_probe_command,
+                    activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                    activity_probe_failure_threshold=activity_probe_failure_threshold,
                     max_runtime_seconds=max_runtime_seconds,
                     reason="max_runtime_exceeded",
+                    probe_history=probe_history,
                 )
             stdout_len = _payload_length(exc.stdout)
             stderr_len = _payload_length(exc.stderr)
             if stdout_len > last_stdout_len or stderr_len > last_stderr_len:
                 if stream_monitor is not None and stdout_len > last_stdout_len:
                     stream_monitor.ingest(_payload_delta(exc.stdout, last_stdout_len))
-                last_activity_at = now
+                last_liveness_at = now
                 last_stdout_len = stdout_len
                 last_stderr_len = stderr_len
+                consecutive_probe_failures = 0
                 continue
 
-            if now - last_activity_at < idle_timeout_seconds:
+            if now - last_liveness_at < idle_timeout_seconds:
                 continue
             if stream_monitor is not None and stream_monitor.waiting_on_long_command:
                 continue
+            if activity_probe_command is not None:
+                if now < next_probe_at:
+                    continue
+                probe_env = env.copy()
+                probe_env["RVF_REVIEWER_PID"] = str(process.pid)
+                probe = run_activity_probe(
+                    activity_probe_command,
+                    cwd=cwd,
+                    env=probe_env,
+                    timeout_seconds=activity_probe_timeout_seconds,
+                    started_at=started_at,
+                )
+                probe_history.append(probe)
+                next_probe_at = time.monotonic() + activity_check_interval_seconds
+                if probe.get("status") == "completed" and probe.get("returncode") == 0:
+                    last_liveness_at = time.monotonic()
+                    consecutive_probe_failures = 0
+                    continue
+                consecutive_probe_failures += 1
+                if consecutive_probe_failures < activity_probe_failure_threshold:
+                    continue
 
             return timeout_completed(
                 process,
                 command,
                 idle_timeout_seconds=idle_timeout_seconds,
                 activity_check_interval_seconds=activity_check_interval_seconds,
+                activity_probe_command=activity_probe_command,
+                activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                activity_probe_failure_threshold=activity_probe_failure_threshold,
                 max_runtime_seconds=max_runtime_seconds,
-                reason="no_observable_activity",
+                reason=(
+                    "no_observable_activity_probe_failed"
+                    if activity_probe_command is not None
+                    else "no_observable_activity"
+                ),
+                probe_history=probe_history,
             )
 
 
@@ -408,35 +674,55 @@ def timeout_completed(
     *,
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None,
+    activity_probe_timeout_seconds: float,
+    activity_probe_failure_threshold: int,
     max_runtime_seconds: float | None,
     reason: str,
-) -> subprocess.CompletedProcess[str]:
-    terminate_process_group(process)
+    probe_history: list[dict[str, Any]],
+) -> ReviewerRunResult:
+    terminated_signal = terminate_process_group(process)
     stdout, stderr = process.communicate()
     timeout_parts = [
         EXTERNAL_REVIEWER_TIMEOUT_FLAG,
         f"idle_timeout_seconds={idle_timeout_seconds:g}",
         f"activity_check_interval_seconds={activity_check_interval_seconds:g}",
     ]
+    if activity_probe_command is not None:
+        timeout_parts.extend(
+            [
+                f"activity_probe_timeout_seconds={activity_probe_timeout_seconds:g}",
+                f"activity_probe_failure_threshold={activity_probe_failure_threshold}",
+                f"activity_probe_failures={len([item for item in probe_history if item.get('status') != 'completed' or item.get('returncode') != 0])}",
+            ]
+        )
     if max_runtime_seconds is not None:
         timeout_parts.append(f"max_runtime_seconds={max_runtime_seconds:g}")
     timeout_parts.append(f"reason={reason}")
     timeout_line = " ".join(timeout_parts)
     stderr = (stderr or "").rstrip()
     stderr = f"{stderr}\n{timeout_line}" if stderr else timeout_line
-    return subprocess.CompletedProcess(
-        command,
-        EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE,
-        stdout,
-        stderr,
+    return ReviewerRunResult(
+        args=command,
+        returncode=EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE,
+        stdout=stdout,
+        stderr=stderr,
+        pid=process.pid,
+        signal=subprocess_signal(process.returncode),
+        terminated_signal=terminated_signal,
+        timeout_reason=reason,
+        probe_history=probe_history,
     )
 
 
-def terminate_process_group(process: subprocess.Popen[str]) -> None:
+def terminate_process_group(process: subprocess.Popen[str]) -> int:
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        signal_number = signal.SIGKILL
+        os.killpg(os.getpgid(process.pid), signal_number)
+        return signal_number
     except Exception:
         process.kill()
+        return signal.SIGKILL
 
 
 def extract_claude_stream_result(output: str) -> str:
@@ -469,13 +755,14 @@ def main() -> int:
     parser.add_argument("--repo", help="Target git repository.")
     parser.add_argument("--session-context", help="File containing the main-agent scope-of-work / Session context block.")
     parser.add_argument("--review-packet", help="Self-contained packet generated by build_review_packet.py, including Session Context.")
+    parser.add_argument("--scope-contract", help="scope.contract.json path for this review run.")
     parser.add_argument("--prompt-file", default=str(DEFAULT_PROMPT), help="Review prompt file.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Alternative reviewer config JSON.")
     parser.add_argument("--output", help="Optional file to write reviewer stdout.")
     parser.add_argument("--check", action="store_true", help="Validate config and command availability only.")
     parser.add_argument("--preflight", action="store_true", help="Validate config, command availability, and configured health command when present.")
     parser.add_argument("--health", action="store_true", help="Run the configured health command.")
-    parser.add_argument("--print-label", action="store_true", help="Print configured provenance label.")
+    parser.add_argument("--print-label", action="store_true", help="Print configured source label.")
     parser.add_argument("--dry-run", action="store_true", help="Print command and prompt length without invoking reviewer.")
     parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
     parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
@@ -551,6 +838,17 @@ def main() -> int:
             config,
             "activity_check_interval_seconds",
             DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS,
+        )
+        activity_probe_command = optional_string_list(config, "activity_probe_command")
+        activity_probe_timeout = positive_float(
+            config,
+            "activity_probe_timeout_seconds",
+            DEFAULT_ACTIVITY_PROBE_TIMEOUT_SECONDS,
+        )
+        activity_probe_failure_threshold = positive_int(
+            config,
+            "activity_probe_failure_threshold",
+            DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD,
         )
         max_runtime = optional_positive_float(
             config,
@@ -702,6 +1000,7 @@ def main() -> int:
     prompt_file = Path(args.prompt_file).expanduser().resolve()
     session_context = Path(args.session_context).expanduser().resolve() if args.session_context else None
     review_packet = Path(args.review_packet).expanduser().resolve() if args.review_packet else None
+    scope_contract = Path(args.scope_contract).expanduser().resolve() if args.scope_contract else None
 
     try:
         if repo is None and review_packet is None:
@@ -712,7 +1011,11 @@ def main() -> int:
             raise ValueError(f"session context file not found: {session_context}")
         if review_packet is not None and not review_packet.exists():
             raise ValueError(f"review packet file not found: {review_packet}")
-        prompt = build_prompt(prompt_file, session_context, review_packet, repo)
+        if scope_contract is None:
+            scope_contract = infer_scope_contract(review_packet)
+        if scope_contract is not None and not scope_contract.exists():
+            raise ValueError(f"scope contract file not found: {scope_contract}")
+        prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract)
     except Exception as exc:
         ledger.event(
             phase="review",
@@ -735,10 +1038,19 @@ def main() -> int:
         env["RVF_SESSION_CONTEXT"] = str(session_context)
     if review_packet is not None:
         env["RVF_REVIEW_PACKET"] = str(review_packet)
+    if scope_contract is not None:
+        env["RVF_SCOPE_CONTRACT"] = str(scope_contract)
 
     if args.dry_run:
         cwd = str(repo) if repo is not None and allow_repo_cwd else str(review_packet.parent if review_packet is not None else SKILL_DIR)
-        payload = {"label": label, "command": command, "cwd": cwd, "prompt_chars": len(prompt)}
+        payload = {
+            "label": label,
+            "command": command,
+            "cwd": cwd,
+            "prompt_chars": len(prompt),
+            "activity_probe_configured": activity_probe_command is not None,
+            "scope_contract": str(scope_contract) if scope_contract is not None else None,
+        }
         ledger.event(
             phase="review",
             event="dry_run",
@@ -757,18 +1069,49 @@ def main() -> int:
         return 0
 
     cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
-    prompt_path = ledger.artifact("reviewer.prompt.txt", prompt, unique=True)
+    reviewer_id = reviewer_id_from_label(label)
+    reviewer_dir = ledger.artifacts_dir / "reviewers" / reviewer_id
+    try:
+        prompt_path = write_child_artifact(reviewer_dir, "reviewer.prompt.txt", prompt, unique=True)
+    except OSError as exc:
+        ledger.event(
+            phase="review",
+            event="artifact_write_failed",
+            status="failed",
+            reason_code="reviewer_artifact_write_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            paths={"reviewer_dir": str(reviewer_dir)},
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_artifact_write_failed",
+            message=f"failed to write reviewer artifact: {exc}",
+            paths={"reviewer_dir": str(reviewer_dir)},
+        )
+        return fail(f"failed to write reviewer artifact: {exc}", 2)
 
-    completed = run_with_activity_timeout(
-        command,
-        input_text=prompt,
-        cwd=cwd,
-        env=env,
-        idle_timeout_seconds=idle_timeout,
-        activity_check_interval_seconds=activity_check_interval,
-        max_runtime_seconds=max_runtime,
-        output_format=output_format,
-    )
+    try:
+        completed = run_with_activity_timeout(
+            command,
+            input_text=prompt,
+            cwd=cwd,
+            env=env,
+            idle_timeout_seconds=idle_timeout,
+            activity_check_interval_seconds=activity_check_interval,
+            activity_probe_command=activity_probe_command,
+            activity_probe_timeout_seconds=activity_probe_timeout,
+            activity_probe_failure_threshold=activity_probe_failure_threshold,
+            max_runtime_seconds=max_runtime,
+            output_format=output_format,
+        )
+    except Exception as exc:
+        completed = ReviewerRunResult(
+            args=command,
+            returncode=1,
+            stdout="",
+            stderr=f"{type(exc).__name__}: {exc}",
+            pid=None,
+        )
 
     raw_stdout = completed.stdout or ""
     raw_stderr = completed.stderr or ""
@@ -776,13 +1119,44 @@ def main() -> int:
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
     stdout = normalize_review_output(stdout)
-    normalized_path = ledger.artifact("reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
-    stdout_path = ledger.artifact("reviewer.stdout.txt", raw_stdout, unique=True)
     stderr = raw_stderr.strip()
-    stderr_path = ledger.artifact("reviewer.stderr.txt", raw_stderr, unique=True)
     timed_out = (
         completed.returncode == EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE
         and EXTERNAL_REVIEWER_TIMEOUT_FLAG in stderr
+    )
+    if timed_out:
+        stdout = EXTERNAL_REVIEWER_TIMEOUT_FLAG
+    normalized_path = write_child_artifact(reviewer_dir, "reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
+    stdout_path = write_child_artifact(reviewer_dir, "reviewer.stdout.txt", raw_stdout, unique=True)
+    stderr_path = write_child_artifact(reviewer_dir, "reviewer.stderr.txt", raw_stderr, unique=True)
+    probe_history_path = write_child_artifact(
+        reviewer_dir,
+        "reviewer.activity_probe_history.json",
+        completed.probe_history,
+        unique=True,
+    )
+    reviewer_summary_path = write_child_artifact(
+        reviewer_dir,
+        "reviewer.summary.json",
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "label": label,
+            "reviewer_id": reviewer_id,
+            "command": command,
+            "cwd": str(cwd),
+            "output_format": output_format,
+            "scope_contract": str(scope_contract) if scope_contract is not None else None,
+            "review_packet": str(review_packet) if review_packet is not None else None,
+            "session_context": str(session_context) if session_context is not None else None,
+            "paths": {
+                "prompt": prompt_path,
+                "stdout": stdout_path,
+                "stderr": stderr_path,
+                "normalized": normalized_path,
+                "activity_probe_history": probe_history_path,
+            },
+        },
+        unique=True,
     )
     if args.output:
         output_text = f"{EXTERNAL_REVIEWER_TIMEOUT_FLAG}\n" if timed_out else stdout + ("\n" if stdout else "")
@@ -795,8 +1169,12 @@ def main() -> int:
         "stdout": stdout_path,
         "stderr": stderr_path,
         "normalized": normalized_path,
+        "activity_probe_history": probe_history_path,
+        "reviewer_summary": reviewer_summary_path,
+        "reviewer_dir": str(reviewer_dir),
         "review_packet": str(review_packet) if review_packet is not None else None,
         "session_context": str(session_context) if session_context is not None else None,
+        "scope_contract": str(scope_contract) if scope_contract is not None else None,
     }
     status = "completed" if completed.returncode == 0 else "failed"
     reason_code = "reviewer_completed"
@@ -813,8 +1191,18 @@ def main() -> int:
         cwd=str(cwd),
         paths={key: value for key, value in paths.items() if value},
         returncode=completed.returncode,
+        pid=completed.pid,
+        signal=signal_name(completed.signal),
+        signal_number=completed.signal,
+        terminated_signal=signal_name(completed.terminated_signal),
+        terminated_signal_number=completed.terminated_signal,
         timed_out=timed_out,
+        timeout_reason=completed.timeout_reason,
+        activity_probe_configured=activity_probe_command is not None,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        activity_probe_history=completed.probe_history,
         output_format=output_format,
+        reviewer_id=reviewer_id,
     )
     ledger.summary(
         status=status,
@@ -824,9 +1212,21 @@ def main() -> int:
         cwd=str(cwd),
         paths={key: value for key, value in paths.items() if value},
         returncode=completed.returncode,
+        pid=completed.pid,
+        signal=signal_name(completed.signal),
+        signal_number=completed.signal,
+        terminated_signal=signal_name(completed.terminated_signal),
+        terminated_signal_number=completed.terminated_signal,
         timed_out=timed_out,
+        timeout_reason=completed.timeout_reason,
+        activity_probe_configured=activity_probe_command is not None,
+        activity_probe_command=activity_probe_command,
+        activity_probe_timeout_seconds=activity_probe_timeout,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        activity_probe_history=completed.probe_history,
         output_format=output_format,
         label=label,
+        reviewer_id=reviewer_id,
     )
 
     if completed.returncode != 0:

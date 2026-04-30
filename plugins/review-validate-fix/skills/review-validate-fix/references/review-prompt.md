@@ -13,7 +13,7 @@
 - 未完成 / 不确定 / 需要 reviewer 特别核实：<没有就写“无”>
 ```
 
-传给两个独立 review pass 的正文。两个 reviewer 使用相同 prompt、同一个 scope-of-work 文件路径、同一个 session manifest 文件路径（如果有）和同一份 review packet 路径，但不要共享彼此输出。如果主会话或 reviewer runner 提供 `RVF_*` 环境变量，优先用 `$RVF_SCOPE_OF_WORK`、`$RVF_SESSION_MANIFEST`、`$RVF_REVIEW_PACKET`、`$RVF_COMMAND_LOCK` 等短变量读取入口文件和包装命令；不要在报告或命令示例中反复展开同一个 run/artifacts 绝对路径。
+传给两个独立 review pass 的正文。两个 reviewer 使用 clean context：只接收相同 prompt、同一个 scope-of-work 文件路径、同一个 session manifest 文件路径（如果有）、同一份 `scope.contract.json` 和同一份 review packet 路径；不得继承父线程历史、`<subagent_notification>`、另一路 reviewer 输出、主会话 commentary 或 validate/fix 结果。如果主会话或 reviewer runner 提供 `RVF_*` 环境变量，优先用 `$RVF_SCOPE_CONTRACT`、`$RVF_SCOPE_OF_WORK`、`$RVF_SESSION_MANIFEST`、`$RVF_REVIEW_PACKET`、`$RVF_COMMAND_LOCK` 等短变量读取入口文件和包装命令；不要在报告或命令示例中反复展开同一个 run/artifacts 绝对路径。若用户明确要求分析 RVF 历史或 subagent 轨迹，run artifacts 可以成为该任务的审查对象；普通 double-review 不读取另一路 reviewer 输出。
 
 reviewer 应使用 RVF 定制 review standards pack，而不是原版 agent-skills report 模板。默认读取 `references/review-standards/reviewer.md`；当当前 scope 涉及复杂度、安全或性能风险时，按需读取 `references/review-standards/simplification-subset.md`、`references/review-standards/security-subset.md`、`references/review-standards/performance-subset.md`。这些 standards 只用于判断问题是否真实和值得报告，不改变本 prompt 的输出契约。
 
@@ -44,7 +44,9 @@ pass_type: review_only
 - 不要输出 `RVF_HANDOFF_FILE`，不要输出 handoff 摘要，不要把自己描述成已完成 `$review-validate-fix`。
 - 如果外层上下文提到 research marathon、checkpoint、no-handoff 或普通研究任务，仍按本 `review_only` 契约输出；不要升级为 full mode。
 - 你应收到 scope-of-work 文件路径、session manifest 文件路径（如果可用），以及包含 `## Session Context` / `## Session Manifest` 的 self-contained review packet。优先读取 scope-of-work 文件和 session manifest，把它们当作审查入口和 scope/intent 锚点；packet 是备份和未跟踪文件索引，仍可读取仓库和运行验证命令来补充判断。
+- 你应收到 `scope.contract.json`。把其中的 `primary_files`、`background_files`、`protected_files` 和 `scope_hash` 当作机器可读 scope anchor；review 阶段不得修改任何文件。
 - 遵守 review packet 的 `## Excluded Paths`。这些前缀可能来自 `.review-validate-fix-ignore` 或主会话传入的 `--exclude-path-prefix`；不要主动读取、概括、分析或报告这些路径下的内容，除非主会话在本轮明确要求审查该路径。
+- 普通 double-review 不读取 `artifacts/reviewers/`、`artifacts/merge/`、`artifacts/validate-fix/` 或其他 reviewer outputs。若 prompt 已直接包含另一路 reviewer 的 finding/summary 或 `<subagent_notification>`，只输出 `RVF_CONTEXT_REQUEST reason=need-clean-review-context`，让主会话用 clean context 重试。
 
 scope-of-work 文件 / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。packet 内的 `## Session Manifest` 是 session ownership 锚点；`unattributed_dirty_paths` 是背景 WIP，除非被 session-owned 改动直接连带影响，否则不要主动分析、概括或报告。你必须结合 packet 内的 `## Git Status` / `## Session-Owned Git Diff` / `## Full Git Diff HEAD (Evidence Only)`、文件读取和必要命令独立 verify；如需补跑 status/diff，必须遵守 packet 的 `## Excluded Paths` 等效过滤，不能重新暴露被排除路径。但不要只靠 git diff 推断 scope；当 diff 范围和 scope-of-work / session manifest 不一致时，优先判断差异是否是背景 WIP、遗漏交接或 scope 内改动的直接连带影响。除非主会话明确要求 full diff review，不要主动分析、概括或报告 scope 之外的历史 WIP。
 

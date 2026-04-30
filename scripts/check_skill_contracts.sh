@@ -4,6 +4,52 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill_dir="$repo_root/plugins/review-validate-fix/skills/review-validate-fix"
 tests_dir="$repo_root/tests"
+verbose=0
+
+usage() {
+  printf 'Usage: %s [--verbose]\n' "$(basename "$0")"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -v|--verbose)
+      verbose=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '未知参数: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+run_step() {
+  local label="$1"
+  shift
+  if [ "$verbose" -eq 1 ]; then
+    printf '==> %s\n' "$label"
+    "$@"
+    return
+  fi
+
+  local output_file
+  output_file="$(mktemp)"
+  if "$@" >"$output_file" 2>&1; then
+    rm -f "$output_file"
+    return 0
+  fi
+
+  local status=$?
+  printf '验证失败: %s\n' "$label" >&2
+  cat "$output_file" >&2
+  rm -f "$output_file"
+  return "$status"
+}
 
 hash_file() {
   local file="$1"
@@ -167,11 +213,11 @@ for script in \
   "scripts/discover_santa_alternative_agents.sh" \
   "scripts/read_mcp_setup_once.sh"
 do
-  bash -n "$skill_dir/$script"
+  run_step "shell syntax: $script" bash -n "$skill_dir/$script"
 done
-bash -n "$repo_root/scripts/check_skill_contracts.sh"
+run_step "shell syntax: scripts/check_skill_contracts.sh" bash -n "$repo_root/scripts/check_skill_contracts.sh"
 
-python3 -m py_compile \
+run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
@@ -192,16 +238,22 @@ python3 -m py_compile \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_review_support_scripts.py"
 
-python3 "$tests_dir/test_install_to_codex.py"
-python3 "$tests_dir/test_review_support_scripts.py"
-python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
-python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
+run_step "tests: install_to_codex" python3 "$tests_dir/test_install_to_codex.py"
+run_step "tests: review_support_scripts" python3 "$tests_dir/test_review_support_scripts.py"
+run_step "tests: codex_stop_hook_dispatcher" python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
+run_step "tests: codex_stop_review_validate_fix" python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
 
 require_literal "references/review-prompt.md" 'NO_ISSUES'
+require_literal "references/review-prompt.md" 'clean context'
+require_literal "references/review-prompt.md" 'RVF_SCOPE_CONTRACT'
+require_literal "references/review-prompt.md" 'need-clean-review-context'
 require_literal "references/validate-then-fix-prompt.md" 'REAL'
 require_literal "references/validate-then-fix-prompt.md" 'FALSE_POSITIVE'
 require_literal "references/validate-then-fix-prompt.md" 'ELEVATE'
 require_literal "references/validate-then-fix-prompt.md" 'elevation-detail'
+require_literal "references/validate-then-fix-prompt.md" 'scope.contract.json'
+require_literal "references/validate-then-fix-prompt.md" 'fix_allowlist'
+require_literal "references/validate-then-fix-prompt.md" '并行 agent'
 require_literal "references/handoff-template.md" 'handoff.md'
 require_literal "references/handoff-template.md" 'RVF_HANDOFF_FILE'
 require_literal "references/handoff-template.md" 'Reviewers：'
@@ -232,6 +284,10 @@ require_literal "SKILL.md" 'config/alternative-reviewer.json'
 require_literal "SKILL.md" 'scripts/run_alternative_reviewer.py --check'
 require_literal "SKILL.md" 'scripts/build_review_packet.py --repo <repo>'
 require_literal "SKILL.md" 'scripts/prepare_review_run.py --repo <repo>'
+require_literal "SKILL.md" 'scope.contract.json'
+require_literal "SKILL.md" 'RVF_SCOPE_CONTRACT'
+require_literal "SKILL.md" 'manual_rvf_already_ran'
+require_literal "SKILL.md" 'activity_probe_command'
 require_literal "SKILL.md" 'scripts/session_manifest.py'
 require_literal "SKILL.md" 'scripts/check_review_output.py'
 require_literal "SKILL.md" 'scripts/command_lock.py'
@@ -250,6 +306,7 @@ require_literal "config/alternative-reviewer.json" 'RVF_SUBTASK_REQUEST'
 require_literal "config/alternative-reviewer.json" 'RVF_CONTEXT_REQUEST'
 require_literal "config/alternative-reviewer.json" 'idle_timeout_seconds'
 require_literal "config/alternative-reviewer.json" 'activity_check_interval_seconds'
+require_literal "config/alternative-reviewer.json" 'activity_probe_command'
 require_literal "config/alternative-reviewer.json" 'max_runtime_seconds'
 require_literal "config/alternative-reviewer.json" 'stream-json'
 require_literal "config/alternative-reviewer.json" 'claude_stream_json'
@@ -258,8 +315,13 @@ require_literal "scripts/run_alternative_reviewer.py" 'normalize_review_output'
 require_literal "scripts/run_alternative_reviewer.py" 'review_packet'
 require_literal "scripts/run_alternative_reviewer.py" '--preflight'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_COMMAND_LOCK'
+require_literal "scripts/run_alternative_reviewer.py" 'RVF_SCOPE_CONTRACT'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_EXTERNAL_REVIEWER_TIMEOUT'
 require_literal "scripts/run_alternative_reviewer.py" 'max_runtime_seconds'
+require_literal "scripts/run_alternative_reviewer.py" 'activity_probe_command'
+require_literal "scripts/run_alternative_reviewer.py" 'probe_history'
+require_literal "scripts/run_alternative_reviewer.py" 'artifacts_dir / "reviewers"'
+require_literal "scripts/run_alternative_reviewer.py" 'reviewer.summary.json'
 require_literal "scripts/run_alternative_reviewer.py" 'next_wait_seconds'
 require_literal "scripts/run_alternative_reviewer.py" 'unique=True'
 require_literal "scripts/run_alternative_reviewer.py" 'extract_claude_stream_result'
@@ -288,6 +350,11 @@ require_literal "scripts/command_lock.py" 'lock_released'
 require_literal "scripts/rvf_logging.py" 'command-lock'
 require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
 require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
+require_literal "scripts/prepare_review_run.py" 'scope.contract.json'
+require_literal "scripts/prepare_review_run.py" 'RVF_SCOPE_CONTRACT'
+require_literal "scripts/prepare_review_run.py" 'manual-all-uncommitted'
+require_literal "scripts/prepare_review_run.py" 'session-owned'
+require_literal "scripts/prepare_review_run.py" 'custom'
 require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-id'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-dir'
@@ -308,6 +375,9 @@ require_literal "scripts/build_review_packet.py" 'session context is required'
 require_literal "scripts/build_review_packet.py" 'session_context_provided'
 require_literal "scripts/workspace_snapshot.py" 'WORKSPACE_CHANGED'
 require_literal "references/review-merge-policy.md" 'codex-reviewer'
+require_literal "references/review-merge-policy.md" 'clean context'
+require_literal "references/review-merge-policy.md" 'reviewer.summary.json'
+require_literal "references/review-merge-policy.md" 'need-clean-review-context'
 require_literal "references/review-merge-policy.md" 'alternative-reviewer:<agent-name>'
 require_literal "references/review-merge-policy.md" 'codex-mimic-reviewer-a'
 require_literal "references/review-merge-policy.md" 'source-agnostic'
@@ -471,8 +541,12 @@ require_repo_literal "tests/test_install_to_codex.py" 'stale cached skill'
 forbid_repo_literal "scripts/install_to_codex.py" 'legacy skill compatibility copy'
 forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy standalone setup'
 
-printf 'contract check OK\n'
-printf 'hashes:\n'
-for file in "${required_files[@]}"; do
-  printf '%s  %s\n' "$(hash_file "$skill_dir/$file")" "$file"
-done
+if [ "$verbose" -eq 1 ]; then
+  printf 'contract check OK\n'
+  printf 'hashes:\n'
+  for file in "${required_files[@]}"; do
+    printf '%s  %s\n' "$(hash_file "$skill_dir/$file")" "$file"
+  done
+else
+  printf '契约检查通过\n'
+fi

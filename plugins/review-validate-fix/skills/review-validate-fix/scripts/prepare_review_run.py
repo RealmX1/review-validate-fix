@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import shutil
@@ -21,6 +22,7 @@ BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
 SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
+SCOPE_CONTRACT_VERSION = 1
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -60,6 +62,8 @@ def review_env_exports(
     run_id: str,
     run_dir: Path,
     artifacts_dir: Path,
+    inputs_dir: Path,
+    scope_contract_path: Path,
     scope_of_work_path: Path | None,
     session_manifest_path: Path | None,
     packet_path: Path,
@@ -72,6 +76,8 @@ def review_env_exports(
         "RVF_RUN_ID": run_id,
         "RVF_RUN_DIR": str(run_dir),
         "RVF_ARTIFACTS_DIR": str(artifacts_dir),
+        "RVF_INPUTS_DIR": str(inputs_dir),
+        "RVF_SCOPE_CONTRACT": str(scope_contract_path),
         "RVF_REVIEW_PACKET": str(packet_path),
         "RVF_REVIEW_PACKET_METADATA": str(metadata_path),
         "RVF_BEFORE_WORKSPACE_SNAPSHOT": str(snapshot_path),
@@ -95,6 +101,14 @@ def review_env_exports(
         lines.append('export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"')
     else:
         lines.append(f"export RVF_ARTIFACTS_DIR={shlex.quote(env['RVF_ARTIFACTS_DIR'])}")
+    if inputs_dir == artifacts_dir / "inputs":
+        lines.append('export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"')
+    else:
+        lines.append(f"export RVF_INPUTS_DIR={shlex.quote(env['RVF_INPUTS_DIR'])}")
+    if scope_contract_path == inputs_dir / "scope.contract.json":
+        lines.append('export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"')
+    else:
+        lines.append(f"export RVF_SCOPE_CONTRACT={shlex.quote(env['RVF_SCOPE_CONTRACT'])}")
     if scope_of_work_path is not None:
         lines.append('export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"')
         lines.append('export RVF_SESSION_CONTEXT="$RVF_SCOPE_OF_WORK"')
@@ -134,6 +148,7 @@ def review_agent_context_text(
         "```",
         "",
         "Entry files:",
+        "- scope contract: `$RVF_SCOPE_CONTRACT`",
     ]
     if scope_of_work_path is not None:
         lines.append("- scope-of-work: `$RVF_SCOPE_OF_WORK`")
@@ -178,6 +193,100 @@ def is_tracked_path(repo: Path, rel_path: str) -> bool:
 
 def safe_stored_name(rel_path: str) -> str:
     return rel_path.replace("/", "__").replace("\\", "__")
+
+
+def normalized_scope_list(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        path = value.strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if path:
+            normalized.append(path)
+    return sorted(set(normalized))
+
+
+def dirty_paths(repo: Path, exclude_prefixes: list[str]) -> list[str]:
+    args = ["status", "--porcelain", "-uall"]
+    if exclude_prefixes:
+        args.extend(["--", ".", *[f":(exclude){prefix}" for prefix in exclude_prefixes]])
+    status = run_git(repo, args)
+    paths: list[str] = []
+    for raw_line in str(status).splitlines():
+        if len(raw_line) < 4:
+            continue
+        path = raw_line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip().replace("\\", "/")
+        if path:
+            paths.append(path)
+    return normalized_scope_list(paths)
+
+
+def metadata_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def write_scope_contract(
+    *,
+    path: Path,
+    run_id: str,
+    repo: Path,
+    created_at: str,
+    scope_mode: str,
+    primary_files: list[str],
+    background_files: list[str],
+    protected_files: list[str],
+    canonical_issues: list[dict[str, Any]],
+    fix_allowlist: list[str],
+    excluded_path_prefixes: list[str],
+    start_snapshot_path: Path,
+    review_packet_path: Path,
+    session_manifest_path: Path | None,
+    scope_of_work_path: Path | None,
+    review_packet_metadata_path: Path,
+) -> dict[str, Any]:
+    canonical_scope = {
+        "version": SCOPE_CONTRACT_VERSION,
+        "repo": str(repo),
+        "scope_mode": scope_mode,
+        "primary_files": primary_files,
+        "background_files": background_files,
+        "protected_files": protected_files,
+        "canonical_issues": canonical_issues,
+        "fix_allowlist": fix_allowlist,
+        "excluded_path_prefixes": excluded_path_prefixes,
+    }
+    scope_hash = hashlib.sha256(canonical_json_bytes(canonical_scope)).hexdigest()
+    contract: dict[str, Any] = {
+        "version": SCOPE_CONTRACT_VERSION,
+        "run_id": run_id,
+        "repo": str(repo),
+        "created_at": created_at,
+        "scope_mode": scope_mode,
+        "scope_hash": scope_hash,
+        "primary_files": primary_files,
+        "background_files": background_files,
+        "protected_files": protected_files,
+        "canonical_issues": canonical_issues,
+        "fix_allowlist": fix_allowlist,
+        "start_snapshot_path": str(start_snapshot_path),
+        "review_packet_path": str(review_packet_path),
+        "session_manifest_path": str(session_manifest_path) if session_manifest_path is not None else None,
+        "scope_of_work_path": str(scope_of_work_path) if scope_of_work_path is not None else None,
+        "review_packet_metadata_path": str(review_packet_metadata_path),
+        "canonical_scope": canonical_scope,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return contract
 
 
 def copy_bootstrap_path(source: Path, target: Path) -> None:
@@ -285,11 +394,19 @@ def prepare_run(
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         artifact_dir = Path(tempfile.mkdtemp(prefix=f"{timestamp}-{safe_repo_name(root)}-", dir=base_dir))
 
+    inputs_dir = artifact_dir / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
     packet_path = artifact_dir / "review-packet.md"
     metadata_path = artifact_dir / "review-packet.metadata.json"
     snapshot_path = artifact_dir / "before-workspace-snapshot.json"
     scope_of_work_path = artifact_dir / "scope-of-work.md"
     session_manifest_path = artifact_dir / "session-manifest.json"
+    input_packet_path = inputs_dir / "review-packet.md"
+    input_metadata_path = inputs_dir / "review-packet.metadata.json"
+    input_snapshot_path = inputs_dir / "before-workspace-snapshot.json"
+    input_scope_of_work_path = inputs_dir / "scope-of-work.md"
+    input_session_manifest_path = inputs_dir / "session-manifest.json"
+    scope_contract_path = inputs_dir / "scope.contract.json"
     review_env_path = artifact_dir / "review-env.sh"
     review_agent_context_path = artifact_dir / "review-agent-context.md"
 
@@ -361,6 +478,46 @@ def prepare_run(
     )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    shutil.copyfile(packet_path, input_packet_path)
+    shutil.copyfile(metadata_path, input_metadata_path)
+    shutil.copyfile(snapshot_path, input_snapshot_path)
+    if scope_of_work_path.exists():
+        shutil.copyfile(scope_of_work_path, input_scope_of_work_path)
+    if session_manifest_path.exists():
+        shutil.copyfile(session_manifest_path, input_session_manifest_path)
+    if metadata.get("session_manifest_provided"):
+        scope_mode = "session-owned"
+    elif primary_files or background_files or exclude_path_prefixes:
+        scope_mode = "custom"
+    else:
+        scope_mode = "manual-all-uncommitted"
+    manual_dirty_paths = dirty_paths(root, metadata_list(metadata.get("excluded_path_prefixes"))) if scope_mode == "manual-all-uncommitted" else []
+    primary_scope_files = normalized_scope_list(
+        primary_files + metadata_list(metadata.get("session_owned_paths")) + manual_dirty_paths
+    )
+    background_scope_files = normalized_scope_list(
+        background_files + metadata_list(metadata.get("unattributed_dirty_paths"))
+    )
+    protected_files = background_scope_files
+    created_at = datetime.now(timezone.utc).isoformat()
+    scope_contract = write_scope_contract(
+        path=scope_contract_path,
+        run_id=ledger.run_id,
+        repo=root,
+        created_at=created_at,
+        scope_mode=scope_mode,
+        primary_files=primary_scope_files,
+        background_files=background_scope_files,
+        protected_files=protected_files,
+        canonical_issues=[],
+        fix_allowlist=primary_scope_files,
+        excluded_path_prefixes=normalized_scope_list(metadata_list(metadata.get("excluded_path_prefixes"))),
+        start_snapshot_path=input_snapshot_path.resolve(),
+        review_packet_path=input_packet_path.resolve(),
+        session_manifest_path=input_session_manifest_path.resolve() if session_manifest_path.exists() else None,
+        scope_of_work_path=input_scope_of_work_path.resolve() if scope_of_work_path.exists() else None,
+        review_packet_metadata_path=input_metadata_path.resolve(),
+    )
     bootstrap = build_worktree_bootstrap(
         repo=root,
         artifact_dir=artifact_dir,
@@ -373,6 +530,8 @@ def prepare_run(
         run_id=ledger.run_id,
         run_dir=ledger.run_dir,
         artifacts_dir=artifact_dir,
+        inputs_dir=inputs_dir,
+        scope_contract_path=scope_contract_path,
         scope_of_work_path=scope_path,
         session_manifest_path=manifest_path,
         packet_path=packet_path,
@@ -396,9 +555,17 @@ def prepare_run(
         "events_path": str(ledger.events_path),
         "summary_path": str(ledger.summary_path),
         "artifacts_dir": str(artifact_dir),
+        "inputs_dir": str(inputs_dir),
+        "scope_contract": str(scope_contract_path),
+        "scope_contract_payload": scope_contract,
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
+        "input_review_packet": str(input_packet_path),
+        "input_review_packet_metadata": str(input_metadata_path),
+        "input_before_workspace_snapshot": str(input_snapshot_path),
+        "input_scope_of_work_file": str(input_scope_of_work_path) if input_scope_of_work_path.exists() else None,
+        "input_session_manifest_file": str(input_session_manifest_path) if input_session_manifest_path.exists() else None,
         "worktree_bootstrap": str(bootstrap["metadata_path"]),
         "worktree_bootstrap_patch": str(bootstrap["patch_path"]),
         "worktree_bootstrap_files_dir": str(bootstrap["files_dir"]),
@@ -434,6 +601,8 @@ def prepare_run(
         repo=str(root),
         cwd=str(root),
         paths={
+            "inputs": str(inputs_dir),
+            "scope_contract": str(scope_contract_path),
             "review_packet": str(packet_path),
             "metadata": str(metadata_path),
             "snapshot": str(snapshot_path),

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import struct
+import hashlib
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +46,21 @@ DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
 DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "report"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
+CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
 SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
+MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
+MANUAL_RVF_RUN_ID_KEY = "manual_rvf_run_id"
+MANUAL_RVF_MARKER_KEYS = (
+    MANUAL_RVF_COMPLETED_AT_KEY,
+    MANUAL_RVF_RUN_ID_KEY,
+    "manual_rvf_updated_at",
+    "manual_rvf_expires_at",
+    "manual_rvf_repo",
+    "manual_rvf_head",
+    "manual_rvf_dirty_hash",
+)
+MANUAL_RVF_MARKER_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "gui"
 APP_SERVER_CLIENT_INFO = {
@@ -405,6 +419,181 @@ def read_session_hook_state(session_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def write_session_hook_state(session_id: str, state: dict[str, Any]) -> Path:
+    path = session_hook_state_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(state)
+    payload["session_id"] = session_id
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def write_manual_rvf_session_marker(
+    *,
+    session_id: str,
+    run_id: str,
+    repo: str | Path | None = None,
+    completed_at: str | None = None,
+    ttl_seconds: int = MANUAL_RVF_MARKER_TTL_SECONDS,
+) -> Path:
+    timestamp = completed_at or datetime.now(timezone.utc).isoformat()
+    try:
+        completed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        completed = datetime.now(timezone.utc)
+    if completed.tzinfo is None:
+        completed = completed.replace(tzinfo=timezone.utc)
+    expires_at = datetime.fromtimestamp(completed.timestamp() + ttl_seconds, timezone.utc).isoformat()
+    state = read_session_hook_state(session_id) or {}
+    marker_update = {
+        MANUAL_RVF_COMPLETED_AT_KEY: timestamp,
+        MANUAL_RVF_RUN_ID_KEY: run_id,
+        "manual_rvf_updated_at": datetime.now(timezone.utc).isoformat(),
+        "manual_rvf_expires_at": expires_at,
+    }
+    snapshot = manual_rvf_dirty_snapshot(Path(repo).expanduser().resolve()) if repo is not None else None
+    if snapshot is not None:
+        marker_update.update(snapshot)
+    state.update(marker_update)
+    return write_session_hook_state(session_id, state)
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def manual_rvf_dirty_snapshot(repo: Path) -> dict[str, str] | None:
+    completed_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed_root.returncode != 0:
+        return None
+    root = Path(completed_root.stdout.strip()).resolve()
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "-uall"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "HEAD", "--"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or status.returncode != 0 or diff.returncode != 0:
+        return None
+    digest = hashlib.sha256()
+    digest.update(head.stdout.encode("utf-8", "replace"))
+    digest.update(b"\0")
+    digest.update(status.stdout.encode("utf-8", "replace"))
+    digest.update(b"\0")
+    digest.update(diff.stdout.encode("utf-8", "replace"))
+    for raw_line in status.stdout.splitlines():
+        if not raw_line.startswith("?? ") or len(raw_line) < 4:
+            continue
+        rel = raw_line[3:].strip()
+        path = root / rel
+        if not path.is_file():
+            continue
+        digest.update(b"\0untracked\0")
+        digest.update(rel.encode("utf-8", "replace"))
+        digest.update(b"\0")
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            return None
+    return {
+        "manual_rvf_repo": str(root),
+        "manual_rvf_head": head.stdout.strip(),
+        "manual_rvf_dirty_hash": digest.hexdigest(),
+    }
+
+
+def read_manual_rvf_session_marker(session_id: str, repo: str | Path | None = None) -> dict[str, Any] | None:
+    state = read_session_hook_state(session_id)
+    if state is None:
+        return None
+
+    completed_at = state.get(MANUAL_RVF_COMPLETED_AT_KEY)
+    run_id = state.get(MANUAL_RVF_RUN_ID_KEY)
+    expires_at = state.get("manual_rvf_expires_at")
+    if not isinstance(completed_at, str) or not completed_at.strip():
+        return None
+    if not isinstance(run_id, str) or not run_id.strip():
+        return None
+    if isinstance(expires_at, str) and expires_at.strip():
+        expires = parse_iso_datetime(expires_at)
+        if expires is None or datetime.now(timezone.utc) >= expires:
+            return None
+    else:
+        completed = parse_iso_datetime(completed_at)
+        if completed is None:
+            return None
+        if datetime.now(timezone.utc).timestamp() - completed.timestamp() >= MANUAL_RVF_MARKER_TTL_SECONDS:
+            return None
+
+    if repo is not None:
+        snapshot = manual_rvf_dirty_snapshot(Path(repo).expanduser().resolve())
+        if snapshot is None:
+            return None
+        for key in ("manual_rvf_repo", "manual_rvf_head", "manual_rvf_dirty_hash"):
+            if state.get(key) != snapshot[key]:
+                return None
+
+    return {
+        "session_id": session_id,
+        MANUAL_RVF_COMPLETED_AT_KEY: completed_at,
+        MANUAL_RVF_RUN_ID_KEY: run_id,
+        "manual_rvf_expires_at": expires_at,
+        "manual_rvf_repo": state.get("manual_rvf_repo"),
+        "manual_rvf_head": state.get("manual_rvf_head"),
+        "manual_rvf_dirty_hash": state.get("manual_rvf_dirty_hash"),
+        "state_path": str(session_hook_state_path(session_id)),
+    }
+
+
+def clear_manual_rvf_session_marker(session_id: str) -> Path | None:
+    state = read_session_hook_state(session_id)
+    path = session_hook_state_path(session_id)
+    if state is None:
+        return None
+
+    for key in MANUAL_RVF_MARKER_KEYS:
+        state.pop(key, None)
+
+    if set(state) <= {"session_id"}:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return path
+
+    return write_session_hook_state(session_id, state)
+
+
 def session_hook_disabled(session_id: str) -> bool:
     state = read_session_hook_state(session_id)
     return state is not None and state.get("enabled") is False
@@ -418,6 +607,13 @@ def set_session_hook_enabled(
 ) -> Path | None:
     path = session_hook_state_path(session_id)
     if enabled:
+        state = read_session_hook_state(session_id) or {}
+        if any(key in state for key in MANUAL_RVF_MARKER_KEYS):
+            state.pop("enabled", None)
+            state.pop("control", None)
+            state.pop("latest_user_message", None)
+            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return write_session_hook_state(session_id, state)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -426,22 +622,16 @@ def set_session_hook_enabled(
             return path
         return path
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "enabled": False,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "control": SESSION_HOOK_CONTROL_KEY,
-                "latest_user_message": latest_user,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    state = read_session_hook_state(session_id) or {}
+    state.update(
+        {
+            "enabled": False,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "control": SESSION_HOOK_CONTROL_KEY,
+            "latest_user_message": latest_user,
+        }
     )
-    return path
+    return write_session_hook_state(session_id, state)
 
 
 def session_hook_control_payload(
@@ -622,6 +812,13 @@ def rvf_fork_context_from_event(event: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def session_user_message_contains(event: dict[str, Any], marker: str) -> bool:
+    return any(
+        user_messages_containing(path.expanduser(), marker)
+        for path in event_session_paths(event)
+    )
+
+
 def cline_kanban_script_path(env_name: str, default: Path) -> Path:
     value = os.environ.get(env_name)
     if value and value.strip():
@@ -785,9 +982,11 @@ def cline_kanban_task_prompt(
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
     return (
         "$review-validate-fix\n\n"
-        "RVF_CLINE_KANBAN_TASK\n"
+        f"{RVF_FORK_MARKER}\n"
+        f"{CLINE_KANBAN_TASK_MARKER}\n"
         "RVF_TARGET_REPO: .\n"
         f"RVF_PARENT_REPO: {cwd}\n"
+        f"RVF_PARENT_CWD: {cwd}\n"
         f"RVF_RUN_ID: {ledger.run_id}\n"
         f"RVF_RUN_DIR: {ledger.run_dir}\n"
         f"RVF_ARTIFACTS_DIR: {artifacts_dir}\n"
@@ -2114,6 +2313,39 @@ def session_scope_gate_payload(
     )
 
 
+def manual_rvf_session_marker_payload(
+    event: dict[str, Any],
+    ledger: RunLedger,
+) -> dict[str, Any] | None:
+    session_id = session_hook_id_from_event(event)
+    if not session_id:
+        return None
+
+    cwd = event.get("cwd")
+    marker = read_manual_rvf_session_marker(session_id, cwd if isinstance(cwd, str) and cwd else None)
+    if marker is None:
+        return None
+
+    run_id = marker[MANUAL_RVF_RUN_ID_KEY]
+    completed_at = marker[MANUAL_RVF_COMPLETED_AT_KEY]
+    return skip_payload(
+        "当前 chat session 已完成手动 $review-validate-fix；"
+        "installed Stop hook 跳过自动 RVF fork/review，"
+        "但这不是 CODEX_RVF_SUPPRESS_STOP_HOOK 全 hook suppress。"
+        f"session_id={session_id}; manual_rvf_run_id={run_id}; "
+        f"manual_rvf_completed_at={completed_at}",
+        ledger,
+        "manual_rvf_already_ran",
+        session_id=session_id,
+        manual_rvf_run_id=run_id,
+        manual_rvf_completed_at=completed_at,
+        manual_rvf_expires_at=marker.get("manual_rvf_expires_at"),
+        manual_rvf_repo=marker.get("manual_rvf_repo"),
+        manual_rvf_dirty_hash=marker.get("manual_rvf_dirty_hash"),
+        manual_rvf_marker_path=marker.get("state_path"),
+    )
+
+
 def should_suppress(event: dict[str, Any], latest_user: str | None = None) -> bool:
     if explicit_suppress_requested(event, latest_user):
         return True
@@ -2129,6 +2361,13 @@ def explicit_suppress_requested(event: dict[str, Any], latest_user: str | None =
         return True
 
     if latest_user and SUPPRESS_STOP_HOOK_MARKER in latest_user:
+        return True
+    if latest_user and CLINE_KANBAN_TASK_MARKER in latest_user:
+        return True
+
+    if session_user_message_contains(event, SUPPRESS_STOP_HOOK_MARKER):
+        return True
+    if session_user_message_contains(event, CLINE_KANBAN_TASK_MARKER):
         return True
 
     if event.get("suppress_review_validate_fix") is True:
@@ -2288,6 +2527,11 @@ def main() -> int:
             state_path=session_control.get("state_path"),
         )
         emit(session_control)
+        return 0
+
+    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
+    if manual_marker_payload is not None:
+        emit(manual_marker_payload)
         return 0
 
     session_id = session_hook_id_from_event(event)

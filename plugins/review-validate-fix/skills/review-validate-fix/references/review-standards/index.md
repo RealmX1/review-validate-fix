@@ -19,5 +19,5 @@
 - reviewer 完成态仍只能是精确 `NO_ISSUES` 或编号 `路径:行号` issue list。
 - validate/fix verdict 仍只能是 `REAL`、`FALSE_POSITIVE` 或 `ELEVATE`。
 - request contract 是非完成态，不得和完成态混写。
-- 子任务默认由主会话 spawn，以保留 run ledger、scope 和 provenance。
+- 子任务默认由主会话 spawn，以保留 run ledger、scope 和来源标签。
 - nested subagent 只有在平台能继承 run id、scope、manifest、packet 和限制时才可启用，且最多一层。

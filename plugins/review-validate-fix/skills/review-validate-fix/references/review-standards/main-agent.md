@@ -7,7 +7,7 @@
 - 先生成可靠的 scope-of-work / session context。
 - 优先使用 session manifest 的 `owned_paths` / `owned_dirty_paths` 锚定审查范围。
 - 让 reviewer 读取 `reviewer.md`，并按需要提供专项 subset。
-- 合并 reviewer 输出时保留 provenance，但不要把 provenance 传给 validate/fix 子代理。
+- 合并 reviewer 输出时保留来源标签，但不要把来源传给 validate/fix 子代理。
 - 处理 `RVF_*_REQUEST`，记录决策和结果。
 - 维护 processed issue merge table 和 validate/fix grouping audit table。
 - 最终 handoff 只写可确认事实，不混入背景 WIP。
@@ -35,7 +35,7 @@ request 本身不得进入 review merge table。只有 requester 重试后的 `N
 
 - run ledger 事件。
 - 原始 scope 和 manifest。
-- reviewer / validate-fix provenance。
+- reviewer / validate-fix 来源。
 - source-agnostic validate/fix boundary。
 - command lock 和 workspace snapshot 纪律。
 

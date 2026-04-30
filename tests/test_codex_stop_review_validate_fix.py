@@ -358,6 +358,29 @@ def test_prompt_suppression_marker_skips(tmp: Path) -> None:
     assert "summary=" not in payload["systemMessage"]
 
 
+def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    write_user_session_messages(
+        transcript,
+        "00000000-0000-0000-0000-000000000202",
+        [
+            "$review-validate-fix\n\nRVF_CLINE_KANBAN_TASK\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+            "later Kanban user turn without the suppress marker",
+        ],
+    )
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+    )
+    payload = parse_json(stdout)
+    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
+    assert "summary=" not in payload["systemMessage"]
+
+
 def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
@@ -406,6 +429,158 @@ def test_session_hook_state_dir_respects_state_dir_override(tmp: Path) -> None:
     try:
         module = load_hook_module()
         assert module.session_hook_state_dir() == tmp / "state-root" / "session-hook"
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+
+def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp: Path) -> None:
+    module = load_hook_module()
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state-root")
+    try:
+        module.set_session_hook_enabled(
+            session_id="manual/session",
+            enabled=False,
+            latest_user="RVF_STOP_HOOK: off",
+        )
+        path = module.write_manual_rvf_session_marker(
+            session_id="manual/session",
+            run_id="rvf-manual-run",
+            completed_at="2999-04-30T00:00:00+00:00",
+        )
+        assert path == tmp / "state-root" / "session-hook" / "manual_session.json"
+
+        marker = module.read_manual_rvf_session_marker("manual/session")
+        assert marker is not None
+        assert marker["manual_rvf_run_id"] == "rvf-manual-run"
+        assert marker["manual_rvf_completed_at"] == "2999-04-30T00:00:00+00:00"
+        assert module.session_hook_disabled("manual/session") is True
+
+        cleared = module.clear_manual_rvf_session_marker("manual/session")
+        assert cleared == path
+        assert module.read_manual_rvf_session_marker("manual/session") is None
+        assert module.session_hook_disabled("manual/session") is True
+        assert json.loads(path.read_text(encoding="utf-8"))["enabled"] is False
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+
+def test_manual_rvf_session_marker_skips_before_fork_gate(tmp: Path) -> None:
+    module = load_hook_module()
+    dirty = init_repo_with_head(tmp / "dirty")
+    state = tmp / "state"
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    try:
+        module.set_session_hook_enabled(
+            session_id="manual-rvf-session",
+            enabled=False,
+            latest_user="RVF_STOP_HOOK: off",
+        )
+        module.write_manual_rvf_session_marker(
+            session_id="manual-rvf-session",
+            run_id="rvf-manual-run",
+            repo=dirty,
+            completed_at="2999-04-30T00:00:00+00:00",
+        )
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "manual-rvf-session",
+                "stop_hook_active": False,
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+
+    assert "decision" not in payload
+    assert "reason=manual_rvf_already_ran" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "manual_rvf_already_ran"
+    assert summary["manual_rvf_run_id"] == "rvf-manual-run"
+    assert summary["manual_rvf_completed_at"] == "2999-04-30T00:00:00+00:00"
+    assert summary["manual_rvf_repo"] == str(dirty.resolve())
+    assert summary["manual_rvf_dirty_hash"]
+    assert "app_server_requests_path" not in summary
+    assert latest_pointer(state)["reason_code"] == "manual_rvf_already_ran"
+
+
+def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp: Path) -> None:
+    module = load_hook_module()
+    dirty = init_repo_with_head(tmp / "dirty")
+    state = tmp / "state"
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    try:
+        module.write_manual_rvf_session_marker(
+            session_id="manual-rvf-session-dirty-changed",
+            run_id="rvf-manual-run",
+            repo=dirty,
+            completed_at="2999-04-30T00:00:00+00:00",
+        )
+    finally:
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+        if old_session_state is not None:
+            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+
+    (dirty / "changed.txt").write_text("new dirty content\n", encoding="utf-8")
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(dirty),
+                "session_id": "manual-rvf-session-dirty-changed",
+                "stop_hook_active": False,
+            },
+            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            state_dir=state,
+        )[0]
+    )
+
+    assert "reason=manual_rvf_already_ran" not in payload["systemMessage"]
+    assert "reason=dry_run" in payload["systemMessage"]
+
+
+def test_manual_rvf_session_marker_expired_does_not_read(tmp: Path) -> None:
+    module = load_hook_module()
+    dirty = init_repo_with_head(tmp / "dirty")
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state")
+    try:
+        module.write_manual_rvf_session_marker(
+            session_id="manual-expired",
+            run_id="rvf-manual-run",
+            repo=dirty,
+            completed_at="2000-01-01T00:00:00+00:00",
+            ttl_seconds=1,
+        )
+        assert module.read_manual_rvf_session_marker("manual-expired", dirty) is None
     finally:
         if old_state is None:
             os.environ.pop("CODEX_RVF_STATE_DIR", None)
@@ -608,8 +783,10 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert "--prompt" in create_argv
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
     assert "RVF_CLINE_KANBAN_TASK" in prompt_text
+    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
     assert "RVF_TARGET_REPO: ." in prompt_text
     assert f"RVF_PARENT_REPO: {repo}" in prompt_text
+    assert f"RVF_PARENT_CWD: {repo}" in prompt_text
     assert f"RVF_TARGET_REPO: {repo}" not in prompt_text
     assert create_argv[create_argv.index("--title") + 1].startswith("RVF repo ")
     assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
@@ -2081,9 +2258,14 @@ def main() -> int:
         test_stop_hook_active_skips,
         test_env_suppression_skips,
         test_prompt_suppression_marker_skips,
+        test_prior_cline_kanban_task_marker_skips_after_later_user_message,
         test_session_without_owned_dirty_skips_fork,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
+        test_manual_rvf_session_marker_write_read_clear_preserves_hook_state,
+        test_manual_rvf_session_marker_skips_before_fork_gate,
+        test_manual_rvf_session_marker_dirty_change_does_not_suppress,
+        test_manual_rvf_session_marker_expired_does_not_read,
         test_socket_probe_reports_unavailable_reason,
         test_bridge_failure_preserves_desktop_probe,
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,

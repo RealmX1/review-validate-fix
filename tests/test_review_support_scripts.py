@@ -13,6 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SKILL_CONTRACTS = ROOT / "scripts" / "check_skill_contracts.sh"
+CHECK_PLUGIN_CONTRACTS = ROOT / "scripts" / "check_plugin_contracts.py"
 SCRIPT_DIR = (
     ROOT
     / "plugins"
@@ -107,6 +108,9 @@ def write_alternative_reviewer_config(
     *,
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None = None,
+    activity_probe_timeout_seconds: float | None = None,
+    activity_probe_failure_threshold: int | None = None,
     max_runtime_seconds: float | None = None,
     output_format: str | None = "text",
 ) -> Path:
@@ -119,6 +123,12 @@ def write_alternative_reviewer_config(
         "activity_check_interval_seconds": activity_check_interval_seconds,
         "env_unset": [],
     }
+    if activity_probe_command is not None:
+        payload["activity_probe_command"] = activity_probe_command
+    if activity_probe_timeout_seconds is not None:
+        payload["activity_probe_timeout_seconds"] = activity_probe_timeout_seconds
+    if activity_probe_failure_threshold is not None:
+        payload["activity_probe_failure_threshold"] = activity_probe_failure_threshold
     if max_runtime_seconds is not None:
         payload["max_runtime_seconds"] = max_runtime_seconds
     if output_format is not None:
@@ -309,6 +319,25 @@ def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
         "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_CONTEXT_REQUEST'",
     ):
         assert literal in script
+
+
+def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
+    skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    plugin_script = CHECK_PLUGIN_CONTRACTS.read_text(encoding="utf-8")
+    for literal in (
+        "verbose=0",
+        "-v|--verbose)",
+        "run_step()",
+        "验证失败:",
+    ):
+        assert literal in skill_script
+    for literal in (
+        'parser.add_argument("-v", "--verbose"',
+        'command.append("--verbose")',
+        "capture_output=True",
+        "plugin 契约检查通过",
+    ):
+        assert literal in plugin_script
 
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
@@ -1060,6 +1089,9 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert Path(payload["review_packet_metadata"]).exists()
     assert Path(payload["before_workspace_snapshot"]).exists()
     assert Path(payload["scope_of_work_file"]).exists()
+    assert Path(payload["inputs_dir"]).exists()
+    assert Path(payload["scope_contract"]).exists()
+    assert payload["scope_contract"].endswith("artifacts/inputs/scope.contract.json")
     assert Path(payload["review_env_file"]).exists()
     assert Path(payload["review_agent_context_file"]).exists()
     assert payload["session_context"] == payload["scope_of_work_file"]
@@ -1067,17 +1099,22 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert payload["session_context_provided"] is True
     assert payload["excluded_path_prefixes"] == ["secret.txt"]
     assert payload["review_env"]["RVF_REPO"] == str(repo.resolve())
+    assert payload["review_env"]["RVF_INPUTS_DIR"] == payload["inputs_dir"]
+    assert payload["review_env"]["RVF_SCOPE_CONTRACT"] == payload["scope_contract"]
     assert payload["review_env"]["RVF_SCOPE_OF_WORK"] == payload["scope_of_work_file"]
     assert payload["review_env"]["RVF_REVIEW_PACKET"] == payload["review_packet"]
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
+    assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
+    assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
     assert 'export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"' in review_env_text
     assert 'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"' in review_env_text
     review_agent_context_text = Path(payload["review_agent_context_file"]).read_text(encoding="utf-8")
     assert payload["review_agent_context"] == review_agent_context_text
     assert "## RVF Generated Reviewer Context" in review_agent_context_text
     assert f". {payload['review_env_file']}" in review_agent_context_text
+    assert "- scope contract: `$RVF_SCOPE_CONTRACT`" in review_agent_context_text
     assert "- scope-of-work: `$RVF_SCOPE_OF_WORK`" in review_agent_context_text
     assert "- review packet: `$RVF_REVIEW_PACKET`" in review_agent_context_text
     assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
@@ -1090,6 +1127,16 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert "## Excluded Paths" in packet_text
     assert "- secret.txt" in packet_text
     assert "### secret.txt" not in packet_text
+    contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
+    assert contract["version"] == 1
+    assert contract["run_id"] == payload["run_id"]
+    assert contract["scope_mode"] == "custom"
+    assert contract["canonical_issues"] == []
+    assert contract["primary_files"] == ["tracked.txt"]
+    assert contract["fix_allowlist"] == ["tracked.txt"]
+    assert contract["review_packet_path"] == payload["input_review_packet"]
+    assert contract["start_snapshot_path"] == payload["input_before_workspace_snapshot"]
+    assert contract["scope_hash"] == payload["scope_contract_payload"]["scope_hash"]
 
     locked = run(
         [
@@ -1118,29 +1165,50 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
     context.write_text("scope\n", encoding="utf-8")
     packet = tmp / "very" / "long" / "artifacts" / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    scope_contract = packet.parent / "inputs" / "scope.contract.json"
+    scope_contract.parent.mkdir()
+    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
 
-    prompt = module.build_prompt(prompt_file, context, packet, repo)
+    prompt = module.build_prompt(prompt_file, context, packet, repo, scope_contract)
 
+    assert "$RVF_SCOPE_CONTRACT" in prompt
     assert "$RVF_SCOPE_OF_WORK" in prompt
     assert "$RVF_REVIEW_PACKET" in prompt
     assert "$RVF_COMMAND_LOCK" in prompt
     assert "$RVF_REPO" in prompt
+    assert str(scope_contract) not in prompt
     assert str(context) not in prompt
     assert str(module.COMMAND_LOCK) not in prompt
 
 
-def test_alternative_reviewer_subprocess_receives_session_context_alias(tmp: Path) -> None:
+def test_alternative_reviewer_infers_scope_contract_from_inputs_layout(tmp: Path) -> None:
+    module = load_alternative_reviewer_module()
+    inputs = tmp / "run" / "artifacts" / "inputs"
+    inputs.mkdir(parents=True)
+    packet = inputs / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    scope_contract = inputs / "scope.contract.json"
+    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
+
+    assert module.infer_scope_contract(packet) == scope_contract.resolve()
+
+
+def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "scope-of-work.md"
     context.write_text("scope\n", encoding="utf-8")
     packet = tmp / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    scope_contract = tmp / "scope.contract.json"
+    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
     reviewer_code = (
         "import os, sys; "
         "sys.stdin.read(); "
         f"expected = {str(context.resolve())!r}; "
+        f"expected_scope = {str(scope_contract.resolve())!r}; "
         "assert os.environ['RVF_SCOPE_OF_WORK'] == expected; "
         "assert os.environ['RVF_SESSION_CONTEXT'] == expected; "
+        "assert os.environ['RVF_SCOPE_CONTRACT'] == expected_scope; "
         "print('NO_ISSUES')"
     )
     config = write_alternative_reviewer_config(
@@ -1162,10 +1230,37 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias(tmp: Pat
             str(context),
             "--review-packet",
             str(packet),
+            "--scope-contract",
+            str(scope_contract),
         ]
     )
 
     assert completed.stdout.strip() == "NO_ISSUES"
+
+
+def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text("scope\n", encoding="utf-8")
+
+    completed = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp / "runs"),
+        ]
+    )
+
+    payload = json.loads(completed.stdout)
+    contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
+    assert contract["scope_mode"] == "manual-all-uncommitted"
+    assert contract["primary_files"] == ["new.txt", "tracked.txt"]
+    assert contract["fix_allowlist"] == ["new.txt", "tracked.txt"]
 
 
 def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
@@ -1427,6 +1522,119 @@ def test_alternative_reviewer_idle_timeout_flag(tmp: Path) -> None:
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
 
 
+def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdin.read(); time.sleep(0.25); print('NO_ISSUES')",
+        ],
+        idle_timeout_seconds=0.08,
+        activity_check_interval_seconds=0.03,
+        activity_probe_command=[
+            sys.executable,
+            "-c",
+            "import os; print('PROBE ' + os.environ.get('RVF_REVIEWER_PID', ''))",
+        ],
+        activity_probe_timeout_seconds=0.5,
+        activity_probe_failure_threshold=2,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "probe-success-test",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES"
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["activity_probe_configured"] is True
+    assert summary["activity_probe_history"]
+    assert any(
+        item["status"] == "completed" and item["stdout"].startswith("PROBE")
+        for item in summary["activity_probe_history"]
+    )
+    normalized = Path(summary["paths"]["normalized"]).read_text(encoding="utf-8")
+    assert normalized.strip() == "NO_ISSUES"
+    assert "PROBE" not in normalized
+
+
+def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdin.read(); time.sleep(1.0)",
+        ],
+        idle_timeout_seconds=0.08,
+        activity_check_interval_seconds=0.03,
+        activity_probe_command=[
+            sys.executable,
+            "-c",
+            "import sys; print('inactive'); sys.exit(2)",
+        ],
+        activity_probe_timeout_seconds=0.1,
+        activity_probe_failure_threshold=2,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "probe-failure-test",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 124
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["reason_code"] == "reviewer_timeout"
+    assert summary["timeout_reason"] == "no_observable_activity_probe_failed"
+    assert summary["pid"] is not None
+    assert summary["terminated_signal"] == "SIGKILL"
+    assert len(summary["activity_probe_history"]) == 2
+    assert all(item["returncode"] == 2 for item in summary["activity_probe_history"])
+    normalized = Path(summary["paths"]["normalized"]).read_text(encoding="utf-8")
+    assert normalized.strip() == "RVF_EXTERNAL_REVIEWER_TIMEOUT"
+
+
 def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -1533,7 +1741,7 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.1,
+        idle_timeout_seconds=0.2,
         activity_check_interval_seconds=0.03,
         output_format="claude_stream_json",
     )
@@ -1644,7 +1852,7 @@ def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp: Path) -> N
 
     assert first.stdout.strip() == "NO_ISSUES"
     assert second.stdout.strip() == "NO_ISSUES"
-    artifacts = run_dir / "artifacts"
+    artifacts = run_dir / "artifacts" / "reviewers" / "test"
     for name in [
         "reviewer.prompt.txt",
         "reviewer.prompt.2.txt",
@@ -1654,8 +1862,11 @@ def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp: Path) -> N
         "reviewer.stderr.2.txt",
         "reviewer.normalized.txt",
         "reviewer.normalized.2.txt",
+        "reviewer.summary.json",
+        "reviewer.summary.2.json",
     ]:
         assert (artifacts / name).exists()
+    assert not (run_dir / "artifacts" / "reviewer.prompt.txt").exists()
 
 
 def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
@@ -2202,6 +2413,7 @@ def main() -> int:
         test_check_review_output_lock_request()
         test_check_review_output_protocol_extension_requests()
         test_check_skill_contracts_requires_validate_fix_request_literals()
+        test_contract_check_entrypoints_default_quiet_with_verbose_flag()
         test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
         test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope")
@@ -2215,13 +2427,17 @@ def main() -> int:
         test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
         test_prepare_review_run_and_command_lock(root / "prepare")
         test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env")
-        test_alternative_reviewer_subprocess_receives_session_context_alias(root / "alternative-session-alias")
+        test_alternative_reviewer_infers_scope_contract_from_inputs_layout(root / "alternative-inputs-scope")
+        test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(root / "alternative-session-alias")
+        test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(root / "prepare-manual-all")
         test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle")
         test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir")
         test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout")
         test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript")
         test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
         test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
+        test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(root / "alternative-probe-success")
+        test_alternative_reviewer_activity_probe_failure_threshold_times_out(root / "alternative-probe-failure")
         test_alternative_reviewer_timeout_kills_child_process_group(root / "alternative-timeout-child")
         test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
         test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(root / "alternative-bash-tool")
