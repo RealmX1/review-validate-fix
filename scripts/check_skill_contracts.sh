@@ -38,17 +38,18 @@ run_step() {
   fi
 
   local output_file
+  local command_status=0
   output_file="$(mktemp)"
-  if "$@" >"$output_file" 2>&1; then
+  "$@" >"$output_file" 2>&1 || command_status=$?
+  if [ "$command_status" -eq 0 ]; then
     rm -f "$output_file"
     return 0
   fi
 
-  local status=$?
   printf '验证失败: %s\n' "$label" >&2
   cat "$output_file" >&2
   rm -f "$output_file"
-  return "$status"
+  return "$command_status"
 }
 
 hash_file() {

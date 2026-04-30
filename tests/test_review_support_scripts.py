@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -328,7 +329,9 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
         "verbose=0",
         "-v|--verbose)",
         "run_step()",
+        "command_status",
         "验证失败:",
+        'return "$command_status"',
     ):
         assert literal in skill_script
     for literal in (
@@ -339,6 +342,23 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     ):
         assert literal in plugin_script
 
+    function_start = skill_script.index("run_step() {")
+    function_end = skill_script.index("\nhash_file() {")
+    probe = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "verbose=0\n"
+        f"{skill_script[function_start:function_end]}\n"
+        f"run_step failing {shlex.quote(sys.executable)} -c "
+        "'import sys; print(\"boom\"); sys.exit(7)'\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        probe_path = Path(tmp_dir) / "probe.sh"
+        probe_path.write_text(probe, encoding="utf-8")
+        completed = subprocess.run(["bash", str(probe_path)], capture_output=True, text=True, check=False)
+    assert completed.returncode == 7
+    assert "验证失败: failing" in completed.stderr
+    assert "boom" in completed.stderr
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     result = run(
