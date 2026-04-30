@@ -19,7 +19,7 @@ COMPONENTS = {
     "stop-hook",
     "prepare-run",
     "reviewer",
-    "vibe-kanban-runner",
+    "cline-kanban",
     "contract-check",
     "installer",
 }
@@ -37,11 +37,13 @@ PRESERVED_SUMMARY_KEYS = {
     "runner_stdout_path",
     "startup_prepare_metadata_path",
     "suppress_child_stop_hook",
-    "vibe_backend_url",
-    "vibe_issue_id",
-    "vibe_management_mode",
-    "vibe_project_id",
-    "vibe_workspace_id",
+    "cline_kanban_task_id",
+    "cline_kanban_base_ref",
+    "cline_kanban_task_prompt_path",
+    "workspace_path",
+    "worktree_bootstrap_path",
+    "worktree_bootstrap_patch_path",
+    "worktree_bootstrap_files_dir",
 }
 PHASES = {
     "dev-sync",

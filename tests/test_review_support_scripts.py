@@ -7,9 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -28,9 +26,9 @@ CHECK_REVIEW_OUTPUT = SCRIPT_DIR / "check_review_output.py"
 COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"
 PREPARE_REVIEW_RUN = SCRIPT_DIR / "prepare_review_run.py"
 RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
-RUN_VIBE_KANBAN_RVF = SCRIPT_DIR / "run_vibe_kanban_rvf.py"
 CANCEL_RVF_RUN = SCRIPT_DIR / "cancel_rvf_run.py"
-VIBE_KANBAN_MCP_CLIENT = SCRIPT_DIR / "vibe_kanban_mcp_client.py"
+CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
+APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
 
@@ -43,24 +41,6 @@ def load_alternative_reviewer_module():
     spec = importlib.util.spec_from_file_location("rvf_run_alternative_reviewer", RUN_ALTERNATIVE_REVIEWER)
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load run_alternative_reviewer module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_vibe_kanban_client_module():
-    spec = importlib.util.spec_from_file_location("rvf_vibe_kanban_mcp_client", VIBE_KANBAN_MCP_CLIENT)
-    if spec is None or spec.loader is None:
-        raise AssertionError("failed to load vibe_kanban_mcp_client module")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_run_vibe_kanban_rvf_module():
-    spec = importlib.util.spec_from_file_location("rvf_run_vibe_kanban_rvf", RUN_VIBE_KANBAN_RVF)
-    if spec is None or spec.loader is None:
-        raise AssertionError("failed to load run_vibe_kanban_rvf module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -191,130 +171,6 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
     ]
     path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
     return path
-
-
-def write_fake_mcp_server(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "import json, os, sys\n"
-        "calls_path = os.environ.get('FAKE_MCP_CALLS')\n"
-        "def read_msg():\n"
-        "    line = sys.stdin.readline()\n"
-        "    if not line:\n"
-        "        return None\n"
-        "    return json.loads(line)\n"
-        "def write_msg(payload):\n"
-        "    sys.stdout.write(json.dumps(payload) + '\\n')\n"
-        "    sys.stdout.flush()\n"
-        "def record(payload):\n"
-        "    if calls_path:\n"
-        "        with open(calls_path, 'a', encoding='utf-8') as handle:\n"
-        "            handle.write(json.dumps(payload) + '\\n')\n"
-        "while True:\n"
-        "    msg = read_msg()\n"
-        "    if msg is None:\n"
-        "        break\n"
-        "    if 'id' not in msg:\n"
-        "        continue\n"
-        "    method = msg.get('method')\n"
-        "    if method == 'initialize':\n"
-        "        write_msg({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'fake'}}})\n"
-        "    elif method == 'tools/list':\n"
-        "        tools = [{'name': 'create_issue'}, {'name': 'update_issue'}, {'name': 'list_repos'}, {'name': 'list_projects'}, {'name': 'list_organizations'}]\n"
-        "        if os.environ.get('FAKE_NO_CREATE_PROJECT') != '1':\n"
-        "            tools.append({'name': 'create_project'})\n"
-        "        write_msg({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'tools': tools}})\n"
-        "    elif method == 'tools/call':\n"
-        "        record(msg['params'])\n"
-        "        tool = msg['params']['name']\n"
-        "        args = msg['params']['arguments']\n"
-        "        if os.environ.get('FAKE_TOOL_ERROR') == tool:\n"
-        "            result = {'success': False, 'error': 'fake tool failure', 'details': 'diagnostic detail'}\n"
-        "            write_msg({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'content': [{'type': 'text', 'text': json.dumps(result)}]}})\n"
-        "            continue\n"
-        "        if tool == 'list_repos':\n"
-        "            result = {'repos': [{'name': 'repo', 'path': os.environ.get('FAKE_REPO_PATH', '/tmp/repo'), 'project_id': 'project-from-repo'}]}\n"
-        "        elif tool == 'list_projects':\n"
-        "            result = {'projects': [{'id': 'project-from-project', 'name': os.environ.get('FAKE_PROJECT_NAME', 'repo')}]}\n"
-        "        elif tool == 'list_organizations':\n"
-        "            result = {'organizations': [{'id': 'organization-1', 'name': 'Default'}]}\n"
-        "        elif tool == 'create_project':\n"
-        "            result = {'project_id': 'project-created', 'tool': tool, 'arguments': args}\n"
-        "        else:\n"
-        "            result = {'issue_id': 'issue-123', 'tool': tool, 'arguments': args, 'backend_url': os.environ.get('VIBE_BACKEND_URL')}\n"
-        "        write_msg({'jsonrpc': '2.0', 'id': msg['id'], 'result': {'content': [{'type': 'text', 'text': json.dumps(result)}]}})\n"
-        "    else:\n"
-        "        write_msg({'jsonrpc': '2.0', 'id': msg['id'], 'result': {}})\n",
-        encoding="utf-8",
-    )
-    return path
-
-
-def start_fake_vibe_api() -> tuple[str, dict[str, object], ThreadingHTTPServer]:
-    state: dict[str, object] = {
-        "requests": [],
-        "workspaces": {},
-        "next_id": 1,
-    }
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, format: str, *args: object) -> None:
-            return
-
-        def _read_json(self) -> dict[str, object]:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length == 0:
-                return {}
-            raw = self.rfile.read(length).decode("utf-8")
-            return json.loads(raw)
-
-        def _write_json(self, payload: dict[str, object]) -> None:
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_POST(self) -> None:
-            body = self._read_json()
-            requests = state["requests"]
-            assert isinstance(requests, list)
-            requests.append({"method": "POST", "path": self.path, "body": body})
-            if self.path == "/api/workspaces":
-                workspace_id = f"workspace-{state['next_id']}"
-                state["next_id"] = int(state["next_id"]) + 1
-                workspace = {"id": workspace_id, "name": body.get("name"), "branch": "vk/rvf"}
-                workspaces = state["workspaces"]
-                assert isinstance(workspaces, dict)
-                workspaces[workspace_id] = workspace
-                self._write_json({"success": True, "data": workspace})
-                return
-            self.send_error(404)
-
-        def do_PUT(self) -> None:
-            body = self._read_json()
-            requests = state["requests"]
-            assert isinstance(requests, list)
-            requests.append({"method": "PUT", "path": self.path, "body": body})
-            if self.path.startswith("/api/workspaces/"):
-                workspace_id = self.path.rsplit("/", 1)[-1]
-                workspaces = state["workspaces"]
-                assert isinstance(workspaces, dict)
-                workspace = dict(workspaces.get(workspace_id, {"id": workspace_id, "branch": "vk/rvf"}))
-                workspace.update(body)
-                workspaces[workspace_id] = workspace
-                self._write_json({"success": True, "data": workspace})
-                return
-            if self.path.startswith("/api/scratch/WORKSPACE_NOTES/"):
-                self._write_json({"success": True, "data": {"id": self.path.rsplit("/", 1)[-1], **body}})
-                return
-            self.send_error(404)
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return f"http://127.0.0.1:{server.server_port}", state, server
 
 
 def test_check_review_output_lock_request() -> None:
@@ -2070,787 +1926,255 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
     assert json.loads(sink.read_text(encoding="utf-8")) == ["--native-stream"]
 
 
-def test_vibe_kanban_mcp_client_create_issue(tmp: Path) -> None:
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
+
+def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp / "fake_kanban_task.py"
     calls = tmp / "calls.jsonl"
+    fake_task.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': []}))\n"
+        "elif sys.argv[1] == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-1'}))\n"
+        "elif sys.argv[1] == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-1', 'status': 'started'}))\n"
+        "elif sys.argv[1] == 'trash':\n"
+        "    print(json.dumps({'task_id': 'task-1', 'status': 'trashed'}))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    repo = init_repo(tmp / "repo")
     env = os.environ.copy()
-    env["FAKE_MCP_CALLS"] = str(calls)
+    env["KANBAN_CALLS"] = str(calls)
+    task_cmd = f"{sys.executable} {fake_task}"
+    ensure = run([sys.executable, str(CLINE_KANBAN_CLIENT), "ensure", "--repo", str(repo), "--task-cmd", task_cmd], env=env)
+    assert json.loads(ensure.stdout)["started"] is False
+    create = run([
+        sys.executable,
+        str(CLINE_KANBAN_CLIENT),
+        "create",
+        "--repo",
+        str(repo),
+        "--task-cmd",
+        task_cmd,
+        "--base-ref",
+        "HEAD",
+        "--prompt",
+        "hello",
+        "--title",
+        "RVF test",
+        "--agent-id",
+        "codex",
+    ], env=env)
+    assert json.loads(create.stdout)["task_id"] == "task-1"
+    started = run([
+        sys.executable,
+        str(CLINE_KANBAN_CLIENT),
+        "start",
+        "--repo",
+        str(repo),
+        "--task-cmd",
+        task_cmd,
+        "--task-id",
+        "task-1",
+    ], env=env)
+    assert json.loads(started.stdout)["status"] == "started"
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert [call[0] for call in recorded] == ["list", "create", "start"]
+    create_call = recorded[1]
+    assert create_call[create_call.index("--title") + 1] == "RVF test"
+    assert create_call[create_call.index("--agent-id") + 1] == "codex"
+
+
+def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
+    (repo / "tracked.txt").write_text("base\n\n", encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "blank context"], cwd=repo)
+    (repo / "tracked.txt").write_text("changed\n\n", encoding="utf-8")
+    (repo / "owned.txt").write_text("owned untracked\n", encoding="utf-8")
+    (repo / "background.txt").write_text("background\n", encoding="utf-8")
+    manifest = tmp / "manifest.json"
+    manifest.write_text(json.dumps({
+        "repo": str(repo),
+        "owned_paths": ["tracked.txt", "owned.txt"],
+        "owned_dirty_paths": ["tracked.txt", "owned.txt"],
+        "unattributed_dirty_paths": ["background.txt"],
+        "confidence": "high",
+    }), encoding="utf-8")
+    context = tmp / "context.md"
+    context.write_text("scope\n", encoding="utf-8")
+    completed = run([
+        sys.executable,
+        str(PREPARE_REVIEW_RUN),
+        "--repo",
+        str(repo),
+        "--session-context",
+        str(context),
+        "--session-manifest",
+        str(manifest),
+    ])
+    payload = json.loads(completed.stdout)
+    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
+    assert bootstrap["tracked_paths"] == ["tracked.txt"]
+    assert [item["path"] for item in bootstrap["untracked_files"]] == ["owned.txt"]
+    assert "background.txt" not in json.dumps(bootstrap)
+    assert "tracked.txt" in Path(payload["worktree_bootstrap_patch"]).read_text(encoding="utf-8")
+    clean = tmp / "clean"
+    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp)
+    run(["git", "apply", "--check", str(payload["worktree_bootstrap_patch"])], cwd=clean)
+
+
+def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    context = tmp / "context.md"
+    context.write_text("scope\n", encoding="utf-8")
+    real_state = tmp / "real-state"
+    real_state.mkdir()
+    symlink_state = tmp / "state-link"
+    symlink_state.symlink_to(real_state, target_is_directory=True)
+    env = os.environ.copy()
+    env["CODEX_RVF_STATE_DIR"] = str(symlink_state)
+
     completed = run(
         [
             sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "create",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-            "--backend-url",
-            "http://127.0.0.1:65432",
-            "--project-id",
-            "project-1",
-            "--title",
-            "RVF test",
-            "--description",
-            "run_dir: /tmp/rvf",
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
         ],
         env=env,
     )
+
     payload = json.loads(completed.stdout)
-    assert payload["issue_id"] == "issue-123"
-    assert payload["backend_url"] == "http://127.0.0.1:65432"
-    recorded = read_jsonl(calls)
-    assert recorded[0]["name"] == "create_issue"
-    assert recorded[0]["arguments"]["project_id"] == "project-1"
+    metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
+    assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
+    assert str(real_state.resolve()) in payload["scope_of_work_file"]
 
 
-def test_vibe_kanban_mcp_client_maps_generic_issue_status(tmp: Path) -> None:
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
-    calls = tmp / "calls.jsonl"
-    env = os.environ.copy()
-    env["FAKE_MCP_CALLS"] = str(calls)
-    completed = run(
-        [
-            sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "update",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-            "--project-id",
-            "project-1",
-            "--issue-id",
-            "issue-1",
-            "--description",
-            "running",
-            "--status",
-            "running",
-        ],
-        env=env,
+def test_apply_worktree_bootstrap_replays_tracked_and_untracked(tmp: Path) -> None:
+    source = init_repo(tmp / "source")
+    clone = tmp / "clone"
+    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp)
+    (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    (source / "owned.txt").write_text("owned\n", encoding="utf-8")
+    base_ref = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    patch = tmp / "bootstrap.patch"
+    patch.write_text(subprocess.run(["git", "diff", "--binary", "HEAD", "--", "tracked.txt"], cwd=source, check=True, capture_output=True, text=True).stdout, encoding="utf-8")
+    files = tmp / "files"
+    files.mkdir()
+    stored = files / "owned.txt"
+    stored.write_text("owned\n", encoding="utf-8")
+    metadata = tmp / "bootstrap.json"
+    metadata.write_text(json.dumps({"base_ref": base_ref, "patch_file": str(patch), "files_dir": str(files), "untracked_files": [{"path": "owned.txt", "stored_path": str(stored)}]}), encoding="utf-8")
+    completed = run([sys.executable, str(APPLY_WORKTREE_BOOTSTRAP), "--metadata", str(metadata), "--repo", str(clone)])
+    assert json.loads(completed.stdout)["ok"] is True
+    assert (clone / "tracked.txt").read_text(encoding="utf-8") == "changed\n"
+    assert (clone / "owned.txt").read_text(encoding="utf-8") == "owned\n"
+
+
+def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp: Path) -> None:
+    source = init_repo(tmp / "source")
+    clone = tmp / "clone"
+    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp)
+    (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    base_ref = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    patch = tmp / "bootstrap.patch"
+    patch.write_text(subprocess.run(["git", "diff", "--binary", "HEAD", "--", "tracked.txt"], cwd=source, check=True, capture_output=True, text=True).stdout, encoding="utf-8")
+    metadata = tmp / "bootstrap.json"
+    metadata.write_text(json.dumps({"base_ref": base_ref, "patch_file": str(patch), "untracked_files": []}), encoding="utf-8")
+
+    (clone / "other.txt").write_text("other\n", encoding="utf-8")
+    run(["git", "add", "other.txt"], cwd=clone)
+    run(["git", "commit", "-q", "-m", "advance clone"], cwd=clone)
+    completed = subprocess.run(
+        [sys.executable, str(APPLY_WORKTREE_BOOTSTRAP), "--metadata", str(metadata), "--repo", str(clone)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
-    payload = json.loads(completed.stdout)
-    assert payload["issue_id"] == "issue-123"
-    recorded = read_jsonl(calls)
-    assert recorded[-1]["name"] == "update_issue"
-    assert recorded[-1]["arguments"]["status"] == "In progress"
+
+    assert completed.returncode != 0
+    assert "base_ref mismatch" in completed.stdout
+    assert (clone / "tracked.txt").read_text(encoding="utf-8") == "base\n"
 
 
-def test_vibe_kanban_mcp_client_create_workspace_uses_local_api(tmp: Path) -> None:
-    backend_url, state, server = start_fake_vibe_api()
-    try:
-        completed = run(
-            [
-                sys.executable,
-                str(VIBE_KANBAN_MCP_CLIENT),
-                "create-workspace",
-                "--backend-url",
-                backend_url,
-                "--title",
-                "RVF test",
-                "--description",
-                "run_dir: /tmp/rvf",
-                "--status",
-                "queued",
-            ],
-        )
-    finally:
-        server.shutdown()
-    payload = json.loads(completed.stdout)
-    assert payload["workspace_id"] == "workspace-1"
-    assert payload["backend_url"] == backend_url
-    requests = state["requests"]
-    assert isinstance(requests, list)
-    assert requests[0]["method"] == "POST"
-    assert requests[0]["path"] == "/api/workspaces"
-    assert requests[0]["body"]["name"] == "RVF queued: RVF test"
-    assert requests[1]["path"] == "/api/scratch/WORKSPACE_NOTES/workspace-1"
-
-
-def test_vibe_kanban_mcp_client_update_workspace_uses_local_api(tmp: Path) -> None:
-    backend_url, state, server = start_fake_vibe_api()
-    try:
-        completed = run(
-            [
-                sys.executable,
-                str(VIBE_KANBAN_MCP_CLIENT),
-                "update-workspace",
-                "--backend-url",
-                backend_url,
-                "--workspace-id",
-                "workspace-1",
-                "--title",
-                "RVF test",
-                "--description",
-                "completed",
-                "--status",
-                "completed",
-            ],
-        )
-    finally:
-        server.shutdown()
-    payload = json.loads(completed.stdout)
-    assert payload["workspace_id"] == "workspace-1"
-    requests = state["requests"]
-    assert isinstance(requests, list)
-    assert requests[0]["method"] == "PUT"
-    assert requests[0]["path"] == "/api/workspaces/workspace-1"
-    assert requests[0]["body"]["name"] == "RVF completed: RVF test"
-
-
-def test_run_ledger_summary_preserves_vibe_management_fields(tmp: Path) -> None:
+def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
     module = load_rvf_logging_module()
     run_dir = tmp / "run"
     ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
     ledger.summary(
-        status="vibe-kanban-started",
-        reason_code="vibe_kanban_runner_started",
-        vibe_management_mode="local-workspace",
-        vibe_workspace_id="workspace-1",
-        vibe_backend_url="http://127.0.0.1:62040",
-        runner_pid=123,
+        status="cline-kanban-started",
+        reason_code="cline_kanban_task_started",
+        cline_kanban_task_id="task-1",
+        cline_kanban_base_ref="HEAD",
+        worktree_bootstrap_path="/tmp/bootstrap.json",
     )
+    later = ledger.summary(status="completed", reason_code="prepare_completed", message="later phase")
+    assert later["cline_kanban_task_id"] == "task-1"
+    assert later["cline_kanban_base_ref"] == "HEAD"
+    assert later["worktree_bootstrap_path"] == "/tmp/bootstrap.json"
 
-    later = ledger.summary(
-        status="completed",
-        reason_code="prepare_completed",
-        message="later phase",
-    )
-
-    assert later["status"] == "completed"
-    assert later["vibe_management_mode"] == "local-workspace"
-    assert later["vibe_workspace_id"] == "workspace-1"
-    assert later["vibe_backend_url"] == "http://127.0.0.1:62040"
-    assert later["runner_pid"] == 123
-
-
-def test_vibe_kanban_mcp_client_parses_lsof_vibe_app_ports() -> None:
-    module = load_vibe_kanban_client_module()
-    output = "\n".join(
-        [
-            "p100",
-            "cvibe-kanb",
-            "nlocalhost:63431",
-            "n127.0.0.1:63432",
-            "p101",
-            "cvibe-kanban-mcp",
-            "nlocalhost:73431",
-            "p102",
-            "cnode",
-            "nlocalhost:83431",
-        ]
-    )
-    assert module._parse_lsof_listen_ports(output) == [63431, 63432]
-
-
-def test_vibe_kanban_mcp_client_prefers_discovered_backend_url() -> None:
-    module = load_vibe_kanban_client_module()
-    original = module.discover_backend_urls
-    try:
-        module.discover_backend_urls = lambda: ["http://127.0.0.1:50280"]
-        assert module._candidate_backend_urls(None) == ["http://127.0.0.1:50280", None]
-    finally:
-        module.discover_backend_urls = original
-
-
-def test_vibe_kanban_mcp_client_starts_local_app_when_probe_lacks_backend(tmp: Path) -> None:
-    module = load_vibe_kanban_client_module()
-    started = {"value": False}
-    starts: list[dict[str, object]] = []
-    original_ensure = module.ensure_vibe_kanban_mcp
-    original_probe = module.probe_mcp_candidates
-    original_discover = module.discover_backend_urls
-    original_reachable = module._backend_url_is_reachable
-    original_start = module.start_vibe_kanban_app
-    try:
-        module.ensure_vibe_kanban_mcp = lambda **_kwargs: {"available": True, "started": False}
-        module.probe_mcp_candidates = lambda *_args, **_kwargs: {"available": True, "started": False}
-        module.discover_backend_urls = (
-            lambda: ["http://127.0.0.1:50280"] if started["value"] else []
-        )
-        module._backend_url_is_reachable = lambda _url: bool(started["value"])
-
-        def fake_start(**kwargs: object) -> dict[str, object]:
-            starts.append(kwargs)
-            started["value"] = True
-            return {"started": True, "launcher": "test"}
-
-        module.start_vibe_kanban_app = fake_start
-        payload = module.ensure_local_backend(
-            mcp_cmd="fake mcp",
-            backend_url=None,
-            start_if_needed=True,
-            start_cmd="fake start",
-            repo=tmp,
-            tmux_session="rvf-test",
-            timeout_seconds=0.2,
-        )
-    finally:
-        module.ensure_vibe_kanban_mcp = original_ensure
-        module.probe_mcp_candidates = original_probe
-        module.discover_backend_urls = original_discover
-        module._backend_url_is_reachable = original_reachable
-        module.start_vibe_kanban_app = original_start
-
-    assert starts
-    assert payload["backend_url"] == "http://127.0.0.1:50280"
-    assert payload["source"] == "started_discovered_backend_url"
-    assert payload["started"] is True
-
-
-def test_vibe_kanban_mcp_client_ignores_stale_port_file(tmp: Path) -> None:
-    module = load_vibe_kanban_client_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    port_file = tmp / "vibe-kanban.port"
-    port_file.write_text('{"main_port": 1}', encoding="utf-8")
-    assert module._backend_urls_from_port_file(port_file) == []
-
-
-def test_vibe_kanban_mcp_client_surfaces_tool_errors(tmp: Path) -> None:
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
-    env = os.environ.copy()
-    env["FAKE_TOOL_ERROR"] = "list_repos"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "list-repos",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
-    assert completed.returncode == 2
-    assert "fake tool failure: diagnostic detail" in completed.stderr
-
-
-def test_vibe_kanban_mcp_client_times_out_when_initialize_hangs(tmp: Path) -> None:
-    fake_server = tmp / "hanging_mcp_server.py"
-    fake_server.parent.mkdir(parents=True, exist_ok=True)
-    fake_server.write_text(
-        "import sys, time\n"
-        "sys.stdin.readline()\n"
-        "time.sleep(60)\n",
-        encoding="utf-8",
-    )
-    env = os.environ.copy()
-    env["CODEX_RVF_VK_MCP_REQUEST_TIMEOUT"] = "0.2"
-    started = time.monotonic()
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "list-repos",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-        timeout=5,
-    )
-    elapsed = time.monotonic() - started
-    assert completed.returncode == 2
-    assert "MCP initialize timed out after 0.2s waiting for stdout" in completed.stderr
-    assert elapsed < 3
-
-
-def test_vibe_kanban_mcp_client_resolves_project_from_repo(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
-    calls = tmp / "calls.jsonl"
-    env = os.environ.copy()
-    env["FAKE_MCP_CALLS"] = str(calls)
-    env["FAKE_REPO_PATH"] = str(repo)
-    completed = run(
-        [
-            sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "resolve-project",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-            "--repo",
-            str(repo),
-            "--create-if-missing",
-        ],
-        env=env,
-    )
-    payload = json.loads(completed.stdout)
-    assert payload["project_id"] == "project-from-repo"
-    assert payload["source"] == "list_repos"
-    recorded = read_jsonl(calls)
-    assert recorded[0]["name"] == "list_repos"
-
-
-def test_vibe_kanban_mcp_client_uses_single_project_fallback(tmp: Path) -> None:
-    repo = init_repo(tmp / "different-repo")
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
-    env = os.environ.copy()
-    env["FAKE_NO_CREATE_PROJECT"] = "1"
-    completed = run(
-        [
-            sys.executable,
-            str(VIBE_KANBAN_MCP_CLIENT),
-            "resolve-project",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-            "--repo",
-            str(repo),
-            "--create-if-missing",
-        ],
-        env=env,
-    )
-    payload = json.loads(completed.stdout)
-    assert payload["project_id"] == "project-from-project"
-    assert payload["source"] == "single_project_fallback"
-
-
-def test_vibe_kanban_runner_success_updates_summary_and_workspace(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    prompt = tmp / "prompt.txt"
-    prompt.write_text("$review-validate-fix\n\noriginal GUI fork prompt marker\n", encoding="utf-8")
-    transcript = tmp / "parent-session.jsonl"
-    transcript.write_text('{"type":"session_meta","payload":{"id":"parent-thread"}}\n', encoding="utf-8")
-    backend_url, api_state, api_server = start_fake_vibe_api()
-    fake_codex = tmp / "fake_codex.py"
-    env_capture = tmp / "codex-env.json"
-    stdin_capture = tmp / "codex-stdin.md"
-    fake_codex.write_text(
-        "import json, os, pathlib, sys, time\n"
-        "args = sys.argv[1:]\n"
-        "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
-        "handoff = final.with_name('handoff.md')\n"
-        "handoff.write_text('# handoff\\n', encoding='utf-8')\n"
-        "final.write_text(f'RVF_HANDOFF_FILE: {handoff}\\n', encoding='utf-8')\n"
-        "stdin = sys.stdin.read()\n"
-        "pathlib.Path(os.environ['FAKE_CODEX_STDIN']).write_text(stdin, encoding='utf-8')\n"
-        "payload = {\n"
-        "    'argv': args,\n"
-        "    'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'),\n"
-        "    'run_id': os.environ.get('CODEX_RVF_RUN_ID'),\n"
-        "    'run_dir': os.environ.get('CODEX_RVF_RUN_DIR'),\n"
-        "    'parent_transcript': os.environ.get('CODEX_RVF_PARENT_TRANSCRIPT_PATH'),\n"
-        "    'fork_mode': os.environ.get('CODEX_RVF_FORK_MODE'),\n"
-        "    'session_manifest': os.environ.get('RVF_SESSION_MANIFEST'),\n"
-        "}\n"
-        "pathlib.Path(os.environ['FAKE_CODEX_ENV']).write_text(json.dumps(payload), encoding='utf-8')\n"
-        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_1', 'type': 'agent_message', 'text': 'reviewer inspecting scope'}}), flush=True)\n"
-        "print(json.dumps({'type': 'item.started', 'item': {'id': 'item_2', 'type': 'command_execution', 'command': '/bin/zsh -lc \"python3 -m py_compile file.py\"', 'status': 'in_progress', 'exit_code': None}}), flush=True)\n"
-        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_2', 'type': 'command_execution', 'command': '/bin/zsh -lc \"python3 -m py_compile file.py\"', 'status': 'completed', 'exit_code': 0}}), flush=True)\n"
-        "print('not-json-progress-line', flush=True)\n"
-        "time.sleep(0.05)\n"
-        "print(json.dumps({'type': 'item.completed', 'item': {'id': 'item_3', 'type': 'agent_message', 'text': f'RVF_HANDOFF_FILE: {handoff}'}}), flush=True)\n",
-        encoding="utf-8",
-    )
-    run_dir = tmp / "state" / "runs" / "rvf-test"
-    startup_prepare = tmp / "startup-prepare.json"
-    startup_prepare.write_text(
-        json.dumps(
-            {
-                "scope_of_work_file": str(run_dir / "artifacts" / "scope-of-work.md"),
-                "session_manifest_file": str(run_dir / "artifacts" / "session-manifest.json"),
-                "review_packet": str(run_dir / "artifacts" / "review-packet.md"),
-                "before_workspace_snapshot": str(run_dir / "artifacts" / "before-workspace-snapshot.json"),
-                "review_env_file": str(run_dir / "artifacts" / "review-env.sh"),
-                "review_agent_context_file": str(run_dir / "artifacts" / "review-agent-context.md"),
-            }
-        ),
-        encoding="utf-8",
-    )
-    env = os.environ.copy()
-    env["FAKE_CODEX_ENV"] = str(env_capture)
-    env["FAKE_CODEX_STDIN"] = str(stdin_capture)
-    env["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-    env["CODEX_RVF_RUN_DIR"] = str(tmp / "parent-run-dir")
-    env["RVF_SESSION_MANIFEST"] = str(tmp / "parent-session-manifest.json")
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(RUN_VIBE_KANBAN_RVF),
-                "--repo",
-                str(repo),
-                "--prompt-file",
-                str(prompt),
-                "--run-id",
-                "rvf-test",
-                "--run-dir",
-                str(run_dir),
-                "--parent-session-id",
-                "parent-thread",
-                "--parent-transcript-path",
-                str(transcript),
-                "--vibe-workspace-id",
-                "workspace-1",
-                "--backend-url",
-                backend_url,
-                "--codex-bin",
-                sys.executable,
-                "--codex-exec-args",
-                str(fake_codex),
-                "--startup-prepare-metadata",
-                str(startup_prepare),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-    finally:
-        api_server.shutdown()
-    assert completed.returncode == 0, completed.stderr
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "vibe-kanban-rvf-completed"
-    assert summary["returncode"] == 0
-    codex_env = json.loads(env_capture.read_text(encoding="utf-8"))
-    assert codex_env["suppress"] == "1"
-    assert codex_env["run_id"] == "rvf-test"
-    assert codex_env["run_dir"] == str(run_dir.resolve())
-    assert codex_env["parent_transcript"] == str(transcript.resolve())
-    assert codex_env["fork_mode"] is None
-    assert codex_env["session_manifest"] is None
-    codex_stdin = stdin_capture.read_text(encoding="utf-8")
-    assert "RVF_HEADLESS_REVIEW_VALIDATE_FIX" in codex_stdin
-    assert "Frozen startup artifacts captured before the headless runner was queued" in codex_stdin
-    assert "不要因 runner 排队后 worktree 变化而重新定义 review scope" in codex_stdin
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in codex_stdin
-    assert "original GUI fork prompt marker" in codex_stdin
-    assert str(transcript.resolve()) in codex_stdin
-    assert "--rvf-run-id rvf-test" in codex_stdin
-    assert f"--rvf-run-dir {run_dir.resolve()}" in codex_stdin
-    assert "prepare_review_run.py" in codex_stdin
-    assert (run_dir / "artifacts" / "codex-exec.prompt.md").read_text(encoding="utf-8") == codex_stdin
-    requests = api_state["requests"]
-    assert isinstance(requests, list)
-    workspace_updates = [request for request in requests if request["path"] == "/api/workspaces/workspace-1"]
-    assert [request["body"]["name"] for request in workspace_updates] == [
-        "RVF running: workspace workspace-1",
-        "RVF completed: workspace workspace-1",
-    ]
-    stdout_text = (run_dir / "artifacts" / "codex-exec.stdout.jsonl").read_text(encoding="utf-8")
-    assert "reviewer inspecting scope" in stdout_text
-    assert "not-json-progress-line" in stdout_text
-    scratch_updates = [request for request in requests if request["path"] == "/api/scratch/WORKSPACE_NOTES/workspace-1"]
-    scratch_texts = [request["body"]["payload"]["data"]["content"] for request in scratch_updates]
-    assert any("assistant: reviewer inspecting scope" in text for text in scratch_texts)
-    assert any("command started: python3 -m py_compile file.py" in text for text in scratch_texts)
-    assert any("command exited 0: python3 -m py_compile file.py" in text for text in scratch_texts)
-    assert not any("item.completed\n" in text or "- item.completed" in text for text in scratch_texts)
-    assert any("malformed stdout: not-json-progress-line" in text for text in scratch_texts)
-    assert any(
-        "next update:" in text
-        and "next update: disabled" not in text
-        and "next update: none (terminal)" not in text
-        for text in scratch_texts
-    )
-    assert "next update: none (terminal)" in scratch_texts[-1]
-    assert any("handoff.md:" in text and "stdout:" in text and "stderr:" in text for text in scratch_texts)
-
-
-def test_vibe_kanban_runner_can_disable_incremental_progress_updates(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    prompt = tmp / "prompt.txt"
-    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
-    backend_url, api_state, api_server = start_fake_vibe_api()
-    fake_codex = tmp / "fake_codex_progress_disabled.py"
-    fake_codex.write_text(
-        "import json, pathlib, sys\n"
-        "args = sys.argv[1:]\n"
-        "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
-        "sys.stdin.read()\n"
-        "print(json.dumps({'event': 'review started', 'message': 'disabled progress event'}), flush=True)\n"
-        "final.write_text('done\\n', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    run_dir = tmp / "state" / "runs" / "rvf-progress-disabled"
-    env = os.environ.copy()
-    env["CODEX_RVF_VK_PROGRESS_INTERVAL_SECONDS"] = "0"
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(RUN_VIBE_KANBAN_RVF),
-                "--repo",
-                str(repo),
-                "--prompt-file",
-                str(prompt),
-                "--run-id",
-                "rvf-progress-disabled",
-                "--run-dir",
-                str(run_dir),
-                "--parent-session-id",
-                "parent-thread",
-                "--vibe-workspace-id",
-                "workspace-1",
-                "--backend-url",
-                backend_url,
-                "--codex-bin",
-                sys.executable,
-                "--codex-exec-args",
-                str(fake_codex),
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
-    finally:
-        api_server.shutdown()
-    assert completed.returncode == 0, completed.stderr
-    requests = api_state["requests"]
-    assert isinstance(requests, list)
-    scratch_updates = [request for request in requests if request["path"] == "/api/scratch/WORKSPACE_NOTES/workspace-1"]
-    assert len(scratch_updates) == 2
-    assert "next update: disabled" in scratch_updates[0]["body"]["payload"]["data"]["content"]
-    assert "next update: none (terminal)" in scratch_updates[-1]["body"]["payload"]["data"]["content"]
-    assert "disabled progress event" in scratch_updates[-1]["body"]["payload"]["data"]["content"]
-
-
-def test_vibe_kanban_runner_progress_updates_remote_issue_description(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    prompt = tmp / "prompt.txt"
-    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
-    fake_server = write_fake_mcp_server(tmp / "fake_mcp_server.py")
-    calls = tmp / "calls.jsonl"
-    fake_codex = tmp / "fake_codex_remote_progress.py"
-    fake_codex.write_text(
-        "import json, pathlib, sys\n"
-        "args = sys.argv[1:]\n"
-        "final = pathlib.Path(args[args.index('--output-last-message') + 1])\n"
-        "sys.stdin.read()\n"
-        "print(json.dumps({'event': 'review started', 'message': 'remote reviewer event'}), flush=True)\n"
-        "final.write_text('done\\n', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    run_dir = tmp / "state" / "runs" / "rvf-remote-progress"
-    env = os.environ.copy()
-    env["FAKE_MCP_CALLS"] = str(calls)
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_VIBE_KANBAN_RVF),
-            "--repo",
-            str(repo),
-            "--prompt-file",
-            str(prompt),
-            "--run-id",
-            "rvf-remote-progress",
-            "--run-dir",
-            str(run_dir),
-            "--parent-session-id",
-            "parent-thread",
-            "--vibe-project-id",
-            "project-1",
-            "--vibe-issue-id",
-            "issue-1",
-            "--mcp-cmd",
-            f"{sys.executable} {fake_server}",
-            "--codex-bin",
-            sys.executable,
-            "--codex-exec-args",
-            str(fake_codex),
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    recorded = read_jsonl(calls)
-    issue_updates = [record for record in recorded if record["name"] == "update_issue"]
-    assert len(issue_updates) >= 3
-    descriptions = [record["arguments"]["description"] for record in issue_updates]
-    assert any("remote reviewer event" in description for description in descriptions)
-    assert issue_updates[0]["arguments"]["status"] == "In progress"
-    assert issue_updates[-1]["arguments"]["status"] == "Done"
-
-
-def test_vibe_kanban_runner_processes_buffered_stdout_events_before_exit(tmp: Path) -> None:
-    module = load_run_vibe_kanban_rvf_module()
-    repo = init_repo(tmp / "repo")
-    fake_codex = tmp / "fake_codex_buffered_stdout.py"
-    fake_codex.write_text(
-        "import json, sys, time\n"
-        "sys.stdin.read()\n"
-        "events = [\n"
-        "    {'event': 'review started', 'message': 'review event'},\n"
-        "    {'event': 'handoff ready', 'message': 'handoff event'},\n"
-        "]\n"
-        "sys.stdout.write(''.join(json.dumps(event) + '\\n' for event in events))\n"
-        "sys.stdout.flush()\n"
-        "time.sleep(0.8)\n",
-        encoding="utf-8",
-    )
-    progress = module.ProgressState(started_monotonic=time.monotonic())
-    updates: list[tuple[float, str]] = []
-    started = time.monotonic()
-
-    def progress_update() -> None:
-        updates.append((time.monotonic() - started, progress.snapshot()["current_activity"]))
-
-    completed = module.run_codex_exec_streaming(
-        command=[sys.executable, str(fake_codex)],
-        repo=repo,
-        prompt="prompt\n",
-        env=os.environ.copy(),
-        stdout_path=tmp / "stdout.jsonl",
-        stderr_path=tmp / "stderr.txt",
-        progress=progress,
-        progress_interval_seconds=30.0,
-        progress_update=progress_update,
-    )
-
-    assert completed.returncode == 0
-    assert any(elapsed < 0.5 and "handoff event" in activity for elapsed, activity in updates)
-    assert "handoff event" in (tmp / "stdout.jsonl").read_text(encoding="utf-8")
-
-
-def test_vibe_kanban_runner_failure_records_returncode(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    prompt = tmp / "prompt.txt"
-    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
-    fake_codex = tmp / "fake_codex_fail.py"
-    fake_codex.write_text(
-        "import sys\n"
-        "sys.stderr.write('codex failed\\n')\n"
-        "sys.exit(7)\n",
-        encoding="utf-8",
-    )
-    run_dir = tmp / "state" / "runs" / "rvf-fail"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_VIBE_KANBAN_RVF),
-            "--repo",
-            str(repo),
-            "--prompt-file",
-            str(prompt),
-            "--run-id",
-            "rvf-fail",
-            "--run-dir",
-            str(run_dir),
-            "--parent-session-id",
-            "parent-thread",
-            "--codex-bin",
-            sys.executable,
-            "--codex-exec-args",
-            str(fake_codex),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 7
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "vibe-kanban-rvf-failed"
-    assert summary["returncode"] == 7
-    assert "codex failed" in (run_dir / "artifacts" / "codex-exec.stderr.txt").read_text(encoding="utf-8")
-
-
-def test_vibe_kanban_runner_signal_records_cancelled(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    prompt = tmp / "prompt.txt"
-    prompt.write_text("$review-validate-fix\n", encoding="utf-8")
-    backend_url, api_state, api_server = start_fake_vibe_api()
-    fake_codex = tmp / "fake_codex_cancel.py"
-    fake_codex.write_text(
-        "import os, signal, sys\n"
-        "sys.stdin.read()\n"
-        "os.kill(os.getpid(), signal.SIGTERM)\n",
-        encoding="utf-8",
-    )
-    run_dir = tmp / "state" / "runs" / "rvf-cancel"
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(RUN_VIBE_KANBAN_RVF),
-                "--repo",
-                str(repo),
-                "--prompt-file",
-                str(prompt),
-                "--run-id",
-                "rvf-cancel",
-                "--run-dir",
-                str(run_dir),
-                "--parent-session-id",
-                "parent-thread",
-                "--vibe-workspace-id",
-                "workspace-1",
-                "--backend-url",
-                backend_url,
-                "--codex-bin",
-                sys.executable,
-                "--codex-exec-args",
-                str(fake_codex),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    finally:
-        api_server.shutdown()
-    assert completed.returncode != 0
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "vibe-kanban-rvf-cancelled"
-    assert summary["reason_code"] == "codex_exec_cancelled"
-    assert summary["returncode"] == -15
-    events = read_jsonl(run_dir / "events.jsonl")
-    assert any(event["event"] == "codex_exec_cancelled" for event in events)
-    requests = api_state["requests"]
-    assert isinstance(requests, list)
-    workspace_updates = [request for request in requests if request["path"] == "/api/workspaces/workspace-1"]
-    assert [request["body"]["name"] for request in workspace_updates] == [
-        "RVF running: workspace workspace-1",
-        "RVF cancelled: workspace workspace-1",
-    ]
-
-
-def test_cancel_rvf_run_marks_cancelled_and_updates_workspace(tmp: Path) -> None:
+def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp: Path) -> None:
     run_dir = tmp / "state" / "runs" / "rvf-user-cancel"
     run_dir.mkdir(parents=True)
-    backend_url, api_state, api_server = start_fake_vibe_api()
+    repo = init_repo(tmp / "repo")
+    fake_task = tmp / "fake_task.py"
+    calls = tmp / "trash-calls.jsonl"
+    fake_task.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'task_id': sys.argv[-1], 'status': 'trashed'}))\n",
+        encoding="utf-8",
+    )
     summary_path = run_dir / "summary.json"
     summary_path.write_text(
         json.dumps(
             {
                 "run_id": "rvf-user-cancel",
-                "status": "vibe-kanban-started",
-                "repo": str(tmp / "repo"),
-                "cwd": str(tmp / "repo"),
+                "status": "cline-kanban-started",
+                "repo": str(repo),
+                "cwd": str(repo),
                 "run_dir": str(run_dir),
-                "issue_title": "RVF test run",
-                "vibe_backend_url": backend_url,
-                "vibe_workspace_id": "workspace-1",
+                "cline_kanban_task_id": "task-1",
                 "runner_pid": 999999,
             }
         ),
         encoding="utf-8",
     )
-    try:
-        completed = run(
-            [
-                sys.executable,
-                str(CANCEL_RVF_RUN),
-                "--summary",
-                str(summary_path),
-                "--force-after",
-                "0",
-            ],
-        )
-    finally:
-        api_server.shutdown()
+    env = os.environ.copy()
+    env["KANBAN_CALLS"] = str(calls)
+    completed = run(
+        [
+            sys.executable,
+            str(CANCEL_RVF_RUN),
+            "--summary",
+            str(summary_path),
+            "--force-after",
+            "0",
+            "--task-cmd",
+            f"{sys.executable} {fake_task}",
+        ],
+        env=env,
+    )
     payload = json.loads(completed.stdout)
     assert payload["status"] == "cancelled"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["status"] == "vibe-kanban-rvf-cancelled"
+    assert summary["status"] == "cline-kanban-rvf-cancelled"
     assert summary["reason_code"] == "user_cancelled"
     events = read_jsonl(run_dir / "events.jsonl")
     assert any(event["event"] == "run_cancel_requested" for event in events)
     assert any(event["event"] == "run_cancelled" for event in events)
-    requests = api_state["requests"]
-    assert isinstance(requests, list)
-    workspace_updates = [request for request in requests if request["path"] == "/api/workspaces/workspace-1"]
-    assert workspace_updates[-1]["body"]["name"] == "RVF cancelled: RVF test run"
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded == [["trash", "--project-path", str(repo.resolve()), "--task-id", "task-1"]]
 
 
 def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> None:
@@ -2870,50 +2194,6 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
 
     assert 4242 not in candidates
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
-
-
-def test_vibe_kanban_local_api_bypasses_proxy_for_localhost() -> None:
-    module = load_vibe_kanban_client_module()
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        def __enter__(self) -> "FakeResponse":
-            return self
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            return None
-
-        def read(self) -> bytes:
-            return b'{"success": true, "data": {"ok": true}}'
-
-    class FakeOpener:
-        def open(self, request: object, timeout: int) -> FakeResponse:
-            captured["request"] = request
-            captured["timeout"] = timeout
-            return FakeResponse()
-
-    original_build_opener = module.urllib_request.build_opener
-    original_urlopen = module.urllib_request.urlopen
-    try:
-        def fake_build_opener(*handlers: object) -> FakeOpener:
-            captured["handlers"] = handlers
-            return FakeOpener()
-
-        module.urllib_request.build_opener = fake_build_opener
-        module.urllib_request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("urlopen should not be used for localhost API requests")
-        )
-        payload = module._api_request("http://127.0.0.1:12345", "GET", "/api/workspaces")
-    finally:
-        module.urllib_request.build_opener = original_build_opener
-        module.urllib_request.urlopen = original_urlopen
-
-    assert payload == {"success": True, "data": {"ok": True}}
-    handlers = captured["handlers"]
-    assert any(
-        handler.__class__.__name__ == "ProxyHandler" and getattr(handler, "proxies", None) == {}
-        for handler in handlers
-    )
 
 
 def main() -> int:
@@ -2955,28 +2235,14 @@ def main() -> int:
             root / "alternative-equals-text-config"
         )
         test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(root / "alternative-wrapper")
-        test_vibe_kanban_mcp_client_create_issue(root / "vibe-mcp-client")
-        test_vibe_kanban_mcp_client_maps_generic_issue_status(root / "vibe-status-map")
-        test_vibe_kanban_mcp_client_create_workspace_uses_local_api(root / "vibe-create-workspace")
-        test_vibe_kanban_mcp_client_update_workspace_uses_local_api(root / "vibe-update-workspace")
-        test_run_ledger_summary_preserves_vibe_management_fields(root / "summary-preserve-vibe")
-        test_vibe_kanban_mcp_client_parses_lsof_vibe_app_ports()
-        test_vibe_kanban_mcp_client_prefers_discovered_backend_url()
-        test_vibe_kanban_mcp_client_starts_local_app_when_probe_lacks_backend(root / "vibe-start-local")
-        test_vibe_kanban_mcp_client_ignores_stale_port_file(root / "vibe-stale-port")
-        test_vibe_kanban_mcp_client_surfaces_tool_errors(root / "vibe-tool-error")
-        test_vibe_kanban_mcp_client_times_out_when_initialize_hangs(root / "vibe-timeout")
-        test_vibe_kanban_mcp_client_resolves_project_from_repo(root / "vibe-resolve-project")
-        test_vibe_kanban_mcp_client_uses_single_project_fallback(root / "vibe-single-project")
-        test_vibe_kanban_runner_success_updates_summary_and_workspace(root / "vibe-runner-success")
-        test_vibe_kanban_runner_can_disable_incremental_progress_updates(root / "vibe-progress-disabled")
-        test_vibe_kanban_runner_progress_updates_remote_issue_description(root / "vibe-remote-progress")
-        test_vibe_kanban_runner_processes_buffered_stdout_events_before_exit(root / "vibe-buffered-progress")
-        test_vibe_kanban_runner_failure_records_returncode(root / "vibe-runner-failure")
-        test_vibe_kanban_runner_signal_records_cancelled(root / "vibe-runner-cancel")
-        test_cancel_rvf_run_marks_cancelled_and_updates_workspace(root / "cancel-rvf-run")
+        test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client")
+        test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap")
+        test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(root / "prepare-symlink-state")
+        test_apply_worktree_bootstrap_replays_tracked_and_untracked(root / "apply-bootstrap")
+        test_apply_worktree_bootstrap_rejects_mismatched_base_ref(root / "apply-bootstrap-base-ref")
+        test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline")
+        test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(root / "cancel-rvf-run")
         test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command()
-        test_vibe_kanban_local_api_bypasses_proxy_for_localhost()
     print("review support script tests OK")
     return 0
 

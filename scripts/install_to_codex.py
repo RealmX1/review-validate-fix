@@ -177,17 +177,28 @@ def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
     return cache_dir
 
 
+def normalize_fork_mode(value: str) -> str:
+    mode = (value or "gui").strip()
+    if mode in {"cline", "kanban", "ck"}:
+        return "cline-kanban"
+    return mode
+
+
 def configure_stop_hook(
     plugin_skill_dir: Path,
     fork_mode: str = "gui",
-    vibe_kanban_project_id: str | None = None,
-    vibe_kanban_mcp_cmd: str | None = None,
-    vibe_kanban_start_cmd: str | None = None,
-    vibe_kanban_backend_url: str | None = None,
-    vibe_kanban_management_mode: str | None = None,
+    cline_kanban_start_cmd: str | None = None,
+    cline_kanban_task_cmd: str | None = None,
+    cline_kanban_start_timeout: str | None = None,
+    cline_kanban_tmux_session: str | None = None,
+    cline_kanban_base_ref: str | None = None,
+    cline_kanban_auto_review_enabled: str | None = None,
+    cline_kanban_auto_review_mode: str | None = None,
+    cline_kanban_start_in_plan_mode: str | None = None,
     open_handoff: bool = True,
     ide_open_cmd: str | None = None,
 ) -> Path:
+    fork_mode = normalize_fork_mode(fork_mode)
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     if hooks_path.exists():
@@ -207,19 +218,16 @@ def configure_stop_hook(
     ide_open_text = (ide_open_cmd or "").strip()
     if ide_open_text:
         env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
-    if fork_mode == "vibe-kanban":
-        management_mode = (vibe_kanban_management_mode or "").strip()
-        if management_mode:
-            env_parts.append(f"CODEX_RVF_VK_MANAGEMENT_MODE={shlex.quote(management_mode)}")
-        project_id = (vibe_kanban_project_id or "").strip()
-        if project_id:
-            env_parts.append(f"CODEX_RVF_VK_PROJECT_ID={shlex.quote(project_id)}")
-        else:
-            env_parts.append("CODEX_RVF_VK_PROJECT_AUTO=1")
+    if fork_mode == "cline-kanban":
         for name, value in (
-            ("CODEX_RVF_VK_MCP_CMD", vibe_kanban_mcp_cmd),
-            ("CODEX_RVF_VK_START_CMD", vibe_kanban_start_cmd),
-            ("CODEX_RVF_VK_BACKEND_URL", vibe_kanban_backend_url),
+            ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
+            ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", cline_kanban_task_cmd),
+            ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", cline_kanban_start_timeout),
+            ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", cline_kanban_tmux_session),
+            ("CODEX_RVF_CLINE_KANBAN_BASE_REF", cline_kanban_base_ref),
+            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED", cline_kanban_auto_review_enabled),
+            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", cline_kanban_auto_review_mode),
+            ("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE", cline_kanban_start_in_plan_mode),
         ):
             text = (value or "").strip()
             if text:
@@ -302,40 +310,50 @@ def main() -> int:
     )
     parser.add_argument(
         "--fork-mode",
-        choices=["gui", "vibe-kanban", "manual", "dry-run"],
+        choices=["gui", "cline-kanban", "cline", "kanban", "ck", "manual", "dry-run"],
         default="gui",
         help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 gui。",
     )
     parser.add_argument(
-        "--vibe-kanban-project-id",
+        "--cline-kanban-start-cmd",
         default=None,
-        help=(
-            "与 --configure-stop-hook --fork-mode vibe-kanban 配合使用；"
-            "也可用 CODEX_RVF_VK_PROJECT_ID 提供。未提供时 Stop hook 会自动匹配或创建项目。"
-        ),
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_START_CMD；默认 npx -y kanban@0.1.66 --no-open。",
     )
     parser.add_argument(
-        "--vibe-kanban-mcp-cmd",
+        "--cline-kanban-task-cmd",
         default=None,
-        help="持久写入 CODEX_RVF_VK_MCP_CMD；用于固定 npx 版本或连接 self-host 本地 Cloud。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_TASK_CMD；默认 npx -y kanban@0.1.66 task。",
     )
     parser.add_argument(
-        "--vibe-kanban-start-cmd",
+        "--cline-kanban-start-timeout",
         default=None,
-        help="持久写入 CODEX_RVF_VK_START_CMD；用于通过 tmux 启动带自定义 env 的 Vibe-Kanban。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_START_TIMEOUT；默认 90。",
     )
     parser.add_argument(
-        "--vibe-kanban-backend-url",
+        "--cline-kanban-tmux-session",
         default=None,
-        help="持久写入 CODEX_RVF_VK_BACKEND_URL；用于固定已有 Vibe-Kanban app backend。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_TMUX_SESSION；默认 rvf-cline-kanban。",
     )
     parser.add_argument(
-        "--vibe-kanban-management-mode",
+        "--cline-kanban-base-ref",
         default=None,
-        help=(
-            "持久写入 CODEX_RVF_VK_MANAGEMENT_MODE；未提供时保持 hook 默认 local-workspace，"
-            "显式 remote-project 会保留旧 project/issue fallback。"
-        ),
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_BASE_REF；未提供时 Stop hook 使用当前 HEAD。",
+    )
+    parser.add_argument(
+        "--cline-kanban-auto-review-enabled",
+        default=None,
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED；默认 0。",
+    )
+    parser.add_argument(
+        "--cline-kanban-auto-review-mode",
+        choices=["commit", "pr", "move_to_trash"],
+        default=None,
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE；仅 auto-review enabled 时传给 Kanban。",
+    )
+    parser.add_argument(
+        "--cline-kanban-start-in-plan-mode",
+        default=None,
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE；默认 0。",
     )
     parser.add_argument(
         "--no-open-handoff",
@@ -367,12 +385,14 @@ def main() -> int:
             hooks_path = configure_stop_hook(
                 dst / PLUGIN_SKILL_REL,
                 args.fork_mode,
-                args.vibe_kanban_project_id or os.environ.get("CODEX_RVF_VK_PROJECT_ID"),
-                args.vibe_kanban_mcp_cmd or os.environ.get("CODEX_RVF_VK_MCP_CMD"),
-                args.vibe_kanban_start_cmd or os.environ.get("CODEX_RVF_VK_START_CMD"),
-                args.vibe_kanban_backend_url or os.environ.get("CODEX_RVF_VK_BACKEND_URL"),
-                args.vibe_kanban_management_mode
-                or os.environ.get("CODEX_RVF_VK_MANAGEMENT_MODE"),
+                args.cline_kanban_start_cmd or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD"),
+                args.cline_kanban_task_cmd or os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD"),
+                args.cline_kanban_start_timeout or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT"),
+                args.cline_kanban_tmux_session or os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION"),
+                args.cline_kanban_base_ref or os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"),
+                args.cline_kanban_auto_review_enabled or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"),
+                args.cline_kanban_auto_review_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE"),
+                args.cline_kanban_start_in_plan_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"),
                 not args.no_open_handoff
                 and os.environ.get("CODEX_RVF_OPEN_HANDOFF", "").strip().lower()
                 not in {"0", "false", "no", "n", "off", "disabled"},

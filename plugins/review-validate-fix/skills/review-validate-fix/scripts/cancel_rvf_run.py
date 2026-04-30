@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root
-from vibe_kanban_mcp_client import DEFAULT_MCP_CMD, update_issue, update_local_workspace
+from cline_kanban_client import DEFAULT_TASK_CMD, trash_task
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
@@ -89,7 +89,8 @@ def command_matches_run(run_id: str, command: str) -> bool:
     if run_id not in command:
         return False
     return (
-        "run_vibe_kanban_rvf.py" in command
+        "cline_kanban_client.py" in command
+        or "apply_worktree_bootstrap.py" in command
         or "codex" in command
         or "review-validate-fix" in command
     )
@@ -179,20 +180,6 @@ def cancellation_description(
     return "\n".join(lines)
 
 
-def summary_title(summary: dict[str, Any]) -> str | None:
-    direct = str(summary.get("issue_title") or "").strip()
-    if direct:
-        return direct
-    command = summary.get("runner_command")
-    if isinstance(command, list):
-        for index, value in enumerate(command):
-            if value == "--issue-title" and index + 1 < len(command):
-                title = str(command[index + 1]).strip()
-                if title:
-                    return title
-    return None
-
-
 def update_management_record(
     *,
     ledger: RunLedger,
@@ -203,56 +190,23 @@ def update_management_record(
     cancelled_pids: list[int],
     still_running_pids: list[int],
 ) -> None:
-    description = cancellation_description(
-        summary=summary,
-        run_id=run_id,
-        run_dir=run_dir,
-        cancelled_pids=cancelled_pids,
-        still_running_pids=still_running_pids,
-    )
-    title = summary_title(summary)
-    backend_url = args.backend_url or summary.get("vibe_backend_url")
-    workspace_id = summary.get("vibe_workspace_id")
-    if isinstance(backend_url, str) and isinstance(workspace_id, str) and workspace_id.strip():
+    del cancelled_pids, still_running_pids
+    task_id = summary.get("cline_kanban_task_id")
+    repo = summary.get("repo") or summary.get("cwd") or summary.get("workspace_path")
+    if isinstance(task_id, str) and task_id.strip() and isinstance(repo, str) and repo.strip():
         try:
-            payload = update_local_workspace(
-                backend_url=backend_url,
-                workspace_id=workspace_id,
-                title=title,
-                description=description,
-                status="cancelled",
+            payload = trash_task(
+                task_cmd=args.task_cmd,
+                repo=Path(repo).expanduser().resolve(),
+                task_id=task_id,
             )
-            ledger.artifact("vibe-kanban-workspace-cancelled.json", payload, unique=True)
+            ledger.artifact("cline-kanban-task-cancelled.json", payload, unique=True)
         except Exception as exc:
             ledger.event(
                 phase="fork",
-                event="vibe_kanban_workspace_update_failed",
+                event="cline_kanban_task_trash_failed",
                 status="warn",
-                reason_code="vibe_kanban_workspace_update_failed",
-                level="warn",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-
-    project_id = summary.get("vibe_project_id")
-    issue_id = summary.get("vibe_issue_id")
-    if isinstance(project_id, str) and isinstance(issue_id, str) and issue_id.strip():
-        try:
-            payload = update_issue(
-                mcp_cmd=args.mcp_cmd,
-                backend_url=backend_url if isinstance(backend_url, str) else None,
-                project_id=project_id,
-                issue_id=issue_id,
-                title=title,
-                description=description,
-                status="cancelled",
-            )
-            ledger.artifact("vibe-kanban-issue-cancelled.json", payload, unique=True)
-        except Exception as exc:
-            ledger.event(
-                phase="fork",
-                event="vibe_kanban_issue_update_failed",
-                status="warn",
-                reason_code="vibe_kanban_issue_update_failed",
+                reason_code="cline_kanban_task_trash_failed",
                 level="warn",
                 error=f"{type(exc).__name__}: {exc}",
             )
@@ -262,7 +216,7 @@ def cancel_run(args: argparse.Namespace) -> dict[str, Any]:
     run_id, run_dir, summary = resolve_run(args)
     repo = summary.get("repo") or summary.get("cwd")
     ledger = RunLedger(
-        component="vibe-kanban-runner",
+        component="cline-kanban",
         repo=repo if isinstance(repo, str) else None,
         cwd=repo if isinstance(repo, str) else None,
         run_id=run_id,
@@ -310,7 +264,7 @@ def cancel_run(args: argparse.Namespace) -> dict[str, Any]:
             signals_sent=signals_sent,
         )
         ledger.summary(
-            status="vibe-kanban-rvf-cancelled",
+            status="cline-kanban-rvf-cancelled",
             reason_code="user_cancelled",
             message="RVF run cancelled by user request.",
             repo=repo if isinstance(repo, str) else None,
@@ -340,13 +294,12 @@ def cancel_run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="取消 Vibe-Kanban/headless RVF run，并把状态标为 cancelled。")
+    parser = argparse.ArgumentParser(description="取消 Cline Kanban RVF run，并把状态标为 cancelled。")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--run-id")
     group.add_argument("--run-dir")
     group.add_argument("--summary")
-    parser.add_argument("--mcp-cmd", default=os.environ.get("CODEX_RVF_VK_MCP_CMD", DEFAULT_MCP_CMD))
-    parser.add_argument("--backend-url", default=os.environ.get("CODEX_RVF_VK_BACKEND_URL") or os.environ.get("VIBE_BACKEND_URL"))
+    parser.add_argument("--task-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_TASK_CMD))
     parser.add_argument("--force-after", type=float, default=5.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

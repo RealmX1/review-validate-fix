@@ -405,14 +405,7 @@ def _command_targets_current_dispatcher(command: str) -> bool:
 
 
 def _merged_hook_config(hook_env: dict[str, str]) -> dict[str, str]:
-    config = dict(hook_env)
-    auto = config.get("CODEX_RVF_VK_PROJECT_AUTO")
-    project_id = config.get("CODEX_RVF_VK_PROJECT_ID", "").strip()
-    if auto is not None and is_truthy(auto):
-        config.pop("CODEX_RVF_VK_PROJECT_ID", None)
-    elif project_id:
-        config.pop("CODEX_RVF_VK_PROJECT_AUTO", None)
-    return config
+    return dict(hook_env)
 
 
 def hook_config_from_hooks_json() -> dict[str, str]:
@@ -446,7 +439,7 @@ def installer_args_from_env() -> list[str]:
     args = ["--configure-stop-hook"]
     # Codex Desktop may invoke a cached hook command after hooks.json has been
     # updated. Prefer the on-disk RVF hook config so dev self-sync does not roll
-    # a newer vibe-kanban hook back to stale gui mode.
+    # a newer Cline Kanban hook back to stale gui mode.
     hook_env = hook_config_from_hooks_json()
     fork_mode = (
         hook_env.get("CODEX_RVF_FORK_MODE")
@@ -468,30 +461,19 @@ def installer_args_from_env() -> list[str]:
         args.extend(["--ide-open-cmd", ide_open_cmd])
     if not fork_mode:
         return args
+    if fork_mode in {"cline", "kanban", "ck"}:
+        fork_mode = "cline-kanban"
     args.extend(["--fork-mode", fork_mode])
-    if fork_mode == "vibe-kanban":
-        hook_auto = hook_env.get("CODEX_RVF_VK_PROJECT_AUTO")
-        env_auto = os.environ.get("CODEX_RVF_VK_PROJECT_AUTO")
-        use_auto = (
-            hook_auto is not None
-            and is_truthy(hook_auto)
-            or hook_auto is None
-            and is_truthy(env_auto)
-        )
-        if not use_auto:
-            project_id = (
-                hook_env.get("CODEX_RVF_VK_PROJECT_ID")
-                or os.environ.get("CODEX_RVF_VK_PROJECT_ID", "")
-            ).strip()
-        else:
-            project_id = ""
-        if project_id:
-            args.extend(["--vibe-kanban-project-id", project_id])
+    if fork_mode == "cline-kanban":
         for env_name, option in (
-            ("CODEX_RVF_VK_MANAGEMENT_MODE", "--vibe-kanban-management-mode"),
-            ("CODEX_RVF_VK_MCP_CMD", "--vibe-kanban-mcp-cmd"),
-            ("CODEX_RVF_VK_START_CMD", "--vibe-kanban-start-cmd"),
-            ("CODEX_RVF_VK_BACKEND_URL", "--vibe-kanban-backend-url"),
+            ("CODEX_RVF_CLINE_KANBAN_START_CMD", "--cline-kanban-start-cmd"),
+            ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", "--cline-kanban-task-cmd"),
+            ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", "--cline-kanban-start-timeout"),
+            ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", "--cline-kanban-tmux-session"),
+            ("CODEX_RVF_CLINE_KANBAN_BASE_REF", "--cline-kanban-base-ref"),
+            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED", "--cline-kanban-auto-review-enabled"),
+            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "--cline-kanban-auto-review-mode"),
+            ("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE", "--cline-kanban-start-in-plan-mode"),
         ):
             value = (hook_env.get(env_name) or os.environ.get(env_name, "")).strip()
             if value:
@@ -659,11 +641,6 @@ def installed_hook_env(ledger: RunLedger | None) -> dict[str, str]:
     env = os.environ.copy()
     hook_env = hook_config_from_hooks_json()
     env.update(hook_env)
-    auto = env.get("CODEX_RVF_VK_PROJECT_AUTO")
-    if auto is not None and is_truthy(auto):
-        env.pop("CODEX_RVF_VK_PROJECT_ID", None)
-    elif env.get("CODEX_RVF_VK_PROJECT_ID", "").strip():
-        env.pop("CODEX_RVF_VK_PROJECT_AUTO", None)
     if ledger is not None:
         env.update(ledger.env())
     return env

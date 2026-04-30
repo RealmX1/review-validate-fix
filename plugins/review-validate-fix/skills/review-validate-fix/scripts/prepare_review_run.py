@@ -65,6 +65,7 @@ def review_env_exports(
     packet_path: Path,
     metadata_path: Path,
     snapshot_path: Path,
+    bootstrap_metadata_path: Path | None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
         "RVF_REPO": str(repo),
@@ -76,6 +77,8 @@ def review_env_exports(
         "RVF_BEFORE_WORKSPACE_SNAPSHOT": str(snapshot_path),
         "RVF_COMMAND_LOCK": str(COMMAND_LOCK),
     }
+    if bootstrap_metadata_path is not None:
+        env["RVF_WORKTREE_BOOTSTRAP"] = str(bootstrap_metadata_path)
     if scope_of_work_path is not None:
         env["RVF_SCOPE_OF_WORK"] = str(scope_of_work_path)
         env["RVF_SESSION_CONTEXT"] = str(scope_of_work_path)
@@ -102,6 +105,7 @@ def review_env_exports(
             'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"',
             'export RVF_REVIEW_PACKET_METADATA="$RVF_ARTIFACTS_DIR/review-packet.metadata.json"',
             'export RVF_BEFORE_WORKSPACE_SNAPSHOT="$RVF_ARTIFACTS_DIR/before-workspace-snapshot.json"',
+            'export RVF_WORKTREE_BOOTSTRAP="$RVF_ARTIFACTS_DIR/worktree-bootstrap.json"',
             f"export RVF_COMMAND_LOCK={shlex.quote(env['RVF_COMMAND_LOCK'])}",
             "",
         ]
@@ -144,6 +148,101 @@ def review_agent_context_text(
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def run_git(repo: Path, args: list[str], *, text: bool = True) -> str | bytes:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=text,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr if text else completed.stderr.decode("utf-8", "replace")
+        stdout = completed.stdout if text else completed.stdout.decode("utf-8", "replace")
+        raise RuntimeError(stderr.strip() or stdout.strip() or f"git {' '.join(args)} failed")
+    return completed.stdout
+
+
+def is_tracked_path(repo: Path, rel_path: str) -> bool:
+    completed = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", rel_path],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0
+
+
+def safe_stored_name(rel_path: str) -> str:
+    return rel_path.replace("/", "__").replace("\\", "__")
+
+
+def copy_bootstrap_path(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir() and not source.is_symlink():
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
+    else:
+        shutil.copy2(source, target)
+
+
+def build_worktree_bootstrap(
+    *,
+    repo: Path,
+    artifact_dir: Path,
+    packet_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    owned_dirty = [
+        path
+        for path in packet_metadata.get("session_owned_dirty_paths", [])
+        if isinstance(path, str) and path.strip()
+    ]
+    patch_path = artifact_dir / "worktree-bootstrap.patch"
+    files_dir = artifact_dir / "worktree-bootstrap-files"
+    bootstrap_path = artifact_dir / "worktree-bootstrap.json"
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    tracked_paths = [path for path in owned_dirty if is_tracked_path(repo, path)]
+    patch_text = ""
+    if tracked_paths:
+        diff_output = run_git(repo, ["diff", "--binary", "--find-renames", "HEAD", "--", *tracked_paths])
+        patch_text = diff_output if isinstance(diff_output, str) else diff_output.decode("utf-8", "replace")
+    patch_path.write_text(patch_text, encoding="utf-8")
+
+    untracked_files: list[dict[str, str]] = []
+    for rel_path in owned_dirty:
+        if rel_path in tracked_paths:
+            continue
+        source = repo / rel_path
+        if not source.exists() and not source.is_symlink():
+            continue
+        stored_name = safe_stored_name(rel_path)
+        stored_path = files_dir / stored_name
+        copy_bootstrap_path(source, stored_path)
+        untracked_files.append({"path": rel_path, "stored_path": str(stored_path)})
+
+    head = str(run_git(repo, ["rev-parse", "HEAD"])).strip()
+    payload = {
+        "repo": str(repo),
+        "base_ref": head,
+        "patch_file": str(patch_path),
+        "files_dir": str(files_dir),
+        "owned_dirty_paths": owned_dirty,
+        "tracked_paths": tracked_paths,
+        "untracked_files": untracked_files,
+        "apply_helper": str(SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"),
+    }
+    bootstrap_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "metadata": payload,
+        "metadata_path": bootstrap_path,
+        "patch_path": patch_path,
+        "files_dir": files_dir,
+    }
 
 
 def prepare_run(
@@ -262,8 +361,13 @@ def prepare_run(
     )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    scope_path = scope_of_work_path if session_context is not None else None
-    manifest_path = session_manifest_path if packet_session_manifest is not None else None
+    bootstrap = build_worktree_bootstrap(
+        repo=root,
+        artifact_dir=artifact_dir,
+        packet_metadata=metadata,
+    )
+    scope_path = scope_of_work_path.resolve() if session_context is not None else None
+    manifest_path = session_manifest_path.resolve() if packet_session_manifest is not None else None
     review_env, review_env_text = review_env_exports(
         repo=root,
         run_id=ledger.run_id,
@@ -274,6 +378,7 @@ def prepare_run(
         packet_path=packet_path,
         metadata_path=metadata_path,
         snapshot_path=snapshot_path,
+        bootstrap_metadata_path=bootstrap["metadata_path"],
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
     review_agent_context = review_agent_context_text(
@@ -294,8 +399,12 @@ def prepare_run(
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
-        "scope_of_work_file": str(scope_of_work_path) if session_context is not None else None,
-        "session_manifest_file": str(session_manifest_path) if packet_session_manifest is not None else None,
+        "worktree_bootstrap": str(bootstrap["metadata_path"]),
+        "worktree_bootstrap_patch": str(bootstrap["patch_path"]),
+        "worktree_bootstrap_files_dir": str(bootstrap["files_dir"]),
+        "worktree_bootstrap_metadata": bootstrap["metadata"],
+        "scope_of_work_file": str(scope_path) if scope_path is not None else None,
+        "session_manifest_file": str(manifest_path) if manifest_path is not None else None,
         "review_env_file": str(review_env_path),
         "review_env": review_env,
         "review_agent_context_file": str(review_agent_context_path),
@@ -306,10 +415,10 @@ def prepare_run(
         "untracked_count": metadata.get("untracked_count"),
         "inlined_untracked_count": metadata.get("inlined_untracked_count"),
         "omitted_untracked_count": metadata.get("omitted_untracked_count"),
-        "session_context": str(scope_of_work_path) if session_context is not None else None,
+        "session_context": str(scope_path) if scope_path is not None else None,
         "session_context_provided": metadata.get("session_context_provided"),
         "session_context_bytes": metadata.get("session_context_bytes"),
-        "session_manifest": str(session_manifest_path) if packet_session_manifest is not None else None,
+        "session_manifest": str(manifest_path) if manifest_path is not None else None,
         "session_manifest_provided": metadata.get("session_manifest_provided"),
         "session_owned_path_count": metadata.get("session_owned_path_count"),
         "unattributed_dirty_paths": metadata.get("unattributed_dirty_paths"),
@@ -328,6 +437,7 @@ def prepare_run(
             "review_packet": str(packet_path),
             "metadata": str(metadata_path),
             "snapshot": str(snapshot_path),
+            "worktree_bootstrap": str(bootstrap["metadata_path"]),
             "scope_of_work": str(scope_of_work_path) if session_context is not None else None,
             "session_manifest": str(session_manifest_path) if packet_session_manifest is not None else None,
             "review_env": str(review_env_path),

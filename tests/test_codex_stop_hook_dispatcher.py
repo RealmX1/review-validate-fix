@@ -261,9 +261,14 @@ def invoke_result(
         "CODEX_RVF_FORK_MODE",
         "CODEX_RVF_RUN_DIR",
         "CODEX_RVF_RUN_ID",
-        "CODEX_RVF_VK_PROJECT_AUTO",
-        "CODEX_RVF_VK_PROJECT_ID",
-        "CODEX_RVF_VK_MANAGEMENT_MODE",
+        "CODEX_RVF_CLINE_KANBAN_START_CMD",
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+        "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT",
+        "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION",
+        "CODEX_RVF_CLINE_KANBAN_BASE_REF",
+        "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED",
+        "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE",
+        "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE",
         "CODEX_RVF_SUPPRESS",
         "CODEX_RVF_SUPPRESS_STOP_HOOK",
         "CODEX_RVF_OPEN_HANDOFF",
@@ -897,7 +902,7 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
     assert marker.exists()
 
 
-def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
+def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
@@ -911,12 +916,15 @@ def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
         hook=hook,
         state=tmp_path / "state",
         extra_env={
-            "CODEX_RVF_FORK_MODE": "vibe-kanban",
-            "CODEX_RVF_VK_MANAGEMENT_MODE": "remote-project",
-            "CODEX_RVF_VK_PROJECT_ID": "project-abc",
-            "CODEX_RVF_VK_MCP_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp",
-            "CODEX_RVF_VK_START_CMD": "env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44",
-            "CODEX_RVF_VK_BACKEND_URL": "http://127.0.0.1:50280",
+            "CODEX_RVF_FORK_MODE": "cline-kanban",
+            "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+            "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT": "120",
+            "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION": "rvf-test-kanban",
+            "CODEX_RVF_CLINE_KANBAN_BASE_REF": "main",
+            "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED": "1",
+            "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE": "commit",
+            "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE": "1",
             "CODEX_RVF_OPEN_HANDOFF": "0",
             "CODEX_RVF_IDE_OPEN_CMD": "code -r",
         },
@@ -926,12 +934,15 @@ def test_dev_sync_preserves_vibe_kanban_installer_args(tmp_path: Path) -> None:
     assert payload["systemMessage"] == "real hook ran"
     install_args = (marker / "install-ran").read_text(encoding="utf-8")
     assert "--configure-stop-hook" in install_args
-    assert "--fork-mode vibe-kanban" in install_args
-    assert "--vibe-kanban-management-mode remote-project" in install_args
-    assert "--vibe-kanban-project-id project-abc" in install_args
-    assert "--vibe-kanban-mcp-cmd" in install_args
-    assert "--vibe-kanban-start-cmd" in install_args
-    assert "--vibe-kanban-backend-url http://127.0.0.1:50280" in install_args
+    assert "--fork-mode cline-kanban" in install_args
+    assert "--cline-kanban-start-cmd" in install_args
+    assert "--cline-kanban-task-cmd" in install_args
+    assert "--cline-kanban-start-timeout 120" in install_args
+    assert "--cline-kanban-tmux-session rvf-test-kanban" in install_args
+    assert "--cline-kanban-base-ref main" in install_args
+    assert "--cline-kanban-auto-review-enabled 1" in install_args
+    assert "--cline-kanban-auto-review-mode commit" in install_args
+    assert "--cline-kanban-start-in-plan-mode 1" in install_args
     assert "--no-open-handoff" in install_args
     assert "--ide-open-cmd code -r" in install_args
 
@@ -957,10 +968,10 @@ def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> No
                                     "type": "command",
                                     "command": (
                                         "CODEX_RVF_MODE=fork "
-                                        "CODEX_RVF_FORK_MODE=vibe-kanban "
-                                        "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project "
-                                        "CODEX_RVF_VK_PROJECT_AUTO=1 "
-                                        "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280 "
+                                        "CODEX_RVF_FORK_MODE=cline-kanban "
+                                        "CODEX_RVF_CLINE_KANBAN_START_CMD='npx -y kanban@0.1.66 --no-open' "
+                                        "CODEX_RVF_CLINE_KANBAN_TASK_CMD='npx -y kanban@0.1.66 task' "
+                                        "CODEX_RVF_CLINE_KANBAN_BASE_REF=main "
                                         f"python3 {SCRIPT}"
                                     ),
                                 }
@@ -982,7 +993,7 @@ def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> No
         extra_env={
             "HOME": str(home),
             "CODEX_RVF_FORK_MODE": "gui",
-            "CODEX_RVF_VK_PROJECT_ID": "stale-project",
+            "CODEX_RVF_CLINE_KANBAN_BASE_REF": "stale-branch",
         },
     )
 
@@ -990,11 +1001,11 @@ def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> No
     assert payload["systemMessage"] == "real hook ran"
     install_args = (marker / "install-ran").read_text(encoding="utf-8")
     assert "--configure-stop-hook" in install_args
-    assert "--fork-mode vibe-kanban" in install_args
-    assert "--vibe-kanban-management-mode remote-project" in install_args
-    assert "--vibe-kanban-project-id" not in install_args
-    assert "--vibe-kanban-backend-url http://127.0.0.1:50280" in install_args
-    assert "stale-project" not in install_args
+    assert "--fork-mode cline-kanban" in install_args
+    assert "--cline-kanban-start-cmd" in install_args
+    assert "--cline-kanban-task-cmd" in install_args
+    assert "--cline-kanban-base-ref main" in install_args
+    assert "stale-branch" not in install_args
 
 
 def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path: Path) -> None:
@@ -1006,7 +1017,7 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
     hook.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, pathlib, sys\n"
-        f"pathlib.Path({str(marker / 'hook-env.json')!r}).write_text(json.dumps({{'mode': os.environ.get('CODEX_RVF_FORK_MODE'), 'management_mode': os.environ.get('CODEX_RVF_VK_MANAGEMENT_MODE'), 'auto': os.environ.get('CODEX_RVF_VK_PROJECT_AUTO'), 'project_id': os.environ.get('CODEX_RVF_VK_PROJECT_ID'), 'backend': os.environ.get('CODEX_RVF_VK_BACKEND_URL')}}), encoding='utf-8')\n"
+        f"pathlib.Path({str(marker / 'hook-env.json')!r}).write_text(json.dumps({{'mode': os.environ.get('CODEX_RVF_FORK_MODE'), 'start_cmd': os.environ.get('CODEX_RVF_CLINE_KANBAN_START_CMD'), 'task_cmd': os.environ.get('CODEX_RVF_CLINE_KANBAN_TASK_CMD'), 'base_ref': os.environ.get('CODEX_RVF_CLINE_KANBAN_BASE_REF')}}), encoding='utf-8')\n"
         "print(json.dumps({'continue': True, 'systemMessage': 'real hook ran'}))\n",
         encoding="utf-8",
     )
@@ -1024,10 +1035,10 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
                                     "type": "command",
                                     "command": (
                                         "CODEX_RVF_MODE=fork "
-                                        "CODEX_RVF_FORK_MODE=vibe-kanban "
-                                        "CODEX_RVF_VK_MANAGEMENT_MODE=remote-project "
-                                        "CODEX_RVF_VK_PROJECT_AUTO=1 "
-                                        "CODEX_RVF_VK_BACKEND_URL=http://127.0.0.1:50280 "
+                                        "CODEX_RVF_FORK_MODE=cline-kanban "
+                                        "CODEX_RVF_CLINE_KANBAN_START_CMD='npx -y kanban@0.1.66 --no-open' "
+                                        "CODEX_RVF_CLINE_KANBAN_TASK_CMD='npx -y kanban@0.1.66 task' "
+                                        "CODEX_RVF_CLINE_KANBAN_BASE_REF=main "
                                         f"python3 {SCRIPT}"
                                     ),
                                 }
@@ -1049,7 +1060,7 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
         extra_env={
             "HOME": str(home),
             "CODEX_RVF_FORK_MODE": "gui",
-            "CODEX_RVF_VK_PROJECT_ID": "stale-project",
+            "CODEX_RVF_CLINE_KANBAN_BASE_REF": "stale-branch",
         },
     )
 
@@ -1057,11 +1068,10 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
     assert payload["systemMessage"] == "real hook ran"
     hook_env = json.loads((marker / "hook-env.json").read_text(encoding="utf-8"))
     assert hook_env == {
-        "mode": "vibe-kanban",
-        "management_mode": "remote-project",
-        "auto": "1",
-        "project_id": None,
-        "backend": "http://127.0.0.1:50280",
+        "mode": "cline-kanban",
+        "start_cmd": "npx -y kanban@0.1.66 --no-open",
+        "task_cmd": "npx -y kanban@0.1.66 task",
+        "base_ref": "main",
     }
 
 
@@ -1088,7 +1098,7 @@ def main() -> int:
         test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
-        test_dev_sync_preserves_vibe_kanban_installer_args,
+        test_dev_sync_preserves_cline_kanban_installer_args,
         test_dev_sync_prefers_hooks_json_over_stale_cached_env,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]

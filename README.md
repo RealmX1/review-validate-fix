@@ -76,25 +76,32 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=gui` 调用 installed plugin skill 的稳定 dispatcher，并由 dispatcher 在必要检查和安装后转交给 `scripts/codex_stop_review_validate_fix.py`。该模式不会打开 Terminal；正常情况下它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。这样父会话保留为可 rewind 的稳定 checkpoint。如果 Codex Desktop control socket 不可用，则默认只报告无法创建 GUI fork，不再回退到 Stop continuation。
 
-如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Vibe-Kanban 管理模式：
+如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Cline Kanban 模式：
 
 ```bash
-python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode vibe-kanban
+python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode cline-kanban
 ```
 
-默认 `CODEX_RVF_VK_MANAGEMENT_MODE=local-workspace`。Stop hook 会先确保本地 Vibe-Kanban app/backend 可用：优先使用 `CODEX_RVF_VK_BACKEND_URL`/`VIBE_BACKEND_URL`，否则读取 `vibe-kanban.port`，再从本机 Vibe-Kanban 监听端口中试探可用 backend；如果当前 app/server 没运行，会用 `tmux` session `rvf-vibe-kanban` 启动 `CODEX_RVF_VK_START_CMD`（默认 `npx -y vibe-kanban@0.1.44`）并等待 MCP 可用（默认 `CODEX_RVF_VK_START_TIMEOUT=90`）。随后 hook 通过本地 Vibe API 创建一个 Workspaces 列表里的 RVF 管理记录，并把 run 详情写入该 workspace 的 notes scratch；runner 会把 workspace 名称从 `RVF queued` 更新为 `RVF running`/`RVF completed`/`RVF failed`。这条路径不使用 Vibe 的 `start_workspace`，也不创建 Vibe 管理的独立 worktree。
+该模式写入 `CODEX_RVF_FORK_MODE=cline-kanban`，也接受别名 `cline` / `kanban` / `ck`。Stop hook 不再后台运行隐藏 `codex exec`；它先生成 RVF run artifacts，并把当前 session-owned 的 dirty diff / untracked files 冻结为 `worktree-bootstrap.patch`、`worktree-bootstrap-files/`、`worktree-bootstrap.json`，然后通过官方 `kanban` CLI 创建并启动一张真实 Kanban task。task 在 Cline Kanban 创建的独立 git worktree 中运行，第一步会执行 bootstrap helper 重放这些改动，再读取 `review-env.sh` / `review-agent-context.md` 并执行完整 `$review-validate-fix`。
 
-旧的 remote project/issue 管理路径仍保留为显式 fallback：设置 `CODEX_RVF_VK_MANAGEMENT_MODE=remote-project` 后，可以用 `--vibe-kanban-project-id <vibe_project_id>` 或 `CODEX_RVF_VK_PROJECT_ID=<vibe_project_id>` 固定 project id；未提供 project id 时，hook 会在 `CODEX_RVF_VK_PROJECT_AUTO=1` 下通过 `list_repos`/`list_projects` 匹配当前 repo。注意 Vibe-Kanban 0.1.44 已把 project/kanban UI 改为 export-only，因此该路径主要用于兼容旧 API，不建议作为默认可视化入口。
-
-若使用 self-hosted Vibe-Kanban Cloud，本地桌面/app 仍需带 `VK_SHARED_API_BASE` 启动，并且这些连接参数必须持久写入 Stop hook，否则 dispatcher 自同步会丢失本地 Cloud 配置。`VK_SHARED_API_BASE=http://localhost:3000` 指向 self-hosted Cloud remote-server；`CODEX_RVF_VK_BACKEND_URL`/`--vibe-kanban-backend-url` 只用于固定本地 Vibe app backend（例如 `http://127.0.0.1:<动态端口>`），不要把它设成 Cloud remote-server。installer 支持 `--vibe-kanban-mcp-cmd`、`--vibe-kanban-start-cmd`、`--vibe-kanban-backend-url`，也会从同名 `CODEX_RVF_VK_*` 环境变量读取。例如：
+默认 CLI 配置为：
 
 ```bash
-python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode vibe-kanban \
-  --vibe-kanban-start-cmd 'env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44' \
-  --vibe-kanban-mcp-cmd 'env VK_SHARED_API_BASE=http://localhost:3000 npx -y vibe-kanban@0.1.44 --mcp'
+CODEX_RVF_CLINE_KANBAN_START_CMD='npx -y kanban@0.1.66 --no-open'
+CODEX_RVF_CLINE_KANBAN_TASK_CMD='npx -y kanban@0.1.66 task'
+CODEX_RVF_CLINE_KANBAN_START_TIMEOUT=90
+CODEX_RVF_CLINE_KANBAN_TMUX_SESSION=rvf-cline-kanban
 ```
 
-该模式写入 `CODEX_RVF_FORK_MODE=vibe-kanban`。Stop hook 只有在本地 Vibe 管理记录创建成功后才启动后台 `run_vibe_kanban_rvf.py`。实际 review 仍由 `codex exec -C <target_repo>` 在父会话同一 worktree 中执行；runner 会把原 GUI fork prompt 包装成 headless RVF prompt，注入 parent transcript、run id/run dir 和 `prepare_review_run.py --rvf-run-id --rvf-run-dir` 复用要求，再复用同一份 RunLedger：`events.jsonl`、`summary.json`、`review-env.sh`、`review-agent-context.md`、stdout/stderr 与 final message 都写入 `state/runs/<run_id>/artifacts/`。Vibe-Kanban 只作为可视化管理平面，不负责创建独立 workspace 或执行沙箱。
+installer 支持 `--cline-kanban-start-cmd`、`--cline-kanban-task-cmd`、`--cline-kanban-start-timeout`、`--cline-kanban-tmux-session`、`--cline-kanban-base-ref`、`--cline-kanban-auto-review-enabled`、`--cline-kanban-auto-review-mode`、`--cline-kanban-start-in-plan-mode`，并会从同名 `CODEX_RVF_CLINE_KANBAN_*` 环境变量读取。例如：
+
+```bash
+python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode cline-kanban \
+  --cline-kanban-start-cmd 'npx -y kanban@0.1.66 --no-open' \
+  --cline-kanban-task-cmd 'npx -y kanban@0.1.66 task'
+```
+
+Cline Kanban task id、base ref、bootstrap artifact 和生成的 task prompt 都会写入同一份 RunLedger：`events.jsonl`、`summary.json`、`review-env.sh`、`review-agent-context.md` 等位于 `state/runs/<run_id>/artifacts/`。默认不自动 commit 或 open PR；用户可以在 Kanban 的 diff viewer、checkpoints、inline comments 中审查结果，再使用 Kanban 的 Commit/Open PR 入口交付。只有显式启用 `CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED=1` 时，hook 才把 `CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE=commit|pr|move_to_trash` 传给 Kanban。
 
 实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_dispatcher.py`，不是直接调用 `codex_stop_review_validate_fix.py`。dispatcher 会在 Stop event 来自本 RVF 源仓库、且不是 subagent 时，先顺序运行：
 
@@ -103,7 +110,7 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-如果当前 Stop hook command 是 Vibe-Kanban 模式，dispatcher 会在自同步安装时带上 `--fork-mode vibe-kanban --vibe-kanban-project-id <id>`，避免把已配置的管理模式覆盖回默认 `gui`。
+如果当前 Stop hook command 是 Cline Kanban 模式，dispatcher 会在自同步安装时保留 `--fork-mode cline-kanban` 和全部 `--cline-kanban-*` 配置，避免把已配置的管理模式覆盖回默认 `gui`。
 
 如果 Stop event 提供 transcript path，dispatcher 会先生成 session manifest；只有存在当前 chat session 归属的 `owned_dirty_paths` 时，才执行 dev sync 并转交 installed `codex_stop_review_validate_fix.py`。这避免其他 session 或其他 agent 留下的 dirty WIP 触发本 session 的同步、安装或自动 review。没有 transcript 时，dispatcher 仍保留旧行为，按 dev repo 主会话执行 sync。
 
@@ -215,7 +222,7 @@ python3 scripts/install_to_codex.py --replace-setup-config
 
 Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Desktop control socket 缺失且未显式允许 bridge app-server 时，fork 模式只报告无法创建 GUI fork。
 
-显式 `CODEX_RVF_FORK_MODE=vibe-kanban` 时，fork 模式不调用 Codex GUI fork；默认 `CODEX_RVF_VK_MANAGEMENT_MODE=local-workspace`，hook 会自动确保 Vibe-Kanban app/backend 可用，并通过本地 `/api/workspaces` 创建一个 RVF 管理 workspace，状态写入 workspace 名称，run 详情写入 `WORKSPACE_NOTES` scratch。创建管理记录成功后再启动后台 runner 调用 `CODEX_RVF_CODEX_EXEC_ARGS`（默认 `exec --json --dangerously-bypass-approvals-and-sandbox`）执行 `codex exec -C <target_repo>`。runner 传入 `codex exec` 的不是原始 GUI fork prompt，而是包含 parent transcript path、scope-of-work 生成要求和 `prepare_review_run.py --rvf-run-id --rvf-run-dir` 的 headless prompt。Vibe-Kanban app/backend 不可用、无法创建本地 workspace，或显式 `remote-project` 模式下无法匹配 project 时直接 fail-safe，不启动隐藏 runner。
+显式 `CODEX_RVF_FORK_MODE=cline-kanban` 时，fork 模式不调用 Codex GUI fork；hook 会用官方 `kanban` CLI 创建并启动一张真实 Cline Kanban task。父 worktree 保持原样，session-owned dirty changes 会先冻结为 bootstrap artifact，再由 task 在 Kanban 独立 worktree 中重放。Kanban 服务不可用、task 创建/启动失败、bootstrap artifact 无法安全生成或重放时直接 fail-safe，不启动隐藏 runner。
 
 ## 验证
 

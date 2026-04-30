@@ -534,249 +534,23 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
     assert latest["socket_selection"]["bridge_policy"] == "report"
 
 
-def test_vibe_kanban_mode_requires_project_id_and_does_not_write_app_server_request(
-    tmp: Path,
-) -> None:
-    module = load_hook_module()
-    state = tmp / "state"
-    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
-    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
-    original_management_mode = os.environ.get("CODEX_RVF_VK_MANAGEMENT_MODE")
-    original_project = os.environ.pop("CODEX_RVF_VK_PROJECT_ID", None)
-    original_auto = os.environ.get("CODEX_RVF_VK_PROJECT_AUTO")
-    try:
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ["CODEX_RVF_VK_MANAGEMENT_MODE"] = "remote-project"
-        os.environ["CODEX_RVF_VK_PROJECT_AUTO"] = "0"
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(tmp),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model=None,
-            reasoning_effort=None,
-            parent_thread_path=None,
-        )
-    finally:
-        if original_state_dir is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
-        if original_mode is None:
-            os.environ.pop("CODEX_RVF_FORK_MODE", None)
-        else:
-            os.environ["CODEX_RVF_FORK_MODE"] = original_mode
-        if original_management_mode is None:
-            os.environ.pop("CODEX_RVF_VK_MANAGEMENT_MODE", None)
-        else:
-            os.environ["CODEX_RVF_VK_MANAGEMENT_MODE"] = original_management_mode
-        if original_project is not None:
-            os.environ["CODEX_RVF_VK_PROJECT_ID"] = original_project
-        if original_auto is None:
-            os.environ.pop("CODEX_RVF_VK_PROJECT_AUTO", None)
-        else:
-            os.environ["CODEX_RVF_VK_PROJECT_AUTO"] = original_auto
-
-    assert "reason=vibe_kanban_unconfigured" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-unconfigured"
-    assert "CODEX_RVF_VK_PROJECT_ID" in str(latest["message"])
-    assert "app_server_requests_path" not in latest
-
-
-def test_vibe_kanban_mode_auto_resolves_project_before_creating_issue(
-    tmp: Path,
-) -> None:
+def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "repo")
     state = tmp / "state"
-    fake_client = tmp / "fake_vk_client.py"
-    fake_runner = tmp / "fake_runner.py"
+    fake_client = tmp / "fake_cline_kanban_client.py"
     client_calls = tmp / "client-calls.jsonl"
-    runner_args = tmp / "runner-args.json"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'resolve-project':\n"
-        "    print(json.dumps({'project_id': 'project-auto', 'source': 'list_repos'}))\n"
-        "else:\n"
-        "    print(json.dumps({'issue_id': 'issue-auto'}))\n",
-        encoding="utf-8",
-    )
-    fake_runner.write_text(
-        "import json, os, sys\n"
-        "open(os.environ['FAKE_RUNNER_ARGS'], 'w', encoding='utf-8').write(json.dumps({'argv': sys.argv[1:]}))\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_VK_MANAGEMENT_MODE",
-            "CODEX_RVF_VK_PROJECT_ID",
-            "CODEX_RVF_VK_PROJECT_AUTO",
-            "CODEX_RVF_VK_START_TIMEOUT",
-            "CODEX_RVF_VK_MCP_CLIENT",
-            "CODEX_RVF_VK_RUNNER",
-            "FAKE_CLIENT_CALLS",
-            "FAKE_RUNNER_ARGS",
-        )
-    }
-    try:
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ["CODEX_RVF_VK_MANAGEMENT_MODE"] = "remote-project"
-        os.environ.pop("CODEX_RVF_VK_PROJECT_ID", None)
-        os.environ["CODEX_RVF_VK_PROJECT_AUTO"] = "1"
-        os.environ.pop("CODEX_RVF_VK_START_TIMEOUT", None)
-        os.environ["CODEX_RVF_VK_MCP_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_VK_RUNNER"] = str(fake_runner)
-        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        os.environ["FAKE_RUNNER_ARGS"] = str(runner_args)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model=None,
-            reasoning_effort=None,
-            parent_thread_path=None,
-        )
-    finally:
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=vibe_kanban_runner_started" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-started"
-    assert latest["vibe_project_id"] == "project-auto"
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert calls[0]["argv"][0] == "resolve-project"
-    start_timeout = calls[0]["argv"][calls[0]["argv"].index("--start-timeout") + 1]
-    assert float(start_timeout) == 90.0
-    assert calls[1]["argv"][0] == "create"
-
-
-def test_vibe_kanban_mode_creates_local_workspace_by_default(
-    tmp: Path,
-) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_vk_client.py"
-    fake_runner = tmp / "fake_runner.py"
-    client_calls = tmp / "client-calls.jsonl"
-    runner_args = tmp / "runner-args.json"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] != 'create-workspace':\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n"
-        "print(json.dumps({'workspace_id': 'workspace-auto', 'backend_url': 'http://127.0.0.1:58070'}))\n",
-        encoding="utf-8",
-    )
-    fake_runner.write_text(
-        "import json, os, sys\n"
-        "open(os.environ['FAKE_RUNNER_ARGS'], 'w', encoding='utf-8').write(json.dumps({'argv': sys.argv[1:]}))\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_VK_MANAGEMENT_MODE",
-            "CODEX_RVF_VK_PROJECT_ID",
-            "CODEX_RVF_VK_MCP_CLIENT",
-            "CODEX_RVF_VK_RUNNER",
-            "FAKE_CLIENT_CALLS",
-            "FAKE_RUNNER_ARGS",
-        )
-    }
-    try:
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ.pop("CODEX_RVF_VK_MANAGEMENT_MODE", None)
-        os.environ.pop("CODEX_RVF_VK_PROJECT_ID", None)
-        os.environ["CODEX_RVF_VK_MCP_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_VK_RUNNER"] = str(fake_runner)
-        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        os.environ["FAKE_RUNNER_ARGS"] = str(runner_args)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model=None,
-            reasoning_effort=None,
-            parent_thread_path=None,
-        )
-    finally:
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=vibe_kanban_runner_started" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-started"
-    assert latest["vibe_management_mode"] == "local-workspace"
-    assert latest["vibe_workspace_id"] == "workspace-auto"
-    assert "vibe_issue_id" not in latest
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["create-workspace"]
-    for _ in range(50):
-        if runner_args.exists():
-            break
-        time.sleep(0.02)
-    runner_payload = json.loads(runner_args.read_text(encoding="utf-8"))
-    assert "--vibe-workspace-id" in runner_payload["argv"]
-    assert runner_payload["argv"][runner_payload["argv"].index("--vibe-workspace-id") + 1] == "workspace-auto"
-    assert "--vibe-project-id" not in runner_payload["argv"]
-    assert "--vibe-issue-id" not in runner_payload["argv"]
-    assert "--startup-prepare-metadata" in runner_payload["argv"]
-    startup_metadata = Path(
-        runner_payload["argv"][runner_payload["argv"].index("--startup-prepare-metadata") + 1]
-    )
-    assert startup_metadata.exists()
-    startup_payload = json.loads(startup_metadata.read_text(encoding="utf-8"))
-    assert Path(startup_payload["review_packet"]).exists()
-    assert Path(startup_payload["before_workspace_snapshot"]).exists()
-
-
-def test_vibe_kanban_mode_marks_local_workspace_failed_when_runner_start_fails(
-    tmp: Path,
-) -> None:
-    module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    state = tmp / "state"
-    fake_client = tmp / "fake_vk_client.py"
-    client_calls = tmp / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "action = sys.argv[1]\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if action == 'create-workspace':\n"
-        "    print(json.dumps({'workspace_id': 'workspace-auto', 'backend_url': 'http://127.0.0.1:58070'}))\n"
-        "elif action == 'update-workspace':\n"
-        "    print(json.dumps({'workspace_id': 'workspace-auto'}))\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-123', 'workspace_path': '/tmp/task-worktree'}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-123', 'status': 'started'}))\n"
         "else:\n"
         "    raise SystemExit(f'unexpected action {action}')\n",
         encoding="utf-8",
@@ -786,104 +560,19 @@ def test_vibe_kanban_mode_marks_local_workspace_failed_when_runner_start_fails(
         for key in (
             "CODEX_RVF_STATE_DIR",
             "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_VK_MANAGEMENT_MODE",
-            "CODEX_RVF_VK_PROJECT_ID",
-            "CODEX_RVF_VK_MCP_CLIENT",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+            "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
             "FAKE_CLIENT_CALLS",
         )
     }
-    original_start_runner = module.start_vibe_kanban_runner
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ.pop("CODEX_RVF_VK_MANAGEMENT_MODE", None)
-        os.environ.pop("CODEX_RVF_VK_PROJECT_ID", None)
-        os.environ["CODEX_RVF_VK_MCP_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        module.start_vibe_kanban_runner = lambda **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("runner boom")
-        )
-        module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(tmp),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model=None,
-            reasoning_effort=None,
-            parent_thread_path=None,
-        )
-    finally:
-        module.start_vibe_kanban_runner = original_start_runner
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-unavailable"
-    assert latest["vibe_workspace_id"] == "workspace-auto"
-    assert latest["vibe_workspace_failed_update"]["workspace_id"] == "workspace-auto"
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["create-workspace", "update-workspace"]
-    update_argv = calls[1]["argv"]
-    assert update_argv[update_argv.index("--workspace-id") + 1] == "workspace-auto"
-    assert update_argv[update_argv.index("--status") + 1] == "failed"
-    assert "runner boom" in update_argv[update_argv.index("--description") + 1]
-
-
-def test_vibe_kanban_mode_creates_issue_and_starts_runner_with_same_run(
-    tmp: Path,
-) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_vk_client.py"
-    fake_runner = tmp / "fake_runner.py"
-    client_args = tmp / "client-args.json"
-    runner_args = tmp / "runner-args.json"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "path = os.environ['FAKE_CLIENT_ARGS']\n"
-        "open(path, 'w', encoding='utf-8').write(json.dumps({'argv': sys.argv[1:]}))\n"
-        "print(json.dumps({'issue_id': 'issue-123'}))\n",
-        encoding="utf-8",
-    )
-    fake_runner.write_text(
-        "import json, os, sys\n"
-        "path = os.environ['FAKE_RUNNER_ARGS']\n"
-        "payload = {'argv': sys.argv[1:], 'run_id': os.environ.get('CODEX_RVF_RUN_ID'), 'run_dir': os.environ.get('CODEX_RVF_RUN_DIR'), 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}\n"
-        "open(path, 'w', encoding='utf-8').write(json.dumps(payload))\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_VK_MANAGEMENT_MODE",
-            "CODEX_RVF_VK_PROJECT_ID",
-            "CODEX_RVF_VK_MCP_CLIENT",
-            "CODEX_RVF_VK_RUNNER",
-            "CODEX_RVF_VK_MCP_CMD",
-            "FAKE_CLIENT_ARGS",
-            "FAKE_RUNNER_ARGS",
-        )
-    }
-    try:
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ["CODEX_RVF_VK_MANAGEMENT_MODE"] = "remote-project"
-        os.environ["CODEX_RVF_VK_PROJECT_ID"] = "project-abc"
-        os.environ["CODEX_RVF_VK_MCP_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_VK_RUNNER"] = str(fake_runner)
-        os.environ["CODEX_RVF_VK_MCP_CMD"] = "fake mcp"
-        os.environ["FAKE_CLIENT_ARGS"] = str(client_args)
-        os.environ["FAKE_RUNNER_ARGS"] = str(runner_args)
         transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
@@ -901,84 +590,66 @@ def test_vibe_kanban_mode_creates_issue_and_starts_runner_with_same_run(
             else:
                 os.environ[key] = value
 
-    assert "reason=vibe_kanban_runner_started" in payload["systemMessage"]
+    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
     latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-started"
-    assert latest["vibe_issue_id"] == "issue-123"
+    assert latest["status"] == "cline-kanban-started"
+    assert latest["cline_kanban_task_id"] == "task-123"
     assert "app_server_requests_path" not in latest
-    for _ in range(50):
-        if runner_args.exists():
-            break
-        time.sleep(0.02)
-    runner_payload = json.loads(runner_args.read_text(encoding="utf-8"))
-    assert runner_payload["run_id"] == latest["run_id"]
-    assert runner_payload["run_dir"] == latest["run_dir"]
-    assert runner_payload["suppress"] == "1"
-    assert "--repo" in runner_payload["argv"]
-    assert runner_payload["argv"][runner_payload["argv"].index("--repo") + 1] == str(repo)
-    assert "--run-id" in runner_payload["argv"]
-    assert runner_payload["argv"][runner_payload["argv"].index("--run-id") + 1] == latest["run_id"]
-    assert "--parent-transcript-path" in runner_payload["argv"]
-    assert runner_payload["argv"][runner_payload["argv"].index("--parent-transcript-path") + 1] == str(transcript)
-    assert "--startup-prepare-metadata" in runner_payload["argv"]
+    assert Path(latest["startup_prepare_metadata_path"]).exists()
+    assert Path(latest["worktree_bootstrap_path"]).exists()
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
+    create_argv = calls[1]["argv"]
+    assert "--base-ref" in create_argv
+    assert "--prompt" in create_argv
+    prompt_text = create_argv[create_argv.index("--prompt") + 1]
+    assert "RVF_CLINE_KANBAN_TASK" in prompt_text
+    assert "RVF_TARGET_REPO: ." in prompt_text
+    assert f"RVF_PARENT_REPO: {repo}" in prompt_text
+    assert f"RVF_TARGET_REPO: {repo}" not in prompt_text
+    assert create_argv[create_argv.index("--title") + 1].startswith("RVF repo ")
+    assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
+    assert calls[0]["suppress"] == "1"
 
 
-def test_vibe_kanban_mode_marks_remote_issue_failed_when_runner_start_fails(
-    tmp: Path,
-) -> None:
+def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
+    repo = init_repo_with_head(tmp / "repo")
     state = tmp / "state"
-    fake_client = tmp / "fake_vk_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    fake_client = tmp / "fake_cline_kanban_client.py"
     fake_client.write_text(
-        "import json, os, sys\n"
-        "action = sys.argv[1]\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if action == 'create':\n"
-        "    print(json.dumps({'issue_id': 'issue-123'}))\n"
-        "elif action == 'update':\n"
-        "    print(json.dumps({'issue_id': 'issue-123'}))\n"
+        "import json, sys\n"
+        "if sys.argv[1] == 'ensure':\n"
+        "    print(json.dumps({'ok': True}))\n"
+        "elif sys.argv[1] == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-123'}))\n"
         "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
+        "    print('start boom', file=sys.stderr)\n"
+        "    raise SystemExit(2)\n",
         encoding="utf-8",
     )
     original_env = {
         key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_VK_MANAGEMENT_MODE",
-            "CODEX_RVF_VK_PROJECT_ID",
-            "CODEX_RVF_VK_MCP_CLIENT",
-            "CODEX_RVF_VK_MCP_CMD",
-            "FAKE_CLIENT_CALLS",
-        )
+        for key in ("CODEX_RVF_STATE_DIR", "CODEX_RVF_FORK_MODE", "CODEX_RVF_CLINE_KANBAN_CLIENT")
     }
-    original_start_runner = module.start_vibe_kanban_runner
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "vibe-kanban"
-        os.environ["CODEX_RVF_VK_MANAGEMENT_MODE"] = "remote-project"
-        os.environ["CODEX_RVF_VK_PROJECT_ID"] = "project-abc"
-        os.environ["CODEX_RVF_VK_MCP_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_VK_MCP_CMD"] = "fake mcp"
-        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        module.start_vibe_kanban_runner = lambda **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("runner boom")
-        )
+        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(repo),
             prompt="$review-validate-fix",
             log_prefix="review-validate-fix-fork",
             model=None,
             reasoning_effort=None,
-            parent_thread_path=None,
+            parent_thread_path=write_apply_patch_transcript(tmp / "session.jsonl", repo),
         )
     finally:
-        module.start_vibe_kanban_runner = original_start_runner
         for key, value in original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -986,21 +657,8 @@ def test_vibe_kanban_mode_marks_remote_issue_failed_when_runner_start_fails(
                 os.environ[key] = value
 
     latest = latest_summary(state)
-    assert latest["status"] == "vibe-kanban-unavailable"
-    assert latest["vibe_project_id"] == "project-abc"
-    assert latest["vibe_issue_id"] == "issue-123"
-    assert latest["vibe_issue_failed_update"]["issue_id"] == "issue-123"
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["create", "update"]
-    update_argv = calls[1]["argv"]
-    assert update_argv[update_argv.index("--project-id") + 1] == "project-abc"
-    assert update_argv[update_argv.index("--issue-id") + 1] == "issue-123"
-    assert update_argv[update_argv.index("--status") + 1] == "failed"
-    assert "runner boom" in update_argv[update_argv.index("--description") + 1]
+    assert latest["status"] == "cline-kanban-unavailable"
+    assert "start boom" in str(latest["message"])
 
 
 def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
@@ -2429,12 +2087,8 @@ def main() -> int:
         test_socket_probe_reports_unavailable_reason,
         test_bridge_failure_preserves_desktop_probe,
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
-        test_vibe_kanban_mode_requires_project_id_and_does_not_write_app_server_request,
-        test_vibe_kanban_mode_auto_resolves_project_before_creating_issue,
-        test_vibe_kanban_mode_creates_local_workspace_by_default,
-        test_vibe_kanban_mode_marks_local_workspace_failed_when_runner_start_fails,
-        test_vibe_kanban_mode_creates_issue_and_starts_runner_with_same_run,
-        test_vibe_kanban_mode_marks_remote_issue_failed_when_runner_start_fails,
+        test_cline_kanban_mode_creates_and_starts_task_with_same_run,
+        test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,
         test_fork_session_visibility_waits_only_for_active_session,
