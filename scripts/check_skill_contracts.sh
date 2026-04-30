@@ -4,6 +4,53 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 skill_dir="$repo_root/plugins/review-validate-fix/skills/review-validate-fix"
 tests_dir="$repo_root/tests"
+verbose=0
+
+usage() {
+  printf 'Usage: %s [--verbose]\n' "$(basename "$0")"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -v|--verbose)
+      verbose=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf '未知参数: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+run_step() {
+  local label="$1"
+  shift
+  if [ "$verbose" -eq 1 ]; then
+    printf '==> %s\n' "$label"
+    "$@"
+    return
+  fi
+
+  local output_file
+  local command_status=0
+  output_file="$(mktemp)"
+  "$@" >"$output_file" 2>&1 || command_status=$?
+  if [ "$command_status" -eq 0 ]; then
+    rm -f "$output_file"
+    return 0
+  fi
+
+  printf '验证失败: %s\n' "$label" >&2
+  cat "$output_file" >&2
+  rm -f "$output_file"
+  return "$command_status"
+}
 
 hash_file() {
   local file="$1"
@@ -167,11 +214,11 @@ for script in \
   "scripts/discover_santa_alternative_agents.sh" \
   "scripts/read_mcp_setup_once.sh"
 do
-  bash -n "$skill_dir/$script"
+  run_step "shell syntax: $script" bash -n "$skill_dir/$script"
 done
-bash -n "$repo_root/scripts/check_skill_contracts.sh"
+run_step "shell syntax: scripts/check_skill_contracts.sh" bash -n "$repo_root/scripts/check_skill_contracts.sh"
 
-python3 -m py_compile \
+run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
@@ -192,10 +239,10 @@ python3 -m py_compile \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_review_support_scripts.py"
 
-python3 "$tests_dir/test_install_to_codex.py"
-python3 "$tests_dir/test_review_support_scripts.py"
-python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
-python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
+run_step "tests: install_to_codex" python3 "$tests_dir/test_install_to_codex.py"
+run_step "tests: review_support_scripts" python3 "$tests_dir/test_review_support_scripts.py"
+run_step "tests: codex_stop_hook_dispatcher" python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
+run_step "tests: codex_stop_review_validate_fix" python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
 
 require_literal "references/review-prompt.md" 'NO_ISSUES'
 require_literal "references/validate-then-fix-prompt.md" 'REAL'
@@ -471,8 +518,12 @@ require_repo_literal "tests/test_install_to_codex.py" 'stale cached skill'
 forbid_repo_literal "scripts/install_to_codex.py" 'legacy skill compatibility copy'
 forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy standalone setup'
 
-printf 'contract check OK\n'
-printf 'hashes:\n'
-for file in "${required_files[@]}"; do
-  printf '%s  %s\n' "$(hash_file "$skill_dir/$file")" "$file"
-done
+if [ "$verbose" -eq 1 ]; then
+  printf 'contract check OK\n'
+  printf 'hashes:\n'
+  for file in "${required_files[@]}"; do
+    printf '%s  %s\n' "$(hash_file "$skill_dir/$file")" "$file"
+  done
+else
+  printf '契约检查通过\n'
+fi

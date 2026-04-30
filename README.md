@@ -50,6 +50,8 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 `scripts/check_skill_contracts.sh` 是最完整的本地验证入口，会执行 shell 语法检查、Python 编译检查和仓库级测试。`scripts/check_plugin_contracts.py` 保留为 plugin 契约入口，当前会委托同一套仓库级检查。安装脚本默认保留本机 `alternative-reviewer.json` 和 `state/`，因此不会覆盖机器相关 setup。
 
+验证入口默认只输出简短成功信息；排查失败或需要查看每个测试脚本输出时，加 `--verbose`。
+
 ## 安装机制
 
 日常开发只改 `plugins/review-validate-fix/skills/review-validate-fix/`。改完后运行契约检查：
@@ -235,4 +237,11 @@ Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Termina
 ```bash
 bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
+```
+
+需要详细输出时运行：
+
+```bash
+bash scripts/check_skill_contracts.sh --verbose
+python3 scripts/check_plugin_contracts.py --verbose
 ```

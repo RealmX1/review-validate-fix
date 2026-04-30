@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SKILL_CONTRACTS = ROOT / "scripts" / "check_skill_contracts.sh"
+CHECK_PLUGIN_CONTRACTS = ROOT / "scripts" / "check_plugin_contracts.py"
 SCRIPT_DIR = (
     ROOT
     / "plugins"
@@ -309,6 +311,45 @@ def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
         "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_CONTEXT_REQUEST'",
     ):
         assert literal in script
+
+
+def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
+    skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    plugin_script = CHECK_PLUGIN_CONTRACTS.read_text(encoding="utf-8")
+    for literal in (
+        "verbose=0",
+        "-v|--verbose)",
+        "run_step()",
+        "command_status",
+        "验证失败:",
+        'return "$command_status"',
+    ):
+        assert literal in skill_script
+    for literal in (
+        'parser.add_argument("-v", "--verbose"',
+        'command.append("--verbose")',
+        "capture_output=True",
+        "plugin 契约检查通过",
+    ):
+        assert literal in plugin_script
+
+    function_start = skill_script.index("run_step() {")
+    function_end = skill_script.index("\nhash_file() {")
+    probe = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "verbose=0\n"
+        f"{skill_script[function_start:function_end]}\n"
+        f"run_step failing {shlex.quote(sys.executable)} -c "
+        "'import sys; print(\"boom\"); sys.exit(7)'\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        probe_path = Path(tmp_dir) / "probe.sh"
+        probe_path.write_text(probe, encoding="utf-8")
+        completed = subprocess.run(["bash", str(probe_path)], capture_output=True, text=True, check=False)
+    assert completed.returncode == 7
+    assert "验证失败: failing" in completed.stderr
+    assert "boom" in completed.stderr
 
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
@@ -1533,7 +1574,7 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.1,
+        idle_timeout_seconds=0.2,
         activity_check_interval_seconds=0.03,
         output_format="claude_stream_json",
     )
@@ -2202,6 +2243,7 @@ def main() -> int:
         test_check_review_output_lock_request()
         test_check_review_output_protocol_extension_requests()
         test_check_skill_contracts_requires_validate_fix_request_literals()
+        test_contract_check_entrypoints_default_quiet_with_verbose_flag()
         test_check_review_output_accepts_wrapped_issue_continuation()
         test_build_packet_metadata_and_scope(root / "packet")
         test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope")
