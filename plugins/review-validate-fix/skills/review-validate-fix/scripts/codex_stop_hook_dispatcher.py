@@ -19,6 +19,8 @@ from session_manifest import build_manifest
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "codex_stop_review_validate_fix.py"
+DEV_SYNC_CONTRACT_SCRIPT = Path("scripts") / "check_plugin_contracts.py"
+DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"
 SESSION_PATH_KEYS = (
     "transcript_path",
     "session_path",
@@ -667,6 +669,28 @@ def step_summary(result: dict[str, Any], ledger: RunLedger, name: str) -> dict[s
     }
 
 
+def dev_repo_script(repo: Path, rel_path: Path) -> Path:
+    repo_root = repo.resolve()
+    script = (repo_root / rel_path).resolve()
+    try:
+        script.relative_to(repo_root)
+    except ValueError as exc:
+        raise ValueError(f"dev-only sync script escaped dev repo: {rel_path}") from exc
+    return script
+
+
+def dev_sync_step_specs(repo: Path) -> list[tuple[str, Path, list[str], str]]:
+    return [
+        ("contract-check", dev_repo_script(repo, DEV_SYNC_CONTRACT_SCRIPT), [], "contract-check"),
+        (
+            "installer",
+            dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
+            installer_args_from_env(),
+            "installer",
+        ),
+    ]
+
+
 def sync_from_dev_repo(
     repo: Path,
     event: dict[str, Any],
@@ -674,8 +698,6 @@ def sync_from_dev_repo(
 ) -> tuple[bool, Path | None, str]:
     python = sys.executable or "python3"
     steps: list[dict[str, Any]] = []
-    contract_script = repo / "scripts" / "check_plugin_contracts.py"
-    install_script = repo / "scripts" / "install_to_codex.py"
     ledger.artifact("stop-event.json", event)
     ledger.event(
         phase="dev-sync",
@@ -687,10 +709,30 @@ def sync_from_dev_repo(
         paths={"stop_event": str(ledger.artifact_path("stop-event.json"))},
     )
 
-    for name, script, args, component in (
-        ("contract-check", contract_script, [], "contract-check"),
-        ("installer", install_script, installer_args_from_env(), "installer"),
-    ):
+    try:
+        step_specs = dev_sync_step_specs(repo)
+    except ValueError as exc:
+        reason = str(exc)
+        ledger.event(
+            phase="dev-sync",
+            event="invalid_dev_sync_script",
+            status="failed",
+            reason_code="invalid_dev_sync_script",
+            repo=str(repo),
+            cwd=str(repo),
+            error=reason,
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="invalid_dev_sync_script",
+            message=reason,
+            repo=str(repo),
+            event=event_summary(event),
+            steps=steps,
+        )
+        return False, ledger.summary_path if ledger.available else None, reason
+
+    for name, script, args, component in step_specs:
         if not script.is_file():
             reason = f"missing script: {script}"
             ledger.event(

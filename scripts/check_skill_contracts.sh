@@ -139,6 +139,18 @@ if find "$skill_dir/scripts" -maxdepth 1 -type f \( -name 'test_*.py' -o -name '
   exit 1
 fi
 
+if find "$skill_dir" -path "$skill_dir/state" -prune -o \( \
+  -name 'install_to_codex.py' -o \
+  -name 'check_plugin_contracts.py' -o \
+  -name 'check_skill_contracts.sh' -o \
+  -path '*/dev-only/*' -o \
+  -path '*/dev_only/*' -o \
+  -path '*/.rvf-dev-only/*' \
+\) -print | grep -q .; then
+  printf 'dev-only 文件不应位于可部署 plugin runtime 中\n' >&2
+  exit 1
+fi
+
 for script in \
   "check_contracts.sh" \
   "check_plugin_contracts.py" \
@@ -377,6 +389,13 @@ require_literal "references/cancel-rvf-run.md" 'cline-kanban-rvf-cancelled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_MODE=cline-kanban'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'cline-kanban-started'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'cline_kanban_task_started'
+require_literal "scripts/codex_stop_hook_dispatcher.py" 'DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"'
+require_literal "scripts/codex_stop_hook_dispatcher.py" 'dev_sync_step_specs'
+require_repo_literal "README.md" 'Dev-only 标准'
+require_literal "SKILL.md" 'dev-only sync chain'
+require_repo_literal "scripts/install_to_codex.py" 'DEV_ONLY_NAMES'
+require_repo_literal "tests/test_install_to_codex.py" 'test_copy_tree_excludes_dev_only_paths'
+require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_resolve_repo_level_dev_scripts'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-cmd'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-task-cmd'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-timeout'

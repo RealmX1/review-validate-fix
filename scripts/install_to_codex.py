@@ -21,10 +21,26 @@ PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "state",
 }
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", "state"}
+DEV_ONLY_NAMES = {
+    ".rvf-dev-only",
+    "dev-only",
+    "dev_only",
+    "check_plugin_contracts.py",
+    "check_skill_contracts.sh",
+    "install_to_codex.py",
+}
 
 
 def ignore(_: str, names: list[str]) -> set[str]:
-    return {name for name in names if name in IGNORE_NAMES or name.endswith(".pyc")}
+    return {
+        name
+        for name in names
+        if name in IGNORE_NAMES or name in DEV_ONLY_NAMES or name.endswith(".pyc")
+    }
+
+
+def is_dev_only_path(path: Path) -> bool:
+    return any(part in DEV_ONLY_NAMES for part in path.parts)
 
 
 def is_preserved(path: Path, preserved: set[Path]) -> bool:
@@ -62,6 +78,8 @@ def merge_tree(src: Path, dst: Path, preserved: set[Path], base: Path = Path()) 
         if child.name in IGNORE_NAMES or child.name.endswith(".pyc"):
             continue
         rel = base / child.name
+        if is_dev_only_path(rel):
+            continue
         target = dst / child.name
         if is_preserved(rel, preserved) and target.exists():
             continue

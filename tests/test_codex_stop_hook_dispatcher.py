@@ -902,6 +902,17 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
     assert marker.exists()
 
 
+def test_dev_sync_step_specs_resolve_repo_level_dev_scripts(tmp_path: Path) -> None:
+    module = load_dispatcher_module()
+    repo = tmp_path / "rvf"
+
+    specs = module.dev_sync_step_specs(repo)
+
+    assert specs[0][1] == (repo / "scripts" / "check_plugin_contracts.py").resolve()
+    assert specs[1][1] == (repo / "scripts" / "install_to_codex.py").resolve()
+    assert specs[1][1] != module.SKILL_DIR / "scripts" / "install_to_codex.py"
+
+
 def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1098,6 +1109,7 @@ def main() -> int:
         test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
+        test_dev_sync_step_specs_resolve_repo_level_dev_scripts,
         test_dev_sync_preserves_cline_kanban_installer_args,
         test_dev_sync_prefers_hooks_json_over_stale_cached_env,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,

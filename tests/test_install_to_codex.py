@@ -386,6 +386,28 @@ def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     assert not (dst / "old.txt").exists()
 
 
+def test_copy_tree_excludes_dev_only_paths(tmp_path: Path) -> None:
+    module = load_installer_module()
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    runtime_scripts = src / "skills" / "review-validate-fix" / "scripts"
+    runtime_scripts.mkdir(parents=True)
+    (runtime_scripts / "codex_stop_hook_dispatcher.py").write_text("runtime\n", encoding="utf-8")
+    (runtime_scripts / "install_to_codex.py").write_text("dev installer\n", encoding="utf-8")
+    (runtime_scripts / "dev_only").mkdir()
+    (runtime_scripts / "dev_only" / "probe.py").write_text("dev helper\n", encoding="utf-8")
+    (src / "dev-only").mkdir()
+    (src / "dev-only" / "notes.md").write_text("dev docs\n", encoding="utf-8")
+
+    module.copy_tree(src, dst, module.PRESERVE_IN_PLUGIN, True)
+
+    deployed_scripts = dst / "skills" / "review-validate-fix" / "scripts"
+    assert (deployed_scripts / "codex_stop_hook_dispatcher.py").exists()
+    assert not (deployed_scripts / "install_to_codex.py").exists()
+    assert not (deployed_scripts / "dev_only").exists()
+    assert not (dst / "dev-only").exists()
+
+
 def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
@@ -431,6 +453,8 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     assert (plugin_skill / "SKILL.md").exists()
     assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert not (plugin_skill / "scripts" / "install_to_codex.py").exists()
+    assert not (cache_skill / "scripts" / "install_to_codex.py").exists()
     assert (cache_skill / "SKILL.md").read_text(encoding="utf-8") == (
         module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
     ).read_text(encoding="utf-8")
@@ -457,6 +481,7 @@ def main() -> int:
         test_main_persists_cline_connection_env,
         test_main_persists_cline_review_options,
         test_copy_tree_preserves_nested_plugin_setup,
+        test_copy_tree_excludes_dev_only_paths,
         test_main_installs_plugin_and_configures_stop_hook,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
