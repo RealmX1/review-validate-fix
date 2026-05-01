@@ -44,6 +44,7 @@ DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
 DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
 DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "report"
+DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS = 60
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
@@ -292,6 +293,35 @@ def latest_user_message(path: Path) -> str | None:
     return latest
 
 
+def first_user_message(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str) and message.strip():
+                        return message
+                    continue
+
+                if record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+                        if text.strip():
+                            return text
+    except OSError:
+        return None
+    return None
+
+
 def user_messages_containing(path: Path, marker: str) -> list[str]:
     messages: list[str] = []
     try:
@@ -334,12 +364,18 @@ def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
 
 
 def session_id_from_path(path: Path) -> str | None:
+    meta = session_meta_from_path(path)
+    value = meta.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def session_meta_from_path(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as handle:
             for _ in range(20):
                 line = handle.readline()
                 if not line:
-                    return None
+                    return {}
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
@@ -347,11 +383,10 @@ def session_id_from_path(path: Path) -> str | None:
                 if record.get("type") != "session_meta":
                     continue
                 payload = record.get("payload")
-                if isinstance(payload, dict) and isinstance(payload.get("id"), str):
-                    return payload["id"]
+                return payload if isinstance(payload, dict) else {}
     except OSError:
-        return None
-    return None
+        return {}
+    return {}
 
 
 def session_id_from_event(event: dict[str, Any]) -> str | None:
@@ -396,6 +431,113 @@ def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
             return value.strip()
 
     return session_id_from_event(event)
+
+
+def short_identifier(value: str | None, fallback: str = "unknown") -> str:
+    if not value:
+        return fallback
+    stripped = value.strip()
+    if not stripped:
+        return fallback
+    first_segment = stripped.split("-", 1)[0]
+    if re.match(r"^[A-Fa-f0-9]{8,}(?:-|$)", stripped):
+        return first_segment[:12]
+    return stripped[:32]
+
+
+def short_run_ref(run_id: str) -> str:
+    match = re.search(r"-([A-Fa-f0-9]{8,})$", run_id)
+    if match:
+        return match.group(1)[:12]
+    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
+
+
+def transcript_origin_label(path: Path | None, session_id: str | None) -> str | None:
+    if path is None:
+        return None
+    stem = path.stem
+    if stem.startswith("rollout-"):
+        stem = stem.removeprefix("rollout-")
+    match = re.match(
+        r"(?P<started>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(?P<session>[A-Za-z0-9]{8,12})",
+        stem,
+    )
+    if match:
+        return f"{match.group('started')} {match.group('session')}"
+    if session_id:
+        return short_identifier(session_id)
+    return path.name
+
+
+def parent_conversation_fallback_chars() -> int:
+    raw = os.environ.get("CODEX_RVF_PARENT_CONVERSATION_FALLBACK_CHARS")
+    if raw is None or not raw.strip():
+        return DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS
+    try:
+        return max(12, int(raw))
+    except ValueError:
+        return DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS
+
+
+def single_line_excerpt(text: str, max_chars: int) -> str:
+    collapsed = re.sub(r"\s+", " ", text).strip()
+    return collapsed.replace('"', "'")[:max_chars].strip()
+
+
+def quoted_prompt_session_name(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    message = first_user_message(path)
+    if not message:
+        return None
+    excerpt = single_line_excerpt(message, parent_conversation_fallback_chars())
+    if not excerpt:
+        return None
+    return f'"{excerpt}"'
+
+
+def name_lookup_confirms_unnamed_thread(name_lookup: dict[str, Any] | None) -> bool:
+    return bool(
+        isinstance(name_lookup, dict)
+        and name_lookup.get("thread_found") is True
+        and not name_lookup.get("name")
+    )
+
+
+def parent_conversation_origin(
+    *,
+    parent_session_id: str | None,
+    parent_thread_path: Path | None,
+    run_id: str,
+    parent_thread_name: str | None = None,
+    name_lookup: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    session_id = parent_session_id or (
+        session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
+    )
+    transcript_path = str(parent_thread_path) if parent_thread_path is not None else None
+    name_source = "app_server_name"
+    label = parent_thread_name.strip() if isinstance(parent_thread_name, str) else ""
+    if not label and name_lookup_confirms_unnamed_thread(name_lookup):
+        label = quoted_prompt_session_name(parent_thread_path) or ""
+        name_source = "first_user_prompt_fallback" if label else "session_ref_fallback"
+    if not label:
+        label = f"Codex {transcript_origin_label(parent_thread_path, session_id) or short_identifier(session_id)}"
+        name_source = "session_ref_fallback"
+    run_ref = short_run_ref(run_id)
+    return {
+        "label": label,
+        "task_title": f"RVF from {label} run {run_ref}",
+        "name_source": name_source,
+        "name_lookup": name_lookup,
+        "session_id": session_id,
+        "session_short_id": short_identifier(session_id),
+        "codex_url": f"codex://local/{session_id}" if session_id else None,
+        "transcript_path": transcript_path,
+        "transcript_file": parent_thread_path.name if parent_thread_path is not None else None,
+        "run_id": run_id,
+        "run_ref": run_ref,
+    }
 
 
 def session_hook_state_path(session_id: str) -> Path:
@@ -1057,11 +1199,16 @@ def cline_kanban_task_prompt(
     prompt_path: str,
     parent_session_id: str,
     parent_thread_path: Path | None,
+    parent_origin: dict[str, Any],
     ledger: RunLedger,
     startup_prepare: dict[str, Any],
 ) -> str:
     del startup_prepare
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
+    parent_conversation_ref = str(parent_origin.get("label") or "<unknown Codex conversation>")
+    parent_conversation_source = str(parent_origin.get("name_source") or "<unknown>")
+    parent_codex_url = str(parent_origin.get("codex_url") or "<unavailable>")
+    parent_transcript_file = str(parent_origin.get("transcript_file") or "<unknown>")
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
     return (
@@ -1075,13 +1222,25 @@ def cline_kanban_task_prompt(
         f"RVF_RUN_DIR: {ledger.run_dir}\n"
         "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts\n"
         f"RVF_PARENT_SESSION_ID: {parent_session_id}\n"
+        f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
+        f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
+        f"RVF_PARENT_CONVERSATION_NAME_SOURCE: {parent_conversation_source}\n"
+        f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
         f"RVF_PARENT_TRANSCRIPT_PATH: {transcript}\n"
+        f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
         "RVF_REVIEW_ENV: $RVF_ARTIFACTS_DIR/review-env.sh\n"
         "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
+        "RVF_ORIGIN_METADATA: $RVF_ARTIFACTS_DIR/origin.json\n"
         "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n\n"
         "Stop hook child-session metadata:\n"
         f"{SUPPRESS_STOP_HOOK_MARKER}\n"
         "当前 Cline Kanban task 结束时必须跳过 review-validate-fix Stop hook。\n\n"
+        "Original Codex conversation trace:\n"
+        f"- name/ref: `{parent_conversation_ref}`\n"
+        f"- name source: `{parent_conversation_source}`\n"
+        f"- open: `{parent_codex_url}`\n"
+        f"- transcript: `{transcript}`\n"
+        f"- origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`\n\n"
         "你运行在 Cline Kanban 为本 task 创建的独立 git worktree 中。执行 repo 是当前 task worktree；"
         "如果需要绝对路径，使用 `git rev-parse --show-toplevel`。上面的父 repo 仅作 metadata，"
         "不要回到父 worktree 运行 review/validate/fix。开始任何 review/validate/fix 前，必须先把父会话的 "
@@ -1102,7 +1261,9 @@ def cline_kanban_task_prompt(
         "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
         "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 以 session manifest 和 review packet 为准。"
         "Handoff 默认开启时，必须持续维护 "
-        "`$RVF_ARTIFACTS_DIR/handoff.md`，最终回复第一行输出 "
+        "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
+        "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
+        "RVF run id 和 origin metadata path。最终回复第一行输出 "
         "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。\n\n"
         "原始 fork prompt 如下，仅作兼容元数据：\n\n"
         "```text\n"
@@ -1117,6 +1278,7 @@ def start_cline_kanban_task(
     prompt_path: str,
     parent_session_id: str,
     parent_thread_path: Path | None,
+    parent_origin: dict[str, Any],
     ledger: RunLedger,
     task_title: str,
     model: str | None,
@@ -1136,6 +1298,7 @@ def start_cline_kanban_task(
         prompt_path=prompt_path,
         parent_session_id=parent_session_id,
         parent_thread_path=parent_thread_path,
+        parent_origin=parent_origin,
         ledger=ledger,
         startup_prepare=startup_prepare,
     )
@@ -1386,6 +1549,15 @@ def run_codex_fork(
             "当前 fork 结束时请跳过 review-validate-fix Stop hook。"
         )
 
+    parent_name_lookup = parent_thread_name_from_app_server(parent_session_id, cwd)
+    parent_origin = parent_conversation_origin(
+        parent_session_id=parent_session_id,
+        parent_thread_path=parent_thread_path,
+        run_id=ledger.run_id,
+        parent_thread_name=parent_name_lookup.get("name"),
+        name_lookup=parent_name_lookup,
+    )
+    origin_path = ledger.artifact("origin.json", parent_origin)
     prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
     ledger.event(
         phase="fork",
@@ -1403,6 +1575,13 @@ def run_codex_fork(
         "log_prefix": log_prefix,
         "parent_thread_id": parent_session_id,
         "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
+        "parent_conversation_ref": parent_origin.get("label"),
+        "parent_conversation_name": parent_origin.get("label"),
+        "parent_conversation_name_source": parent_origin.get("name_source"),
+        "parent_thread_name_lookup": parent_name_lookup,
+        "parent_codex_url": parent_origin.get("codex_url"),
+        "parent_origin_path": origin_path,
+        "parent_transcript_file": parent_origin.get("transcript_file"),
         "cwd": cwd,
         "prompt_path": prompt_path,
         "suppress_child_stop_hook": suppress_child_stop_hook,
@@ -1451,13 +1630,14 @@ def run_codex_fork(
                 }
             )
         else:
-            task_title = f"RVF {Path(cwd).name} {ledger.run_id}"
+            task_title = str(parent_origin["task_title"])
             try:
                 task_payload = start_cline_kanban_task(
                     cwd=cwd,
                     prompt_path=prompt_path,
                     parent_session_id=parent_session_id,
                     parent_thread_path=parent_thread_path,
+                    parent_origin=parent_origin,
                     ledger=ledger,
                     task_title=task_title,
                     model=model,
@@ -1467,6 +1647,7 @@ def run_codex_fork(
                     {
                         "status": "cline-kanban-started",
                         "task_title": task_title,
+                        "cline_kanban_task_title": task_title,
                         **task_payload,
                     }
                 )
@@ -1550,6 +1731,8 @@ def run_codex_fork(
     event_paths: dict[str, Any] = {}
     if prompt_path:
         event_paths["prompt"] = prompt_path
+    if result.get("parent_origin_path"):
+        event_paths["origin"] = result["parent_origin_path"]
     if result.get("app_server_requests_path"):
         event_paths["app_server_requests"] = result["app_server_requests_path"]
     if result.get("cline_kanban_task_prompt_path"):
@@ -1578,7 +1761,12 @@ def run_codex_fork(
             paths=event_paths,
             mode="cline-kanban",
             cline_kanban_task_id=result.get("cline_kanban_task_id"),
+            cline_kanban_task_title=result.get("task_title"),
             cline_kanban_base_ref=result.get("cline_kanban_base_ref"),
+            parent_conversation_ref=result.get("parent_conversation_ref"),
+            parent_conversation_name=result.get("parent_conversation_name"),
+            parent_conversation_name_source=result.get("parent_conversation_name_source"),
+            parent_codex_url=result.get("parent_codex_url"),
         )
     elif status in {"dry-run", "manual-prepared"}:
         ledger.event(
@@ -1866,6 +2054,38 @@ def select_app_server_socket() -> tuple[Path, str, dict[str, Any]]:
     }
 
 
+def select_existing_app_server_socket_for_metadata() -> tuple[Path, str, dict[str, Any]]:
+    explicit = os.environ.get("CODEX_RVF_APP_SERVER_SOCKET")
+    if explicit and explicit.strip():
+        socket_path = Path(explicit).expanduser().resolve()
+        probe = probe_app_server_socket(socket_path)
+        if probe.get("connect_ok"):
+            return socket_path, "explicit", {"explicit": probe}
+        raise AppServerSocketSelectionError(
+            "explicit app-server socket unavailable for metadata lookup",
+            {"explicit": probe},
+        )
+
+    desktop_probe = probe_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
+    if desktop_probe.get("connect_ok"):
+        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control", {
+            "desktop_control": desktop_probe,
+        }
+
+    bridge_path = bridge_socket_path()
+    bridge_probe = probe_app_server_socket(bridge_path)
+    if bridge_probe.get("connect_ok"):
+        return bridge_path, "bridge", {
+            "desktop_control": desktop_probe,
+            "bridge": bridge_probe,
+        }
+
+    raise AppServerSocketSelectionError(
+        "no existing app-server socket available for metadata lookup",
+        {"desktop_control": desktop_probe, "bridge": bridge_probe},
+    )
+
+
 def bridge_gui_unverified_policy() -> str:
     if is_truthy(os.environ.get("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER")):
         return "bridge"
@@ -2114,6 +2334,22 @@ def compact_app_server_thread(thread: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def initialize_app_server_client(client: Any) -> None:
+    client.request(
+        "initialize",
+        {
+            "clientInfo": APP_SERVER_CLIENT_INFO,
+            "capabilities": {
+                "experimentalApi": True,
+                "optOutNotificationMethods": [],
+            },
+        },
+    )
+    send_json = getattr(client, "send_json", None)
+    if callable(send_json):
+        send_json({"method": "initialized"})
+
+
 def request_app_server_diagnostic(
     client: AppServerWebSocket,
     method: str,
@@ -2203,6 +2439,135 @@ def app_server_thread_visibility_diagnostics(
     return diagnostics
 
 
+def app_server_thread_name_from_result(result: dict[str, Any], thread_id: str) -> str | None:
+    thread = result.get("thread")
+    if isinstance(thread, dict) and thread.get("id") == thread_id:
+        name = thread.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def app_server_thread_metadata_from_result(result: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
+    thread = result.get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != thread_id:
+        return None
+    name = thread.get("name")
+    return {"thread_found": True, "name": name.strip() if isinstance(name, str) and name.strip() else None}
+
+
+def parent_thread_name_from_app_server(
+    thread_id: str | None,
+    cwd: str | None,
+) -> dict[str, Any]:
+    if not thread_id:
+        return {"name": None, "thread_found": False, "source": "missing-thread-id"}
+    try:
+        socket_path, socket_source, socket_selection = select_existing_app_server_socket_for_metadata()
+    except Exception as exc:
+        return {
+            "name": None,
+            "thread_found": False,
+            "source": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    try:
+        client = AppServerWebSocket(socket_path)
+    except Exception as exc:
+        return {
+            "name": None,
+            "thread_found": False,
+            "source": socket_source,
+            "socket_path": str(socket_path),
+            "socket_selection": socket_selection,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        initialize_app_server_client(client)
+        read_error = None
+        try:
+            read_result = client.request(
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": False},
+            )
+            read_metadata = app_server_thread_metadata_from_result(read_result, thread_id)
+            name = read_metadata.get("name") if read_metadata else None
+        except Exception as exc:
+            read_metadata = None
+            name = None
+            read_error = f"{type(exc).__name__}: {exc}"
+        if name:
+            return {
+                "name": name,
+                "thread_found": True,
+                "source": socket_source,
+                "method": "thread/read",
+                "socket_path": str(socket_path),
+                "socket_selection": socket_selection,
+            }
+        if read_metadata is not None:
+            return {
+                "name": None,
+                "thread_found": True,
+                "source": socket_source,
+                "method": "thread/read",
+                "socket_path": str(socket_path),
+                "socket_selection": socket_selection,
+                "reason": "thread-unnamed",
+            }
+
+        list_params: dict[str, Any] = {
+            "limit": 50,
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "archived": False,
+            "useStateDbOnly": False,
+        }
+        if cwd:
+            list_params["cwd"] = cwd
+        list_result = client.request("thread/list", list_params)
+        data = list_result.get("data")
+        threads = data if isinstance(data, list) else []
+        for thread in threads:
+            if not isinstance(thread, dict) or thread.get("id") != thread_id:
+                continue
+            name_value = thread.get("name")
+            name = name_value.strip() if isinstance(name_value, str) else ""
+            lookup = {
+                "name": name or None,
+                "thread_found": True,
+                "source": socket_source,
+                "method": "thread/list",
+                "socket_path": str(socket_path),
+                "socket_selection": socket_selection,
+            }
+            if not name:
+                lookup["reason"] = "thread-unnamed"
+            return lookup
+        return {
+            "name": None,
+            "thread_found": False,
+            "source": socket_source,
+            "method": "thread/list",
+            "socket_path": str(socket_path),
+            "socket_selection": socket_selection,
+            "reason": "thread-not-found",
+            "thread_read_error": read_error,
+        }
+    except Exception as exc:
+        return {
+            "name": None,
+            "thread_found": False,
+            "source": socket_source,
+            "socket_path": str(socket_path),
+            "socket_selection": socket_selection,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        client.close()
+
+
 def run_app_server_fork(
     *,
     parent_thread_id: str,
@@ -2216,16 +2581,7 @@ def run_app_server_fork(
     socket_path, socket_source, socket_selection = select_app_server_socket()
     client = AppServerWebSocket(socket_path)
     try:
-        client.request(
-            "initialize",
-            {
-                "clientInfo": APP_SERVER_CLIENT_INFO,
-                "capabilities": {
-                    "experimentalApi": True,
-                    "optOutNotificationMethods": [],
-                },
-            },
-        )
+        initialize_app_server_client(client)
         requests = app_server_fork_requests(
             parent_thread_id=parent_thread_id,
             parent_thread_path=parent_thread_path,

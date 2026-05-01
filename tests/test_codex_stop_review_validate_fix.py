@@ -265,6 +265,163 @@ def test_normalize_backend_from_env(tmp: Path) -> None:
                 os.environ[name] = value
 
 
+def test_parent_conversation_origin_prefers_app_server_chat_name(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    origin = module.parent_conversation_origin(
+        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+        parent_thread_path=transcript,
+        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+        parent_thread_name="Find RVF_STOP_HOOK behavior",
+        name_lookup={"name": "Find RVF_STOP_HOOK behavior", "source": "desktop-control"},
+    )
+
+    assert origin["label"] == "Find RVF_STOP_HOOK behavior"
+    assert origin["name_source"] == "app_server_name"
+    assert origin["task_title"] == "RVF from Find RVF_STOP_HOOK behavior run 562915ad"
+    assert origin["codex_url"] == "codex://local/019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    assert origin["transcript_file"] == transcript.name
+
+
+def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    first_prompt = (
+        "for the path in RVF hook fork to cline kanban, we need way to trace "
+        "which original conversation the fork comes from"
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": first_prompt},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    origin = module.parent_conversation_origin(
+        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+        parent_thread_path=transcript,
+        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+    )
+
+    assert origin["label"] == '"for the path in RVF hook fork to cline kanban, we need way t"'
+    assert origin["name_source"] == "first_user_prompt_fallback"
+    assert origin["task_title"] == (
+        'RVF from "for the path in RVF hook fork to cline kanban, we need way t" run 562915ad'
+    )
+
+
+def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "this prompt must not be quoted"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    origin = module.parent_conversation_origin(
+        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+        parent_thread_path=transcript,
+        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+        name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+    )
+
+    assert origin["label"] == "Codex 2026-05-01T11-25-17 019de191"
+    assert origin["name_source"] == "session_ref_fallback"
+    assert '"' not in origin["task_title"]
+
+
+def test_parent_thread_name_from_app_server_reads_thread_name(tmp: Path) -> None:
+    module = load_hook_module()
+    socket_path = tmp / "app-server.sock"
+    calls: list[tuple[str, dict[str, object] | None]] = []
+    notifications: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, socket: Path) -> None:
+            assert socket == socket_path
+            self.notifications: list[dict[str, object]] = []
+
+        def request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+            calls.append((method, params))
+            if method == "initialize":
+                return {}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "parent-thread",
+                        "name": "Find RVF_STOP_HOOK behavior",
+                    }
+                }
+            raise AssertionError(method)
+
+        def send_json(self, payload: dict[str, object]) -> None:
+            notifications.append(payload)
+
+        def close(self) -> None:
+            pass
+
+    original_client = module.AppServerWebSocket
+    original_select = module.select_existing_app_server_socket_for_metadata
+    try:
+        module.AppServerWebSocket = FakeClient
+        module.select_existing_app_server_socket_for_metadata = lambda: (
+            socket_path,
+            "desktop-control",
+            {},
+        )
+        lookup = module.parent_thread_name_from_app_server("parent-thread", str(tmp))
+    finally:
+        module.AppServerWebSocket = original_client
+        module.select_existing_app_server_socket_for_metadata = original_select
+
+    assert lookup["name"] == "Find RVF_STOP_HOOK behavior"
+    assert lookup["thread_found"] is True
+    assert lookup["source"] == "desktop-control"
+    assert lookup["method"] == "thread/read"
+    assert calls[0][0] == "initialize"
+    assert calls[1] == ("thread/read", {"threadId": "parent-thread", "includeTurns": False})
+    assert notifications == [{"method": "initialized"}]
+
+
 def write_subagent_session(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -801,7 +958,14 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
             "FAKE_CLIENT_CALLS",
         )
     }
+    original_lookup = module.parent_thread_name_from_app_server
     try:
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
@@ -819,6 +983,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
             parent_thread_path=transcript,
         )
     finally:
+        module.parent_thread_name_from_app_server = original_lookup
         for key, value in original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -861,7 +1026,18 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert f"{artifacts_dir}/review-packet.md" not in prompt_text
     assert f"{artifacts_dir}/session-manifest.json" not in prompt_text
     assert f"{artifacts_dir}/worktree-bootstrap.json" not in prompt_text
-    assert create_argv[create_argv.index("--title") + 1].startswith("RVF repo ")
+    task_title = create_argv[create_argv.index("--title") + 1]
+    assert task_title.startswith("RVF from Codex parent-thread run ")
+    assert " repo " not in task_title
+    assert latest["parent_conversation_ref"] == "Codex parent-thread"
+    assert latest["parent_codex_url"] == "codex://local/parent-thread"
+    assert Path(latest["parent_origin_path"]).exists()
+    assert "RVF_PARENT_CONVERSATION_REF: Codex parent-thread" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_NAME: Codex parent-thread" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: session_ref_fallback" in prompt_text
+    assert "RVF_PARENT_CODEX_URL: codex://local/parent-thread" in prompt_text
+    assert "## Origin" in prompt_text
+    assert "origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`" in prompt_text
     assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
     assert calls[0]["suppress"] == "1"
 
@@ -1107,7 +1283,14 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) ->
         key: os.environ.get(key)
         for key in ("CODEX_RVF_STATE_DIR", "CODEX_RVF_FORK_MODE", "CODEX_RVF_CLINE_KANBAN_CLIENT")
     }
+    original_lookup = module.parent_thread_name_from_app_server
     try:
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
@@ -1121,6 +1304,7 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) ->
             parent_thread_path=write_apply_patch_transcript(tmp / "session.jsonl", repo),
         )
     finally:
+        module.parent_thread_name_from_app_server = original_lookup
         for key, value in original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -2531,6 +2715,10 @@ def test_log_unavailable_does_not_break_hook_payload(tmp: Path) -> None:
 def main() -> int:
     tests = [
         test_normalize_backend_from_env,
+        test_parent_conversation_origin_prefers_app_server_chat_name,
+        test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed,
+        test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails,
+        test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
         test_diagnose_codex_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
