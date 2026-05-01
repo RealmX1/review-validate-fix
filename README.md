@@ -175,7 +175,7 @@ cat <events_path>
 
 `latest.json` 只是 pointer，不是完整状态源；主程序和测试都应读取 `summary.json` 或 `events.jsonl`。如果日志目录不可写，hook payload 仍应可用，并在 `systemMessage` 或 summary diagnostics 中标记 `log_unavailable`。`CODEX_RVF_LOG_MAX_INLINE_BYTES` 和 `CODEX_RVF_LOG_LEVEL` 只用于日志行为调试，不应改变 hook 协议。
 
-hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。
+hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没有 path 时才退回 thread/session id。这样可以避开 Desktop 环境 id 无法被外部 app-server 直接索引的问题。legacy GUI fork 的首条 `$review-validate-fix` prompt 也会携带 parent conversation name/ref、name source、`codex://local/<thread-id>`、transcript path 和 `origin.json` path，确保 fork 内生成的 handoff 不会把 `RVF_PARENT_SESSION_ID` 误记为 conversation name source。
 
 如果 Codex Desktop 没有暴露 legacy control app-server socket，legacy GUI fallback 默认会进入 `CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=auto`：优先复用可连通的 `~/.codex/app-server-control/rvf-app-server.sock`，否则尝试启动 bridge app-server。bridge fork 的 summary 会保留 `socket_source=bridge` 和 `gui_visibility=unverified-bridge-only`，便于排障；如果复用的 bridge 在 fork/turn 时返回配置加载或权限类 app-server 错误，hook 会终止 RVF 专用 socket 上的旧 bridge listener、重启 bridge 并重试一次。需要禁止 bridge fallback 时，显式设置 `CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY=report|manual|fail`；无论哪种失败策略，都不会注入 `$review-validate-fix` continuation prompt。
 

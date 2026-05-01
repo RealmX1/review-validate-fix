@@ -638,6 +638,60 @@ def parent_conversation_origin(
     }
 
 
+def value_or_unavailable(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is not None:
+        text = str(value).strip()
+        if text:
+            return text
+    return "<unavailable>"
+
+
+def parent_origin_prompt_block(
+    *,
+    parent_origin: dict[str, Any],
+    origin_path: str | None,
+) -> str:
+    parent_conversation_ref = value_or_unavailable(
+        parent_origin.get("label") or parent_origin.get("session_id")
+    )
+    parent_conversation_source = value_or_unavailable(parent_origin.get("name_source"))
+    parent_codex_url = value_or_unavailable(parent_origin.get("codex_url"))
+    parent_transcript_path = value_or_unavailable(parent_origin.get("transcript_path"))
+    parent_transcript_file = value_or_unavailable(parent_origin.get("transcript_file"))
+    parent_origin_path = value_or_unavailable(origin_path)
+    return (
+        "Original Codex conversation metadata:\n"
+        f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
+        f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
+        f"RVF_PARENT_CONVERSATION_NAME_SOURCE: {parent_conversation_source}\n"
+        f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
+        f"RVF_PARENT_TRANSCRIPT_PATH: {parent_transcript_path}\n"
+        f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
+        f"RVF_ORIGIN_METADATA: {parent_origin_path}\n\n"
+        "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
+        "Codex conversation name/ref、name source、codex URL、transcript path "
+        "和 origin metadata path；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
+    )
+
+
+def add_parent_origin_to_rvf_fork_prompt(
+    prompt: str,
+    *,
+    parent_origin: dict[str, Any],
+    origin_path: str | None,
+) -> str:
+    if RVF_FORK_MARKER not in prompt:
+        return prompt
+    if "RVF_PARENT_CONVERSATION_NAME_SOURCE:" in prompt:
+        return prompt
+    return (
+        f"{prompt.rstrip()}\n\n"
+        f"{parent_origin_prompt_block(parent_origin=parent_origin, origin_path=origin_path)}"
+    )
+
+
 def session_hook_state_path(session_id: str) -> Path:
     return session_hook_state_dir() / f"{safe_state_key(session_id)}.json"
 
@@ -1945,6 +1999,11 @@ def run_codex_fork(
         name_lookup=parent_name_lookup,
     )
     origin_path = ledger.artifact("origin.json", parent_origin)
+    effective_prompt = add_parent_origin_to_rvf_fork_prompt(
+        effective_prompt,
+        parent_origin=parent_origin,
+        origin_path=origin_path,
+    )
     prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
     ledger.event(
         phase="fork",
