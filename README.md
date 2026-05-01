@@ -105,6 +105,14 @@ python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode cline-kanb
 
 Cline Kanban task id、base ref、bootstrap artifact 和生成的 task prompt 都会写入同一份 RunLedger：`events.jsonl`、`summary.json`、`review-env.sh`、`review-agent-context.md` 等位于 `state/runs/<run_id>/artifacts/`。默认不自动 commit 或 open PR；用户可以在 Kanban 的 diff viewer、checkpoints、inline comments 中审查结果，再使用 Kanban 的 Commit/Open PR 入口交付。只有显式启用 `CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED=1` 时，hook 才把 `CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE=commit|pr|move_to_trash` 传给 Kanban。
 
+如果当前 Stop hook 本身运行在 Cline Kanban task 内，并且 Kanban host 已定制支持真实 follow-up user message 注入，可配置：
+
+```bash
+python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode kanban-followup
+```
+
+该模式写入 `CODEX_RVF_FORK_MODE=kanban-followup`，也接受别名 `kanban-message` / `kanban-inject`。dirty gate 通过后，hook 不 fork、不创建新 task，而是要求环境或 Stop event 提供 `KANBAN_TASK_ID`（兼容 `CLINE_KANBAN_TASK_ID` / `task_id`），再调用定制的 `kanban task message --project-path <repo> --task-id <id> --prompt-file <prompt> --source review-validate-fix --idempotency-key <run_id>`。这个命令必须走 Kanban host 的真实用户消息通道，把 `$review-validate-fix` prompt 注入当前 task 的 active coding-agent chat session；不得实现为 card activity、metadata、hook context、system message 或 `contextModification`。注入失败时 hook 只报告 `kanban_followup_unavailable` / `kanban_followup_missing_task_id` 并停止，不回退到 continuation、新 task 或 GUI fork。
+
 实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_dispatcher.py`，不是直接调用 `codex_stop_review_validate_fix.py`。dispatcher 会在 Stop event 来自本 RVF 源仓库、且不是 subagent 时，先顺序运行：
 
 ```bash
@@ -164,17 +172,19 @@ flowchart TD
 
     Backend -- "gui" --> Gui["Codex GUI/app-server\nthread/fork + turn/start"]
     Backend -- "kanban" --> Kanban["Cline Kanban task\nprepare artifacts + bootstrap"]
+    Backend -- "kanban-followup" --> KanbanFollowup["Cline Kanban 当前 task\n真实 follow-up user message"]
     Backend -- "manual" --> Manual["只写 fork prompt artifact"]
     Backend -- "dry-run" --> DryRun["只写 app-server request artifact"]
     Backend -- "report-only/off" --> Skip
 
     Gui --> Result["emit started/failed payload"]
     Kanban --> Result
+    KanbanFollowup --> Result
     Manual --> Result
     DryRun --> Result
 ```
 
-这张图里的关键边界是：dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 GUI fork、Cline Kanban、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认成功路径会创建新的 GUI fork 用户 prompt checkpoint，失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
+这张图里的关键边界是：dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 GUI fork、Cline Kanban task、Cline Kanban follow-up、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认成功路径会创建新的 GUI fork 用户 prompt checkpoint；`kanban-followup` 的 checkpoint 由 Kanban host 真实 user-message 注入语义保证；失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
 
 fork 诊断不再通过 Stop hook 主路径里的 `RVF_FORK_EXPERIMENT` 自动触发；需要排查 app-server fork 行为时，手动运行 plugin runtime 的 `scripts/diagnose_codex_fork.py --mode dry-run|gui|manual`，并把 Stop event JSON 通过 stdin 传入。
 
@@ -224,6 +234,8 @@ python3 scripts/install_to_codex.py --replace-setup-config
 Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Desktop control socket 缺失且未显式允许 bridge app-server 时，fork 模式只报告无法创建 GUI fork。
 
 显式 `CODEX_RVF_FORK_MODE=cline-kanban` 时，fork 模式不调用 Codex GUI fork；hook 会用官方 `kanban` CLI 创建并启动一张真实 Cline Kanban task。父 worktree 保持原样，session-owned dirty changes 会先冻结为 bootstrap artifact，再由 task 在 Kanban 独立 worktree 中重放。Kanban 服务不可用、task 创建/启动失败、bootstrap artifact 无法安全生成或重放时直接 fail-safe，不启动隐藏 runner。
+
+显式 `CODEX_RVF_FORK_MODE=kanban-followup` 时，fork 模式也不调用 Codex GUI fork；hook 只通过定制 `kanban task message` 向当前 Kanban task 注入真实 follow-up 用户消息。缺少当前 task id、Kanban CLI 不支持 message、或 host 无法确认注入时直接 fail-safe，不启动新 task，也不使用 Stop continuation。
 
 ## 验证
 

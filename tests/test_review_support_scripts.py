@@ -2172,6 +2172,8 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
         "    print(json.dumps({'task_id': 'task-1'}))\n"
         "elif sys.argv[1] == 'start':\n"
         "    print(json.dumps({'task_id': 'task-1', 'status': 'started'}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-1', 'message_id': 'msg-1', 'status': 'queued'}))\n"
         "elif sys.argv[1] == 'trash':\n"
         "    print(json.dumps({'task_id': 'task-1', 'status': 'trashed'}))\n"
         "else:\n"
@@ -2214,11 +2216,81 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
         "task-1",
     ], env=env)
     assert json.loads(started.stdout)["status"] == "started"
+    prompt_file = tmp / "prompt.md"
+    prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
+    message = run([
+        sys.executable,
+        str(CLINE_KANBAN_CLIENT),
+        "message",
+        "--repo",
+        str(repo),
+        "--task-cmd",
+        task_cmd,
+        "--task-id",
+        "task-1",
+        "--prompt-file",
+        str(prompt_file),
+        "--source",
+        "review-validate-fix",
+        "--idempotency-key",
+        "run-1",
+    ], env=env)
+    assert json.loads(message.stdout)["message_id"] == "msg-1"
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert [call[0] for call in recorded] == ["list", "create", "start"]
+    assert [call[0] for call in recorded] == ["list", "create", "start", "message"]
     create_call = recorded[1]
     assert create_call[create_call.index("--title") + 1] == "RVF test"
     assert create_call[create_call.index("--agent-id") + 1] == "codex"
+    message_call = recorded[3]
+    assert message_call[message_call.index("--task-id") + 1] == "task-1"
+    assert message_call[message_call.index("--prompt-file") + 1] == str(prompt_file.resolve())
+    assert message_call[message_call.index("--idempotency-key") + 1] == "run-1"
+
+
+def test_cline_kanban_client_message_accepts_response_without_task_id(tmp: Path) -> None:
+    tmp.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp / "fake_kanban_task.py"
+    calls = tmp / "calls.jsonl"
+    fake_task.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'message_id': 'msg-1', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    repo = init_repo(tmp / "repo")
+    prompt_file = tmp / "prompt.md"
+    prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["KANBAN_CALLS"] = str(calls)
+    task_cmd = f"{sys.executable} {fake_task}"
+
+    message = run([
+        sys.executable,
+        str(CLINE_KANBAN_CLIENT),
+        "message",
+        "--repo",
+        str(repo),
+        "--task-cmd",
+        task_cmd,
+        "--task-id",
+        "task-1",
+        "--prompt-file",
+        str(prompt_file),
+        "--source",
+        "review-validate-fix",
+        "--idempotency-key",
+        "run-1",
+    ], env=env)
+
+    payload = json.loads(message.stdout)
+    assert payload["task_id"] == "task-1"
+    assert payload["message_id"] == "msg-1"
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-1"
 
 
 def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
@@ -2472,6 +2544,7 @@ def main() -> int:
         )
         test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(root / "alternative-wrapper")
         test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client")
+        test_cline_kanban_client_message_accepts_response_without_task_id(root / "cline-kanban-message")
         test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap")
         test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(root / "prepare-symlink-state")
         test_apply_worktree_bootstrap_replays_tracked_and_untracked(root / "apply-bootstrap")

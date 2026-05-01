@@ -47,6 +47,7 @@ DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "report"
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
+KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
 SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
 MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
@@ -797,6 +798,37 @@ def fork_review_validate_fix_prompt(
     )
 
 
+def kanban_followup_review_validate_fix_prompt(
+    *,
+    task_id: str,
+    attempt_id: str | None,
+    target_repo: str,
+    cwd: str | None,
+    ledger: RunLedger,
+) -> str:
+    attempt_line = f"RVF_CURRENT_ATTEMPT_ID: {attempt_id}\n" if attempt_id else ""
+    cwd_line = cwd or "<unknown cwd>"
+    return (
+        "$review-validate-fix\n\n"
+        f"{KANBAN_FOLLOWUP_MARKER}\n"
+        f"RVF_RUN_ID: {ledger.run_id}\n"
+        f"RVF_TARGET_REPO: {target_repo}\n"
+        f"RVF_CURRENT_TASK_ID: {task_id}\n"
+        f"{attempt_line}"
+        f"RVF_CURRENT_CWD: {cwd_line}\n\n"
+        "这是由 Cline Kanban host 在当前 task 的 coding agent chat session 中注入的"
+        "真实用户消息，用于在同一 task/session 内触发 review-validate-fix。"
+        "不要创建新的 Kanban task，不要 fork 新会话，也不要把这条消息当作 hook system context。\n\n"
+        "请在当前 task worktree 中运行完整 review-validate-fix。目标仓库为上面的 "
+        "`RVF_TARGET_REPO`；如果当前 task worktree 的 repo root 与该路径不同，以当前 task "
+        "worktree 为执行位置，并在 handoff 中记录这一点。\n\n"
+        "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
+        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
+        "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
+        "handoff 文件内容。Stop hook 会在本会话结束时自动打开该 markdown 文件。"
+    )
+
+
 def parse_marker_value(text: str, key: str) -> str | None:
     pattern = re.compile(rf"^{re.escape(key)}:\s*(.+?)\s*$", re.MULTILINE)
     match = pattern.search(text)
@@ -839,6 +871,47 @@ def cline_kanban_script_path(env_name: str, default: Path) -> Path:
     if value and value.strip():
         return Path(value).expanduser()
     return default
+
+
+def event_or_env_text(
+    event: dict[str, Any],
+    env_names: tuple[str, ...],
+    event_keys: tuple[str, ...],
+) -> str | None:
+    for name in env_names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return string_event_value(event, event_keys)
+
+
+# Cline Kanban 在 task session 的 hook 环境中自动设置 KANBAN_TASK_ID 和
+# KANBAN_WORKSPACE_ID；这是 kanban-followup 判断“当前 Stop hook 位于 Kanban task
+# 内”的原生信号。ATTEMPT/PROJECT_PATH 不是公开文档确认的自动变量，这里只作为
+# host 定制字段或 Stop event 扩展字段兼容读取。
+def current_kanban_task_id(event: dict[str, Any]) -> str | None:
+    return event_or_env_text(
+        event,
+        ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID"),
+        ("kanban_task_id", "kanbanTaskId", "task_id", "taskId"),
+    )
+
+
+def current_kanban_attempt_id(event: dict[str, Any]) -> str | None:
+    return event_or_env_text(
+        event,
+        ("KANBAN_ATTEMPT_ID", "CLINE_KANBAN_ATTEMPT_ID"),
+        ("kanban_attempt_id", "kanbanAttemptId", "attempt_id", "attemptId"),
+    )
+
+
+def current_kanban_project_path(event: dict[str, Any], fallback: str) -> str:
+    value = event_or_env_text(
+        event,
+        ("KANBAN_PROJECT_PATH", "CLINE_KANBAN_PROJECT_PATH"),
+        ("kanban_project_path", "kanbanProjectPath", "project_path", "projectPath"),
+    )
+    return value or fallback
 
 
 def startup_scope_text(
@@ -1193,6 +1266,82 @@ def start_cline_kanban_task(
         "worktree_bootstrap_patch_path": metadata.get("worktree_bootstrap_patch"),
         "worktree_bootstrap_files_dir": metadata.get("worktree_bootstrap_files_dir"),
     }
+
+
+def start_cline_kanban_followup_message(
+    *,
+    project_path: str,
+    task_id: str,
+    attempt_id: str | None,
+    prompt: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
+    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+    prompt_path = ledger.artifact("kanban-followup.prompt.md", prompt)
+    if not prompt_path:
+        raise RuntimeError("failed to write Cline Kanban follow-up prompt artifact")
+
+    command = [
+        sys.executable,
+        str(client),
+        "message",
+        "--repo",
+        project_path,
+        "--task-cmd",
+        task_cmd,
+        "--task-id",
+        task_id,
+        "--prompt-file",
+        prompt_path,
+        "--source",
+        "review-validate-fix",
+        "--idempotency-key",
+        ledger.run_id,
+    ]
+    if attempt_id:
+        command.extend(["--attempt-id", attempt_id])
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    command_path = ledger.artifact(
+        "kanban-followup-message.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    payload = parse_json_command_output(completed, label="Cline Kanban task message")
+    message_id = str(payload.get("message_id") or payload.get("messageId") or "").strip()
+    if not message_id:
+        raise RuntimeError(f"Cline Kanban task message response did not include message_id: {payload!r}")
+    payload["message_id"] = message_id
+    payload.setdefault("task_id", task_id)
+    if attempt_id:
+        payload.setdefault("attempt_id", attempt_id)
+
+    ledger.artifact(
+        "kanban-followup-message-result.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "payload": payload,
+        },
+    )
+    payload["command_artifact_path"] = command_path
+    payload["prompt_path"] = prompt_path
+    payload["task_cmd"] = task_cmd
+    payload["project_path"] = project_path
+    return payload
 
 
 def run_codex_fork(
@@ -2193,6 +2342,8 @@ def normalize_backend_from_env(mode_env_name: str = "CODEX_RVF_FORK_MODE") -> st
         return "gui"
     if fork_mode in {"cline-kanban", "cline", "kanban", "ck"}:
         return "kanban"
+    if fork_mode in {"kanban-followup", "kanban-message", "kanban-inject"}:
+        return "kanban-followup"
     if fork_mode in {"manual", "prepare", "prepared", "log-only"}:
         return "manual"
     if fork_mode == "dry-run":
@@ -2261,6 +2412,121 @@ def launch_backend(
             "missing_target_repo",
             backend=decision.backend,
         )
+    cwd = decision.cwd or fork_cwd_for_event(event, decision.repo)
+    if decision.backend == "kanban-followup":
+        task_id = current_kanban_task_id(event)
+        if not task_id:
+            return skip_payload(
+                "Cline Kanban follow-up backend requires KANBAN_TASK_ID or task_id in the Stop event.",
+                ledger,
+                "kanban_followup_missing_task_id",
+                repo=decision.repo,
+                cwd=cwd,
+                backend=decision.backend,
+            )
+        attempt_id = current_kanban_attempt_id(event)
+        project_path = current_kanban_project_path(event, decision.repo)
+        prompt = kanban_followup_review_validate_fix_prompt(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            target_repo=decision.repo,
+            cwd=cwd,
+            ledger=ledger,
+        )
+        ledger.event(
+            phase="fork",
+            event="kanban_followup_started",
+            status="started",
+            reason_code="kanban_followup_started",
+            repo=decision.repo,
+            cwd=cwd,
+            mode="kanban-followup",
+            cline_kanban_task_id=task_id,
+            cline_kanban_attempt_id=attempt_id,
+        )
+        try:
+            message_payload = start_cline_kanban_followup_message(
+                project_path=project_path,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                prompt=prompt,
+                ledger=ledger,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_failed",
+                status="kanban-followup-unavailable",
+                reason_code="kanban_followup_unavailable",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                error=error,
+            )
+            return ledger.hook_payload(
+                status="kanban-followup-unavailable",
+                reason_code="kanban_followup_unavailable",
+                message=f"Cline Kanban follow-up user message was not injected: {error}",
+                repo=decision.repo,
+                cwd=cwd,
+                backend=decision.backend,
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                cline_kanban_project_path=project_path,
+                error=error,
+            )
+
+        raw_status = str(message_payload.get("status") or "").strip().lower()
+        status = (
+            "kanban-followup-started"
+            if raw_status in {"started", "running", "in_progress", "in-progress"}
+            else "kanban-followup-enqueued"
+        )
+        reason_code = status.replace("-", "_")
+        paths = {
+            key: value
+            for key, value in {
+                "prompt": message_payload.get("prompt_path"),
+                "message_command": message_payload.get("command_artifact_path"),
+            }.items()
+            if value
+        }
+        ledger.event(
+            phase="fork",
+            event="kanban_followup_completed",
+            status=status,
+            reason_code=reason_code,
+            repo=decision.repo,
+            cwd=cwd,
+            paths=paths,
+            mode="kanban-followup",
+            cline_kanban_task_id=message_payload.get("task_id"),
+            cline_kanban_attempt_id=message_payload.get("attempt_id"),
+            cline_kanban_message_id=message_payload.get("message_id"),
+            cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+            cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
+        )
+        return ledger.hook_payload(
+            status=status,
+            reason_code=reason_code,
+            message="Cline Kanban follow-up user message was injected.",
+            repo=decision.repo,
+            cwd=cwd,
+            backend=decision.backend,
+            mode="kanban-followup",
+            prompt_path=message_payload.get("prompt_path"),
+            cline_kanban_task_id=message_payload.get("task_id"),
+            cline_kanban_attempt_id=message_payload.get("attempt_id"),
+            cline_kanban_project_path=project_path,
+            cline_kanban_message_id=message_payload.get("message_id"),
+            cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+            cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
+            kanban_followup_payload=message_payload,
+            **(decision.summary_fields or {}),
+        )
     if not decision.parent_thread_id:
         return skip_payload(
             "Stop event did not expose a parent thread id.",
@@ -2271,7 +2537,6 @@ def launch_backend(
             backend=decision.backend,
         )
 
-    cwd = decision.cwd or fork_cwd_for_event(event, decision.repo)
     prompt = fork_review_validate_fix_prompt(decision.parent_thread_id, cwd, decision.repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
@@ -2673,6 +2938,16 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
         if payload is not None:
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
 
+    if latest_user and KANBAN_FOLLOWUP_MARKER in latest_user:
+        return skip_decision(
+            "当前最新用户消息是 Cline Kanban 注入的 RVF follow-up trigger；"
+            "本次 Stop 跳过自动 RVF，避免同一 synthetic user turn 结束后递归触发。",
+            ledger,
+            "kanban_followup_trigger_turn",
+            cwd=cwd,
+            backend="kanban-followup",
+        )
+
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
     if fork_context is not None:
         return skip_decision(
@@ -2753,7 +3028,8 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 return report_only_decision(cwd_result.repo, ledger)
 
             parent_thread_id = parent_thread_id_from_event(event)
-            if not parent_thread_id:
+            parent_thread_path = parent_thread_path_from_event(event)
+            if backend != "kanban-followup" and not parent_thread_id:
                 return skip_decision(
                     "Stop event did not expose a parent thread id.",
                     ledger,
@@ -2763,8 +3039,6 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     backend=backend,
                     log_prefix="review-validate-fix-fork",
                 )
-
-            parent_thread_path = parent_thread_path_from_event(event)
             if backend == "kanban":
                 parent_thread_path = first_readable_session_path(event)
                 if parent_thread_path is None:

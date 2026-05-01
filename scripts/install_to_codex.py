@@ -199,6 +199,8 @@ def normalize_fork_mode(value: str) -> str:
     mode = (value or "gui").strip()
     if mode in {"cline", "kanban", "ck"}:
         return "cline-kanban"
+    if mode in {"kanban-message", "kanban-inject"}:
+        return "kanban-followup"
     return mode
 
 
@@ -236,7 +238,7 @@ def configure_stop_hook(
     ide_open_text = (ide_open_cmd or "").strip()
     if ide_open_text:
         env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
-    if fork_mode == "cline-kanban":
+    if fork_mode in {"cline-kanban", "kanban-followup"}:
         for name, value in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
             ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", cline_kanban_task_cmd),
@@ -328,7 +330,18 @@ def main() -> int:
     )
     parser.add_argument(
         "--fork-mode",
-        choices=["gui", "cline-kanban", "cline", "kanban", "ck", "manual", "dry-run"],
+        choices=[
+            "gui",
+            "cline-kanban",
+            "cline",
+            "kanban",
+            "ck",
+            "kanban-followup",
+            "kanban-message",
+            "kanban-inject",
+            "manual",
+            "dry-run",
+        ],
         default="gui",
         help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 gui。",
     )

@@ -123,7 +123,7 @@ def invoke(
 ) -> tuple[str, str]:
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             env.pop(name, None)
     env.pop("CODEX_THREAD_ID", None)
     if config is not None:
@@ -246,6 +246,9 @@ def test_normalize_backend_from_env(tmp: Path) -> None:
         ({"CODEX_RVF_FORK_MODE": "cline-kanban"}, "kanban"),
         ({"CODEX_RVF_FORK_MODE": "cline"}, "kanban"),
         ({"CODEX_RVF_FORK_MODE": "ck"}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-followup"}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-message"}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-inject"}, "kanban-followup"),
         ({"CODEX_RVF_FORK_MODE": "surprise"}, "surprise"),
     ]
     try:
@@ -906,6 +909,182 @@ def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp:
     assert latest["backend"] == "kanban"
     assert "startup_prepare_metadata_path" not in latest
     assert not client_calls.exists()
+
+
+def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
+        "if sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued', 'checkpoint_id': 'checkpoint-1'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_ATTEMPT_ID": "attempt-9",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "kanban-followup-enqueued"
+    assert latest["backend"] == "kanban-followup"
+    assert latest["cline_kanban_task_id"] == "task-77"
+    assert latest["cline_kanban_attempt_id"] == "attempt-9"
+    assert latest["cline_kanban_message_id"] == "msg-77"
+    assert latest["cline_kanban_checkpoint_id"] == "checkpoint-1"
+    assert "parent_thread_id" not in latest or latest["parent_thread_id"] is None
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["message"]
+    message_argv = calls[0]["argv"]
+    assert "--task-id" in message_argv
+    assert message_argv[message_argv.index("--task-id") + 1] == "task-77"
+    assert "--attempt-id" in message_argv
+    assert message_argv[message_argv.index("--attempt-id") + 1] == "attempt-9"
+    assert "--prompt-file" in message_argv
+    prompt_path = Path(message_argv[message_argv.index("--prompt-file") + 1])
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    assert prompt_text.startswith("$review-validate-fix\n")
+    assert "RVF_KANBAN_FOLLOWUP_TRIGGER" in prompt_text
+    assert "RVF_CURRENT_TASK_ID: task-77" in prompt_text
+    assert "RVF_CURRENT_ATTEMPT_ID: attempt-9" in prompt_text
+    assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
+    assert calls[0]["suppress"] is None
+
+
+def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    subdir = repo / "nested"
+    subdir.mkdir()
+    state = tmp / "state"
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+    original_env = {
+        key: os.environ.pop(key, None)
+        for key in ("KANBAN_PROJECT_PATH", "CLINE_KANBAN_PROJECT_PATH")
+    }
+    try:
+        stdout, _ = invoke(
+            {
+                "cwd": str(subdir),
+                "stop_hook_active": False,
+            },
+            extra_env={
+                "CODEX_RVF_FORK_MODE": "kanban-followup",
+                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+                "KANBAN_TASK_ID": "task-77",
+                "FAKE_CLIENT_CALLS": str(client_calls),
+            },
+            state_dir=state,
+        )
+    finally:
+        for key, value in original_env.items():
+            if value is not None:
+                os.environ[key] = value
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["cwd"] == str(subdir.resolve())
+    assert latest["cline_kanban_project_path"] == str(repo.resolve())
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    message_argv = calls[0]["argv"]
+    assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
+
+
+def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_missing_task_id" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "kanban_followup_missing_task_id"
+    assert latest["backend"] == "kanban-followup"
+    assert not client_calls.exists()
+
+
+def test_kanban_followup_trigger_marker_skips_one_turn(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "last_user_message": "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER",
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "kanban-followup"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_trigger_turn" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "kanban_followup_trigger_turn"
 
 
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) -> None:
@@ -2370,6 +2549,10 @@ def main() -> int:
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
+        test_kanban_followup_mode_injects_current_task_message,
+        test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd,
+        test_kanban_followup_mode_without_task_id_reports_without_fallback,
+        test_kanban_followup_trigger_marker_skips_one_turn,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,

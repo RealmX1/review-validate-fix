@@ -958,6 +958,33 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     assert "--ide-open-cmd code -r" in install_args
 
 
+def test_dev_sync_preserves_kanban_followup_installer_args(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-message",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+        },
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    install_args = (marker / "install-ran").read_text(encoding="utf-8")
+    assert "--configure-stop-hook" in install_args
+    assert "--fork-mode kanban-followup" in install_args
+    assert "--cline-kanban-task-cmd" in install_args
+
+
 def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1111,6 +1138,7 @@ def main() -> int:
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
         test_dev_sync_step_specs_resolve_repo_level_dev_scripts,
         test_dev_sync_preserves_cline_kanban_installer_args,
+        test_dev_sync_preserves_kanban_followup_installer_args,
         test_dev_sync_prefers_hooks_json_over_stale_cached_env,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]

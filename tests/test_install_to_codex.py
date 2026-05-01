@@ -169,6 +169,26 @@ def test_configure_stop_hook_can_write_cline_kanban_mode(tmp_path: Path) -> None
     assert "CODEX_RVF_FORK_MODE=cline-kanban" in matching[0]["command"]
 
 
+def test_configure_stop_hook_can_write_kanban_followup_mode(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            "kanban-message",
+            cline_kanban_task_cmd="npx -y kanban@0.1.66 task",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    command = matching[0]["command"]
+    assert "CODEX_RVF_FORK_MODE=kanban-followup" in command
+    assert "CODEX_RVF_CLINE_KANBAN_TASK_CMD=" in command
+
+
 def test_configure_stop_hook_can_write_cline_kanban_connection_env(tmp_path: Path) -> None:
     module = load_installer_module()
 
@@ -474,6 +494,7 @@ def main() -> int:
         test_configure_stop_hook_deduplicates_existing_rvf_hooks,
         test_configure_stop_hook_adds_dispatcher_when_missing,
         test_configure_stop_hook_can_write_cline_kanban_mode,
+        test_configure_stop_hook_can_write_kanban_followup_mode,
         test_configure_stop_hook_can_write_cline_kanban_connection_env,
         test_configure_stop_hook_can_write_cline_kanban_review_options,
         test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd,

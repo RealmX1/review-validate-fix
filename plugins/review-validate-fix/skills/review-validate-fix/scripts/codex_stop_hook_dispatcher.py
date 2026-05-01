@@ -465,8 +465,10 @@ def installer_args_from_env() -> list[str]:
         return args
     if fork_mode in {"cline", "kanban", "ck"}:
         fork_mode = "cline-kanban"
+    if fork_mode in {"kanban-message", "kanban-inject"}:
+        fork_mode = "kanban-followup"
     args.extend(["--fork-mode", fork_mode])
-    if fork_mode == "cline-kanban":
+    if fork_mode in {"cline-kanban", "kanban-followup"}:
         for env_name, option in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", "--cline-kanban-start-cmd"),
             ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", "--cline-kanban-task-cmd"),

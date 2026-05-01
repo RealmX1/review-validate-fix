@@ -18,8 +18,9 @@ DEFAULT_TASK_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} task"
 DEFAULT_START_TIMEOUT_SECONDS = 90.0
 DEFAULT_TMUX_SESSION = "rvf-cline-kanban"
 
-# Contract surface: this wrapper shells out to `kanban task create`,
-# `kanban task start`, and `kanban task trash`.
+# 契约边界：这个 wrapper 只 shell 到 `kanban task create`、
+# `kanban task start`、`kanban task trash`，以及 RVF 定制的
+# `kanban task message` follow-up 用户消息注入命令。
 
 
 class KanbanError(RuntimeError):
@@ -143,6 +144,19 @@ def normalize_task_id(payload: dict[str, Any]) -> str:
     raise KanbanError(f"Kanban response did not include task id: {payload!r}")
 
 
+def normalize_message_id(payload: dict[str, Any]) -> str:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        value = message.get("id") or message.get("message_id") or message.get("messageId")
+        if isinstance(value, str) and value.strip():
+            return value
+    for key in ("message_id", "messageId"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise KanbanError(f"Kanban response did not include message id: {payload!r}")
+
+
 def create_task(
     *,
     task_cmd: str,
@@ -203,9 +217,46 @@ def trash_task(*, task_cmd: str, repo: Path, task_id: str) -> dict[str, Any]:
     return payload
 
 
+def send_task_message(
+    *,
+    task_cmd: str,
+    repo: Path,
+    task_id: str,
+    prompt: str | None,
+    prompt_file: Path | None,
+    source: str,
+    idempotency_key: str,
+    attempt_id: str | None,
+) -> dict[str, Any]:
+    if prompt is None and prompt_file is None:
+        raise KanbanError("message requires --prompt or --prompt-file")
+    command = task_command(
+        task_cmd,
+        "message",
+        "--project-path",
+        str(repo),
+        "--task-id",
+        task_id,
+    )
+    if prompt_file is not None:
+        command.extend(["--prompt-file", str(prompt_file)])
+    else:
+        command.extend(["--prompt", prompt or ""])
+    command.extend(["--source", source, "--idempotency-key", idempotency_key])
+    if attempt_id:
+        command.extend(["--attempt-id", attempt_id])
+    payload = parse_json_stdout(run_command(command, cwd=repo))
+    try:
+        payload["task_id"] = normalize_task_id(payload)
+    except KanbanError:
+        payload["task_id"] = task_id
+    payload["message_id"] = normalize_message_id(payload)
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cline Kanban CLI client for RVF.")
-    parser.add_argument("action", choices=["ensure", "list", "create", "start", "trash"])
+    parser.add_argument("action", choices=["ensure", "list", "create", "start", "trash", "message"])
     parser.add_argument("--task-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_TASK_CMD))
     parser.add_argument("--start-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD", DEFAULT_START_CMD))
     parser.add_argument("--start-timeout", type=float, default=float(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", DEFAULT_START_TIMEOUT_SECONDS)))
@@ -213,10 +264,14 @@ def main() -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--start-if-needed", action="store_true")
     parser.add_argument("--prompt")
+    parser.add_argument("--prompt-file")
     parser.add_argument("--base-ref", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"))
     parser.add_argument("--title")
     parser.add_argument("--agent-id")
     parser.add_argument("--task-id")
+    parser.add_argument("--attempt-id")
+    parser.add_argument("--source", default="review-validate-fix")
+    parser.add_argument("--idempotency-key")
     parser.add_argument("--start-in-plan-mode", action="store_true")
     parser.add_argument("--auto-review-enabled", action="store_true")
     parser.add_argument("--auto-review-mode", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit"))
@@ -255,10 +310,25 @@ def main() -> int:
             if not args.task_id:
                 raise KanbanError("--task-id is required for start")
             payload = start_task(task_cmd=args.task_cmd, repo=repo, task_id=args.task_id)
-        else:
+        elif args.action == "trash":
             if not args.task_id:
                 raise KanbanError("--task-id is required for trash")
             payload = trash_task(task_cmd=args.task_cmd, repo=repo, task_id=args.task_id)
+        else:
+            if not args.task_id:
+                raise KanbanError("--task-id is required for message")
+            if not args.idempotency_key:
+                raise KanbanError("--idempotency-key is required for message")
+            payload = send_task_message(
+                task_cmd=args.task_cmd,
+                repo=repo,
+                task_id=args.task_id,
+                prompt=args.prompt,
+                prompt_file=Path(args.prompt_file).expanduser().resolve() if args.prompt_file else None,
+                source=args.source,
+                idempotency_key=args.idempotency_key,
+                attempt_id=args.attempt_id,
+            )
     except Exception as exc:
         print(f"cline-kanban error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
