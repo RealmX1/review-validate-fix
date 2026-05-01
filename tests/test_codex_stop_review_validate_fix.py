@@ -21,6 +21,7 @@ SCRIPT = (
     / "scripts"
     / "codex_stop_review_validate_fix.py"
 )
+DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_codex_fork.py")
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -231,6 +232,36 @@ def load_hook_module():
     return module
 
 
+def test_normalize_backend_from_env(tmp: Path) -> None:
+    module = load_hook_module()
+    original = {name: os.environ.get(name) for name in ("CODEX_RVF_MODE", "CODEX_RVF_FORK_MODE")}
+    cases = [
+        ({}, "gui"),
+        ({"CODEX_RVF_MODE": "off"}, "off"),
+        ({"CODEX_RVF_MODE": "continuation"}, "report-only"),
+        ({"CODEX_RVF_MODE": "block"}, "report-only"),
+        ({"CODEX_RVF_FORK_MODE": "manual"}, "manual"),
+        ({"CODEX_RVF_FORK_MODE": "prepare"}, "manual"),
+        ({"CODEX_RVF_FORK_MODE": "dry-run"}, "dry-run"),
+        ({"CODEX_RVF_FORK_MODE": "cline-kanban"}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "cline"}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "ck"}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "surprise"}, "surprise"),
+    ]
+    try:
+        for env, expected in cases:
+            os.environ.pop("CODEX_RVF_MODE", None)
+            os.environ.pop("CODEX_RVF_FORK_MODE", None)
+            os.environ.update(env)
+            assert module.normalize_backend_from_env() == expected
+    finally:
+        for name, value in original.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def write_subagent_session(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -284,7 +315,7 @@ def write_user_session_messages(path: Path, session_id: str, messages: list[str]
     )
 
 
-def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
+def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp: Path) -> None:
     transcript = tmp / "session.jsonl"
     state = tmp / "state"
     write_user_session(
@@ -305,13 +336,39 @@ def test_fork_experiment_marker_dry_run(tmp: Path) -> None:
     )
     payload = parse_json(stdout)
     assert "decision" not in payload
+    assert "reason=dry_run" not in payload["systemMessage"]
+    assert "reason=cwd_not_git_repo" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "cwd_not_git_repo"
+    assert "app_server_requests_path" not in latest
+
+
+def test_diagnose_codex_fork_dry_run_writes_requests(tmp: Path) -> None:
+    state = tmp / "state"
+    message = "RVF_FORK_EXPERIMENT: custom diagnostic message"
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_"):
+            env.pop(name, None)
+    env["CODEX_RVF_STATE_DIR"] = str(state)
+    completed = subprocess.run(
+        [sys.executable, str(DIAGNOSTIC_SCRIPT), "--mode", "dry-run", "--message", message],
+        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp)}),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+
+    payload = parse_json(completed.stdout)
     assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
     latest = latest_summary(state)
-    assert latest["suppress_child_stop_hook"] is True
-    prompt = prompt_text(latest)
+    assert latest["status"] == "dry-run"
+    assert read_text_artifact(latest, "latest_user_message_path") == message
     requests = app_server_requests(latest)
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in prompt
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" in requests[1]["params"]["input"][0]["text"]
+    assert requests[0]["method"] == "thread/fork"
+    assert requests[1]["method"] == "turn/start"
 
 
 def test_stop_hook_active_skips(tmp: Path) -> None:
@@ -806,6 +863,51 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert calls[0]["suppress"] == "1"
 
 
+def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True}))\n"
+        "elif action == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-123'}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-123', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": "parent-thread",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "cline-kanban",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=cline_kanban_missing_scope_anchor" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "cline_kanban_missing_scope_anchor"
+    assert latest["backend"] == "kanban"
+    assert "startup_prepare_metadata_path" not in latest
+    assert not client_calls.exists()
+
+
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "repo")
@@ -854,42 +956,24 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) ->
 def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
     tmp: Path,
 ) -> None:
-    module = load_hook_module()
     state = tmp / "state"
-    desktop_socket = tmp / "missing-control.sock"
-    bridge_socket = tmp / "missing-bridge.sock"
-    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
-    original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
-    original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
-    original_experiment_mode = os.environ.pop("CODEX_RVF_FORK_EXPERIMENT_MODE", None)
-    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
-    original_bridge_socket_path = module.bridge_socket_path
-    original_ensure_bridge = module.ensure_bridge_app_server
-    try:
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
-        module.bridge_socket_path = lambda: bridge_socket
-        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
-            AssertionError("bridge should not start for fork experiment by default")
-        )
-        payload = module.run_fork_experiment(
-            {"session_id": "parent-thread", "cwd": str(tmp)},
-            "RVF_FORK_EXPERIMENT: diagnose fork behavior",
-        )
-    finally:
-        if original_state_dir is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
-        if original_bridge_policy is not None:
-            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
-        if original_allow_bridge is not None:
-            os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
-        if original_experiment_mode is not None:
-            os.environ["CODEX_RVF_FORK_EXPERIMENT_MODE"] = original_experiment_mode
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
-        module.bridge_socket_path = original_bridge_socket_path
-        module.ensure_bridge_app_server = original_ensure_bridge
+    home = tmp / "home"
+    home.mkdir(parents=True)
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_"):
+            env.pop(name, None)
+    env["HOME"] = str(home)
+    env["CODEX_RVF_STATE_DIR"] = str(state)
+    completed = subprocess.run(
+        [sys.executable, str(DIAGNOSTIC_SCRIPT)],
+        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp)}),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    payload = parse_json(completed.stdout)
 
     assert "decision" not in payload
     assert payload["continue"] is True
@@ -2267,7 +2351,9 @@ def test_log_unavailable_does_not_break_hook_payload(tmp: Path) -> None:
 
 def main() -> int:
     tests = [
-        test_fork_experiment_marker_dry_run,
+        test_normalize_backend_from_env,
+        test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
+        test_diagnose_codex_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
         test_env_suppression_skips,
         test_prompt_suppression_marker_skips,
@@ -2283,6 +2369,7 @@ def main() -> int:
         test_bridge_failure_preserves_desktop_probe,
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
+        test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,

@@ -485,6 +485,13 @@ def prepare_run(
         shutil.copyfile(scope_of_work_path, input_scope_of_work_path)
     if session_manifest_path.exists():
         shutil.copyfile(session_manifest_path, input_session_manifest_path)
+    resolved_input_packet_path = input_packet_path.resolve()
+    resolved_input_metadata_path = input_metadata_path.resolve()
+    resolved_input_snapshot_path = input_snapshot_path.resolve()
+    resolved_input_scope_of_work_path = input_scope_of_work_path.resolve() if input_scope_of_work_path.exists() else None
+    resolved_input_session_manifest_path = (
+        input_session_manifest_path.resolve() if input_session_manifest_path.exists() else None
+    )
     if metadata.get("session_manifest_provided"):
         scope_mode = "session-owned"
     elif primary_files or background_files or exclude_path_prefixes:
@@ -512,11 +519,11 @@ def prepare_run(
         canonical_issues=[],
         fix_allowlist=primary_scope_files,
         excluded_path_prefixes=normalized_scope_list(metadata_list(metadata.get("excluded_path_prefixes"))),
-        start_snapshot_path=input_snapshot_path.resolve(),
-        review_packet_path=input_packet_path.resolve(),
-        session_manifest_path=input_session_manifest_path.resolve() if session_manifest_path.exists() else None,
-        scope_of_work_path=input_scope_of_work_path.resolve() if scope_of_work_path.exists() else None,
-        review_packet_metadata_path=input_metadata_path.resolve(),
+        start_snapshot_path=resolved_input_snapshot_path,
+        review_packet_path=resolved_input_packet_path,
+        session_manifest_path=resolved_input_session_manifest_path,
+        scope_of_work_path=resolved_input_scope_of_work_path,
+        review_packet_metadata_path=resolved_input_metadata_path,
     )
     bootstrap = build_worktree_bootstrap(
         repo=root,
@@ -561,11 +568,15 @@ def prepare_run(
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
-        "input_review_packet": str(input_packet_path),
-        "input_review_packet_metadata": str(input_metadata_path),
-        "input_before_workspace_snapshot": str(input_snapshot_path),
-        "input_scope_of_work_file": str(input_scope_of_work_path) if input_scope_of_work_path.exists() else None,
-        "input_session_manifest_file": str(input_session_manifest_path) if input_session_manifest_path.exists() else None,
+        "input_review_packet": str(resolved_input_packet_path),
+        "input_review_packet_metadata": str(resolved_input_metadata_path),
+        "input_before_workspace_snapshot": str(resolved_input_snapshot_path),
+        "input_scope_of_work_file": str(resolved_input_scope_of_work_path)
+        if resolved_input_scope_of_work_path is not None
+        else None,
+        "input_session_manifest_file": str(resolved_input_session_manifest_path)
+        if resolved_input_session_manifest_path is not None
+        else None,
         "worktree_bootstrap": str(bootstrap["metadata_path"]),
         "worktree_bootstrap_patch": str(bootstrap["patch_path"]),
         "worktree_bootstrap_files_dir": str(bootstrap["files_dir"]),

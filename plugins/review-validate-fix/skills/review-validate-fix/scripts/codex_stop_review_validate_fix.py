@@ -89,6 +89,21 @@ class GateResult:
     output: str
 
 
+@dataclass(frozen=True)
+class StopDecision:
+    action: str
+    reason_code: str
+    repo: str | None = None
+    cwd: str | None = None
+    parent_thread_id: str | None = None
+    parent_thread_path: Path | None = None
+    backend: str = "off"
+    message: str = ""
+    summary_fields: dict[str, Any] | None = None
+    payload: dict[str, Any] | None = None
+    status: str = "skipped"
+
+
 class AppServerError(RuntimeError):
     pass
 
@@ -1195,8 +1210,13 @@ def run_codex_fork(
     allow_desktop_unavailable_report: bool = True,
     ledger: RunLedger | None = None,
     extra_summary: dict[str, Any] | None = None,
+    launch_mode: str | None = None,
 ) -> dict[str, Any]:
-    mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
+    mode = (
+        launch_mode
+        if launch_mode is not None
+        else os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE)
+    ).strip().lower()
     ledger = ledger or start_run("stop-hook", repo=cwd, cwd=cwd)
 
     if not parent_session_id:
@@ -1257,7 +1277,17 @@ def run_codex_fork(
         result["app_server_requests_path"] = request_path
     elif mode in {"cline-kanban", "cline", "kanban", "ck"}:
         result["mode"] = "cline-kanban"
-        if not cwd:
+        if parent_thread_path is None:
+            result.update(
+                {
+                    "status": "cline-kanban-unavailable",
+                    "error": (
+                        "CODEX_RVF_FORK_MODE=cline-kanban requires a readable parent "
+                        "transcript/session scope anchor; task was not started."
+                    ),
+                }
+            )
+        elif not cwd:
             result.update(
                 {
                     "status": "cline-kanban-unconfigured",
@@ -2142,14 +2172,6 @@ def run_fork_experiment(
     return payload
 
 
-def should_run_fork_experiment(event: dict[str, Any]) -> tuple[bool, str | None]:
-    marker = os.environ.get("CODEX_RVF_FORK_EXPERIMENT_MARKER", FORK_EXPERIMENT_MARKER)
-    latest_user = latest_user_message_from_event(event)
-    if latest_user and marker in latest_user:
-        return True, latest_user
-    return False, latest_user
-
-
 def rvf_mode() -> str:
     mode = os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE).strip().lower()
     if mode in {"continuation", "continue", "block"}:
@@ -2157,6 +2179,33 @@ def rvf_mode() -> str:
     if mode in {"off", "skip", "disabled", "disable"}:
         return "off"
     return "fork"
+
+
+def normalize_backend_from_env(mode_env_name: str = "CODEX_RVF_FORK_MODE") -> str:
+    mode = os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE).strip().lower()
+    if mode in {"off", "skip", "disabled", "disable"}:
+        return "off"
+    if mode in {"continuation", "continue", "block"}:
+        return "report-only"
+
+    fork_mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
+    if fork_mode in {"gui", "app-server", "appserver", "auto"}:
+        return "gui"
+    if fork_mode in {"cline-kanban", "cline", "kanban", "ck"}:
+        return "kanban"
+    if fork_mode in {"manual", "prepare", "prepared", "log-only"}:
+        return "manual"
+    if fork_mode == "dry-run":
+        return "dry-run"
+    return fork_mode
+
+
+def launch_mode_for_backend(backend: str) -> str:
+    if backend == "kanban":
+        return "cline-kanban"
+    if backend == "gui":
+        return "gui"
+    return backend
 
 
 def fork_cwd_for_event(event: dict[str, Any], repo: str) -> str:
@@ -2197,6 +2246,51 @@ def fork_review_validate_fix(
         parent_thread_path=parent_thread_path,
         fallback_failure_reason=fork_failure_report(repo),
         ledger=ledger,
+    )
+
+
+def launch_backend(
+    decision: StopDecision,
+    event: dict[str, Any],
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    if not decision.repo:
+        return skip_payload(
+            "Stop decision did not include a target repo.",
+            ledger,
+            "missing_target_repo",
+            backend=decision.backend,
+        )
+    if not decision.parent_thread_id:
+        return skip_payload(
+            "Stop event did not expose a parent thread id.",
+            ledger,
+            "missing_parent_thread_id",
+            repo=decision.repo,
+            cwd=decision.cwd,
+            backend=decision.backend,
+        )
+
+    cwd = decision.cwd or fork_cwd_for_event(event, decision.repo)
+    prompt = fork_review_validate_fix_prompt(decision.parent_thread_id, cwd, decision.repo)
+    model = string_event_value(event, ("model",))
+    reasoning_effort = reasoning_effort_for_fork(event)
+    return run_codex_fork(
+        parent_session_id=decision.parent_thread_id,
+        cwd=cwd,
+        prompt=prompt,
+        log_prefix="review-validate-fix-fork",
+        suppress_child_stop_hook=False,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        parent_thread_path=decision.parent_thread_path,
+        fallback_failure_reason=fork_failure_report(decision.repo),
+        ledger=ledger,
+        launch_mode=launch_mode_for_backend(decision.backend),
+        extra_summary={
+            "backend": decision.backend,
+            **(decision.summary_fields or {}),
+        },
     )
 
 
@@ -2425,12 +2519,313 @@ def fork_failure_report(repo: str) -> str:
     )
 
 
+def payload_decision(
+    payload: dict[str, Any],
+    *,
+    reason_code: str,
+    repo: str | None = None,
+    cwd: str | None = None,
+    backend: str = "off",
+    status: str = "skipped",
+) -> StopDecision:
+    return StopDecision(
+        action="emit",
+        reason_code=reason_code,
+        repo=repo,
+        cwd=cwd,
+        backend=backend,
+        payload=payload,
+        status=status,
+    )
+
+
+def skip_decision(
+    message: str,
+    ledger: RunLedger,
+    reason_code: str,
+    *,
+    repo: str | None = None,
+    cwd: str | None = None,
+    backend: str = "off",
+    **summary_fields: Any,
+) -> StopDecision:
+    payload_fields = dict(summary_fields)
+    if repo is not None:
+        payload_fields.setdefault("repo", repo)
+    if cwd is not None:
+        payload_fields.setdefault("cwd", cwd)
+    if backend != "off":
+        payload_fields.setdefault("backend", backend)
+    payload = skip_payload(
+        message,
+        ledger,
+        reason_code,
+        **payload_fields,
+    )
+    return StopDecision(
+        action="emit",
+        reason_code=reason_code,
+        repo=repo,
+        cwd=cwd,
+        backend=backend,
+        message=message,
+        summary_fields=payload_fields,
+        payload=payload,
+        status="skipped",
+    )
+
+
+def session_hook_control_decision(
+    event: dict[str, Any],
+    latest_user: str | None,
+    ledger: RunLedger,
+) -> StopDecision | None:
+    session_control = session_hook_control_payload(event, latest_user)
+    if session_control is None:
+        return None
+
+    session_control_reason = (
+        session_control.get("reason_code")
+        if isinstance(session_control.get("reason_code"), str)
+        else "session_hook_control"
+    )
+    session_control_message = (
+        session_control.get("systemMessage")
+        if isinstance(session_control.get("systemMessage"), str)
+        else None
+    )
+    ledger.event(
+        phase="gate",
+        event="session_hook_control",
+        status="completed",
+        reason_code=session_control_reason,
+        session_id=session_hook_id_from_event(event),
+        control_action=session_control.get("control_action"),
+        session_hook_gate_state=session_control.get("session_hook_gate_state"),
+        state_path=session_control.get("state_path"),
+    )
+    ledger.summary(
+        status="session-hook-control",
+        reason_code=session_control_reason,
+        message=session_control_message,
+        session_id=session_hook_id_from_event(event),
+        control_action=session_control.get("control_action"),
+        session_hook_gate_state=session_control.get("session_hook_gate_state"),
+        state_path=session_control.get("state_path"),
+    )
+    payload = ledger.hook_payload(
+        status="session-hook-control",
+        reason_code=session_control_reason,
+        message=session_control_message,
+        session_id=session_hook_id_from_event(event),
+        control_action=session_control.get("control_action"),
+        session_hook_gate_state=session_control.get("session_hook_gate_state"),
+        state_path=session_control.get("state_path"),
+    )
+    return payload_decision(
+        payload,
+        reason_code=session_control_reason,
+        status="session-hook-control",
+    )
+
+
+def report_only_decision(repo: str, ledger: RunLedger) -> StopDecision:
+    report = fork_failure_report(repo)
+    ledger.event(
+        phase="fork",
+        event="skipped",
+        status="skipped",
+        reason_code="continuation_disabled",
+        repo=repo,
+        message=report,
+    )
+    payload = ledger.hook_payload(
+        status="skipped",
+        reason_code="continuation_disabled",
+        message=report,
+        repo=repo,
+        backend="report-only",
+    )
+    return payload_decision(
+        payload,
+        reason_code="continuation_disabled",
+        repo=repo,
+        backend="report-only",
+    )
+
+
+def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecision:
+    latest_user = latest_user_message_from_event(event)
+    cwd_value = event.get("cwd")
+    cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
+
+    if event.get("stop_hook_active") is True:
+        return skip_decision(
+            "检测到 stop_hook_active=true，为避免递归已跳过。",
+            ledger,
+            "stop_hook_active",
+            cwd=cwd,
+            detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
+        )
+
+    if handoff_path_from_event(event) is not None:
+        payload = handoff_completion_payload(event, ledger)
+        if payload is not None:
+            return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
+    if fork_context is not None:
+        return skip_decision(
+            "当前会话已是 review-validate-fix fork，会等待最终 RVF_HANDOFF_FILE，不会再次 fork。",
+            ledger,
+            "already_rvf_fork",
+            cwd=cwd,
+        )
+
+    if event_marks_subagent(event):
+        return skip_decision(
+            "Stop event 来自 Codex subagent，post-work review 只允许主会话触发。",
+            ledger,
+            "subagent_stop_event",
+            cwd=cwd,
+        )
+
+    session_control = session_hook_control_decision(event, latest_user, ledger)
+    if session_control is not None:
+        return session_control
+
+    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
+    if manual_marker_payload is not None:
+        return payload_decision(
+            manual_marker_payload,
+            reason_code="manual_rvf_already_ran",
+            cwd=cwd,
+        )
+
+    session_id = session_hook_id_from_event(event)
+    if session_id and session_hook_disabled(session_id):
+        return skip_decision(
+            "当前 chat session 已禁用 RVF_STOP_HOOK；"
+            "只跳过 RVF fork/continuation/review gate，"
+            f"不控制 dispatcher 的 dev sync。session_id={session_id}",
+            ledger,
+            "session_hook_disabled",
+            cwd=cwd,
+            session_id=session_id,
+        )
+
+    if should_suppress(event, latest_user):
+        return skip_decision("检测到 suppress 标记或环境变量。", ledger, "suppressed", cwd=cwd)
+
+    cwd_result: GateResult | None = None
+    if cwd:
+        cwd_result = run_gate(cwd)
+        ledger.event(
+            phase="gate",
+            event="dirty_gate_completed",
+            status=cwd_result.status.lower(),
+            reason_code=f"gate_{cwd_result.status.lower()}",
+            repo=cwd_result.repo,
+            cwd=cwd,
+            gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
+        )
+        if cwd_result.status == "DIRTY" and cwd_result.repo:
+            session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
+            if session_scope_payload is not None:
+                return payload_decision(
+                    session_scope_payload,
+                    reason_code="session_scope_skipped",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                )
+
+            backend = normalize_backend_from_env()
+            if backend == "off":
+                return skip_decision(
+                    "CODEX_RVF_MODE=off",
+                    ledger,
+                    "mode_off",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                    backend=backend,
+                )
+            if backend == "report-only":
+                return report_only_decision(cwd_result.repo, ledger)
+
+            parent_thread_id = parent_thread_id_from_event(event)
+            if not parent_thread_id:
+                return skip_decision(
+                    "Stop event did not expose a parent thread id.",
+                    ledger,
+                    "missing_parent_thread_id",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                    backend=backend,
+                    log_prefix="review-validate-fix-fork",
+                )
+
+            parent_thread_path = parent_thread_path_from_event(event)
+            if backend == "kanban":
+                parent_thread_path = first_readable_session_path(event)
+                if parent_thread_path is None:
+                    return skip_decision(
+                        "Cline Kanban backend requires a readable parent transcript/session "
+                        "scope anchor; skipped to avoid starting with an empty session-owned "
+                        "worktree bootstrap.",
+                        ledger,
+                        "cline_kanban_missing_scope_anchor",
+                        repo=cwd_result.repo,
+                        cwd=cwd,
+                        backend=backend,
+                    )
+
+            return StopDecision(
+                action="launch",
+                reason_code="backend_selected",
+                repo=cwd_result.repo,
+                cwd=fork_cwd_for_event(event, cwd_result.repo),
+                parent_thread_id=parent_thread_id,
+                parent_thread_path=parent_thread_path,
+                backend=backend,
+                message="RVF backend selected.",
+                summary_fields={"gate_status": cwd_result.status},
+                status="started",
+            )
+        if cwd_result.status == "CLEAN":
+            return skip_decision(
+                f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
+                ledger,
+                "clean_repo",
+                repo=cwd_result.repo or cwd,
+                cwd=cwd,
+            )
+
+    if cwd_result is not None:
+        return skip_decision(
+            "当前 cwd 不在 git repo/worktree 内，未自动选择目标仓库。"
+            f"cwd gate={cwd_result.status}; cwd={cwd}。"
+            "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
+            ledger,
+            "cwd_not_git_repo",
+            cwd=cwd,
+            gate_status=cwd_result.status,
+        )
+
+    return skip_decision(
+        "Stop event 未提供可检查的 cwd，未自动选择目标仓库。"
+        "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
+        ledger,
+        "missing_cwd",
+    )
+
+
 def main() -> int:
     event = read_event()
     if event is None:
         return 0
 
     latest_user = latest_user_message_from_event(event)
+    # 整体 suppress 必须早于 ledger 创建，避免子会话停止时生成 RVF run artifact。
     if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
         emit(suppressed_without_ledger_payload())
         return 0
@@ -2451,169 +2846,12 @@ def main() -> int:
         paths={"stop_event": stop_event_path} if stop_event_path else {},
     )
 
-    if event.get("stop_hook_active") is True:
-        emit(
-            skip_payload(
-                "检测到 stop_hook_active=true，为避免递归已跳过。",
-                ledger,
-                "stop_hook_active",
-                detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
-            )
-        )
+    decision = evaluate_stop_event(event, ledger)
+    if decision.action == "launch":
+        emit(launch_backend(decision, event, ledger))
         return 0
-
-    if handoff_path_from_event(event) is not None:
-        payload = handoff_completion_payload(event, ledger)
-        if payload is not None:
-            emit(payload)
-            return 0
-
-    fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
-    if fork_context is not None:
-        emit(
-            skip_payload(
-                "当前会话已是 review-validate-fix fork，会等待最终 RVF_HANDOFF_FILE，不会再次 fork。",
-                ledger,
-                "already_rvf_fork",
-            )
-        )
-        return 0
-
-    if event_marks_subagent(event):
-        emit(
-            skip_payload(
-                "Stop event 来自 Codex subagent，post-work review 只允许主会话触发。",
-                ledger,
-                "subagent_stop_event",
-            )
-        )
-        return 0
-
-    session_control = session_hook_control_payload(event, latest_user)
-    if session_control is not None:
-        session_control_reason = (
-            session_control.get("reason_code")
-            if isinstance(session_control.get("reason_code"), str)
-            else "session_hook_control"
-        )
-        session_control_message = (
-            session_control.get("systemMessage")
-            if isinstance(session_control.get("systemMessage"), str)
-            else None
-        )
-        ledger.event(
-            phase="gate",
-            event="session_hook_control",
-            status="completed",
-            reason_code=session_control_reason,
-            session_id=session_hook_id_from_event(event),
-            control_action=session_control.get("control_action"),
-            session_hook_gate_state=session_control.get("session_hook_gate_state"),
-            state_path=session_control.get("state_path"),
-        )
-        ledger.summary(
-            status="session-hook-control",
-            reason_code=session_control_reason,
-            message=session_control_message,
-            session_id=session_hook_id_from_event(event),
-            control_action=session_control.get("control_action"),
-            session_hook_gate_state=session_control.get("session_hook_gate_state"),
-            state_path=session_control.get("state_path"),
-        )
-        session_control = ledger.hook_payload(
-            status="session-hook-control",
-            reason_code=session_control_reason,
-            message=session_control_message,
-            session_id=session_hook_id_from_event(event),
-            control_action=session_control.get("control_action"),
-            session_hook_gate_state=session_control.get("session_hook_gate_state"),
-            state_path=session_control.get("state_path"),
-        )
-        emit(session_control)
-        return 0
-
-    manual_marker_payload = manual_rvf_session_marker_payload(event, ledger)
-    if manual_marker_payload is not None:
-        emit(manual_marker_payload)
-        return 0
-
-    session_id = session_hook_id_from_event(event)
-    if session_id and session_hook_disabled(session_id):
-        emit(
-            skip_payload(
-                "当前 chat session 已禁用 RVF_STOP_HOOK；"
-                "只跳过 RVF fork/continuation/review gate，"
-                f"不控制 dispatcher 的 dev sync。session_id={session_id}",
-                ledger,
-                "session_hook_disabled",
-                session_id=session_id,
-            )
-        )
-        return 0
-
-    should_experiment, latest_user = should_run_fork_experiment(event)
-    if should_experiment and latest_user is not None:
-        emit(run_fork_experiment(event, latest_user, ledger))
-        return 0
-
-    if should_suppress(event, latest_user):
-        emit(skip_payload("检测到 suppress 标记或环境变量。", ledger, "suppressed"))
-        return 0
-
-    cwd = event.get("cwd")
-    cwd_result: GateResult | None = None
-    if isinstance(cwd, str) and cwd:
-        cwd_result = run_gate(cwd)
-        ledger.event(
-            phase="gate",
-            event="dirty_gate_completed",
-            status=cwd_result.status.lower(),
-            reason_code=f"gate_{cwd_result.status.lower()}",
-            repo=cwd_result.repo,
-            cwd=cwd,
-            gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
-        )
-        if cwd_result.status == "DIRTY" and cwd_result.repo:
-            session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
-            if session_scope_payload is not None:
-                emit(session_scope_payload)
-                return 0
-            payload = review_validate_fix_dispatch(event, cwd_result.repo, ledger)
-            if payload is not None:
-                emit(payload)
-            return 0
-        if cwd_result.status == "CLEAN":
-            emit(
-                skip_payload(
-                    f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
-                    ledger,
-                    "clean_repo",
-                    repo=cwd_result.repo or cwd,
-                )
-            )
-            return 0
-
-    if cwd_result is not None:
-        emit(
-            skip_payload(
-                "当前 cwd 不在 git repo/worktree 内，未自动选择目标仓库。"
-                f"cwd gate={cwd_result.status}; cwd={cwd}。"
-                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
-                ledger,
-                "cwd_not_git_repo",
-                cwd=cwd,
-                gate_status=cwd_result.status,
-            )
-        )
-    else:
-        emit(
-            skip_payload(
-                "Stop event 未提供可检查的 cwd，未自动选择目标仓库。"
-                "请主会话询问用户提供要运行 review-validate-fix 的目标 repo 路径。",
-                ledger,
-                "missing_cwd",
-            )
-        )
+    if decision.payload is not None:
+        emit(decision.payload)
     return 0
 
 

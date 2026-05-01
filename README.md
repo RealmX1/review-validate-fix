@@ -150,40 +150,33 @@ flowchart TD
     Hooks --> Stop["Codex 主会话停止\nStop event JSON"]
     Stop --> Dispatcher["installed dispatcher\ncodex_stop_hook_dispatcher.py"]
 
-    Dispatcher --> DevCheck{"Stop event 是否来自\nRVF dev repo 主会话？"}
-    DevCheck -- "是" --> SessionScope{"transcript 是否显示\nsession-owned dirty paths？"}
-    SessionScope -- "否" --> SkipSync["continue: true\nsystemMessage 说明跳过 sync/review"]
-    SessionScope -- "无 transcript" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
-    SessionScope -- "是" --> Sync
+    Dispatcher --> DevCheck{"是否 RVF dev repo\n且需要 dev sync？"}
+    DevCheck -- "否" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
+    DevCheck -- "是" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
     Sync --> SyncOk{"检查和安装成功？"}
     SyncOk -- "否" --> BlockingFail["continue: true\nsystemMessage + summary\n不运行旧 installed plugin"]
-    SyncOk -- "是" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
-    DevCheck -- "否：其他 repo 或 subagent" --> InstalledHook
+    SyncOk -- "是" --> InstalledHook
 
-    InstalledHook --> Recursion{"递归、fork 子会话、subagent\n或 suppress/session off？"}
-    Recursion -- "是" --> Skip["continue: true\nsystemMessage 说明跳过原因"]
-    Recursion -- "否" --> Gate["dirty gate\nreview_validate_fix_gate.sh cwd"]
-    Gate --> GateResult{"cwd repo 状态"}
-    GateResult -- "CLEAN" --> Skip
-    GateResult -- "NO_GIT / NOT_FOUND / 无 cwd" --> AskRepo["continue: true\n提示主会话询问目标 repo"]
-    GateResult -- "DIRTY" --> Mode{"CODEX_RVF_MODE"}
+    InstalledHook --> Evaluate["evaluate_stop_event()\npreflight decision"]
+    Evaluate --> Decision{"action"}
+    Decision -- "skip / handoff / session control" --> Skip["emit payload\n统一 reason_code + summary"]
+    Decision -- "launch" --> Backend{"backend"}
 
-    Mode -- "off" --> Skip
-    Mode -- "continuation / block" --> ReportOnly["continue: true\n报告 GUI fork 不可用\n不注入 continuation prompt"]
-    Mode -- "fork" --> Fork["GUI/app-server fork\nthread/fork + turn/start\n注入 $review-validate-fix prompt"]
-    Fork --> Socket{"Desktop control socket 可用？"}
-    Socket -- "可用" --> Forked["新 GUI fork 会话运行\nreview -> validate/fix -> handoff"]
-    Socket -- "不可用且未显式允许 bridge" --> ReportOnly
-    Socket -- "显式允许 bridge" --> Bridge["bridge app-server fork\nGUI 可见性不保证"]
-    Bridge --> Forked
+    Backend -- "gui" --> Gui["Codex GUI/app-server\nthread/fork + turn/start"]
+    Backend -- "kanban" --> Kanban["Cline Kanban task\nprepare artifacts + bootstrap"]
+    Backend -- "manual" --> Manual["只写 fork prompt artifact"]
+    Backend -- "dry-run" --> DryRun["只写 app-server request artifact"]
+    Backend -- "report-only/off" --> Skip
 
-    Forked --> ForkStop["fork 会话停止"]
-    ForkStop --> Handoff{"最终回复包含\n<handoff-context>？"}
-    Handoff -- "是" --> Advisory["systemMessage 提醒\n把 handoff block 粘回父会话"]
-    Handoff -- "否" --> Skip
+    Gui --> Result["emit started/failed payload"]
+    Kanban --> Result
+    Manual --> Result
+    DryRun --> Result
 ```
 
-这张图里的关键边界是：dispatcher 只负责在本 RVF 源仓库主会话停止时先同步 installed plugin，然后把原始 Stop event 交给 installed hook；真正的 review gate 和 GUI fork 只在 `codex_stop_review_validate_fix.py` 内发生。默认成功路径会创建新的 GUI fork 用户 prompt checkpoint，失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
+这张图里的关键边界是：dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 GUI fork、Cline Kanban、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认成功路径会创建新的 GUI fork 用户 prompt checkpoint，失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
+
+fork 诊断不再通过 Stop hook 主路径里的 `RVF_FORK_EXPERIMENT` 自动触发；需要排查 app-server fork 行为时，手动运行 plugin runtime 的 `scripts/diagnose_codex_fork.py --mode dry-run|gui|manual`，并把 Stop event JSON 通过 stdin 传入。
 
 ### 当前 session 开关
 
