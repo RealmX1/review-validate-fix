@@ -28,28 +28,279 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+timestamp_ms() {
+  python3 -c 'import time; print(time.time_ns() // 1000000)'
+}
+
+record_step_timing() {
+  local label="$1"
+  local command_status="$2"
+  local duration_ms="$3"
+  local execution_mode="${4:-serial}"
+  if [ -n "${RVF_CONTRACT_TIMING_JSONL:-}" ] && [ "${RVF_CONTRACT_TIMING_SCRIPT:-}" = "$0" ]; then
+    python3 - "$RVF_CONTRACT_TIMING_JSONL" "$label" "$command_status" "$duration_ms" "$execution_mode" <<'PY' || true
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+label = sys.argv[2]
+returncode = int(sys.argv[3])
+duration_ms = max(0, int(sys.argv[4]))
+execution_mode = sys.argv[5]
+record = {
+    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "label": label,
+    "status": "completed" if returncode == 0 else "failed",
+    "returncode": returncode,
+    "duration_ms": duration_ms,
+    "execution_mode": execution_mode,
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+PY
+  fi
+}
+
 run_step() {
   local label="$1"
   shift
+  local started_ms
+  local ended_ms
+  local duration_ms
+  local command_status=0
+  started_ms="$(timestamp_ms)"
   if [ "$verbose" -eq 1 ]; then
     printf '==> %s\n' "$label"
-    "$@"
-    return
+    "$@" || command_status=$?
+  else
+    local output_file
+    output_file="$(mktemp)"
+    "$@" >"$output_file" 2>&1 || command_status=$?
   fi
 
-  local output_file
-  local command_status=0
-  output_file="$(mktemp)"
-  "$@" >"$output_file" 2>&1 || command_status=$?
+  ended_ms="$(timestamp_ms)"
+  duration_ms=$((ended_ms - started_ms))
+  record_step_timing "$label" "$command_status" "$duration_ms" "serial"
+
   if [ "$command_status" -eq 0 ]; then
-    rm -f "$output_file"
+    if [ "$verbose" -eq 0 ]; then
+      rm -f "$output_file"
+    fi
     return 0
   fi
 
   printf '验证失败: %s\n' "$label" >&2
-  cat "$output_file" >&2
-  rm -f "$output_file"
+  if [ "$verbose" -eq 0 ]; then
+    cat "$output_file" >&2
+    rm -f "$output_file"
+  fi
   return "$command_status"
+}
+
+contract_parallel_tests_enabled() {
+  case "${RVF_CONTRACT_PARALLEL_TESTS:-1}" in
+    0|false|False|FALSE|no|No|NO|off|Off|OFF)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+contract_parallel_jobs() {
+  local value="${RVF_CONTRACT_PARALLEL_JOBS:-8}"
+  case "$value" in
+    ''|*[!0-9]*)
+      printf '8'
+      ;;
+    0)
+      printf '1'
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+contract_review_support_shards() {
+  local value="${RVF_CONTRACT_REVIEW_SUPPORT_SHARDS:-4}"
+  case "$value" in
+    ''|*[!0-9]*)
+      printf '4'
+      ;;
+    0)
+      printf '1'
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+contract_stop_hook_shards() {
+  local value="${RVF_CONTRACT_STOP_HOOK_SHARDS:-4}"
+  case "$value" in
+    ''|*[!0-9]*)
+      printf '4'
+      ;;
+    0)
+      printf '1'
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+contract_dispatcher_shards() {
+  local value="${RVF_CONTRACT_DISPATCHER_SHARDS:-1}"
+  case "$value" in
+    ''|*[!0-9]*)
+      printf '1'
+      ;;
+    0)
+      printf '1'
+      ;;
+    *)
+      printf '%s' "$value"
+      ;;
+  esac
+}
+
+run_parallel_test_steps() {
+  local jobs
+  jobs="$(contract_parallel_jobs)"
+  local review_support_shards
+  local stop_hook_shards
+  local dispatcher_shards
+  if contract_parallel_tests_enabled && [ "$jobs" -gt 1 ]; then
+    review_support_shards="$(contract_review_support_shards)"
+    stop_hook_shards="$(contract_stop_hook_shards)"
+    dispatcher_shards="$(contract_dispatcher_shards)"
+  else
+    review_support_shards=1
+    stop_hook_shards=1
+    dispatcher_shards=1
+  fi
+
+  local labels=()
+  local scripts=()
+  local args=()
+  labels+=("tests: install_to_codex")
+  scripts+=("$tests_dir/test_install_to_codex.py")
+  args+=("")
+  local shard_index
+  for ((shard_index = 0; shard_index < review_support_shards; shard_index++)); do
+    if [ "$review_support_shards" -eq 1 ]; then
+      labels+=("tests: review_support_scripts")
+      args+=("")
+    else
+      labels+=("tests: review_support_scripts shard $((shard_index + 1))/$review_support_shards")
+      args+=("--shard-count $review_support_shards --shard-index $shard_index")
+    fi
+    scripts+=("$tests_dir/test_review_support_scripts.py")
+  done
+  for ((shard_index = 0; shard_index < dispatcher_shards; shard_index++)); do
+    if [ "$dispatcher_shards" -eq 1 ]; then
+      labels+=("tests: codex_stop_hook_dispatcher")
+      args+=("")
+    else
+      labels+=("tests: codex_stop_hook_dispatcher shard $((shard_index + 1))/$dispatcher_shards")
+      args+=("--shard-count $dispatcher_shards --shard-index $shard_index")
+    fi
+    scripts+=("$tests_dir/test_codex_stop_hook_dispatcher.py")
+  done
+  for ((shard_index = 0; shard_index < stop_hook_shards; shard_index++)); do
+    if [ "$stop_hook_shards" -eq 1 ]; then
+      labels+=("tests: codex_stop_review_validate_fix")
+      args+=("")
+    else
+      labels+=("tests: codex_stop_review_validate_fix shard $((shard_index + 1))/$stop_hook_shards")
+      args+=("--shard-count $stop_hook_shards --shard-index $shard_index")
+    fi
+    scripts+=("$tests_dir/test_codex_stop_review_validate_fix.py")
+  done
+
+  if ! contract_parallel_tests_enabled || [ "$jobs" -le 1 ]; then
+    local serial_index
+    for serial_index in "${!labels[@]}"; do
+      if [ -n "${args[$serial_index]}" ]; then
+        run_step "${labels[$serial_index]}" python3 "${scripts[$serial_index]}" ${args[$serial_index]}
+      else
+        run_step "${labels[$serial_index]}" python3 "${scripts[$serial_index]}"
+      fi
+    done
+    return
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local pids=()
+  local active_indices=()
+  local output_files=()
+  local status_files=()
+  local duration_files=()
+  local index
+
+  for index in "${!labels[@]}"; do
+    output_files[$index]="$tmp_dir/$index.out"
+    status_files[$index]="$tmp_dir/$index.status"
+    duration_files[$index]="$tmp_dir/$index.duration"
+    if [ "$verbose" -eq 1 ]; then
+      printf '==> %s (parallel)\n' "${labels[$index]}"
+    fi
+    (
+      command_status=0
+      started_ms="$(timestamp_ms)"
+      if [ -n "${args[$index]}" ]; then
+        python3 "${scripts[$index]}" ${args[$index]} >"${output_files[$index]}" 2>&1 || command_status=$?
+      else
+        python3 "${scripts[$index]}" >"${output_files[$index]}" 2>&1 || command_status=$?
+      fi
+      ended_ms="$(timestamp_ms)"
+      printf '%s\n' "$command_status" >"${status_files[$index]}"
+      printf '%s\n' "$((ended_ms - started_ms))" >"${duration_files[$index]}"
+      exit 0
+    ) &
+    pids[$index]=$!
+    active_indices+=("$index")
+
+    if [ "${#active_indices[@]}" -ge "$jobs" ]; then
+      wait "${pids[${active_indices[0]}]}"
+      active_indices=("${active_indices[@]:1}")
+    fi
+  done
+
+  for index in "${active_indices[@]}"; do
+    wait "${pids[$index]}"
+  done
+
+  local overall_status=0
+  local command_status
+  local duration_ms
+  for index in "${!labels[@]}"; do
+    command_status="$(cat "${status_files[$index]}")"
+    duration_ms="$(cat "${duration_files[$index]}")"
+    record_step_timing "${labels[$index]}" "$command_status" "$duration_ms" "parallel"
+    if [ "$command_status" -eq 0 ]; then
+      if [ "$verbose" -eq 1 ] && [ -s "${output_files[$index]}" ]; then
+        cat "${output_files[$index]}"
+      fi
+      continue
+    fi
+    if [ "$overall_status" -eq 0 ]; then
+      overall_status="$command_status"
+    fi
+    printf '验证失败: %s\n' "${labels[$index]}" >&2
+    cat "${output_files[$index]}" >&2
+  done
+
+  rm -rf "$tmp_dir"
+  return "$overall_status"
 }
 
 hash_file() {
@@ -239,10 +490,7 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_review_support_scripts.py"
 
-run_step "tests: install_to_codex" python3 "$tests_dir/test_install_to_codex.py"
-run_step "tests: review_support_scripts" python3 "$tests_dir/test_review_support_scripts.py"
-run_step "tests: codex_stop_hook_dispatcher" python3 "$tests_dir/test_codex_stop_hook_dispatcher.py"
-run_step "tests: codex_stop_review_validate_fix" python3 "$tests_dir/test_codex_stop_review_validate_fix.py"
+run_parallel_test_steps
 
 require_literal "references/review-prompt.md" 'NO_ISSUES'
 require_literal "references/review-prompt.md" 'clean context'
@@ -464,6 +712,10 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'cline_kanban_task_s
 require_literal "scripts/codex_stop_hook_dispatcher.py" 'DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"'
 require_literal "scripts/codex_stop_hook_dispatcher.py" 'dev_sync_step_specs'
 require_repo_literal "README.md" 'Dev-only 标准'
+require_repo_literal "README.md" 'RVF_CONTRACT_PARALLEL_TESTS'
+require_repo_literal "README.md" 'RVF_CONTRACT_REVIEW_SUPPORT_SHARDS'
+require_repo_literal "README.md" 'RVF_CONTRACT_STOP_HOOK_SHARDS'
+require_repo_literal "README.md" '--shard-count'
 require_literal "SKILL.md" 'dev-only sync chain'
 require_repo_literal "scripts/install_to_codex.py" 'DEV_ONLY_NAMES'
 require_repo_literal "tests/test_install_to_codex.py" 'test_copy_tree_excludes_dev_only_paths'

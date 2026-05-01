@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import importlib.util
 import os
@@ -61,6 +62,18 @@ def load_rvf_logging_module():
     spec = importlib.util.spec_from_file_location("rvf_logging", RVF_LOGGING)
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load rvf_logging module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_check_plugin_contracts_module():
+    spec = importlib.util.spec_from_file_location(
+        "rvf_check_plugin_contracts",
+        CHECK_PLUGIN_CONTRACTS,
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load check_plugin_contracts module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -338,6 +351,12 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
         "verbose=0",
         "-v|--verbose)",
         "run_step()",
+        "run_parallel_test_steps()",
+        "RVF_CONTRACT_PARALLEL_TESTS",
+        "RVF_CONTRACT_PARALLEL_JOBS",
+        "RVF_CONTRACT_REVIEW_SUPPORT_SHARDS",
+        "RVF_CONTRACT_STOP_HOOK_SHARDS",
+        "RVF_CONTRACT_DISPATCHER_SHARDS",
         "command_status",
         "验证失败:",
         'return "$command_status"',
@@ -351,7 +370,7 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     ):
         assert literal in plugin_script
 
-    function_start = skill_script.index("run_step() {")
+    function_start = skill_script.index("timestamp_ms() {")
     function_end = skill_script.index("\nhash_file() {")
     probe = (
         "#!/usr/bin/env bash\n"
@@ -363,11 +382,169 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     )
     with tempfile.TemporaryDirectory() as tmp_dir:
         probe_path = Path(tmp_dir) / "probe.sh"
+        timing_path = Path(tmp_dir) / "timing.jsonl"
         probe_path.write_text(probe, encoding="utf-8")
-        completed = subprocess.run(["bash", str(probe_path)], capture_output=True, text=True, check=False)
+        env = os.environ.copy()
+        env["RVF_CONTRACT_TIMING_JSONL"] = str(timing_path)
+        env["RVF_CONTRACT_TIMING_SCRIPT"] = str(CHECK_SKILL_CONTRACTS)
+        completed = subprocess.run(
+            ["bash", str(probe_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        assert not timing_path.exists()
     assert completed.returncode == 7
     assert "验证失败: failing" in completed.stderr
     assert "boom" in completed.stderr
+
+
+def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
+    skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    function_start = skill_script.index("timestamp_ms() {")
+    function_end = skill_script.index("\nhash_file() {")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        root = Path(tmp_dir)
+        tests_dir = root / "tests"
+        tests_dir.mkdir()
+        for name in (
+            "test_install_to_codex.py",
+            "test_review_support_scripts.py",
+            "test_codex_stop_hook_dispatcher.py",
+            "test_codex_stop_review_validate_fix.py",
+        ):
+            (tests_dir / name).write_text(
+                "#!/usr/bin/env python3\n"
+                "import time\n"
+                "time.sleep(0.05)\n"
+                "print('ok')\n",
+                encoding="utf-8",
+            )
+        timing_path = root / "timing.jsonl"
+        probe = (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "verbose=0\n"
+            f"tests_dir={shlex.quote(str(tests_dir))}\n"
+            f"export RVF_CONTRACT_TIMING_JSONL={shlex.quote(str(timing_path))}\n"
+            "export RVF_CONTRACT_TIMING_SCRIPT=\"$0\"\n"
+            "export RVF_CONTRACT_PARALLEL_JOBS=4\n"
+            "export RVF_CONTRACT_REVIEW_SUPPORT_SHARDS=4\n"
+            "export RVF_CONTRACT_STOP_HOOK_SHARDS=4\n"
+            "export RVF_CONTRACT_DISPATCHER_SHARDS=2\n"
+            f"{skill_script[function_start:function_end]}\n"
+            "run_parallel_test_steps\n"
+        )
+        probe_path = root / "probe.sh"
+        probe_path.write_text(probe, encoding="utf-8")
+        completed = subprocess.run(
+            ["bash", str(probe_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        records = [json.loads(line) for line in timing_path.read_text(encoding="utf-8").splitlines()]
+
+    assert completed.returncode == 0
+    assert [record["execution_mode"] for record in records] == ["parallel"] * 11
+    assert {record["label"] for record in records} == {
+        "tests: install_to_codex",
+        "tests: review_support_scripts shard 1/4",
+        "tests: review_support_scripts shard 2/4",
+        "tests: review_support_scripts shard 3/4",
+        "tests: review_support_scripts shard 4/4",
+        "tests: codex_stop_hook_dispatcher shard 1/2",
+        "tests: codex_stop_hook_dispatcher shard 2/2",
+        "tests: codex_stop_review_validate_fix shard 1/4",
+        "tests: codex_stop_review_validate_fix shard 2/4",
+        "tests: codex_stop_review_validate_fix shard 3/4",
+        "tests: codex_stop_review_validate_fix shard 4/4",
+    }
+
+
+def test_contract_check_timing_report_accounts_internal_steps() -> None:
+    module = load_check_plugin_contracts_module()
+
+    report = module.build_timing_report(
+        started_at="2026-05-01T00:00:00Z",
+        ended_at="2026-05-01T00:00:01Z",
+        duration_ms=1000,
+        returncode=0,
+        command=["bash", "scripts/check_skill_contracts.sh"],
+        top_level_steps=[
+            {
+                "label": "preflight",
+                "source": "check_plugin_contracts.py",
+                "status": "completed",
+                "returncode": 0,
+                "duration_ms": 50,
+            },
+            {
+                "label": "contract shell script",
+                "source": "check_plugin_contracts.py",
+                "status": "completed",
+                "returncode": 0,
+                "duration_ms": 900,
+            },
+        ],
+        shell_steps=[
+            {
+                "label": "python compile",
+                "source": "check_skill_contracts.sh",
+                "status": "completed",
+                "returncode": 0,
+                "duration_ms": 200,
+            },
+            {
+                "label": "tests: codex_stop_review_validate_fix",
+                "source": "check_skill_contracts.sh",
+                "status": "completed",
+                "returncode": 0,
+                "duration_ms": 600,
+            },
+        ],
+    )
+
+    assert report["slowest_step"]["label"] == "tests: codex_stop_review_validate_fix"
+    assert report["slowest_step"]["percentage_of_total"] == 60.0
+    assert report["slowest_step"]["percentage_of_wall_time"] == 60.0
+    assert report["slowest_step"]["percentage_of_measured_work"] == 63.16
+    assert report["measured_work_duration_ms"] == 950
+    assert any(step["label"] == "shell script overhead" for step in report["steps"])
+    assert report["groups"][0]["name"] == "tests"
+    assert report["groups"][0]["duration_ms"] == 600
+
+
+def test_run_ledger_summary_preserves_contract_timing_fields(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    ledger = module.RunLedger(
+        component="dispatcher",
+        run_id="rvf-contract-timing-preserve",
+        run_dir=tmp / "run",
+    )
+
+    ledger.summary(
+        status="synced",
+        reason_code="synced",
+        dev_sync_steps=[{"name": "contract-check"}],
+        contract_check_timing_report_path="/tmp/contract-check.timing.json",
+        contract_check_timing={
+            "path": "/tmp/contract-check.timing.json",
+            "slowest_step": {"label": "tests: codex_stop_review_validate_fix"},
+        },
+    )
+    later = ledger.summary(
+        status="session-hook-control",
+        reason_code="session_hook_gate_disabled",
+    )
+
+    assert later["dev_sync_steps"] == [{"name": "contract-check"}]
+    assert later["contract_check_timing_report_path"] == "/tmp/contract-check.timing.json"
+    assert later["contract_check_timing"]["slowest_step"]["label"] == (
+        "tests: codex_stop_review_validate_fix"
+    )
+
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     result = run(
@@ -1627,7 +1804,7 @@ def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Pa
             "-c",
             "import sys; print('inactive'); sys.exit(2)",
         ],
-        activity_probe_timeout_seconds=0.1,
+        activity_probe_timeout_seconds=0.5,
         activity_probe_failure_threshold=2,
     )
 
@@ -2617,63 +2794,273 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
 
 
+def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
+    return [
+        ("check_review_output_lock_request", lambda: test_check_review_output_lock_request()),
+        (
+            "check_review_output_protocol_extension_requests",
+            lambda: test_check_review_output_protocol_extension_requests(),
+        ),
+        (
+            "check_skill_contracts_requires_validate_fix_request_literals",
+            lambda: test_check_skill_contracts_requires_validate_fix_request_literals(),
+        ),
+        (
+            "contract_check_entrypoints_default_quiet_with_verbose_flag",
+            lambda: test_contract_check_entrypoints_default_quiet_with_verbose_flag(),
+        ),
+        (
+            "contract_check_parallel_test_steps_record_parallel_timing",
+            lambda: test_contract_check_parallel_test_steps_record_parallel_timing(),
+        ),
+        (
+            "contract_check_timing_report_accounts_internal_steps",
+            lambda: test_contract_check_timing_report_accounts_internal_steps(),
+        ),
+        (
+            "run_ledger_summary_preserves_contract_timing_fields",
+            lambda: test_run_ledger_summary_preserves_contract_timing_fields(
+                root / "summary-preserve-contract-timing"
+            ),
+        ),
+        (
+            "check_review_output_accepts_wrapped_issue_continuation",
+            lambda: test_check_review_output_accepts_wrapped_issue_continuation(),
+        ),
+        ("build_packet_metadata_and_scope", lambda: test_build_packet_metadata_and_scope(root / "packet")),
+        (
+            "build_packet_allows_clean_repo_with_manual_scope",
+            lambda: test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope"),
+        ),
+        (
+            "session_manifest_extracts_apply_patch_and_command_candidates",
+            lambda: test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest"),
+        ),
+        (
+            "session_manifest_resolves_exec_paths_from_command_workdir",
+            lambda: test_session_manifest_resolves_exec_paths_from_command_workdir(
+                root / "session-manifest-workdir"
+            ),
+        ),
+        (
+            "build_packet_uses_session_manifest_as_scope_anchor",
+            lambda: test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest"),
+        ),
+        (
+            "build_packet_rejects_session_manifest_for_different_repo",
+            lambda: test_build_packet_rejects_session_manifest_for_different_repo(
+                root / "packet-manifest-repo"
+            ),
+        ),
+        (
+            "build_packet_rejects_empty_session_owned_scope",
+            lambda: test_build_packet_rejects_empty_session_owned_scope(root / "packet-manifest-empty"),
+        ),
+        (
+            "build_packet_requires_session_context",
+            lambda: test_build_packet_requires_session_context(root / "packet-requires-context"),
+        ),
+        (
+            "build_packet_honors_review_validate_fix_ignore",
+            lambda: test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore"),
+        ),
+        (
+            "build_packet_treats_ignore_prefixes_as_literal_pathspecs",
+            lambda: test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore"),
+        ),
+        ("prepare_review_run_and_command_lock", lambda: test_prepare_review_run_and_command_lock(root / "prepare")),
+        (
+            "alternative_reviewer_prompt_uses_session_env_refs",
+            lambda: test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env"),
+        ),
+        (
+            "alternative_reviewer_infers_scope_contract_from_inputs_layout",
+            lambda: test_alternative_reviewer_infers_scope_contract_from_inputs_layout(
+                root / "alternative-inputs-scope"
+            ),
+        ),
+        (
+            "alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract",
+            lambda: test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(
+                root / "alternative-session-alias"
+            ),
+        ),
+        (
+            "prepare_review_run_manual_all_uncommitted_allows_dirty_paths",
+            lambda: test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(root / "prepare-manual-all"),
+        ),
+        (
+            "command_lock_writes_lifecycle_events",
+            lambda: test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle"),
+        ),
+        (
+            "command_lock_respects_env_run_dir",
+            lambda: test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir"),
+        ),
+        (
+            "command_lock_logs_timeout_with_holder_metadata",
+            lambda: test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout"),
+        ),
+        (
+            "prepare_review_run_can_build_session_manifest_from_transcript",
+            lambda: test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript"),
+        ),
+        (
+            "prepare_review_run_requires_session_context",
+            lambda: test_prepare_review_run_requires_session_context(root / "prepare-requires-context"),
+        ),
+        (
+            "alternative_reviewer_idle_timeout_flag",
+            lambda: test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout"),
+        ),
+        (
+            "alternative_reviewer_activity_probe_keeps_silent_reviewer_alive",
+            lambda: test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(
+                root / "alternative-probe-success"
+            ),
+        ),
+        (
+            "alternative_reviewer_activity_probe_failure_threshold_times_out",
+            lambda: test_alternative_reviewer_activity_probe_failure_threshold_times_out(
+                root / "alternative-probe-failure"
+            ),
+        ),
+        (
+            "alternative_reviewer_timeout_kills_child_process_group",
+            lambda: test_alternative_reviewer_timeout_kills_child_process_group(root / "alternative-timeout-child"),
+        ),
+        (
+            "alternative_reviewer_activity_refreshes_idle_timeout",
+            lambda: test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity"),
+        ),
+        (
+            "alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout",
+            lambda: test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(
+                root / "alternative-bash-tool"
+            ),
+        ),
+        (
+            "alternative_reviewer_claude_split_jsonl_preserves_tool_use",
+            lambda: test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(root / "alternative-split-jsonl"),
+        ),
+        (
+            "alternative_reviewer_repeated_run_keeps_prior_artifacts",
+            lambda: test_alternative_reviewer_repeated_run_keeps_prior_artifacts(root / "alternative-repeat-artifacts"),
+        ),
+        (
+            "alternative_reviewer_long_command_wait_uses_check_interval",
+            lambda: test_alternative_reviewer_long_command_wait_uses_check_interval(),
+        ),
+        (
+            "alternative_reviewer_claude_stream_json_extracts_result",
+            lambda: test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json"),
+        ),
+        (
+            "alternative_reviewer_legacy_claude_config_gets_stream_json",
+            lambda: test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config"),
+        ),
+        (
+            "alternative_reviewer_respects_explicit_claude_text_output",
+            lambda: test_alternative_reviewer_respects_explicit_claude_text_output(root / "alternative-text-config"),
+        ),
+        (
+            "alternative_reviewer_respects_explicit_claude_equals_text_output",
+            lambda: test_alternative_reviewer_respects_explicit_claude_equals_text_output(
+                root / "alternative-equals-text-config"
+            ),
+        ),
+        (
+            "alternative_reviewer_non_claude_stream_json_command_is_not_patched",
+            lambda: test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(
+                root / "alternative-wrapper"
+            ),
+        ),
+        ("cline_kanban_client_detects_runtime_port", lambda: test_cline_kanban_client_detects_runtime_port()),
+        (
+            "cline_kanban_client_rejects_ambiguous_runtime_ports",
+            lambda: test_cline_kanban_client_rejects_ambiguous_runtime_ports(),
+        ),
+        (
+            "cline_kanban_client_rejects_foreign_listener",
+            lambda: test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener"),
+        ),
+        (
+            "cline_kanban_client_create_and_start_task",
+            lambda: test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client"),
+        ),
+        (
+            "cline_kanban_client_message_accepts_response_without_task_id",
+            lambda: test_cline_kanban_client_message_accepts_response_without_task_id(root / "cline-kanban-message"),
+        ),
+        (
+            "prepare_review_run_writes_worktree_bootstrap",
+            lambda: test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap"),
+        ),
+        (
+            "prepare_review_run_scope_file_matches_metadata_through_symlink_state",
+            lambda: test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(
+                root / "prepare-symlink-state"
+            ),
+        ),
+        (
+            "apply_worktree_bootstrap_replays_tracked_and_untracked",
+            lambda: test_apply_worktree_bootstrap_replays_tracked_and_untracked(root / "apply-bootstrap"),
+        ),
+        (
+            "apply_worktree_bootstrap_rejects_mismatched_base_ref",
+            lambda: test_apply_worktree_bootstrap_rejects_mismatched_base_ref(root / "apply-bootstrap-base-ref"),
+        ),
+        (
+            "run_ledger_summary_preserves_cline_kanban_fields",
+            lambda: test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline"),
+        ),
+        (
+            "cancel_rvf_run_marks_cancelled_and_trashes_cline_task",
+            lambda: test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(root / "cancel-rvf-run"),
+        ),
+        (
+            "cancel_rvf_run_ignores_stale_runner_pid_without_matching_command",
+            lambda: test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command(),
+        ),
+    ]
+
+
+def selected_test_cases(
+    cases: list[tuple[str, object]],
+    *,
+    shard_count: int,
+    shard_index: int,
+) -> list[tuple[str, object]]:
+    if shard_count <= 1:
+        return cases
+    return [case for index, case in enumerate(cases) if index % shard_count == shard_index]
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    args = parser.parse_args()
+    if args.shard_count < 1:
+        raise SystemExit("--shard-count must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise SystemExit("--shard-index must be in [0, shard-count)")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        test_check_review_output_lock_request()
-        test_check_review_output_protocol_extension_requests()
-        test_check_skill_contracts_requires_validate_fix_request_literals()
-        test_contract_check_entrypoints_default_quiet_with_verbose_flag()
-        test_check_review_output_accepts_wrapped_issue_continuation()
-        test_build_packet_metadata_and_scope(root / "packet")
-        test_build_packet_allows_clean_repo_with_manual_scope(root / "packet-clean-manual-scope")
-        test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest")
-        test_session_manifest_resolves_exec_paths_from_command_workdir(root / "session-manifest-workdir")
-        test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest")
-        test_build_packet_rejects_session_manifest_for_different_repo(root / "packet-manifest-repo")
-        test_build_packet_rejects_empty_session_owned_scope(root / "packet-manifest-empty")
-        test_build_packet_requires_session_context(root / "packet-requires-context")
-        test_build_packet_honors_review_validate_fix_ignore(root / "packet-ignore")
-        test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore")
-        test_prepare_review_run_and_command_lock(root / "prepare")
-        test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env")
-        test_alternative_reviewer_infers_scope_contract_from_inputs_layout(root / "alternative-inputs-scope")
-        test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(root / "alternative-session-alias")
-        test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(root / "prepare-manual-all")
-        test_command_lock_writes_lifecycle_events(root / "command-lock-lifecycle")
-        test_command_lock_respects_env_run_dir(root / "command-lock-env-run-dir")
-        test_command_lock_logs_timeout_with_holder_metadata(root / "command-lock-timeout")
-        test_prepare_review_run_can_build_session_manifest_from_transcript(root / "prepare-transcript")
-        test_prepare_review_run_requires_session_context(root / "prepare-requires-context")
-        test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout")
-        test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(root / "alternative-probe-success")
-        test_alternative_reviewer_activity_probe_failure_threshold_times_out(root / "alternative-probe-failure")
-        test_alternative_reviewer_timeout_kills_child_process_group(root / "alternative-timeout-child")
-        test_alternative_reviewer_activity_refreshes_idle_timeout(root / "alternative-activity")
-        test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(root / "alternative-bash-tool")
-        test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(root / "alternative-split-jsonl")
-        test_alternative_reviewer_repeated_run_keeps_prior_artifacts(root / "alternative-repeat-artifacts")
-        test_alternative_reviewer_long_command_wait_uses_check_interval()
-        test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json")
-        test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config")
-        test_alternative_reviewer_respects_explicit_claude_text_output(root / "alternative-text-config")
-        test_alternative_reviewer_respects_explicit_claude_equals_text_output(
-            root / "alternative-equals-text-config"
+        cases = selected_test_cases(
+            review_support_test_cases(root),
+            shard_count=args.shard_count,
+            shard_index=args.shard_index,
         )
-        test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(root / "alternative-wrapper")
-        test_cline_kanban_client_detects_runtime_port()
-        test_cline_kanban_client_rejects_ambiguous_runtime_ports()
-        test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener")
-        test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client")
-        test_cline_kanban_client_message_accepts_response_without_task_id(root / "cline-kanban-message")
-        test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap")
-        test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(root / "prepare-symlink-state")
-        test_apply_worktree_bootstrap_replays_tracked_and_untracked(root / "apply-bootstrap")
-        test_apply_worktree_bootstrap_rejects_mismatched_base_ref(root / "apply-bootstrap-base-ref")
-        test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline")
-        test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(root / "cancel-rvf-run")
-        test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command()
-    print("review support script tests OK")
+        for _, test_case in cases:
+            test_case()
+    suffix = (
+        f" shard {args.shard_index + 1}/{args.shard_count}"
+        if args.shard_count > 1
+        else ""
+    )
+    print(f"review support script tests OK{suffix}")
     return 0
 
 

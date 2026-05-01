@@ -52,6 +52,35 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 验证入口默认只输出简短成功信息；排查失败或需要查看每个测试脚本输出时，加 `--verbose`。
 
+契约检查默认会并行运行较重的测试脚本，并把部分大测试文件拆成进程级 shard。默认配置是：
+
+- `RVF_CONTRACT_PARALLEL_TESTS=1`
+- `RVF_CONTRACT_PARALLEL_JOBS=8`
+- `RVF_CONTRACT_REVIEW_SUPPORT_SHARDS=4`
+- `RVF_CONTRACT_STOP_HOOK_SHARDS=4`
+- `RVF_CONTRACT_DISPATCHER_SHARDS=1`
+
+这些 shard 只影响测试 runner 的进程调度，不改变测试语义。需要复现串行行为或排查时可运行：
+
+```bash
+RVF_CONTRACT_PARALLEL_TESTS=0 bash scripts/check_skill_contracts.sh
+RVF_CONTRACT_PARALLEL_TESTS=0 python3 scripts/check_plugin_contracts.py
+```
+
+需要查看 contract check 内部耗时分布时，可写出 timing report：
+
+```bash
+python3 scripts/check_plugin_contracts.py --timing-report /tmp/rvf-contract-timing.json
+```
+
+新增测试时不需要手写 shard 逻辑；只需要把测试函数加入对应文件的集中 runner 清单：
+
+- `tests/test_review_support_scripts.py`：加入 `review_support_test_cases(root)`。
+- `tests/test_codex_stop_review_validate_fix.py`：加入 `main()` 里的 `tests` 列表。
+- `tests/test_codex_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
+
+新测试应继续使用传入的 `tmp` / `tmp_path` 派生独立目录，避免共享固定路径、端口、全局环境或可长期存在的进程。确实需要临时修改 `os.environ`、模块 monkeypatch、socket/port、sleep/timeout 的测试，必须在 `finally` 中恢复状态；这类测试在高并发下容易成为 flake，应优先使用更宽松的超时边界，或放在默认不拆分的测试组中。
+
 ## 安装机制
 
 日常开发只改 `plugins/review-validate-fix/skills/review-validate-fix/`。改完后运行契约检查：
@@ -202,7 +231,7 @@ RVF_STOP_HOOK: off
 RVF_STOP_HOOK: on
 ```
 
-查看当前 session 状态：
+`on` 会清除 disabled 标记，并让当前这一次 Stop event 继续走正常 dirty/session scope/backend gate；如果当前 session 仍有 session-owned dirty scope，它可以在同一轮创建 GUI fork 或 Cline Kanban task。查看当前 session 状态：
 
 ```text
 RVF_STOP_HOOK: status
@@ -243,6 +272,23 @@ Stop hook 的默认首选自动路径是 GUI/app-server fork。不要把 Termina
 bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 ```
+
+这两个入口默认并行运行重测试，并把 `test_review_support_scripts.py` 与 `test_codex_stop_review_validate_fix.py` 做进程级分片。需要串行复现时：
+
+```bash
+RVF_CONTRACT_PARALLEL_TESTS=0 bash scripts/check_skill_contracts.sh
+RVF_CONTRACT_PARALLEL_TESTS=0 python3 scripts/check_plugin_contracts.py
+```
+
+需要单独跑某个 shard 时：
+
+```bash
+python3 tests/test_review_support_scripts.py --shard-count 4 --shard-index 0
+python3 tests/test_codex_stop_review_validate_fix.py --shard-count 4 --shard-index 0
+python3 tests/test_codex_stop_hook_dispatcher.py --shard-count 2 --shard-index 0
+```
+
+默认没有拆分 dispatcher 测试；`test_codex_stop_hook_dispatcher.py` 的 shard 参数主要用于本地诊断，开启 `RVF_CONTRACT_DISPATCHER_SHARDS` 前应确认没有放大时序敏感测试。
 
 需要详细输出时运行：
 

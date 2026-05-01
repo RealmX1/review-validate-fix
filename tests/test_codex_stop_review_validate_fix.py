@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import os
@@ -188,6 +189,15 @@ def latest_summary(state: Path) -> dict[str, object]:
         "updated_at",
     }
     return json.loads(Path(str(pointer["summary_path"])).read_text(encoding="utf-8"))
+
+
+def latest_events(state: Path) -> list[dict[str, object]]:
+    pointer = latest_pointer(state)
+    return [
+        json.loads(line)
+        for line in Path(str(pointer["events_path"])).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def read_json_artifact(summary: dict[str, object], key: str) -> object:
@@ -2212,46 +2222,106 @@ def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
     )
     assert (state / "session-hook" / "session-reenabled.json").exists()
 
-    write_user_session(
-        transcript,
-        "session-reenabled",
-        "RVF_STOP_HOOK: on",
-    )
+    write_apply_patch_transcript(transcript, dirty, session_id="session-reenabled")
     payload = parse_json(
         invoke(
             {
                 "cwd": str(dirty),
                 "stop_hook_active": False,
                 "transcript_path": str(transcript),
+                "last_user_message": "RVF_STOP_HOOK: on",
             },
             extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
             state_dir=state,
         )[0]
     )
     summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "session_hook_gate_enabled"
-    assert summary["control_action"] == "on"
-    assert summary["session_hook_gate_state"] == "enabled"
-    assert "enabled" in str(summary["message"])
-    assert "不是关闭全局 Stop hook" in str(summary["message"])
+    assert summary["reason_code"] == "dry_run"
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
     assert not (state / "session-hook" / "session-reenabled.json").exists()
-    assert latest_pointer(state)["status"] == "session-hook-control"
+    assert latest_pointer(state)["status"] == "dry-run"
+    events = latest_events(state)
+    assert any(
+        event["event"] == "session_hook_control_continue"
+        and event["reason_code"] == "session_hook_gate_enabled"
+        for event in events
+    )
 
-    write_apply_patch_transcript(transcript, dirty)
+
+def test_session_hook_control_reenable_starts_cline_kanban_task(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    transcript = tmp / "session.jsonl"
+    write_user_session(
+        transcript,
+        "session-kanban-reenabled",
+        "RVF_STOP_HOOK: off",
+    )
+    invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    assert (state / "session-hook" / "session-kanban-reenabled.json").exists()
+
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-reenabled', 'workspace_path': '/tmp/task-worktree'}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-reenabled', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+    write_apply_patch_transcript(transcript, repo, session_id="session-kanban-reenabled")
+
     payload = parse_json(
         invoke(
             {
-                "cwd": str(dirty),
+                "cwd": str(repo),
                 "stop_hook_active": False,
                 "transcript_path": str(transcript),
+                "last_user_message": "RVF_STOP_HOOK: on",
             },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+            extra_env={
+                "CODEX_RVF_FORK_MODE": "cline-kanban",
+                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+                "FAKE_CLIENT_CALLS": str(client_calls),
+            },
             state_dir=state,
         )[0]
     )
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+
+    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    assert not (state / "session-hook" / "session-kanban-reenabled.json").exists()
     latest = latest_summary(state)
-    assert latest["status"] == "dry-run"
+    assert latest["status"] == "cline-kanban-started"
+    assert latest["cline_kanban_task_id"] == "task-reenabled"
+    events = latest_events(state)
+    assert any(
+        event["event"] == "session_hook_control_continue"
+        and event["reason_code"] == "session_hook_gate_enabled"
+        for event in events
+    )
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
 
 
 def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
@@ -2970,6 +3040,15 @@ def test_log_unavailable_does_not_break_hook_payload(tmp: Path) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    args = parser.parse_args()
+    if args.shard_count < 1:
+        raise SystemExit("--shard-count must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise SystemExit("--shard-index must be in [0, shard-count)")
+
     tests = [
         test_normalize_backend_from_env,
         test_parent_conversation_origin_prefers_app_server_chat_name,
@@ -3017,6 +3096,7 @@ def main() -> int:
         test_session_hook_control_status_reports_current_session,
         test_session_hook_control_status_works_when_env_suppressed,
         test_session_hook_control_reenables_current_session,
+        test_session_hook_control_reenable_starts_cline_kanban_task,
         test_disabled_session_skips_fork_experiment_marker,
         test_subagent_source_ignores_session_hook_control,
         test_subagent_source_skips,
@@ -3047,9 +3127,19 @@ def main() -> int:
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        for test in tests:
+        selected = [
+            test
+            for index, test in enumerate(tests)
+            if args.shard_count <= 1 or index % args.shard_count == args.shard_index
+        ]
+        for test in selected:
             test(root / test.__name__)
-    print("codex stop review-validate-fix hook tests OK")
+    suffix = (
+        f" shard {args.shard_index + 1}/{args.shard_count}"
+        if args.shard_count > 1
+        else ""
+    )
+    print(f"codex stop review-validate-fix hook tests OK{suffix}")
     return 0
 
 

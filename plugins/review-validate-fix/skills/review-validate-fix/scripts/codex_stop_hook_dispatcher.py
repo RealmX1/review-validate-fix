@@ -334,15 +334,23 @@ def should_sync_session_scope(
     return False, "no session-owned dirty paths", "no_session_owned_dirty"
 
 
-def run_step(cmd: list[str], *, cwd: Path) -> dict[str, Any]:
+def run_step(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    extra_env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     started = time.monotonic()
+    env = sync_child_env()
+    if extra_env:
+        env.update(extra_env)
     try:
         completed = subprocess.run(
             cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
-            env=sync_child_env(),
+            env=env,
             timeout=command_timeout(),
         )
         return {
@@ -671,6 +679,37 @@ def step_summary(result: dict[str, Any], ledger: RunLedger, name: str) -> dict[s
     }
 
 
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def compact_contract_timing_report(path: Path) -> dict[str, Any] | None:
+    report = read_json_object(path)
+    if not report:
+        return None
+    timing: dict[str, Any] = {
+        "path": str(path),
+        "duration_seconds": report.get("duration_seconds"),
+        "measured_work_duration_seconds": report.get("measured_work_duration_seconds"),
+        "returncode": report.get("returncode"),
+    }
+    slowest_step = report.get("slowest_step")
+    if isinstance(slowest_step, dict):
+        timing["slowest_step"] = {
+            "label": slowest_step.get("label"),
+            "duration_seconds": slowest_step.get("duration_seconds"),
+            "percentage_of_total": slowest_step.get("percentage_of_total"),
+        }
+    groups = report.get("groups")
+    if isinstance(groups, list):
+        timing["groups"] = groups[:5]
+    return timing
+
+
 def dev_repo_script(repo: Path, rel_path: Path) -> Path:
     repo_root = repo.resolve()
     script = (repo_root / rel_path).resolve()
@@ -700,6 +739,8 @@ def sync_from_dev_repo(
 ) -> tuple[bool, Path | None, str]:
     python = sys.executable or "python3"
     steps: list[dict[str, Any]] = []
+    contract_timing_report_path: Path | None = None
+    contract_timing: dict[str, Any] | None = None
     ledger.artifact("stop-event.json", event)
     ledger.event(
         phase="dev-sync",
@@ -735,6 +776,10 @@ def sync_from_dev_repo(
         return False, ledger.summary_path if ledger.available else None, reason
 
     for name, script, args, component in step_specs:
+        extra_env: dict[str, str] = {}
+        if name == "contract-check":
+            contract_timing_report_path = ledger.artifact_path("contract-check.timing.json")
+            extra_env["RVF_CONTRACT_TIMING_REPORT"] = str(contract_timing_report_path)
         if not script.is_file():
             reason = f"missing script: {script}"
             ledger.event(
@@ -758,8 +803,15 @@ def sync_from_dev_repo(
                 steps=steps,
             )
             return False, ledger.summary_path if ledger.available else None, reason
-        result = run_step([python, str(script), *args], cwd=repo)
+        result = run_step([python, str(script), *args], cwd=repo, extra_env=extra_env)
         summary = step_summary(result, ledger, name)
+        if (
+            name == "contract-check"
+            and contract_timing_report_path is not None
+            and contract_timing_report_path.is_file()
+        ):
+            summary["paths"]["timing_report"] = str(contract_timing_report_path)
+            contract_timing = compact_contract_timing_report(contract_timing_report_path)
         steps.append(summary)
         ledger.event(
             component=component,
@@ -773,6 +825,7 @@ def sync_from_dev_repo(
             paths=summary["paths"],
             cmd=result["cmd"],
             returncode=result["returncode"],
+            contract_timing=contract_timing if name == "contract-check" else None,
         )
         if result["returncode"] != 0:
             reason = f"command failed: {' '.join(map(str, result['cmd']))}"
@@ -783,6 +836,14 @@ def sync_from_dev_repo(
                 repo=str(repo),
                 event=event_summary(event),
                 steps=steps,
+                dev_sync_steps=steps,
+                contract_check_timing=contract_timing,
+                contract_check_timing_report_path=(
+                    str(contract_timing_report_path)
+                    if contract_timing_report_path is not None
+                    and contract_timing_report_path.is_file()
+                    else None
+                ),
             )
             return False, ledger.summary_path if ledger.available else None, reason
 
@@ -794,6 +855,7 @@ def sync_from_dev_repo(
         repo=str(repo),
         cwd=str(repo),
         steps=steps,
+        contract_timing=contract_timing,
     )
     ledger.summary(
         status="synced",
@@ -802,6 +864,13 @@ def sync_from_dev_repo(
         repo=str(repo),
         event=event_summary(event),
         steps=steps,
+        dev_sync_steps=steps,
+        contract_check_timing=contract_timing,
+        contract_check_timing_report_path=(
+            str(contract_timing_report_path)
+            if contract_timing_report_path is not None and contract_timing_report_path.is_file()
+            else None
+        ),
     )
     return True, ledger.summary_path if ledger.available else None, "synced"
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -53,6 +54,39 @@ def write_fake_dev_scripts(repo: Path, marker: Path, *, fail_sync: bool = False)
     if fail_sync:
         contract_body += "sys.exit(7)\n"
     (scripts / "check_plugin_contracts.py").write_text(contract_body, encoding="utf-8")
+    (scripts / "install_to_codex.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(marker / 'install-ran')!r}).write_text("
+        "'install ' + ' '.join(sys.argv[1:]) + '\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+
+def write_timing_dev_scripts(repo: Path, marker: Path) -> None:
+    scripts = repo / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    (scripts / "check_plugin_contracts.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib\n"
+        f"pathlib.Path({str(marker / 'sync-ran')!r}).write_text('sync\\n', encoding='utf-8')\n"
+        "report_path = pathlib.Path(os.environ['RVF_CONTRACT_TIMING_REPORT'])\n"
+        "report_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "report_path.write_text(json.dumps({\n"
+        "    'version': 1,\n"
+        "    'kind': 'plugin-contract-timing',\n"
+        "    'duration_seconds': 2.5,\n"
+        "    'measured_work_duration_seconds': 4.0,\n"
+        "    'returncode': 0,\n"
+        "    'groups': [{'name': 'tests', 'duration_seconds': 2.0}],\n"
+        "    'slowest_step': {\n"
+        "        'label': 'tests: codex_stop_review_validate_fix',\n"
+        "        'duration_seconds': 2.0,\n"
+        "        'percentage_of_total': 80.0,\n"
+        "    },\n"
+        "}) + '\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
     (scripts / "install_to_codex.py").write_text(
         "#!/usr/bin/env python3\n"
         "import pathlib, sys\n"
@@ -656,6 +690,34 @@ def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -
     assert summary["reason_code"] == "sync_command_failed"
 
 
+def test_dev_sync_registers_contract_check_timing_report(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_timing_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    summary = latest_summary(state)
+    report_path = Path(str(summary["contract_check_timing_report_path"]))
+    assert report_path.is_file()
+    assert summary["contract_check_timing"]["slowest_step"]["label"] == (
+        "tests: codex_stop_review_validate_fix"
+    )
+    assert summary["contract_check_timing"]["measured_work_duration_seconds"] == 4.0
+    assert summary["dev_sync_steps"][0]["paths"]["timing_report"] == str(report_path)
+
+
 def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
@@ -1114,6 +1176,15 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    args = parser.parse_args()
+    if args.shard_count < 1:
+        raise SystemExit("--shard-count must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise SystemExit("--shard-index must be in [0, shard-count)")
+
     tests = [
         test_dev_repo_main_session_syncs_before_running_installed_hook,
         test_handoff_marker_opens_before_dev_sync_or_installed_hook,
@@ -1126,6 +1197,7 @@ def main() -> int:
         test_suppress_env_skips_before_sync_and_installed_hook,
         test_suppress_env_skips_handoff_marker_before_opening,
         test_sync_failure_skips_installed_hook_to_avoid_stale_fork,
+        test_dev_sync_registers_contract_check_timing_report,
         test_installed_hook_failure_blocks_instead_of_continuing,
         test_missing_installed_hook_blocks_instead_of_continuing,
         test_installed_hook_timeout_blocks_instead_of_continuing,
@@ -1144,12 +1216,22 @@ def main() -> int:
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        for test in tests:
+        selected = [
+            test
+            for index, test in enumerate(tests)
+            if args.shard_count <= 1 or index % args.shard_count == args.shard_index
+        ]
+        for test in selected:
             if test is test_coerce_text_handles_timeout_bytes:
                 test()
             else:
                 test(root / test.__name__)
-    print("codex stop hook dispatcher tests OK")
+    suffix = (
+        f" shard {args.shard_index + 1}/{args.shard_count}"
+        if args.shard_count > 1
+        else ""
+    )
+    print(f"codex stop hook dispatcher tests OK{suffix}")
     return 0
 
 

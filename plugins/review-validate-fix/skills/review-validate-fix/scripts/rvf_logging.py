@@ -53,6 +53,9 @@ PRESERVED_SUMMARY_KEYS = {
     "worktree_bootstrap_path",
     "worktree_bootstrap_patch_path",
     "worktree_bootstrap_files_dir",
+    "dev_sync_steps",
+    "contract_check_timing",
+    "contract_check_timing_report_path",
 }
 PHASES = {
     "dev-sync",
