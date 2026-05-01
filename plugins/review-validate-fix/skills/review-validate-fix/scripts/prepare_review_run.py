@@ -22,6 +22,8 @@ BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
 SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
+WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
+CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
 SCOPE_CONTRACT_VERSION = 1
 
 
@@ -82,6 +84,9 @@ def review_env_exports(
         "RVF_REVIEW_PACKET_METADATA": str(metadata_path),
         "RVF_BEFORE_WORKSPACE_SNAPSHOT": str(snapshot_path),
         "RVF_COMMAND_LOCK": str(COMMAND_LOCK),
+        "RVF_WRITE_REVIEW_RESULT": str(WRITE_REVIEW_RESULT),
+        "RVF_CHECK_REVIEW_RESULT": str(CHECK_REVIEW_RESULT),
+        "RVF_REVIEW_RESULT": str(artifacts_dir / "reviewers" / "reviewer" / "review-result.json"),
     }
     if bootstrap_metadata_path is not None:
         env["RVF_WORKTREE_BOOTSTRAP"] = str(bootstrap_metadata_path)
@@ -121,6 +126,9 @@ def review_env_exports(
             'export RVF_BEFORE_WORKSPACE_SNAPSHOT="$RVF_ARTIFACTS_DIR/before-workspace-snapshot.json"',
             'export RVF_WORKTREE_BOOTSTRAP="$RVF_ARTIFACTS_DIR/worktree-bootstrap.json"',
             f"export RVF_COMMAND_LOCK={shlex.quote(env['RVF_COMMAND_LOCK'])}",
+            f"export RVF_WRITE_REVIEW_RESULT={shlex.quote(env['RVF_WRITE_REVIEW_RESULT'])}",
+            f"export RVF_CHECK_REVIEW_RESULT={shlex.quote(env['RVF_CHECK_REVIEW_RESULT'])}",
+            'export RVF_REVIEW_RESULT="$RVF_ARTIFACTS_DIR/reviewers/${RVF_REVIEWER_ID:-reviewer}/review-result.json"',
             "",
         ]
     )
@@ -158,8 +166,11 @@ def review_agent_context_text(
         [
             "- review packet: `$RVF_REVIEW_PACKET`",
             "- command lock wrapper: `$RVF_COMMAND_LOCK`",
+            "- review result writer: `$RVF_WRITE_REVIEW_RESULT`",
+            "- review result checker: `$RVF_CHECK_REVIEW_RESULT`",
+            "- reviewer result artifact: `$RVF_REVIEW_RESULT` (set `RVF_REVIEWER_ID` before sourcing when launching multiple reviewers)",
             "",
-            "Use the variables above in commands and notes instead of expanding the run artifacts directory.",
+            "Use the variables above in commands and notes instead of expanding the run artifacts directory. The result artifact is protocol output and is the only file a review-only agent may write intentionally.",
         ]
     )
     return "\n".join(lines) + "\n"

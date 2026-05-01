@@ -26,6 +26,8 @@ SCRIPT_DIR = (
 )
 BUILD_PACKET = SCRIPT_DIR / "build_review_packet.py"
 CHECK_REVIEW_OUTPUT = SCRIPT_DIR / "check_review_output.py"
+WRITE_REVIEW_RESULT = SCRIPT_DIR / "write_review_result.py"
+CHECK_REVIEW_RESULT = SCRIPT_DIR / "check_review_result.py"
 COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"
 PREPARE_REVIEW_RUN = SCRIPT_DIR / "prepare_review_run.py"
 RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
@@ -161,6 +163,16 @@ def write_alternative_reviewer_config(
         encoding="utf-8",
     )
     return path
+
+
+def clean_review_result_python(*, stdout: str = "artifact written") -> str:
+    return (
+        "import os, subprocess, sys; "
+        "sys.stdin.read(); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        f"print({stdout!r})"
+    )
 
 
 def write_codex_transcript(path: Path, repo: Path) -> Path:
@@ -331,6 +343,188 @@ def test_check_review_output_protocol_extension_requests() -> None:
         check=False,
     )
     assert mixed_with_completion.returncode != 0
+
+
+def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
+    clean = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp / "run")
+
+    run(
+        [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(clean)],
+        env=env,
+    )
+    clean_check = run([sys.executable, str(CHECK_REVIEW_RESULT), str(clean), "--json"])
+    clean_payload = json.loads(clean_check.stdout)
+    assert clean_payload["valid"] is True
+    assert clean_payload["kind"] == "no_issues"
+
+    issues = tmp / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
+    run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(issues),
+            "--path",
+            "src/foo.ts",
+            "--line",
+            "42",
+            "--message",
+            "空输入时会跳过必要校验。",
+        ],
+        env=env,
+    )
+    run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(issues),
+            "--path",
+            "Dockerfile",
+            "--line",
+            "3",
+            "--message",
+            "构建参数没有传入默认值。",
+        ],
+        env=env,
+    )
+    issue_check = run([sys.executable, str(CHECK_REVIEW_RESULT), str(issues), "--json"])
+    issue_payload = json.loads(issue_check.stdout)
+    assert issue_payload["valid"] is True
+    assert issue_payload["kind"] == "issues"
+    assert issue_payload["issue_count"] == 2
+    assert issue_payload["issues"][0]["path"] == "src/foo.ts"
+
+
+def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None:
+    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp / "run")
+    run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "lock-request",
+            "--out",
+            str(result),
+            "--name",
+            "npm-test",
+            "--command",
+            "npm test",
+            "--reason",
+            "测试命令会争用共享缓存。",
+        ],
+        env=env,
+    )
+    payload = json.loads(run([sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"]).stdout)
+    assert payload["valid"] is True
+    assert payload["kind"] == "request"
+    assert payload["request_types"] == ["lock_request"]
+
+    excluded = tmp / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
+    contract = tmp / "scope.contract.json"
+    contract.write_text('{"canonical_scope":{"excluded_path_prefixes":["vendor"]}}\n', encoding="utf-8")
+    run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(excluded),
+            "--path",
+            "vendor/generated.py",
+            "--line",
+            "1",
+            "--message",
+            "不应报告 excluded path。",
+        ],
+        env=env,
+    )
+    invalid = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(excluded), "--scope-contract", str(contract), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert invalid.returncode != 0
+    assert "excluded" in invalid.stdout
+
+
+def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> None:
+    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp / "run")
+
+    missing = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing.returncode != 0
+    assert "missing review result artifact" in missing.stdout
+
+    bad_path = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(result),
+            "--path",
+            "../escape.py",
+            "--line",
+            "1",
+            "--message",
+            "bad",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad_path.returncode != 0
+
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "no_issues",
+                "issues": [{"path": "src/a.py", "line": 1, "message": "mixed"}],
+                "requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    mixed = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert mixed.returncode != 0
+    assert "no_issues result must not include issues" in mixed.stdout
+
+    outside = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "no-issues",
+            "--out",
+            str(tmp / "outside.json"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert outside.returncode != 0
+    assert "RVF_RUN_DIR" in outside.stderr
 
 
 def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
@@ -1309,6 +1503,10 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert payload["review_env"]["RVF_SCOPE_CONTRACT"] == payload["scope_contract"]
     assert payload["review_env"]["RVF_SCOPE_OF_WORK"] == payload["scope_of_work_file"]
     assert payload["review_env"]["RVF_REVIEW_PACKET"] == payload["review_packet"]
+    assert payload["review_env"]["RVF_WRITE_REVIEW_RESULT"].endswith("scripts/write_review_result.py")
+    assert payload["review_env"]["RVF_CHECK_REVIEW_RESULT"].endswith("scripts/check_review_result.py")
+    assert payload["review_env"]["RVF_REVIEW_RESULT"].endswith("artifacts/reviewers/reviewer/review-result.json")
+    assert "${" not in payload["review_env"]["RVF_REVIEW_RESULT"]
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
@@ -1316,6 +1514,7 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
     assert 'export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"' in review_env_text
     assert 'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"' in review_env_text
+    assert 'export RVF_REVIEW_RESULT="$RVF_ARTIFACTS_DIR/reviewers/${RVF_REVIEWER_ID:-reviewer}/review-result.json"' in review_env_text
     review_agent_context_text = Path(payload["review_agent_context_file"]).read_text(encoding="utf-8")
     assert payload["review_agent_context"] == review_agent_context_text
     assert "## RVF Generated Reviewer Context" in review_agent_context_text
@@ -1324,6 +1523,8 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert "- scope-of-work: `$RVF_SCOPE_OF_WORK`" in review_agent_context_text
     assert "- review packet: `$RVF_REVIEW_PACKET`" in review_agent_context_text
     assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
+    assert "- review result writer: `$RVF_WRITE_REVIEW_RESULT`" in review_agent_context_text
+    assert "- reviewer result artifact: `$RVF_REVIEW_RESULT`" in review_agent_context_text
     assert payload["scope_of_work_file"] not in review_agent_context_text
     assert payload["review_packet"] not in review_agent_context_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
@@ -1375,15 +1576,20 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
     scope_contract.parent.mkdir()
     scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
 
-    prompt = module.build_prompt(prompt_file, context, packet, repo, scope_contract)
+    result_path = tmp / "run" / "artifacts" / "reviewers" / "test" / "review-result.json"
+    prompt = module.build_prompt(prompt_file, context, packet, repo, scope_contract, result_path)
 
     assert "$RVF_SCOPE_CONTRACT" in prompt
     assert "$RVF_SCOPE_OF_WORK" in prompt
     assert "$RVF_REVIEW_PACKET" in prompt
     assert "$RVF_COMMAND_LOCK" in prompt
+    assert "$RVF_WRITE_REVIEW_RESULT" in prompt
+    assert "$RVF_CHECK_REVIEW_RESULT" in prompt
+    assert "$RVF_REVIEW_RESULT" in prompt
     assert "$RVF_REPO" in prompt
     assert str(scope_contract) not in prompt
     assert str(context) not in prompt
+    assert str(result_path) not in prompt
     assert str(module.COMMAND_LOCK) not in prompt
 
 
@@ -1415,7 +1621,11 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
         "assert os.environ['RVF_SCOPE_OF_WORK'] == expected; "
         "assert os.environ['RVF_SESSION_CONTEXT'] == expected; "
         "assert os.environ['RVF_SCOPE_CONTRACT'] == expected_scope; "
-        "print('NO_ISSUES')"
+        "assert os.environ['RVF_REVIEW_RESULT']; "
+        "import subprocess; "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        "print('artifact written')"
     )
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
@@ -1441,7 +1651,7 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
         ]
     )
 
-    assert completed.stdout.strip() == "NO_ISSUES"
+    assert completed.stdout.strip() == "artifact written"
 
 
 def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path) -> None:
@@ -1738,7 +1948,7 @@ def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp: Pa
         [
             sys.executable,
             "-c",
-            "import sys, time; sys.stdin.read(); time.sleep(0.25); print('NO_ISSUES')",
+            "import time; time.sleep(0.25); " + clean_review_result_python(stdout="NO_ISSUES"),
         ],
         idle_timeout_seconds=0.08,
         activity_check_interval_seconds=0.03,
@@ -1783,6 +1993,52 @@ def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp: Pa
     normalized = Path(summary["paths"]["normalized"]).read_text(encoding="utf-8")
     assert normalized.strip() == "NO_ISSUES"
     assert "PROBE" not in normalized
+    assert summary["review_result_valid"] is True
+    result_summary = json.loads(Path(summary["paths"]["review_result_summary"]).read_text(encoding="utf-8"))
+    assert result_summary["kind"] == "no_issues"
+
+
+def test_alternative_reviewer_requires_review_result_artifact(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.read(); print('NO_ISSUES')",
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "missing-result-test",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "missing review result artifact" in completed.stderr
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["reason_code"] == "reviewer_result_invalid"
+    assert summary["review_result_valid"] is False
 
 
 def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Path) -> None:
@@ -1896,12 +2152,14 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None
             "-u",
             "-c",
             (
-                "import sys, time; sys.stdin.read(); "
+                "import os, subprocess, sys, time; sys.stdin.read(); "
                 "[print(f'tick-{i}', flush=True) or time.sleep(0.08) for i in range(4)]; "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
                 "print('NO_ISSUES', flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.12,
+        idle_timeout_seconds=0.3,
         activity_check_interval_seconds=0.05,
     )
 
@@ -1936,7 +2194,7 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
             "-u",
             "-c",
             (
-                "import json, sys, time; sys.stdin.read(); "
+                "import json, os, subprocess, sys, time; sys.stdin.read(); "
                 "print(json.dumps({'type':'assistant','message':{'content':["
                 "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
                 "]}}), flush=True); "
@@ -1944,6 +2202,8 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
                 "print(json.dumps({'type':'user','message':{'content':["
                 "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
                 "]}}), flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
@@ -1983,7 +2243,7 @@ def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -
             "-u",
             "-c",
             (
-                "import json, sys, time; sys.stdin.read(); "
+                "import json, os, subprocess, sys, time; sys.stdin.read(); "
                 "event = json.dumps({'type':'assistant','message':{'content':["
                 "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
                 "]}}); "
@@ -1995,6 +2255,8 @@ def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -
                 "print(json.dumps({'type':'user','message':{'content':["
                 "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
                 "]}}), flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
@@ -2033,7 +2295,7 @@ def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp: Path) -> N
         [
             sys.executable,
             "-c",
-            "import sys; sys.stdin.read(); print('NO_ISSUES')",
+            clean_review_result_python(stdout="NO_ISSUES"),
         ],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -2108,15 +2370,17 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> N
             "-u",
             "-c",
             (
-                "import sys, time, json; sys.stdin.read(); "
+                "import os, subprocess, sys, time, json; sys.stdin.read(); "
                 "print(json.dumps({'type':'system','subtype':'init'}), flush=True); "
                 "time.sleep(0.08); "
                 "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}), flush=True); "
                 "time.sleep(0.08); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
                 "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.12,
+        idle_timeout_seconds=0.3,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -2150,9 +2414,11 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
         "\n".join(
             [
                 f"#!{sys.executable}",
-                "import json, sys",
+                "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
             ]
         )
@@ -2205,9 +2471,11 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) ->
         "\n".join(
             [
                 f"#!{sys.executable}",
-                "import json, sys",
+                "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
                 "print('NO_ISSUES', flush=True)",
             ]
         )
@@ -2255,9 +2523,11 @@ def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: P
         "\n".join(
             [
                 f"#!{sys.executable}",
-                "import json, sys",
+                "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
                 "print('NO_ISSUES', flush=True)",
             ]
         )
@@ -2305,9 +2575,11 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
         "\n".join(
             [
                 f"#!{sys.executable}",
-                "import json, sys",
+                "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
             ]
         )
@@ -2802,6 +3074,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_check_review_output_protocol_extension_requests(),
         ),
         (
+            "review_result_artifact_no_issues_and_issues",
+            lambda: test_review_result_artifact_no_issues_and_issues(root / "review-result-basic"),
+        ),
+        (
+            "review_result_artifact_requests_and_scope_exclusions",
+            lambda: test_review_result_artifact_requests_and_scope_exclusions(root / "review-result-request"),
+        ),
+        (
+            "review_result_artifact_rejects_malformed_and_mixed_state",
+            lambda: test_review_result_artifact_rejects_malformed_and_mixed_state(root / "review-result-invalid"),
+        ),
+        (
             "check_skill_contracts_requires_validate_fix_request_literals",
             lambda: test_check_skill_contracts_requires_validate_fix_request_literals(),
         ),
@@ -2917,6 +3201,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "alternative_reviewer_activity_probe_keeps_silent_reviewer_alive",
             lambda: test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(
                 root / "alternative-probe-success"
+            ),
+        ),
+        (
+            "alternative_reviewer_requires_review_result_artifact",
+            lambda: test_alternative_reviewer_requires_review_result_artifact(
+                root / "alternative-missing-result"
             ),
         ),
         (

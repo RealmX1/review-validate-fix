@@ -27,7 +27,7 @@ description: Use when the user asks for a post-work code review loop, review val
 ## 运行选项
 
 - 本 skill 支持显式 `pass_type` / `mode`，默认是 `full`：执行 double review -> merge -> validate/fix -> handoff。只有用户明确写出 `$review-validate-fix` 且没有指定更窄模式时，才进入默认 `full` 流程。
-- `pass_type: review_only` / `mode: review_only` 是只读 reviewer 子 pass：只允许读取、搜索、运行不会主动写回源码的验证命令，并最终只输出精确 `NO_ISSUES` 或编号 issue list。禁止修改文件、禁止 validate/fix、禁止 stage/commit、禁止生成 handoff.md，也不要输出 handoff 摘要。
+- `pass_type: review_only` / `mode: review_only` 是只读 reviewer 子 pass：只允许读取、搜索、运行不会主动写回源码的验证命令，并最终通过 `$RVF_REVIEW_RESULT` 写 canonical review result artifact。禁止修改 repo 源文件、禁止 validate/fix、禁止 stage/commit、禁止生成 handoff.md，也不要输出 handoff 摘要。
 - `pass_type: validate_fix` / `mode: validate_fix` 只处理主会话分配的 canonical issue 包：允许按 `references/validate-then-fix-prompt.md` 对 `REAL` 问题做最小修复，但仍禁止重新执行 double review、扩大审查范围或生成 handoff.md。
 - `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint` 不是 review loop：只输出用户要求的研究 checkpoint / 汇总，不启动 review、validate/fix 或 handoff。即使上下文中提到 `$review-validate-fix`、review、fix 或 handoff，也不得生成 handoff.md。
 - 如果本 skill 文本被放进子代理或研究代理上下文，而该代理的当前任务明确是只读 review、普通研究、checkpoint、ledger 维护或 no-handoff 汇总，当前任务的窄模式优先于默认 `full`。不要因为上下文出现 `$review-validate-fix` 叙事就升级为完整流程。
@@ -77,7 +77,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 ## Review
 
-- review pass 的 `pass_type` 永远是 `review_only`。无论它由 full 流程派生、由用户单独要求只读 review，还是出现在研究马拉松 checkpoint 中，都必须停在 `NO_ISSUES` 或 issue list；不得把自己升级为完整 `$review-validate-fix` 流程。
+- review pass 的 `pass_type` 永远是 `review_only`。无论它由 full 流程派生、由用户单独要求只读 review，还是出现在研究马拉松 checkpoint 中，都必须停在 canonical review result artifact；不得把自己升级为完整 `$review-validate-fix` 流程。
 - RVF 使用 `references/review-standards/` 中的定制 Review Standards Pack。它提炼 `code-review-and-quality`、`code-simplification`、`security-and-hardening`、`performance-optimization` 的适用子集，但不采用原版 agent-skills 的 report/checklist 输出格式。主会话可读取完整 pack；reviewer 默认读取 `reviewer.md` 和按需专项 subset；validate/fix 默认读取 `validate-fix.md` 和 assigned issue 相关 subset。
 - 默认执行 santa-method double review：始终并行启动两个独立 review pass。
 - 如果用户显式要求跳过 review：
@@ -87,40 +87,40 @@ description: Use when the user asks for a post-work code review loop, review val
   - 如果用户没有提供 issue list，则跳过 Validate / Fix，直接进入最终汇总；handoff 默认仍开启，除非用户也显式关闭 handoff。
   - 最终汇总和 handoff 必须写明 `review_status: SKIPPED_BY_USER`。
 - review 阶段优先使用能力隔离，而不是事后追责：
-  - Codex-native reviewer 优先用探索型 agent；如果当前 Codex agent API 暴露工具或 capability allowlist，就保留读取、检索、shell/test 能力，不授予直接编辑、patch、文件写入、stage、commit 或 validate/fix 相关能力。
-  - 启动 Codex-native reviewer 子代理时，必须使用 clean context；不要继承父线程历史、`<subagent_notification>`、先完成 reviewer 的输出、主会话 commentary 或 validate/fix 结果。reviewer prompt 里只给目标 repo 绝对路径、`review_agent_context_file` / `review-env.sh`、同一份 `scope.contract.json`、scope-of-work、session manifest、review packet 和 command lock 入口，并要求它在目标 repo 下读取文件和运行命令，不得默认落到 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree。
-  - Codex-native reviewer prompt 应直接复用 `prepare_review_run.py` 生成的 `review_agent_context` 或让 reviewer 读取 `review_agent_context_file`，不要由主会话手写 export block。该生成块已经包含 repo、`review-env.sh` 加载命令、scope、manifest、packet 和 command lock 的变量化入口。
-  - Reviewer 输出在所有 reviewer 完成或超时前不得注入另一路 reviewer 的上下文。每路 reviewer 的 prompt、stdout、stderr、normalized、summary 应写到 `artifacts/reviewers/<reviewer-id>/`；普通 double-review 不把这些输出交给另一 reviewer。若用户明确要求分析 RVF 历史或 subagent 轨迹，则这些 artifact 可以作为该任务的输入。
+  - Codex-native reviewer 优先用探索型 agent；如果当前 Codex agent API 暴露工具或 capability allowlist，就保留读取、检索、shell/test 能力，不授予直接编辑、patch、repo 源文件写入、stage、commit 或 validate/fix 相关能力。允许 reviewer 通过 `$RVF_WRITE_REVIEW_RESULT` 写 `$RVF_REVIEW_RESULT`；这是 review protocol output，不是 fix/writeback。
+  - 启动 Codex-native reviewer 子代理时，必须使用 clean context；不要继承父线程历史、`<subagent_notification>`、先完成 reviewer 的输出、主会话 commentary 或 validate/fix 结果。reviewer prompt 里只给目标 repo 绝对路径、`review_agent_context_file` / `review-env.sh`、同一份 `scope.contract.json`、scope-of-work、session manifest、review packet、command lock 入口、result writer/checker 和 reviewer-specific `RVF_REVIEW_RESULT`，并要求它在目标 repo 下读取文件和运行命令，不得默认落到 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree。
+  - Codex-native reviewer prompt 应直接复用 `prepare_review_run.py` 生成的 `review_agent_context` 或让 reviewer 读取 `review_agent_context_file`，不要由主会话手写 export block。该生成块已经包含 repo、`review-env.sh` 加载命令、scope、manifest、packet、command lock、result writer/checker 和 result artifact 的变量化入口。启动多个 reviewer 时，主会话或 runner 必须先设置唯一 `RVF_REVIEWER_ID` 或直接覆盖 `RVF_REVIEW_RESULT`。
+  - Reviewer 输出在所有 reviewer 完成或超时前不得注入另一路 reviewer 的上下文。每路 reviewer 的 prompt、stdout、stderr、normalized、`review-result.json`、`review-result.summary.json`、summary 应写到 `artifacts/reviewers/<reviewer-id>/`；普通 double-review 不把这些输出交给另一 reviewer。若用户明确要求分析 RVF 历史或 subagent 轨迹，则这些 artifact 可以作为该任务的输入。
   - 如果当前 Codex `spawn_agent` 接口没有显式 capability allowlist（只有 agent type / model / reasoning 等参数），不要把 prompt 当成硬沙箱；仍可让 reviewer 读取仓库、运行测试/lint/build，但必须在 prompt 中明确禁止直接写文件、修复、stage/commit 和 handoff。
   - external alternative reviewer 应允许读取仓库并运行测试命令；配置层面只剥离直接编辑/写入工具。不要因为 reviewer 需要 shell 或 repo cwd 就降级为 fallback。
 - `alternative reviewer` 可以是用户配置的任意外部 coding agent（例如某个 CLI、MCP 暴露的 agent、IDE agent 或本地 wrapper）。不要在本 skill 中硬编码具体 vendor、模型名或命令名。
-- 如果 `config/alternative-reviewer.json` 已配置且 `scripts/run_alternative_reviewer.py --check` 通过，则使用一个 Codex-native reviewer 加一个 `alternative-reviewer:<agent-name>`；需要确认认证/健康状态时优先用 `scripts/run_alternative_reviewer.py --preflight`，它会在配置了 `health_command` 时一并检查。运行 external reviewer 时用 `scripts/run_alternative_reviewer.py --repo <repo> --review-packet <packet> --session-context <file>`，让 reviewer 能结合 packet 与本地测试结果审查。
+- 如果 `config/alternative-reviewer.json` 已配置且 `scripts/run_alternative_reviewer.py --check` 通过，则使用一个 Codex-native reviewer 加一个 `alternative-reviewer:<agent-name>`；需要确认认证/健康状态时优先用 `scripts/run_alternative_reviewer.py --preflight`，它会在配置了 `health_command` 时一并检查。运行 external reviewer 时用 `scripts/run_alternative_reviewer.py --repo <repo> --review-packet <packet> --session-context <file>`，让 reviewer 能结合 packet 与本地测试结果审查；runner 会注入并校验 `RVF_REVIEW_RESULT`。
 - external alternative reviewer 仍允许运行测试、lint、typecheck、build 或复现命令。不要把“可能产生测试缓存/报告/临时文件”误当成禁止运行命令的理由。
 - external alternative reviewer 默认必须自行完成审查；除非本轮 prompt 明确要求等待人工步骤，否则不要期待开发者手动运行命令、提供额外操作或协助它完成 review。
-- external alternative reviewer 的等待机制是可观测活动空闲超时：`scripts/run_alternative_reviewer.py` 从 `config/alternative-reviewer.json` 读取 `idle_timeout_seconds`、`activity_check_interval_seconds`、可选 `activity_probe_command` / `activity_probe_timeout_seconds` 与可选 `max_runtime_seconds`；默认配置每 5 秒检查一次 stdout/stderr 是否有新活动，连续 300 秒没有可观测活动时先结合 probe 判断 liveness，只有 probe inactive、probe 多次失败、进程退出或超过 max runtime 才终止该 reviewer，返回 exit code `124` 并输出 `RVF_EXTERNAL_REVIEWER_TIMEOUT ...`。probe 输出只写入 liveness metadata 和 probe history，不进入 review scope、review packet 或 issue merge。默认不设置总运行时上限；如果本机配置确实需要总上限，应使用宽松的一小时级别限制。对支持事件流的外部 CLI，配置层应优先启用事件流输出，并由 runner 提取最终 review 文本，避免“agent 正在使用工具但 text stdout 直到结束才输出”的误超时；Claude stream-json 中已开始但尚未返回 tool_result 的 Bash 工具调用视为正在等待长命令运行，不按普通静默期超时。此时不要合并任何 partial reviewer 输出；除非用户要求 external-only fail-close，否则把真正超时或不可启动的 external reviewer 视为不可用并走 Codex-only fallback。
+- external alternative reviewer 的等待机制是可观测活动空闲超时：`scripts/run_alternative_reviewer.py` 从 `config/alternative-reviewer.json` 读取 `idle_timeout_seconds`、`activity_check_interval_seconds`、可选 `activity_probe_command` / `activity_probe_timeout_seconds` 与可选 `max_runtime_seconds`；默认配置每 5 秒检查一次 stdout/stderr 是否有新活动，连续 300 秒没有可观测活动时先结合 probe 判断 liveness，只有 probe inactive、probe 多次失败、进程退出或超过 max runtime 才终止该 reviewer，返回 exit code `124` 并输出 `RVF_EXTERNAL_REVIEWER_TIMEOUT ...`。probe 输出只写入 liveness metadata 和 probe history，不进入 review scope、review packet 或 issue merge。默认不设置总运行时上限；如果本机配置确实需要总上限，应使用宽松的一小时级别限制。对支持事件流的外部 CLI，配置层应优先启用事件流输出刷新活动时间；Claude stream-json 中已开始但尚未返回 tool_result 的 Bash 工具调用视为正在等待长命令运行，不按普通静默期超时。stdout/stderr 只作为 diagnostic，canonical review outcome 来自 result artifact；除非用户要求 external-only fail-close，否则把真正超时、不可启动或缺少 valid artifact 的 external reviewer 视为不可用并走 Codex-only fallback。
 - 对可能与主会话或另一个 reviewer 冲突的命令，优先使用 `scripts/command_lock.py --repo <repo> --name <stable-lock-name> -- <command ...>` 做 repo-scoped 锁保护。典型场景包括共享 dev server 端口、会写同一缓存/coverage/report 目录的长测试、包管理器安装/构建、会独占设备或全局资源的命令。command lock 会通过统一 run ledger 记录 `lock_wait_started`、`lock_acquired`、`lock_timeout` 与 `lock_released` 事件。
-- 如果 reviewer 判断某个命令需要锁但当前 prompt 或环境没有提供可用锁，它必须输出 `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` 作为唯一响应；这不是完成的 review 结果，主会话应提供锁包装后的命令或更新 prompt 后重试该 reviewer。不要把 `RVF_LOCK_REQUEST` 合并为 bug finding。
-- 如果 reviewer 需要专项标准、测量、受控子任务或缺失上下文，它可以输出 `RVF_STANDARD_REQUEST ...`、`RVF_MEASUREMENT_REQUEST ...`、`RVF_SUBTASK_REQUEST ...` 或 `RVF_CONTEXT_REQUEST ...` 作为唯一响应；这些 request 不得与 `NO_ISSUES` 或 issue list 混写。默认由主会话满足、驳回或 spawn 子任务，并记录 run ledger 后让 reviewer 重试。只有平台能继承 run id、scope、manifest、packet 和 no-handoff/no-review-loop 约束时，才允许最多一层 nested subagent。
+- 如果 reviewer 判断某个命令需要锁但当前 prompt 或环境没有提供可用锁，它必须通过 `$RVF_WRITE_REVIEW_RESULT lock-request --out "$RVF_REVIEW_RESULT" ...` 写 request artifact；这不是完成的 review 结果，主会话应提供锁包装后的命令或更新 prompt 后重试该 reviewer。不要把 lock request 合并为 bug finding。
+- 如果 reviewer 需要专项标准、测量、受控子任务或缺失上下文，它可以通过 `$RVF_WRITE_REVIEW_RESULT standard-request`、`measurement-request`、`subtask-request` 或 `context-request` 写 request artifact；这些 request 不得与 clean 或 issue result 混写。默认由主会话满足、驳回或 spawn 子任务，并记录 run ledger 后让 reviewer 重试。只有平台能继承 run id、scope、manifest、packet 和 no-handoff/no-review-loop 约束时，才允许最多一层 nested subagent。
 - 如果 alternative reviewer 未配置、配置未完成、命令不可用或本轮无法启动，默认使用 Codex-only fallback；不要询问用户、不要中断 review loop、不要降级为单 reviewer。
 - Codex-only fallback 必须并行启动两个 Codex-native 子代理模拟 santa-method：两个子代理使用同一份 review prompt、同一个 scope-of-work 文件路径和同一份 review packet 路径，彼此不看对方输出，并用 `codex-mimic-reviewer-a` / `codex-mimic-reviewer-b` 作为来源标签。
 - 只有用户在本轮明确要求必须使用外部 alternative reviewer、且不接受 Codex-only fallback 时，才因 alternative reviewer 不可用而 fail-close。
 - 两个 reviewer 使用同一份 review prompt、同一个 scope-of-work 文件路径、同一份 session manifest 文件路径（如果有）和同一份 review packet 路径，但彼此不看对方输出。主会话不要把同一大段 scope 文本分别粘贴给两个 reviewer；把文件路径或本轮 `RVF_*` 变量交给它们读取即可，减少 prompt 重复。scope-of-work / session context 是主会话对本 turn 已完成工作的交接说明；session manifest 是机器提取的 ownership anchor；reviewer 应结合它们判断 intent/scope，再用 packet、diff、status、文件读取和验证命令独立核实。reviewer 的默认假设是：另一个独立 reviewer 可能正并行工作；因此命令需按锁规则协调。reviewer 的审查范围以 session manifest 的 owned paths 和主会话提供的 scope-of-work 为准，不得把整个 `git diff HEAD` 当作 full-scope analysis 来源；除非主会话明确要求 full diff review，否则只审查 scope 内改动及其直接连带影响。
-- 完成态 Review 输出契约必须严格为：
-  - 无问题：只输出 `NO_ISSUES`。
-  - 有问题：输出编号 issue list，每条含 `路径:行号` 和 1-2 句中文说明。
-- 非完成态 request 契约为：只输出一行或多行 `RVF_*_REQUEST ...`，由主会话处理后重试；request 不得与 `NO_ISSUES` 或 issue list 混在同一个输出中，也不得进入 merge table。
-- 每个 reviewer 输出必须先用 `scripts/check_review_output.py` 或等价解析器校验；中文化“没有问题”、空响应、纯 prose、handoff、validate/fix verdict、修复说明或无 `路径:行号` 的列表都不是合格 review 输出。只要每条 issue 都以编号 `路径:行号` 开头，同一 issue 的换行续句、缩进续行或前后空白属于可归一化小格式漂移，不应触发重试、fail-close 或重罚。
-- 如果 reviewer 输出 `RVF_*_REQUEST`，先满足、驳回、spawn 子任务或提供上下文，再重试 reviewer；重试后的输出仍必须是完成态契约。request 本身不计入合格 double-review 来源。
-- 如果 reviewer 输出存在严重契约违规，可用同一 review packet 重试一次并明确指出只允许 `NO_ISSUES`、编号 issue list，或纯 `RVF_*_REQUEST`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。严重违规不包括可无损归一化的小格式漂移。
+- 完成态 Review artifact 契约必须严格为：
+  - 无问题：`kind: no_issues`。
+  - 有问题：`kind: issues`，每条含 `path`、`line`、`message`。
+- 非完成态 request 契约为 `kind: request`，由主会话处理后重试；request 不得与 clean 或 issue result 混在同一个 artifact 中，也不得进入 merge table。
+- 每个 reviewer result artifact 必须先用 `scripts/check_review_result.py` 或等价解析器校验；artifact 缺失、损坏、schema invalid、path 越界、excluded path、clean/issues/request 混合状态都不是合格 review result。reviewer final prose、stdout、stderr、中文化“没有问题”、handoff、validate/fix verdict 或修复说明都只作为 diagnostic，不作为 canonical result。
+- 如果 reviewer artifact 是 `kind: request`，先满足、驳回、spawn 子任务或提供上下文，再重试 reviewer；重试后的 artifact 仍必须是完成态契约。request 本身不计入合格 double-review 来源。
+- 如果 reviewer artifact 存在严重契约违规，可用同一 review packet 和新的 reviewer result path 重试一次并明确要求调用 `$RVF_WRITE_REVIEW_RESULT` 和 `$RVF_CHECK_REVIEW_RESULT`；再次违规则 fail-close，用中文询问用户如何处理，且不要把该 reviewer 当作合格 double-review 来源。
 - review 前后可用 `scripts/workspace_snapshot.py capture/compare` 记录状态，尤其是 reviewer 会运行测试/lint/build 时。状态变化只表示 `WORKSPACE_CHANGED_DURING_REVIEW`，不推断 reviewer 主动编辑，也不自动使输出失格；主会话应检查变化是测试缓存/报告等可解释副作用，还是源文件、lockfile、snapshot 等需要人工处理的污染。不要自动 revert 用户或其他进程可能造成的改动。
 - 详细 review prompt 见 `references/review-prompt.md`。
-- 合并两个 reviewer 的输出时读取 `references/review-merge-policy.md`：合并重复项、分组紧密相关 issue，并为每个 processed issue 记录来源 reviewer。
+- 合并两个 reviewer 的 artifact 时读取 `references/review-merge-policy.md`：合并重复项、分组紧密相关 issue，并为每个 processed issue 记录来源 reviewer。
 
 ## Validate / Fix
 
-- `NO_ISSUES` 进入 clean path，handoff 默认仍开启，除非用户显式关闭 handoff。
-- 可解析 issue list 进入 validate/fix。
-- 中文化“没有问题”、空响应、纯 prose 或缺少 `路径:行号` 的不可解析列表都 fail-close：用中文询问用户如何处理，不静默当作 0 个问题。仅有换行、缩进或空白问题且能归属到上一条编号 issue 时，归一化后继续 validate/fix。
+- `kind: no_issues` 进入 clean path，handoff 默认仍开启，除非用户显式关闭 handoff。
+- `kind: issues` 进入 validate/fix。
+- artifact 缺失、损坏、schema invalid、纯 prose 或 final message 声称 clean 但 artifact 无效都 fail-close：用中文询问用户如何处理，不静默当作 0 个问题。
 - 每条 issue 必须先验证，再决定：
   - `REAL`：真问题且可独立最小修复。
   - `FALSE_POSITIVE`：不成立，不改文件。

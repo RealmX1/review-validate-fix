@@ -392,7 +392,8 @@ required_files=(
   "scripts/review_validate_fix_gate.sh"
   "scripts/run_alternative_reviewer.py"
   "scripts/build_review_packet.py"
-  "scripts/check_review_output.py"
+  "scripts/write_review_result.py"
+  "scripts/check_review_result.py"
   "scripts/command_lock.py"
   "scripts/prepare_review_run.py"
   "scripts/apply_worktree_bootstrap.py"
@@ -474,7 +475,8 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/install_to_codex.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
-  "$skill_dir/scripts/check_review_output.py" \
+  "$skill_dir/scripts/write_review_result.py" \
+  "$skill_dir/scripts/check_review_result.py" \
   "$skill_dir/scripts/command_lock.py" \
   "$skill_dir/scripts/prepare_review_run.py" \
   "$skill_dir/scripts/apply_worktree_bootstrap.py" \
@@ -492,7 +494,10 @@ run_step "python compile" python3 -m py_compile \
 
 run_parallel_test_steps
 
-require_literal "references/review-prompt.md" 'NO_ISSUES'
+require_literal "references/review-prompt.md" 'RVF_WRITE_REVIEW_RESULT'
+require_literal "references/review-prompt.md" 'RVF_CHECK_REVIEW_RESULT'
+require_literal "references/review-prompt.md" 'RVF_REVIEW_RESULT'
+require_literal "references/review-prompt.md" 'kind: no_issues'
 require_literal "references/review-prompt.md" 'clean context'
 require_literal "references/review-prompt.md" 'RVF_SCOPE_CONTRACT'
 require_literal "references/review-prompt.md" 'need-clean-review-context'
@@ -538,7 +543,8 @@ require_literal "SKILL.md" 'RVF_SCOPE_CONTRACT'
 require_literal "SKILL.md" 'manual_rvf_already_ran'
 require_literal "SKILL.md" 'activity_probe_command'
 require_literal "SKILL.md" 'scripts/session_manifest.py'
-require_literal "SKILL.md" 'scripts/check_review_output.py'
+require_literal "SKILL.md" 'scripts/check_review_result.py'
+require_literal "SKILL.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "SKILL.md" 'scripts/command_lock.py'
 require_literal "SKILL.md" 'scripts/workspace_snapshot.py capture/compare'
 require_literal "references/review-merge-policy.md" 'scripts/run_alternative_reviewer.py --repo <repo> --review-packet <packet> --session-context <file>'
@@ -562,6 +568,9 @@ require_literal "scripts/run_alternative_reviewer.py" 'review_packet'
 require_literal "scripts/run_alternative_reviewer.py" '--preflight'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_COMMAND_LOCK'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_SCOPE_CONTRACT'
+require_literal "scripts/run_alternative_reviewer.py" 'RVF_REVIEW_RESULT'
+require_literal "scripts/run_alternative_reviewer.py" 'RVF_WRITE_REVIEW_RESULT'
+require_literal "scripts/run_alternative_reviewer.py" 'check_review_result_artifact'
 require_literal "scripts/run_alternative_reviewer.py" 'RVF_EXTERNAL_REVIEWER_TIMEOUT'
 require_literal "scripts/run_alternative_reviewer.py" 'max_runtime_seconds'
 require_literal "scripts/run_alternative_reviewer.py" 'activity_probe_command'
@@ -579,15 +588,17 @@ require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_re
 require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout'
 require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_repeated_run_keeps_prior_artifacts'
 require_repo_literal "tests/test_review_support_scripts.py" 'test_alternative_reviewer_long_command_wait_uses_check_interval'
-require_literal "scripts/check_review_output.py" 'NO_ISSUES'
-require_literal "scripts/check_review_output.py" 'RVF_LOCK_REQUEST'
-require_literal "scripts/check_review_output.py" 'RVF_STANDARD_REQUEST'
-require_literal "scripts/check_review_output.py" 'RVF_MEASUREMENT_REQUEST'
-require_literal "scripts/check_review_output.py" 'RVF_SUBTASK_REQUEST'
-require_literal "scripts/check_review_output.py" 'RVF_CONTEXT_REQUEST'
-require_literal "scripts/check_review_output.py" 'lock_request'
-require_literal "scripts/check_review_output.py" 'standard_request'
-require_repo_literal "tests/test_review_support_scripts.py" 'test_check_review_output_protocol_extension_requests'
+require_literal "scripts/write_review_result.py" 'no-issues'
+require_literal "scripts/write_review_result.py" 'lock-request'
+require_literal "scripts/write_review_result.py" 'standard-request'
+require_literal "scripts/write_review_result.py" 'measurement-request'
+require_literal "scripts/write_review_result.py" 'subtask-request'
+require_literal "scripts/write_review_result.py" 'context-request'
+require_literal "scripts/check_review_result.py" 'no_issues'
+require_literal "scripts/check_review_result.py" 'lock_request'
+require_literal "scripts/check_review_result.py" 'excluded_path_prefixes'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_review_result_artifact_no_issues_and_issues'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_review_result_artifact_rejects_malformed_and_mixed_state'
 require_literal "scripts/command_lock.py" 'fcntl.flock'
 require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/command_lock.py" 'lock_acquired'
@@ -598,6 +609,9 @@ require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
 require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
 require_literal "scripts/prepare_review_run.py" 'scope.contract.json'
 require_literal "scripts/prepare_review_run.py" 'RVF_SCOPE_CONTRACT'
+require_literal "scripts/prepare_review_run.py" 'RVF_REVIEW_RESULT'
+require_literal "scripts/prepare_review_run.py" 'RVF_WRITE_REVIEW_RESULT'
+require_literal "scripts/prepare_review_run.py" 'RVF_CHECK_REVIEW_RESULT'
 require_literal "scripts/prepare_review_run.py" 'manual-all-uncommitted'
 require_literal "scripts/prepare_review_run.py" 'session-owned'
 require_literal "scripts/prepare_review_run.py" 'custom'
@@ -629,25 +643,22 @@ require_literal "references/review-merge-policy.md" 'codex-mimic-reviewer-a'
 require_literal "references/review-merge-policy.md" 'source-agnostic'
 require_literal "references/review-merge-policy.md" 'CONTRACT_VIOLATION'
 require_literal "references/review-merge-policy.md" 'WORKSPACE_CHANGED_DURING_REVIEW'
-require_literal "references/review-merge-policy.md" 'RVF_LOCK_REQUEST'
-require_literal "references/review-merge-policy.md" 'RVF_STANDARD_REQUEST'
-require_literal "references/review-merge-policy.md" 'RVF_MEASUREMENT_REQUEST'
-require_literal "references/review-merge-policy.md" 'RVF_SUBTASK_REQUEST'
-require_literal "references/review-merge-policy.md" 'RVF_CONTEXT_REQUEST'
-require_literal "references/review-prompt.md" 'RVF_LOCK_REQUEST'
-require_literal "references/review-prompt.md" 'RVF_STANDARD_REQUEST'
-require_literal "references/review-prompt.md" 'RVF_MEASUREMENT_REQUEST'
-require_literal "references/review-prompt.md" 'RVF_SUBTASK_REQUEST'
-require_literal "references/review-prompt.md" 'RVF_CONTEXT_REQUEST'
+require_literal "references/review-merge-policy.md" 'check_review_result.py'
+require_literal "references/review-merge-policy.md" 'kind: request'
+require_literal "references/review-prompt.md" 'lock-request'
+require_literal "references/review-prompt.md" 'standard-request'
+require_literal "references/review-prompt.md" 'measurement-request'
+require_literal "references/review-prompt.md" 'subtask-request'
+require_literal "references/review-prompt.md" 'context-request'
 require_literal "references/review-prompt.md" 'command lock'
 require_literal "references/review-standards/index.md" 'RVF Review Standards Pack'
 require_literal "references/review-standards/main-agent.md" '默认策略：子代理可以请求子任务，但由主会话 spawn'
-require_literal "references/review-standards/reviewer.md" 'RVF_STANDARD_REQUEST'
+require_literal "references/review-standards/reviewer.md" 'standard-request'
 require_literal "references/review-standards/validate-fix.md" 'RVF_*_REQUEST'
 require_literal "references/review-standards/simplification-subset.md" "Chesterton's Fence"
 require_literal "references/review-standards/security-subset.md" 'Three-tier boundary system'
 require_literal "references/review-standards/performance-subset.md" 'Measure before optimizing'
-require_literal "references/review-standards/protocol-extensions.md" 'RVF_SUBTASK_REQUEST'
+require_literal "references/review-standards/protocol-extensions.md" 'subtask-request'
 require_literal "references/review-prompt.md" '不要让 reviewer 只靠 `git diff HEAD` 猜 scope'
 require_literal "SKILL.md" '不要让 reviewer 只靠 `git diff HEAD` 猜 scope'
 require_literal "SKILL.md" '--allow-missing-session-context'
