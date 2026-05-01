@@ -20,6 +20,10 @@ PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
     PLUGIN_SKILL_REL / "state",
 }
+PRESERVE_IN_STANDALONE = {
+    Path("config") / "alternative-reviewer.json",
+    Path("state"),
+}
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", "state"}
 DEV_ONLY_NAMES = {
     ".rvf-dev-only",
@@ -104,15 +108,63 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
-def remove_legacy_standalone_skill() -> Path | None:
-    legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
-    if not legacy.exists() and not legacy.is_symlink():
-        return None
-    if legacy.is_dir() and not legacy.is_symlink():
-        shutil.rmtree(legacy)
-    else:
-        legacy.unlink()
-    return legacy
+def install_standalone_skill(plugin_skill_dir: Path, preserve_local_config: bool) -> Path:
+    standalone = Path.home() / ".codex" / "skills" / SKILL_NAME
+    effective_preserve = PRESERVE_IN_STANDALONE if preserve_local_config else set()
+    standalone.mkdir(parents=True, exist_ok=True)
+    remove_unpreserved(standalone, effective_preserve)
+    standalone.joinpath("SKILL.md").write_text(
+        standalone_skill_launcher_text(plugin_skill_dir),
+        encoding="utf-8",
+    )
+    return standalone
+
+
+def standalone_skill_launcher_text(plugin_skill_dir: Path) -> str:
+    runtime_skill = plugin_skill_dir / "SKILL.md"
+    cache_skill = (
+        Path.home()
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / marketplace_name()
+        / SKILL_NAME
+        / plugin_version()
+        / "skills"
+        / SKILL_NAME
+        / "SKILL.md"
+    )
+    return f"""---
+name: {SKILL_NAME}
+description: Use only when the user explicitly writes `$review-validate-fix` or explicitly asks to run the Review Validate Fix plugin by exact name. Do not use for generic review, validation, fixing, handoff, or post-work analysis requests unless the exact RVF invocation is present.
+---
+
+# Review Validate Fix CLI Launcher
+
+这是 Review Validate Fix plugin 的 Codex CLI 兼容入口。它只解决当前 Codex CLI
+不会把 plugin UI 的显式安装态自动转成 model-visible skill 的问题；canonical runtime
+仍然是 installed plugin skill，不在这里维护第二份实现。
+
+只有当用户消息中明确出现 `$review-validate-fix`，或明确要求按 exact name 运行
+Review Validate Fix plugin 时，才继续。普通 “review / validate / fix / handoff”
+请求不得触发本 launcher。
+
+运行时请先读取：
+
+```text
+{runtime_skill}
+```
+
+如果该文件不可读，再读取缓存副本：
+
+```text
+{cache_skill}
+```
+
+读取 runtime `SKILL.md` 后，按其中的完整 Review Validate Fix 流程执行。runtime
+内提到的相对 `scripts/`、`references/`、`setup/` 路径都以被读取的 runtime
+skill 目录为基准。不要修改这个 launcher；代码和文档改动只进入 plugin runtime 源码。
+"""
 
 
 def plugin_version() -> str:
@@ -133,6 +185,52 @@ def marketplace_name() -> str:
         return "local-codex-plugins"
     name = data.get("name")
     return name if isinstance(name, str) and name.strip() else "local-codex-plugins"
+
+
+def plugin_config_id() -> str:
+    return f"{SKILL_NAME}@{marketplace_name()}"
+
+
+def ensure_codex_plugin_enabled() -> Path:
+    config_path = Path.home() / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    header = f'[plugins."{plugin_config_id()}"]'
+    header_line = f"{header}\n"
+    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True) if config_path.exists() else []
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip() == header:
+            start = index
+            break
+
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend([header_line, "enabled = true\n"])
+    else:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            stripped = lines[index].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                end = index
+                break
+
+        enabled_index: int | None = None
+        for index in range(start + 1, end):
+            key = lines[index].split("#", 1)[0].split("=", 1)[0].strip()
+            if key == "enabled":
+                enabled_index = index
+                break
+        if enabled_index is None:
+            lines.insert(end, "enabled = true\n")
+        else:
+            lines[enabled_index] = "enabled = true\n"
+
+    config_path.write_text("".join(lines), encoding="utf-8")
+    return config_path
 
 
 def update_marketplace(plugin_parent: Path) -> Path:
@@ -196,7 +294,7 @@ def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
 
 
 def normalize_fork_mode(value: str) -> str:
-    mode = (value or "gui").strip()
+    mode = (value or "auto").strip()
     if mode in {"cline", "kanban", "ck"}:
         return "cline-kanban"
     if mode in {"kanban-message", "kanban-inject"}:
@@ -206,7 +304,7 @@ def normalize_fork_mode(value: str) -> str:
 
 def configure_stop_hook(
     plugin_skill_dir: Path,
-    fork_mode: str = "gui",
+    fork_mode: str = "auto",
     cline_kanban_start_cmd: str | None = None,
     cline_kanban_task_cmd: str | None = None,
     cline_kanban_start_timeout: str | None = None,
@@ -238,7 +336,7 @@ def configure_stop_hook(
     ide_open_text = (ide_open_cmd or "").strip()
     if ide_open_text:
         env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
-    if fork_mode in {"cline-kanban", "kanban-followup"}:
+    if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
         for name, value in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
             ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", cline_kanban_task_cmd),
@@ -332,6 +430,7 @@ def main() -> int:
         "--fork-mode",
         choices=[
             "gui",
+            "auto",
             "cline-kanban",
             "cline",
             "kanban",
@@ -342,8 +441,8 @@ def main() -> int:
             "manual",
             "dry-run",
         ],
-        default="gui",
-        help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 gui。",
+        default="auto",
+        help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 auto。",
     )
     parser.add_argument(
         "--cline-kanban-start-cmd",
@@ -404,12 +503,15 @@ def main() -> int:
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / SKILL_NAME
-        removed_legacy = remove_legacy_standalone_skill()
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
+        plugin_config = ensure_codex_plugin_enabled()
         plugin_cache = sync_codex_plugin_cache(preserve)
+        standalone_skill = install_standalone_skill(dst / PLUGIN_SKILL_REL, preserve)
         installed.append(f"plugin: {dst}")
+        installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
+        installed.append(f"standalone CLI launcher compatibility entry: {standalone_skill}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:
@@ -430,17 +532,12 @@ def main() -> int:
                 args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
             )
             installed.append(f"stop hook: {hooks_path}")
-        if removed_legacy is not None:
-            installed.append(f"removed deprecated standalone skill: {removed_legacy}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2
 
     for item in installed:
-        if item.startswith("removed "):
-            print(f"已移除 {item.removeprefix('removed ')}")
-        else:
-            print(f"已安装 {item}")
+        print(f"已安装 {item}")
     if preserve:
         print("已默认保留本机 setup 配置: alternative-reviewer.json 与 state/。")
     return 0

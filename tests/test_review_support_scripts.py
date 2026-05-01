@@ -1581,7 +1581,7 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp: Path) -> None:
             "--",
             sys.executable,
             "-c",
-            "import time; time.sleep(1)",
+            "import time; time.sleep(3)",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1609,9 +1609,9 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp: Path) -> None:
                 "--lock-dir",
                 str(lock_dir),
                 "--timeout",
-                "0.05",
+                "0.3",
                 "--poll-interval",
-                "0.01",
+                "0.05",
                 "--",
                 sys.executable,
                 "-c",
@@ -1848,7 +1848,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> No
     marker = tmp / "child-survived.txt"
     child_code = (
         "import pathlib, time; "
-        "time.sleep(1.0); "
+        "time.sleep(2.0); "
         f"pathlib.Path({str(marker)!r}).write_text('survived', encoding='utf-8')"
     )
     parent_code = (
@@ -1860,7 +1860,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> No
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", parent_code],
-        idle_timeout_seconds=0.2,
+        idle_timeout_seconds=0.5,
         activity_check_interval_seconds=0.05,
     )
 
@@ -1881,7 +1881,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> No
     )
     assert completed.returncode == 124
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-    time.sleep(1.2)
+    time.sleep(2.3)
     assert not marker.exists()
 
 
@@ -1897,11 +1897,11 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None
             "-c",
             (
                 "import sys, time; sys.stdin.read(); "
-                "[print(f'tick-{i}', flush=True) or time.sleep(0.08) for i in range(4)]; "
+                "[print(f'tick-{i}', flush=True) or time.sleep(0.15) for i in range(5)]; "
                 "print('NO_ISSUES', flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.12,
+        idle_timeout_seconds=0.6,
         activity_check_interval_seconds=0.05,
     )
 
@@ -1940,14 +1940,14 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
                 "print(json.dumps({'type':'assistant','message':{'content':["
                 "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
                 "]}}), flush=True); "
-                "time.sleep(0.25); "
+                "time.sleep(1.5); "
                 "print(json.dumps({'type':'user','message':{'content':["
                 "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
                 "]}}), flush=True); "
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.2,
+        idle_timeout_seconds=1.0,
         activity_check_interval_seconds=0.03,
         output_format="claude_stream_json",
     )
@@ -1998,7 +1998,7 @@ def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.1,
+        idle_timeout_seconds=1.0,
         activity_check_interval_seconds=0.03,
         output_format="claude_stream_json",
     )
@@ -2079,6 +2079,12 @@ def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
     module = load_alternative_reviewer_module()
     assert module.next_wait_seconds(
         activity_check_interval_seconds=5.0,
+        remaining_idle_seconds=2.0,
+        max_runtime_remaining_seconds=None,
+        waiting_on_long_command=False,
+    ) == 2.0
+    assert module.next_wait_seconds(
+        activity_check_interval_seconds=5.0,
         remaining_idle_seconds=0.0,
         max_runtime_remaining_seconds=None,
         waiting_on_long_command=True,
@@ -2097,6 +2103,71 @@ def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
     ) == 0.01
 
 
+def test_alternative_reviewer_claude_stream_monitor_tracks_bash_tool_state() -> None:
+    module = load_alternative_reviewer_module()
+    monitor = module.ClaudeStreamActivityMonitor()
+    tool_use_event = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "sleep 1"},
+                    }
+                ]
+            },
+        }
+    )
+    split_at = len(tool_use_event) // 2
+
+    monitor.ingest(tool_use_event[:split_at])
+    assert monitor.waiting_on_long_command is False
+    monitor.ingest(tool_use_event[split_at:] + "\n")
+    assert monitor.waiting_on_long_command is True
+    monitor.ingest(
+        json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": "",
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    assert monitor.waiting_on_long_command is False
+
+    monitor.ingest(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "sleep 1"},
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    assert monitor.waiting_on_long_command is True
+    monitor.ingest(json.dumps({"type": "result", "result": "NO_ISSUES"}) + "\n")
+    assert monitor.waiting_on_long_command is False
+
+
 def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -2110,13 +2181,11 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> N
             (
                 "import sys, time, json; sys.stdin.read(); "
                 "print(json.dumps({'type':'system','subtype':'init'}), flush=True); "
-                "time.sleep(0.08); "
                 "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}), flush=True); "
-                "time.sleep(0.08); "
                 "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.12,
+        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -2950,6 +3019,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_long_command_wait_uses_check_interval",
             lambda: test_alternative_reviewer_long_command_wait_uses_check_interval(),
+        ),
+        (
+            "alternative_reviewer_claude_stream_monitor_tracks_bash_tool_state",
+            lambda: test_alternative_reviewer_claude_stream_monitor_tracks_bash_tool_state(),
         ),
         (
             "alternative_reviewer_claude_stream_json_extracts_result",

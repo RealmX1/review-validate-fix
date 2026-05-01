@@ -617,6 +617,10 @@ def test_suppress_env_skips_before_sync_and_installed_hook(tmp_path: Path) -> No
     payload = json.loads(completed.stdout)
     assert payload["continue"] is True
     assert "reason=suppressed" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(tmp_path / "state")
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
     assert completed.stderr == ""
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
@@ -655,6 +659,10 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
     payload = json.loads(completed.stdout)
     assert payload["continue"] is True
     assert "reason=suppressed" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(tmp_path / "state")
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
     assert not opener_marker.exists()
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
@@ -1047,6 +1055,33 @@ def test_dev_sync_preserves_kanban_followup_installer_args(tmp_path: Path) -> No
     assert "--cline-kanban-task-cmd" in install_args
 
 
+def test_dev_sync_preserves_auto_installer_kanban_args(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    stdout = invoke(
+        {"cwd": str(repo), "hook_event_name": "Stop"},
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "auto",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+        },
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    install_args = (marker / "install-ran").read_text(encoding="utf-8")
+    assert "--configure-stop-hook" in install_args
+    assert "--fork-mode auto" in install_args
+    assert "--cline-kanban-task-cmd" in install_args
+
+
 def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1211,6 +1246,7 @@ def main() -> int:
         test_dev_sync_step_specs_resolve_repo_level_dev_scripts,
         test_dev_sync_preserves_cline_kanban_installer_args,
         test_dev_sync_preserves_kanban_followup_installer_args,
+        test_dev_sync_preserves_auto_installer_kanban_args,
         test_dev_sync_prefers_hooks_json_over_stale_cached_env,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]

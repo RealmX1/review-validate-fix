@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -244,29 +246,40 @@ def load_hook_module():
 
 def test_normalize_backend_from_env(tmp: Path) -> None:
     module = load_hook_module()
-    original = {name: os.environ.get(name) for name in ("CODEX_RVF_MODE", "CODEX_RVF_FORK_MODE")}
+    original = {
+        name: os.environ.get(name)
+        for name in (
+            "CODEX_RVF_MODE",
+            "CODEX_RVF_FORK_MODE",
+            "KANBAN_TASK_ID",
+            "CLINE_KANBAN_TASK_ID",
+        )
+    }
     cases = [
-        ({}, "gui"),
-        ({"CODEX_RVF_MODE": "off"}, "off"),
-        ({"CODEX_RVF_MODE": "continuation"}, "report-only"),
-        ({"CODEX_RVF_MODE": "block"}, "report-only"),
-        ({"CODEX_RVF_FORK_MODE": "manual"}, "manual"),
-        ({"CODEX_RVF_FORK_MODE": "prepare"}, "manual"),
-        ({"CODEX_RVF_FORK_MODE": "dry-run"}, "dry-run"),
-        ({"CODEX_RVF_FORK_MODE": "cline-kanban"}, "kanban"),
-        ({"CODEX_RVF_FORK_MODE": "cline"}, "kanban"),
-        ({"CODEX_RVF_FORK_MODE": "ck"}, "kanban"),
-        ({"CODEX_RVF_FORK_MODE": "kanban-followup"}, "kanban-followup"),
-        ({"CODEX_RVF_FORK_MODE": "kanban-message"}, "kanban-followup"),
-        ({"CODEX_RVF_FORK_MODE": "kanban-inject"}, "kanban-followup"),
-        ({"CODEX_RVF_FORK_MODE": "surprise"}, "surprise"),
+        ({}, {}, "kanban"),
+        ({"CODEX_RVF_MODE": "off"}, {}, "off"),
+        ({"CODEX_RVF_MODE": "continuation"}, {}, "report-only"),
+        ({"CODEX_RVF_MODE": "block"}, {}, "report-only"),
+        ({"CODEX_RVF_FORK_MODE": "auto"}, {}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "auto"}, {"task_id": "task-1"}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "auto", "KANBAN_TASK_ID": "task-2"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "manual"}, {}, "manual"),
+        ({"CODEX_RVF_FORK_MODE": "prepare"}, {}, "manual"),
+        ({"CODEX_RVF_FORK_MODE": "dry-run"}, {}, "dry-run"),
+        ({"CODEX_RVF_FORK_MODE": "cline-kanban"}, {}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "cline"}, {}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "ck"}, {}, "kanban"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-followup"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-message"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "kanban-inject"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "surprise"}, {}, "surprise"),
     ]
     try:
-        for env, expected in cases:
-            os.environ.pop("CODEX_RVF_MODE", None)
-            os.environ.pop("CODEX_RVF_FORK_MODE", None)
+        for env, event, expected in cases:
+            for name in original:
+                os.environ.pop(name, None)
             os.environ.update(env)
-            assert module.normalize_backend_from_env() == expected
+            assert module.normalize_backend_from_env(event) == expected
     finally:
         for name, value in original.items():
             if value is None:
@@ -660,14 +673,19 @@ def test_env_suppression_skips(tmp: Path) -> None:
         },
     )
     payload = parse_json(stdout)
-    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
-    assert "summary=" not in payload["systemMessage"]
-    assert not run_dir.exists()
+    assert "review-validate-fix: skipped; reason=suppressed;" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
+    assert summary["run_id"] == "rvf-child"
+    assert run_dir.exists()
 
 
 def test_prompt_suppression_marker_skips(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
+    state = tmp / "state"
     write_user_session(
         transcript,
         "00000000-0000-0000-0000-000000000201",
@@ -679,15 +697,20 @@ def test_prompt_suppression_marker_skips(tmp: Path) -> None:
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
+        state_dir=state,
     )
     payload = parse_json(stdout)
-    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
-    assert "summary=" not in payload["systemMessage"]
+    assert "review-validate-fix: skipped; reason=suppressed;" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
 
 
 def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
+    state = tmp / "state"
     write_user_session_messages(
         transcript,
         "00000000-0000-0000-0000-000000000202",
@@ -702,10 +725,14 @@ def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
+        state_dir=state,
     )
     payload = parse_json(stdout)
-    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
-    assert "summary=" not in payload["systemMessage"]
+    assert "review-validate-fix: skipped; reason=suppressed;" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
 
 
 def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp: Path) -> None:
@@ -735,8 +762,11 @@ def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp: Path) -
     )
 
     payload = parse_json(stdout)
-    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
-    assert "summary=" not in payload["systemMessage"]
+    assert "review-validate-fix: skipped; reason=suppressed;" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
 
 
 def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
@@ -966,6 +996,130 @@ def test_socket_probe_reports_unavailable_reason(tmp: Path) -> None:
     assert regular_probe["exists"] is True
 
 
+def test_app_server_websocket_sends_http_upgrade(tmp: Path) -> None:
+    module = load_hook_module()
+    created: list[object] = []
+
+    class FakeSocket:
+        def __init__(self, *_: object) -> None:
+            self.sent = b""
+            self.timeout: float | None = None
+            self.closed = False
+
+        def settimeout(self, timeout: float) -> None:
+            self.timeout = timeout
+
+        def connect(self, path: str) -> None:
+            assert path == str(tmp / "app-server.sock")
+
+        def sendall(self, data: bytes) -> None:
+            self.sent += data
+
+        def recv(self, _: int) -> bytes:
+            request = self.sent.decode("iso-8859-1")
+            headers = {}
+            for line in request.split("\r\n")[1:]:
+                name, sep, value = line.partition(":")
+                if sep:
+                    headers[name.strip().lower()] = value.strip()
+            key = headers["sec-websocket-key"]
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            return (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Connection: Upgrade\r\n"
+                "Upgrade: websocket\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n"
+                "\r\n"
+            ).encode("ascii")
+
+        def close(self) -> None:
+            self.closed = True
+
+    def fake_socket(*args: object) -> FakeSocket:
+        sock = FakeSocket(*args)
+        created.append(sock)
+        return sock
+
+    original_socket = module.socket.socket
+    try:
+        module.socket.socket = fake_socket
+        client = module.AppServerWebSocket(tmp / "app-server.sock", timeout=2)
+        client.close()
+    finally:
+        module.socket.socket = original_socket
+
+    assert created
+    request = created[0].sent.decode("iso-8859-1")
+    assert request.startswith("GET / HTTP/1.1\r\n")
+    assert "Upgrade: websocket\r\n" in request
+    assert "Sec-WebSocket-Key:" in request
+
+
+def test_app_server_websocket_masks_pong_frame(tmp: Path) -> None:
+    module = load_hook_module()
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent = b""
+
+        def sendall(self, data: bytes) -> None:
+            self.sent += data
+
+    sock = FakeSocket()
+    client = module.AppServerWebSocket.__new__(module.AppServerWebSocket)
+    client.socket = sock
+
+    original_urandom = module.os.urandom
+    try:
+        module.os.urandom = lambda length: b"\x01\x02\x03\x04"
+        client.send_pong(b"ping")
+    finally:
+        module.os.urandom = original_urandom
+
+    assert sock.sent[:2] == bytes([0x8A, 0x80 | 4])
+    assert sock.sent[2:6] == b"\x01\x02\x03\x04"
+    assert sock.sent[6:] == bytes(
+        byte ^ b"\x01\x02\x03\x04"[index % 4] for index, byte in enumerate(b"ping")
+    )
+
+
+def test_socket_probe_requires_websocket_upgrade(tmp: Path) -> None:
+    module = load_hook_module()
+    socket_path = tmp / "app-server.sock"
+    socket_path.parent.mkdir(parents=True)
+    socket_path.write_text("socket placeholder\n", encoding="utf-8")
+
+    original_is_socket = Path.is_socket
+    original_client = module.AppServerWebSocket
+
+    def fake_is_socket(path: Path) -> bool:
+        if path == socket_path:
+            return True
+        return original_is_socket(path)
+
+    class FailingHandshakeClient:
+        def __init__(self, path: Path, timeout: float = 15) -> None:
+            assert path == socket_path
+            assert timeout == 0.5
+            raise module.AppServerError("app-server websocket handshake failed: HTTP/1.1 200 OK")
+
+    try:
+        Path.is_socket = fake_is_socket
+        module.AppServerWebSocket = FailingHandshakeClient
+        probe = module.probe_app_server_socket(socket_path)
+    finally:
+        Path.is_socket = original_is_socket
+        module.AppServerWebSocket = original_client
+
+    assert probe["connect_ok"] is True
+    assert probe["protocol_ok"] is False
+    assert probe["reason"] == "websocket-failed"
+
+
 def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     module = load_hook_module()
     state = tmp / "state"
@@ -1028,6 +1182,7 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
     original_ensure_bridge = module.ensure_bridge_app_server
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "report"
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
         module.bridge_socket_path = lambda: bridge_socket
         module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
@@ -1050,6 +1205,8 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
             os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
         if original_bridge_policy is not None:
             os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
+        else:
+            os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
         if original_allow_bridge is not None:
             os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
@@ -1065,6 +1222,276 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
     assert latest["report_reason"] == "visible fork failure"
     assert latest["socket_selection"]["desktop_control"]["reason"] == "missing"
     assert latest["socket_selection"]["bridge_policy"] == "report"
+
+
+def test_missing_desktop_control_auto_uses_existing_bridge(tmp: Path) -> None:
+    module = load_hook_module()
+    desktop_socket = tmp / "missing-control.sock"
+    bridge_socket = tmp / "bridge.sock"
+    original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
+    original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
+    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = module.bridge_socket_path
+    original_probe = module.probe_app_server_socket
+    original_ensure_bridge = module.ensure_bridge_app_server
+    try:
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        module.bridge_socket_path = lambda: bridge_socket
+
+        def fake_probe(path: Path) -> dict[str, object]:
+            if path == bridge_socket:
+                return {
+                    "path": str(path),
+                    "exists": True,
+                    "parent_exists": True,
+                    "is_socket": True,
+                    "connect_ok": True,
+                    "reason": "connect-ok",
+                }
+            return {
+                "path": str(path),
+                "exists": False,
+                "parent_exists": True,
+                "is_socket": False,
+                "connect_ok": False,
+                "reason": "missing",
+            }
+
+        module.probe_app_server_socket = fake_probe
+        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+            AssertionError("existing bridge should be selected without restart")
+        )
+
+        socket_path, source, selection = module.select_app_server_socket()
+    finally:
+        if original_bridge_policy is not None:
+            os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
+        if original_allow_bridge is not None:
+            os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
+        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        module.bridge_socket_path = original_bridge_socket_path
+        module.probe_app_server_socket = original_probe
+        module.ensure_bridge_app_server = original_ensure_bridge
+
+    assert socket_path == bridge_socket
+    assert source == "bridge"
+    assert selection["desktop_control"]["reason"] == "missing"
+    assert selection["bridge"]["reason"] == "connect-ok"
+    assert selection["bridge_policy"] == "auto"
+    assert selection["bridge_decision"] == "existing-bridge-connect-ok"
+
+
+def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp: Path) -> None:
+    module = load_hook_module()
+    bridge_socket = tmp / "rvf-app-server.sock"
+
+    class FakeCompleted:
+        def __init__(self, returncode: int, stdout: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def fake_run(args: list[str], **_: object) -> FakeCompleted:
+        if args == ["lsof", "-nP", "-U"]:
+            return FakeCompleted(
+                0,
+                "\n".join(
+                    [
+                        f"codex-aar 111 user 20u unix 0x1 0t0 {bridge_socket}",
+                        f"codex-aar 222 user 21u unix 0x2 0t0 {bridge_socket}",
+                        f"codex-aar 333 user 22u unix 0x3 0t0 {tmp / 'other.sock'}",
+                    ]
+                ),
+            )
+        if args[:3] == ["ps", "-p", "111"]:
+            return FakeCompleted(
+                0,
+                f"/opt/homebrew/bin/codex app-server --listen unix://{bridge_socket}\n",
+            )
+        if args[:3] == ["ps", "-p", "222"]:
+            return FakeCompleted(0, "codex exec something-else\n")
+        if args[:3] == ["ps", "-p", "333"]:
+            return FakeCompleted(
+                0,
+                f"/opt/homebrew/bin/codex app-server --listen unix://{tmp / 'other.sock'}\n",
+            )
+        raise AssertionError(args)
+
+    original_run = module.subprocess.run
+    try:
+        module.subprocess.run = fake_run
+        assert module.bridge_app_server_listener_pids(bridge_socket) == [111]
+    finally:
+        module.subprocess.run = original_run
+
+
+def test_restart_bridge_stops_existing_listener_before_relaunch(tmp: Path) -> None:
+    module = load_hook_module()
+    bridge_socket = tmp / "rvf-app-server.sock"
+    bridge_socket.parent.mkdir(parents=True)
+    bridge_socket.write_text("stale", encoding="utf-8")
+    started = False
+    calls: list[tuple[str, Path]] = []
+
+    class FakePopen:
+        def __init__(self, args: list[str], **_: object) -> None:
+            nonlocal started
+            assert args[-1] == f"unix://{bridge_socket}"
+            started = True
+            bridge_socket.write_text("fresh", encoding="utf-8")
+
+    original_bridge_socket_path = module.bridge_socket_path
+    original_bridge_log_path = module.bridge_log_path
+    original_stop = module.stop_existing_bridge_app_servers
+    original_can_connect = module.can_connect_app_server_socket
+    original_popen = module.subprocess.Popen
+    original_codex_bin = module.codex_bin
+    try:
+        module.bridge_socket_path = lambda: bridge_socket
+        module.bridge_log_path = lambda: tmp / "rvf-app-server.log"
+        module.stop_existing_bridge_app_servers = lambda path: calls.append(
+            ("stop", path)
+        ) or {"pids": [111], "stopped": [111], "failed": [], "still_running": []}
+        module.can_connect_app_server_socket = lambda path: started and path == bridge_socket
+        module.subprocess.Popen = FakePopen
+        module.codex_bin = lambda: "codex"
+
+        assert module.ensure_bridge_app_server(restart_existing=True) == bridge_socket
+    finally:
+        module.bridge_socket_path = original_bridge_socket_path
+        module.bridge_log_path = original_bridge_log_path
+        module.stop_existing_bridge_app_servers = original_stop
+        module.can_connect_app_server_socket = original_can_connect
+        module.subprocess.Popen = original_popen
+        module.codex_bin = original_codex_bin
+
+    assert calls == [("stop", bridge_socket)]
+    assert bridge_socket.read_text(encoding="utf-8") == "fresh"
+
+
+def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
+    module = load_hook_module()
+    first_socket = tmp / "stale.sock"
+    retry_socket = tmp / "fresh.sock"
+    active_path = tmp / "sessions" / "fork-retry.jsonl"
+    active_path.parent.mkdir(parents=True)
+    active_path.write_text("{}\n", encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeClient:
+        instances = 0
+
+        def __init__(self, socket_path: Path) -> None:
+            self.socket_path = socket_path
+            self.notifications: list[dict[str, object]] = []
+            FakeClient.instances += 1
+            self.instance = FakeClient.instances
+
+        def request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
+            if method == "initialize":
+                return {}
+            if self.instance == 1 and method == "thread/fork":
+                raise module.AppServerError(
+                    '{"code": -32600, "message": "failed to load configuration: Operation not permitted (os error 1)"}'
+                )
+            if method == "thread/fork":
+                assert self.socket_path == retry_socket
+                return {
+                    "thread": {
+                        "id": "fork-retry",
+                        "path": str(active_path),
+                        "cwd": str(tmp),
+                    }
+                }
+            if method == "turn/start":
+                calls.append("turn/start")
+                return {"turn": {"id": "turn-retry"}}
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "fork-retry",
+                        "path": str(active_path),
+                        "cwd": str(tmp),
+                    }
+                }
+            if method == "thread/list":
+                return {
+                    "data": [
+                        {
+                            "id": "fork-retry",
+                            "path": str(active_path),
+                            "cwd": str(tmp),
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            if method == "thread/loaded/list":
+                return {"data": ["fork-retry"], "nextCursor": None}
+            raise AssertionError(method)
+
+        def close(self) -> None:
+            pass
+
+    original_client = module.AppServerWebSocket
+    original_select = module.select_app_server_socket
+    original_ensure = module.ensure_bridge_app_server
+    original_probe = module.probe_app_server_socket
+    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_open = module.maybe_open_fork_in_codex
+    original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
+    original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
+    try:
+        module.AppServerWebSocket = FakeClient
+        module.select_app_server_socket = lambda: (
+            first_socket,
+            "bridge",
+            {"bridge_policy": "auto", "bridge": {"reason": "connect-ok"}},
+        )
+        module.ensure_bridge_app_server = lambda restart_existing=False: (
+            retry_socket if restart_existing else first_socket
+        )
+        module.probe_app_server_socket = lambda path: {
+            "path": str(path),
+            "exists": True,
+            "parent_exists": True,
+            "is_socket": True,
+            "connect_ok": True,
+            "reason": "connect-ok",
+        }
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.maybe_open_fork_in_codex = lambda _: True
+        os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "0"
+        os.environ["CODEX_RVF_OPEN_GUI_FORK"] = "0"
+        result = module.run_app_server_fork(
+            parent_thread_id="parent",
+            parent_thread_path=None,
+            cwd=str(tmp),
+            prompt="$review-validate-fix",
+            model=None,
+            reasoning_effort=None,
+            log_path=tmp / "hook.json",
+        )
+    finally:
+        module.AppServerWebSocket = original_client
+        module.select_app_server_socket = original_select
+        module.ensure_bridge_app_server = original_ensure
+        module.probe_app_server_socket = original_probe
+        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        module.maybe_open_fork_in_codex = original_open
+        if original_timeout is None:
+            os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = original_timeout
+        if original_open_gui is None:
+            os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
+        else:
+            os.environ["CODEX_RVF_OPEN_GUI_FORK"] = original_open_gui
+
+    assert calls == ["turn/start"]
+    assert result["status"] == "app-server-started"
+    assert result["socket_path"] == str(retry_socket)
+    assert result["socket_selection"]["bridge_decision"] == "restarted-after-app-server-error"
+    assert result["bridge_retry"]["reason"] == "app-server-error"
+    assert "failed to load configuration" in result["bridge_retry"]["first_error"]
 
 
 def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> None:
@@ -1190,6 +1617,138 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert suppression_marker["task_id"] == "task-123"
     assert suppression_marker["suppress_stop_hook"] is True
     assert suppression_marker["run_id"] == latest["run_id"]
+
+
+def test_auto_mode_creates_cline_kanban_task_by_default(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-auto', 'workspace_path': '/tmp/task-worktree'}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-auto', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "auto-parent",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            extra_env={
+                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+                "FAKE_CLIENT_CALLS": str(client_calls),
+            },
+            state_dir=state,
+        )[0]
+    )
+
+    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-started"
+    assert latest["backend"] == "kanban"
+    assert latest["backend_selection_mode"] == "auto"
+    assert latest["cline_kanban_task_id"] == "task-auto"
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
+
+
+def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import sys\n"
+        "raise SystemExit('kanban unavailable for fallback test')\n",
+        encoding="utf-8",
+    )
+
+    original_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    original_client = os.environ.get("CODEX_RVF_CLINE_KANBAN_CLIENT")
+    original_task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD")
+    original_lookup = module.parent_thread_name_from_app_server
+    original_gui = module.run_app_server_fork
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "auto"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        module.run_app_server_fork = lambda **_: {
+            "status": "app-server-started",
+            "socket_path": str(tmp / "legacy.sock"),
+            "socket_source": "test",
+            "socket_selection": {},
+            "fork_thread_id": "legacy-fork",
+            "turn_id": "legacy-turn",
+            "gui_visibility": "legacy-fallback-test",
+            "opened_gui_deeplink": False,
+            "open_gui_deeplink": {"opened": False, "attempts": []},
+            "notifications": [],
+        }
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=transcript,
+            launch_mode="cline-kanban",
+            extra_summary={"backend_selection_mode": "auto", "backend": "kanban"},
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        module.run_app_server_fork = original_gui
+        for key, value in {
+            "CODEX_RVF_STATE_DIR": original_state,
+            "CODEX_RVF_FORK_MODE": original_mode,
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": original_client,
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": original_task_cmd,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=fork_started" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "app-server-started"
+    assert latest["mode"] == "legacy-gui"
+    assert latest["effective_backend"] == "legacy-gui"
+    assert latest["backend"] == "kanban"
+    assert latest["legacy_gui_fallback"]["started"] is True
+    assert latest["legacy_gui_fallback"]["primary_backend"] == "cline-kanban"
+    assert latest["legacy_gui_fallback"]["fallback_backend"] == "gui"
+    assert latest["legacy_gui_fallback"]["primary_failure"]["status"] == "cline-kanban-unavailable"
 
 
 def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp: Path) -> None:
@@ -1595,6 +2154,7 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
             env.pop(name, None)
     env["HOME"] = str(home)
     env["CODEX_RVF_STATE_DIR"] = str(state)
+    env["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "report"
     completed = subprocess.run(
         [sys.executable, str(DIAGNOSTIC_SCRIPT)],
         input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp)}),
@@ -2409,7 +2969,7 @@ def test_clean_repo_skips(tmp: Path) -> None:
     assert_skip_reason(stdout, "clean")
 
 
-def test_dirty_repo_forks_in_gui_by_default(tmp: Path) -> None:
+def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     state = tmp / "state"
     payload = parse_json(
@@ -2774,6 +3334,10 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp: Path) -> None:
     )
     assert payload["continue"] is True
     assert "reason=suppressed" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "suppressed"
     assert not opener_marker.exists()
     assert not (state / "handoff-advised").exists()
 
@@ -3072,9 +3636,18 @@ def main() -> int:
         test_manual_rvf_session_marker_dirty_change_does_not_suppress,
         test_manual_rvf_session_marker_expired_does_not_read,
         test_socket_probe_reports_unavailable_reason,
+        test_app_server_websocket_sends_http_upgrade,
+        test_app_server_websocket_masks_pong_frame,
+        test_socket_probe_requires_websocket_upgrade,
         test_bridge_failure_preserves_desktop_probe,
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
+        test_missing_desktop_control_auto_uses_existing_bridge,
+        test_bridge_app_server_listener_pids_filters_rvf_socket,
+        test_restart_bridge_stops_existing_listener_before_relaunch,
+        test_bridge_app_server_error_restarts_bridge_once,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
+        test_auto_mode_creates_cline_kanban_task_by_default,
+        test_auto_mode_uses_legacy_gui_as_backup_of_backup,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
@@ -3102,7 +3675,7 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
-        test_dirty_repo_forks_in_gui_by_default,
+        test_dirty_repo_dry_run_prepares_legacy_gui_requests,
         test_dirty_repo_manual_mode_only_prepares_prompt,
         test_dirty_repo_fork_dry_run,
         test_dirty_repo_fork_inherits_parent_cwd_inside_worktree,
