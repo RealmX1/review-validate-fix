@@ -104,14 +104,53 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
-def remove_legacy_standalone_skill() -> Path | None:
+def copy_missing_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    if src.is_file():
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        return
+    for child in src.rglob("*"):
+        rel = child.relative_to(src)
+        target = dst / rel
+        if child.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
+
+
+def copy_legacy_config_if_safe(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    repo_default = PLUGIN_SRC / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json"
+    should_copy = not dst.exists()
+    if not should_copy and repo_default.exists():
+        try:
+            should_copy = dst.read_bytes() == repo_default.read_bytes()
+        except OSError:
+            should_copy = False
+    if should_copy:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+def remove_legacy_codex_skill_dir(plugin_skill_dir: Path, preserve_local_config: bool) -> Path | None:
     legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
     if not legacy.exists() and not legacy.is_symlink():
         return None
-    if legacy.is_dir() and not legacy.is_symlink():
-        shutil.rmtree(legacy)
-    else:
+    if preserve_local_config:
+        copy_legacy_config_if_safe(
+            legacy / "config" / "alternative-reviewer.json",
+            plugin_skill_dir / "config" / "alternative-reviewer.json",
+        )
+        copy_missing_tree(legacy / "state", plugin_skill_dir / "state")
+    if legacy.is_symlink() or legacy.is_file():
         legacy.unlink()
+    else:
+        shutil.rmtree(legacy)
     return legacy
 
 
@@ -133,6 +172,52 @@ def marketplace_name() -> str:
         return "local-codex-plugins"
     name = data.get("name")
     return name if isinstance(name, str) and name.strip() else "local-codex-plugins"
+
+
+def plugin_config_id() -> str:
+    return f"{SKILL_NAME}@{marketplace_name()}"
+
+
+def ensure_codex_plugin_enabled() -> Path:
+    config_path = Path.home() / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    header = f'[plugins."{plugin_config_id()}"]'
+    header_line = f"{header}\n"
+    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True) if config_path.exists() else []
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip() == header:
+            start = index
+            break
+
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend([header_line, "enabled = true\n"])
+    else:
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            stripped = lines[index].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                end = index
+                break
+
+        enabled_index: int | None = None
+        for index in range(start + 1, end):
+            key = lines[index].split("#", 1)[0].split("=", 1)[0].strip()
+            if key == "enabled":
+                enabled_index = index
+                break
+        if enabled_index is None:
+            lines.insert(end, "enabled = true\n")
+        else:
+            lines[enabled_index] = "enabled = true\n"
+
+    config_path.write_text("".join(lines), encoding="utf-8")
+    return config_path
 
 
 def update_marketplace(plugin_parent: Path) -> Path:
@@ -181,7 +266,7 @@ def update_marketplace(plugin_parent: Path) -> Path:
     return marketplace_path
 
 
-def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
+def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Path:
     cache_dir = (
         Path.home()
         / ".codex"
@@ -191,12 +276,21 @@ def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
         / SKILL_NAME
         / plugin_version()
     )
-    copy_tree(PLUGIN_SRC, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
+    copy_tree(plugin_src, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
+    if preserve_local_config:
+        copy_legacy_config_if_safe(
+            plugin_src / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+            cache_dir / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+        )
+        copy_missing_tree(
+            plugin_src / PLUGIN_SKILL_REL / "state",
+            cache_dir / PLUGIN_SKILL_REL / "state",
+        )
     return cache_dir
 
 
 def normalize_fork_mode(value: str) -> str:
-    mode = (value or "gui").strip()
+    mode = (value or "auto").strip()
     if mode in {"cline", "kanban", "ck"}:
         return "cline-kanban"
     if mode in {"kanban-message", "kanban-inject"}:
@@ -206,7 +300,7 @@ def normalize_fork_mode(value: str) -> str:
 
 def configure_stop_hook(
     plugin_skill_dir: Path,
-    fork_mode: str = "gui",
+    fork_mode: str = "auto",
     cline_kanban_start_cmd: str | None = None,
     cline_kanban_task_cmd: str | None = None,
     cline_kanban_start_timeout: str | None = None,
@@ -238,7 +332,7 @@ def configure_stop_hook(
     ide_open_text = (ide_open_cmd or "").strip()
     if ide_open_text:
         env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
-    if fork_mode in {"cline-kanban", "kanban-followup"}:
+    if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
         for name, value in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
             ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", cline_kanban_task_cmd),
@@ -332,6 +426,7 @@ def main() -> int:
         "--fork-mode",
         choices=[
             "gui",
+            "auto",
             "cline-kanban",
             "cline",
             "kanban",
@@ -342,8 +437,8 @@ def main() -> int:
             "manual",
             "dry-run",
         ],
-        default="gui",
-        help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 gui。",
+        default="auto",
+        help="与 --configure-stop-hook 配合写入 CODEX_RVF_FORK_MODE；默认 auto。",
     )
     parser.add_argument(
         "--cline-kanban-start-cmd",
@@ -404,12 +499,16 @@ def main() -> int:
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / SKILL_NAME
-        removed_legacy = remove_legacy_standalone_skill()
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
-        plugin_cache = sync_codex_plugin_cache(preserve)
+        plugin_config = ensure_codex_plugin_enabled()
+        removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
+        plugin_cache = sync_codex_plugin_cache(dst, preserve)
         installed.append(f"plugin: {dst}")
+        installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
+        if removed_legacy_skill:
+            installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:
@@ -430,17 +529,12 @@ def main() -> int:
                 args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
             )
             installed.append(f"stop hook: {hooks_path}")
-        if removed_legacy is not None:
-            installed.append(f"removed deprecated standalone skill: {removed_legacy}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2
 
     for item in installed:
-        if item.startswith("removed "):
-            print(f"已移除 {item.removeprefix('removed ')}")
-        else:
-            print(f"已安装 {item}")
+        print(f"已安装 {item}")
     if preserve:
         print("已默认保留本机 setup 配置: alternative-reviewer.json 与 state/。")
     return 0

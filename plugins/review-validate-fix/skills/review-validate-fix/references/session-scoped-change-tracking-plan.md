@@ -1,5 +1,9 @@
 # Session-scoped change tracking plan
 
+## 后续替代方向
+
+本文件描述的是当前已落地的 per-chat session tracking。它仍是现有运行期行为的基础，但不再是长期并发模型。下一阶段设计应迁移到 repo 级 global reviewed-diff tracker：在 repo 下按 branch/worktree 维护 diff units、chat session assignment、reviewer lease、activity probe 和 stale release。详见仓库文档 `docs/global-reviewed-diff-tracker-overhaul-plan.md`。
+
 ## 目标
 
 恢复 Claude Code 版本中“只审查当前 chat session 修改”的能力，避免多个 Codex 会话、reviewer 或 validate/fix agent 共用同一个 worktree 时，把其他会话的未提交改动混进本轮 `$review-validate-fix` scope。

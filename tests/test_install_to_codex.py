@@ -116,7 +116,7 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     command = matching[0]["command"]
     assert "codex_stop_hook_dispatcher.py" in command
     assert "/plugins/review-validate-fix/skills/review-validate-fix/" in command
-    assert "CODEX_RVF_FORK_MODE=gui" in command
+    assert "CODEX_RVF_FORK_MODE=auto" in command
     assert "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180" in command
     assert "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60" in command
     assert "python3 /tmp/other.py" in json.dumps(data)
@@ -428,13 +428,164 @@ def test_copy_tree_excludes_dev_only_paths(tmp_path: Path) -> None:
     assert not (dst / "dev-only").exists()
 
 
+def test_ensure_codex_plugin_enabled_updates_user_config(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    config_path = home / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "\n".join(
+            [
+                'model = "gpt-5.5"',
+                "",
+                '[plugins."review-validate-fix@local-codex-plugins"]',
+                "enabled = false",
+                "",
+                '[projects."/tmp/repo"]',
+                'trust_level = "trusted"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with_fake_home(module, home, lambda: module.ensure_codex_plugin_enabled())
+
+    text = config_path.read_text(encoding="utf-8")
+    assert '[plugins."review-validate-fix@local-codex-plugins"]' in text
+    assert "enabled = true" in text
+    assert '[projects."/tmp/repo"]' in text
+    assert 'trust_level = "trusted"' in text
+
+
+def test_remove_legacy_codex_skill_dir_removes_broken_symlink(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
+    legacy_skill.parent.mkdir(parents=True)
+    legacy_skill.symlink_to(home / "missing-legacy-skill")
+
+    def run_test() -> None:
+        removed = module.remove_legacy_codex_skill_dir(
+            home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            True,
+        )
+        assert removed == legacy_skill
+
+    with_fake_home(module, home, run_test)
+
+    assert not legacy_skill.exists()
+    assert not legacy_skill.is_symlink()
+
+
+def test_main_syncs_legacy_only_setup_into_empty_plugin_cache(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
+    legacy_config = legacy_skill / "config"
+    legacy_state = legacy_skill / "state"
+    legacy_config.mkdir(parents=True)
+    legacy_state.mkdir(parents=True)
+    (legacy_config / "alternative-reviewer.json").write_text("legacy-only config\n", encoding="utf-8")
+    (legacy_state / "run.json").write_text("legacy-only state\n", encoding="utf-8")
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+
+    plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    cache_skill = (
+        home
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "local-codex-plugins"
+        / "review-validate-fix"
+        / module.plugin_version()
+        / "skills"
+        / "review-validate-fix"
+    )
+    assert (plugin_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
+        "legacy-only config\n"
+    )
+    assert (plugin_skill / "state" / "run.json").read_text(encoding="utf-8") == "legacy-only state\n"
+    assert (cache_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
+        "legacy-only config\n"
+    )
+    assert (cache_skill / "state" / "run.json").read_text(encoding="utf-8") == "legacy-only state\n"
+    assert not legacy_skill.exists()
+
+
+def test_main_syncs_legacy_config_over_default_plugin_cache(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
+    legacy_config = legacy_skill / "config"
+    legacy_config.mkdir(parents=True)
+    (legacy_config / "alternative-reviewer.json").write_text("legacy-over-default config\n", encoding="utf-8")
+    cache_skill = (
+        home
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "local-codex-plugins"
+        / "review-validate-fix"
+        / module.plugin_version()
+        / "skills"
+        / "review-validate-fix"
+    )
+    cache_config = cache_skill / "config"
+    cache_config.mkdir(parents=True)
+    (cache_config / "alternative-reviewer.json").write_bytes(
+        (module.PLUGIN_SRC / module.PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json").read_bytes()
+    )
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+
+    assert (cache_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
+        "legacy-over-default config\n"
+    )
+    assert not legacy_skill.exists()
+
+
 def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
     plugin_parent = home / "plugins"
     legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
-    legacy_skill.mkdir(parents=True)
-    (legacy_skill / "SKILL.md").write_text("legacy standalone\n", encoding="utf-8")
+    legacy_config = legacy_skill / "config"
+    legacy_state = legacy_skill / "state"
+    legacy_config.mkdir(parents=True)
+    legacy_state.mkdir(parents=True)
+    (legacy_skill / "SKILL.md").write_text("legacy skill\n", encoding="utf-8")
+    (legacy_config / "alternative-reviewer.json").write_text("local legacy config\n", encoding="utf-8")
+    (legacy_state / "run.json").write_text("local legacy state\n", encoding="utf-8")
     cache_skill = (
         home
         / ".codex"
@@ -482,11 +633,19 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert (cache_config / "alternative-reviewer.json").read_text(encoding="utf-8") == "local cache config\n"
     assert (cache_state / "run.json").read_text(encoding="utf-8") == "local cache state\n"
     assert not legacy_skill.exists()
+    assert (plugin_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
+        "local legacy config\n"
+    )
+    assert (plugin_skill / "state" / "run.json").read_text(encoding="utf-8") == "local legacy state\n"
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
     assert str(plugin_skill / "scripts" / "codex_stop_hook_dispatcher.py") in matching[0]["command"]
+    assert "CODEX_RVF_FORK_MODE=auto" in matching[0]["command"]
     assert matching[0]["statusMessage"] == "Review-Validate-Fix：同步插件并运行停止检查"
+    codex_config = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert '[plugins."review-validate-fix@local-codex-plugins"]' in codex_config
+    assert "enabled = true" in codex_config
 
 
 def main() -> int:
@@ -503,6 +662,10 @@ def main() -> int:
         test_main_persists_cline_review_options,
         test_copy_tree_preserves_nested_plugin_setup,
         test_copy_tree_excludes_dev_only_paths,
+        test_ensure_codex_plugin_enabled_updates_user_config,
+        test_remove_legacy_codex_skill_dir_removes_broken_symlink,
+        test_main_syncs_legacy_only_setup_into_empty_plugin_cache,
+        test_main_syncs_legacy_config_over_default_plugin_cache,
         test_main_installs_plugin_and_configures_stop_hook,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:

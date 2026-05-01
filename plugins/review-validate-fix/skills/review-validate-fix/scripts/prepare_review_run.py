@@ -63,6 +63,7 @@ def review_env_exports(
     repo: Path,
     run_id: str,
     run_dir: Path,
+    log_root: Path,
     artifacts_dir: Path,
     inputs_dir: Path,
     scope_contract_path: Path,
@@ -87,6 +88,9 @@ def review_env_exports(
         "RVF_WRITE_REVIEW_RESULT": str(WRITE_REVIEW_RESULT),
         "RVF_CHECK_REVIEW_RESULT": str(CHECK_REVIEW_RESULT),
         "RVF_REVIEW_RESULT": str(artifacts_dir / "reviewers" / "reviewer" / "review-result.json"),
+        "CODEX_RVF_LOG_ROOT": str(log_root),
+        "CODEX_RVF_RUN_ID": run_id,
+        "CODEX_RVF_RUN_DIR": str(run_dir),
     }
     if bootstrap_metadata_path is not None:
         env["RVF_WORKTREE_BOOTSTRAP"] = str(bootstrap_metadata_path)
@@ -101,6 +105,9 @@ def review_env_exports(
         f"export RVF_REPO={shlex.quote(env['RVF_REPO'])}",
         f"export RVF_RUN_ID={shlex.quote(env['RVF_RUN_ID'])}",
         f"export RVF_RUN_DIR={shlex.quote(env['RVF_RUN_DIR'])}",
+        f"export CODEX_RVF_LOG_ROOT={shlex.quote(env['CODEX_RVF_LOG_ROOT'])}",
+        'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"',
+        'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"',
     ]
     if artifacts_dir == run_dir / "artifacts":
         lines.append('export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"')
@@ -550,6 +557,7 @@ def prepare_run(
         repo=root,
         run_id=ledger.run_id,
         run_dir=ledger.run_dir,
+        log_root=ledger.root,
         artifacts_dir=artifact_dir,
         inputs_dir=inputs_dir,
         scope_contract_path=scope_contract_path,
