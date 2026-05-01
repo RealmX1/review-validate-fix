@@ -2041,6 +2041,67 @@ def test_alternative_reviewer_requires_review_result_artifact(tmp: Path) -> None
     assert summary["review_result_valid"] is False
 
 
+def test_alternative_reviewer_records_request_as_pending_state(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    reviewer_code = (
+        "import os, subprocess, sys; "
+        "sys.stdin.read(); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'lock-request', '--out', os.environ['RVF_REVIEW_RESULT'], "
+        "'--name', 'pytest', '--command', 'python3 -m pytest', "
+        "'--reason', 'needs serialized test cache'], check=True); "
+        "print('request written')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "request-pending-test",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "request written"
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "pending"
+    assert summary["reason_code"] == "reviewer_request_pending"
+    assert summary["returncode"] == 0
+    assert summary["review_result_valid"] is True
+    assert summary["review_result_kind"] == "request"
+    assert summary["review_result_complete"] is False
+    assert summary["review_request_pending"] is True
+    assert summary["review_result_summary"]["request_types"] == ["lock_request"]
+    events = read_jsonl(run_dir / "events.jsonl")
+    assert any(
+        event["event"] == "request_pending"
+        and event["reason_code"] == "reviewer_request_pending"
+        and event["review_result_kind"] == "request"
+        for event in events
+    )
+
+
 def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -2900,6 +2961,63 @@ def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
     run(["git", "apply", "--check", str(payload["worktree_bootstrap_patch"])], cwd=clean)
 
 
+def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
+    tmp: Path,
+) -> None:
+    repo = init_repo(tmp / "repo")
+    (repo / "a").mkdir()
+    (repo / "a" / "b.txt").write_text("slash path\n", encoding="utf-8")
+    (repo / "a__b.txt").write_text("flat path\n", encoding="utf-8")
+    manifest = tmp / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "repo": str(repo),
+                "owned_paths": ["a/b.txt", "a__b.txt"],
+                "owned_dirty_paths": ["a/b.txt", "a__b.txt"],
+                "unattributed_dirty_paths": [],
+                "confidence": "high",
+            }
+        ),
+        encoding="utf-8",
+    )
+    context = tmp / "context.md"
+    context.write_text("scope\n", encoding="utf-8")
+
+    completed = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+        ]
+    )
+    payload = json.loads(completed.stdout)
+    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
+    stored_paths = [item["stored_path"] for item in bootstrap["untracked_files"]]
+    assert [item["path"] for item in bootstrap["untracked_files"]] == ["a/b.txt", "a__b.txt"]
+    assert len(set(stored_paths)) == 2
+
+    clean = tmp / "clean"
+    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp)
+    run(
+        [
+            sys.executable,
+            str(APPLY_WORKTREE_BOOTSTRAP),
+            "--metadata",
+            str(payload["worktree_bootstrap"]),
+            "--repo",
+            str(clean),
+        ]
+    )
+    assert (clean / "a" / "b.txt").read_text(encoding="utf-8") == "slash path\n"
+    assert (clean / "a__b.txt").read_text(encoding="utf-8") == "flat path\n"
+
+
 def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     context = tmp / "context.md"
@@ -3210,6 +3328,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "alternative_reviewer_records_request_as_pending_state",
+            lambda: test_alternative_reviewer_records_request_as_pending_state(
+                root / "alternative-request-pending"
+            ),
+        ),
+        (
             "alternative_reviewer_activity_probe_failure_threshold_times_out",
             lambda: test_alternative_reviewer_activity_probe_failure_threshold_times_out(
                 root / "alternative-probe-failure"
@@ -3285,6 +3409,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "prepare_review_run_writes_worktree_bootstrap",
             lambda: test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap"),
+        ),
+        (
+            "prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide",
+            lambda: test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
+                root / "worktree-bootstrap-name-collision"
+            ),
         ),
         (
             "prepare_review_run_scope_file_matches_metadata_through_symlink_state",

@@ -203,7 +203,10 @@ def is_tracked_path(repo: Path, rel_path: str) -> bool:
 
 
 def safe_stored_name(rel_path: str) -> str:
-    return rel_path.replace("/", "__").replace("\\", "__")
+    normalized = rel_path.strip().replace("\\", "/").strip("/")
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    leaf = Path(normalized).name or "path"
+    return f"{digest}-{leaf}"
 
 
 def normalized_scope_list(values: list[Any]) -> list[str]:

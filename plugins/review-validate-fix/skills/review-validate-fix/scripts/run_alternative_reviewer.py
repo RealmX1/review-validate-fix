@@ -1186,6 +1186,9 @@ def main() -> int:
             errors = review_result_summary.get("errors")
             error_text = "; ".join(str(item) for item in errors) if isinstance(errors, list) else "invalid review result artifact"
             stderr = f"{stderr}\n{error_text}".strip()
+    review_result_kind = review_result_summary.get("kind") if review_result_summary else None
+    review_result_complete = review_result_kind in {"no_issues", "issues"}
+    review_request_pending = review_result_kind == "request"
     probe_history_path = write_child_artifact(
         reviewer_dir,
         "reviewer.activity_probe_history.json",
@@ -1215,6 +1218,8 @@ def main() -> int:
                 "activity_probe_history": probe_history_path,
             },
             "review_result_summary": review_result_summary,
+            "review_result_complete": review_result_complete,
+            "review_request_pending": review_request_pending,
         },
         unique=True,
     )
@@ -1240,15 +1245,28 @@ def main() -> int:
     }
     status = "completed" if completed.returncode == 0 else "failed"
     reason_code = "reviewer_completed"
+    event_name = "completed"
+    message = "alternative reviewer completed"
     if timed_out:
         reason_code = "reviewer_timeout"
+        event_name = "failed"
+        message = "alternative reviewer failed"
     elif review_result_summary is not None and not review_result_summary.get("valid"):
         reason_code = "reviewer_result_invalid"
+        event_name = "failed"
+        message = "alternative reviewer failed"
+    elif review_request_pending:
+        status = "pending"
+        reason_code = "reviewer_request_pending"
+        event_name = "request_pending"
+        message = "alternative reviewer recorded a request"
     elif completed.returncode != 0:
         reason_code = "reviewer_failed"
+        event_name = "failed"
+        message = "alternative reviewer failed"
     ledger.event(
         phase="review",
-        event="completed" if completed.returncode == 0 else "failed",
+        event=event_name,
         status=status,
         reason_code=reason_code,
         repo=str(repo) if repo is not None else None,
@@ -1263,7 +1281,9 @@ def main() -> int:
         timed_out=timed_out,
         timeout_reason=completed.timeout_reason,
         review_result_valid=bool(review_result_summary and review_result_summary.get("valid")),
-        review_result_kind=review_result_summary.get("kind") if review_result_summary else None,
+        review_result_kind=review_result_kind,
+        review_result_complete=review_result_complete,
+        review_request_pending=review_request_pending,
         review_result_check_stderr=review_result_check_stderr,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_failure_threshold=activity_probe_failure_threshold,
@@ -1274,7 +1294,7 @@ def main() -> int:
     ledger.summary(
         status=status,
         reason_code=reason_code,
-        message="alternative reviewer completed" if completed.returncode == 0 else "alternative reviewer failed",
+        message=message,
         repo=str(repo) if repo is not None else None,
         cwd=str(cwd),
         paths={key: value for key, value in paths.items() if value},
@@ -1287,7 +1307,9 @@ def main() -> int:
         timed_out=timed_out,
         timeout_reason=completed.timeout_reason,
         review_result_valid=bool(review_result_summary and review_result_summary.get("valid")),
-        review_result_kind=review_result_summary.get("kind") if review_result_summary else None,
+        review_result_kind=review_result_kind,
+        review_result_complete=review_result_complete,
+        review_request_pending=review_request_pending,
         review_result_summary=review_result_summary,
         review_result_check_stderr=review_result_check_stderr,
         activity_probe_configured=activity_probe_command is not None,
