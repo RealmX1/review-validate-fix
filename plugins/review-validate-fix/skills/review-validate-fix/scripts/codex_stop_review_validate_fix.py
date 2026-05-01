@@ -40,6 +40,7 @@ DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
+KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
 DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
@@ -106,6 +107,14 @@ class StopDecision:
     status: str = "skipped"
 
 
+@dataclass(frozen=True)
+class ProviderHealthRequirement:
+    provider: str
+    reason: str
+    command: tuple[str, ...]
+    remediation: str
+
+
 class AppServerError(RuntimeError):
     pass
 
@@ -150,6 +159,40 @@ def state_dir() -> Path:
     return log_root()
 
 
+def kanban_task_suppression_path(task_id: str) -> Path:
+    return state_dir() / KANBAN_TASK_SUPPRESSIONS_DIRNAME / f"{safe_state_key(task_id)}.json"
+
+
+def write_kanban_task_suppression(
+    *,
+    task_id: str,
+    cwd: str,
+    ledger: RunLedger,
+) -> str:
+    path = kanban_task_suppression_path(task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "task_id": task_id,
+        "suppress_stop_hook": True,
+        "reason": "rvf-created-cline-kanban-task",
+        "repo": cwd,
+        "run_id": ledger.run_id,
+        "run_dir": str(ledger.run_dir),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def read_kanban_task_suppression(task_id: str) -> dict[str, Any] | None:
+    path = kanban_task_suppression_path(task_id)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def session_hook_state_dir() -> Path:
     explicit = os.environ.get("CODEX_RVF_SESSION_HOOK_STATE_DIR")
     if explicit and explicit.strip():
@@ -179,6 +222,30 @@ def is_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def is_falsey(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"0", "false", "no", "n", "off", "skip", "disabled"}
+
+
+def provider_health_check_enabled() -> bool:
+    return not is_falsey(os.environ.get("CODEX_RVF_PROVIDER_HEALTH_CHECK"))
+
+
+def provider_health_timeout_seconds() -> float:
+    raw = os.environ.get("CODEX_RVF_PROVIDER_HEALTH_TIMEOUT_SECONDS")
+    if raw is None or not raw.strip():
+        return 12.0
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 12.0
+
+
+def codex_bin() -> str:
+    return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
 
 
 def safe_state_key(value: str) -> str:
@@ -1056,6 +1123,289 @@ def event_or_env_text(
     return string_event_value(event, event_keys)
 
 
+def is_codex_agent_id(agent_id: str | None) -> bool:
+    if agent_id is None:
+        return False
+    normalized = agent_id.strip().lower()
+    return (
+        normalized in {"codex", "codex-cli", "openai-codex"}
+        or normalized.startswith("codex:")
+        or "codex" in re.split(r"[^a-z0-9]+", normalized)
+    )
+
+
+def provider_health_requirements(
+    decision: StopDecision,
+    event: dict[str, Any],
+) -> list[ProviderHealthRequirement]:
+    if decision.backend == "gui":
+        return [
+            ProviderHealthRequirement(
+                provider="codex",
+                reason="GUI/app-server RVF backend uses Codex as the child session provider.",
+                command=(codex_bin(), "login", "status"),
+                remediation="请先运行 `codex login`，或使用 `codex login --with-api-key` 配置可用认证。",
+            )
+        ]
+
+    if decision.backend == "kanban":
+        agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+        if is_codex_agent_id(agent_id):
+            return [
+                ProviderHealthRequirement(
+                    provider="codex",
+                    reason=f"Cline Kanban RVF task will start agent_id={agent_id!r}.",
+                    command=(codex_bin(), "login", "status"),
+                    remediation=(
+                        "请先运行 `codex login`，确认 `codex login status` 成功后再让 "
+                        "Stop hook 创建 Cline Kanban RVF task。"
+                    ),
+                )
+            ]
+
+    if decision.backend == "kanban-followup":
+        agent_id = (
+            event_or_env_text(
+                event,
+                ("KANBAN_AGENT_ID", "CLINE_KANBAN_AGENT_ID"),
+                ("kanban_agent_id", "kanbanAgentId", "agent_id", "agentId"),
+            )
+            or os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip()
+            or "codex"
+        )
+        if is_codex_agent_id(agent_id):
+            return [
+                ProviderHealthRequirement(
+                    provider="codex",
+                    reason=f"Cline Kanban follow-up is targeting agent_id={agent_id!r}.",
+                    command=(codex_bin(), "login", "status"),
+                    remediation="请先运行 `codex login`，再重试 RVF follow-up 注入。",
+                )
+            ]
+
+    return []
+
+
+def command_output_text(stdout: str | None, stderr: str | None) -> str:
+    return "\n".join(part for part in (stdout or "", stderr or "") if part).strip()
+
+
+def subprocess_output_text(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def codex_login_output_indicates_failure(output: str) -> bool:
+    normalized = output.strip().lower()
+    if not normalized:
+        return False
+    failure_markers = (
+        "not logged in",
+        "not authenticated",
+        "logged out",
+        "login expired",
+        "session expired",
+        "expired session",
+        "authentication expired",
+        "auth expired",
+        "invalid credentials",
+        "credential expired",
+        "token expired",
+    )
+    return any(marker in normalized for marker in failure_markers)
+
+
+def run_provider_health_requirement(
+    requirement: ProviderHealthRequirement,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    command = list(requirement.command)
+    record: dict[str, Any] = {
+        "provider": requirement.provider,
+        "reason": requirement.reason,
+        "command": command,
+        "remediation": requirement.remediation,
+        "status": "failed",
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        record.update(
+            {
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"{type(exc).__name__}: {exc}",
+                "failure_reason": "command_missing",
+            }
+        )
+        return record
+    except subprocess.TimeoutExpired as exc:
+        record.update(
+            {
+                "returncode": None,
+                "stdout": subprocess_output_text(exc.stdout),
+                "stderr": subprocess_output_text(exc.stderr),
+                "failure_reason": "timeout",
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return record
+    except Exception as exc:
+        record.update(
+            {
+                "returncode": None,
+                "stdout": "",
+                "stderr": f"{type(exc).__name__}: {exc}",
+                "failure_reason": "error",
+            }
+        )
+        return record
+
+    output = command_output_text(completed.stdout, completed.stderr)
+    failed = completed.returncode != 0
+    if requirement.provider == "codex" and codex_login_output_indicates_failure(output):
+        failed = True
+    record.update(
+        {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "status": "failed" if failed else "ok",
+            "failure_reason": "nonzero_or_auth_unhealthy" if failed else None,
+        }
+    )
+    return record
+
+
+def maybe_start_codex_login(ledger: RunLedger) -> dict[str, Any] | None:
+    if not is_truthy(os.environ.get("CODEX_RVF_AUTO_CODEX_LOGIN")):
+        return None
+
+    log_path = ledger.artifacts_dir / "codex-login.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                [codex_bin(), "login"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=log_file,
+                start_new_session=True,
+            )
+    except Exception as exc:
+        return {
+            "started": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "command": [codex_bin(), "login"],
+            "log_path": str(log_path),
+        }
+
+    return {
+        "started": True,
+        "pid": process.pid,
+        "command": [codex_bin(), "login"],
+        "log_path": str(log_path),
+    }
+
+
+def provider_health_failure_message(
+    failed: list[dict[str, Any]],
+    login_attempt: dict[str, Any] | None,
+) -> str:
+    providers = ", ".join(sorted({str(item.get("provider")) for item in failed if item.get("provider")}))
+    first = failed[0]
+    remediation = str(first.get("remediation") or "请先修复 provider 认证状态后重试。")
+    detail = command_output_text(
+        str(first.get("stdout") or ""),
+        str(first.get("stderr") or ""),
+    )
+    detail_line = f" health_output={detail[:240]!r}。" if detail else ""
+    login_line = ""
+    if login_attempt is not None:
+        if login_attempt.get("started") is True:
+            login_line = (
+                " 已按 CODEX_RVF_AUTO_CODEX_LOGIN=1 尝试后台启动 `codex login`，"
+                f"log={login_attempt.get('log_path')}。"
+            )
+        else:
+            login_line = (
+                " 已尝试后台启动 `codex login`，但启动失败："
+                f"{login_attempt.get('error')}。"
+            )
+    return (
+        "provider 登录/认证健康检查未通过，已阻止 RVF 自动启动，避免创建会立即失败的 "
+        f"review 任务。providers={providers or '<unknown>'}。{remediation}"
+        f"{detail_line}{login_line}"
+    )
+
+
+def provider_health_guard_decision(
+    decision: StopDecision,
+    event: dict[str, Any],
+    ledger: RunLedger,
+) -> StopDecision | None:
+    if not provider_health_check_enabled():
+        return None
+
+    requirements = provider_health_requirements(decision, event)
+    if not requirements:
+        return None
+
+    timeout_seconds = provider_health_timeout_seconds()
+    results = [run_provider_health_requirement(requirement, timeout_seconds) for requirement in requirements]
+    health_path = ledger.artifact(
+        "provider-health.json",
+        {
+            "enabled": True,
+            "backend": decision.backend,
+            "timeout_seconds": timeout_seconds,
+            "results": results,
+        },
+    )
+    failed = [result for result in results if result.get("status") != "ok"]
+    ledger.event(
+        phase="provider-health",
+        event="completed" if not failed else "failed",
+        status="completed" if not failed else "failed",
+        reason_code="provider_health_completed" if not failed else "provider_health_failed",
+        repo=decision.repo,
+        cwd=decision.cwd,
+        backend=decision.backend,
+        paths={"provider_health": health_path} if health_path else {},
+        providers=[result.get("provider") for result in results],
+    )
+    if not failed:
+        return None
+
+    login_attempt = (
+        maybe_start_codex_login(ledger)
+        if any(result.get("provider") == "codex" for result in failed)
+        else None
+    )
+    message = provider_health_failure_message(failed, login_attempt)
+    return skip_decision(
+        message,
+        ledger,
+        "provider_health_failed",
+        repo=decision.repo,
+        cwd=decision.cwd,
+        backend=decision.backend,
+        provider_health_path=health_path,
+        provider_health=results,
+        login_attempt=login_attempt,
+        gate_status=(decision.summary_fields or {}).get("gate_status"),
+    )
+
+
 # Cline Kanban 在 task session 的 hook 环境中自动设置 KANBAN_TASK_ID 和
 # KANBAN_WORKSPACE_ID；这是 kanban-followup 判断“当前 Stop hook 位于 Kanban task
 # 内”的原生信号。ATTEMPT/PROJECT_PATH 不是公开文档确认的自动变量，这里只作为
@@ -1261,9 +1611,6 @@ def cline_kanban_task_prompt(
         "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
         "RVF_ORIGIN_METADATA: $RVF_ARTIFACTS_DIR/origin.json\n"
         "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n\n"
-        "Stop hook child-session metadata:\n"
-        f"{SUPPRESS_STOP_HOOK_MARKER}\n"
-        "当前 Cline Kanban task 结束时必须跳过 review-validate-fix Stop hook。\n\n"
         "Original Codex conversation trace:\n"
         f"- name/ref: `{parent_conversation_ref}`\n"
         f"- name source: `{parent_conversation_source}`\n"
@@ -1299,6 +1646,13 @@ def cline_kanban_task_prompt(
         f"{original_prompt.rstrip()}\n"
         "```\n"
     )
+
+
+def cline_kanban_client_env(ledger: RunLedger) -> dict[str, str]:
+    env = {**os.environ, **ledger.env()}
+    for name in SUPPRESS_ENV_NAMES:
+        env.pop(name, None)
+    return env
 
 
 def start_cline_kanban_task(
@@ -1347,7 +1701,7 @@ def start_cline_kanban_task(
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
     start_in_plan_mode = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"))
-    env = {**os.environ, **ledger.env(), "CODEX_RVF_SUPPRESS_STOP_HOOK": "1"}
+    env = cline_kanban_client_env(ledger)
 
     ensure_command = [
         sys.executable,
@@ -1414,6 +1768,7 @@ def start_cline_kanban_task(
     task_id = str(create_payload.get("task_id") or "").strip()
     if not task_id:
         raise RuntimeError(f"Cline Kanban task create response did not include task_id: {create_payload!r}")
+    suppression_path = write_kanban_task_suppression(task_id=task_id, cwd=cwd, ledger=ledger)
 
     start_command = [
         sys.executable,
@@ -1443,6 +1798,7 @@ def start_cline_kanban_task(
         "cline_kanban_task_id": task_id,
         "cline_kanban_base_ref": base_ref,
         "cline_kanban_task_prompt_path": task_prompt_path,
+        "cline_kanban_stop_hook_suppression_path": suppression_path,
         "cline_kanban_ensure": ensure_payload,
         "cline_kanban_create": create_payload,
         "cline_kanban_start": start_payload,
@@ -2143,11 +2499,10 @@ def ensure_bridge_app_server() -> Path:
 
     log_path = bridge_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    codex_bin = os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
     with log_path.open("ab") as log_file:
         subprocess.Popen(
             [
-                codex_bin,
+                codex_bin(),
                 "app-server",
                 "--listen",
                 f"unix://{socket_path}",
@@ -3109,13 +3464,15 @@ def explicit_suppress_requested(event: dict[str, Any], latest_user: str | None =
 
     if latest_user and SUPPRESS_STOP_HOOK_MARKER in latest_user:
         return True
-    if latest_user and CLINE_KANBAN_TASK_MARKER in latest_user:
-        return True
 
     if session_user_message_contains(event, SUPPRESS_STOP_HOOK_MARKER):
         return True
-    if session_user_message_contains(event, CLINE_KANBAN_TASK_MARKER):
-        return True
+
+    task_id = current_kanban_task_id(event)
+    if task_id:
+        marker = read_kanban_task_suppression(task_id)
+        if marker and marker.get("suppress_stop_hook") is True:
+            return True
 
     if event.get("suppress_review_validate_fix") is True:
         return True
@@ -3507,6 +3864,10 @@ def main() -> int:
 
     decision = evaluate_stop_event(event, ledger)
     if decision.action == "launch":
+        provider_health_decision = provider_health_guard_decision(decision, event, ledger)
+        if provider_health_decision is not None and provider_health_decision.payload is not None:
+            emit(provider_health_decision.payload)
+            return 0
         emit(launch_backend(decision, event, ledger))
         return 0
     if decision.payload is not None:

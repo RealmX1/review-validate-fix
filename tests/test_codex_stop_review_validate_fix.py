@@ -698,6 +698,37 @@ def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path
     assert "summary=" not in payload["systemMessage"]
 
 
+def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp: Path) -> None:
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    state = tmp / "state"
+    marker_dir = state / "kanban-task-suppressions"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "task-202.json").write_text(
+        json.dumps(
+            {
+                "task_id": "task-202",
+                "suppress_stop_hook": True,
+                "reason": "rvf-created-cline-kanban-task",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+        },
+        extra_env={"KANBAN_TASK_ID": "task-202"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert payload["systemMessage"] == "review-validate-fix: skipped; reason=suppressed"
+    assert "summary=" not in payload["systemMessage"]
+
+
 def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
@@ -1055,6 +1086,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
             "CODEX_RVF_CLINE_KANBAN_CLIENT",
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
             "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
+            "CODEX_RVF_SUPPRESS_STOP_HOOK",
             "FAKE_CLIENT_CALLS",
         )
     }
@@ -1071,6 +1103,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
+        os.environ["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
         payload = module.run_codex_fork(
@@ -1109,6 +1142,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
     assert "RVF_CLINE_KANBAN_TASK" in prompt_text
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
+    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert "RVF_TARGET_REPO: ." in prompt_text
     assert f"RVF_PARENT_REPO: {repo}" in prompt_text
     assert f"RVF_PARENT_CWD: {repo}" in prompt_text
@@ -1139,7 +1173,13 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert "## Origin" in prompt_text
     assert "origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`" in prompt_text
     assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
-    assert calls[0]["suppress"] == "1"
+    assert all(call["suppress"] is None for call in calls)
+    suppression_path = Path(latest["cline_kanban_stop_hook_suppression_path"])
+    assert suppression_path.exists()
+    suppression_marker = json.loads(suppression_path.read_text(encoding="utf-8"))
+    assert suppression_marker["task_id"] == "task-123"
+    assert suppression_marker["suppress_stop_hook"] is True
+    assert suppression_marker["run_id"] == latest["run_id"]
 
 
 def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp: Path) -> None:
@@ -1187,6 +1227,65 @@ def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp:
     assert not client_calls.exists()
 
 
+def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
+    fake_codex = tmp / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1:3] == ['login', 'status']:\n"
+        "    print('session expired; please login again', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "raise SystemExit(f'unexpected codex argv: {sys.argv[1:]}')\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "print(json.dumps({'task_id': 'should-not-start'}))\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "cline-kanban",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CODEX_BIN": str(fake_codex),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=provider_health_failed" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "provider_health_failed"
+    assert latest["backend"] == "kanban"
+    assert latest["gate_status"] == "DIRTY"
+    assert "codex login" in str(latest["message"])
+    assert "startup_prepare_metadata_path" not in latest
+    assert not client_calls.exists()
+    health = read_json_artifact(latest, "provider_health_path")
+    assert isinstance(health, dict)
+    results = health["results"]
+    assert isinstance(results, list)
+    assert results[0]["provider"] == "codex"
+    assert results[0]["status"] == "failed"
+    assert "session expired" in results[0]["stderr"]
+
+
 def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
     repo = init_repo_with_head(tmp / "repo")
     state = tmp / "state"
@@ -1210,6 +1309,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -1282,6 +1382,7 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp: Pa
             },
             extra_env={
                 "CODEX_RVF_FORK_MODE": "kanban-followup",
+                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "KANBAN_TASK_ID": "task-77",
@@ -1306,6 +1407,62 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp: Pa
     ]
     message_argv = calls[0]["argv"]
     assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
+
+
+def test_kanban_followup_blocks_expired_codex_login_before_message(tmp: Path) -> None:
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    fake_codex = tmp / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "if sys.argv[1:3] == ['login', 'status']:\n"
+        "    print('session expired; please login again', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+        "raise SystemExit(f'unexpected codex argv: {sys.argv[1:]}')\n",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    client_calls = tmp / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "print(json.dumps({'task_id': 'task-77', 'message_id': 'should-not-enqueue'}))\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "CODEX_RVF_CODEX_BIN": str(fake_codex),
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=provider_health_failed" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "provider_health_failed"
+    assert latest["backend"] == "kanban-followup"
+    assert "codex login" in str(latest["message"])
+    assert not client_calls.exists()
+    health = read_json_artifact(latest, "provider_health_path")
+    results = health["results"]
+    assert results[0]["provider"] == "codex"
+    assert results[0]["status"] == "failed"
+    assert "session expired" in results[0]["stderr"]
 
 
 def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp: Path) -> None:
@@ -2827,6 +2984,7 @@ def main() -> int:
         test_env_suppression_skips,
         test_prompt_suppression_marker_skips,
         test_prior_cline_kanban_task_marker_skips_after_later_user_message,
+        test_kanban_task_suppression_marker_skips_without_prompt_marker,
         test_session_without_owned_dirty_skips_fork,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
@@ -2839,8 +2997,10 @@ def main() -> int:
         test_missing_desktop_control_reports_failure_not_bridge_or_continuation,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
+        test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
         test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd,
+        test_kanban_followup_blocks_expired_codex_login_before_message,
         test_kanban_followup_mode_without_task_id_reports_without_fallback,
         test_kanban_followup_trigger_marker_skips_one_turn,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
