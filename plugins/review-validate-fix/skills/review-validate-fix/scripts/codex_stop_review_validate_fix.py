@@ -263,6 +263,32 @@ def text_from_message_payload(payload: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def strip_codex_user_message_preamble(text: str) -> str:
+    remaining = text.lstrip()
+    while remaining:
+        changed = False
+        if remaining.startswith("# AGENTS.md instructions for "):
+            match = re.search(r"</INSTRUCTIONS>\s*", remaining, flags=re.DOTALL)
+            if not match:
+                return ""
+            remaining = remaining[match.end() :].lstrip()
+            changed = True
+
+        for tag in ("environment_context",):
+            open_tag = f"<{tag}>"
+            close_tag = f"</{tag}>"
+            if remaining.startswith(open_tag):
+                close_index = remaining.find(close_tag)
+                if close_index == -1:
+                    return ""
+                remaining = remaining[close_index + len(close_tag) :].lstrip()
+                changed = True
+
+        if not changed:
+            break
+    return remaining.strip()
+
+
 def latest_user_message(path: Path) -> str | None:
     latest: str | None = None
     try:
@@ -309,14 +335,17 @@ def first_user_message(path: Path) -> str | None:
                 if record.get("type") == "event_msg" and payload.get("type") == "user_message":
                     message = payload.get("message")
                     if isinstance(message, str) and message.strip():
-                        return message
+                        cleaned = strip_codex_user_message_preamble(message)
+                        if cleaned:
+                            return cleaned
                     continue
 
                 if record.get("type") == "response_item":
                     if payload.get("type") == "message" and payload.get("role") == "user":
                         text = text_from_message_payload(payload)
-                        if text.strip():
-                            return text
+                        cleaned = strip_codex_user_message_preamble(text)
+                        if cleaned:
+                            return cleaned
     except OSError:
         return None
     return None

@@ -335,6 +335,106 @@ def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(t
     )
 
 
+def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    user_prompt = (
+        "currently the fallback chat session name in handoff as well as cline-task "
+        "is incorrectly using the stitched prompt"
+    )
+    stitched_prompt = (
+        "# AGENTS.md instructions for /Users/bominzhang/Documents/GitHub/review-validate-fix\n\n"
+        "<INSTRUCTIONS>\n"
+        "你应该默认使用中文作为主要语言进行回复。\n"
+        "</INSTRUCTIONS><environment_context>\n"
+        "  <cwd>/Users/bominzhang/Documents/GitHub/review-validate-fix</cwd>\n"
+        "</environment_context>\n"
+        f"{user_prompt}"
+    )
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": stitched_prompt},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    origin = module.parent_conversation_origin(
+        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+        parent_thread_path=transcript,
+        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+    )
+
+    expected_excerpt = module.single_line_excerpt(
+        user_prompt,
+        module.DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS,
+    )
+    assert origin["label"] == f'"{expected_excerpt}"'
+    assert "AGENTS.md instructions" not in origin["task_title"]
+    assert origin["name_source"] == "first_user_prompt_fallback"
+
+
+def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed(tmp: Path) -> None:
+    module = load_hook_module()
+    tmp.mkdir(parents=True, exist_ok=True)
+    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    context_only = (
+        "# AGENTS.md instructions for /Users/bominzhang/Documents/GitHub/review-validate-fix\n\n"
+        "<INSTRUCTIONS>\n"
+        "project instructions\n"
+        "</INSTRUCTIONS><environment_context>\n"
+        "  <cwd>/Users/bominzhang/Documents/GitHub/review-validate-fix</cwd>\n"
+        "</environment_context>\n"
+    )
+    user_prompt = "please run review validate fix for the current change"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": context_only},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": user_prompt},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    origin = module.parent_conversation_origin(
+        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+        parent_thread_path=transcript,
+        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+    )
+
+    assert origin["label"] == f'"{user_prompt}"'
+    assert "AGENTS.md instructions" not in origin["task_title"]
+
+
 def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp: Path) -> None:
     module = load_hook_module()
     tmp.mkdir(parents=True, exist_ok=True)
@@ -2717,6 +2817,8 @@ def main() -> int:
         test_normalize_backend_from_env,
         test_parent_conversation_origin_prefers_app_server_chat_name,
         test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed,
+        test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed,
+        test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed,
         test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
