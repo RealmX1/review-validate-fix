@@ -429,6 +429,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
             f"tests_dir={shlex.quote(str(tests_dir))}\n"
             f"export RVF_CONTRACT_TIMING_JSONL={shlex.quote(str(timing_path))}\n"
             "export RVF_CONTRACT_TIMING_SCRIPT=\"$0\"\n"
+            "export RVF_CONTRACT_PARALLEL_TESTS=1\n"
             "export RVF_CONTRACT_PARALLEL_JOBS=4\n"
             "export RVF_CONTRACT_REVIEW_SUPPORT_SHARDS=4\n"
             "export RVF_CONTRACT_STOP_HOOK_SHARDS=4\n"
