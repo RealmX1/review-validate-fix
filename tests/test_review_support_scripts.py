@@ -34,6 +34,7 @@ CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
+RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -110,6 +111,32 @@ def run(
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_rvf_handoff_cli_opens_with_configured_editor(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    marker = tmp_path / "opened.txt"
+    opener = tmp_path / "open_handoff.py"
+    opener.write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(os.environ['RVF_OPEN_MARKER']).write_text(sys.argv[1], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    env = {
+        **os.environ,
+        "CODEX_RVF_IDE_OPEN_CMD": f"{shlex.quote(sys.executable)} {shlex.quote(str(opener))}",
+        "RVF_OPEN_MARKER": str(marker),
+    }
+
+    completed = run([sys.executable, str(RVF_HANDOFF), "open", str(handoff)], env=env)
+    payload = json.loads(completed.stdout)
+
+    assert payload["valid"] is True
+    assert payload["opened"] is True
+    assert payload["handoff_path"] == str(handoff.resolve())
+    assert marker.read_text(encoding="utf-8") == str(handoff.resolve())
 
 
 def init_repo(path: Path) -> Path:
@@ -545,6 +572,37 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp: Path) -> None:
     assert later["contract_check_timing"]["slowest_step"]["label"] == (
         "tests: codex_stop_review_validate_fix"
     )
+
+
+def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    installed_skill = tmp / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    installed_skill.mkdir(parents=True)
+    (installed_skill / "SKILL.md").write_text("# skill\n", encoding="utf-8")
+    cline_skill = (
+        tmp
+        / "home"
+        / ".cline"
+        / "worktrees"
+        / "9336c"
+        / "review-validate-fix"
+        / "plugins"
+        / "review-validate-fix"
+        / "skills"
+        / "review-validate-fix"
+    )
+
+    original = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
+    try:
+        assert module.default_log_root_for_skill_dir(cline_skill) == installed_skill / "state"
+        dev_skill = tmp / "dev" / "skills" / "review-validate-fix"
+        assert module.default_log_root_for_skill_dir(dev_skill) == dev_skill / "state"
+    finally:
+        if original is None:
+            os.environ.pop("CODEX_RVF_INSTALLED_SKILL_DIR", None)
+        else:
+            os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = original
 
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
@@ -1310,8 +1368,14 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert payload["review_env"]["RVF_SCOPE_CONTRACT"] == payload["scope_contract"]
     assert payload["review_env"]["RVF_SCOPE_OF_WORK"] == payload["scope_of_work_file"]
     assert payload["review_env"]["RVF_REVIEW_PACKET"] == payload["review_packet"]
+    assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
+    assert payload["review_env"]["CODEX_RVF_RUN_ID"] == payload["run_id"]
+    assert payload["review_env"]["CODEX_RVF_RUN_DIR"] == payload["run_dir"]
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
+    assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
+    assert 'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"' in review_env_text
+    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
     assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
@@ -2866,6 +2930,10 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
 
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
+        (
+            "rvf_handoff_cli_opens_with_configured_editor",
+            lambda: test_rvf_handoff_cli_opens_with_configured_editor(root / "handoff-open"),
+        ),
         ("check_review_output_lock_request", lambda: test_check_review_output_lock_request()),
         (
             "check_review_output_protocol_extension_requests",
@@ -2891,6 +2959,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "run_ledger_summary_preserves_contract_timing_fields",
             lambda: test_run_ledger_summary_preserves_contract_timing_fields(
                 root / "summary-preserve-contract-timing"
+            ),
+        ),
+        (
+            "rvf_logging_cline_worktree_defaults_to_installed_plugin_state",
+            lambda: test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(
+                root / "cline-worktree-log-root"
             ),
         ),
         (

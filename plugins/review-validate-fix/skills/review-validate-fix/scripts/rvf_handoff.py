@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -178,6 +179,26 @@ def open_handoff_file(path: Path) -> dict[str, Any]:
     }
 
 
+def manual_open_handoff_payload(path: Path) -> dict[str, Any]:
+    valid, reason = validate_handoff_path(path)
+    if not valid:
+        return {
+            "valid": False,
+            "handoff_path": str(path),
+            "opened": False,
+            "reason": f"handoff_file_{reason}",
+        }
+    resolved = path.expanduser().resolve()
+    open_result = open_handoff_file(resolved)
+    return {
+        "valid": True,
+        "handoff_path": str(resolved),
+        "opened": bool(open_result.get("opened")),
+        "reason": open_result.get("reason"),
+        "open_result": open_result,
+    }
+
+
 def _advised_marker_path(ledger: RunLedger, session_id: str, handoff_path: Path) -> Path:
     digest = hashlib.sha256(str(handoff_path).encode("utf-8")).hexdigest()[:12]
     return (
@@ -283,3 +304,23 @@ def handoff_completion_payload(
         marker_error=marker_error,
         already_advised=already_advised,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Open an RVF handoff markdown file with the configured/default editor."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    open_parser = subparsers.add_parser("open", help="Open a handoff markdown file.")
+    open_parser.add_argument("path", help="Path to handoff.md.")
+    args = parser.parse_args(argv)
+
+    if args.command == "open":
+        payload = manual_open_handoff_payload(Path(args.path).expanduser())
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0 if payload.get("valid") else 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

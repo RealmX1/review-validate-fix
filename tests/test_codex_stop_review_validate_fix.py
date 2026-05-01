@@ -1639,6 +1639,9 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert f"RVF_TARGET_REPO: {repo}" not in prompt_text
     assert "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts" in prompt_text
     assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
+    assert "export CODEX_RVF_LOG_ROOT=" in prompt_text
+    assert "export CODEX_RVF_RUN_ID=" in prompt_text
+    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in prompt_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in prompt_text
     assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
     assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text
@@ -1646,6 +1649,9 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert "- review packet: `$RVF_REVIEW_PACKET`" in prompt_text
     assert "- session manifest: `$RVF_SESSION_MANIFEST`" in prompt_text
     assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
+    assert "rvf_handoff.py" in prompt_text
+    assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' in prompt_text
+    assert "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py`" in prompt_text
     artifacts_dir = latest["artifacts_dir"]
     assert f"{artifacts_dir}/review-packet.md" not in prompt_text
     assert f"{artifacts_dir}/session-manifest.json" not in prompt_text

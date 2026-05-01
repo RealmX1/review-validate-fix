@@ -41,6 +41,7 @@ DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
+DEFAULT_HANDOFF_HELPER = SKILL_DIR / "scripts" / "rvf_handoff.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
@@ -1088,7 +1089,10 @@ def fork_review_validate_fix_prompt(
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
         "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
         "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
-        "handoff 文件内容。Stop hook 会在本会话结束时自动打开该 markdown 文件。"
+        "handoff 文件内容。最终回复前先运行 "
+        f"`python3 {shell_quote(str(DEFAULT_HANDOFF_HELPER))} open <handoff.md 绝对路径>` "
+        "尝试用默认编辑器打开该 markdown 文件；Stop hook 仍会把 "
+        "`RVF_HANDOFF_FILE` marker 作为兜底完成信号处理。"
     )
 
 
@@ -1119,7 +1123,10 @@ def kanban_followup_review_validate_fix_prompt(
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
         "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
         "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
-        "handoff 文件内容。Stop hook 会在本会话结束时自动打开该 markdown 文件。"
+        "handoff 文件内容。最终回复前先运行 "
+        f"`python3 {shell_quote(str(DEFAULT_HANDOFF_HELPER))} open <handoff.md 绝对路径>` "
+        "尝试用默认编辑器打开该 markdown 文件；Stop hook 仍会把 "
+        "`RVF_HANDOFF_FILE` marker 作为兜底完成信号处理。"
     )
 
 
@@ -1645,6 +1652,7 @@ def cline_kanban_task_prompt(
     parent_codex_url = str(parent_origin.get("codex_url") or "<unavailable>")
     parent_transcript_file = str(parent_origin.get("transcript_file") or "<unknown>")
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
+    handoff_helper = DEFAULT_HANDOFF_HELPER
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
     return (
         "$review-validate-fix\n\n"
@@ -1680,6 +1688,9 @@ def cline_kanban_task_prompt(
         "```sh\n"
         'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
         f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
+        f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
+        f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
+        'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
         'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
         '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
         'export RVF_REPO="$RVF_TASK_REPO"\n'
@@ -1692,11 +1703,18 @@ def cline_kanban_task_prompt(
         "- session manifest: `$RVF_SESSION_MANIFEST`\n"
         "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
         "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 以 session manifest 和 review packet 为准。"
+        "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py` 创建新的 run；"
+        "本 task 已经复用上面的 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、"
+        "summary 和 events 都必须继续写入该 installed plugin state run。"
         "Handoff 默认开启时，必须持续维护 "
         "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
         "RVF run id 和 origin metadata path。最终回复第一行输出 "
-        "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。\n\n"
+        "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。"
+        "最终回复前必须先运行：\n\n"
+        "```sh\n"
+        f"python3 {shell_quote(str(handoff_helper))} open \"$RVF_ARTIFACTS_DIR/handoff.md\"\n"
+        "```\n\n"
         "原始 fork prompt 如下，仅作兼容元数据：\n\n"
         "```text\n"
         f"{original_prompt.rstrip()}\n"

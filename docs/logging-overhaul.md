@@ -31,10 +31,11 @@
 | latest pointer | 已降级为 `run_id`、`summary_path`、`events_path`、`status`、`reason_code`、`updated_at` | 任何主程序逻辑不得把 `latest.json` 当完整状态源 |
 | Stop hook stdout | 保持只输出 Codex hook payload JSON | 诊断信息只能进 `systemMessage` 摘要或 run ledger；dispatcher 失败也不走非零 stderr |
 | dispatcher dev sync | 已接入同一 run ledger，失败时输出 hook payload 并给 summary path | 不允许把 stale installed plugin 的继续执行作为 fallback，也不要让 stderr 变成当前会话 continuation |
+| Stop hook suppress | 已接入最小 run ledger，用户可见 `systemMessage` 保留 summary path | suppress 仍必须早于 handoff、dirty gate 和 backend launch；只记录 stop event、suppressed/skipped 事件和 summary |
 | prepare/reviewer | 已支持 `--rvf-run-id` 和 `--rvf-run-dir` | manual run 和 external reviewer 必须可通过 run ledger 排障 |
 | 日志失败 | helper 返回 `log_unavailable` diagnostics，hook payload 仍可用 | 不得让日志目录不可写破坏 Stop hook 协议 |
 
-日志根目录默认是 plugin skill 的 `state/`；可用 `CODEX_RVF_LOG_ROOT` 覆盖，`CODEX_RVF_STATE_DIR` 作为兼容别名仍可识别。两者都只影响本机排障位置，不改变 hook payload 协议。
+日志根目录默认是 plugin skill 的 `state/`；可用 `CODEX_RVF_LOG_ROOT` 覆盖，`CODEX_RVF_STATE_DIR` 作为兼容别名仍可识别。两者都只影响本机排障位置，不改变 hook payload 协议。若运行中的 skill copy 位于 Cline Kanban `.cline/worktrees/...` task worktree，且用户没有显式覆盖日志根目录，默认改用 `~/plugins/review-validate-fix/skills/review-validate-fix/state/`，避免 task worktree 承载 RVF run ledger。
 
 ## 目标
 

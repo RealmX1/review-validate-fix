@@ -7,3 +7,5 @@ skill/review-validate-fix/state/
 plugins/review-validate-fix/skills/review-validate-fix/state/
 
 dev_backward_compatibility/
+
+tmp/

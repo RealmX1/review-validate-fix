@@ -12,6 +12,7 @@ from typing import Any
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_ROOT = SKILL_DIR / "state"
+INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
 DEFAULT_INLINE_BYTES = 2048
 COMPONENTS = {
     "command-lock",
@@ -91,12 +92,38 @@ def new_event_id() -> str:
     return f"evt-{secrets.token_hex(8)}"
 
 
+def _is_cline_worktree_path(path: Path) -> bool:
+    parts = path.expanduser().parts
+    return any(
+        parts[index] == ".cline" and index + 1 < len(parts) and parts[index + 1] == "worktrees"
+        for index in range(len(parts))
+    )
+
+
+def installed_plugin_skill_dir() -> Path:
+    configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
+
+
+def default_log_root_for_skill_dir(skill_dir: Path) -> Path:
+    installed_skill_dir = installed_plugin_skill_dir()
+    if (
+        _is_cline_worktree_path(skill_dir)
+        and installed_skill_dir != skill_dir
+        and (installed_skill_dir / "SKILL.md").is_file()
+    ):
+        return installed_skill_dir / "state"
+    return skill_dir / "state"
+
+
 def log_root() -> Path:
     for key in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR"):
         value = os.environ.get(key)
         if value and value.strip():
             return Path(value).expanduser()
-    return DEFAULT_LOG_ROOT
+    return default_log_root_for_skill_dir(SKILL_DIR)
 
 
 def max_inline_bytes(default: int = DEFAULT_INLINE_BYTES) -> int:

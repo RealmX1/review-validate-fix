@@ -31,6 +31,8 @@ request 本身不得进入 review merge table。只有 requester 重试后的 `N
 
 默认策略：子代理可以请求子任务，但由主会话 spawn。
 
+主会话 spawn 的所有 RVF 子代理都默认使用当前可用的最佳模型，并显式设置 `reasoning_effort=high`。这包括 Codex-native reviewer、Codex-only fallback reviewer、validate/fix 子代理，以及为 `RVF_*_REQUEST` 派生的受控子任务。若当前接口不支持传入 model / reasoning effort，或用户、平台、本轮运行环境明确限制，主会话必须把降级原因写入 run ledger、handoff 和最终汇总。
+
 这样能保留：
 
 - run ledger 事件。
