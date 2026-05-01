@@ -1,10 +1,10 @@
 # Review Validate Fix
 
-这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 `review-validate-fix@local-codex-plugins`，并额外生成一个 `~/.codex/skills/review-validate-fix` CLI 兼容 launcher，确保 Codex CLI / Cline Kanban 启动的普通 `codex` 进程能识别显式 `$review-validate-fix`。
+这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 `review-validate-fix@local-codex-plugins`，并清理旧的 `~/.codex/skills/review-validate-fix` 目录，避免 Codex GUI/CLI 出现两个同名 skill。
 
 ## 当前结论
 
-Codex 可以接受 plugin。这个 workflow 仍以 plugin 作为唯一维护源；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并携带 `skills/review-validate-fix/` 作为实际运行内容。由于当前 Codex CLI 对 `agents/openai.yaml` 里的 `allow_implicit_invocation: false` 会把 skill 从 model-visible 列表隐藏，安装脚本不会把 runtime skill 原样复制到 `~/.codex/skills`，而是生成一个只响应精确 `$review-validate-fix` 的 standalone launcher。人工修改仍只进入 plugin skill 源码。
+Codex 可以接受 plugin。这个 workflow 仍以 plugin 作为唯一维护源；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并携带 `skills/review-validate-fix/` 作为实际运行内容。当前 Codex CLI 的 slash 菜单与 Codex GUI 的 skill picker 行为并不完全一致；安装脚本只负责安装并启用 plugin，不再通过同名本机 skill 目录伪造第二个入口。人工修改仍只进入 plugin skill 源码。
 
 ## 核心设计支柱：Stop 后 GUI Fork
 
@@ -17,7 +17,7 @@ Cline Kanban task 必须在独立 worktree/checkpoint 中重放当前 session-ow
 | 维度 | 当前策略 |
 | --- | --- |
 | canonical 源码 | `plugins/review-validate-fix/skills/review-validate-fix/` |
-| 本机安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` plugin enablement，并生成 `~/.codex/skills/review-validate-fix` CLI launcher |
+| 本机安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` plugin enablement；安装时会删除旧 `~/.codex/skills/review-validate-fix` 目录 |
 | 触发方式 | plugin 暴露 `$review-validate-fix` skill，`agents/openai.yaml` 控制隐式调用 |
 | 废弃路径 | 仓库内旧 `skill/review-validate-fix/` 源码树 |
 
@@ -97,7 +97,7 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py
 ```
 
-安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry，在 `~/.codex/config.toml` 写入 `[plugins."review-validate-fix@local-codex-plugins"] enabled = true`，并把一个轻量 CLI launcher 写入 `~/.codex/skills/review-validate-fix`。这个 standalone 目录只负责让普通 Codex CLI / Cline Kanban task 在用户显式写出 `$review-validate-fix` 时能找到入口；它会指向 installed plugin skill，不是第二份 canonical 源码，也不复制 runtime `agents/openai.yaml`。
+安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry，在 `~/.codex/config.toml` 写入 `[plugins."review-validate-fix@local-codex-plugins"] enabled = true`，并删除旧 `~/.codex/skills/review-validate-fix` 目录。删除前会尽量把旧目录里的本机 `config/alternative-reviewer.json` 与 `state/` 迁到 installed plugin skill，避免保留第二个同名 skill 造成 GUI picker 重复。
 
 配置 Codex Stop hook：
 

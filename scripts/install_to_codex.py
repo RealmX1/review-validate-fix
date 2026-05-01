@@ -20,10 +20,6 @@ PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
     PLUGIN_SKILL_REL / "state",
 }
-PRESERVE_IN_STANDALONE = {
-    Path("config") / "alternative-reviewer.json",
-    Path("state"),
-}
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", "state"}
 DEV_ONLY_NAMES = {
     ".rvf-dev-only",
@@ -108,63 +104,54 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
-def install_standalone_skill(plugin_skill_dir: Path, preserve_local_config: bool) -> Path:
-    standalone = Path.home() / ".codex" / "skills" / SKILL_NAME
-    effective_preserve = PRESERVE_IN_STANDALONE if preserve_local_config else set()
-    standalone.mkdir(parents=True, exist_ok=True)
-    remove_unpreserved(standalone, effective_preserve)
-    standalone.joinpath("SKILL.md").write_text(
-        standalone_skill_launcher_text(plugin_skill_dir),
-        encoding="utf-8",
-    )
-    return standalone
+def copy_missing_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    if src.is_file():
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        return
+    for child in src.rglob("*"):
+        rel = child.relative_to(src)
+        target = dst / rel
+        if child.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif not target.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
 
 
-def standalone_skill_launcher_text(plugin_skill_dir: Path) -> str:
-    runtime_skill = plugin_skill_dir / "SKILL.md"
-    cache_skill = (
-        Path.home()
-        / ".codex"
-        / "plugins"
-        / "cache"
-        / marketplace_name()
-        / SKILL_NAME
-        / plugin_version()
-        / "skills"
-        / SKILL_NAME
-        / "SKILL.md"
-    )
-    return f"""---
-name: {SKILL_NAME}
-description: Use only when the user explicitly writes `$review-validate-fix` or explicitly asks to run the Review Validate Fix plugin by exact name. Do not use for generic review, validation, fixing, handoff, or post-work analysis requests unless the exact RVF invocation is present.
----
+def copy_legacy_config_if_safe(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    repo_default = PLUGIN_SRC / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json"
+    should_copy = not dst.exists()
+    if not should_copy and repo_default.exists():
+        try:
+            should_copy = dst.read_bytes() == repo_default.read_bytes()
+        except OSError:
+            should_copy = False
+    if should_copy:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
 
-# Review Validate Fix CLI Launcher
 
-这是 Review Validate Fix plugin 的 Codex CLI 兼容入口。它只解决当前 Codex CLI
-不会把 plugin UI 的显式安装态自动转成 model-visible skill 的问题；canonical runtime
-仍然是 installed plugin skill，不在这里维护第二份实现。
-
-只有当用户消息中明确出现 `$review-validate-fix`，或明确要求按 exact name 运行
-Review Validate Fix plugin 时，才继续。普通 “review / validate / fix / handoff”
-请求不得触发本 launcher。
-
-运行时请先读取：
-
-```text
-{runtime_skill}
-```
-
-如果该文件不可读，再读取缓存副本：
-
-```text
-{cache_skill}
-```
-
-读取 runtime `SKILL.md` 后，按其中的完整 Review Validate Fix 流程执行。runtime
-内提到的相对 `scripts/`、`references/`、`setup/` 路径都以被读取的 runtime
-skill 目录为基准。不要修改这个 launcher；代码和文档改动只进入 plugin runtime 源码。
-"""
+def remove_legacy_codex_skill_dir(plugin_skill_dir: Path, preserve_local_config: bool) -> Path | None:
+    legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
+    if not legacy.exists() and not legacy.is_symlink():
+        return None
+    if preserve_local_config:
+        copy_legacy_config_if_safe(
+            legacy / "config" / "alternative-reviewer.json",
+            plugin_skill_dir / "config" / "alternative-reviewer.json",
+        )
+        copy_missing_tree(legacy / "state", plugin_skill_dir / "state")
+    if legacy.is_symlink() or legacy.is_file():
+        legacy.unlink()
+    else:
+        shutil.rmtree(legacy)
+    return legacy
 
 
 def plugin_version() -> str:
@@ -279,7 +266,7 @@ def update_marketplace(plugin_parent: Path) -> Path:
     return marketplace_path
 
 
-def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
+def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Path:
     cache_dir = (
         Path.home()
         / ".codex"
@@ -289,7 +276,16 @@ def sync_codex_plugin_cache(preserve_local_config: bool) -> Path:
         / SKILL_NAME
         / plugin_version()
     )
-    copy_tree(PLUGIN_SRC, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
+    copy_tree(plugin_src, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
+    if preserve_local_config:
+        copy_legacy_config_if_safe(
+            plugin_src / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+            cache_dir / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+        )
+        copy_missing_tree(
+            plugin_src / PLUGIN_SKILL_REL / "state",
+            cache_dir / PLUGIN_SKILL_REL / "state",
+        )
     return cache_dir
 
 
@@ -506,12 +502,13 @@ def main() -> int:
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         plugin_config = ensure_codex_plugin_enabled()
-        plugin_cache = sync_codex_plugin_cache(preserve)
-        standalone_skill = install_standalone_skill(dst / PLUGIN_SKILL_REL, preserve)
+        removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
+        plugin_cache = sync_codex_plugin_cache(dst, preserve)
         installed.append(f"plugin: {dst}")
         installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
-        installed.append(f"standalone CLI launcher compatibility entry: {standalone_skill}")
+        if removed_legacy_skill:
+            installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:
