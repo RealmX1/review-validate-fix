@@ -84,7 +84,7 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode cline-kanban
 ```
 
-该模式写入 `CODEX_RVF_FORK_MODE=cline-kanban`，也接受别名 `cline` / `kanban` / `ck`。Stop hook 不再后台运行隐藏 `codex exec`；它先生成 RVF run artifacts，并把当前 session-owned 的 dirty diff / untracked files 冻结为 `worktree-bootstrap.patch`、`worktree-bootstrap-files/`、`worktree-bootstrap.json`，然后通过官方 `kanban` CLI 创建并启动一张真实 Kanban task。task 在 Cline Kanban 创建的独立 git worktree 中运行，第一步会执行 bootstrap helper 重放这些改动，再读取 `review-env.sh` / `review-agent-context.md` 并执行完整 `$review-validate-fix`。
+该模式写入 `CODEX_RVF_FORK_MODE=cline-kanban`，也接受别名 `cline` / `kanban` / `ck`。Stop hook 不再后台运行隐藏 `codex exec`；它先生成 RVF run artifacts，并把当前 session-owned 的 dirty diff / untracked files 冻结为 `worktree-bootstrap.patch`、`worktree-bootstrap-files/`、`worktree-bootstrap.json`，然后通过官方 `kanban` CLI 创建并启动一张真实 Kanban task。task 在 Cline Kanban 创建的独立 git worktree 中运行，第一步会在 task worktree 内解析 repo root，source `$RVF_ARTIFACTS_DIR/review-env.sh`，把 `RVF_REPO` 覆盖为 task worktree root，再用 `$RVF_WORKTREE_BOOTSTRAP` 执行 bootstrap helper 重放这些改动。后续 prompt 继续用 `$RVF_REVIEW_PACKET`、`$RVF_SESSION_MANIFEST`、`$RVF_WORKTREE_BOOTSTRAP`、`$RVF_ARTIFACTS_DIR/handoff.md` 等变量，不重复展开 run artifacts 绝对路径，并执行完整 `$review-validate-fix`。
 
 默认 CLI 配置为：
 

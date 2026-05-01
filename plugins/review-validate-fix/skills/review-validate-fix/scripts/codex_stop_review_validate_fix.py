@@ -972,13 +972,9 @@ def cline_kanban_task_prompt(
     ledger: RunLedger,
     startup_prepare: dict[str, Any],
 ) -> str:
-    metadata = startup_prepare.get("metadata") if isinstance(startup_prepare.get("metadata"), dict) else {}
+    del startup_prepare
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
-    artifacts_dir = ledger.artifacts_dir
-    bootstrap = metadata.get("worktree_bootstrap") or "<unavailable>"
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
-    review_env = metadata.get("review_env_file") or artifacts_dir / "review-env.sh"
-    review_context = metadata.get("review_agent_context_file") or artifacts_dir / "review-agent-context.md"
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
     return (
         "$review-validate-fix\n\n"
@@ -989,10 +985,12 @@ def cline_kanban_task_prompt(
         f"RVF_PARENT_CWD: {cwd}\n"
         f"RVF_RUN_ID: {ledger.run_id}\n"
         f"RVF_RUN_DIR: {ledger.run_dir}\n"
-        f"RVF_ARTIFACTS_DIR: {artifacts_dir}\n"
+        "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts\n"
         f"RVF_PARENT_SESSION_ID: {parent_session_id}\n"
         f"RVF_PARENT_TRANSCRIPT_PATH: {transcript}\n"
-        f"RVF_ORIGINAL_FORK_PROMPT: {prompt_path}\n\n"
+        "RVF_REVIEW_ENV: $RVF_ARTIFACTS_DIR/review-env.sh\n"
+        "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
+        "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n\n"
         "Stop hook child-session metadata:\n"
         f"{SUPPRESS_STOP_HOOK_MARKER}\n"
         "当前 Cline Kanban task 结束时必须跳过 review-validate-fix Stop hook。\n\n"
@@ -1001,17 +999,22 @@ def cline_kanban_task_prompt(
         "不要回到父 worktree 运行 review/validate/fix。开始任何 review/validate/fix 前，必须先把父会话的 "
         "session-owned 未提交改动重放到当前 worktree：\n\n"
         "```sh\n"
-        f"python3 {shell_quote(str(apply_helper))} --metadata {shell_quote(str(bootstrap))} --repo .\n"
+        'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
+        f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
+        'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
+        '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
+        'export RVF_REPO="$RVF_TASK_REPO"\n'
+        f"python3 {shell_quote(str(apply_helper))} --metadata \"$RVF_WORKTREE_BOOTSTRAP\" --repo \"$RVF_REPO\"\n"
         "```\n\n"
-        "然后读取并复用已经冻结的 RVF artifacts：\n"
-        f"- review env: `{review_env}`\n"
-        f"- review agent context: `{review_context}`\n"
-        f"- review packet: `{metadata.get('review_packet') or '<unavailable>'}`\n"
-        f"- session manifest: `{metadata.get('session_manifest_file') or '<unavailable>'}`\n"
-        f"- worktree bootstrap: `{bootstrap}`\n\n"
+        "然后读取并复用已经冻结的 RVF artifacts；命令和说明中继续使用这些变量，不要重复展开 run artifacts 目录：\n"
+        "- review env: `$RVF_ARTIFACTS_DIR/review-env.sh`\n"
+        "- review agent context: `$RVF_ARTIFACTS_DIR/review-agent-context.md`\n"
+        "- review packet: `$RVF_REVIEW_PACKET`\n"
+        "- session manifest: `$RVF_SESSION_MANIFEST`\n"
+        "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
         "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 以 session manifest 和 review packet 为准。"
         "Handoff 默认开启时，必须持续维护 "
-        f"`{artifacts_dir / 'handoff.md'}`，最终回复第一行输出 "
+        "`$RVF_ARTIFACTS_DIR/handoff.md`，最终回复第一行输出 "
         "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。\n\n"
         "原始 fork prompt 如下，仅作兼容元数据：\n\n"
         "```text\n"

@@ -788,6 +788,19 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert f"RVF_PARENT_REPO: {repo}" in prompt_text
     assert f"RVF_PARENT_CWD: {repo}" in prompt_text
     assert f"RVF_TARGET_REPO: {repo}" not in prompt_text
+    assert "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts" in prompt_text
+    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
+    assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in prompt_text
+    assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
+    assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text
+    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' in prompt_text
+    assert "- review packet: `$RVF_REVIEW_PACKET`" in prompt_text
+    assert "- session manifest: `$RVF_SESSION_MANIFEST`" in prompt_text
+    assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
+    artifacts_dir = latest["artifacts_dir"]
+    assert f"{artifacts_dir}/review-packet.md" not in prompt_text
+    assert f"{artifacts_dir}/session-manifest.json" not in prompt_text
+    assert f"{artifacts_dir}/worktree-bootstrap.json" not in prompt_text
     assert create_argv[create_argv.index("--title") + 1].startswith("RVF repo ")
     assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
     assert calls[0]["suppress"] == "1"
