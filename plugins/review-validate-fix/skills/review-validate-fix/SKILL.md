@@ -65,7 +65,7 @@ Codex CLI 兼容入口：当前 CLI 会把带 `allow_implicit_invocation: false`
 - 如果环境变量 `CODEX_RVF_SUPPRESS=1` 或 `CODEX_RVF_SUPPRESS_STOP_HOOK=1`，必须直接跳过；该开关用于 research marathon 等主会话已接管调度的场景。
 - Stop hook matcher 当前不能按 repo 过滤，因此脚本必须先使用 `scripts/review_validate_fix_gate.sh` 做 dirty gate。
 - 如果当前 `cwd` 不在任何 git repo/worktree 内，Stop hook 不得扫描 `cwd` 的子目录、`~/.codex/config.toml` trusted projects 或其他候选 repo 来猜目标；必须 fail-safe 跳过，并通过 `systemMessage` 要求主会话询问用户提供目标 repo 路径。
-- fork prompt 必须包含目标仓库路径、`RVF_FORKED_REVIEW_VALIDATE_FIX`、父 thread/session id 和父 cwd，让新 fork 能在正确仓库执行并在结束时识别自身。
+- fork prompt 必须包含目标仓库路径、`RVF_FORKED_REVIEW_VALIDATE_FIX`、父 thread/session id、父 cwd，以及 `RVF_PARENT_CONVERSATION_NAME` / `RVF_PARENT_CONVERSATION_REF`、`RVF_PARENT_CONVERSATION_NAME_SOURCE`、`RVF_PARENT_CODEX_URL`、`RVF_PARENT_TRANSCRIPT_PATH`、`RVF_ORIGIN_METADATA` 等 origin metadata，让新 fork 能在正确仓库执行、在结束时识别自身，并在 handoff 中反查原始 Codex chat；legacy GUI fork 也不得把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。
 - 如果 Stop 事件提供 `transcript_path` / `session_path` / `conversation_path`，app-server fork 必须优先用该 rollout path 调用 `thread/fork`；Desktop 暴露的环境 thread id 可能不是可由外部 app-server 直接索引的 saved session id。
 - 新 fork 会话或手动 RVF 会话结束时，如果 Stop 事件的 `last_assistant_message` 或 transcript 末尾包含 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，hook 必须在 dev sync gate 和 dirty/fork gate 前把该 markdown 文件作为完成信号处理，默认自动打开它，并停止后续自动 fork。可用 `CODEX_RVF_OPEN_HANDOFF=0` 关闭自动打开；可用 `CODEX_RVF_IDE_OPEN_CMD` 指定 coding agent IDE 打开命令，未设置时使用系统默认打开方式。
 - app-server fork 会在 Stop 事件提供 `model` 时显式传入 model，并从 Stop 事件、`CODEX_RVF_FORK_REASONING_EFFORT` 或 `~/.codex/config.toml` 的 `model_reasoning_effort` 推出 reasoning effort 后在 `turn/start` 中传入。若父会话使用了 hook 不可见的临时 reasoning override，则无法完全保证继承。

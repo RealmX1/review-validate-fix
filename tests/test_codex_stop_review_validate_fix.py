@@ -492,6 +492,59 @@ def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp: 
     assert '"' not in origin["task_title"]
 
 
+def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp: Path) -> None:
+    module = load_hook_module()
+    state = tmp / "state"
+    transcript = tmp / "rollout-2026-05-01T11-25-17-parent-thread.jsonl"
+    write_user_session(transcript, "parent-thread", "please review the Stop hook change")
+
+    original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_lookup = module.parent_thread_name_from_app_server
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": "Original GUI Review",
+            "thread_found": True,
+            "source": "test",
+        }
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(tmp),
+            prompt=module.fork_review_validate_fix_prompt(
+                "parent-thread",
+                str(tmp),
+                str(tmp / "repo"),
+            ),
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=transcript,
+            launch_mode="dry-run",
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        if original_state_dir is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = original_state_dir
+
+    assert "reason=dry_run" in payload["systemMessage"]
+    latest = latest_summary(state)
+    prompt = prompt_text(latest)
+    origin_path = latest["parent_origin_path"]
+    assert "RVF_PARENT_CONVERSATION_REF: Original GUI Review" in prompt
+    assert "RVF_PARENT_CONVERSATION_NAME: Original GUI Review" in prompt
+    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: app_server_name" in prompt
+    assert "RVF_PARENT_CODEX_URL: codex://local/parent-thread" in prompt
+    assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript}" in prompt
+    assert f"RVF_ORIGIN_METADATA: {origin_path}" in prompt
+    assert "不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source" in prompt
+    requests = app_server_requests(latest)
+    turn_input = requests[1]["params"]["input"][0]
+    assert isinstance(turn_input, dict)
+    assert turn_input["text"] == prompt
+
+
 def test_parent_thread_name_from_app_server_reads_thread_name(tmp: Path) -> None:
     module = load_hook_module()
     socket_path = tmp / "app-server.sock"
@@ -3620,6 +3673,7 @@ def main() -> int:
         test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed,
         test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed,
         test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails,
+        test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
         test_diagnose_codex_fork_dry_run_writes_requests,
