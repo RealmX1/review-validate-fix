@@ -66,6 +66,15 @@ def load_rvf_logging_module():
     return module
 
 
+def load_cline_kanban_client_module():
+    spec = importlib.util.spec_from_file_location("rvf_cline_kanban_client", CLINE_KANBAN_CLIENT)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load cline_kanban_client module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def run(
     cmd: list[str],
     cwd: Path | None = None,
@@ -2158,6 +2167,98 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
 
 
 
+def test_cline_kanban_client_detects_runtime_port() -> None:
+    module = load_cline_kanban_client_module()
+    assert module.resolve_runtime_port(
+        start_cmd="npx -y kanban@0.1.66 --no-open",
+        task_cmd="npx -y kanban@0.1.66 task",
+        env={},
+    ) == 3484
+    assert module.resolve_runtime_port(
+        start_cmd="kanban --port 3499 --no-open",
+        task_cmd="kanban task",
+        env={},
+    ) == 3499
+    assert module.resolve_runtime_port(
+        start_cmd="kanban --port=3500 --no-open",
+        task_cmd="kanban --port=3500 task",
+        env={},
+    ) == 3500
+    assert module.resolve_runtime_port(task_cmd="env KANBAN_RUNTIME_PORT=3502 kanban task", env={}) == 3502
+    assert module.resolve_runtime_port(task_cmd="kanban task", env={"KANBAN_RUNTIME_PORT": "3501"}) == 3501
+
+
+def test_cline_kanban_client_rejects_ambiguous_runtime_ports() -> None:
+    module = load_cline_kanban_client_module()
+    for kwargs, expected in (
+        (
+            {
+                "start_cmd": "kanban --port auto --no-open",
+                "task_cmd": "kanban task",
+                "env": {},
+            },
+            "--port auto is not supported",
+        ),
+        (
+            {
+                "start_cmd": "kanban --port 3499 --no-open",
+                "task_cmd": "kanban --port 3500 task",
+                "env": {},
+            },
+            "conflicting Cline Kanban runtime ports",
+        ),
+    ):
+        try:
+            module.resolve_runtime_port(**kwargs)
+        except module.KanbanError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"expected KanbanError containing {expected!r}")
+
+
+def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json\n"
+        "print(json.dumps({'ok': True, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        try:
+            module.ensure_kanban(
+                task_cmd=f"{sys.executable} {fake_task}",
+                start_cmd="npx -y kanban@0.1.66 --no-open",
+                repo=repo,
+                tmux_session="unused",
+                timeout_seconds=0,
+                start_if_needed=False,
+            )
+        except module.KanbanError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected foreign Kanban listener to be rejected")
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+
+    assert "not started from expected repo" in message
+    assert str(repo) in message
+    assert str(other) in message
+
+
 def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     tmp.mkdir(parents=True, exist_ok=True)
     fake_task = tmp / "fake_kanban_task.py"
@@ -2165,7 +2266,10 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     fake_task.write_text(
         "import json, os, sys\n"
         "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "    handle.write(json.dumps({\n"
+        "        'argv': sys.argv[1:],\n"
+        "        'port': os.environ.get('KANBAN_RUNTIME_PORT'),\n"
+        "    }) + '\\n')\n"
         "if sys.argv[1] == 'list':\n"
         "    print(json.dumps({'ok': True, 'tasks': []}))\n"
         "elif sys.argv[1] == 'create':\n"
@@ -2182,9 +2286,22 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     )
     repo = init_repo(tmp / "repo")
     env = os.environ.copy()
+    env.pop("KANBAN_RUNTIME_PORT", None)
+    env["CODEX_RVF_CLINE_KANBAN_START_CMD"] = "kanban --port 45678"
     env["KANBAN_CALLS"] = str(calls)
     task_cmd = f"{sys.executable} {fake_task}"
-    ensure = run([sys.executable, str(CLINE_KANBAN_CLIENT), "ensure", "--repo", str(repo), "--task-cmd", task_cmd], env=env)
+    ensure = run(
+        [
+            sys.executable,
+            str(CLINE_KANBAN_CLIENT),
+            "ensure",
+            "--repo",
+            str(repo),
+            "--task-cmd",
+            task_cmd,
+        ],
+        env=env,
+    )
     assert json.loads(ensure.stdout)["started"] is False
     create = run([
         sys.executable,
@@ -2237,11 +2354,12 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     ], env=env)
     assert json.loads(message.stdout)["message_id"] == "msg-1"
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert [call[0] for call in recorded] == ["list", "create", "start", "message"]
-    create_call = recorded[1]
+    assert [entry["argv"][0] for entry in recorded] == ["list", "create", "start", "message"]
+    assert [entry["port"] for entry in recorded] == ["45678", "45678", "45678", "45678"]
+    create_call = recorded[1]["argv"]
     assert create_call[create_call.index("--title") + 1] == "RVF test"
     assert create_call[create_call.index("--agent-id") + 1] == "codex"
-    message_call = recorded[3]
+    message_call = recorded[3]["argv"]
     assert message_call[message_call.index("--task-id") + 1] == "task-1"
     assert message_call[message_call.index("--prompt-file") + 1] == str(prompt_file.resolve())
     assert message_call[message_call.index("--idempotency-key") + 1] == "run-1"
@@ -2543,6 +2661,9 @@ def main() -> int:
             root / "alternative-equals-text-config"
         )
         test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(root / "alternative-wrapper")
+        test_cline_kanban_client_detects_runtime_port()
+        test_cline_kanban_client_rejects_ambiguous_runtime_ports()
+        test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener")
         test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client")
         test_cline_kanban_client_message_accepts_response_without_task_id(root / "cline-kanban-message")
         test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap")
