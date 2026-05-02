@@ -165,6 +165,8 @@ def write_alternative_reviewer_config(
     activity_probe_failure_threshold: int | None = None,
     max_runtime_seconds: float | None = None,
     output_format: str | None = "text",
+    health_command: list[str] | None = None,
+    pre_run_health: bool | None = None,
 ) -> Path:
     payload = {
         "enabled": True,
@@ -185,6 +187,10 @@ def write_alternative_reviewer_config(
         payload["max_runtime_seconds"] = max_runtime_seconds
     if output_format is not None:
         payload["output_format"] = output_format
+    if health_command is not None:
+        payload["health_command"] = health_command
+    if pre_run_health is not None:
+        payload["pre_run_health"] = pre_run_health
     path.write_text(
         json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
@@ -1717,6 +1723,149 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
     )
 
     assert completed.stdout.strip() == "artifact written"
+
+
+def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    stale_run_dir = tmp / "stale-run"
+    stale_run_dir.mkdir()
+    token = tmp / "health-token"
+    order = tmp / "order.txt"
+    health_code = (
+        "from pathlib import Path; "
+        f"Path({str(token)!r}).write_text('ready', encoding='utf-8'); "
+        f"Path({str(order)!r}).write_text('health\\n', encoding='utf-8'); "
+        "print('HEALTH_OK')"
+    )
+    reviewer_code = (
+        "import os, subprocess, sys; "
+        "from pathlib import Path; "
+        "sys.stdin.read(); "
+        f"assert Path({str(token)!r}).read_text(encoding='utf-8') == 'ready'; "
+        f"Path({str(order)!r}).write_text(Path({str(order)!r}).read_text(encoding='utf-8') + 'reviewer\\n', encoding='utf-8'); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        "print('artifact written')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        health_command=[sys.executable, "-c", health_code],
+        pre_run_health=True,
+    )
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(stale_run_dir)
+    env["RVF_REVIEW_RESULT"] = str(stale_run_dir / "wrong" / "review-result.json")
+
+    completed = run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env=env,
+    )
+
+    assert completed.stdout.strip() == "artifact written"
+    assert order.read_text(encoding="utf-8") == "health\nreviewer\n"
+    assert not (stale_run_dir / "wrong" / "review-result.json").exists()
+
+
+def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    marker = tmp / "reviewer-ran"
+    reviewer_code = (
+        "from pathlib import Path; "
+        "import sys; "
+        "sys.stdin.read(); "
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        health_command=[sys.executable, "-c", "import sys; print('login failed'); sys.exit(7)"],
+        pre_run_health=True,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert "login failed" in completed.stderr
+    assert not marker.exists()
+
+
+def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    marker = tmp / "reviewer-ran"
+    reviewer_code = (
+        "from pathlib import Path; "
+        "import sys; "
+        "sys.stdin.read(); "
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        health_command=[sys.executable, "-c", "import time; time.sleep(2)"],
+        pre_run_health=True,
+    )
+    payload = json.loads(config.read_text(encoding="utf-8"))
+    payload["health_timeout_seconds"] = 0.1
+    config.write_text(json.dumps(payload), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert "health command timed out after" in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not marker.exists()
 
 
 def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path) -> None:
@@ -3430,6 +3579,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract",
             lambda: test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(
                 root / "alternative-session-alias"
+            ),
+        ),
+        (
+            "alternative_reviewer_pre_run_health_refreshes_before_reviewer",
+            lambda: test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(
+                root / "alternative-pre-run-health"
+            ),
+        ),
+        (
+            "alternative_reviewer_pre_run_health_failure_skips_reviewer",
+            lambda: test_alternative_reviewer_pre_run_health_failure_skips_reviewer(
+                root / "alternative-pre-run-health-failure"
+            ),
+        ),
+        (
+            "alternative_reviewer_pre_run_health_timeout_skips_reviewer",
+            lambda: test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(
+                root / "alternative-pre-run-health-timeout"
             ),
         ),
         (

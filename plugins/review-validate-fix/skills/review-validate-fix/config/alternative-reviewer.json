@@ -20,6 +20,7 @@
   "activity_probe_failure_threshold": 3,
   "max_runtime_seconds": null,
   "health_timeout_seconds": 30,
+  "pre_run_health": true,
   "output_format": "claude_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"

@@ -33,6 +33,20 @@ EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 SUPPORTED_OUTPUT_FORMATS = {OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_CLAUDE_STREAM_JSON}
+CHILD_RVF_ENV_KEYS = {
+    "RVF_RUN_DIR",
+    "RVF_ARTIFACTS_DIR",
+    "RVF_INPUTS_DIR",
+    "RVF_REPO",
+    "RVF_SCOPE_CONTRACT",
+    "RVF_SCOPE_OF_WORK",
+    "RVF_SESSION_CONTEXT",
+    "RVF_SESSION_MANIFEST",
+    "RVF_REVIEW_PACKET",
+    "RVF_REVIEW_PACKET_METADATA",
+    "RVF_REVIEW_RESULT",
+    "RVF_REVIEWER_ID",
+}
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -212,11 +226,6 @@ def write_child_artifact(
 
 
 def infer_scope_contract(review_packet: Path | None) -> Path | None:
-    env_value = os.environ.get("RVF_SCOPE_CONTRACT")
-    if env_value and env_value.strip():
-        candidate = Path(env_value).expanduser().resolve()
-        if candidate.exists():
-            return candidate
     if review_packet is not None:
         candidates = [
             review_packet.parent / "scope.contract.json",
@@ -226,6 +235,11 @@ def infer_scope_contract(review_packet: Path | None) -> Path | None:
         for candidate in candidates:
             if candidate.exists():
                 return candidate.resolve()
+    env_value = os.environ.get("RVF_SCOPE_CONTRACT")
+    if env_value and env_value.strip():
+        candidate = Path(env_value).expanduser().resolve()
+        if candidate.exists():
+            return candidate
     return None
 
 
@@ -294,6 +308,8 @@ def build_prompt(
 
 def scrub_env(env_unset: list[str]) -> dict[str, str]:
     env = os.environ.copy()
+    for name in CHILD_RVF_ENV_KEYS:
+        env.pop(name, None)
     for name in env_unset:
         env.pop(name, None)
     env["RVF_SKILL_DIR"] = str(SKILL_DIR)
@@ -323,18 +339,28 @@ def check_review_result_artifact(path: Path, scope_contract: Path | None) -> tup
     return payload, completed.stderr.strip()
 
 
-def run_health(command: list[str], env: dict[str, str], timeout: int) -> int:
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
+def run_health(
+    command: list[str],
+    env: dict[str, str],
+    timeout: int,
+    *,
+    emit_output: bool = True,
+) -> int:
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return fail(f"health command timed out after {timeout}s")
     if completed.returncode != 0:
         return fail(completed.stderr.strip() or completed.stdout.strip() or "health command failed")
-    print(completed.stdout.strip())
+    if emit_output:
+        print(completed.stdout.strip())
     return 0
 
 
@@ -890,6 +916,12 @@ def main() -> int:
             DEFAULT_MAX_RUNTIME_SECONDS,
         )
         health_timeout = int(positive_float(config, "health_timeout_seconds", 30.0))
+        health_command = optional_string_list(config, "health_command")
+        pre_run_health = config.get("pre_run_health", False)
+        if not isinstance(pre_run_health, bool):
+            raise ValueError("pre_run_health must be a boolean")
+        if pre_run_health and health_command is None:
+            raise ValueError("pre_run_health requires health_command")
         output_format = config.get("output_format")
         if output_format is None and is_claude_print_command(command):
             cli_output_format = claude_output_format_arg(command)
@@ -951,6 +983,8 @@ def main() -> int:
 
     env = scrub_env(env_unset)
     env.update(ledger.env())
+    env["RVF_RUN_DIR"] = str(ledger.run_dir)
+    env["RVF_ARTIFACTS_DIR"] = str(ledger.artifacts_dir)
 
     if args.check:
         ledger.event(
@@ -972,7 +1006,6 @@ def main() -> int:
 
     if args.preflight:
         print(f"OK {label} {command_path}")
-        health_command = config.get("health_command")
         if health_command is None:
             ledger.event(
                 phase="review",
@@ -992,7 +1025,7 @@ def main() -> int:
             )
             print("health command not configured")
             return 0
-        returncode = run_health(string_list(config, "health_command"), env, health_timeout)
+        returncode = run_health(health_command, env, health_timeout)
         ledger.event(
             phase="review",
             event="health_completed",
@@ -1011,7 +1044,8 @@ def main() -> int:
         return returncode
 
     if args.health:
-        health_command = string_list(config, "health_command")
+        if health_command is None:
+            return fail("health command not configured", 2)
         returncode = run_health(health_command, env, health_timeout)
         ledger.event(
             phase="review",
@@ -1107,6 +1141,30 @@ def main() -> int:
         )
         print(json.dumps(payload, ensure_ascii=False))
         return 0
+
+    if pre_run_health and health_command is not None:
+        returncode = run_health(health_command, env, health_timeout, emit_output=False)
+        ledger.event(
+            phase="review",
+            event="pre_run_health_completed",
+            status="completed" if returncode == 0 else "failed",
+            reason_code=(
+                "reviewer_pre_run_health_completed"
+                if returncode == 0
+                else "reviewer_pre_run_health_failed"
+            ),
+            command=health_command,
+            returncode=returncode,
+        )
+        if returncode != 0:
+            ledger.summary(
+                status="failed",
+                reason_code="reviewer_pre_run_health_failed",
+                message="alternative reviewer pre-run health command failed",
+                command=health_command,
+                returncode=returncode,
+            )
+            return returncode
 
     cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
     try:
