@@ -1575,11 +1575,17 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
     assert payload["review_env"]["CODEX_RVF_RUN_ID"] == payload["run_id"]
     assert payload["review_env"]["CODEX_RVF_RUN_DIR"] == payload["run_dir"]
+    assert payload["review_env"]["RVF_BACKEND"] == "manual"
+    assert payload["rvf_backend"] == "manual"
+    assert payload["rvf_state_phase"] == "prepare"
+    assert payload["rvf_scope_contract_path"] == payload["scope_contract"]
+    assert payload["rvf_review_packet_path"] == payload["review_packet"]
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
     assert 'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"' in review_env_text
     assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in review_env_text
+    assert "export RVF_BACKEND=manual" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
     assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
@@ -3394,6 +3400,31 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
     assert later["cline_kanban_base_ref"] == "HEAD"
     assert later["worktree_bootstrap_path"] == "/tmp/bootstrap.json"
 
+
+def test_run_ledger_summary_preserves_rvf_state_fields(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    run_dir = tmp / "run"
+    ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+    ledger.summary(
+        status="cline-kanban-started",
+        reason_code="cline_kanban_task_started",
+        **module.rvf_state_fields(
+            phase="prepare",
+            backend="kanban-task",
+            backend_raw="cline-kanban",
+            scope_contract_path="/tmp/scope.contract.json",
+            review_packet_path="/tmp/review-packet.md",
+        ),
+    )
+    later = ledger.summary(status="completed", reason_code="prepare_completed", message="later phase")
+    assert later["rvf_backend"] == "kanban-task"
+    assert later["rvf_backend_raw"] == "cline-kanban"
+    assert later["rvf_state_phase"] == "prepare"
+    assert later["rvf_scope_contract_path"] == "/tmp/scope.contract.json"
+    assert later["rvf_review_packet_path"] == "/tmp/review-packet.md"
+    assert later["rvf_state"]["phases"] == list(module.RVF_STATE_PHASES)
+
+
 def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp: Path) -> None:
     run_dir = tmp / "state" / "runs" / "rvf-user-cancel"
     run_dir.mkdir(parents=True)
@@ -3749,6 +3780,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "run_ledger_summary_preserves_cline_kanban_fields",
             lambda: test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline"),
+        ),
+        (
+            "run_ledger_summary_preserves_rvf_state_fields",
+            lambda: test_run_ledger_summary_preserves_rvf_state_fields(root / "summary-preserve-rvf-state"),
         ),
         (
             "cancel_rvf_run_marks_cancelled_and_trashes_cline_task",

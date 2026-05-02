@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, log_root, start_run
+from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from session_manifest import build_manifest
 from cline_kanban_client import (
@@ -156,6 +156,29 @@ def skip_payload(
         "continue": True,
         "systemMessage": f"review-validate-fix Stop hook 未创建 fork：{reason}",
     }
+
+
+def stop_hook_rvf_state_fields(
+    *,
+    phase: str,
+    backend: str | None = None,
+    backend_raw: str | None = None,
+    prepare_metadata: dict[str, Any] | None = None,
+    handoff_path: str | Path | None = None,
+    completion_gate: str | None = None,
+) -> dict[str, Any]:
+    metadata = prepare_metadata or {}
+    return rvf_state_fields(
+        phase=phase,
+        backend=backend,
+        backend_raw=backend_raw,
+        scope_contract_path=metadata.get("scope_contract"),
+        scope_of_work_path=metadata.get("scope_of_work_file"),
+        review_packet_path=metadata.get("review_packet"),
+        session_manifest_path=metadata.get("session_manifest_file"),
+        handoff_path=handoff_path,
+        completion_gate=completion_gate,
+    )
 
 
 def state_dir() -> Path:
@@ -1445,6 +1468,11 @@ def provider_health_guard_decision(
         backend=decision.backend,
         paths={"provider_health": health_path} if health_path else {},
         providers=[result.get("provider") for result in results],
+        **stop_hook_rvf_state_fields(
+            phase="prepare",
+            backend=decision.backend,
+            backend_raw=decision.backend,
+        ),
     )
     if not failed:
         return None
@@ -1466,6 +1494,11 @@ def provider_health_guard_decision(
         provider_health=results,
         login_attempt=login_attempt,
         gate_status=(decision.summary_fields or {}).get("gate_status"),
+        **stop_hook_rvf_state_fields(
+            phase="prepare",
+            backend=decision.backend,
+            backend_raw=decision.backend,
+        ),
     )
 
 
@@ -1553,6 +1586,8 @@ def freeze_cline_kanban_startup_artifacts(
         ledger.run_id,
         "--rvf-run-dir",
         str(ledger.run_dir),
+        "--rvf-backend",
+        "kanban-task",
     ]
     if parent_thread_path is not None:
         command.extend(["--transcript", str(parent_thread_path)])
@@ -1600,6 +1635,12 @@ def freeze_cline_kanban_startup_artifacts(
             "review_env": metadata.get("review_env_file"),
             "review_agent_context": metadata.get("review_agent_context_file"),
         },
+        **stop_hook_rvf_state_fields(
+            phase="prepare",
+            backend="kanban-task",
+            backend_raw="cline-kanban",
+            prepare_metadata=metadata,
+        ),
     )
     return {"metadata_path": metadata_path, "metadata": metadata}
 
@@ -1887,6 +1928,12 @@ def start_cline_kanban_task(
         "worktree_bootstrap_path": metadata.get("worktree_bootstrap"),
         "worktree_bootstrap_patch_path": metadata.get("worktree_bootstrap_patch"),
         "worktree_bootstrap_files_dir": metadata.get("worktree_bootstrap_files_dir"),
+        **stop_hook_rvf_state_fields(
+            phase="prepare",
+            backend="kanban-task",
+            backend_raw="cline-kanban",
+            prepare_metadata=metadata,
+        ),
     }
 
 
@@ -2323,8 +2370,26 @@ def run_codex_fork(
 
     summary_fields = dict(result)
     summary_fields.pop("status", None)
+    result_state_fields = {
+        key: value
+        for key, value in summary_fields.items()
+        if key == "rvf_state" or key.startswith("rvf_")
+    }
     if extra_summary:
         summary_fields.update(extra_summary)
+    if result_state_fields.get("rvf_state"):
+        summary_fields.update(result_state_fields)
+    if "rvf_state" not in summary_fields:
+        backend_raw = str(summary_fields.get("backend") or result.get("mode") or mode)
+        canonical_backend = normalize_rvf_backend(backend_raw)
+        if canonical_backend is not None:
+            summary_fields.update(
+                stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend=canonical_backend,
+                    backend_raw=backend_raw,
+                )
+            )
     return ledger.hook_payload(
         status=str(status),
         reason_code=reason_code,
@@ -3571,6 +3636,11 @@ def launch_backend(
                 repo=decision.repo,
                 cwd=cwd,
                 backend=decision.backend,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                ),
             )
         attempt_id = current_kanban_attempt_id(event)
         project_path = current_kanban_project_path(event, decision.repo)
@@ -3591,6 +3661,11 @@ def launch_backend(
             mode="kanban-followup",
             cline_kanban_task_id=task_id,
             cline_kanban_attempt_id=attempt_id,
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend="kanban-followup",
+                backend_raw=decision.backend,
+            ),
         )
         try:
             message_payload = start_cline_kanban_followup_message(
@@ -3613,6 +3688,11 @@ def launch_backend(
                 cline_kanban_task_id=task_id,
                 cline_kanban_attempt_id=attempt_id,
                 error=error,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                ),
             )
             return ledger.hook_payload(
                 status="kanban-followup-unavailable",
@@ -3625,6 +3705,11 @@ def launch_backend(
                 cline_kanban_attempt_id=attempt_id,
                 cline_kanban_project_path=project_path,
                 error=error,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                ),
             )
 
         raw_status = str(message_payload.get("status") or "").strip().lower()
@@ -3656,6 +3741,11 @@ def launch_backend(
             cline_kanban_message_id=message_payload.get("message_id"),
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend="kanban-followup",
+                backend_raw=decision.backend,
+            ),
         )
         return ledger.hook_payload(
             status=status,
@@ -3673,7 +3763,16 @@ def launch_backend(
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             kanban_followup_payload=message_payload,
-            **(decision.summary_fields or {}),
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend="kanban-followup",
+                backend_raw=decision.backend,
+            ),
+            **{
+                key: value
+                for key, value in (decision.summary_fields or {}).items()
+                if key != "rvf_state" and not key.startswith("rvf_")
+            },
         )
     if not decision.parent_thread_id:
         return skip_payload(
@@ -3683,6 +3782,11 @@ def launch_backend(
             repo=decision.repo,
             cwd=decision.cwd,
             backend=decision.backend,
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend=decision.backend,
+                backend_raw=decision.backend,
+            ),
         )
 
     prompt = fork_review_validate_fix_prompt(decision.parent_thread_id, cwd, decision.repo)
@@ -3853,6 +3957,12 @@ def manual_rvf_session_marker_payload(
         manual_rvf_repo=marker.get("manual_rvf_repo"),
         manual_rvf_dirty_hash=marker.get("manual_rvf_dirty_hash"),
         manual_rvf_marker_path=marker.get("state_path"),
+        **stop_hook_rvf_state_fields(
+            phase="complete",
+            backend="manual",
+            backend_raw="manual",
+            completion_gate="manual_rvf_already_ran",
+        ),
     )
 
 
@@ -4108,6 +4218,12 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             "kanban_followup_trigger_turn",
             cwd=cwd,
             backend="kanban-followup",
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_trigger_turn",
+            ),
         )
 
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
@@ -4231,6 +4347,11 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     "legacy_gui_fallback_role": "backup-of-backup"
                     if backend_selection_mode == "auto"
                     else None,
+                    **stop_hook_rvf_state_fields(
+                        phase="prepare",
+                        backend=backend,
+                        backend_raw=backend,
+                    ),
                 },
                 status="started",
             )

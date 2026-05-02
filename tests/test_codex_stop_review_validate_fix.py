@@ -1616,6 +1616,20 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert "reason=cline_kanban_task_started" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-started"
+    assert latest["rvf_backend"] == "kanban-task"
+    assert latest["rvf_backend_raw"] == "cline-kanban"
+    assert latest["rvf_state_phase"] == "prepare"
+    assert latest["rvf_scope_contract_path"].endswith("artifacts/inputs/scope.contract.json")
+    assert latest["rvf_review_packet_path"].endswith("artifacts/review-packet.md")
+    assert latest["rvf_state"]["phases"] == [
+        "prepare",
+        "review",
+        "merge",
+        "validate_fix",
+        "verify",
+        "handoff",
+        "complete",
+    ]
     assert latest["cline_kanban_task_id"] == "task-123"
     assert "app_server_requests_path" not in latest
     assert Path(latest["startup_prepare_metadata_path"]).exists()
@@ -1953,6 +1967,8 @@ def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
     latest = latest_summary(state)
     assert latest["status"] == "kanban-followup-enqueued"
     assert latest["backend"] == "kanban-followup"
+    assert latest["rvf_backend"] == "kanban-followup"
+    assert latest["rvf_state_phase"] == "prepare"
     assert latest["cline_kanban_task_id"] == "task-77"
     assert latest["cline_kanban_attempt_id"] == "attempt-9"
     assert latest["cline_kanban_message_id"] == "msg-77"
@@ -3076,6 +3092,8 @@ def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
     assert "review-validate-fix: manual-prepared; reason=manual_prepared;" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "manual-prepared"
+    assert latest["rvf_backend"] == "manual"
+    assert latest["rvf_state_phase"] == "prepare"
     assert Path(latest["prompt_path"]).exists()
 
 
@@ -3298,6 +3316,9 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> Non
     assert "reason=handoff_file_ready" in payload["systemMessage"]
     summary = summary_from_payload(payload)
     assert summary["handoff_path"] == str(handoff.resolve())
+    assert summary["rvf_state_phase"] == "complete"
+    assert summary["rvf_completion_gate"] == "handoff_file_ready"
+    assert summary["rvf_handoff_path"] == str(handoff.resolve())
     assert summary["handoff_open_result"]["opened"] is True
     assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
 

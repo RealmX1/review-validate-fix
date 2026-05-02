@@ -57,6 +57,47 @@ PRESERVED_SUMMARY_KEYS = {
     "dev_sync_steps",
     "contract_check_timing",
     "contract_check_timing_report_path",
+    "rvf_state",
+    "rvf_backend",
+    "rvf_backend_raw",
+    "rvf_state_phase",
+    "rvf_state_phase_index",
+    "rvf_state_phases",
+    "rvf_scope_contract_path",
+    "rvf_scope_of_work_path",
+    "rvf_review_packet_path",
+    "rvf_session_manifest_path",
+    "rvf_handoff_path",
+    "rvf_completion_gate",
+}
+RVF_STATE_PHASES = (
+    "prepare",
+    "review",
+    "merge",
+    "validate_fix",
+    "verify",
+    "handoff",
+    "complete",
+)
+RVF_STATE_BACKENDS = {
+    "manual",
+    "kanban-followup",
+    "kanban-task",
+}
+RVF_STATE_BACKEND_ALIASES = {
+    "manual": "manual",
+    "prepare": "manual",
+    "prepared": "manual",
+    "log-only": "manual",
+    "manual-prepared": "manual",
+    "kanban-followup": "kanban-followup",
+    "kanban-message": "kanban-followup",
+    "kanban-inject": "kanban-followup",
+    "cline-kanban": "kanban-task",
+    "cline": "kanban-task",
+    "kanban": "kanban-task",
+    "ck": "kanban-task",
+    "kanban-task": "kanban-task",
 }
 PHASES = {
     "dev-sync",
@@ -64,9 +105,13 @@ PHASES = {
     "fork",
     "prepare",
     "review",
+    "merge",
     "provider-health",
     "validate",
+    "validate_fix",
+    "verify",
     "handoff",
+    "complete",
     "cleanup",
 }
 
@@ -82,6 +127,72 @@ def compact_timestamp() -> str:
 def safe_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
     return token.strip("-")[:80] or "rvf"
+
+
+def normalize_rvf_backend(value: str | None) -> str | None:
+    if value is None:
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    return RVF_STATE_BACKEND_ALIASES.get(raw)
+
+
+def rvf_phase_index(phase: str) -> int | None:
+    try:
+        return RVF_STATE_PHASES.index(phase)
+    except ValueError:
+        return None
+
+
+def rvf_state_fields(
+    *,
+    phase: str,
+    backend: str | None = None,
+    backend_raw: str | None = None,
+    scope_contract_path: str | Path | None = None,
+    scope_of_work_path: str | Path | None = None,
+    review_packet_path: str | Path | None = None,
+    session_manifest_path: str | Path | None = None,
+    handoff_path: str | Path | None = None,
+    completion_gate: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    canonical_backend = normalize_rvf_backend(backend) or normalize_rvf_backend(backend_raw)
+    artifact_paths = {
+        "scope_contract": str(scope_contract_path) if scope_contract_path is not None else None,
+        "scope_of_work": str(scope_of_work_path) if scope_of_work_path is not None else None,
+        "review_packet": str(review_packet_path) if review_packet_path is not None else None,
+        "session_manifest": str(session_manifest_path) if session_manifest_path is not None else None,
+        "handoff": str(handoff_path) if handoff_path is not None else None,
+    }
+    payload: dict[str, Any] = {
+        "phase": phase,
+        "phase_index": rvf_phase_index(phase),
+        "phases": list(RVF_STATE_PHASES),
+        "backend": canonical_backend,
+        "backend_raw": backend_raw or backend,
+        "artifact_paths": artifact_paths,
+        "completion_gate": completion_gate,
+    }
+    if extra:
+        payload["extra"] = extra
+
+    fields: dict[str, Any] = {
+        "rvf_state": payload,
+        "rvf_backend": canonical_backend,
+        "rvf_backend_raw": backend_raw or backend,
+        "rvf_state_phase": phase,
+        "rvf_state_phase_index": payload["phase_index"],
+        "rvf_state_phases": list(RVF_STATE_PHASES),
+        "rvf_scope_contract_path": artifact_paths["scope_contract"],
+        "rvf_scope_of_work_path": artifact_paths["scope_of_work"],
+        "rvf_review_packet_path": artifact_paths["review_packet"],
+        "rvf_session_manifest_path": artifact_paths["session_manifest"],
+        "rvf_handoff_path": artifact_paths["handoff"],
+        "rvf_completion_gate": completion_gate,
+    }
+    return fields
 
 
 def new_run_id(component: str) -> str:
