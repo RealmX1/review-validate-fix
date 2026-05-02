@@ -1,6 +1,6 @@
 # Reviewer Standards
 
-本文件是 `pass_type: review_only` 子代理使用的标准。它补充 `references/review-prompt.md`，但不改变 reviewer 完成态输出契约。
+本文件是 `pass_type: review_only` 子代理使用的标准。它补充 `references/review-prompt.md`，但不改变 reviewer result artifact 契约。
 
 ## 审查目标
 
@@ -30,13 +30,13 @@
 - 复杂度相关判断读取 `simplification-subset.md`。
 - 安全相关判断读取 `security-subset.md`。
 - 性能相关判断读取 `performance-subset.md`。
-- 如果 prompt 未提供所需 subset，可输出 `RVF_STANDARD_REQUEST ...`。
+- 如果 prompt 未提供所需 subset，可用 `$RVF_WRITE_REVIEW_RESULT standard-request --out "$RVF_REVIEW_RESULT" ...` 写 request artifact。
 
-## 输出契约
+## Artifact 契约
 
 完成态只能是：
 
-- 精确 `NO_ISSUES`。
-- 编号 issue list，每条以 `路径:行号` 开始。
+- `kind: no_issues`。
+- `kind: issues`，每条含 `path`、`line`、`message`。
 
-非完成态只能是 `protocol-extensions.md` 中的 request contract。request 不得和完成态混写。
+非完成态只能是 `protocol-extensions.md` 中的 `kind: request` artifact。request 不得和完成态混写。最终自然语言 message 只作为日志，不是机器可读 review 状态。

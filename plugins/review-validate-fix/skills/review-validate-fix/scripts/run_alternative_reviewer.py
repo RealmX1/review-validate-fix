@@ -21,6 +21,8 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = SKILL_DIR / "config" / "alternative-reviewer.json"
 DEFAULT_PROMPT = SKILL_DIR / "references" / "review-prompt.md"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
+WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
+CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
 DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
 DEFAULT_ACTIVITY_PROBE_TIMEOUT_SECONDS = 10.0
@@ -233,6 +235,7 @@ def build_prompt(
     review_packet: Path | None,
     repo: Path | None,
     scope_contract: Path | None = None,
+    result_path: Path | None = None,
 ) -> str:
     parts = []
     env_lines = [
@@ -266,8 +269,17 @@ def build_prompt(
         env_lines.extend(
             [
                 "- `RVF_COMMAND_LOCK`: repo-scoped command lock wrapper.",
+                "- `RVF_WRITE_REVIEW_RESULT`: script for writing the canonical review result artifact.",
+                "- `RVF_CHECK_REVIEW_RESULT`: script for validating the canonical artifact before final response.",
                 '- Example: `python3 "$RVF_COMMAND_LOCK" --repo "$RVF_REPO" --name <stable-lock-name> -- <command ...>`',
-                "- If a potentially conflicting command needs coordination and no lock is available, output `RVF_LOCK_REQUEST name=<stable-lock-name> command=<command> reason=<why>` as the only response so the main agent can provide a locked retry.",
+                '- Result example: `python3 "$RVF_WRITE_REVIEW_RESULT" no-issues --out "$RVF_REVIEW_RESULT"`',
+            ]
+        )
+    if result_path is not None:
+        env_lines.extend(
+            [
+                "- `RVF_REVIEW_RESULT`: canonical reviewer result artifact. This protocol output is under the RVF run directory and is not a repo source edit.",
+                '- Validate before your final message with: `python3 "$RVF_CHECK_REVIEW_RESULT" "$RVF_REVIEW_RESULT"`',
             ]
         )
     if session_context is not None:
@@ -286,7 +298,29 @@ def scrub_env(env_unset: list[str]) -> dict[str, str]:
         env.pop(name, None)
     env["RVF_SKILL_DIR"] = str(SKILL_DIR)
     env["RVF_COMMAND_LOCK"] = str(COMMAND_LOCK)
+    env["RVF_WRITE_REVIEW_RESULT"] = str(WRITE_REVIEW_RESULT)
+    env["RVF_CHECK_REVIEW_RESULT"] = str(CHECK_REVIEW_RESULT)
     return env
+
+
+def check_review_result_artifact(path: Path, scope_contract: Path | None) -> tuple[dict[str, Any], str]:
+    command = [sys.executable, str(CHECK_REVIEW_RESULT), str(path), "--json"]
+    if scope_contract is not None:
+        command.extend(["--scope-contract", str(scope_contract)])
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    stdout = completed.stdout.strip()
+    try:
+        payload = json.loads(stdout) if stdout else {}
+    except json.JSONDecodeError:
+        payload = {
+            "valid": False,
+            "kind": "invalid",
+            "issue_count": 0,
+            "request_count": 0,
+            "request_types": [],
+            "errors": [stdout or completed.stderr.strip() or "check_review_result.py returned invalid output"],
+        }
+    return payload, completed.stderr.strip()
 
 
 def run_health(command: list[str], env: dict[str, str], timeout: int) -> int:
@@ -1001,6 +1035,9 @@ def main() -> int:
     session_context = Path(args.session_context).expanduser().resolve() if args.session_context else None
     review_packet = Path(args.review_packet).expanduser().resolve() if args.review_packet else None
     scope_contract = Path(args.scope_contract).expanduser().resolve() if args.scope_contract else None
+    reviewer_id = reviewer_id_from_label(label)
+    reviewer_dir = ledger.artifacts_dir / "reviewers" / reviewer_id
+    review_result_path = reviewer_dir / "review-result.json"
 
     try:
         if repo is None and review_packet is None:
@@ -1015,7 +1052,7 @@ def main() -> int:
             scope_contract = infer_scope_contract(review_packet)
         if scope_contract is not None and not scope_contract.exists():
             raise ValueError(f"scope contract file not found: {scope_contract}")
-        prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract)
+        prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract, review_result_path)
     except Exception as exc:
         ledger.event(
             phase="review",
@@ -1040,6 +1077,8 @@ def main() -> int:
         env["RVF_REVIEW_PACKET"] = str(review_packet)
     if scope_contract is not None:
         env["RVF_SCOPE_CONTRACT"] = str(scope_contract)
+    env["RVF_REVIEWER_ID"] = reviewer_id
+    env["RVF_REVIEW_RESULT"] = str(review_result_path)
 
     if args.dry_run:
         cwd = str(repo) if repo is not None and allow_repo_cwd else str(review_packet.parent if review_packet is not None else SKILL_DIR)
@@ -1050,6 +1089,7 @@ def main() -> int:
             "prompt_chars": len(prompt),
             "activity_probe_configured": activity_probe_command is not None,
             "scope_contract": str(scope_contract) if scope_contract is not None else None,
+            "review_result": str(review_result_path),
         }
         ledger.event(
             phase="review",
@@ -1069,8 +1109,6 @@ def main() -> int:
         return 0
 
     cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
-    reviewer_id = reviewer_id_from_label(label)
-    reviewer_dir = ledger.artifacts_dir / "reviewers" / reviewer_id
     try:
         prompt_path = write_child_artifact(reviewer_dir, "reviewer.prompt.txt", prompt, unique=True)
     except OSError as exc:
@@ -1129,6 +1167,28 @@ def main() -> int:
     normalized_path = write_child_artifact(reviewer_dir, "reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
     stdout_path = write_child_artifact(reviewer_dir, "reviewer.stdout.txt", raw_stdout, unique=True)
     stderr_path = write_child_artifact(reviewer_dir, "reviewer.stderr.txt", raw_stderr, unique=True)
+    review_result_summary: dict[str, Any] | None = None
+    review_result_check_stderr = ""
+    review_result_summary_path: str | None = None
+    if completed.returncode == 0:
+        review_result_summary, review_result_check_stderr = check_review_result_artifact(
+            review_result_path,
+            scope_contract,
+        )
+        review_result_summary_path = write_child_artifact(
+            reviewer_dir,
+            "review-result.summary.json",
+            review_result_summary,
+            unique=True,
+        )
+        if not review_result_summary.get("valid"):
+            completed.returncode = 1
+            errors = review_result_summary.get("errors")
+            error_text = "; ".join(str(item) for item in errors) if isinstance(errors, list) else "invalid review result artifact"
+            stderr = f"{stderr}\n{error_text}".strip()
+    review_result_kind = review_result_summary.get("kind") if review_result_summary else None
+    review_result_complete = review_result_kind in {"no_issues", "issues"}
+    review_request_pending = review_result_kind == "request"
     probe_history_path = write_child_artifact(
         reviewer_dir,
         "reviewer.activity_probe_history.json",
@@ -1153,8 +1213,13 @@ def main() -> int:
                 "stdout": stdout_path,
                 "stderr": stderr_path,
                 "normalized": normalized_path,
+                "review_result": str(review_result_path),
+                "review_result_summary": review_result_summary_path,
                 "activity_probe_history": probe_history_path,
             },
+            "review_result_summary": review_result_summary,
+            "review_result_complete": review_result_complete,
+            "review_request_pending": review_request_pending,
         },
         unique=True,
     )
@@ -1169,6 +1234,8 @@ def main() -> int:
         "stdout": stdout_path,
         "stderr": stderr_path,
         "normalized": normalized_path,
+        "review_result": str(review_result_path),
+        "review_result_summary": review_result_summary_path,
         "activity_probe_history": probe_history_path,
         "reviewer_summary": reviewer_summary_path,
         "reviewer_dir": str(reviewer_dir),
@@ -1178,13 +1245,28 @@ def main() -> int:
     }
     status = "completed" if completed.returncode == 0 else "failed"
     reason_code = "reviewer_completed"
+    event_name = "completed"
+    message = "alternative reviewer completed"
     if timed_out:
         reason_code = "reviewer_timeout"
+        event_name = "failed"
+        message = "alternative reviewer failed"
+    elif review_result_summary is not None and not review_result_summary.get("valid"):
+        reason_code = "reviewer_result_invalid"
+        event_name = "failed"
+        message = "alternative reviewer failed"
+    elif review_request_pending:
+        status = "pending"
+        reason_code = "reviewer_request_pending"
+        event_name = "request_pending"
+        message = "alternative reviewer recorded a request"
     elif completed.returncode != 0:
         reason_code = "reviewer_failed"
+        event_name = "failed"
+        message = "alternative reviewer failed"
     ledger.event(
         phase="review",
-        event="completed" if completed.returncode == 0 else "failed",
+        event=event_name,
         status=status,
         reason_code=reason_code,
         repo=str(repo) if repo is not None else None,
@@ -1198,6 +1280,11 @@ def main() -> int:
         terminated_signal_number=completed.terminated_signal,
         timed_out=timed_out,
         timeout_reason=completed.timeout_reason,
+        review_result_valid=bool(review_result_summary and review_result_summary.get("valid")),
+        review_result_kind=review_result_kind,
+        review_result_complete=review_result_complete,
+        review_request_pending=review_request_pending,
+        review_result_check_stderr=review_result_check_stderr,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_failure_threshold=activity_probe_failure_threshold,
         activity_probe_history=completed.probe_history,
@@ -1207,7 +1294,7 @@ def main() -> int:
     ledger.summary(
         status=status,
         reason_code=reason_code,
-        message="alternative reviewer completed" if completed.returncode == 0 else "alternative reviewer failed",
+        message=message,
         repo=str(repo) if repo is not None else None,
         cwd=str(cwd),
         paths={key: value for key, value in paths.items() if value},
@@ -1219,6 +1306,12 @@ def main() -> int:
         terminated_signal_number=completed.terminated_signal,
         timed_out=timed_out,
         timeout_reason=completed.timeout_reason,
+        review_result_valid=bool(review_result_summary and review_result_summary.get("valid")),
+        review_result_kind=review_result_kind,
+        review_result_complete=review_result_complete,
+        review_request_pending=review_request_pending,
+        review_result_summary=review_result_summary,
+        review_result_check_stderr=review_result_check_stderr,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_command=activity_probe_command,
         activity_probe_timeout_seconds=activity_probe_timeout,
