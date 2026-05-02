@@ -1471,12 +1471,14 @@ def provider_health_guard_decision(
 
 # Cline Kanban 在 task session 的 hook 环境中自动设置 KANBAN_TASK_ID 和
 # KANBAN_WORKSPACE_ID；这是 kanban-followup 判断“当前 Stop hook 位于 Kanban task
-# 内”的原生信号。ATTEMPT/PROJECT_PATH 不是公开文档确认的自动变量，这里只作为
-# host 定制字段或 Stop event 扩展字段兼容读取。
+# 内”的原生信号。早期 Kanban task 只设置 KANBAN_HOOK_TASK_ID，重启 runtime 后
+# 这些旧 session 仍可能触发 Stop hook，因此保留 legacy hook env alias。ATTEMPT/
+# PROJECT_PATH 不是公开文档确认的自动变量，这里只作为 host 定制字段或 Stop event
+# 扩展字段兼容读取。
 def current_kanban_task_id(event: dict[str, Any]) -> str | None:
     return event_or_env_text(
         event,
-        ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID"),
+        ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID"),
         ("kanban_task_id", "kanbanTaskId", "task_id", "taskId"),
     )
 
@@ -2125,7 +2127,7 @@ def run_codex_fork(
         if (
             extra_summary
             and extra_summary.get("backend_selection_mode") == "auto"
-            and result.get("status") in {"cline-kanban-unavailable", "cline-kanban-unconfigured"}
+            and cline_kanban_failure_allows_legacy_gui_fallback(result)
             and legacy_gui_fallback_enabled()
         ):
             cline_failure = {
@@ -3497,6 +3499,17 @@ def fork_mode_selection_from_env(mode_env_name: str = "CODEX_RVF_FORK_MODE") -> 
 
 def legacy_gui_fallback_enabled() -> bool:
     return not is_falsey(os.environ.get("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK", "1"))
+
+
+def cline_kanban_failure_allows_legacy_gui_fallback(result: dict[str, Any]) -> bool:
+    if result.get("status") not in {"cline-kanban-unavailable", "cline-kanban-unconfigured"}:
+        return False
+    error = str(result.get("error") or "")
+    blocking_fragments = (
+        "listener was not started from expected repo",
+        "Stop the stale Kanban/tmux session",
+    )
+    return not any(fragment in error for fragment in blocking_fragments)
 
 
 def launch_mode_for_backend(backend: str) -> str:

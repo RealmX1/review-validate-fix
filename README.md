@@ -105,7 +105,7 @@ python3 scripts/install_to_codex.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的稳定 dispatcher，并由 dispatcher 在必要检查和安装后转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败，或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的稳定 dispatcher，并由 dispatcher 在必要检查和安装后转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 来自错误 repo），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
 
 如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Cline Kanban 模式：
 
@@ -213,7 +213,7 @@ flowchart TD
     DryRun --> Result
 ```
 
-这张图里的关键边界是：dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 Cline Kanban task、Cline Kanban follow-up、legacy GUI fallback、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认 `auto` 成功路径会在普通 Codex GUI session 中创建新的 Cline Kanban task，在 Kanban task session 中注入 follow-up user message；只有自动模式下 Kanban task 启动失败时才进入 legacy GUI fallback。失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
+这张图里的关键边界是：dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 Cline Kanban task、Cline Kanban follow-up、legacy GUI fallback、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认 `auto` 成功路径会在普通 Codex GUI session 中创建新的 Cline Kanban task，在 Kanban task session 中注入 follow-up user message；只有自动模式下 Kanban task 启动失败且不是 stale listener / wrong repo 这类可诊断 Kanban 管理面错误时才进入 legacy GUI fallback。失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
 
 fork 诊断不再通过 Stop hook 主路径里的 `RVF_FORK_EXPERIMENT` 自动触发；需要排查 app-server fork 行为时，手动运行 plugin runtime 的 `scripts/diagnose_codex_fork.py --mode dry-run|gui|manual`，并把 Stop event JSON 通过 stdin 传入。
 
@@ -260,7 +260,7 @@ python3 scripts/install_to_codex.py --replace-setup-config
 
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
 
-Stop hook 的默认 `CODEX_RVF_FORK_MODE=auto` 会按运行上下文选择 backend：当前 Stop event/环境提供 Kanban task id 时使用 `kanban-followup`，否则创建新的 Cline Kanban task。Codex GUI/app-server fork 只是 legacy backup-of-backup；显式 `CODEX_RVF_FORK_MODE=gui` 或自动模式下 Cline Kanban task 启动失败时才会使用。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Kanban 和 legacy GUI fallback 都不可用时，fork 模式只报告失败。
+Stop hook 的默认 `CODEX_RVF_FORK_MODE=auto` 会按运行上下文选择 backend：当前 Stop event/环境提供 Kanban task id（`KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id`）时使用 `kanban-followup`，否则创建新的 Cline Kanban task。Codex GUI/app-server fork 只是 legacy backup-of-backup；显式 `CODEX_RVF_FORK_MODE=gui` 或自动模式下 Cline Kanban task 启动失败且失败不属于可诊断 Kanban 管理面错误时才会使用。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Kanban 和 legacy GUI fallback 都不可用时，fork 模式只报告失败。
 
 显式 `CODEX_RVF_FORK_MODE=cline-kanban` 时，fork 模式不调用 Codex GUI fork；hook 会用官方 `kanban` CLI 创建并启动一张真实 Cline Kanban task。父 worktree 保持原样，session-owned dirty changes 会先冻结为 bootstrap artifact，再由 task 在 Kanban 独立 worktree 中重放。Kanban 服务不可用、task 创建/启动失败、bootstrap artifact 无法安全生成或重放时直接 fail-safe，不启动隐藏 runner。
 

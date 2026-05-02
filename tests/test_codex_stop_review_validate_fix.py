@@ -253,6 +253,7 @@ def test_normalize_backend_from_env(tmp: Path) -> None:
             "CODEX_RVF_FORK_MODE",
             "KANBAN_TASK_ID",
             "CLINE_KANBAN_TASK_ID",
+            "KANBAN_HOOK_TASK_ID",
         )
     }
     cases = [
@@ -263,6 +264,7 @@ def test_normalize_backend_from_env(tmp: Path) -> None:
         ({"CODEX_RVF_FORK_MODE": "auto"}, {}, "kanban"),
         ({"CODEX_RVF_FORK_MODE": "auto"}, {"task_id": "task-1"}, "kanban-followup"),
         ({"CODEX_RVF_FORK_MODE": "auto", "KANBAN_TASK_ID": "task-2"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": "auto", "KANBAN_HOOK_TASK_ID": "task-legacy"}, {}, "kanban-followup"),
         ({"CODEX_RVF_FORK_MODE": "manual"}, {}, "manual"),
         ({"CODEX_RVF_FORK_MODE": "prepare"}, {}, "manual"),
         ({"CODEX_RVF_FORK_MODE": "dry-run"}, {}, "dry-run"),
@@ -1808,6 +1810,78 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp: Path) -> None:
     assert latest["legacy_gui_fallback"]["primary_backend"] == "cline-kanban"
     assert latest["legacy_gui_fallback"]["fallback_backend"] == "gui"
     assert latest["legacy_gui_fallback"]["primary_failure"]["status"] == "cline-kanban-unavailable"
+
+
+def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "repo")
+    state = tmp / "state"
+    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
+    fake_client = tmp / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import sys\n"
+        "print('cline-kanban error: KanbanError: Kanban CLI reached a server on "
+        "127.0.0.1:3484, but that listener was not started from expected repo "
+        f"{repo}. Listener(s): pid=123 cwd=/tmp/other command=kanban. Stop the stale "
+        f"Kanban/tmux session or restart it from {repo} before creating RVF tasks.', file=sys.stderr)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    original_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    original_client = os.environ.get("CODEX_RVF_CLINE_KANBAN_CLIENT")
+    original_task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD")
+    original_lookup = module.parent_thread_name_from_app_server
+    original_gui = module.run_app_server_fork
+    gui_calls: list[dict[str, object]] = []
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "auto"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        module.run_app_server_fork = lambda **kwargs: gui_calls.append(kwargs) or {
+            "status": "app-server-started",
+            "fork_thread_id": "unexpected-gui-fork",
+        }
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=transcript,
+            launch_mode="cline-kanban",
+            extra_summary={"backend_selection_mode": "auto", "backend": "kanban"},
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        module.run_app_server_fork = original_gui
+        for key, value in {
+            "CODEX_RVF_STATE_DIR": original_state,
+            "CODEX_RVF_FORK_MODE": original_mode,
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": original_client,
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": original_task_cmd,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
+    assert gui_calls == []
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-unavailable"
+    assert latest["backend"] == "kanban"
+    assert "listener was not started from expected repo" in str(latest["error"])
+    assert "legacy_gui_fallback" not in latest
 
 
 def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp: Path) -> None:
@@ -3708,6 +3782,7 @@ def main() -> int:
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
         test_auto_mode_creates_cline_kanban_task_by_default,
         test_auto_mode_uses_legacy_gui_as_backup_of_backup,
+        test_auto_mode_reports_stale_kanban_listener_without_gui_fallback,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
