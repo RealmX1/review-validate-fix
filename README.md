@@ -1,6 +1,6 @@
 # Review Validate Fix
 
-这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 `review-validate-fix@local-codex-plugins`，并清理旧的 `~/.codex/skills/review-validate-fix` 目录，避免 Codex GUI/CLI 出现两个同名 skill。
+这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 `rvf@local-codex-plugins`，并清理旧的 `~/.codex/skills/review-validate-fix` 目录及旧同名 plugin enablement/cache，避免 Codex GUI/CLI 出现两个同名入口。
 
 ## 当前结论
 
@@ -97,7 +97,7 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py
 ```
 
-安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry，在 `~/.codex/config.toml` 写入 `[plugins."review-validate-fix@local-codex-plugins"] enabled = true`，并删除旧 `~/.codex/skills/review-validate-fix` 目录。删除前会尽量把旧目录里的本机 `config/alternative-reviewer.json` 与 `state/` 迁到 installed plugin skill，避免保留第二个同名 skill 造成 GUI picker 重复。
+安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry `rvf`，在 `~/.codex/config.toml` 写入 `[plugins."rvf@local-codex-plugins"] enabled = true`，并删除旧 `~/.codex/skills/review-validate-fix` 目录、旧 `[plugins."review-validate-fix@local-codex-plugins"]` enablement 和旧 plugin cache。plugin id 与 skill 名刻意不同：`$review-validate-fix` 应只作为 skill mention 出现，避免 Codex CLI 同时展示同名 `[Plugin]` 与 `[Skill]` 候选。删除前会尽量把旧目录里的本机 `config/alternative-reviewer.json` 与 `state/` 迁到 installed plugin skill，避免保留第二个同名 skill 造成 GUI picker 重复。
 
 配置 Codex Stop hook：
 

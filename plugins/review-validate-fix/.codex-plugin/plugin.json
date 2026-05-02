@@ -1,5 +1,5 @@
 {
-  "name": "review-validate-fix",
+  "name": "rvf",
   "version": "0.1.0",
   "description": "Run a post-work double-review, validate/fix, and handoff loop for Codex workspaces.",
   "author": {
@@ -20,7 +20,7 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "Review Validate Fix",
+    "displayName": "RVF Plugin Bundle",
     "shortDescription": "Double-review, validate, fix, and hand off changes",
     "longDescription": "Adds the review-validate-fix Codex skill as a plugin-packaged workflow for post-work review loops, issue validation, minimal fixes, and handoff generation.",
     "developerName": "Bomin Zhang",

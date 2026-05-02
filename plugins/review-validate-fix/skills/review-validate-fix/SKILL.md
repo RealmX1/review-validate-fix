@@ -11,7 +11,7 @@ description: Use when the user asks for a post-work code review loop, review val
 
 例外：如果用户已经配置本 skill 附带的 Codex Stop hook，该 hook 可以在明确的 dirty repo 停止点创建新的 Cline Kanban task，或在 Cline Kanban 当前 task 中通过 host 定制的真实 follow-up user message 启动 review loop。Codex GUI/app-server `thread/fork` + `turn/start` 只保留为 legacy backup-of-backup，不是默认路径。这属于用户预配置脚本生成的显式 prompt 边界，不是模型隐式启用 skill，也不改变 `allow_implicit_invocation: false` 的约束。
 
-Codex CLI / GUI 入口：安装器会在 `~/.codex/config.toml` 启用 `review-validate-fix@local-codex-plugins`，并删除旧 `~/.codex/skills/review-validate-fix` 目录，避免同一个 workflow 在 GUI skill picker 中出现两次。当前 CLI 的 slash 菜单与 GUI skill picker 行为并不完全一致；不要为了补 CLI 的 `/review-validate-fix` 直达项而重新生成同名本机 skill。
+Codex CLI / GUI 入口：安装器会在 `~/.codex/config.toml` 启用 `rvf@local-codex-plugins`，并删除旧 `~/.codex/skills/review-validate-fix` 目录，避免同一个 workflow 在 GUI skill picker 中出现两次。plugin package id 有意使用 `rvf`，真正的手动入口仍是 skill 名 `review-validate-fix`；这样 Codex CLI 的 `$review-validate-fix` mention popup 只命中 skill，不再同时出现同名 `[Plugin]` 与 `[Skill]` 候选。不要为了补 CLI 的 `/review-validate-fix` 直达项而重新生成同名本机 skill。
 
 ## 入口判断
 

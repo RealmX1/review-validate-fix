@@ -11,9 +11,12 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_SRC = ROOT / "plugins" / "review-validate-fix"
+PLUGIN_DIR_NAME = "review-validate-fix"
+PLUGIN_NAME = "rvf"
+PLUGIN_SRC = ROOT / "plugins" / PLUGIN_DIR_NAME
 PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
+DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
 PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
 
 PRESERVE_IN_PLUGIN = {
@@ -165,17 +168,51 @@ def plugin_version() -> str:
 def marketplace_name() -> str:
     marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
     if not marketplace_path.exists():
-        return "local-codex-plugins"
+        return DEFAULT_MARKETPLACE_NAME
     try:
         data = json.loads(marketplace_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return "local-codex-plugins"
+        return DEFAULT_MARKETPLACE_NAME
     name = data.get("name")
-    return name if isinstance(name, str) and name.strip() else "local-codex-plugins"
+    return name if isinstance(name, str) and name.strip() else DEFAULT_MARKETPLACE_NAME
 
 
 def plugin_config_id() -> str:
-    return f"{SKILL_NAME}@{marketplace_name()}"
+    return f"{PLUGIN_NAME}@{marketplace_name()}"
+
+
+def legacy_plugin_config_ids() -> set[str]:
+    return {
+        f"{SKILL_NAME}@{DEFAULT_MARKETPLACE_NAME}",
+        f"{SKILL_NAME}@{marketplace_name()}",
+    }
+
+
+def remove_plugin_sections(lines: list[str], plugin_ids: set[str]) -> list[str]:
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        stripped = lines[index].strip()
+        matched = False
+        for plugin_id in plugin_ids:
+            if stripped == f'[plugins."{plugin_id}"]':
+                matched = True
+                index += 1
+                while index < len(lines):
+                    next_stripped = lines[index].strip()
+                    if next_stripped.startswith("[") and next_stripped.endswith("]"):
+                        break
+                    index += 1
+                break
+        if matched:
+            while output and not output[-1].strip():
+                output.pop()
+            if index < len(lines) and output and output[-1].strip():
+                output.append("\n")
+            continue
+        output.append(lines[index])
+        index += 1
+    return output
 
 
 def ensure_codex_plugin_enabled() -> Path:
@@ -186,6 +223,7 @@ def ensure_codex_plugin_enabled() -> Path:
     lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True) if config_path.exists() else []
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
+    lines = remove_plugin_sections(lines, legacy_plugin_config_ids())
 
     start: int | None = None
     for index, line in enumerate(lines):
@@ -236,10 +274,10 @@ def update_marketplace(plugin_parent: Path) -> Path:
     data.setdefault("interface", {}).setdefault("displayName", "Local Codex Plugins")
     plugins = data.setdefault("plugins", [])
     entry = {
-        "name": SKILL_NAME,
+        "name": PLUGIN_NAME,
         "source": {
             "source": "local",
-            "path": f"./plugins/{SKILL_NAME}",
+            "path": f"./plugins/{PLUGIN_DIR_NAME}",
         },
         "policy": {
             "installation": "AVAILABLE",
@@ -247,12 +285,19 @@ def update_marketplace(plugin_parent: Path) -> Path:
         },
         "category": "Coding",
     }
-    for idx, plugin in enumerate(plugins):
-        if plugin.get("name") == SKILL_NAME:
-            plugins[idx] = entry
-            break
-    else:
-        plugins.append(entry)
+    source_path = entry["source"]["path"]
+    plugins[:] = [
+        plugin
+        for plugin in plugins
+        if not (
+            plugin.get("name") in {PLUGIN_NAME, SKILL_NAME}
+            or (
+                isinstance(plugin.get("source"), dict)
+                and plugin["source"].get("path") == source_path
+            )
+        )
+    ]
+    plugins.append(entry)
 
     marketplace_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -273,7 +318,7 @@ def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Pa
         / "plugins"
         / "cache"
         / marketplace_name()
-        / SKILL_NAME
+        / PLUGIN_NAME
         / plugin_version()
     )
     copy_tree(plugin_src, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
@@ -287,6 +332,17 @@ def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Pa
             cache_dir / PLUGIN_SKILL_REL / "state",
         )
     return cache_dir
+
+
+def remove_legacy_plugin_cache() -> Path | None:
+    legacy_cache = Path.home() / ".codex" / "plugins" / "cache" / marketplace_name() / SKILL_NAME
+    if not legacy_cache.exists() and not legacy_cache.is_symlink():
+        return None
+    if legacy_cache.is_symlink() or legacy_cache.is_file():
+        legacy_cache.unlink()
+    else:
+        shutil.rmtree(legacy_cache)
+    return legacy_cache
 
 
 def normalize_fork_mode(value: str) -> str:
@@ -410,7 +466,7 @@ def main() -> int:
     parser.add_argument(
         "--plugin-parent",
         default=str(Path.home() / "plugins"),
-        help="plugin 父目录；默认符合 ~/.agents/plugins/marketplace.json 的 ./plugins/<name> 约定。",
+        help="plugin 父目录；默认安装到 ~/plugins/review-validate-fix 并由 marketplace entry rvf 指向。",
     )
     parser.add_argument(
         "--replace-setup-config",
@@ -498,17 +554,20 @@ def main() -> int:
 
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
-        dst = parent / SKILL_NAME
+        dst = parent / PLUGIN_DIR_NAME
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         plugin_config = ensure_codex_plugin_enabled()
         removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
+        removed_legacy_plugin_cache = remove_legacy_plugin_cache()
         installed.append(f"plugin: {dst}")
         installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
         if removed_legacy_skill:
             installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
+        if removed_legacy_plugin_cache:
+            installed.append(f"removed legacy Codex plugin cache: {removed_legacy_plugin_cache}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:
