@@ -114,6 +114,8 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     matching = rvf_hooks(data)
     assert len(matching) == 1
     command = matching[0]["command"]
+    assert "codex_stop_hook_router.py" in command
+    assert "CODEX_RVF_STABLE_STOP_HOOK=" in command
     assert "codex_stop_hook_dispatcher.py" in command
     assert "/plugins/review-validate-fix/skills/review-validate-fix/" in command
     assert "CODEX_RVF_FORK_MODE=auto" in command
@@ -176,7 +178,7 @@ def test_configure_stop_hook_can_write_kanban_followup_mode(tmp_path: Path) -> N
         module.configure_stop_hook(
             tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
             "kanban-message",
-            cline_kanban_task_cmd="npx -y kanban@0.1.66 task",
+            cline_kanban_task_cmd="kanban --port 4567 task",
         )
 
     with_fake_home(module, tmp_path, run_test)
@@ -196,8 +198,8 @@ def test_configure_stop_hook_can_write_cline_kanban_connection_env(tmp_path: Pat
         module.configure_stop_hook(
             tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
             "cline-kanban",
-            cline_kanban_start_cmd="npx -y kanban@0.1.66 --no-open",
-            cline_kanban_task_cmd="npx -y kanban@0.1.66 task",
+            cline_kanban_start_cmd="kanban --port 4567 --no-open",
+            cline_kanban_task_cmd="kanban --port 4567 task",
             cline_kanban_start_timeout="120",
             cline_kanban_tmux_session="rvf-test-kanban",
         )
@@ -210,7 +212,7 @@ def test_configure_stop_hook_can_write_cline_kanban_connection_env(tmp_path: Pat
     command = matching[0]["command"]
     assert "CODEX_RVF_FORK_MODE=cline-kanban" in command
     assert "CODEX_RVF_CLINE_KANBAN_START_CMD=" in command
-    assert "kanban@0.1.66" in command
+    assert "kanban --port 4567 --no-open" in command
     assert "CODEX_RVF_CLINE_KANBAN_TASK_CMD=" in command
     assert "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT=120" in command
     assert "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION=rvf-test-kanban" in command
@@ -322,8 +324,8 @@ def test_main_persists_cline_connection_env(tmp_path: Path) -> None:
         home,
         lambda: with_env(
             {
-                "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
-                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+                "CODEX_RVF_CLINE_KANBAN_START_CMD": "kanban --port 4567 --no-open",
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "kanban --port 4567 task",
             },
             run_main,
         ),
@@ -335,6 +337,48 @@ def test_main_persists_cline_connection_env(tmp_path: Path) -> None:
     assert "CODEX_RVF_FORK_MODE=cline-kanban" in matching[0]["command"]
     assert "CODEX_RVF_CLINE_KANBAN_START_CMD=" in matching[0]["command"]
     assert "CODEX_RVF_CLINE_KANBAN_TASK_CMD=" in matching[0]["command"]
+
+
+def test_main_drops_legacy_npx_kanban_defaults_from_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "cline-kanban",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env(
+            {
+                "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+            },
+            run_main,
+        ),
+    )
+
+    data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_hooks(data)
+    assert len(matching) == 1
+    command = matching[0]["command"]
+    assert "CODEX_RVF_FORK_MODE=cline-kanban" in command
+    assert "CODEX_RVF_CLINE_KANBAN_START_CMD=" not in command
+    assert "CODEX_RVF_CLINE_KANBAN_TASK_CMD=" not in command
 
 
 def test_main_persists_cline_review_options(tmp_path: Path) -> None:
@@ -754,9 +798,10 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
+    assert str(plugin_skill / "scripts" / "codex_stop_hook_router.py") in matching[0]["command"]
     assert str(plugin_skill / "scripts" / "codex_stop_hook_dispatcher.py") in matching[0]["command"]
     assert "CODEX_RVF_FORK_MODE=auto" in matching[0]["command"]
-    assert matching[0]["statusMessage"] == "Review-Validate-Fix：同步插件并运行停止检查"
+    assert matching[0]["statusMessage"] == "Review-Validate-Fix：选择通道并运行停止检查"
     codex_config = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
     assert '[plugins."rvf@local-codex-plugins"]' in codex_config
     assert "enabled = true" in codex_config
@@ -773,6 +818,7 @@ def main() -> int:
         test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd,
         test_main_persists_handoff_open_env,
         test_main_persists_cline_connection_env,
+        test_main_drops_legacy_npx_kanban_defaults_from_env,
         test_main_persists_cline_review_options,
         test_copy_tree_preserves_nested_plugin_setup,
         test_copy_tree_excludes_dev_only_paths,

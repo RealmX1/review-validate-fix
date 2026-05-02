@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_KANBAN_VERSION = "0.1.66"
-DEFAULT_START_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} --no-open"
-DEFAULT_TASK_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} task"
+DEFAULT_KANBAN_VERSION = "0.1.67"
+DEFAULT_START_CMD = "kanban --no-open"
+DEFAULT_TASK_CMD = "kanban task"
 DEFAULT_START_TIMEOUT_SECONDS = 90.0
 DEFAULT_TMUX_SESSION = "rvf-cline-kanban"
 DEFAULT_RUNTIME_PORT = 3484
@@ -143,14 +143,22 @@ def run_command(
     check: bool = True,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=dict(env) if env is not None else None,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dict(env) if env is not None else None,
+        )
+    except FileNotFoundError as exc:
+        raise KanbanError(
+            f"Cline Kanban command not found: {command[0]!r}. Install or upgrade a stable "
+            f"`kanban` binary with `npm install -g kanban@{DEFAULT_KANBAN_VERSION}`, "
+            "or set CODEX_RVF_CLINE_KANBAN_TASK_CMD/CODEX_RVF_CLINE_KANBAN_START_CMD "
+            "to a stable local binary. RVF does not use npx for its default Kanban path."
+        ) from exc
     if check and completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"{command[0]} failed"
         raise KanbanError(detail)

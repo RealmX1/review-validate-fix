@@ -18,6 +18,10 @@ PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
 DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
 PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
+LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
+    "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
+    "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+}
 
 PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
@@ -58,6 +62,15 @@ def contains_preserved(path: Path, preserved: set[Path]) -> bool:
         if path == item or path in item.parents:
             return True
     return False
+
+
+def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if LEGACY_DEFAULT_CLINE_KANBAN_ENV.get(name) == text:
+        return None
+    return text
 
 
 def remove_unpreserved(dst: Path, preserved: set[Path], base: Path = Path()) -> None:
@@ -378,10 +391,14 @@ def configure_stop_hook(
 
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
-    dispatcher = plugin_skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
+    router = plugin_skill_dir / "scripts" / "codex_stop_hook_router.py"
+    stable_dispatcher = plugin_skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
+    dev_dispatcher = ROOT / "plugins" / PLUGIN_DIR_NAME / PLUGIN_SKILL_REL / "scripts" / "codex_stop_hook_dispatcher.py"
     env_parts = [
         "CODEX_RVF_MODE=fork",
         f"CODEX_RVF_FORK_MODE={shlex.quote(fork_mode)}",
+        f"CODEX_RVF_STABLE_STOP_HOOK={shlex.quote(str(stable_dispatcher))}",
+        f"CODEX_RVF_DEV_STOP_HOOK={shlex.quote(str(dev_dispatcher))}",
     ]
     if not open_handoff:
         env_parts.append("CODEX_RVF_OPEN_HANDOFF=0")
@@ -407,7 +424,7 @@ def configure_stop_hook(
             "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
             "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
             f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
-            f"python3 {shlex.quote(str(dispatcher))}",
+            f"python3 {shlex.quote(str(router))}",
         ]
     )
     command = " ".join(env_parts)
@@ -415,7 +432,7 @@ def configure_stop_hook(
         "type": "command",
         "command": command,
         "timeout": 300,
-        "statusMessage": "Review-Validate-Fix：同步插件并运行停止检查",
+        "statusMessage": "Review-Validate-Fix：选择通道并运行停止检查",
     }
 
     target_group: dict[str, object] | None = None
@@ -438,6 +455,7 @@ def configure_stop_hook(
                 and (
                     "codex_stop_review_validate_fix.py" in command_value
                     or "codex_stop_hook_dispatcher.py" in command_value
+                    or "codex_stop_hook_router.py" in command_value
                 )
             )
             if is_rvf_hook:
@@ -476,7 +494,7 @@ def main() -> int:
     parser.add_argument(
         "--configure-stop-hook",
         action="store_true",
-        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 dispatcher 同步本 repo，再调用 plugin skill。",
+        help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 router 选择 stable/dev channel，再调用对应 dispatcher。",
     )
     parser.add_argument(
         "--fork-mode",
@@ -499,12 +517,12 @@ def main() -> int:
     parser.add_argument(
         "--cline-kanban-start-cmd",
         default=None,
-        help="持久写入 CODEX_RVF_CLINE_KANBAN_START_CMD；默认 npx -y kanban@0.1.66 --no-open。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_START_CMD；默认 kanban --no-open。",
     )
     parser.add_argument(
         "--cline-kanban-task-cmd",
         default=None,
-        help="持久写入 CODEX_RVF_CLINE_KANBAN_TASK_CMD；默认 npx -y kanban@0.1.66 task。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_TASK_CMD；默认 kanban task。",
     )
     parser.add_argument(
         "--cline-kanban-start-timeout",
@@ -574,8 +592,16 @@ def main() -> int:
             hooks_path = configure_stop_hook(
                 dst / PLUGIN_SKILL_REL,
                 args.fork_mode,
-                args.cline_kanban_start_cmd or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD"),
-                args.cline_kanban_task_cmd or os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD"),
+                args.cline_kanban_start_cmd
+                or legacy_default_cline_kanban_env_value(
+                    "CODEX_RVF_CLINE_KANBAN_START_CMD",
+                    os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD"),
+                ),
+                args.cline_kanban_task_cmd
+                or legacy_default_cline_kanban_env_value(
+                    "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+                    os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD"),
+                ),
                 args.cline_kanban_start_timeout or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT"),
                 args.cline_kanban_tmux_session or os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION"),
                 args.cline_kanban_base_ref or os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"),

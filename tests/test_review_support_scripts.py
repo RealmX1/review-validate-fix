@@ -3157,9 +3157,11 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
 
 def test_cline_kanban_client_detects_runtime_port() -> None:
     module = load_cline_kanban_client_module()
+    assert module.DEFAULT_START_CMD == "kanban --no-open"
+    assert module.DEFAULT_TASK_CMD == "kanban task"
     assert module.resolve_runtime_port(
-        start_cmd="npx -y kanban@0.1.66 --no-open",
-        task_cmd="npx -y kanban@0.1.66 task",
+        start_cmd=module.DEFAULT_START_CMD,
+        task_cmd=module.DEFAULT_TASK_CMD,
         env={},
     ) == 3484
     assert module.resolve_runtime_port(
@@ -3204,6 +3206,19 @@ def test_cline_kanban_client_rejects_ambiguous_runtime_ports() -> None:
             raise AssertionError(f"expected KanbanError containing {expected!r}")
 
 
+def test_cline_kanban_client_reports_missing_stable_binary() -> None:
+    module = load_cline_kanban_client_module()
+    try:
+        module.run_command(["rvf-missing-kanban-command-for-test"], check=False)
+    except module.KanbanError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected missing kanban command to raise KanbanError")
+    assert "Cline Kanban command not found" in message
+    assert "npm install -g kanban@0.1.67" in message
+    assert "does not use npx" in message
+
+
 def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     module = load_cline_kanban_client_module()
     repo = tmp / "repo"
@@ -3227,7 +3242,7 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
         try:
             module.ensure_kanban(
                 task_cmd=f"{sys.executable} {fake_task}",
-                start_cmd="npx -y kanban@0.1.66 --no-open",
+                start_cmd="kanban --no-open",
                 repo=repo,
                 tmux_session="unused",
                 timeout_seconds=0,
@@ -3948,6 +3963,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "cline_kanban_client_rejects_ambiguous_runtime_ports",
             lambda: test_cline_kanban_client_rejects_ambiguous_runtime_ports(),
+        ),
+        (
+            "cline_kanban_client_reports_missing_stable_binary",
+            test_cline_kanban_client_reports_missing_stable_binary,
         ),
         (
             "cline_kanban_client_rejects_foreign_listener",
