@@ -32,6 +32,7 @@
 | Stop hook stdout | 保持只输出 Codex hook payload JSON | 诊断信息只能进 `systemMessage` 摘要或 run ledger；dispatcher 失败也不走非零 stderr |
 | dispatcher dev sync | 已接入同一 run ledger，失败时输出 hook payload 并给 summary path | 不允许把 stale installed plugin 的继续执行作为 fallback，也不要让 stderr 变成当前会话 continuation |
 | Stop hook suppress | 已接入最小 run ledger，用户可见 `systemMessage` 保留 summary path | suppress 仍必须早于 handoff、dirty gate 和 backend launch；只记录 stop event、suppressed/skipped 事件和 summary |
+| Stop hook UI trace | 可选 `CODEX_RVF_STOP_HOOK_UI_TRACE=summary|full` | trace 只追加到最终 `systemMessage`，不向 stdout 写第二段日志；完整事实源仍是 `events.jsonl` |
 | prepare/reviewer | 已支持 `--rvf-run-id` 和 `--rvf-run-dir` | manual run 和 external reviewer 必须可通过 run ledger 排障 |
 | 日志失败 | helper 返回 `log_unavailable` diagnostics，hook payload 仍可用 | 不得让日志目录不可写破坏 Stop hook 协议 |
 
@@ -252,8 +253,9 @@ state/
 3. dispatcher、Stop hook、fork、prepare run、reviewer 的事件共享同一 `run_id` 或可解释的 parent/child run 关系。
 4. prompt、review packet、stdout、stderr、snapshot 不出现在事件主字段，只出现在 artifacts。
 5. 日志目录不可写时，hook 返回仍可用，并包含 `log_unavailable`。
-6. `scripts/check_plugin_contracts.py`、`scripts/check_skill_contracts.sh` 和 pytest 全部通过。
-7. 没有新增长期 backward compatibility 分支；如有临时兼容工作，已按项目规则清理并记录。
+6. 可选 UI trace 只根据当前 run 的 `events.jsonl` 生成，且不破坏 hook stdout 纯 JSON payload。
+7. `scripts/check_plugin_contracts.py`、`scripts/check_skill_contracts.sh` 和 pytest 全部通过。
+8. 没有新增长期 backward compatibility 分支；如有临时兼容工作，已按项目规则清理并记录。
 
 ## 不做的事
 

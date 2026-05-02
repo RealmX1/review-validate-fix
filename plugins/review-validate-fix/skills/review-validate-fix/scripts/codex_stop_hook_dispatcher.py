@@ -469,6 +469,18 @@ def installer_args_from_env() -> list[str]:
     ).strip()
     if ide_open_cmd:
         args.extend(["--ide-open-cmd", ide_open_cmd])
+    stop_hook_ui_trace = (
+        hook_env.get("CODEX_RVF_STOP_HOOK_UI_TRACE")
+        or os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE", "")
+    ).strip()
+    if stop_hook_ui_trace:
+        args.extend(["--stop-hook-ui-trace", stop_hook_ui_trace])
+    stop_hook_ui_trace_max_events = (
+        hook_env.get("CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS")
+        or os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS", "")
+    ).strip()
+    if stop_hook_ui_trace_max_events:
+        args.extend(["--stop-hook-ui-trace-max-events", stop_hook_ui_trace_max_events])
     if not fork_mode:
         return args
     if fork_mode in {"cline", "kanban", "ck"}:

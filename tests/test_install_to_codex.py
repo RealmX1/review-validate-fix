@@ -258,6 +258,25 @@ def test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd(tmp_path
     assert "CODEX_RVF_IDE_OPEN_CMD='code -r'" in command
 
 
+def test_configure_stop_hook_can_write_stop_hook_ui_trace(tmp_path: Path) -> None:
+    module = load_installer_module()
+
+    def run_test() -> None:
+        module.configure_stop_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
+            stop_hook_ui_trace="full",
+            stop_hook_ui_trace_max_events="12",
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    command = rvf_hooks(
+        json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    )[0]["command"]
+    assert "CODEX_RVF_STOP_HOOK_UI_TRACE=full" in command
+    assert "CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS=12" in command
+
+
 def test_main_persists_handoff_open_env(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
@@ -377,6 +396,44 @@ def test_main_persists_cline_review_options(tmp_path: Path) -> None:
     assert "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED=1" in command
     assert "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE=commit" in command
     assert "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE=1" in command
+
+
+def test_main_persists_stop_hook_ui_trace_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env(
+            {
+                "CODEX_RVF_STOP_HOOK_UI_TRACE": "summary",
+                "CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS": "20",
+            },
+            run_main,
+        ),
+    )
+
+    command = rvf_hooks(
+        json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    )[0]["command"]
+    assert "CODEX_RVF_STOP_HOOK_UI_TRACE=summary" in command
+    assert "CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS=20" in command
 
 
 def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
@@ -657,9 +714,11 @@ def main() -> int:
         test_configure_stop_hook_can_write_cline_kanban_connection_env,
         test_configure_stop_hook_can_write_cline_kanban_review_options,
         test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd,
+        test_configure_stop_hook_can_write_stop_hook_ui_trace,
         test_main_persists_handoff_open_env,
         test_main_persists_cline_connection_env,
         test_main_persists_cline_review_options,
+        test_main_persists_stop_hook_ui_trace_env,
         test_copy_tree_preserves_nested_plugin_setup,
         test_copy_tree_excludes_dev_only_paths,
         test_ensure_codex_plugin_enabled_updates_user_config,

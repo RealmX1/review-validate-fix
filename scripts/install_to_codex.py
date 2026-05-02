@@ -311,6 +311,8 @@ def configure_stop_hook(
     cline_kanban_start_in_plan_mode: str | None = None,
     open_handoff: bool = True,
     ide_open_cmd: str | None = None,
+    stop_hook_ui_trace: str | None = None,
+    stop_hook_ui_trace_max_events: str | None = None,
 ) -> Path:
     fork_mode = normalize_fork_mode(fork_mode)
     hooks_path = Path.home() / ".codex" / "hooks.json"
@@ -332,6 +334,12 @@ def configure_stop_hook(
     ide_open_text = (ide_open_cmd or "").strip()
     if ide_open_text:
         env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
+    ui_trace_text = (stop_hook_ui_trace or "").strip().lower()
+    if ui_trace_text and ui_trace_text != "off":
+        env_parts.append(f"CODEX_RVF_STOP_HOOK_UI_TRACE={shlex.quote(ui_trace_text)}")
+    ui_trace_max_text = (stop_hook_ui_trace_max_events or "").strip()
+    if ui_trace_text and ui_trace_text != "off" and ui_trace_max_text:
+        env_parts.append(f"CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS={shlex.quote(ui_trace_max_text)}")
     if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
         for name, value in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
@@ -491,6 +499,17 @@ def main() -> int:
         default=None,
         help="持久写入 CODEX_RVF_IDE_OPEN_CMD；用于指定打开 handoff.md 的 coding agent IDE 命令。",
     )
+    parser.add_argument(
+        "--stop-hook-ui-trace",
+        choices=["off", "summary", "full"],
+        default=None,
+        help="持久写入 CODEX_RVF_STOP_HOOK_UI_TRACE；summary/full 会把 Stop hook decision trace 追加到最终 systemMessage。",
+    )
+    parser.add_argument(
+        "--stop-hook-ui-trace-max-events",
+        default=None,
+        help="持久写入 CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS；限制 systemMessage trace 展示的事件数。",
+    )
     args = parser.parse_args()
 
     preserve = not args.replace_setup_config
@@ -527,6 +546,8 @@ def main() -> int:
                 and os.environ.get("CODEX_RVF_OPEN_HANDOFF", "").strip().lower()
                 not in {"0", "false", "no", "n", "off", "disabled"},
                 args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
+                args.stop_hook_ui_trace or os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE"),
+                args.stop_hook_ui_trace_max_events or os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS"),
             )
             installed.append(f"stop hook: {hooks_path}")
     except Exception as exc:

@@ -14,6 +14,9 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_ROOT = SKILL_DIR / "state"
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
 DEFAULT_INLINE_BYTES = 2048
+DEFAULT_UI_TRACE_MAX_EVENTS = 80
+STOP_HOOK_UI_TRACE_ENV = "CODEX_RVF_STOP_HOOK_UI_TRACE"
+STOP_HOOK_UI_TRACE_MAX_EVENTS_ENV = "CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS"
 COMPONENTS = {
     "command-lock",
     "dispatcher",
@@ -141,6 +144,28 @@ def log_level() -> str:
     return value if value in {"debug", "info", "warn", "error"} else "info"
 
 
+def stop_hook_ui_trace_mode() -> str:
+    value = os.environ.get(STOP_HOOK_UI_TRACE_ENV, "off").strip().lower()
+    normalized = value.replace("_", "-")
+    if normalized in {"", "0", "false", "no", "n", "off", "disabled"}:
+        return "off"
+    if normalized in {"1", "true", "yes", "y", "on", "summary"}:
+        return "summary"
+    if normalized in {"full", "verbose", "all"}:
+        return "full"
+    return "off"
+
+
+def stop_hook_ui_trace_max_events() -> int:
+    value = os.environ.get(STOP_HOOK_UI_TRACE_MAX_EVENTS_ENV, "").strip()
+    if value:
+        try:
+            return max(1, int(value))
+        except ValueError:
+            pass
+    return DEFAULT_UI_TRACE_MAX_EVENTS
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
@@ -160,6 +185,102 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _event_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _read_event_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def _summary_trace_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    previous_key: tuple[str, str, str, str, str] | None = None
+    for record in records:
+        key = (
+            _event_text(record.get("component")),
+            _event_text(record.get("phase")),
+            _event_text(record.get("event")),
+            _event_text(record.get("status")),
+            _event_text(record.get("reason_code")),
+        )
+        if key == previous_key:
+            continue
+        previous_key = key
+        selected.append(record)
+    return selected
+
+
+def _trace_extra_fields(record: dict[str, Any], *, mode: str) -> list[str]:
+    keys = (
+        "backend",
+        "mode",
+        "gate_status",
+        "returncode",
+        "cline_kanban_task_id",
+        "cline_kanban_attempt_id",
+        "cline_kanban_message_id",
+        "parent_thread_id",
+        "fork_thread_id",
+    )
+    extras = [
+        f"{key}={record[key]}"
+        for key in keys
+        if record.get(key) not in (None, "", [], {})
+    ]
+    error = record.get("error")
+    if mode == "full" and error not in (None, "", [], {}):
+        extras.append(f"error={error}")
+    return extras
+
+
+def format_stop_hook_ui_trace(events_path: Path, *, mode: str) -> str | None:
+    records = _read_event_records(events_path)
+    if not records:
+        return None
+    trace_records = records if mode == "full" else _summary_trace_records(records)
+    max_events = stop_hook_ui_trace_max_events()
+    total = len(trace_records)
+    visible = trace_records[:max_events]
+    lines = ["RVF stop hook trace:"]
+    for index, record in enumerate(visible, start=1):
+        component = _event_text(record.get("component")) or "unknown"
+        phase = _event_text(record.get("phase")) or "unknown"
+        event = _event_text(record.get("event")) or "unknown"
+        status = _event_text(record.get("status")) or "unknown"
+        reason = _event_text(record.get("reason_code"))
+        reason_note = f"; reason={reason}" if reason else ""
+        extras = _trace_extra_fields(record, mode=mode)
+        extra_note = f"; {'; '.join(extras)}" if extras else ""
+        lines.append(
+            f"{index}. {component} {phase} {event}: {status}{reason_note}{extra_note}"
+        )
+    if total > len(visible):
+        lines.append(
+            f"... {total - len(visible)} more events omitted; "
+            f"see {events_path}"
+        )
+    return "\n".join(lines)
 
 
 class RunLedger:
@@ -414,6 +535,11 @@ class RunLedger:
                 f"review-validate-fix: {status}; reason={reason_code}{detail_note}; "
                 f"summary={self.summary_path}"
             )
+            trace_mode = stop_hook_ui_trace_mode()
+            if trace_mode != "off":
+                trace = format_stop_hook_ui_trace(self.events_path, mode=trace_mode)
+                if trace:
+                    system_message = f"{system_message}\n\n{trace}"
         return {"continue": continue_, "systemMessage": system_message}
 
 

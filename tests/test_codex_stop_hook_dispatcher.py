@@ -1008,6 +1008,8 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
             "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE": "1",
             "CODEX_RVF_OPEN_HANDOFF": "0",
             "CODEX_RVF_IDE_OPEN_CMD": "code -r",
+            "CODEX_RVF_STOP_HOOK_UI_TRACE": "summary",
+            "CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS": "12",
         },
     )
 
@@ -1026,6 +1028,8 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     assert "--cline-kanban-start-in-plan-mode 1" in install_args
     assert "--no-open-handoff" in install_args
     assert "--ide-open-cmd code -r" in install_args
+    assert "--stop-hook-ui-trace summary" in install_args
+    assert "--stop-hook-ui-trace-max-events 12" in install_args
 
 
 def test_dev_sync_preserves_kanban_followup_installer_args(tmp_path: Path) -> None:

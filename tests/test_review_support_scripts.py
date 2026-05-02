@@ -3245,6 +3245,80 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
     assert later["cline_kanban_base_ref"] == "HEAD"
     assert later["worktree_bootstrap_path"] == "/tmp/bootstrap.json"
 
+
+def test_run_ledger_hook_payload_can_include_summary_ui_trace(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    original_trace = os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE")
+    try:
+        os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE"] = "summary"
+        run_dir = tmp / "run"
+        ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+        ledger.event(
+            phase="gate",
+            event="stop_event_received",
+            status="started",
+            reason_code="stop_event_received",
+        )
+        ledger.event(
+            phase="gate",
+            event="dirty_gate_completed",
+            status="dirty",
+            reason_code="gate_dirty",
+        )
+
+        payload = ledger.hook_payload(status="dry-run", reason_code="dry_run")
+    finally:
+        if original_trace is None:
+            os.environ.pop("CODEX_RVF_STOP_HOOK_UI_TRACE", None)
+        else:
+            os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE"] = original_trace
+
+    assert payload["continue"] is True
+    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    assert "RVF stop hook trace:" in payload["systemMessage"]
+    assert "1. stop-hook gate stop_event_received: started; reason=stop_event_received" in payload["systemMessage"]
+    assert "2. stop-hook gate dirty_gate_completed: dirty; reason=gate_dirty" in payload["systemMessage"]
+    assert json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))["status"] == "dry-run"
+
+
+def test_run_ledger_hook_payload_full_ui_trace_includes_extra_fields(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    original_trace = os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE")
+    original_max = os.environ.get("CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS")
+    try:
+        os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE"] = "full"
+        os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS"] = "1"
+        run_dir = tmp / "run"
+        ledger = module.RunLedger(component="dispatcher", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+        ledger.event(
+            phase="dev-sync",
+            event="installed_hook_started",
+            status="started",
+            reason_code="handoff_to_installed_hook",
+            backend="kanban-followup",
+        )
+        ledger.event(
+            phase="dev-sync",
+            event="installed_hook_completed",
+            status="completed",
+            reason_code="installed_hook_completed",
+        )
+
+        payload = ledger.hook_payload(status="completed", reason_code="installed_hook_completed")
+    finally:
+        if original_trace is None:
+            os.environ.pop("CODEX_RVF_STOP_HOOK_UI_TRACE", None)
+        else:
+            os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE"] = original_trace
+        if original_max is None:
+            os.environ.pop("CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS", None)
+        else:
+            os.environ["CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS"] = original_max
+
+    assert "1. dispatcher dev-sync installed_hook_started: started; reason=handoff_to_installed_hook; backend=kanban-followup" in payload["systemMessage"]
+    assert "... 1 more events omitted;" in payload["systemMessage"]
+
+
 def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp: Path) -> None:
     run_dir = tmp / "state" / "runs" / "rvf-user-cancel"
     run_dir.mkdir(parents=True)
@@ -3582,6 +3656,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "run_ledger_summary_preserves_cline_kanban_fields",
             lambda: test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline"),
+        ),
+        (
+            "run_ledger_hook_payload_can_include_summary_ui_trace",
+            lambda: test_run_ledger_hook_payload_can_include_summary_ui_trace(root / "summary-ui-trace"),
+        ),
+        (
+            "run_ledger_hook_payload_full_ui_trace_includes_extra_fields",
+            lambda: test_run_ledger_hook_payload_full_ui_trace_includes_extra_fields(root / "full-ui-trace"),
         ),
         (
             "cancel_rvf_run_marks_cancelled_and_trashes_cline_task",

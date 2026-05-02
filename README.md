@@ -163,6 +163,14 @@ Stop hook 自同步链是 dev-only sync chain：部署后的 dispatcher 只能�
 
 所有 dispatcher、Stop hook、manual run、external reviewer 和 command lock 的排障日志都写入统一 run ledger。入口是 `state/latest.json` 指向的 `state/runs/<run_id>/summary.json` 和 `events.jsonl`；大文本如 Stop event、fork prompt、review packet、stdout/stderr 会作为 `artifacts/` 文件保存。显式 suppress 的 Stop hook 也会写入最小 ledger，并在 Coding Agent UI 的 `systemMessage` 中保留 `summary=<summary_path>`。command lock 会记录 `lock_wait_started`、`lock_acquired`、`lock_timeout` 与 `lock_released` 事件。hook stdout 仍只输出 Codex hook payload，用户可见 `systemMessage` 保持短格式：`review-validate-fix: <status>; reason=<reason_code>; detail=<human_readable_note>; summary=<summary_path>`，其中 `detail` 只在需要解释非错误跳过、递归保护等用户易误解状态时出现。可用 `CODEX_RVF_LOG_ROOT` 或兼容别名 `CODEX_RVF_STATE_DIR` 覆盖日志根目录，未设置时使用 plugin skill 的 `state/`；如果运行中的 skill copy 位于 Cline Kanban `.cline/worktrees/...`，默认会改用 `~/plugins/review-validate-fix/skills/review-validate-fix/state/`，避免 task worktree 承载 RVF run ledger。
 
+如果希望 Coding Agent UI 直接展示 Stop hook decision tree，可在安装 Stop hook 时写入：
+
+```bash
+python3 scripts/install_to_codex.py --configure-stop-hook --stop-hook-ui-trace summary
+```
+
+`--stop-hook-ui-trace summary|full|off` 对应 `CODEX_RVF_STOP_HOOK_UI_TRACE`。`summary` 会把阶段、事件、状态和 reason 的精简 trace 追加到最终 `systemMessage`；`full` 会包含更多事件和关键字段。`--stop-hook-ui-trace-max-events <n>` 对应 `CODEX_RVF_STOP_HOOK_UI_TRACE_MAX_EVENTS`，用于限制 UI 展示长度。这个 trace 仍是最终 hook payload 的一部分，不是实时 streaming；完整记录始终以 `events.jsonl` 为准。
+
 ### 日志排障入口
 
 `state/` 是本机运行状态，已被 gitignore，不属于可分发 plugin 内容。排障时先看：
