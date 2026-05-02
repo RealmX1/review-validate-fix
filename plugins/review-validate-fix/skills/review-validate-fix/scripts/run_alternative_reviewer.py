@@ -32,7 +32,12 @@ EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
-SUPPORTED_OUTPUT_FORMATS = {OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_CLAUDE_STREAM_JSON}
+OUTPUT_FORMAT_CODEX_JSON = "codex_json"
+SUPPORTED_OUTPUT_FORMATS = {
+    OUTPUT_FORMAT_TEXT,
+    OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
+    OUTPUT_FORMAT_CODEX_JSON,
+}
 CHILD_RVF_ENV_KEYS = {
     "RVF_RUN_DIR",
     "RVF_ARTIFACTS_DIR",
@@ -131,6 +136,56 @@ def is_claude_print_command(command: list[str]) -> bool:
     )
 
 
+def codex_subcommand_index(command: list[str]) -> int | None:
+    if not command or Path(command[0]).name != "codex":
+        return None
+
+    options_with_values = {
+        "-a",
+        "--add-dir",
+        "--ask-for-approval",
+        "-c",
+        "-C",
+        "--cd",
+        "--config",
+        "--disable",
+        "--enable",
+        "-i",
+        "--image",
+        "--local-provider",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "--remote",
+        "--remote-auth-token-env",
+        "-s",
+        "--sandbox",
+    }
+    index = 1
+    while index < len(command):
+        item = command[index]
+        if item in {"exec", "e"}:
+            return index
+        if item == "--":
+            return None
+        if item in options_with_values:
+            index += 2
+            continue
+        if item.startswith("--") and "=" in item:
+            index += 1
+            continue
+        if item.startswith("-"):
+            index += 1
+            continue
+        return None
+    return None
+
+
+def is_codex_exec_command(command: list[str]) -> bool:
+    return codex_subcommand_index(command) is not None
+
+
 def claude_output_format_arg(command: list[str]) -> str | None:
     for index, item in enumerate(command):
         if item.startswith("--output-format="):
@@ -168,6 +223,19 @@ def ensure_claude_stream_json_command(command: list[str]) -> list[str]:
         patched.append("--verbose")
     if "--disable-slash-commands" not in patched:
         patched.append("--disable-slash-commands")
+    return patched
+
+
+def codex_json_enabled(command: list[str]) -> bool:
+    return "--json" in command
+
+
+def ensure_codex_json_command(command: list[str]) -> list[str]:
+    patched = list(command)
+    if "--json" not in patched:
+        patched.append("--json")
+    if "-" not in patched:
+        patched.append("-")
     return patched
 
 
@@ -806,6 +874,102 @@ def extract_claude_stream_result(output: str) -> str:
     return output.strip()
 
 
+def text_parts_from_content(content: object) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        for key in ("output_text", "input_text"):
+            value = item.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+                break
+    return parts
+
+
+def message_text_from_payload(payload: dict[str, Any]) -> str | None:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        content_text = "\n".join(text_parts_from_content(message.get("content"))).strip()
+        if content_text:
+            return content_text
+
+    if payload.get("type") == "message":
+        content_text = "\n".join(text_parts_from_content(payload.get("content"))).strip()
+        if content_text:
+            return content_text
+
+    for key in ("text", "result", "output"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_codex_json_result(output: str) -> str:
+    """从 `codex exec --json` JSONL stdout 中提取最后一条 assistant 文本。"""
+
+    result: str | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+
+        record_type = record.get("type")
+        payload = record.get("payload")
+        if record_type in {"agent_message", "assistant_message"}:
+            text = message_text_from_payload(record)
+            if text:
+                result = text
+        elif record_type == "event_msg" and isinstance(payload, dict):
+            payload_type = payload.get("type")
+            if payload_type in {"agent_message", "assistant_message"}:
+                text = message_text_from_payload(payload)
+                if text:
+                    result = text
+        elif record_type == "response_item" and isinstance(payload, dict):
+            if payload.get("type") == "message" and payload.get("role") == "assistant":
+                text = message_text_from_payload(payload)
+                if text:
+                    result = text
+        elif record_type == "item.completed" and isinstance(record.get("item"), dict):
+            item = record["item"]
+            item_type = item.get("type")
+            if item_type in {"agent_message", "assistant_message"}:
+                text = message_text_from_payload(item)
+                if text:
+                    result = text
+            elif item_type == "message" and item.get("role") == "assistant":
+                text = message_text_from_payload(item)
+                if text:
+                    result = text
+        elif record_type in {"result", "task_complete"}:
+            text = message_text_from_payload(record)
+            if text:
+                result = text
+
+    if result is not None:
+        return result.strip()
+    return output.strip()
+
+
 def normalize_review_output(output: str) -> str:
     return output.strip()
 
@@ -930,6 +1094,8 @@ def main() -> int:
                 command = ensure_claude_stream_json_command(command)
             else:
                 output_format = OUTPUT_FORMAT_TEXT
+        elif output_format is None and is_codex_exec_command(command):
+            output_format = OUTPUT_FORMAT_CODEX_JSON if codex_json_enabled(command) else OUTPUT_FORMAT_TEXT
         elif output_format is None:
             output_format = OUTPUT_FORMAT_TEXT
         if output_format not in SUPPORTED_OUTPUT_FORMATS:
@@ -938,6 +1104,8 @@ def main() -> int:
             )
         if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
             command = ensure_claude_stream_json_command(command)
+        if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(command):
+            command = ensure_codex_json_command(command)
     except Exception as exc:
         ledger.event(
             phase="review",
@@ -1214,6 +1382,8 @@ def main() -> int:
     stdout = raw_stdout.strip()
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
+    elif output_format == OUTPUT_FORMAT_CODEX_JSON:
+        stdout = extract_codex_json_result(stdout)
     stdout = normalize_review_output(stdout)
     stderr = raw_stderr.strip()
     timed_out = (

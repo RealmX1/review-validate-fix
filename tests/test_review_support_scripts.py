@@ -2755,6 +2755,194 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> N
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
+def test_alternative_reviewer_codex_json_extracts_agent_message(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, os, subprocess, sys; sys.stdin.read(); "
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'working'}}), flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, os, subprocess, sys; sys.stdin.read(); "
+                "print('non-json warning line', flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'NO_ISSUES'}}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["exec", "--json", "-"]
+
+
+def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "--ask-for-approval", "never", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
+
+
 def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -3715,6 +3903,26 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_claude_stream_json_extracts_result",
             lambda: test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json"),
+        ),
+        (
+            "alternative_reviewer_codex_json_extracts_agent_message",
+            lambda: test_alternative_reviewer_codex_json_extracts_agent_message(root / "alternative-codex-json"),
+        ),
+        (
+            "alternative_reviewer_codex_json_extracts_item_completed_agent_message",
+            lambda: test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(
+                root / "alternative-codex-json-item-completed"
+            ),
+        ),
+        (
+            "alternative_reviewer_codex_exec_json_command_is_patched",
+            lambda: test_alternative_reviewer_codex_exec_json_command_is_patched(root / "alternative-codex-command"),
+        ),
+        (
+            "alternative_reviewer_codex_exec_after_global_options_is_patched",
+            lambda: test_alternative_reviewer_codex_exec_after_global_options_is_patched(
+                root / "alternative-codex-global-options"
+            ),
         ),
         (
             "alternative_reviewer_legacy_claude_config_gets_stream_json",
