@@ -2943,6 +2943,68 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Pa
     assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
 
 
+def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "env.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps({"
+                "'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'), "
+                "'thread': os.environ.get('CODEX_THREAD_ID')"
+                "}))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp}:{env.get('PATH', '')}"
+    env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
+    env.pop("CODEX_RVF_SUPPRESS_STOP_HOOK", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    payload = json.loads(sink.read_text(encoding="utf-8"))
+    assert payload == {
+        "suppress": "1",
+        "thread": "parent-thread-id-for-regression-test",
+    }
+
+
 def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -3938,6 +4000,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_alternative_reviewer_codex_exec_after_global_options_is_patched(
                 root / "alternative-codex-global-options"
             ),
+        ),
+        (
+            "alternative_reviewer_sets_codex_stop_hook_suppress_env",
+            lambda: test_alternative_reviewer_sets_codex_stop_hook_suppress_env(root / "alternative-codex-suppress"),
         ),
         (
             "alternative_reviewer_legacy_claude_config_gets_stream_json",

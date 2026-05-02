@@ -33,6 +33,7 @@ EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
+SUPPRESS_STOP_HOOK_ENV = "CODEX_RVF_SUPPRESS_STOP_HOOK"
 SUPPORTED_OUTPUT_FORMATS = {
     OUTPUT_FORMAT_TEXT,
     OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
@@ -1151,6 +1152,7 @@ def main() -> int:
 
     env = scrub_env(env_unset)
     env.update(ledger.env())
+    env[SUPPRESS_STOP_HOOK_ENV] = "1"
     env["RVF_RUN_DIR"] = str(ledger.run_dir)
     env["RVF_ARTIFACTS_DIR"] = str(ledger.artifacts_dir)
 
