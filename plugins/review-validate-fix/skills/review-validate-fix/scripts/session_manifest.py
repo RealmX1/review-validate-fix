@@ -11,6 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import diff_tracker
+
 
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:>>?|1>|2>|&>)\s*(?P<path>[^&|;\s]+)")
 
@@ -251,10 +254,18 @@ def dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def build_manifest(repo: Path, transcript: Path) -> dict[str, Any]:
+def build_manifest(
+    repo: Path,
+    transcript: Path,
+    *,
+    tracker_enabled: bool = True,
+    tracker_run_id: str | None = None,
+    tracker_log_root: Path | None = None,
+) -> dict[str, Any]:
     root = git_root(repo)
     records = parse_jsonl(transcript)
     owned_paths: set[str] = set()
+    apply_patch_paths: set[str] = set()
     apply_patch_operations: list[dict[str, Any]] = []
     command_candidates: list[dict[str, Any]] = []
     command_events: list[dict[str, Any]] = []
@@ -271,6 +282,7 @@ def build_manifest(repo: Path, transcript: Path) -> dict[str, Any]:
             operations, paths = parse_apply_patch(root, patch_text, int(record.get("_line_number", 0)))
             apply_patch_operations.extend(operations)
             owned_paths.update(paths)
+            apply_patch_paths.update(paths)
             continue
         if tool_name != "exec_command":
             continue
@@ -307,12 +319,55 @@ def build_manifest(repo: Path, transcript: Path) -> dict[str, Any]:
     dirty = dirty_paths(root)
     owned_dirty = sorted(path for path in dirty if path in owned_paths)
     unattributed_dirty = sorted(path for path in dirty if path not in owned_paths)
+    session_id = session_id_from_records(records)
+
+    tracker_payload: dict[str, Any] = {"status": "skipped"}
+    tracker_units: list[dict[str, Any]] = []
+    if tracker_enabled and owned_dirty:
+        owned_dirty_set = set(owned_dirty)
+        tracker_apply_patch_paths = apply_patch_paths & owned_dirty_set
+        tracker_exec_only_paths = owned_dirty_set - tracker_apply_patch_paths
+        register_session_id = session_id or (tracker_run_id or f"transcript-{transcript.name}")
+        units = diff_tracker._build_owned_units(
+            root,
+            owned_paths=owned_dirty,
+            apply_patch_paths=tracker_apply_patch_paths,
+            exec_only_paths=tracker_exec_only_paths,
+        )
+        tracker_units = [
+            {
+                "path": unit.path,
+                "unit": unit.unit,
+                "evidence": evidence,
+                "hunk_anchor": unit.hunk_anchor.to_dict() if unit.hunk_anchor is not None else None,
+            }
+            for unit, evidence in units
+        ]
+        result = diff_tracker.register_claims(
+            repo=root,
+            session_id=register_session_id,
+            run_id=tracker_run_id,
+            worktree=root,
+            branch=None,
+            owned_paths=owned_dirty,
+            apply_patch_paths=tracker_apply_patch_paths,
+            exec_only_paths=tracker_exec_only_paths,
+            log_root_override=tracker_log_root,
+        )
+        tracker_payload = result.to_dict()
+        tracker_payload["session_id"] = register_session_id
+        tracker_payload["owned_units"] = tracker_units
+    elif not tracker_enabled:
+        tracker_payload = {"status": "disabled_by_caller"}
+    else:
+        tracker_payload = {"status": "no_owned_dirty_paths"}
+
     return {
         "version": 1,
         "generated": datetime.now(timezone.utc).isoformat(),
         "repo": str(root),
         "transcript": str(transcript.resolve()),
-        "session_id": session_id_from_records(records),
+        "session_id": session_id,
         "confidence": "medium" if apply_patch_operations else "low",
         "owned_paths": sorted(owned_paths),
         "owned_dirty_paths": owned_dirty,
@@ -320,6 +375,7 @@ def build_manifest(repo: Path, transcript: Path) -> dict[str, Any]:
         "apply_patch_operations": apply_patch_operations,
         "command_path_candidates": command_candidates,
         "command_events": command_events,
+        "tracker": tracker_payload,
         "warnings": [
             "Transcript-derived command side effects are conservative hints; without Pre/Post tool snapshots, shell writes cannot be fully attributed.",
         ],
@@ -331,13 +387,27 @@ def main() -> int:
     parser.add_argument("--repo", required=True, help="Target git repository.")
     parser.add_argument("--transcript", required=True, help="Codex JSONL transcript / rollout path.")
     parser.add_argument("--output", help="Write manifest JSON to this path. Prints JSON to stdout when omitted.")
+    parser.add_argument(
+        "--no-tracker",
+        action="store_true",
+        help="Skip writing claims to the global reviewed-diff tracker. For tests and debugging only.",
+    )
+    parser.add_argument(
+        "--tracker-run-id",
+        help="Associate tracker claims with this RVF run id; falls back to environment / no run id.",
+    )
     args = parser.parse_args()
 
     try:
         transcript = Path(args.transcript).expanduser().resolve()
         if not transcript.exists():
             raise ValueError(f"transcript not found: {transcript}")
-        manifest = build_manifest(Path(args.repo).expanduser().resolve(), transcript)
+        manifest = build_manifest(
+            Path(args.repo).expanduser().resolve(),
+            transcript,
+            tracker_enabled=not args.no_tracker,
+            tracker_run_id=args.tracker_run_id,
+        )
     except Exception as exc:
         return fail(str(exc), 2)
 

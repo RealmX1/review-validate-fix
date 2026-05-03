@@ -15,6 +15,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import start_run
+import diff_tracker
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +74,8 @@ def review_env_exports(
     metadata_path: Path,
     snapshot_path: Path,
     bootstrap_metadata_path: Path | None,
+    tracker_dir: Path | None = None,
+    tracker_repo_key: str | None = None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
         "RVF_REPO": str(repo),
@@ -99,6 +102,10 @@ def review_env_exports(
         env["RVF_SESSION_CONTEXT"] = str(scope_of_work_path)
     if session_manifest_path is not None:
         env["RVF_SESSION_MANIFEST"] = str(session_manifest_path)
+    if tracker_dir is not None:
+        env["RVF_TRACKER_DIR"] = str(tracker_dir)
+    if tracker_repo_key:
+        env["RVF_TRACKER_REPO_KEY"] = tracker_repo_key
 
     lines = [
         "# Source this file in review subprocesses to avoid repeating long RVF paths.",
@@ -136,9 +143,13 @@ def review_env_exports(
             f"export RVF_WRITE_REVIEW_RESULT={shlex.quote(env['RVF_WRITE_REVIEW_RESULT'])}",
             f"export RVF_CHECK_REVIEW_RESULT={shlex.quote(env['RVF_CHECK_REVIEW_RESULT'])}",
             'export RVF_REVIEW_RESULT="$RVF_ARTIFACTS_DIR/reviewers/${RVF_REVIEWER_ID:-reviewer}/review-result.json"',
-            "",
         ]
     )
+    if tracker_dir is not None:
+        lines.append(f"export RVF_TRACKER_DIR={shlex.quote(str(tracker_dir))}")
+    if tracker_repo_key:
+        lines.append(f"export RVF_TRACKER_REPO_KEY={shlex.quote(tracker_repo_key)}")
+    lines.append("")
     return env, "\n".join(lines)
 
 
@@ -449,6 +460,8 @@ def prepare_run(
                 str(transcript),
                 "--output",
                 str(session_manifest_path),
+                "--tracker-run-id",
+                ledger.run_id,
             ]
         )
         packet_session_manifest = session_manifest_path
@@ -553,6 +566,31 @@ def prepare_run(
     )
     scope_path = scope_of_work_path.resolve() if session_context is not None else None
     manifest_path = session_manifest_path.resolve() if packet_session_manifest is not None else None
+
+    tracker_dir_path: Path | None = None
+    tracker_repo_key_value: str | None = None
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest_payload = {}
+        if isinstance(manifest_payload, dict):
+            tracker_meta = manifest_payload.get("tracker") if isinstance(manifest_payload.get("tracker"), dict) else None
+            if tracker_meta is not None:
+                if isinstance(tracker_meta.get("tracker_dir"), str) and tracker_meta["tracker_dir"]:
+                    tracker_dir_path = Path(tracker_meta["tracker_dir"]).expanduser()
+                if isinstance(tracker_meta.get("repo_key"), str) and tracker_meta["repo_key"]:
+                    tracker_repo_key_value = tracker_meta["repo_key"]
+                heartbeat_session = tracker_meta.get("session_id") or manifest_payload.get("session_id")
+                if isinstance(heartbeat_session, str) and heartbeat_session:
+                    try:
+                        diff_tracker.heartbeat(
+                            root,
+                            session_id=heartbeat_session,
+                            run_id=ledger.run_id,
+                        )
+                    except Exception:
+                        pass
     review_env, review_env_text = review_env_exports(
         repo=root,
         run_id=ledger.run_id,
@@ -567,6 +605,8 @@ def prepare_run(
         metadata_path=metadata_path,
         snapshot_path=snapshot_path,
         bootstrap_metadata_path=bootstrap["metadata_path"],
+        tracker_dir=tracker_dir_path,
+        tracker_repo_key=tracker_repo_key_value,
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
     review_agent_context = review_agent_context_text(

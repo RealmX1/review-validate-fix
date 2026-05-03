@@ -3468,6 +3468,611 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
 
 
+DIFF_TRACKER = SCRIPT_DIR / "diff_tracker.py"
+
+
+def load_diff_tracker_module():
+    if "rvf_diff_tracker" in sys.modules:
+        return sys.modules["rvf_diff_tracker"]
+    spec = importlib.util.spec_from_file_location("rvf_diff_tracker", DIFF_TRACKER)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load diff_tracker module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["rvf_diff_tracker"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("rvf_diff_tracker", None)
+        raise
+    return module
+
+
+def _write_session_transcript(path: Path, repo: Path, *, session_id: str, target_path: str, line: str) -> Path:
+    apply_patch_input = (
+        "*** Begin Patch\n"
+        f"*** Update File: {target_path}\n"
+        "@@\n"
+        "-base\n"
+        f"+{line}\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": str(repo)},
+        },
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": apply_patch_input,
+                "call_id": "call_patch",
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+    return path
+
+
+def test_diff_tracker_register_creates_state_and_events(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    result = module.register_claims(
+        repo=repo,
+        session_id="session-1",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert result.status == "ok"
+    assert result.repo_key
+    assert result.tracker_dir
+    tracker_path = Path(result.tracker_dir)
+    assert (tracker_path / "state.json").is_file()
+    assert (tracker_path / "events.jsonl").is_file()
+    assert (tracker_path / "meta.json").is_file()
+    state = json.loads((tracker_path / "state.json").read_text(encoding="utf-8"))
+    assert state["claims"]
+    claim = state["claims"][0]
+    assert claim["session_id"] == "session-1"
+    assert claim["path"] == "tracked.txt"
+    assert claim["unit"] == "hunk"
+    assert claim["hunk_anchor"]["header"]
+    events = read_jsonl(tracker_path / "events.jsonl")
+    assert any(event.get("event") == "claim_added" for event in events)
+
+
+def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
+    load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    (repo / "second.txt").write_text("base\nedit b\n", encoding="utf-8")
+    run(["git", "add", "second.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add second"], cwd=repo)
+    (repo / "second.txt").write_text("base\nedit b session-2\n", encoding="utf-8")
+    log_root = tmp / "logs"
+
+    # Both child processes block until the same absolute wall-clock timestamp
+    # before calling register_claims. Without this barrier the first proc
+    # routinely finishes before the second one even imports diff_tracker, so
+    # the flock/contention path is never exercised — the test would only
+    # confirm "two sequential writers don't drop each other's claims".
+    snippet = (
+        "import os, sys, time, json\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        "import diff_tracker as dt\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"repo = Path({str(repo)!r})\n"
+        "session = sys.argv[1]\n"
+        "path = sys.argv[2]\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.register_claims(\n"
+        "    repo=repo, session_id=session, run_id=session,\n"
+        "    worktree=None, branch=None,\n"
+        "    owned_paths=[path], apply_patch_paths={path}, exec_only_paths=set(),\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result.to_dict()))\n"
+    )
+    # Give both subprocesses ~1.5s to start and import before they unblock.
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = []
+    for session, path in (("session-A", "tracked.txt"), ("session-B", "second.txt")):
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", snippet, session, path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        )
+    outputs = [proc.communicate() for proc in procs]
+    for stdout, stderr in outputs:
+        if stderr.strip():
+            raise AssertionError(stderr.strip())
+        payload = json.loads(stdout.strip().splitlines()[-1])
+        assert payload["status"] == "ok"
+    repo_key = json.loads(outputs[0][0].splitlines()[-1])["repo_key"]
+    state = json.loads((log_root / "tracker" / repo_key / "state.json").read_text(encoding="utf-8"))
+    sessions = {claim["session_id"] for claim in state["claims"]}
+    assert sessions == {"session-A", "session-B"}
+
+
+def test_diff_tracker_hunk_anchor_stable_across_reruns(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-stable",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-stable",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.claim_ids == second.claim_ids
+    assert second.dropped_stale_claim_ids == []
+    state = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
+    assert len(state["claims"]) == 1
+
+
+def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
+    """Two distinct edits in the same file must yield two distinct claim_ids
+    on first register, and rerunning the same session must NOT drop or fold
+    them together. This guards against the regression where deriving anchors
+    via `git diff -U0` produced empty `context_lines`, collapsing every
+    fuzzy-match decision down to "ranges within ±5 lines".
+    """
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    # 14-line baseline so two well-separated edits stay as two distinct hunks
+    # under -U3 (gap of 8 unchanged lines between them — beyond the 6-line
+    # context window where git would otherwise merge adjacent hunks).
+    baseline = "".join(f"line-{i}\n" for i in range(1, 15))
+    (repo / "tracked.txt").write_text(baseline, encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    edited_lines = [f"line-{i}\n" for i in range(1, 15)]
+    edited_lines[0] = "LINE-1\n"    # change line 1
+    edited_lines[9] = "LINE-10\n"   # change line 10 → 2 hunks under -U3
+    (repo / "tracked.txt").write_text("".join(edited_lines), encoding="utf-8")
+    log_root = tmp / "logs"
+
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-close-hunks",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    # Two distinct hunks → two distinct claim_ids.
+    assert len(first.claim_ids) == 2, first.claim_ids
+    assert len(set(first.claim_ids)) == 2, first.claim_ids
+
+    state = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
+    assert len(state["claims"]) == 2, state["claims"]
+    headers = {claim["hunk_anchor"]["header"] for claim in state["claims"]}
+    assert len(headers) == 2, headers
+    context_hashes = {claim["hunk_anchor"]["context_hash"] for claim in state["claims"]}
+    # Distinct context lines → distinct context_hash values (regression guard:
+    # before the fix, both would be sha1("")[:16] == "da39a3ee5e6b4b0d").
+    assert "da39a3ee5e6b4b0d" not in context_hashes, context_hashes
+    assert len(context_hashes) == 2, context_hashes
+
+    # Rerun must be idempotent: same claim_ids, no stale drops, claims unchanged.
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-close-hunks",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert sorted(first.claim_ids) == sorted(second.claim_ids)
+    assert second.dropped_stale_claim_ids == []
+    state2 = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
+    assert len(state2["claims"]) == 2
+
+
+def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Path) -> None:
+    """A second register call with an empty owned_paths list must NOT drop
+    the session's existing claims — that path used to fall through to the
+    drop-all branch, silently moving every claim into tombstones.
+    """
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    seed = module.register_claims(
+        repo=repo,
+        session_id="session-empty",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert seed.status == "ok"
+    state_path = Path(seed.tracker_dir) / "state.json"
+    state_before = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(state_before["claims"]) == 1
+    assert len(state_before.get("tombstones", [])) == 0
+
+    noop = module.register_claims(
+        repo=repo,
+        session_id="session-empty",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=[],
+        apply_patch_paths=set(),
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert noop.status == "no_paths", noop.to_dict()
+    assert noop.claim_ids == []
+    assert noop.dropped_stale_claim_ids == []
+
+    state_after = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(state_after["claims"]) == 1
+    assert state_after["claims"][0]["claim_id"] == seed.claim_ids[0]
+    assert len(state_after.get("tombstones", [])) == 0
+
+
+def test_diff_tracker_list_conflicts_reports_other_session_overlap(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    module.register_claims(
+        repo=repo,
+        session_id="session-A",
+        run_id="run-A",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
+    conflicts = module.list_conflicts(
+        repo,
+        current_session_id="session-B",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert len(conflicts) == 1
+    payload = conflicts[0].to_dict()
+    assert payload["other_session_id"] == "session-A"
+    assert payload["path"] == "tracked.txt"
+    same_session = module.list_conflicts(
+        repo,
+        current_session_id="session-A",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert same_session == []
+
+
+def test_diff_tracker_path_claim_conflicts_with_hunk_claim(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # session-A claims tracked.txt with hunk evidence (apply_patch).
+    module.register_claims(
+        repo=repo,
+        session_id="session-A",
+        run_id="run-A",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    # session-B comes in with only a path-level claim — it must overlap.
+    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
+    conflicts = module.list_conflicts(
+        repo,
+        current_session_id="session-B",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert len(conflicts) == 1
+    assert conflicts[0].to_dict()["unit"] == "hunk"
+
+
+def test_session_manifest_writes_tracker_claim(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-tracker",
+        ],
+        env=env,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tracker = payload.get("tracker")
+    assert isinstance(tracker, dict)
+    assert tracker["status"] == "ok"
+    assert tracker["repo_key"]
+    assert tracker["claim_ids"]
+    assert tracker["tracker_dir"]
+    assert any(unit.get("unit") in {"hunk", "path"} for unit in tracker.get("owned_units", []))
+
+
+def test_build_packet_emits_cross_session_conflict_section(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # Pre-register a claim from a different session so the current run sees a conflict.
+    module.register_claims(
+        repo=repo,
+        session_id="other-session",
+        run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-current",
+        ],
+        env=env,
+    )
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：cross-session conflict test\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest_path),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ],
+        env=env,
+    )
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Cross-Session Conflicts" in packet_text
+    assert "other-session" in packet_text
+    assert payload["cross_session_conflicts"]
+    assert payload["cross_session_conflicts"][0]["other_session_id"] == "other-session"
+
+
+def test_build_packet_omits_cross_session_section_when_clean(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-1",
+        ],
+        env=env,
+    )
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：no conflict path\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest_path),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ],
+        env=env,
+    )
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Cross-Session Conflicts" not in packet_text
+    assert payload["cross_session_conflicts"] == []
+
+
+def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    previous = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
+
+    def _run_with_disable_value(value: str | None) -> object:
+        if value is None:
+            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = value
+        return module.register_claims(
+            repo=repo,
+            session_id="session-1",
+            run_id="run-1",
+            worktree=None,
+            branch=None,
+            owned_paths=["tracked.txt"],
+            apply_patch_paths={"tracked.txt"},
+            exec_only_paths=set(),
+            log_root_override=log_root,
+        )
+
+    try:
+        # Truthy values disable.
+        assert _run_with_disable_value("1").status == "disabled"
+        assert not (log_root / "tracker").exists()
+        # `no` / `off` / `false` must NOT disable — they read as "do not
+        # disable", matching user intuition. Previously they silently
+        # disabled because the check was a blacklist.
+        for falsy in ("no", "off", "false", "False", "NO"):
+            res = _run_with_disable_value(falsy)
+            assert res.status == "ok", f"value={falsy!r} unexpectedly disabled tracker"
+    finally:
+        if previous is None:
+            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = previous
+
+
+def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # Pre-register so the tracker dir exists.
+    seed = module.register_claims(
+        repo=repo,
+        session_id="seed",
+        run_id="seed",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert seed.status == "ok"
+    lock_path = Path(seed.tracker_dir) / "state.lock"
+    blocker_script = (
+        "import fcntl, os, sys, time\n"
+        "with open(sys.argv[1], 'a+', encoding='utf-8') as handle:\n"
+        "    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
+        "    sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
+        "    time.sleep(float(sys.argv[2]))\n"
+    )
+    blocker = subprocess.Popen(
+        [sys.executable, "-c", blocker_script, str(lock_path), "8"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Wait until the helper signals it has the lock.
+        line = blocker.stdout.readline()
+        assert line.strip() == "LOCKED", f"blocker did not acquire lock; got: {line!r}"
+        # Patch the diff_tracker timeout temporarily so the test stays fast.
+        original = module.LOCK_TIMEOUT_SECONDS
+        module.LOCK_TIMEOUT_SECONDS = 0.5
+        try:
+            result = module.register_claims(
+                repo=repo,
+                session_id="session-blocked",
+                run_id="run-blocked",
+                worktree=None,
+                branch=None,
+                owned_paths=["tracked.txt"],
+                apply_patch_paths={"tracked.txt"},
+                exec_only_paths=set(),
+                log_root_override=log_root,
+            )
+        finally:
+            module.LOCK_TIMEOUT_SECONDS = original
+    finally:
+        blocker.terminate()
+        blocker.wait(timeout=5)
+    assert result.status == "lock_timeout"
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -3757,6 +4362,58 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "cancel_rvf_run_ignores_stale_runner_pid_without_matching_command",
             lambda: test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command(),
+        ),
+        (
+            "diff_tracker_register_creates_state_and_events",
+            lambda: test_diff_tracker_register_creates_state_and_events(root / "diff-tracker-register"),
+        ),
+        (
+            "diff_tracker_register_concurrent_writers",
+            lambda: test_diff_tracker_register_concurrent_writers(root / "diff-tracker-concurrent"),
+        ),
+        (
+            "diff_tracker_hunk_anchor_stable_across_reruns",
+            lambda: test_diff_tracker_hunk_anchor_stable_across_reruns(root / "diff-tracker-stable"),
+        ),
+        (
+            "diff_tracker_hunk_anchor_distinguishes_close_hunks",
+            lambda: test_diff_tracker_hunk_anchor_distinguishes_close_hunks(
+                root / "diff-tracker-close-hunks"
+            ),
+        ),
+        (
+            "diff_tracker_register_empty_owned_paths_preserves_session_claim",
+            lambda: test_diff_tracker_register_empty_owned_paths_preserves_session_claim(
+                root / "diff-tracker-empty-paths"
+            ),
+        ),
+        (
+            "diff_tracker_list_conflicts_reports_other_session_overlap",
+            lambda: test_diff_tracker_list_conflicts_reports_other_session_overlap(root / "diff-tracker-conflicts"),
+        ),
+        (
+            "diff_tracker_path_claim_conflicts_with_hunk_claim",
+            lambda: test_diff_tracker_path_claim_conflicts_with_hunk_claim(root / "diff-tracker-path-vs-hunk"),
+        ),
+        (
+            "session_manifest_writes_tracker_claim",
+            lambda: test_session_manifest_writes_tracker_claim(root / "session-manifest-tracker"),
+        ),
+        (
+            "build_packet_emits_cross_session_conflict_section",
+            lambda: test_build_packet_emits_cross_session_conflict_section(root / "packet-cross-session"),
+        ),
+        (
+            "build_packet_omits_cross_session_section_when_clean",
+            lambda: test_build_packet_omits_cross_session_section_when_clean(root / "packet-cross-session-clean"),
+        ),
+        (
+            "diff_tracker_disable_env_short_circuits",
+            lambda: test_diff_tracker_disable_env_short_circuits(root / "diff-tracker-disabled"),
+        ),
+        (
+            "diff_tracker_lock_timeout_degrades_gracefully",
+            lambda: test_diff_tracker_lock_timeout_degrades_gracefully(root / "diff-tracker-lock-timeout"),
         ),
     ]
 

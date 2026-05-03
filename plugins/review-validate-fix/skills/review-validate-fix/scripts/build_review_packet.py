@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import diff_tracker
+
 IGNORE_FILE = ".review-validate-fix-ignore"
 
 
@@ -200,6 +203,25 @@ def build_packet(
     owned_diff = diff_for_paths(root, owned_paths, all_exclude_prefixes) if session_manifest is not None else ""
     owned_untracked = [path for path in untracked if path in owned_path_set]
     background_untracked = [path for path in untracked if path not in owned_path_set]
+
+    cross_session_conflicts: list[dict[str, Any]] = []
+    tracker_status: str | None = None
+    tracker_repo_key: str | None = None
+    if session_manifest is not None:
+        tracker_meta = session_manifest.get("tracker") if isinstance(session_manifest.get("tracker"), dict) else None
+        if tracker_meta is not None:
+            tracker_status = tracker_meta.get("status") if isinstance(tracker_meta.get("status"), str) else None
+            tracker_repo_key = tracker_meta.get("repo_key") if isinstance(tracker_meta.get("repo_key"), str) else None
+            current_session = tracker_meta.get("session_id") or session_manifest.get("session_id") or ""
+            if isinstance(current_session, str) and current_session:
+                owned_units = diff_tracker.owned_units_from_manifest(session_manifest)
+                if owned_units:
+                    conflicts = diff_tracker.list_conflicts(
+                        root,
+                        current_session_id=current_session,
+                        owned_units=owned_units,
+                    )
+                    cross_session_conflicts = [conflict.to_dict() for conflict in conflicts]
     session_context_text = ""
     if session_context is None:
         if not allow_missing_session_context:
@@ -235,6 +257,9 @@ def build_packet(
         "primary_files": primary_files,
         "background_files": background_files,
         "untracked_files": [],
+        "tracker_status": tracker_status,
+        "tracker_repo_key": tracker_repo_key,
+        "cross_session_conflicts": cross_session_conflicts,
     }
 
     lines: list[str] = [
@@ -284,6 +309,27 @@ def build_packet(
             lines.extend(f"- {path}" for path in unattributed)
         else:
             lines.append("(none)")
+        lines.append("")
+
+    if cross_session_conflicts:
+        lines.extend(
+            [
+                "## Cross-Session Conflicts",
+                "",
+                "Other live RVF sessions in this clone hold claims that overlap with the current session-owned scope. Reviewers should treat these as scope contention: prefer issuing a `lock-request` review-result artifact and let the main session resolve before re-running.",
+                "",
+            ]
+        )
+        for conflict in cross_session_conflicts:
+            anchor = f" `{conflict['hunk_header']}`" if conflict.get("hunk_header") else ""
+            run_id = conflict.get("other_run_id") or "(unknown run)"
+            branch = conflict.get("other_branch") or "(unknown branch)"
+            worktree = conflict.get("other_worktree") or "(unknown worktree)"
+            last_seen = conflict.get("last_seen_at") or "(unknown)"
+            lines.append(
+                f"- `{conflict['path']}`{anchor} — claimed by session `{conflict['other_session_id']}` "
+                f"(run `{run_id}`, branch `{branch}`, worktree `{worktree}`, last_seen `{last_seen}`)"
+            )
         lines.append("")
 
     lines.extend(

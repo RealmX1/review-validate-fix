@@ -2,7 +2,7 @@
 
 ## 后续替代方向
 
-本文件描述的是当前已落地的 per-chat session tracking。它仍是现有运行期行为的基础，但不再是长期并发模型。下一阶段设计应迁移到 repo 级 global reviewed-diff tracker：在 repo 下按 branch/worktree 维护 diff units、chat session assignment、reviewer lease、activity probe 和 stale release。详见仓库文档 `docs/global-reviewed-diff-tracker-overhaul-plan.md`。
+本文件描述的是当前已落地的 per-chat session tracking。它仍是现有运行期行为的基础，但不再是长期并发模型。下一阶段设计已迁移到 repo 级 global reviewed-diff tracker：在 repo 下按 branch/worktree 维护 diff units、chat session assignment、reviewer lease、activity probe 和 stale release。Phase 1（repo 级共享状态 + cross-session conflict 暴露）已落地，session_manifest 写出的 `tracker` 字段与 build_review_packet 的 `## Cross-Session Conflicts` 即来源于此；Phase 2–4 见仓库文档 `docs/global-reviewed-diff-tracker-overhaul-plan.md`。
 
 ## 目标
 
