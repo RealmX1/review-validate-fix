@@ -731,15 +731,19 @@ def dev_repo_script(repo: Path, rel_path: Path) -> Path:
 
 
 def dev_sync_step_specs(repo: Path) -> list[tuple[str, Path, list[str], str]]:
-    return [
+    steps = [
         ("contract-check", dev_repo_script(repo, DEV_SYNC_CONTRACT_SCRIPT), [], "contract-check"),
-        (
-            "installer",
-            dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
-            installer_args_from_env(),
-            "installer",
-        ),
     ]
+    if is_truthy(os.environ.get("CODEX_RVF_DEV_SYNC_INSTALL"), default=True):
+        steps.append(
+            (
+                "installer",
+                dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
+                installer_args_from_env(),
+                "installer",
+            )
+        )
+    return steps
 
 
 def sync_from_dev_repo(

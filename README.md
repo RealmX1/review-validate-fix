@@ -160,12 +160,21 @@ python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode kanban-fol
 
 该模式写入 `CODEX_RVF_FORK_MODE=kanban-followup`，也接受别名 `kanban-message` / `kanban-inject`。dirty gate 通过后，hook 不 fork、不创建新 task，而是要求环境或 Stop event 提供 `KANBAN_TASK_ID`（兼容 `CLINE_KANBAN_TASK_ID` / `task_id`），再调用定制的 `kanban task message --project-path <repo> --task-id <id> --prompt-file <prompt> --source review-validate-fix --idempotency-key <run_id>`。这个命令必须走 Kanban host 的真实用户消息通道，把 `$review-validate-fix` prompt 注入当前 task 的 active coding-agent chat session；不得实现为 card activity、metadata、hook context、system message 或 `contextModification`。注入失败时 hook 只报告 `kanban_followup_unavailable` / `kanban_followup_missing_task_id` 并停止，不回退到 continuation、新 task 或 GUI fork。
 
-实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_router.py`，不是直接调用 `codex_stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并强制关闭子 dispatcher 的 repo-path dev sync；stable channel 转发到 installed stable dispatcher。dispatcher 的 dev-only sync 能力仍保留给直接调用 dispatcher 的受控开发路径使用：
+实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_router.py`，不是直接调用 `codex_stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。stable channel 转发到 installed stable dispatcher，并关闭子 dispatcher 的 repo-path dev sync；选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并允许它在 `CODEX_RVF_DEV_REPO` 匹配当前 Stop event repo 时运行 repo 级 contract check，但会设置 `CODEX_RVF_DEV_SYNC_INSTALL=0`，避免 Stop hook 把 dev checkout 自动安装进 stable plugin。dispatcher 的完整 dev-only sync 安装能力仍保留给直接调用 dispatcher 的受控开发路径使用：
 
 ```bash
 python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
+
+更新 stable channel 必须是显式人工动作：先切到要发布为 stable 的 checkout、branch 或 tag，确认 contract 通过，再运行安装器。例如：
+
+```bash
+python3 scripts/check_plugin_contracts.py
+python3 scripts/install_to_codex.py --configure-stop-hook
+```
+
+这会更新 installed plugin skill 与 `~/.codex/hooks.json` 中的 stable dispatcher/router 绑定；不会改变当前 session 的 `RVF_STOP_HOOK_CHANNEL` marker。Stop hook 的自动同步只服务 dev channel 的开发预检，不负责发布 stable channel。
 
 如果当前 Stop hook command 是 `auto`、Cline Kanban 或 Kanban follow-up 模式，dispatcher 在执行自同步安装时会保留 `--fork-mode ...` 和全部 `--cline-kanban-*` 配置，避免把已配置的管理模式覆盖回默认值。
 
@@ -175,7 +184,7 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 ### Dev-only 标准
 
-Stop hook 自同步链是 dev-only sync chain：部署后的 dispatcher 只有在直接作为开发入口运行、Stop event 的 git root 等于 `CODEX_RVF_DEV_REPO`、事件不是 subagent，且 session scope 允许时，才运行 `CODEX_RVF_DEV_REPO/scripts/check_plugin_contracts.py` 和 `CODEX_RVF_DEV_REPO/scripts/install_to_codex.py --configure-stop-hook`。它不得运行 deployed plugin 内的安装脚本，也不得从 installed plugin cache 复用旧 installer。经 router 运行的 stable/dev channel 都不得因为 repo 路径匹配而触发 dev sync；stable channel 下即使当前 cwd 是 RVF 开发仓库，也必须使用 stable workflow。
+Stop hook 自同步链是 dev-only sync chain：部署后的 dispatcher 只有在直接作为开发入口运行、Stop event 的 git root 等于 `CODEX_RVF_DEV_REPO`、事件不是 subagent，且 session scope 允许时，才运行 `CODEX_RVF_DEV_REPO/scripts/check_plugin_contracts.py` 和 `CODEX_RVF_DEV_REPO/scripts/install_to_codex.py --configure-stop-hook`。它不得运行 deployed plugin 内的安装脚本，也不得从 installed plugin cache 复用旧 installer。经 router 运行时，stable channel 不得因为 repo 路径匹配而触发 dev sync；dev channel 可以触发 repo 级 contract check，但 router 必须禁用安装 step，避免 dev Stop hook 自动更新 stable channel。stable channel 下即使当前 cwd 是 RVF 开发仓库，也必须使用 stable workflow。
 
 `scripts/install_to_codex.py`、`scripts/check_plugin_contracts.py`、`scripts/check_skill_contracts.sh` 和未来的 dev-only helper 都属于仓库级开发工具，不属于可分发 plugin runtime。未来新增 dev-only 文件时，优先放在仓库顶层 `scripts/` 或显式 `dev-only` / `dev_only` / `.rvf-dev-only` 路径；安装器会过滤这些名称，契约检查也会阻止它们出现在 deployed plugin skill 目录中。runtime 代码需要跨边界时，只能通过 `CODEX_RVF_DEV_REPO` 指向的 dev repo subprocess 调用，不能 import 或复制 dev-only 模块。
 
@@ -209,9 +218,12 @@ flowchart TD
     Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\ncodex_stop_hook_dispatcher.py"]
 
     Dispatcher --> DevCheck{"是否 RVF dev repo\n且需要 dev sync？"}
-    DevDispatcher --> InstalledHook
+    DevDispatcher --> DevContract{"是否 RVF dev repo\n且需要 dev 预检？"}
     DevCheck -- "否" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
     DevCheck -- "是" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
+    DevContract -- "否" --> InstalledHook
+    DevContract -- "是" --> ContractOnly["dev channel preflight\ncheck_plugin_contracts.py\n不安装 stable"]
+    ContractOnly --> InstalledHook
     Sync --> SyncOk{"检查和安装成功？"}
     SyncOk -- "否" --> BlockingFail["continue: true\nsystemMessage + summary\n不运行旧 installed plugin"]
     SyncOk -- "是" --> InstalledHook

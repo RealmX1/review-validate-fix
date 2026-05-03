@@ -130,7 +130,7 @@ def write_fake_router_target(path: Path, marker: Path, label: str) -> None:
         "import json, os, pathlib, sys\n"
         "raw = sys.stdin.read()\n"
         f"pathlib.Path({str(marker / f'{label}-input.json')!r}).write_text(raw, encoding='utf-8')\n"
-        f"pathlib.Path({str(marker / f'{label}-env.json')!r}).write_text(json.dumps({{'selected_channel': os.environ.get('CODEX_RVF_SELECTED_CHANNEL'), 'dev_sync': os.environ.get('CODEX_RVF_DEV_SYNC'), 'state_dir': os.environ.get('CODEX_RVF_SESSION_HOOK_STATE_DIR')}}), encoding='utf-8')\n"
+        f"pathlib.Path({str(marker / f'{label}-env.json')!r}).write_text(json.dumps({{'selected_channel': os.environ.get('CODEX_RVF_SELECTED_CHANNEL'), 'dev_sync': os.environ.get('CODEX_RVF_DEV_SYNC'), 'dev_sync_install': os.environ.get('CODEX_RVF_DEV_SYNC_INSTALL'), 'state_dir': os.environ.get('CODEX_RVF_SESSION_HOOK_STATE_DIR')}}), encoding='utf-8')\n"
         f"print(json.dumps({{'continue': True, 'systemMessage': '{label} hook ran'}}))\n",
         encoding="utf-8",
     )
@@ -304,6 +304,7 @@ def invoke_result(
         "CODEX_RVF_DEV_SYNC_STATE_DIR",
         "CODEX_RVF_LOG_ROOT",
         "CODEX_RVF_DEV_SYNC",
+        "CODEX_RVF_DEV_SYNC_INSTALL",
         "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT",
         "CODEX_RVF_CORRELATION_ID",
         "CODEX_RVF_FORK_MODE",
@@ -376,6 +377,7 @@ def invoke_router(
         "CODEX_RVF_LOG_ROOT",
         "CODEX_RVF_SELECTED_CHANNEL",
         "CODEX_RVF_DEV_SYNC",
+        "CODEX_RVF_DEV_SYNC_INSTALL",
     ):
         env.pop(key, None)
     env["CODEX_RVF_STABLE_STOP_HOOK"] = str(stable_hook)
@@ -447,6 +449,7 @@ def test_router_defaults_to_stable_even_in_dev_repo(tmp_path: Path) -> None:
     stable_env = json.loads((marker / "stable-env.json").read_text(encoding="utf-8"))
     assert stable_env["selected_channel"] == "stable"
     assert stable_env["dev_sync"] == "0"
+    assert stable_env["dev_sync_install"] is None
 
 
 def test_router_channel_dev_marker_routes_current_and_later_stops(tmp_path: Path) -> None:
@@ -479,7 +482,8 @@ def test_router_channel_dev_marker_routes_current_and_later_stops(tmp_path: Path
     assert session_state["channel"] == "dev"
     dev_env = json.loads((marker / "dev-env.json").read_text(encoding="utf-8"))
     assert dev_env["selected_channel"] == "dev"
-    assert dev_env["dev_sync"] == "0"
+    assert dev_env["dev_sync"] == "1"
+    assert dev_env["dev_sync_install"] == "0"
 
     (marker / "dev-input.json").unlink()
     stdout = invoke_router_stdout(
@@ -743,6 +747,35 @@ def test_session_hook_off_still_syncs_before_running_installed_hook(tmp_path: Pa
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
     assert (marker / "install-ran").exists()
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_dev_channel_sync_skips_stable_install(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "parent-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+    }
+    stdout = invoke(
+        event,
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_DEV_SYNC_INSTALL": "0"},
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
@@ -1197,6 +1230,23 @@ def test_dev_sync_step_specs_resolve_repo_level_dev_scripts(tmp_path: Path) -> N
     assert specs[1][1] != module.SKILL_DIR / "scripts" / "install_to_codex.py"
 
 
+def test_dev_sync_step_specs_can_skip_installer_for_router_dev_channel(tmp_path: Path) -> None:
+    module = load_dispatcher_module()
+    repo = tmp_path / "rvf"
+    previous = os.environ.get("CODEX_RVF_DEV_SYNC_INSTALL")
+    os.environ["CODEX_RVF_DEV_SYNC_INSTALL"] = "0"
+    try:
+        specs = module.dev_sync_step_specs(repo)
+    finally:
+        if previous is None:
+            os.environ.pop("CODEX_RVF_DEV_SYNC_INSTALL", None)
+        else:
+            os.environ["CODEX_RVF_DEV_SYNC_INSTALL"] = previous
+
+    assert [spec[0] for spec in specs] == ["contract-check"]
+    assert specs[0][1] == (repo / "scripts" / "check_plugin_contracts.py").resolve()
+
+
 def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1545,6 +1595,7 @@ def main() -> int:
         test_literal_plan_markers_in_completion_do_not_skip_hook,
         test_prior_plan_output_does_not_suppress_future_turn,
         test_session_hook_off_still_syncs_before_running_installed_hook,
+        test_dev_channel_sync_skips_stable_install,
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
         test_suppress_env_skips_before_sync_and_installed_hook,
@@ -1562,6 +1613,7 @@ def main() -> int:
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
         test_dev_sync_step_specs_resolve_repo_level_dev_scripts,
+        test_dev_sync_step_specs_can_skip_installer_for_router_dev_channel,
         test_dev_sync_preserves_cline_kanban_installer_args,
         test_hook_config_drops_legacy_npx_kanban_defaults,
         test_hook_config_extracts_router_env_when_current_dispatcher_is_second_target,

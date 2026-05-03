@@ -368,9 +368,12 @@ def route_to_target(
     env.update(ledger.env())
     env["CODEX_RVF_SELECTED_CHANNEL"] = channel
     env["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = str(state_dir())
-    # Channel routing owns stable/dev selection. Child dispatchers must not
-    # infer dev mode from the current repository path.
-    env["CODEX_RVF_DEV_SYNC"] = "0"
+    # Channel routing owns stable/dev selection. Stable must never be updated
+    # implicitly by Stop hook activity. Dev may run repository checks, but it
+    # must not copy dev code into the stable installed plugin.
+    env["CODEX_RVF_DEV_SYNC"] = "1" if channel == "dev" else "0"
+    if channel == "dev":
+        env["CODEX_RVF_DEV_SYNC_INSTALL"] = "0"
     ledger.event(
         phase="router",
         event="target_started",
