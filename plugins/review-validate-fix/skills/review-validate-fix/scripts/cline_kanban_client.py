@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_KANBAN_VERSION = "0.1.66"
-DEFAULT_START_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} --no-open"
-DEFAULT_TASK_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} task"
+DEFAULT_KANBAN_VERSION = "0.1.67"
+DEFAULT_START_CMD = "kanban --no-open"
+DEFAULT_TASK_CMD = "kanban task"
 DEFAULT_START_TIMEOUT_SECONDS = 90.0
 DEFAULT_TMUX_SESSION = "rvf-cline-kanban"
 DEFAULT_RUNTIME_PORT = 3484
@@ -143,14 +143,22 @@ def run_command(
     check: bool = True,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        env=dict(env) if env is not None else None,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=dict(env) if env is not None else None,
+        )
+    except FileNotFoundError as exc:
+        raise KanbanError(
+            f"Cline Kanban command not found: {command[0]!r}. Install or upgrade a stable "
+            f"`kanban` binary with `npm install -g kanban@{DEFAULT_KANBAN_VERSION}`, "
+            "or set CODEX_RVF_CLINE_KANBAN_TASK_CMD/CODEX_RVF_CLINE_KANBAN_START_CMD "
+            "to a stable local binary. RVF does not use npx for its default Kanban path."
+        ) from exc
     if check and completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"{command[0]} failed"
         raise KanbanError(detail)
@@ -208,7 +216,34 @@ def describe_listener(pid: int) -> str:
     return f"pid={pid} cwd={cwd_text} command={command_text}"
 
 
-def assert_server_belongs_to_repo(*, port: int, repo: Path) -> None:
+def payload_workspace_path(payload: dict[str, Any]) -> Path | None:
+    for key in ("workspacePath", "workspace_path", "projectPath", "project_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    workspace = payload.get("workspace")
+    if isinstance(workspace, dict):
+        value = workspace.get("path")
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    return None
+
+
+def assert_server_belongs_to_repo(
+    *,
+    port: int,
+    repo: Path,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    workspace_path = payload_workspace_path(payload) if payload is not None else None
+    if workspace_path is not None:
+        if same_path(workspace_path, repo):
+            return
+        raise KanbanError(
+            f"Kanban CLI on 127.0.0.1:{port} returned workspace {workspace_path}, "
+            f"but RVF expected {repo}."
+        )
+
     pids = listener_pids_for_port(port)
     if not pids:
         return
@@ -221,6 +256,19 @@ def assert_server_belongs_to_repo(*, port: int, repo: Path) -> None:
         f"Kanban CLI reached a server on 127.0.0.1:{port}, but that listener was not "
         f"started from expected repo {repo}. Listener(s): {details}. Stop the stale "
         f"Kanban/tmux session or restart it from {repo} before creating RVF tasks."
+    )
+
+
+def running_listener_error(*, port: int, last_error: str) -> KanbanError:
+    pids = listener_pids_for_port(port)
+    if not pids:
+        return KanbanError(last_error or "Kanban server is unavailable")
+    details = "; ".join(describe_listener(pid) for pid in pids)
+    detail = last_error or "Kanban task list failed"
+    return KanbanError(
+        f"Kanban server is already listening on 127.0.0.1:{port}, but RVF could not "
+        f"connect with task list and will not start another Kanban server. "
+        f"Error: {detail}. Listener(s): {details}"
     )
 
 
@@ -297,10 +345,13 @@ def ensure_kanban(
     )
     if first.returncode == 0:
         payload = parse_json_stdout(first)
-        assert_server_belongs_to_repo(port=runtime_port, repo=repo)
+        assert_server_belongs_to_repo(port=runtime_port, repo=repo, payload=payload)
         return {"started": False, "list": payload}
+    first_error = first.stderr.strip() or first.stdout.strip() or "Kanban server is unavailable"
     if not start_if_needed:
-        raise KanbanError(first.stderr.strip() or first.stdout.strip() or "Kanban server is unavailable")
+        raise running_listener_error(port=runtime_port, last_error=first_error)
+    if listener_pids_for_port(runtime_port):
+        raise running_listener_error(port=runtime_port, last_error=first_error)
 
     launcher = start_kanban_server(
         start_cmd=start_cmd,
@@ -309,7 +360,7 @@ def ensure_kanban(
         runtime_port=runtime_port,
     )
     deadline = time.monotonic() + max(0.0, timeout_seconds)
-    last_error = first.stderr.strip() or first.stdout.strip()
+    last_error = first_error
     while time.monotonic() <= deadline:
         probe = run_command(
             task_command(task_cmd, "list", "--project-path", str(repo)),
@@ -319,7 +370,7 @@ def ensure_kanban(
         )
         if probe.returncode == 0:
             payload = parse_json_stdout(probe)
-            assert_server_belongs_to_repo(port=runtime_port, repo=repo)
+            assert_server_belongs_to_repo(port=runtime_port, repo=repo, payload=payload)
             return {"started": True, "launcher": launcher, "list": payload}
         last_error = probe.stderr.strip() or probe.stdout.strip() or last_error
         time.sleep(1.0)

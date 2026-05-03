@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import start_run
 import diff_tracker
+from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -76,6 +76,7 @@ def review_env_exports(
     bootstrap_metadata_path: Path | None,
     tracker_dir: Path | None = None,
     tracker_repo_key: str | None = None,
+    rvf_backend: str | None = None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
         "RVF_REPO": str(repo),
@@ -95,6 +96,9 @@ def review_env_exports(
         "CODEX_RVF_RUN_ID": run_id,
         "CODEX_RVF_RUN_DIR": str(run_dir),
     }
+    canonical_backend = normalize_rvf_backend(rvf_backend)
+    if canonical_backend is not None:
+        env["RVF_BACKEND"] = canonical_backend
     if bootstrap_metadata_path is not None:
         env["RVF_WORKTREE_BOOTSTRAP"] = str(bootstrap_metadata_path)
     if scope_of_work_path is not None:
@@ -133,6 +137,8 @@ def review_env_exports(
         lines.append('export RVF_SESSION_CONTEXT="$RVF_SCOPE_OF_WORK"')
     if session_manifest_path is not None:
         lines.append('export RVF_SESSION_MANIFEST="$RVF_ARTIFACTS_DIR/session-manifest.json"')
+    if canonical_backend is not None:
+        lines.append(f"export RVF_BACKEND={shlex.quote(canonical_backend)}")
     lines.extend(
         [
             'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"',
@@ -401,8 +407,10 @@ def prepare_run(
     allow_missing_session_context: bool = False,
     rvf_run_id: str | None = None,
     rvf_run_dir: Path | None = None,
+    rvf_backend: str | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
+    canonical_backend = normalize_rvf_backend(rvf_backend) or "manual"
     ledger = start_run(
         "prepare-run",
         repo=str(root),
@@ -607,6 +615,7 @@ def prepare_run(
         bootstrap_metadata_path=bootstrap["metadata_path"],
         tracker_dir=tracker_dir_path,
         tracker_repo_key=tracker_repo_key_value,
+        rvf_backend=canonical_backend,
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
     review_agent_context = review_agent_context_text(
@@ -665,6 +674,15 @@ def prepare_run(
         "primary_files": primary_files,
         "background_files": background_files,
         "excluded_path_prefixes": metadata.get("excluded_path_prefixes"),
+        **rvf_state_fields(
+            phase="prepare",
+            backend=canonical_backend,
+            backend_raw=rvf_backend or canonical_backend,
+            scope_contract_path=scope_contract_path,
+            scope_of_work_path=scope_path,
+            review_packet_path=packet_path,
+            session_manifest_path=manifest_path,
+        ),
     }
     ledger.event(
         phase="prepare",
@@ -686,6 +704,15 @@ def prepare_run(
             "review_agent_context": str(review_agent_context_path),
         },
         packet_bytes=metadata.get("packet_bytes"),
+        **rvf_state_fields(
+            phase="prepare",
+            backend=canonical_backend,
+            backend_raw=rvf_backend or canonical_backend,
+            scope_contract_path=scope_contract_path,
+            scope_of_work_path=scope_path,
+            review_packet_path=packet_path,
+            session_manifest_path=manifest_path,
+        ),
     )
     ledger.summary(
         status="completed",
@@ -706,6 +733,7 @@ def main() -> int:
     parser.add_argument("--output-json", help="Write run metadata JSON to this path. Prints JSON to stdout when omitted.")
     parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
     parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
+    parser.add_argument("--rvf-backend", help="RVF entry backend: manual, kanban-followup, or kanban-task.")
     parser.add_argument("--max-file-bytes", type=int, default=200_000, help="Max untracked file bytes to inline.")
     parser.add_argument("--max-packet-bytes", type=int, default=0, help="Fail if the generated packet exceeds this many bytes. 0 disables the check.")
     parser.add_argument("--primary-file", action="append", default=[], help="Path known to be primary work for this turn. May be repeated.")
@@ -755,6 +783,7 @@ def main() -> int:
             allow_missing_session_context=args.allow_missing_session_context,
             rvf_run_id=args.rvf_run_id,
             rvf_run_dir=Path(args.rvf_run_dir).expanduser().resolve() if args.rvf_run_dir else None,
+            rvf_backend=args.rvf_backend,
         )
     except Exception as exc:
         return fail(str(exc), 2)

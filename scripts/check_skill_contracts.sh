@@ -403,6 +403,7 @@ required_files=(
   "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
+  "scripts/codex_stop_hook_router.py"
   "scripts/codex_stop_review_validate_fix.py"
   "scripts/discover_santa_alternative_agents.sh"
   "scripts/read_mcp_setup_once.sh"
@@ -622,8 +623,12 @@ require_literal "scripts/prepare_review_run.py" 'custom'
 require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-id'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-dir'
+require_literal "scripts/prepare_review_run.py" '--rvf-backend'
 require_literal "scripts/rvf_logging.py" 'class RunLedger'
 require_literal "scripts/rvf_logging.py" 'cline-kanban'
+require_literal "scripts/rvf_logging.py" 'RVF_STATE_PHASES'
+require_literal "scripts/rvf_logging.py" 'kanban-task'
+require_literal "scripts/rvf_logging.py" 'rvf_state_fields'
 require_literal "scripts/rvf_logging.py" 'events.jsonl'
 require_literal "scripts/rvf_logging.py" 'summary.json'
 require_literal "scripts/rvf_logging.py" 'reason_code'
@@ -706,7 +711,8 @@ require_literal "SKILL.md" 'CODEX_RVF_FORK_MODE=cline-kanban'
 require_literal "SKILL.md" 'CODEX_RVF_FORK_MODE=kanban-followup'
 require_literal "SKILL.md" 'Cline Kanban'
 require_literal "SKILL.md" 'worktree bootstrap'
-require_literal "scripts/cline_kanban_client.py" 'DEFAULT_TASK_CMD = f"npx -y kanban@{DEFAULT_KANBAN_VERSION} task"'
+require_literal "scripts/cline_kanban_client.py" 'DEFAULT_TASK_CMD = "kanban task"'
+require_literal "scripts/cline_kanban_client.py" 'RVF does not use npx for its default Kanban path'
 require_literal "scripts/cline_kanban_client.py" 'task create'
 require_literal "scripts/cline_kanban_client.py" 'task start'
 require_literal "scripts/cline_kanban_client.py" 'task trash'

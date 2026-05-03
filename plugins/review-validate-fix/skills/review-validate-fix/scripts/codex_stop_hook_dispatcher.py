@@ -21,6 +21,10 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "codex_stop_review_validate_fix.py"
 DEV_SYNC_CONTRACT_SCRIPT = Path("scripts") / "check_plugin_contracts.py"
 DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"
+LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
+    "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
+    "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
+}
 SESSION_PATH_KEYS = (
     "transcript_path",
     "session_path",
@@ -407,15 +411,21 @@ def _command_targets_current_dispatcher(command: str) -> bool:
     for token in tokens:
         if not token.endswith("codex_stop_hook_dispatcher.py"):
             continue
+        candidate = token.split("=", 1)[1] if "=" in token else token
         try:
-            return Path(token).expanduser().resolve() == current
+            if Path(candidate).expanduser().resolve() == current:
+                return True
         except OSError:
-            return False
+            continue
     return False
 
 
 def _merged_hook_config(hook_env: dict[str, str]) -> dict[str, str]:
-    return dict(hook_env)
+    merged = dict(hook_env)
+    for name, legacy_value in LEGACY_DEFAULT_CLINE_KANBAN_ENV.items():
+        if merged.get(name, "").strip() == legacy_value:
+            merged.pop(name, None)
+    return merged
 
 
 def hook_config_from_hooks_json() -> dict[str, str]:
@@ -721,15 +731,19 @@ def dev_repo_script(repo: Path, rel_path: Path) -> Path:
 
 
 def dev_sync_step_specs(repo: Path) -> list[tuple[str, Path, list[str], str]]:
-    return [
+    steps = [
         ("contract-check", dev_repo_script(repo, DEV_SYNC_CONTRACT_SCRIPT), [], "contract-check"),
-        (
-            "installer",
-            dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
-            installer_args_from_env(),
-            "installer",
-        ),
     ]
+    if is_truthy(os.environ.get("CODEX_RVF_DEV_SYNC_INSTALL"), default=True):
+        steps.append(
+            (
+                "installer",
+                dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
+                installer_args_from_env(),
+                "installer",
+            )
+        )
+    return steps
 
 
 def sync_from_dev_repo(

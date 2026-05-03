@@ -1575,11 +1575,17 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
     assert payload["review_env"]["CODEX_RVF_RUN_ID"] == payload["run_id"]
     assert payload["review_env"]["CODEX_RVF_RUN_DIR"] == payload["run_dir"]
+    assert payload["review_env"]["RVF_BACKEND"] == "manual"
+    assert payload["rvf_backend"] == "manual"
+    assert payload["rvf_state_phase"] == "prepare"
+    assert payload["rvf_scope_contract_path"] == payload["scope_contract"]
+    assert payload["rvf_review_packet_path"] == payload["review_packet"]
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
     assert 'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"' in review_env_text
     assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in review_env_text
+    assert "export RVF_BACKEND=manual" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
     assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
@@ -2749,6 +2755,256 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> N
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
+def test_alternative_reviewer_codex_json_extracts_agent_message(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, os, subprocess, sys; sys.stdin.read(); "
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'working'}}), flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, os, subprocess, sys; sys.stdin.read(); "
+                "print('non-json warning line', flush=True); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'NO_ISSUES'}}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["exec", "--json", "-"]
+
+
+def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "--ask-for-approval", "never", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
+
+
+def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp / "codex"
+    sink = tmp / "env.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps({"
+                "'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'), "
+                "'thread': os.environ.get('CODEX_THREAD_ID')"
+                "}))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        ["codex", "exec"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    env = os.environ.copy()
+    env["PATH"] = f"{tmp}:{env.get('PATH', '')}"
+    env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
+    env.pop("CODEX_RVF_SUPPRESS_STOP_HOOK", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    payload = json.loads(sink.read_text(encoding="utf-8"))
+    assert payload == {
+        "suppress": "1",
+        "thread": "parent-thread-id-for-regression-test",
+    }
+
+
 def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -2963,9 +3219,11 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
 
 def test_cline_kanban_client_detects_runtime_port() -> None:
     module = load_cline_kanban_client_module()
+    assert module.DEFAULT_START_CMD == "kanban --no-open"
+    assert module.DEFAULT_TASK_CMD == "kanban task"
     assert module.resolve_runtime_port(
-        start_cmd="npx -y kanban@0.1.66 --no-open",
-        task_cmd="npx -y kanban@0.1.66 task",
+        start_cmd=module.DEFAULT_START_CMD,
+        task_cmd=module.DEFAULT_TASK_CMD,
         env={},
     ) == 3484
     assert module.resolve_runtime_port(
@@ -3010,6 +3268,19 @@ def test_cline_kanban_client_rejects_ambiguous_runtime_ports() -> None:
             raise AssertionError(f"expected KanbanError containing {expected!r}")
 
 
+def test_cline_kanban_client_reports_missing_stable_binary() -> None:
+    module = load_cline_kanban_client_module()
+    try:
+        module.run_command(["rvf-missing-kanban-command-for-test"], check=False)
+    except module.KanbanError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected missing kanban command to raise KanbanError")
+    assert "Cline Kanban command not found" in message
+    assert "npm install -g kanban@0.1.67" in message
+    assert "does not use npx" in message
+
+
 def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     module = load_cline_kanban_client_module()
     repo = tmp / "repo"
@@ -3033,7 +3304,7 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
         try:
             module.ensure_kanban(
                 task_cmd=f"{sys.executable} {fake_task}",
-                start_cmd="npx -y kanban@0.1.66 --no-open",
+                start_cmd="kanban --no-open",
                 repo=repo,
                 tmux_session="unused",
                 timeout_seconds=0,
@@ -3051,6 +3322,92 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     assert "not started from expected repo" in message
     assert str(repo) in message
     assert str(other) in message
+
+
+def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        result = module.ensure_kanban(
+            task_cmd=f"{sys.executable} {fake_task}",
+            start_cmd="npx -y kanban@0.1.66 --no-open",
+            repo=repo,
+            tmux_session="unused",
+            timeout_seconds=0,
+            start_if_needed=False,
+        )
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+
+    assert result["started"] is False
+    assert result["list"]["workspacePath"] == str(repo)
+
+
+def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import sys\n"
+        "print('task list failed', file=sys.stderr)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    started: list[object] = []
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_start = module.start_kanban_server
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.start_kanban_server = lambda **kwargs: started.append(kwargs) or {}
+        try:
+            module.ensure_kanban(
+                task_cmd=f"{sys.executable} {fake_task}",
+                start_cmd="npx -y kanban@0.1.66 --no-open",
+                repo=repo,
+                tmux_session="unused",
+                timeout_seconds=0,
+                start_if_needed=True,
+            )
+        except module.KanbanError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected existing listener connection failure")
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.start_kanban_server = original_start
+
+    assert started == []
+    assert "will not start another Kanban server" in message
+    assert "task list failed" in message
 
 
 def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
@@ -3393,6 +3750,31 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
     assert later["cline_kanban_task_id"] == "task-1"
     assert later["cline_kanban_base_ref"] == "HEAD"
     assert later["worktree_bootstrap_path"] == "/tmp/bootstrap.json"
+
+
+def test_run_ledger_summary_preserves_rvf_state_fields(tmp: Path) -> None:
+    module = load_rvf_logging_module()
+    run_dir = tmp / "run"
+    ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+    ledger.summary(
+        status="cline-kanban-started",
+        reason_code="cline_kanban_task_started",
+        **module.rvf_state_fields(
+            phase="prepare",
+            backend="kanban-task",
+            backend_raw="cline-kanban",
+            scope_contract_path="/tmp/scope.contract.json",
+            review_packet_path="/tmp/review-packet.md",
+        ),
+    )
+    later = ledger.summary(status="completed", reason_code="prepare_completed", message="later phase")
+    assert later["rvf_backend"] == "kanban-task"
+    assert later["rvf_backend_raw"] == "cline-kanban"
+    assert later["rvf_state_phase"] == "prepare"
+    assert later["rvf_scope_contract_path"] == "/tmp/scope.contract.json"
+    assert later["rvf_review_packet_path"] == "/tmp/review-packet.md"
+    assert later["rvf_state"]["phases"] == list(module.RVF_STATE_PHASES)
+
 
 def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp: Path) -> None:
     run_dir = tmp / "state" / "runs" / "rvf-user-cancel"
@@ -4291,6 +4673,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json"),
         ),
         (
+            "alternative_reviewer_codex_json_extracts_agent_message",
+            lambda: test_alternative_reviewer_codex_json_extracts_agent_message(root / "alternative-codex-json"),
+        ),
+        (
+            "alternative_reviewer_codex_json_extracts_item_completed_agent_message",
+            lambda: test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(
+                root / "alternative-codex-json-item-completed"
+            ),
+        ),
+        (
+            "alternative_reviewer_codex_exec_json_command_is_patched",
+            lambda: test_alternative_reviewer_codex_exec_json_command_is_patched(root / "alternative-codex-command"),
+        ),
+        (
+            "alternative_reviewer_codex_exec_after_global_options_is_patched",
+            lambda: test_alternative_reviewer_codex_exec_after_global_options_is_patched(
+                root / "alternative-codex-global-options"
+            ),
+        ),
+        (
+            "alternative_reviewer_sets_codex_stop_hook_suppress_env",
+            lambda: test_alternative_reviewer_sets_codex_stop_hook_suppress_env(root / "alternative-codex-suppress"),
+        ),
+        (
             "alternative_reviewer_legacy_claude_config_gets_stream_json",
             lambda: test_alternative_reviewer_legacy_claude_config_gets_stream_json(root / "alternative-legacy-config"),
         ),
@@ -4316,8 +4722,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_cline_kanban_client_rejects_ambiguous_runtime_ports(),
         ),
         (
+            "cline_kanban_client_reports_missing_stable_binary",
+            test_cline_kanban_client_reports_missing_stable_binary,
+        ),
+        (
             "cline_kanban_client_rejects_foreign_listener",
             lambda: test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener"),
+        ),
+        (
+            "cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener",
+            lambda: test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(
+                root / "cline-kanban-workspace-payload"
+            ),
+        ),
+        (
+            "cline_kanban_client_does_not_start_when_listener_exists_but_list_fails",
+            lambda: test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
+                root / "cline-kanban-existing-listener-list-fails"
+            ),
         ),
         (
             "cline_kanban_client_create_and_start_task",
@@ -4354,6 +4776,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "run_ledger_summary_preserves_cline_kanban_fields",
             lambda: test_run_ledger_summary_preserves_cline_kanban_fields(root / "summary-preserve-cline"),
+        ),
+        (
+            "run_ledger_summary_preserves_rvf_state_fields",
+            lambda: test_run_ledger_summary_preserves_rvf_state_fields(root / "summary-preserve-rvf-state"),
         ),
         (
             "cancel_rvf_run_marks_cancelled_and_trashes_cline_task",

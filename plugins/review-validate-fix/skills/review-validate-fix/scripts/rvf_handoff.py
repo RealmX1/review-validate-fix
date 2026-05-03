@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import RunLedger, safe_token
+from rvf_logging import RunLedger, rvf_state_fields, safe_token
 
 
 HANDOFF_FILE_MARKER = "RVF_HANDOFF_FILE"
@@ -229,6 +229,24 @@ def handoff_completion_payload(
         return None
 
     resolved = handoff_path.expanduser().resolve()
+    try:
+        previous_summary = json.loads(ledger.summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous_summary = {}
+    if not isinstance(previous_summary, dict):
+        previous_summary = {}
+    previous_state_fields = {
+        "backend": previous_summary.get("rvf_backend")
+        if isinstance(previous_summary.get("rvf_backend"), str)
+        else None,
+        "backend_raw": previous_summary.get("rvf_backend_raw")
+        if isinstance(previous_summary.get("rvf_backend_raw"), str)
+        else None,
+        "scope_contract_path": previous_summary.get("rvf_scope_contract_path"),
+        "scope_of_work_path": previous_summary.get("rvf_scope_of_work_path"),
+        "review_packet_path": previous_summary.get("rvf_review_packet_path"),
+        "session_manifest_path": previous_summary.get("rvf_session_manifest_path"),
+    }
     session_id = str(event.get("session_id") or "unknown-session")
     marker_path = _advised_marker_path(ledger, session_id, resolved)
     marker_written = False
@@ -281,6 +299,12 @@ def handoff_completion_payload(
         marker_written=marker_written,
         marker_error=marker_error,
         already_advised=already_advised,
+        **rvf_state_fields(
+            phase="complete",
+            **previous_state_fields,
+            handoff_path=resolved,
+            completion_gate="handoff_file_ready",
+        ),
     )
     message = f"review-validate-fix run 已结束。Handoff markdown 文件: {resolved}"
     if open_result.get("enabled") is False:
@@ -303,6 +327,12 @@ def handoff_completion_payload(
         marker_written=marker_written,
         marker_error=marker_error,
         already_advised=already_advised,
+        **rvf_state_fields(
+            phase="complete",
+            **previous_state_fields,
+            handoff_path=resolved,
+            completion_gate="handoff_file_ready",
+        ),
     )
 
 
