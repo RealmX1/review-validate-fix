@@ -3324,6 +3324,92 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     assert str(other) in message
 
 
+def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        result = module.ensure_kanban(
+            task_cmd=f"{sys.executable} {fake_task}",
+            start_cmd="npx -y kanban@0.1.66 --no-open",
+            repo=repo,
+            tmux_session="unused",
+            timeout_seconds=0,
+            start_if_needed=False,
+        )
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+
+    assert result["started"] is False
+    assert result["list"]["workspacePath"] == str(repo)
+
+
+def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import sys\n"
+        "print('task list failed', file=sys.stderr)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    started: list[object] = []
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_start = module.start_kanban_server
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.start_kanban_server = lambda **kwargs: started.append(kwargs) or {}
+        try:
+            module.ensure_kanban(
+                task_cmd=f"{sys.executable} {fake_task}",
+                start_cmd="npx -y kanban@0.1.66 --no-open",
+                repo=repo,
+                tmux_session="unused",
+                timeout_seconds=0,
+                start_if_needed=True,
+            )
+        except module.KanbanError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected existing listener connection failure")
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.start_kanban_server = original_start
+
+    assert started == []
+    assert "will not start another Kanban server" in message
+    assert "task list failed" in message
+
+
 def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     tmp.mkdir(parents=True, exist_ok=True)
     fake_task = tmp / "fake_kanban_task.py"
@@ -4037,6 +4123,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "cline_kanban_client_rejects_foreign_listener",
             lambda: test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener"),
+        ),
+        (
+            "cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener",
+            lambda: test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(
+                root / "cline-kanban-workspace-payload"
+            ),
+        ),
+        (
+            "cline_kanban_client_does_not_start_when_listener_exists_but_list_fails",
+            lambda: test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
+                root / "cline-kanban-existing-listener-list-fails"
+            ),
         ),
         (
             "cline_kanban_client_create_and_start_task",
