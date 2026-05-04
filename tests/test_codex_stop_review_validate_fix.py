@@ -1835,9 +1835,10 @@ def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp: Path)
     fake_client.write_text(
         "import sys\n"
         "print('cline-kanban error: KanbanError: Kanban CLI reached a server on "
-        "127.0.0.1:3484, but that listener was not started from expected repo "
-        f"{repo}. Listener(s): pid=123 cwd=/tmp/other command=kanban. Stop the stale "
-        f"Kanban/tmux session or restart it from {repo} before creating RVF tasks.', file=sys.stderr)\n"
+        "127.0.0.1:3484, but no listener pane belongs to tmux session `cline-kanban` "
+        "or `cline-kanban-*`. Listener(s): pid=123 cwd=/tmp/other tmux=rvf-vibe-kanban "
+        "command=kanban. Stop the foreign listener or restart Kanban from a correctly "
+        "named tmux session before creating RVF tasks.', file=sys.stderr)\n"
         "raise SystemExit(2)\n",
         encoding="utf-8",
     )
@@ -1894,7 +1895,7 @@ def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp: Path)
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-unavailable"
     assert latest["backend"] == "kanban"
-    assert "listener was not started from expected repo" in str(latest["error"])
+    assert "no listener pane belongs to tmux session `cline-kanban`" in str(latest["error"])
     assert "legacy_gui_fallback" not in latest
 
 

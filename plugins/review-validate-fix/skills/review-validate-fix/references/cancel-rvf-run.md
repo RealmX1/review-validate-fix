@@ -17,7 +17,7 @@
 - 取消原因使用 `user_cancelled`。
 - 如果 summary 中存在 `cline_kanban_task_id`，优先调用 `kanban task trash --project-path <repo> --task-id <id>`；trash 失败也要把失败详情写入 ledger。
 - 只终止当前 run 相关进程：summary 中的 `runner_pid`，以及命令行包含同一 `run_id` 的 `cline_kanban_client.py`、`apply_worktree_bootstrap.py`、`codex` 或 `review-validate-fix` 进程。
-- 不要终止 Cline Kanban server、tmux `rvf-cline-kanban` session、其他 RVF run，或不含当前 `run_id` 的进程。
+- 不要终止 Cline Kanban server、tmux `cline-kanban` / `cline-kanban-*` session、其他 RVF run，或不含当前 `run_id` 的进程。
 - 不要删除 run artifacts、workspace、events.jsonl 或 summary.json；取消本身是审计事件。
 
 ## 排查

@@ -16,8 +16,9 @@ DEFAULT_KANBAN_VERSION = "0.1.67"
 DEFAULT_START_CMD = "kanban --no-open"
 DEFAULT_TASK_CMD = "kanban task"
 DEFAULT_START_TIMEOUT_SECONDS = 90.0
-DEFAULT_TMUX_SESSION = "rvf-cline-kanban"
+DEFAULT_TMUX_SESSION = "cline-kanban-3484"
 DEFAULT_RUNTIME_PORT = 3484
+CLINE_KANBAN_TMUX_SESSION_NAME = "cline-kanban"
 
 # 契约边界：这个 wrapper 只 shell 到 `kanban task create`、
 # `kanban task start`、`kanban task trash`，以及 RVF 定制的
@@ -208,12 +209,72 @@ def process_command(pid: int) -> str:
     return completed.stdout.strip()
 
 
+def process_parent_pid(pid: int) -> int | None:
+    completed = run_command(["ps", "-p", str(pid), "-o", "ppid="], check=False)
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.strip()
+    if not text:
+        return None
+    try:
+        parent_pid = int(text)
+    except ValueError:
+        return None
+    if parent_pid <= 0:
+        return None
+    return parent_pid
+
+
+def process_ancestry(pid: int, *, max_depth: int = 32) -> list[int]:
+    ancestry: list[int] = []
+    seen: set[int] = set()
+    current: int | None = pid
+    while current is not None and current not in seen and len(ancestry) < max_depth:
+        ancestry.append(current)
+        seen.add(current)
+        current = process_parent_pid(current)
+    return ancestry
+
+
+def tmux_sessions_for_pid(pid: int) -> list[str]:
+    completed = run_command(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_pid}",
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    candidate_pids = {str(ancestor_pid) for ancestor_pid in process_ancestry(pid)}
+    sessions: list[str] = []
+    for line in completed.stdout.splitlines():
+        try:
+            session_name, pane_pid = line.split("\t", 1)
+        except ValueError:
+            continue
+        if pane_pid.strip() in candidate_pids:
+            sessions.append(session_name.strip())
+    return sorted(session for session in sessions if session)
+
+
+def is_cline_kanban_tmux_session(session_name: str) -> bool:
+    return session_name == CLINE_KANBAN_TMUX_SESSION_NAME or session_name.startswith(
+        f"{CLINE_KANBAN_TMUX_SESSION_NAME}-"
+    )
+
+
 def describe_listener(pid: int) -> str:
     cwd = process_cwd(pid)
     command = process_command(pid)
+    tmux_sessions = tmux_sessions_for_pid(pid)
     cwd_text = str(cwd) if cwd is not None else "<unknown>"
     command_text = command or "<unknown>"
-    return f"pid={pid} cwd={cwd_text} command={command_text}"
+    tmux_text = ",".join(tmux_sessions) if tmux_sessions else "<none>"
+    return f"pid={pid} cwd={cwd_text} tmux={tmux_text} command={command_text}"
 
 
 def payload_workspace_path(payload: dict[str, Any]) -> Path | None:
@@ -237,25 +298,25 @@ def assert_server_belongs_to_repo(
 ) -> None:
     workspace_path = payload_workspace_path(payload) if payload is not None else None
     if workspace_path is not None:
-        if same_path(workspace_path, repo):
-            return
-        raise KanbanError(
-            f"Kanban CLI on 127.0.0.1:{port} returned workspace {workspace_path}, "
-            f"but RVF expected {repo}."
-        )
+        if not same_path(workspace_path, repo):
+            raise KanbanError(
+                f"Kanban CLI on 127.0.0.1:{port} returned workspace {workspace_path}, "
+                f"but RVF expected {repo}."
+            )
 
     pids = listener_pids_for_port(port)
     if not pids:
         return
     for pid in pids:
-        cwd = process_cwd(pid)
-        if cwd is not None and same_path(cwd, repo):
+        if any(is_cline_kanban_tmux_session(session) for session in tmux_sessions_for_pid(pid)):
             return
     details = "; ".join(describe_listener(pid) for pid in pids)
     raise KanbanError(
-        f"Kanban CLI reached a server on 127.0.0.1:{port}, but that listener was not "
-        f"started from expected repo {repo}. Listener(s): {details}. Stop the stale "
-        f"Kanban/tmux session or restart it from {repo} before creating RVF tasks."
+        f"Kanban CLI reached a server on 127.0.0.1:{port}, but no listener pane belongs "
+        f"to tmux session `{CLINE_KANBAN_TMUX_SESSION_NAME}` or "
+        f"`{CLINE_KANBAN_TMUX_SESSION_NAME}-*`. Listener(s): {details}. Stop the "
+        "foreign listener or restart Kanban from a correctly named tmux session before "
+        "creating RVF tasks."
     )
 
 

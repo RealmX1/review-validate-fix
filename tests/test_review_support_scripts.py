@@ -3281,7 +3281,7 @@ def test_cline_kanban_client_reports_missing_stable_binary() -> None:
     assert "does not use npx" in message
 
 
-def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
+def test_cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd(tmp: Path) -> None:
     module = load_cline_kanban_client_module()
     repo = tmp / "repo"
     other = tmp / "other"
@@ -3297,10 +3297,78 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
+        result = module.ensure_kanban(
+            task_cmd=f"{sys.executable} {fake_task}",
+            start_cmd="kanban --no-open",
+            repo=repo,
+            tmux_session="unused",
+            timeout_seconds=0,
+            start_if_needed=False,
+        )
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
+
+    assert result["started"] is False
+    assert result["list"]["ok"] is True
+
+
+def test_cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane() -> None:
+    module = load_cline_kanban_client_module()
+    original_run_command = module.run_command
+    original_process_parent_pid = module.process_parent_pid
+    try:
+        module.process_parent_pid = lambda pid: {4242: 1000, 1000: 1}.get(pid)
+
+        def fake_run_command(command, **kwargs):
+            if command[:3] == ["tmux", "list-panes", "-a"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="cline-kanban-3484\t1000\nrvf-other\t7777\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        module.run_command = fake_run_command
+        sessions = module.tmux_sessions_for_pid(4242)
+    finally:
+        module.run_command = original_run_command
+        module.process_parent_pid = original_process_parent_pid
+
+    assert sessions == ["cline-kanban-3484"]
+
+
+def test_cline_kanban_client_rejects_listener_without_cline_tmux_session(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json\n"
+        "print(json.dumps({'ok': True, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["rvf-vibe-kanban"]
         try:
             module.ensure_kanban(
                 task_cmd=f"{sys.executable} {fake_task}",
@@ -3313,18 +3381,18 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
         except module.KanbanError as exc:
             message = str(exc)
         else:
-            raise AssertionError("expected foreign Kanban listener to be rejected")
+            raise AssertionError("expected non-Cline Kanban tmux listener to be rejected")
     finally:
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
 
-    assert "not started from expected repo" in message
-    assert str(repo) in message
-    assert str(other) in message
+    assert "no listener pane belongs to tmux session `cline-kanban`" in message
+    assert "rvf-vibe-kanban" in message
 
 
-def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(tmp: Path) -> None:
+def test_cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener(tmp: Path) -> None:
     module = load_cline_kanban_client_module()
     repo = tmp / "repo"
     other = tmp / "other"
@@ -3341,10 +3409,12 @@ def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
         result = module.ensure_kanban(
             task_cmd=f"{sys.executable} {fake_task}",
             start_cmd="npx -y kanban@0.1.66 --no-open",
@@ -3357,9 +3427,56 @@ def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
 
     assert result["started"] is False
     assert result["list"]["workspacePath"] == str(repo)
+
+
+def test_cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener(tmp: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp / "repo"
+    other = tmp / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: []
+        try:
+            module.ensure_kanban(
+                task_cmd=f"{sys.executable} {fake_task}",
+                start_cmd="npx -y kanban@0.1.66 --no-open",
+                repo=repo,
+                tmux_session="unused",
+                timeout_seconds=0,
+                start_if_needed=False,
+            )
+        except module.KanbanError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected workspace echo without Cline Kanban tmux listener to be rejected")
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
+
+    assert "no listener pane belongs to tmux session `cline-kanban`" in message
+    assert str(other) in message
 
 
 def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp: Path) -> None:
@@ -3380,11 +3497,13 @@ def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     original_start = module.start_kanban_server
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
         module.start_kanban_server = lambda **kwargs: started.append(kwargs) or {}
         try:
             module.ensure_kanban(
@@ -3403,6 +3522,7 @@ def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
         module.start_kanban_server = original_start
 
     assert started == []
@@ -4121,13 +4241,31 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             test_cline_kanban_client_reports_missing_stable_binary,
         ),
         (
-            "cline_kanban_client_rejects_foreign_listener",
-            lambda: test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener"),
+            "cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd",
+            lambda: test_cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd(
+                root / "cline-kanban-cline-tmux-listener"
+            ),
         ),
         (
-            "cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener",
-            lambda: test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(
+            "cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane",
+            test_cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane,
+        ),
+        (
+            "cline_kanban_client_rejects_listener_without_cline_tmux_session",
+            lambda: test_cline_kanban_client_rejects_listener_without_cline_tmux_session(
+                root / "cline-kanban-non-cline-tmux-listener"
+            ),
+        ),
+        (
+            "cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener",
+            lambda: test_cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener(
                 root / "cline-kanban-workspace-payload"
+            ),
+        ),
+        (
+            "cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener",
+            lambda: test_cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener(
+                root / "cline-kanban-workspace-payload-no-tmux"
             ),
         ),
         (

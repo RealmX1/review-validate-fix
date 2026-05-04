@@ -3572,8 +3572,8 @@ def cline_kanban_failure_allows_legacy_gui_fallback(result: dict[str, Any]) -> b
         return False
     error = str(result.get("error") or "")
     blocking_fragments = (
-        "listener was not started from expected repo",
-        "Stop the stale Kanban/tmux session",
+        "no listener pane belongs to tmux session `cline-kanban`",
+        "Stop the foreign listener",
     )
     return not any(fragment in error for fragment in blocking_fragments)
 
