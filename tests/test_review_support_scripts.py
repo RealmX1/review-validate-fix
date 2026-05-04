@@ -5,6 +5,7 @@ import argparse
 import json
 import importlib.util
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -6202,6 +6203,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_lease_acquire_prunes_stale_leases_first(root / "lease-T3"),
         ),
         (
+            "stale_prune_does_not_release_unit_reacquired_by_fresh_lease",
+            lambda: test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease(root / "lease-T3b"),
+        ),
+        (
             "lease_refresh_extends_expires_at",
             lambda: test_lease_refresh_extends_expires_at(root / "lease-T4"),
         ),
@@ -6236,6 +6241,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "run_alternative_reviewer_releases_lease_on_timeout",
             lambda: test_run_alternative_reviewer_releases_lease_on_timeout(root / "lease-T12"),
+        ),
+        (
+            "run_alternative_reviewer_sigterm_kills_child_before_release",
+            lambda: test_run_alternative_reviewer_sigterm_kills_child_before_release(root / "lease-T12b"),
         ),
         (
             "lease_acquire_concurrent_writers_serialize",
@@ -6969,6 +6978,56 @@ def test_lease_acquire_prunes_stale_leases_first(tmp: Path) -> None:
     assert rows[second["lease_id"]] == "active"
 
 
+def test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first_unit, unrelated_unit = unit_ids[:2]
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-old",
+        run_id="lease-run-stale-old",
+        reviewer_id="reviewer-a",
+        unit_ids=[first_unit],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    fresh = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-fresh",
+        run_id="lease-run-stale-fresh",
+        reviewer_id="reviewer-b",
+        unit_ids=[first_unit],
+        lease_ttl_seconds=60,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    unrelated = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-unrelated",
+        run_id="lease-run-stale-unrelated",
+        reviewer_id="reviewer-c",
+        unit_ids=[unrelated_unit],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert first["acquired"] is True
+    assert fresh["acquired"] is True
+    assert unrelated["acquired"] is True
+
+    released = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:04Z",
+    )
+
+    assert [item["lease_id"] for item in released] == [unrelated["lease_id"]]
+    assert _lease_unit_states(log_root, repo_key, [first_unit, unrelated_unit]) == {
+        first_unit: "assigned",
+        unrelated_unit: "available",
+    }
+
+
 def test_lease_refresh_extends_expires_at(tmp: Path) -> None:
     module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
     acquired = module.lease_acquire(
@@ -7135,6 +7194,16 @@ def _run_reviewer_with_lease(
     )
 
 
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> None:
     _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
     completed = _run_reviewer_with_lease(
@@ -7178,6 +7247,78 @@ def test_run_alternative_reviewer_releases_lease_on_timeout(tmp: Path) -> None:
     assert completed.returncode == 124
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stdout
     assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_run_alternative_reviewer_sigterm_kills_child_before_release(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nlease signal test\n", encoding="utf-8")
+    contract = _lease_contract(tmp / "scope.contract.json", repo=repo, unit_ids=unit_ids[:1])
+    pid_file = tmp / "reviewer.pid"
+    reviewer_code = (
+        "import os, pathlib, sys, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "sys.stdin.read()\n"
+        "time.sleep(30)\n"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=60,
+        activity_check_interval_seconds=0.05,
+        max_runtime_seconds=60,
+    )
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--scope-contract",
+            str(contract),
+            "--rvf-run-id",
+            "lease-reviewer-signal-run",
+            "--rvf-run-dir",
+            str(tmp / "run"),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    child_pid: int | None = None
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not pid_file.exists() and proc.poll() is None:
+            time.sleep(0.02)
+        if not pid_file.exists():
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(f"reviewer child did not start; rc={proc.returncode}; stdout={stdout}; stderr={stderr}")
+        child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+        os.kill(proc.pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=10)
+
+        assert proc.returncode == 143, f"stdout={stdout}; stderr={stderr}"
+        deadline = time.time() + 5
+        while time.time() < deadline and _process_is_running(child_pid):
+            time.sleep(0.05)
+        assert not _process_is_running(child_pid)
+        assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=5)
+        if child_pid is not None and _process_is_running(child_pid):
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:

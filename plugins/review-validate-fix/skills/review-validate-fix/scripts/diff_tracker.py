@@ -2532,38 +2532,64 @@ def _list_dirty_paths(repo: Path) -> list[str]:
 
 def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
     """Mark every active lease whose `expires_at <= now` as `stale-released`.
-    Returns the number of leases freed. Lease_units rows stay intact so the
-    underlying units flip back to `available` via the trigger below."""
-    cur = conn.execute(
+    Returns the number of leases freed."""
+    stale_rows = conn.execute(
         """
-        UPDATE leases
-           SET state='stale-released'
+        SELECT lease_id
+          FROM leases
          WHERE state='active'
            AND expires_at <= ?
         """,
         (now_iso,),
+    ).fetchall()
+    stale_lease_ids = [row["lease_id"] for row in stale_rows]
+    if not stale_lease_ids:
+        return 0
+    placeholders = ",".join("?" for _ in stale_lease_ids)
+    conn.execute(
+        """
+        UPDATE leases
+           SET state='stale-released'
+         WHERE lease_id IN ({placeholders})
+        """.format(placeholders=placeholders),
+        tuple(stale_lease_ids),
     )
-    freed = cur.rowcount or 0
-    if freed:
-        # Unleash any units pinned by these leases so they re-enter the
-        # candidate pool. We only flip `assigned -> available`; reviewed /
-        # tombstoned units keep their state.
+    unit_rows = conn.execute(
+        """
+        SELECT DISTINCT unit_id
+          FROM lease_units
+         WHERE lease_id IN ({placeholders})
+        """.format(placeholders=placeholders),
+        tuple(stale_lease_ids),
+    ).fetchall()
+    unit_ids = [row["unit_id"] for row in unit_rows]
+    if unit_ids:
+        unit_placeholders = ",".join("?" for _ in unit_ids)
+        # Only units not held by a still-active lease can re-enter the pool.
         conn.execute(
             """
             UPDATE units
                SET review_state='available'
              WHERE review_state='assigned'
-               AND unit_id IN (
+               AND unit_id IN ({unit_placeholders})
+               AND unit_id NOT IN (
                    SELECT lu.unit_id
                      FROM lease_units lu
                      JOIN leases l ON l.lease_id = lu.lease_id
-                    WHERE l.state='stale-released'
-                      AND l.expires_at <= ?
+                    WHERE l.state='active'
+                      AND lu.unit_id IN ({unit_placeholders})
                )
-            """,
-            (now_iso,),
+            """.format(unit_placeholders=unit_placeholders),
+            tuple(unit_ids) + tuple(unit_ids),
         )
-    return freed
+    conn.execute(
+        """
+        DELETE FROM lease_units
+         WHERE lease_id IN ({placeholders})
+        """.format(placeholders=placeholders),
+        tuple(stale_lease_ids),
+    )
+    return len(stale_lease_ids)
 
 
 def _observe_and_upsert_units_in_txn(
