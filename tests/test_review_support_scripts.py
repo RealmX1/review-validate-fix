@@ -3899,7 +3899,9 @@ def _write_session_transcript(path: Path, repo: Path, *, session_id: str, target
     return path
 
 
-def test_diff_tracker_register_creates_state_and_events(tmp: Path) -> None:
+def test_diff_tracker_register_creates_sqlite_and_events(tmp: Path) -> None:
+    import sqlite3 as _sqlite
+
     module = load_diff_tracker_module()
     repo = init_repo(tmp / "repo")
     log_root = tmp / "logs"
@@ -3918,18 +3920,37 @@ def test_diff_tracker_register_creates_state_and_events(tmp: Path) -> None:
     assert result.repo_key
     assert result.tracker_dir
     tracker_path = Path(result.tracker_dir)
-    assert (tracker_path / "state.json").is_file()
+    # Slice 2-A: tracker dir lives under diff-tracker/repos/<key>/
+    assert "diff-tracker" in tracker_path.parts and "repos" in tracker_path.parts
+    db_path = tracker_path / "tracker.sqlite3"
+    assert db_path.is_file()
     assert (tracker_path / "events.jsonl").is_file()
     assert (tracker_path / "meta.json").is_file()
-    state = json.loads((tracker_path / "state.json").read_text(encoding="utf-8"))
-    assert state["claims"]
-    claim = state["claims"][0]
-    assert claim["session_id"] == "session-1"
-    assert claim["path"] == "tracked.txt"
-    assert claim["unit"] == "hunk"
-    assert claim["hunk_anchor"]["header"]
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units = conn.execute(
+            "SELECT path, kind, observed_state, review_state FROM units"
+        ).fetchall()
+        assert len(units) == 1, units
+        assert units[0][0] == "tracked.txt"
+        assert units[0][1] == "tracked_hunk"
+        assert units[0][2] == "dirty"
+        assert units[0][3] == "available"
+        sessions = conn.execute(
+            "SELECT session_id FROM sessions"
+        ).fetchall()
+        assert {row[0] for row in sessions} == {"session-1"}
+        session_units = conn.execute(
+            "SELECT session_id, assignment_kind FROM session_units"
+        ).fetchall()
+        assert session_units == [("session-1", "owned")]
+    finally:
+        conn.close()
     events = read_jsonl(tracker_path / "events.jsonl")
     assert any(event.get("event") == "claim_added" for event in events)
+    # claim_ids are now content-addressed sha256 unit_ids — sanity check shape.
+    assert len(result.claim_ids) == 1
+    assert len(result.claim_ids[0]) == 64
 
 
 def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
@@ -3950,6 +3971,10 @@ def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
         "import os, sys, time, json\n"
         f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
         "from pathlib import Path\n"
+        # Bump busy_timeout high enough that the second writer can wait out
+        # the first's lock even under load (4-shard contract checks run several
+        # tests in parallel, slowing each register_claims's git calls).
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
         "import diff_tracker as dt\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"repo = Path({str(repo)!r})\n"
@@ -3987,13 +4012,20 @@ def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
             raise AssertionError(stderr.strip())
         payload = json.loads(stdout.strip().splitlines()[-1])
         assert payload["status"] == "ok"
+    import sqlite3 as _sqlite
     repo_key = json.loads(outputs[0][0].splitlines()[-1])["repo_key"]
-    state = json.loads((log_root / "tracker" / repo_key / "state.json").read_text(encoding="utf-8"))
-    sessions = {claim["session_id"] for claim in state["claims"]}
+    db_path = log_root / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        sessions = {row[0] for row in conn.execute("SELECT session_id FROM sessions").fetchall()}
+    finally:
+        conn.close()
     assert sessions == {"session-A", "session-B"}
 
 
-def test_diff_tracker_hunk_anchor_stable_across_reruns(tmp: Path) -> None:
+def test_canonical_patch_hash_stable_across_reruns(tmp: Path) -> None:
+    import sqlite3 as _sqlite
+
     module = load_diff_tracker_module()
     repo = init_repo(tmp / "repo")
     log_root = tmp / "logs"
@@ -4021,8 +4053,13 @@ def test_diff_tracker_hunk_anchor_stable_across_reruns(tmp: Path) -> None:
     )
     assert first.claim_ids == second.claim_ids
     assert second.dropped_stale_claim_ids == []
-    state = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
-    assert len(state["claims"]) == 1
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units = conn.execute("SELECT unit_id FROM units").fetchall()
+    finally:
+        conn.close()
+    assert len(units) == 1
 
 
 def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
@@ -4051,6 +4088,8 @@ def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
     (repo / "tracked.txt").write_text("".join(edited_lines), encoding="utf-8")
     log_root = tmp / "logs"
 
+    import sqlite3 as _sqlite
+
     first = module.register_claims(
         repo=repo,
         session_id="session-close-hunks",
@@ -4063,21 +4102,25 @@ def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
         log_root_override=log_root,
     )
     assert first.status == "ok", first.to_dict()
-    # Two distinct hunks → two distinct claim_ids.
+    # Two distinct hunks → two distinct unit_ids.
     assert len(first.claim_ids) == 2, first.claim_ids
     assert len(set(first.claim_ids)) == 2, first.claim_ids
 
-    state = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
-    assert len(state["claims"]) == 2, state["claims"]
-    headers = {claim["hunk_anchor"]["header"] for claim in state["claims"]}
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, hunk_header FROM units WHERE kind='tracked_hunk' ORDER BY hunk_header"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2, rows
+    headers = {row[1] for row in rows}
     assert len(headers) == 2, headers
-    context_hashes = {claim["hunk_anchor"]["context_hash"] for claim in state["claims"]}
-    # Distinct context lines → distinct context_hash values (regression guard:
-    # before the fix, both would be sha1("")[:16] == "da39a3ee5e6b4b0d").
-    assert "da39a3ee5e6b4b0d" not in context_hashes, context_hashes
-    assert len(context_hashes) == 2, context_hashes
+    unit_ids = {row[0] for row in rows}
+    assert len(unit_ids) == 2, unit_ids
 
-    # Rerun must be idempotent: same claim_ids, no stale drops, claims unchanged.
+    # Rerun must be idempotent: same unit_ids, no stale drops, units unchanged.
     second = module.register_claims(
         repo=repo,
         session_id="session-close-hunks",
@@ -4092,8 +4135,12 @@ def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
     assert second.status == "ok"
     assert sorted(first.claim_ids) == sorted(second.claim_ids)
     assert second.dropped_stale_claim_ids == []
-    state2 = json.loads((Path(first.tracker_dir) / "state.json").read_text(encoding="utf-8"))
-    assert len(state2["claims"]) == 2
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows2 = conn.execute("SELECT unit_id FROM units WHERE kind='tracked_hunk'").fetchall()
+    finally:
+        conn.close()
+    assert len(rows2) == 2
 
 
 def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Path) -> None:
@@ -4115,11 +4162,18 @@ def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Pa
         exec_only_paths=set(),
         log_root_override=log_root,
     )
+    import sqlite3 as _sqlite
+
     assert seed.status == "ok"
-    state_path = Path(seed.tracker_dir) / "state.json"
-    state_before = json.loads(state_path.read_text(encoding="utf-8"))
-    assert len(state_before["claims"]) == 1
-    assert len(state_before.get("tombstones", [])) == 0
+    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        before = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
+        before_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert len(before) == 1
+    assert len(before_tomb) == 0
 
     noop = module.register_claims(
         repo=repo,
@@ -4136,10 +4190,15 @@ def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Pa
     assert noop.claim_ids == []
     assert noop.dropped_stale_claim_ids == []
 
-    state_after = json.loads(state_path.read_text(encoding="utf-8"))
-    assert len(state_after["claims"]) == 1
-    assert state_after["claims"][0]["claim_id"] == seed.claim_ids[0]
-    assert len(state_after.get("tombstones", [])) == 0
+    conn = _sqlite.connect(str(db_path))
+    try:
+        after = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
+        after_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert len(after) == 1
+    assert after[0][0] == seed.claim_ids[0]
+    assert len(after_tomb) == 0
 
 
 def test_diff_tracker_list_conflicts_reports_other_session_overlap(tmp: Path) -> None:
@@ -4357,6 +4416,385 @@ def test_build_packet_omits_cross_session_section_when_clean(tmp: Path) -> None:
     assert payload["cross_session_conflicts"] == []
 
 
+def test_canonical_patch_hash_stable_under_line_shift(tmp: Path) -> None:
+    """Inserting blank lines above an unrelated hunk shifts only `@@ -A,B +C,D @@`
+    line numbers; the hunk's content payload is untouched, so its
+    canonical_patch_hash (== unit_id) must stay byte-identical."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    baseline = "".join(f"line-{i}\n" for i in range(1, 21))
+    target = repo / "shift.txt"
+    target.write_text(baseline, encoding="utf-8")
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+
+    # First edit: change line-15 only — produces a single hunk near EOF.
+    first_lines = baseline.splitlines(keepends=True)
+    first_lines[14] = "LINE-15\n"
+    target.write_text("".join(first_lines), encoding="utf-8")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-shift",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["shift.txt"],
+        apply_patch_paths={"shift.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    assert len(first.claim_ids) == 1
+    first_unit_id = first.claim_ids[0]
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+
+    # Second edit: re-write file inserting 5 blank lines at top, keeping the
+    # same line-15 → LINE-15 edit (which now sits at line 20). The hunk content
+    # the diff emits is identical (same context lines, same +/- pair); only
+    # the @@ header numbers change.
+    shifted = ["\n"] * 5 + first_lines
+    target.write_text("".join(shifted), encoding="utf-8")
+    # Recommit baseline so HEAD also has the prefix blanks — otherwise the diff
+    # would include the blank-line insertions and the hunk content would
+    # legitimately differ.
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "shift baseline"], cwd=repo)
+    # Restore the same edit on the new baseline.
+    new_baseline = "".join(["\n"] * 5 + baseline.splitlines(keepends=True))
+    target.write_text(new_baseline, encoding="utf-8")
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "restore base after shift"], cwd=repo)
+    edited2 = new_baseline.splitlines(keepends=True)
+    edited2[19] = "LINE-15\n"  # 14 (original index) + 5 (prefix blanks) = 19
+    target.write_text("".join(edited2), encoding="utf-8")
+
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-shift",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["shift.txt"],
+        apply_patch_paths={"shift.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok", second.to_dict()
+    assert second.claim_ids == [first_unit_id], (first_unit_id, second.claim_ids)
+    assert second.dropped_stale_claim_ids == []
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state FROM units WHERE path='shift.txt'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1, rows
+    assert rows[0][0] == first_unit_id
+    assert rows[0][1] == "dirty"
+
+
+def test_canonical_patch_hash_changes_on_content_edit(tmp: Path) -> None:
+    """Editing the hunk content (not just shifting line numbers) must produce
+    a new unit_id and demote the old unit to observed_state='superseded'."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    baseline = "alpha\nbeta\ngamma\n"
+    target = repo / "edit.txt"
+    target.write_text(baseline, encoding="utf-8")
+    run(["git", "add", "edit.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    target.write_text("alpha\nBETA-v1\ngamma\n", encoding="utf-8")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-edit",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["edit.txt"],
+        apply_patch_paths={"edit.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok"
+    assert len(first.claim_ids) == 1
+    old_unit_id = first.claim_ids[0]
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+
+    # Now genuinely change the hunk content — different replacement line.
+    target.write_text("alpha\nBETA-v2\ngamma\n", encoding="utf-8")
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-edit",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["edit.txt"],
+        apply_patch_paths={"edit.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert len(second.claim_ids) == 1
+    new_unit_id = second.claim_ids[0]
+    assert new_unit_id != old_unit_id
+    # The old session_units row must be gone (replaced by the new unit_id),
+    # and dropped_stale_claim_ids surfaces the old unit_id.
+    assert old_unit_id in second.dropped_stale_claim_ids
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state FROM units WHERE path='edit.txt' ORDER BY first_observed_at"
+        ).fetchall()
+        session_units = conn.execute(
+            "SELECT unit_id FROM session_units WHERE session_id='session-edit'"
+        ).fetchall()
+    finally:
+        conn.close()
+    by_unit = {row[0]: row[1] for row in rows}
+    assert by_unit.get(old_unit_id) == "superseded", by_unit
+    assert by_unit.get(new_unit_id) == "dirty", by_unit
+    assert {row[0] for row in session_units} == {new_unit_id}
+
+
+def test_migration_phase1_json_to_sqlite_idempotent(tmp: Path) -> None:
+    """Hand-write a Phase 1 state.json + events.jsonl + meta.json under the
+    legacy `<log_root>/tracker/<key>/` path. First register_claims call must
+    create sqlite, archive legacy files into `_legacy/`, and stamp meta.json
+    with `migrated_from`. Second call must not re-import or re-archive."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key = module.repo_key(common_dir)
+    legacy_dir = log_root / "tracker" / repo_key
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_state = {
+        "schema_version": 1,
+        "claims": [
+            {
+                "claim_id": "clm-legacy-001",
+                "session_id": "session-legacy",
+                "run_id": "run-legacy",
+                "worktree": str(repo.resolve()),
+                "branch": "main",
+                "path": "tracked.txt",
+                "unit": "hunk",
+                "hunk_anchor": {
+                    "header": "@@ -1 +1,2 @@",
+                    "context_hash": "deadbeefdeadbeef",
+                    "old_range": [1, 1],
+                    "new_range": [1, 2],
+                },
+                "evidence": "apply_patch",
+                "claimed_at": "2026-04-01T00:00:00Z",
+                "last_seen_at": "2026-04-01T00:00:00Z",
+                "lease": None,
+            },
+        ],
+        "tombstones": [
+            {
+                "claim_id": "clm-tombstoned",
+                "session_id": "session-legacy",
+                "path": "removed.txt",
+                "unit": "path",
+                "dropped_at": "2026-04-01T00:00:00Z",
+                "reason": "session_no_longer_owns",
+            },
+        ],
+    }
+    (legacy_dir / "state.json").write_text(
+        json.dumps(legacy_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (legacy_dir / "events.jsonl").write_text(
+        json.dumps({"timestamp": "2026-04-01T00:00:00Z", "event": "claim_added"}) + "\n",
+        encoding="utf-8",
+    )
+    (legacy_dir / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "repo_key": repo_key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-after-migration",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    new_dir = log_root / "diff-tracker" / "repos" / repo_key
+    db_path = new_dir / "tracker.sqlite3"
+    assert db_path.is_file()
+    archive = legacy_dir / "_legacy"
+    assert (archive / "state.json").is_file()
+    assert (archive / "events.jsonl").is_file()
+    assert not (legacy_dir / "state.json").exists()
+    meta_payload = json.loads((new_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta_payload.get("migrated_from") == "json-v1"
+    assert meta_payload.get("schema_version") == module.SCHEMA_VERSION
+    archive_state = json.loads((archive / "state.json").read_text(encoding="utf-8"))
+    assert archive_state["claims"][0]["claim_id"] == "clm-legacy-001"
+
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units_before = conn.execute("SELECT unit_id, path FROM units ORDER BY unit_id").fetchall()
+        sessions_before = conn.execute("SELECT session_id FROM sessions").fetchall()
+        tombstones_before = conn.execute("SELECT ref_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert {row[0] for row in sessions_before} == {"session-legacy", "session-after-migration"}
+    assert any(row[0] == "clm-tombstoned" for row in tombstones_before)
+    archive_state_mtime = (archive / "state.json").stat().st_mtime
+
+    events_first = read_jsonl(new_dir / "events.jsonl")
+    migration_started_first = sum(1 for e in events_first if e.get("event") == "migration_started")
+    assert migration_started_first == 1, events_first
+
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-after-migration",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert (archive / "state.json").stat().st_mtime == archive_state_mtime
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units_after = conn.execute("SELECT unit_id, path FROM units ORDER BY unit_id").fetchall()
+    finally:
+        conn.close()
+    assert units_after == units_before
+    events_second = read_jsonl(new_dir / "events.jsonl")
+    migration_started_second = sum(1 for e in events_second if e.get("event") == "migration_started")
+    assert migration_started_second == 1, events_second
+
+
+def test_migration_phase1_recovers_when_archive_predates_db_marker(tmp: Path) -> None:
+    """Simulate the historical crash window: legacy state.json was already moved
+    into `_legacy/` but the SQLite transaction that recorded `migrated_from`
+    was rolled back (process death between archive and COMMIT). The next
+    register_claims call MUST re-import claims from the archived state.json
+    rather than treat the missing live state.json as "nothing to migrate"
+    and silently lose every Phase-1 claim."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key = module.repo_key(common_dir)
+
+    # Stage the post-crash on-disk shape directly: archive dir holds the
+    # legacy state.json, but live legacy_dir/state.json is gone and the
+    # SQLite db has no `migrated_from` row.
+    legacy_dir = log_root / "tracker" / repo_key
+    archive = legacy_dir / "_legacy"
+    archive.mkdir(parents=True, exist_ok=True)
+    legacy_state = {
+        "schema_version": 1,
+        "claims": [
+            {
+                "claim_id": "clm-recover-001",
+                "session_id": "session-recover",
+                "run_id": "run-recover",
+                "worktree": str(repo.resolve()),
+                "branch": "main",
+                "path": "tracked.txt",
+                "unit": "path",
+                "evidence": "apply_patch",
+                "claimed_at": "2026-04-02T00:00:00Z",
+                "last_seen_at": "2026-04-02T00:00:00Z",
+                "lease": None,
+            },
+        ],
+        "tombstones": [],
+    }
+    (archive / "state.json").write_text(
+        json.dumps(legacy_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    # The archived events.jsonl is the only surviving copy after the crash
+    # window: a prior _post_commit moved the live copy into _legacy/ before
+    # the SQLite COMMIT rolled back. Recovery must replay these into the new
+    # events.jsonl, matching the normal-migration path's side effects.
+    (archive / "events.jsonl").write_text(
+        json.dumps(
+            {"timestamp": "2026-04-02T00:00:00Z", "event": "claim_added", "claim_id": "clm-recover-001"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # No live state.json — represents the "archived but not committed" gap.
+
+    result = module.register_claims(
+        repo=repo,
+        session_id="session-after-crash",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert result.status == "ok", result.to_dict()
+
+    new_dir = log_root / "diff-tracker" / "repos" / repo_key
+    db_path = new_dir / "tracker.sqlite3"
+    assert db_path.is_file()
+    conn = _sqlite.connect(str(db_path))
+    try:
+        sessions = {row[0] for row in conn.execute("SELECT session_id FROM sessions").fetchall()}
+        migrated_from = conn.execute(
+            "SELECT value FROM meta WHERE key='migrated_from'"
+        ).fetchone()
+    finally:
+        conn.close()
+    # Both the recovered legacy session AND the new one must be present.
+    assert sessions == {"session-recover", "session-after-crash"}, sessions
+    assert migrated_from is not None and migrated_from[0] == "json-v1"
+    # Archive remains intact; live legacy state.json must NOT have been
+    # re-created (would re-trigger migration on every call).
+    assert (archive / "state.json").is_file()
+    assert not (legacy_dir / "state.json").exists()
+    # Recovery must replay the archived phase1 events into the new events.jsonl
+    # so the recovery branch is observationally aligned with the normal
+    # migration path's events.jsonl side effects.
+    new_events = read_jsonl(new_dir / "events.jsonl")
+    replayed = [e for e in new_events if e.get("imported_from") == "phase1"]
+    assert any(
+        e.get("event") == "claim_added" and e.get("claim_id") == "clm-recover-001"
+        for e in replayed
+    ), new_events
+
+
 def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
     module = load_diff_tracker_module()
     repo = init_repo(tmp / "repo")
@@ -4383,7 +4821,7 @@ def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
     try:
         # Truthy values disable.
         assert _run_with_disable_value("1").status == "disabled"
-        assert not (log_root / "tracker").exists()
+        assert not (log_root / "diff-tracker").exists()
         # `no` / `off` / `false` must NOT disable — they read as "do not
         # disable", matching user intuition. Previously they silently
         # disabled because the check was a blacklist.
@@ -4401,7 +4839,7 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
     module = load_diff_tracker_module()
     repo = init_repo(tmp / "repo")
     log_root = tmp / "logs"
-    # Pre-register so the tracker dir exists.
+    # Pre-register so the sqlite file exists.
     seed = module.register_claims(
         repo=repo,
         session_id="seed",
@@ -4414,27 +4852,29 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
         log_root_override=log_root,
     )
     assert seed.status == "ok"
-    lock_path = Path(seed.tracker_dir) / "state.lock"
+    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
+    # External holder takes a BEGIN IMMEDIATE write lock and sleeps so the
+    # next BEGIN IMMEDIATE inside register_claims must contend for it.
     blocker_script = (
-        "import fcntl, os, sys, time\n"
-        "with open(sys.argv[1], 'a+', encoding='utf-8') as handle:\n"
-        "    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
-        "    sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
-        "    time.sleep(float(sys.argv[2]))\n"
+        "import sqlite3, sys, time\n"
+        "conn = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=10)\n"
+        "conn.execute('BEGIN IMMEDIATE')\n"
+        "sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
+        "time.sleep(float(sys.argv[2]))\n"
+        "conn.execute('ROLLBACK')\n"
+        "conn.close()\n"
     )
     blocker = subprocess.Popen(
-        [sys.executable, "-c", blocker_script, str(lock_path), "8"],
+        [sys.executable, "-c", blocker_script, str(db_path), "5"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     try:
-        # Wait until the helper signals it has the lock.
         line = blocker.stdout.readline()
         assert line.strip() == "LOCKED", f"blocker did not acquire lock; got: {line!r}"
-        # Patch the diff_tracker timeout temporarily so the test stays fast.
-        original = module.LOCK_TIMEOUT_SECONDS
-        module.LOCK_TIMEOUT_SECONDS = 0.5
+        # Shrink busy_timeout so the test stays fast.
+        os.environ["CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS"] = "300"
         try:
             result = module.register_claims(
                 repo=repo,
@@ -4448,7 +4888,7 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
                 log_root_override=log_root,
             )
         finally:
-            module.LOCK_TIMEOUT_SECONDS = original
+            os.environ.pop("CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS", None)
     finally:
         blocker.terminate()
         blocker.wait(timeout=5)
@@ -4790,16 +5230,34 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command(),
         ),
         (
-            "diff_tracker_register_creates_state_and_events",
-            lambda: test_diff_tracker_register_creates_state_and_events(root / "diff-tracker-register"),
+            "diff_tracker_register_creates_sqlite_and_events",
+            lambda: test_diff_tracker_register_creates_sqlite_and_events(root / "diff-tracker-register"),
         ),
         (
             "diff_tracker_register_concurrent_writers",
             lambda: test_diff_tracker_register_concurrent_writers(root / "diff-tracker-concurrent"),
         ),
         (
-            "diff_tracker_hunk_anchor_stable_across_reruns",
-            lambda: test_diff_tracker_hunk_anchor_stable_across_reruns(root / "diff-tracker-stable"),
+            "canonical_patch_hash_stable_across_reruns",
+            lambda: test_canonical_patch_hash_stable_across_reruns(root / "diff-tracker-stable"),
+        ),
+        (
+            "canonical_patch_hash_stable_under_line_shift",
+            lambda: test_canonical_patch_hash_stable_under_line_shift(root / "diff-tracker-line-shift"),
+        ),
+        (
+            "canonical_patch_hash_changes_on_content_edit",
+            lambda: test_canonical_patch_hash_changes_on_content_edit(root / "diff-tracker-content-edit"),
+        ),
+        (
+            "migration_phase1_json_to_sqlite_idempotent",
+            lambda: test_migration_phase1_json_to_sqlite_idempotent(root / "diff-tracker-migration"),
+        ),
+        (
+            "migration_phase1_recovers_when_archive_predates_db_marker",
+            lambda: test_migration_phase1_recovers_when_archive_predates_db_marker(
+                root / "diff-tracker-migration-recover"
+            ),
         ),
         (
             "diff_tracker_hunk_anchor_distinguishes_close_hunks",
