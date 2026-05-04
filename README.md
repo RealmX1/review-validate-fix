@@ -107,7 +107,7 @@ python3 scripts/install_to_codex.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `codex_stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 来自错误 repo），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `codex_stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 不属于 tmux `cline-kanban` / `cline-kanban-*` session），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
 
 如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Cline Kanban 模式：
 
@@ -123,10 +123,10 @@ python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode cline-kanb
 CODEX_RVF_CLINE_KANBAN_START_CMD='kanban --no-open'
 CODEX_RVF_CLINE_KANBAN_TASK_CMD='kanban task'
 CODEX_RVF_CLINE_KANBAN_START_TIMEOUT=90
-CODEX_RVF_CLINE_KANBAN_TMUX_SESSION=rvf-cline-kanban
+CODEX_RVF_CLINE_KANBAN_TMUX_SESSION=cline-kanban-3484
 ```
 
-默认路径依赖 PATH 上稳定安装的 `kanban` binary，不再通过 `npx` 临时执行目录运行。安装器和 dev-sync 会把旧的精确默认值 `npx -y kanban@0.1.66 ...` 视为 legacy default 并丢弃，让新默认生效；显式传入的自定义命令仍会持久写入。
+默认路径依赖 PATH 上稳定安装的 `kanban` binary，不再通过 `npx` 临时执行目录运行。安装器和 dev-sync 会把旧的精确默认值 `npx -y kanban@0.1.66 ...` 视为 legacy default 并丢弃，让新默认生效；显式传入的自定义命令仍会持久写入。RVF 复用既有 Kanban listener 时不再要求 listener 的 cwd 等于目标 repo，但必须能通过 tmux 反查到 listener pane 属于 `cline-kanban` 或 `cline-kanban-*` session；普通进程或旧 `vibe-kanban` session 占用同一 port 会 fail-close。
 
 本地 Cline Kanban 开发/升级流程：
 

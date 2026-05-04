@@ -378,10 +378,10 @@ def test_check_review_output_protocol_extension_requests() -> None:
     assert mixed_with_completion.returncode != 0
 
 
-def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
-    clean = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+def test_review_result_artifact_no_issues_and_issues(tmp_path: Path) -> None:
+    clean = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
     env = os.environ.copy()
-    env["RVF_RUN_DIR"] = str(tmp / "run")
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
 
     run(
         [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(clean)],
@@ -392,7 +392,7 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
     assert clean_payload["valid"] is True
     assert clean_payload["kind"] == "no_issues"
 
-    issues = tmp / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
+    issues = tmp_path / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
     run(
         [
             sys.executable,
@@ -406,6 +406,10 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
             "42",
             "--message",
             "空输入时会跳过必要校验。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "high",
         ],
         env=env,
     )
@@ -422,6 +426,10 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
             "3",
             "--message",
             "构建参数没有传入默认值。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "medium",
         ],
         env=env,
     )
@@ -431,12 +439,16 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
     assert issue_payload["kind"] == "issues"
     assert issue_payload["issue_count"] == 2
     assert issue_payload["issues"][0]["path"] == "src/foo.ts"
+    assert issue_payload["issues"][0]["kind"] == "REAL"
+    assert issue_payload["issues"][0]["severity"] == "high"
+    assert issue_payload["issues"][1]["kind"] == "REAL"
+    assert issue_payload["issues"][1]["severity"] == "medium"
 
 
-def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None:
-    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+def test_review_result_artifact_requests_and_scope_exclusions(tmp_path: Path) -> None:
+    result = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
     env = os.environ.copy()
-    env["RVF_RUN_DIR"] = str(tmp / "run")
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
     run(
         [
             sys.executable,
@@ -458,8 +470,8 @@ def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None
     assert payload["kind"] == "request"
     assert payload["request_types"] == ["lock_request"]
 
-    excluded = tmp / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
-    contract = tmp / "scope.contract.json"
+    excluded = tmp_path / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
+    contract = tmp_path / "scope.contract.json"
     contract.write_text('{"canonical_scope":{"excluded_path_prefixes":["vendor"]}}\n', encoding="utf-8")
     run(
         [
@@ -474,6 +486,10 @@ def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None
             "1",
             "--message",
             "不应报告 excluded path。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "medium",
         ],
         env=env,
     )
@@ -487,10 +503,10 @@ def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None
     assert "excluded" in invalid.stdout
 
 
-def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> None:
-    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp_path: Path) -> None:
+    result = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
     env = os.environ.copy()
-    env["RVF_RUN_DIR"] = str(tmp / "run")
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
 
     missing = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
@@ -514,6 +530,10 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
             "1",
             "--message",
             "bad",
+            "--kind",
+            "REAL",
+            "--severity",
+            "high",
         ],
         env=env,
         capture_output=True,
@@ -528,7 +548,15 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
             {
                 "schema_version": 1,
                 "kind": "no_issues",
-                "issues": [{"path": "src/a.py", "line": 1, "message": "mixed"}],
+                "issues": [
+                    {
+                        "path": "src/a.py",
+                        "line": 1,
+                        "message": "mixed",
+                        "kind": "REAL",
+                        "severity": "high",
+                    }
+                ],
                 "requests": [],
             }
         ),
@@ -549,7 +577,7 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
             str(WRITE_REVIEW_RESULT),
             "no-issues",
             "--out",
-            str(tmp / "outside.json"),
+            str(tmp_path / "outside.json"),
         ],
         env=env,
         capture_output=True,
@@ -558,6 +586,127 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
     )
     assert outside.returncode != 0
     assert "RVF_RUN_DIR" in outside.stderr
+
+
+def test_issue_requires_kind(tmp_path: Path) -> None:
+    out = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(out),
+            "--path",
+            "src/foo.py",
+            "--line",
+            "1",
+            "--message",
+            "missing kind argument",
+            "--severity",
+            "high",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--kind" in result.stderr
+
+
+def test_issue_requires_severity(tmp_path: Path) -> None:
+    out = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(out),
+            "--path",
+            "src/foo.py",
+            "--line",
+            "1",
+            "--message",
+            "missing severity argument",
+            "--kind",
+            "REAL",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--severity" in result.stderr
+
+
+def test_check_rejects_issue_without_kind(tmp_path: Path) -> None:
+    result = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "issues",
+                "issues": [
+                    {
+                        "path": "src/foo.py",
+                        "line": 1,
+                        "message": "missing kind",
+                        "severity": "high",
+                    }
+                ],
+                "requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode != 0
+    assert "kind" in check.stdout
+
+
+def test_check_rejects_invalid_severity(tmp_path: Path) -> None:
+    result = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "issues",
+                "issues": [
+                    {
+                        "path": "src/foo.py",
+                        "line": 1,
+                        "message": "bad severity value",
+                        "kind": "REAL",
+                        "severity": "wat",
+                    }
+                ],
+                "requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode != 0
+    assert "severity" in check.stdout
 
 
 def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
@@ -744,12 +893,12 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
     assert report["groups"][0]["duration_ms"] == 600
 
 
-def test_run_ledger_summary_preserves_contract_timing_fields(tmp: Path) -> None:
+def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> None:
     module = load_rvf_logging_module()
     ledger = module.RunLedger(
         component="dispatcher",
         run_id="rvf-contract-timing-preserve",
-        run_dir=tmp / "run",
+        run_dir=tmp_path / "run",
     )
 
     ledger.summary(
@@ -774,13 +923,13 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp: Path) -> None:
     )
 
 
-def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp: Path) -> None:
+def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp_path: Path) -> None:
     module = load_rvf_logging_module()
-    installed_skill = tmp / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    installed_skill = tmp_path / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     installed_skill.mkdir(parents=True)
     (installed_skill / "SKILL.md").write_text("# skill\n", encoding="utf-8")
     cline_skill = (
-        tmp
+        tmp_path
         / "home"
         / ".cline"
         / "worktrees"
@@ -796,7 +945,7 @@ def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp: Path
     os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
     try:
         assert module.default_log_root_for_skill_dir(cline_skill) == installed_skill / "state"
-        dev_skill = tmp / "dev" / "skills" / "review-validate-fix"
+        dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
         assert module.default_log_root_for_skill_dir(dev_skill) == dev_skill / "state"
     finally:
         if original is None:
@@ -1088,17 +1237,17 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     assert unnumbered_unicode_issue.returncode != 0
 
 
-def test_build_packet_metadata_and_scope(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_metadata_and_scope(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
         "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
         encoding="utf-8",
     )
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
     run(
         [
             sys.executable,
@@ -1129,11 +1278,11 @@ def test_build_packet_metadata_and_scope(tmp: Path) -> None:
     assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
 
 
-def test_build_packet_allows_clean_repo_with_manual_scope(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_build_packet_allows_clean_repo_with_manual_scope(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     run(["git", "add", "tracked.txt", "new.txt"], cwd=repo)
     run(["git", "commit", "-q", "-m", "settle worktree"], cwd=repo)
-    context = tmp / "context.md"
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：manual scoped review\n"
@@ -1141,8 +1290,8 @@ def test_build_packet_allows_clean_repo_with_manual_scope(tmp: Path) -> None:
         "- Scope：审查 tracked.txt 的现有实现面\n",
         encoding="utf-8",
     )
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
 
     run(
         [
@@ -1174,13 +1323,13 @@ def test_build_packet_allows_clean_repo_with_manual_scope(tmp: Path) -> None:
     assert payload["session_context_provided"] is True
 
 
-def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
     (repo / "generated.txt").write_text("generated\n", encoding="utf-8")
     (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
-    manifest_path = tmp / "manifest.json"
+    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
+    manifest_path = tmp_path / "manifest.json"
 
     run(
         [
@@ -1210,12 +1359,12 @@ def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp: Path)
     assert manifest["command_path_candidates"][0]["reason"] == "shell_redirect"
 
 
-def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     docs = repo / "docs"
     docs.mkdir()
     (docs / "note.md").write_text("x\n", encoding="utf-8")
-    transcript = tmp / "session.jsonl"
+    transcript = tmp_path / "session.jsonl"
     records = [
         {
             "timestamp": "2026-04-27T00:00:00.000Z",
@@ -1234,7 +1383,7 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp: Path) ->
         },
     ]
     transcript.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
-    manifest_path = tmp / "manifest.json"
+    manifest_path = tmp_path / "manifest.json"
 
     run(
         [
@@ -1256,9 +1405,9 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp: Path) ->
     assert "docs/note.md" not in manifest["unattributed_dirty_paths"]
 
 
-def test_build_packet_uses_session_manifest_as_scope_anchor(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
@@ -1267,8 +1416,8 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp: Path) -> None:
     )
     (repo / "owned-new.txt").write_text("owned contents\n", encoding="utf-8")
     (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
-    manifest = tmp / "manifest.json"
+    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
+    manifest = tmp_path / "manifest.json"
     run(
         [
             sys.executable,
@@ -1282,8 +1431,8 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp: Path) -> None:
         ]
     )
 
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
     run(
         [
             sys.executable,
@@ -1320,21 +1469,21 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp: Path) -> None:
     assert payload["background_untracked_count"] >= 2
 
 
-def test_build_packet_rejects_session_manifest_for_different_repo(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_rejects_session_manifest_for_different_repo(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
         "- 本 turn 主会话实际完成的工作：reject mismatched manifest\n",
         encoding="utf-8",
     )
-    manifest = tmp / "manifest.json"
+    manifest = tmp_path / "manifest.json"
     manifest.write_text(
         json.dumps(
             {
                 "version": 1,
-                "repo": str(tmp / "other-repo"),
+                "repo": str(tmp_path / "other-repo"),
                 "owned_paths": ["tracked.txt"],
                 "owned_dirty_paths": ["tracked.txt"],
             }
@@ -1361,16 +1510,16 @@ def test_build_packet_rejects_session_manifest_for_different_repo(tmp: Path) -> 
     assert "session manifest repo does not match current repo" in completed.stderr
 
 
-def test_build_packet_rejects_empty_session_owned_scope(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_rejects_empty_session_owned_scope(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
         "- 本 turn 主会话实际完成的工作：reject empty manifest scope\n",
         encoding="utf-8",
     )
-    manifest = tmp / "manifest.json"
+    manifest = tmp_path / "manifest.json"
     manifest.write_text(
         json.dumps(
             {
@@ -1402,8 +1551,8 @@ def test_build_packet_rejects_empty_session_owned_scope(tmp: Path) -> None:
     assert "session manifest has no owned paths" in completed.stderr
 
 
-def test_build_packet_requires_session_context(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_build_packet_requires_session_context(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     completed = subprocess.run(
         [
             sys.executable,
@@ -1419,9 +1568,9 @@ def test_build_packet_requires_session_context(tmp: Path) -> None:
     assert "session context is required" in completed.stderr
 
 
-def test_build_packet_honors_review_validate_fix_ignore(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_honors_review_validate_fix_ignore(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
@@ -1439,8 +1588,8 @@ def test_build_packet_honors_review_validate_fix_ignore(tmp: Path) -> None:
     (repo / "secret-alpha.txt").write_text("ignored secret prefix contents\n", encoding="utf-8")
     (repo / "kept.txt").write_text("visible contents\n", encoding="utf-8")
 
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
     run(
         [
             sys.executable,
@@ -1476,9 +1625,9 @@ def test_build_packet_honors_review_validate_fix_ignore(tmp: Path) -> None:
     assert "ignored secret prefix contents" not in packet_text
 
 
-def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
@@ -1495,8 +1644,8 @@ def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp: Path) -> 
     (repo / "secret*.txt").write_text("hidden literal file\n", encoding="utf-8")
     (repo / "secret-alpha.txt").write_text("visible wildcard-like file\n", encoding="utf-8")
 
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
     run(
         [
             sys.executable,
@@ -1523,9 +1672,9 @@ def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp: Path) -> 
     assert "visible wildcard-like file" in packet_text
 
 
-def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
@@ -1542,7 +1691,7 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
             "--session-context",
             str(context),
             "--base-dir",
-            str(tmp / "runs"),
+            str(tmp_path / "runs"),
             "--primary-file",
             "tracked.txt",
             "--exclude-path-prefix",
@@ -1642,21 +1791,21 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert "locked" in locked.stdout
 
 
-def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
+def test_alternative_reviewer_prompt_uses_session_env_refs(tmp_path: Path) -> None:
     module = load_alternative_reviewer_module()
-    repo = init_repo(tmp / "repo")
-    prompt_file = tmp / "review-prompt.md"
+    repo = init_repo(tmp_path / "repo")
+    prompt_file = tmp_path / "review-prompt.md"
     prompt_file.write_text("# Review Prompt\n\nBody\n", encoding="utf-8")
-    context = tmp / "very" / "long" / "artifacts" / "scope-of-work.md"
+    context = tmp_path / "very" / "long" / "artifacts" / "scope-of-work.md"
     context.parent.mkdir(parents=True)
     context.write_text("scope\n", encoding="utf-8")
-    packet = tmp / "very" / "long" / "artifacts" / "review-packet.md"
+    packet = tmp_path / "very" / "long" / "artifacts" / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     scope_contract = packet.parent / "inputs" / "scope.contract.json"
     scope_contract.parent.mkdir()
     scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
 
-    result_path = tmp / "run" / "artifacts" / "reviewers" / "test" / "review-result.json"
+    result_path = tmp_path / "run" / "artifacts" / "reviewers" / "test" / "review-result.json"
     prompt = module.build_prompt(prompt_file, context, packet, repo, scope_contract, result_path)
 
     assert "$RVF_SCOPE_CONTRACT" in prompt
@@ -1673,9 +1822,9 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp: Path) -> None:
     assert str(module.COMMAND_LOCK) not in prompt
 
 
-def test_alternative_reviewer_infers_scope_contract_from_inputs_layout(tmp: Path) -> None:
+def test_alternative_reviewer_infers_scope_contract_from_inputs_layout(tmp_path: Path) -> None:
     module = load_alternative_reviewer_module()
-    inputs = tmp / "run" / "artifacts" / "inputs"
+    inputs = tmp_path / "run" / "artifacts" / "inputs"
     inputs.mkdir(parents=True)
     packet = inputs / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
@@ -1685,13 +1834,13 @@ def test_alternative_reviewer_infers_scope_contract_from_inputs_layout(tmp: Path
     assert module.infer_scope_contract(packet) == scope_contract.resolve()
 
 
-def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "scope-of-work.md"
+def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "scope-of-work.md"
     context.write_text("scope\n", encoding="utf-8")
-    packet = tmp / "review-packet.md"
+    packet = tmp_path / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    scope_contract = tmp / "scope.contract.json"
+    scope_contract = tmp_path / "scope.contract.json"
     scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
     reviewer_code = (
         "import os, sys; "
@@ -1708,7 +1857,7 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
         "print('artifact written')"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -1734,14 +1883,14 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
     assert completed.stdout.strip() == "artifact written"
 
 
-def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "review-packet.md"
+def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    stale_run_dir = tmp / "stale-run"
+    stale_run_dir = tmp_path / "stale-run"
     stale_run_dir.mkdir()
-    token = tmp / "health-token"
-    order = tmp / "order.txt"
+    token = tmp_path / "health-token"
+    order = tmp_path / "order.txt"
     health_code = (
         "from pathlib import Path; "
         f"Path({str(token)!r}).write_text('ready', encoding='utf-8'); "
@@ -1759,7 +1908,7 @@ def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp: Path
         "print('artifact written')"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -1789,11 +1938,11 @@ def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp: Path
     assert not (stale_run_dir / "wrong" / "review-result.json").exists()
 
 
-def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "review-packet.md"
+def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp / "reviewer-ran"
+    marker = tmp_path / "reviewer-ran"
     reviewer_code = (
         "from pathlib import Path; "
         "import sys; "
@@ -1801,7 +1950,7 @@ def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp: Path) -
         f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -1831,11 +1980,11 @@ def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp: Path) -
     assert not marker.exists()
 
 
-def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "review-packet.md"
+def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp / "reviewer-ran"
+    marker = tmp_path / "reviewer-ran"
     reviewer_code = (
         "from pathlib import Path; "
         "import sys; "
@@ -1843,7 +1992,7 @@ def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp: Path) -
         f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -1877,9 +2026,9 @@ def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp: Path) -
     assert not marker.exists()
 
 
-def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text("scope\n", encoding="utf-8")
 
     completed = run(
@@ -1891,7 +2040,7 @@ def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path)
             "--session-context",
             str(context),
             "--base-dir",
-            str(tmp / "runs"),
+            str(tmp_path / "runs"),
         ]
     )
 
@@ -1902,9 +2051,9 @@ def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp: Path)
     assert contract["fix_allowlist"] == ["new.txt", "tracked.txt"]
 
 
-def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    state = tmp / "state"
+def test_command_lock_writes_lifecycle_events(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
     run_id = "test-command-lock-lifecycle"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
@@ -1942,10 +2091,10 @@ def test_command_lock_writes_lifecycle_events(tmp: Path) -> None:
     assert summary["lock_name"] == "lifecycle-test"
 
 
-def test_command_lock_respects_env_run_dir(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    state = tmp / "state"
-    run_dir = tmp / "custom-run-dir"
+def test_command_lock_respects_env_run_dir(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    run_dir = tmp_path / "custom-run-dir"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
     env["CODEX_RVF_RUN_ID"] = "test-command-lock-custom-dir"
@@ -1973,10 +2122,10 @@ def test_command_lock_respects_env_run_dir(tmp: Path) -> None:
     assert [event["event"] for event in events] == ["lock_wait_started", "lock_acquired", "lock_released"]
 
 
-def test_command_lock_logs_timeout_with_holder_metadata(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    state = tmp / "state"
-    lock_dir = tmp / "locks"
+def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    state = tmp_path / "state"
+    lock_dir = tmp_path / "locks"
     holder_env = os.environ.copy()
     holder_env["CODEX_RVF_LOG_ROOT"] = str(state)
     holder_env["CODEX_RVF_RUN_ID"] = "test-command-lock-holder"
@@ -2072,9 +2221,9 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp: Path) -> None:
     assert "contended-test" in str(timeout_event["holder_metadata"])
 
 
-def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text(
         "## Session context\n"
         "- 用户最初的请求 / 意图：test\n"
@@ -2083,7 +2232,7 @@ def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path
     )
     (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
     (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
 
     result = run(
         [
@@ -2096,7 +2245,7 @@ def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path
             "--transcript",
             str(transcript),
             "--base-dir",
-            str(tmp / "runs"),
+            str(tmp_path / "runs"),
         ]
     )
     payload = json.loads(result.stdout)
@@ -2108,8 +2257,8 @@ def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp: Path
     assert "background contents" not in packet_text
 
 
-def test_prepare_review_run_requires_session_context(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_prepare_review_run_requires_session_context(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     completed = subprocess.run(
         [
             sys.executable,
@@ -2117,7 +2266,7 @@ def test_prepare_review_run_requires_session_context(tmp: Path) -> None:
             "--repo",
             str(repo),
             "--base-dir",
-            str(tmp / "runs"),
+            str(tmp_path / "runs"),
         ],
         capture_output=True,
         text=True,
@@ -2127,12 +2276,12 @@ def test_prepare_review_run_requires_session_context(tmp: Path) -> None:
     assert "session context is required" in completed.stderr
 
 
-def test_alternative_reviewer_idle_timeout_flag(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_idle_timeout_flag(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
@@ -2161,13 +2310,13 @@ def test_alternative_reviewer_idle_timeout_flag(tmp: Path) -> None:
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
 
 
-def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp / "run"
+    run_dir = tmp_path / "run"
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
@@ -2221,13 +2370,13 @@ def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp: Pa
     assert result_summary["kind"] == "no_issues"
 
 
-def test_alternative_reviewer_requires_review_result_artifact(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_requires_review_result_artifact(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp / "run"
+    run_dir = tmp_path / "run"
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
@@ -2264,11 +2413,11 @@ def test_alternative_reviewer_requires_review_result_artifact(tmp: Path) -> None
     assert summary["review_result_valid"] is False
 
 
-def test_alternative_reviewer_records_request_as_pending_state(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_records_request_as_pending_state(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp / "run"
+    run_dir = tmp_path / "run"
     reviewer_code = (
         "import os, subprocess, sys; "
         "sys.stdin.read(); "
@@ -2279,7 +2428,7 @@ def test_alternative_reviewer_records_request_as_pending_state(tmp: Path) -> Non
         "print('request written')"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -2325,13 +2474,13 @@ def test_alternative_reviewer_records_request_as_pending_state(tmp: Path) -> Non
     )
 
 
-def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp / "run"
+    run_dir = tmp_path / "run"
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
@@ -2381,11 +2530,11 @@ def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp: Pa
     assert normalized.strip() == "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 
 
-def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_timeout_kills_child_process_group(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp / "child-survived.txt"
+    marker = tmp_path / "child-survived.txt"
     child_code = (
         "import pathlib, time; "
         "time.sleep(2.0); "
@@ -2398,7 +2547,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> No
         "time.sleep(10.0)"
     )
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", parent_code],
         idle_timeout_seconds=0.5,
         activity_check_interval_seconds=0.05,
@@ -2425,12 +2574,12 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp: Path) -> No
     assert not marker.exists()
 
 
-def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2467,12 +2616,12 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp: Path) -> None
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
-def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2516,12 +2665,12 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp: Pa
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
-def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2569,13 +2718,13 @@ def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp: Path) -
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
-def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp / "run"
+    run_dir = tmp_path / "run"
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
@@ -2714,12 +2863,12 @@ def test_alternative_reviewer_claude_stream_monitor_tracks_bash_tool_state() -> 
     assert monitor.waiting_on_long_command is False
 
 
-def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_claude_stream_json_extracts_result(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2758,12 +2907,12 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp: Path) -> N
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
-def test_alternative_reviewer_codex_json_extracts_agent_message(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_codex_json_extracts_agent_message(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2800,12 +2949,12 @@ def test_alternative_reviewer_codex_json_extracts_agent_message(tmp: Path) -> No
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
-def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-u",
@@ -2842,12 +2991,65 @@ def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(t
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
-def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_codex_json_reports_backend_challenge_html(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "codex"
-    sink = tmp / "argv.json"
+    run_dir = tmp_path / "run"
+    html = (
+        "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        "<body><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1\"></script>"
+        "Cloudflare challenge</body></html>"
+    )
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            f"import sys; sys.stdin.read(); print({html!r})",
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stdout
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stderr
+    reviewer_dir = run_dir / "artifacts" / "reviewers" / "test"
+    normalized = next(reviewer_dir.glob("reviewer.normalized*.txt")).read_text(encoding="utf-8")
+    raw_stdout = next(reviewer_dir.glob("reviewer.stdout*.txt")).read_text(encoding="utf-8")
+    summary = json.loads(next(reviewer_dir.glob("reviewer.summary*.json")).read_text(encoding="utf-8"))
+    assert normalized.startswith("RVF_CODEX_BACKEND_CHALLENGE")
+    assert "challenge-platform" in raw_stdout
+    assert summary["output_error_reason"] == "codex_backend_challenge"
+
+
+def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp_path / "codex"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -2865,7 +3067,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> N
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["codex", "exec"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -2883,7 +3085,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> N
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
         text=True,
         check=False,
@@ -2894,12 +3096,12 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> N
     assert argv == ["exec", "--json", "-"]
 
 
-def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "codex"
-    sink = tmp / "argv.json"
+    shim = tmp_path / "codex"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -2917,7 +3119,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Pa
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["codex", "--ask-for-approval", "never", "exec"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -2935,7 +3137,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Pa
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
         text=True,
         check=False,
@@ -2946,12 +3148,12 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp: Pa
     assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
 
 
-def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "codex"
-    sink = tmp / "env.json"
+    shim = tmp_path / "codex"
+    sink = tmp_path / "env.json"
     shim.write_text(
         "\n".join(
             [
@@ -2972,7 +3174,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> No
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["codex", "exec"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -2980,7 +3182,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> No
     )
 
     env = os.environ.copy()
-    env["PATH"] = f"{tmp}:{env.get('PATH', '')}"
+    env["PATH"] = f"{tmp_path}:{env.get('PATH', '')}"
     env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
     env.pop("CODEX_RVF_SUPPRESS_STOP_HOOK", None)
     completed = subprocess.run(
@@ -3008,12 +3210,12 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp: Path) -> No
     }
 
 
-def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "claude"
-    sink = tmp / "argv.json"
+    shim = tmp_path / "claude"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -3031,7 +3233,7 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["claude", "-p"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -3049,7 +3251,7 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
         text=True,
         check=False,
@@ -3065,12 +3267,12 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp: Path) -
     assert "--disable-slash-commands" in argv
 
 
-def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "claude"
-    sink = tmp / "argv.json"
+    shim = tmp_path / "claude"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -3088,7 +3290,7 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) ->
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["claude", "-p", "--output-format", "text"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -3106,7 +3308,7 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) ->
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
         text=True,
         check=False,
@@ -3117,12 +3319,12 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp: Path) ->
     assert argv == ["-p", "--output-format", "text"]
 
 
-def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "claude"
-    sink = tmp / "argv.json"
+    shim = tmp_path / "claude"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -3140,7 +3342,7 @@ def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: P
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         ["claude", "-p", "--output-format=text"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -3158,7 +3360,7 @@ def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: P
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp}:{os.environ.get('PATH', '')}"},
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
         text=True,
         check=False,
@@ -3169,12 +3371,12 @@ def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp: P
     assert argv == ["-p", "--output-format=text"]
 
 
-def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    packet = tmp / "packet.md"
+def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp / "stream_wrapper"
-    sink = tmp / "argv.json"
+    shim = tmp_path / "stream_wrapper"
+    sink = tmp_path / "argv.json"
     shim.write_text(
         "\n".join(
             [
@@ -3192,7 +3394,7 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp:
     )
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
-        tmp / "alternative-reviewer.json",
+        tmp_path / "alternative-reviewer.json",
         [sys.executable, "-u", str(shim), "--native-stream"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
@@ -3284,13 +3486,13 @@ def test_cline_kanban_client_reports_missing_stable_binary() -> None:
     assert "does not use npx" in message
 
 
-def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
+def test_cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd(tmp_path: Path) -> None:
     module = load_cline_kanban_client_module()
-    repo = tmp / "repo"
-    other = tmp / "other"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
     repo.mkdir(parents=True)
     other.mkdir()
-    fake_task = tmp / "fake_kanban_task.py"
+    fake_task = tmp_path / "fake_kanban_task.py"
     fake_task.write_text(
         "import json\n"
         "print(json.dumps({'ok': True, 'tasks': []}))\n",
@@ -3300,10 +3502,78 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
+        result = module.ensure_kanban(
+            task_cmd=f"{sys.executable} {fake_task}",
+            start_cmd="kanban --no-open",
+            repo=repo,
+            tmux_session="unused",
+            timeout_seconds=0,
+            start_if_needed=False,
+        )
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
+
+    assert result["started"] is False
+    assert result["list"]["ok"] is True
+
+
+def test_cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane() -> None:
+    module = load_cline_kanban_client_module()
+    original_run_command = module.run_command
+    original_process_parent_pid = module.process_parent_pid
+    try:
+        module.process_parent_pid = lambda pid: {4242: 1000, 1000: 1}.get(pid)
+
+        def fake_run_command(command, **kwargs):
+            if command[:3] == ["tmux", "list-panes", "-a"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="cline-kanban-3484\t1000\nrvf-other\t7777\n",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected command: {command!r}")
+
+        module.run_command = fake_run_command
+        sessions = module.tmux_sessions_for_pid(4242)
+    finally:
+        module.run_command = original_run_command
+        module.process_parent_pid = original_process_parent_pid
+
+    assert sessions == ["cline-kanban-3484"]
+
+
+def test_cline_kanban_client_rejects_listener_without_cline_tmux_session(tmp_path: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp_path / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json\n"
+        "print(json.dumps({'ok': True, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["rvf-vibe-kanban"]
         try:
             module.ensure_kanban(
                 task_cmd=f"{sys.executable} {fake_task}",
@@ -3316,24 +3586,24 @@ def test_cline_kanban_client_rejects_foreign_listener(tmp: Path) -> None:
         except module.KanbanError as exc:
             message = str(exc)
         else:
-            raise AssertionError("expected foreign Kanban listener to be rejected")
+            raise AssertionError("expected non-Cline Kanban tmux listener to be rejected")
     finally:
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
 
-    assert "not started from expected repo" in message
-    assert str(repo) in message
-    assert str(other) in message
+    assert "no listener pane belongs to tmux session `cline-kanban`" in message
+    assert "rvf-vibe-kanban" in message
 
 
-def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(tmp: Path) -> None:
+def test_cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener(tmp_path: Path) -> None:
     module = load_cline_kanban_client_module()
-    repo = tmp / "repo"
-    other = tmp / "other"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
     repo.mkdir(parents=True)
     other.mkdir()
-    fake_task = tmp / "fake_kanban_task.py"
+    fake_task = tmp_path / "fake_kanban_task.py"
     fake_task.write_text(
         "import json, sys\n"
         "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
@@ -3344,10 +3614,12 @@ def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
         result = module.ensure_kanban(
             task_cmd=f"{sys.executable} {fake_task}",
             start_cmd="npx -y kanban@0.1.66 --no-open",
@@ -3360,18 +3632,65 @@ def test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
 
     assert result["started"] is False
     assert result["list"]["workspacePath"] == str(repo)
 
 
-def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp: Path) -> None:
+def test_cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener(tmp_path: Path) -> None:
     module = load_cline_kanban_client_module()
-    repo = tmp / "repo"
-    other = tmp / "other"
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
     repo.mkdir(parents=True)
     other.mkdir()
-    fake_task = tmp / "fake_kanban_task.py"
+    fake_task = tmp_path / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
+        encoding="utf-8",
+    )
+
+    original_listener_pids = module.listener_pids_for_port
+    original_process_cwd = module.process_cwd
+    original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
+    try:
+        module.listener_pids_for_port = lambda port: [4242]
+        module.process_cwd = lambda pid: other
+        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: []
+        try:
+            module.ensure_kanban(
+                task_cmd=f"{sys.executable} {fake_task}",
+                start_cmd="npx -y kanban@0.1.66 --no-open",
+                repo=repo,
+                tmux_session="unused",
+                timeout_seconds=0,
+                start_if_needed=False,
+            )
+        except module.KanbanError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected workspace echo without Cline Kanban tmux listener to be rejected")
+    finally:
+        module.listener_pids_for_port = original_listener_pids
+        module.process_cwd = original_process_cwd
+        module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
+
+    assert "no listener pane belongs to tmux session `cline-kanban`" in message
+    assert str(other) in message
+
+
+def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp_path: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = tmp_path / "repo"
+    other = tmp_path / "other"
+    repo.mkdir(parents=True)
+    other.mkdir()
+    fake_task = tmp_path / "fake_kanban_task.py"
     fake_task.write_text(
         "import sys\n"
         "print('task list failed', file=sys.stderr)\n"
@@ -3383,11 +3702,13 @@ def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
     original_listener_pids = module.listener_pids_for_port
     original_process_cwd = module.process_cwd
     original_process_command = module.process_command
+    original_tmux_sessions = module.tmux_sessions_for_pid
     original_start = module.start_kanban_server
     try:
         module.listener_pids_for_port = lambda port: [4242]
         module.process_cwd = lambda pid: other
         module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
+        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
         module.start_kanban_server = lambda **kwargs: started.append(kwargs) or {}
         try:
             module.ensure_kanban(
@@ -3406,6 +3727,7 @@ def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
         module.listener_pids_for_port = original_listener_pids
         module.process_cwd = original_process_cwd
         module.process_command = original_process_command
+        module.tmux_sessions_for_pid = original_tmux_sessions
         module.start_kanban_server = original_start
 
     assert started == []
@@ -3413,10 +3735,10 @@ def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(
     assert "task list failed" in message
 
 
-def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    fake_task = tmp / "fake_kanban_task.py"
-    calls = tmp / "calls.jsonl"
+def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp_path / "fake_kanban_task.py"
+    calls = tmp_path / "calls.jsonl"
     fake_task.write_text(
         "import json, os, sys\n"
         "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -3438,7 +3760,7 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
         "    raise SystemExit(2)\n",
         encoding="utf-8",
     )
-    repo = init_repo(tmp / "repo")
+    repo = init_repo(tmp_path / "repo")
     env = os.environ.copy()
     env.pop("KANBAN_RUNTIME_PORT", None)
     env["CODEX_RVF_CLINE_KANBAN_START_CMD"] = "kanban --port 45678"
@@ -3487,7 +3809,7 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
         "task-1",
     ], env=env)
     assert json.loads(started.stdout)["status"] == "started"
-    prompt_file = tmp / "prompt.md"
+    prompt_file = tmp_path / "prompt.md"
     prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
     message = run([
         sys.executable,
@@ -3519,10 +3841,10 @@ def test_cline_kanban_client_create_and_start_task(tmp: Path) -> None:
     assert message_call[message_call.index("--idempotency-key") + 1] == "run-1"
 
 
-def test_cline_kanban_client_message_accepts_response_without_task_id(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    fake_task = tmp / "fake_kanban_task.py"
-    calls = tmp / "calls.jsonl"
+def test_cline_kanban_client_message_accepts_response_without_task_id(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp_path / "fake_kanban_task.py"
+    calls = tmp_path / "calls.jsonl"
     fake_task.write_text(
         "import json, os, sys\n"
         "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -3533,8 +3855,8 @@ def test_cline_kanban_client_message_accepts_response_without_task_id(tmp: Path)
         "    raise SystemExit(2)\n",
         encoding="utf-8",
     )
-    repo = init_repo(tmp / "repo")
-    prompt_file = tmp / "prompt.md"
+    repo = init_repo(tmp_path / "repo")
+    prompt_file = tmp_path / "prompt.md"
     prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
     env = os.environ.copy()
     env["KANBAN_CALLS"] = str(calls)
@@ -3565,8 +3887,8 @@ def test_cline_kanban_client_message_accepts_response_without_task_id(tmp: Path)
     assert recorded[0][recorded[0].index("--task-id") + 1] == "task-1"
 
 
-def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
+def test_prepare_review_run_writes_worktree_bootstrap(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
     run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
     (repo / "tracked.txt").write_text("base\n\n", encoding="utf-8")
     run(["git", "add", "tracked.txt"], cwd=repo)
@@ -3574,7 +3896,7 @@ def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
     (repo / "tracked.txt").write_text("changed\n\n", encoding="utf-8")
     (repo / "owned.txt").write_text("owned untracked\n", encoding="utf-8")
     (repo / "background.txt").write_text("background\n", encoding="utf-8")
-    manifest = tmp / "manifest.json"
+    manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({
         "repo": str(repo),
         "owned_paths": ["tracked.txt", "owned.txt"],
@@ -3582,7 +3904,7 @@ def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
         "unattributed_dirty_paths": ["background.txt"],
         "confidence": "high",
     }), encoding="utf-8")
-    context = tmp / "context.md"
+    context = tmp_path / "context.md"
     context.write_text("scope\n", encoding="utf-8")
     completed = run([
         sys.executable,
@@ -3600,19 +3922,19 @@ def test_prepare_review_run_writes_worktree_bootstrap(tmp: Path) -> None:
     assert [item["path"] for item in bootstrap["untracked_files"]] == ["owned.txt"]
     assert "background.txt" not in json.dumps(bootstrap)
     assert "tracked.txt" in Path(payload["worktree_bootstrap_patch"]).read_text(encoding="utf-8")
-    clean = tmp / "clean"
-    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp)
+    clean = tmp_path / "clean"
+    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp_path)
     run(["git", "apply", "--check", str(payload["worktree_bootstrap_patch"])], cwd=clean)
 
 
 def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
-    tmp: Path,
+    tmp_path: Path,
 ) -> None:
-    repo = init_repo(tmp / "repo")
+    repo = init_repo(tmp_path / "repo")
     (repo / "a").mkdir()
     (repo / "a" / "b.txt").write_text("slash path\n", encoding="utf-8")
     (repo / "a__b.txt").write_text("flat path\n", encoding="utf-8")
-    manifest = tmp / "manifest.json"
+    manifest = tmp_path / "manifest.json"
     manifest.write_text(
         json.dumps(
             {
@@ -3625,7 +3947,7 @@ def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_co
         ),
         encoding="utf-8",
     )
-    context = tmp / "context.md"
+    context = tmp_path / "context.md"
     context.write_text("scope\n", encoding="utf-8")
 
     completed = run(
@@ -3646,8 +3968,8 @@ def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_co
     assert [item["path"] for item in bootstrap["untracked_files"]] == ["a/b.txt", "a__b.txt"]
     assert len(set(stored_paths)) == 2
 
-    clean = tmp / "clean"
-    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp)
+    clean = tmp_path / "clean"
+    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp_path)
     run(
         [
             sys.executable,
@@ -3662,13 +3984,13 @@ def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_co
     assert (clean / "a__b.txt").read_text(encoding="utf-8") == "flat path\n"
 
 
-def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    context = tmp / "context.md"
+def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
     context.write_text("scope\n", encoding="utf-8")
-    real_state = tmp / "real-state"
+    real_state = tmp_path / "real-state"
     real_state.mkdir()
-    symlink_state = tmp / "state-link"
+    symlink_state = tmp_path / "state-link"
     symlink_state.symlink_to(real_state, target_is_directory=True)
     env = os.environ.copy()
     env["CODEX_RVF_STATE_DIR"] = str(symlink_state)
@@ -3691,20 +4013,20 @@ def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tm
     assert str(real_state.resolve()) in payload["scope_of_work_file"]
 
 
-def test_apply_worktree_bootstrap_replays_tracked_and_untracked(tmp: Path) -> None:
-    source = init_repo(tmp / "source")
-    clone = tmp / "clone"
-    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp)
+def test_apply_worktree_bootstrap_replays_tracked_and_untracked(tmp_path: Path) -> None:
+    source = init_repo(tmp_path / "source")
+    clone = tmp_path / "clone"
+    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp_path)
     (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
     (source / "owned.txt").write_text("owned\n", encoding="utf-8")
     base_ref = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
-    patch = tmp / "bootstrap.patch"
+    patch = tmp_path / "bootstrap.patch"
     patch.write_text(subprocess.run(["git", "diff", "--binary", "HEAD", "--", "tracked.txt"], cwd=source, check=True, capture_output=True, text=True).stdout, encoding="utf-8")
-    files = tmp / "files"
+    files = tmp_path / "files"
     files.mkdir()
     stored = files / "owned.txt"
     stored.write_text("owned\n", encoding="utf-8")
-    metadata = tmp / "bootstrap.json"
+    metadata = tmp_path / "bootstrap.json"
     metadata.write_text(json.dumps({"base_ref": base_ref, "patch_file": str(patch), "files_dir": str(files), "untracked_files": [{"path": "owned.txt", "stored_path": str(stored)}]}), encoding="utf-8")
     completed = run([sys.executable, str(APPLY_WORKTREE_BOOTSTRAP), "--metadata", str(metadata), "--repo", str(clone)])
     assert json.loads(completed.stdout)["ok"] is True
@@ -3712,15 +4034,15 @@ def test_apply_worktree_bootstrap_replays_tracked_and_untracked(tmp: Path) -> No
     assert (clone / "owned.txt").read_text(encoding="utf-8") == "owned\n"
 
 
-def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp: Path) -> None:
-    source = init_repo(tmp / "source")
-    clone = tmp / "clone"
-    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp)
+def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp_path: Path) -> None:
+    source = init_repo(tmp_path / "source")
+    clone = tmp_path / "clone"
+    run(["git", "clone", "-q", str(source), str(clone)], cwd=tmp_path)
     (source / "tracked.txt").write_text("changed\n", encoding="utf-8")
     base_ref = run(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
-    patch = tmp / "bootstrap.patch"
+    patch = tmp_path / "bootstrap.patch"
     patch.write_text(subprocess.run(["git", "diff", "--binary", "HEAD", "--", "tracked.txt"], cwd=source, check=True, capture_output=True, text=True).stdout, encoding="utf-8")
-    metadata = tmp / "bootstrap.json"
+    metadata = tmp_path / "bootstrap.json"
     metadata.write_text(json.dumps({"base_ref": base_ref, "patch_file": str(patch), "untracked_files": []}), encoding="utf-8")
 
     (clone / "other.txt").write_text("other\n", encoding="utf-8")
@@ -3738,10 +4060,10 @@ def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp: Path) -> None
     assert (clone / "tracked.txt").read_text(encoding="utf-8") == "base\n"
 
 
-def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
+def test_run_ledger_summary_preserves_cline_kanban_fields(tmp_path: Path) -> None:
     module = load_rvf_logging_module()
-    run_dir = tmp / "run"
-    ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+    run_dir = tmp_path / "run"
+    ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
         status="cline-kanban-started",
         reason_code="cline_kanban_task_started",
@@ -3755,10 +4077,10 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp: Path) -> None:
     assert later["worktree_bootstrap_path"] == "/tmp/bootstrap.json"
 
 
-def test_run_ledger_summary_preserves_rvf_state_fields(tmp: Path) -> None:
+def test_run_ledger_summary_preserves_rvf_state_fields(tmp_path: Path) -> None:
     module = load_rvf_logging_module()
-    run_dir = tmp / "run"
-    ledger = module.RunLedger(component="stop-hook", repo=tmp, cwd=tmp, run_id="run-1", run_dir=run_dir)
+    run_dir = tmp_path / "run"
+    ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
         status="cline-kanban-started",
         reason_code="cline_kanban_task_started",
@@ -3779,12 +4101,12 @@ def test_run_ledger_summary_preserves_rvf_state_fields(tmp: Path) -> None:
     assert later["rvf_state"]["phases"] == list(module.RVF_STATE_PHASES)
 
 
-def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp: Path) -> None:
-    run_dir = tmp / "state" / "runs" / "rvf-user-cancel"
+def test_cancel_rvf_run_marks_cancelled_and_trashes_cline_task(tmp_path: Path) -> None:
+    run_dir = tmp_path / "state" / "runs" / "rvf-user-cancel"
     run_dir.mkdir(parents=True)
-    repo = init_repo(tmp / "repo")
-    fake_task = tmp / "fake_task.py"
-    calls = tmp / "trash-calls.jsonl"
+    repo = init_repo(tmp_path / "repo")
+    fake_task = tmp_path / "fake_task.py"
+    calls = tmp_path / "trash-calls.jsonl"
     fake_task.write_text(
         "import json, os, sys\n"
         "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -5337,6 +5659,22 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_review_result_artifact_rejects_malformed_and_mixed_state(root / "review-result-invalid"),
         ),
         (
+            "issue_requires_kind",
+            lambda: test_issue_requires_kind(root / "issue-requires-kind"),
+        ),
+        (
+            "issue_requires_severity",
+            lambda: test_issue_requires_severity(root / "issue-requires-severity"),
+        ),
+        (
+            "check_rejects_issue_without_kind",
+            lambda: test_check_rejects_issue_without_kind(root / "check-rejects-no-kind"),
+        ),
+        (
+            "check_rejects_invalid_severity",
+            lambda: test_check_rejects_invalid_severity(root / "check-rejects-bad-severity"),
+        ),
+        (
             "check_skill_contracts_requires_validate_fix_request_literals",
             lambda: test_check_skill_contracts_requires_validate_fix_request_literals(),
         ),
@@ -5541,6 +5879,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "alternative_reviewer_codex_json_reports_backend_challenge_html",
+            lambda: test_alternative_reviewer_codex_json_reports_backend_challenge_html(
+                root / "alternative-codex-challenge-html"
+            ),
+        ),
+        (
             "alternative_reviewer_codex_exec_json_command_is_patched",
             lambda: test_alternative_reviewer_codex_exec_json_command_is_patched(root / "alternative-codex-command"),
         ),
@@ -5584,13 +5928,31 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             test_cline_kanban_client_reports_missing_stable_binary,
         ),
         (
-            "cline_kanban_client_rejects_foreign_listener",
-            lambda: test_cline_kanban_client_rejects_foreign_listener(root / "cline-kanban-foreign-listener"),
+            "cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd",
+            lambda: test_cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd(
+                root / "cline-kanban-cline-tmux-listener"
+            ),
         ),
         (
-            "cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener",
-            lambda: test_cline_kanban_client_accepts_workspace_payload_from_foreign_cwd_listener(
+            "cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane",
+            test_cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane,
+        ),
+        (
+            "cline_kanban_client_rejects_listener_without_cline_tmux_session",
+            lambda: test_cline_kanban_client_rejects_listener_without_cline_tmux_session(
+                root / "cline-kanban-non-cline-tmux-listener"
+            ),
+        ),
+        (
+            "cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener",
+            lambda: test_cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener(
                 root / "cline-kanban-workspace-payload"
+            ),
+        ),
+        (
+            "cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener",
+            lambda: test_cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener(
+                root / "cline-kanban-workspace-payload-no-tmux"
             ),
         ),
         (

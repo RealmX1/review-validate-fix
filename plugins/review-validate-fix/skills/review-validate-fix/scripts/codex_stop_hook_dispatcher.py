@@ -14,6 +14,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
+from rvf_run_finalize import finalize_for_handoff
 from session_manifest import build_manifest
 
 
@@ -1260,9 +1261,25 @@ def main() -> int:
             message="Codex plan operation completed; skipped RVF Stop hook",
             detail="检测到 Codex plan operation 结束，已跳过 RVF Stop hook。",
         )
-    if handoff_path_from_event(event) is not None:
+    handoff_path_value = handoff_path_from_event(event)
+    if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger)
         if payload is not None:
+            try:
+                finalize_for_handoff(
+                    handoff_path=handoff_path_value,
+                    event=event,
+                    decision_kind="dispatcher-handoff",
+                )
+            except Exception as exc:
+                ledger.event(
+                    phase="handoff",
+                    event="finalize_failed",
+                    status="warning",
+                    reason_code="finalize_error",
+                    level="warn",
+                    error={"kind": type(exc).__name__, "message": str(exc)},
+                )
             emit(payload)
             return 0
     sync_needed, reason, repo = should_sync(event)

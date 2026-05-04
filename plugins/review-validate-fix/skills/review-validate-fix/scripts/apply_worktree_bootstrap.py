@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from workspace_snapshot import capture as snapshot_capture  # noqa: E402
 
 
 # Contract surface: tracked bootstrap changes are replayed through `git apply`.
@@ -97,13 +103,58 @@ def apply_bootstrap(*, repo: Path, metadata_path: Path) -> dict[str, Any]:
             run_git(root, ["apply", "-"], input_text=patch_text)
             patch_applied = True
     copied = copy_untracked_files(root, metadata)
+    snapshot_result = _capture_post_bootstrap_snapshot(root, metadata)
     return {
         "ok": True,
         "repo": str(root),
         "metadata": str(metadata_path),
         "patch_applied": patch_applied,
         "copied_untracked_files": copied,
+        "before_snapshot": snapshot_result,
     }
+
+
+def _capture_post_bootstrap_snapshot(root: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    """在 patch + untracked 文件应用完成后立即拍 before-workspace-snapshot.json。
+
+    针对 cline-kanban 场景：源工作区的未提交改动是先经 bootstrap 复制进
+    新 worktree 的，这一刻才是 RVF 真正"开始"前的工作树状态。
+    """
+
+    target_value: str | None = None
+    for key in (
+        "before_snapshot_path",
+        "rvf_before_snapshot_path",
+        "snapshot_path",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            target_value = value
+            break
+    if target_value is None:
+        run_dir_value = metadata.get("rvf_run_dir") or os.environ.get("CODEX_RVF_RUN_DIR")
+        if isinstance(run_dir_value, str) and run_dir_value:
+            target_value = str(
+                Path(run_dir_value).expanduser() / "artifacts" / "before-workspace-snapshot.json"
+            )
+    if target_value is None:
+        return {"captured": False, "reason": "no_target_path"}
+    target = Path(target_value).expanduser()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = snapshot_capture(root)
+        target.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {"captured": True, "path": str(target)}
+    except Exception as exc:
+        return {
+            "captured": False,
+            "reason": "capture_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "path": str(target),
+        }
 
 
 def main() -> int:

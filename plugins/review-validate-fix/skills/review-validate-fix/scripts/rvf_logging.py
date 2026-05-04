@@ -309,6 +309,8 @@ class RunLedger:
         self.events_path = self.run_dir / "events.jsonl"
         self.summary_path = self.run_dir / "summary.json"
         self.artifacts_dir = self.run_dir / "artifacts"
+        self.trajectory_dir = self.artifacts_dir / "trajectory"
+        self.finalize_lock_path = self.artifacts_dir / ".finalize.lock"
         self.available = True
         self.diagnostics: list[dict[str, Any]] = []
         self.last_summary: dict[str, Any] | None = None
@@ -543,4 +545,33 @@ def start_run(
         run_id=run_id,
         correlation_id=correlation_id,
         run_dir=run_dir,
+    )
+
+
+def open_run(
+    run_dir: str | Path,
+    *,
+    component: str = "stop-hook",
+) -> RunLedger:
+    """Open an existing RVF run directory for read/append access.
+
+    用于 finalize 阶段——actual RVF run 早已结束并写入 summary.json，
+    finalize hook 需要在该 run_dir 上追加 trajectory / workspace-diff artifact，
+    并不希望 RunLedger 把它当作新 run（生成新 run_id、新 latest 指针）。
+    """
+    resolved = Path(run_dir).expanduser().resolve()
+    summary = _read_json_object(resolved / "summary.json")
+    run_id = summary.get("run_id") if isinstance(summary.get("run_id"), str) else None
+    correlation_id = (
+        summary.get("correlation_id")
+        if isinstance(summary.get("correlation_id"), str)
+        else None
+    )
+    repo = summary.get("repo") if isinstance(summary.get("repo"), str) else None
+    return RunLedger(
+        component=component,
+        repo=repo,
+        run_id=run_id,
+        correlation_id=correlation_id,
+        run_dir=resolved,
     )

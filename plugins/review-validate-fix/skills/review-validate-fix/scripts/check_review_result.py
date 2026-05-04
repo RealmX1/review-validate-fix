@@ -26,6 +26,8 @@ SUBTASK_TYPES = {
     "simplification_probe",
 }
 CONTEXT_NEEDS = {"file", "manifest", "packet", "prior-output", "test-result"}
+ISSUE_KINDS = {"REAL", "NIT", "ELEVATE"}
+ISSUE_SEVERITIES = {"high", "medium", "low"}
 
 
 def fail(errors: list[str], *, json_output: bool) -> int:
@@ -100,6 +102,8 @@ def validate_issue(issue: Any, index: int, errors: list[str], excluded_prefixes:
     path = issue.get("path")
     line = issue.get("line")
     message = issue.get("message")
+    kind = issue.get("kind")
+    severity = issue.get("severity")
     if not isinstance(path, str) or not is_relative_repo_path(path):
         errors.append(f"issues[{index}].path must be a relative repo path without '..'")
     elif is_excluded(path, excluded_prefixes):
@@ -108,6 +112,14 @@ def validate_issue(issue: Any, index: int, errors: list[str], excluded_prefixes:
         errors.append(f"issues[{index}].line must be an integer >= 1")
     if not isinstance(message, str) or not message.strip():
         errors.append(f"issues[{index}].message must be a non-empty string")
+    if not isinstance(kind, str) or kind not in ISSUE_KINDS:
+        errors.append(
+            f"issues[{index}].kind must be one of: {', '.join(sorted(ISSUE_KINDS))}"
+        )
+    if not isinstance(severity, str) or severity not in ISSUE_SEVERITIES:
+        errors.append(
+            f"issues[{index}].severity must be one of: {', '.join(sorted(ISSUE_SEVERITIES))}"
+        )
 
 
 def non_empty_string(request: dict[str, Any], field: str, errors: list[str], prefix: str) -> str | None:

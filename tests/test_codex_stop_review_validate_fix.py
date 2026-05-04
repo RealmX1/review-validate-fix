@@ -244,7 +244,7 @@ def load_hook_module():
     return module
 
 
-def test_normalize_backend_from_env(tmp: Path) -> None:
+def test_normalize_backend_from_env(tmp_path: Path) -> None:
     module = load_hook_module()
     original = {
         name: os.environ.get(name)
@@ -290,10 +290,10 @@ def test_normalize_backend_from_env(tmp: Path) -> None:
                 os.environ[name] = value
 
 
-def test_parent_conversation_origin_prefers_app_server_chat_name(tmp: Path) -> None:
+def test_parent_conversation_origin_prefers_app_server_chat_name(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
     transcript.write_text(
         json.dumps(
             {
@@ -320,10 +320,10 @@ def test_parent_conversation_origin_prefers_app_server_chat_name(tmp: Path) -> N
     assert origin["transcript_file"] == transcript.name
 
 
-def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(tmp: Path) -> None:
+def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
     first_prompt = (
         "for the path in RVF hook fork to cline kanban, we need way to trace "
         "which original conversation the fork comes from"
@@ -360,10 +360,10 @@ def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(t
     )
 
 
-def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed(tmp: Path) -> None:
+def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
     user_prompt = (
         "currently the fallback chat session name in handoff as well as cline-task "
         "is incorrectly using the stitched prompt"
@@ -411,10 +411,10 @@ def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unna
     assert origin["name_source"] == "first_user_prompt_fallback"
 
 
-def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed(tmp: Path) -> None:
+def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
     context_only = (
         "# AGENTS.md instructions for /Users/bominzhang/Documents/GitHub/review-validate-fix\n\n"
         "<INSTRUCTIONS>\n"
@@ -460,10 +460,10 @@ def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_u
     assert "AGENTS.md instructions" not in origin["task_title"]
 
 
-def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp: Path) -> None:
+def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
-    transcript = tmp / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
     transcript.write_text(
         json.dumps(
             {
@@ -494,10 +494,10 @@ def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp: 
     assert '"' not in origin["task_title"]
 
 
-def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp: Path) -> None:
+def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp_path: Path) -> None:
     module = load_hook_module()
-    state = tmp / "state"
-    transcript = tmp / "rollout-2026-05-01T11-25-17-parent-thread.jsonl"
+    state = tmp_path / "state"
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-parent-thread.jsonl"
     write_user_session(transcript, "parent-thread", "please review the Stop hook change")
 
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
@@ -511,11 +511,11 @@ def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp: Pat
         }
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt=module.fork_review_validate_fix_prompt(
                 "parent-thread",
-                str(tmp),
-                str(tmp / "repo"),
+                str(tmp_path),
+                str(tmp_path / "repo"),
             ),
             log_prefix="review-validate-fix-fork",
             model=None,
@@ -547,9 +547,9 @@ def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp: Pat
     assert turn_input["text"] == prompt
 
 
-def test_parent_thread_name_from_app_server_reads_thread_name(tmp: Path) -> None:
+def test_parent_thread_name_from_app_server_reads_thread_name(tmp_path: Path) -> None:
     module = load_hook_module()
-    socket_path = tmp / "app-server.sock"
+    socket_path = tmp_path / "app-server.sock"
     calls: list[tuple[str, dict[str, object] | None]] = []
     notifications: list[dict[str, object]] = []
 
@@ -586,7 +586,7 @@ def test_parent_thread_name_from_app_server_reads_thread_name(tmp: Path) -> None
             "desktop-control",
             {},
         )
-        lookup = module.parent_thread_name_from_app_server("parent-thread", str(tmp))
+        lookup = module.parent_thread_name_from_app_server("parent-thread", str(tmp_path))
     finally:
         module.AppServerWebSocket = original_client
         module.select_existing_app_server_socket_for_metadata = original_select
@@ -653,9 +653,9 @@ def write_user_session_messages(path: Path, session_id: str, messages: list[str]
     )
 
 
-def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp: Path) -> None:
-    transcript = tmp / "session.jsonl"
-    state = tmp / "state"
+def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp_path: Path) -> None:
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
     write_user_session(
         transcript,
         "00000000-0000-0000-0000-000000000001",
@@ -663,7 +663,7 @@ def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp: Path) -> 
     )
     stdout, _ = invoke(
         {
-            "cwd": str(tmp),
+            "cwd": str(tmp_path),
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
@@ -682,8 +682,8 @@ def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp: Path) -> 
     assert "app_server_requests_path" not in latest
 
 
-def test_diagnose_codex_fork_dry_run_writes_requests(tmp: Path) -> None:
-    state = tmp / "state"
+def test_diagnose_codex_fork_dry_run_writes_requests(tmp_path: Path) -> None:
+    state = tmp_path / "state"
     message = "RVF_FORK_EXPERIMENT: custom diagnostic message"
     env = os.environ.copy()
     for name in tuple(env):
@@ -692,7 +692,7 @@ def test_diagnose_codex_fork_dry_run_writes_requests(tmp: Path) -> None:
     env["CODEX_RVF_STATE_DIR"] = str(state)
     completed = subprocess.run(
         [sys.executable, str(DIAGNOSTIC_SCRIPT), "--mode", "dry-run", "--message", message],
-        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp)}),
+        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp_path)}),
         capture_output=True,
         text=True,
         check=True,
@@ -709,16 +709,16 @@ def test_diagnose_codex_fork_dry_run_writes_requests(tmp: Path) -> None:
     assert requests[1]["method"] == "turn/start"
 
 
-def test_stop_hook_active_skips(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
+def test_stop_hook_active_skips(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
     payload = assert_skip_reason(stdout, "stop_hook_active=true")
     assert "detail=Codex 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
 
 
-def test_env_suppression_skips(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    run_dir = tmp / "state" / "runs" / "rvf-child"
+def test_env_suppression_skips(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    run_dir = tmp_path / "state" / "runs" / "rvf-child"
     stdout, _ = invoke(
         {"cwd": str(dirty), "stop_hook_active": False},
         extra_env={
@@ -737,10 +737,10 @@ def test_env_suppression_skips(tmp: Path) -> None:
     assert run_dir.exists()
 
 
-def test_prompt_suppression_marker_skips(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    transcript = tmp / "session.jsonl"
-    state = tmp / "state"
+def test_prompt_suppression_marker_skips(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
     write_user_session(
         transcript,
         "00000000-0000-0000-0000-000000000201",
@@ -762,10 +762,10 @@ def test_prompt_suppression_marker_skips(tmp: Path) -> None:
     assert summary["reason_code"] == "suppressed"
 
 
-def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    transcript = tmp / "session.jsonl"
-    state = tmp / "state"
+def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
     write_user_session_messages(
         transcript,
         "00000000-0000-0000-0000-000000000202",
@@ -790,9 +790,9 @@ def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp: Path
     assert summary["reason_code"] == "suppressed"
 
 
-def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
     marker_dir = state / "kanban-task-suppressions"
     marker_dir.mkdir(parents=True)
     (marker_dir / "task-202.json").write_text(
@@ -824,10 +824,10 @@ def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp: Path) -
     assert summary["reason_code"] == "suppressed"
 
 
-def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    transcript = tmp / "session.jsonl"
-    state = tmp / "state"
+def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
     write_user_session(
         transcript,
         "session-with-background-dirty",
@@ -1128,7 +1128,7 @@ def test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_f
     assert "session_manifest_failed" in raw
 
 
-def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -> None:
+def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp_path: Path) -> None:
     old_state = os.environ.pop("CODEX_RVF_STATE_DIR", None)
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
     try:
@@ -1142,13 +1142,13 @@ def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
 
 
-def test_session_hook_state_dir_respects_state_dir_override(tmp: Path) -> None:
+def test_session_hook_state_dir_respects_state_dir_override(tmp_path: Path) -> None:
     old_state = os.environ.get("CODEX_RVF_STATE_DIR")
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state-root")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state-root")
     try:
         module = load_hook_module()
-        assert module.session_hook_state_dir() == tmp / "state-root" / "session-hook"
+        assert module.session_hook_state_dir() == tmp_path / "state-root" / "session-hook"
     finally:
         if old_state is None:
             os.environ.pop("CODEX_RVF_STATE_DIR", None)
@@ -1158,11 +1158,11 @@ def test_session_hook_state_dir_respects_state_dir_override(tmp: Path) -> None:
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
 
 
-def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp: Path) -> None:
+def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp_path: Path) -> None:
     module = load_hook_module()
     old_state = os.environ.get("CODEX_RVF_STATE_DIR")
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state-root")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state-root")
     try:
         module.set_session_hook_enabled(
             session_id="manual/session",
@@ -1174,7 +1174,7 @@ def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp: Pa
             run_id="rvf-manual-run",
             completed_at="2999-04-30T00:00:00+00:00",
         )
-        assert path == tmp / "state-root" / "session-hook" / "manual_session.json"
+        assert path == tmp_path / "state-root" / "session-hook" / "manual_session.json"
 
         marker = module.read_manual_rvf_session_marker("manual/session")
         assert marker is not None
@@ -1196,10 +1196,10 @@ def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp: Pa
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
 
 
-def test_manual_rvf_session_marker_skips_before_fork_gate(tmp: Path) -> None:
+def test_manual_rvf_session_marker_skips_before_fork_gate(tmp_path: Path) -> None:
     module = load_hook_module()
-    dirty = init_repo_with_head(tmp / "dirty")
-    state = tmp / "state"
+    dirty = init_repo_with_head(tmp_path / "dirty")
+    state = tmp_path / "state"
     old_state = os.environ.get("CODEX_RVF_STATE_DIR")
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
     os.environ["CODEX_RVF_STATE_DIR"] = str(state)
@@ -1247,10 +1247,10 @@ def test_manual_rvf_session_marker_skips_before_fork_gate(tmp: Path) -> None:
     assert latest_pointer(state)["reason_code"] == "manual_rvf_already_ran"
 
 
-def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp: Path) -> None:
+def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp_path: Path) -> None:
     module = load_hook_module()
-    dirty = init_repo_with_head(tmp / "dirty")
-    state = tmp / "state"
+    dirty = init_repo_with_head(tmp_path / "dirty")
+    state = tmp_path / "state"
     old_state = os.environ.get("CODEX_RVF_STATE_DIR")
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
     os.environ["CODEX_RVF_STATE_DIR"] = str(state)
@@ -1286,12 +1286,12 @@ def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp: Path) -> 
     assert "reason=dry_run" in payload["systemMessage"]
 
 
-def test_manual_rvf_session_marker_expired_does_not_read(tmp: Path) -> None:
+def test_manual_rvf_session_marker_expired_does_not_read(tmp_path: Path) -> None:
     module = load_hook_module()
-    dirty = init_repo_with_head(tmp / "dirty")
+    dirty = init_repo_with_head(tmp_path / "dirty")
     old_state = os.environ.get("CODEX_RVF_STATE_DIR")
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp / "state")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state")
     try:
         module.write_manual_rvf_session_marker(
             session_id="manual-expired",
@@ -1310,17 +1310,17 @@ def test_manual_rvf_session_marker_expired_does_not_read(tmp: Path) -> None:
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
 
 
-def test_socket_probe_reports_unavailable_reason(tmp: Path) -> None:
+def test_socket_probe_reports_unavailable_reason(tmp_path: Path) -> None:
     module = load_hook_module()
-    tmp.mkdir(parents=True, exist_ok=True)
+    tmp_path.mkdir(parents=True, exist_ok=True)
 
-    missing = tmp / "missing.sock"
+    missing = tmp_path / "missing.sock"
     missing_probe = module.probe_app_server_socket(missing)
     assert missing_probe["connect_ok"] is False
     assert missing_probe["reason"] == "missing"
     assert missing_probe["parent_exists"] is True
 
-    regular = tmp / "regular.sock"
+    regular = tmp_path / "regular.sock"
     regular.write_text("not a socket\n", encoding="utf-8")
     regular_probe = module.probe_app_server_socket(regular)
     assert regular_probe["connect_ok"] is False
@@ -1328,7 +1328,7 @@ def test_socket_probe_reports_unavailable_reason(tmp: Path) -> None:
     assert regular_probe["exists"] is True
 
 
-def test_app_server_websocket_sends_http_upgrade(tmp: Path) -> None:
+def test_app_server_websocket_sends_http_upgrade(tmp_path: Path) -> None:
     module = load_hook_module()
     created: list[object] = []
 
@@ -1342,7 +1342,7 @@ def test_app_server_websocket_sends_http_upgrade(tmp: Path) -> None:
             self.timeout = timeout
 
         def connect(self, path: str) -> None:
-            assert path == str(tmp / "app-server.sock")
+            assert path == str(tmp_path / "app-server.sock")
 
         def sendall(self, data: bytes) -> None:
             self.sent += data
@@ -1379,7 +1379,7 @@ def test_app_server_websocket_sends_http_upgrade(tmp: Path) -> None:
     original_socket = module.socket.socket
     try:
         module.socket.socket = fake_socket
-        client = module.AppServerWebSocket(tmp / "app-server.sock", timeout=2)
+        client = module.AppServerWebSocket(tmp_path / "app-server.sock", timeout=2)
         client.close()
     finally:
         module.socket.socket = original_socket
@@ -1391,7 +1391,7 @@ def test_app_server_websocket_sends_http_upgrade(tmp: Path) -> None:
     assert "Sec-WebSocket-Key:" in request
 
 
-def test_app_server_websocket_masks_pong_frame(tmp: Path) -> None:
+def test_app_server_websocket_masks_pong_frame(tmp_path: Path) -> None:
     module = load_hook_module()
 
     class FakeSocket:
@@ -1419,10 +1419,10 @@ def test_app_server_websocket_masks_pong_frame(tmp: Path) -> None:
     )
 
 
-def test_socket_probe_requires_websocket_upgrade(tmp: Path) -> None:
+def test_socket_probe_requires_websocket_upgrade(tmp_path: Path) -> None:
     module = load_hook_module()
-    socket_path = tmp / "app-server.sock"
-    socket_path.parent.mkdir(parents=True)
+    socket_path = tmp_path / "app-server.sock"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.write_text("socket placeholder\n", encoding="utf-8")
 
     original_is_socket = Path.is_socket
@@ -1452,11 +1452,11 @@ def test_socket_probe_requires_websocket_upgrade(tmp: Path) -> None:
     assert probe["reason"] == "websocket-failed"
 
 
-def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
+def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
     module = load_hook_module()
-    state = tmp / "state"
-    desktop_socket = tmp / "missing-control.sock"
-    bridge_socket = tmp / "missing-bridge.sock"
+    state = tmp_path / "state"
+    desktop_socket = tmp_path / "missing-control.sock"
+    bridge_socket = tmp_path / "missing-bridge.sock"
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
     original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
@@ -1474,7 +1474,7 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
         module.ensure_bridge_app_server = fail_bridge
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="$review-validate-fix",
             log_prefix="review-validate-fix-fork",
             model=None,
@@ -1501,11 +1501,11 @@ def test_bridge_failure_preserves_desktop_probe(tmp: Path) -> None:
     assert latest["socket_selection"]["bridge"]["reason"] == "missing"
 
 
-def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp: Path) -> None:
+def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_path: Path) -> None:
     module = load_hook_module()
-    state = tmp / "state"
-    desktop_socket = tmp / "missing-control.sock"
-    bridge_socket = tmp / "missing-bridge.sock"
+    state = tmp_path / "state"
+    desktop_socket = tmp_path / "missing-control.sock"
+    bridge_socket = tmp_path / "missing-bridge.sock"
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
@@ -1522,7 +1522,7 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
         )
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="fork prompt should not be used",
             log_prefix="review-validate-fix-fork",
             model=None,
@@ -1556,10 +1556,10 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp:
     assert latest["socket_selection"]["bridge_policy"] == "report"
 
 
-def test_missing_desktop_control_auto_uses_existing_bridge(tmp: Path) -> None:
+def test_missing_desktop_control_auto_uses_existing_bridge(tmp_path: Path) -> None:
     module = load_hook_module()
-    desktop_socket = tmp / "missing-control.sock"
-    bridge_socket = tmp / "bridge.sock"
+    desktop_socket = tmp_path / "missing-control.sock"
+    bridge_socket = tmp_path / "bridge.sock"
     original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
     original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
@@ -1613,9 +1613,9 @@ def test_missing_desktop_control_auto_uses_existing_bridge(tmp: Path) -> None:
     assert selection["bridge_decision"] == "existing-bridge-connect-ok"
 
 
-def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp: Path) -> None:
+def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp_path: Path) -> None:
     module = load_hook_module()
-    bridge_socket = tmp / "rvf-app-server.sock"
+    bridge_socket = tmp_path / "rvf-app-server.sock"
 
     class FakeCompleted:
         def __init__(self, returncode: int, stdout: str) -> None:
@@ -1630,7 +1630,7 @@ def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp: Path) -> None:
                     [
                         f"codex-aar 111 user 20u unix 0x1 0t0 {bridge_socket}",
                         f"codex-aar 222 user 21u unix 0x2 0t0 {bridge_socket}",
-                        f"codex-aar 333 user 22u unix 0x3 0t0 {tmp / 'other.sock'}",
+                        f"codex-aar 333 user 22u unix 0x3 0t0 {tmp_path / 'other.sock'}",
                     ]
                 ),
             )
@@ -1644,7 +1644,7 @@ def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp: Path) -> None:
         if args[:3] == ["ps", "-p", "333"]:
             return FakeCompleted(
                 0,
-                f"/opt/homebrew/bin/codex app-server --listen unix://{tmp / 'other.sock'}\n",
+                f"/opt/homebrew/bin/codex app-server --listen unix://{tmp_path / 'other.sock'}\n",
             )
         raise AssertionError(args)
 
@@ -1656,10 +1656,10 @@ def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp: Path) -> None:
         module.subprocess.run = original_run
 
 
-def test_restart_bridge_stops_existing_listener_before_relaunch(tmp: Path) -> None:
+def test_restart_bridge_stops_existing_listener_before_relaunch(tmp_path: Path) -> None:
     module = load_hook_module()
-    bridge_socket = tmp / "rvf-app-server.sock"
-    bridge_socket.parent.mkdir(parents=True)
+    bridge_socket = tmp_path / "rvf-app-server.sock"
+    bridge_socket.parent.mkdir(parents=True, exist_ok=True)
     bridge_socket.write_text("stale", encoding="utf-8")
     started = False
     calls: list[tuple[str, Path]] = []
@@ -1679,7 +1679,7 @@ def test_restart_bridge_stops_existing_listener_before_relaunch(tmp: Path) -> No
     original_codex_bin = module.codex_bin
     try:
         module.bridge_socket_path = lambda: bridge_socket
-        module.bridge_log_path = lambda: tmp / "rvf-app-server.log"
+        module.bridge_log_path = lambda: tmp_path / "rvf-app-server.log"
         module.stop_existing_bridge_app_servers = lambda path: calls.append(
             ("stop", path)
         ) or {"pids": [111], "stopped": [111], "failed": [], "still_running": []}
@@ -1700,12 +1700,12 @@ def test_restart_bridge_stops_existing_listener_before_relaunch(tmp: Path) -> No
     assert bridge_socket.read_text(encoding="utf-8") == "fresh"
 
 
-def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
+def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
     module = load_hook_module()
-    first_socket = tmp / "stale.sock"
-    retry_socket = tmp / "fresh.sock"
-    active_path = tmp / "sessions" / "fork-retry.jsonl"
-    active_path.parent.mkdir(parents=True)
+    first_socket = tmp_path / "stale.sock"
+    retry_socket = tmp_path / "fresh.sock"
+    active_path = tmp_path / "sessions" / "fork-retry.jsonl"
+    active_path.parent.mkdir(parents=True, exist_ok=True)
     active_path.write_text("{}\n", encoding="utf-8")
     calls: list[str] = []
 
@@ -1731,7 +1731,7 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
                     "thread": {
                         "id": "fork-retry",
                         "path": str(active_path),
-                        "cwd": str(tmp),
+                        "cwd": str(tmp_path),
                     }
                 }
             if method == "turn/start":
@@ -1742,7 +1742,7 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
                     "thread": {
                         "id": "fork-retry",
                         "path": str(active_path),
-                        "cwd": str(tmp),
+                        "cwd": str(tmp_path),
                     }
                 }
             if method == "thread/list":
@@ -1751,7 +1751,7 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
                         {
                             "id": "fork-retry",
                             "path": str(active_path),
-                            "cwd": str(tmp),
+                            "cwd": str(tmp_path),
                         }
                     ],
                     "nextCursor": None,
@@ -1789,18 +1789,18 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
             "connect_ok": True,
             "reason": "connect-ok",
         }
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         module.maybe_open_fork_in_codex = lambda _: True
         os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "0"
         os.environ["CODEX_RVF_OPEN_GUI_FORK"] = "0"
         result = module.run_app_server_fork(
             parent_thread_id="parent",
             parent_thread_path=None,
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="$review-validate-fix",
             model=None,
             reasoning_effort=None,
-            log_path=tmp / "hook.json",
+            log_path=tmp_path / "hook.json",
         )
     finally:
         module.AppServerWebSocket = original_client
@@ -1826,12 +1826,12 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp: Path) -> None:
     assert "failed to load configuration" in result["bridge_retry"]["first_error"]
 
 
-def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> None:
+def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path) -> None:
     module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -1874,7 +1874,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
         os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
         os.environ["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
+        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
@@ -1971,12 +1971,12 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp: Path) -> N
     assert suppression_marker["run_id"] == latest["run_id"]
 
 
-def test_auto_mode_creates_cline_kanban_task_by_default(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2025,12 +2025,12 @@ def test_auto_mode_creates_cline_kanban_task_by_default(tmp: Path) -> None:
     assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
 
 
-def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp: Path) -> None:
+def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
     module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
-    fake_client = tmp / "fake_cline_kanban_client.py"
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
     fake_client.write_text(
         "import sys\n"
         "raise SystemExit('kanban unavailable for fallback test')\n",
@@ -2056,7 +2056,7 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp: Path) -> None:
         }
         module.run_app_server_fork = lambda **_: {
             "status": "app-server-started",
-            "socket_path": str(tmp / "legacy.sock"),
+            "socket_path": str(tmp_path / "legacy.sock"),
             "socket_source": "test",
             "socket_selection": {},
             "fork_thread_id": "legacy-fork",
@@ -2103,18 +2103,19 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp: Path) -> None:
     assert latest["legacy_gui_fallback"]["primary_failure"]["status"] == "cline-kanban-unavailable"
 
 
-def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp: Path) -> None:
+def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp_path: Path) -> None:
     module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
-    fake_client = tmp / "fake_cline_kanban_client.py"
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
     fake_client.write_text(
         "import sys\n"
         "print('cline-kanban error: KanbanError: Kanban CLI reached a server on "
-        "127.0.0.1:3484, but that listener was not started from expected repo "
-        f"{repo}. Listener(s): pid=123 cwd=/tmp/other command=kanban. Stop the stale "
-        f"Kanban/tmux session or restart it from {repo} before creating RVF tasks.', file=sys.stderr)\n"
+        "127.0.0.1:3484, but no listener pane belongs to tmux session `cline-kanban` "
+        "or `cline-kanban-*`. Listener(s): pid=123 cwd=/tmp/other tmux=rvf-vibe-kanban "
+        "command=kanban. Stop the foreign listener or restart Kanban from a correctly "
+        "named tmux session before creating RVF tasks.', file=sys.stderr)\n"
         "raise SystemExit(2)\n",
         encoding="utf-8",
     )
@@ -2171,15 +2172,15 @@ def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp: Path)
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-unavailable"
     assert latest["backend"] == "kanban"
-    assert "listener was not started from expected repo" in str(latest["error"])
+    assert "no listener pane belongs to tmux session `cline-kanban`" in str(latest["error"])
     assert "legacy_gui_fallback" not in latest
 
 
-def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2220,11 +2221,11 @@ def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp:
     assert not client_calls.exists()
 
 
-def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    transcript = write_apply_patch_transcript(tmp / "session.jsonl", repo)
-    fake_codex = tmp / "fake_codex.py"
+def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+    fake_codex = tmp_path / "fake_codex.py"
     fake_codex.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
@@ -2235,8 +2236,8 @@ def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp: Pat
         encoding="utf-8",
     )
     fake_codex.chmod(0o755)
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2279,11 +2280,11 @@ def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp: Pat
     assert "session expired" in results[0]["stderr"]
 
 
-def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2348,13 +2349,13 @@ def test_kanban_followup_mode_injects_current_task_message(tmp: Path) -> None:
     assert calls[0]["suppress"] is None
 
 
-def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
+def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
     subdir = repo / "nested"
     subdir.mkdir()
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2404,10 +2405,10 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp: Pa
     assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
 
 
-def test_kanban_followup_blocks_expired_codex_login_before_message(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_codex = tmp / "fake_codex.py"
+def test_kanban_followup_blocks_expired_codex_login_before_message(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_codex = tmp_path / "fake_codex.py"
     fake_codex.write_text(
         "#!/usr/bin/env python3\n"
         "import sys\n"
@@ -2418,8 +2419,8 @@ def test_kanban_followup_blocks_expired_codex_login_before_message(tmp: Path) ->
         encoding="utf-8",
     )
     fake_codex.chmod(0o755)
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2460,11 +2461,11 @@ def test_kanban_followup_blocks_expired_codex_login_before_message(tmp: Path) ->
     assert "session expired" in results[0]["stderr"]
 
 
-def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2494,9 +2495,9 @@ def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp: Path
     assert not client_calls.exists()
 
 
-def test_kanban_followup_trigger_marker_skips_one_turn(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_kanban_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
 
     stdout, _ = invoke(
         {
@@ -2515,11 +2516,11 @@ def test_kanban_followup_trigger_marker_skips_one_turn(tmp: Path) -> None:
     assert latest["reason_code"] == "kanban_followup_trigger_turn"
 
 
-def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) -> None:
+def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:
     module = load_hook_module()
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    fake_client = tmp / "fake_cline_kanban_client.py"
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
     fake_client.write_text(
         "import json, sys\n"
         "if sys.argv[1] == 'ensure':\n"
@@ -2553,7 +2554,7 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) ->
             log_prefix="review-validate-fix-fork",
             model=None,
             reasoning_effort=None,
-            parent_thread_path=write_apply_patch_transcript(tmp / "session.jsonl", repo),
+            parent_thread_path=write_apply_patch_transcript(tmp_path / "session.jsonl", repo),
         )
     finally:
         module.parent_thread_name_from_app_server = original_lookup
@@ -2569,10 +2570,10 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp: Path) ->
 
 
 def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
-    tmp: Path,
+    tmp_path: Path,
 ) -> None:
-    state = tmp / "state"
-    home = tmp / "home"
+    state = tmp_path / "state"
+    home = tmp_path / "home"
     home.mkdir(parents=True)
     env = os.environ.copy()
     for name in tuple(env):
@@ -2583,7 +2584,7 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
     env["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "report"
     completed = subprocess.run(
         [sys.executable, str(DIAGNOSTIC_SCRIPT)],
-        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp)}),
+        input=json.dumps({"session_id": "parent-thread", "cwd": str(tmp_path)}),
         capture_output=True,
         text=True,
         check=True,
@@ -2602,11 +2603,11 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
     assert latest["marker"] == "RVF_FORK_EXPERIMENT"
 
 
-def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
+def test_missing_desktop_control_fail_policy_reports(tmp_path: Path) -> None:
     module = load_hook_module()
-    state = tmp / "state"
-    desktop_socket = tmp / "missing-control.sock"
-    bridge_socket = tmp / "missing-bridge.sock"
+    state = tmp_path / "state"
+    desktop_socket = tmp_path / "missing-control.sock"
+    bridge_socket = tmp_path / "missing-bridge.sock"
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
@@ -2623,7 +2624,7 @@ def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
         )
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="fork prompt should not be used",
             log_prefix="review-validate-fix-fork",
             model=None,
@@ -2656,11 +2657,11 @@ def test_missing_desktop_control_fail_policy_reports(tmp: Path) -> None:
     assert latest["socket_selection"]["bridge_policy"] == "fail"
 
 
-def test_fork_session_visibility_waits_only_for_active_session(tmp: Path) -> None:
+def test_fork_session_visibility_waits_only_for_active_session(tmp_path: Path) -> None:
     module = load_hook_module()
     original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
     try:
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         active_path = (
             module.DEFAULT_CODEX_SESSIONS_DIR
             / "2026"
@@ -2688,10 +2689,10 @@ def test_fork_session_visibility_waits_only_for_active_session(tmp: Path) -> Non
         module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
 
 
-def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> None:
+def test_app_server_fork_waits_for_session_file_before_deeplink(tmp_path: Path) -> None:
     module = load_hook_module()
-    socket_path = tmp / "app-server.sock"
-    active_path = tmp / "sessions" / "rollout-fork-wait.jsonl"
+    socket_path = tmp_path / "app-server.sock"
+    active_path = tmp_path / "sessions" / "rollout-fork-wait.jsonl"
     calls: list[str] = []
 
     class FakeClient:
@@ -2714,7 +2715,7 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
                     "thread": {
                         "id": "fork-wait",
                         "path": str(active_path),
-                        "cwd": str(tmp),
+                        "cwd": str(tmp_path),
                         "source": "vscode",
                     }
                 }
@@ -2722,13 +2723,13 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
                 assert params is not None
                 assert params["sortKey"] == "updated_at"
                 assert params["useStateDbOnly"] is False
-                assert params["cwd"] == str(tmp)
+                assert params["cwd"] == str(tmp_path)
                 return {
                     "data": [
                         {
                             "id": "fork-wait",
                             "path": str(active_path),
-                            "cwd": str(tmp),
+                            "cwd": str(tmp_path),
                             "source": "vscode",
                         }
                     ],
@@ -2752,7 +2753,7 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
     try:
         module.AppServerWebSocket = FakeClient
         module.select_app_server_socket = lambda: (socket_path, "bridge", {})
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         module.sys.platform = "darwin"
 
         def fake_open(thread_id: str) -> bool:
@@ -2768,11 +2769,11 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
         result = module.run_app_server_fork(
             parent_thread_id="parent",
             parent_thread_path=None,
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="$review-validate-fix",
             model=None,
             reasoning_effort=None,
-            log_path=tmp / "hook.json",
+            log_path=tmp_path / "hook.json",
         )
     finally:
         module.AppServerWebSocket = original_client
@@ -2806,11 +2807,11 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp: Path) -> No
 
 
 def test_desktop_control_fork_requires_active_session_for_verified_gui(
-    tmp: Path,
+    tmp_path: Path,
 ) -> None:
     module = load_hook_module()
-    socket_path = tmp / "app-server.sock"
-    missing_path = tmp / "sessions" / "rollout-fork-missing.jsonl"
+    socket_path = tmp_path / "app-server.sock"
+    missing_path = tmp_path / "sessions" / "rollout-fork-missing.jsonl"
     calls: list[str] = []
 
     class FakeClient:
@@ -2831,7 +2832,7 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
                     "thread": {
                         "id": "fork-missing",
                         "path": str(missing_path),
-                        "cwd": str(tmp),
+                        "cwd": str(tmp_path),
                         "source": "vscode",
                     }
                 }
@@ -2841,7 +2842,7 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
                         {
                             "id": "fork-missing",
                             "path": str(missing_path),
-                            "cwd": str(tmp),
+                            "cwd": str(tmp_path),
                             "source": "vscode",
                         }
                     ],
@@ -2865,7 +2866,7 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
     try:
         module.AppServerWebSocket = FakeClient
         module.select_app_server_socket = lambda: (socket_path, "desktop-control", {})
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp / "sessions"
+        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         module.sys.platform = "darwin"
 
         def fake_open(thread_id: str) -> bool:
@@ -2881,11 +2882,11 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
         result = module.run_app_server_fork(
             parent_thread_id="parent",
             parent_thread_path=None,
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="$review-validate-fix",
             model=None,
             reasoning_effort=None,
-            log_path=tmp / "hook.json",
+            log_path=tmp_path / "hook.json",
         )
     finally:
         module.AppServerWebSocket = original_client
@@ -2912,9 +2913,9 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
     assert result["gui_visibility"] == "unverified-session-missing"
 
 
-def test_bridge_fork_message_marks_gui_visibility_unverified(tmp: Path) -> None:
+def test_bridge_fork_message_marks_gui_visibility_unverified(tmp_path: Path) -> None:
     module = load_hook_module()
-    state = tmp / "state"
+    state = tmp_path / "state"
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_run = module.run_app_server_fork
     try:
@@ -2936,7 +2937,7 @@ def test_bridge_fork_message_marks_gui_visibility_unverified(tmp: Path) -> None:
         module.run_app_server_fork = fake_run_app_server_fork
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
-            cwd=str(tmp),
+            cwd=str(tmp_path),
             prompt="$review-validate-fix",
             log_prefix="review-validate-fix-fork",
             model=None,
@@ -2956,7 +2957,7 @@ def test_bridge_fork_message_marks_gui_visibility_unverified(tmp: Path) -> None:
     assert latest["gui_visibility"] == "unverified-bridge-only"
 
 
-def test_open_gui_fork_disabled_skips_retry_sleep(tmp: Path) -> None:
+def test_open_gui_fork_disabled_skips_retry_sleep(tmp_path: Path) -> None:
     module = load_hook_module()
     calls: list[str] = []
     original_sleep = module.time.sleep
@@ -2991,7 +2992,7 @@ def test_open_gui_fork_disabled_skips_retry_sleep(tmp: Path) -> None:
     assert calls == []
 
 
-def test_open_gui_fork_success_stops_retries(tmp: Path) -> None:
+def test_open_gui_fork_success_stops_retries(tmp_path: Path) -> None:
     module = load_hook_module()
     calls: list[str] = []
     original_sleep = module.time.sleep
@@ -3031,7 +3032,7 @@ def test_open_gui_fork_success_stops_retries(tmp: Path) -> None:
     assert calls == ["fork-success"]
 
 
-def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp: Path) -> None:
+def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp_path: Path) -> None:
     module = load_hook_module()
     calls: list[str] = []
     original_sleep = module.time.sleep
@@ -3069,10 +3070,10 @@ def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp: Path) -> None
     assert calls == []
 
 
-def test_session_hook_control_disables_current_session(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_session_hook_control_disables_current_session(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-disabled",
@@ -3119,10 +3120,10 @@ def test_session_hook_control_disables_current_session(tmp: Path) -> None:
     assert latest_pointer(state)["status"] == "skipped"
 
 
-def test_session_hook_control_status_reports_current_session(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_session_hook_control_status_reports_current_session(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-status",
@@ -3161,10 +3162,10 @@ def test_session_hook_control_status_reports_current_session(tmp: Path) -> None:
     assert "session-status" in str(summary["message"])
 
 
-def test_session_hook_control_status_works_when_env_suppressed(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_session_hook_control_status_works_when_env_suppressed(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-status-suppressed",
@@ -3189,10 +3190,10 @@ def test_session_hook_control_status_works_when_env_suppressed(tmp: Path) -> Non
     assert "session-status-suppressed" in str(summary["message"])
 
 
-def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_session_hook_control_reenables_current_session(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-reenabled",
@@ -3234,10 +3235,10 @@ def test_session_hook_control_reenables_current_session(tmp: Path) -> None:
     )
 
 
-def test_session_hook_control_reenable_starts_cline_kanban_task(tmp: Path) -> None:
-    repo = init_repo_with_head(tmp / "repo")
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-kanban-reenabled",
@@ -3253,8 +3254,8 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp: Path) -> No
     )
     assert (state / "session-hook" / "session-kanban-reenabled.json").exists()
 
-    fake_client = tmp / "fake_cline_kanban_client.py"
-    client_calls = tmp / "client-calls.jsonl"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -3310,10 +3311,10 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp: Path) -> No
     assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
 
 
-def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_disabled_session_skips_fork_experiment_marker(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session(
         transcript,
         "session-disabled-experiment",
@@ -3346,9 +3347,9 @@ def test_disabled_session_skips_fork_experiment_marker(tmp: Path) -> None:
     assert latest_pointer(state)["status"] == "skipped"
 
 
-def test_subagent_source_ignores_session_hook_control(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_subagent_source_ignores_session_hook_control(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
     stdout, _ = invoke(
         {
             "cwd": str(dirty),
@@ -3363,8 +3364,8 @@ def test_subagent_source_ignores_session_hook_control(tmp: Path) -> None:
     assert not (state / "session-hook" / "subagent-control.json").exists()
 
 
-def test_subagent_source_skips(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
+def test_subagent_source_skips(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
     stdout, _ = invoke(
         {
             "cwd": str(dirty),
@@ -3375,9 +3376,9 @@ def test_subagent_source_skips(tmp: Path) -> None:
     assert_skip_reason(stdout, "subagent")
 
 
-def test_subagent_session_meta_skips(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    transcript = tmp / "subagent.jsonl"
+def test_subagent_session_meta_skips(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = tmp_path / "subagent.jsonl"
     write_subagent_session(transcript)
     stdout, _ = invoke(
         {
@@ -3389,15 +3390,15 @@ def test_subagent_session_meta_skips(tmp: Path) -> None:
     assert_skip_reason(stdout, "subagent")
 
 
-def test_clean_repo_skips(tmp: Path) -> None:
-    clean = init_repo(tmp / "clean", dirty=False)
+def test_clean_repo_skips(tmp_path: Path) -> None:
+    clean = init_repo(tmp_path / "clean", dirty=False)
     stdout, _ = invoke({"cwd": str(clean), "stop_hook_active": False})
     assert_skip_reason(stdout, "clean")
 
 
-def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
     payload = parse_json(
         invoke(
             {
@@ -3422,9 +3423,9 @@ def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp: Path) -> None:
     assert str(dirty) in prompt
 
 
-def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_dirty_repo_manual_mode_only_prepares_prompt(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
     payload = parse_json(
         invoke(
             {
@@ -3448,9 +3449,9 @@ def test_dirty_repo_manual_mode_only_prepares_prompt(tmp: Path) -> None:
     assert Path(latest["prompt_path"]).exists()
 
 
-def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
+def test_dirty_repo_fork_dry_run(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
     payload = parse_json(
         invoke(
             {
@@ -3488,11 +3489,11 @@ def test_dirty_repo_fork_dry_run(tmp: Path) -> None:
     assert requests[1]["params"]["effort"] == "high"
 
 
-def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
+def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
     subdir = dirty / "nested"
     subdir.mkdir()
-    state = tmp / "state"
+    state = tmp_path / "state"
 
     payload = parse_json(
         invoke(
@@ -3520,12 +3521,12 @@ def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp: Path) -> None:
     assert f"RVF_TARGET_REPO: {dirty.resolve()}" in prompt
 
 
-def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp: Path) -> None:
-    plain = tmp / "plain"
+def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
     plain.mkdir(parents=True)
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    config = tmp / "config.toml"
-    state = tmp / "state"
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    config = tmp_path / "config.toml"
+    state = tmp_path / "state"
     write_config(config, [dirty])
 
     payload = parse_json(
@@ -3552,10 +3553,10 @@ def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp: Path) -> None:
     assert latest_pointer(state)["status"] == "skipped"
 
 
-def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    transcript = tmp / "session.jsonl"
-    state = tmp / "state"
+def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
     write_apply_patch_transcript(
         transcript,
         dirty,
@@ -3586,10 +3587,10 @@ def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp: Path) -> No
     assert fork_params["path"] == str(transcript.resolve())
 
 
-def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    log_path = tmp / "hook.log"
+def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    log_path = tmp_path / "hook.log"
     log_path.write_text("not a rollout jsonl\n", encoding="utf-8")
     payload = parse_json(
         invoke(
@@ -3613,8 +3614,8 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp: Path) -> None
     assert "path" not in app_server_requests(latest)[0]["params"]
 
 
-def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
+def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
     payload = parse_json(
         invoke(
             {
@@ -3634,23 +3635,23 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp: Path) -> Non
     assert "Stop continuation prompt 已禁用" in str(summary["message"])
 
 
-def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> None:
-    state = tmp / "state"
-    handoff = tmp / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
-    handoff.parent.mkdir(parents=True)
+def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
+    handoff.parent.mkdir(parents=True, exist_ok=True)
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp / "opened.txt"
-    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
         "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp}\n"
-        f"RVF_TARGET_REPO: {tmp / 'repo'}\n"
+        f"RVF_PARENT_CWD: {tmp_path}\n"
+        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
     )
 
     event = {
-        "cwd": str(tmp),
+        "cwd": str(tmp_path),
         "session_id": "child-session",
         "stop_hook_active": False,
         "last_user_message": fork_prompt,
@@ -3684,18 +3685,18 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp: Path) -> Non
     assert summary["handoff_open_result"]["reason"] == "already_advised"
 
 
-def test_handoff_advisory_respects_open_disabled(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    state = tmp / "state"
-    handoff = tmp / "handoff.md"
+def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state = tmp_path / "state"
+    handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp / "opened.txt"
-    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
 
     payload = parse_json(
         invoke(
             {
-                "cwd": str(tmp),
+                "cwd": str(tmp_path),
                 "session_id": "child-session",
                 "stop_hook_active": False,
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
@@ -3713,18 +3714,18 @@ def test_handoff_advisory_respects_open_disabled(tmp: Path) -> None:
     assert not opener_marker.exists()
 
 
-def test_handoff_advisory_records_open_failure(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    state = tmp / "state"
-    handoff = tmp / "handoff.md"
+def test_handoff_advisory_records_open_failure(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state = tmp_path / "state"
+    handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp / "opened.txt"
-    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker, fail=True)
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker, fail=True)
 
     payload = parse_json(
         invoke(
             {
-                "cwd": str(tmp),
+                "cwd": str(tmp_path),
                 "session_id": "child-session",
                 "stop_hook_active": False,
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
@@ -3740,18 +3741,18 @@ def test_handoff_advisory_records_open_failure(tmp: Path) -> None:
     assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
 
 
-def test_suppress_env_skips_handoff_marker_before_advisory(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    state = tmp / "state"
-    handoff = tmp / "handoff.md"
+def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state = tmp_path / "state"
+    handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp / "opened.txt"
-    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
 
     payload = parse_json(
         invoke(
             {
-                "cwd": str(tmp),
+                "cwd": str(tmp_path),
                 "session_id": "headless-child",
                 "stop_hook_active": False,
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
@@ -3773,13 +3774,13 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp: Path) -> None:
     assert not (state / "handoff-advised").exists()
 
 
-def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    handoff = tmp / "handoff.md"
+def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp / "opened.txt"
-    opener = write_fake_opener(tmp / "open_handoff.py", opener_marker)
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
 
     payload = parse_json(
         invoke(
@@ -3799,12 +3800,12 @@ def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp: Path) -> Non
     assert not (state / "handoff-advised").exists()
 
 
-def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp: Path) -> None:
-    dirty = init_repo(tmp / "dirty", dirty=True)
-    state = tmp / "state"
-    handoff = tmp / "handoff.md"
+def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener = write_fake_opener(tmp / "open_handoff.py", tmp / "opened.txt")
+    opener = write_fake_opener(tmp_path / "open_handoff.py", tmp_path / "opened.txt")
 
     payload = parse_json(
         invoke(
@@ -3827,19 +3828,19 @@ def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp: Path) -> Non
     assert "app_server_requests_path" not in summary
 
 
-def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None:
-    state = tmp / "state"
+def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp_path: Path) -> None:
+    state = tmp_path / "state"
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
         "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp}\n"
-        f"RVF_TARGET_REPO: {tmp / 'repo'}\n"
+        f"RVF_PARENT_CWD: {tmp_path}\n"
+        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
     )
 
     stdout, _ = invoke(
         {
-            "cwd": str(tmp),
+            "cwd": str(tmp_path),
             "session_id": "child-session",
             "stop_hook_active": False,
             "last_user_message": fork_prompt,
@@ -3851,19 +3852,19 @@ def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp: Path) -> None
     assert not (state / "handoff-advised").exists()
 
 
-def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> None:
-    state = tmp / "state"
+def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -> None:
+    state = tmp_path / "state"
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
         "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp}\n"
-        f"RVF_TARGET_REPO: {tmp / 'repo'}\n"
+        f"RVF_PARENT_CWD: {tmp_path}\n"
+        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
     )
 
     stdout, _ = invoke(
         {
-            "cwd": str(tmp),
+            "cwd": str(tmp_path),
             "session_id": "child-session",
             "stop_hook_active": False,
             "last_user_message": fork_prompt,
@@ -3874,13 +3875,13 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp: Path) -> Non
     assert not (state / "handoff-advised").exists()
 
 
-def test_invalid_handoff_marker_continues_existing_gate(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    state = tmp / "state"
-    missing = tmp / "missing.md"
+def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state = tmp_path / "state"
+    missing = tmp_path / "missing.md"
     stdout, _ = invoke(
         {
-            "cwd": str(tmp),
+            "cwd": str(tmp_path),
             "session_id": "child-session",
             "stop_hook_active": False,
             "last_assistant_message": f"RVF_HANDOFF_FILE: {missing}",
@@ -3890,15 +3891,15 @@ def test_invalid_handoff_marker_continues_existing_gate(tmp: Path) -> None:
     assert_skip_reason(stdout, "当前 cwd 不在 git repo/worktree 内")
 
 
-def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp: Path) -> None:
-    dirty = init_repo(tmp / "repo", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "repo", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
         "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp}\n"
+        f"RVF_PARENT_CWD: {tmp_path}\n"
         f"RVF_TARGET_REPO: {dirty}\n"
     )
     write_user_session_messages(
@@ -3924,15 +3925,15 @@ def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_messag
     assert latest_pointer(state)["status"] == "skipped"
 
 
-def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> None:
-    dirty = init_repo(tmp / "repo", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "repo", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
         "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp}\n"
+        f"RVF_PARENT_CWD: {tmp_path}\n"
         f"RVF_TARGET_REPO: {dirty}\n"
     )
     write_user_session_messages(
@@ -3959,10 +3960,10 @@ def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp: Path) -> No
     assert latest_pointer(state)["status"] == "skipped"
 
 
-def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path) -> None:
-    dirty = init_repo(tmp / "repo", dirty=True)
-    state = tmp / "state"
-    transcript = tmp / "session.jsonl"
+def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "repo", dirty=True)
+    state = tmp_path / "state"
+    transcript = tmp_path / "session.jsonl"
     write_user_session_messages(
         transcript,
         "ordinary-session",
@@ -4015,7 +4016,7 @@ def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp: Path
     assert str(dirty) in prompt
 
 
-def test_missing_cwd_skips_and_requests_target_repo(tmp: Path) -> None:
+def test_missing_cwd_skips_and_requests_target_repo(tmp_path: Path) -> None:
     payload = parse_json(invoke({"stop_hook_active": False})[0])
     assert "decision" not in payload
     assert payload["continue"] is True
@@ -4024,9 +4025,9 @@ def test_missing_cwd_skips_and_requests_target_repo(tmp: Path) -> None:
     assert "提供要运行 review-validate-fix 的目标 repo 路径" in str(summary["message"])
 
 
-def test_log_unavailable_does_not_break_hook_payload(tmp: Path) -> None:
-    tmp.mkdir(parents=True, exist_ok=True)
-    state_file = tmp / "state-is-a-file"
+def test_log_unavailable_does_not_break_hook_payload(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    state_file = tmp_path / "state-is-a-file"
     state_file.write_text("not a directory\n", encoding="utf-8")
     payload = parse_json(invoke({"stop_hook_active": False}, state_dir=state_file)[0])
     assert "decision" not in payload

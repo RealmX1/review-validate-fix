@@ -532,7 +532,7 @@ def main() -> int:
     parser.add_argument(
         "--cline-kanban-tmux-session",
         default=None,
-        help="持久写入 CODEX_RVF_CLINE_KANBAN_TMUX_SESSION；默认 rvf-cline-kanban。",
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_TMUX_SESSION；默认 cline-kanban-3484。",
     )
     parser.add_argument(
         "--cline-kanban-base-ref",
