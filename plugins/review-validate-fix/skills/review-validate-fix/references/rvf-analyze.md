@@ -36,9 +36,10 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analy
 | `0` | 已成功 scaffold ``analysis/summary.md`` 与 ``analysis/causality.json``。 | 进入"叙事补全"流程（见下） |
 | `2` | classification == ``running``（run 看起来还在跑）。 | **询问用户**：是否仍要复盘？得到肯定后追加 ``--force`` 重入；否则结束 |
 | `3` | classification 是 ``orphan_candidate`` 或 ``cancel_without_lock``，需要决策。 | **询问用户**："这个 run 看起来未完成，要现在 lazy finalize 一次再分析吗？"；用户答 yes → 追加 ``--auto-finalize-orphan`` 重入；用户答 no → 追加 ``--decline-finalize`` 重入 |
+| `5` | 上轮调用传了 ``--auto-finalize-orphan`` 但 ``finalize_run`` 自己抛异常。 | **不要再次询问 lazy finalize 决策**。读 stdout 里 ``error`` 字段把失败原因转给用户；可建议用户 ``--decline-finalize`` 重入做降级分析，或排查 finalize_run 自身问题 |
 | `4` | 解析 run_dir 失败（找不到目录 / latest pointer 缺失）。 | 反馈错误信息给用户，请其确认 ``--run-id`` / ``--run-dir`` 是否正确 |
 
-agent 不得在退出码 2/3 上自作主张选择——必须用中文向用户提问。
+agent 不得在退出码 2/3 上自作主张选择——必须用中文向用户提问。退出码 5 已经代表"用户上轮已经选过 lazy finalize"——只能转述错误并提议降级路径，不要再次发起同一个询问。
 ``--auto-finalize-orphan`` 会真的去拍 trajectory + workspace diff，可能保留
 abandon 期间的杂质 record，是用户该决定是否接受的事。
 

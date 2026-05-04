@@ -179,6 +179,7 @@ def test_analyze_orphan_decline_finalize_writes_marker_and_scaffolds(
     record = json.loads(marker.read_text(encoding="utf-8"))
     assert record["user_decision"] == "declined_finalize"
     assert record["classification"]["kind"] == "orphan_candidate"
+    assert "pre_finalize_classification" not in record
 
 
 def test_analyze_orphan_auto_finalize_invokes_finalize_run(tmp_path, monkeypatch):
@@ -209,6 +210,13 @@ def test_analyze_orphan_auto_finalize_invokes_finalize_run(tmp_path, monkeypatch
     assert payload["classification"]["kind"] == "finalized"
     assert "lazy_finalize" in payload
     assert payload["lazy_finalize"]["decision_kind"] == "lazy_orphan_finalize"
+    # marker must preserve the pre-finalize diagnostic state alongside the
+    # post-finalize classification.
+    assert marker["classification"]["kind"] == "finalized"
+    assert "pre_finalize_classification" in marker
+    pre = marker["pre_finalize_classification"]
+    assert pre["kind"] == "orphan_candidate"
+    assert pre["prior_status"] == "started"
 
 
 def test_analyze_running_refuses_without_force(tmp_path, monkeypatch):
@@ -238,6 +246,7 @@ def test_analyze_force_through_running_scaffolds_with_marker(tmp_path, monkeypat
     )
     assert marker["user_decision"] == "auto_classified_only"
     assert marker["extra"].get("forced_through_running") is True
+    assert "pre_finalize_classification" not in marker
 
 
 def test_analyze_half_broken_writes_marker_and_scaffolds(tmp_path, monkeypatch):
@@ -254,6 +263,8 @@ def test_analyze_half_broken_writes_marker_and_scaffolds(tmp_path, monkeypatch):
     assert payload["user_decision"] == "auto_classified_only"
     marker = run_dir / "artifacts" / ".interrupted"
     assert marker.is_file()
+    record = json.loads(marker.read_text(encoding="utf-8"))
+    assert "pre_finalize_classification" not in record
 
 
 def test_analyze_resolve_failed_exit_code(tmp_path, monkeypatch):
@@ -264,6 +275,103 @@ def test_analyze_resolve_failed_exit_code(tmp_path, monkeypatch):
     code, payload = rvf_analyze.analyze(_make_args(run_id="never-existed"))
     assert code == rvf_analyze.EXIT_RESOLVE_FAILED
     assert payload["status"] == "resolve_failed"
+
+
+def test_analyze_lazy_finalize_failure_returns_dedicated_exit_code(
+    tmp_path, monkeypatch
+):
+    rvf_analyze = _load("rvf_analyze")
+    log_root = tmp_path / "rvf-log"
+    run_dir = _bootstrap_run(
+        log_root,
+        run_id="rvf-finalize-fail",
+        status="started",
+        timestamp="2026-01-01T00:00:00Z",
+    )
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    # Inject a stub rvf_run_finalize module whose finalize_run raises.
+    import types
+
+    stub = types.ModuleType("rvf_run_finalize")
+
+    def _boom(**_kwargs):
+        raise RuntimeError("boom")
+
+    stub.finalize_run = _boom
+    monkeypatch.setitem(sys.modules, "rvf_run_finalize", stub)
+
+    code, payload = rvf_analyze.analyze(
+        _make_args(run_id="rvf-finalize-fail", auto_finalize_orphan=True)
+    )
+
+    assert code == rvf_analyze.EXIT_LAZY_FINALIZE_FAILED
+    assert code == 5
+    assert payload["status"] == "lazy_finalize_failed"
+    assert "RuntimeError" in payload["error"]
+    assert "boom" in payload["error"]
+    # finalize raised → no .interrupted marker, no .finalize.lock written
+    assert not (run_dir / "artifacts" / ".interrupted").exists()
+    assert not (run_dir / "artifacts" / ".finalize.lock").exists()
+
+
+def test_resolve_run_dir_rejects_dir_without_summary_json(tmp_path, monkeypatch):
+    rvf_analyze = _load("rvf_analyze")
+    log_root = tmp_path / "rvf-log"
+    log_root.mkdir()
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    # --run-dir branch: empty directory must NOT be accepted.
+    empty_dir = tmp_path / "totally-empty"
+    empty_dir.mkdir()
+    args = _make_args(run_dir=str(empty_dir))
+    assert rvf_analyze.resolve_run_dir(args) is None
+
+    # Positional target branch (Path(target).expanduser().resolve() fall-through):
+    # a *relative* path that doesn't resolve under log_root/runs and has no
+    # summary.json must also be rejected. We use a relative path so we hit the
+    # second candidate inside resolve_run_dir rather than aliasing into
+    # log_root/runs via pathlib's absolute-path anchor behavior.
+    other_dir = tmp_path / "not-a-run"
+    other_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+    args = _make_args(target="not-a-run")
+    assert rvf_analyze.resolve_run_dir(args) is None
+
+    # Sanity check: once a summary.json is dropped in, --run-dir accepts it.
+    (empty_dir / "summary.json").write_text("{}", encoding="utf-8")
+    args = _make_args(run_dir=str(empty_dir))
+    assert rvf_analyze.resolve_run_dir(args) == empty_dir.resolve()
+
+
+def test_resolve_positional_absolute_path_requires_summary_json(tmp_path, monkeypatch):
+    """An absolute positional target must NOT short-circuit through the
+    log_root/runs/<arg> branch (pathlib drops the left anchor when the right
+    side is absolute), and must still require summary.json on the fall-through.
+    """
+    rvf_analyze = _load("rvf_analyze")
+    log_root = tmp_path / "rvf-log"
+    log_root.mkdir()
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    weird_dir = tmp_path / "weird-dir"
+    weird_dir.mkdir()
+    # Intentionally NO summary.json.
+    args = _make_args(target=str(weird_dir))
+    assert rvf_analyze.resolve_run_dir(args) is None
+
+
+def test_resolve_positional_absolute_path_accepted_when_has_summary(tmp_path, monkeypatch):
+    rvf_analyze = _load("rvf_analyze")
+    log_root = tmp_path / "rvf-log"
+    log_root.mkdir()
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    weird_dir = tmp_path / "weird-dir"
+    weird_dir.mkdir()
+    (weird_dir / "summary.json").write_text("{}", encoding="utf-8")
+    args = _make_args(target=str(weird_dir))
+    assert rvf_analyze.resolve_run_dir(args) == weird_dir.resolve()
 
 
 def test_main_emits_json_and_exit_code(tmp_path, monkeypatch, capsys):

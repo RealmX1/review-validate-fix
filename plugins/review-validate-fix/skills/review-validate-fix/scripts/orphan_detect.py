@@ -36,7 +36,7 @@ UserDecision = Literal[
 ]
 
 
-INTERRUPTED_MARKER_SCHEMA_VERSION = 1
+INTERRUPTED_MARKER_SCHEMA_VERSION = 2
 INTERRUPTED_MARKER_FILENAME = ".interrupted"
 
 # Status strings RunLedger.summary() may emit. Only the two explicitly listed
@@ -170,6 +170,7 @@ def write_interrupted_marker(
     user_decision: UserDecision,
     lazy_finalize_decision_kind: str | None = None,
     extra: dict | None = None,
+    pre_finalize_classification: Classification | None = None,
 ) -> Path:
     """Atomically write ``<run_dir>/artifacts/.interrupted``. Overwrites any prior marker."""
     run_dir = Path(run_dir)
@@ -184,6 +185,8 @@ def write_interrupted_marker(
         "extra": extra if extra is not None else {},
         "written_at": _utc_now_iso(),
     }
+    if pre_finalize_classification is not None:
+        payload["pre_finalize_classification"] = asdict(pre_finalize_classification)
 
     _atomic_write_json(marker_path, payload)
     return marker_path

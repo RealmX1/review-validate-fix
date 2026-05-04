@@ -47,6 +47,7 @@ EXIT_OK = 0
 EXIT_RUNNING = 2
 EXIT_NEEDS_DECISION = 3
 EXIT_RESOLVE_FAILED = 4
+EXIT_LAZY_FINALIZE_FAILED = 5
 
 
 def _read_latest_run_dir() -> Path | None:
@@ -71,18 +72,20 @@ def resolve_run_dir(args: argparse.Namespace) -> Path | None:
     """按 mutex 优先级解析目标 run_dir。返回 None 表示无法定位。"""
     if args.run_dir:
         candidate = Path(args.run_dir).expanduser().resolve()
-        return candidate if (candidate / "summary.json").is_file() or candidate.is_dir() else None
+        return candidate if (candidate / "summary.json").is_file() else None
     if args.run_id:
         candidate = log_root() / "runs" / args.run_id
         return candidate if candidate.is_dir() else None
     if args.target:
         if args.target == "latest":
             return _read_latest_run_dir()
-        candidate = log_root() / "runs" / args.target
-        if candidate.is_dir():
-            return candidate
-        candidate = Path(args.target).expanduser().resolve()
-        if candidate.is_dir():
+        target_path = Path(args.target).expanduser()
+        if not target_path.is_absolute():
+            candidate = log_root() / "runs" / args.target
+            if candidate.is_dir() and (candidate / "summary.json").is_file():
+                return candidate
+        candidate = target_path.resolve()
+        if (candidate / "summary.json").is_file():
             return candidate
         return None
     if args.latest:
@@ -149,10 +152,11 @@ def analyze(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 "message": "pass exactly one of --auto-finalize-orphan / --decline-finalize",
             }
         if args.auto_finalize_orphan:
+            pre_classification = classification
             try:
                 finalize_record = _lazy_finalize(run_dir)
             except Exception as exc:  # noqa: BLE001 — CLI must not raise
-                return EXIT_NEEDS_DECISION, {
+                return EXIT_LAZY_FINALIZE_FAILED, {
                     "status": "lazy_finalize_failed",
                     "classification": _classification_payload(classification),
                     "error": f"{type(exc).__name__}: {exc}",
@@ -167,6 +171,7 @@ def analyze(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
                 classification=classification,
                 user_decision=decision_chosen,
                 lazy_finalize_decision_kind="lazy_orphan_finalize",
+                pre_finalize_classification=pre_classification,
             )
         elif args.decline_finalize:
             decision_chosen = "declined_finalize"

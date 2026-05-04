@@ -187,12 +187,81 @@ def test_marker_round_trip_includes_extra(tmp_path: Path) -> None:
     payload = od.read_interrupted_marker(run_dir)
     assert payload is not None
     assert payload["schema_version"] == od.INTERRUPTED_MARKER_SCHEMA_VERSION
+    assert payload["schema_version"] == 2
     assert payload["user_decision"] == "lazy_finalized"
     assert payload["lazy_finalize_decision_kind"] == "lazy_orphan_finalize"
     assert payload["extra"] == extra
     assert payload["classification"]["run_id"] == "r-rt"
     assert payload["classification"]["kind"] == "orphan_candidate"
     assert "written_at" in payload and payload["written_at"].endswith("Z")
+
+
+def test_marker_omits_pre_finalize_classification_when_not_passed(tmp_path: Path) -> None:
+    od = _load("orphan_detect")
+    run_dir = _make_run_dir(tmp_path)
+    _write_summary(
+        run_dir,
+        {
+            "run_id": "r-no-pre",
+            "status": "started",
+            "timestamp": "2026-05-04T00:00:00Z",
+        },
+    )
+    cls = od.classify_run(run_dir, now_iso="2026-05-04T12:00:00Z")
+    od.write_interrupted_marker(
+        run_dir,
+        classification=cls,
+        user_decision="declined_finalize",
+    )
+    payload = od.read_interrupted_marker(run_dir)
+    assert payload is not None
+    # Key must be absent (not present-with-null), so downstream readers can
+    # treat presence as the only signal.
+    assert "pre_finalize_classification" not in payload
+
+
+def test_marker_includes_pre_finalize_classification_when_passed(tmp_path: Path) -> None:
+    od = _load("orphan_detect")
+    run_dir = _make_run_dir(tmp_path)
+    _write_summary(
+        run_dir,
+        {
+            "run_id": "r-pre",
+            "status": "started",
+            "timestamp": "2026-05-04T00:00:00Z",
+        },
+    )
+    pre_cls = od.classify_run(run_dir, now_iso="2026-05-04T12:00:00Z")
+    assert pre_cls.kind == "orphan_candidate"
+    # Simulate a "post-finalize" classification (different kind) without
+    # actually running finalize_run -- we only care about the marker payload.
+    post_cls = od.Classification(
+        kind="finalized",
+        run_dir=str(run_dir),
+        run_id="r-pre",
+        prior_status="started",
+        prior_timestamp="2026-05-04T00:00:00Z",
+        age_seconds=43200.0,
+        has_finalize_lock=True,
+        has_interrupted_marker=False,
+        detected_at="2026-05-04T12:00:01Z",
+    )
+    od.write_interrupted_marker(
+        run_dir,
+        classification=post_cls,
+        user_decision="lazy_finalized",
+        lazy_finalize_decision_kind="lazy_orphan_finalize",
+        pre_finalize_classification=pre_cls,
+    )
+    payload = od.read_interrupted_marker(run_dir)
+    assert payload is not None
+    assert payload["classification"]["kind"] == "finalized"
+    assert payload["classification"]["has_finalize_lock"] is True
+    assert "pre_finalize_classification" in payload
+    pre = payload["pre_finalize_classification"]
+    assert pre["kind"] == "orphan_candidate"
+    assert pre["prior_status"] == "started"
+    assert pre["run_id"] == "r-pre"
 
 
 def test_marker_overwrite_replaces_state_atomically(tmp_path: Path) -> None:
