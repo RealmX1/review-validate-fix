@@ -6188,6 +6188,59 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "allocate_review_scope_output_consumed_by_prepare_run",
             lambda: test_allocate_review_scope_output_consumed_by_prepare_run(root / "alloc-T15"),
         ),
+        # Slice 4 lease lifecycle.
+        (
+            "lease_acquire_creates_lease_and_assigns_units",
+            lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
+        ),
+        (
+            "lease_acquire_rejects_when_any_unit_already_leased",
+            lambda: test_lease_acquire_rejects_when_any_unit_already_leased(root / "lease-T2"),
+        ),
+        (
+            "lease_acquire_prunes_stale_leases_first",
+            lambda: test_lease_acquire_prunes_stale_leases_first(root / "lease-T3"),
+        ),
+        (
+            "lease_refresh_extends_expires_at",
+            lambda: test_lease_refresh_extends_expires_at(root / "lease-T4"),
+        ),
+        (
+            "lease_refresh_returns_expired_when_past_ttl",
+            lambda: test_lease_refresh_returns_expired_when_past_ttl(root / "lease-T5"),
+        ),
+        (
+            "lease_release_returns_units_to_available",
+            lambda: test_lease_release_returns_units_to_available(root / "lease-T6"),
+        ),
+        (
+            "lease_release_idempotent",
+            lambda: test_lease_release_idempotent(root / "lease-T7"),
+        ),
+        (
+            "sweep_stale_releases_expired_active_leases",
+            lambda: test_sweep_stale_releases_expired_active_leases(root / "lease-T8"),
+        ),
+        (
+            "sweep_stale_no_op_when_all_active_leases_fresh",
+            lambda: test_sweep_stale_no_op_when_all_active_leases_fresh(root / "lease-T9"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_normal_exit",
+            lambda: test_run_alternative_reviewer_releases_lease_on_normal_exit(root / "lease-T10"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_codex_backend_challenge",
+            lambda: test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge(root / "lease-T11"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_timeout",
+            lambda: test_run_alternative_reviewer_releases_lease_on_timeout(root / "lease-T12"),
+        ),
+        (
+            "lease_acquire_concurrent_writers_serialize",
+            lambda: test_lease_acquire_concurrent_writers_serialize(root / "lease-T13"),
+        ),
     ]
 
 
@@ -6782,6 +6835,393 @@ def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None
     assert contract["primary_units"] == sorted(allocator["scope"]["unit_ids"])
     assert contract["tracker_lease_id"] == allocator["lease_id"]
     assert contract["tracker_scope_hash"] == allocator["scope_hash"]
+
+
+def _lease_seed(tmp: Path) -> tuple[object, Path, Path, list[str], str]:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    seeded = module.allocate_review_scope(
+        repo=repo,
+        session_id="lease-seed",
+        run_id="lease-seed-run",
+        reviewer_id=None,
+        dry_run=True,
+        log_root_override=log_root,
+    )
+    assert seeded["status"] == "dry_run"
+    conn = _alloc_open_db(log_root, seeded["repo_key"])
+    try:
+        unit_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT unit_id FROM units WHERE review_state='available' ORDER BY path, unit_id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert unit_ids
+    return module, repo, log_root, unit_ids, seeded["repo_key"]
+
+
+def _lease_contract(path: Path, *, repo: Path, unit_ids: list[str]) -> Path:
+    payload = {
+        "version": 2,
+        "run_id": "lease-reviewer-run",
+        "repo": str(repo),
+        "primary_units": unit_ids,
+        "tracker_lease_id": None,
+        "tracker_scope_hash": "sha256:" + "a" * 64,
+        "session_manifest_path": None,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _lease_unit_states(log_root: Path, repo_key: str, unit_ids: list[str]) -> dict[str, str]:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        placeholders = ",".join("?" for _ in unit_ids)
+        rows = conn.execute(
+            f"SELECT unit_id, review_state FROM units WHERE unit_id IN ({placeholders})",
+            tuple(unit_ids),
+        ).fetchall()
+        return {unit_id: state for unit_id, state in rows}
+    finally:
+        conn.close()
+
+
+def _lease_rows(log_root: Path, repo_key: str) -> list[tuple[str, str]]:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        return list(conn.execute("SELECT lease_id, state FROM leases ORDER BY created_at, lease_id"))
+    finally:
+        conn.close()
+
+
+def test_lease_acquire_creates_lease_and_assigns_units(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    result = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess",
+        run_id="lease-run",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert result["acquired"] is True
+    assert result["reason"] == "lease_acquired"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
+    events = read_jsonl(_alloc_events_path(log_root, repo_key))
+    assert any(event.get("event") == "lease_acquired" for event in events)
+
+
+def test_lease_acquire_rejects_when_any_unit_already_leased(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first_unit, second_unit = unit_ids[:2]
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-a",
+        run_id="lease-run-a",
+        reviewer_id="reviewer-a",
+        unit_ids=[first_unit],
+        log_root_override=log_root,
+    )
+    assert first["acquired"] is True
+    second = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-b",
+        run_id="lease-run-b",
+        reviewer_id="reviewer-b",
+        unit_ids=[first_unit, second_unit],
+        log_root_override=log_root,
+    )
+    assert second["acquired"] is False
+    assert second["reason"] == "lease_unit_already_assigned"
+    assert _lease_unit_states(log_root, repo_key, [second_unit])[second_unit] == "available"
+
+
+def test_lease_acquire_prunes_stale_leases_first(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale",
+        run_id="lease-run-stale",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    second = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-new",
+        run_id="lease-run-new",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert first["acquired"] is True
+    assert second["acquired"] is True
+    rows = dict(_lease_rows(log_root, repo_key))
+    assert rows[first["lease_id"]] == "stale-released"
+    assert rows[second["lease_id"]] == "active"
+
+
+def test_lease_refresh_extends_expires_at(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-refresh",
+        run_id="lease-run-refresh",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=10,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    refreshed = module.lease_refresh(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        ttl_seconds=20,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:05Z",
+    )
+    assert refreshed["refreshed"] is True
+    assert refreshed["expires_at"] == "2026-05-05T00:00:25Z"
+
+
+def test_lease_refresh_returns_expired_when_past_ttl(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-expired",
+        run_id="lease-run-expired",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    refreshed = module.lease_refresh(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert refreshed["refreshed"] is False
+    assert refreshed["reason"] == "lease_expired_before_refresh"
+
+
+def test_lease_release_returns_units_to_available(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-release",
+        run_id="lease-run-release",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    released = module.lease_release(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        log_root_override=log_root,
+    )
+    assert released["released"] is True
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_lease_release_idempotent(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-idem",
+        run_id="lease-run-idem",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    first = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
+    second = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
+    assert first["released"] is True
+    assert second["released"] is False
+    assert second["reason"] == "lease_not_found"
+
+
+def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-sweep",
+        run_id="lease-run-sweep",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    released = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert [item["lease_id"] for item in released] == [acquired["lease_id"]]
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "stale-released"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_sweep_stale_no_op_when_all_active_leases_fresh(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-fresh",
+        run_id="lease-run-fresh",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=60,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    assert module.sweep_stale(repo=repo, log_root_override=log_root, now="2026-05-05T00:00:02Z") == []
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "active"
+
+
+def _run_reviewer_with_lease(
+    *,
+    tmp: Path,
+    repo: Path,
+    log_root: Path,
+    unit_ids: list[str],
+    reviewer_code: str,
+    output_format: str = "text",
+    max_runtime_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nlease test\n", encoding="utf-8")
+    contract = _lease_contract(tmp / "scope.contract.json", repo=repo, unit_ids=unit_ids)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=0.2,
+        activity_check_interval_seconds=0.05,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+    )
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    return subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--scope-contract",
+            str(contract),
+            "--rvf-run-id",
+            "lease-reviewer-run",
+            "--rvf-run-dir",
+            str(tmp / "run"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code=clean_review_result_python(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_rows(log_root, repo_key)[-1][1] == "completed"
+
+
+def test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    html = "<html><title>Just a moment</title><body>Cloudflare challenge-platform</body></html>"
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code=f"import sys; sys.stdin.read(); print({html!r})",
+        output_format="codex_json",
+    )
+    assert completed.returncode != 0
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stderr
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_run_alternative_reviewer_releases_lease_on_timeout(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code="import sys, time; sys.stdin.read(); time.sleep(5)",
+        max_runtime_seconds=0.2,
+    )
+    assert completed.returncode == 124
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stdout
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    snippet = (
+        "import json, os, sys, time\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import diff_tracker as dt\n"
+        f"repo = Path({str(repo)!r})\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"unit_id = {unit_ids[0]!r}\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.lease_acquire(\n"
+        "    repo=repo, session_id=sys.argv[1], run_id=sys.argv[1],\n"
+        "    reviewer_id='r-' + sys.argv[1], unit_ids=[unit_id],\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result))\n"
+    )
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", snippet, session],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for session in ("lease-conc-A", "lease-conc-B")
+    ]
+    payloads = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=60)
+        if stderr.strip():
+            raise AssertionError(stderr)
+        payloads.append(json.loads(stdout.strip().splitlines()[-1]))
+    assert sum(1 for payload in payloads if payload["acquired"]) == 1
+    assert sum(1 for payload in payloads if not payload["acquired"]) == 1
 
 
 if __name__ == "__main__":

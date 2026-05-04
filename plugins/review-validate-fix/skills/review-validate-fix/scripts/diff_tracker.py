@@ -1952,20 +1952,461 @@ def heartbeat(
                 pass
 
 
-def lease_acquire(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError("lease_acquire lands in Slice 4 of the global reviewed-diff tracker")
+def _lease_repo_paths(
+    repo: str | Path,
+    log_root_override: Path | None,
+) -> tuple[Path, str, Path, Path, Path, Path]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    if is_bare_repo(repo_resolved):
+        raise ValueError(f"bare repositories are not supported: {repo_resolved}")
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        raise ValueError(f"not a git repository: {repo_resolved}")
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    directory.mkdir(parents=True, exist_ok=True)
+    return (
+        repo_resolved,
+        key,
+        directory,
+        directory / SQLITE_FILENAME,
+        directory / EVENTS_FILENAME,
+        common_dir,
+    )
 
 
-def lease_refresh(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError("lease_refresh lands in Slice 4 of the global reviewed-diff tracker")
+def _lease_active_unit_conflicts_in_txn(
+    conn: sqlite3.Connection,
+    unit_ids: list[str],
+    now_iso: str,
+) -> list[str]:
+    if not unit_ids:
+        return []
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT lu.unit_id
+          FROM lease_units lu
+          JOIN leases l ON l.lease_id = lu.lease_id
+         WHERE l.state='active'
+           AND l.expires_at > ?
+           AND lu.unit_id IN ({placeholders})
+        """,
+        (now_iso, *unit_ids),
+    ).fetchall()
+    return sorted(row["unit_id"] for row in rows)
 
 
-def lease_release(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-    raise NotImplementedError("lease_release lands in Slice 4 of the global reviewed-diff tracker")
+def _lease_existing_assigned_units_in_txn(
+    conn: sqlite3.Connection,
+    unit_ids: list[str],
+) -> list[str]:
+    if not unit_ids:
+        return []
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT unit_id
+          FROM units
+         WHERE review_state='assigned'
+           AND unit_id IN ({placeholders})
+        """,
+        tuple(unit_ids),
+    ).fetchall()
+    return sorted(row["unit_id"] for row in rows)
 
 
-def sweep_stale(*_args: Any, **_kwargs: Any) -> list[Any]:
-    return []
+def lease_acquire(
+    *,
+    repo: str | Path,
+    session_id: str,
+    run_id: str,
+    reviewer_id: str,
+    unit_ids: list[str],
+    holder_kind: str = "reviewer",
+    lease_ttl_seconds: int | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if not unit_ids:
+        raise ValueError("unit_ids must not be empty")
+    if holder_kind not in {"reviewer", "validate-fix", "manual"}:
+        raise ValueError("holder_kind must be reviewer, validate-fix, or manual")
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    ttl_seconds = _lease_ttl_seconds(lease_ttl_seconds)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            stale_freed = _prune_stale_leases_in_txn(conn, now_iso)
+            active_conflicts = _lease_active_unit_conflicts_in_txn(conn, unit_ids, now_iso)
+            if active_conflicts:
+                result = {
+                    "status": "conflict",
+                    "acquired": False,
+                    "reason": "lease_unit_already_assigned",
+                    "lease_id": None,
+                    "unit_ids": unit_ids,
+                    "conflicting_unit_ids": active_conflicts,
+                    "stale_freed": stale_freed,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+                return result
+            assigned_conflicts = _lease_existing_assigned_units_in_txn(conn, unit_ids)
+            if assigned_conflicts:
+                return {
+                    "status": "conflict",
+                    "acquired": False,
+                    "reason": "lease_already_held_by_other",
+                    "lease_id": None,
+                    "unit_ids": unit_ids,
+                    "conflicting_unit_ids": assigned_conflicts,
+                    "stale_freed": stale_freed,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            branch_value = _current_branch(repo_resolved)
+            branch_key = _upsert_branch(conn, branch_value, now_iso) if branch_value else None
+            worktree_key = _upsert_worktree(conn, str(repo_resolved), branch_key, None, now_iso)
+            _upsert_session(conn, session_id, worktree_key, now_iso)
+            scope_hash = _compute_scope_hash(unit_ids)
+            lease_id = _new_lease_id(now_iso)
+            _create_lease_in_txn(
+                conn,
+                lease_id=lease_id,
+                session_id=session_id,
+                run_id=run_id,
+                reviewer_id=reviewer_id,
+                holder_kind=holder_kind,
+                scope_hash=scope_hash,
+                unit_ids=unit_ids,
+                ttl_seconds=ttl_seconds,
+                now_iso=now_iso,
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_acquired",
+                "rvf_state_phase": "review",
+                "session_id": session_id,
+                "run_id": run_id,
+                "reviewer_id": reviewer_id,
+                "holder_kind": holder_kind,
+                "lease_id": lease_id,
+                "scope_hash": scope_hash,
+                "unit_count": len(unit_ids),
+                "stale_freed": stale_freed,
+                "reason_code": "lease_acquired",
+            },
+        )
+        return {
+            "status": "acquired",
+            "acquired": True,
+            "reason": "lease_acquired",
+            "lease_id": lease_id,
+            "scope_hash": scope_hash,
+            "unit_ids": unit_ids,
+            "ttl_seconds": ttl_seconds,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def lease_refresh(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    ttl_seconds: int | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    ttl = _lease_ttl_seconds(ttl_seconds)
+    expires_at = _datetime_to_iso((_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl))
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                "SELECT lease_id, state, expires_at FROM leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                return {
+                    "status": "missing",
+                    "refreshed": False,
+                    "reason": "lease_not_found",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            if row["expires_at"] <= now_iso:
+                return {
+                    "status": "expired",
+                    "refreshed": False,
+                    "reason": "lease_expired_before_refresh",
+                    "lease_id": lease_id,
+                    "expires_at": row["expires_at"],
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            conn.execute(
+                """
+                UPDATE leases
+                   SET last_activity_at=?, expires_at=?, ttl_seconds=?
+                 WHERE lease_id=?
+                """,
+                (now_iso, expires_at, ttl, lease_id),
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_refreshed",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "expires_at": expires_at,
+                "reason_code": "lease_refreshed",
+            },
+        )
+        return {
+            "status": "refreshed",
+            "refreshed": True,
+            "reason": "lease_refreshed",
+            "lease_id": lease_id,
+            "expires_at": expires_at,
+            "ttl_seconds": ttl,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def lease_release(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    reason: str = "completed",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                "SELECT lease_id, state FROM leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None or row["state"] in {"completed", "stale-released", "failed-released"}:
+                return {
+                    "status": "missing",
+                    "released": False,
+                    "reason": "lease_not_found",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            unit_rows = conn.execute(
+                "SELECT unit_id FROM lease_units WHERE lease_id=?",
+                (lease_id,),
+            ).fetchall()
+            unit_ids = [row["unit_id"] for row in unit_rows]
+            if unit_ids:
+                placeholders = ",".join("?" for _ in unit_ids)
+                conn.execute(
+                    f"""
+                    UPDATE units
+                       SET review_state='available'
+                     WHERE review_state='assigned'
+                       AND unit_id IN ({placeholders})
+                    """,
+                    tuple(unit_ids),
+                )
+            conn.execute("DELETE FROM lease_units WHERE lease_id=?", (lease_id,))
+            release_state = "completed" if reason == "completed" else "failed-released"
+            conn.execute(
+                """
+                UPDATE leases
+                   SET state=?, last_activity_at=?
+                 WHERE lease_id=?
+                """,
+                (release_state, now_iso, lease_id),
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_released",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "release_reason": reason,
+                "released_unit_count": len(unit_ids),
+                "reason_code": "lease_released",
+            },
+        )
+        return {
+            "status": "released",
+            "released": True,
+            "reason": "lease_released",
+            "lease_id": lease_id,
+            "release_state": release_state,
+            "unit_ids": unit_ids,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def sweep_stale(
+    *,
+    repo: str | Path,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> list[dict[str, Any]]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    released: list[dict[str, Any]] = []
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            rows = conn.execute(
+                """
+                SELECT lease_id, session_id, run_id, reviewer_id, expires_at
+                  FROM leases
+                 WHERE state='active'
+                   AND expires_at <= ?
+                 ORDER BY expires_at, lease_id
+                """,
+                (now_iso,),
+            ).fetchall()
+            _emit_event(
+                events_path,
+                {
+                    "event": "lease_sweep_started",
+                    "rvf_state_phase": "review",
+                    "checked": len(rows),
+                    "reason_code": "lease_sweep_started",
+                },
+            )
+            for row in rows:
+                unit_rows = conn.execute(
+                    "SELECT unit_id FROM lease_units WHERE lease_id=?",
+                    (row["lease_id"],),
+                ).fetchall()
+                unit_ids = [unit_row["unit_id"] for unit_row in unit_rows]
+                released.append(
+                    {
+                        "lease_id": row["lease_id"],
+                        "session_id": row["session_id"],
+                        "run_id": row["run_id"],
+                        "reviewer_id": row["reviewer_id"],
+                        "expires_at": row["expires_at"],
+                        "unit_ids": unit_ids,
+                    }
+                )
+            _prune_stale_leases_in_txn(conn, now_iso)
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_sweep_completed",
+                "rvf_state_phase": "review",
+                "released": len(released),
+                "lease_ids": [item["lease_id"] for item in released],
+                "reason_code": "sweep_completed",
+            },
+        )
+        return released
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def lease_holder_for_unit(
+    *,
+    repo: str | Path,
+    unit_id: str,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any] | None:
+    _, _, directory, db_path, _, _ = _lease_repo_paths(repo, log_root_override)
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        row = conn.execute(
+            """
+            SELECT l.lease_id, l.session_id, l.run_id, l.reviewer_id, l.holder_kind,
+                   l.scope_hash, l.state, l.expires_at
+              FROM lease_units lu
+              JOIN leases l ON l.lease_id = lu.lease_id
+             WHERE lu.unit_id=?
+               AND l.state='active'
+               AND l.expires_at > ?
+             ORDER BY l.created_at DESC
+             LIMIT 1
+            """,
+            (unit_id, now_iso),
+        ).fetchone()
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys()} | {"tracker_dir": str(directory)}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def units_for_path(
+    *,
+    repo: str | Path,
+    path: str,
+    log_root_override: Path | None = None,
+) -> list[str]:
+    _, _, _, db_path, _, _ = _lease_repo_paths(repo, log_root_override)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        rows = conn.execute(
+            """
+            SELECT unit_id
+              FROM units
+             WHERE path=?
+             ORDER BY unit_id
+            """,
+            (path,),
+        ).fetchall()
+        return [row["unit_id"] for row in rows]
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def owned_units_from_manifest(manifest: dict[str, Any]) -> list[OwnedUnit]:
@@ -2942,12 +3383,85 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
     )
+    lease_acq = subparsers.add_parser(
+        "lease-acquire",
+        help="Acquire a public reviewer lease over explicit tracker unit ids.",
+    )
+    lease_acq.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    lease_acq.add_argument("--session-id", required=True)
+    lease_acq.add_argument("--run-id", required=True)
+    lease_acq.add_argument("--reviewer-id", required=True)
+    lease_acq.add_argument("--unit-ids", nargs="+", required=True)
+    lease_acq.add_argument(
+        "--holder-kind",
+        choices=("reviewer", "validate-fix", "manual"),
+        default="reviewer",
+    )
+    lease_acq.add_argument("--lease-ttl-seconds", type=int, default=None)
+    lease_acq.add_argument("--print-result", action="store_true")
+    lease_acq.add_argument("--log-root", default=None, help="Override CODEX_RVF_LOG_ROOT.")
+
+    lease_rel = subparsers.add_parser(
+        "lease-release",
+        help="Release a tracker lease and return its units to the available pool.",
+    )
+    lease_rel.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    lease_rel.add_argument("--lease-id", required=True)
+    lease_rel.add_argument("--reason", default="completed")
+    lease_rel.add_argument("--print-result", action="store_true")
+    lease_rel.add_argument("--log-root", default=None, help="Override CODEX_RVF_LOG_ROOT.")
+
+    lease_sweep = subparsers.add_parser(
+        "lease-sweep",
+        help="Release stale active leases whose TTL has expired.",
+    )
+    lease_sweep.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    lease_sweep.add_argument("--print-result", action="store_true")
+    lease_sweep.add_argument("--log-root", default=None, help="Override CODEX_RVF_LOG_ROOT.")
     return parser
 
 
 def _main(argv: list[str] | None = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
+    if args.subcommand is None:
+        parser.print_help()
+        return 2
+    if args.subcommand == "lease-acquire":
+        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
+        result = lease_acquire(
+            repo=Path(args.repo).expanduser().resolve(),
+            session_id=args.session_id,
+            run_id=args.run_id,
+            reviewer_id=args.reviewer_id,
+            unit_ids=list(args.unit_ids),
+            holder_kind=args.holder_kind,
+            lease_ttl_seconds=args.lease_ttl_seconds,
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "lease-release":
+        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
+        result = lease_release(
+            repo=Path(args.repo).expanduser().resolve(),
+            lease_id=args.lease_id,
+            reason=args.reason,
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "lease-sweep":
+        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
+        result = sweep_stale(
+            repo=Path(args.repo).expanduser().resolve(),
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
     if args.subcommand != "allocate-review-scope":
         parser.print_help()
         return 2
