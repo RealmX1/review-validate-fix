@@ -2988,6 +2988,59 @@ def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(t
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
 
 
+def test_alternative_reviewer_codex_json_reports_backend_challenge_html(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp / "run"
+    html = (
+        "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
+        "<body><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1\"></script>"
+        "Cloudflare challenge</body></html>"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            f"import sys; sys.stdin.read(); print({html!r})",
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stdout
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stderr
+    reviewer_dir = run_dir / "artifacts" / "reviewers" / "test"
+    normalized = next(reviewer_dir.glob("reviewer.normalized*.txt")).read_text(encoding="utf-8")
+    raw_stdout = next(reviewer_dir.glob("reviewer.stdout*.txt")).read_text(encoding="utf-8")
+    summary = json.loads(next(reviewer_dir.glob("reviewer.summary*.json")).read_text(encoding="utf-8"))
+    assert normalized.startswith("RVF_CODEX_BACKEND_CHALLENGE")
+    assert "challenge-platform" in raw_stdout
+    assert summary["output_error_reason"] == "codex_backend_challenge"
+
+
 def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp: Path) -> None:
     repo = init_repo(tmp / "repo")
     packet = tmp / "packet.md"
@@ -4360,6 +4413,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "alternative_reviewer_codex_json_extracts_item_completed_agent_message",
             lambda: test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(
                 root / "alternative-codex-json-item-completed"
+            ),
+        ),
+        (
+            "alternative_reviewer_codex_json_reports_backend_challenge_html",
+            lambda: test_alternative_reviewer_codex_json_reports_backend_challenge_html(
+                root / "alternative-codex-challenge-html"
             ),
         ),
         (

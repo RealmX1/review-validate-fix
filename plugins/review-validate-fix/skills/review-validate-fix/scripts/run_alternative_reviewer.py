@@ -30,6 +30,7 @@ DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
+CODEX_BACKEND_CHALLENGE_FLAG = "RVF_CODEX_BACKEND_CHALLENGE"
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
@@ -531,6 +532,12 @@ class ReviewerRunResult:
         self.probe_history = probe_history or []
 
 
+class CodexJsonOutputError(ValueError):
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 def signal_name(signal_number: int | None) -> str | None:
     if signal_number is None:
         return None
@@ -918,6 +925,24 @@ def message_text_from_payload(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def looks_like_codex_backend_challenge(output: str) -> bool:
+    text = output.lstrip()[:8192].lower()
+    if not text:
+        return False
+    htmlish = text.startswith("<!doctype html") or text.startswith("<html") or "<html" in text[:512]
+    if not htmlish:
+        return False
+    challenge_markers = (
+        "cloudflare",
+        "cf-chl",
+        "challenge-platform",
+        "just a moment",
+        "turnstile",
+        "checking your browser",
+    )
+    return any(marker in text for marker in challenge_markers)
+
+
 def extract_codex_json_result(output: str) -> str:
     """从 `codex exec --json` JSONL stdout 中提取最后一条 assistant 文本。"""
 
@@ -968,6 +993,14 @@ def extract_codex_json_result(output: str) -> str:
 
     if result is not None:
         return result.strip()
+    if looks_like_codex_backend_challenge(output):
+        raise CodexJsonOutputError(
+            "codex_backend_challenge",
+            (
+                f"{CODEX_BACKEND_CHALLENGE_FLAG} Codex CLI returned ChatGPT/Codex "
+                "backend challenge HTML instead of valid `codex exec --json` output."
+            ),
+        )
     return output.strip()
 
 
@@ -1382,10 +1415,18 @@ def main() -> int:
     raw_stdout = completed.stdout or ""
     raw_stderr = completed.stderr or ""
     stdout = raw_stdout.strip()
+    output_error_reason: str | None = None
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
     elif output_format == OUTPUT_FORMAT_CODEX_JSON:
-        stdout = extract_codex_json_result(stdout)
+        try:
+            stdout = extract_codex_json_result(stdout)
+        except CodexJsonOutputError as exc:
+            output_error_reason = exc.reason_code
+            stdout = str(exc)
+            if completed.returncode == 0:
+                completed.returncode = 1
+            raw_stderr = f"{raw_stderr.rstrip()}\n{exc}".strip()
     stdout = normalize_review_output(stdout)
     stderr = raw_stderr.strip()
     timed_out = (
@@ -1450,6 +1491,7 @@ def main() -> int:
             "review_result_summary": review_result_summary,
             "review_result_complete": review_result_complete,
             "review_request_pending": review_request_pending,
+            "output_error_reason": output_error_reason,
         },
         unique=True,
     )
@@ -1490,6 +1532,10 @@ def main() -> int:
         reason_code = "reviewer_request_pending"
         event_name = "request_pending"
         message = "alternative reviewer recorded a request"
+    elif output_error_reason == "codex_backend_challenge":
+        reason_code = "reviewer_codex_backend_challenge"
+        event_name = "failed"
+        message = "alternative reviewer failed before producing valid Codex JSON output"
     elif completed.returncode != 0:
         reason_code = "reviewer_failed"
         event_name = "failed"
@@ -1515,6 +1561,7 @@ def main() -> int:
         review_result_complete=review_result_complete,
         review_request_pending=review_request_pending,
         review_result_check_stderr=review_result_check_stderr,
+        output_error_reason=output_error_reason,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_failure_threshold=activity_probe_failure_threshold,
         activity_probe_history=completed.probe_history,
@@ -1542,6 +1589,7 @@ def main() -> int:
         review_request_pending=review_request_pending,
         review_result_summary=review_result_summary,
         review_result_check_stderr=review_result_check_stderr,
+        output_error_reason=output_error_reason,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_command=activity_probe_command,
         activity_probe_timeout_seconds=activity_probe_timeout,
