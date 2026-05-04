@@ -225,6 +225,7 @@ def _build_run(tmp_path: Path, *, with_summary: bool = True) -> Path:
                 {
                     "id": "santa-2",
                     "kind": "NIT",
+                    "severity": "low",
                     "summary": "Style nit",
                     "path": "src/bar.py",
                     "line": 3,

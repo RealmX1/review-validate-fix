@@ -406,6 +406,10 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
             "42",
             "--message",
             "空输入时会跳过必要校验。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "high",
         ],
         env=env,
     )
@@ -422,6 +426,10 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
             "3",
             "--message",
             "构建参数没有传入默认值。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "medium",
         ],
         env=env,
     )
@@ -431,6 +439,10 @@ def test_review_result_artifact_no_issues_and_issues(tmp: Path) -> None:
     assert issue_payload["kind"] == "issues"
     assert issue_payload["issue_count"] == 2
     assert issue_payload["issues"][0]["path"] == "src/foo.ts"
+    assert issue_payload["issues"][0]["kind"] == "REAL"
+    assert issue_payload["issues"][0]["severity"] == "high"
+    assert issue_payload["issues"][1]["kind"] == "REAL"
+    assert issue_payload["issues"][1]["severity"] == "medium"
 
 
 def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None:
@@ -474,6 +486,10 @@ def test_review_result_artifact_requests_and_scope_exclusions(tmp: Path) -> None
             "1",
             "--message",
             "不应报告 excluded path。",
+            "--kind",
+            "REAL",
+            "--severity",
+            "medium",
         ],
         env=env,
     )
@@ -514,6 +530,10 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
             "1",
             "--message",
             "bad",
+            "--kind",
+            "REAL",
+            "--severity",
+            "high",
         ],
         env=env,
         capture_output=True,
@@ -528,7 +548,15 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
             {
                 "schema_version": 1,
                 "kind": "no_issues",
-                "issues": [{"path": "src/a.py", "line": 1, "message": "mixed"}],
+                "issues": [
+                    {
+                        "path": "src/a.py",
+                        "line": 1,
+                        "message": "mixed",
+                        "kind": "REAL",
+                        "severity": "high",
+                    }
+                ],
                 "requests": [],
             }
         ),
@@ -558,6 +586,127 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp: Path) -> 
     )
     assert outside.returncode != 0
     assert "RVF_RUN_DIR" in outside.stderr
+
+
+def test_issue_requires_kind(tmp: Path) -> None:
+    out = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp / "run")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(out),
+            "--path",
+            "src/foo.py",
+            "--line",
+            "1",
+            "--message",
+            "missing kind argument",
+            "--severity",
+            "high",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--kind" in result.stderr
+
+
+def test_issue_requires_severity(tmp: Path) -> None:
+    out = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp / "run")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "issue",
+            "--out",
+            str(out),
+            "--path",
+            "src/foo.py",
+            "--line",
+            "1",
+            "--message",
+            "missing severity argument",
+            "--kind",
+            "REAL",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--severity" in result.stderr
+
+
+def test_check_rejects_issue_without_kind(tmp: Path) -> None:
+    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "issues",
+                "issues": [
+                    {
+                        "path": "src/foo.py",
+                        "line": 1,
+                        "message": "missing kind",
+                        "severity": "high",
+                    }
+                ],
+                "requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode != 0
+    assert "kind" in check.stdout
+
+
+def test_check_rejects_invalid_severity(tmp: Path) -> None:
+    result = tmp / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "issues",
+                "issues": [
+                    {
+                        "path": "src/foo.py",
+                        "line": 1,
+                        "message": "bad severity value",
+                        "kind": "REAL",
+                        "severity": "wat",
+                    }
+                ],
+                "requests": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    check = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(result), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode != 0
+    assert "severity" in check.stdout
 
 
 def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
@@ -3992,6 +4141,22 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "review_result_artifact_rejects_malformed_and_mixed_state",
             lambda: test_review_result_artifact_rejects_malformed_and_mixed_state(root / "review-result-invalid"),
+        ),
+        (
+            "issue_requires_kind",
+            lambda: test_issue_requires_kind(root / "issue-requires-kind"),
+        ),
+        (
+            "issue_requires_severity",
+            lambda: test_issue_requires_severity(root / "issue-requires-severity"),
+        ),
+        (
+            "check_rejects_issue_without_kind",
+            lambda: test_check_rejects_issue_without_kind(root / "check-rejects-no-kind"),
+        ),
+        (
+            "check_rejects_invalid_severity",
+            lambda: test_check_rejects_invalid_severity(root / "check-rejects-bad-severity"),
         ),
         (
             "check_skill_contracts_requires_validate_fix_request_literals",

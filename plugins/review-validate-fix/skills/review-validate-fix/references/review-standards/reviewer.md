@@ -37,6 +37,15 @@
 完成态只能是：
 
 - `kind: no_issues`。
-- `kind: issues`，每条含 `path`、`line`、`message`。
+- `kind: issues`，每条含 `path`、`line`、`message`、`kind`（`REAL`/`NIT`/`ELEVATE`）、`severity`（`high`/`medium`/`low`）。
 
 非完成态只能是 `protocol-extensions.md` 中的 `kind: request` artifact。request 不得和完成态混写。最终自然语言 message 只作为日志，不是机器可读 review 状态。
+
+## Issue 字段语义
+
+- `kind=REAL`：真实 bug / regression / 必须修的 correctness 或安全问题。
+- `kind=NIT`：风格 / 命名 / 纯 cosmetic 偏好；按上文 "审查目标" 规则 reviewer 本不应报告，但枚举值保留给 elevations downstream 使用。
+- `kind=ELEVATE`：需要主会话或人类做 design 决定，不是 reviewer 可以单独定性的真假问题。
+- `severity=high`：阻塞发布 / 必须本轮处理。
+- `severity=medium`：应当修，但短期内可容忍。
+- `severity=low`：可以推迟到后续 turn。

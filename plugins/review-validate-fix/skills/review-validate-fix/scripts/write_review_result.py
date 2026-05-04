@@ -26,6 +26,8 @@ SUBTASK_TYPES = {
     "simplification_probe",
 }
 CONTEXT_NEEDS = {"file", "manifest", "packet", "prior-output", "test-result"}
+ISSUE_KINDS = {"REAL", "NIT", "ELEVATE"}
+ISSUE_SEVERITIES = {"high", "medium", "low"}
 
 
 def fail(message: str, code: int = 2) -> int:
@@ -118,6 +120,8 @@ def command_issue(args: argparse.Namespace) -> int:
         "path": args.path,
         "line": args.line,
         "message": args.message.strip(),
+        "kind": args.kind,
+        "severity": args.severity,
     }
     issue.update(optional_fields(args, ("evidence_command", "confidence", "source")))
     payload.setdefault("issues", []).append(issue)
@@ -240,6 +244,18 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--path", required=True, help="Relative repo path.")
     issue.add_argument("--line", required=True, type=int, help="1-based line number.")
     issue.add_argument("--message", required=True, help="Issue explanation.")
+    issue.add_argument(
+        "--kind",
+        required=True,
+        choices=sorted(ISSUE_KINDS),
+        help="Issue kind: REAL (true bug/regression), NIT (cosmetic), ELEVATE (needs human design call).",
+    )
+    issue.add_argument(
+        "--severity",
+        required=True,
+        choices=sorted(ISSUE_SEVERITIES),
+        help="Issue severity: high (release blocker), medium (should fix soon), low (deferrable).",
+    )
     issue.add_argument("--evidence-command", help="Optional command used as evidence.")
     issue.add_argument("--confidence", help="Optional confidence label.")
     issue.add_argument("--source", help="Optional local note; main merge still owns provenance.")
