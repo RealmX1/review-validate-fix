@@ -19,6 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
+from rvf_run_finalize import finalize_for_handoff
 from session_manifest import build_manifest
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
@@ -4219,9 +4220,25 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
         )
 
-    if handoff_path_from_event(event) is not None:
+    handoff_path_value = handoff_path_from_event(event)
+    if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger)
         if payload is not None:
+            try:
+                finalize_for_handoff(
+                    handoff_path=handoff_path_value,
+                    event=event,
+                    decision_kind="handoff-advisory",
+                )
+            except Exception as exc:
+                ledger.event(
+                    phase="handoff",
+                    event="finalize_failed",
+                    status="warning",
+                    reason_code="finalize_error",
+                    level="warn",
+                    error={"kind": type(exc).__name__, "message": str(exc)},
+                )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
 
     if latest_user and KANBAN_FOLLOWUP_MARKER in latest_user:

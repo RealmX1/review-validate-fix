@@ -282,6 +282,23 @@ def cancel_run(args: argparse.Namespace) -> dict[str, Any]:
             cancelled_pids=cancelled_pids,
             still_running_pids=still_running,
         )
+        try:
+            from rvf_run_finalize import finalize_run
+
+            finalize_run(
+                run_dir=run_dir,
+                event=None,
+                decision_kind="cancelled",
+            )
+        except Exception as exc:
+            ledger.event(
+                phase="fork",
+                event="finalize_failed",
+                status="warn",
+                reason_code="finalize_on_cancel_failed",
+                level="warn",
+                error=f"{type(exc).__name__}: {exc}",
+            )
     return {
         "run_id": run_id,
         "run_dir": str(run_dir),

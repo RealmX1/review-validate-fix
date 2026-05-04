@@ -629,6 +629,226 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
     assert summary["handoff_path"] == str(handoff.resolve())
 
 
+def _ensure_initial_commit(repo: Path) -> None:
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    if head.returncode == 0:
+        return
+    run(["git", "config", "user.email", "rvf@example.com"], cwd=repo)
+    run(["git", "config", "user.name", "RVF"], cwd=repo)
+    seed = repo / ".rvf-seed"
+    seed.write_text("seed\n", encoding="utf-8")
+    run(["git", "add", str(seed)], cwd=repo)
+    run(["git", "commit", "-q", "-m", "seed"], cwd=repo)
+
+
+def _seed_finalize_run_dir(
+    *,
+    state: Path,
+    repo: Path,
+    run_id: str = "rvf-child",
+) -> tuple[Path, Path]:
+    _ensure_initial_commit(repo)
+    run_dir = state / "runs" / run_id
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    handoff = artifacts / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    (run_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": "started",
+                "reason_code": "test",
+                "repo": str(repo),
+                "events_path": str(run_dir / "events.jsonl"),
+                "artifacts_dir": str(artifacts),
+                "run_dir": str(run_dir),
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_module = load_workspace_snapshot_module()
+    (artifacts / "before-workspace-snapshot.json").write_text(
+        json.dumps(snapshot_module.capture(repo), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return run_dir, handoff
+
+
+def load_workspace_snapshot_module():
+    import importlib.util as _il
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "plugins"
+        / "review-validate-fix"
+        / "skills"
+        / "review-validate-fix"
+        / "scripts"
+        / "workspace_snapshot.py"
+    )
+    spec = _il.spec_from_file_location("rvf_workspace_snapshot_for_tests", script)
+    assert spec is not None and spec.loader is not None
+    module = _il.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
+    records = [
+        {"type": "session_meta", "payload": {"id": "child-session", "cwd": str(repo)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "background work"}},
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "ack"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "running rvf"}},
+    ]
+    path.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
+    transcript = _write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    # mutate workspace so workspace_diff has a real change
+    (repo / ".rvf-seed").write_text("seed\nchanged\n", encoding="utf-8")
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "child-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+        "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+    }
+    invoke(
+        event,
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+    )
+
+    # finalize artifacts in the seeded run_dir
+    lock = run_dir / "artifacts" / ".finalize.lock"
+    assert lock.exists(), "finalize lock should be written"
+    traj_dir = run_dir / "artifacts" / "trajectory"
+    pre = traj_dir / "pre-rvf" / "rollout.codex.jsonl"
+    post = traj_dir / "rvf" / "rollout.codex.jsonl"
+    assert pre.exists() and post.exists()
+    assert pre.read_bytes() + post.read_bytes() == transcript.read_bytes()
+    distilled = traj_dir / "rvf" / "trajectory.jsonl"
+    assert distilled.exists()
+    diff_json = run_dir / "artifacts" / "workspace-diff.json"
+    assert diff_json.exists()
+    payload = json.loads(diff_json.read_text(encoding="utf-8"))
+    assert payload["status"] == "complete"
+    paths = {item["path"]: item["op"] for item in payload["changed_paths"]}
+    assert paths.get(".rvf-seed") == "modified"
+    summary_payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary_payload.get("finalize", {}).get("decision_kind") == "dispatcher-handoff"
+
+
+def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+    run_dir, handoff = _seed_finalize_run_dir(
+        state=state, repo=repo, run_id="rvf-forked"
+    )
+    parent_transcript = tmp_path / "parent.jsonl"
+    parent_transcript.write_text(
+        json.dumps(
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "parent context"}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    child_transcript = tmp_path / "child.jsonl"
+    child_transcript.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "session_meta", "payload": {"id": "forked-child"}}),
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "artifacts" / "origin.json").write_text(
+        json.dumps(
+            {
+                "session_id": "parent-session",
+                "transcript_path": str(parent_transcript),
+            }
+        ),
+        encoding="utf-8",
+    )
+    opener = write_fake_opener(tmp_path / "open_handoff.py", tmp_path / "opened.txt")
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "forked-child",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(child_transcript),
+        "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+    }
+    invoke(
+        event,
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+    )
+
+    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    assert pre.read_bytes() == parent_transcript.read_bytes()
+    assert post.read_bytes() == child_transcript.read_bytes()
+    pre_manifest = json.loads(
+        (run_dir / "artifacts" / "trajectory" / "pre-rvf" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert pre_manifest["source_kind"] == "forked-source-full"
+
+
 def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1591,6 +1811,8 @@ def main() -> int:
         test_router_channel_status_reports_gate_and_channel,
         test_dev_repo_main_session_syncs_before_running_installed_hook,
         test_handoff_marker_opens_before_dev_sync_or_installed_hook,
+        test_handoff_marker_finalizes_run_artifacts_same_session,
+        test_handoff_marker_finalizes_run_artifacts_forked_session,
         test_plan_operation_skips_before_dev_sync_or_installed_hook,
         test_literal_plan_markers_in_completion_do_not_skip_hook,
         test_prior_plan_output_does_not_suppress_future_turn,
