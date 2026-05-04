@@ -18,8 +18,12 @@
 Host 耦合说明:
 - ``distill_codex_jsonl`` / ``_distill_codex_record`` / ``_codex_parse_apply_patch_fallback``
   / ``_patch_lines_for_op`` / ``_patch_op_name`` 全部专门解析 **Codex** rollout
-  schema (``event_msg`` / ``response_item.function_call`` / ``apply_patch``
-  custom-format patch 等)。
+  schema (``event_msg`` / ``response_item.function_call`` /
+  ``response_item.custom_tool_call`` / ``apply_patch`` custom-format patch 等)。
+  当前 Codex 把 ``apply_patch`` 调用走 ``custom_tool_call`` (``payload.input``);
+  ``exec_command`` 等仍走 ``function_call`` (``payload.arguments``); 两条路径
+  都要识别。同理 output 既可能是 ``function_call_output`` 也可能是
+  ``custom_tool_call_output``。
 - ``distill_reviewer_stream`` 解析 Claude Code stream-json (Claude Code 子进程
   reviewer 的 stdout NDJSON)，与上面的 Codex 主轨迹解析无关。
 - 未来若要让 RVF 主流程跑在 Claude Code host 上，应平行实现
@@ -203,9 +207,13 @@ def _distill_codex_record(
 
     if record_type == "response_item" and payload:
         sub = payload.get("type")
-        if sub == "function_call":
+        if sub in ("function_call", "custom_tool_call"):
             tool = payload.get("name")
-            arguments = payload.get("arguments")
+            # function_call carries arguments string; custom_tool_call uses input.
+            # apply_patch on current Codex versions arrives as custom_tool_call.
+            arguments = (
+                payload.get("arguments") if sub == "function_call" else payload.get("input")
+            )
             artifact_refs: list[dict[str, Any]] = []
             summary_parts: list[str] = [f"call {tool}"]
             if tool == "apply_patch":
@@ -242,7 +250,7 @@ def _distill_codex_record(
                 "summary": _truncate(" ".join(summary_parts)),
                 "artifact_refs": artifact_refs,
             }
-        if sub == "function_call_output":
+        if sub in ("function_call_output", "custom_tool_call_output"):
             output_text = payload.get("output")
             if isinstance(output_text, dict):
                 output_text = output_text.get("output") or output_text.get("text") or json.dumps(output_text, ensure_ascii=False)

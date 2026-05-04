@@ -99,6 +99,57 @@ def test_distill_function_call_apply_patch_records_artifact_refs(tmp_path: Path)
     assert index["kind_counts"].get("tool_result") == 1
 
 
+def test_distill_custom_tool_call_apply_patch_records_artifact_refs(tmp_path: Path) -> None:
+    """Current Codex versions emit apply_patch under custom_tool_call/custom_tool_call_output
+    (with payload.input rather than payload.arguments). Distill must handle both."""
+    distill = _load("trajectory_distill")
+    rollout = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        rollout,
+        [
+            {"timestamp": "t0", "type": "session_meta", "payload": {"id": "s"}},
+            {
+                "timestamp": "t1",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "name": "apply_patch",
+                    "input": SAMPLE_PATCH,
+                    "call_id": "call_xyz",
+                },
+            },
+            {
+                "timestamp": "t2",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_xyz",
+                    "output": "Success. Updated the following files:\nM src/foo.py",
+                },
+            },
+        ],
+    )
+    distilled, index = distill.distill_codex_jsonl(
+        rollout_path=rollout,
+        rollout_filename="rollout.codex.jsonl",
+        repo=None,
+    )
+    patch_call = next(item for item in distilled if item["kind"] == "tool_call")
+    assert patch_call["tool"] == "apply_patch"
+    assert patch_call["call_id"] == "call_xyz"
+    assert patch_call["artifact_refs"], "apply_patch via custom_tool_call must produce artifact_refs"
+    ref = patch_call["artifact_refs"][0]
+    assert ref["path"] == "src/foo.py"
+    assert ref["op"] == "edit"
+    assert ref["lines"] == [10, 14]
+    tool_result = next(item for item in distilled if item["kind"] == "tool_result")
+    assert tool_result["call_id"] == "call_xyz"
+    assert "Success" in tool_result["summary"]
+    assert index["kind_counts"].get("tool_call") == 1
+    assert index["kind_counts"].get("tool_result") == 1
+
+
 def test_distill_exec_command_summary_includes_cmd(tmp_path: Path) -> None:
     distill = _load("trajectory_distill")
     rollout = tmp_path / "rollout.jsonl"
