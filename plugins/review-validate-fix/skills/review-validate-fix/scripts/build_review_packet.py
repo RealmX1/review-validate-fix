@@ -207,6 +207,7 @@ def build_packet(
     cross_session_conflicts: list[dict[str, Any]] = []
     tracker_status: str | None = None
     tracker_repo_key: str | None = None
+    tracker_scope: dict[str, Any] | None = None
     if session_manifest is not None:
         tracker_meta = session_manifest.get("tracker") if isinstance(session_manifest.get("tracker"), dict) else None
         if tracker_meta is not None:
@@ -222,6 +223,14 @@ def build_packet(
                         owned_units=owned_units,
                     )
                     cross_session_conflicts = [conflict.to_dict() for conflict in conflicts]
+            scope_candidate = tracker_meta.get("tracker_scope")
+            if isinstance(scope_candidate, dict) and (
+                isinstance(scope_candidate.get("unit_ids"), list)
+                and isinstance(scope_candidate.get("lease_id"), str)
+                and isinstance(scope_candidate.get("scope_hash"), str)
+                and isinstance(scope_candidate.get("paths"), list)
+            ):
+                tracker_scope = scope_candidate
     session_context_text = ""
     if session_context is None:
         if not allow_missing_session_context:
@@ -260,6 +269,19 @@ def build_packet(
         "tracker_status": tracker_status,
         "tracker_repo_key": tracker_repo_key,
         "cross_session_conflicts": cross_session_conflicts,
+        "tracker_scope_present": tracker_scope is not None,
+        "tracker_scope_unit_count": len(tracker_scope["unit_ids"]) if tracker_scope is not None else 0,
+        "tracker_scope_lease_id": tracker_scope["lease_id"] if tracker_scope is not None else None,
+        "tracker_scope_hash": tracker_scope["scope_hash"] if tracker_scope is not None else None,
+        "tracker_scope_paths": [
+            path for path in tracker_scope["paths"] if isinstance(path, str)
+        ] if tracker_scope is not None else [],
+        "tracker_scope_source_session_id": tracker_scope.get("source_session_id")
+        if tracker_scope is not None and isinstance(tracker_scope.get("source_session_id"), str)
+        else None,
+        "tracker_scope_takeover_from_session_id": tracker_scope.get("takeover_from_session_id")
+        if tracker_scope is not None and isinstance(tracker_scope.get("takeover_from_session_id"), str)
+        else None,
     }
 
     lines: list[str] = [
@@ -311,6 +333,64 @@ def build_packet(
             lines.append("(none)")
         lines.append("")
 
+    if tracker_scope is not None:
+        lines.extend(
+            [
+                "## Tracker Scope",
+                "",
+                "This section is the allocator-assigned scope anchor. Reviewers must treat the listed unit_ids as authoritative scope; `## Allocated Git Diff` below is the path-projection.",
+                "",
+                f"- lease id: `{tracker_scope['lease_id']}`",
+                f"- scope hash: `{tracker_scope['scope_hash']}`",
+            ]
+        )
+        source_session = tracker_scope.get("source_session_id")
+        if isinstance(source_session, str) and source_session.strip():
+            lines.append(f"- source session: `{source_session}`")
+        else:
+            lines.append("- source session: (none)")
+        takeover_session = tracker_scope.get("takeover_from_session_id")
+        if isinstance(takeover_session, str) and takeover_session.strip():
+            lines.append(f"- takeover from session: `{takeover_session}`")
+        else:
+            lines.append("- takeover from session: (none)")
+        lines.append("")
+        scope_unit_ids = [uid for uid in tracker_scope["unit_ids"] if isinstance(uid, str)]
+        scope_hunks_raw = tracker_scope.get("hunks")
+        scope_hunks = [h for h in scope_hunks_raw if isinstance(h, dict)] if isinstance(scope_hunks_raw, list) else []
+        if scope_hunks:
+            hunks_by_unit: dict[str, list[dict[str, Any]]] = {}
+            for entry in scope_hunks:
+                uid = entry.get("unit_id")
+                if isinstance(uid, str):
+                    hunks_by_unit.setdefault(uid, []).append(entry)
+            lines.append("Allocated units:")
+            for uid in scope_unit_ids:
+                entries = hunks_by_unit.get(uid, [])
+                if entries:
+                    head = entries[0]
+                    path_text = head.get("path") if isinstance(head.get("path"), str) else "(unknown path)"
+                    hunk_header = head.get("hunk_header") if isinstance(head.get("hunk_header"), str) else None
+                    if hunk_header:
+                        lines.append(f"- `{uid}` — path `{path_text}` — hunk `{hunk_header}`")
+                    else:
+                        lines.append(f"- `{uid}` — path `{path_text}` — (path-level)")
+                else:
+                    lines.append(f"- `{uid}` — (no hunk metadata)")
+            lines.append("")
+        else:
+            lines.append("Allocated unit_ids:")
+            for uid in scope_unit_ids:
+                lines.append(f"- `{uid}`")
+            lines.append("")
+        scope_paths = [path for path in tracker_scope["paths"] if isinstance(path, str)]
+        lines.append("Allocated paths:")
+        if scope_paths:
+            lines.extend(f"- {path}" for path in scope_paths)
+        else:
+            lines.append("(none — units are hunk-only; see allocated units above)")
+        lines.append("")
+
     if cross_session_conflicts:
         lines.extend(
             [
@@ -352,7 +432,34 @@ def build_packet(
     else:
         lines.extend(["(none)", ""])
     lines.extend(["## Git Status", "", "```text", status or "(clean)", "```", ""])
-    if session_manifest is not None:
+    if tracker_scope is not None:
+        scope_paths = [path for path in tracker_scope["paths"] if isinstance(path, str)]
+        if scope_paths:
+            allocated_diff = diff_for_paths(root, scope_paths, all_exclude_prefixes)
+            allocated_body = allocated_diff or "(no tracked diff for allocated paths)"
+        else:
+            allocated_body = "(allocator did not allocate any path; see Tracker Scope hunks above for unit-level scope)"
+        lines.extend(
+            [
+                "## Allocated Git Diff",
+                "",
+                "Path-limited diff over the allocator-assigned paths. Reviewers must treat the listed unit_ids in `## Tracker Scope` as authoritative scope; this diff is the path projection.",
+                "",
+                "```diff",
+                allocated_body,
+                "```",
+                "",
+                "## Full Git Diff HEAD (Evidence Only)",
+                "",
+                "This full dirty diff may include other sessions' work. Use it only as supporting evidence for direct dependencies from session-owned changes.",
+                "",
+                "```diff",
+                diff or "(no tracked diff)",
+                "```",
+                "",
+            ]
+        )
+    elif session_manifest is not None:
         lines.extend(
             [
                 "## Session-Owned Git Diff",

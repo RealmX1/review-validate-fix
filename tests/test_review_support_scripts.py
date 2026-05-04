@@ -1612,7 +1612,7 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert "- secret.txt" in packet_text
     assert "### secret.txt" not in packet_text
     contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
-    assert contract["version"] == 1
+    assert contract["version"] == 2
     assert contract["run_id"] == payload["run_id"]
     assert contract["scope_mode"] == "custom"
     assert contract["canonical_issues"] == []
@@ -1621,6 +1621,9 @@ def test_prepare_review_run_and_command_lock(tmp: Path) -> None:
     assert contract["review_packet_path"] == payload["input_review_packet"]
     assert contract["start_snapshot_path"] == payload["input_before_workspace_snapshot"]
     assert contract["scope_hash"] == payload["scope_contract_payload"]["scope_hash"]
+    assert contract["primary_units"] is None
+    assert contract["tracker_lease_id"] is None
+    assert contract["tracker_scope_hash"] is None
 
     locked = run(
         [
@@ -4895,6 +4898,421 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
     assert result.status == "lock_timeout"
 
 
+def _slice_2b_repo_with_two_dirty(tmp: Path) -> Path:
+    """init_repo + a second tracked file so two paths are dirty."""
+    repo = init_repo(tmp / "repo")
+    (repo / "tracked2.txt").write_text("base2\n", encoding="utf-8")
+    run(["git", "add", "tracked2.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add tracked2"], cwd=repo)
+    (repo / "tracked2.txt").write_text("base2\nchange2\n", encoding="utf-8")
+    return repo
+
+
+def _slice_2b_tracker_scope_payload(
+    *,
+    paths: list[str] | None = None,
+    unit_ids: list[str] | None = None,
+    lease_id: str = "lse-2b-test",
+    scope_hash: str = "sha256:" + "b" * 64,
+    hunks: object = "default",
+    source_session_id: str | None = "sess-2b",
+    takeover_from_session_id: str | None = None,
+    extras: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if unit_ids is None:
+        unit_ids = ["a" * 64, "c" * 64]
+    if paths is None:
+        paths = ["tracked.txt"]
+    if hunks == "default":
+        hunks = [
+            {"unit_id": unit_ids[0], "path": paths[0] if paths else "tracked.txt", "hunk_header": "@@ -1 +1,2 @@"}
+        ]
+    payload: dict[str, object] = {
+        "unit_ids": unit_ids,
+        "lease_id": lease_id,
+        "scope_hash": scope_hash,
+        "paths": paths,
+        "hunks": hunks,
+        "source_session_id": source_session_id,
+        "takeover_from_session_id": takeover_from_session_id,
+    }
+    if extras:
+        payload.update(extras)
+    return payload
+
+
+def _slice_2b_write_scope_file(tmp: Path, payload: dict[str, object]) -> Path:
+    path = tmp / "tracker-scope.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _slice_2b_prepare(
+    *,
+    tmp: Path,
+    repo: Path,
+    tracker_scope_path: Path | None,
+    log_root: Path,
+    extra_args: list[str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path | None]:
+    """Run prepare_review_run.py with a transcript, optionally with --tracker-scope.
+
+    Returns (completed_process, run_dir_or_None). When tracker_scope rejection
+    happens (non-zero exit), run_dir is None.
+    """
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n- intent: 2-B test\n- work: edit tracked.txt\n",
+        encoding="utf-8",
+    )
+    output_json = tmp / "run.json"
+    base_dir = tmp / "runs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(PREPARE_REVIEW_RUN),
+        "--repo",
+        str(repo),
+        "--session-context",
+        str(context),
+        "--transcript",
+        str(transcript),
+        "--output-json",
+        str(output_json),
+        "--base-dir",
+        str(base_dir),
+    ]
+    if tracker_scope_path is not None:
+        cmd.extend(["--tracker-scope", str(tracker_scope_path)])
+    if extra_args:
+        cmd.extend(extra_args)
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    if completed.returncode != 0:
+        return completed, None
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    return completed, Path(payload["artifacts_dir"])
+
+
+def test_tracker_scope_payload_splices_into_manifest(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    artifact_manifest = json.loads((artifacts_dir / "session-manifest.json").read_text(encoding="utf-8"))
+    input_manifest = json.loads((artifacts_dir / "inputs" / "session-manifest.json").read_text(encoding="utf-8"))
+    for manifest_payload in (artifact_manifest, input_manifest):
+        tracker_block = manifest_payload.get("tracker")
+        assert isinstance(tracker_block, dict)
+        scope = tracker_block.get("tracker_scope")
+        assert isinstance(scope, dict)
+        assert scope["unit_ids"] == payload["unit_ids"]
+        assert scope["lease_id"] == payload["lease_id"]
+        assert scope["scope_hash"] == payload["scope_hash"]
+        assert scope["paths"] == payload["paths"]
+        assert scope["hunks"] == payload["hunks"]
+        assert scope["source_session_id"] == payload["source_session_id"]
+        assert scope["takeover_from_session_id"] == payload["takeover_from_session_id"]
+    # tracker_scope_file (artifact-root entry) must point to artifact_dir copy,
+    # not the inputs/ duplicate; otherwise downstream consumers cannot retrieve
+    # the artifact-root tracker-scope.json.
+    run_payload = json.loads((tmp / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["tracker_scope_file"] is not None
+    assert run_payload["input_tracker_scope_file"] is not None
+    assert run_payload["tracker_scope_file"] != run_payload["input_tracker_scope_file"]
+    assert run_payload["tracker_scope_file"] == str((artifacts_dir / "tracker-scope.json").resolve())
+    assert run_payload["input_tracker_scope_file"] == str(
+        (artifacts_dir / "inputs" / "tracker-scope.json").resolve()
+    )
+
+
+def test_tracker_scope_unlocks_scope_contract_v2_fields(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(unit_ids=["e" * 64, "d" * 64])
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] == sorted({"e" * 64, "d" * 64})
+    assert contract["tracker_lease_id"] == payload["lease_id"]
+    assert contract["tracker_scope_hash"] == payload["scope_hash"]
+    canonical = contract["canonical_scope"]
+    assert "primary_units" not in canonical
+    assert "tracker_lease_id" not in canonical
+    assert "tracker_scope_hash" not in canonical
+
+
+def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=None, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] is None
+    assert contract["tracker_lease_id"] is None
+    assert contract["tracker_scope_hash"] is None
+    canonical = contract["canonical_scope"]
+    assert canonical["version"] == 2
+    assert set(canonical.keys()) == {
+        "version",
+        "repo",
+        "scope_mode",
+        "primary_files",
+        "background_files",
+        "protected_files",
+        "canonical_issues",
+        "fix_allowlist",
+        "excluded_path_prefixes",
+    }
+
+
+def test_packet_emits_tracker_scope_section_when_present(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    assert "## Tracker Scope" in packet_text
+    assert "## Allocated Git Diff" in packet_text
+    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
+    assert "## Session-Owned Git Diff" not in packet_text
+    assert payload["lease_id"] in packet_text
+    assert payload["scope_hash"] in packet_text
+
+
+def test_packet_omits_tracker_scope_section_when_absent(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=None, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    assert "## Tracker Scope" not in packet_text
+    assert "## Allocated Git Diff" not in packet_text
+    assert "## Session-Owned Git Diff" in packet_text
+
+
+def test_packet_metadata_carries_tracker_scope_keys(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    metadata = json.loads((artifacts_dir / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert metadata["tracker_scope_present"] is True
+    assert metadata["tracker_scope_unit_count"] == len(payload["unit_ids"])
+    assert metadata["tracker_scope_lease_id"] == payload["lease_id"]
+    assert metadata["tracker_scope_hash"] == payload["scope_hash"]
+    assert metadata["tracker_scope_paths"] == payload["paths"]
+    assert metadata["tracker_scope_source_session_id"] == payload["source_session_id"]
+    assert metadata["tracker_scope_takeover_from_session_id"] == payload["takeover_from_session_id"]
+
+    completed_b, artifacts_b = _slice_2b_prepare(
+        tmp=tmp / "no-scope",
+        repo=init_repo(tmp / "no-scope" / "repo"),
+        tracker_scope_path=None,
+        log_root=tmp / "no-scope" / "logs",
+    )
+    assert completed_b.returncode == 0, completed_b.stderr
+    assert artifacts_b is not None
+    metadata_b = json.loads((artifacts_b / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert metadata_b["tracker_scope_present"] is False
+    assert metadata_b["tracker_scope_unit_count"] == 0
+    assert metadata_b["tracker_scope_lease_id"] is None
+    assert metadata_b["tracker_scope_hash"] is None
+    assert metadata_b["tracker_scope_paths"] == []
+    assert metadata_b["tracker_scope_source_session_id"] is None
+    assert metadata_b["tracker_scope_takeover_from_session_id"] is None
+
+
+def test_tracker_scope_payload_rejects_invalid_payloads(tmp: Path) -> None:
+    cases = [
+        ("missing_unit_ids", {"unit_ids": None}, "tracker_scope.unit_ids"),
+        ("empty_unit_ids", {"unit_ids": []}, "tracker_scope.unit_ids"),
+        ("non_string_unit_id", {"unit_ids": [123, "a" * 64]}, "tracker_scope.unit_ids"),
+        ("non_hex_unit_id", {"unit_ids": ["zzzz" * 16]}, "tracker_scope.unit_ids"),
+        ("missing_lease", {"lease_id": ""}, "tracker_scope.lease_id"),
+        ("missing_scope_hash", {"scope_hash": ""}, "tracker_scope.scope_hash"),
+        ("malformed_scope_hash", {"scope_hash": "sha256:short"}, "tracker_scope.scope_hash"),
+        ("non_list_paths", {"paths": "tracked.txt"}, "tracker_scope.paths"),
+        ("non_string_path", {"paths": [123]}, "tracker_scope.paths"),
+        ("non_list_hunks", {"hunks": "x"}, "tracker_scope.hunks"),
+    ]
+    log_root = tmp / "logs"
+    for index, (label, override, expected_substr) in enumerate(cases):
+        sub_tmp = tmp / f"case-{index}-{label}"
+        sub_tmp.mkdir(parents=True, exist_ok=True)
+        repo = init_repo(sub_tmp / "repo")
+        payload = _slice_2b_tracker_scope_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        scope_path = _slice_2b_write_scope_file(sub_tmp, payload)
+        completed, artifacts_dir = _slice_2b_prepare(
+            tmp=sub_tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+        )
+        assert completed.returncode != 0, f"case {label} should have failed, got: {completed.stdout}"
+        assert artifacts_dir is None
+        assert expected_substr in completed.stderr, (
+            f"case {label}: stderr did not mention {expected_substr!r}: {completed.stderr!r}"
+        )
+
+
+def test_tracker_scope_requires_session_manifest_or_transcript(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    context = tmp / "context.md"
+    context.write_text("## Session context\n- intent: D4 test\n", encoding="utf-8")
+    base_dir = tmp / "runs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--tracker-scope",
+            str(scope_path),
+            "--base-dir",
+            str(base_dir),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "--tracker-scope requires --session-manifest or --transcript" in completed.stderr
+
+
+def test_tracker_scope_tolerates_unknown_keys(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(extras={"future_field": "preserved"})
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    manifest = json.loads((artifacts_dir / "session-manifest.json").read_text(encoding="utf-8"))
+    spliced = manifest["tracker"]["tracker_scope"]
+    assert spliced.get("future_field") == "preserved"
+
+
+def test_review_env_exports_rvf_tracker_scope_path(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    env_text = (artifacts_dir / "review-env.sh").read_text(encoding="utf-8")
+    assert "RVF_TRACKER_SCOPE" in env_text
+    assert "tracker-scope.json" in env_text
+    assert (artifacts_dir / "inputs" / "tracker-scope.json").exists()
+
+    repo_b = init_repo(tmp / "no-scope" / "repo")
+    log_root_b = tmp / "no-scope" / "logs"
+    completed_b, artifacts_b = _slice_2b_prepare(
+        tmp=tmp / "no-scope", repo=repo_b, tracker_scope_path=None, log_root=log_root_b
+    )
+    assert completed_b.returncode == 0, completed_b.stderr
+    assert artifacts_b is not None
+    env_text_b = (artifacts_b / "review-env.sh").read_text(encoding="utf-8")
+    assert "RVF_TRACKER_SCOPE" not in env_text_b
+    assert not (artifacts_b / "inputs" / "tracker-scope.json").exists()
+
+
+def test_allocated_git_diff_uses_tracker_scope_paths(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(paths=["tracked.txt"])
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    allocated_idx = packet_text.index("## Allocated Git Diff")
+    full_idx = packet_text.index("## Full Git Diff HEAD (Evidence Only)")
+    assert allocated_idx < full_idx
+    allocated_block = packet_text[allocated_idx:full_idx]
+    full_block = packet_text[full_idx:]
+    assert "diff --git a/tracked.txt b/tracked.txt" in allocated_block
+    assert "diff --git a/tracked2.txt b/tracked2.txt" not in allocated_block
+    assert "diff --git a/tracked.txt b/tracked.txt" in full_block
+    assert "diff --git a/tracked2.txt b/tracked2.txt" in full_block
+
+
+def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    module.register_claims(
+        repo=repo,
+        session_id="other-session",
+        run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    metadata = json.loads((artifacts_dir / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert "## Tracker Scope" in packet_text
+    assert "## Cross-Session Conflicts" in packet_text
+    assert "other-session" in packet_text
+    assert metadata["cross_session_conflicts"]
+    assert metadata["tracker_scope_present"] is True
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -5298,6 +5716,54 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "diff_tracker_lock_timeout_degrades_gracefully",
             lambda: test_diff_tracker_lock_timeout_degrades_gracefully(root / "diff-tracker-lock-timeout"),
+        ),
+        (
+            "tracker_scope_payload_splices_into_manifest",
+            lambda: test_tracker_scope_payload_splices_into_manifest(root / "tracker-scope-splice"),
+        ),
+        (
+            "tracker_scope_unlocks_scope_contract_v2_fields",
+            lambda: test_tracker_scope_unlocks_scope_contract_v2_fields(root / "tracker-scope-contract-v2"),
+        ),
+        (
+            "scope_contract_v2_emitted_without_tracker_scope",
+            lambda: test_scope_contract_v2_emitted_without_tracker_scope(root / "tracker-scope-contract-v2-bare"),
+        ),
+        (
+            "packet_emits_tracker_scope_section_when_present",
+            lambda: test_packet_emits_tracker_scope_section_when_present(root / "tracker-scope-packet-present"),
+        ),
+        (
+            "packet_omits_tracker_scope_section_when_absent",
+            lambda: test_packet_omits_tracker_scope_section_when_absent(root / "tracker-scope-packet-absent"),
+        ),
+        (
+            "packet_metadata_carries_tracker_scope_keys",
+            lambda: test_packet_metadata_carries_tracker_scope_keys(root / "tracker-scope-metadata"),
+        ),
+        (
+            "tracker_scope_payload_rejects_invalid_payloads",
+            lambda: test_tracker_scope_payload_rejects_invalid_payloads(root / "tracker-scope-rejection"),
+        ),
+        (
+            "tracker_scope_requires_session_manifest_or_transcript",
+            lambda: test_tracker_scope_requires_session_manifest_or_transcript(root / "tracker-scope-d4"),
+        ),
+        (
+            "tracker_scope_tolerates_unknown_keys",
+            lambda: test_tracker_scope_tolerates_unknown_keys(root / "tracker-scope-unknown-keys"),
+        ),
+        (
+            "review_env_exports_rvf_tracker_scope_path",
+            lambda: test_review_env_exports_rvf_tracker_scope_path(root / "tracker-scope-env"),
+        ),
+        (
+            "allocated_git_diff_uses_tracker_scope_paths",
+            lambda: test_allocated_git_diff_uses_tracker_scope_paths(root / "tracker-scope-diff-filter"),
+        ),
+        (
+            "existing_cross_session_conflicts_path_unchanged_with_tracker_scope",
+            lambda: test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(root / "tracker-scope-cross-session"),
         ),
     ]
 
