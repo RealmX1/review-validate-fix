@@ -774,6 +774,55 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     assert summary_payload.get("finalize", {}).get("decision_kind") == "dispatcher-handoff"
 
 
+def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    state = tmp_path / "state"
+    run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
+    transcript = _write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    analysis_path = run_dir / "artifacts" / "analysis"
+    analysis_path.write_text("blocks analysis scaffold directory\n", encoding="utf-8")
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "child-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+        "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+    }
+    stdout = invoke(
+        event,
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+        extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
+    )
+
+    payload = json.loads(stdout)
+    assert "finalize_errors=1" in payload["systemMessage"]
+    hook_summary = latest_summary(state)
+    assert hook_summary["finalize_status"] == "warning"
+    assert hook_summary["finalize_error_count"] == 1
+    assert hook_summary["finalized_run_dir"] == str(run_dir.resolve())
+    assert hook_summary["finalize_errors"][0]["stage"] == "analysis_scaffold"
+    run_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert run_summary["finalize"]["errors"][0]["stage"] == "analysis_scaffold"
+    events = [
+        json.loads(line)
+        for line in Path(str(hook_summary["events_path"])).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["event"] == "finalize_completed_with_errors" for event in events)
+
+
 def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
@@ -1812,6 +1861,7 @@ def main() -> int:
         test_dev_repo_main_session_syncs_before_running_installed_hook,
         test_handoff_marker_opens_before_dev_sync_or_installed_hook,
         test_handoff_marker_finalizes_run_artifacts_same_session,
+        test_handoff_marker_surfaces_finalize_record_errors,
         test_handoff_marker_finalizes_run_artifacts_forked_session,
         test_plan_operation_skips_before_dev_sync_or_installed_hook,
         test_literal_plan_markers_in_completion_do_not_skip_hook,

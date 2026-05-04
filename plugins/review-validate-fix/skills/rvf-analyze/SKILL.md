@@ -7,8 +7,8 @@ description: Use when the user asks for a post-mortem of a finalized RVF run —
 
 本 skill 仅用于对一次**已 finalize 的 RVF run** 做事后复盘。它读
 `<run_dir>/artifacts/` 下由 `rvf_run_finalize` 已经落盘的 trajectory + workspace
-diff + reviewer 产物，写出叙事化的 `analysis/summary.md` 与
-`analysis/causality.json`。
+diff + reviewer 产物，补全已经 scaffold 的 `artifacts/analysis/summary.md` 与
+`artifacts/analysis/causality.json`。
 
 > ⚠️ 本 skill 与 `review-validate-fix` 严格分离。即便上下文里同时出现
 > review/validate/fix 的叙事，本 skill 的唯一职责是**复盘已 finalize 的 run**：
@@ -18,6 +18,11 @@ diff + reviewer 产物，写出叙事化的 `analysis/summary.md` 与
 本 skill 只应由用户显式调用：`$rvf-analyze`、`$rvf-analyze latest`、
 `$rvf-analyze <run_id>` 或 `$rvf-analyze /abs/path/to/run_dir`。
 不要因为上下文出现 `$review-validate-fix` 叙事自动转到本 skill，反之亦然。
+
+自动化边界：`rvf_run_finalize.finalize_run()` 会在 RVF finish/finalize 后自动运行
+确定性 scaffold 后端，生成 `artifacts/analysis/summary.md` 与
+`artifacts/analysis/causality.json` 的初始骨架；这不是一次 LLM skill 调用。
+只有用户显式调用本 skill 时，agent 才进入叙事补全与 issue ↔ patch 因果归属流程。
 
 ## 入口与脚本
 
