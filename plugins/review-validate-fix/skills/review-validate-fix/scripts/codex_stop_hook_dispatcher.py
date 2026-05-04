@@ -260,6 +260,179 @@ def should_sync_session_scope(
     repo: Path,
     ledger: RunLedger,
 ) -> tuple[bool, str, str]:
+    """Slice 3 dispatcher gate. New main path runs the allocator in dry-run
+    mode and skips the installed hook when there are no unassigned review
+    units. Tracker-disabled / session-id-less events fall back to the
+    pre-Slice-3 manifest-based legacy gate so disable-mode behavior matches
+    Phase 0/1 byte-for-byte."""
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    from codex_stop_review_validate_fix import (
+        _StopContextError,
+        resolve_stop_context,
+        refresh_global_diff_tracker,
+        allocate_auto_review_scope,
+    )
+    from diff_tracker import (
+        LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+        LEGACY_REASON_SESSION_OWNED_DIRTY,
+        REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+        REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+        _disabled as _tracker_disabled,
+    )
+
+    if _tracker_disabled():
+        return _legacy_should_sync_session_scope(event, repo, ledger)
+
+    try:
+        context = resolve_stop_context(event, str(repo), ledger)
+    except _StopContextError:
+        # `resolve_stop_context` already emitted the gate-side
+        # `transcript_unavailable` event under phase=gate. Mirror the
+        # dev-sync side so dispatcher logs grep cleanly, then refuse to sync.
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_unavailable",
+            status="failed",
+            reason_code="transcript_unavailable",
+            repo=str(repo),
+            cwd=str(repo),
+        )
+        return (
+            False,
+            "session transcript path was provided but is not readable; skipped RVF dev sync and installed hook",
+            "transcript_unavailable",
+        )
+    except Exception as exc:
+        # Transcript readable but malformed (binary garbage, etc.) — the
+        # transcript-derived helpers may raise UnicodeDecodeError before the
+        # allocator gets a chance. Match the legacy `session_manifest_failed`
+        # path so disable-mode and tracker-enabled dispatchers agree on the
+        # reason code.
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=str(repo),
+            cwd=str(repo),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return (
+            False,
+            "session manifest failed; skipped RVF dev sync and installed hook",
+            "session_manifest_failed",
+        )
+    if not context.get("session_paths"):
+        # Match legacy behavior: missing transcript path means we keep
+        # running the installed hook the way the pre-tracker dispatcher did.
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_unavailable",
+            status="skipped",
+            reason_code="missing_transcript",
+            repo=str(repo),
+            cwd=str(repo),
+        )
+        return (
+            True,
+            "session transcript unavailable; preserving legacy dev sync behavior",
+            "missing_transcript",
+        )
+
+    # Mirror the Stop-hook orchestrator: seed `session_units` via
+    # `refresh_global_diff_tracker` (which calls build_manifest →
+    # register_claims) before running the allocator dry-run. Without this
+    # step, the allocator sees zero session-attributed units and always
+    # reports `would_proceed=False`.
+    refresh_result = refresh_global_diff_tracker(context, ledger)
+    refresh_error = (
+        refresh_result.get("error") if isinstance(refresh_result, dict) else None
+    )
+    if refresh_error:
+        # build_manifest 失败时 fail-loud：mirror Stop-hook orchestrator 的行为，
+        # 在 dev-sync 端 emit `session_scope_failed` 并返回
+        # `session_manifest_failed`，避免 allocator 看到空 session_units 后被
+        # 静默判为 `no_unassigned_review_scope`（这会让 dispatcher 错误地跳过
+        # dev-sync 与 installed hook）。
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=str(repo),
+            cwd=str(repo),
+            error=refresh_error,
+        )
+        return (
+            False,
+            "session manifest failed; skipped RVF dev sync and installed hook",
+            "session_manifest_failed",
+        )
+    try:
+        result = allocate_auto_review_scope(context, ledger, dry_run=True)
+    except Exception as exc:
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=str(repo),
+            cwd=str(repo),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return (
+            False,
+            "session manifest failed; skipped RVF dev sync and installed hook",
+            "session_manifest_failed",
+        )
+
+    if result is None:
+        # Allocator returned None — happens when repo can't be resolved.
+        # Fall back to legacy gate so the dispatcher sees Phase-0 behavior.
+        return _legacy_should_sync_session_scope(event, repo, ledger)
+
+    if result.get("would_proceed"):
+        ledger.event(
+            phase="dev-sync",
+            event="session_scope_detected",
+            status="dirty",
+            reason_code=REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+            reason_code_legacy_alias=LEGACY_REASON_SESSION_OWNED_DIRTY,
+            repo=str(repo),
+            cwd=str(repo),
+            candidate_unit_count=result.get("candidate_unit_count", 0),
+        )
+        return (
+            True,
+            "unassigned review scope available",
+            REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+        )
+
+    ledger.event(
+        phase="dev-sync",
+        event="session_scope_clean",
+        status="skipped",
+        reason_code=REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+        reason_code_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+        repo=str(repo),
+        cwd=str(repo),
+        candidate_unit_count=result.get("candidate_unit_count", 0),
+    )
+    return (
+        False,
+        "no unassigned review scope",
+        REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+    )
+
+
+def _legacy_should_sync_session_scope(
+    event: dict[str, Any],
+    repo: Path,
+    ledger: RunLedger,
+) -> tuple[bool, str, str]:
+    """Pre-Slice-3 dispatcher gate body, kept verbatim. Reason-code literals
+    stay as `session_owned_dirty` / `no_session_owned_dirty` so disable-mode
+    users see no behavior change."""
     session_paths = event_session_paths(event)
     transcript = first_readable_session_path(event)
     if transcript is None:
@@ -1110,10 +1283,14 @@ def main() -> int:
         ledger,
     )
     if not session_sync_needed:
-        if (
-            session_reason_code == "no_session_owned_dirty"
-            and is_session_hook_control_event(event)
-        ):
+        # Slice 3 reason-code rename: accept both the legacy
+        # `no_session_owned_dirty` (emitted by tracker-disabled fallback) and
+        # the new `no_unassigned_review_scope` (emitted by the allocator dry
+        # run). The detail message branches on the same set.
+        sys.path.insert(0, str(SKILL_DIR / "scripts"))
+        from diff_tracker import REASON_NO_UNASSIGNED_REVIEW_SCOPE
+        clean_scope_codes = ("no_session_owned_dirty", REASON_NO_UNASSIGNED_REVIEW_SCOPE)
+        if session_reason_code in clean_scope_codes and is_session_hook_control_event(event):
             ledger.event(
                 phase="dev-sync",
                 event="session_hook_control_handoff",
@@ -1124,6 +1301,14 @@ def main() -> int:
                 cwd=str(repo),
             )
             return run_installed_stop_hook(raw_input, ledger)
+        # Stamp the legacy reason alias on the summary file so downstream
+        # `latest_summary` consumers (and integration tests) can grep both
+        # spellings during the one-release transition window.
+        legacy_alias = (
+            "no_session_owned_dirty"
+            if session_reason_code == REASON_NO_UNASSIGNED_REVIEW_SCOPE
+            else None
+        )
         return emit_terminal_payload(
             ledger,
             status="skipped",
@@ -1132,10 +1317,13 @@ def main() -> int:
             detail=(
                 "session manifest 构建失败，已跳过 RVF dev sync 和 installed hook"
                 if session_reason_code == "session_manifest_failed"
-                else "当前 chat session 没有 session-owned dirty paths，跳过 RVF dev sync 和自动 review"
+                else "当前 chat session 没有未分配的 review scope，跳过 RVF dev sync 和自动 review"
+                if session_reason_code in clean_scope_codes
+                else "RVF dev sync skipped"
             ),
             repo=str(repo),
             event=event_summary(event),
+            reason_code_legacy_alias=legacy_alias,
         )
 
     synced, log_path, sync_reason = sync_from_dev_repo(repo, event, ledger)

@@ -5765,6 +5765,67 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "existing_cross_session_conflicts_path_unchanged_with_tracker_scope",
             lambda: test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(root / "tracker-scope-cross-session"),
         ),
+        # Slice 3 allocator T1-T15.
+        (
+            "allocate_review_scope_emits_valid_tracker_scope_json",
+            lambda: test_allocate_review_scope_emits_valid_tracker_scope_json(root / "alloc-T1"),
+        ),
+        (
+            "allocate_review_scope_empty_returns_no_unassigned_review_scope",
+            lambda: test_allocate_review_scope_empty_returns_no_unassigned_review_scope(root / "alloc-T2"),
+        ),
+        (
+            "allocate_review_scope_excludes_active_leased_units",
+            lambda: test_allocate_review_scope_excludes_active_leased_units(root / "alloc-T3"),
+        ),
+        (
+            "allocate_review_scope_inserts_lease_and_marks_units_assigned",
+            lambda: test_allocate_review_scope_inserts_lease_and_marks_units_assigned(root / "alloc-T4"),
+        ),
+        (
+            "allocate_review_scope_prunes_stale_leases_first",
+            lambda: test_allocate_review_scope_prunes_stale_leases_first(root / "alloc-T5"),
+        ),
+        (
+            "allocate_review_scope_concurrent_writers_serialize",
+            lambda: test_allocate_review_scope_concurrent_writers_serialize(root / "alloc-T6"),
+        ),
+        (
+            "fork_first_stop_takeover_transfers_unleased_units",
+            lambda: test_fork_first_stop_takeover_transfers_unleased_units(root / "alloc-T7"),
+        ),
+        (
+            "fork_takeover_skips_actively_leased_units",
+            lambda: test_fork_takeover_skips_actively_leased_units(root / "alloc-T8"),
+        ),
+        (
+            "scope_hash_is_sha256_of_sorted_unit_ids",
+            lambda: test_scope_hash_is_sha256_of_sorted_unit_ids(root / "alloc-T9"),
+        ),
+        (
+            "allocator_event_appended_to_events_jsonl",
+            lambda: test_allocator_event_appended_to_events_jsonl(root / "alloc-T10"),
+        ),
+        (
+            "allocate_review_scope_disable_env_short_circuits",
+            lambda: test_allocate_review_scope_disable_env_short_circuits(root / "alloc-T11"),
+        ),
+        (
+            "allocate_review_scope_busy_timeout_degrades",
+            lambda: test_allocate_review_scope_busy_timeout_degrades(root / "alloc-T12"),
+        ),
+        (
+            "allocate_review_scope_writes_paths_and_hunks",
+            lambda: test_allocate_review_scope_writes_paths_and_hunks(root / "alloc-T13"),
+        ),
+        (
+            "allocate_review_scope_dry_run_does_not_create_lease",
+            lambda: test_allocate_review_scope_dry_run_does_not_create_lease(root / "alloc-T14"),
+        ),
+        (
+            "allocate_review_scope_output_consumed_by_prepare_run",
+            lambda: test_allocate_review_scope_output_consumed_by_prepare_run(root / "alloc-T15"),
+        ),
     ]
 
 
@@ -5805,6 +5866,560 @@ def main() -> int:
     )
     print(f"review support script tests OK{suffix}")
     return 0
+
+
+# --------------------------- Slice 3 allocator tests ---------------------------
+
+def _alloc_invoke(
+    *,
+    repo: Path,
+    log_root: Path,
+    session_id: str,
+    run_id: str,
+    reviewer_id: str | None = "reviewer-a",
+    output_scope: Path | None = None,
+    parent_session_id: str | None = None,
+    holder_kind: str = "reviewer",
+    lease_ttl_seconds: int | None = None,
+    dry_run: bool = False,
+    extra_env: dict[str, str] | None = None,
+    timeout: float = 60.0,
+) -> dict[str, object]:
+    cmd = [
+        sys.executable,
+        str(DIFF_TRACKER),
+        "allocate-review-scope",
+        "--repo",
+        str(repo),
+        "--session-id",
+        session_id,
+        "--run-id",
+        run_id,
+        "--log-root",
+        str(log_root),
+        "--print-result",
+    ]
+    if reviewer_id is not None:
+        cmd.extend(["--reviewer-id", reviewer_id])
+    if output_scope is not None:
+        cmd.extend(["--output-scope", str(output_scope)])
+    if parent_session_id is not None:
+        cmd.extend(["--parent-session-id", parent_session_id])
+    if holder_kind != "reviewer":
+        cmd.extend(["--holder-kind", holder_kind])
+    if lease_ttl_seconds is not None:
+        cmd.extend(["--lease-ttl-seconds", str(lease_ttl_seconds)])
+    if dry_run:
+        cmd.append("--dry-run")
+    env = {**os.environ}
+    if extra_env:
+        env.update(extra_env)
+    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=timeout)
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
+            f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
+        )
+    last_line = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "{}"
+    return json.loads(last_line)
+
+
+def _alloc_db_path(log_root: Path, repo_key: str) -> Path:
+    return log_root / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+
+
+def _alloc_events_path(log_root: Path, repo_key: str) -> Path:
+    return log_root / "diff-tracker" / "repos" / repo_key / "events.jsonl"
+
+
+def _alloc_open_db(log_root: Path, repo_key: str):
+    import sqlite3 as _sqlite
+
+    return _sqlite.connect(str(_alloc_db_path(log_root, repo_key)))
+
+
+def test_allocate_review_scope_emits_valid_tracker_scope_json(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T1",
+        run_id="run-T1",
+        output_scope=output_scope,
+    )
+    assert result["status"] == "allocated"
+    assert result["acquired"] is True
+    assert result["reason"] == "unassigned_review_scope_available"
+    assert result["reason_legacy_alias"] == "session_owned_dirty"
+    assert output_scope.exists()
+    payload = json.loads(output_scope.read_text(encoding="utf-8"))
+    spec = importlib.util.spec_from_file_location("rvf_prepare_review_run", PREPARE_REVIEW_RUN)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loaded = module.load_tracker_scope(output_scope)
+    assert loaded["unit_ids"] == payload["unit_ids"]
+    for unit_id in payload["unit_ids"]:
+        assert isinstance(unit_id, str)
+        assert len(unit_id) == 64
+        int(unit_id, 16)  # raises ValueError if not hex
+    assert payload["lease_id"].startswith("lse-")
+    assert payload["scope_hash"].startswith("sha256:")
+    assert len(payload["scope_hash"].split(":", 1)[1]) == 64
+
+
+def test_allocate_review_scope_empty_returns_no_unassigned_review_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    # Wipe the dirty state from init_repo so the worktree is clean.
+    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
+    (repo / "new.txt").unlink()
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T2",
+        run_id="run-T2",
+        output_scope=output_scope,
+    )
+    assert result["status"] == "empty"
+    assert result["acquired"] is False
+    assert result["reason"] == "no_unassigned_review_scope"
+    assert result["reason_legacy_alias"] == "no_session_owned_dirty"
+    assert not output_scope.exists()
+
+
+def test_allocate_review_scope_excludes_active_leased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T3a",
+        run_id="run-T3a",
+        output_scope=tmp / "first.json",
+    )
+    assert first["status"] == "allocated"
+    repo_key = first["repo_key"]
+    # Manually flip the lease's units back to 'available' while leaving the
+    # active lease in place. This forces step 4 to include them as candidates
+    # so step 5's anti-join is exercised — exactly the race the leased
+    # exclusion is supposed to absorb.
+    leased_unit_ids = first["scope"]["unit_ids"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        placeholders = ",".join("?" * len(leased_unit_ids))
+        conn.execute(
+            f"UPDATE units SET review_state='available' WHERE unit_id IN ({placeholders})",
+            tuple(leased_unit_ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Same session re-allocates: every candidate is now an actively-leased
+    # unit so the result is empty AND leased_excluded_count covers them all.
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T3a",
+        run_id="run-T3b",
+    )
+    assert second["status"] == "empty"
+    assert second["leased_excluded_count"] >= 1
+
+
+def test_allocate_review_scope_inserts_lease_and_marks_units_assigned(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T4",
+        run_id="run-T4",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    repo_key = result["repo_key"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        leases = list(conn.execute("SELECT lease_id, state FROM leases"))
+        assert leases, "lease row should exist"
+        assert all(state == "active" for _, state in leases)
+        lease_units = list(conn.execute("SELECT unit_id FROM lease_units"))
+        assert {row[0] for row in lease_units} == set(result["scope"]["unit_ids"])
+        unit_states = list(
+            conn.execute(
+                f"SELECT review_state FROM units WHERE unit_id IN ({','.join('?' * len(lease_units))})",
+                tuple(row[0] for row in lease_units),
+            )
+        )
+        assert all(state == "assigned" for (state,) in unit_states)
+    finally:
+        conn.close()
+
+
+def test_allocate_review_scope_prunes_stale_leases_first(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    # First allocator run lays down a real lease.
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T5",
+        run_id="run-T5",
+        output_scope=tmp / "first.json",
+    )
+    repo_key = first["repo_key"]
+    # Manually expire the lease in the DB so the next allocator run treats it
+    # as stale and frees its units.
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE leases SET expires_at='1970-01-01T00:00:00Z'")
+        conn.commit()
+    finally:
+        conn.close()
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T5b",
+        run_id="run-T5b",
+        output_scope=tmp / "second.json",
+    )
+    assert second["status"] == "allocated"
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        first_state = list(conn.execute("SELECT state FROM leases WHERE lease_id=?", (first["lease_id"],)))
+        assert first_state and first_state[0][0] == "stale-released"
+        active = list(conn.execute("SELECT lease_id FROM leases WHERE state='active'"))
+        assert active and active[0][0] == second["lease_id"]
+    finally:
+        conn.close()
+
+
+def test_allocate_review_scope_concurrent_writers_serialize(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    snippet = (
+        "import os, sys, time, json\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import diff_tracker as dt\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"repo = Path({str(repo)!r})\n"
+        "session = sys.argv[1]\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.allocate_review_scope(\n"
+        "    repo=repo, session_id=session, run_id=session,\n"
+        "    reviewer_id='r-' + session,\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result, default=str))\n"
+    )
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = []
+    for session in ("conc-A", "conc-B"):
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", snippet, session],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        )
+    outputs = [proc.communicate(timeout=60) for proc in procs]
+    payloads = []
+    for stdout, stderr in outputs:
+        if stderr.strip():
+            raise AssertionError(stderr.strip())
+        payloads.append(json.loads(stdout.strip().splitlines()[-1]))
+    statuses = [p["status"] for p in payloads]
+    assert sorted(statuses) in (["allocated", "empty"], ["allocated", "allocated"])
+    repo_key = next(p["repo_key"] for p in payloads if p["repo_key"])
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = list(conn.execute("SELECT unit_id, COUNT(*) FROM lease_units GROUP BY unit_id"))
+        for unit_id, count in rows:
+            assert count == 1, f"unit {unit_id} held by {count} leases"
+    finally:
+        conn.close()
+
+
+def test_fork_first_stop_takeover_transfers_unleased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="parent",
+        run_id="parent-run",
+        output_scope=tmp / "parent.json",
+    )
+    assert parent["status"] == "allocated"
+    repo_key = parent["repo_key"]
+    # Free the parent's lease so its units re-enter the candidate pool.
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    child = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="child",
+        run_id="child-run",
+        parent_session_id="parent",
+        output_scope=tmp / "child.json",
+    )
+    assert child["status"] == "allocated"
+    assert child["scope"]["takeover_from_session_id"] == "parent"
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        parent_kinds = {
+            row[0] for row in conn.execute(
+                "SELECT assignment_kind FROM session_units WHERE session_id='parent'"
+            )
+        }
+        child_kinds = {
+            row[0] for row in conn.execute(
+                "SELECT assignment_kind FROM session_units WHERE session_id='child'"
+            )
+        }
+    finally:
+        conn.close()
+    assert parent_kinds == {"transferred"} or parent_kinds == set()
+    assert "takeover" in child_kinds
+
+
+def test_fork_takeover_skips_actively_leased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="parent2",
+        run_id="parent2-run",
+        output_scope=tmp / "parent2.json",
+    )
+    assert parent["status"] == "allocated"
+    repo_key = parent["repo_key"]
+    parent_unit_ids = parent["scope"]["unit_ids"]
+    assert len(parent_unit_ids) >= 2
+    # Keep parent's lease active over only one unit by deleting the other
+    # lease_units row. The dropped unit goes back to 'available'.
+    pinned_unit, freed_unit = parent_unit_ids[0], parent_unit_ids[1]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("DELETE FROM lease_units WHERE lease_id=? AND unit_id=?", (parent["lease_id"], freed_unit))
+        conn.execute("UPDATE units SET review_state='available' WHERE unit_id=?", (freed_unit,))
+        conn.commit()
+    finally:
+        conn.close()
+    child = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="child2",
+        run_id="child2-run",
+        parent_session_id="parent2",
+        output_scope=tmp / "child2.json",
+    )
+    assert child["status"] == "allocated"
+    transferred_unit_ids = set(child["scope"]["unit_ids"])
+    assert pinned_unit not in transferred_unit_ids
+    assert freed_unit in transferred_unit_ids
+
+
+def test_scope_hash_is_sha256_of_sorted_unit_ids(tmp: Path) -> None:
+    import hashlib as _hash
+
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sh-A",
+        run_id="run-A",
+        output_scope=tmp / "first.json",
+    )
+    assert first["status"] == "allocated"
+    expected = "sha256:" + _hash.sha256(
+        "\n".join(sorted(first["scope"]["unit_ids"])).encode("utf-8")
+    ).hexdigest()
+    assert first["scope_hash"] == expected
+    # Second invocation over the same dirty paths but from a fresh log_root
+    # must produce the same scope_hash because the unit_ids are
+    # canonical-patch-hash derived.
+    log_root_b = tmp / "logs-b"
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root_b,
+        session_id="sh-B",
+        run_id="run-B",
+        output_scope=tmp / "second.json",
+    )
+    assert second["status"] == "allocated"
+    assert second["scope_hash"] == first["scope_hash"]
+
+
+def test_allocator_event_appended_to_events_jsonl(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-event",
+        run_id="run-event",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    events_path = _alloc_events_path(log_root, result["repo_key"])
+    records = read_jsonl(events_path)
+    matching = [r for r in records if r.get("event") == "allocate_review_scope"]
+    assert matching, f"no allocate_review_scope event in {records!r}"
+    record = matching[-1]
+    assert record["rvf_state_phase"] == "review"
+    assert record["lease_id"] == result["lease_id"]
+    assert record["scope_hash"] == result["scope_hash"]
+    assert record["unit_count"] == len(result["scope"]["unit_ids"])
+    assert record["paths"] == result["scope"]["paths"]
+    assert record["reason_code"] == "unassigned_review_scope_available"
+    assert record["reason_code_legacy_alias"] == "session_owned_dirty"
+
+
+def test_allocate_review_scope_disable_env_short_circuits(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-disable",
+        run_id="run-disable",
+        output_scope=tmp / "scope.json",
+        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+    )
+    assert result["status"] == "disabled"
+    assert not (tmp / "scope.json").exists()
+    # No SQLite file should have been created.
+    assert not _alloc_db_path(log_root, "anything").parent.parent.exists()
+
+
+def test_allocate_review_scope_busy_timeout_degrades(tmp: Path) -> None:
+    import threading
+    import sqlite3 as _sqlite
+
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    # Seed the SQLite file by running the allocator once normally.
+    seeded = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-seed",
+        run_id="run-seed",
+        output_scope=tmp / "seed.json",
+    )
+    assert seeded["status"] == "allocated"
+    db_path = _alloc_db_path(log_root, seeded["repo_key"])
+    blocker = _sqlite.connect(str(db_path), isolation_level=None, timeout=30.0)
+    release = threading.Event()
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        result = _alloc_invoke(
+            repo=repo,
+            log_root=log_root,
+            session_id="sess-busy",
+            run_id="run-busy",
+            output_scope=tmp / "busy.json",
+            extra_env={"CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS": "300"},
+            timeout=30.0,
+        )
+    finally:
+        try:
+            blocker.execute("ROLLBACK")
+        except _sqlite.Error:
+            pass
+        blocker.close()
+        release.set()
+    assert result["status"] == "lock_timeout"
+
+
+def test_allocate_review_scope_writes_paths_and_hunks(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T13",
+        run_id="run-T13",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    scope = result["scope"]
+    assert scope["paths"] == sorted(set(scope["paths"]))
+    for hunk in scope["hunks"]:
+        assert "unit_id" in hunk
+        assert "path" in hunk
+        assert "hunk_header" in hunk
+
+
+def test_allocate_review_scope_dry_run_does_not_create_lease(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "should-not-exist.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-dry",
+        run_id="run-dry",
+        reviewer_id=None,
+        output_scope=output_scope,
+        dry_run=True,
+    )
+    assert result["status"] == "dry_run"
+    assert result["would_acquire"] is True
+    assert result["candidate_unit_count"] > 0
+    assert not output_scope.exists()
+    repo_key = result["repo_key"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = list(conn.execute("SELECT COUNT(*) FROM leases"))
+    finally:
+        conn.close()
+    assert rows[0][0] == 0
+
+
+def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    allocator = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T15",
+        run_id="run-T15",
+        output_scope=output_scope,
+    )
+    assert allocator["status"] == "allocated"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=output_scope, log_root=log_root
+    )
+    assert completed.returncode == 0
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] == sorted(allocator["scope"]["unit_ids"])
+    assert contract["tracker_lease_id"] == allocator["lease_id"]
+    assert contract["tracker_scope_hash"] == allocator["scope_hash"]
 
 
 if __name__ == "__main__":

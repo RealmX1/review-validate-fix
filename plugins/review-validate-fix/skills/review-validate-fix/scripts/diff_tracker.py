@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -42,6 +45,18 @@ HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 RANGE_TOLERANCE = 5
 
 DISABLE_ENV = "CODEX_RVF_TRACKER_DISABLE"
+
+# Slice 3 reason-code rename (with one-release alias). The new names belong to
+# the `allocate_review_scope` path; the legacy names stay live in the
+# `CODEX_RVF_TRACKER_DISABLE=1` fallback so disable-mode users see no behavior
+# change.
+REASON_NO_UNASSIGNED_REVIEW_SCOPE = "no_unassigned_review_scope"
+REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE = "unassigned_review_scope_available"
+LEGACY_REASON_NO_SESSION_OWNED_DIRTY = "no_session_owned_dirty"
+LEGACY_REASON_SESSION_OWNED_DIRTY = "session_owned_dirty"
+
+DEFAULT_LEASE_TTL_SECONDS = 600
+LEASE_TTL_ENV = "CODEX_RVF_TRACKER_LEASE_TTL_SECONDS"
 
 
 def _disabled() -> bool:
@@ -1985,3 +2000,985 @@ def owned_units_from_manifest(manifest: dict[str, Any]) -> list[OwnedUnit]:
         seen.add(key)
         units.append(OwnedUnit(path=path, unit="path", hunk_anchor=None))
     return units
+
+
+# -------------------------- Slice 3: allocate-review-scope --------------------------
+
+def _compute_scope_hash(unit_ids: Iterable[str]) -> str:
+    """sha256 of newline-joined sorted unit_ids. Stable across allocator runs
+    over the same dirty paths and consumed verbatim by Slice 2-B
+    `prepare_review_run.load_tracker_scope`."""
+    payload = "\n".join(sorted(unit_ids)).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _new_lease_id(now_iso: str) -> str:
+    compact = re.sub(r"[^0-9A-Za-z]", "-", now_iso)
+    return f"lse-{compact}-{secrets.token_hex(4)}"
+
+
+def _lease_ttl_seconds(override: int | None) -> int:
+    if override is not None and override > 0:
+        return int(override)
+    raw = os.environ.get(LEASE_TTL_ENV, "").strip()
+    if not raw:
+        return DEFAULT_LEASE_TTL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_LEASE_TTL_SECONDS
+    return value if value > 0 else DEFAULT_LEASE_TTL_SECONDS
+
+
+def _iso_to_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        # `utc_now()` emits `...Z`; normalize to `+00:00` for fromisoformat.
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _datetime_to_iso(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _list_dirty_paths(repo: Path) -> list[str]:
+    """Return the sorted unique set of paths reported by `git status -z`.
+    Renames surface as two halves (old + new) — both are emitted so the
+    observation step can classify each side independently. The pathspec
+    branch used by `_classify_path` then deduplicates per path."""
+    try:
+        raw = _run_git(repo, ["status", "--porcelain=v1", "-z"])
+    except RuntimeError:
+        return []
+    if not raw:
+        return []
+    paths: set[str] = set()
+    entries = raw.split("\0")
+    idx = 0
+    while idx < len(entries):
+        entry = entries[idx]
+        if not entry:
+            idx += 1
+            continue
+        if len(entry) < 3:
+            idx += 1
+            continue
+        code_x = entry[0]
+        code_y = entry[1]
+        body = entry[3:]
+        # Renames: `R ` / `RM` / etc carry `<new>\0<old>` across two NUL
+        # records. Push both halves into the dirty path set so each side gets
+        # classified independently.
+        if code_x == "R" or code_y == "R":
+            new_path = body
+            old_path = entries[idx + 1] if idx + 1 < len(entries) else ""
+            if new_path:
+                paths.add(new_path)
+            if old_path:
+                paths.add(old_path)
+            idx += 2
+            continue
+        if body:
+            paths.add(body)
+        idx += 1
+    return sorted(paths)
+
+
+def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
+    """Mark every active lease whose `expires_at <= now` as `stale-released`.
+    Returns the number of leases freed. Lease_units rows stay intact so the
+    underlying units flip back to `available` via the trigger below."""
+    cur = conn.execute(
+        """
+        UPDATE leases
+           SET state='stale-released'
+         WHERE state='active'
+           AND expires_at <= ?
+        """,
+        (now_iso,),
+    )
+    freed = cur.rowcount or 0
+    if freed:
+        # Unleash any units pinned by these leases so they re-enter the
+        # candidate pool. We only flip `assigned -> available`; reviewed /
+        # tombstoned units keep their state.
+        conn.execute(
+            """
+            UPDATE units
+               SET review_state='available'
+             WHERE review_state='assigned'
+               AND unit_id IN (
+                   SELECT lu.unit_id
+                     FROM lease_units lu
+                     JOIN leases l ON l.lease_id = lu.lease_id
+                    WHERE l.state='stale-released'
+                      AND l.expires_at <= ?
+               )
+            """,
+            (now_iso,),
+        )
+    return freed
+
+
+def _observe_and_upsert_units_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    repo: Path,
+    branch_value: str | None,
+    worktree_value: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Walk the worktree, upsert units for every dirty path, and mark units
+    that no longer have an observable change as `superseded`. Returns a dict
+    with `branch_key`, `worktree_key`, and the set of currently-observed
+    `unit_ids`."""
+    branch_key = _upsert_branch(conn, branch_value, now_iso) if branch_value else None
+    worktree_key = _upsert_worktree(conn, worktree_value, branch_key, None, now_iso)
+
+    dirty_paths = _list_dirty_paths(repo)
+    observed_unit_ids: set[str] = set()
+    observed_paths: set[str] = set()
+    for path in dirty_paths:
+        observation = _classify_path(repo, path)
+        if observation is None:
+            # No observable change on this path — fall back to path_only so
+            # the row still anchors session ownership for paths whose only
+            # evidence was an exec_command (e.g. `chmod +x`).
+            spec = _UnitSpec(
+                unit_id=_canonical_hash_path_only(path),
+                path=path,
+                old_path=None,
+                kind="path_only",
+                change_type="modify",
+                preimage_blob=None,
+                postimage_hash=None,
+                hunk_header=None,
+            )
+            _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
+            observed_unit_ids.add(spec.unit_id)
+            observed_paths.add(path)
+            continue
+        if observation.kind == "tracked_hunk":
+            for hunk in observation.hunks:
+                spec = _UnitSpec(
+                    unit_id=hunk.canonical_hash,
+                    path=path,
+                    old_path=None,
+                    kind="tracked_hunk",
+                    change_type=observation.change_type,
+                    preimage_blob=observation.preimage_blob,
+                    postimage_hash=observation.postimage_hash,
+                    hunk_header=hunk.anchor.header,
+                )
+                _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
+                observed_unit_ids.add(spec.unit_id)
+            observed_paths.add(path)
+            continue
+        if observation.kind == "untracked_file":
+            spec = _UnitSpec(
+                unit_id=_canonical_hash_untracked(path, observation.postimage_hash or ""),
+                path=path,
+                old_path=None,
+                kind="untracked_file",
+                change_type="add",
+                preimage_blob=None,
+                postimage_hash=observation.postimage_hash,
+                hunk_header=None,
+            )
+        elif observation.kind == "deleted_file":
+            spec = _UnitSpec(
+                unit_id=_canonical_hash_deleted(path, observation.preimage_blob or ""),
+                path=path,
+                old_path=None,
+                kind="deleted_file",
+                change_type="delete",
+                preimage_blob=observation.preimage_blob,
+                postimage_hash=None,
+                hunk_header=None,
+            )
+        elif observation.kind == "binary_file":
+            spec = _UnitSpec(
+                unit_id=_canonical_hash_binary(
+                    path,
+                    observation.preimage_blob or "",
+                    observation.postimage_hash or "",
+                ),
+                path=path,
+                old_path=None,
+                kind="binary_file",
+                change_type=observation.change_type,
+                preimage_blob=observation.preimage_blob,
+                postimage_hash=observation.postimage_hash,
+                hunk_header=None,
+            )
+        else:
+            spec = _UnitSpec(
+                unit_id=_canonical_hash_path_only(path),
+                path=path,
+                old_path=None,
+                kind="path_only",
+                change_type="modify",
+                preimage_blob=None,
+                postimage_hash=None,
+                hunk_header=None,
+            )
+        _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
+        observed_unit_ids.add(spec.unit_id)
+        observed_paths.add(path)
+
+    # Mark units whose paths disappeared from the worktree (file got committed
+    # / reverted) as `superseded` so they don't show up as candidates.
+    if observed_paths is not None:
+        rows = conn.execute(
+            """
+            SELECT unit_id, path
+              FROM units
+             WHERE worktree_key=?
+               AND observed_state='dirty'
+               AND review_state IN ('available','assigned')
+            """,
+            (worktree_key,),
+        ).fetchall()
+        for row in rows:
+            unit_id = row["unit_id"]
+            if unit_id in observed_unit_ids:
+                continue
+            conn.execute(
+                "UPDATE units SET observed_state='superseded', last_observed_at=? WHERE unit_id=?",
+                (now_iso, unit_id),
+            )
+
+    return {
+        "branch_key": branch_key,
+        "worktree_key": worktree_key,
+        "observed_unit_ids": observed_unit_ids,
+    }
+
+
+def _takeover_transfer_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    parent_session_id: str,
+    current_session_id: str,
+    now_iso: str,
+) -> list[str]:
+    """Transfer the parent's owned-and-unleased units to the current session.
+    Parent rows flip `assignment_kind='owned' -> 'transferred'`; the current
+    session gets matching `assignment_kind='takeover'` rows. Returns the list
+    of transferred unit_ids."""
+    rows = conn.execute(
+        """
+        SELECT su.unit_id, su.run_id, su.branch, su.worktree, su.evidence
+          FROM session_units su
+          JOIN units u ON u.unit_id = su.unit_id
+         WHERE su.session_id=?
+           AND su.assignment_kind='owned'
+           AND u.review_state IN ('available','assigned')
+           AND u.unit_id NOT IN (
+               SELECT lu.unit_id
+                 FROM lease_units lu
+                 JOIN leases l ON l.lease_id = lu.lease_id
+                WHERE l.state='active'
+                  AND l.expires_at > ?
+           )
+        """,
+        (parent_session_id, now_iso),
+    ).fetchall()
+    transferred: list[str] = []
+    for row in rows:
+        unit_id = row["unit_id"]
+        conn.execute(
+            "UPDATE session_units SET assignment_kind='transferred', last_seen_at=? WHERE session_id=? AND unit_id=?",
+            (now_iso, parent_session_id, unit_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO session_units(session_id, unit_id, assignment_kind, assigned_at, run_id, branch, worktree, evidence, last_seen_at)
+            VALUES (?, ?, 'takeover', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, unit_id) DO UPDATE SET
+                assignment_kind='takeover',
+                last_seen_at=excluded.last_seen_at
+            """,
+            (
+                current_session_id,
+                unit_id,
+                now_iso,
+                row["run_id"],
+                row["branch"],
+                row["worktree"],
+                row["evidence"],
+                now_iso,
+            ),
+        )
+        transferred.append(unit_id)
+    return transferred
+
+
+def _resolve_session_assignment_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    parent_session_id: str | None,
+    worktree_key: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Detect first-stop forks (no row yet for `session_id`) and run the
+    takeover transfer before the upsert seeds `last_seen_at`. Then upsert the
+    session row. Returns `{takeover_from: <parent or None>, transferred_unit_ids: [...]}`."""
+    cur = conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,))
+    is_first_stop = cur.fetchone() is None
+    transferred: list[str] = []
+    takeover_from: str | None = None
+    # Insert the child session row BEFORE the takeover transfer so the
+    # `session_units(child).session_id` FK is satisfied. Detection has
+    # already been captured in `is_first_stop` so this re-ordering is safe.
+    _upsert_session(conn, session_id, worktree_key, now_iso)
+    if is_first_stop and parent_session_id and parent_session_id != session_id:
+        # Multi-parent forks join with `;` but Slice 3 only supports one parent
+        # per stop; multi-parent is left for Slice 5 manual takeover CLI.
+        transferred = _takeover_transfer_in_txn(
+            conn,
+            parent_session_id=parent_session_id,
+            current_session_id=session_id,
+            now_iso=now_iso,
+        )
+        if transferred:
+            takeover_from = parent_session_id
+    if parent_session_id and parent_session_id != session_id:
+        # Record the parent linkage even when nothing was transferred so a
+        # later allocator pass sees the lineage.
+        conn.execute(
+            "UPDATE sessions SET parent_session_id=COALESCE(parent_session_id, ?) WHERE session_id=?",
+            (parent_session_id, session_id),
+        )
+    return {"takeover_from": takeover_from, "transferred_unit_ids": transferred}
+
+
+def _collect_candidate_unit_ids_in_txn(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT su.unit_id
+          FROM session_units su
+          JOIN units u ON u.unit_id = su.unit_id
+         WHERE su.session_id=?
+           AND su.assignment_kind IN ('owned','takeover')
+           AND u.review_state='available'
+           AND u.observed_state IN ('dirty','committed')
+         ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
+        """,
+        (session_id,),
+    ).fetchall()
+    return [row["unit_id"] for row in rows]
+
+
+def _exclude_active_leased_in_txn(
+    conn: sqlite3.Connection,
+    candidate_unit_ids: list[str],
+    now_iso: str,
+) -> tuple[list[str], int]:
+    if not candidate_unit_ids:
+        return ([], 0)
+    placeholders = ",".join("?" for _ in candidate_unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT lu.unit_id
+          FROM lease_units lu
+          JOIN leases l ON l.lease_id = lu.lease_id
+         WHERE l.state='active'
+           AND l.expires_at > ?
+           AND lu.unit_id IN ({placeholders})
+        """,
+        (now_iso, *candidate_unit_ids),
+    ).fetchall()
+    leased = {row["unit_id"] for row in rows}
+    excluded = sum(1 for uid in candidate_unit_ids if uid in leased)
+    surviving = [uid for uid in candidate_unit_ids if uid not in leased]
+    return (surviving, excluded)
+
+
+def _create_lease_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    lease_id: str,
+    session_id: str,
+    run_id: str,
+    reviewer_id: str,
+    holder_kind: str,
+    scope_hash: str,
+    unit_ids: list[str],
+    ttl_seconds: int,
+    now_iso: str,
+) -> None:
+    expires_dt = (_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl_seconds)
+    expires_at = _datetime_to_iso(expires_dt)
+    conn.execute(
+        """
+        INSERT INTO leases(
+            lease_id, session_id, run_id, reviewer_id, holder_kind, scope_hash,
+            state, ttl_seconds, created_at, last_activity_at, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+        """,
+        (
+            lease_id,
+            session_id,
+            run_id,
+            reviewer_id,
+            holder_kind,
+            scope_hash,
+            ttl_seconds,
+            now_iso,
+            now_iso,
+            expires_at,
+        ),
+    )
+    for unit_id in unit_ids:
+        conn.execute(
+            "INSERT INTO lease_units(lease_id, unit_id) VALUES (?, ?)",
+            (lease_id, unit_id),
+        )
+    placeholders = ",".join("?" for _ in unit_ids)
+    conn.execute(
+        f"UPDATE units SET review_state='assigned' WHERE unit_id IN ({placeholders})",
+        tuple(unit_ids),
+    )
+
+
+def _collect_paths_and_hunks_in_txn(
+    conn: sqlite3.Connection,
+    unit_ids: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    if not unit_ids:
+        return ([], [])
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT unit_id, path, hunk_header
+          FROM units
+         WHERE unit_id IN ({placeholders})
+         ORDER BY path, hunk_header IS NULL, hunk_header, unit_id
+        """,
+        tuple(unit_ids),
+    ).fetchall()
+    paths_set: set[str] = set()
+    hunks: list[dict[str, Any]] = []
+    for row in rows:
+        path = row["path"]
+        if isinstance(path, str):
+            paths_set.add(path)
+        hunks.append(
+            {
+                "unit_id": row["unit_id"],
+                "path": path,
+                "hunk_header": row["hunk_header"],
+            }
+        )
+    return (sorted(paths_set), hunks)
+
+
+def _empty_allocate_result(
+    *,
+    status: str,
+    reason: str | None,
+    reason_legacy_alias: str | None,
+    repo_key_value: str,
+    tracker_dir_value: str | None,
+    candidate_unit_count: int = 0,
+    leased_excluded_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "acquired": False,
+        "would_acquire": False,
+        "reason": reason,
+        "reason_legacy_alias": reason_legacy_alias,
+        "scope": None,
+        "scope_path": None,
+        "lease_id": None,
+        "scope_hash": None,
+        "candidate_unit_count": candidate_unit_count,
+        "leased_excluded_count": leased_excluded_count,
+        "repo_key": repo_key_value,
+        "tracker_dir": tracker_dir_value,
+    }
+
+
+def allocate_review_scope(
+    *,
+    repo: Path,
+    session_id: str,
+    run_id: str,
+    reviewer_id: str | None = None,
+    output_scope_path: Path | None = None,
+    parent_session_id: str | None = None,
+    holder_kind: str = "reviewer",
+    lease_ttl_seconds: int | None = None,
+    dry_run: bool = False,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+    auto_claim_observed: bool = True,
+) -> dict[str, Any]:
+    """Producer half of the global reviewed-diff tracker.
+
+    On `status='allocated'` writes `tracker-scope.json` to `output_scope_path`
+    when supplied; the JSON shape passes `prepare_review_run.load_tracker_scope`
+    unchanged. On `status='empty'` writes nothing — the dispatcher / Stop hook
+    converts that into the `no_unassigned_review_scope` skip payload.
+
+    `dry_run=True` runs the same observation + candidate query but stops short
+    of inserting a lease — used by the dispatcher to decide whether the
+    installed Stop hook should fire.
+    """
+    repo_resolved = repo.resolve()
+    if _disabled():
+        return _empty_allocate_result(
+            status="disabled",
+            reason=None,
+            reason_legacy_alias=None,
+            repo_key_value="",
+            tracker_dir_value=None,
+        )
+    if is_bare_repo(repo_resolved):
+        return _empty_allocate_result(
+            status="unsupported_repo",
+            reason=None,
+            reason_legacy_alias=None,
+            repo_key_value="",
+            tracker_dir_value=None,
+        )
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        return _empty_allocate_result(
+            status="unsupported_repo",
+            reason=None,
+            reason_legacy_alias=None,
+            repo_key_value="",
+            tracker_dir_value=None,
+        )
+    if not dry_run and not reviewer_id:
+        raise ValueError("reviewer_id is required when dry_run=False")
+
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    directory.mkdir(parents=True, exist_ok=True)
+    db_path = directory / SQLITE_FILENAME
+    events_path = directory / EVENTS_FILENAME
+
+    branch_value = _current_branch(repo_resolved)
+    worktree_value = str(repo_resolved)
+    now_iso = now or utc_now()
+    ttl_seconds = _lease_ttl_seconds(lease_ttl_seconds)
+    holder_kind_value = holder_kind if holder_kind in {"reviewer", "validate-fix", "manual"} else "reviewer"
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        # Slice 3 step 1-7 all live inside one BEGIN IMMEDIATE; step 8 (file
+        # writes + events.jsonl append) happens after COMMIT so a rollback
+        # leaves no half-written tracker-scope.json behind.
+        committed_payload: dict[str, Any] | None = None
+        result_status: str
+        candidate_unit_count = 0
+        leased_excluded_count = 0
+        with _begin_immediate(conn):
+            migration_finalize: Callable[[], None] | None = None
+            migration_finalize = _migrate_phase1_if_needed(
+                repo=repo_resolved,
+                common_dir=common_dir,
+                key=key,
+                log_root_dir=base,
+                new_dir=directory,
+                conn=conn,
+                events_path=events_path,
+            )
+
+            # Step 1: prune stale leases.
+            stale_freed = _prune_stale_leases_in_txn(conn, now_iso)
+
+            # Step 2: observe worktree → upsert units.
+            observation = _observe_and_upsert_units_in_txn(
+                conn,
+                repo=repo_resolved,
+                branch_value=branch_value,
+                worktree_value=worktree_value,
+                now_iso=now_iso,
+            )
+            worktree_key = observation["worktree_key"]
+
+            # Step 3: resolve session assignment (fork takeover before upsert).
+            session_resolution = _resolve_session_assignment_in_txn(
+                conn,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                worktree_key=worktree_key,
+                now_iso=now_iso,
+            )
+            takeover_from = session_resolution.get("takeover_from")
+
+            # Step 3b: claim observed units when this is a fresh session with
+            # no prior `register_claims` attribution AND no parent fork. This
+            # is the manual-CLI escape hatch (D8 commentary): the producer
+            # operating without transcript-derived ownership has to fall back
+            # to "review whatever's dirty in this worktree". The auto Stop-hook
+            # path passes `auto_claim_observed=False` because
+            # `refresh_global_diff_tracker` already pre-populated
+            # `session_units` via `build_manifest` → `register_claims`, so any
+            # auto-claim here would broaden scope past the transcript intent.
+            if auto_claim_observed and not session_resolution.get("transferred_unit_ids"):
+                existing = conn.execute(
+                    "SELECT 1 FROM session_units WHERE session_id=? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if existing is None:
+                    for unit_id in observation["observed_unit_ids"]:
+                        _upsert_session_unit(
+                            conn,
+                            session_id,
+                            unit_id,
+                            run_id=run_id,
+                            branch=branch_value,
+                            worktree=worktree_value,
+                            evidence="allocator",
+                            now=now_iso,
+                        )
+
+            # Step 4: collect candidate unit_ids.
+            candidates = _collect_candidate_unit_ids_in_txn(conn, session_id)
+            candidate_unit_count = len(candidates)
+
+            # Step 5: exclude active-leased units (anti-join).
+            surviving, leased_excluded_count = _exclude_active_leased_in_txn(conn, candidates, now_iso)
+
+            if not surviving:
+                # Step 6 (empty): no lease, no scope file. Build the empty
+                # result eagerly so we can emit the events.jsonl marker after
+                # COMMIT for grep reliability (D2).
+                committed_payload = {
+                    "status": "empty",
+                    "scope": None,
+                    "lease_id": None,
+                    "scope_hash": None,
+                    "unit_ids": [],
+                    "paths": [],
+                    "hunks": [],
+                    "stale_freed": stale_freed,
+                    "takeover_from": takeover_from,
+                    "transferred_unit_ids": session_resolution.get("transferred_unit_ids", []),
+                }
+                result_status = "empty"
+            elif dry_run:
+                # Step 6 (dry_run): no DB writes, but still report the would-be
+                # scope hash so callers can dedupe.
+                scope_hash = _compute_scope_hash(surviving)
+                paths_list, hunks_list = _collect_paths_and_hunks_in_txn(conn, surviving)
+                committed_payload = {
+                    "status": "dry_run",
+                    "scope": None,
+                    "lease_id": None,
+                    "scope_hash": scope_hash,
+                    "unit_ids": surviving,
+                    "paths": paths_list,
+                    "hunks": hunks_list,
+                    "stale_freed": stale_freed,
+                    "takeover_from": takeover_from,
+                    "transferred_unit_ids": session_resolution.get("transferred_unit_ids", []),
+                }
+                result_status = "dry_run"
+            else:
+                # Steps 6-7 (allocate): hash, lease, mark assigned, collect paths.
+                scope_hash = _compute_scope_hash(surviving)
+                lease_id = _new_lease_id(now_iso)
+                _create_lease_in_txn(
+                    conn,
+                    lease_id=lease_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    reviewer_id=reviewer_id or "",
+                    holder_kind=holder_kind_value,
+                    scope_hash=scope_hash,
+                    unit_ids=surviving,
+                    ttl_seconds=ttl_seconds,
+                    now_iso=now_iso,
+                )
+                paths_list, hunks_list = _collect_paths_and_hunks_in_txn(conn, surviving)
+                scope_payload: dict[str, Any] = {
+                    "unit_ids": surviving,
+                    "lease_id": lease_id,
+                    "scope_hash": scope_hash,
+                    "paths": paths_list,
+                    "hunks": hunks_list,
+                    "source_session_id": session_id,
+                    "takeover_from_session_id": takeover_from,
+                }
+                committed_payload = {
+                    "status": "allocated",
+                    "scope": scope_payload,
+                    "lease_id": lease_id,
+                    "scope_hash": scope_hash,
+                    "unit_ids": surviving,
+                    "paths": paths_list,
+                    "hunks": hunks_list,
+                    "stale_freed": stale_freed,
+                    "takeover_from": takeover_from,
+                    "transferred_unit_ids": session_resolution.get("transferred_unit_ids", []),
+                }
+                result_status = "allocated"
+
+        # Step 8 (post-COMMIT): write tracker-scope.json + events.jsonl event.
+        if migration_finalize is not None:
+            try:
+                migration_finalize()
+            except Exception:
+                pass
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+
+        assert committed_payload is not None
+        scope_path_str: str | None = None
+        if result_status == "allocated":
+            scope = committed_payload["scope"]
+            if output_scope_path is not None:
+                output_scope_path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_text(
+                    output_scope_path,
+                    json.dumps(scope, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                )
+                scope_path_str = str(output_scope_path)
+            _emit_event(
+                events_path,
+                {
+                    "event": "allocate_review_scope",
+                    "rvf_state_phase": "review",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "reviewer_id": reviewer_id,
+                    "holder_kind": holder_kind_value,
+                    "lease_id": committed_payload["lease_id"],
+                    "scope_hash": committed_payload["scope_hash"],
+                    "unit_count": len(committed_payload["unit_ids"]),
+                    "paths": committed_payload["paths"],
+                    "leased_excluded_count": leased_excluded_count,
+                    "stale_freed": committed_payload["stale_freed"],
+                    "takeover_from_session_id": committed_payload["takeover_from"],
+                    "reason_code": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+                    "reason_code_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
+                },
+            )
+            return {
+                "status": "allocated",
+                "acquired": True,
+                "would_acquire": True,
+                "reason": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+                "reason_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
+                "scope": scope,
+                "scope_path": scope_path_str,
+                "lease_id": committed_payload["lease_id"],
+                "scope_hash": committed_payload["scope_hash"],
+                "candidate_unit_count": candidate_unit_count,
+                "leased_excluded_count": leased_excluded_count,
+                "repo_key": key,
+                "tracker_dir": str(directory),
+            }
+        if result_status == "dry_run":
+            _emit_event(
+                events_path,
+                {
+                    "event": "allocate_review_scope_dry_run",
+                    "rvf_state_phase": "review",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "scope_hash": committed_payload["scope_hash"],
+                    "unit_count": len(committed_payload["unit_ids"]),
+                    "paths": committed_payload["paths"],
+                    "leased_excluded_count": leased_excluded_count,
+                    "reason_code": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+                    "reason_code_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
+                },
+            )
+            return {
+                "status": "dry_run",
+                "acquired": False,
+                "would_acquire": True,
+                "reason": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+                "reason_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
+                "scope": None,
+                "scope_path": None,
+                "lease_id": None,
+                "scope_hash": committed_payload["scope_hash"],
+                "candidate_unit_count": candidate_unit_count,
+                "leased_excluded_count": leased_excluded_count,
+                "repo_key": key,
+                "tracker_dir": str(directory),
+            }
+        # status == "empty"
+        _emit_event(
+            events_path,
+            {
+                "event": "allocate_review_scope_empty",
+                "rvf_state_phase": "review",
+                "session_id": session_id,
+                "run_id": run_id,
+                "reviewer_id": reviewer_id,
+                "holder_kind": holder_kind_value,
+                "candidate_unit_count": candidate_unit_count,
+                "leased_excluded_count": leased_excluded_count,
+                "stale_freed": committed_payload["stale_freed"],
+                "takeover_from_session_id": committed_payload["takeover_from"],
+                "reason_code": REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+                "reason_code_legacy_alias": LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+            },
+        )
+        return _empty_allocate_result(
+            status="empty",
+            reason=REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+            reason_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+            repo_key_value=key,
+            tracker_dir_value=str(directory),
+            candidate_unit_count=candidate_unit_count,
+            leased_excluded_count=leased_excluded_count,
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_lock_busy(exc):
+            _emit_event(
+                events_path,
+                {
+                    "event": "lock_timeout",
+                    "phase": "allocate_review_scope",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                },
+            )
+            return _empty_allocate_result(
+                status="lock_timeout",
+                reason=None,
+                reason_legacy_alias=None,
+                repo_key_value=key,
+                tracker_dir_value=str(directory),
+            )
+        _emit_event(
+            events_path,
+            {
+                "event": "allocate_review_scope_failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "error": repr(exc),
+            },
+        )
+        return _empty_allocate_result(
+            status="error",
+            reason=None,
+            reason_legacy_alias=None,
+            repo_key_value=key,
+            tracker_dir_value=str(directory),
+        )
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        _emit_event(
+            events_path,
+            {
+                "event": "allocate_review_scope_failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "error": repr(exc),
+            },
+        )
+        return _empty_allocate_result(
+            status="error",
+            reason=None,
+            reason_legacy_alias=None,
+            repo_key_value=key,
+            tracker_dir_value=str(directory),
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+# -------------------------- CLI dispatcher --------------------------
+
+def _build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="diff_tracker",
+        description="Global reviewed-diff tracker producer (Slice 3 of Phase 2).",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand")
+    # Slice 3 only registers `allocate-review-scope`. Slice 4/5 will add their
+    # own subparsers; we deliberately skip `required=True` so future subcommand
+    # registration stays additive.
+    alloc = subparsers.add_parser(
+        "allocate-review-scope",
+        help="Allocate a reviewer lease over the current session's unleased units.",
+    )
+    alloc.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    alloc.add_argument("--session-id", required=True)
+    alloc.add_argument("--run-id", required=True)
+    alloc.add_argument("--reviewer-id", default=None)
+    alloc.add_argument("--parent-session-id", default=None)
+    alloc.add_argument(
+        "--holder-kind",
+        choices=("reviewer", "validate-fix", "manual"),
+        default="reviewer",
+    )
+    alloc.add_argument(
+        "--output-scope",
+        default=None,
+        help="Path to write tracker-scope.json on status=allocated.",
+    )
+    alloc.add_argument("--lease-ttl-seconds", type=int, default=None)
+    alloc.add_argument("--dry-run", action="store_true")
+    alloc.add_argument("--print-result", action="store_true")
+    alloc.add_argument(
+        "--log-root",
+        default=None,
+        help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
+    )
+    return parser
+
+
+def _main(argv: list[str] | None = None) -> int:
+    parser = _build_argparser()
+    args = parser.parse_args(argv)
+    if args.subcommand != "allocate-review-scope":
+        parser.print_help()
+        return 2
+    if not args.dry_run and not args.reviewer_id:
+        print(
+            json.dumps(
+                {"status": "error", "error": "--reviewer-id is required unless --dry-run is set"},
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
+    output_scope_path = Path(args.output_scope).expanduser().resolve() if args.output_scope else None
+    repo_path = Path(args.repo).expanduser().resolve()
+    result = allocate_review_scope(
+        repo=repo_path,
+        session_id=args.session_id,
+        run_id=args.run_id,
+        reviewer_id=args.reviewer_id,
+        output_scope_path=output_scope_path,
+        parent_session_id=args.parent_session_id,
+        holder_kind=args.holder_kind,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        dry_run=bool(args.dry_run),
+        log_root_override=log_root_override,
+    )
+    if args.print_result:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

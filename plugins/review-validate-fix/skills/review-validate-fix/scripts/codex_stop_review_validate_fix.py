@@ -20,6 +20,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from session_manifest import build_manifest
+from diff_tracker import (
+    LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+    LEGACY_REASON_SESSION_OWNED_DIRTY,
+    REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+    REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+    _disabled as _tracker_disabled,
+    allocate_review_scope,
+)
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
@@ -3859,11 +3867,353 @@ def review_validate_fix_dispatch(
     return fork_review_validate_fix(event, repo, ledger)
 
 
-def session_scope_gate_payload(
+class _StopContextError(Exception):
+    """Raised by `resolve_stop_context` when the Stop event provided a session
+    transcript path but it isn't readable. The orchestrator unwraps the
+    `skip_payload` attribute and short-circuits the gate."""
+
+    def __init__(self, skip_payload_value: dict[str, Any]) -> None:
+        super().__init__("stop context unresolved")
+        self.skip_payload = skip_payload_value
+
+
+def resolve_stop_context(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    """Pull the structured fields the rest of the gate flow needs out of the
+    Stop event. Raises `_StopContextError` when a session transcript path was
+    provided but unreadable — caller maps that to a `transcript_unavailable`
+    skip payload."""
+    session_paths = event_session_scope_paths(event)
+    transcript: Path | None = None
+    if session_paths:
+        transcript = first_readable_session_path(event)
+        if transcript is None:
+            ledger.event(
+                phase="gate",
+                event="session_scope_unavailable",
+                status="skipped",
+                reason_code="transcript_unavailable",
+                repo=repo,
+                cwd=event.get("cwd"),
+                paths={"transcripts": [str(path) for path in session_paths]},
+            )
+            raise _StopContextError(
+                skip_payload(
+                    "session transcript path was provided but is not readable; skipped RVF fork/review.",
+                    ledger,
+                    "transcript_unavailable",
+                    repo=repo,
+                )
+            )
+    return {
+        "event": event,
+        "repo": repo,
+        "cwd": event.get("cwd"),
+        "session_id": session_hook_id_from_event(event),
+        "parent_session_id": parent_thread_id_from_event(event),
+        "session_paths": session_paths,
+        "transcript": transcript,
+        "latest_user": latest_user_message_from_event(event),
+        "session_hook_control": parse_session_hook_control(latest_user_message_from_event(event)),
+    }
+
+
+def refresh_global_diff_tracker(
+    context: dict[str, Any],
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    """Emit the Slice 3 shape-compliance ledger event and seed session-unit
+    attribution from the transcript via `build_manifest`. The manifest helper
+    transitively calls `diff_tracker.register_claims`, which writes
+    `session_units` rows for transcript-attributed owned paths. The allocator
+    then reads those rows directly without re-deriving them.
+
+    Stays a light step in spirit: nothing here touches the SQLite store
+    directly (D10) — observation is still consolidated inside the allocator's
+    BEGIN IMMEDIATE transaction. The `build_manifest` invocation pre-populates
+    `session_units` for transcript-aware sessions; manual CLI invocations (no
+    transcript) bypass this entirely and rely on the allocator's
+    `auto_claim_observed=True` fallback."""
+    repo = context.get("repo")
+    transcript = context.get("transcript")
+    ledger.event(
+        phase="gate",
+        event="tracker_refresh_started",
+        status="in_progress",
+        reason_code="tracker_refresh_started",
+        repo=repo,
+        cwd=context.get("cwd"),
+        session_id=context.get("session_id"),
+    )
+    if not isinstance(repo, str) or not repo or transcript is None:
+        # 没 transcript / 没 repo：合法的"无 seeding"分支，不算失败。调用方
+        # 会继续走 allocator 的 auto-claim fallback 或返回 None。
+        return {"observed": False, "manifest": None}
+    try:
+        manifest = build_manifest(Path(repo).expanduser().resolve(), transcript)
+    except Exception as exc:
+        # build_manifest 失败时 emit `tracker_refresh_failed`（保持原 ledger
+        # event，不双重 log），并把错误信息回传给调用方，让 orchestrator /
+        # dispatcher 显式 emit `session_manifest_failed` skip_payload。
+        # 历史上的 legacy_session_scope_gate_payload 在同样条件下也是 fail-loud
+        # 跳过 fork；新版 4-function split 必须保留这个语义，否则 manifest
+        # 失败会被 allocator 的空 session_units 静默降级为 "no scope" 误判。
+        error_message = f"{type(exc).__name__}: {exc}"
+        ledger.event(
+            phase="gate",
+            event="tracker_refresh_failed",
+            status="failed",
+            reason_code="session_manifest_failed",
+            repo=repo,
+            cwd=context.get("cwd"),
+            error=error_message,
+        )
+        return {"observed": False, "manifest": None, "error": error_message}
+    context["manifest"] = manifest
+    return {"observed": True, "manifest": manifest}
+
+
+def evaluate_session_gate(
+    context: dict[str, Any],
+    ledger: RunLedger,
+) -> dict[str, Any] | None:
+    """Hand back a skip payload when the session-level gate already says
+    "don't fork" (manual marker present, RVF_STOP_HOOK=disable). Returns None
+    to continue with allocator-driven scope check."""
+    if context.get("session_hook_control") == "disable":
+        # When the user disabled the stop hook for this session via
+        # `RVF_STOP_HOOK: disable`, suppress the auto fork. Note the dispatch
+        # higher up in main() also catches this; this is a defense-in-depth
+        # check so direct callers of the gate flow get the same answer.
+        ledger.event(
+            phase="gate",
+            event="session_hook_disabled_via_marker",
+            status="skipped",
+            reason_code="session_hook_disabled",
+            repo=context.get("repo"),
+            cwd=context.get("cwd"),
+            session_id=context.get("session_id"),
+        )
+        return skip_payload(
+            "RVF_STOP_HOOK marker disabled the auto fork for this session.",
+            ledger,
+            "session_hook_disabled",
+            repo=context.get("repo"),
+            session_id=context.get("session_id"),
+        )
+    marker_payload = manual_rvf_session_marker_payload(context["event"], ledger)
+    if marker_payload is not None:
+        return marker_payload
+    # Slice 5 TODO: short-circuit when manual_rvf_runs has a recent row whose
+    # scope_hash matches the current allocator candidate set.
+    return None
+
+
+def allocate_auto_review_scope(
+    context: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any] | None:
+    """Producer-side gate. Tracker-disabled fallback delegates to the legacy
+    manifest-based gate. Otherwise runs `allocate_review_scope` and converts
+    the outcome into:
+        * None       — allocator acquired a lease (or dry-run says one would
+                       be acquired); the Stop hook continues to fork.
+        * skip_payload — empty allocator scope or unrecoverable error.
+        * dry_run dict — when `dry_run=True` the dispatcher gets the candidate
+                         metadata without any tracker writes.
+    """
+    repo = context.get("repo")
+    if _tracker_disabled():
+        if dry_run:
+            # The dispatcher dry-run path also predates the tracker — feed it
+            # back through the manifest gate so disable-mode dispatchers see
+            # exactly the same answer they did before Slice 3.
+            return _dispatcher_dry_run_via_legacy(context, ledger)
+        return legacy_session_scope_gate_payload(context["event"], repo, ledger)
+
+    session_id = context.get("session_id")
+    if not session_id:
+        # Without a session id we can't meaningfully bind the allocator.
+        # Fall back to the legacy gate so behavior matches Phase 0/1 for
+        # transcript-less events.
+        if dry_run:
+            return _dispatcher_dry_run_via_legacy(context, ledger)
+        return legacy_session_scope_gate_payload(context["event"], repo, ledger)
+
+    repo_path = Path(repo).expanduser().resolve() if isinstance(repo, str) and repo else None
+    if repo_path is None:
+        return None
+
+    run_id = ledger.run_id if hasattr(ledger, "run_id") else "stop-hook-run"
+    reviewer_id = "stop-hook" if not dry_run else None
+    parent_session_id = context.get("parent_session_id")
+    if parent_session_id == session_id:
+        parent_session_id = None
+    try:
+        result = allocate_review_scope(
+            repo=repo_path,
+            session_id=session_id,
+            run_id=run_id,
+            reviewer_id=reviewer_id,
+            output_scope_path=None,  # Stop-hook stamps via ledger.artifact below.
+            parent_session_id=parent_session_id,
+            holder_kind="reviewer",
+            dry_run=dry_run,
+            # Auto Stop-hook attribution comes from
+            # `refresh_global_diff_tracker` → `build_manifest` →
+            # `register_claims`; auto-claim here would broaden scope past
+            # transcript intent.
+            auto_claim_observed=False,
+        )
+    except Exception as exc:
+        ledger.event(
+            phase="gate",
+            event="allocate_review_scope_failed",
+            status="failed",
+            reason_code="allocator_error",
+            repo=repo,
+            cwd=context.get("cwd"),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        if dry_run:
+            return {"would_proceed": False, "candidate_unit_count": 0, "result": None}
+        return skip_payload(
+            "allocator raised; skipped RVF fork/review.",
+            ledger,
+            "allocator_error",
+            repo=repo,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    status = result.get("status")
+    if status == "allocated":
+        scope_payload = result.get("scope")
+        artifact_path = ledger.artifact("tracker-scope.json", scope_payload) if scope_payload else None
+        # D12: stash the tracker scope meta on the ledger so subsequent hook
+        # payload builders (Slice 6 fork-prompt splice) can pick it up. The
+        # field is a convention; nothing in Slice 3 reads it back yet.
+        if artifact_path is not None:
+            try:
+                meta = getattr(ledger, "tracker_scope_meta", None)
+                if not isinstance(meta, dict):
+                    meta = {}
+                    setattr(ledger, "tracker_scope_meta", meta)
+                meta["tracker_scope_path"] = artifact_path
+                meta["tracker_lease_id"] = result.get("lease_id")
+                meta["tracker_scope_hash"] = result.get("scope_hash")
+            except (AttributeError, TypeError):
+                pass
+        ledger.event(
+            phase="gate",
+            event="tracker_scope_allocated",
+            status="allocated",
+            reason_code=REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
+            reason_code_legacy_alias=LEGACY_REASON_SESSION_OWNED_DIRTY,
+            repo=repo,
+            cwd=context.get("cwd"),
+            session_id=session_id,
+            tracker_scope_path=artifact_path,
+            tracker_lease_id=result.get("lease_id"),
+            tracker_scope_hash=result.get("scope_hash"),
+            tracker_unit_count=len(result.get("scope", {}).get("unit_ids", []) if scope_payload else []),
+        )
+        if dry_run:
+            return {
+                "would_proceed": True,
+                "candidate_unit_count": result.get("candidate_unit_count", 0),
+                "result": result,
+            }
+        return None
+    if status == "dry_run":
+        return {
+            "would_proceed": bool(result.get("would_acquire")),
+            "candidate_unit_count": result.get("candidate_unit_count", 0),
+            "result": result,
+        }
+    if status == "empty":
+        ledger.event(
+            phase="gate",
+            event="session_scope_clean",
+            status="skipped",
+            reason_code=REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+            reason_code_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+            repo=repo,
+            cwd=context.get("cwd"),
+            session_id=session_id,
+            candidate_unit_count=result.get("candidate_unit_count", 0),
+            leased_excluded_count=result.get("leased_excluded_count", 0),
+        )
+        if dry_run:
+            return {
+                "would_proceed": False,
+                "candidate_unit_count": result.get("candidate_unit_count", 0),
+                "result": result,
+            }
+        return skip_payload(
+            "no unassigned review scope",
+            ledger,
+            REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+            # D4: keep legacy `reason=no_session_owned_dirty` substring in the
+            # hook systemMessage for one release so dispatcher / installed-hook
+            # downstream assertions don't all churn at once. The structured
+            # `reason_code` field has already flipped to the new name.
+            detail=f"reason={LEGACY_REASON_NO_SESSION_OWNED_DIRTY}",
+            repo=repo,
+            session_id=session_id,
+            reason_code_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
+            candidate_unit_count=result.get("candidate_unit_count", 0),
+            leased_excluded_count=result.get("leased_excluded_count", 0),
+        )
+    # Other statuses (lock_timeout / error / disabled / unsupported_repo) all
+    # degrade gracefully: the allocator already emitted its own events.jsonl
+    # marker, and we let the Stop hook continue (returning None) so callers
+    # see Phase-0 behavior rather than a hard skip on transient lock issues.
+    if dry_run:
+        return {
+            "would_proceed": False,
+            "candidate_unit_count": result.get("candidate_unit_count", 0),
+            "result": result,
+        }
+    return None
+
+
+def _dispatcher_dry_run_via_legacy(
+    context: dict[str, Any],
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    """Dispatcher dry-run helper for tracker-disabled / session-id-less events.
+    Builds the manifest exactly like the legacy gate and reports whether the
+    legacy `owned_dirty_paths` set is non-empty."""
+    repo = context.get("repo")
+    transcript = context.get("transcript")
+    if not isinstance(repo, str) or not repo or transcript is None:
+        return {"would_proceed": False, "candidate_unit_count": 0, "result": None}
+    try:
+        manifest = build_manifest(Path(repo).expanduser().resolve(), transcript)
+    except Exception:
+        return {"would_proceed": False, "candidate_unit_count": 0, "result": None}
+    owned_dirty = manifest.get("owned_dirty_paths")
+    has_dirty = isinstance(owned_dirty, list) and bool(owned_dirty)
+    return {
+        "would_proceed": has_dirty,
+        "candidate_unit_count": len(owned_dirty) if isinstance(owned_dirty, list) else 0,
+        "result": {"status": "legacy", "manifest": manifest},
+    }
+
+
+def legacy_session_scope_gate_payload(
     event: dict[str, Any],
     repo: str,
     ledger: RunLedger,
 ) -> dict[str, Any] | None:
+    """Phase-0/1 gate body, kept verbatim so `CODEX_RVF_TRACKER_DISABLE=1`
+    users see no behavior change. Reason-code literals stay
+    `no_session_owned_dirty` / `session_owned_dirty` here on purpose."""
     session_paths = event_session_scope_paths(event)
     if not session_paths:
         return None
@@ -3939,6 +4289,43 @@ def session_scope_gate_payload(
         repo=repo,
         unattributed_dirty_paths=manifest.get("unattributed_dirty_paths"),
     )
+
+
+def session_scope_gate_payload(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+) -> dict[str, Any] | None:
+    """Thin orchestrator over the 4 split functions. Preserves the historical
+    contract: returns None to continue, or a hook payload dict to skip."""
+    if _tracker_disabled():
+        return legacy_session_scope_gate_payload(event, repo, ledger)
+    try:
+        context = resolve_stop_context(event, repo, ledger)
+    except _StopContextError as exc:
+        return exc.skip_payload
+    if not context.get("session_paths"):
+        # Match legacy behavior: no transcript-derived paths means no gate.
+        return None
+    refresh_result = refresh_global_diff_tracker(context, ledger)
+    refresh_error = refresh_result.get("error") if isinstance(refresh_result, dict) else None
+    if refresh_error:
+        # 与 legacy_session_scope_gate_payload 的 build_manifest 异常分支一致：
+        # manifest 构建失败时返回 `session_manifest_failed` skip payload，让
+        # Stop hook 显式跳过 fork（fail-loud），避免下游 allocator 看到空的
+        # session_units 后被静默判为 `no_unassigned_review_scope` 干净跳过。
+        return skip_payload(
+            "session manifest failed; skipped RVF fork/review.",
+            ledger,
+            "session_manifest_failed",
+            repo=context.get("repo"),
+            session_id=context.get("session_id"),
+            error=refresh_error,
+        )
+    gated = evaluate_session_gate(context, ledger)
+    if gated is not None:
+        return gated
+    return allocate_auto_review_scope(context, ledger, dry_run=False)
 
 
 def manual_rvf_session_marker_payload(

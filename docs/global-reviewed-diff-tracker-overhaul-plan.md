@@ -363,6 +363,8 @@ python3 scripts/diff_tracker.py allocate-review-scope \
 
 lease 字段已在 schema 中定义。`lease_acquire` 不阻塞、不等待，candidate 为空时直接返回 `acquired=False, reason="no_unassigned_review_scope"`。
 
+> Slice 3 实现注脚：`lease_acquire` / `lease_refresh` / `lease_release` 公共 API 仍保持 `NotImplementedError`；Slice 3 allocator 的 8 步流程直接在自己的 `BEGIN IMMEDIATE` 事务里写 `leases` / `lease_units` / `units.review_state='assigned'`。完整公共 API + reviewer-side heartbeat 落到 Slice 4。
+
 lease 只影响 reviewer scope generation。validate/fix 仍受 `scope.contract.json` 的 `fix_allowlist` / `protected_files` 管理；命令并发仍用 `command_lock.py`。
 
 ## Stop hook gate 重构
@@ -495,7 +497,7 @@ main 在 commit `12c0f6b` 引入 `rvf_logging.RVF_STATE_PHASES` 与 `rvf_state_f
 
 1. **Slice 2-A**：写 SQL DDL + migration runner（Phase 1 JSON → SQLite）；`diff_tracker.py` 内换实现，`register_claims` / `list_conflicts` API 表面不变。配套测试：`test_migration_phase1_json_to_sqlite_idempotent`、`test_canonical_patch_hash_*`。
 2. **Slice 2-B**：`prepare_review_run.py --tracker-scope <json>`；`build_review_packet.py` 优先消费 tracker scope；`scope.contract.json` v2 字段。（已实现：`--tracker-scope <PATH>` splice 进 `manifest.tracker.tracker_scope`；strict-required-tolerant-extras 校验；`SCOPE_CONTRACT_VERSION=2` 顶层加 `primary_units` / `tracker_lease_id` / `tracker_scope_hash` 三字段（不进 `canonical_scope`）；packet 在 `## Session Manifest` 后插 `## Tracker Scope`，`## Allocated Git Diff` 替代 `## Session-Owned Git Diff`，path-limited（hunk-limited 推迟到 Slice 3+）；`review-env.sh` 导出 `RVF_TRACKER_SCOPE`。）
-3. **Slice 3**：`scripts/diff_tracker.py allocate-review-scope` CLI + 8 步流程；Stop hook gate 4 函数拆分；reason code 改名 + alias。
+3. **Slice 3**：`scripts/diff_tracker.py allocate-review-scope` CLI + 8 步流程；Stop hook gate 4 函数拆分；reason code 改名 + alias。（已实现：CLI + 8 步原子流程在单 `BEGIN IMMEDIATE` 中跑完，`tracker-scope.json` / `events.jsonl` 落 post-COMMIT；`session_scope_gate_payload` 拆为 `resolve_stop_context` / `refresh_global_diff_tracker` / `evaluate_session_gate` / `allocate_auto_review_scope`；reason code 改名为 `no_unassigned_review_scope` / `unassigned_review_scope_available`，旧 `no_session_owned_dirty` / `session_owned_dirty` 作为 `reason_code_legacy_alias` 字段并保留 systemMessage 子串一个 release；`CODEX_RVF_TRACKER_DISABLE=1` 走 `legacy_session_scope_gate_payload`，不动旧 reason code；fork 第一次 stop 经 `_takeover_transfer_in_txn` 把 parent owned-and-unleased units 转给 child。dispatcher `should_sync_session_scope` 重写为 allocator dry-run + legacy 回退。lease 公共 API stub（`lease_acquire` / `lease_refresh` / `lease_release`）维持 `NotImplementedError`，留给 Slice 4。auto-flow 把 `tracker_scope_path` / `tracker_lease_id` / `tracker_scope_hash` stash 在 ledger 上（`tracker_scope_meta` 属性约定）；fork 提示词的 `--tracker-scope` 拼接交给 Slice 6。）
 4. **Slice 4**：reviewer lease 集成（`run_alternative_reviewer.py` claude_json + codex_json 两路；Codex-native reviewer 主会话端 heartbeat）。
 5. **Slice 5**：手动 fork takeover 算法 + 双 fork 共享 dirty 测试。
 6. **Slice 6**：reference / prompt 更新；reviewer 从 `scope.contract.json.primary_units` 取 scope；session manifest 退为 evidence-only。

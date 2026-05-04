@@ -844,11 +844,288 @@ def test_session_without_owned_dirty_skips_fork(tmp: Path) -> None:
         state_dir=state,
     )
 
+    # Slice 3 reason-code rename: dispatcher / packet-side assertions still
+    # see the legacy substring (D4 transitional alias) but the structured
+    # reason_code field has flipped to the new name.
+    payload = assert_skip_reason(stdout, "no unassigned review scope")
+    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "no_unassigned_review_scope"
+    assert summary.get("reason_code_legacy_alias") == "no_session_owned_dirty"
+    assert "app_server_requests_path" not in summary
+
+
+def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -> None:
+    """`CODEX_RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
+    for-byte so disable-mode users see no churn during the Slice 3 rename."""
+    dirty = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    state = tmp / "state"
+    write_user_session(
+        transcript,
+        "session-disabled-tracker",
+        "只是查看状态，没有修改文件。",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "dry-run",
+            "CODEX_RVF_TRACKER_DISABLE": "1",
+        },
+        state_dir=state,
+    )
+
     payload = assert_skip_reason(stdout, "no session-owned dirty paths")
     assert "reason=no_session_owned_dirty" in payload["systemMessage"]
     summary = summary_from_payload(payload)
     assert summary["reason_code"] == "no_session_owned_dirty"
-    assert "app_server_requests_path" not in summary
+
+
+def _make_test_ledger(module, state: Path):
+    """Set CODEX_RVF_LOG_ROOT to `state` and return a fresh stop-hook ledger.
+    Caller is responsible for clearing the env when done."""
+    state.mkdir(parents=True, exist_ok=True)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
+    return module.start_run("stop-hook-test", repo=str(state), cwd=str(state))
+
+
+def test_resolve_stop_context_returns_session_branch_worktree(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo(tmp / "dirty", dirty=True)
+    transcript = tmp / "session.jsonl"
+    write_user_session(transcript, "sess-resolve-ctx", "只是查看状态，没有修改文件。")
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state)
+        event = {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        }
+        context = module.resolve_stop_context(event, str(repo), ledger)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+    assert context["repo"] == str(repo)
+    assert context["cwd"] == str(repo)
+    assert context["session_id"] == "sess-resolve-ctx"
+    # `first_readable_session_path` resolves the path; compare resolved.
+    assert context["transcript"] == transcript.resolve()
+    assert context["session_paths"] == [transcript]
+
+
+def test_evaluate_session_gate_suppresses_on_manual_marker(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_user_session(transcript, "sess-marker", "工作完成了。")
+    state = tmp / "state"
+    state_dir_root = tmp / "state-root"
+    state_dir_root.mkdir()
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state_dir_root)
+    try:
+        ledger = _make_test_ledger(module, state)
+        marker_path = module.write_manual_rvf_session_marker(
+            session_id="sess-marker",
+            run_id="manual-run",
+            repo=repo,
+        )
+        assert Path(marker_path).exists()
+        event = {
+            "cwd": str(repo),
+            "transcript_path": str(transcript),
+        }
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        gated = module.evaluate_session_gate(context, ledger)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+    assert gated is not None
+    # systemMessage carries `reason=manual_rvf_already_ran`; summary file holds
+    # the structured `manual_rvf_run_id` field.
+    assert "manual_rvf_already_ran" in gated.get("systemMessage", "")
+
+
+def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path) -> None:
+    """With `CODEX_RVF_TRACKER_DISABLE=1`, the orchestrator must delegate to
+    the verbatim Phase-0 body so legacy `session_owned_dirty` reason codes
+    flow through unchanged."""
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    apply_patch_input = (
+        "*** Begin Patch\n"
+        "*** Update File: changed.txt\n"
+        "@@\n"
+        "-base\n"
+        "+dirty\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": "sess-legacy", "cwd": str(repo)},
+        },
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": apply_patch_input,
+                "call_id": "call_patch",
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_disable = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
+    os.environ["CODEX_RVF_TRACKER_DISABLE"] = "1"
+    try:
+        ledger = _make_test_ledger(module, state)
+        event = {
+            "cwd": str(repo),
+            "transcript_path": str(transcript),
+        }
+        result = module.session_scope_gate_payload(event, str(repo), ledger)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_disable is None:
+            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = old_disable
+    assert result is None  # session-owned dirty → legacy path returns None to continue
+    # Verify the legacy reason code went through the events log.
+    events_path = ledger.events_path
+    raw = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert "session_owned_dirty" in raw
+    assert "no_unassigned_review_scope" not in raw
+
+
+def test_allocate_auto_review_scope_writes_artifact_when_scope_present(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    # Transcript with apply_patch on changed.txt — this is what gives
+    # `register_claims` a session-owned attribution to seed `session_units`.
+    apply_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: changed.txt\n"
+        "@@\n"
+        "-base\n"
+        "+dirty\n"
+        "*** End Patch\n"
+    )
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "sess-alloc", "cwd": str(repo)}}, ensure_ascii=False)
+        + "\n"
+        + json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "apply_patch",
+                    "input": apply_patch,
+                    "call_id": "call_patch",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        # `refresh_global_diff_tracker` seeds session_units via build_manifest.
+        module.refresh_global_diff_tracker(context, ledger)
+        result = module.allocate_auto_review_scope(context, ledger, dry_run=False)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+    # Allocator allocated → returns None (Stop hook continues to fork).
+    assert result is None
+    artifacts_dir = state / "runs" / ledger.run_id / "artifacts"
+    assert (artifacts_dir / "tracker-scope.json").exists()
+    # D12: tracker meta is stashed on the ledger as a convention.
+    meta = getattr(ledger, "tracker_scope_meta", None)
+    assert isinstance(meta, dict)
+    assert "tracker_scope_path" in meta
+    assert meta["tracker_lease_id"] is not None
+    assert meta["tracker_scope_hash"] is not None
+
+
+def test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails(
+    tmp: Path,
+) -> None:
+    """`refresh_global_diff_tracker` 在 `build_manifest` 抛错时返回带 `error`
+    字段的 sentinel，而不再静默吞错；orchestrator 必须把它转成
+    `session_manifest_failed` skip payload，与 legacy 路径行为一致。否则
+    allocator 会看到空 session_units 并把 manifest 失败误判为
+    `no_unassigned_review_scope` 干净跳过。"""
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_user_session(transcript, "sess-manifest-fail", "做了一些改动。")
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_build_manifest = module.build_manifest
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("boom: synthetic build_manifest failure")
+
+    try:
+        module.build_manifest = _raise  # type: ignore[assignment]
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        result = module.session_scope_gate_payload(event, str(repo), ledger)
+    finally:
+        module.build_manifest = original_build_manifest  # type: ignore[assignment]
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+    # orchestrator 必须返回 skip payload（不是 None，也不是
+    # no_unassigned_review_scope skip）。
+    assert result is not None
+    system_message = result.get("systemMessage", "")
+    assert "reason=session_manifest_failed" in system_message
+    assert "no_unassigned_review_scope" not in system_message
+    assert "no_session_owned_dirty" not in system_message
+    # ledger 仍然 emit 了 `tracker_refresh_failed`，没有重复 log。
+    events_path = ledger.events_path
+    raw = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    assert "tracker_refresh_failed" in raw
+    assert "session_manifest_failed" in raw
 
 
 def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp: Path) -> None:
@@ -3784,6 +4061,12 @@ def main() -> int:
         test_prior_cline_kanban_task_marker_skips_after_later_user_message,
         test_kanban_task_suppression_marker_skips_without_prompt_marker,
         test_session_without_owned_dirty_skips_fork,
+        test_session_without_owned_dirty_legacy_disable_keeps_old_codes,
+        test_resolve_stop_context_returns_session_branch_worktree,
+        test_evaluate_session_gate_suppresses_on_manual_marker,
+        test_legacy_session_scope_gate_payload_used_when_tracker_disabled,
+        test_allocate_auto_review_scope_writes_artifact_when_scope_present,
+        test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
         test_manual_rvf_session_marker_write_read_clear_preserves_hook_state,
