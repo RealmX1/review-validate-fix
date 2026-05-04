@@ -14,6 +14,16 @@
 }
 
 只做确定性蒸馏（无 LLM），为后续 `/rvf-analyze` 复盘 agent 提供基础。
+
+Host 耦合说明:
+- ``distill_codex_jsonl`` / ``_distill_codex_record`` / ``_codex_parse_apply_patch_fallback``
+  / ``_patch_lines_for_op`` / ``_patch_op_name`` 全部专门解析 **Codex** rollout
+  schema (``event_msg`` / ``response_item.function_call`` / ``apply_patch``
+  custom-format patch 等)。
+- ``distill_reviewer_stream`` 解析 Claude Code stream-json (Claude Code 子进程
+  reviewer 的 stdout NDJSON)，与上面的 Codex 主轨迹解析无关。
+- 未来若要让 RVF 主流程跑在 Claude Code host 上，应平行实现
+  ``distill_claude_jsonl`` / ``_distill_claude_record`` 等而不是扩展 Codex 函数。
 """
 
 from __future__ import annotations
@@ -204,7 +214,7 @@ def _distill_codex_record(
                     if repo is not None:
                         ops, _ = parse_apply_patch(repo, patch_text, line_number)
                     else:
-                        ops, _ = _parse_apply_patch_fallback(patch_text, line_number)
+                        ops, _ = _codex_parse_apply_patch_fallback(patch_text, line_number)
                     for op in ops:
                         artifact_refs.append(
                             {
@@ -274,8 +284,11 @@ def _distill_codex_record(
     return None
 
 
-def _parse_apply_patch_fallback(patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
-    """Repo-less patch parser; mirrors session_manifest.parse_apply_patch shape but skips path normalization."""
+def _codex_parse_apply_patch_fallback(patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
+    """Repo-less Codex apply_patch parser; mirrors session_manifest.parse_apply_patch
+    shape but skips path normalization. Codex-specific patch text format
+    (``*** Add File: ...`` / ``*** Update File: ...``).
+    """
     operations: list[dict[str, Any]] = []
     paths: set[str] = set()
     for raw_line in patch_text.splitlines():

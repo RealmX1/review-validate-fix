@@ -18,6 +18,21 @@
     ├── trajectory.jsonl              # 蒸馏后统一 schema
     ├── trajectory.index.json         # 反向索引
     └── reviewers/<id>/{trajectory.jsonl, trajectory.manifest.json}
+
+Host 耦合说明:
+本模块当前只支持 **Codex** rollout JSONL 作为 transcript 输入。下列函数
+显式或隐式依赖 Codex schema（``event_msg.user_message`` / ``response_item.message``
+等 record type）：
+
+- ``_codex_user_message_text``（私有 helper）
+- ``find_rvf_start_in_jsonl``（透过上述 helper 解析 user message）
+- ``capture_run``（在 same-session 分支里写出 ``rollout.codex.jsonl``，
+  通过 ``trajectory_distill.distill_codex_jsonl`` 蒸馏 Codex schema）
+
+未来若要支持 Claude Code transcript（``~/.claude/projects/<proj>/<sid>.jsonl``，
+schema 是 ``type: user|assistant|tool_use|tool_result`` 的不同 NDJSON），
+应当并行实现 ``_claude_user_message_text`` + ``find_rvf_start_in_claude_jsonl``，
+并在 ``capture_run`` 入口按 transcript 探测分派；不要原地扩展现有 Codex 解析器。
 """
 
 from __future__ import annotations
@@ -99,7 +114,14 @@ def _iter_jsonl_with_offsets(path: Path):
         line_index += 1
 
 
-def _record_user_message_text(record: dict[str, Any]) -> str | None:
+def _codex_user_message_text(record: dict[str, Any]) -> str | None:
+    """从一条 Codex rollout JSONL record 中抽出 user message 文本。
+
+    专门解析 Codex schema (``event_msg.user_message`` 或
+    ``response_item.message[role=user]``)。其他 host（如 Claude Code）的
+    transcript schema 不同，需要写 ``_claude_user_message_text`` 平行实现，
+    不要扩展本函数的 record type 分支。
+    """
     if record.get("type") == "event_msg":
         payload = record.get("payload")
         if isinstance(payload, dict) and payload.get("type") == "user_message":
@@ -137,13 +159,17 @@ def find_rvf_start_in_jsonl(
     ``record["timestamp"] >= since_timestamp`` 的 marker 行。用于同会话连续两次 RVF
     的场景——第二次 finalize 不应把第一次的 marker 当 cut。本仓库 timestamp
     统一带 ``Z`` 后缀的 UTC ISO8601，字典序即时间序，无需 datetime 解析。
+
+    Host 耦合：此函数透过 ``_codex_user_message_text`` 解析 user message，
+    只识别 Codex rollout schema。若未来要支持 Claude Code transcript，
+    应当新增 ``find_rvf_start_in_claude_jsonl`` 平行实现而非在此扩展。
     """
     last_index = -1
     for line_index, byte_start, _byte_end, record in _iter_jsonl_with_offsets(path):
         last_index = line_index
         if record is None:
             continue
-        text = _record_user_message_text(record)
+        text = _codex_user_message_text(record)
         if not text:
             continue
         matched = next((marker for marker in markers if marker in text), None)
