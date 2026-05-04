@@ -71,9 +71,12 @@ def _make_run(tmp_path: Path, repo: Path, transcript: Path) -> Path:
     return run_dir
 
 
-def _write_transcript(path: Path, marker: str) -> None:
+def _write_transcript(path: Path, marker: str, *, originator: str | None = "Codex Desktop") -> None:
+    session_meta_payload: dict = {"id": "S"}
+    if originator is not None:
+        session_meta_payload["originator"] = originator
     records = [
-        {"timestamp": "t0", "type": "session_meta", "payload": {"id": "S"}},
+        {"timestamp": "t0", "type": "session_meta", "payload": session_meta_payload},
         {
             "timestamp": "t1",
             "type": "event_msg",
@@ -98,6 +101,8 @@ def test_finalize_run_writes_trajectory_and_diff_and_is_idempotent(tmp_path: Pat
 
     record1 = finalize.finalize_run(run_dir=run_dir, event=event, decision_kind="test")
     assert record1["trajectory"]["pre_rvf_source_kind"] == "same-session-slice"
+    assert record1["trajectory"]["host"] == "codex"
+    assert record1["trajectory"]["host_originator"] == "Codex Desktop"
     assert record1["workspace_diff"]["status"] == "complete"
     lock = run_dir / "artifacts" / ".finalize.lock"
     assert lock.exists()

@@ -204,6 +204,43 @@ def test_distill_reasoning_redacts_encrypted_blob(tmp_path: Path) -> None:
     assert "encrypted" in distilled[0]["summary"]
 
 
+def test_host_kind_constant_is_codex() -> None:
+    distill = _load("trajectory_distill")
+    assert distill.HOST_KIND == "codex"
+
+
+def test_read_codex_originator_returns_value_from_session_meta(tmp_path: Path) -> None:
+    distill = _load("trajectory_distill")
+    rollout = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        rollout,
+        [
+            {
+                "timestamp": "t0",
+                "type": "session_meta",
+                "payload": {"id": "s", "originator": "Codex Desktop"},
+            },
+            {"timestamp": "t1", "type": "event_msg", "payload": {"type": "task_started"}},
+        ],
+    )
+    assert distill.read_codex_originator(rollout) == "Codex Desktop"
+
+
+def test_read_codex_originator_none_when_field_missing(tmp_path: Path) -> None:
+    distill = _load("trajectory_distill")
+    rollout = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        rollout,
+        [{"timestamp": "t0", "type": "session_meta", "payload": {"id": "s"}}],
+    )
+    assert distill.read_codex_originator(rollout) is None
+
+
+def test_read_codex_originator_none_when_file_missing(tmp_path: Path) -> None:
+    distill = _load("trajectory_distill")
+    assert distill.read_codex_originator(tmp_path / "nope.jsonl") is None
+
+
 def test_distill_reviewer_stream(tmp_path: Path) -> None:
     distill = _load("trajectory_distill")
     stdout = tmp_path / "reviewer.stdout.txt"

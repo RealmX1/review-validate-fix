@@ -57,8 +57,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from subagent_capture import capture_all_subagents  # noqa: E402
 from trajectory_distill import (  # noqa: E402
+    HOST_KIND,
     distill_codex_jsonl,
     distill_reviewer_stream,
+    read_codex_originator,
     write_jsonl,
 )
 
@@ -76,6 +78,16 @@ DEFAULT_MARKERS = (RVF_FORK_MARKER, KANBAN_FOLLOWUP_MARKER, *RVF_PROMPT_MARKERS)
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _host_meta(src: Path | None) -> dict[str, Any]:
+    """构造 ``{host, host_originator}``：host 始终为 ``HOST_KIND="codex"``；
+    ``host_originator`` 来自 rollout 首个 ``session_meta.payload.originator``，
+    缺失或 src 不可读时为 None。注入所有 manifest 与 summary 顶层。"""
+    originator: str | None = None
+    if src is not None and src.exists():
+        originator = read_codex_originator(src)
+    return {"host": HOST_KIND, "host_originator": originator}
 
 
 def _sha256_file(path: Path) -> str:
@@ -234,10 +246,12 @@ def _write_pre_slice(
     """同会话切片：写出 src 的 [0, cut.byte_offset) 字节到 dst_jsonl。"""
     dst_jsonl.parent.mkdir(parents=True, exist_ok=True)
     src_size = src.stat().st_size
+    host_meta = _host_meta(src)
     if src_size > LARGE_FILE_BYTES:
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "status": "too_large_pointer_only",
+            **host_meta,
             "source_kind": source_kind,
             "source_path": str(src),
             "source_size_bytes": src_size,
@@ -259,6 +273,7 @@ def _write_pre_slice(
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
+        **host_meta,
         "source_kind": source_kind,
         "source_path": str(src),
         "source_size_bytes": src_size,
@@ -292,10 +307,12 @@ def _write_full_copy(
     extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     dst_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    host_meta = _host_meta(src)
     if not src.exists():
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "status": "source_unavailable",
+            **host_meta,
             "source_kind": source_kind,
             "source_path": str(src),
             "source_session_id": source_session_id,
@@ -314,6 +331,7 @@ def _write_full_copy(
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "status": "too_large_pointer_only",
+            **host_meta,
             "source_kind": source_kind,
             "source_path": str(src),
             "source_size_bytes": src_size,
@@ -332,6 +350,7 @@ def _write_full_copy(
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
+        **host_meta,
         "source_kind": source_kind,
         "source_path": str(src),
         "source_size_bytes": src_size,
@@ -361,10 +380,12 @@ def _write_post_slice(
     dst_jsonl.parent.mkdir(parents=True, exist_ok=True)
     src_size = src.stat().st_size
     src_sha = _sha256_file(src)
+    host_meta = _host_meta(src)
     if src_size > LARGE_FILE_BYTES:
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "status": "too_large_pointer_only",
+            **host_meta,
             "source_kind": "same-session-slice",
             "source_path": str(src),
             "source_size_bytes": src_size,
@@ -385,6 +406,7 @@ def _write_post_slice(
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "status": "ok",
+        **host_meta,
         "source_kind": "same-session-slice",
         "source_path": str(src),
         "source_size_bytes": src_size,
@@ -510,6 +532,7 @@ def capture_run(
             post_manifest = {
                 "schema_version": SCHEMA_VERSION,
                 "status": "rollout_unavailable",
+                **_host_meta(None),
                 "source_kind": post_kind,
                 "source_session_id": event_session_id,
                 "generated_at": _utc_now(),
@@ -562,6 +585,7 @@ def capture_run(
                 pre_manifest = {
                     "schema_version": SCHEMA_VERSION,
                     "status": "no_marker_found",
+                    **_host_meta(current_transcript),
                     "source_kind": pre_kind,
                     "source_path": str(current_transcript),
                     "source_session_id": event_session_id,
@@ -583,6 +607,7 @@ def capture_run(
             pre_manifest = {
                 "schema_version": SCHEMA_VERSION,
                 "status": "rollout_unavailable",
+                **_host_meta(None),
                 "source_kind": "none",
                 "generated_at": _utc_now(),
             }
@@ -593,6 +618,7 @@ def capture_run(
             post_manifest = {
                 "schema_version": SCHEMA_VERSION,
                 "status": "rollout_unavailable",
+                **_host_meta(None),
                 "source_kind": "none",
                 "generated_at": _utc_now(),
             }
@@ -634,8 +660,22 @@ def capture_run(
             repo=repo,
         )
 
+    # Summary-level host: 始终为 codex（本捕获栈唯一支持的 orchestrator）。
+    # host_originator 优先取 post rollout（即 RVF 自身轨迹）；同会话 slice 与
+    # forked-target 都会写出 rvf/rollout.codex.jsonl，可直接读取；缺失时退到
+    # post_manifest.host_originator / pre_manifest.host_originator。
+    rvf_rollout_for_host = rvf_dir / "rollout.codex.jsonl"
+    summary_host_meta = _host_meta(rvf_rollout_for_host if rvf_rollout_for_host.exists() else None)
+    if summary_host_meta.get("host_originator") is None:
+        for candidate in (post_manifest, pre_manifest):
+            originator = candidate.get("host_originator") if isinstance(candidate, dict) else None
+            if isinstance(originator, str) and originator:
+                summary_host_meta["host_originator"] = originator
+                break
+
     summary = {
         "schema_version": SCHEMA_VERSION,
+        **summary_host_meta,
         "trajectory_dir": str(out_dir),
         "pre_rvf_source_kind": pre_kind,
         "post_rvf_source_kind": post_kind,

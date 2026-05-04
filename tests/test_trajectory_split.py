@@ -253,6 +253,73 @@ def test_capture_run_same_session_picks_run_specific_marker(tmp_path: Path) -> N
     assert pre_bytes + post_bytes == transcript.read_bytes()
 
 
+def test_capture_run_summary_and_manifests_carry_host_fields(tmp_path: Path) -> None:
+    """同会话切片场景下 summary 与 pre/post manifest 都应写入 host=codex 与 originator。"""
+    capture = _load("trajectory_capture")
+    transcript = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {
+                "timestamp": "t0",
+                "type": "session_meta",
+                "payload": {"id": "S", "originator": "Codex Desktop"},
+            },
+            _user_event("intro"),
+            _user_event(f"start {capture.RVF_FORK_MARKER}"),
+            _agent_message("running"),
+        ],
+    )
+    run_dir = tmp_path / "rvf-run"
+    (run_dir / "artifacts").mkdir(parents=True)
+    summary = capture.capture_run(
+        run_dir=run_dir,
+        event={"transcript_path": str(transcript), "session_id": "S"},
+    )
+    assert summary["host"] == "codex"
+    assert summary["host_originator"] == "Codex Desktop"
+
+    pre_manifest = json.loads(
+        (run_dir / "artifacts" / "trajectory" / "pre-rvf" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    post_manifest = json.loads(
+        (
+            run_dir
+            / "artifacts"
+            / "trajectory"
+            / "rvf"
+            / "rollout.codex.manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert pre_manifest["host"] == "codex"
+    assert pre_manifest["host_originator"] == "Codex Desktop"
+    assert post_manifest["host"] == "codex"
+    assert post_manifest["host_originator"] == "Codex Desktop"
+
+
+def test_capture_run_summary_host_when_originator_missing(tmp_path: Path) -> None:
+    """没有 originator 的 rollout：host=codex 但 host_originator=None。"""
+    capture = _load("trajectory_capture")
+    transcript = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {"timestamp": "t0", "type": "session_meta", "payload": {"id": "S"}},
+            _user_event(f"go {capture.RVF_FORK_MARKER}"),
+        ],
+    )
+    run_dir = tmp_path / "rvf-run"
+    (run_dir / "artifacts").mkdir(parents=True)
+    summary = capture.capture_run(
+        run_dir=run_dir,
+        event={"transcript_path": str(transcript), "session_id": "S"},
+    )
+    assert summary["host"] == "codex"
+    assert summary["host_originator"] is None
+
+
 def test_capture_run_no_marker_falls_back_to_full_post(tmp_path: Path) -> None:
     capture = _load("trajectory_capture")
     transcript = tmp_path / "rollout.jsonl"

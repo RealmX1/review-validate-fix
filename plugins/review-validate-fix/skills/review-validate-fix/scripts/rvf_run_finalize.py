@@ -129,6 +129,8 @@ def finalize_run(
     try:
         traj_summary = capture_run(run_dir=run_dir, event=event or {}, repo=repo)
         finalize_record["trajectory"] = {
+            "host": traj_summary.get("host"),
+            "host_originator": traj_summary.get("host_originator"),
             "trajectory_dir": traj_summary.get("trajectory_dir"),
             "pre_rvf_source_kind": traj_summary.get("pre_rvf_source_kind"),
             "post_rvf_source_kind": traj_summary.get("post_rvf_source_kind"),

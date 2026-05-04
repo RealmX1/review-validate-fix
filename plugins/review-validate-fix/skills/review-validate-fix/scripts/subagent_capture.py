@@ -39,7 +39,12 @@ from typing import Any, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trajectory_distill import distill_codex_jsonl, write_jsonl  # noqa: E402
+from trajectory_distill import (  # noqa: E402
+    HOST_KIND,
+    distill_codex_jsonl,
+    read_codex_originator,
+    write_jsonl,
+)
 
 SCHEMA_VERSION = 1
 LARGE_FILE_BYTES = 200 * 1024 * 1024  # 200 MB; pointer-only 上界，与 trajectory_capture 同
@@ -180,10 +185,16 @@ def _write_manifest(
     spawn: SpawnRecord,
     status: str,
     extra: dict[str, Any],
+    host_originator: str | None = None,
 ) -> dict[str, Any]:
+    """Subagent manifest 的统一 writer。``host`` 始终为 ``HOST_KIND="codex"``
+    （Codex spawn_agent 派生的子代理也是 Codex rollout schema）；
+    ``host_originator`` 来自子代理 rollout 的 session_meta，缺失时为 None。"""
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
+        "host": HOST_KIND,
+        "host_originator": host_originator,
         "spawn": _spawn_meta(spawn),
         "generated_at": _utc_now(),
     }
@@ -219,10 +230,12 @@ def capture_subagent(
             spawn=spawn,
             status="rollout_unavailable",
             extra={"source_path": None},
+            host_originator=None,
         )
 
     src_size = src.stat().st_size
     src_sha = _sha256_file(src)
+    src_originator = read_codex_originator(src)
 
     if src_size > LARGE_FILE_BYTES:
         return _write_manifest(
@@ -234,6 +247,7 @@ def capture_subagent(
                 "source_size_bytes": src_size,
                 "source_sha256": src_sha,
             },
+            host_originator=src_originator,
         )
 
     shutil.copyfile(src, dst_rollout)
@@ -275,6 +289,7 @@ def capture_subagent(
             "distill_error": distill_error,
             "distill_index": distill_index,
         },
+        host_originator=src_originator,
     )
 
 

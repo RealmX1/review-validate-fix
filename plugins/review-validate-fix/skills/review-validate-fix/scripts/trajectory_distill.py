@@ -45,6 +45,48 @@ from session_manifest import parse_apply_patch  # noqa: E402
 SCHEMA_VERSION = 1
 SUMMARY_MAX_BYTES = 2048
 
+HOST_KIND = "codex"
+"""单一 host kind 常量。整个 RVF 数据捕获栈当前只支持 Codex transcript schema；
+此常量被 trajectory_capture / subagent_capture / rvf_run_finalize 写进 manifest 与
+summary.json 的 ``host`` 字段，让事后分析者无需再从文件名 / 函数名等隐式信号推断
+host 来源。未来若要支持 Claude Code，应当在引入 ``_claude_*`` 平行解析器的同时
+新增独立的 host kind 常量并按 transcript 探测分派。"""
+
+
+def read_codex_originator(rollout_path: Path) -> str | None:
+    """从 rollout JSONL 首个 ``session_meta`` record 读 ``originator`` 字段。
+
+    Codex CLI / Codex Desktop 在 rollout 起始 session_meta 中写入 ``originator``
+    字符串（例如 ``"Codex Desktop"`` / ``"codex_cli_rs"`` 等）。我们把这个值
+    promote 到 manifest 的 ``host_originator`` 字段，作为 host kind 之外的更
+    细粒度信号。读取失败 / 字段缺失返回 None，不抛异常。
+    """
+    if not rollout_path.exists():
+        return None
+    try:
+        with rollout_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                if isinstance(payload, dict):
+                    originator = payload.get("originator")
+                    if isinstance(originator, str) and originator:
+                        return originator
+                return None
+    except OSError:
+        return None
+    return None
+
 
 def _truncate(text: str, limit: int = SUMMARY_MAX_BYTES) -> str:
     encoded = text.encode("utf-8")

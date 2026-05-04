@@ -202,6 +202,8 @@ def test_capture_subagent_writes_rollout_manifest_and_distill(tmp_path: Path) ->
     manifest = mod.capture_subagent(spawn, dst_dir=dst_dir, sessions_root=sessions_root)
 
     assert manifest["status"] == "ok"
+    assert manifest["host"] == "codex"
+    assert manifest["host_originator"] is None  # 测试 rollout 未带 originator
     assert manifest["spawn"]["agent_id"] == "agent-bbb-2222"
     assert manifest["spawn"]["role"] == "worker"
     assert manifest["distill_status"] == "ok"
@@ -243,10 +245,44 @@ def test_capture_subagent_missing_rollout_writes_pointer_only(tmp_path: Path) ->
     dst_dir = tmp_path / "out" / "agent-missing"
     manifest = mod.capture_subagent(spawn, dst_dir=dst_dir, sessions_root=sessions_root)
     assert manifest["status"] == "rollout_unavailable"
+    assert manifest["host"] == "codex"
+    assert manifest["host_originator"] is None
     assert (dst_dir / "manifest.json").is_file()
     # No rollout file written when source missing.
     assert not (dst_dir / "rollout.codex.jsonl").exists()
     assert not (dst_dir / "trajectory.jsonl").exists()
+
+
+def test_capture_subagent_propagates_originator_from_rollout(tmp_path: Path) -> None:
+    mod = _load("subagent_capture")
+    sessions_root = tmp_path / "sessions"
+    day_dir = sessions_root / "2026" / "05" / "04"
+    day_dir.mkdir(parents=True)
+    rollout = day_dir / "rollout-2026-05-04T18-25-21-agent-orig-1.jsonl"
+    _write_jsonl(
+        rollout,
+        [
+            {
+                "timestamp": "s0",
+                "type": "session_meta",
+                "payload": {"id": "agent-orig-1", "originator": "codex_cli_rs"},
+            }
+        ],
+    )
+    spawn = mod.SpawnRecord(
+        call_id="c",
+        agent_id="agent-orig-1",
+        role="worker",
+        nickname=None,
+        prompt=None,
+        ts="t",
+        line_index=0,
+    )
+    dst_dir = tmp_path / "out" / "agent-orig-1"
+    manifest = mod.capture_subagent(spawn, dst_dir=dst_dir, sessions_root=sessions_root)
+    assert manifest["status"] == "ok"
+    assert manifest["host"] == "codex"
+    assert manifest["host_originator"] == "codex_cli_rs"
 
 
 def test_capture_all_subagents_writes_one_dir_per_spawn(tmp_path: Path) -> None:
