@@ -39,6 +39,15 @@ ANALYSIS_DIR_NAME = "analysis"
 
 
 @dataclass(frozen=True)
+class SubagentInput:
+    """单个 spawn_agent 子代理已捕获的产物路径与 spawn metadata。"""
+
+    agent_id: str
+    trajectory_jsonl: Path | None
+    manifest: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class AnalysisInputs:
     """已发现的分析输入路径集合。缺失文件对应字段为 ``None`` / 空列表。"""
 
@@ -53,6 +62,7 @@ class AnalysisInputs:
     pre_rvf_dir: Path | None
     reviewer_results: list[Path] = field(default_factory=list)
     reviewer_trajectories: list[Path] = field(default_factory=list)
+    subagents: list[SubagentInput] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -67,7 +77,9 @@ class ScaffoldStats:
     post_rvf_source_kind: str | None
     trajectory_record_count: int
     trajectory_kind_counts: dict[str, int]
-    patch_event_count: int
+    patch_event_count: int  # 主 rollout 内 apply_patch 数
+    subagent_count: int
+    subagent_patch_event_count: int  # 所有 subagent rollouts 内 apply_patch 数合计
     reviewer_count: int
     reviewer_issue_counts: dict[str, int]
     workspace_changed_path_count: int
@@ -182,6 +194,25 @@ def discover_inputs(run_dir: Path) -> AnalysisInputs:
             if traj.is_file():
                 reviewer_trajectories.append(traj)
 
+    subagents: list[SubagentInput] = []
+    subagents_dir = rvf_traj_dir / "subagents"
+    if subagents_dir.is_dir():
+        for entry in sorted(subagents_dir.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir():
+                continue
+            manifest_path = entry / "manifest.json"
+            manifest_payload = _safe_load_json(manifest_path)
+            if not isinstance(manifest_payload, dict):
+                manifest_payload = {}
+            traj_path = entry / "trajectory.jsonl"
+            subagents.append(
+                SubagentInput(
+                    agent_id=entry.name,
+                    trajectory_jsonl=traj_path if traj_path.is_file() else None,
+                    manifest=manifest_payload,
+                )
+            )
+
     return AnalysisInputs(
         run_dir=run_dir,
         summary_json=summary_json if summary_json.is_file() else None,
@@ -200,6 +231,7 @@ def discover_inputs(run_dir: Path) -> AnalysisInputs:
         pre_rvf_dir=pre_rvf_dir if pre_manifest.is_file() else None,
         reviewer_results=reviewer_results,
         reviewer_trajectories=reviewer_trajectories,
+        subagents=subagents,
     )
 
 
@@ -319,6 +351,19 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
 
     record_count, kind_counts, patch_event_count = _count_trajectory(inputs)
 
+    subagent_patch_event_count = 0
+    for subagent in inputs.subagents:
+        if subagent.trajectory_jsonl is None:
+            continue
+        for record in _iter_jsonl(subagent.trajectory_jsonl):
+            if record.get("kind") != "tool_call":
+                continue
+            if record.get("tool") != "apply_patch":
+                continue
+            refs = record.get("artifact_refs")
+            if isinstance(refs, list) and refs:
+                subagent_patch_event_count += 1
+
     reviewer_issue_counts: dict[str, int] = {}
     for result_path in inputs.reviewer_results:
         rid = _reviewer_id_from_result_path(result_path)
@@ -363,6 +408,8 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
         trajectory_record_count=record_count,
         trajectory_kind_counts=dict(kind_counts),
         patch_event_count=patch_event_count,
+        subagent_count=len(inputs.subagents),
+        subagent_patch_event_count=subagent_patch_event_count,
         reviewer_count=len(inputs.reviewer_results),
         reviewer_issue_counts=reviewer_issue_counts,
         workspace_changed_path_count=changed_path_count,
@@ -449,7 +496,24 @@ def scaffold_summary_md(
     lines.append(
         f"- 各 kind 计数: {_format_kind_counts(stats.trajectory_kind_counts)}"
     )
-    lines.append(f"- apply_patch 事件: `{stats.patch_event_count}`")
+    lines.append(f"- apply_patch 事件（主 rollout）: `{stats.patch_event_count}`")
+    lines.append(
+        f"- spawn_agent 子代理: `{stats.subagent_count}`；"
+        f"子代理 apply_patch 合计: `{stats.subagent_patch_event_count}`"
+    )
+    if inputs.subagents:
+        lines.append("- 子代理 trajectory:")
+        for subagent in inputs.subagents:
+            spawn = subagent.manifest.get("spawn") if isinstance(subagent.manifest, dict) else None
+            if isinstance(spawn, dict):
+                role = spawn.get("role") or "-"
+                nickname = spawn.get("nickname") or "-"
+            else:
+                role = nickname = "-"
+            traj_label = _rel_or_abs(subagent.trajectory_jsonl, run_dir)
+            lines.append(
+                f"  - `{subagent.agent_id}` (role=`{role}`, nickname=`{nickname}`) → `{traj_label}`"
+            )
     lines.append("")
     lines.append(_todo("梳理 RVF 自身 agent 的关键阶段（review/validate/fix/handoff）和 patch 时间线"))
     lines.append("")
@@ -564,11 +628,20 @@ def _collect_issues(inputs: AnalysisInputs) -> list[dict[str, Any]]:
     return out
 
 
-def _collect_patches(inputs: AnalysisInputs) -> list[dict[str, Any]]:
-    if inputs.trajectory_jsonl is None:
-        return []
+def _patches_from_trajectory(
+    traj_path: Path,
+    *,
+    source_agent_id: str | None,
+) -> list[dict[str, Any]]:
+    """从一份蒸馏 trajectory.jsonl 中抽出 ``apply_patch`` tool_calls。
+
+    ``source_agent_id`` = ``None`` 表示主 RVF rollout；非空表示某个 spawn_agent
+    子代理的 rollout（reviewer / validate-fix 等）。每条 patch 都标 source 字段，
+    后续 LLM agent 才能区分 "造成 bug 的 main-agent patch" vs "修 bug 的
+    validate-fix subagent patch"。
+    """
     out: list[dict[str, Any]] = []
-    for record in _iter_jsonl(inputs.trajectory_jsonl):
+    for record in _iter_jsonl(traj_path):
         if record.get("kind") != "tool_call":
             continue
         if record.get("tool") != "apply_patch":
@@ -600,8 +673,25 @@ def _collect_patches(inputs: AnalysisInputs) -> list[dict[str, Any]]:
                 "tool": "apply_patch",
                 "artifact_refs": clean_refs,
                 "trajectory_line": line_no,
+                "source_agent_id": source_agent_id,
             }
         )
+    return out
+
+
+def _collect_patches(inputs: AnalysisInputs) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if inputs.trajectory_jsonl is not None:
+        out.extend(_patches_from_trajectory(inputs.trajectory_jsonl, source_agent_id=None))
+    for subagent in inputs.subagents:
+        if subagent.trajectory_jsonl is None:
+            continue
+        out.extend(
+            _patches_from_trajectory(
+                subagent.trajectory_jsonl, source_agent_id=subagent.agent_id
+            )
+        )
+    out.sort(key=lambda item: (item.get("ts") or "", item.get("source_agent_id") or ""))
     return out
 
 
@@ -649,6 +739,8 @@ def scaffold_run(run_dir: Path) -> dict[str, Any]:
             "trajectory_record_count": stats.trajectory_record_count,
             "trajectory_kind_counts": dict(stats.trajectory_kind_counts),
             "patch_event_count": stats.patch_event_count,
+            "subagent_count": stats.subagent_count,
+            "subagent_patch_event_count": stats.subagent_patch_event_count,
             "reviewer_count": stats.reviewer_count,
             "reviewer_issue_counts": dict(stats.reviewer_issue_counts),
             "workspace_changed_path_count": stats.workspace_changed_path_count,

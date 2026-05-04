@@ -17,7 +17,13 @@
     ├── rollout.codex.manifest.json
     ├── trajectory.jsonl              # 蒸馏后统一 schema
     ├── trajectory.index.json         # 反向索引
-    └── reviewers/<id>/{trajectory.jsonl, trajectory.manifest.json}
+    ├── reviewers/<id>/{trajectory.jsonl, trajectory.manifest.json}
+    └── subagents/<agent_id>/{rollout.codex.jsonl, trajectory.jsonl,
+                              trajectory.index.json, manifest.json}
+                                       # spawn_agent 子代理（reviewer / validate-fix
+                                       # 等）独立 rollout 拷贝 + 蒸馏；spawn metadata
+                                       # （role / nickname / prompt / call_id）写在
+                                       # manifest.json::spawn 下。
 
 Host 耦合说明:
 本模块当前只支持 **Codex** rollout JSONL 作为 transcript 输入。下列函数
@@ -49,6 +55,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from subagent_capture import capture_all_subagents  # noqa: E402
 from trajectory_distill import (  # noqa: E402
     distill_codex_jsonl,
     distill_reviewer_stream,
@@ -616,6 +623,17 @@ def capture_run(
 
     reviewer_summaries = _capture_reviewers(artifacts_dir=artifacts_dir, out_dir=rvf_dir)
 
+    # 抓取 spawn_agent 子代理 rollouts。reviewer / validate-fix 子代理走 Codex
+    # 内置 spawn_agent，独立 session_id；它们的 apply_patch 不会出现在主 rollout，
+    # 必须从 ~/.codex/sessions/ 拉回来才能让 causality.json 看到真正的 fix patch。
+    subagent_manifests: list[dict[str, Any]] = []
+    if rvf_rollout.exists():
+        subagent_manifests = capture_all_subagents(
+            main_rollout_path=rvf_rollout,
+            dst_root=rvf_dir / "subagents",
+            repo=repo,
+        )
+
     summary = {
         "schema_version": SCHEMA_VERSION,
         "trajectory_dir": str(out_dir),
@@ -625,6 +643,7 @@ def capture_run(
         "post_manifest": post_manifest,
         "distill_index": distill_index,
         "reviewers": reviewer_summaries,
+        "subagents": subagent_manifests,
         "generated_at": _utc_now(),
     }
     (out_dir / "summary.json").write_text(

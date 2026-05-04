@@ -372,6 +372,128 @@ def test_gather_stats_per_reviewer_issue_counts(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# subagent integration
+# --------------------------------------------------------------------------- #
+
+
+def _add_subagent(
+    run_dir: Path,
+    *,
+    agent_id: str,
+    role: str,
+    nickname: str,
+    patch_records: list[dict[str, Any]] | None = None,
+) -> None:
+    """Drop a captured subagent layout into the run's trajectory tree."""
+    sub_dir = run_dir / "artifacts" / "trajectory" / "rvf" / "subagents" / agent_id
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        sub_dir / "manifest.json",
+        {
+            "schema_version": 1,
+            "status": "ok",
+            "spawn": {
+                "agent_id": agent_id,
+                "spawn_call_id": f"call_spawn_{agent_id}",
+                "role": role,
+                "nickname": nickname,
+                "spawned_at": "2026-05-04T01:02:00Z",
+                "main_rollout_line_index": 7,
+                "prompt": "stub prompt",
+            },
+        },
+    )
+    records: list[dict[str, Any]] = patch_records if patch_records is not None else []
+    _write_jsonl(sub_dir / "trajectory.jsonl", records)
+
+
+def test_discover_inputs_picks_up_subagents(tmp_path: Path) -> None:
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)
+    _add_subagent(run_dir, agent_id="agent-A", role="explorer", nickname="Faraday")
+    _add_subagent(run_dir, agent_id="agent-B", role="worker", nickname="Tesla")
+
+    inputs = mod.discover_inputs(run_dir)
+    assert [s.agent_id for s in inputs.subagents] == ["agent-A", "agent-B"]
+    assert inputs.subagents[0].manifest["spawn"]["role"] == "explorer"
+
+
+def test_collect_patches_merges_subagent_patches_and_tags_source(tmp_path: Path) -> None:
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)
+    # validate-fix subagent contributes a patch AFTER the main-rollout patches (ts later).
+    _add_subagent(
+        run_dir,
+        agent_id="agent-fixer",
+        role="worker",
+        nickname="Tesla",
+        patch_records=[
+            {
+                "schema_version": 1,
+                "ts": "2026-05-04T02:00:00Z",
+                "source": "codex",
+                "kind": "tool_call",
+                "tool": "apply_patch",
+                "call_id": "subagent_patch_1",
+                "raw_ref": {"file": "rollout.codex.jsonl", "line": 12},
+                "summary": "fix patch",
+                "artifact_refs": [
+                    {"path": "src/foo.py", "lines": [5, 5], "op": "edit"},
+                ],
+            }
+        ],
+    )
+
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    out_path = run_dir / "artifacts" / "analysis" / "causality.json"
+    mod.scaffold_causality_json(inputs, stats, out_path)
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+
+    patches = payload["patches"]
+    # Sorted by ts; main rollout's two patches (01:00:04 / 01:00:05) precede subagent's 02:00.
+    sources = [p["source_agent_id"] for p in patches]
+    assert sources == [None, None, "agent-fixer"]
+    fix_patch = next(p for p in patches if p["source_agent_id"] == "agent-fixer")
+    assert fix_patch["call_id"] == "subagent_patch_1"
+    assert fix_patch["artifact_refs"][0]["path"] == "src/foo.py"
+
+    # Stats must surface subagent contributions distinctly from main rollout.
+    assert stats.subagent_count == 1
+    assert stats.subagent_patch_event_count == 1
+    assert stats.patch_event_count == 2  # main rollout still has 2 patches
+
+
+def test_summary_md_reports_subagent_section(tmp_path: Path) -> None:
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)
+    _add_subagent(
+        run_dir,
+        agent_id="agent-fixer",
+        role="worker",
+        nickname="Tesla",
+        patch_records=[
+            {
+                "schema_version": 1,
+                "ts": "2026-05-04T02:00:00Z",
+                "kind": "tool_call",
+                "tool": "apply_patch",
+                "call_id": "subagent_patch_1",
+                "artifact_refs": [{"path": "src/foo.py", "op": "edit", "lines": [5, 5]}],
+            }
+        ],
+    )
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    out_path = run_dir / "artifacts" / "analysis" / "summary.md"
+    mod.scaffold_summary_md(inputs, stats, out_path)
+    text = out_path.read_text(encoding="utf-8")
+    assert "spawn_agent 子代理" in text
+    assert "agent-fixer" in text
+    assert "worker" in text
+
+
+# --------------------------------------------------------------------------- #
 # scaffold_summary_md
 # --------------------------------------------------------------------------- #
 
@@ -536,6 +658,8 @@ def test_scaffold_summary_md_atomic_replace(tmp_path: Path) -> None:
         trajectory_record_count=0,
         trajectory_kind_counts={},
         patch_event_count=0,
+        subagent_count=0,
+        subagent_patch_event_count=0,
         reviewer_count=0,
         reviewer_issue_counts={},
         workspace_changed_path_count=0,
