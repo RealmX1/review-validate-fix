@@ -135,6 +135,8 @@ state/
         review-packet.md
         review-packet.metadata.json
         before-workspace-snapshot.json
+        usage/
+          usage-summary.json
         reviewer-a.stdout.txt
         reviewer-a.stderr.txt
         reviewer-a.normalized.txt
@@ -149,6 +151,9 @@ state/
 - `events.jsonl`：append-only 事件流，供排障、测试和外部工具消费。
 - `summary.json`：面向用户和 hook systemMessage 的稳定摘要。
 - `artifacts/`：prompt、review packet、snapshot、stdout/stderr、normalized review output 等大文本或敏感内容。
+- `artifacts/usage/usage-summary.json`：finalize 时从 captured rollout 的
+  `token_count` event 确定性抽取 token / duration 摘要；叙事型 analysis 只引用它，
+  不负责重新估算。
 - `latest.json`：仓库级 pointer，只含 `run_id`、`summary_path`、`events_path`、`status`、`reason_code`、`updated_at`。
 
 ## 事件 schema

@@ -3613,6 +3613,59 @@ def test_clean_repo_skips(tmp_path: Path) -> None:
     assert_skip_reason(stdout, "clean")
 
 
+def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "doc-plan", dirty=False)
+    state = tmp_path / "state"
+    plan = repo / "docs" / "codebase-slimdown-plan.md"
+    plan.parent.mkdir()
+    plan.write_text("# Plan\n\nDoc-only planning change.\n", encoding="utf-8")
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": "plan-doc-session",
+            "stop_hook_active": False,
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "decision" not in payload
+    assert "reason=plan_document_only" in payload["systemMessage"], payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert "Plan/Doc Maintainer Review" in summary["message"]
+    assert summary["reason_code"] == "plan_document_only"
+    assert summary["route"] == "plan-doc-maintainer-review"
+    assert summary["changed_paths"] == ["docs/codebase-slimdown-plan.md"]
+    assert summary["rvf_backend_raw"] == "plan-doc-review"
+    events = latest_events(state)
+    assert any(event.get("event") == "plan_doc_review_routed" for event in events)
+
+
+def test_plan_document_route_does_not_hide_source_rename(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "rename-to-plan")
+    state = tmp_path / "state"
+    (repo / "docs").mkdir()
+    run(["git", "mv", "changed.txt", "docs/codebase-slimdown-plan.md"], repo)
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": "plan-doc-rename-session",
+            "stop_hook_active": False,
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=plan_document_only" not in payload["systemMessage"], payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["status"] == "dry-run"
+
+
 def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     state = tmp_path / "state"
@@ -4374,6 +4427,8 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
+        test_plan_document_only_routes_out_of_full_rvf,
+        test_plan_document_route_does_not_hide_source_rename,
         test_dirty_repo_dry_run_prepares_legacy_gui_requests,
         test_dirty_repo_manual_mode_only_prepares_prompt,
         test_dirty_repo_fork_dry_run,

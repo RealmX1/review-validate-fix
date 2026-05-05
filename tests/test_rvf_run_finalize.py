@@ -78,9 +78,41 @@ def _write_transcript(path: Path, marker: str, *, originator: str | None = "Code
     records = [
         {"timestamp": "t0", "type": "session_meta", "payload": session_meta_payload},
         {
-            "timestamp": "t1",
+            "timestamp": "2026-05-05T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 60,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 110,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-05-05T00:00:01Z",
             "type": "event_msg",
             "payload": {"type": "user_message", "message": f"go {marker}"},
+        },
+        {
+            "timestamp": "2026-05-05T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 250,
+                        "cached_input_tokens": 160,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 3,
+                        "total_tokens": 280,
+                    }
+                },
+            },
         },
     ]
     with path.open("w", encoding="utf-8") as handle:
@@ -104,6 +136,11 @@ def test_finalize_run_writes_trajectory_and_diff_and_is_idempotent(tmp_path: Pat
     assert record1["trajectory"]["host"] == "codex"
     assert record1["trajectory"]["host_originator"] == "Codex Desktop"
     assert record1["workspace_diff"]["status"] == "complete"
+    assert record1["usage"]["input_tokens"] == 150
+    assert record1["usage"]["cached_input_tokens"] == 100
+    assert record1["usage"]["output_tokens"] == 20
+    assert record1["usage"]["noncached_input_tokens"] == 50
+    assert (run_dir / "artifacts" / "usage" / "usage-summary.json").is_file()
     assert record1["analysis"]["summary_md_path"].endswith(
         "/artifacts/analysis/summary.md"
     )

@@ -104,6 +104,105 @@ def _scaffold_analysis(run_dir: Path) -> dict[str, Any]:
     }
 
 
+TOKEN_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _rollout_token_usage(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    with handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if not isinstance(total, dict):
+                continue
+            records.append(
+                {
+                    "timestamp": record.get("timestamp"),
+                    "total": {
+                        key: int(total.get(key) or 0)
+                        for key in TOKEN_USAGE_KEYS
+                    },
+                }
+            )
+    return records
+
+
+def _duration_seconds(start: Any, end: Any) -> float | None:
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0.0, round((end_dt - start_dt).total_seconds(), 3))
+
+
+def _usage_summary(run_dir: Path) -> dict[str, Any]:
+    pre_rollout = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
+    rvf_rollout = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre_records = _rollout_token_usage(pre_rollout)
+    rvf_records = _rollout_token_usage(rvf_rollout)
+    baseline = pre_records[-1]["total"] if pre_records else {key: 0 for key in TOKEN_USAGE_KEYS}
+    final = rvf_records[-1]["total"] if rvf_records else baseline
+    delta = {
+        key: max(0, int(final.get(key, 0)) - int(baseline.get(key, 0)))
+        for key in TOKEN_USAGE_KEYS
+    }
+    delta["noncached_input_tokens"] = max(
+        0,
+        delta["input_tokens"] - delta["cached_input_tokens"],
+    )
+    return {
+        "schema_version": 1,
+        "source": "artifacts/trajectory/rvf/rollout.codex.jsonl",
+        "baseline_source": (
+            "artifacts/trajectory/pre-rvf/rollout.codex.jsonl"
+            if pre_records
+            else None
+        ),
+        "started_at": rvf_records[0].get("timestamp") if rvf_records else None,
+        "ended_at": rvf_records[-1].get("timestamp") if rvf_records else None,
+        "wall_seconds": _duration_seconds(
+            rvf_records[0].get("timestamp") if rvf_records else None,
+            rvf_records[-1].get("timestamp") if rvf_records else None,
+        ),
+        "token_count_event_count": len(rvf_records),
+        "baseline_total_token_usage": baseline,
+        "final_total_token_usage": final,
+        **delta,
+    }
+
+
+def _write_usage_summary(run_dir: Path) -> dict[str, Any]:
+    summary = _usage_summary(run_dir)
+    path = run_dir / "artifacts" / "usage" / "usage-summary.json"
+    _atomic_write_json(path, summary)
+    return {"summary_path": str(path), **summary}
+
+
 def finalize_run(
     *,
     run_dir: Path,
@@ -135,6 +234,7 @@ def finalize_run(
         "run_dir": str(run_dir),
         "repo": str(repo) if repo else None,
         "trajectory": None,
+        "usage": None,
         "workspace_diff": None,
         "analysis": None,
         "errors": [],
@@ -155,6 +255,17 @@ def finalize_run(
         finalize_record["errors"].append(
             {
                 "stage": "trajectory_capture",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
+
+    try:
+        finalize_record["usage"] = _write_usage_summary(run_dir)
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "usage_summary",
                 "error": f"{type(exc).__name__}: {exc}",
                 "trace": traceback.format_exc(),
             }

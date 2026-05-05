@@ -98,6 +98,18 @@ SESSION_PATH_KEYS = (
     "session_file",
 )
 SESSION_SCOPE_PATH_KEYS = tuple(key for key in SESSION_PATH_KEYS if key != "log_path")
+PLAN_DOC_REVIEW_DIR_PREFIXES = ("docs/", "doc/", ".claude/plans/")
+PLAN_DOC_REVIEW_NAME_MARKERS = (
+    "plan",
+    "blueprint",
+    "prd",
+    "proposal",
+    "decision",
+    "scaffold",
+    "handoff",
+    "roadmap",
+    "rfc",
+)
 
 
 @dataclass(frozen=True)
@@ -4500,6 +4512,45 @@ def run_gate(repo: str) -> GateResult:
     return GateResult(status, resolved_repo, output)
 
 
+def changed_paths_from_gate_output(output: str) -> list[str]:
+    paths: list[str] = []
+    for line in output.splitlines()[1:]:
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if not path:
+            continue
+        if " -> " in path:
+            old_path, new_path = path.rsplit(" -> ", 1)
+            paths.extend([old_path.strip(), new_path.strip()])
+            continue
+        paths.append(path)
+    return paths
+
+
+def plan_doc_review_classification(paths: list[str]) -> dict[str, Any]:
+    normalized = [path.replace("\\", "/") for path in paths if path]
+    doc_paths = [
+        path
+        for path in normalized
+        if path.startswith(PLAN_DOC_REVIEW_DIR_PREFIXES)
+        and path.lower().endswith((".md", ".mdx", ".rst", ".txt"))
+    ]
+    plan_like_paths = [
+        path
+        for path in doc_paths
+        if any(marker in Path(path).name.lower() for marker in PLAN_DOC_REVIEW_NAME_MARKERS)
+    ]
+    return {
+        "changed_paths": normalized,
+        "doc_paths": doc_paths,
+        "plan_like_paths": plan_like_paths,
+        "should_route": bool(normalized)
+        and len(doc_paths) == len(normalized)
+        and bool(plan_like_paths),
+    }
+
+
 def fork_failure_report(repo: str) -> str:
     return (
         "review-validate-fix Stop hook 未运行：无法创建 Codex GUI fork，"
@@ -4773,6 +4824,39 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
+            doc_review = plan_doc_review_classification(
+                changed_paths_from_gate_output(cwd_result.output)
+            )
+            if doc_review["should_route"]:
+                ledger.event(
+                    phase="gate",
+                    event="plan_doc_review_routed",
+                    status="skipped",
+                    reason_code="plan_document_only",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                    changed_paths=doc_review["changed_paths"],
+                    plan_like_paths=doc_review["plan_like_paths"],
+                    route="plan-doc-maintainer-review",
+                )
+                return skip_decision(
+                    "plan/document-only dirty scope should route to Plan/Doc Maintainer Review, "
+                    "not full review-validate-fix.",
+                    ledger,
+                    "plan_document_only",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                    route="plan-doc-maintainer-review",
+                    changed_paths=doc_review["changed_paths"],
+                    doc_paths=doc_review["doc_paths"],
+                    plan_like_paths=doc_review["plan_like_paths"],
+                    **stop_hook_rvf_state_fields(
+                        phase="complete",
+                        backend="plan-doc-review",
+                        backend_raw="plan-doc-review",
+                        completion_gate="plan_document_only",
+                    ),
+                )
             session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
             if session_scope_payload is not None:
                 return payload_decision(
