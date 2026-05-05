@@ -135,8 +135,8 @@ Codex CLI / GUI 入口：安装器会在 `~/.codex/config.toml` 启用 `rvf@loca
 - 只有在当前运行环境确实没有可用子代理接口、用户本轮明确要求主会话本地执行 validate/fix，或某个 validate/fix 子代理已返回 `REAL` 且只剩主会话可安全完成的机械收尾时，才允许本地执行；最终汇总和 handoff 必须写明本地执行原因。不能把“为了省时间”“问题很小”当成本地执行理由。
 - 分配 validate/fix 子代理时按问题耦合度组织：不必一条 issue 一个 agent。共享根因、同一文件区域、同一测试路径或同一决策前提的问题，应合并成一个验证包交给同一个 validate/fix 子代理；验证包仍要逐项输出 verdict。
 - 主会话必须为 validate/fix 分组保留一张审计表，不只把分组信息写进子代理 prompt。每个分组记录 `validation_group_id`、包含的 canonical issue / processed id、分组理由、分配给哪个 validate/fix 子代理；若触发允许本地执行的窄例外，还必须记录本地执行原因；以及逐项 verdict 汇总。
-- 主会话等待 validate/fix 子代理时必须给相对宽松的时间窗口：首次 `wait_agent` / 等价等待不要使用几十秒级短超时；优先使用数分钟级到平台允许的较长超时，并可重复宽松等待。等待期间只能准备不依赖最终 patch 的合并表、handoff pending 字段和验证计划，不得抢先审查未返回的 patch、替子代理做 verdict，或把“还在处理”当作超时失败。
-- 如果宽松等待到期但子代理未完成，主会话必须先做非侵入式进度 probe，而不是盲等或直接接管：用 `send_input` / 等价机制询问当前阶段、已读文件、已修改或计划修改的路径、正在运行的验证、阻塞点和预计下一步；probe 不得扩大 scope、注入 reviewer 来源或要求中止。probe 结果应写入 run ledger / handoff 的 validate/fix 审计表，再继续宽松等待或根据明确阻塞处理。
+- 主会话等待 validate/fix 子代理时必须给相对宽松的时间窗口：首次 `wait_agent` / 等价等待不要使用几十秒级短超时；优先使用数分钟级到平台允许的较长超时，并可重复宽松等待。等待期间只能准备不依赖最终 patch 的合并表、验证计划，以及 handoff enabled 或 handoff 文件已存在时的 pending 字段，不得抢先审查未返回的 patch、替子代理做 verdict，或把“还在处理”当作超时失败。
+- 如果宽松等待到期但子代理未完成，主会话必须先做非侵入式进度 probe，而不是盲等或直接接管：用 `send_input` / 等价机制询问当前阶段、已读文件、已修改或计划修改的路径、正在运行的验证、阻塞点和预计下一步；probe 不得扩大 scope、注入 reviewer 来源或要求中止。probe 结果必须写入 run ledger 和 validate/fix 分组审计表；只有 handoff enabled 或 handoff 文件已存在时，才同步写入 handoff 的 validate/fix 审计区，再继续宽松等待或根据明确阻塞处理。
 - 发给 validate/fix 子代理的 prompt 应包含同一份 `scope.contract.json` 路径和 `scope_hash`，把 `fix_allowlist` 当作默认可写范围。若最小真实修复确实需要修改 allowlist 外文件，先在回复中说明原因并让主会话决定是否扩大 scope。allowlist 外 dirty changes、并行 agent 新增文件、reviewer liveness/probe artifacts、背景 WIP 或 protected files 是预期存在的并行工作，不得清理、删除、格式化或顺手修复。
 - 发给 validate/fix 子代理的 issue context 必须 source-agnostic：不要包含“Codex 发现”“alternative reviewer 发现”“两个 reviewer 都发现”等来源标签，也不要暗示哪个模型或 agent 支持该 issue。来源只保留在主会话的合并表 / handoff 中。
 - validate/fix 子代理只处理主会话分配给它的 canonical issue 包；不得自行扩大 review 范围、重新执行 double review、生成 handoff 或处理未分配问题。
