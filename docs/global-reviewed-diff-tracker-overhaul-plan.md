@@ -36,13 +36,13 @@ Phase 1 已经落地了 repo 级 shared registry（hunk-level claim、`state/tra
 | Phase | Scope | 状态 |
 |---|---|---|
 | 1 | repo-key 推导 + tracker state（单文件 JSON 布局）+ session_manifest 注册 claim + build_review_packet 暴露 cross-session conflict + heartbeat / lease / sweep_stale stub | **已落地**（commit `3f62fc1`） |
-| 2 | 状态层迁移到 SQLite + JSONL；引入 units / sessions / leases / branches / worktrees 表；canonical_patch_hash unit identity；commit ≠ clear；branch/worktree prune | 设计落定，待实现 |
-| 3 | reviewer scope allocator（8 步事务）；`scope.contract.json` 加 `primary_units` / `tracker_lease_id` / `tracker_scope_hash`；`prepare_review_run.py --tracker-scope` | 设计落定，待实现 |
-| 4 | reviewer lease 的 acquire / refresh / release（含 TTL）；`run_alternative_reviewer.py`（claude + codex 两路）与 Codex-native reviewer 子代理在拿到 scope 时申请 lease；validate/fix 同理 | 设计落定，待实现 |
-| 5 | activity probe / heartbeat 矩阵 + stale-release sweeper；dispatcher 在每个 Stop event 上 refresh；TTL 默认 6h | 设计落定，待实现 |
-| 6 | Stop hook gate 重构（`resolve_stop_context` / `refresh_global_diff_tracker` / `evaluate_session_gate` / `allocate_auto_review_scope` 4 函数拆分）；reason code `no_session_owned_dirty` → `no_unassigned_review_scope`；手动 fork takeover；prompt / reference 更新 | 设计落定，待实现 |
+| 2 | 状态层迁移到 SQLite + JSONL；引入 units / sessions / leases / branches / worktrees 表；canonical_patch_hash unit identity；commit ≠ clear；branch/worktree prune | **已落地**（Slice 2-A，commit `ba4cb5d`） |
+| 3 | reviewer scope allocator（8 步事务）；`scope.contract.json` 加 `primary_units` / `tracker_lease_id` / `tracker_scope_hash`；`prepare_review_run.py --tracker-scope` | **已落地**（Slice 2-B `8ea9a35` + Slice 3 `6addd82`） |
+| 4 | reviewer lease 的 acquire / refresh / release（含 TTL）；`run_alternative_reviewer.py`（claude + codex 两路）与 Codex-native reviewer 子代理在拿到 scope 时申请 lease；validate/fix 同理 | **已落地**（Slice 4，commits `8f62b84` + `112f093`） |
+| 5 | activity probe / heartbeat 矩阵 + stale-release sweeper；dispatcher 在每个 Stop event 上 refresh；TTL 默认 6h | **部分落地**：`lease_refresh` / `sweep_stale` 公共 API + reviewer-side heartbeat 已在 Slice 4 落地；dispatcher 在每个 Stop event 上自动 refresh / 全局 activity probe daemon 仍待后续 slice |
+| 6 | Stop hook gate 重构（`resolve_stop_context` / `refresh_global_diff_tracker` / `evaluate_session_gate` / `allocate_auto_review_scope` 4 函数拆分）；reason code `no_session_owned_dirty` → `no_unassigned_review_scope`；手动 fork takeover；prompt / reference 更新 | **部分落地**：4 函数拆分 + reason code rename 在 Slice 3 落；手动 fork takeover（`manual_takeover` / `record_manual_rvf_run` / `_manual_suppression_scope_probe` + `evaluate_session_gate` 接线）在 Slice 5（`fbe08e6`）落；reviewer prompt 改读 `scope.contract.json.primary_units` / fork prompt 拼 `--tracker-scope` 等 prompt/reference 更新仍是 Slice 6 |
 
-Phase 1 的 stub（`lease_*` `NotImplementedError`、`heartbeat` no-op、`sweep_stale` 返回 `[]`）保留 API 形状，让 Phase 2–6 落地时不再破坏调用方。
+Phase 1 的 stub（`lease_*` `NotImplementedError`、`heartbeat` no-op、`sweep_stale` 返回 `[]`）保留 API 形状，让 Phase 2–6 落地时不再破坏调用方。**截至 Slice 5：`lease_acquire` / `lease_refresh` / `lease_release` / `sweep_stale` 已全部实装；`heartbeat` 仍是 Slice 1 时期的 no-op，待 Slice 6 后续 dispatcher 整合再处理。**
 
 ## 分层模型
 
@@ -363,7 +363,7 @@ python3 scripts/diff_tracker.py allocate-review-scope \
 
 lease 字段已在 schema 中定义。`lease_acquire` 不阻塞、不等待，candidate 为空时直接返回 `acquired=False, reason="no_unassigned_review_scope"`。
 
-> Slice 3 实现注脚：`lease_acquire` / `lease_refresh` / `lease_release` 公共 API 仍保持 `NotImplementedError`；Slice 3 allocator 的 8 步流程直接在自己的 `BEGIN IMMEDIATE` 事务里写 `leases` / `lease_units` / `units.review_state='assigned'`。完整公共 API + reviewer-side heartbeat 落到 Slice 4。
+> Slice 3 实现注脚：allocator 的 8 步流程直接在自己的 `BEGIN IMMEDIATE` 事务里写 `leases` / `lease_units` / `units.review_state='assigned'`。完整公共 API + reviewer-side heartbeat 由 Slice 4 落地（见下文 Slice 4）。
 
 lease 只影响 reviewer scope generation。validate/fix 仍受 `scope.contract.json` 的 `fix_allowlist` / `protected_files` 管理；命令并发仍用 `command_lock.py`。
 
@@ -493,14 +493,21 @@ main 在 commit `12c0f6b` 引入 `rvf_logging.RVF_STATE_PHASES` 与 `rvf_state_f
 
 集成手测：两份合成 transcript 跑同一 repo + 一次 `allocate-review-scope` + 一次 reviewer release，预期 events.jsonl 有完整轨迹，sqlite 中 `units.review_state` 流转正确。
 
+**Slice 4 + 5 实际落地的覆盖**（共 24 函数 in `tests/test_review_support_scripts.py`）：
+- Lease 生命周期：`test_lease_acquire_*` / `test_lease_refresh_*` / `test_lease_release_*` / `test_sweep_stale_*` / `test_lease_acquire_concurrent_writers_serialize`（替代上面 `test_stale_lease_release_allows_realloc` / `test_completed_lease_marks_units_reviewed` / `test_allocator_concurrent_writers` 三项的 lease 段）。
+- Reviewer release 五条退出路径：`test_run_alternative_reviewer_releases_lease_on_normal_exit` / `*_on_codex_backend_challenge` / `*_on_signal_terminates_subprocess_first`（RVF 抓到的 SIGTERM 子进程残留 issue 回归）/ `*_on_acquire_failure_returns_structured_result` 等。
+- Stale prune 不踩活 lease：`test_sweep_stale_does_not_free_units_held_by_fresh_active_lease`（RVF 抓到的 `_prune_stale_leases_in_txn` 竞争回归）。
+- Manual flow：`test_manual_rvf_run_*`（insert / upsert / find / TTL / 已有 v2 DB ensure-table 兼容）+ `test_manual_takeover_*`（transfer / skip-leased / reject-missing-parent）+ `test_manual_takeover_cli_records_takeover` + 在 `tests/test_codex_stop_review_validate_fix.py` 加的 `evaluate_session_gate` 抑制路径与 with-parent-takeover 安全性。
+
 ## 实施切片（与上节阶段总览对齐）
 
 1. **Slice 2-A**：写 SQL DDL + migration runner（Phase 1 JSON → SQLite）；`diff_tracker.py` 内换实现，`register_claims` / `list_conflicts` API 表面不变。配套测试：`test_migration_phase1_json_to_sqlite_idempotent`、`test_canonical_patch_hash_*`。
 2. **Slice 2-B**：`prepare_review_run.py --tracker-scope <json>`；`build_review_packet.py` 优先消费 tracker scope；`scope.contract.json` v2 字段。（已实现：`--tracker-scope <PATH>` splice 进 `manifest.tracker.tracker_scope`；strict-required-tolerant-extras 校验；`SCOPE_CONTRACT_VERSION=2` 顶层加 `primary_units` / `tracker_lease_id` / `tracker_scope_hash` 三字段（不进 `canonical_scope`）；packet 在 `## Session Manifest` 后插 `## Tracker Scope`，`## Allocated Git Diff` 替代 `## Session-Owned Git Diff`，path-limited（hunk-limited 推迟到 Slice 3+）；`review-env.sh` 导出 `RVF_TRACKER_SCOPE`。）
 3. **Slice 3**：`scripts/diff_tracker.py allocate-review-scope` CLI + 8 步流程；Stop hook gate 4 函数拆分；reason code 改名 + alias。（已实现：CLI + 8 步原子流程在单 `BEGIN IMMEDIATE` 中跑完，`tracker-scope.json` / `events.jsonl` 落 post-COMMIT；`session_scope_gate_payload` 拆为 `resolve_stop_context` / `refresh_global_diff_tracker` / `evaluate_session_gate` / `allocate_auto_review_scope`；reason code 改名为 `no_unassigned_review_scope` / `unassigned_review_scope_available`，旧 `no_session_owned_dirty` / `session_owned_dirty` 作为 `reason_code_legacy_alias` 字段并保留 systemMessage 子串一个 release；`CODEX_RVF_TRACKER_DISABLE=1` 走 `legacy_session_scope_gate_payload`，不动旧 reason code；fork 第一次 stop 经 `_takeover_transfer_in_txn` 把 parent owned-and-unleased units 转给 child。dispatcher `should_sync_session_scope` 重写为 allocator dry-run + legacy 回退。lease 公共 API stub（`lease_acquire` / `lease_refresh` / `lease_release`）维持 `NotImplementedError`，留给 Slice 4。auto-flow 把 `tracker_scope_path` / `tracker_lease_id` / `tracker_scope_hash` stash 在 ledger 上（`tracker_scope_meta` 属性约定）；fork 提示词的 `--tracker-scope` 拼接交给 Slice 6。）
-4. **Slice 4**：reviewer lease 集成（`run_alternative_reviewer.py` claude_json + codex_json 两路；Codex-native reviewer 主会话端 heartbeat）。
-5. **Slice 5**：手动 fork takeover 算法 + 双 fork 共享 dirty 测试。
+4. **Slice 4**：reviewer lease 集成（`run_alternative_reviewer.py` claude_json + codex_json 两路；Codex-native reviewer 主会话端 heartbeat）。（已实现 commits `8f62b84` + `112f093`：`lease_acquire` / `lease_refresh` / `lease_release` / `sweep_stale` 四个公共 API 替换 stub；CLI 子命令 `lease-acquire` / `lease-release` / `lease-sweep`（无 `lease-refresh`，refresh 走进程内 API）；events `lease_acquired` / `lease_refreshed` / `lease_released` / `lease_sweep_started` / `lease_sweep_completed`；`run_alternative_reviewer.py` 接 acquire→heartbeat→release（环境变量 `CODEX_RVF_LEASE_HEARTBEAT_SECONDS` 默 60），release 在 timeout / `CodexJsonOutputError` / SIGINT/SIGTERM / 正常退出五条路径全部触发；Phase B query helpers `lease_holder_for_unit(unit_id)` / `units_for_path(path)` 同时落地。RVF 抓到并修复两条 real issue：(a) `_prune_stale_leases_in_txn` 之前不删 stale `lease_units` 行，导致 fresh active lease 持有的 unit 被后续 sweep 误改回 `available`；fix 改为在过期 release 时同步删除 lease_units 行。(b) SIGINT/SIGTERM handler 之前先 release lease 再退出，但 reviewer 子进程 `start_new_session=True` 不随父退出；fix 在 release 之前调用 `terminate_active_reviewer_process` 终止子进程组。）
+5. **Slice 5**：手动 fork takeover 算法 + 双 fork 共享 dirty 测试。（已实现 commit `fbe08e6`（cherry-pick 自 `8863325`）：公共 API `record_manual_rvf_run` / `find_manual_rvf_run_for_scope_hash` / `manual_takeover`（复用 Slice 3 `_takeover_transfer_in_txn`）；CLI 子命令 `record-manual-run` / `manual-takeover`；events `manual_rvf_run_recorded` / `manual_takeover_completed` / `manual_scope_hash_match`；`evaluate_session_gate` 在 `codex_stop_review_validate_fix.py:4062` 用专用只读 helper `_manual_suppression_scope_probe` 探 candidate scope_hash → 若 `find_manual_rvf_run_for_scope_hash` 命中则 `skip_payload(REASON_MANUAL_SCOPE_ALREADY_COMPLETED)`，文件型 session-hook marker 仍优先；`_ensure_manual_rvf_runs_schema` 在每次 open 时 `CREATE TABLE IF NOT EXISTS` 以兼容已有 v2 DB（不 bump SCHEMA_VERSION）。RVF 抓到并修复三条 real issue：(a) DDL 添加但已有 v2 DB 不会自动建表 → 加 `_ensure_manual_rvf_runs_schema` 幂等 ensure 步。(b) suppression probe 早期复用 `allocate_review_scope(dry_run=True)`，仍会 upsert session / 跑 takeover transfer；fix 提取专用 `_manual_suppression_scope_probe` 不写任何 tracker 状态。(c) `manual_takeover` 早期会 `_upsert_session(parent)` 静默吞掉拼错的 parent；fix 改为 parent 不存在时 raise `RuntimeError`。）
 6. **Slice 6**：reference / prompt 更新；reviewer 从 `scope.contract.json.primary_units` 取 scope；session manifest 退为 evidence-only。
+   - Caveat：Slice 6 含的 "auto-flow fork prompt 拼 `--tracker-scope`" 当前形态在本 plan 落地；一旦 RVF dispatch overhaul（见 `docs/rvf-dispatch-flow-overhaul-plan.md`）落地，tracker scope path 改由 prep file `rvf_run.tracker_scope_path` 字段承载，wiring 做 thin refactor。
 
 每个 slice 末尾跑：`python3 tests/test_review_support_scripts.py`、`python3 tests/test_codex_stop_hook_dispatcher.py`、`python3 tests/test_codex_stop_review_validate_fix.py`、`python3 tests/test_install_to_codex.py`、`bash scripts/check_skill_contracts.sh`、`python3 scripts/check_plugin_contracts.py`。
 
@@ -510,3 +517,4 @@ main 在 commit `12c0f6b` 引入 `rvf_logging.RVF_STATE_PHASES` 与 `rvf_state_f
 - 把 `unattributed_dirty_paths` 强制清零；背景 WIP 仍是合法状态，tracker 只让「归属其他 session」从 unattributed 中分离出来。
 - 用 tracker 做 commit / merge / push 锁。
 - ORM。直接用 `sqlite3` stdlib + 手写 SQL（预计几百行）即可，避免引入额外依赖与抽象层。
+- **RVF dispatch / fork-flow 异质性**（flow 1/2/3/4 的统一、Stop hook 拆分、UserPromptSubmit hook + prep file 机制、cline-kanban codex fork 集成、flow 2 worktree env setup、flow 3 故障态化）：见 `docs/rvf-dispatch-flow-overhaul-plan.md`。两份 plan 独立推进；唯一耦合点是 Slice 6 的 `--tracker-scope` wiring（见上 Slice 6 caveat）。
