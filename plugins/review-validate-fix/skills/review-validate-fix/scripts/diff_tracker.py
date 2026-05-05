@@ -57,6 +57,9 @@ LEGACY_REASON_SESSION_OWNED_DIRTY = "session_owned_dirty"
 
 DEFAULT_LEASE_TTL_SECONDS = 600
 LEASE_TTL_ENV = "CODEX_RVF_TRACKER_LEASE_TTL_SECONDS"
+MANUAL_RUN_TTL_ENV = "CODEX_RVF_MANUAL_RUN_TTL_SECONDS"
+REASON_MANUAL_SCOPE_ALREADY_COMPLETED = "manual_scope_already_completed"
+REASON_MANUAL_TAKEOVER_COMPLETED = "manual_takeover_completed"
 
 
 def _disabled() -> bool:
@@ -975,8 +978,24 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
     if version == SCHEMA_VERSION:
+        _ensure_manual_rvf_runs_schema(conn)
         return
     raise RuntimeError(f"unknown tracker schema version: {version}")
+
+
+def _ensure_manual_rvf_runs_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_rvf_runs (
+          session_id   TEXT NOT NULL,
+          run_id       TEXT NOT NULL,
+          scope_hash   TEXT NOT NULL,
+          completed_at TEXT NOT NULL,
+          PRIMARY KEY (session_id, run_id),
+          FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        )
+        """
+    )
 
 
 @contextlib.contextmanager
@@ -2786,6 +2805,27 @@ def _takeover_transfer_in_txn(
     return transferred
 
 
+def _preview_takeover_candidate_unit_ids_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    parent_session_id: str,
+) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT su.unit_id
+          FROM session_units su
+          JOIN units u ON u.unit_id = su.unit_id
+         WHERE su.session_id=?
+           AND su.assignment_kind='owned'
+           AND u.review_state='available'
+           AND u.observed_state IN ('dirty','committed')
+         ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
+        """,
+        (parent_session_id,),
+    ).fetchall()
+    return [row["unit_id"] for row in rows]
+
+
 def _resolve_session_assignment_in_txn(
     conn: sqlite3.Connection,
     *,
@@ -3371,6 +3411,236 @@ def allocate_review_scope(
                 pass
 
 
+def _manual_tracker_store(repo_resolved: Path, log_root_override: Path | None) -> tuple[str, Path, Path, Path, Path]:
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        raise RuntimeError(f"unsupported repo: {repo_resolved}")
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    directory.mkdir(parents=True, exist_ok=True)
+    return key, common_dir, directory, directory / SQLITE_FILENAME, directory / EVENTS_FILENAME
+
+
+def _manual_run_ttl_seconds(override: int | None) -> int | None:
+    raw = os.environ.get(MANUAL_RUN_TTL_ENV, "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            return override
+        return value if value > 0 else None
+    if override is not None and override > 0:
+        return int(override)
+    return None
+
+
+def record_manual_rvf_run(
+    *,
+    repo: str | Path,
+    session_id: str,
+    run_id: str,
+    scope_hash: str,
+    completed_at: str | None = None,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    now_iso = completed_at or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            branch_key = _upsert_branch(conn, _current_branch(repo_resolved), now_iso)
+            worktree_key = _upsert_worktree(conn, str(repo_resolved), branch_key, None, now_iso)
+            _upsert_session(conn, session_id, worktree_key, now_iso)
+            conn.execute(
+                """
+                INSERT INTO manual_rvf_runs(session_id, run_id, scope_hash, completed_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, run_id) DO UPDATE SET
+                    scope_hash=excluded.scope_hash,
+                    completed_at=excluded.completed_at
+                """,
+                (session_id, run_id, scope_hash, now_iso),
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        payload = {
+            "status": "recorded",
+            "session_id": session_id,
+            "run_id": run_id,
+            "scope_hash": scope_hash,
+            "completed_at": now_iso,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "manual_rvf_run_recorded", **payload})
+        return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def find_manual_rvf_run_for_scope_hash(
+    *,
+    repo: str | Path,
+    scope_hash: str,
+    ttl_seconds: int | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any] | None:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    ttl_value = _manual_run_ttl_seconds(ttl_seconds)
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                """
+                SELECT session_id, run_id, completed_at
+                  FROM manual_rvf_runs
+                 WHERE scope_hash=?
+                 ORDER BY completed_at DESC
+                 LIMIT 1
+                """,
+                (scope_hash,),
+            ).fetchone()
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        if row is None:
+            return None
+        completed_at = row["completed_at"]
+        if ttl_value is not None:
+            completed_dt = _iso_to_datetime(completed_at)
+            now_dt = _iso_to_datetime(now_iso)
+            if completed_dt is None or now_dt is None:
+                return None
+            if (now_dt - completed_dt).total_seconds() > ttl_value:
+                return None
+        payload = {
+            "session_id": row["session_id"],
+            "run_id": row["run_id"],
+            "completed_at": completed_at,
+        }
+        _emit_event(
+            events_path,
+            {
+                "event": "manual_scope_hash_match",
+                "scope_hash": scope_hash,
+                **payload,
+            },
+        )
+        return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _manual_suppression_scope_probe(
+    *,
+    repo: str | Path,
+    session_id: str,
+    parent_session_id: str | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, _common_dir, directory, db_path, _events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            candidates = _collect_candidate_unit_ids_in_txn(conn, session_id)
+            if parent_session_id and parent_session_id != session_id:
+                for unit_id in _preview_takeover_candidate_unit_ids_in_txn(
+                    conn,
+                    parent_session_id=parent_session_id,
+                ):
+                    if unit_id not in candidates:
+                        candidates.append(unit_id)
+            candidate_unit_count = len(candidates)
+            surviving, leased_excluded_count = _exclude_active_leased_in_txn(conn, candidates, now_iso)
+            paths_list, hunks_list = _collect_paths_and_hunks_in_txn(conn, surviving)
+        return {
+            "status": "dry_run" if surviving else "empty",
+            "would_acquire": bool(surviving),
+            "scope_hash": _compute_scope_hash(surviving) if surviving else None,
+            "candidate_unit_count": candidate_unit_count,
+            "leased_excluded_count": leased_excluded_count,
+            "unit_ids": surviving,
+            "paths": paths_list,
+            "hunks": hunks_list,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def manual_takeover(
+    *,
+    repo: str | Path,
+    parent_session_id: str,
+    current_session_id: str,
+    run_id: str,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    now_iso = now or utc_now()
+    transferred: list[str] = []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            branch_key = _upsert_branch(conn, _current_branch(repo_resolved), now_iso)
+            worktree_key = _upsert_worktree(conn, str(repo_resolved), branch_key, None, now_iso)
+            parents = [item.strip() for item in parent_session_id.split(";") if item.strip()]
+            missing_parents = [
+                parent
+                for parent in parents
+                if conn.execute("SELECT 1 FROM sessions WHERE session_id=?", (parent,)).fetchone() is None
+            ]
+            if missing_parents:
+                raise RuntimeError(f"manual takeover parent session not found: {', '.join(missing_parents)}")
+            _upsert_session(conn, current_session_id, worktree_key, now_iso)
+            for parent in parents:
+                transferred.extend(
+                    _takeover_transfer_in_txn(
+                        conn,
+                        parent_session_id=parent,
+                        current_session_id=current_session_id,
+                        now_iso=now_iso,
+                    )
+                )
+            if parents:
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id=COALESCE(parent_session_id, ?) WHERE session_id=?",
+                    (parent_session_id, current_session_id),
+                )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        transferred_unique = list(dict.fromkeys(transferred))
+        payload = {
+            "status": "completed",
+            "reason": REASON_MANUAL_TAKEOVER_COMPLETED,
+            "parent_session_id": parent_session_id,
+            "current_session_id": current_session_id,
+            "run_id": run_id,
+            "transferred_unit_ids": transferred_unique,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "manual_takeover_completed", **payload})
+        return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 # -------------------------- CLI dispatcher --------------------------
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -3444,6 +3714,36 @@ def _build_argparser() -> argparse.ArgumentParser:
     lease_sweep.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
     lease_sweep.add_argument("--print-result", action="store_true")
     lease_sweep.add_argument("--log-root", default=None, help="Override CODEX_RVF_LOG_ROOT.")
+
+    record = subparsers.add_parser(
+        "record-manual-run",
+        help="Record a completed manual RVF run for a scope_hash.",
+    )
+    record.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    record.add_argument("--session-id", required=True)
+    record.add_argument("--run-id", required=True)
+    record.add_argument("--scope-hash", required=True)
+    record.add_argument("--completed-at", default=None)
+    record.add_argument("--print-result", action="store_true")
+    record.add_argument(
+        "--log-root",
+        default=None,
+        help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
+    )
+    takeover = subparsers.add_parser(
+        "manual-takeover",
+        help="Transfer a parent session's unleased units to the current session.",
+    )
+    takeover.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    takeover.add_argument("--parent-session-id", required=True)
+    takeover.add_argument("--current-session-id", required=True)
+    takeover.add_argument("--run-id", required=True)
+    takeover.add_argument("--print-result", action="store_true")
+    takeover.add_argument(
+        "--log-root",
+        default=None,
+        help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
+    )
     return parser
 
 
@@ -3453,8 +3753,8 @@ def _main(argv: list[str] | None = None) -> int:
     if args.subcommand is None:
         parser.print_help()
         return 2
+    log_root_override = Path(args.log_root).expanduser().resolve() if getattr(args, "log_root", None) else None
     if args.subcommand == "lease-acquire":
-        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
         result = lease_acquire(
             repo=Path(args.repo).expanduser().resolve(),
             session_id=args.session_id,
@@ -3469,7 +3769,6 @@ def _main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     if args.subcommand == "lease-release":
-        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
         result = lease_release(
             repo=Path(args.repo).expanduser().resolve(),
             lease_id=args.lease_id,
@@ -3480,9 +3779,31 @@ def _main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     if args.subcommand == "lease-sweep":
-        log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
         result = sweep_stale(
             repo=Path(args.repo).expanduser().resolve(),
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "record-manual-run":
+        result = record_manual_rvf_run(
+            repo=Path(args.repo).expanduser().resolve(),
+            session_id=args.session_id,
+            run_id=args.run_id,
+            scope_hash=args.scope_hash,
+            completed_at=args.completed_at,
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "manual-takeover":
+        result = manual_takeover(
+            repo=Path(args.repo).expanduser().resolve(),
+            parent_session_id=args.parent_session_id,
+            current_session_id=args.current_session_id,
+            run_id=args.run_id,
             log_root_override=log_root_override,
         )
         if args.print_result:
@@ -3500,7 +3821,6 @@ def _main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    log_root_override = Path(args.log_root).expanduser().resolve() if args.log_root else None
     output_scope_path = Path(args.output_scope).expanduser().resolve() if args.output_scope else None
     repo_path = Path(args.repo).expanduser().resolve()
     result = allocate_review_scope(

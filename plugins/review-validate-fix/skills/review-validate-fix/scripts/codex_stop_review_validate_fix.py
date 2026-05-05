@@ -25,9 +25,12 @@ from diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
     LEGACY_REASON_SESSION_OWNED_DIRTY,
     REASON_NO_UNASSIGNED_REVIEW_SCOPE,
+    REASON_MANUAL_SCOPE_ALREADY_COMPLETED,
     REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
     _disabled as _tracker_disabled,
+    _manual_suppression_scope_probe,
     allocate_review_scope,
+    find_manual_rvf_run_for_scope_hash,
 )
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
@@ -4008,8 +4011,8 @@ def evaluate_session_gate(
     marker_payload = manual_rvf_session_marker_payload(context["event"], ledger)
     if marker_payload is not None:
         return marker_payload
-    # Slice 5 TODO: short-circuit when manual_rvf_runs has a recent row whose
-    # scope_hash matches the current allocator candidate set.
+    # DB scope_hash suppression is wired at allocator entry; candidate unit_ids
+    # are not available at this layer.
     return None
 
 
@@ -4056,6 +4059,74 @@ def allocate_auto_review_scope(
     if parent_session_id == session_id:
         parent_session_id = None
     try:
+        manual_probe = _manual_suppression_scope_probe(
+            repo=repo_path,
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+        )
+        scope_hash = manual_probe.get("scope_hash") if isinstance(manual_probe, dict) else None
+        if isinstance(scope_hash, str) and scope_hash:
+            manual_match = find_manual_rvf_run_for_scope_hash(
+                repo=repo_path,
+                scope_hash=scope_hash,
+            )
+            if manual_match is not None:
+                ledger.event(
+                    phase="gate",
+                    event="manual_scope_hash_match",
+                    status="skipped",
+                    reason_code=REASON_MANUAL_SCOPE_ALREADY_COMPLETED,
+                    repo=repo,
+                    cwd=context.get("cwd"),
+                    session_id=session_id,
+                    tracker_scope_hash=scope_hash,
+                    manual_rvf_session_id=manual_match.get("session_id"),
+                    manual_rvf_run_id=manual_match.get("run_id"),
+                    manual_rvf_completed_at=manual_match.get("completed_at"),
+                )
+                if dry_run:
+                    return {
+                        "would_proceed": False,
+                        "candidate_unit_count": manual_probe.get("candidate_unit_count", 0),
+                        "result": manual_probe,
+                        "reason": REASON_MANUAL_SCOPE_ALREADY_COMPLETED,
+                    }
+                return skip_payload(
+                    "manual RVF already completed for this tracker scope",
+                    ledger,
+                    REASON_MANUAL_SCOPE_ALREADY_COMPLETED,
+                    repo=repo,
+                    session_id=session_id,
+                    tracker_scope_hash=scope_hash,
+                    manual_rvf_session_id=manual_match.get("session_id"),
+                    manual_rvf_run_id=manual_match.get("run_id"),
+                    manual_rvf_completed_at=manual_match.get("completed_at"),
+                )
+        if dry_run:
+            result = allocate_review_scope(
+                repo=repo_path,
+                session_id=session_id,
+                run_id=run_id,
+                reviewer_id=reviewer_id,
+                output_scope_path=None,
+                parent_session_id=parent_session_id,
+                holder_kind="reviewer",
+                dry_run=True,
+                auto_claim_observed=False,
+            )
+            status = result.get("status")
+            if status == "dry_run":
+                return {
+                    "would_proceed": bool(result.get("would_acquire")),
+                    "candidate_unit_count": result.get("candidate_unit_count", 0),
+                    "result": result,
+                }
+            if status == "empty":
+                return {
+                    "would_proceed": False,
+                    "candidate_unit_count": result.get("candidate_unit_count", 0),
+                    "result": result,
+                }
         result = allocate_review_scope(
             repo=repo_path,
             session_id=session_id,

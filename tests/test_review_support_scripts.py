@@ -6170,6 +6170,50 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_allocator_event_appended_to_events_jsonl(root / "alloc-T10"),
         ),
         (
+            "manual_rvf_run_inserts_row_and_emits_event",
+            lambda: test_manual_rvf_run_inserts_row_and_emits_event(root / "manual-run-T1"),
+        ),
+        (
+            "manual_rvf_run_upserts_on_pk_conflict",
+            lambda: test_manual_rvf_run_upserts_on_pk_conflict(root / "manual-run-T2"),
+        ),
+        (
+            "manual_rvf_run_find_returns_none_when_empty",
+            lambda: test_manual_rvf_run_find_returns_none_when_empty(root / "manual-run-T3"),
+        ),
+        (
+            "manual_rvf_run_find_returns_latest_completed_at",
+            lambda: test_manual_rvf_run_find_returns_latest_completed_at(root / "manual-run-T4"),
+        ),
+        (
+            "manual_rvf_run_find_respects_ttl",
+            lambda: test_manual_rvf_run_find_respects_ttl(root / "manual-run-T5"),
+        ),
+        (
+            "manual_rvf_run_ensures_table_for_existing_v2_db",
+            lambda: test_manual_rvf_run_ensures_table_for_existing_v2_db(root / "manual-run-T6"),
+        ),
+        (
+            "manual_takeover_transfers_unleased_units",
+            lambda: test_manual_takeover_transfers_unleased_units(root / "manual-takeover-T1"),
+        ),
+        (
+            "manual_takeover_skips_actively_leased_units",
+            lambda: test_manual_takeover_skips_actively_leased_units(root / "manual-takeover-T2"),
+        ),
+        (
+            "manual_takeover_rejects_missing_parent_session",
+            lambda: test_manual_takeover_rejects_missing_parent_session(root / "manual-takeover-T3"),
+        ),
+        (
+            "manual_takeover_cli_records_takeover",
+            lambda: test_manual_takeover_cli_records_takeover(root / "manual-takeover-cli"),
+        ),
+        (
+            "record_manual_run_cli_writes_row",
+            lambda: test_record_manual_run_cli_writes_row(root / "manual-record-cli"),
+        ),
+        (
             "allocate_review_scope_disable_env_short_circuits",
             lambda: test_allocate_review_scope_disable_env_short_circuits(root / "alloc-T11"),
         ),
@@ -6720,6 +6764,340 @@ def test_allocator_event_appended_to_events_jsonl(tmp: Path) -> None:
     assert record["paths"] == result["scope"]["paths"]
     assert record["reason_code"] == "unassigned_review_scope_available"
     assert record["reason_code_legacy_alias"] == "session_owned_dirty"
+
+
+def test_manual_rvf_run_inserts_row_and_emits_event(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:manual-a",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    assert result["status"] == "recorded"
+    conn = _alloc_open_db(log_root, result["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash, completed_at FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-session", "manual-run", "sha256:manual-a", "2026-05-05T00:00:00Z")]
+    events = read_jsonl(_alloc_events_path(log_root, result["repo_key"]))
+    assert any(event.get("event") == "manual_rvf_run_recorded" for event in events)
+
+
+def test_manual_rvf_run_upserts_on_pk_conflict(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:old",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:new",
+        completed_at="2026-05-05T00:10:00Z",
+        log_root_override=log_root,
+    )
+    conn = _alloc_open_db(log_root, first["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT scope_hash, completed_at FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("sha256:new", "2026-05-05T00:10:00Z")]
+
+
+def test_manual_rvf_run_find_returns_none_when_empty(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    assert (
+        module.find_manual_rvf_run_for_scope_hash(
+            repo=repo,
+            scope_hash="sha256:missing",
+            log_root_override=tmp / "logs",
+        )
+        is None
+    )
+
+
+def test_manual_rvf_run_find_returns_latest_completed_at(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-old",
+        run_id="run-old",
+        scope_hash="sha256:same",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-new",
+        run_id="run-new",
+        scope_hash="sha256:same",
+        completed_at="2026-05-05T00:10:00Z",
+        log_root_override=log_root,
+    )
+    match = module.find_manual_rvf_run_for_scope_hash(
+        repo=repo,
+        scope_hash="sha256:same",
+        log_root_override=log_root,
+    )
+    assert match == {
+        "session_id": "manual-new",
+        "run_id": "run-new",
+        "completed_at": "2026-05-05T00:10:00Z",
+    }
+
+
+def test_manual_rvf_run_find_respects_ttl(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:ttl",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    assert (
+        module.find_manual_rvf_run_for_scope_hash(
+            repo=repo,
+            scope_hash="sha256:ttl",
+            ttl_seconds=30,
+            now="2026-05-05T00:01:00Z",
+            log_root_override=log_root,
+        )
+        is None
+    )
+
+
+def test_manual_rvf_run_ensures_table_for_existing_v2_db(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    initial = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-schema-session",
+        run_id="manual-schema-run",
+        output_scope=tmp / "manual-schema.json",
+    )
+    conn = _alloc_open_db(log_root, initial["repo_key"])
+    try:
+        conn.execute("DROP TABLE manual_rvf_runs")
+        conn.execute(f"PRAGMA user_version = {module.SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-schema-session",
+        run_id="manual-schema-run",
+        scope_hash="sha256:manual-schema",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+
+    conn = _alloc_open_db(log_root, initial["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-schema-session", "manual-schema-run", "sha256:manual-schema")]
+
+
+def test_manual_takeover_transfers_unleased_units(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-parent",
+        run_id="manual-parent-run",
+        output_scope=tmp / "parent.json",
+    )
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    takeover = module.manual_takeover(
+        repo=repo,
+        parent_session_id="manual-parent",
+        current_session_id="manual-child",
+        run_id="manual-child-run",
+        log_root_override=log_root,
+    )
+    assert takeover["reason"] == "manual_takeover_completed"
+    assert set(takeover["transferred_unit_ids"]) == set(parent["scope"]["unit_ids"])
+
+
+def test_manual_takeover_skips_actively_leased_units(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-parent-active",
+        run_id="manual-parent-active-run",
+        output_scope=tmp / "parent-active.json",
+    )
+    unit_ids = parent["scope"]["unit_ids"]
+    assert len(unit_ids) >= 2
+    pinned_unit, freed_unit = unit_ids[0], unit_ids[1]
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("DELETE FROM lease_units WHERE lease_id=? AND unit_id=?", (parent["lease_id"], freed_unit))
+        conn.execute("UPDATE units SET review_state='available' WHERE unit_id=?", (freed_unit,))
+        conn.commit()
+    finally:
+        conn.close()
+    takeover = module.manual_takeover(
+        repo=repo,
+        parent_session_id="manual-parent-active",
+        current_session_id="manual-child-active",
+        run_id="manual-child-active-run",
+        log_root_override=log_root,
+    )
+    transferred = set(takeover["transferred_unit_ids"])
+    assert pinned_unit not in transferred
+    assert freed_unit in transferred
+
+
+def test_manual_takeover_rejects_missing_parent_session(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    try:
+        module.manual_takeover(
+            repo=repo,
+            parent_session_id="missing-parent",
+            current_session_id="manual-child-missing-parent",
+            run_id="manual-child-run",
+            log_root_override=log_root,
+        )
+    except RuntimeError as exc:
+        assert "manual takeover parent session not found: missing-parent" in str(exc)
+    else:
+        raise AssertionError("manual_takeover accepted a missing parent session")
+
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key_value = module.repo_key(common_dir)
+    conn = _alloc_open_db(log_root, repo_key_value)
+    try:
+        rows = list(conn.execute("SELECT session_id FROM sessions ORDER BY session_id"))
+    finally:
+        conn.close()
+    assert rows == []
+
+
+def test_manual_takeover_cli_records_takeover(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-cli-parent",
+        run_id="manual-cli-parent-run",
+        output_scope=tmp / "manual-cli-parent.json",
+    )
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DIFF_TRACKER),
+            "manual-takeover",
+            "--repo",
+            str(repo),
+            "--parent-session-id",
+            "manual-cli-parent",
+            "--current-session-id",
+            "manual-cli-child",
+            "--run-id",
+            "manual-cli-child-run",
+            "--log-root",
+            str(log_root),
+            "--print-result",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["reason"] == "manual_takeover_completed"
+    assert set(payload["transferred_unit_ids"]) == set(parent["scope"]["unit_ids"])
+
+
+def test_record_manual_run_cli_writes_row(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DIFF_TRACKER),
+            "record-manual-run",
+            "--repo",
+            str(repo),
+            "--session-id",
+            "manual-cli-session",
+            "--run-id",
+            "manual-cli-run",
+            "--scope-hash",
+            "sha256:manual-cli",
+            "--completed-at",
+            "2026-05-05T00:00:00Z",
+            "--log-root",
+            str(log_root),
+            "--print-result",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    conn = _alloc_open_db(log_root, payload["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-cli-session", "manual-cli-run", "sha256:manual-cli")]
 
 
 def test_allocate_review_scope_disable_env_short_circuits(tmp: Path) -> None:

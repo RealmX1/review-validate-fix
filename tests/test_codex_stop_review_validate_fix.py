@@ -1084,6 +1084,159 @@ def test_allocate_auto_review_scope_writes_artifact_when_scope_present(tmp: Path
     assert meta["tracker_scope_hash"] is not None
 
 
+def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_apply_patch_transcript(transcript, repo, session_id="sess-manual-db")
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        module.refresh_global_diff_tracker(context, ledger)
+        dry = module.allocate_auto_review_scope(context, ledger, dry_run=True)
+        assert dry is not None and dry["would_proceed"] is True
+        scope_hash = dry["result"]["scope_hash"]
+
+        diff_tracker = sys.modules["diff_tracker"]
+        diff_tracker.record_manual_rvf_run(
+            repo=repo,
+            session_id="manual-db-session",
+            run_id="manual-db-run",
+            scope_hash=scope_hash,
+            completed_at="2026-05-05T00:00:00Z",
+            log_root_override=state,
+        )
+
+        next_ledger = _make_test_ledger(module, state)
+        gated = module.session_scope_gate_payload(event, str(repo), next_ledger)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+    assert gated is not None
+    assert "manual_scope_already_completed" in gated.get("systemMessage", "")
+    summary = summary_from_payload(gated)
+    assert summary["reason_code"] == "manual_scope_already_completed"
+    assert summary["manual_rvf_run_id"] == "manual-db-run"
+    assert summary["tracker_scope_hash"] == scope_hash
+
+
+def test_manual_scope_suppression_does_not_transfer_parent_takeover_units(tmp: Path) -> None:
+    module = load_hook_module()
+    diff_tracker = sys.modules["diff_tracker"]
+    repo = init_repo_with_head(tmp / "dirty")
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state)
+        parent = diff_tracker.allocate_review_scope(
+            repo=repo,
+            session_id="manual-parent-scope",
+            run_id="manual-parent-run",
+            reviewer_id="parent-reviewer",
+            log_root_override=state,
+        )
+        assert parent["status"] == "allocated"
+        db_path = Path(parent["tracker_dir"]) / "tracker.sqlite3"
+        import sqlite3 as _sqlite
+
+        conn = _sqlite.connect(str(db_path))
+        try:
+            conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+            conn.execute(
+                "UPDATE units SET review_state='available' WHERE unit_id IN "
+                "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+                (parent["lease_id"],),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        diff_tracker.record_manual_rvf_run(
+            repo=repo,
+            session_id="manual-parent-scope",
+            run_id="manual-completed-run",
+            scope_hash=parent["scope_hash"],
+            completed_at="2026-05-05T00:00:00Z",
+            log_root_override=state,
+        )
+        context = {
+            "repo": str(repo),
+            "cwd": str(repo),
+            "session_id": "manual-child-scope",
+            "parent_session_id": "manual-parent-scope",
+            "event": {"cwd": str(repo), "session_id": "manual-child-scope"},
+        }
+        gated = module.allocate_auto_review_scope(context, ledger, dry_run=False)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+    assert gated is not None
+    assert "manual_scope_already_completed" in gated.get("systemMessage", "")
+    conn = _sqlite.connect(str(db_path))
+    try:
+        parent_kinds = {
+            row[0]
+            for row in conn.execute(
+                "SELECT assignment_kind FROM session_units WHERE session_id='manual-parent-scope'"
+            )
+        }
+        child_rows = list(
+            conn.execute("SELECT assignment_kind FROM session_units WHERE session_id='manual-child-scope'")
+        )
+    finally:
+        conn.close()
+    assert parent_kinds == {"owned"}
+    assert child_rows == []
+
+
+def test_evaluate_session_gate_file_marker_takes_precedence_over_db_marker(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_user_session(transcript, "sess-file-marker-first", "手动 RVF 已完成。")
+    state = tmp / "state"
+    state_dir_root = tmp / "state-root"
+    state_dir_root.mkdir()
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_find = module.find_manual_rvf_run_for_scope_hash
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state_dir_root)
+
+    def _raise_if_db_marker_checked(*args, **kwargs):
+        raise AssertionError("DB marker should not be checked before file marker")
+
+    try:
+        module.find_manual_rvf_run_for_scope_hash = _raise_if_db_marker_checked
+        ledger = _make_test_ledger(module, state)
+        module.write_manual_rvf_session_marker(
+            session_id="sess-file-marker-first",
+            run_id="file-marker-run",
+            repo=repo,
+        )
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        gated = module.evaluate_session_gate(context, ledger)
+    finally:
+        module.find_manual_rvf_run_for_scope_hash = original_find
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_state is None:
+            os.environ.pop("CODEX_RVF_STATE_DIR", None)
+        else:
+            os.environ["CODEX_RVF_STATE_DIR"] = old_state
+    assert gated is not None
+    assert "manual_rvf_already_ran" in gated.get("systemMessage", "")
+
+
 def test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails(
     tmp: Path,
 ) -> None:
@@ -4067,6 +4220,9 @@ def main() -> int:
         test_evaluate_session_gate_suppresses_on_manual_marker,
         test_legacy_session_scope_gate_payload_used_when_tracker_disabled,
         test_allocate_auto_review_scope_writes_artifact_when_scope_present,
+        test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
+        test_manual_scope_suppression_does_not_transfer_parent_takeover_units,
+        test_evaluate_session_gate_file_marker_takes_precedence_over_db_marker,
         test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails,
         test_session_hook_default_state_dir_is_skill_state_session_hook,
         test_session_hook_state_dir_respects_state_dir_override,
