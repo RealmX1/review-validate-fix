@@ -244,6 +244,70 @@ def load_hook_module():
     return module
 
 
+def load_workspace_snapshot_module():
+    script = SCRIPT.with_name("workspace_snapshot.py")
+    spec = importlib.util.spec_from_file_location("rvf_workspace_snapshot_for_tests", script)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def seed_finalize_run_dir(
+    *,
+    state: Path,
+    repo: Path,
+    run_id: str = "rvf-child",
+) -> tuple[Path, Path]:
+    run_dir = state / "runs" / run_id
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    handoff = artifacts / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    (run_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": "started",
+                "reason_code": "test",
+                "repo": str(repo),
+                "events_path": str(run_dir / "events.jsonl"),
+                "artifacts_dir": str(artifacts),
+                "run_dir": str(run_dir),
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot_module = load_workspace_snapshot_module()
+    (artifacts / "before-workspace-snapshot.json").write_text(
+        json.dumps(snapshot_module.capture(repo), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return run_dir, handoff
+
+
+def write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
+    records = [
+        {"type": "session_meta", "payload": {"id": "child-session", "cwd": str(repo)}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "background work"}},
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "ack"}},
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "running rvf"}},
+    ]
+    path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_normalize_backend_from_env(tmp_path: Path) -> None:
     module = load_hook_module()
     original = {
@@ -3838,6 +3902,45 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     assert summary["handoff_open_result"]["reason"] == "already_advised"
 
 
+def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    (run_dir / "artifacts" / "analysis").write_text(
+        "blocks analysis scaffold directory\n",
+        encoding="utf-8",
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
+        )[0]
+    )
+
+    assert "finalize_errors=1" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["finalize_status"] == "warning"
+    assert summary["finalize_error_count"] == 1
+    assert summary["finalized_run_dir"] == str(run_dir.resolve())
+    assert summary["finalize_errors"][0]["stage"] == "analysis_scaffold"
+    run_summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert run_summary["finalize"]["errors"][0]["stage"] == "analysis_scaffold"
+    events = latest_events(state)
+    assert any(event["event"] == "finalize_completed_with_errors" for event in events)
+
+
 def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
@@ -4280,6 +4383,7 @@ def main() -> int:
         test_stop_event_log_path_is_not_used_as_fork_rollout_path,
         test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
+        test_handoff_advisory_surfaces_finalize_record_errors,
         test_handoff_advisory_respects_open_disabled,
         test_handoff_advisory_records_open_failure,
         test_suppress_env_skips_handoff_marker_before_advisory,

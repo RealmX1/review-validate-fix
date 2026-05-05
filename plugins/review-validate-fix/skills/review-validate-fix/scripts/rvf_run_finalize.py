@@ -91,6 +91,19 @@ def _resolve_repo(run_dir: Path, summary: dict[str, Any], event: dict[str, Any] 
     return None
 
 
+def _scaffold_analysis(run_dir: Path) -> dict[str, Any]:
+    """在 finalize 末尾生成 ``$rvf-analyze`` 的确定性分析骨架。"""
+    # 延迟导入，保持 finalize 启动轻量。
+    from analysis_artifacts import scaffold_run  # noqa: WPS433
+
+    scaffold = scaffold_run(run_dir)
+    return {
+        "summary_md_path": str(scaffold["summary_md_path"]),
+        "causality_json_path": str(scaffold["causality_json_path"]),
+        "stats": scaffold["stats_dict"],
+    }
+
+
 def finalize_run(
     *,
     run_dir: Path,
@@ -123,6 +136,7 @@ def finalize_run(
         "repo": str(repo) if repo else None,
         "trajectory": None,
         "workspace_diff": None,
+        "analysis": None,
         "errors": [],
     }
 
@@ -186,6 +200,27 @@ def finalize_run(
     if summary_path.exists():
         merged = _read_summary(summary_path)
         merged["finalize"] = finalize_record
+        try:
+            _atomic_write_json(summary_path, merged)
+        except OSError as exc:
+            finalize_record["errors"].append(
+                {"stage": "summary_merge", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    try:
+        finalize_record["analysis"] = _scaffold_analysis(run_dir)
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "analysis_scaffold",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
+
+    if summary_path.exists():
+        merged = _read_summary(summary_path)
+        merged["finalize"] = finalize_record
         merged["finalize_completed_at"] = finalize_record["completed_at"]
         try:
             _atomic_write_json(summary_path, merged)
@@ -220,6 +255,85 @@ def finalize_for_handoff(
     if run_dir is None:
         return None
     return finalize_run(run_dir=run_dir, event=event, decision_kind=decision_kind)
+
+
+def public_finalize_errors(record: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """返回适合写入 hook ledger/summary 的 finalize 错误摘要。"""
+    if not isinstance(record, dict):
+        return []
+    errors = record.get("errors")
+    if not isinstance(errors, list):
+        return []
+
+    public_errors: list[dict[str, Any]] = []
+    for item in errors:
+        if not isinstance(item, dict):
+            public_errors.append({"stage": "unknown", "error": str(item)})
+            continue
+        stage = item.get("stage")
+        error = item.get("error")
+        public_errors.append(
+            {
+                "stage": stage if isinstance(stage, str) and stage else "unknown",
+                "error": error if isinstance(error, str) else str(error),
+            }
+        )
+    return public_errors
+
+
+def surface_finalize_record_errors(
+    ledger: Any,
+    record: dict[str, Any] | None,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """把 finalize 返回记录中的非抛出错误暴露到当前 hook 的 ledger/summary。
+
+    finalize_run 仍保留 trajectory/workspace_diff/analysis 的非致命错误模型；
+    该 helper 只负责让 handoff completion caller 不再把这些错误隐藏在 actual run
+    summary 内部。
+    """
+    errors = public_finalize_errors(record)
+    if not errors:
+        return []
+
+    run_dir = record.get("run_dir") if isinstance(record, dict) else None
+    paths = {"run_dir": run_dir} if isinstance(run_dir, str) and run_dir else {}
+    try:
+        ledger.event(
+            phase="handoff",
+            event="finalize_completed_with_errors",
+            status="warning",
+            reason_code="finalize_error",
+            level="warn",
+            paths=paths,
+            finalize_error_count=len(errors),
+            finalize_errors=errors,
+        )
+    except Exception:
+        pass
+
+    summary_path = getattr(ledger, "summary_path", None)
+    if summary_path is not None:
+        try:
+            path = Path(summary_path)
+            summary = _read_summary(path)
+            if summary:
+                summary["finalize_status"] = "warning"
+                summary["finalize_error_count"] = len(errors)
+                summary["finalize_errors"] = errors
+                if isinstance(run_dir, str) and run_dir:
+                    summary["finalized_run_dir"] = run_dir
+                _atomic_write_json(path, summary)
+        except OSError:
+            pass
+
+    if payload is not None:
+        message = payload.get("systemMessage")
+        if isinstance(message, str) and "finalize_errors=" not in message:
+            payload["systemMessage"] = f"{message}; finalize_errors={len(errors)}"
+
+    return errors
 
 
 def main() -> int:

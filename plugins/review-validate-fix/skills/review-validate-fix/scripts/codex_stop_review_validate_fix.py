@@ -19,7 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
-from rvf_run_finalize import finalize_for_handoff
+from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from session_manifest import build_manifest
 from diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
@@ -4683,11 +4683,12 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
         payload = handoff_completion_payload(event, ledger)
         if payload is not None:
             try:
-                finalize_for_handoff(
+                finalize_record = finalize_for_handoff(
                     handoff_path=handoff_path_value,
                     event=event,
                     decision_kind="handoff-advisory",
                 )
+                surface_finalize_record_errors(ledger, finalize_record, payload=payload)
             except Exception as exc:
                 ledger.event(
                     phase="handoff",

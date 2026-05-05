@@ -104,11 +104,20 @@ def test_finalize_run_writes_trajectory_and_diff_and_is_idempotent(tmp_path: Pat
     assert record1["trajectory"]["host"] == "codex"
     assert record1["trajectory"]["host_originator"] == "Codex Desktop"
     assert record1["workspace_diff"]["status"] == "complete"
+    assert record1["analysis"]["summary_md_path"].endswith(
+        "/artifacts/analysis/summary.md"
+    )
+    assert record1["analysis"]["causality_json_path"].endswith(
+        "/artifacts/analysis/causality.json"
+    )
+    assert (run_dir / "artifacts" / "analysis" / "summary.md").is_file()
+    assert (run_dir / "artifacts" / "analysis" / "causality.json").is_file()
     lock = run_dir / "artifacts" / ".finalize.lock"
     assert lock.exists()
     summary_after = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert "finalize" in summary_after
     assert summary_after["finalize"]["run_id"] == "rvf-test-run"
+    assert summary_after["finalize"]["analysis"]["stats"]["run_id"] == "rvf-test-run"
 
     # Idempotency: rerun returns cached
     lock_mtime_before = lock.stat().st_mtime_ns
