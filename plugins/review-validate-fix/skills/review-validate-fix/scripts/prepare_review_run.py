@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import diff_tracker
 from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
 
 
@@ -24,7 +25,7 @@ SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
-SCOPE_CONTRACT_VERSION = 1
+SCOPE_CONTRACT_VERSION = 2
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -73,6 +74,9 @@ def review_env_exports(
     metadata_path: Path,
     snapshot_path: Path,
     bootstrap_metadata_path: Path | None,
+    tracker_dir: Path | None = None,
+    tracker_repo_key: str | None = None,
+    tracker_scope_path: Path | None = None,
     rvf_backend: str | None = None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
@@ -103,6 +107,12 @@ def review_env_exports(
         env["RVF_SESSION_CONTEXT"] = str(scope_of_work_path)
     if session_manifest_path is not None:
         env["RVF_SESSION_MANIFEST"] = str(session_manifest_path)
+    if tracker_dir is not None:
+        env["RVF_TRACKER_DIR"] = str(tracker_dir)
+    if tracker_repo_key:
+        env["RVF_TRACKER_REPO_KEY"] = tracker_repo_key
+    if tracker_scope_path is not None:
+        env["RVF_TRACKER_SCOPE"] = str(tracker_scope_path)
 
     lines = [
         "# Source this file in review subprocesses to avoid repeating long RVF paths.",
@@ -142,9 +152,18 @@ def review_env_exports(
             f"export RVF_WRITE_REVIEW_RESULT={shlex.quote(env['RVF_WRITE_REVIEW_RESULT'])}",
             f"export RVF_CHECK_REVIEW_RESULT={shlex.quote(env['RVF_CHECK_REVIEW_RESULT'])}",
             'export RVF_REVIEW_RESULT="$RVF_ARTIFACTS_DIR/reviewers/${RVF_REVIEWER_ID:-reviewer}/review-result.json"',
-            "",
         ]
     )
+    if tracker_dir is not None:
+        lines.append(f"export RVF_TRACKER_DIR={shlex.quote(str(tracker_dir))}")
+    if tracker_repo_key:
+        lines.append(f"export RVF_TRACKER_REPO_KEY={shlex.quote(tracker_repo_key)}")
+    if tracker_scope_path is not None:
+        if tracker_scope_path == inputs_dir / "tracker-scope.json":
+            lines.append('export RVF_TRACKER_SCOPE="$RVF_INPUTS_DIR/tracker-scope.json"')
+        else:
+            lines.append(f"export RVF_TRACKER_SCOPE={shlex.quote(str(tracker_scope_path))}")
+    lines.append("")
     return env, "\n".join(lines)
 
 
@@ -257,6 +276,81 @@ def metadata_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
 
 
+_HEX64_CHARS = set("0123456789abcdef")
+
+
+def _is_hex64(value: str) -> bool:
+    return len(value) == 64 and all(ch in _HEX64_CHARS for ch in value.lower())
+
+
+def load_tracker_scope(path: Path) -> dict[str, Any]:
+    """Validate an allocator tracker_scope JSON file.
+
+    Required keys: unit_ids (non-empty list of 64-hex sha256 strings), lease_id
+    (non-empty string), scope_hash (64-hex or "sha256:<64-hex>"), paths (list of
+    strings, may be empty).
+
+    Optional keys: hunks (list of dicts), source_session_id (str),
+    takeover_from_session_id (str).
+
+    Unknown keys are tolerated and passed through unchanged so future allocator
+    versions can extend the payload without re-touching this consumer.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"tracker_scope: failed to read {path}: {exc}")
+    if not isinstance(raw, dict):
+        raise ValueError("tracker_scope: payload must be a JSON object")
+
+    unit_ids_raw = raw.get("unit_ids")
+    if not isinstance(unit_ids_raw, list) or not unit_ids_raw:
+        raise ValueError("tracker_scope.unit_ids must be a non-empty list")
+    unit_ids: list[str] = []
+    for index, item in enumerate(unit_ids_raw):
+        if not isinstance(item, str) or not _is_hex64(item):
+            raise ValueError(
+                f"tracker_scope.unit_ids[{index}] must be a 64-character hex string"
+            )
+        unit_ids.append(item.lower())
+
+    lease_id = raw.get("lease_id")
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        raise ValueError("tracker_scope.lease_id must be a non-empty string")
+
+    scope_hash_raw = raw.get("scope_hash")
+    if not isinstance(scope_hash_raw, str) or not scope_hash_raw.strip():
+        raise ValueError("tracker_scope.scope_hash must be a non-empty string")
+    bare = scope_hash_raw[len("sha256:") :] if scope_hash_raw.startswith("sha256:") else scope_hash_raw
+    if not _is_hex64(bare):
+        raise ValueError(
+            "tracker_scope.scope_hash must be 64 hex characters or 'sha256:<64-hex>'"
+        )
+    scope_hash = f"sha256:{bare.lower()}"
+
+    paths_raw = raw.get("paths")
+    if not isinstance(paths_raw, list):
+        raise ValueError("tracker_scope.paths must be a list of strings")
+    for index, item in enumerate(paths_raw):
+        if not isinstance(item, str):
+            raise ValueError(f"tracker_scope.paths[{index}] must be a string")
+    paths = normalized_scope_list(paths_raw)
+
+    if "hunks" in raw and not isinstance(raw.get("hunks"), list):
+        raise ValueError("tracker_scope.hunks must be a list when present")
+    if "source_session_id" in raw and raw["source_session_id"] is not None and not isinstance(raw["source_session_id"], str):
+        raise ValueError("tracker_scope.source_session_id must be a string or null")
+    if "takeover_from_session_id" in raw and raw["takeover_from_session_id"] is not None and not isinstance(raw["takeover_from_session_id"], str):
+        raise ValueError("tracker_scope.takeover_from_session_id must be a string or null")
+
+    payload: dict[str, Any] = dict(raw)
+    payload["unit_ids"] = unit_ids
+    payload["lease_id"] = lease_id
+    payload["scope_hash"] = scope_hash
+    payload["paths"] = paths
+    return payload
+
+
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -279,6 +373,9 @@ def write_scope_contract(
     session_manifest_path: Path | None,
     scope_of_work_path: Path | None,
     review_packet_metadata_path: Path,
+    primary_units: list[str] | None = None,
+    tracker_lease_id: str | None = None,
+    tracker_scope_hash: str | None = None,
 ) -> dict[str, Any]:
     canonical_scope = {
         "version": SCOPE_CONTRACT_VERSION,
@@ -304,6 +401,9 @@ def write_scope_contract(
         "protected_files": protected_files,
         "canonical_issues": canonical_issues,
         "fix_allowlist": fix_allowlist,
+        "primary_units": primary_units,
+        "tracker_lease_id": tracker_lease_id,
+        "tracker_scope_hash": tracker_scope_hash,
         "start_snapshot_path": str(start_snapshot_path),
         "review_packet_path": str(review_packet_path),
         "session_manifest_path": str(session_manifest_path) if session_manifest_path is not None else None,
@@ -397,6 +497,7 @@ def prepare_run(
     rvf_run_id: str | None = None,
     rvf_run_dir: Path | None = None,
     rvf_backend: str | None = None,
+    tracker_scope: Path | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
     canonical_backend = normalize_rvf_backend(rvf_backend) or "manual"
@@ -457,6 +558,8 @@ def prepare_run(
                 str(transcript),
                 "--output",
                 str(session_manifest_path),
+                "--tracker-run-id",
+                ledger.run_id,
             ]
         )
         packet_session_manifest = session_manifest_path
@@ -465,6 +568,33 @@ def prepare_run(
         shutil.copyfile(session_manifest, session_manifest_path)
         packet_session_manifest = session_manifest_path
         source_session_manifest = str(session_manifest)
+
+    tracker_scope_payload: dict[str, Any] | None = None
+    artifact_tracker_scope_path: Path | None = None
+    if tracker_scope is not None:
+        if packet_session_manifest is None:
+            raise ValueError(
+                "--tracker-scope requires --session-manifest or --transcript so the "
+                "tracker_scope payload can be spliced into manifest.tracker.tracker_scope"
+            )
+        tracker_scope_payload = load_tracker_scope(tracker_scope)
+        try:
+            manifest_dict = json.loads(session_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"failed to read session manifest for tracker_scope splice: {exc}")
+        if not isinstance(manifest_dict, dict):
+            raise ValueError("session manifest is not a JSON object; cannot splice tracker_scope")
+        manifest_tracker = manifest_dict.get("tracker")
+        if not isinstance(manifest_tracker, dict):
+            manifest_tracker = {}
+            manifest_dict["tracker"] = manifest_tracker
+        manifest_tracker["tracker_scope"] = tracker_scope_payload
+        session_manifest_path.write_text(
+            json.dumps(manifest_dict, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        artifact_tracker_scope_path = artifact_dir / "tracker-scope.json"
+        shutil.copyfile(tracker_scope, artifact_tracker_scope_path)
 
     packet_cmd = [
         sys.executable,
@@ -514,6 +644,13 @@ def prepare_run(
         shutil.copyfile(scope_of_work_path, input_scope_of_work_path)
     if session_manifest_path.exists():
         shutil.copyfile(session_manifest_path, input_session_manifest_path)
+    resolved_input_tracker_scope_path: Path | None = None
+    resolved_artifact_tracker_scope_path: Path | None = None
+    if artifact_tracker_scope_path is not None and artifact_tracker_scope_path.exists():
+        input_tracker_scope_path = inputs_dir / "tracker-scope.json"
+        shutil.copyfile(artifact_tracker_scope_path, input_tracker_scope_path)
+        resolved_input_tracker_scope_path = input_tracker_scope_path.resolve()
+        resolved_artifact_tracker_scope_path = artifact_tracker_scope_path.resolve()
     resolved_input_packet_path = input_packet_path.resolve()
     resolved_input_metadata_path = input_metadata_path.resolve()
     resolved_input_snapshot_path = input_snapshot_path.resolve()
@@ -536,6 +673,14 @@ def prepare_run(
     )
     protected_files = background_scope_files
     created_at = datetime.now(timezone.utc).isoformat()
+    if tracker_scope_payload is not None:
+        contract_primary_units: list[str] | None = sorted(set(tracker_scope_payload["unit_ids"]))
+        contract_tracker_lease_id: str | None = tracker_scope_payload["lease_id"]
+        contract_tracker_scope_hash: str | None = tracker_scope_payload["scope_hash"]
+    else:
+        contract_primary_units = None
+        contract_tracker_lease_id = None
+        contract_tracker_scope_hash = None
     scope_contract = write_scope_contract(
         path=scope_contract_path,
         run_id=ledger.run_id,
@@ -553,6 +698,9 @@ def prepare_run(
         session_manifest_path=resolved_input_session_manifest_path,
         scope_of_work_path=resolved_input_scope_of_work_path,
         review_packet_metadata_path=resolved_input_metadata_path,
+        primary_units=contract_primary_units,
+        tracker_lease_id=contract_tracker_lease_id,
+        tracker_scope_hash=contract_tracker_scope_hash,
     )
     bootstrap = build_worktree_bootstrap(
         repo=root,
@@ -561,6 +709,31 @@ def prepare_run(
     )
     scope_path = scope_of_work_path.resolve() if session_context is not None else None
     manifest_path = session_manifest_path.resolve() if packet_session_manifest is not None else None
+
+    tracker_dir_path: Path | None = None
+    tracker_repo_key_value: str | None = None
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest_payload = {}
+        if isinstance(manifest_payload, dict):
+            tracker_meta = manifest_payload.get("tracker") if isinstance(manifest_payload.get("tracker"), dict) else None
+            if tracker_meta is not None:
+                if isinstance(tracker_meta.get("tracker_dir"), str) and tracker_meta["tracker_dir"]:
+                    tracker_dir_path = Path(tracker_meta["tracker_dir"]).expanduser()
+                if isinstance(tracker_meta.get("repo_key"), str) and tracker_meta["repo_key"]:
+                    tracker_repo_key_value = tracker_meta["repo_key"]
+                heartbeat_session = tracker_meta.get("session_id") or manifest_payload.get("session_id")
+                if isinstance(heartbeat_session, str) and heartbeat_session:
+                    try:
+                        diff_tracker.heartbeat(
+                            root,
+                            session_id=heartbeat_session,
+                            run_id=ledger.run_id,
+                        )
+                    except Exception:
+                        pass
     review_env, review_env_text = review_env_exports(
         repo=root,
         run_id=ledger.run_id,
@@ -575,6 +748,9 @@ def prepare_run(
         metadata_path=metadata_path,
         snapshot_path=snapshot_path,
         bootstrap_metadata_path=bootstrap["metadata_path"],
+        tracker_dir=tracker_dir_path,
+        tracker_repo_key=tracker_repo_key_value,
+        tracker_scope_path=resolved_input_tracker_scope_path,
         rvf_backend=canonical_backend,
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
@@ -607,6 +783,12 @@ def prepare_run(
         else None,
         "input_session_manifest_file": str(resolved_input_session_manifest_path)
         if resolved_input_session_manifest_path is not None
+        else None,
+        "input_tracker_scope_file": str(resolved_input_tracker_scope_path)
+        if resolved_input_tracker_scope_path is not None
+        else None,
+        "tracker_scope_file": str(resolved_artifact_tracker_scope_path)
+        if resolved_artifact_tracker_scope_path is not None
         else None,
         "worktree_bootstrap": str(bootstrap["metadata_path"]),
         "worktree_bootstrap_patch": str(bootstrap["patch_path"]),
@@ -700,6 +882,14 @@ def main() -> int:
     parser.add_argument("--background-file", action="append", default=[], help="Path known to be pre-existing background WIP. May be repeated.")
     parser.add_argument("--exclude-path-prefix", action="append", default=[], help="Path prefix to omit from status, diff, and untracked packet sections. May be repeated.")
     parser.add_argument(
+        "--tracker-scope",
+        help=(
+            "Path to an allocator tracker_scope JSON object. Splices into "
+            "manifest.tracker.tracker_scope and unlocks scope.contract.json v2 fields. "
+            "Requires --session-manifest or --transcript."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-session-context",
         action="store_true",
         help="Debug-only escape hatch. Normal review runs must pass --session-context.",
@@ -729,6 +919,14 @@ def main() -> int:
             raise ValueError(f"session manifest file not found: {session_manifest}")
         if transcript is not None and not transcript.exists():
             raise ValueError(f"transcript file not found: {transcript}")
+        tracker_scope = Path(args.tracker_scope).expanduser().resolve() if args.tracker_scope else None
+        if tracker_scope is not None and session_manifest is None and transcript is None:
+            raise ValueError(
+                "--tracker-scope requires --session-manifest or --transcript so the "
+                "tracker_scope payload can be spliced into manifest.tracker.tracker_scope"
+            )
+        if tracker_scope is not None and not tracker_scope.exists():
+            raise ValueError(f"tracker scope file not found: {tracker_scope}")
         result = prepare_run(
             repo=Path(args.repo).expanduser().resolve(),
             session_context=session_context,
@@ -744,6 +942,7 @@ def main() -> int:
             rvf_run_id=args.rvf_run_id,
             rvf_run_dir=Path(args.rvf_run_dir).expanduser().resolve() if args.rvf_run_dir else None,
             rvf_backend=args.rvf_backend,
+            tracker_scope=tracker_scope,
         )
     except Exception as exc:
         return fail(str(exc), 2)

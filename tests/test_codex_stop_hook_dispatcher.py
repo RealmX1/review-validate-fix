@@ -1323,11 +1323,51 @@ def test_dev_repo_without_session_owned_dirty_skips_sync_and_hook(tmp_path: Path
     assert completed.returncode == 0
     payload = json.loads(completed.stdout)
     assert payload["continue"] is True
-    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    # Slice 3 reason-code rename: structured reason_code is the new name; the
+    # legacy substring is preserved as the `reason_code_legacy_alias` summary
+    # field but does NOT appear in systemMessage on the dispatcher path.
+    assert "reason=no_unassigned_review_scope" in payload["systemMessage"]
+    summary = latest_summary(tmp_path / "state")
+    assert summary["reason_code"] == "no_unassigned_review_scope"
+    assert summary.get("reason_code_legacy_alias") == "no_session_owned_dirty"
     assert completed.stderr == ""
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
+
+
+def test_dispatcher_falls_back_to_legacy_when_tracker_disabled(tmp_path: Path) -> None:
+    """`CODEX_RVF_TRACKER_DISABLE=1` keeps Phase-0 reason codes
+    (`no_session_owned_dirty`) flowing through the dispatcher gate so
+    disable-mode users see no behavior change."""
+    repo = init_repo(tmp_path / "rvf")
+    (repo / "background.txt").write_text("background\n", encoding="utf-8")
+    transcript = write_user_transcript(tmp_path / "session.jsonl", repo)
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    summary = latest_summary(tmp_path / "state")
+    assert summary["reason_code"] == "no_session_owned_dirty"
+    assert not (marker / "sync-ran").exists()
 
 
 def test_session_hook_control_forwards_without_session_owned_dirty(tmp_path: Path) -> None:
@@ -1458,6 +1498,68 @@ def test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook(tmp_path: Path) -
     assert (marker / "sync-ran").exists()
     assert (marker / "install-ran").exists()
     assert (marker / "hook-input.json").exists()
+
+
+def test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fails(
+    tmp_path: Path,
+) -> None:
+    """`should_sync_session_scope` 必须在 `refresh_global_diff_tracker` 因
+    build_manifest 异常返回 sentinel 时 fail-loud 返回
+    `session_manifest_failed`，而不是继续走 allocator dry-run（后者会因为
+    空 session_units 把 manifest 失败误判为 `no_unassigned_review_scope`，
+    导致 dispatcher 错误地跳过 dev-sync 与 installed hook）。"""
+    module = load_dispatcher_module()
+    repo = init_repo(tmp_path / "rvf")
+    transcript = write_user_transcript(tmp_path / "session.jsonl", repo)
+
+    # 直接加载 codex_stop_review_validate_fix 模块，把它的 `build_manifest`
+    # 替换成立即抛错的 stub。dispatcher 在 should_sync_session_scope 里用
+    # `from codex_stop_review_validate_fix import refresh_global_diff_tracker`
+    # 后调用，所以替换该模块全局即可生效。
+    skill_scripts = SCRIPT.parent
+    sys.path.insert(0, str(skill_scripts))
+    try:
+        import codex_stop_review_validate_fix as hook_module
+    finally:
+        # 保留 sys.path 修改：dispatcher 也会用同一前缀路径。
+        pass
+    original_build_manifest = hook_module.build_manifest
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("boom: synthetic build_manifest failure")
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
+    old_disable = os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+    try:
+        hook_module.build_manifest = _raise  # type: ignore[assignment]
+        ledger = hook_module.start_run(
+            "stop-hook-dispatcher-test", repo=str(repo), cwd=str(repo)
+        )
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        synced, message, reason_code = module.should_sync_session_scope(
+            event, repo, ledger
+        )
+    finally:
+        hook_module.build_manifest = original_build_manifest  # type: ignore[assignment]
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_disable is not None:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = old_disable
+
+    assert synced is False
+    assert reason_code == "session_manifest_failed"
+    assert "session manifest failed" in message
+    # ledger 应记录 dev-sync 端的 session_scope_failed 与上游
+    # tracker_refresh_failed，二者都用 session_manifest_failed reason code。
+    raw = ledger.events_path.read_text(encoding="utf-8") if ledger.events_path.exists() else ""
+    assert "tracker_refresh_failed" in raw
+    assert "session_scope_failed" in raw
+    assert raw.count("session_manifest_failed") >= 2
 
 
 def test_coerce_text_handles_timeout_bytes() -> None:
@@ -1878,10 +1980,12 @@ def main() -> int:
         test_missing_installed_hook_blocks_instead_of_continuing,
         test_installed_hook_timeout_blocks_instead_of_continuing,
         test_dev_repo_without_session_owned_dirty_skips_sync_and_hook,
+        test_dispatcher_falls_back_to_legacy_when_tracker_disabled,
         test_session_hook_control_forwards_without_session_owned_dirty,
         test_session_manifest_failure_skips_sync_and_installed_hook,
         test_provided_missing_transcript_skips_sync_and_installed_hook,
         test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook,
+        test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fails,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
         test_dev_sync_step_specs_resolve_repo_level_dev_scripts,

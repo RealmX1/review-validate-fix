@@ -5,6 +5,7 @@ import argparse
 import json
 import importlib.util
 import os
+import signal
 import shlex
 import subprocess
 import sys
@@ -1761,7 +1762,7 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert "- secret.txt" in packet_text
     assert "### secret.txt" not in packet_text
     contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
-    assert contract["version"] == 1
+    assert contract["version"] == 2
     assert contract["run_id"] == payload["run_id"]
     assert contract["scope_mode"] == "custom"
     assert contract["canonical_issues"] == []
@@ -1770,6 +1771,9 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert contract["review_packet_path"] == payload["input_review_packet"]
     assert contract["start_snapshot_path"] == payload["input_before_workspace_snapshot"]
     assert contract["scope_hash"] == payload["scope_contract_payload"]["scope_hash"]
+    assert contract["primary_units"] is None
+    assert contract["tracker_lease_id"] is None
+    assert contract["tracker_scope_hash"] is None
 
     locked = run(
         [
@@ -4172,6 +4176,1466 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
 
 
+DIFF_TRACKER = SCRIPT_DIR / "diff_tracker.py"
+
+
+def load_diff_tracker_module():
+    if "rvf_diff_tracker" in sys.modules:
+        return sys.modules["rvf_diff_tracker"]
+    spec = importlib.util.spec_from_file_location("rvf_diff_tracker", DIFF_TRACKER)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load diff_tracker module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["rvf_diff_tracker"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("rvf_diff_tracker", None)
+        raise
+    return module
+
+
+def _write_session_transcript(path: Path, repo: Path, *, session_id: str, target_path: str, line: str) -> Path:
+    apply_patch_input = (
+        "*** Begin Patch\n"
+        f"*** Update File: {target_path}\n"
+        "@@\n"
+        "-base\n"
+        f"+{line}\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {
+            "timestamp": "2026-04-27T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": session_id, "cwd": str(repo)},
+        },
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": apply_patch_input,
+                "call_id": "call_patch",
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+    return path
+
+
+def test_diff_tracker_register_creates_sqlite_and_events(tmp: Path) -> None:
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    result = module.register_claims(
+        repo=repo,
+        session_id="session-1",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert result.status == "ok"
+    assert result.repo_key
+    assert result.tracker_dir
+    tracker_path = Path(result.tracker_dir)
+    # Slice 2-A: tracker dir lives under diff-tracker/repos/<key>/
+    assert "diff-tracker" in tracker_path.parts and "repos" in tracker_path.parts
+    db_path = tracker_path / "tracker.sqlite3"
+    assert db_path.is_file()
+    assert (tracker_path / "events.jsonl").is_file()
+    assert (tracker_path / "meta.json").is_file()
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units = conn.execute(
+            "SELECT path, kind, observed_state, review_state FROM units"
+        ).fetchall()
+        assert len(units) == 1, units
+        assert units[0][0] == "tracked.txt"
+        assert units[0][1] == "tracked_hunk"
+        assert units[0][2] == "dirty"
+        assert units[0][3] == "available"
+        sessions = conn.execute(
+            "SELECT session_id FROM sessions"
+        ).fetchall()
+        assert {row[0] for row in sessions} == {"session-1"}
+        session_units = conn.execute(
+            "SELECT session_id, assignment_kind FROM session_units"
+        ).fetchall()
+        assert session_units == [("session-1", "owned")]
+    finally:
+        conn.close()
+    events = read_jsonl(tracker_path / "events.jsonl")
+    assert any(event.get("event") == "claim_added" for event in events)
+    # claim_ids are now content-addressed sha256 unit_ids — sanity check shape.
+    assert len(result.claim_ids) == 1
+    assert len(result.claim_ids[0]) == 64
+
+
+def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
+    load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    (repo / "second.txt").write_text("base\nedit b\n", encoding="utf-8")
+    run(["git", "add", "second.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add second"], cwd=repo)
+    (repo / "second.txt").write_text("base\nedit b session-2\n", encoding="utf-8")
+    log_root = tmp / "logs"
+
+    # Both child processes block until the same absolute wall-clock timestamp
+    # before calling register_claims. Without this barrier the first proc
+    # routinely finishes before the second one even imports diff_tracker, so
+    # the flock/contention path is never exercised — the test would only
+    # confirm "two sequential writers don't drop each other's claims".
+    snippet = (
+        "import os, sys, time, json\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        # Bump busy_timeout high enough that the second writer can wait out
+        # the first's lock even under load (4-shard contract checks run several
+        # tests in parallel, slowing each register_claims's git calls).
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import diff_tracker as dt\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"repo = Path({str(repo)!r})\n"
+        "session = sys.argv[1]\n"
+        "path = sys.argv[2]\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.register_claims(\n"
+        "    repo=repo, session_id=session, run_id=session,\n"
+        "    worktree=None, branch=None,\n"
+        "    owned_paths=[path], apply_patch_paths={path}, exec_only_paths=set(),\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result.to_dict()))\n"
+    )
+    # Give both subprocesses ~1.5s to start and import before they unblock.
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = []
+    for session, path in (("session-A", "tracked.txt"), ("session-B", "second.txt")):
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", snippet, session, path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        )
+    outputs = [proc.communicate() for proc in procs]
+    for stdout, stderr in outputs:
+        if stderr.strip():
+            raise AssertionError(stderr.strip())
+        payload = json.loads(stdout.strip().splitlines()[-1])
+        assert payload["status"] == "ok"
+    import sqlite3 as _sqlite
+    repo_key = json.loads(outputs[0][0].splitlines()[-1])["repo_key"]
+    db_path = log_root / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        sessions = {row[0] for row in conn.execute("SELECT session_id FROM sessions").fetchall()}
+    finally:
+        conn.close()
+    assert sessions == {"session-A", "session-B"}
+
+
+def test_canonical_patch_hash_stable_across_reruns(tmp: Path) -> None:
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-stable",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-stable",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.claim_ids == second.claim_ids
+    assert second.dropped_stale_claim_ids == []
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units = conn.execute("SELECT unit_id FROM units").fetchall()
+    finally:
+        conn.close()
+    assert len(units) == 1
+
+
+def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
+    """Two distinct edits in the same file must yield two distinct claim_ids
+    on first register, and rerunning the same session must NOT drop or fold
+    them together. This guards against the regression where deriving anchors
+    via `git diff -U0` produced empty `context_lines`, collapsing every
+    fuzzy-match decision down to "ranges within ±5 lines".
+    """
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    # 14-line baseline so two well-separated edits stay as two distinct hunks
+    # under -U3 (gap of 8 unchanged lines between them — beyond the 6-line
+    # context window where git would otherwise merge adjacent hunks).
+    baseline = "".join(f"line-{i}\n" for i in range(1, 15))
+    (repo / "tracked.txt").write_text(baseline, encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    edited_lines = [f"line-{i}\n" for i in range(1, 15)]
+    edited_lines[0] = "LINE-1\n"    # change line 1
+    edited_lines[9] = "LINE-10\n"   # change line 10 → 2 hunks under -U3
+    (repo / "tracked.txt").write_text("".join(edited_lines), encoding="utf-8")
+    log_root = tmp / "logs"
+
+    import sqlite3 as _sqlite
+
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-close-hunks",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    # Two distinct hunks → two distinct unit_ids.
+    assert len(first.claim_ids) == 2, first.claim_ids
+    assert len(set(first.claim_ids)) == 2, first.claim_ids
+
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, hunk_header FROM units WHERE kind='tracked_hunk' ORDER BY hunk_header"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2, rows
+    headers = {row[1] for row in rows}
+    assert len(headers) == 2, headers
+    unit_ids = {row[0] for row in rows}
+    assert len(unit_ids) == 2, unit_ids
+
+    # Rerun must be idempotent: same unit_ids, no stale drops, units unchanged.
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-close-hunks",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert sorted(first.claim_ids) == sorted(second.claim_ids)
+    assert second.dropped_stale_claim_ids == []
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows2 = conn.execute("SELECT unit_id FROM units WHERE kind='tracked_hunk'").fetchall()
+    finally:
+        conn.close()
+    assert len(rows2) == 2
+
+
+def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Path) -> None:
+    """A second register call with an empty owned_paths list must NOT drop
+    the session's existing claims — that path used to fall through to the
+    drop-all branch, silently moving every claim into tombstones.
+    """
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    seed = module.register_claims(
+        repo=repo,
+        session_id="session-empty",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    import sqlite3 as _sqlite
+
+    assert seed.status == "ok"
+    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        before = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
+        before_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert len(before) == 1
+    assert len(before_tomb) == 0
+
+    noop = module.register_claims(
+        repo=repo,
+        session_id="session-empty",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=[],
+        apply_patch_paths=set(),
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert noop.status == "no_paths", noop.to_dict()
+    assert noop.claim_ids == []
+    assert noop.dropped_stale_claim_ids == []
+
+    conn = _sqlite.connect(str(db_path))
+    try:
+        after = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
+        after_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert len(after) == 1
+    assert after[0][0] == seed.claim_ids[0]
+    assert len(after_tomb) == 0
+
+
+def test_diff_tracker_list_conflicts_reports_other_session_overlap(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    module.register_claims(
+        repo=repo,
+        session_id="session-A",
+        run_id="run-A",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
+    conflicts = module.list_conflicts(
+        repo,
+        current_session_id="session-B",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert len(conflicts) == 1
+    payload = conflicts[0].to_dict()
+    assert payload["other_session_id"] == "session-A"
+    assert payload["path"] == "tracked.txt"
+    same_session = module.list_conflicts(
+        repo,
+        current_session_id="session-A",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert same_session == []
+
+
+def test_diff_tracker_path_claim_conflicts_with_hunk_claim(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # session-A claims tracked.txt with hunk evidence (apply_patch).
+    module.register_claims(
+        repo=repo,
+        session_id="session-A",
+        run_id="run-A",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    # session-B comes in with only a path-level claim — it must overlap.
+    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
+    conflicts = module.list_conflicts(
+        repo,
+        current_session_id="session-B",
+        owned_units=units,
+        log_root_override=log_root,
+    )
+    assert len(conflicts) == 1
+    assert conflicts[0].to_dict()["unit"] == "hunk"
+
+
+def test_session_manifest_writes_tracker_claim(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-tracker",
+        ],
+        env=env,
+    )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tracker = payload.get("tracker")
+    assert isinstance(tracker, dict)
+    assert tracker["status"] == "ok"
+    assert tracker["repo_key"]
+    assert tracker["claim_ids"]
+    assert tracker["tracker_dir"]
+    assert any(unit.get("unit") in {"hunk", "path"} for unit in tracker.get("owned_units", []))
+
+
+def test_build_packet_emits_cross_session_conflict_section(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # Pre-register a claim from a different session so the current run sees a conflict.
+    module.register_claims(
+        repo=repo,
+        session_id="other-session",
+        run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-current",
+        ],
+        env=env,
+    )
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：cross-session conflict test\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest_path),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ],
+        env=env,
+    )
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Cross-Session Conflicts" in packet_text
+    assert "other-session" in packet_text
+    assert payload["cross_session_conflicts"]
+    assert payload["cross_session_conflicts"][0]["other_session_id"] == "other-session"
+
+
+def test_build_packet_omits_cross_session_section_when_clean(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    manifest_path = tmp / "manifest.json"
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    run(
+        [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(repo),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(manifest_path),
+            "--tracker-run-id",
+            "run-1",
+        ],
+        env=env,
+    )
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：no conflict path\n"
+        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
+        encoding="utf-8",
+    )
+    packet = tmp / "packet.md"
+    metadata = tmp / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest_path),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ],
+        env=env,
+    )
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert "## Cross-Session Conflicts" not in packet_text
+    assert payload["cross_session_conflicts"] == []
+
+
+def test_canonical_patch_hash_stable_under_line_shift(tmp: Path) -> None:
+    """Inserting blank lines above an unrelated hunk shifts only `@@ -A,B +C,D @@`
+    line numbers; the hunk's content payload is untouched, so its
+    canonical_patch_hash (== unit_id) must stay byte-identical."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    baseline = "".join(f"line-{i}\n" for i in range(1, 21))
+    target = repo / "shift.txt"
+    target.write_text(baseline, encoding="utf-8")
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+
+    # First edit: change line-15 only — produces a single hunk near EOF.
+    first_lines = baseline.splitlines(keepends=True)
+    first_lines[14] = "LINE-15\n"
+    target.write_text("".join(first_lines), encoding="utf-8")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-shift",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["shift.txt"],
+        apply_patch_paths={"shift.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    assert len(first.claim_ids) == 1
+    first_unit_id = first.claim_ids[0]
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+
+    # Second edit: re-write file inserting 5 blank lines at top, keeping the
+    # same line-15 → LINE-15 edit (which now sits at line 20). The hunk content
+    # the diff emits is identical (same context lines, same +/- pair); only
+    # the @@ header numbers change.
+    shifted = ["\n"] * 5 + first_lines
+    target.write_text("".join(shifted), encoding="utf-8")
+    # Recommit baseline so HEAD also has the prefix blanks — otherwise the diff
+    # would include the blank-line insertions and the hunk content would
+    # legitimately differ.
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "shift baseline"], cwd=repo)
+    # Restore the same edit on the new baseline.
+    new_baseline = "".join(["\n"] * 5 + baseline.splitlines(keepends=True))
+    target.write_text(new_baseline, encoding="utf-8")
+    run(["git", "add", "shift.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "restore base after shift"], cwd=repo)
+    edited2 = new_baseline.splitlines(keepends=True)
+    edited2[19] = "LINE-15\n"  # 14 (original index) + 5 (prefix blanks) = 19
+    target.write_text("".join(edited2), encoding="utf-8")
+
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-shift",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["shift.txt"],
+        apply_patch_paths={"shift.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok", second.to_dict()
+    assert second.claim_ids == [first_unit_id], (first_unit_id, second.claim_ids)
+    assert second.dropped_stale_claim_ids == []
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state FROM units WHERE path='shift.txt'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1, rows
+    assert rows[0][0] == first_unit_id
+    assert rows[0][1] == "dirty"
+
+
+def test_canonical_patch_hash_changes_on_content_edit(tmp: Path) -> None:
+    """Editing the hunk content (not just shifting line numbers) must produce
+    a new unit_id and demote the old unit to observed_state='superseded'."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    baseline = "alpha\nbeta\ngamma\n"
+    target = repo / "edit.txt"
+    target.write_text(baseline, encoding="utf-8")
+    run(["git", "add", "edit.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    target.write_text("alpha\nBETA-v1\ngamma\n", encoding="utf-8")
+    log_root = tmp / "logs"
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-edit",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["edit.txt"],
+        apply_patch_paths={"edit.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok"
+    assert len(first.claim_ids) == 1
+    old_unit_id = first.claim_ids[0]
+    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
+
+    # Now genuinely change the hunk content — different replacement line.
+    target.write_text("alpha\nBETA-v2\ngamma\n", encoding="utf-8")
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-edit",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["edit.txt"],
+        apply_patch_paths={"edit.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert len(second.claim_ids) == 1
+    new_unit_id = second.claim_ids[0]
+    assert new_unit_id != old_unit_id
+    # The old session_units row must be gone (replaced by the new unit_id),
+    # and dropped_stale_claim_ids surfaces the old unit_id.
+    assert old_unit_id in second.dropped_stale_claim_ids
+    conn = _sqlite.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state FROM units WHERE path='edit.txt' ORDER BY first_observed_at"
+        ).fetchall()
+        session_units = conn.execute(
+            "SELECT unit_id FROM session_units WHERE session_id='session-edit'"
+        ).fetchall()
+    finally:
+        conn.close()
+    by_unit = {row[0]: row[1] for row in rows}
+    assert by_unit.get(old_unit_id) == "superseded", by_unit
+    assert by_unit.get(new_unit_id) == "dirty", by_unit
+    assert {row[0] for row in session_units} == {new_unit_id}
+
+
+def test_migration_phase1_json_to_sqlite_idempotent(tmp: Path) -> None:
+    """Hand-write a Phase 1 state.json + events.jsonl + meta.json under the
+    legacy `<log_root>/tracker/<key>/` path. First register_claims call must
+    create sqlite, archive legacy files into `_legacy/`, and stamp meta.json
+    with `migrated_from`. Second call must not re-import or re-archive."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key = module.repo_key(common_dir)
+    legacy_dir = log_root / "tracker" / repo_key
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy_state = {
+        "schema_version": 1,
+        "claims": [
+            {
+                "claim_id": "clm-legacy-001",
+                "session_id": "session-legacy",
+                "run_id": "run-legacy",
+                "worktree": str(repo.resolve()),
+                "branch": "main",
+                "path": "tracked.txt",
+                "unit": "hunk",
+                "hunk_anchor": {
+                    "header": "@@ -1 +1,2 @@",
+                    "context_hash": "deadbeefdeadbeef",
+                    "old_range": [1, 1],
+                    "new_range": [1, 2],
+                },
+                "evidence": "apply_patch",
+                "claimed_at": "2026-04-01T00:00:00Z",
+                "last_seen_at": "2026-04-01T00:00:00Z",
+                "lease": None,
+            },
+        ],
+        "tombstones": [
+            {
+                "claim_id": "clm-tombstoned",
+                "session_id": "session-legacy",
+                "path": "removed.txt",
+                "unit": "path",
+                "dropped_at": "2026-04-01T00:00:00Z",
+                "reason": "session_no_longer_owns",
+            },
+        ],
+    }
+    (legacy_dir / "state.json").write_text(
+        json.dumps(legacy_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (legacy_dir / "events.jsonl").write_text(
+        json.dumps({"timestamp": "2026-04-01T00:00:00Z", "event": "claim_added"}) + "\n",
+        encoding="utf-8",
+    )
+    (legacy_dir / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "repo_key": repo_key}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    first = module.register_claims(
+        repo=repo,
+        session_id="session-after-migration",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert first.status == "ok", first.to_dict()
+    new_dir = log_root / "diff-tracker" / "repos" / repo_key
+    db_path = new_dir / "tracker.sqlite3"
+    assert db_path.is_file()
+    archive = legacy_dir / "_legacy"
+    assert (archive / "state.json").is_file()
+    assert (archive / "events.jsonl").is_file()
+    assert not (legacy_dir / "state.json").exists()
+    meta_payload = json.loads((new_dir / "meta.json").read_text(encoding="utf-8"))
+    assert meta_payload.get("migrated_from") == "json-v1"
+    assert meta_payload.get("schema_version") == module.SCHEMA_VERSION
+    archive_state = json.loads((archive / "state.json").read_text(encoding="utf-8"))
+    assert archive_state["claims"][0]["claim_id"] == "clm-legacy-001"
+
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units_before = conn.execute("SELECT unit_id, path FROM units ORDER BY unit_id").fetchall()
+        sessions_before = conn.execute("SELECT session_id FROM sessions").fetchall()
+        tombstones_before = conn.execute("SELECT ref_id FROM tombstones").fetchall()
+    finally:
+        conn.close()
+    assert {row[0] for row in sessions_before} == {"session-legacy", "session-after-migration"}
+    assert any(row[0] == "clm-tombstoned" for row in tombstones_before)
+    archive_state_mtime = (archive / "state.json").stat().st_mtime
+
+    events_first = read_jsonl(new_dir / "events.jsonl")
+    migration_started_first = sum(1 for e in events_first if e.get("event") == "migration_started")
+    assert migration_started_first == 1, events_first
+
+    second = module.register_claims(
+        repo=repo,
+        session_id="session-after-migration",
+        run_id="run-2",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert second.status == "ok"
+    assert (archive / "state.json").stat().st_mtime == archive_state_mtime
+    conn = _sqlite.connect(str(db_path))
+    try:
+        units_after = conn.execute("SELECT unit_id, path FROM units ORDER BY unit_id").fetchall()
+    finally:
+        conn.close()
+    assert units_after == units_before
+    events_second = read_jsonl(new_dir / "events.jsonl")
+    migration_started_second = sum(1 for e in events_second if e.get("event") == "migration_started")
+    assert migration_started_second == 1, events_second
+
+
+def test_migration_phase1_recovers_when_archive_predates_db_marker(tmp: Path) -> None:
+    """Simulate the historical crash window: legacy state.json was already moved
+    into `_legacy/` but the SQLite transaction that recorded `migrated_from`
+    was rolled back (process death between archive and COMMIT). The next
+    register_claims call MUST re-import claims from the archived state.json
+    rather than treat the missing live state.json as "nothing to migrate"
+    and silently lose every Phase-1 claim."""
+    import sqlite3 as _sqlite
+
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key = module.repo_key(common_dir)
+
+    # Stage the post-crash on-disk shape directly: archive dir holds the
+    # legacy state.json, but live legacy_dir/state.json is gone and the
+    # SQLite db has no `migrated_from` row.
+    legacy_dir = log_root / "tracker" / repo_key
+    archive = legacy_dir / "_legacy"
+    archive.mkdir(parents=True, exist_ok=True)
+    legacy_state = {
+        "schema_version": 1,
+        "claims": [
+            {
+                "claim_id": "clm-recover-001",
+                "session_id": "session-recover",
+                "run_id": "run-recover",
+                "worktree": str(repo.resolve()),
+                "branch": "main",
+                "path": "tracked.txt",
+                "unit": "path",
+                "evidence": "apply_patch",
+                "claimed_at": "2026-04-02T00:00:00Z",
+                "last_seen_at": "2026-04-02T00:00:00Z",
+                "lease": None,
+            },
+        ],
+        "tombstones": [],
+    }
+    (archive / "state.json").write_text(
+        json.dumps(legacy_state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    # The archived events.jsonl is the only surviving copy after the crash
+    # window: a prior _post_commit moved the live copy into _legacy/ before
+    # the SQLite COMMIT rolled back. Recovery must replay these into the new
+    # events.jsonl, matching the normal-migration path's side effects.
+    (archive / "events.jsonl").write_text(
+        json.dumps(
+            {"timestamp": "2026-04-02T00:00:00Z", "event": "claim_added", "claim_id": "clm-recover-001"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # No live state.json — represents the "archived but not committed" gap.
+
+    result = module.register_claims(
+        repo=repo,
+        session_id="session-after-crash",
+        run_id="run-1",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert result.status == "ok", result.to_dict()
+
+    new_dir = log_root / "diff-tracker" / "repos" / repo_key
+    db_path = new_dir / "tracker.sqlite3"
+    assert db_path.is_file()
+    conn = _sqlite.connect(str(db_path))
+    try:
+        sessions = {row[0] for row in conn.execute("SELECT session_id FROM sessions").fetchall()}
+        migrated_from = conn.execute(
+            "SELECT value FROM meta WHERE key='migrated_from'"
+        ).fetchone()
+    finally:
+        conn.close()
+    # Both the recovered legacy session AND the new one must be present.
+    assert sessions == {"session-recover", "session-after-crash"}, sessions
+    assert migrated_from is not None and migrated_from[0] == "json-v1"
+    # Archive remains intact; live legacy state.json must NOT have been
+    # re-created (would re-trigger migration on every call).
+    assert (archive / "state.json").is_file()
+    assert not (legacy_dir / "state.json").exists()
+    # Recovery must replay the archived phase1 events into the new events.jsonl
+    # so the recovery branch is observationally aligned with the normal
+    # migration path's events.jsonl side effects.
+    new_events = read_jsonl(new_dir / "events.jsonl")
+    replayed = [e for e in new_events if e.get("imported_from") == "phase1"]
+    assert any(
+        e.get("event") == "claim_added" and e.get("claim_id") == "clm-recover-001"
+        for e in replayed
+    ), new_events
+
+
+def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    previous = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
+
+    def _run_with_disable_value(value: str | None) -> object:
+        if value is None:
+            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = value
+        return module.register_claims(
+            repo=repo,
+            session_id="session-1",
+            run_id="run-1",
+            worktree=None,
+            branch=None,
+            owned_paths=["tracked.txt"],
+            apply_patch_paths={"tracked.txt"},
+            exec_only_paths=set(),
+            log_root_override=log_root,
+        )
+
+    try:
+        # Truthy values disable.
+        assert _run_with_disable_value("1").status == "disabled"
+        assert not (log_root / "diff-tracker").exists()
+        # `no` / `off` / `false` must NOT disable — they read as "do not
+        # disable", matching user intuition. Previously they silently
+        # disabled because the check was a blacklist.
+        for falsy in ("no", "off", "false", "False", "NO"):
+            res = _run_with_disable_value(falsy)
+            assert res.status == "ok", f"value={falsy!r} unexpectedly disabled tracker"
+    finally:
+        if previous is None:
+            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["CODEX_RVF_TRACKER_DISABLE"] = previous
+
+
+def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    # Pre-register so the sqlite file exists.
+    seed = module.register_claims(
+        repo=repo,
+        session_id="seed",
+        run_id="seed",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert seed.status == "ok"
+    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
+    # External holder takes a BEGIN IMMEDIATE write lock and sleeps so the
+    # next BEGIN IMMEDIATE inside register_claims must contend for it.
+    blocker_script = (
+        "import sqlite3, sys, time\n"
+        "conn = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=10)\n"
+        "conn.execute('BEGIN IMMEDIATE')\n"
+        "sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
+        "time.sleep(float(sys.argv[2]))\n"
+        "conn.execute('ROLLBACK')\n"
+        "conn.close()\n"
+    )
+    blocker = subprocess.Popen(
+        [sys.executable, "-c", blocker_script, str(db_path), "5"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = blocker.stdout.readline()
+        assert line.strip() == "LOCKED", f"blocker did not acquire lock; got: {line!r}"
+        # Shrink busy_timeout so the test stays fast.
+        os.environ["CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS"] = "300"
+        try:
+            result = module.register_claims(
+                repo=repo,
+                session_id="session-blocked",
+                run_id="run-blocked",
+                worktree=None,
+                branch=None,
+                owned_paths=["tracked.txt"],
+                apply_patch_paths={"tracked.txt"},
+                exec_only_paths=set(),
+                log_root_override=log_root,
+            )
+        finally:
+            os.environ.pop("CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS", None)
+    finally:
+        blocker.terminate()
+        blocker.wait(timeout=5)
+    assert result.status == "lock_timeout"
+
+
+def _slice_2b_repo_with_two_dirty(tmp: Path) -> Path:
+    """init_repo + a second tracked file so two paths are dirty."""
+    repo = init_repo(tmp / "repo")
+    (repo / "tracked2.txt").write_text("base2\n", encoding="utf-8")
+    run(["git", "add", "tracked2.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add tracked2"], cwd=repo)
+    (repo / "tracked2.txt").write_text("base2\nchange2\n", encoding="utf-8")
+    return repo
+
+
+def _slice_2b_tracker_scope_payload(
+    *,
+    paths: list[str] | None = None,
+    unit_ids: list[str] | None = None,
+    lease_id: str = "lse-2b-test",
+    scope_hash: str = "sha256:" + "b" * 64,
+    hunks: object = "default",
+    source_session_id: str | None = "sess-2b",
+    takeover_from_session_id: str | None = None,
+    extras: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if unit_ids is None:
+        unit_ids = ["a" * 64, "c" * 64]
+    if paths is None:
+        paths = ["tracked.txt"]
+    if hunks == "default":
+        hunks = [
+            {"unit_id": unit_ids[0], "path": paths[0] if paths else "tracked.txt", "hunk_header": "@@ -1 +1,2 @@"}
+        ]
+    payload: dict[str, object] = {
+        "unit_ids": unit_ids,
+        "lease_id": lease_id,
+        "scope_hash": scope_hash,
+        "paths": paths,
+        "hunks": hunks,
+        "source_session_id": source_session_id,
+        "takeover_from_session_id": takeover_from_session_id,
+    }
+    if extras:
+        payload.update(extras)
+    return payload
+
+
+def _slice_2b_write_scope_file(tmp: Path, payload: dict[str, object]) -> Path:
+    path = tmp / "tracker-scope.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _slice_2b_prepare(
+    *,
+    tmp: Path,
+    repo: Path,
+    tracker_scope_path: Path | None,
+    log_root: Path,
+    extra_args: list[str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path | None]:
+    """Run prepare_review_run.py with a transcript, optionally with --tracker-scope.
+
+    Returns (completed_process, run_dir_or_None). When tracker_scope rejection
+    happens (non-zero exit), run_dir is None.
+    """
+    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
+    context = tmp / "context.md"
+    context.write_text(
+        "## Session context\n- intent: 2-B test\n- work: edit tracked.txt\n",
+        encoding="utf-8",
+    )
+    output_json = tmp / "run.json"
+    base_dir = tmp / "runs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        str(PREPARE_REVIEW_RUN),
+        "--repo",
+        str(repo),
+        "--session-context",
+        str(context),
+        "--transcript",
+        str(transcript),
+        "--output-json",
+        str(output_json),
+        "--base-dir",
+        str(base_dir),
+    ]
+    if tracker_scope_path is not None:
+        cmd.extend(["--tracker-scope", str(tracker_scope_path)])
+    if extra_args:
+        cmd.extend(extra_args)
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    if completed.returncode != 0:
+        return completed, None
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    return completed, Path(payload["artifacts_dir"])
+
+
+def test_tracker_scope_payload_splices_into_manifest(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    artifact_manifest = json.loads((artifacts_dir / "session-manifest.json").read_text(encoding="utf-8"))
+    input_manifest = json.loads((artifacts_dir / "inputs" / "session-manifest.json").read_text(encoding="utf-8"))
+    for manifest_payload in (artifact_manifest, input_manifest):
+        tracker_block = manifest_payload.get("tracker")
+        assert isinstance(tracker_block, dict)
+        scope = tracker_block.get("tracker_scope")
+        assert isinstance(scope, dict)
+        assert scope["unit_ids"] == payload["unit_ids"]
+        assert scope["lease_id"] == payload["lease_id"]
+        assert scope["scope_hash"] == payload["scope_hash"]
+        assert scope["paths"] == payload["paths"]
+        assert scope["hunks"] == payload["hunks"]
+        assert scope["source_session_id"] == payload["source_session_id"]
+        assert scope["takeover_from_session_id"] == payload["takeover_from_session_id"]
+    # tracker_scope_file (artifact-root entry) must point to artifact_dir copy,
+    # not the inputs/ duplicate; otherwise downstream consumers cannot retrieve
+    # the artifact-root tracker-scope.json.
+    run_payload = json.loads((tmp / "run.json").read_text(encoding="utf-8"))
+    assert run_payload["tracker_scope_file"] is not None
+    assert run_payload["input_tracker_scope_file"] is not None
+    assert run_payload["tracker_scope_file"] != run_payload["input_tracker_scope_file"]
+    assert run_payload["tracker_scope_file"] == str((artifacts_dir / "tracker-scope.json").resolve())
+    assert run_payload["input_tracker_scope_file"] == str(
+        (artifacts_dir / "inputs" / "tracker-scope.json").resolve()
+    )
+
+
+def test_tracker_scope_unlocks_scope_contract_v2_fields(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(unit_ids=["e" * 64, "d" * 64])
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] == sorted({"e" * 64, "d" * 64})
+    assert contract["tracker_lease_id"] == payload["lease_id"]
+    assert contract["tracker_scope_hash"] == payload["scope_hash"]
+    canonical = contract["canonical_scope"]
+    assert "primary_units" not in canonical
+    assert "tracker_lease_id" not in canonical
+    assert "tracker_scope_hash" not in canonical
+
+
+def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=None, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] is None
+    assert contract["tracker_lease_id"] is None
+    assert contract["tracker_scope_hash"] is None
+    canonical = contract["canonical_scope"]
+    assert canonical["version"] == 2
+    assert set(canonical.keys()) == {
+        "version",
+        "repo",
+        "scope_mode",
+        "primary_files",
+        "background_files",
+        "protected_files",
+        "canonical_issues",
+        "fix_allowlist",
+        "excluded_path_prefixes",
+    }
+
+
+def test_packet_emits_tracker_scope_section_when_present(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    assert "## Tracker Scope" in packet_text
+    assert "## Allocated Git Diff" in packet_text
+    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
+    assert "## Session-Owned Git Diff" not in packet_text
+    assert payload["lease_id"] in packet_text
+    assert payload["scope_hash"] in packet_text
+
+
+def test_packet_omits_tracker_scope_section_when_absent(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=None, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    assert "## Tracker Scope" not in packet_text
+    assert "## Allocated Git Diff" not in packet_text
+    assert "## Session-Owned Git Diff" in packet_text
+
+
+def test_packet_metadata_carries_tracker_scope_keys(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    metadata = json.loads((artifacts_dir / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert metadata["tracker_scope_present"] is True
+    assert metadata["tracker_scope_unit_count"] == len(payload["unit_ids"])
+    assert metadata["tracker_scope_lease_id"] == payload["lease_id"]
+    assert metadata["tracker_scope_hash"] == payload["scope_hash"]
+    assert metadata["tracker_scope_paths"] == payload["paths"]
+    assert metadata["tracker_scope_source_session_id"] == payload["source_session_id"]
+    assert metadata["tracker_scope_takeover_from_session_id"] == payload["takeover_from_session_id"]
+
+    completed_b, artifacts_b = _slice_2b_prepare(
+        tmp=tmp / "no-scope",
+        repo=init_repo(tmp / "no-scope" / "repo"),
+        tracker_scope_path=None,
+        log_root=tmp / "no-scope" / "logs",
+    )
+    assert completed_b.returncode == 0, completed_b.stderr
+    assert artifacts_b is not None
+    metadata_b = json.loads((artifacts_b / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert metadata_b["tracker_scope_present"] is False
+    assert metadata_b["tracker_scope_unit_count"] == 0
+    assert metadata_b["tracker_scope_lease_id"] is None
+    assert metadata_b["tracker_scope_hash"] is None
+    assert metadata_b["tracker_scope_paths"] == []
+    assert metadata_b["tracker_scope_source_session_id"] is None
+    assert metadata_b["tracker_scope_takeover_from_session_id"] is None
+
+
+def test_tracker_scope_payload_rejects_invalid_payloads(tmp: Path) -> None:
+    cases = [
+        ("missing_unit_ids", {"unit_ids": None}, "tracker_scope.unit_ids"),
+        ("empty_unit_ids", {"unit_ids": []}, "tracker_scope.unit_ids"),
+        ("non_string_unit_id", {"unit_ids": [123, "a" * 64]}, "tracker_scope.unit_ids"),
+        ("non_hex_unit_id", {"unit_ids": ["zzzz" * 16]}, "tracker_scope.unit_ids"),
+        ("missing_lease", {"lease_id": ""}, "tracker_scope.lease_id"),
+        ("missing_scope_hash", {"scope_hash": ""}, "tracker_scope.scope_hash"),
+        ("malformed_scope_hash", {"scope_hash": "sha256:short"}, "tracker_scope.scope_hash"),
+        ("non_list_paths", {"paths": "tracked.txt"}, "tracker_scope.paths"),
+        ("non_string_path", {"paths": [123]}, "tracker_scope.paths"),
+        ("non_list_hunks", {"hunks": "x"}, "tracker_scope.hunks"),
+    ]
+    log_root = tmp / "logs"
+    for index, (label, override, expected_substr) in enumerate(cases):
+        sub_tmp = tmp / f"case-{index}-{label}"
+        sub_tmp.mkdir(parents=True, exist_ok=True)
+        repo = init_repo(sub_tmp / "repo")
+        payload = _slice_2b_tracker_scope_payload()
+        for key, value in override.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        scope_path = _slice_2b_write_scope_file(sub_tmp, payload)
+        completed, artifacts_dir = _slice_2b_prepare(
+            tmp=sub_tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+        )
+        assert completed.returncode != 0, f"case {label} should have failed, got: {completed.stdout}"
+        assert artifacts_dir is None
+        assert expected_substr in completed.stderr, (
+            f"case {label}: stderr did not mention {expected_substr!r}: {completed.stderr!r}"
+        )
+
+
+def test_tracker_scope_requires_session_manifest_or_transcript(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    context = tmp / "context.md"
+    context.write_text("## Session context\n- intent: D4 test\n", encoding="utf-8")
+    base_dir = tmp / "runs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    log_root = tmp / "logs"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--tracker-scope",
+            str(scope_path),
+            "--base-dir",
+            str(base_dir),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "--tracker-scope requires --session-manifest or --transcript" in completed.stderr
+
+
+def test_tracker_scope_tolerates_unknown_keys(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(extras={"future_field": "preserved"})
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    manifest = json.loads((artifacts_dir / "session-manifest.json").read_text(encoding="utf-8"))
+    spliced = manifest["tracker"]["tracker_scope"]
+    assert spliced.get("future_field") == "preserved"
+
+
+def test_review_env_exports_rvf_tracker_scope_path(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    env_text = (artifacts_dir / "review-env.sh").read_text(encoding="utf-8")
+    assert "RVF_TRACKER_SCOPE" in env_text
+    assert "tracker-scope.json" in env_text
+    assert (artifacts_dir / "inputs" / "tracker-scope.json").exists()
+
+    repo_b = init_repo(tmp / "no-scope" / "repo")
+    log_root_b = tmp / "no-scope" / "logs"
+    completed_b, artifacts_b = _slice_2b_prepare(
+        tmp=tmp / "no-scope", repo=repo_b, tracker_scope_path=None, log_root=log_root_b
+    )
+    assert completed_b.returncode == 0, completed_b.stderr
+    assert artifacts_b is not None
+    env_text_b = (artifacts_b / "review-env.sh").read_text(encoding="utf-8")
+    assert "RVF_TRACKER_SCOPE" not in env_text_b
+    assert not (artifacts_b / "inputs" / "tracker-scope.json").exists()
+
+
+def test_allocated_git_diff_uses_tracker_scope_paths(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    payload = _slice_2b_tracker_scope_payload(paths=["tracked.txt"])
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    allocated_idx = packet_text.index("## Allocated Git Diff")
+    full_idx = packet_text.index("## Full Git Diff HEAD (Evidence Only)")
+    assert allocated_idx < full_idx
+    allocated_block = packet_text[allocated_idx:full_idx]
+    full_block = packet_text[full_idx:]
+    assert "diff --git a/tracked.txt b/tracked.txt" in allocated_block
+    assert "diff --git a/tracked2.txt b/tracked2.txt" not in allocated_block
+    assert "diff --git a/tracked.txt b/tracked.txt" in full_block
+    assert "diff --git a/tracked2.txt b/tracked2.txt" in full_block
+
+
+def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    module.register_claims(
+        repo=repo,
+        session_id="other-session",
+        run_id="run-other",
+        worktree=None,
+        branch=None,
+        owned_paths=["tracked.txt"],
+        apply_patch_paths={"tracked.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    payload = _slice_2b_tracker_scope_payload()
+    scope_path = _slice_2b_write_scope_file(tmp, payload)
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=scope_path, log_root=log_root
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert artifacts_dir is not None
+    packet_text = (artifacts_dir / "review-packet.md").read_text(encoding="utf-8")
+    metadata = json.loads((artifacts_dir / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert "## Tracker Scope" in packet_text
+    assert "## Cross-Session Conflicts" in packet_text
+    assert "other-session" in packet_text
+    assert metadata["cross_session_conflicts"]
+    assert metadata["tracker_scope_present"] is True
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -4546,6 +6010,290 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "cancel_rvf_run_ignores_stale_runner_pid_without_matching_command",
             lambda: test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command(),
         ),
+        (
+            "diff_tracker_register_creates_sqlite_and_events",
+            lambda: test_diff_tracker_register_creates_sqlite_and_events(root / "diff-tracker-register"),
+        ),
+        (
+            "diff_tracker_register_concurrent_writers",
+            lambda: test_diff_tracker_register_concurrent_writers(root / "diff-tracker-concurrent"),
+        ),
+        (
+            "canonical_patch_hash_stable_across_reruns",
+            lambda: test_canonical_patch_hash_stable_across_reruns(root / "diff-tracker-stable"),
+        ),
+        (
+            "canonical_patch_hash_stable_under_line_shift",
+            lambda: test_canonical_patch_hash_stable_under_line_shift(root / "diff-tracker-line-shift"),
+        ),
+        (
+            "canonical_patch_hash_changes_on_content_edit",
+            lambda: test_canonical_patch_hash_changes_on_content_edit(root / "diff-tracker-content-edit"),
+        ),
+        (
+            "migration_phase1_json_to_sqlite_idempotent",
+            lambda: test_migration_phase1_json_to_sqlite_idempotent(root / "diff-tracker-migration"),
+        ),
+        (
+            "migration_phase1_recovers_when_archive_predates_db_marker",
+            lambda: test_migration_phase1_recovers_when_archive_predates_db_marker(
+                root / "diff-tracker-migration-recover"
+            ),
+        ),
+        (
+            "diff_tracker_hunk_anchor_distinguishes_close_hunks",
+            lambda: test_diff_tracker_hunk_anchor_distinguishes_close_hunks(
+                root / "diff-tracker-close-hunks"
+            ),
+        ),
+        (
+            "diff_tracker_register_empty_owned_paths_preserves_session_claim",
+            lambda: test_diff_tracker_register_empty_owned_paths_preserves_session_claim(
+                root / "diff-tracker-empty-paths"
+            ),
+        ),
+        (
+            "diff_tracker_list_conflicts_reports_other_session_overlap",
+            lambda: test_diff_tracker_list_conflicts_reports_other_session_overlap(root / "diff-tracker-conflicts"),
+        ),
+        (
+            "diff_tracker_path_claim_conflicts_with_hunk_claim",
+            lambda: test_diff_tracker_path_claim_conflicts_with_hunk_claim(root / "diff-tracker-path-vs-hunk"),
+        ),
+        (
+            "session_manifest_writes_tracker_claim",
+            lambda: test_session_manifest_writes_tracker_claim(root / "session-manifest-tracker"),
+        ),
+        (
+            "build_packet_emits_cross_session_conflict_section",
+            lambda: test_build_packet_emits_cross_session_conflict_section(root / "packet-cross-session"),
+        ),
+        (
+            "build_packet_omits_cross_session_section_when_clean",
+            lambda: test_build_packet_omits_cross_session_section_when_clean(root / "packet-cross-session-clean"),
+        ),
+        (
+            "diff_tracker_disable_env_short_circuits",
+            lambda: test_diff_tracker_disable_env_short_circuits(root / "diff-tracker-disabled"),
+        ),
+        (
+            "diff_tracker_lock_timeout_degrades_gracefully",
+            lambda: test_diff_tracker_lock_timeout_degrades_gracefully(root / "diff-tracker-lock-timeout"),
+        ),
+        (
+            "tracker_scope_payload_splices_into_manifest",
+            lambda: test_tracker_scope_payload_splices_into_manifest(root / "tracker-scope-splice"),
+        ),
+        (
+            "tracker_scope_unlocks_scope_contract_v2_fields",
+            lambda: test_tracker_scope_unlocks_scope_contract_v2_fields(root / "tracker-scope-contract-v2"),
+        ),
+        (
+            "scope_contract_v2_emitted_without_tracker_scope",
+            lambda: test_scope_contract_v2_emitted_without_tracker_scope(root / "tracker-scope-contract-v2-bare"),
+        ),
+        (
+            "packet_emits_tracker_scope_section_when_present",
+            lambda: test_packet_emits_tracker_scope_section_when_present(root / "tracker-scope-packet-present"),
+        ),
+        (
+            "packet_omits_tracker_scope_section_when_absent",
+            lambda: test_packet_omits_tracker_scope_section_when_absent(root / "tracker-scope-packet-absent"),
+        ),
+        (
+            "packet_metadata_carries_tracker_scope_keys",
+            lambda: test_packet_metadata_carries_tracker_scope_keys(root / "tracker-scope-metadata"),
+        ),
+        (
+            "tracker_scope_payload_rejects_invalid_payloads",
+            lambda: test_tracker_scope_payload_rejects_invalid_payloads(root / "tracker-scope-rejection"),
+        ),
+        (
+            "tracker_scope_requires_session_manifest_or_transcript",
+            lambda: test_tracker_scope_requires_session_manifest_or_transcript(root / "tracker-scope-d4"),
+        ),
+        (
+            "tracker_scope_tolerates_unknown_keys",
+            lambda: test_tracker_scope_tolerates_unknown_keys(root / "tracker-scope-unknown-keys"),
+        ),
+        (
+            "review_env_exports_rvf_tracker_scope_path",
+            lambda: test_review_env_exports_rvf_tracker_scope_path(root / "tracker-scope-env"),
+        ),
+        (
+            "allocated_git_diff_uses_tracker_scope_paths",
+            lambda: test_allocated_git_diff_uses_tracker_scope_paths(root / "tracker-scope-diff-filter"),
+        ),
+        (
+            "existing_cross_session_conflicts_path_unchanged_with_tracker_scope",
+            lambda: test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(root / "tracker-scope-cross-session"),
+        ),
+        # Slice 3 allocator T1-T15.
+        (
+            "allocate_review_scope_emits_valid_tracker_scope_json",
+            lambda: test_allocate_review_scope_emits_valid_tracker_scope_json(root / "alloc-T1"),
+        ),
+        (
+            "allocate_review_scope_empty_returns_no_unassigned_review_scope",
+            lambda: test_allocate_review_scope_empty_returns_no_unassigned_review_scope(root / "alloc-T2"),
+        ),
+        (
+            "allocate_review_scope_excludes_active_leased_units",
+            lambda: test_allocate_review_scope_excludes_active_leased_units(root / "alloc-T3"),
+        ),
+        (
+            "allocate_review_scope_inserts_lease_and_marks_units_assigned",
+            lambda: test_allocate_review_scope_inserts_lease_and_marks_units_assigned(root / "alloc-T4"),
+        ),
+        (
+            "allocate_review_scope_prunes_stale_leases_first",
+            lambda: test_allocate_review_scope_prunes_stale_leases_first(root / "alloc-T5"),
+        ),
+        (
+            "allocate_review_scope_concurrent_writers_serialize",
+            lambda: test_allocate_review_scope_concurrent_writers_serialize(root / "alloc-T6"),
+        ),
+        (
+            "fork_first_stop_takeover_transfers_unleased_units",
+            lambda: test_fork_first_stop_takeover_transfers_unleased_units(root / "alloc-T7"),
+        ),
+        (
+            "fork_takeover_skips_actively_leased_units",
+            lambda: test_fork_takeover_skips_actively_leased_units(root / "alloc-T8"),
+        ),
+        (
+            "scope_hash_is_sha256_of_sorted_unit_ids",
+            lambda: test_scope_hash_is_sha256_of_sorted_unit_ids(root / "alloc-T9"),
+        ),
+        (
+            "allocator_event_appended_to_events_jsonl",
+            lambda: test_allocator_event_appended_to_events_jsonl(root / "alloc-T10"),
+        ),
+        (
+            "manual_rvf_run_inserts_row_and_emits_event",
+            lambda: test_manual_rvf_run_inserts_row_and_emits_event(root / "manual-run-T1"),
+        ),
+        (
+            "manual_rvf_run_upserts_on_pk_conflict",
+            lambda: test_manual_rvf_run_upserts_on_pk_conflict(root / "manual-run-T2"),
+        ),
+        (
+            "manual_rvf_run_find_returns_none_when_empty",
+            lambda: test_manual_rvf_run_find_returns_none_when_empty(root / "manual-run-T3"),
+        ),
+        (
+            "manual_rvf_run_find_returns_latest_completed_at",
+            lambda: test_manual_rvf_run_find_returns_latest_completed_at(root / "manual-run-T4"),
+        ),
+        (
+            "manual_rvf_run_find_respects_ttl",
+            lambda: test_manual_rvf_run_find_respects_ttl(root / "manual-run-T5"),
+        ),
+        (
+            "manual_rvf_run_ensures_table_for_existing_v2_db",
+            lambda: test_manual_rvf_run_ensures_table_for_existing_v2_db(root / "manual-run-T6"),
+        ),
+        (
+            "manual_takeover_transfers_unleased_units",
+            lambda: test_manual_takeover_transfers_unleased_units(root / "manual-takeover-T1"),
+        ),
+        (
+            "manual_takeover_skips_actively_leased_units",
+            lambda: test_manual_takeover_skips_actively_leased_units(root / "manual-takeover-T2"),
+        ),
+        (
+            "manual_takeover_rejects_missing_parent_session",
+            lambda: test_manual_takeover_rejects_missing_parent_session(root / "manual-takeover-T3"),
+        ),
+        (
+            "manual_takeover_cli_records_takeover",
+            lambda: test_manual_takeover_cli_records_takeover(root / "manual-takeover-cli"),
+        ),
+        (
+            "record_manual_run_cli_writes_row",
+            lambda: test_record_manual_run_cli_writes_row(root / "manual-record-cli"),
+        ),
+        (
+            "allocate_review_scope_disable_env_short_circuits",
+            lambda: test_allocate_review_scope_disable_env_short_circuits(root / "alloc-T11"),
+        ),
+        (
+            "allocate_review_scope_busy_timeout_degrades",
+            lambda: test_allocate_review_scope_busy_timeout_degrades(root / "alloc-T12"),
+        ),
+        (
+            "allocate_review_scope_writes_paths_and_hunks",
+            lambda: test_allocate_review_scope_writes_paths_and_hunks(root / "alloc-T13"),
+        ),
+        (
+            "allocate_review_scope_dry_run_does_not_create_lease",
+            lambda: test_allocate_review_scope_dry_run_does_not_create_lease(root / "alloc-T14"),
+        ),
+        (
+            "allocate_review_scope_output_consumed_by_prepare_run",
+            lambda: test_allocate_review_scope_output_consumed_by_prepare_run(root / "alloc-T15"),
+        ),
+        # Slice 4 lease lifecycle.
+        (
+            "lease_acquire_creates_lease_and_assigns_units",
+            lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
+        ),
+        (
+            "lease_acquire_rejects_when_any_unit_already_leased",
+            lambda: test_lease_acquire_rejects_when_any_unit_already_leased(root / "lease-T2"),
+        ),
+        (
+            "lease_acquire_prunes_stale_leases_first",
+            lambda: test_lease_acquire_prunes_stale_leases_first(root / "lease-T3"),
+        ),
+        (
+            "stale_prune_does_not_release_unit_reacquired_by_fresh_lease",
+            lambda: test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease(root / "lease-T3b"),
+        ),
+        (
+            "lease_refresh_extends_expires_at",
+            lambda: test_lease_refresh_extends_expires_at(root / "lease-T4"),
+        ),
+        (
+            "lease_refresh_returns_expired_when_past_ttl",
+            lambda: test_lease_refresh_returns_expired_when_past_ttl(root / "lease-T5"),
+        ),
+        (
+            "lease_release_returns_units_to_available",
+            lambda: test_lease_release_returns_units_to_available(root / "lease-T6"),
+        ),
+        (
+            "lease_release_idempotent",
+            lambda: test_lease_release_idempotent(root / "lease-T7"),
+        ),
+        (
+            "sweep_stale_releases_expired_active_leases",
+            lambda: test_sweep_stale_releases_expired_active_leases(root / "lease-T8"),
+        ),
+        (
+            "sweep_stale_no_op_when_all_active_leases_fresh",
+            lambda: test_sweep_stale_no_op_when_all_active_leases_fresh(root / "lease-T9"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_normal_exit",
+            lambda: test_run_alternative_reviewer_releases_lease_on_normal_exit(root / "lease-T10"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_codex_backend_challenge",
+            lambda: test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge(root / "lease-T11"),
+        ),
+        (
+            "run_alternative_reviewer_releases_lease_on_timeout",
+            lambda: test_run_alternative_reviewer_releases_lease_on_timeout(root / "lease-T12"),
+        ),
+        (
+            "run_alternative_reviewer_sigterm_kills_child_before_release",
+            lambda: test_run_alternative_reviewer_sigterm_kills_child_before_release(root / "lease-T12b"),
+        ),
+        (
+            "lease_acquire_concurrent_writers_serialize",
+            lambda: test_lease_acquire_concurrent_writers_serialize(root / "lease-T13"),
+        ),
     ]
 
 
@@ -4586,6 +6334,1413 @@ def main() -> int:
     )
     print(f"review support script tests OK{suffix}")
     return 0
+
+
+# --------------------------- Slice 3 allocator tests ---------------------------
+
+def _alloc_invoke(
+    *,
+    repo: Path,
+    log_root: Path,
+    session_id: str,
+    run_id: str,
+    reviewer_id: str | None = "reviewer-a",
+    output_scope: Path | None = None,
+    parent_session_id: str | None = None,
+    holder_kind: str = "reviewer",
+    lease_ttl_seconds: int | None = None,
+    dry_run: bool = False,
+    extra_env: dict[str, str] | None = None,
+    timeout: float = 60.0,
+) -> dict[str, object]:
+    cmd = [
+        sys.executable,
+        str(DIFF_TRACKER),
+        "allocate-review-scope",
+        "--repo",
+        str(repo),
+        "--session-id",
+        session_id,
+        "--run-id",
+        run_id,
+        "--log-root",
+        str(log_root),
+        "--print-result",
+    ]
+    if reviewer_id is not None:
+        cmd.extend(["--reviewer-id", reviewer_id])
+    if output_scope is not None:
+        cmd.extend(["--output-scope", str(output_scope)])
+    if parent_session_id is not None:
+        cmd.extend(["--parent-session-id", parent_session_id])
+    if holder_kind != "reviewer":
+        cmd.extend(["--holder-kind", holder_kind])
+    if lease_ttl_seconds is not None:
+        cmd.extend(["--lease-ttl-seconds", str(lease_ttl_seconds)])
+    if dry_run:
+        cmd.append("--dry-run")
+    env = {**os.environ}
+    if extra_env:
+        env.update(extra_env)
+    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=timeout)
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
+            f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
+        )
+    last_line = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "{}"
+    return json.loads(last_line)
+
+
+def _alloc_db_path(log_root: Path, repo_key: str) -> Path:
+    return log_root / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+
+
+def _alloc_events_path(log_root: Path, repo_key: str) -> Path:
+    return log_root / "diff-tracker" / "repos" / repo_key / "events.jsonl"
+
+
+def _alloc_open_db(log_root: Path, repo_key: str):
+    import sqlite3 as _sqlite
+
+    return _sqlite.connect(str(_alloc_db_path(log_root, repo_key)))
+
+
+def test_allocate_review_scope_emits_valid_tracker_scope_json(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T1",
+        run_id="run-T1",
+        output_scope=output_scope,
+    )
+    assert result["status"] == "allocated"
+    assert result["acquired"] is True
+    assert result["reason"] == "unassigned_review_scope_available"
+    assert result["reason_legacy_alias"] == "session_owned_dirty"
+    assert output_scope.exists()
+    payload = json.loads(output_scope.read_text(encoding="utf-8"))
+    spec = importlib.util.spec_from_file_location("rvf_prepare_review_run", PREPARE_REVIEW_RUN)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loaded = module.load_tracker_scope(output_scope)
+    assert loaded["unit_ids"] == payload["unit_ids"]
+    for unit_id in payload["unit_ids"]:
+        assert isinstance(unit_id, str)
+        assert len(unit_id) == 64
+        int(unit_id, 16)  # raises ValueError if not hex
+    assert payload["lease_id"].startswith("lse-")
+    assert payload["scope_hash"].startswith("sha256:")
+    assert len(payload["scope_hash"].split(":", 1)[1]) == 64
+
+
+def test_allocate_review_scope_empty_returns_no_unassigned_review_scope(tmp: Path) -> None:
+    repo = init_repo(tmp / "repo")
+    # Wipe the dirty state from init_repo so the worktree is clean.
+    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
+    (repo / "new.txt").unlink()
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T2",
+        run_id="run-T2",
+        output_scope=output_scope,
+    )
+    assert result["status"] == "empty"
+    assert result["acquired"] is False
+    assert result["reason"] == "no_unassigned_review_scope"
+    assert result["reason_legacy_alias"] == "no_session_owned_dirty"
+    assert not output_scope.exists()
+
+
+def test_allocate_review_scope_excludes_active_leased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T3a",
+        run_id="run-T3a",
+        output_scope=tmp / "first.json",
+    )
+    assert first["status"] == "allocated"
+    repo_key = first["repo_key"]
+    # Manually flip the lease's units back to 'available' while leaving the
+    # active lease in place. This forces step 4 to include them as candidates
+    # so step 5's anti-join is exercised — exactly the race the leased
+    # exclusion is supposed to absorb.
+    leased_unit_ids = first["scope"]["unit_ids"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        placeholders = ",".join("?" * len(leased_unit_ids))
+        conn.execute(
+            f"UPDATE units SET review_state='available' WHERE unit_id IN ({placeholders})",
+            tuple(leased_unit_ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Same session re-allocates: every candidate is now an actively-leased
+    # unit so the result is empty AND leased_excluded_count covers them all.
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T3a",
+        run_id="run-T3b",
+    )
+    assert second["status"] == "empty"
+    assert second["leased_excluded_count"] >= 1
+
+
+def test_allocate_review_scope_inserts_lease_and_marks_units_assigned(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T4",
+        run_id="run-T4",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    repo_key = result["repo_key"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        leases = list(conn.execute("SELECT lease_id, state FROM leases"))
+        assert leases, "lease row should exist"
+        assert all(state == "active" for _, state in leases)
+        lease_units = list(conn.execute("SELECT unit_id FROM lease_units"))
+        assert {row[0] for row in lease_units} == set(result["scope"]["unit_ids"])
+        unit_states = list(
+            conn.execute(
+                f"SELECT review_state FROM units WHERE unit_id IN ({','.join('?' * len(lease_units))})",
+                tuple(row[0] for row in lease_units),
+            )
+        )
+        assert all(state == "assigned" for (state,) in unit_states)
+    finally:
+        conn.close()
+
+
+def test_allocate_review_scope_prunes_stale_leases_first(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    # First allocator run lays down a real lease.
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T5",
+        run_id="run-T5",
+        output_scope=tmp / "first.json",
+    )
+    repo_key = first["repo_key"]
+    # Manually expire the lease in the DB so the next allocator run treats it
+    # as stale and frees its units.
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE leases SET expires_at='1970-01-01T00:00:00Z'")
+        conn.commit()
+    finally:
+        conn.close()
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T5b",
+        run_id="run-T5b",
+        output_scope=tmp / "second.json",
+    )
+    assert second["status"] == "allocated"
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        first_state = list(conn.execute("SELECT state FROM leases WHERE lease_id=?", (first["lease_id"],)))
+        assert first_state and first_state[0][0] == "stale-released"
+        active = list(conn.execute("SELECT lease_id FROM leases WHERE state='active'"))
+        assert active and active[0][0] == second["lease_id"]
+    finally:
+        conn.close()
+
+
+def test_allocate_review_scope_concurrent_writers_serialize(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    snippet = (
+        "import os, sys, time, json\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import diff_tracker as dt\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"repo = Path({str(repo)!r})\n"
+        "session = sys.argv[1]\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.allocate_review_scope(\n"
+        "    repo=repo, session_id=session, run_id=session,\n"
+        "    reviewer_id='r-' + session,\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result, default=str))\n"
+    )
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = []
+    for session in ("conc-A", "conc-B"):
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-c", snippet, session],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        )
+    outputs = [proc.communicate(timeout=60) for proc in procs]
+    payloads = []
+    for stdout, stderr in outputs:
+        if stderr.strip():
+            raise AssertionError(stderr.strip())
+        payloads.append(json.loads(stdout.strip().splitlines()[-1]))
+    statuses = [p["status"] for p in payloads]
+    assert sorted(statuses) in (["allocated", "empty"], ["allocated", "allocated"])
+    repo_key = next(p["repo_key"] for p in payloads if p["repo_key"])
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = list(conn.execute("SELECT unit_id, COUNT(*) FROM lease_units GROUP BY unit_id"))
+        for unit_id, count in rows:
+            assert count == 1, f"unit {unit_id} held by {count} leases"
+    finally:
+        conn.close()
+
+
+def test_fork_first_stop_takeover_transfers_unleased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="parent",
+        run_id="parent-run",
+        output_scope=tmp / "parent.json",
+    )
+    assert parent["status"] == "allocated"
+    repo_key = parent["repo_key"]
+    # Free the parent's lease so its units re-enter the candidate pool.
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    child = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="child",
+        run_id="child-run",
+        parent_session_id="parent",
+        output_scope=tmp / "child.json",
+    )
+    assert child["status"] == "allocated"
+    assert child["scope"]["takeover_from_session_id"] == "parent"
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        parent_kinds = {
+            row[0] for row in conn.execute(
+                "SELECT assignment_kind FROM session_units WHERE session_id='parent'"
+            )
+        }
+        child_kinds = {
+            row[0] for row in conn.execute(
+                "SELECT assignment_kind FROM session_units WHERE session_id='child'"
+            )
+        }
+    finally:
+        conn.close()
+    assert parent_kinds == {"transferred"} or parent_kinds == set()
+    assert "takeover" in child_kinds
+
+
+def test_fork_takeover_skips_actively_leased_units(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="parent2",
+        run_id="parent2-run",
+        output_scope=tmp / "parent2.json",
+    )
+    assert parent["status"] == "allocated"
+    repo_key = parent["repo_key"]
+    parent_unit_ids = parent["scope"]["unit_ids"]
+    assert len(parent_unit_ids) >= 2
+    # Keep parent's lease active over only one unit by deleting the other
+    # lease_units row. The dropped unit goes back to 'available'.
+    pinned_unit, freed_unit = parent_unit_ids[0], parent_unit_ids[1]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("DELETE FROM lease_units WHERE lease_id=? AND unit_id=?", (parent["lease_id"], freed_unit))
+        conn.execute("UPDATE units SET review_state='available' WHERE unit_id=?", (freed_unit,))
+        conn.commit()
+    finally:
+        conn.close()
+    child = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="child2",
+        run_id="child2-run",
+        parent_session_id="parent2",
+        output_scope=tmp / "child2.json",
+    )
+    assert child["status"] == "allocated"
+    transferred_unit_ids = set(child["scope"]["unit_ids"])
+    assert pinned_unit not in transferred_unit_ids
+    assert freed_unit in transferred_unit_ids
+
+
+def test_scope_hash_is_sha256_of_sorted_unit_ids(tmp: Path) -> None:
+    import hashlib as _hash
+
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sh-A",
+        run_id="run-A",
+        output_scope=tmp / "first.json",
+    )
+    assert first["status"] == "allocated"
+    expected = "sha256:" + _hash.sha256(
+        "\n".join(sorted(first["scope"]["unit_ids"])).encode("utf-8")
+    ).hexdigest()
+    assert first["scope_hash"] == expected
+    # Second invocation over the same dirty paths but from a fresh log_root
+    # must produce the same scope_hash because the unit_ids are
+    # canonical-patch-hash derived.
+    log_root_b = tmp / "logs-b"
+    second = _alloc_invoke(
+        repo=repo,
+        log_root=log_root_b,
+        session_id="sh-B",
+        run_id="run-B",
+        output_scope=tmp / "second.json",
+    )
+    assert second["status"] == "allocated"
+    assert second["scope_hash"] == first["scope_hash"]
+
+
+def test_allocator_event_appended_to_events_jsonl(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-event",
+        run_id="run-event",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    events_path = _alloc_events_path(log_root, result["repo_key"])
+    records = read_jsonl(events_path)
+    matching = [r for r in records if r.get("event") == "allocate_review_scope"]
+    assert matching, f"no allocate_review_scope event in {records!r}"
+    record = matching[-1]
+    assert record["rvf_state_phase"] == "review"
+    assert record["lease_id"] == result["lease_id"]
+    assert record["scope_hash"] == result["scope_hash"]
+    assert record["unit_count"] == len(result["scope"]["unit_ids"])
+    assert record["paths"] == result["scope"]["paths"]
+    assert record["reason_code"] == "unassigned_review_scope_available"
+    assert record["reason_code_legacy_alias"] == "session_owned_dirty"
+
+
+def test_manual_rvf_run_inserts_row_and_emits_event(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:manual-a",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    assert result["status"] == "recorded"
+    conn = _alloc_open_db(log_root, result["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash, completed_at FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-session", "manual-run", "sha256:manual-a", "2026-05-05T00:00:00Z")]
+    events = read_jsonl(_alloc_events_path(log_root, result["repo_key"]))
+    assert any(event.get("event") == "manual_rvf_run_recorded" for event in events)
+
+
+def test_manual_rvf_run_upserts_on_pk_conflict(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    first = module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:old",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:new",
+        completed_at="2026-05-05T00:10:00Z",
+        log_root_override=log_root,
+    )
+    conn = _alloc_open_db(log_root, first["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT scope_hash, completed_at FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("sha256:new", "2026-05-05T00:10:00Z")]
+
+
+def test_manual_rvf_run_find_returns_none_when_empty(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    assert (
+        module.find_manual_rvf_run_for_scope_hash(
+            repo=repo,
+            scope_hash="sha256:missing",
+            log_root_override=tmp / "logs",
+        )
+        is None
+    )
+
+
+def test_manual_rvf_run_find_returns_latest_completed_at(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-old",
+        run_id="run-old",
+        scope_hash="sha256:same",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-new",
+        run_id="run-new",
+        scope_hash="sha256:same",
+        completed_at="2026-05-05T00:10:00Z",
+        log_root_override=log_root,
+    )
+    match = module.find_manual_rvf_run_for_scope_hash(
+        repo=repo,
+        scope_hash="sha256:same",
+        log_root_override=log_root,
+    )
+    assert match == {
+        "session_id": "manual-new",
+        "run_id": "run-new",
+        "completed_at": "2026-05-05T00:10:00Z",
+    }
+
+
+def test_manual_rvf_run_find_respects_ttl(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-session",
+        run_id="manual-run",
+        scope_hash="sha256:ttl",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+    assert (
+        module.find_manual_rvf_run_for_scope_hash(
+            repo=repo,
+            scope_hash="sha256:ttl",
+            ttl_seconds=30,
+            now="2026-05-05T00:01:00Z",
+            log_root_override=log_root,
+        )
+        is None
+    )
+
+
+def test_manual_rvf_run_ensures_table_for_existing_v2_db(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    initial = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-schema-session",
+        run_id="manual-schema-run",
+        output_scope=tmp / "manual-schema.json",
+    )
+    conn = _alloc_open_db(log_root, initial["repo_key"])
+    try:
+        conn.execute("DROP TABLE manual_rvf_runs")
+        conn.execute(f"PRAGMA user_version = {module.SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    module.record_manual_rvf_run(
+        repo=repo,
+        session_id="manual-schema-session",
+        run_id="manual-schema-run",
+        scope_hash="sha256:manual-schema",
+        completed_at="2026-05-05T00:00:00Z",
+        log_root_override=log_root,
+    )
+
+    conn = _alloc_open_db(log_root, initial["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-schema-session", "manual-schema-run", "sha256:manual-schema")]
+
+
+def test_manual_takeover_transfers_unleased_units(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-parent",
+        run_id="manual-parent-run",
+        output_scope=tmp / "parent.json",
+    )
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    takeover = module.manual_takeover(
+        repo=repo,
+        parent_session_id="manual-parent",
+        current_session_id="manual-child",
+        run_id="manual-child-run",
+        log_root_override=log_root,
+    )
+    assert takeover["reason"] == "manual_takeover_completed"
+    assert set(takeover["transferred_unit_ids"]) == set(parent["scope"]["unit_ids"])
+
+
+def test_manual_takeover_skips_actively_leased_units(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-parent-active",
+        run_id="manual-parent-active-run",
+        output_scope=tmp / "parent-active.json",
+    )
+    unit_ids = parent["scope"]["unit_ids"]
+    assert len(unit_ids) >= 2
+    pinned_unit, freed_unit = unit_ids[0], unit_ids[1]
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("DELETE FROM lease_units WHERE lease_id=? AND unit_id=?", (parent["lease_id"], freed_unit))
+        conn.execute("UPDATE units SET review_state='available' WHERE unit_id=?", (freed_unit,))
+        conn.commit()
+    finally:
+        conn.close()
+    takeover = module.manual_takeover(
+        repo=repo,
+        parent_session_id="manual-parent-active",
+        current_session_id="manual-child-active",
+        run_id="manual-child-active-run",
+        log_root_override=log_root,
+    )
+    transferred = set(takeover["transferred_unit_ids"])
+    assert pinned_unit not in transferred
+    assert freed_unit in transferred
+
+
+def test_manual_takeover_rejects_missing_parent_session(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    try:
+        module.manual_takeover(
+            repo=repo,
+            parent_session_id="missing-parent",
+            current_session_id="manual-child-missing-parent",
+            run_id="manual-child-run",
+            log_root_override=log_root,
+        )
+    except RuntimeError as exc:
+        assert "manual takeover parent session not found: missing-parent" in str(exc)
+    else:
+        raise AssertionError("manual_takeover accepted a missing parent session")
+
+    common_dir = module.git_common_dir(repo.resolve())
+    assert common_dir is not None
+    repo_key_value = module.repo_key(common_dir)
+    conn = _alloc_open_db(log_root, repo_key_value)
+    try:
+        rows = list(conn.execute("SELECT session_id FROM sessions ORDER BY session_id"))
+    finally:
+        conn.close()
+    assert rows == []
+
+
+def test_manual_takeover_cli_records_takeover(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    parent = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="manual-cli-parent",
+        run_id="manual-cli-parent-run",
+        output_scope=tmp / "manual-cli-parent.json",
+    )
+    conn = _alloc_open_db(log_root, parent["repo_key"])
+    try:
+        conn.execute("UPDATE leases SET state='completed' WHERE lease_id=?", (parent["lease_id"],))
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id IN "
+            "(SELECT unit_id FROM lease_units WHERE lease_id=?)",
+            (parent["lease_id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DIFF_TRACKER),
+            "manual-takeover",
+            "--repo",
+            str(repo),
+            "--parent-session-id",
+            "manual-cli-parent",
+            "--current-session-id",
+            "manual-cli-child",
+            "--run-id",
+            "manual-cli-child-run",
+            "--log-root",
+            str(log_root),
+            "--print-result",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["reason"] == "manual_takeover_completed"
+    assert set(payload["transferred_unit_ids"]) == set(parent["scope"]["unit_ids"])
+
+
+def test_record_manual_run_cli_writes_row(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(DIFF_TRACKER),
+            "record-manual-run",
+            "--repo",
+            str(repo),
+            "--session-id",
+            "manual-cli-session",
+            "--run-id",
+            "manual-cli-run",
+            "--scope-hash",
+            "sha256:manual-cli",
+            "--completed-at",
+            "2026-05-05T00:00:00Z",
+            "--log-root",
+            str(log_root),
+            "--print-result",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    conn = _alloc_open_db(log_root, payload["repo_key"])
+    try:
+        rows = list(conn.execute("SELECT session_id, run_id, scope_hash FROM manual_rvf_runs"))
+    finally:
+        conn.close()
+    assert rows == [("manual-cli-session", "manual-cli-run", "sha256:manual-cli")]
+
+
+def test_allocate_review_scope_disable_env_short_circuits(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-disable",
+        run_id="run-disable",
+        output_scope=tmp / "scope.json",
+        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+    )
+    assert result["status"] == "disabled"
+    assert not (tmp / "scope.json").exists()
+    # No SQLite file should have been created.
+    assert not _alloc_db_path(log_root, "anything").parent.parent.exists()
+
+
+def test_allocate_review_scope_busy_timeout_degrades(tmp: Path) -> None:
+    import threading
+    import sqlite3 as _sqlite
+
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    # Seed the SQLite file by running the allocator once normally.
+    seeded = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-seed",
+        run_id="run-seed",
+        output_scope=tmp / "seed.json",
+    )
+    assert seeded["status"] == "allocated"
+    db_path = _alloc_db_path(log_root, seeded["repo_key"])
+    blocker = _sqlite.connect(str(db_path), isolation_level=None, timeout=30.0)
+    release = threading.Event()
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        result = _alloc_invoke(
+            repo=repo,
+            log_root=log_root,
+            session_id="sess-busy",
+            run_id="run-busy",
+            output_scope=tmp / "busy.json",
+            extra_env={"CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS": "300"},
+            timeout=30.0,
+        )
+    finally:
+        try:
+            blocker.execute("ROLLBACK")
+        except _sqlite.Error:
+            pass
+        blocker.close()
+        release.set()
+    assert result["status"] == "lock_timeout"
+
+
+def test_allocate_review_scope_writes_paths_and_hunks(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T13",
+        run_id="run-T13",
+        output_scope=tmp / "scope.json",
+    )
+    assert result["status"] == "allocated"
+    scope = result["scope"]
+    assert scope["paths"] == sorted(set(scope["paths"]))
+    for hunk in scope["hunks"]:
+        assert "unit_id" in hunk
+        assert "path" in hunk
+        assert "hunk_header" in hunk
+
+
+def test_allocate_review_scope_dry_run_does_not_create_lease(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "should-not-exist.json"
+    result = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-dry",
+        run_id="run-dry",
+        reviewer_id=None,
+        output_scope=output_scope,
+        dry_run=True,
+    )
+    assert result["status"] == "dry_run"
+    assert result["would_acquire"] is True
+    assert result["candidate_unit_count"] > 0
+    assert not output_scope.exists()
+    repo_key = result["repo_key"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = list(conn.execute("SELECT COUNT(*) FROM leases"))
+    finally:
+        conn.close()
+    assert rows[0][0] == 0
+
+
+def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None:
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    output_scope = tmp / "tracker-scope.json"
+    allocator = _alloc_invoke(
+        repo=repo,
+        log_root=log_root,
+        session_id="sess-T15",
+        run_id="run-T15",
+        output_scope=output_scope,
+    )
+    assert allocator["status"] == "allocated"
+    completed, artifacts_dir = _slice_2b_prepare(
+        tmp=tmp, repo=repo, tracker_scope_path=output_scope, log_root=log_root
+    )
+    assert completed.returncode == 0
+    contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    assert contract["version"] == 2
+    assert contract["primary_units"] == sorted(allocator["scope"]["unit_ids"])
+    assert contract["tracker_lease_id"] == allocator["lease_id"]
+    assert contract["tracker_scope_hash"] == allocator["scope_hash"]
+
+
+def _lease_seed(tmp: Path) -> tuple[object, Path, Path, list[str], str]:
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    seeded = module.allocate_review_scope(
+        repo=repo,
+        session_id="lease-seed",
+        run_id="lease-seed-run",
+        reviewer_id=None,
+        dry_run=True,
+        log_root_override=log_root,
+    )
+    assert seeded["status"] == "dry_run"
+    conn = _alloc_open_db(log_root, seeded["repo_key"])
+    try:
+        unit_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT unit_id FROM units WHERE review_state='available' ORDER BY path, unit_id"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert unit_ids
+    return module, repo, log_root, unit_ids, seeded["repo_key"]
+
+
+def _lease_contract(path: Path, *, repo: Path, unit_ids: list[str]) -> Path:
+    payload = {
+        "version": 2,
+        "run_id": "lease-reviewer-run",
+        "repo": str(repo),
+        "primary_units": unit_ids,
+        "tracker_lease_id": None,
+        "tracker_scope_hash": "sha256:" + "a" * 64,
+        "session_manifest_path": None,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _lease_unit_states(log_root: Path, repo_key: str, unit_ids: list[str]) -> dict[str, str]:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        placeholders = ",".join("?" for _ in unit_ids)
+        rows = conn.execute(
+            f"SELECT unit_id, review_state FROM units WHERE unit_id IN ({placeholders})",
+            tuple(unit_ids),
+        ).fetchall()
+        return {unit_id: state for unit_id, state in rows}
+    finally:
+        conn.close()
+
+
+def _lease_rows(log_root: Path, repo_key: str) -> list[tuple[str, str]]:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        return list(conn.execute("SELECT lease_id, state FROM leases ORDER BY created_at, lease_id"))
+    finally:
+        conn.close()
+
+
+def test_lease_acquire_creates_lease_and_assigns_units(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    result = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess",
+        run_id="lease-run",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert result["acquired"] is True
+    assert result["reason"] == "lease_acquired"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
+    events = read_jsonl(_alloc_events_path(log_root, repo_key))
+    assert any(event.get("event") == "lease_acquired" for event in events)
+
+
+def test_lease_acquire_rejects_when_any_unit_already_leased(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first_unit, second_unit = unit_ids[:2]
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-a",
+        run_id="lease-run-a",
+        reviewer_id="reviewer-a",
+        unit_ids=[first_unit],
+        log_root_override=log_root,
+    )
+    assert first["acquired"] is True
+    second = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-b",
+        run_id="lease-run-b",
+        reviewer_id="reviewer-b",
+        unit_ids=[first_unit, second_unit],
+        log_root_override=log_root,
+    )
+    assert second["acquired"] is False
+    assert second["reason"] == "lease_unit_already_assigned"
+    assert _lease_unit_states(log_root, repo_key, [second_unit])[second_unit] == "available"
+
+
+def test_lease_acquire_prunes_stale_leases_first(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale",
+        run_id="lease-run-stale",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    second = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-new",
+        run_id="lease-run-new",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert first["acquired"] is True
+    assert second["acquired"] is True
+    rows = dict(_lease_rows(log_root, repo_key))
+    assert rows[first["lease_id"]] == "stale-released"
+    assert rows[second["lease_id"]] == "active"
+
+
+def test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    first_unit, unrelated_unit = unit_ids[:2]
+    first = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-old",
+        run_id="lease-run-stale-old",
+        reviewer_id="reviewer-a",
+        unit_ids=[first_unit],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    fresh = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-fresh",
+        run_id="lease-run-stale-fresh",
+        reviewer_id="reviewer-b",
+        unit_ids=[first_unit],
+        lease_ttl_seconds=60,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    unrelated = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-unrelated",
+        run_id="lease-run-stale-unrelated",
+        reviewer_id="reviewer-c",
+        unit_ids=[unrelated_unit],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert first["acquired"] is True
+    assert fresh["acquired"] is True
+    assert unrelated["acquired"] is True
+
+    released = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:04Z",
+    )
+
+    assert [item["lease_id"] for item in released] == [unrelated["lease_id"]]
+    assert _lease_unit_states(log_root, repo_key, [first_unit, unrelated_unit]) == {
+        first_unit: "assigned",
+        unrelated_unit: "available",
+    }
+
+
+def test_lease_refresh_extends_expires_at(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-refresh",
+        run_id="lease-run-refresh",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=10,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    refreshed = module.lease_refresh(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        ttl_seconds=20,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:05Z",
+    )
+    assert refreshed["refreshed"] is True
+    assert refreshed["expires_at"] == "2026-05-05T00:00:25Z"
+
+
+def test_lease_refresh_returns_expired_when_past_ttl(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-expired",
+        run_id="lease-run-expired",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    refreshed = module.lease_refresh(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert refreshed["refreshed"] is False
+    assert refreshed["reason"] == "lease_expired_before_refresh"
+
+
+def test_lease_release_returns_units_to_available(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-release",
+        run_id="lease-run-release",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    released = module.lease_release(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        log_root_override=log_root,
+    )
+    assert released["released"] is True
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_lease_release_idempotent(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-idem",
+        run_id="lease-run-idem",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    first = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
+    second = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
+    assert first["released"] is True
+    assert second["released"] is False
+    assert second["reason"] == "lease_not_found"
+
+
+def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-sweep",
+        run_id="lease-run-sweep",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    released = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert [item["lease_id"] for item in released] == [acquired["lease_id"]]
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "stale-released"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_sweep_stale_no_op_when_all_active_leases_fresh(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-fresh",
+        run_id="lease-run-fresh",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=60,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    assert module.sweep_stale(repo=repo, log_root_override=log_root, now="2026-05-05T00:00:02Z") == []
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "active"
+
+
+def _run_reviewer_with_lease(
+    *,
+    tmp: Path,
+    repo: Path,
+    log_root: Path,
+    unit_ids: list[str],
+    reviewer_code: str,
+    output_format: str = "text",
+    max_runtime_seconds: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nlease test\n", encoding="utf-8")
+    contract = _lease_contract(tmp / "scope.contract.json", repo=repo, unit_ids=unit_ids)
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=0.2,
+        activity_check_interval_seconds=0.05,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+    )
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    return subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--scope-contract",
+            str(contract),
+            "--rvf-run-id",
+            "lease-reviewer-run",
+            "--rvf-run-dir",
+            str(tmp / "run"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code=clean_review_result_python(),
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_rows(log_root, repo_key)[-1][1] == "completed"
+
+
+def test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    html = "<html><title>Just a moment</title><body>Cloudflare challenge-platform</body></html>"
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code=f"import sys; sys.stdin.read(); print({html!r})",
+        output_format="codex_json",
+    )
+    assert completed.returncode != 0
+    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stderr
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_run_alternative_reviewer_releases_lease_on_timeout(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    completed = _run_reviewer_with_lease(
+        tmp=tmp,
+        repo=repo,
+        log_root=log_root,
+        unit_ids=unit_ids[:1],
+        reviewer_code="import sys, time; sys.stdin.read(); time.sleep(5)",
+        max_runtime_seconds=0.2,
+    )
+    assert completed.returncode == 124
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stdout
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_run_alternative_reviewer_sigterm_kills_child_before_release(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nlease signal test\n", encoding="utf-8")
+    contract = _lease_contract(tmp / "scope.contract.json", repo=repo, unit_ids=unit_ids[:1])
+    pid_file = tmp / "reviewer.pid"
+    reviewer_code = (
+        "import os, pathlib, sys, time\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "sys.stdin.read()\n"
+        "time.sleep(30)\n"
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=60,
+        activity_check_interval_seconds=0.05,
+        max_runtime_seconds=60,
+    )
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--scope-contract",
+            str(contract),
+            "--rvf-run-id",
+            "lease-reviewer-signal-run",
+            "--rvf-run-dir",
+            str(tmp / "run"),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    child_pid: int | None = None
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not pid_file.exists() and proc.poll() is None:
+            time.sleep(0.02)
+        if not pid_file.exists():
+            stdout, stderr = proc.communicate(timeout=5)
+            raise AssertionError(f"reviewer child did not start; rc={proc.returncode}; stdout={stdout}; stderr={stderr}")
+        child_pid = int(pid_file.read_text(encoding="utf-8"))
+
+        os.kill(proc.pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=10)
+
+        assert proc.returncode == 143, f"stdout={stdout}; stderr={stderr}"
+        deadline = time.time() + 5
+        while time.time() < deadline and _process_is_running(child_pid):
+            time.sleep(0.05)
+        assert not _process_is_running(child_pid)
+        assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=5)
+        if child_pid is not None and _process_is_running(child_pid):
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:
+    _module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    snippet = (
+        "import json, os, sys, time\n"
+        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        "from pathlib import Path\n"
+        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import diff_tracker as dt\n"
+        f"repo = Path({str(repo)!r})\n"
+        f"log_root = Path({str(log_root)!r})\n"
+        f"unit_id = {unit_ids[0]!r}\n"
+        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
+        "remaining = wait_until - time.time()\n"
+        "if remaining > 0:\n"
+        "    time.sleep(remaining)\n"
+        "result = dt.lease_acquire(\n"
+        "    repo=repo, session_id=sys.argv[1], run_id=sys.argv[1],\n"
+        "    reviewer_id='r-' + sys.argv[1], unit_ids=[unit_id],\n"
+        "    log_root_override=log_root,\n"
+        ")\n"
+        "print(json.dumps(result))\n"
+    )
+    wait_until = time.time() + 1.5
+    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", snippet, session],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        for session in ("lease-conc-A", "lease-conc-B")
+    ]
+    payloads = []
+    for proc in procs:
+        stdout, stderr = proc.communicate(timeout=60)
+        if stderr.strip():
+            raise AssertionError(stderr)
+        payloads.append(json.loads(stdout.strip().splitlines()[-1]))
+    assert sum(1 for payload in payloads if payload["acquired"]) == 1
+    assert sum(1 for payload in payloads if not payload["acquired"]) == 1
 
 
 if __name__ == "__main__":

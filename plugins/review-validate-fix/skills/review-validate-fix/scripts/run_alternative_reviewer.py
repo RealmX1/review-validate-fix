@@ -8,12 +8,14 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import diff_tracker
 from rvf_logging import start_run
 
 
@@ -28,6 +30,8 @@ DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
 DEFAULT_ACTIVITY_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
+DEFAULT_LEASE_HEARTBEAT_SECONDS = 60.0
+LEASE_HEARTBEAT_ENV = "CODEX_RVF_LEASE_HEARTBEAT_SECONDS"
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 CODEX_BACKEND_CHALLENGE_FLAG = "RVF_CODEX_BACKEND_CHALLENGE"
@@ -54,6 +58,8 @@ CHILD_RVF_ENV_KEYS = {
     "RVF_REVIEW_RESULT",
     "RVF_REVIEWER_ID",
 }
+_ACTIVE_REVIEWER_PROCESS_LOCK = threading.Lock()
+_ACTIVE_REVIEWER_PROCESS: subprocess.Popen[str] | None = None
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -311,6 +317,156 @@ def infer_scope_contract(review_packet: Path | None) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def load_scope_contract(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def tracker_scope_from_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    session_manifest_path = contract.get("session_manifest_path")
+    if not isinstance(session_manifest_path, str) or not session_manifest_path:
+        return {}
+    try:
+        manifest = json.loads(Path(session_manifest_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(manifest, dict):
+        return {}
+    tracker = manifest.get("tracker")
+    if not isinstance(tracker, dict):
+        return {}
+    scope = tracker.get("tracker_scope")
+    return scope if isinstance(scope, dict) else {}
+
+
+def lease_heartbeat_seconds() -> float:
+    raw = os.environ.get(LEASE_HEARTBEAT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_LEASE_HEARTBEAT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_LEASE_HEARTBEAT_SECONDS
+    return value if value > 0 else DEFAULT_LEASE_HEARTBEAT_SECONDS
+
+
+class TrackerLeaseRuntime:
+    def __init__(
+        self,
+        *,
+        repo: Path | None,
+        scope_contract: dict[str, Any],
+        reviewer_id: str,
+        run_id: str,
+    ) -> None:
+        self.repo = repo
+        self.scope_contract = scope_contract
+        self.reviewer_id = reviewer_id
+        self.run_id = run_id
+        self.lease_id: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._old_handlers: dict[int, Any] = {}
+
+    def acquire(self) -> None:
+        if self.repo is None:
+            return
+        unit_ids = self.scope_contract.get("primary_units")
+        if not isinstance(unit_ids, list) or not all(isinstance(item, str) and item for item in unit_ids):
+            return
+        if not unit_ids:
+            return
+        existing = self.scope_contract.get("tracker_lease_id")
+        if isinstance(existing, str) and existing:
+            self.lease_id = existing
+            return
+        tracker_scope = tracker_scope_from_contract(self.scope_contract)
+        session_id = tracker_scope.get("source_session_id")
+        if not isinstance(session_id, str) or not session_id:
+            session_id = os.environ.get("CODEX_SESSION_ID") or "alternative-reviewer"
+        result = diff_tracker.lease_acquire(
+            repo=self.repo,
+            session_id=session_id,
+            run_id=str(self.scope_contract.get("run_id") or self.run_id),
+            reviewer_id=self.reviewer_id,
+            unit_ids=list(dict.fromkeys(unit_ids)),
+            log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+            if os.environ.get("CODEX_RVF_LOG_ROOT")
+            else None,
+        )
+        if not result.get("acquired"):
+            raise RuntimeError(f"tracker lease acquire failed: {result.get('reason')}")
+        lease_id = result.get("lease_id")
+        if not isinstance(lease_id, str) or not lease_id:
+            raise RuntimeError("tracker lease acquire returned no lease_id")
+        self.lease_id = lease_id
+
+    def start(self) -> None:
+        if self.repo is None or self.lease_id is None:
+            return
+        self._install_signal_handlers()
+        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        self._restore_signal_handlers()
+
+    def release(self, reason: str) -> None:
+        if self.repo is None or self.lease_id is None:
+            return
+        diff_tracker.lease_release(
+            repo=self.repo,
+            lease_id=self.lease_id,
+            reason=reason,
+            log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+            if os.environ.get("CODEX_RVF_LOG_ROOT")
+            else None,
+        )
+        self.lease_id = None
+
+    def _heartbeat_loop(self) -> None:
+        assert self.repo is not None
+        assert self.lease_id is not None
+        interval = lease_heartbeat_seconds()
+        while not self._stop.wait(interval):
+            diff_tracker.lease_refresh(
+                repo=self.repo,
+                lease_id=self.lease_id,
+                log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+                if os.environ.get("CODEX_RVF_LOG_ROOT")
+                else None,
+            )
+
+    def _install_signal_handlers(self) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            self._old_handlers[sig] = signal.getsignal(sig)
+
+            def _handler(signum: int, frame: object, *, _sig: int = sig) -> None:
+                terminate_active_reviewer_process()
+                self.stop()
+                self.release(f"signal:{signal_name(signum)}")
+                old = self._old_handlers.get(_sig)
+                if callable(old):
+                    old(signum, frame)
+                raise SystemExit(128 + signum)
+
+            signal.signal(sig, _handler)
+
+    def _restore_signal_handlers(self) -> None:
+        for sig, handler in self._old_handlers.items():
+            signal.signal(sig, handler)
+        self._old_handlers.clear()
 
 
 def build_prompt(
@@ -637,6 +793,32 @@ def next_wait_seconds(
     return max(0.01, min(wait_candidates))
 
 
+def set_active_reviewer_process(process: subprocess.Popen[str]) -> None:
+    global _ACTIVE_REVIEWER_PROCESS
+    with _ACTIVE_REVIEWER_PROCESS_LOCK:
+        _ACTIVE_REVIEWER_PROCESS = process
+
+
+def clear_active_reviewer_process(process: subprocess.Popen[str]) -> None:
+    global _ACTIVE_REVIEWER_PROCESS
+    with _ACTIVE_REVIEWER_PROCESS_LOCK:
+        if _ACTIVE_REVIEWER_PROCESS is process:
+            _ACTIVE_REVIEWER_PROCESS = None
+
+
+def terminate_active_reviewer_process() -> int | None:
+    with _ACTIVE_REVIEWER_PROCESS_LOCK:
+        process = _ACTIVE_REVIEWER_PROCESS
+    if process is None or process.poll() is not None:
+        return None
+    signal_number = terminate_process_group(process)
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        pass
+    return signal_number
+
+
 def run_with_activity_timeout(
     command: list[str],
     *,
@@ -667,6 +849,7 @@ def run_with_activity_timeout(
         env=env,
         start_new_session=True,
     )
+    set_active_reviewer_process(process)
     started_at = time.monotonic()
     last_liveness_at = started_at
     last_stdout_len = 0
@@ -681,60 +864,8 @@ def run_with_activity_timeout(
         else None
     )
 
-    while True:
-        now = time.monotonic()
-        if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
-            return timeout_completed(
-                process,
-                command,
-                idle_timeout_seconds=idle_timeout_seconds,
-                activity_check_interval_seconds=activity_check_interval_seconds,
-                activity_probe_command=activity_probe_command,
-                activity_probe_timeout_seconds=activity_probe_timeout_seconds,
-                activity_probe_failure_threshold=activity_probe_failure_threshold,
-                max_runtime_seconds=max_runtime_seconds,
-                reason="max_runtime_exceeded",
-                probe_history=probe_history,
-            )
-        idle_for = now - last_liveness_at
-        remaining_idle = max(0.0, idle_timeout_seconds - idle_for)
-        max_runtime_remaining = (
-            max_runtime_seconds - (now - started_at)
-            if max_runtime_seconds is not None
-            else None
-        )
-        probe_retry_remaining = None
-        if (
-            activity_probe_command is not None
-            and remaining_idle <= 0.0
-            and next_probe_at > now
-        ):
-            probe_retry_remaining = max(0.0, next_probe_at - now)
-        wait_for = next_wait_seconds(
-            activity_check_interval_seconds=activity_check_interval_seconds,
-            remaining_idle_seconds=remaining_idle,
-            max_runtime_remaining_seconds=max_runtime_remaining,
-            waiting_on_long_command=(
-                stream_monitor.waiting_on_long_command
-                if stream_monitor is not None
-                else False
-            ),
-            probe_retry_remaining_seconds=probe_retry_remaining,
-        )
-
-        try:
-            stdout, stderr = process.communicate(input=pending_input, timeout=wait_for)
-            return ReviewerRunResult(
-                args=command,
-                returncode=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
-                pid=process.pid,
-                signal=subprocess_signal(process.returncode),
-                probe_history=probe_history,
-            )
-        except subprocess.TimeoutExpired as exc:
-            pending_input = None
+    try:
+        while True:
             now = time.monotonic()
             if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
                 return timeout_completed(
@@ -749,59 +880,118 @@ def run_with_activity_timeout(
                     reason="max_runtime_exceeded",
                     probe_history=probe_history,
                 )
-            stdout_len = _payload_length(exc.stdout)
-            stderr_len = _payload_length(exc.stderr)
-            if stdout_len > last_stdout_len or stderr_len > last_stderr_len:
-                if stream_monitor is not None and stdout_len > last_stdout_len:
-                    stream_monitor.ingest(_payload_delta(exc.stdout, last_stdout_len))
-                last_liveness_at = now
-                last_stdout_len = stdout_len
-                last_stderr_len = stderr_len
-                consecutive_probe_failures = 0
-                continue
+            idle_for = now - last_liveness_at
+            remaining_idle = max(0.0, idle_timeout_seconds - idle_for)
+            max_runtime_remaining = (
+                max_runtime_seconds - (now - started_at)
+                if max_runtime_seconds is not None
+                else None
+            )
+            probe_retry_remaining = None
+            if (
+                activity_probe_command is not None
+                and remaining_idle <= 0.0
+                and next_probe_at > now
+            ):
+                probe_retry_remaining = max(0.0, next_probe_at - now)
+            wait_for = next_wait_seconds(
+                activity_check_interval_seconds=activity_check_interval_seconds,
+                remaining_idle_seconds=remaining_idle,
+                max_runtime_remaining_seconds=max_runtime_remaining,
+                waiting_on_long_command=(
+                    stream_monitor.waiting_on_long_command
+                    if stream_monitor is not None
+                    else False
+                ),
+                probe_retry_remaining_seconds=probe_retry_remaining,
+            )
 
-            if now - last_liveness_at < idle_timeout_seconds:
-                continue
-            if stream_monitor is not None and stream_monitor.waiting_on_long_command:
-                continue
-            if activity_probe_command is not None:
-                if now < next_probe_at:
-                    continue
-                probe_env = env.copy()
-                probe_env["RVF_REVIEWER_PID"] = str(process.pid)
-                probe = run_activity_probe(
-                    activity_probe_command,
-                    cwd=cwd,
-                    env=probe_env,
-                    timeout_seconds=activity_probe_timeout_seconds,
-                    started_at=started_at,
+            try:
+                stdout, stderr = process.communicate(input=pending_input, timeout=wait_for)
+                return ReviewerRunResult(
+                    args=command,
+                    returncode=process.returncode,
+                    stdout=stdout,
+                    stderr=stderr,
+                    pid=process.pid,
+                    signal=subprocess_signal(process.returncode),
+                    probe_history=probe_history,
                 )
-                probe_history.append(probe)
-                next_probe_at = time.monotonic() + activity_check_interval_seconds
-                if probe.get("status") == "completed" and probe.get("returncode") == 0:
-                    last_liveness_at = time.monotonic()
+            except subprocess.TimeoutExpired as exc:
+                pending_input = None
+                now = time.monotonic()
+                if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
+                    return timeout_completed(
+                        process,
+                        command,
+                        idle_timeout_seconds=idle_timeout_seconds,
+                        activity_check_interval_seconds=activity_check_interval_seconds,
+                        activity_probe_command=activity_probe_command,
+                        activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                        activity_probe_failure_threshold=activity_probe_failure_threshold,
+                        max_runtime_seconds=max_runtime_seconds,
+                        reason="max_runtime_exceeded",
+                        probe_history=probe_history,
+                    )
+                stdout_len = _payload_length(exc.stdout)
+                stderr_len = _payload_length(exc.stderr)
+                if stdout_len > last_stdout_len or stderr_len > last_stderr_len:
+                    if stream_monitor is not None and stdout_len > last_stdout_len:
+                        stream_monitor.ingest(_payload_delta(exc.stdout, last_stdout_len))
+                    last_liveness_at = now
+                    last_stdout_len = stdout_len
+                    last_stderr_len = stderr_len
                     consecutive_probe_failures = 0
                     continue
-                consecutive_probe_failures += 1
-                if consecutive_probe_failures < activity_probe_failure_threshold:
-                    continue
 
-            return timeout_completed(
-                process,
-                command,
-                idle_timeout_seconds=idle_timeout_seconds,
-                activity_check_interval_seconds=activity_check_interval_seconds,
-                activity_probe_command=activity_probe_command,
-                activity_probe_timeout_seconds=activity_probe_timeout_seconds,
-                activity_probe_failure_threshold=activity_probe_failure_threshold,
-                max_runtime_seconds=max_runtime_seconds,
-                reason=(
-                    "no_observable_activity_probe_failed"
-                    if activity_probe_command is not None
-                    else "no_observable_activity"
-                ),
-                probe_history=probe_history,
-            )
+                if now - last_liveness_at < idle_timeout_seconds:
+                    continue
+                if stream_monitor is not None and stream_monitor.waiting_on_long_command:
+                    continue
+                if activity_probe_command is not None:
+                    if now < next_probe_at:
+                        continue
+                    probe_env = env.copy()
+                    probe_env["RVF_REVIEWER_PID"] = str(process.pid)
+                    probe = run_activity_probe(
+                        activity_probe_command,
+                        cwd=cwd,
+                        env=probe_env,
+                        timeout_seconds=activity_probe_timeout_seconds,
+                        started_at=started_at,
+                    )
+                    probe_history.append(probe)
+                    next_probe_at = time.monotonic() + activity_check_interval_seconds
+                    if probe.get("status") == "completed" and probe.get("returncode") == 0:
+                        last_liveness_at = time.monotonic()
+                        consecutive_probe_failures = 0
+                        continue
+                    consecutive_probe_failures += 1
+                    if consecutive_probe_failures < activity_probe_failure_threshold:
+                        continue
+
+                return timeout_completed(
+                    process,
+                    command,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    activity_check_interval_seconds=activity_check_interval_seconds,
+                    activity_probe_command=activity_probe_command,
+                    activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                    activity_probe_failure_threshold=activity_probe_failure_threshold,
+                    max_runtime_seconds=max_runtime_seconds,
+                    reason=(
+                        "no_observable_activity_probe_failed"
+                        if activity_probe_command is not None
+                        else "no_observable_activity"
+                    ),
+                    probe_history=probe_history,
+                )
+    except BaseException:
+        if process.poll() is None:
+            terminate_process_group(process)
+        raise
+    finally:
+        clear_active_reviewer_process(process)
 
 
 def timeout_completed(
@@ -1289,6 +1479,7 @@ def main() -> int:
             scope_contract = infer_scope_contract(review_packet)
         if scope_contract is not None and not scope_contract.exists():
             raise ValueError(f"scope contract file not found: {scope_contract}")
+        scope_contract_payload = load_scope_contract(scope_contract)
         prompt = build_prompt(prompt_file, session_context, review_packet, repo, scope_contract, review_result_path)
     except Exception as exc:
         ledger.event(
@@ -1389,28 +1580,50 @@ def main() -> int:
         )
         return fail(f"failed to write reviewer artifact: {exc}", 2)
 
+    lease_runtime = TrackerLeaseRuntime(
+        repo=repo,
+        scope_contract=scope_contract_payload,
+        reviewer_id=reviewer_id,
+        run_id=ledger.run_id,
+    )
+    lease_release_reason = "failed"
     try:
-        completed = run_with_activity_timeout(
-            command,
-            input_text=prompt,
-            cwd=cwd,
-            env=env,
-            idle_timeout_seconds=idle_timeout,
-            activity_check_interval_seconds=activity_check_interval,
-            activity_probe_command=activity_probe_command,
-            activity_probe_timeout_seconds=activity_probe_timeout,
-            activity_probe_failure_threshold=activity_probe_failure_threshold,
-            max_runtime_seconds=max_runtime,
-            output_format=output_format,
+        lease_runtime.acquire()
+        lease_runtime.start()
+        try:
+            completed = run_with_activity_timeout(
+                command,
+                input_text=prompt,
+                cwd=cwd,
+                env=env,
+                idle_timeout_seconds=idle_timeout,
+                activity_check_interval_seconds=activity_check_interval,
+                activity_probe_command=activity_probe_command,
+                activity_probe_timeout_seconds=activity_probe_timeout,
+                activity_probe_failure_threshold=activity_probe_failure_threshold,
+                max_runtime_seconds=max_runtime,
+                output_format=output_format,
+            )
+        except Exception as exc:
+            completed = ReviewerRunResult(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr=f"{type(exc).__name__}: {exc}",
+                pid=None,
+            )
+        lease_release_reason = (
+            "failed"
+            if completed.returncode != 0
+            or (
+                output_format == OUTPUT_FORMAT_CODEX_JSON
+                and looks_like_codex_backend_challenge(completed.stdout or "")
+            )
+            else "completed"
         )
-    except Exception as exc:
-        completed = ReviewerRunResult(
-            args=command,
-            returncode=1,
-            stdout="",
-            stderr=f"{type(exc).__name__}: {exc}",
-            pid=None,
-        )
+    finally:
+        lease_runtime.stop()
+        lease_runtime.release(lease_release_reason)
 
     raw_stdout = completed.stdout or ""
     raw_stderr = completed.stderr or ""
