@@ -36,6 +36,7 @@ CANCEL_RVF_RUN = SCRIPT_DIR / "cancel_rvf_run.py"
 CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
+DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
 RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 
@@ -1404,6 +1405,98 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Pat
     assert "note.md" not in manifest["owned_paths"]
     assert "docs/note.md" in manifest["owned_dirty_paths"]
     assert "docs/note.md" not in manifest["unattributed_dirty_paths"]
+
+
+def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    transcript = tmp_path / "claude-session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-06T06:00:00.000Z",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Edit",
+                            "input": {"file_path": str(repo / "tracked.txt")},
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    run_dir = tmp_path / "run"
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "stop-event.json").write_text(
+        json.dumps({"cwd": str(repo), "transcript_path": str(transcript)}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (artifacts / "session-manifest.json").write_text(
+        json.dumps(
+            {
+                "owned_paths": [],
+                "owned_dirty_paths": [],
+                "unattributed_dirty_paths": ["tracked.txt"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    summary = run_dir / "summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-06T06:00:01Z",
+                "status": "skipped",
+                "reason_code": "no_session_owned_dirty",
+                "repo": str(repo),
+                "run_dir": str(run_dir),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    old_scripts = tmp_path / "old-scripts"
+    old_scripts.mkdir()
+    (old_scripts / "session_manifest.py").write_text(
+        "def build_manifest():\n"
+        "    return {'owned_dirty_paths': []}\n",
+        encoding="utf-8",
+    )
+    (old_scripts / "codex_stop_review_validate_fix.py").write_text(
+        "def legacy_session_scope_gate_payload():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    completed = run(
+        [
+            sys.executable,
+            str(DIAGNOSE_STOP_HOOK_SCOPE),
+            "--summary",
+            str(summary),
+            "--runtime-scripts-dir",
+            str(old_scripts),
+            "--format",
+            "json",
+        ]
+    )
+    payload = json.loads(completed.stdout)
+    codes = {item["code"] for item in payload["diagnoses"]}
+
+    assert payload["transcript_probe"]["claude_dirty_write_paths"] == ["tracked.txt"]
+    assert "stop_hook_skipped_no_session_owned_dirty" in codes
+    assert "run_manifest_missing_tracker_field" in codes
+    assert "claude_writes_not_attributed" in codes
+    assert "runtime_session_manifest_differs_from_reference" in codes
+    assert "runtime_session_manifest_lacks_tracker_field" in codes
 
 
 def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> None:
@@ -5720,6 +5813,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "session_manifest_resolves_exec_paths_from_command_workdir",
             lambda: test_session_manifest_resolves_exec_paths_from_command_workdir(
                 root / "session-manifest-workdir"
+            ),
+        ),
+        (
+            "diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap",
+            lambda: test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(
+                root / "diagnose-stop-hook-scope"
             ),
         ),
         (
