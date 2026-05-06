@@ -6364,12 +6364,28 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_lease_refresh_returns_expired_when_past_ttl(root / "lease-T5"),
         ),
         (
-            "lease_release_returns_units_to_available",
-            lambda: test_lease_release_returns_units_to_available(root / "lease-T6"),
+            "lease_release_completed_marks_units_reviewed",
+            lambda: test_lease_release_completed_marks_units_reviewed(root / "lease-T6"),
         ),
         (
             "lease_release_idempotent",
             lambda: test_lease_release_idempotent(root / "lease-T7"),
+        ),
+        (
+            "complete_review_scope_unions_contract_and_lease_units",
+            lambda: test_complete_review_scope_unions_contract_and_lease_units(root / "lease-T7a"),
+        ),
+        (
+            "complete_review_scope_does_not_complete_failed_released_lease",
+            lambda: test_complete_review_scope_does_not_complete_failed_released_lease(root / "lease-T7c"),
+        ),
+        (
+            "complete_review_scope_supersedes_overlapping_active_lease",
+            lambda: test_complete_review_scope_supersedes_overlapping_active_lease(root / "lease-T7d"),
+        ),
+        (
+            "complete_review_scope_keeps_different_scope_active_lease",
+            lambda: test_complete_review_scope_keeps_different_scope_active_lease(root / "lease-T7e"),
         ),
         (
             "lease_participants_finish_does_not_release_shared_lease",
@@ -7634,7 +7650,7 @@ def test_lease_refresh_returns_expired_when_past_ttl(tmp: Path) -> None:
     assert refreshed["reason"] == "lease_expired_before_refresh"
 
 
-def test_lease_release_returns_units_to_available(tmp: Path) -> None:
+def test_lease_release_completed_marks_units_reviewed(tmp: Path) -> None:
     module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
     acquired = module.lease_acquire(
         repo=repo,
@@ -7650,7 +7666,7 @@ def test_lease_release_returns_units_to_available(tmp: Path) -> None:
         log_root_override=log_root,
     )
     assert released["released"] is True
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
 
 
 def test_lease_release_idempotent(tmp: Path) -> None:
@@ -7666,8 +7682,128 @@ def test_lease_release_idempotent(tmp: Path) -> None:
     first = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
     second = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
     assert first["released"] is True
-    assert second["released"] is False
-    assert second["reason"] == "lease_not_found"
+    assert second["released"] is True
+    assert second["reason"] == "lease_already_completed"
+
+
+def test_complete_review_scope_unions_contract_and_lease_units(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    assert len(unit_ids) >= 2
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-complete-union",
+        run_id="lease-run-complete-union",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:2],
+        log_root_override=log_root,
+    )
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 0
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:2]) == {
+        unit_ids[0]: "reviewed",
+        unit_ids[1]: "reviewed",
+    }
+
+
+def test_complete_review_scope_does_not_complete_failed_released_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-complete-failed",
+        run_id="lease-run-complete-failed",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    failed = module.lease_release(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reason="failed",
+        log_root_override=log_root,
+    )
+    assert failed["released"] is True
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is False
+    assert completed["reason"] == "lease_failed_released"
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "failed-released"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_complete_review_scope_supersedes_overlapping_active_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    stale = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-complete",
+        run_id="lease-run-stale-complete",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    swept = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert [item["lease_id"] for item in swept] == [stale["lease_id"]]
+    active = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-overlap-complete",
+        run_id="lease-run-overlap-complete",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert active["acquired"] is True
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=stale["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert active["lease_id"] in completed["superseded_active_lease_ids"]
+    assert _lease_unit_count(log_root, repo_key, active["lease_id"]) == 0
+    assert dict(_lease_rows(log_root, repo_key))[active["lease_id"]] == "completed"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
+
+
+def test_complete_review_scope_keeps_different_scope_active_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    active = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-overlap-different-scope",
+        run_id="lease-run-overlap-different-scope",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-old-lease",
+        unit_ids=unit_ids[:1],
+        scope_hash="different-old-scope",
+        run_id="old-run",
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert completed["unit_ids"] == []
+    assert completed["blocked_active_lease_ids"] == [active["lease_id"]]
+    assert dict(_lease_rows(log_root, repo_key))[active["lease_id"]] == "active"
+    assert _lease_unit_count(log_root, repo_key, active["lease_id"]) == 1
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
 
 
 def test_lease_participants_finish_does_not_release_shared_lease(tmp: Path) -> None:
@@ -7728,7 +7864,7 @@ def test_lease_participants_finish_does_not_release_shared_lease(tmp: Path) -> N
     )
     assert released["released"] is True
     assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 0
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
 
 
 def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
@@ -7847,7 +7983,7 @@ def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> No
         reviewer_code=clean_review_result_python(),
     )
     assert completed.returncode == 0, completed.stderr
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
     assert _lease_rows(log_root, repo_key)[-1][1] == "completed"
 
 

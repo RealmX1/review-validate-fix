@@ -2272,6 +2272,39 @@ def _participant_state_for_reason(reason: str) -> str:
     return "completed" if reason == "completed" else "failed"
 
 
+def _normalize_unit_id_list(unit_ids: Iterable[Any] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in unit_ids or []:
+        if not isinstance(value, str):
+            continue
+        stripped = value.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        normalized.append(stripped)
+    return normalized
+
+
+def _unit_ids_for_lease_in_txn(conn: sqlite3.Connection, lease_id: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT unit_id FROM lease_units WHERE lease_id=? ORDER BY unit_id",
+        (lease_id,),
+    ).fetchall()
+    return [row["unit_id"] for row in rows]
+
+
+def _existing_unit_ids_in_txn(conn: sqlite3.Connection, unit_ids: list[str]) -> list[str]:
+    if not unit_ids:
+        return []
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"SELECT unit_id FROM units WHERE unit_id IN ({placeholders}) ORDER BY unit_id",
+        tuple(unit_ids),
+    ).fetchall()
+    return [row["unit_id"] for row in rows]
+
+
 def _active_participant_count_in_txn(conn: sqlite3.Connection, lease_id: str) -> int:
     row = conn.execute(
         "SELECT COUNT(*) AS count FROM lease_participants WHERE lease_id=? AND state='active'",
@@ -2574,6 +2607,15 @@ def lease_release(
     log_root_override: Path | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
+    if reason == "completed":
+        return complete_review_scope(
+            repo=repo,
+            lease_id=lease_id,
+            reason=reason,
+            log_root_override=log_root_override,
+            now=now,
+        )
+
     repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
         repo,
         log_root_override,
@@ -2651,6 +2693,220 @@ def lease_release(
             "lease_id": lease_id,
             "release_state": release_state,
             "unit_ids": unit_ids,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def complete_review_scope(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    unit_ids: Iterable[Any] | None = None,
+    scope_hash: str | None = None,
+    run_id: str | None = None,
+    reason: str = "completed",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Mark a finished review scope as reviewed.
+
+    This is intentionally stronger than generic lease release: completed RVF
+    scopes must leave durable `reviewed` unit state, even when a long-running
+    reviewer let its lease expire and stale-sweep already removed `lease_units`.
+    """
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    contract_unit_ids = _normalize_unit_id_list(unit_ids)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                "SELECT lease_id, state, scope_hash, run_id FROM leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None and not contract_unit_ids:
+                return {
+                    "status": "missing",
+                    "released": False,
+                    "reason": "lease_not_found",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+
+            prior_state = row["state"] if row is not None else "missing"
+            if prior_state in {"failed-released"}:
+                return {
+                    "status": "missing",
+                    "released": False,
+                    "reason": "lease_failed_released",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+
+            lease_unit_ids = _unit_ids_for_lease_in_txn(conn, lease_id) if row is not None else []
+            selected_unit_ids = _normalize_unit_id_list([*contract_unit_ids, *lease_unit_ids])
+            existing_unit_ids = _existing_unit_ids_in_txn(conn, selected_unit_ids)
+            effective_scope_hash = scope_hash or (row["scope_hash"] if row is not None else None)
+            effective_run_id = run_id or (row["run_id"] if row is not None else None)
+            superseded_active_lease_ids: list[str] = []
+            blocked_active_lease_ids: list[str] = []
+            blocked_unit_ids: set[str] = set()
+            if existing_unit_ids:
+                placeholders = ",".join("?" for _ in existing_unit_ids)
+                overlap_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT l.lease_id, l.scope_hash, lu.unit_id
+                      FROM lease_units lu
+                      JOIN leases l ON l.lease_id = lu.lease_id
+                     WHERE l.state='active'
+                       AND l.lease_id<>?
+                       AND lu.unit_id IN ({placeholders})
+                    """,
+                    (lease_id, *existing_unit_ids),
+                ).fetchall()
+                for overlap in overlap_rows:
+                    overlap_lease_id = overlap["lease_id"]
+                    if effective_scope_hash and overlap["scope_hash"] == effective_scope_hash:
+                        if overlap_lease_id not in superseded_active_lease_ids:
+                            superseded_active_lease_ids.append(overlap_lease_id)
+                    else:
+                        if overlap_lease_id not in blocked_active_lease_ids:
+                            blocked_active_lease_ids.append(overlap_lease_id)
+                        blocked_unit_ids.add(overlap["unit_id"])
+                if superseded_active_lease_ids:
+                    lease_placeholders = ",".join("?" for _ in superseded_active_lease_ids)
+                    conn.execute(
+                        f"""
+                        DELETE FROM lease_units
+                         WHERE lease_id IN ({lease_placeholders})
+                           AND unit_id IN ({placeholders})
+                        """,
+                        tuple(superseded_active_lease_ids) + tuple(existing_unit_ids),
+                    )
+                    emptied_rows = conn.execute(
+                        f"""
+                        SELECT l.lease_id
+                          FROM leases l
+                         WHERE l.state='active'
+                           AND l.lease_id IN ({lease_placeholders})
+                           AND NOT EXISTS (
+                               SELECT 1 FROM lease_units lu WHERE lu.lease_id=l.lease_id
+                           )
+                        """,
+                        tuple(superseded_active_lease_ids),
+                    ).fetchall()
+                    emptied_lease_ids = [emptied["lease_id"] for emptied in emptied_rows]
+                    if emptied_lease_ids:
+                        emptied_placeholders = ",".join("?" for _ in emptied_lease_ids)
+                        conn.execute(
+                            f"""
+                            UPDATE leases
+                               SET state='completed',
+                                   last_activity_at=?
+                             WHERE lease_id IN ({emptied_placeholders})
+                            """,
+                            (now_iso, *emptied_lease_ids),
+                        )
+                        conn.execute(
+                            f"""
+                            UPDATE lease_participants
+                               SET state='completed',
+                                   last_activity_at=?,
+                                   finished_at=?,
+                                   release_reason='completed-by-overlapping-scope'
+                             WHERE state='active'
+                               AND lease_id IN ({emptied_placeholders})
+                            """,
+                            (now_iso, now_iso, *emptied_lease_ids),
+                        )
+                reviewable_unit_ids = [unit_id for unit_id in existing_unit_ids if unit_id not in blocked_unit_ids]
+                reviewable_placeholders = ",".join("?" for _ in reviewable_unit_ids)
+                if reviewable_unit_ids:
+                    conn.execute(
+                        f"""
+                        UPDATE units
+                           SET review_state='reviewed'
+                         WHERE review_state IN ('available','assigned','reviewed')
+                           AND unit_id IN ({reviewable_placeholders})
+                        """,
+                        tuple(reviewable_unit_ids),
+                    )
+                else:
+                    reviewable_unit_ids = []
+            else:
+                reviewable_unit_ids = []
+
+            if row is not None:
+                conn.execute("DELETE FROM lease_units WHERE lease_id=?", (lease_id,))
+                conn.execute(
+                    """
+                    UPDATE lease_participants
+                       SET state='completed',
+                           last_activity_at=?,
+                           finished_at=?,
+                           release_reason=?
+                     WHERE lease_id=?
+                       AND state='active'
+                    """,
+                    (now_iso, now_iso, reason, lease_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE leases
+                       SET state='completed',
+                           last_activity_at=?
+                     WHERE lease_id=?
+                    """,
+                    (now_iso, lease_id),
+                )
+
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        if prior_state == "completed":
+            completed_reason = "lease_already_completed"
+        elif prior_state == "stale-released":
+            completed_reason = "lease_completed_after_stale"
+        elif prior_state == "missing":
+            completed_reason = "lease_completed_from_contract"
+        else:
+            completed_reason = "lease_completed"
+        _emit_event(
+            events_path,
+            {
+                "event": "review_scope_completed",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "run_id": effective_run_id,
+                "scope_hash": effective_scope_hash,
+                "previous_lease_state": prior_state,
+                "completed_unit_count": len(reviewable_unit_ids),
+                "superseded_active_lease_ids": superseded_active_lease_ids,
+                "blocked_active_lease_ids": blocked_active_lease_ids,
+                "reason_code": completed_reason,
+            },
+        )
+        return {
+            "status": "released",
+            "released": True,
+            "reason": completed_reason,
+            "lease_id": lease_id,
+            "release_state": "completed",
+            "unit_ids": reviewable_unit_ids,
+            "released_unit_count": len(reviewable_unit_ids),
+            "scope_hash": effective_scope_hash,
+            "run_id": effective_run_id,
+            "previous_lease_state": prior_state,
+            "superseded_active_lease_ids": superseded_active_lease_ids,
+            "blocked_active_lease_ids": blocked_active_lease_ids,
             "repo_key": key,
             "tracker_dir": str(directory),
         }
@@ -4070,7 +4326,7 @@ def _build_argparser() -> argparse.ArgumentParser:
 
     lease_rel = subparsers.add_parser(
         "lease-release",
-        help="Release a tracker lease and return its units to the available pool.",
+        help="Release a tracker lease; completed leases mark units reviewed.",
     )
     lease_rel.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
     lease_rel.add_argument("--lease-id", required=True)

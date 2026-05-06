@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -1148,6 +1149,107 @@ def test_allocate_auto_review_scope_writes_artifact_when_scope_present(tmp: Path
     assert "tracker_scope_path" in meta
     assert meta["tracker_lease_id"] is not None
     assert meta["tracker_scope_hash"] is not None
+
+
+def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_apply_patch_transcript(transcript, repo, session_id="sess-followup-ttl")
+    state = tmp / "state"
+    original_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    try:
+        os.environ["CODEX_RVF_FORK_MODE"] = "kanban-followup"
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript), "task_id": "task-ttl"}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        module.refresh_global_diff_tracker(context, ledger)
+        result = module.allocate_auto_review_scope(context, ledger, dry_run=False)
+    finally:
+        if original_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original_log
+        if original_mode is None:
+            os.environ.pop("CODEX_RVF_FORK_MODE", None)
+        else:
+            os.environ["CODEX_RVF_FORK_MODE"] = original_mode
+
+    assert result is None
+    meta = getattr(ledger, "tracker_scope_meta", None)
+    assert isinstance(meta, dict)
+    db_path = Path(meta["tracker_dir"]) / "tracker.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT ttl_seconds FROM leases WHERE lease_id=?",
+            (meta["tracker_lease_id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row[0] == 3600
+
+
+def test_kanban_followup_without_task_id_does_not_allocate_review_scope(tmp: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_apply_patch_transcript(transcript, repo, session_id="sess-followup-no-task")
+    state = tmp / "state"
+    original_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    task_env_names = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
+    original_task_env = {name: os.environ.get(name) for name in task_env_names}
+    try:
+        os.environ["CODEX_RVF_FORK_MODE"] = "kanban-followup"
+        for name in task_env_names:
+            os.environ.pop(name, None)
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        module.refresh_global_diff_tracker(context, ledger)
+        result = module.allocate_auto_review_scope(context, ledger, dry_run=False)
+    finally:
+        if original_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original_log
+        if original_mode is None:
+            os.environ.pop("CODEX_RVF_FORK_MODE", None)
+        else:
+            os.environ["CODEX_RVF_FORK_MODE"] = original_mode
+        for name, value in original_task_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert result is not None
+    assert "reason=kanban_followup_missing_task_id" in result["systemMessage"]
+    meta = getattr(ledger, "tracker_scope_meta", None)
+    assert meta is None
+
+    diff_tracker = sys.modules["diff_tracker"]
+    _, _, tracker_dir, db_path, _, _ = diff_tracker._lease_repo_paths(
+        repo,
+        log_root_override=state / "global-diff-tracker",
+    )
+    assert Path(tracker_dir).exists()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        has_leases_table = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='leases'"
+        ).fetchone()[0]
+        count = (
+            conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
+            if has_leases_table
+            else 0
+        )
+    finally:
+        conn.close()
+    assert count == 0
 
 
 def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp: Path) -> None:
@@ -4767,6 +4869,8 @@ def main() -> int:
         test_evaluate_session_gate_suppresses_on_manual_marker,
         test_legacy_session_scope_gate_payload_used_when_tracker_disabled,
         test_allocate_auto_review_scope_writes_artifact_when_scope_present,
+        test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl,
+        test_kanban_followup_without_task_id_does_not_allocate_review_scope,
         test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
         test_manual_scope_suppression_does_not_transfer_parent_takeover_units,
         test_evaluate_session_gate_file_marker_takes_precedence_over_db_marker,

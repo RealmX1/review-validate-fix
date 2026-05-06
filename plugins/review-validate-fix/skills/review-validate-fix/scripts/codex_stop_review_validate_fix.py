@@ -65,6 +65,8 @@ FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
+DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
+KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
 SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
 MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
@@ -4473,6 +4475,28 @@ def evaluate_session_gate(
     return None
 
 
+def _positive_int_from_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def auto_review_lease_ttl_seconds(context: dict[str, Any]) -> int | None:
+    event = context.get("event")
+    backend = normalize_backend_from_env(event if isinstance(event, dict) else None)
+    if backend == "kanban-followup" and isinstance(event, dict) and current_kanban_task_id(event):
+        return _positive_int_from_env(
+            KANBAN_FOLLOWUP_LEASE_TTL_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS,
+        )
+    return None
+
+
 def allocate_auto_review_scope(
     context: dict[str, Any],
     ledger: RunLedger,
@@ -4510,11 +4534,54 @@ def allocate_auto_review_scope(
     if repo_path is None:
         return None
 
+    event = context.get("event")
+    backend = normalize_backend_from_env(event if isinstance(event, dict) else None)
+    if backend == "kanban-followup" and (
+        not isinstance(event, dict) or not current_kanban_task_id(event)
+    ):
+        ledger.event(
+            phase="gate",
+            event="kanban_followup_missing_task_id",
+            status="skipped",
+            reason_code="kanban_followup_missing_task_id",
+            repo=repo,
+            cwd=context.get("cwd"),
+            session_id=session_id,
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_missing_task_id",
+            ),
+        )
+        if dry_run:
+            return {
+                "would_proceed": False,
+                "candidate_unit_count": 0,
+                "result": None,
+                "reason": "kanban_followup_missing_task_id",
+            }
+        return skip_payload(
+            "kanban-followup backend requires the current Cline Kanban task id.",
+            ledger,
+            "kanban_followup_missing_task_id",
+            repo=repo,
+            session_id=session_id,
+            backend="kanban-followup",
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_missing_task_id",
+            ),
+        )
+
     run_id = ledger.run_id if hasattr(ledger, "run_id") else "stop-hook-run"
     reviewer_id = "stop-hook" if not dry_run else None
     parent_session_id = context.get("parent_session_id")
     if parent_session_id == session_id:
         parent_session_id = None
+    lease_ttl_seconds = auto_review_lease_ttl_seconds(context)
     try:
         manual_probe = _manual_suppression_scope_probe(
             repo=repo_path,
@@ -4570,6 +4637,7 @@ def allocate_auto_review_scope(
                 holder_kind="reviewer",
                 dry_run=True,
                 auto_claim_observed=False,
+                lease_ttl_seconds=lease_ttl_seconds,
             )
             status = result.get("status")
             if status == "dry_run":
@@ -4593,6 +4661,7 @@ def allocate_auto_review_scope(
             parent_session_id=parent_session_id,
             holder_kind="reviewer",
             dry_run=dry_run,
+            lease_ttl_seconds=lease_ttl_seconds,
             # Auto Stop-hook attribution comes from
             # `refresh_global_diff_tracker` → `build_manifest` →
             # `register_claims`; auto-claim here would broaden scope past
@@ -4635,6 +4704,8 @@ def allocate_auto_review_scope(
                 meta["tracker_scope_path"] = artifact_path
                 meta["tracker_lease_id"] = result.get("lease_id")
                 meta["tracker_scope_hash"] = result.get("scope_hash")
+                meta["tracker_dir"] = result.get("tracker_dir")
+                meta["tracker_lease_ttl_seconds"] = lease_ttl_seconds
             except (AttributeError, TypeError):
                 pass
         ledger.event(
@@ -4650,6 +4721,7 @@ def allocate_auto_review_scope(
             tracker_lease_id=result.get("lease_id"),
             tracker_scope_hash=result.get("scope_hash"),
             tracker_unit_count=len(result.get("scope", {}).get("unit_ids", []) if scope_payload else []),
+            tracker_lease_ttl_seconds=lease_ttl_seconds,
         )
         if dry_run:
             return {

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -69,6 +70,21 @@ def _make_run(tmp_path: Path, repo: Path, transcript: Path) -> Path:
         encoding="utf-8",
     )
     return run_dir
+
+
+def _unit_review_states(tracker_dir: str, unit_ids: list[str]) -> dict[str, str]:
+    placeholders = ",".join("?" for _ in unit_ids)
+    conn = sqlite3.connect(str(Path(tracker_dir) / "tracker.sqlite3"))
+    try:
+        return {
+            unit_id: state
+            for unit_id, state in conn.execute(
+                f"SELECT unit_id, review_state FROM units WHERE unit_id IN ({placeholders})",
+                tuple(unit_ids),
+            )
+        }
+    finally:
+        conn.close()
 
 
 def _write_transcript(path: Path, marker: str, *, originator: str | None = "Codex Desktop") -> None:
@@ -227,13 +243,100 @@ def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path,
 
     assert record["tracker_lease_release"]["released"] is True
     assert record["tracker_lease_release"]["lease_id"] == allocated["lease_id"]
+    assert record["tracker_lease_release"]["release_state"] == "completed"
+    states = _unit_review_states(allocated["tracker_dir"], allocated["scope"]["unit_ids"])
+    assert states
+    assert set(states.values()) == {"reviewed"}
+    next_alloc = diff_tracker.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="rvf-next-run",
+        reviewer_id="allocator",
+        log_root_override=log_root,
+    )
+    assert next_alloc["status"] == "empty"
     second = diff_tracker.lease_release(
         repo=repo,
         lease_id=allocated["lease_id"],
         log_root_override=log_root,
     )
-    assert second["released"] is False
-    assert second["reason"] == "lease_not_found"
+    assert second["released"] is True
+    assert second["reason"] == "lease_already_completed"
+
+
+def test_finalize_run_marks_stale_tracker_scope_reviewed_from_contract_units(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    finalize = _load("rvf_run_finalize")
+    diff_tracker = _load("diff_tracker")
+    capture = _load("trajectory_capture")
+    repo = _init_repo(tmp_path / "repo")
+    transcript = tmp_path / "rollout.jsonl"
+    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    run_dir = _make_run(tmp_path, repo, transcript)
+    log_root = tmp_path / "state"
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    (repo / "README.md").write_text("hello changed for stale tracker\n", encoding="utf-8")
+    allocated = diff_tracker.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="rvf-test-run",
+        reviewer_id="allocator",
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-06T00:00:00Z",
+    )
+    assert allocated["status"] == "allocated"
+    swept = diff_tracker.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-06T00:00:02Z",
+    )
+    assert [item["lease_id"] for item in swept] == [allocated["lease_id"]]
+    assert set(
+        _unit_review_states(allocated["tracker_dir"], allocated["scope"]["unit_ids"]).values()
+    ) == {"available"}
+
+    inputs = run_dir / "artifacts" / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    (inputs / "scope.contract.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "run_id": "rvf-test-run",
+                "repo": str(repo),
+                "primary_units": allocated["scope"]["unit_ids"],
+                "tracker_lease_id": allocated["lease_id"],
+                "tracker_scope_hash": allocated["scope_hash"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = finalize.finalize_run(
+        run_dir=run_dir,
+        event={"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)},
+        decision_kind="test",
+    )
+
+    release = record["tracker_lease_release"]
+    assert release["released"] is True
+    assert release["status"] == "released"
+    assert release["reason"] == "lease_completed_after_stale"
+    assert release["released_unit_count"] == len(allocated["scope"]["unit_ids"])
+    assert set(
+        _unit_review_states(allocated["tracker_dir"], allocated["scope"]["unit_ids"]).values()
+    ) == {"reviewed"}
+    next_alloc = diff_tracker.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="rvf-next-run",
+        reviewer_id="allocator",
+        log_root_override=log_root,
+    )
+    assert next_alloc["status"] == "empty"
 
 
 def test_finalize_for_handoff_returns_none_when_run_dir_missing(
