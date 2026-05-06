@@ -432,11 +432,14 @@ def build_worktree_bootstrap(
     artifact_dir: Path,
     packet_metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    owned_dirty = [
-        path
-        for path in packet_metadata.get("session_owned_dirty_paths", [])
-        if isinstance(path, str) and path.strip()
-    ]
+    if packet_metadata.get("tracker_scope_present"):
+        owned_dirty = normalized_scope_list(metadata_list(packet_metadata.get("tracker_scope_paths")))
+    else:
+        owned_dirty = [
+            path
+            for path in packet_metadata.get("session_owned_dirty_paths", [])
+            if isinstance(path, str) and path.strip()
+        ]
     patch_path = artifact_dir / "worktree-bootstrap.patch"
     files_dir = artifact_dir / "worktree-bootstrap-files"
     bootstrap_path = artifact_dir / "worktree-bootstrap.json"
@@ -594,7 +597,8 @@ def prepare_run(
             encoding="utf-8",
         )
         artifact_tracker_scope_path = artifact_dir / "tracker-scope.json"
-        shutil.copyfile(tracker_scope, artifact_tracker_scope_path)
+        if tracker_scope.resolve() != artifact_tracker_scope_path.resolve():
+            shutil.copyfile(tracker_scope, artifact_tracker_scope_path)
 
     packet_cmd = [
         sys.executable,
@@ -665,22 +669,32 @@ def prepare_run(
     else:
         scope_mode = "manual-all-uncommitted"
     manual_dirty_paths = dirty_paths(root, metadata_list(metadata.get("excluded_path_prefixes"))) if scope_mode == "manual-all-uncommitted" else []
-    primary_scope_files = normalized_scope_list(
-        primary_files + metadata_list(metadata.get("session_owned_paths")) + manual_dirty_paths
-    )
-    background_scope_files = normalized_scope_list(
-        background_files + metadata_list(metadata.get("unattributed_dirty_paths"))
-    )
-    protected_files = background_scope_files
-    created_at = datetime.now(timezone.utc).isoformat()
     if tracker_scope_payload is not None:
+        primary_scope_files = normalized_scope_list(tracker_scope_payload["paths"])
+        non_allocated_dirty = [
+            path
+            for path in normalized_scope_list(
+                metadata_list(metadata.get("session_owned_dirty_paths"))
+                + metadata_list(metadata.get("unattributed_dirty_paths"))
+            )
+            if path not in set(primary_scope_files)
+        ]
+        background_scope_files = normalized_scope_list(background_files + non_allocated_dirty)
         contract_primary_units: list[str] | None = sorted(set(tracker_scope_payload["unit_ids"]))
         contract_tracker_lease_id: str | None = tracker_scope_payload["lease_id"]
         contract_tracker_scope_hash: str | None = tracker_scope_payload["scope_hash"]
     else:
+        primary_scope_files = normalized_scope_list(
+            primary_files + metadata_list(metadata.get("session_owned_paths")) + manual_dirty_paths
+        )
+        background_scope_files = normalized_scope_list(
+            background_files + metadata_list(metadata.get("unattributed_dirty_paths"))
+        )
         contract_primary_units = None
         contract_tracker_lease_id = None
         contract_tracker_scope_hash = None
+    protected_files = background_scope_files
+    created_at = datetime.now(timezone.utc).isoformat()
     scope_contract = write_scope_contract(
         path=scope_contract_path,
         run_id=ledger.run_id,
