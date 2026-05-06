@@ -3515,6 +3515,22 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-started"
     assert latest["cline_kanban_task_id"] == "task-reenabled"
+    startup_metadata = read_json_artifact(latest, "startup_prepare_metadata_path")
+    assert isinstance(startup_metadata, dict)
+    assert startup_metadata["input_tracker_scope_file"].endswith("artifacts/inputs/tracker-scope.json")
+    assert startup_metadata["tracker_scope_file"].endswith("artifacts/tracker-scope.json")
+    scope_contract = json.loads(Path(startup_metadata["scope_contract"]).read_text(encoding="utf-8"))
+    assert scope_contract["primary_files"] == ["changed.txt"]
+    assert scope_contract["fix_allowlist"] == ["changed.txt"]
+    assert scope_contract["primary_units"]
+    assert scope_contract["tracker_lease_id"]
+    assert scope_contract["tracker_scope_hash"]
+    assert startup_metadata["worktree_bootstrap_metadata"]["owned_dirty_paths"] == ["changed.txt"]
+    packet_metadata = json.loads(
+        Path(startup_metadata["review_packet_metadata"]).read_text(encoding="utf-8")
+    )
+    assert packet_metadata["tracker_scope_present"] is True
+    assert packet_metadata["tracker_scope_unit_count"] == len(scope_contract["primary_units"])
     events = latest_events(state)
     assert any(
         event["event"] == "session_hook_control_continue"
