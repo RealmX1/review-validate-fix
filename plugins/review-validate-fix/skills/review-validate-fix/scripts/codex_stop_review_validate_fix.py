@@ -14,7 +14,7 @@ import base64
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
@@ -52,6 +52,7 @@ DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-se
 DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
+DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
 DEFAULT_HANDOFF_HELPER = SKILL_DIR / "scripts" / "rvf_handoff.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
@@ -686,6 +687,38 @@ def parent_conversation_origin(
     }
 
 
+def source_origin_for_kanban_task(
+    *,
+    task_id: str,
+    attempt_id: str | None,
+    task_title: str | None,
+    task_title_source: str | None,
+    fallback_origin: dict[str, Any],
+) -> dict[str, Any]:
+    title = task_title.strip() if isinstance(task_title, str) else ""
+    origin = dict(fallback_origin)
+    if title:
+        label = title
+        name_source = task_title_source or "cline_kanban_task_title"
+    else:
+        label = f"Cline Kanban task {task_id}"
+        name_source = "cline_kanban_task_id_fallback"
+    origin.update(
+        {
+            "label": label,
+            "name_source": name_source,
+            "source_kind": "cline-kanban-task",
+            "kanban_task_id": task_id,
+            "kanban_attempt_id": attempt_id,
+            "kanban_task_title": title or None,
+            "kanban_task_title_source": task_title_source,
+            "codex_session_label": fallback_origin.get("label"),
+            "codex_session_name_source": fallback_origin.get("name_source"),
+        }
+    )
+    return origin
+
+
 def value_or_unavailable(value: Any) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
@@ -709,7 +742,7 @@ def parent_origin_prompt_block(
     parent_transcript_path = value_or_unavailable(parent_origin.get("transcript_path"))
     parent_transcript_file = value_or_unavailable(parent_origin.get("transcript_file"))
     parent_origin_path = value_or_unavailable(origin_path)
-    return (
+    lines = [
         "Original Codex conversation metadata:\n"
         f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
         f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
@@ -717,11 +750,56 @@ def parent_origin_prompt_block(
         f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
         f"RVF_PARENT_TRANSCRIPT_PATH: {parent_transcript_path}\n"
         f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
-        f"RVF_ORIGIN_METADATA: {parent_origin_path}\n\n"
+        f"RVF_ORIGIN_METADATA: {parent_origin_path}\n"
+    ]
+    if parent_origin.get("source_kind") == "cline-kanban-task":
+        lines.append(
+            "RVF_PARENT_SOURCE_KIND: cline-kanban-task\n"
+            f"RVF_PARENT_KANBAN_TASK_ID: {value_or_unavailable(parent_origin.get('kanban_task_id'))}\n"
+            f"RVF_PARENT_KANBAN_ATTEMPT_ID: {value_or_unavailable(parent_origin.get('kanban_attempt_id'))}\n"
+            f"RVF_PARENT_KANBAN_TASK_TITLE: {value_or_unavailable(parent_origin.get('kanban_task_title'))}\n"
+            "RVF_PARENT_KANBAN_TASK_TITLE_SOURCE: "
+            f"{value_or_unavailable(parent_origin.get('kanban_task_title_source'))}\n"
+            "RVF_PARENT_CODEX_SESSION_REF: "
+            f"{value_or_unavailable(parent_origin.get('codex_session_label'))}\n"
+            "RVF_PARENT_CODEX_SESSION_NAME_SOURCE: "
+            f"{value_or_unavailable(parent_origin.get('codex_session_name_source'))}\n"
+        )
+    lines.append(
+        "\n"
         "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
         "Codex conversation name/ref、name source、codex URL、transcript path "
         "和 origin metadata path；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
     )
+    return "".join(lines)
+
+
+def parent_origin_summary_fields(
+    *,
+    parent_session_id: str | None,
+    parent_thread_path: Path | None,
+    parent_origin: dict[str, Any],
+    parent_name_lookup: dict[str, Any],
+    origin_path: str | None,
+) -> dict[str, Any]:
+    return {
+        "parent_thread_id": parent_session_id,
+        "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
+        "parent_conversation_ref": parent_origin.get("label"),
+        "parent_conversation_name": parent_origin.get("label"),
+        "parent_conversation_name_source": parent_origin.get("name_source"),
+        "parent_thread_name_lookup": parent_name_lookup,
+        "parent_codex_url": parent_origin.get("codex_url"),
+        "parent_origin_path": origin_path,
+        "parent_transcript_file": parent_origin.get("transcript_file"),
+        "parent_source_kind": parent_origin.get("source_kind"),
+        "parent_kanban_task_id": parent_origin.get("kanban_task_id"),
+        "parent_kanban_attempt_id": parent_origin.get("kanban_attempt_id"),
+        "parent_kanban_task_title": parent_origin.get("kanban_task_title"),
+        "parent_kanban_task_title_source": parent_origin.get("kanban_task_title_source"),
+        "parent_codex_session_ref": parent_origin.get("codex_session_label"),
+        "parent_codex_session_name_source": parent_origin.get("codex_session_name_source"),
+    }
 
 
 def add_parent_origin_to_rvf_fork_prompt(
@@ -1151,9 +1229,15 @@ def kanban_followup_review_validate_fix_prompt(
     target_repo: str,
     cwd: str | None,
     ledger: RunLedger,
+    source_origin: dict[str, Any],
+    origin_path: str | None,
 ) -> str:
     attempt_line = f"RVF_CURRENT_ATTEMPT_ID: {attempt_id}\n" if attempt_id else ""
     cwd_line = cwd or "<unknown cwd>"
+    origin_block = parent_origin_prompt_block(
+        parent_origin=source_origin,
+        origin_path=origin_path,
+    )
     return (
         "$review-validate-fix\n\n"
         f"{KANBAN_FOLLOWUP_MARKER}\n"
@@ -1162,6 +1246,14 @@ def kanban_followup_review_validate_fix_prompt(
         f"RVF_CURRENT_TASK_ID: {task_id}\n"
         f"{attempt_line}"
         f"RVF_CURRENT_CWD: {cwd_line}\n\n"
+        f"{origin_block}\n\n"
+        "上面的 RVF_PARENT_CONVERSATION_* 字段指本次 follow-up 的定位来源："
+        "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task "
+        "title/name，方便开发者在 Kanban UI 中定位；否则使用源 Codex chat session "
+        "name/ref。维护 handoff.md 时，`## Origin` 的 `original Codex conversation`、"
+        "`conversation name source`、`original Codex URL`、`original transcript` "
+        "和 `origin metadata` 必须保留这些值；若存在 `RVF_PARENT_KANBAN_*` 字段，"
+        "`generated Kanban task` 也必须写当前 task/attempt id。\n\n"
         "这是由 Cline Kanban host 在当前 task 的 coding agent chat session 中注入的"
         "真实用户消息，用于在同一 task/session 内触发 review-validate-fix。"
         "不要创建新的 Kanban task，不要 fork 新会话，也不要把这条消息当作 hook system context。\n\n"
@@ -1546,6 +1638,28 @@ def current_kanban_attempt_id(event: dict[str, Any]) -> str | None:
         event,
         ("KANBAN_ATTEMPT_ID", "CLINE_KANBAN_ATTEMPT_ID"),
         ("kanban_attempt_id", "kanbanAttemptId", "attempt_id", "attemptId"),
+    )
+
+
+def current_kanban_task_title(event: dict[str, Any]) -> str | None:
+    return event_or_env_text(
+        event,
+        (
+            "KANBAN_TASK_TITLE",
+            "KANBAN_TASK_NAME",
+            "CLINE_KANBAN_TASK_TITLE",
+            "CLINE_KANBAN_TASK_NAME",
+        ),
+        (
+            "kanban_task_title",
+            "kanbanTaskTitle",
+            "kanban_task_name",
+            "kanbanTaskName",
+            "task_title",
+            "taskTitle",
+            "task_name",
+            "taskName",
+        ),
     )
 
 
@@ -2048,6 +2162,237 @@ def start_cline_kanban_followup_message(
     payload["task_cmd"] = task_cmd
     payload["project_path"] = project_path
     return payload
+
+
+def _iter_nested_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_nested_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_nested_dicts(child)
+
+
+def _task_id_from_mapping(value: dict[str, Any]) -> str | None:
+    for key in ("id", "task_id", "taskId"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _task_title_from_mapping(value: dict[str, Any]) -> str | None:
+    for key in ("title", "name", "task_title", "taskTitle", "task_name", "taskName"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def kanban_task_title_from_payload(payload: dict[str, Any], task_id: str) -> str | None:
+    expected = task_id.strip()
+    if not expected:
+        return None
+    for candidate in _iter_nested_dicts(payload):
+        if _task_id_from_mapping(candidate) != expected:
+            continue
+        title = _task_title_from_mapping(candidate)
+        if title:
+            return title
+    return None
+
+
+def cline_kanban_state_dir() -> Path:
+    value = os.environ.get("CODEX_RVF_CLINE_KANBAN_STATE_DIR")
+    if isinstance(value, str) and value.strip():
+        return Path(value).expanduser()
+    return DEFAULT_CLINE_KANBAN_STATE_DIR
+
+
+def _same_existing_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def _kanban_session_matches_project(session: dict[str, Any], *, task_id: str, project_path: Path) -> bool:
+    session_task_id = session.get("taskId") or session.get("task_id") or session.get("id")
+    if session_task_id != task_id:
+        return False
+    workspace_path = session.get("workspacePath") or session.get("workspace_path")
+    if not isinstance(workspace_path, str) or not workspace_path.strip():
+        return False
+    return _same_existing_path(Path(workspace_path), project_path)
+
+
+def _candidate_kanban_board_paths(*, project_path: Path, task_id: str) -> list[Path]:
+    workspaces_dir = cline_kanban_state_dir() / "workspaces"
+    if not workspaces_dir.is_dir():
+        return []
+    candidates: list[Path] = []
+
+    project_named_board = workspaces_dir / project_path.name / "board.json"
+    if project_named_board.exists():
+        candidates.append(project_named_board)
+
+    for sessions_path in sorted(workspaces_dir.glob("*/sessions.json")):
+        try:
+            payload = json.loads(sessions_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        sessions = [value for value in payload.values() if isinstance(value, dict)]
+        if any(_kanban_session_matches_project(session, task_id=task_id, project_path=project_path) for session in sessions):
+            board_path = sessions_path.with_name("board.json")
+            if board_path.exists() and board_path not in candidates:
+                candidates.insert(0, board_path)
+
+    return candidates
+
+
+def lookup_cline_kanban_board_task_title(
+    *,
+    project_path: str,
+    task_id: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    project = Path(project_path).expanduser()
+    checked: list[str] = []
+    errors: list[str] = []
+    for board_path in _candidate_kanban_board_paths(project_path=project, task_id=task_id):
+        checked.append(str(board_path))
+        try:
+            payload = json.loads(board_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{board_path}: {type(exc).__name__}: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"{board_path}: non-object JSON")
+            continue
+        title = kanban_task_title_from_payload(payload, task_id)
+        if title:
+            artifact = ledger.artifact(
+                "kanban-followup-board-title-lookup.json",
+                {
+                    "state_dir": str(cline_kanban_state_dir()),
+                    "project_path": project_path,
+                    "task_id": task_id,
+                    "checked": checked,
+                    "matched_board": str(board_path),
+                    "title": title,
+                    "errors": errors,
+                },
+            )
+            return {
+                "title": title,
+                "source": "cline_kanban_board_lookup",
+                "artifact": artifact,
+            }
+    artifact = ledger.artifact(
+        "kanban-followup-board-title-lookup.json",
+        {
+            "state_dir": str(cline_kanban_state_dir()),
+            "project_path": project_path,
+            "task_id": task_id,
+            "checked": checked,
+            "errors": errors,
+        },
+    )
+    return {
+        "title": None,
+        "source": "cline_kanban_board_lookup_missing_title",
+        "artifact": artifact,
+    }
+
+
+def lookup_cline_kanban_task_title(
+    *,
+    project_path: str,
+    task_id: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
+    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+    command = [
+        sys.executable,
+        str(client),
+        "list",
+        "--repo",
+        project_path,
+        "--task-cmd",
+        task_cmd,
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    artifact = ledger.artifact(
+        "kanban-followup-task-lookup.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode != 0:
+        board_lookup = lookup_cline_kanban_board_task_title(
+            project_path=project_path,
+            task_id=task_id,
+            ledger=ledger,
+        )
+        if board_lookup.get("title"):
+            board_lookup["task_list_lookup"] = {
+                "source": "cline_kanban_task_lookup_failed",
+                "artifact": artifact,
+                "error": completed.stderr.strip() or completed.stdout.strip(),
+            }
+            return board_lookup
+        return {
+            "title": None,
+            "source": "cline_kanban_task_lookup_failed",
+            "artifact": artifact,
+            "error": completed.stderr.strip() or completed.stdout.strip(),
+        }
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "title": None,
+            "source": "cline_kanban_task_lookup_invalid_json",
+            "artifact": artifact,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "title": None,
+            "source": "cline_kanban_task_lookup_invalid_payload",
+            "artifact": artifact,
+        }
+    title = kanban_task_title_from_payload(payload, task_id)
+    if not title:
+        board_lookup = lookup_cline_kanban_board_task_title(
+            project_path=project_path,
+            task_id=task_id,
+            ledger=ledger,
+        )
+        if board_lookup.get("title"):
+            board_lookup["task_list_lookup"] = {
+                "source": "cline_kanban_task_lookup_missing_title",
+                "artifact": artifact,
+            }
+            return board_lookup
+    return {
+        "title": title,
+        "source": "cline_kanban_task_lookup" if title else "cline_kanban_task_lookup_missing_title",
+        "artifact": artifact,
+    }
 
 
 def run_codex_fork(
@@ -3692,12 +4037,52 @@ def launch_backend(
             )
         attempt_id = current_kanban_attempt_id(event)
         project_path = current_kanban_project_path(event, decision.repo)
+        source_session_id = session_id_from_event(event) or parent_thread_id_from_event(event)
+        source_thread_path = parent_thread_path_from_event(event)
+        source_name_lookup = parent_thread_name_from_app_server(source_session_id, cwd)
+        codex_origin = parent_conversation_origin(
+            parent_session_id=source_session_id,
+            parent_thread_path=source_thread_path,
+            run_id=ledger.run_id,
+            parent_thread_name=source_name_lookup.get("name"),
+            name_lookup=source_name_lookup,
+        )
+        task_title = current_kanban_task_title(event)
+        task_title_source = "cline_kanban_task_env" if task_title else None
+        task_lookup: dict[str, Any] | None = None
+        if not task_title:
+            task_lookup = lookup_cline_kanban_task_title(
+                project_path=project_path,
+                task_id=task_id,
+                ledger=ledger,
+            )
+            lookup_title = task_lookup.get("title")
+            if isinstance(lookup_title, str) and lookup_title.strip():
+                task_title = lookup_title.strip()
+                task_title_source = str(task_lookup.get("source") or "cline_kanban_task_lookup")
+        source_origin = source_origin_for_kanban_task(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            task_title=task_title,
+            task_title_source=task_title_source,
+            fallback_origin=codex_origin,
+        )
+        origin_path = ledger.artifact("origin.json", source_origin)
+        source_origin_fields = parent_origin_summary_fields(
+            parent_session_id=source_session_id,
+            parent_thread_path=source_thread_path,
+            parent_origin=source_origin,
+            parent_name_lookup=source_name_lookup,
+            origin_path=origin_path,
+        )
         prompt = kanban_followup_review_validate_fix_prompt(
             task_id=task_id,
             attempt_id=attempt_id,
             target_repo=decision.repo,
             cwd=cwd,
             ledger=ledger,
+            source_origin=source_origin,
+            origin_path=origin_path,
         )
         ledger.event(
             phase="fork",
@@ -3709,6 +4094,10 @@ def launch_backend(
             mode="kanban-followup",
             cline_kanban_task_id=task_id,
             cline_kanban_attempt_id=attempt_id,
+            cline_kanban_task_title=source_origin.get("kanban_task_title"),
+            cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+            cline_kanban_task_lookup=task_lookup,
+            **source_origin_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -3735,6 +4124,10 @@ def launch_backend(
                 mode="kanban-followup",
                 cline_kanban_task_id=task_id,
                 cline_kanban_attempt_id=attempt_id,
+                cline_kanban_task_title=source_origin.get("kanban_task_title"),
+                cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+                cline_kanban_task_lookup=task_lookup,
+                **source_origin_fields,
                 error=error,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
@@ -3752,7 +4145,11 @@ def launch_backend(
                 cline_kanban_task_id=task_id,
                 cline_kanban_attempt_id=attempt_id,
                 cline_kanban_project_path=project_path,
+                cline_kanban_task_title=source_origin.get("kanban_task_title"),
+                cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+                cline_kanban_task_lookup=task_lookup,
                 error=error,
+                **source_origin_fields,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
                     backend="kanban-followup",
@@ -3786,9 +4183,13 @@ def launch_backend(
             mode="kanban-followup",
             cline_kanban_task_id=message_payload.get("task_id"),
             cline_kanban_attempt_id=message_payload.get("attempt_id"),
+            cline_kanban_task_title=source_origin.get("kanban_task_title"),
+            cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+            cline_kanban_task_lookup=task_lookup,
             cline_kanban_message_id=message_payload.get("message_id"),
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
+            **source_origin_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -3807,10 +4208,14 @@ def launch_backend(
             cline_kanban_task_id=message_payload.get("task_id"),
             cline_kanban_attempt_id=message_payload.get("attempt_id"),
             cline_kanban_project_path=project_path,
+            cline_kanban_task_title=source_origin.get("kanban_task_title"),
+            cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+            cline_kanban_task_lookup=task_lookup,
             cline_kanban_message_id=message_payload.get("message_id"),
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             kanban_followup_payload=message_payload,
+            **source_origin_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",

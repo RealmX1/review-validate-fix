@@ -2501,13 +2501,18 @@ def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp_path
 def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> None:
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
+    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    write_apply_patch_transcript(transcript, repo, session_id=session_id)
     fake_client = tmp_path / "fake_cline_kanban_client.py"
     client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
-        "if sys.argv[1] == 'message':\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata'}]}))\n"
+        "elif sys.argv[1] == 'message':\n"
         "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued', 'checkpoint_id': 'checkpoint-1'}))\n"
         "else:\n"
         "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
@@ -2518,6 +2523,8 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
         {
             "cwd": str(repo),
             "stop_hook_active": False,
+            "session_id": session_id,
+            "transcript_path": str(transcript),
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
@@ -2543,14 +2550,25 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert latest["cline_kanban_attempt_id"] == "attempt-9"
     assert latest["cline_kanban_message_id"] == "msg-77"
     assert latest["cline_kanban_checkpoint_id"] == "checkpoint-1"
-    assert "parent_thread_id" not in latest or latest["parent_thread_id"] is None
+    assert latest["cline_kanban_task_title"] == "Fix RVF follow-up source metadata"
+    assert latest["cline_kanban_task_title_source"] == "cline_kanban_task_lookup"
+    assert latest["parent_thread_id"] == session_id
+    assert latest["parent_thread_path"] == str(transcript.resolve())
+    assert latest["parent_source_kind"] == "cline-kanban-task"
+    assert latest["parent_conversation_ref"] == "Fix RVF follow-up source metadata"
+    assert latest["parent_conversation_name"] == latest["parent_conversation_ref"]
+    assert latest["parent_conversation_name_source"] == "cline_kanban_task_lookup"
+    assert latest["parent_codex_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
+    assert latest["parent_codex_session_name_source"] == "session_ref_fallback"
+    assert latest["parent_codex_url"] == f"codex://local/{session_id}"
+    assert Path(str(latest["parent_origin_path"])).exists()
     calls = [
         json.loads(line)
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [call["argv"][0] for call in calls] == ["message"]
-    message_argv = calls[0]["argv"]
+    assert [call["argv"][0] for call in calls] == ["list", "message"]
+    message_argv = calls[1]["argv"]
     assert "--task-id" in message_argv
     assert message_argv[message_argv.index("--task-id") + 1] == "task-77"
     assert "--attempt-id" in message_argv
@@ -2562,9 +2580,268 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert "RVF_KANBAN_FOLLOWUP_TRIGGER" in prompt_text
     assert "RVF_CURRENT_TASK_ID: task-77" in prompt_text
     assert "RVF_CURRENT_ATTEMPT_ID: attempt-9" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_REF: Fix RVF follow-up source metadata" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_NAME: Fix RVF follow-up source metadata" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_task_lookup" in prompt_text
+    assert "RVF_PARENT_SOURCE_KIND: cline-kanban-task" in prompt_text
+    assert "RVF_PARENT_KANBAN_TASK_ID: task-77" in prompt_text
+    assert "RVF_PARENT_KANBAN_ATTEMPT_ID: attempt-9" in prompt_text
+    assert "RVF_PARENT_KANBAN_TASK_TITLE: Fix RVF follow-up source metadata" in prompt_text
+    assert "RVF_PARENT_CODEX_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
+    assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
+    assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
+    assert "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task" in prompt_text
     assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
     assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert calls[0]["suppress"] is None
+    assert calls[1]["suppress"] is None
+
+
+def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
+    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    write_apply_patch_transcript(transcript, repo, session_id=session_id)
+    kanban_state = tmp_path / "kanban"
+    workspace = kanban_state / "workspaces" / "repo"
+    workspace.mkdir(parents=True)
+    (workspace / "board.json").write_text(
+        json.dumps(
+            {
+                "columns": [
+                    {
+                        "id": "in_progress",
+                        "cards": [
+                            {
+                                "id": "task-77",
+                                "title": 'The kanban "follow up" rvf handoff source chat title',
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": session_id,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_ATTEMPT_ID": "attempt-9",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    latest = latest_summary(state)
+    expected_title = 'The kanban "follow up" rvf handoff source chat title'
+    assert latest["cline_kanban_task_title"] == expected_title
+    assert latest["cline_kanban_task_title_source"] == "cline_kanban_board_lookup"
+    assert latest["parent_conversation_ref"] == expected_title
+    assert latest["parent_conversation_name_source"] == "cline_kanban_board_lookup"
+    task_lookup = latest["cline_kanban_task_lookup"]
+    assert task_lookup["source"] == "cline_kanban_board_lookup"
+    assert task_lookup["task_list_lookup"]["source"] == "cline_kanban_task_lookup_missing_title"
+    assert Path(task_lookup["artifact"]).exists()
+
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["list", "message"]
+    prompt_path = Path(calls[1]["argv"][calls[1]["argv"].index("--prompt-file") + 1])
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+    assert f"RVF_PARENT_CONVERSATION_REF: {expected_title}" in prompt_text
+    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_board_lookup" in prompt_text
+    assert f"RVF_PARENT_KANBAN_TASK_TITLE: {expected_title}" in prompt_text
+
+
+def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    kanban_state = tmp_path / "kanban"
+    stale_workspace = kanban_state / "workspaces" / "stale-project"
+    stale_workspace.mkdir(parents=True)
+    (stale_workspace / "board.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "task-77",
+                        "title": "Wrong stale workspace title",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["cline_kanban_task_title"] is None
+    assert latest["cline_kanban_task_title_source"] is None
+    assert latest["parent_conversation_ref"] == "Cline Kanban task task-77"
+    assert latest["parent_conversation_name_source"] == "cline_kanban_task_id_fallback"
+    task_lookup = latest["cline_kanban_task_lookup"]
+    assert task_lookup["source"] == "cline_kanban_task_lookup_missing_title"
+
+
+def test_kanban_followup_title_uses_session_matched_board_state(tmp_path: Path) -> None:
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    kanban_state = tmp_path / "kanban"
+    matched_workspace = kanban_state / "workspaces" / "task-workspace"
+    matched_workspace.mkdir(parents=True)
+    (matched_workspace / "sessions.json").write_text(
+        json.dumps(
+            {
+                "session-1": {
+                    "taskId": "task-77",
+                    "workspacePath": str(repo),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (matched_workspace / "board.json").write_text(
+        json.dumps(
+            {
+                "columns": [
+                    {
+                        "cards": [
+                            {
+                                "id": "task-77",
+                                "title": "Session matched workspace title",
+                            }
+                        ]
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_workspace = kanban_state / "workspaces" / "aaa-stale-project"
+    stale_workspace.mkdir(parents=True)
+    (stale_workspace / "board.json").write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {
+                        "id": "task-77",
+                        "title": "Wrong stale workspace title",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["cline_kanban_task_title"] == "Session matched workspace title"
+    assert latest["cline_kanban_task_title_source"] == "cline_kanban_board_lookup"
+    assert latest["parent_conversation_ref"] == "Session matched workspace title"
+    task_lookup = latest["cline_kanban_task_lookup"]
+    assert task_lookup["source"] == "cline_kanban_board_lookup"
+    board_lookup = json.loads(Path(task_lookup["artifact"]).read_text(encoding="utf-8"))
+    assert board_lookup["matched_board"] == str(matched_workspace / "board.json")
+    assert str(stale_workspace / "board.json") not in board_lookup["checked"]
 
 
 def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_path: Path) -> None:
@@ -2578,7 +2855,9 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'message':\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77', 'title': 'Subdir follow-up'}]}))\n"
+        "elif sys.argv[1] == 'message':\n"
         "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
         "else:\n"
         "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
@@ -2619,7 +2898,10 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    message_argv = calls[0]["argv"]
+    assert [call["argv"][0] for call in calls] == ["list", "message"]
+    list_argv = calls[0]["argv"]
+    assert list_argv[list_argv.index("--repo") + 1] == str(repo.resolve())
+    message_argv = calls[1]["argv"]
     assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
 
 
@@ -4455,6 +4737,9 @@ def main() -> int:
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
+        test_kanban_followup_title_falls_back_to_local_board_state,
+        test_kanban_followup_title_ignores_unrelated_board_with_same_task_id,
+        test_kanban_followup_title_uses_session_matched_board_state,
         test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd,
         test_kanban_followup_blocks_expired_codex_login_before_message,
         test_kanban_followup_mode_without_task_id_reports_without_fallback,
