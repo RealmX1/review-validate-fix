@@ -788,6 +788,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         tests_dir.mkdir()
         for name in (
             "test_install_to_codex.py",
+            "test_rvf_handoff_intake.py",
             "test_review_support_scripts.py",
             "test_codex_stop_hook_dispatcher.py",
             "test_codex_stop_review_validate_fix.py",
@@ -826,9 +827,10 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         records = [json.loads(line) for line in timing_path.read_text(encoding="utf-8").splitlines()]
 
     assert completed.returncode == 0
-    assert [record["execution_mode"] for record in records] == ["parallel"] * 11
+    assert [record["execution_mode"] for record in records] == ["parallel"] * 12
     assert {record["label"] for record in records} == {
         "tests: install_to_codex",
+        "tests: rvf_handoff_intake",
         "tests: review_support_scripts shard 1/4",
         "tests: review_support_scripts shard 2/4",
         "tests: review_support_scripts shard 3/4",
