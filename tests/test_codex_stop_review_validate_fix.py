@@ -25,6 +25,7 @@ SCRIPT = (
     / "codex_stop_review_validate_fix.py"
 )
 DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_codex_fork.py")
+RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -4287,6 +4288,58 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     summary = summary_from_payload(payload)
     assert summary["already_advised"] is True
     assert summary["handoff_open_result"]["reason"] == "already_advised"
+
+
+def test_manual_handoff_open_suppresses_followup_advisory_open(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
+    handoff.parent.mkdir(parents=True, exist_ok=True)
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_log = tmp_path / "opened.txt"
+    opener = tmp_path / "open_handoff.py"
+    opener.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
+        encoding="utf-8",
+    )
+    opener.chmod(0o755)
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_"):
+            env.pop(name, None)
+    env.update(
+        {
+            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    manual_payload = parse_json(completed.stdout)
+    assert manual_payload["opened"] is True
+    assert manual_payload["manual_open_marker"]["marker_written"] is True
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(tmp_path),
+            "session_id": "child-session",
+            "stop_hook_active": False,
+            "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+        },
+        state_dir=state,
+        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+    )
+    payload = parse_json(stdout)
+    summary = summary_from_payload(payload)
+    assert summary["already_opened"] is True
+    assert summary["handoff_open_result"]["reason"] == "already_opened"
+    assert opener_log.read_text(encoding="utf-8").splitlines() == [str(handoff.resolve())]
 
 
 def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> None:
