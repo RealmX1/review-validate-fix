@@ -20,6 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
+from rvf_analyze_advisory import (
+    RVF_ANALYZE_FOLLOWUP_MARKER,
+    surface_rvf_analyze_advisory,
+)
 from session_manifest import build_manifest
 from diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
@@ -5318,6 +5322,12 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     decision_kind="handoff-advisory",
                 )
                 surface_finalize_record_errors(ledger, finalize_record, payload=payload)
+                surface_rvf_analyze_advisory(
+                    event=event,
+                    ledger=ledger,
+                    payload=payload,
+                    finalize_record=finalize_record,
+                )
             except Exception as exc:
                 ledger.event(
                     phase="handoff",
@@ -5328,6 +5338,15 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     error={"kind": type(exc).__name__, "message": str(exc)},
                 )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
+        return skip_decision(
+            "当前最新用户消息是 Cline Kanban 注入的 RVF analyze follow-up trigger；"
+            "本次 Stop 跳过自动 RVF，避免复盘消息结束后递归触发主 review loop。",
+            ledger,
+            "rvf_analyze_followup_trigger_turn",
+            cwd=cwd,
+        )
 
     if latest_user and KANBAN_FOLLOWUP_MARKER in latest_user:
         return skip_decision(

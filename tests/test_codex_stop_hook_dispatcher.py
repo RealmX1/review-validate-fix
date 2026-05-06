@@ -289,6 +289,42 @@ def write_apply_patch_transcript(path: Path, repo: Path, rel_path: str) -> Path:
     return path
 
 
+def write_timestamped_apply_patch_transcript(
+    path: Path,
+    repo: Path,
+    rel_path: str,
+    *,
+    timestamp: str = "2020-01-01T00:00:00Z",
+) -> Path:
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: {rel_path}\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": {"id": "session-with-edit", "cwd": str(repo)},
+        },
+        {
+            "timestamp": timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "call_patch",
+            },
+        },
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    return path
+
+
 def invoke_result(
     event: dict[str, object],
     *,
@@ -746,7 +782,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
         "transcript_path": str(transcript),
         "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
     }
-    invoke(
+    stdout = invoke(
         event,
         dev_repo=repo,
         hook=hook,
@@ -772,6 +808,11 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     assert paths.get(".rvf-seed") == "modified"
     summary_payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload.get("finalize", {}).get("decision_kind") == "dispatcher-handoff"
+    payload = json.loads(stdout)
+    assert "rvf_analyze=manual_required" in payload["systemMessage"]
+    hook_summary = latest_summary(state)
+    assert hook_summary["rvf_analyze_status"] == "manual-required"
+    assert hook_summary["rvf_analyze_run_dir"] == str(run_dir.resolve())
 
 
 def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
@@ -896,6 +937,32 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
         (run_dir / "artifacts" / "trajectory" / "pre-rvf" / "manifest.json").read_text(encoding="utf-8")
     )
     assert pre_manifest["source_kind"] == "forked-source-full"
+
+
+def test_rvf_analyze_followup_trigger_skips_dispatcher_sync(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    stdout = invoke(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "last_user_message": "$rvf-analyze /tmp/run\n\nRVF_KANBAN_ANALYZE_TRIGGER",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    payload = json.loads(stdout)
+    assert "reason=rvf_analyze_followup_trigger_turn" in payload["systemMessage"]
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
 
 
 def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
@@ -1500,6 +1567,75 @@ def test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook(tmp_path: Path) -
     assert (marker / "hook-input.json").exists()
 
 
+def test_committed_session_edit_with_later_same_path_dirty_skips_tracker_gate(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    _ensure_initial_commit(repo)
+    (repo / "owned.txt").write_text("new\n", encoding="utf-8")
+    run(["git", "add", "owned.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit session edit"], cwd=repo)
+    (repo / "owned.txt").write_text("background\n", encoding="utf-8")
+    transcript = write_timestamped_apply_patch_transcript(tmp_path / "session.jsonl", repo, "owned.txt")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=no_unassigned_review_scope" in payload["systemMessage"]
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+
+
+def test_committed_session_edit_with_later_same_path_dirty_skips_legacy_gate(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    _ensure_initial_commit(repo)
+    (repo / "owned.txt").write_text("new\n", encoding="utf-8")
+    run(["git", "add", "owned.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit session edit"], cwd=repo)
+    (repo / "owned.txt").write_text("background\n", encoding="utf-8")
+    transcript = write_timestamped_apply_patch_transcript(tmp_path / "session.jsonl", repo, "owned.txt")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=tmp_path / "state",
+        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+
+
 def test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fails(
     tmp_path: Path,
 ) -> None:
@@ -1965,6 +2101,7 @@ def main() -> int:
         test_handoff_marker_finalizes_run_artifacts_same_session,
         test_handoff_marker_surfaces_finalize_record_errors,
         test_handoff_marker_finalizes_run_artifacts_forked_session,
+        test_rvf_analyze_followup_trigger_skips_dispatcher_sync,
         test_plan_operation_skips_before_dev_sync_or_installed_hook,
         test_literal_plan_markers_in_completion_do_not_skip_hook,
         test_prior_plan_output_does_not_suppress_future_turn,
@@ -1985,6 +2122,8 @@ def main() -> int:
         test_session_manifest_failure_skips_sync_and_installed_hook,
         test_provided_missing_transcript_skips_sync_and_installed_hook,
         test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook,
+        test_committed_session_edit_with_later_same_path_dirty_skips_tracker_gate,
+        test_committed_session_edit_with_later_same_path_dirty_skips_legacy_gate,
         test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fails,
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,

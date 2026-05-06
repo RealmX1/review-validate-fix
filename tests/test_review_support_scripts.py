@@ -215,8 +215,8 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
         "*** Begin Patch\n"
         "*** Update File: tracked.txt\n"
         "@@\n"
-        "-base\n"
-        "+base edited by session\n"
+        " base\n"
+        "+change\n"
         "*** Add File: owned-new.txt\n"
         "+owned\n"
         "*** Delete File: removed.txt\n"
@@ -224,12 +224,12 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
     )
     records = [
         {
-            "timestamp": "2026-04-27T00:00:00.000Z",
+            "timestamp": "2999-04-27T00:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": "session-tracking-test", "cwd": str(repo)},
         },
         {
-            "timestamp": "2026-04-27T00:00:01.000Z",
+            "timestamp": "2999-04-27T00:00:01.000Z",
             "type": "response_item",
             "payload": {
                 "type": "custom_tool_call",
@@ -239,7 +239,7 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
             },
         },
         {
-            "timestamp": "2026-04-27T00:00:02.000Z",
+            "timestamp": "2999-04-27T00:00:02.000Z",
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -1363,6 +1363,226 @@ def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp_path: 
     assert manifest["command_path_candidates"][0]["reason"] == "shell_redirect"
 
 
+def test_session_manifest_does_not_claim_post_commit_same_path_background_dirty(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    transcript = tmp_path / "session.jsonl"
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {"timestamp": "2020-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "S"}},
+        {
+            "timestamp": "2020-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-old"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit owned change"], cwd=repo)
+    (repo / "a.txt").write_text("background\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["owned_paths"] == ["a.txt"]
+    assert manifest["owned_dirty_paths"] == []
+    assert manifest["unattributed_dirty_paths"] == ["a.txt"]
+    assert manifest["ownership_baseline"]["mode"] == "head_commit_time"
+    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
+
+
+def test_session_manifest_claims_apply_patch_after_commit_cutoff(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    old_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    new_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " owned\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": old_patch}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "git commit -m owned", "workdir": str(repo)}),
+                "call_id": "commit-call",
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "commit-call", "exit_code": 0}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": new_patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "owned"], cwd=repo)
+    (repo / "a.txt").write_text("owned\nnew\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["owned_paths"] == ["a.txt"]
+    assert manifest["owned_dirty_paths"] == ["a.txt"]
+    assert manifest["unattributed_dirty_paths"] == []
+    assert manifest["ownership_baseline"]["mode"] == "line_cutoff"
+    assert manifest["ownership_baseline"]["included_tool_record_count"] == 1
+    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
+
+
+def test_session_manifest_only_claims_matching_apply_patch_hunk(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n"
+        "keep\n"
+        "middle\n"
+        "keep\n"
+        "bottom\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " bottom\n"
+        "+session-owned\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text(
+        "top\n"
+        "background\n"
+        "middle\n"
+        "keep\n"
+        "bottom\n"
+        "session-owned\n",
+        encoding="utf-8",
+    )
+    log_root = tmp_path / "state"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+            ],
+            env=env,
+        ).stdout
+    )
+
+    owned_units = manifest["tracker"]["owned_units"]
+    assert manifest["owned_dirty_paths"] == ["a.txt"]
+    assert len(owned_units) == 1
+    assert owned_units[0]["unit"] == "hunk"
+    assert "session-owned" in run(["git", "diff", "HEAD", "--", "a.txt"], cwd=repo).stdout
+
+
+def test_session_manifest_legacy_timestampless_transcript_fallback_warns(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: tracked.txt\n"
+        "@@\n"
+        "-base\n"
+        "+base\n"
+        "+legacy\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "legacy-session"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["ownership_baseline"]["mode"] == "legacy_full_transcript"
+    assert any("ownership_baseline_fallback" in warning for warning in manifest["warnings"])
+
+
 def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     docs = repo / "docs"
@@ -1371,12 +1591,12 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Pat
     transcript = tmp_path / "session.jsonl"
     records = [
         {
-            "timestamp": "2026-04-27T00:00:00.000Z",
+            "timestamp": "2999-04-27T00:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": "session-subdir-test", "cwd": str(repo)},
         },
         {
-            "timestamp": "2026-04-27T00:00:01.000Z",
+            "timestamp": "2999-04-27T00:00:01.000Z",
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -1563,6 +1783,98 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> N
     assert payload["session_owned_path_count"] >= 3
     assert payload["owned_untracked_count"] == 1
     assert payload["background_untracked_count"] >= 2
+
+
+def test_build_packet_filters_session_owned_diff_to_tracker_hunk(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n" + "\n".join(f"keep-{index}" for index in range(20)) + "\nbottom\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n"
+        "background\n"
+        + "\n".join(f"keep-{index}" for index in range(20))
+        + "\nbottom\n"
+        + "session-owned\n",
+        encoding="utf-8",
+    )
+    diff_text = run(["git", "diff", "-U3", "HEAD", "--", "a.txt"], cwd=repo).stdout
+    selected_header: str | None = None
+    current_header: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            current_header = line
+        if "+session-owned" in line:
+            selected_header = current_header
+            break
+    assert selected_header is not None
+
+    context = tmp_path / "context.md"
+    context.write_text("session context\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repo": str(repo.resolve()),
+                "session_id": "S",
+                "confidence": "medium",
+                "owned_paths": ["a.txt"],
+                "owned_dirty_paths": ["a.txt"],
+                "unattributed_dirty_paths": [],
+                "tracker": {
+                    "status": "ok",
+                    "session_id": "S",
+                    "tracker_scope": {
+                        "unit_ids": ["unit-session"],
+                        "lease_id": "lse-test",
+                        "scope_hash": "sha256:" + "a" * 64,
+                        "paths": ["a.txt"],
+                        "hunks": [
+                            {
+                                "unit_id": "unit-session",
+                                "path": "a.txt",
+                                "hunk_header": selected_header,
+                            }
+                        ],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
+
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    session_owned_diff = packet_text.split("## Full Git Diff HEAD", 1)[0]
+    assert "+session-owned" in session_owned_diff
+    assert "+background" not in session_owned_diff
+    assert "+background" in packet_text
 
 
 def test_build_packet_rejects_session_manifest_for_different_repo(tmp_path: Path) -> None:
@@ -5812,6 +6124,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest"),
         ),
         (
+            "session_manifest_does_not_claim_post_commit_same_path_background_dirty",
+            lambda: test_session_manifest_does_not_claim_post_commit_same_path_background_dirty(
+                root / "session-manifest-post-commit"
+            ),
+        ),
+        (
+            "session_manifest_claims_apply_patch_after_commit_cutoff",
+            lambda: test_session_manifest_claims_apply_patch_after_commit_cutoff(
+                root / "session-manifest-commit-cutoff"
+            ),
+        ),
+        (
+            "session_manifest_only_claims_matching_apply_patch_hunk",
+            lambda: test_session_manifest_only_claims_matching_apply_patch_hunk(
+                root / "session-manifest-live-hunk"
+            ),
+        ),
+        (
+            "session_manifest_legacy_timestampless_transcript_fallback_warns",
+            lambda: test_session_manifest_legacy_timestampless_transcript_fallback_warns(
+                root / "session-manifest-legacy-fallback"
+            ),
+        ),
+        (
             "session_manifest_resolves_exec_paths_from_command_workdir",
             lambda: test_session_manifest_resolves_exec_paths_from_command_workdir(
                 root / "session-manifest-workdir"
@@ -5826,6 +6162,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "build_packet_uses_session_manifest_as_scope_anchor",
             lambda: test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest"),
+        ),
+        (
+            "build_packet_filters_session_owned_diff_to_tracker_hunk",
+            lambda: test_build_packet_filters_session_owned_diff_to_tracker_hunk(
+                root / "packet-tracker-hunk"
+            ),
         ),
         (
             "build_packet_rejects_session_manifest_for_different_repo",

@@ -1589,6 +1589,7 @@ def register_claims(
     owned_paths: Iterable[str],
     apply_patch_paths: set[str],
     exec_only_paths: set[str],
+    owned_units_override: list[tuple[OwnedUnit, str]] | None = None,
     log_root_override: Path | None = None,
 ) -> RegisterResult:
     repo_resolved = repo.resolve()
@@ -1618,12 +1619,19 @@ def register_claims(
         _ensure_meta(directory, repo_resolved, common_dir, key)
         return RegisterResult(status="no_paths", repo_key=key, tracker_dir=str(directory))
 
-    units = _build_owned_units(
-        repo_resolved,
-        owned_paths=paths_list,
-        apply_patch_paths={path for path in apply_patch_paths if isinstance(path, str)},
-        exec_only_paths={path for path in exec_only_paths if isinstance(path, str)},
-    )
+    if owned_units_override is None:
+        units = _build_owned_units(
+            repo_resolved,
+            owned_paths=paths_list,
+            apply_patch_paths={path for path in apply_patch_paths if isinstance(path, str)},
+            exec_only_paths={path for path in exec_only_paths if isinstance(path, str)},
+        )
+    else:
+        units = [
+            (owned_unit, evidence)
+            for owned_unit, evidence in owned_units_override
+            if isinstance(owned_unit, OwnedUnit) and isinstance(evidence, str)
+        ]
 
     branch_value = branch if branch is not None else _current_branch(repo_resolved)
     worktree_value = str(worktree.resolve()) if worktree is not None else str(repo_resolved)

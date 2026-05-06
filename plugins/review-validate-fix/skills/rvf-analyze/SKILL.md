@@ -22,6 +22,9 @@ diff + reviewer 产物，补全已经 scaffold 的 `artifacts/analysis/summary.m
 自动化边界：`rvf_run_finalize.finalize_run()` 会在 RVF finish/finalize 后自动运行
 确定性 scaffold 后端，生成 `artifacts/analysis/summary.md` 与
 `artifacts/analysis/causality.json` 的初始骨架；这不是一次 LLM skill 调用。
+如果 finish 发生在 Cline Kanban native task session，Stop hook 可以在同一 task
+中注入一条真实 `$rvf-analyze <run_dir>` follow-up 用户消息；如果 finish 发生在
+Codex GUI / 非 Kanban native session，Stop hook 只会提示用户手动触发同一命令。
 只有用户显式调用本 skill 时，agent 才进入叙事补全与 issue ↔ patch 因果归属流程。
 
 ## 入口与脚本

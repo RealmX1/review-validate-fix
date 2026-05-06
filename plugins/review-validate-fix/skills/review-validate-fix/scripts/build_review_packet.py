@@ -154,6 +154,15 @@ def session_owned_paths(manifest: dict[str, Any] | None) -> list[str]:
     return sorted(set(string_list(manifest.get("owned_paths"))) | set(string_list(manifest.get("owned_dirty_paths"))))
 
 
+def session_owned_dirty_paths(manifest: dict[str, Any] | None) -> list[str]:
+    if manifest is None:
+        return []
+    if "owned_dirty_paths" not in manifest:
+        return session_owned_paths(manifest)
+    dirty = string_list(manifest.get("owned_dirty_paths"))
+    return sorted(set(dirty))
+
+
 def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path: Path | None) -> None:
     if manifest is None:
         return
@@ -173,6 +182,70 @@ def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str]) ->
     if exclude_prefixes:
         args.extend(exclude_pathspecs(exclude_prefixes))
     return run_git(repo, args).rstrip()
+
+
+def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> str:
+    if not diff_text or not allowed_headers:
+        return diff_text.rstrip()
+    output: list[str] = []
+    file_header: list[str] = []
+    in_allowed_hunk = False
+    in_any_hunk = False
+    emitted_header = False
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            file_header = [line]
+            in_allowed_hunk = False
+            in_any_hunk = False
+            emitted_header = False
+            continue
+        if line.startswith("@@"):
+            in_any_hunk = True
+            normalized = diff_tracker._normalize_header(line)
+            in_allowed_hunk = normalized in allowed_headers
+            if in_allowed_hunk and not emitted_header:
+                output.extend(file_header)
+                emitted_header = True
+            if in_allowed_hunk:
+                output.append(line)
+            continue
+        if not emitted_header and not in_any_hunk:
+            file_header.append(line)
+            continue
+        if in_allowed_hunk:
+            output.append(line)
+    return "\n".join(output).rstrip()
+
+
+def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str]) -> str:
+    paths = [path for path in tracker_scope.get("paths", []) if isinstance(path, str)]
+    if not paths:
+        return ""
+    hunk_headers_by_path: dict[str, set[str]] = {}
+    path_level_paths: set[str] = set()
+    for entry in tracker_scope.get("hunks", []):
+        if not isinstance(entry, dict):
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str):
+            continue
+        header = entry.get("hunk_header")
+        if isinstance(header, str) and header:
+            hunk_headers_by_path.setdefault(path, set()).add(diff_tracker._normalize_header(header))
+        else:
+            path_level_paths.add(path)
+    chunks: list[str] = []
+    for path in paths:
+        if path in path_level_paths or path not in hunk_headers_by_path:
+            chunk = diff_for_paths(repo, [path], exclude_prefixes)
+        else:
+            chunk = filter_diff_for_hunk_headers(
+                diff_for_paths(repo, [path], exclude_prefixes),
+                hunk_headers_by_path[path],
+            )
+        if chunk:
+            chunks.append(chunk)
+    return "\n".join(chunks).rstrip()
 
 
 def build_packet(
@@ -199,10 +272,6 @@ def build_packet(
     session_manifest = load_session_manifest(session_manifest_path)
     validate_session_manifest(session_manifest, root, session_manifest_path)
     owned_paths = session_owned_paths(session_manifest)
-    owned_path_set = set(owned_paths)
-    owned_diff = diff_for_paths(root, owned_paths, all_exclude_prefixes) if session_manifest is not None else ""
-    owned_untracked = [path for path in untracked if path in owned_path_set]
-    background_untracked = [path for path in untracked if path not in owned_path_set]
 
     cross_session_conflicts: list[dict[str, Any]] = []
     tracker_status: str | None = None
@@ -261,8 +330,8 @@ def build_packet(
         "session_owned_path_count": len(owned_paths),
         "session_owned_dirty_paths": string_list(session_manifest.get("owned_dirty_paths")) if session_manifest is not None else [],
         "unattributed_dirty_paths": string_list(session_manifest.get("unattributed_dirty_paths")) if session_manifest is not None else [],
-        "owned_untracked_count": len(owned_untracked) if session_manifest is not None else len(untracked),
-        "background_untracked_count": len(background_untracked) if session_manifest is not None else 0,
+        "owned_untracked_count": 0,
+        "background_untracked_count": 0,
         "primary_files": primary_files,
         "background_files": background_files,
         "untracked_files": [],
@@ -283,6 +352,20 @@ def build_packet(
         if tracker_scope is not None and isinstance(tracker_scope.get("takeover_from_session_id"), str)
         else None,
     }
+    owned_dirty_paths = session_owned_dirty_paths(session_manifest)
+    owned_diff_paths = [
+        path for path in metadata["tracker_scope_paths"] if isinstance(path, str)
+    ] if tracker_scope is not None else owned_dirty_paths
+    owned_path_set = set(owned_diff_paths)
+    if tracker_scope is not None:
+        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes)
+    else:
+        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes) if session_manifest is not None else ""
+    owned_untracked = [path for path in untracked if path in owned_path_set]
+    background_untracked = [path for path in untracked if path not in owned_path_set]
+    metadata["session_owned_diff_paths"] = owned_diff_paths
+    metadata["owned_untracked_count"] = len(owned_untracked) if session_manifest is not None else len(untracked)
+    metadata["background_untracked_count"] = len(background_untracked) if session_manifest is not None else 0
 
     lines: list[str] = [
         "# Review Packet",
@@ -435,8 +518,7 @@ def build_packet(
     if tracker_scope is not None:
         scope_paths = [path for path in tracker_scope["paths"] if isinstance(path, str)]
         if scope_paths:
-            allocated_diff = diff_for_paths(root, scope_paths, all_exclude_prefixes)
-            allocated_body = allocated_diff or "(no tracked diff for allocated paths)"
+            allocated_body = owned_diff or "(no tracked diff for allocated paths)"
         else:
             allocated_body = "(allocator did not allocate any path; see Tracker Scope hunks above for unit-level scope)"
         lines.extend(

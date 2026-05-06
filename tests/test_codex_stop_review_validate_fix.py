@@ -66,8 +66,8 @@ def write_apply_patch_transcript(
         "*** Begin Patch\n"
         f"*** Update File: {rel_path}\n"
         "@@\n"
-        "-old\n"
-        "+new\n"
+        "-base\n"
+        "+dirty\n"
         "*** End Patch\n"
     )
     path.write_text(
@@ -1046,12 +1046,12 @@ def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path)
     )
     records = [
         {
-            "timestamp": "2026-04-27T00:00:00.000Z",
+            "timestamp": "2999-04-27T00:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": "sess-legacy", "cwd": str(repo)},
         },
         {
-            "timestamp": "2026-04-27T00:00:01.000Z",
+            "timestamp": "2999-04-27T00:00:01.000Z",
             "type": "response_item",
             "payload": {
                 "type": "custom_tool_call",
@@ -3123,6 +3123,27 @@ def test_kanban_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:
     assert latest["reason_code"] == "kanban_followup_trigger_turn"
 
 
+def test_rvf_analyze_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "last_user_message": "$rvf-analyze /tmp/rvf-run\n\nRVF_KANBAN_ANALYZE_TRIGGER",
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "kanban-followup"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=rvf_analyze_followup_trigger_turn" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "rvf_analyze_followup_trigger_turn"
+
+
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
@@ -4487,6 +4508,100 @@ def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> Non
     assert any(event["event"] == "finalize_completed_with_errors" for event in events)
 
 
+def test_handoff_advisory_surfaces_manual_rvf_analyze_trigger(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
+        )[0]
+    )
+
+    assert "rvf_analyze=manual_required" in payload["systemMessage"]
+    assert f"$rvf-analyze {run_dir.resolve()}" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["rvf_analyze_status"] == "manual-required"
+    assert summary["rvf_analyze_run_dir"] == str(run_dir.resolve())
+    assert summary["rvf_analyze_summary_md_path"].endswith("/artifacts/analysis/summary.md")
+    assert summary["rvf_analyze_causality_json_path"].endswith("/artifacts/analysis/causality.json")
+    assert (run_dir / "artifacts" / "analysis" / "summary.md").is_file()
+    assert (run_dir / "artifacts" / "analysis" / "causality.json").is_file()
+    events = latest_events(state)
+    assert any(event["event"] == "rvf_analyze_manual_advisory" for event in events)
+
+
+def test_handoff_advisory_injects_rvf_analyze_in_kanban_task(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'task_id': 'task-99', 'attempt_id': 'attempt-3', 'message_id': 'msg-analyze', 'status': 'queued'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_OPEN_HANDOFF": "0",
+                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+                "KANBAN_TASK_ID": "task-99",
+                "KANBAN_ATTEMPT_ID": "attempt-3",
+                "KANBAN_PROJECT_PATH": str(repo),
+                "FAKE_CLIENT_CALLS": str(client_calls),
+            },
+        )[0]
+    )
+
+    assert "rvf_analyze=kanban_injected" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["rvf_analyze_status"] == "kanban-injected"
+    assert summary["rvf_analyze_kanban_task_id"] == "task-99"
+    assert summary["rvf_analyze_kanban_attempt_id"] == "attempt-3"
+    assert summary["rvf_analyze_kanban_message_id"] == "msg-analyze"
+    prompt_text = Path(summary["rvf_analyze_followup_prompt_path"]).read_text(encoding="utf-8")
+    assert f"$rvf-analyze {run_dir.resolve()}" in prompt_text
+    assert "RVF_KANBAN_ANALYZE_TRIGGER" in prompt_text
+    call = json.loads(client_calls.read_text(encoding="utf-8").splitlines()[0])
+    assert call["argv"][0] == "message"
+    assert "--source" in call["argv"]
+    assert "rvf-analyze" in call["argv"]
+
+
 def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
@@ -4905,6 +5020,7 @@ def main() -> int:
         test_kanban_followup_blocks_expired_codex_login_before_message,
         test_kanban_followup_mode_without_task_id_reports_without_fallback,
         test_kanban_followup_trigger_marker_skips_one_turn,
+        test_rvf_analyze_followup_trigger_marker_skips_one_turn,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,
@@ -4938,6 +5054,8 @@ def main() -> int:
         test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
         test_handoff_advisory_surfaces_finalize_record_errors,
+        test_handoff_advisory_surfaces_manual_rvf_analyze_trigger,
+        test_handoff_advisory_injects_rvf_analyze_in_kanban_task,
         test_handoff_advisory_respects_open_disabled,
         test_handoff_advisory_records_open_failure,
         test_suppress_env_skips_handoff_marker_before_advisory,
