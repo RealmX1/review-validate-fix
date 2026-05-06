@@ -67,6 +67,9 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 - original Codex URL: <RVF_PARENT_CODEX_URL 或 unavailable>
 - original transcript: <RVF_PARENT_TRANSCRIPT_PATH 或 unavailable>
 - origin metadata: <RVF_ORIGIN_METADATA 或 unavailable>
+- source Kanban task id: <RVF_PARENT_KANBAN_TASK_ID 或 unavailable>
+- source Kanban attempt id: <RVF_PARENT_KANBAN_ATTEMPT_ID 或 unavailable>
+- source Kanban task title at trigger: <RVF_PARENT_KANBAN_TASK_TITLE 或 unavailable>
 - generated Kanban task: <task title 或 task id；未知则写 unavailable>
 
 ## 原始任务

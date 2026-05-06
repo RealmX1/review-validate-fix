@@ -769,7 +769,9 @@ def parent_origin_prompt_block(
         "\n"
         "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
         "Codex conversation name/ref、name source、codex URL、transcript path "
-        "和 origin metadata path；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
+        "和 origin metadata path；如果存在 `RVF_PARENT_KANBAN_TASK_ID`，还必须写入 "
+        "`source Kanban task id` 和 `source Kanban attempt id`，以便任务改名后仍可反查"
+        "当前 task title；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
     )
     return "".join(lines)
 
@@ -1253,7 +1255,10 @@ def kanban_followup_review_validate_fix_prompt(
         "name/ref。维护 handoff.md 时，`## Origin` 的 `original Codex conversation`、"
         "`conversation name source`、`original Codex URL`、`original transcript` "
         "和 `origin metadata` 必须保留这些值；若存在 `RVF_PARENT_KANBAN_*` 字段，"
-        "`generated Kanban task` 也必须写当前 task/attempt id。\n\n"
+        "还必须写 `source Kanban task id`、`source Kanban attempt id`、"
+        "`source Kanban task title at trigger`，并让 `generated Kanban task` 写当前 "
+        "task/attempt id。即使 task title 之后被开发者改名，后续 agent 也能用 task id "
+        "查回当前名称。\n\n"
         "这是由 Cline Kanban host 在当前 task 的 coding agent chat session 中注入的"
         "真实用户消息，用于在同一 task/session 内触发 review-validate-fix。"
         "不要创建新的 Kanban task，不要 fork 新会话，也不要把这条消息当作 hook system context。\n\n"

@@ -2588,6 +2588,9 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert "RVF_PARENT_KANBAN_TASK_ID: task-77" in prompt_text
     assert "RVF_PARENT_KANBAN_ATTEMPT_ID: attempt-9" in prompt_text
     assert "RVF_PARENT_KANBAN_TASK_TITLE: Fix RVF follow-up source metadata" in prompt_text
+    assert "`source Kanban task id`" in prompt_text
+    assert "`source Kanban attempt id`" in prompt_text
+    assert "`source Kanban task title at trigger`" in prompt_text
     assert "RVF_PARENT_CODEX_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
     assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
     assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
@@ -2685,6 +2688,7 @@ def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -
     assert f"RVF_PARENT_CONVERSATION_REF: {expected_title}" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_board_lookup" in prompt_text
     assert f"RVF_PARENT_KANBAN_TASK_TITLE: {expected_title}" in prompt_text
+    assert "`source Kanban task id`" in prompt_text
 
 
 def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_path: Path) -> None:
