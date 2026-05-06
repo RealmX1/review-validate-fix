@@ -371,6 +371,8 @@ class TrackerLeaseRuntime:
         self.reviewer_id = reviewer_id
         self.run_id = run_id
         self.lease_id: str | None = None
+        self._owns_lease = False
+        self._participant_joined = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._old_handlers: dict[int, Any] = {}
@@ -386,6 +388,19 @@ class TrackerLeaseRuntime:
         existing = self.scope_contract.get("tracker_lease_id")
         if isinstance(existing, str) and existing:
             self.lease_id = existing
+            result = diff_tracker.lease_participant_join(
+                repo=self.repo,
+                lease_id=existing,
+                reviewer_id=self.reviewer_id,
+                run_id=self.run_id,
+                owns_lease=False,
+                log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+                if os.environ.get("CODEX_RVF_LOG_ROOT")
+                else None,
+            )
+            if not result.get("joined"):
+                raise RuntimeError(f"tracker lease participant join failed: {result.get('reason')}")
+            self._participant_joined = True
             return
         tracker_scope = tracker_scope_from_contract(self.scope_contract)
         session_id = tracker_scope.get("source_session_id")
@@ -407,6 +422,20 @@ class TrackerLeaseRuntime:
         if not isinstance(lease_id, str) or not lease_id:
             raise RuntimeError("tracker lease acquire returned no lease_id")
         self.lease_id = lease_id
+        self._owns_lease = True
+        joined = diff_tracker.lease_participant_join(
+            repo=self.repo,
+            lease_id=lease_id,
+            reviewer_id=self.reviewer_id,
+            run_id=self.run_id,
+            owns_lease=True,
+            log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+            if os.environ.get("CODEX_RVF_LOG_ROOT")
+            else None,
+        )
+        if not joined.get("joined"):
+            raise RuntimeError(f"tracker lease participant join failed: {joined.get('reason')}")
+        self._participant_joined = True
 
     def start(self) -> None:
         if self.repo is None or self.lease_id is None:
@@ -425,24 +454,46 @@ class TrackerLeaseRuntime:
     def release(self, reason: str) -> None:
         if self.repo is None or self.lease_id is None:
             return
-        diff_tracker.lease_release(
-            repo=self.repo,
-            lease_id=self.lease_id,
-            reason=reason,
-            log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
+        log_root_override = (
+            Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
             if os.environ.get("CODEX_RVF_LOG_ROOT")
-            else None,
+            else None
         )
+        active_participant_count = 0
+        if self._participant_joined:
+            result = diff_tracker.lease_participant_finish(
+                repo=self.repo,
+                lease_id=self.lease_id,
+                reviewer_id=self.reviewer_id,
+                run_id=self.run_id,
+                reason=reason,
+                log_root_override=log_root_override,
+            )
+            active_participant_count = int(result.get("active_participant_count") or 0)
+            owning_participant_count = int(result.get("owning_participant_count") or 0)
+        else:
+            owning_participant_count = 1 if self._owns_lease else 0
+        if self._owns_lease and owning_participant_count > 0 and active_participant_count == 0:
+            diff_tracker.lease_release(
+                repo=self.repo,
+                lease_id=self.lease_id,
+                reason=reason,
+                log_root_override=log_root_override,
+            )
         self.lease_id = None
+        self._owns_lease = False
+        self._participant_joined = False
 
     def _heartbeat_loop(self) -> None:
         assert self.repo is not None
         assert self.lease_id is not None
         interval = lease_heartbeat_seconds()
         while not self._stop.wait(interval):
-            diff_tracker.lease_refresh(
+            diff_tracker.lease_participant_refresh(
                 repo=self.repo,
                 lease_id=self.lease_id,
+                reviewer_id=self.reviewer_id,
+                run_id=self.run_id,
                 log_root_override=Path(os.environ["CODEX_RVF_LOG_ROOT"]).expanduser().resolve()
                 if os.environ.get("CODEX_RVF_LOG_ROOT")
                 else None,

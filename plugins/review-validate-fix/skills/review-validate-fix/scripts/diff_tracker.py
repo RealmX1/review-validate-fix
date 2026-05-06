@@ -28,7 +28,7 @@ from rvf_logging import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SQLITE_FILENAME = "tracker.sqlite3"
 EVENTS_FILENAME = "events.jsonl"
 META_FILENAME = "meta.json"
@@ -904,6 +904,21 @@ CREATE TABLE IF NOT EXISTS lease_units (
 );
 CREATE INDEX IF NOT EXISTS idx_lease_units_unit ON lease_units(unit_id);
 
+CREATE TABLE IF NOT EXISTS lease_participants (
+  lease_id         TEXT NOT NULL,
+  reviewer_id      TEXT NOT NULL,
+  run_id           TEXT NOT NULL,
+  state            TEXT NOT NULL CHECK (state IN ('active','completed','failed')),
+  joined_at        TEXT NOT NULL,
+  last_activity_at TEXT NOT NULL,
+  finished_at      TEXT,
+  release_reason   TEXT,
+  owns_lease       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (lease_id, reviewer_id, run_id),
+  FOREIGN KEY (lease_id) REFERENCES leases(lease_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_lease_participants_state ON lease_participants(lease_id, state);
+
 CREATE TABLE IF NOT EXISTS tombstones (
   tombstone_id  INTEGER PRIMARY KEY AUTOINCREMENT,
   kind          TEXT NOT NULL CHECK (kind IN ('unit','lease','session','branch','worktree')),
@@ -977,8 +992,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(DDL)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return
+    if version == 2:
+        _migrate_schema_v2_to_v3(conn)
+        return
     if version == SCHEMA_VERSION:
         _ensure_manual_rvf_runs_schema(conn)
+        _ensure_lease_participants_schema(conn)
         return
     raise RuntimeError(f"unknown tracker schema version: {version}")
 
@@ -996,6 +1015,38 @@ def _ensure_manual_rvf_runs_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lease_participants (
+          lease_id         TEXT NOT NULL,
+          reviewer_id      TEXT NOT NULL,
+          run_id           TEXT NOT NULL,
+          state            TEXT NOT NULL CHECK (state IN ('active','completed','failed')),
+          joined_at        TEXT NOT NULL,
+          last_activity_at TEXT NOT NULL,
+          finished_at      TEXT,
+          release_reason   TEXT,
+          owns_lease       INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (lease_id, reviewer_id, run_id),
+          FOREIGN KEY (lease_id) REFERENCES leases(lease_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_lease_participants_state
+          ON lease_participants(lease_id, state)
+        """
+    )
+
+
+def _migrate_schema_v2_to_v3(conn: sqlite3.Connection) -> None:
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 @contextlib.contextmanager
@@ -2217,6 +2268,304 @@ def lease_refresh(
             conn.close()
 
 
+def _participant_state_for_reason(reason: str) -> str:
+    return "completed" if reason == "completed" else "failed"
+
+
+def _active_participant_count_in_txn(conn: sqlite3.Connection, lease_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM lease_participants WHERE lease_id=? AND state='active'",
+        (lease_id,),
+    ).fetchone()
+    return int(row["count"] or 0) if row is not None else 0
+
+
+def _owning_participant_count_in_txn(conn: sqlite3.Connection, lease_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM lease_participants WHERE lease_id=? AND owns_lease=1",
+        (lease_id,),
+    ).fetchone()
+    return int(row["count"] or 0) if row is not None else 0
+
+
+def lease_participant_join(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    reviewer_id: str,
+    run_id: str,
+    owns_lease: bool = False,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                "SELECT lease_id, state, expires_at FROM leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                return {
+                    "status": "missing",
+                    "joined": False,
+                    "reason": "lease_not_found",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            if row["expires_at"] <= now_iso:
+                return {
+                    "status": "expired",
+                    "joined": False,
+                    "reason": "lease_expired_before_join",
+                    "lease_id": lease_id,
+                    "expires_at": row["expires_at"],
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            conn.execute(
+                """
+                INSERT INTO lease_participants(
+                    lease_id, reviewer_id, run_id, state, joined_at,
+                    last_activity_at, finished_at, release_reason, owns_lease
+                )
+                VALUES (?, ?, ?, 'active', ?, ?, NULL, NULL, ?)
+                ON CONFLICT(lease_id, reviewer_id, run_id) DO UPDATE SET
+                    state='active',
+                    last_activity_at=excluded.last_activity_at,
+                    finished_at=NULL,
+                    release_reason=NULL,
+                    owns_lease=MAX(lease_participants.owns_lease, excluded.owns_lease)
+                """,
+                (lease_id, reviewer_id, run_id, now_iso, now_iso, 1 if owns_lease else 0),
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_participant_joined",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "reviewer_id": reviewer_id,
+                "run_id": run_id,
+                "owns_lease": owns_lease,
+                "reason_code": "lease_participant_joined",
+            },
+        )
+        return {
+            "status": "joined",
+            "joined": True,
+            "reason": "lease_participant_joined",
+            "lease_id": lease_id,
+            "reviewer_id": reviewer_id,
+            "run_id": run_id,
+            "owns_lease": owns_lease,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def lease_participant_refresh(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    reviewer_id: str,
+    run_id: str,
+    ttl_seconds: int | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    ttl = _lease_ttl_seconds(ttl_seconds)
+    expires_at = _datetime_to_iso((_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl))
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                "SELECT lease_id, state, expires_at FROM leases WHERE lease_id=?",
+                (lease_id,),
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                return {
+                    "status": "missing",
+                    "refreshed": False,
+                    "reason": "lease_not_found",
+                    "lease_id": lease_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            if row["expires_at"] <= now_iso:
+                return {
+                    "status": "expired",
+                    "refreshed": False,
+                    "reason": "lease_expired_before_refresh",
+                    "lease_id": lease_id,
+                    "expires_at": row["expires_at"],
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            cur = conn.execute(
+                """
+                UPDATE lease_participants
+                   SET last_activity_at=?
+                 WHERE lease_id=?
+                   AND reviewer_id=?
+                   AND run_id=?
+                   AND state='active'
+                """,
+                (now_iso, lease_id, reviewer_id, run_id),
+            )
+            if not (cur.rowcount or 0):
+                return {
+                    "status": "missing",
+                    "refreshed": False,
+                    "reason": "lease_participant_not_found",
+                    "lease_id": lease_id,
+                    "reviewer_id": reviewer_id,
+                    "run_id": run_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            conn.execute(
+                """
+                UPDATE leases
+                   SET last_activity_at=?, expires_at=?, ttl_seconds=?
+                 WHERE lease_id=?
+                """,
+                (now_iso, expires_at, ttl, lease_id),
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_participant_refreshed",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "reviewer_id": reviewer_id,
+                "run_id": run_id,
+                "expires_at": expires_at,
+                "reason_code": "lease_participant_refreshed",
+            },
+        )
+        return {
+            "status": "refreshed",
+            "refreshed": True,
+            "reason": "lease_participant_refreshed",
+            "lease_id": lease_id,
+            "reviewer_id": reviewer_id,
+            "run_id": run_id,
+            "expires_at": expires_at,
+            "ttl_seconds": ttl,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def lease_participant_finish(
+    *,
+    repo: str | Path,
+    lease_id: str,
+    reviewer_id: str,
+    run_id: str,
+    reason: str = "completed",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = now or utc_now()
+    participant_state = _participant_state_for_reason(reason)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            row = conn.execute(
+                """
+                SELECT state, owns_lease
+                  FROM lease_participants
+                 WHERE lease_id=? AND reviewer_id=? AND run_id=?
+                """,
+                (lease_id, reviewer_id, run_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "status": "missing",
+                    "finished": False,
+                    "reason": "lease_participant_not_found",
+                    "lease_id": lease_id,
+                    "reviewer_id": reviewer_id,
+                    "run_id": run_id,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            if row["state"] not in {"completed", "failed"}:
+                conn.execute(
+                    """
+                    UPDATE lease_participants
+                       SET state=?, last_activity_at=?, finished_at=?, release_reason=?
+                     WHERE lease_id=? AND reviewer_id=? AND run_id=?
+                    """,
+                    (participant_state, now_iso, now_iso, reason, lease_id, reviewer_id, run_id),
+                )
+            active_count = _active_participant_count_in_txn(conn, lease_id)
+            owning_count = _owning_participant_count_in_txn(conn, lease_id)
+            owns_lease_value = bool(row["owns_lease"])
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "lease_participant_finished",
+                "rvf_state_phase": "review",
+                "lease_id": lease_id,
+                "reviewer_id": reviewer_id,
+                "run_id": run_id,
+                "participant_state": participant_state,
+                "release_reason": reason,
+                "active_participant_count": active_count,
+                "owning_participant_count": owning_count,
+                "owns_lease": owns_lease_value,
+                "reason_code": "lease_participant_finished",
+            },
+        )
+        return {
+            "status": "finished",
+            "finished": True,
+            "reason": "lease_participant_finished",
+            "lease_id": lease_id,
+            "reviewer_id": reviewer_id,
+            "run_id": run_id,
+            "participant_state": participant_state,
+            "active_participant_count": active_count,
+            "owning_participant_count": owning_count,
+            "owns_lease": owns_lease_value,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def lease_release(
     *,
     repo: str | Path,
@@ -2265,6 +2614,16 @@ def lease_release(
                 )
             conn.execute("DELETE FROM lease_units WHERE lease_id=?", (lease_id,))
             release_state = "completed" if reason == "completed" else "failed-released"
+            participant_state = _participant_state_for_reason(reason)
+            conn.execute(
+                """
+                UPDATE lease_participants
+                   SET state=?, last_activity_at=?, finished_at=?, release_reason=?
+                 WHERE lease_id=?
+                   AND state='active'
+                """,
+                (participant_state, now_iso, now_iso, reason, lease_id),
+            )
             conn.execute(
                 """
                 UPDATE leases
@@ -2572,6 +2931,18 @@ def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
          WHERE lease_id IN ({placeholders})
         """.format(placeholders=placeholders),
         tuple(stale_lease_ids),
+    )
+    conn.execute(
+        """
+        UPDATE lease_participants
+           SET state='failed',
+               last_activity_at=?,
+               finished_at=?,
+               release_reason='stale-released'
+         WHERE state='active'
+           AND lease_id IN ({placeholders})
+        """.format(placeholders=placeholders),
+        (now_iso, now_iso, *stale_lease_ids),
     )
     unit_rows = conn.execute(
         """

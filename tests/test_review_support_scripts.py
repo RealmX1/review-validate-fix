@@ -6334,6 +6334,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         # Slice 4 lease lifecycle.
         (
+            "tracker_schema_v2_migrates_lease_participants_table",
+            lambda: test_tracker_schema_v2_migrates_lease_participants_table(root / "lease-T0"),
+        ),
+        (
             "lease_acquire_creates_lease_and_assigns_units",
             lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
         ),
@@ -6366,6 +6370,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_lease_release_idempotent(root / "lease-T7"),
         ),
         (
+            "lease_participants_finish_does_not_release_shared_lease",
+            lambda: test_lease_participants_finish_does_not_release_shared_lease(root / "lease-T7b"),
+        ),
+        (
             "sweep_stale_releases_expired_active_leases",
             lambda: test_sweep_stale_releases_expired_active_leases(root / "lease-T8"),
         ),
@@ -6376,6 +6384,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "run_alternative_reviewer_releases_lease_on_normal_exit",
             lambda: test_run_alternative_reviewer_releases_lease_on_normal_exit(root / "lease-T10"),
+        ),
+        (
+            "run_alternative_reviewer_shared_lease_does_not_release_on_exit",
+            lambda: test_run_alternative_reviewer_shared_lease_does_not_release_on_exit(root / "lease-T10b"),
         ),
         (
             "run_alternative_reviewer_releases_lease_on_codex_backend_challenge",
@@ -7350,13 +7362,19 @@ def _lease_seed(tmp: Path) -> tuple[object, Path, Path, list[str], str]:
     return module, repo, log_root, unit_ids, seeded["repo_key"]
 
 
-def _lease_contract(path: Path, *, repo: Path, unit_ids: list[str]) -> Path:
+def _lease_contract(
+    path: Path,
+    *,
+    repo: Path,
+    unit_ids: list[str],
+    tracker_lease_id: str | None = None,
+) -> Path:
     payload = {
         "version": 2,
         "run_id": "lease-reviewer-run",
         "repo": str(repo),
         "primary_units": unit_ids,
-        "tracker_lease_id": None,
+        "tracker_lease_id": tracker_lease_id,
         "tracker_scope_hash": "sha256:" + "a" * 64,
         "session_manifest_path": None,
     }
@@ -7383,6 +7401,70 @@ def _lease_rows(log_root: Path, repo_key: str) -> list[tuple[str, str]]:
         return list(conn.execute("SELECT lease_id, state FROM leases ORDER BY created_at, lease_id"))
     finally:
         conn.close()
+
+
+def _lease_unit_count(log_root: Path, repo_key: str, lease_id: str) -> int:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM lease_units WHERE lease_id=?", (lease_id,)).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def _lease_participant_states(log_root: Path, repo_key: str, lease_id: str) -> dict[str, str]:
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = conn.execute(
+            """
+            SELECT reviewer_id, state
+              FROM lease_participants
+             WHERE lease_id=?
+             ORDER BY reviewer_id
+            """,
+            (lease_id,),
+        ).fetchall()
+        return {reviewer_id: state for reviewer_id, state in rows}
+    finally:
+        conn.close()
+
+
+def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    db_path = _alloc_db_path(log_root, repo_key)
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_lease_participants_state")
+        conn.execute("DROP TABLE IF EXISTS lease_participants")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    finally:
+        conn.close()
+
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-migrate",
+        run_id="lease-run-migrate",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+
+    assert acquired["acquired"] is True
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='lease_participants'"
+        ).fetchone()
+        index = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_lease_participants_state'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert db_path.exists()
+    assert table is not None
+    assert index is not None
 
 
 def test_lease_acquire_creates_lease_and_assigns_units(tmp: Path) -> None:
@@ -7586,6 +7668,67 @@ def test_lease_release_idempotent(tmp: Path) -> None:
     assert second["reason"] == "lease_not_found"
 
 
+def test_lease_participants_finish_does_not_release_shared_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-shared",
+        run_id="lease-run-shared",
+        reviewer_id="allocator",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert acquired["acquired"] is True
+    for reviewer_id, owns_lease in (("reviewer-a", True), ("reviewer-b", False)):
+        joined = module.lease_participant_join(
+            repo=repo,
+            lease_id=acquired["lease_id"],
+            reviewer_id=reviewer_id,
+            run_id="lease-run-shared",
+            owns_lease=owns_lease,
+            log_root_override=log_root,
+        )
+        assert joined["joined"] is True
+
+    first_finish = module.lease_participant_finish(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reviewer_id="reviewer-a",
+        run_id="lease-run-shared",
+        reason="completed",
+        log_root_override=log_root,
+    )
+
+    assert first_finish["finished"] is True
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "active"
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 1
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
+
+    second_finish = module.lease_participant_finish(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reviewer_id="reviewer-b",
+        run_id="lease-run-shared",
+        reason="completed",
+        log_root_override=log_root,
+    )
+
+    assert second_finish["finished"] is True
+    assert second_finish["active_participant_count"] == 0
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "active"
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 1
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
+
+    released = module.lease_release(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        log_root_override=log_root,
+    )
+    assert released["released"] is True
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 0
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
 def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
     module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
     acquired = module.lease_acquire(
@@ -7598,6 +7741,16 @@ def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
         log_root_override=log_root,
         now="2026-05-05T00:00:00Z",
     )
+    joined = module.lease_participant_join(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reviewer_id="reviewer-a",
+        run_id="lease-run-sweep",
+        owns_lease=True,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    assert joined["joined"] is True
     released = module.sweep_stale(
         repo=repo,
         log_root_override=log_root,
@@ -7605,6 +7758,7 @@ def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
     )
     assert [item["lease_id"] for item in released] == [acquired["lease_id"]]
     assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "stale-released"
+    assert _lease_participant_states(log_root, repo_key, acquired["lease_id"]) == {"reviewer-a": "failed"}
     assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
 
 
@@ -7693,6 +7847,85 @@ def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> No
     assert completed.returncode == 0, completed.stderr
     assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
     assert _lease_rows(log_root, repo_key)[-1][1] == "completed"
+
+
+def test_run_alternative_reviewer_shared_lease_does_not_release_on_exit(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-shared-runner",
+        run_id="lease-reviewer-run",
+        reviewer_id="allocator",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert acquired["acquired"] is True
+    owner = module.lease_participant_join(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reviewer_id="owner-reviewer",
+        run_id="lease-reviewer-run",
+        owns_lease=True,
+        log_root_override=log_root,
+    )
+    assert owner["joined"] is True
+    finished_owner = module.lease_participant_finish(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reviewer_id="owner-reviewer",
+        run_id="lease-reviewer-run",
+        reason="completed",
+        log_root_override=log_root,
+    )
+    assert finished_owner["finished"] is True
+
+    packet = tmp / "packet.md"
+    packet.write_text("## Review Packet\n\nshared lease test\n", encoding="utf-8")
+    contract = _lease_contract(
+        tmp / "scope.contract.json",
+        repo=repo,
+        unit_ids=unit_ids[:1],
+        tracker_lease_id=acquired["lease_id"],
+    )
+    config = write_alternative_reviewer_config(
+        tmp / "alternative-reviewer.json",
+        [sys.executable, "-c", clean_review_result_python()],
+        idle_timeout_seconds=0.2,
+        activity_check_interval_seconds=0.05,
+    )
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--scope-contract",
+            str(contract),
+            "--rvf-run-id",
+            "lease-reviewer-run",
+            "--rvf-run-dir",
+            str(tmp / "run"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "active"
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 1
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
+    assert _lease_participant_states(log_root, repo_key, acquired["lease_id"]) == {
+        "owner-reviewer": "completed",
+        "test": "completed",
+    }
 
 
 def test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge(tmp: Path) -> None:

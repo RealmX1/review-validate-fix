@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -203,6 +204,44 @@ def _write_usage_summary(run_dir: Path) -> dict[str, Any]:
     return {"summary_path": str(path), **summary}
 
 
+def _release_tracker_lease(
+    run_dir: Path,
+    repo: Path | None,
+    *,
+    decision_kind: str,
+) -> dict[str, Any] | None:
+    if repo is None:
+        return None
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(contract, dict):
+        return None
+    lease_id = contract.get("tracker_lease_id")
+    if not isinstance(lease_id, str) or not lease_id:
+        return None
+
+    import diff_tracker  # noqa: WPS433
+
+    log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
+    log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
+    release_reason = "failed" if decision_kind in {"cancelled", "cancel", "interrupted"} else "completed"
+    result = diff_tracker.lease_release(
+        repo=repo,
+        lease_id=lease_id,
+        reason=release_reason,
+        log_root_override=log_root_override,
+    )
+    return {
+        "scope_contract_path": str(contract_path),
+        "lease_id": lease_id,
+        "release_reason": release_reason,
+        **result,
+    }
+
+
 def finalize_run(
     *,
     run_dir: Path,
@@ -236,6 +275,7 @@ def finalize_run(
         "trajectory": None,
         "usage": None,
         "workspace_diff": None,
+        "tracker_lease_release": None,
         "analysis": None,
         "errors": [],
     }
@@ -304,6 +344,21 @@ def finalize_run(
                 "missing_before_snapshot" if not before_path.exists() else "missing_repo"
             ),
         }
+
+    try:
+        finalize_record["tracker_lease_release"] = _release_tracker_lease(
+            run_dir,
+            repo,
+            decision_kind=decision_kind,
+        )
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "tracker_lease_release",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
 
     finalize_record["completed_at"] = _utc_now()
 
