@@ -3893,6 +3893,30 @@ class _StopContextError(Exception):
         self.skip_payload = skip_payload_value
 
 
+@dataclass
+class SessionScopePrecheck:
+    checked: bool = False
+    context: dict[str, Any] | None = None
+    skip_payload: dict[str, Any] | None = None
+    route_paths: list[str] | None = None
+
+
+def _string_list(value: Any) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def session_change_type_from_manifest(manifest: dict[str, Any] | None) -> str | None:
+    if not isinstance(manifest, dict):
+        return None
+    owned_paths = _string_list(manifest.get("owned_paths"))
+    owned_dirty_paths = _string_list(manifest.get("owned_dirty_paths"))
+    if not owned_paths:
+        return "no_codebase_changes"
+    if not owned_dirty_paths:
+        return "no_dirty_codebase_changes"
+    return "dirty_codebase_changes"
+
+
 def resolve_stop_context(
     event: dict[str, Any],
     repo: str,
@@ -3989,6 +4013,7 @@ def refresh_global_diff_tracker(
         )
         return {"observed": False, "manifest": None, "error": error_message}
     context["manifest"] = manifest
+    context["session_change_type"] = session_change_type_from_manifest(manifest)
     return {"observed": True, "manifest": manifest}
 
 
@@ -4220,6 +4245,12 @@ def allocate_auto_review_scope(
             "result": result,
         }
     if status == "empty":
+        manifest = context.get("manifest")
+        session_change_type = context.get("session_change_type")
+        session_owned_paths = _string_list(manifest.get("owned_paths")) if isinstance(manifest, dict) else []
+        session_owned_dirty_paths = (
+            _string_list(manifest.get("owned_dirty_paths")) if isinstance(manifest, dict) else []
+        )
         ledger.event(
             phase="gate",
             event="session_scope_clean",
@@ -4231,12 +4262,16 @@ def allocate_auto_review_scope(
             session_id=session_id,
             candidate_unit_count=result.get("candidate_unit_count", 0),
             leased_excluded_count=result.get("leased_excluded_count", 0),
+            session_change_type=session_change_type,
+            session_owned_paths=session_owned_paths,
+            session_owned_dirty_paths=session_owned_dirty_paths,
         )
         if dry_run:
             return {
                 "would_proceed": False,
                 "candidate_unit_count": result.get("candidate_unit_count", 0),
                 "result": result,
+                "session_change_type": session_change_type,
             }
         return skip_payload(
             "no unassigned review scope",
@@ -4252,6 +4287,9 @@ def allocate_auto_review_scope(
             reason_code_legacy_alias=LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
             candidate_unit_count=result.get("candidate_unit_count", 0),
             leased_excluded_count=result.get("leased_excluded_count", 0),
+            session_change_type=session_change_type,
+            session_owned_paths=session_owned_paths,
+            session_owned_dirty_paths=session_owned_dirty_paths,
         )
     # Other statuses (lock_timeout / error / disabled / unsupported_repo) all
     # degrade gracefully: the allocator already emitted its own events.jsonl
@@ -4410,6 +4448,54 @@ def session_scope_gate_payload(
     if gated is not None:
         return gated
     return allocate_auto_review_scope(context, ledger, dry_run=False)
+
+
+def precheck_session_scope_for_dirty_route(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+) -> SessionScopePrecheck:
+    """Run the transcript-aware part of the session gate before whole-repo
+    dirty-route shortcuts. This keeps background dirty files from deciding
+    route type for a read-only chat session."""
+    if not event_session_scope_paths(event):
+        return SessionScopePrecheck()
+
+    if _tracker_disabled():
+        payload = legacy_session_scope_gate_payload(event, repo, ledger)
+        return SessionScopePrecheck(checked=True, skip_payload=payload)
+
+    try:
+        context = resolve_stop_context(event, repo, ledger)
+    except _StopContextError as exc:
+        return SessionScopePrecheck(checked=True, skip_payload=exc.skip_payload)
+
+    refresh_result = refresh_global_diff_tracker(context, ledger)
+    refresh_error = refresh_result.get("error") if isinstance(refresh_result, dict) else None
+    if refresh_error:
+        return SessionScopePrecheck(
+            checked=True,
+            skip_payload=skip_payload(
+                "session manifest failed; skipped RVF fork/review.",
+                ledger,
+                "session_manifest_failed",
+                repo=context.get("repo"),
+                session_id=context.get("session_id"),
+                error=refresh_error,
+            ),
+        )
+
+    gated = evaluate_session_gate(context, ledger)
+    if gated is not None:
+        return SessionScopePrecheck(checked=True, context=context, skip_payload=gated)
+
+    manifest = context.get("manifest")
+    route_paths = (
+        _string_list(manifest.get("owned_dirty_paths"))
+        if isinstance(manifest, dict)
+        else None
+    )
+    return SessionScopePrecheck(checked=True, context=context, route_paths=route_paths)
 
 
 def manual_rvf_session_marker_payload(
@@ -4824,9 +4910,26 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
-            doc_review = plan_doc_review_classification(
-                changed_paths_from_gate_output(cwd_result.output)
+            all_changed_paths = changed_paths_from_gate_output(cwd_result.output)
+            session_precheck = precheck_session_scope_for_dirty_route(
+                event,
+                cwd_result.repo,
+                ledger,
             )
+            if session_precheck.skip_payload is not None:
+                return payload_decision(
+                    session_precheck.skip_payload,
+                    reason_code="session_scope_skipped",
+                    repo=cwd_result.repo,
+                    cwd=cwd,
+                )
+
+            route_candidate_paths = (
+                session_precheck.route_paths
+                if session_precheck.route_paths is not None
+                else all_changed_paths
+            )
+            doc_review = plan_doc_review_classification(route_candidate_paths)
             if doc_review["should_route"]:
                 ledger.event(
                     phase="gate",
@@ -4857,7 +4960,16 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                         completion_gate="plan_document_only",
                     ),
                 )
-            session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
+            if session_precheck.context is not None:
+                session_scope_payload = allocate_auto_review_scope(
+                    session_precheck.context,
+                    ledger,
+                    dry_run=False,
+                )
+            elif session_precheck.checked:
+                session_scope_payload = None
+            else:
+                session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
             if session_scope_payload is not None:
                 return payload_decision(
                     session_scope_payload,

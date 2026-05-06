@@ -916,6 +916,7 @@ def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
     summary = summary_from_payload(payload)
     assert summary["reason_code"] == "no_unassigned_review_scope"
     assert summary.get("reason_code_legacy_alias") == "no_session_owned_dirty"
+    assert summary["session_change_type"] == "no_codebase_changes"
     assert "app_server_requests_path" not in summary
 
 
@@ -3644,6 +3645,41 @@ def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
     assert any(event.get("event") == "plan_doc_review_routed" for event in events)
 
 
+def test_read_only_session_with_background_plan_docs_does_not_plan_route(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "doc-plan-background", dirty=False)
+    state = tmp_path / "state"
+    plan = repo / "docs" / "codebase-slimdown-plan.md"
+    plan.parent.mkdir()
+    plan.write_text("# Plan\n\nBackground planning change.\n", encoding="utf-8")
+    transcript = tmp_path / "session.jsonl"
+    write_user_session(
+        transcript,
+        "read-only-session-with-background-plan-doc",
+        "只是问答和代码库探索，没有修改文件。",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": "read-only-session-with-background-plan-doc",
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=plan_document_only" not in payload["systemMessage"], payload["systemMessage"]
+    assert "reason=no_unassigned_review_scope" in payload["systemMessage"], payload["systemMessage"]
+    summary = latest_summary(state)
+    assert summary["reason_code"] == "no_unassigned_review_scope"
+    assert summary["session_change_type"] == "no_codebase_changes"
+    assert summary["session_owned_dirty_paths"] == []
+    events = latest_events(state)
+    assert not any(event.get("event") == "plan_doc_review_routed" for event in events)
+
+
 def test_plan_document_route_does_not_hide_source_rename(tmp_path: Path) -> None:
     repo = init_repo_with_head(tmp_path / "rename-to-plan")
     state = tmp_path / "state"
@@ -4428,6 +4464,7 @@ def main() -> int:
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
         test_plan_document_only_routes_out_of_full_rvf,
+        test_read_only_session_with_background_plan_docs_does_not_plan_route,
         test_plan_document_route_does_not_hide_source_rename,
         test_dirty_repo_dry_run_prepares_legacy_gui_requests,
         test_dirty_repo_manual_mode_only_prepares_prompt,
