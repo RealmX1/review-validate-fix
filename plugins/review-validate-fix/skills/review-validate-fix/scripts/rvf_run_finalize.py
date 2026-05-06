@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -104,6 +105,143 @@ def _scaffold_analysis(run_dir: Path) -> dict[str, Any]:
     }
 
 
+TOKEN_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _rollout_token_usage(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    with handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            total = info.get("total_token_usage") if isinstance(info, dict) else None
+            if not isinstance(total, dict):
+                continue
+            records.append(
+                {
+                    "timestamp": record.get("timestamp"),
+                    "total": {
+                        key: int(total.get(key) or 0)
+                        for key in TOKEN_USAGE_KEYS
+                    },
+                }
+            )
+    return records
+
+
+def _duration_seconds(start: Any, end: Any) -> float | None:
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0.0, round((end_dt - start_dt).total_seconds(), 3))
+
+
+def _usage_summary(run_dir: Path) -> dict[str, Any]:
+    pre_rollout = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
+    rvf_rollout = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre_records = _rollout_token_usage(pre_rollout)
+    rvf_records = _rollout_token_usage(rvf_rollout)
+    baseline = pre_records[-1]["total"] if pre_records else {key: 0 for key in TOKEN_USAGE_KEYS}
+    final = rvf_records[-1]["total"] if rvf_records else baseline
+    delta = {
+        key: max(0, int(final.get(key, 0)) - int(baseline.get(key, 0)))
+        for key in TOKEN_USAGE_KEYS
+    }
+    delta["noncached_input_tokens"] = max(
+        0,
+        delta["input_tokens"] - delta["cached_input_tokens"],
+    )
+    return {
+        "schema_version": 1,
+        "source": "artifacts/trajectory/rvf/rollout.codex.jsonl",
+        "baseline_source": (
+            "artifacts/trajectory/pre-rvf/rollout.codex.jsonl"
+            if pre_records
+            else None
+        ),
+        "started_at": rvf_records[0].get("timestamp") if rvf_records else None,
+        "ended_at": rvf_records[-1].get("timestamp") if rvf_records else None,
+        "wall_seconds": _duration_seconds(
+            rvf_records[0].get("timestamp") if rvf_records else None,
+            rvf_records[-1].get("timestamp") if rvf_records else None,
+        ),
+        "token_count_event_count": len(rvf_records),
+        "baseline_total_token_usage": baseline,
+        "final_total_token_usage": final,
+        **delta,
+    }
+
+
+def _write_usage_summary(run_dir: Path) -> dict[str, Any]:
+    summary = _usage_summary(run_dir)
+    path = run_dir / "artifacts" / "usage" / "usage-summary.json"
+    _atomic_write_json(path, summary)
+    return {"summary_path": str(path), **summary}
+
+
+def _release_tracker_lease(
+    run_dir: Path,
+    repo: Path | None,
+    *,
+    decision_kind: str,
+) -> dict[str, Any] | None:
+    if repo is None:
+        return None
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(contract, dict):
+        return None
+    lease_id = contract.get("tracker_lease_id")
+    if not isinstance(lease_id, str) or not lease_id:
+        return None
+
+    import diff_tracker  # noqa: WPS433
+
+    log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
+    log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
+    release_reason = "failed" if decision_kind in {"cancelled", "cancel", "interrupted"} else "completed"
+    result = diff_tracker.lease_release(
+        repo=repo,
+        lease_id=lease_id,
+        reason=release_reason,
+        log_root_override=log_root_override,
+    )
+    return {
+        "scope_contract_path": str(contract_path),
+        "lease_id": lease_id,
+        "release_reason": release_reason,
+        **result,
+    }
+
+
 def finalize_run(
     *,
     run_dir: Path,
@@ -135,7 +273,9 @@ def finalize_run(
         "run_dir": str(run_dir),
         "repo": str(repo) if repo else None,
         "trajectory": None,
+        "usage": None,
         "workspace_diff": None,
+        "tracker_lease_release": None,
         "analysis": None,
         "errors": [],
     }
@@ -155,6 +295,17 @@ def finalize_run(
         finalize_record["errors"].append(
             {
                 "stage": "trajectory_capture",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
+
+    try:
+        finalize_record["usage"] = _write_usage_summary(run_dir)
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "usage_summary",
                 "error": f"{type(exc).__name__}: {exc}",
                 "trace": traceback.format_exc(),
             }
@@ -193,6 +344,21 @@ def finalize_run(
                 "missing_before_snapshot" if not before_path.exists() else "missing_repo"
             ),
         }
+
+    try:
+        finalize_record["tracker_lease_release"] = _release_tracker_lease(
+            run_dir,
+            repo,
+            decision_kind=decision_kind,
+        )
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "tracker_lease_release",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
 
     finalize_record["completed_at"] = _utc_now()
 

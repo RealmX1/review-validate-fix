@@ -78,9 +78,41 @@ def _write_transcript(path: Path, marker: str, *, originator: str | None = "Code
     records = [
         {"timestamp": "t0", "type": "session_meta", "payload": session_meta_payload},
         {
-            "timestamp": "t1",
+            "timestamp": "2026-05-05T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 60,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 1,
+                        "total_tokens": 110,
+                    }
+                },
+            },
+        },
+        {
+            "timestamp": "2026-05-05T00:00:01Z",
             "type": "event_msg",
             "payload": {"type": "user_message", "message": f"go {marker}"},
+        },
+        {
+            "timestamp": "2026-05-05T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 250,
+                        "cached_input_tokens": 160,
+                        "output_tokens": 30,
+                        "reasoning_output_tokens": 3,
+                        "total_tokens": 280,
+                    }
+                },
+            },
         },
     ]
     with path.open("w", encoding="utf-8") as handle:
@@ -104,6 +136,11 @@ def test_finalize_run_writes_trajectory_and_diff_and_is_idempotent(tmp_path: Pat
     assert record1["trajectory"]["host"] == "codex"
     assert record1["trajectory"]["host_originator"] == "Codex Desktop"
     assert record1["workspace_diff"]["status"] == "complete"
+    assert record1["usage"]["input_tokens"] == 150
+    assert record1["usage"]["cached_input_tokens"] == 100
+    assert record1["usage"]["output_tokens"] == 20
+    assert record1["usage"]["noncached_input_tokens"] == 50
+    assert (run_dir / "artifacts" / "usage" / "usage-summary.json").is_file()
     assert record1["analysis"]["summary_md_path"].endswith(
         "/artifacts/analysis/summary.md"
     )
@@ -143,6 +180,60 @@ def test_finalize_for_handoff_resolves_run_dir_from_handoff_path(tmp_path: Path)
     assert record is not None
     assert record["run_dir"] == str(run_dir)
     assert record["decision_kind"] == "handoff-advisory"
+
+
+def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path, monkeypatch) -> None:
+    finalize = _load("rvf_run_finalize")
+    diff_tracker = _load("diff_tracker")
+    capture = _load("trajectory_capture")
+    repo = _init_repo(tmp_path / "repo")
+    transcript = tmp_path / "rollout.jsonl"
+    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    run_dir = _make_run(tmp_path, repo, transcript)
+    log_root = tmp_path / "state"
+    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
+
+    (repo / "README.md").write_text("hello changed for tracker\n", encoding="utf-8")
+    allocated = diff_tracker.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="rvf-test-run",
+        reviewer_id="allocator",
+        log_root_override=log_root,
+    )
+    assert allocated["status"] == "allocated"
+
+    inputs = run_dir / "artifacts" / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    (inputs / "scope.contract.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "run_id": "rvf-test-run",
+                "repo": str(repo),
+                "primary_units": allocated["scope"]["unit_ids"],
+                "tracker_lease_id": allocated["lease_id"],
+                "tracker_scope_hash": allocated["scope_hash"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = finalize.finalize_run(
+        run_dir=run_dir,
+        event={"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)},
+        decision_kind="test",
+    )
+
+    assert record["tracker_lease_release"]["released"] is True
+    assert record["tracker_lease_release"]["lease_id"] == allocated["lease_id"]
+    second = diff_tracker.lease_release(
+        repo=repo,
+        lease_id=allocated["lease_id"],
+        log_root_override=log_root,
+    )
+    assert second["released"] is False
+    assert second["reason"] == "lease_not_found"
 
 
 def test_finalize_for_handoff_returns_none_when_run_dir_missing(

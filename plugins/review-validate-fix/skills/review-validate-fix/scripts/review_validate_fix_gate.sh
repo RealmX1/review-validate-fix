@@ -13,12 +13,12 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
   exit 2
 fi
 
-status="$(git status --porcelain 2>/dev/null || true)"
+status="$(git status --porcelain -uall 2>/dev/null || true)"
 if [ -z "$status" ]; then
   printf 'CLEAN %s\n' "$(git rev-parse --show-toplevel)"
   exit 0
 fi
 
 printf 'DIRTY %s\n' "$(git rev-parse --show-toplevel)"
-git status --short
+git status --short -uall
 exit 1
