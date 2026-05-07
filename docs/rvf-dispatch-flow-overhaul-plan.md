@@ -12,7 +12,7 @@
 |---|---|---|---|---|---|---|
 | 1 | kanban main session | stop hook → kanban hook 自接 | **同 session 自我注入 prompt** | 同 session（self-rising） | 同 worktree | 程序化（kanban CLI inject prompt） |
 | 2 | non-kanban main session | stop hook | new kanban task **brand-new session** | 不继承 context | 新 worktree（kanban 自动 copy uncommitted） | **prompt 驱动**（agent 自己读自然语言 setup） |
-| 3 | non-kanban main session | stop hook（kanban 不可用 fallback） | non-kanban codex GUI fork | **继承 context** | **同 worktree（共享 tree）** | prompt 驱动 |
+| 3 | non-kanban main session | stop hook（kanban 不可用 fallback） | **诊断态 systemMessage**；显式 `CODEX_RVF_FORK_MODE=gui` 或 `CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK=1` 才走 legacy GUI fork | 默认不新建 session | 默认不共享 tree | 程序化报告 |
 | 4 | 任意 main session | 手动 `/review-validate-fix` | 同 session | 同 session | 同 worktree | skill 内置 setup |
 
 ## 痛点
@@ -161,13 +161,15 @@ flowchart LR
 
 ## Slice 切分
 
+本轮实现进度和 before/after 记录见 `docs/rvf-dispatch-flow-overhaul-phase-report.md`。
+
 | Slice | 内容 | 依赖 |
 |---|---|---|
 | **A** | cline-kanban 后端：parent_session_id / worktree_mode / arbitrary base-ref / codex fork 启动 | 无 |
 | **B** | cline-kanban UI：base-ref dropdown 增强（last-update + git graph preview） | A 已落地（可推迟） |
-| **C** | RVF plugin Stop hook 拆分 + flow_dispatcher + flow 3 fallback systemMessage | A 字段就位（仅消费侧）|
-| **D** | RVF plugin UserPromptSubmit hook + prep_file 机制 + token-based dispatch | C 已落地 |
-| **E** | Flow 2 worktree env setup（搬运未 commit work + pause-main 系统消息）| C, D 已落地 |
+| **C** | RVF plugin Stop hook 拆分 + flow_dispatcher + flow 3 fallback systemMessage | A 字段就位（仅消费侧）；**Flow 3 默认诊断态已落地，legacy GUI fallback 需显式 opt-in** |
+| **D** | RVF plugin UserPromptSubmit hook + prep_file 机制 + token-based dispatch | C 已落地；prep file / token detector / installer 注册 / fork prompt metadata 已落地 |
+| **E** | Flow 2 worktree env setup（搬运未 commit work + pause-main 系统消息）| C, D 已落地；worktree bootstrap 已搬运 session-owned dirty work，prep file 已回填真实 `workspace_path`，父会话 systemMessage 已提示暂停 origin 编辑 |
 | **F** | Sweep prep file TTL + collision handling 收尾 | D 已落地 |
 | **Future** | Inter-agent communication（同 base-ref 多 agent）；UI git graph preview 高级化；auto-fork-to-PR 模式 | 不在本 plan 范围 |
 

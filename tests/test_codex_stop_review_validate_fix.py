@@ -2221,7 +2221,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         "if action == 'ensure':\n"
         "    print(json.dumps({'ok': True, 'started': False}))\n"
         "elif action == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-123', 'workspace_path': '/tmp/task-worktree'}))\n"
+        "    print(json.dumps({'task_id': 'task-123', 'workspacePath': '/tmp/task-worktree'}))\n"
         "elif action == 'start':\n"
         "    print(json.dumps({'task_id': 'task-123', 'status': 'started'}))\n"
         "else:\n"
@@ -2274,8 +2274,11 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
                 os.environ[key] = value
 
     assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    assert "pause_origin_edits=true" in payload["systemMessage"]
+    assert "workspace=/tmp/task-worktree" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-started"
+    assert "请暂停在 origin worktree 继续编辑" in latest["message"]
     assert latest["rvf_backend"] == "kanban-task"
     assert latest["rvf_backend_raw"] == "cline-kanban"
     assert latest["rvf_state_phase"] == "prepare"
@@ -2291,6 +2294,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         "complete",
     ]
     assert latest["cline_kanban_task_id"] == "task-123"
+    assert latest["workspace_path"] == "/tmp/task-worktree"
     assert "app_server_requests_path" not in latest
     assert Path(latest["startup_prepare_metadata_path"]).exists()
     assert Path(latest["worktree_bootstrap_path"]).exists()
@@ -2353,7 +2357,10 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert prep["origin_session_id"] == "parent-thread"
     assert Path(str(prep["origin_repo"])).resolve() == repo.resolve()
     assert prep["target_flow"] == "flow-2-branch"
-    assert Path(str(prep["target_worktree"])).resolve() == repo.resolve()
+    assert prep["target_worktree"] == "/tmp/task-worktree"
+    assert prep["target_kanban_task_id"] == "task-123"
+    assert latest["rvf_dispatch_target_worktree"] == "/tmp/task-worktree"
+    assert latest["rvf_dispatch_target_kanban_task_id"] == "task-123"
     assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "RVF_PARENT_CONVERSATION_REF: Codex parent-thread" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME: Codex parent-thread" in prompt_text
@@ -2369,6 +2376,71 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert suppression_marker["task_id"] == "task-123"
     assert suppression_marker["suppress_stop_hook"] is True
     assert suppression_marker["run_id"] == latest["run_id"]
+
+
+def test_cline_kanban_mode_requires_workspace_path(tmp_path: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import json, sys\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        "    print(json.dumps({'task_id': 'task-no-workspace'}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-no-workspace', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+    original_env = {
+        key: os.environ.get(key)
+        for key in (
+            "CODEX_RVF_STATE_DIR",
+            "CODEX_RVF_FORK_MODE",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+        )
+    }
+    original_lookup = module.parent_thread_name_from_app_server
+    try:
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            parent_thread_path=transcript,
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-unavailable"
+    assert "workspace_path/workspacePath" in latest["error"]
+    assert "workspace_path" not in latest
+    assert latest["rvf_dispatch_target_worktree"] is None
+    prep = dispatch_prep_payload(latest)
+    assert prep["target_worktree"] is None
 
 
 def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
@@ -2425,7 +2497,7 @@ def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
     assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
 
 
-def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
+def test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback(tmp_path: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
@@ -2441,11 +2513,85 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
     original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
     original_client = os.environ.get("CODEX_RVF_CLINE_KANBAN_CLIENT")
     original_task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD")
+    original_legacy = os.environ.get("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK")
+    original_lookup = module.parent_thread_name_from_app_server
+    original_gui = module.run_app_server_fork
+    gui_calls: list[dict[str, object]] = []
+    try:
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "auto"
+        os.environ.pop("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK", None)
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        module.run_app_server_fork = lambda **kwargs: gui_calls.append(kwargs) or {
+            "status": "app-server-started",
+            "fork_thread_id": "unexpected-gui-fork",
+        }
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            model=None,
+            reasoning_effort=None,
+            parent_thread_path=transcript,
+            launch_mode="cline-kanban",
+            extra_summary={"backend_selection_mode": "auto", "backend": "kanban"},
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        module.run_app_server_fork = original_gui
+        for key, value in {
+            "CODEX_RVF_STATE_DIR": original_state,
+            "CODEX_RVF_FORK_MODE": original_mode,
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": original_client,
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": original_task_cmd,
+            "CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK": original_legacy,
+        }.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
+    assert gui_calls == []
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-unavailable"
+    assert latest["mode"] == "cline-kanban"
+    assert latest["backend"] == "kanban"
+    assert latest["legacy_gui_fallback_enabled"] is False
+    assert "legacy_gui_fallback" not in latest
+
+
+def test_auto_mode_can_opt_into_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import sys\n"
+        "raise SystemExit('kanban unavailable for fallback test')\n",
+        encoding="utf-8",
+    )
+
+    original_state = os.environ.get("CODEX_RVF_STATE_DIR")
+    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    original_client = os.environ.get("CODEX_RVF_CLINE_KANBAN_CLIENT")
+    original_task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD")
+    original_legacy = os.environ.get("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK")
     original_lookup = module.parent_thread_name_from_app_server
     original_gui = module.run_app_server_fork
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_FORK_MODE"] = "auto"
+        os.environ["CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK"] = "1"
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         module.parent_thread_name_from_app_server = lambda *_: {
@@ -2485,6 +2631,7 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
             "CODEX_RVF_FORK_MODE": original_mode,
             "CODEX_RVF_CLINE_KANBAN_CLIENT": original_client,
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": original_task_cmd,
+            "CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK": original_legacy,
         }.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -2496,6 +2643,7 @@ def test_auto_mode_uses_legacy_gui_as_backup_of_backup(tmp_path: Path) -> None:
     assert latest["status"] == "app-server-started"
     assert latest["mode"] == "legacy-gui"
     assert latest["effective_backend"] == "legacy-gui"
+    assert latest["legacy_gui_fallback_enabled"] is True
     assert latest["backend"] == "kanban"
     assert latest["legacy_gui_fallback"]["started"] is True
     assert latest["legacy_gui_fallback"]["primary_backend"] == "cline-kanban"
@@ -5106,8 +5254,10 @@ def main() -> int:
         test_restart_bridge_stops_existing_listener_before_relaunch,
         test_bridge_app_server_error_restarts_bridge_once,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
+        test_cline_kanban_mode_requires_workspace_path,
         test_auto_mode_creates_cline_kanban_task_by_default,
-        test_auto_mode_uses_legacy_gui_as_backup_of_backup,
+        test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback,
+        test_auto_mode_can_opt_into_legacy_gui_as_backup_of_backup,
         test_auto_mode_reports_stale_kanban_listener_without_gui_fallback,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,

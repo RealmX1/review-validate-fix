@@ -1182,11 +1182,17 @@ def dispatch_prep_summary_fields(
     *,
     target_flow: str,
 ) -> dict[str, Any]:
+    target_worktree = record.payload.get("target_worktree")
+    target_kanban_task_id = record.payload.get("target_kanban_task_id")
     return {
         "rvf_dispatch_token": record.token,
         "rvf_dispatch_prep_file_path": str(record.path),
         "rvf_dispatch_prep_status": "written",
         "rvf_dispatch_target_flow": target_flow,
+        "rvf_dispatch_target_worktree": target_worktree if isinstance(target_worktree, str) else None,
+        "rvf_dispatch_target_kanban_task_id": (
+            target_kanban_task_id if isinstance(target_kanban_task_id, str) else None
+        ),
     }
 
 
@@ -1280,6 +1286,58 @@ def write_dispatch_prep_file(
         target_kanban_task_id=target_kanban_task_id,
     )
     return record
+
+
+def update_dispatch_prep_file(
+    *,
+    ledger: RunLedger,
+    record: rvf_prep_file.PrepFileRecord,
+    target_flow: str,
+    target_worktree: str | None = None,
+    target_kanban_task_id: str | None = None,
+    target_session_id: str | None = None,
+) -> rvf_prep_file.PrepFileRecord:
+    updates = {
+        key: value
+        for key, value in {
+            "target_worktree": target_worktree,
+            "target_kanban_task_id": target_kanban_task_id,
+            "target_session_id": target_session_id,
+        }.items()
+        if value is not None
+    }
+    if not updates:
+        return record
+    updated = rvf_prep_file.update_prep_file(record, updates)
+    ledger.artifact(
+        "dispatch-prep-file.json",
+        {
+            "token": updated.token,
+            "prep_file_path": str(updated.path),
+            "target_flow": target_flow,
+            "payload": updated.payload,
+        },
+    )
+    ledger.event(
+        phase="prepare",
+        event="dispatch_prep_file_updated",
+        status="completed",
+        reason_code="dispatch_prep_file_updated",
+        paths={"prep_file": str(updated.path)},
+        target_flow=target_flow,
+        target_worktree=target_worktree,
+        target_kanban_task_id=target_kanban_task_id,
+    )
+    return updated
+
+
+def cline_kanban_workspace_path(*payloads: dict[str, Any]) -> str | None:
+    for payload in payloads:
+        for key in ("workspace_path", "workspacePath"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
 
 
 def kanban_followup_review_validate_fix_prompt(
@@ -2111,6 +2169,11 @@ def start_cline_kanban_task(
         },
     )
     metadata = startup_prepare.get("metadata") if isinstance(startup_prepare.get("metadata"), dict) else {}
+    workspace_path = cline_kanban_workspace_path(create_payload, start_payload)
+    if workspace_path is None:
+        raise RuntimeError(
+            "Cline Kanban task create/start response did not include workspace_path/workspacePath"
+        )
     return {
         "cline_kanban_task_id": task_id,
         "cline_kanban_base_ref": base_ref,
@@ -2125,7 +2188,7 @@ def start_cline_kanban_task(
         "cline_kanban_agent_id": agent_id,
         "cline_kanban_auto_review_enabled": auto_review_enabled,
         "cline_kanban_auto_review_mode": auto_review_mode if auto_review_enabled else None,
-        "workspace_path": cwd,
+        "workspace_path": workspace_path,
         "startup_prepare_metadata_path": startup_prepare.get("metadata_path"),
         "worktree_bootstrap_path": metadata.get("worktree_bootstrap"),
         "worktree_bootstrap_patch_path": metadata.get("worktree_bootstrap_patch"),
@@ -2510,7 +2573,7 @@ def run_codex_fork(
         origin_repo=origin_repo or cwd,
         origin_cwd=cwd,
         target_flow=target_flow,
-        target_worktree=cwd,
+        target_worktree=None if target_flow == "flow-2-branch" else cwd,
         origin_metadata_path=origin_path,
         parent_thread_path=parent_thread_path,
     )
@@ -2571,6 +2634,7 @@ def run_codex_fork(
         result["app_server_requests_path"] = request_path
     elif mode in {"cline-kanban", "cline", "kanban", "ck"}:
         result["mode"] = "cline-kanban"
+        result["legacy_gui_fallback_enabled"] = legacy_gui_fallback_enabled()
         if parent_thread_path is None:
             result.update(
                 {
@@ -2609,12 +2673,28 @@ def run_codex_fork(
                     model=model,
                     reasoning_effort=reasoning_effort,
                 )
+                dispatch_prep = update_dispatch_prep_file(
+                    ledger=ledger,
+                    record=dispatch_prep,
+                    target_flow=target_flow,
+                    target_worktree=(
+                        str(task_payload.get("workspace_path"))
+                        if isinstance(task_payload.get("workspace_path"), str)
+                        else None
+                    ),
+                    target_kanban_task_id=(
+                        str(task_payload.get("cline_kanban_task_id"))
+                        if isinstance(task_payload.get("cline_kanban_task_id"), str)
+                        else None
+                    ),
+                )
                 result.update(
                     {
                         "status": "cline-kanban-started",
                         "task_title": task_title,
                         "cline_kanban_task_title": task_title,
                         **task_payload,
+                        **dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow),
                     }
                 )
             except Exception as exc:
@@ -2627,7 +2707,7 @@ def run_codex_fork(
         if dispatch_flow.should_attempt_legacy_gui_fallback(
             primary_result=result,
             backend_selection_mode=(extra_summary or {}).get("backend_selection_mode"),
-            fallback_enabled=legacy_gui_fallback_enabled(),
+            fallback_enabled=bool(result.get("legacy_gui_fallback_enabled")),
         ):
             cline_failure = {
                 "status": result.get("status"),
@@ -2806,22 +2886,38 @@ def run_codex_fork(
         )
 
     if status == "manual-prepared":
+        detail = None
         message = (
             "manual fork prompt prepared; no Terminal was launched and no "
             "current-chat continuation was submitted."
         )
     elif status == "app-server-started":
+        detail = None
         message = "Codex GUI/app-server fork was started."
     elif status == "cline-kanban-started":
-        message = "Cline Kanban RVF task was created and started."
+        workspace = result.get("workspace_path")
+        workspace_line = f" workspace={workspace}." if isinstance(workspace, str) and workspace else ""
+        detail = (
+            "pause_origin_edits=true"
+            + (f",workspace={workspace}" if isinstance(workspace, str) and workspace else "")
+        )
+        message = (
+            "Cline Kanban RVF task was created and started."
+            f"{workspace_line} Flow 2 branch mode 已使用独立 task worktree；"
+            "请暂停在 origin worktree 继续编辑，等 RVF_HANDOFF_FILE 返回后再合并。"
+        )
     elif status == "cline-kanban-unconfigured":
+        detail = None
         message = str(result.get("error") or "Cline Kanban RVF mode is not configured.")
     elif status == "cline-kanban-unavailable":
+        detail = None
         message = str(result.get("error") or "Cline Kanban is unavailable; task was not started.")
     elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
+        detail = None
         report_reason = result.get("report_reason")
         message = report_reason if isinstance(report_reason, str) else "Codex GUI fork unavailable."
     else:
+        detail = None
         message = f"{log_prefix} triggered: {status}."
 
     summary_fields = dict(result)
@@ -2850,6 +2946,7 @@ def run_codex_fork(
         status=str(status),
         reason_code=reason_code,
         message=message,
+        detail=detail,
         **summary_fields,
     )
 
@@ -3996,7 +4093,7 @@ def fork_mode_selection_from_env(mode_env_name: str = "CODEX_RVF_FORK_MODE") -> 
 
 
 def legacy_gui_fallback_enabled() -> bool:
-    return not is_falsey(os.environ.get("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK", "1"))
+    return not is_falsey(os.environ.get("CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK", "0"))
 
 
 def cline_kanban_failure_allows_legacy_gui_fallback(result: dict[str, Any]) -> bool:

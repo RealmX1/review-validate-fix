@@ -73,6 +73,8 @@ PRESERVED_SUMMARY_KEYS = {
     "rvf_dispatch_prep_file_path",
     "rvf_dispatch_prep_status",
     "rvf_dispatch_target_flow",
+    "rvf_dispatch_target_worktree",
+    "rvf_dispatch_target_kanban_task_id",
 }
 RVF_STATE_PHASES = (
     "prepare",

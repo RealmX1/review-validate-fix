@@ -165,6 +165,33 @@ def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
     assert valid.status == "valid"
     assert valid.payload["origin_session_id"] == "session-a"
 
+    updated = prep.update_prep_file(
+        written,
+        {
+            "target_worktree": str(tmp_path / "task-worktree"),
+            "target_kanban_task_id": "task-123",
+        },
+    )
+    assert updated.path == written.path
+    assert updated.payload["created_at"] == "2026-05-07T00:00:00Z"
+    assert updated.payload["expires_at"] == "2026-05-07T00:05:00Z"
+    assert updated.payload["target_worktree"] == str(tmp_path / "task-worktree")
+    valid_updated = prep.read_prep_file(
+        "0123456789abcdef",
+        root=root,
+        now=prep.parse_timestamp("2026-05-07T00:01:00Z"),
+    )
+    assert valid_updated.status == "valid"
+    assert valid_updated.payload["target_kanban_task_id"] == "task-123"
+
+    for protected_key in ("created_at", "expires_at", "token", "schema_version"):
+        try:
+            prep.update_prep_file(updated, {protected_key: "bad"})
+        except prep.PrepFileError as exc:
+            assert protected_key in str(exc)
+        else:
+            raise AssertionError(f"expected PrepFileError for protected field {protected_key}")
+
     expired = prep.read_prep_file(
         "0123456789abcdef",
         root=root,

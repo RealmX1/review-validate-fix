@@ -15,6 +15,7 @@ SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 300
 TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
 ENV_PREP_ROOT = "CODEX_RVF_PREP_ROOT"
+PROTECTED_UPDATE_FIELDS = frozenset({"schema_version", "token", "created_at", "expires_at"})
 
 
 class PrepFileError(ValueError):
@@ -130,6 +131,27 @@ def write_prep_file(
     path = prep_file_path(normalized_token, root)
     _atomic_write_json(path, normalized_payload)
     return PrepFileRecord(token=normalized_token, path=path, payload=normalized_payload)
+
+
+def update_prep_file(
+    record: PrepFileRecord,
+    updates: dict[str, Any],
+) -> PrepFileRecord:
+    if not isinstance(updates, dict):
+        raise PrepFileError("prep file updates must be a JSON object")
+    protected = sorted(PROTECTED_UPDATE_FIELDS.intersection(updates))
+    if protected:
+        raise PrepFileError(f"prep file updates cannot override protected fields: {', '.join(protected)}")
+    payload = dict(record.payload)
+    payload.update(updates)
+    payload["schema_version"] = SCHEMA_VERSION
+    payload["token"] = validate_token(record.token)
+    if not isinstance(payload.get("created_at"), str):
+        raise PrepFileError("existing prep payload is missing created_at")
+    if not isinstance(payload.get("expires_at"), str):
+        raise PrepFileError("existing prep payload is missing expires_at")
+    _atomic_write_json(record.path, payload)
+    return PrepFileRecord(token=record.token, path=record.path, payload=payload)
 
 
 def _invalid(token: str, path: Path, status: str, error: str | None = None) -> PrepFileLookup:
