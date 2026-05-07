@@ -38,6 +38,14 @@ from cline_kanban_client import (
     DEFAULT_TASK_CMD as DEFAULT_CLINE_KANBAN_TASK_CMD,
     DEFAULT_TMUX_SESSION as DEFAULT_CLINE_KANBAN_TMUX_SESSION,
 )
+from session_label import (
+    DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS,
+    first_user_message,
+    parent_conversation_fallback_chars,
+    single_line_excerpt,
+    strip_codex_user_message_preamble,
+    text_from_message_payload,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -59,7 +67,6 @@ DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
 DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
 DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "auto"
-DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS = 60
 FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
@@ -363,49 +370,6 @@ def first_readable_session_path(event: dict[str, Any]) -> Path | None:
     return None
 
 
-def text_from_message_payload(payload: dict[str, Any]) -> str:
-    content = payload.get("content")
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        text = item.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n".join(parts)
-
-
-def strip_codex_user_message_preamble(text: str) -> str:
-    remaining = text.lstrip()
-    while remaining:
-        changed = False
-        if remaining.startswith("# AGENTS.md instructions for "):
-            match = re.search(r"</INSTRUCTIONS>\s*", remaining, flags=re.DOTALL)
-            if not match:
-                return ""
-            remaining = remaining[match.end() :].lstrip()
-            changed = True
-
-        for tag in ("environment_context",):
-            open_tag = f"<{tag}>"
-            close_tag = f"</{tag}>"
-            if remaining.startswith(open_tag):
-                close_index = remaining.find(close_tag)
-                if close_index == -1:
-                    return ""
-                remaining = remaining[close_index + len(close_tag) :].lstrip()
-                changed = True
-
-        if not changed:
-            break
-    return remaining.strip()
-
-
 def latest_user_message(path: Path) -> str | None:
     latest: str | None = None
     try:
@@ -434,38 +398,6 @@ def latest_user_message(path: Path) -> str | None:
     except OSError:
         return None
     return latest
-
-
-def first_user_message(path: Path) -> str | None:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    if isinstance(message, str) and message.strip():
-                        cleaned = strip_codex_user_message_preamble(message)
-                        if cleaned:
-                            return cleaned
-                    continue
-
-                if record.get("type") == "response_item":
-                    if payload.get("type") == "message" and payload.get("role") == "user":
-                        text = text_from_message_payload(payload)
-                        cleaned = strip_codex_user_message_preamble(text)
-                        if cleaned:
-                            return cleaned
-    except OSError:
-        return None
-    return None
 
 
 def user_messages_containing(path: Path, marker: str) -> list[str]:
@@ -613,21 +545,6 @@ def transcript_origin_label(path: Path | None, session_id: str | None) -> str | 
     if session_id:
         return short_identifier(session_id)
     return path.name
-
-
-def parent_conversation_fallback_chars() -> int:
-    raw = os.environ.get("CODEX_RVF_PARENT_CONVERSATION_FALLBACK_CHARS")
-    if raw is None or not raw.strip():
-        return DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS
-    try:
-        return max(12, int(raw))
-    except ValueError:
-        return DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS
-
-
-def single_line_excerpt(text: str, max_chars: int) -> str:
-    collapsed = re.sub(r"\s+", " ", text).strip()
-    return collapsed.replace('"', "'")[:max_chars].strip()
 
 
 def quoted_prompt_session_name(path: Path | None) -> str | None:
