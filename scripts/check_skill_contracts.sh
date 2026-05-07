@@ -373,10 +373,6 @@ forbid_repo_literal() {
 
 required_files=(
   "SKILL.md"
-  "references/legacy-claude-command.md"
-  "references/legacy-claude-stop-hook.md"
-  "references/legacy-claude-mark-activity.sh"
-  "references/legacy-compatibility-notes.md"
   "references/review-merge-policy.md"
   "references/review-prompt.md"
   "references/review-standards/index.md"
@@ -551,7 +547,6 @@ require_literal "references/validate-then-fix-prompt.md" '必须启动至少一�
 require_literal "references/validate-then-fix-prompt.md" '不得因为问题看起来简单'
 require_literal "references/validate-then-fix-prompt.md" '“为了省时间”或“问题很小”不是例外'
 require_literal "references/handoff-template.md" '本地执行：<原因>'
-require_literal "references/legacy-compatibility-notes.md" 'Stop hook 触发点是会话内部自动事件'
 require_literal "SKILL.md" 'santa-method double review'
 require_literal "SKILL.md" 'config/alternative-reviewer.json'
 require_literal "SKILL.md" 'scripts/run_alternative_reviewer.py --check'
@@ -780,9 +775,6 @@ require_repo_literal "tests/test_review_support_scripts.py" 'test_cline_kanban_c
 require_repo_literal "tests/test_review_support_scripts.py" 'test_prepare_review_run_writes_worktree_bootstrap'
 require_repo_literal "tests/test_review_support_scripts.py" 'test_apply_worktree_bootstrap_replays_tracked_and_untracked'
 require_literal "SKILL.md" 'CODEX_RVF_FORK_REASONING_EFFORT'
-require_literal "references/legacy-compatibility-notes.md" 'Codex Stop fork'
-require_literal "references/legacy-compatibility-notes.md" 'Codex Stop continuation 不再作为 fallback'
-require_literal "references/legacy-compatibility-notes.md" '不再使用 `decision: "block"`'
 require_literal "scripts/codex_stop_review_validate_fix.py" '$review-validate-fix'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'stop_hook_active'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'systemMessage'
