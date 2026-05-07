@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-ANALYSIS_SCHEMA_VERSION = 1
+ANALYSIS_SCHEMA_VERSION = 2
 ANALYSIS_DIR_NAME = "analysis"
 
 
@@ -116,6 +117,20 @@ def _safe_load_json(path: Path | None) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+def _repo_from_summary(summary_path: Path | None) -> Path | None:
+    payload = _safe_load_json(summary_path)
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("repo")
+    if not isinstance(value, str) or not value:
+        finalize = payload.get("finalize")
+        if isinstance(finalize, dict):
+            value = finalize.get("repo")
+    if not isinstance(value, str) or not value:
+        return None
+    return Path(value).expanduser().resolve()
 
 
 def _rel_or_abs(path: Path | None, run_dir: Path) -> str:
@@ -701,11 +716,38 @@ def scaffold_causality_json(
     out_path: Path,
 ) -> Path:
     """写出 causality.json scaffold。两份列表都允许为空，缺源不会 raise。"""
+    diagnostics: list[str] = []
+    ledger: dict[str, Any] | None = None
+    repo = _repo_from_summary(inputs.summary_json)
+    if repo is not None and stats.run_id:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import diff_tracker  # noqa: WPS433
+
+            ledger = diff_tracker.rvf_causality_for_run(repo=repo, run_id=stats.run_id)
+            if ledger.get("status") != "found":
+                diagnostics.append("causality_ledger_missing")
+        except Exception as exc:  # noqa: BLE001 - scaffold must not fail analysis.
+            diagnostics.append(f"causality_ledger_read_failed: {type(exc).__name__}: {exc}")
+            ledger = None
+    else:
+        diagnostics.append("causality_ledger_unavailable: missing repo or run_id")
+
+    fallback_issues = _collect_issues(inputs)
+    ledger_issues = ledger.get("issues") if isinstance(ledger, dict) else None
+    issues = ledger_issues if isinstance(ledger_issues, list) and ledger_issues else fallback_issues
+    if issues is fallback_issues:
+        for issue in issues:
+            issue.setdefault("candidate_patch_call_ids", [])
+
     payload = {
         "schema_version": ANALYSIS_SCHEMA_VERSION,
         "run_id": stats.run_id,
         "generated_at": _utc_now(),
-        "issues": _collect_issues(inputs),
+        "diagnostics": diagnostics,
+        "issues": issues,
+        "fix_attempts": ledger.get("fix_attempts", []) if isinstance(ledger, dict) else [],
+        "patch_events": ledger.get("patch_events", []) if isinstance(ledger, dict) else [],
         "patches": _collect_patches(inputs),
     }
     _atomic_write_json(out_path, payload)

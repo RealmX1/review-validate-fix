@@ -103,6 +103,7 @@ def test_collect_snapshot_after_allocate_release(tmp_path: Path) -> None:
     snap = dashboard.collect_snapshot(repo, log_root_override=log_root, events_limit=20)
     assert snap["repo"]["db_exists"] is True
     assert snap["counters"]["units_total"] >= 1
+    assert snap["counters"]["tombstone_state"]["active"] >= 1
     assert snap["counters"]["leases_total"] >= 1
     assert snap["counters"]["sessions_total"] >= 1
     assert any(ev["event"] == "allocate_review_scope" for ev in snap["events"])

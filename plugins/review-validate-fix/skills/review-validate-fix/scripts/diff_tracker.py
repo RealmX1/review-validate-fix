@@ -28,7 +28,7 @@ from rvf_logging import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 SQLITE_FILENAME = "tracker.sqlite3"
 EVENTS_FILENAME = "events.jsonl"
 META_FILENAME = "meta.json"
@@ -828,7 +828,10 @@ CREATE TABLE IF NOT EXISTS units (
   first_observed_at    TEXT NOT NULL,
   last_observed_at     TEXT NOT NULL,
   observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
-  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed','tombstoned')),
+  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed')),
+  is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
+  tombstoned_at        TEXT,
+  tombstone_reason     TEXT,
   FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
   FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
 );
@@ -836,6 +839,7 @@ CREATE INDEX IF NOT EXISTS idx_units_branch       ON units(branch_key, observed_
 CREATE INDEX IF NOT EXISTS idx_units_worktree     ON units(worktree_key, observed_state);
 CREATE INDEX IF NOT EXISTS idx_units_path         ON units(path);
 CREATE INDEX IF NOT EXISTS idx_units_review_state ON units(review_state);
+CREATE INDEX IF NOT EXISTS idx_units_tombstone    ON units(is_tombstoned, review_state);
 CREATE INDEX IF NOT EXISTS idx_units_canonical    ON units(canonical_patch_hash);
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -929,6 +933,74 @@ CREATE TABLE IF NOT EXISTS tombstones (
   expires_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tombstones_expires ON tombstones(expires_at);
+
+CREATE TABLE IF NOT EXISTS rvf_issues (
+  issue_key     TEXT PRIMARY KEY,
+  repo_key      TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  issue_id      TEXT NOT NULL,
+  payload       TEXT NOT NULL,
+  source_refs   TEXT NOT NULL,
+  artifact_path TEXT,
+  state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE(run_id, issue_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_issues_run ON rvf_issues(run_id);
+
+CREATE TABLE IF NOT EXISTS rvf_fix_attempts (
+  attempt_id             TEXT PRIMARY KEY,
+  issue_key              TEXT NOT NULL,
+  repo_key               TEXT NOT NULL,
+  run_id                 TEXT NOT NULL,
+  issue_id               TEXT NOT NULL,
+  worktree_path          TEXT NOT NULL,
+  base_head              TEXT,
+  baseline_overlay_path  TEXT,
+  baseline_commit        TEXT,
+  fix_patch_path         TEXT,
+  status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+  result_payload         TEXT NOT NULL DEFAULT '{}',
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  started_at             TEXT,
+  stopped_at             TEXT,
+  applied_at             TEXT,
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_run ON rvf_fix_attempts(run_id);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_issue ON rvf_fix_attempts(issue_key);
+
+CREATE TABLE IF NOT EXISTS rvf_fix_patch_events (
+  patch_event_id TEXT PRIMARY KEY,
+  attempt_id     TEXT NOT NULL,
+  issue_key      TEXT NOT NULL,
+  repo_key       TEXT NOT NULL,
+  run_id         TEXT NOT NULL,
+  issue_id       TEXT NOT NULL,
+  path           TEXT NOT NULL,
+  op             TEXT NOT NULL,
+  call_id        TEXT,
+  trajectory_ref TEXT,
+  diff_ref       TEXT,
+  created_at     TEXT NOT NULL,
+  FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_attempt ON rvf_fix_patch_events(attempt_id);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_run ON rvf_fix_patch_events(run_id);
+
+CREATE TABLE IF NOT EXISTS rvf_issue_patch_links (
+  issue_key      TEXT NOT NULL,
+  attempt_id     TEXT NOT NULL,
+  patch_event_id TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY(issue_key, attempt_id, patch_event_id),
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE,
+  FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+  FOREIGN KEY(patch_event_id) REFERENCES rvf_fix_patch_events(patch_event_id) ON DELETE CASCADE
+);
 """
 
 
@@ -994,10 +1066,21 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         return
     if version == 2:
         _migrate_schema_v2_to_v3(conn)
+        _migrate_schema_v3_to_v4(conn)
+        _migrate_schema_v4_to_v5(conn)
+        return
+    if version == 3:
+        _migrate_schema_v3_to_v4(conn)
+        _migrate_schema_v4_to_v5(conn)
+        return
+    if version == 4:
+        _migrate_schema_v4_to_v5(conn)
         return
     if version == SCHEMA_VERSION:
+        _ensure_unit_tombstone_schema(conn)
         _ensure_manual_rvf_runs_schema(conn)
         _ensure_lease_participants_schema(conn)
+        _ensure_rvf_causality_schema(conn)
         return
     raise RuntimeError(f"unknown tracker schema version: {version}")
 
@@ -1043,9 +1126,205 @@ def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _ensure_unit_tombstone_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(units)").fetchall()}
+    if "is_tombstoned" not in columns:
+        conn.execute(
+            "ALTER TABLE units ADD COLUMN is_tombstoned INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1))"
+        )
+    if "tombstoned_at" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN tombstoned_at TEXT")
+    if "tombstone_reason" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN tombstone_reason TEXT")
+    if _rebuild_units_without_legacy_tombstoned_review_state(conn):
+        return
+    conn.execute(
+        """
+        UPDATE units
+           SET is_tombstoned=1,
+               tombstone_reason=COALESCE(tombstone_reason, 'legacy_review_state_tombstoned')
+         WHERE review_state='tombstoned'
+        """
+    )
+    conn.execute(
+        "UPDATE units SET review_state='reviewed' WHERE review_state='tombstoned'"
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_units_tombstone
+          ON units(is_tombstoned, review_state)
+        """
+    )
+
+
+def _rebuild_units_without_legacy_tombstoned_review_state(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='units'"
+    ).fetchone()
+    table_sql = row["sql"] if row else ""
+    if "'tombstoned'" not in table_sql:
+        return False
+
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE units_v5 (
+              unit_id              TEXT PRIMARY KEY,
+              branch_key           TEXT,
+              worktree_key         TEXT NOT NULL,
+              path                 TEXT NOT NULL,
+              old_path             TEXT,
+              kind                 TEXT NOT NULL CHECK (kind IN
+                                     ('tracked_hunk','untracked_file','deleted_file','binary_file','path_only')),
+              change_type          TEXT NOT NULL CHECK (change_type IN ('add','modify','delete')),
+              preimage_blob        TEXT,
+              postimage_hash       TEXT,
+              hunk_header          TEXT,
+              canonical_patch_hash TEXT NOT NULL,
+              first_observed_at    TEXT NOT NULL,
+              last_observed_at     TEXT NOT NULL,
+              observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
+              review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed')),
+              is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
+              tombstoned_at        TEXT,
+              tombstone_reason     TEXT,
+              FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
+              FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
+            );
+
+            INSERT INTO units_v5(
+                unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                first_observed_at, last_observed_at, observed_state, review_state,
+                is_tombstoned, tombstoned_at, tombstone_reason
+            )
+            SELECT
+                unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                first_observed_at, last_observed_at, observed_state,
+                CASE WHEN review_state='tombstoned' THEN 'reviewed' ELSE review_state END,
+                CASE WHEN review_state='tombstoned' THEN 1 ELSE COALESCE(is_tombstoned, 0) END,
+                tombstoned_at,
+                CASE
+                  WHEN review_state='tombstoned'
+                    THEN COALESCE(tombstone_reason, 'legacy_review_state_tombstoned')
+                  ELSE tombstone_reason
+                END
+              FROM units;
+
+            DROP TABLE units;
+            ALTER TABLE units_v5 RENAME TO units;
+            CREATE INDEX IF NOT EXISTS idx_units_branch       ON units(branch_key, observed_state);
+            CREATE INDEX IF NOT EXISTS idx_units_worktree     ON units(worktree_key, observed_state);
+            CREATE INDEX IF NOT EXISTS idx_units_path         ON units(path);
+            CREATE INDEX IF NOT EXISTS idx_units_review_state ON units(review_state);
+            CREATE INDEX IF NOT EXISTS idx_units_tombstone    ON units(is_tombstoned, review_state);
+            CREATE INDEX IF NOT EXISTS idx_units_canonical    ON units(canonical_patch_hash);
+            """
+        )
+    finally:
+        if foreign_keys:
+            conn.execute("PRAGMA foreign_keys = ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"tracker schema migration left foreign key violations: {violations!r}")
+    return True
+
+
 def _migrate_schema_v2_to_v3(conn: sqlite3.Connection) -> None:
     _ensure_manual_rvf_runs_schema(conn)
     _ensure_lease_participants_schema(conn)
+    conn.execute("PRAGMA user_version = 3")
+
+
+def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS rvf_issues (
+          issue_key     TEXT PRIMARY KEY,
+          repo_key      TEXT NOT NULL,
+          run_id        TEXT NOT NULL,
+          issue_id      TEXT NOT NULL,
+          payload       TEXT NOT NULL,
+          source_refs   TEXT NOT NULL,
+          artifact_path TEXT,
+          state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          UNIQUE(run_id, issue_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_issues_run ON rvf_issues(run_id);
+
+        CREATE TABLE IF NOT EXISTS rvf_fix_attempts (
+          attempt_id             TEXT PRIMARY KEY,
+          issue_key              TEXT NOT NULL,
+          repo_key               TEXT NOT NULL,
+          run_id                 TEXT NOT NULL,
+          issue_id               TEXT NOT NULL,
+          worktree_path          TEXT NOT NULL,
+          base_head              TEXT,
+          baseline_overlay_path  TEXT,
+          baseline_commit        TEXT,
+          fix_patch_path         TEXT,
+          status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+          result_payload         TEXT NOT NULL DEFAULT '{}',
+          created_at             TEXT NOT NULL,
+          updated_at             TEXT NOT NULL,
+          started_at             TEXT,
+          stopped_at             TEXT,
+          applied_at             TEXT,
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_run ON rvf_fix_attempts(run_id);
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_issue ON rvf_fix_attempts(issue_key);
+
+        CREATE TABLE IF NOT EXISTS rvf_fix_patch_events (
+          patch_event_id TEXT PRIMARY KEY,
+          attempt_id     TEXT NOT NULL,
+          issue_key      TEXT NOT NULL,
+          repo_key       TEXT NOT NULL,
+          run_id         TEXT NOT NULL,
+          issue_id       TEXT NOT NULL,
+          path           TEXT NOT NULL,
+          op             TEXT NOT NULL,
+          call_id        TEXT,
+          trajectory_ref TEXT,
+          diff_ref       TEXT,
+          created_at     TEXT NOT NULL,
+          FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_attempt ON rvf_fix_patch_events(attempt_id);
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_run ON rvf_fix_patch_events(run_id);
+
+        CREATE TABLE IF NOT EXISTS rvf_issue_patch_links (
+          issue_key      TEXT NOT NULL,
+          attempt_id     TEXT NOT NULL,
+          patch_event_id TEXT NOT NULL,
+          created_at     TEXT NOT NULL,
+          PRIMARY KEY(issue_key, attempt_id, patch_event_id),
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE,
+          FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+          FOREIGN KEY(patch_event_id) REFERENCES rvf_fix_patch_events(patch_event_id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    _ensure_rvf_causality_schema(conn)
+    conn.execute("PRAGMA user_version = 4")
+
+
+def _migrate_schema_v4_to_v5(conn: sqlite3.Connection) -> None:
+    _ensure_unit_tombstone_schema(conn)
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    _ensure_rvf_causality_schema(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -1192,7 +1471,10 @@ def _upsert_unit(
             postimage_hash=COALESCE(excluded.postimage_hash, units.postimage_hash),
             hunk_header=COALESCE(excluded.hunk_header, units.hunk_header),
             last_observed_at=excluded.last_observed_at,
-            observed_state='dirty'
+            observed_state='dirty',
+            is_tombstoned=0,
+            tombstoned_at=NULL,
+            tombstone_reason=NULL
         """,
         (
             spec.unit_id,
@@ -1209,6 +1491,25 @@ def _upsert_unit(
             now,
             now,
         ),
+    )
+
+
+def _mark_unit_tombstoned_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    unit_id: str,
+    reason: str,
+    now_iso: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE units
+           SET is_tombstoned=1,
+               tombstoned_at=?,
+               tombstone_reason=?
+         WHERE unit_id=?
+        """,
+        (now_iso, reason, unit_id),
     )
 
 
@@ -1706,6 +2007,12 @@ def register_claims(
                     "UPDATE units SET observed_state='superseded' WHERE unit_id=?",
                     (orphan_unit_id,),
                 )
+                _mark_unit_tombstoned_in_txn(
+                    conn,
+                    unit_id=orphan_unit_id,
+                    reason="session_no_longer_owns",
+                    now_iso=now,
+                )
                 conn.execute(
                     """
                     INSERT INTO tombstones(kind, ref_id, reason, payload, retired_at, expires_at)
@@ -2088,6 +2395,26 @@ def _lease_existing_assigned_units_in_txn(
         SELECT unit_id
           FROM units
          WHERE review_state='assigned'
+           AND is_tombstoned=0
+           AND unit_id IN ({placeholders})
+        """,
+        tuple(unit_ids),
+    ).fetchall()
+    return sorted(row["unit_id"] for row in rows)
+
+
+def _lease_tombstoned_units_in_txn(
+    conn: sqlite3.Connection,
+    unit_ids: list[str],
+) -> list[str]:
+    if not unit_ids:
+        return []
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT unit_id
+          FROM units
+         WHERE is_tombstoned=1
            AND unit_id IN ({placeholders})
         """,
         tuple(unit_ids),
@@ -2145,6 +2472,19 @@ def lease_acquire(
                     "lease_id": None,
                     "unit_ids": unit_ids,
                     "conflicting_unit_ids": assigned_conflicts,
+                    "stale_freed": stale_freed,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            tombstoned_conflicts = _lease_tombstoned_units_in_txn(conn, unit_ids)
+            if tombstoned_conflicts:
+                return {
+                    "status": "conflict",
+                    "acquired": False,
+                    "reason": "lease_unit_tombstoned",
+                    "lease_id": None,
+                    "unit_ids": unit_ids,
+                    "conflicting_unit_ids": tombstoned_conflicts,
                     "stale_freed": stale_freed,
                     "repo_key": key,
                     "tracker_dir": str(directory),
@@ -2658,6 +2998,7 @@ def lease_release(
                     UPDATE units
                        SET review_state='available'
                      WHERE review_state='assigned'
+                       AND is_tombstoned=0
                        AND unit_id IN ({placeholders})
                     """,
                     tuple(unit_ids),
@@ -2845,6 +3186,7 @@ def complete_review_scope(
                         UPDATE units
                            SET review_state='reviewed'
                          WHERE review_state IN ('available','assigned','reviewed')
+                           AND is_tombstoned=0
                            AND unit_id IN ({reviewable_placeholders})
                         """,
                         tuple(reviewable_unit_ids),
@@ -3225,6 +3567,7 @@ def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
             UPDATE units
                SET review_state='available'
              WHERE review_state='assigned'
+               AND is_tombstoned=0
                AND unit_id IN ({unit_placeholders})
                AND unit_id NOT IN (
                    SELECT lu.unit_id
@@ -3362,6 +3705,7 @@ def _observe_and_upsert_units_in_txn(
              WHERE worktree_key=?
                AND observed_state='dirty'
                AND review_state IN ('available','assigned')
+               AND is_tombstoned=0
             """,
             (worktree_key,),
         ).fetchall()
@@ -3400,6 +3744,7 @@ def _takeover_transfer_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind='owned'
            AND u.review_state IN ('available','assigned')
+           AND u.is_tombstoned=0
            AND u.unit_id NOT IN (
                SELECT lu.unit_id
                  FROM lease_units lu
@@ -3453,6 +3798,7 @@ def _preview_takeover_candidate_unit_ids_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind='owned'
            AND u.review_state='available'
+           AND u.is_tombstoned=0
            AND u.observed_state IN ('dirty','committed')
          ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
@@ -3513,6 +3859,7 @@ def _collect_candidate_unit_ids_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind IN ('owned','takeover')
            AND u.review_state='available'
+           AND u.is_tombstoned=0
            AND u.observed_state IN ('dirty','committed')
          ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
@@ -3589,7 +3936,7 @@ def _create_lease_in_txn(
         )
     placeholders = ",".join("?" for _ in unit_ids)
     conn.execute(
-        f"UPDATE units SET review_state='assigned' WHERE unit_id IN ({placeholders})",
+        f"UPDATE units SET review_state='assigned' WHERE is_tombstoned=0 AND unit_id IN ({placeholders})",
         tuple(unit_ids),
     )
 
@@ -4271,6 +4618,388 @@ def manual_takeover(
         }
         _emit_event(events_path, {"event": "manual_takeover_completed", **payload})
         return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# -------------------------- RVF causality ledger --------------------------
+
+RVF_ATTEMPT_STATUSES = {
+    "prepared",
+    "started",
+    "fixed",
+    "false_positive",
+    "elevated",
+    "failed",
+    "applied",
+    "merge_conflict",
+}
+
+
+def _rvf_issue_key(run_id: str, issue_id: str) -> str:
+    return f"{safe_token(run_id)}:{safe_token(issue_id)}"
+
+
+def _json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _json_loads(raw: Any, fallback: Any) -> Any:
+    if not isinstance(raw, str) or not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def _rvf_store(repo: str | Path, log_root_override: Path | None) -> tuple[Path, str, Path, Path, Path, Path]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    return repo_resolved, key, common_dir, directory, db_path, events_path
+
+
+def rvf_issue_upsert(
+    *,
+    repo: str | Path,
+    run_id: str,
+    issue_id: str,
+    payload: dict[str, Any],
+    artifact_path: str | Path | None = None,
+    source_refs: list[dict[str, Any]] | None = None,
+    state: str = "open",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if state not in {"open", "fixed", "false_positive", "elevated", "failed", "superseded"}:
+        raise ValueError("invalid RVF issue state")
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    issue_key = _rvf_issue_key(run_id, issue_id)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            existing = conn.execute(
+                "SELECT created_at FROM rvf_issues WHERE issue_key=?",
+                (issue_key,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now_iso
+            conn.execute(
+                """
+                INSERT INTO rvf_issues(
+                  issue_key, repo_key, run_id, issue_id, payload, source_refs,
+                  artifact_path, state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                  payload=excluded.payload,
+                  source_refs=excluded.source_refs,
+                  artifact_path=excluded.artifact_path,
+                  state=excluded.state,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    issue_key,
+                    key,
+                    run_id,
+                    issue_id,
+                    _json_dumps(payload),
+                    _json_dumps(source_refs or []),
+                    str(artifact_path) if artifact_path is not None else None,
+                    state,
+                    created_at,
+                    now_iso,
+                ),
+            )
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": "upserted",
+            "issue_key": issue_key,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_issue_upserted", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_attempt_upsert(
+    *,
+    repo: str | Path,
+    run_id: str,
+    issue_id: str,
+    attempt_id: str,
+    worktree_path: str | Path,
+    base_head: str | None = None,
+    baseline_overlay_path: str | Path | None = None,
+    baseline_commit: str | None = None,
+    fix_patch_path: str | Path | None = None,
+    status: str = "prepared",
+    result_payload: dict[str, Any] | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if status not in RVF_ATTEMPT_STATUSES:
+        raise ValueError("invalid RVF attempt status")
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    issue_key = _rvf_issue_key(run_id, issue_id)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            if conn.execute("SELECT 1 FROM rvf_issues WHERE issue_key=?", (issue_key,)).fetchone() is None:
+                raise ValueError(f"RVF issue does not exist: {issue_id}")
+            existing = conn.execute(
+                "SELECT created_at, started_at, stopped_at, applied_at FROM rvf_fix_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now_iso
+            started_at = existing["started_at"] if existing is not None else None
+            stopped_at = existing["stopped_at"] if existing is not None else None
+            applied_at = existing["applied_at"] if existing is not None else None
+            if status == "started" and started_at is None:
+                started_at = now_iso
+            if status in {"fixed", "false_positive", "elevated", "failed"} and stopped_at is None:
+                stopped_at = now_iso
+            if status == "applied" and applied_at is None:
+                applied_at = now_iso
+            conn.execute(
+                """
+                INSERT INTO rvf_fix_attempts(
+                  attempt_id, issue_key, repo_key, run_id, issue_id, worktree_path,
+                  base_head, baseline_overlay_path, baseline_commit, fix_patch_path,
+                  status, result_payload, created_at, updated_at, started_at, stopped_at, applied_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id) DO UPDATE SET
+                  worktree_path=excluded.worktree_path,
+                  base_head=COALESCE(excluded.base_head, rvf_fix_attempts.base_head),
+                  baseline_overlay_path=COALESCE(excluded.baseline_overlay_path, rvf_fix_attempts.baseline_overlay_path),
+                  baseline_commit=COALESCE(excluded.baseline_commit, rvf_fix_attempts.baseline_commit),
+                  fix_patch_path=COALESCE(excluded.fix_patch_path, rvf_fix_attempts.fix_patch_path),
+                  status=excluded.status,
+                  result_payload=excluded.result_payload,
+                  updated_at=excluded.updated_at,
+                  started_at=COALESCE(rvf_fix_attempts.started_at, excluded.started_at),
+                  stopped_at=COALESCE(rvf_fix_attempts.stopped_at, excluded.stopped_at),
+                  applied_at=COALESCE(rvf_fix_attempts.applied_at, excluded.applied_at)
+                """,
+                (
+                    attempt_id,
+                    issue_key,
+                    key,
+                    run_id,
+                    issue_id,
+                    str(worktree_path),
+                    base_head,
+                    str(baseline_overlay_path) if baseline_overlay_path is not None else None,
+                    baseline_commit,
+                    str(fix_patch_path) if fix_patch_path is not None else None,
+                    status,
+                    _json_dumps(result_payload or {}),
+                    created_at,
+                    now_iso,
+                    started_at,
+                    stopped_at,
+                    applied_at,
+                ),
+            )
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": status,
+            "attempt_id": attempt_id,
+            "issue_key": issue_key,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_fix_attempt_upserted", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_attempt_get(
+    *,
+    repo: str | Path,
+    attempt_id: str,
+    log_root_override: Path | None = None,
+) -> dict[str, Any] | None:
+    _repo, _key, _common_dir, directory, db_path, _events_path = _rvf_store(repo, log_root_override)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        row = conn.execute(
+            "SELECT * FROM rvf_fix_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = {key: row[key] for key in row.keys()}
+        payload["result_payload"] = _json_loads(payload.get("result_payload"), {})
+        payload["tracker_dir"] = str(directory)
+        return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_patch_events_replace(
+    *,
+    repo: str | Path,
+    attempt_id: str,
+    events: list[dict[str, Any]],
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            attempt = conn.execute(
+                "SELECT issue_key, run_id, issue_id FROM rvf_fix_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise ValueError(f"RVF attempt does not exist: {attempt_id}")
+            issue_key = attempt["issue_key"]
+            run_id = attempt["run_id"]
+            issue_id = attempt["issue_id"]
+            conn.execute("DELETE FROM rvf_issue_patch_links WHERE attempt_id=?", (attempt_id,))
+            conn.execute("DELETE FROM rvf_fix_patch_events WHERE attempt_id=?", (attempt_id,))
+            written = 0
+            for index, event in enumerate(events):
+                path = str(event.get("path") or "").strip()
+                if not path:
+                    continue
+                patch_event_id = str(event.get("patch_event_id") or f"{attempt_id}:{index}:{safe_token(path)}")
+                conn.execute(
+                    """
+                    INSERT INTO rvf_fix_patch_events(
+                      patch_event_id, attempt_id, issue_key, repo_key, run_id, issue_id,
+                      path, op, call_id, trajectory_ref, diff_ref, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        patch_event_id,
+                        attempt_id,
+                        issue_key,
+                        key,
+                        run_id,
+                        issue_id,
+                        path,
+                        str(event.get("op") or "modified"),
+                        event.get("call_id") if isinstance(event.get("call_id"), str) else None,
+                        _json_dumps(event.get("trajectory_ref")) if event.get("trajectory_ref") is not None else None,
+                        _json_dumps(event.get("diff_ref")) if event.get("diff_ref") is not None else None,
+                        now_iso,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO rvf_issue_patch_links(issue_key, attempt_id, patch_event_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (issue_key, attempt_id, patch_event_id, now_iso),
+                )
+                written += 1
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": "recorded",
+            "attempt_id": attempt_id,
+            "patch_event_count": written,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_fix_patch_events_recorded", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_causality_for_run(
+    *,
+    repo: str | Path,
+    run_id: str,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    _repo, _key, _common_dir, directory, db_path, _events_path = _rvf_store(repo, log_root_override)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        issue_rows = conn.execute(
+            "SELECT * FROM rvf_issues WHERE run_id=? ORDER BY issue_id",
+            (run_id,),
+        ).fetchall()
+        attempt_rows = conn.execute(
+            "SELECT * FROM rvf_fix_attempts WHERE run_id=? ORDER BY created_at, attempt_id",
+            (run_id,),
+        ).fetchall()
+        event_rows = conn.execute(
+            "SELECT * FROM rvf_fix_patch_events WHERE run_id=? ORDER BY created_at, patch_event_id",
+            (run_id,),
+        ).fetchall()
+        events_by_issue: dict[str, list[sqlite3.Row]] = {}
+        for row in event_rows:
+            events_by_issue.setdefault(row["issue_key"], []).append(row)
+        attempts = []
+        for row in attempt_rows:
+            payload = {key: row[key] for key in row.keys()}
+            payload["result_payload"] = _json_loads(payload.get("result_payload"), {})
+            attempts.append(payload)
+        patch_events = []
+        for row in event_rows:
+            payload = {key: row[key] for key in row.keys()}
+            payload["trajectory_ref"] = _json_loads(payload.get("trajectory_ref"), None)
+            payload["diff_ref"] = _json_loads(payload.get("diff_ref"), None)
+            patch_events.append(payload)
+        issues = []
+        for row in issue_rows:
+            payload = _json_loads(row["payload"], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            call_ids = [
+                event["call_id"]
+                for event in events_by_issue.get(row["issue_key"], [])
+                if isinstance(event["call_id"], str) and event["call_id"]
+            ]
+            fix_patch_paths = [
+                attempt["fix_patch_path"]
+                for attempt in attempts
+                if attempt["issue_key"] == row["issue_key"] and attempt.get("fix_patch_path")
+            ]
+            issue = {
+                **payload,
+                "issue_id": row["issue_id"],
+                "run_id": row["run_id"],
+                "state": row["state"],
+                "candidate_patch_call_ids": list(dict.fromkeys(call_ids)),
+                "fix_patch_paths": list(dict.fromkeys(fix_patch_paths)),
+                "source_refs": _json_loads(row["source_refs"], []),
+                "artifact_path": row["artifact_path"],
+            }
+            issues.append(issue)
+        return {
+            "status": "found" if issue_rows else "missing",
+            "run_id": run_id,
+            "issues": issues,
+            "fix_attempts": attempts,
+            "patch_events": patch_events,
+            "tracker_dir": str(directory),
+        }
     finally:
         if conn is not None:
             conn.close()

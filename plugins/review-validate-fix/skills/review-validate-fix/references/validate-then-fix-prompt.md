@@ -18,6 +18,8 @@ pass_type: validate_fix
 
 你应收到 `scope.contract.json` 路径和 `scope_hash`。读取合同，把 `fix_allowlist` 当作默认可写范围。若最小真实修复必须修改 allowlist 外文件，先说明原因并让主会话决定是否扩大 scope；不要自行顺手扩大。allowlist 外 dirty changes、并行 agent 新增文件、reviewer liveness/probe artifacts、背景 WIP 或 protected files 都可能是预期存在的并行工作，不得清理、删除、格式化或顺手修复。
 
+如果主会话提供了 RVF fix attempt 信息，你必须只在 attempt worktree 中工作，不要回到主 RVF worktree 修改文件。开始验证/修复前运行 `rvf_fix_attempt.py start --attempt-id <attempt_id>`；完成 verdict 前运行 `rvf_fix_attempt.py stop --attempt-id <attempt_id> --status fixed|false_positive|elevated|failed`。attempt worktree 是本次 issue 的 patch ownership 边界；不要写 handoff，不要清理主 worktree，也不要处理未分配 issue。
+
 按 issue 类型读取 RVF 定制 standards pack 的相关子集：`references/review-standards/validate-fix.md` 是默认标准；复杂度问题读取 `simplification-subset.md`，安全问题读取 `security-subset.md`，性能问题读取 `performance-subset.md`。这些 standards 只用于验证和最小修复，不允许你扩大 scope 或重新 review。
 
 如果当前只缺主会话可提供的专项标准、测量、受控子任务或上下文，可以先只输出 `RVF_STANDARD_REQUEST ...`、`RVF_MEASUREMENT_REQUEST ...`、`RVF_SUBTASK_REQUEST ...` 或 `RVF_CONTEXT_REQUEST ...`。request 是非完成态，不能和 `REAL` / `FALSE_POSITIVE` / `ELEVATE` 混写；主会话处理后会要求你重试。
@@ -43,6 +45,8 @@ pass_type: validate_fix
 - 验证包必须 source-agnostic：不要告诉子代理该 issue 来自 Codex、alternative reviewer、两个 reviewer 共同发现，或某个 reviewer 的原始编号。
 - 子代理只接收 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
 - 子代理还应接收同一份 `scope.contract.json` 路径、`scope_hash` 和 `fix_allowlist`；验证包之外的 dirty changes 视为并行工作，除非主会话明确扩大 scope，否则不处理、不清理。
+- 派发子代理前，主会话应把 canonical issue 写成 JSON artifact，运行 `rvf_fix_issue.py upsert --repo "$RVF_REPO" --run-dir "$RVF_RUN_DIR" --issue-file <issue.json>`，再运行 `rvf_fix_attempt.py prepare --repo "$RVF_REPO" --run-dir "$RVF_RUN_DIR" --issue-id <issue_id>`。子代理 prompt 必须包含 `attempt_id`、attempt worktree path、`RVF_RUN_DIR` 和原始主 repo path；子代理 cwd 应切到 attempt worktree。
+- 子代理返回后，主会话用 `rvf_fix_attempt.py apply --attempt-id <attempt_id> --target-repo "$RVF_REPO"` 将该 attempt 的 `fix.patch` 合回主 RVF worktree；若返回 `merge_conflict`，记录为该 attempt 的未合并状态，不得手工搬运后伪装为已归因 patch。
 - 子代理可以用 `RVF_*_REQUEST` 请求缺失标准、测量、受控子任务或上下文，但 request 本身不是 verdict，不得进入最终结果。
 
 ## ELEVATE 详情

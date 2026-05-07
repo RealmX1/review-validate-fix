@@ -138,7 +138,7 @@ def test_analyze_finalized_run_scaffolds(tmp_path, monkeypatch):
     assert Path(payload["summary_md_path"]).is_file()
     assert Path(payload["causality_json_path"]).is_file()
     causality = json.loads(Path(payload["causality_json_path"]).read_text(encoding="utf-8"))
-    assert causality["schema_version"] == 1
+    assert causality["schema_version"] == 2
 
 
 def test_analyze_orphan_without_decision_returns_needs_decision(tmp_path, monkeypatch):

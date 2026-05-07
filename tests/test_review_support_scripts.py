@@ -5576,16 +5576,33 @@ def test_canonical_patch_hash_changes_on_content_edit(tmp: Path) -> None:
     conn = _sqlite.connect(str(db_path))
     try:
         rows = conn.execute(
-            "SELECT unit_id, observed_state FROM units WHERE path='edit.txt' ORDER BY first_observed_at"
+            """
+            SELECT unit_id, observed_state, review_state, is_tombstoned, tombstone_reason
+              FROM units
+             WHERE path='edit.txt'
+             ORDER BY first_observed_at
+            """
         ).fetchall()
         session_units = conn.execute(
             "SELECT unit_id FROM session_units WHERE session_id='session-edit'"
         ).fetchall()
+        try:
+            conn.execute("UPDATE units SET review_state='tombstoned' WHERE unit_id=?", (new_unit_id,))
+        except _sqlite.IntegrityError:
+            rejected_review_tombstone = True
+        else:
+            rejected_review_tombstone = False
     finally:
         conn.close()
-    by_unit = {row[0]: row[1] for row in rows}
-    assert by_unit.get(old_unit_id) == "superseded", by_unit
-    assert by_unit.get(new_unit_id) == "dirty", by_unit
+    by_unit = {row[0]: row[1:] for row in rows}
+    assert by_unit.get(old_unit_id) == (
+        "superseded",
+        "available",
+        1,
+        "session_no_longer_owns",
+    ), by_unit
+    assert by_unit.get(new_unit_id) == ("dirty", "available", 0, None), by_unit
+    assert rejected_review_tombstone is True
     assert {row[0] for row in session_units} == {new_unit_id}
 
 
@@ -6976,12 +6993,20 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_tracker_schema_v2_migrates_lease_participants_table(root / "lease-T0"),
         ),
         (
+            "tracker_schema_v4_rebuilds_legacy_tombstoned_review_state",
+            lambda: test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state(root / "lease-T0b"),
+        ),
+        (
             "lease_acquire_creates_lease_and_assigns_units",
             lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
         ),
         (
             "lease_acquire_rejects_when_any_unit_already_leased",
             lambda: test_lease_acquire_rejects_when_any_unit_already_leased(root / "lease-T2"),
+        ),
+        (
+            "lease_acquire_rejects_tombstoned_unit",
+            lambda: test_lease_acquire_rejects_tombstoned_unit(root / "lease-T2b"),
         ),
         (
             "lease_acquire_prunes_stale_leases_first",
@@ -8083,8 +8108,8 @@ def _lease_participant_states(log_root: Path, repo_key: str, lease_id: str) -> d
         conn.close()
 
 
-def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
-    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+def test_tracker_schema_v2_migrates_lease_participants_table(tmp_path: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp_path)
     db_path = _alloc_db_path(log_root, repo_key)
     conn = _alloc_open_db(log_root, repo_key)
     try:
@@ -8107,9 +8132,12 @@ def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
     assert acquired["acquired"] is True
     conn = _alloc_open_db(log_root, repo_key)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
         table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='lease_participants'"
+        ).fetchone()
+        rvf_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='rvf_fix_attempts'"
         ).fetchone()
         index = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_lease_participants_state'"
@@ -8118,7 +8146,108 @@ def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
         conn.close()
     assert db_path.exists()
     assert table is not None
+    assert rvf_table is not None
     assert index is not None
+
+
+def test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state(tmp: Path) -> None:
+    import sqlite3 as _sqlite
+
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    legacy_unit = unit_ids[0]
+    db_path = _alloc_db_path(log_root, repo_key)
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        original_rows = conn.execute(
+            """
+            SELECT unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                   preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                   first_observed_at, last_observed_at, observed_state
+              FROM units
+            """
+        ).fetchall()
+        assert original_rows
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.executescript(
+            """
+            DROP TABLE units;
+            CREATE TABLE units (
+              unit_id              TEXT PRIMARY KEY,
+              branch_key           TEXT,
+              worktree_key         TEXT NOT NULL,
+              path                 TEXT NOT NULL,
+              old_path             TEXT,
+              kind                 TEXT NOT NULL CHECK (kind IN
+                                     ('tracked_hunk','untracked_file','deleted_file','binary_file','path_only')),
+              change_type          TEXT NOT NULL CHECK (change_type IN ('add','modify','delete')),
+              preimage_blob        TEXT,
+              postimage_hash       TEXT,
+              hunk_header          TEXT,
+              canonical_patch_hash TEXT NOT NULL,
+              first_observed_at    TEXT NOT NULL,
+              last_observed_at     TEXT NOT NULL,
+              observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
+              review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed','tombstoned')),
+              FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
+              FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_units_branch       ON units(branch_key, observed_state);
+            CREATE INDEX idx_units_worktree     ON units(worktree_key, observed_state);
+            CREATE INDEX idx_units_path         ON units(path);
+            CREATE INDEX idx_units_review_state ON units(review_state);
+            CREATE INDEX idx_units_canonical    ON units(canonical_patch_hash);
+            PRAGMA user_version = 4;
+            """
+        )
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO units(
+                unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                first_observed_at, last_observed_at, observed_state, review_state
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available')
+            """,
+            original_rows,
+        )
+        conn.execute("UPDATE units SET review_state='tombstoned' WHERE unit_id=?", (legacy_unit,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-v4-migrate",
+        run_id="lease-run-v4-migrate",
+        reviewer_id="reviewer-a",
+        unit_ids=[legacy_unit],
+        log_root_override=log_root,
+    )
+
+    assert result["acquired"] is False
+    assert result["reason"] == "lease_unit_tombstoned"
+    conn = _sqlite.connect(str(db_path))
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
+        table_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='units'"
+        ).fetchone()[0]
+        row = conn.execute(
+            "SELECT review_state, is_tombstoned, tombstone_reason FROM units WHERE unit_id=?",
+            (legacy_unit,),
+        ).fetchone()
+        try:
+            conn.execute("UPDATE units SET review_state='tombstoned' WHERE unit_id=?", (legacy_unit,))
+        except _sqlite.IntegrityError:
+            rejected_review_tombstone = True
+        else:
+            rejected_review_tombstone = False
+    finally:
+        conn.close()
+
+    assert "'tombstoned'" not in table_sql
+    assert row == ("reviewed", 1, "legacy_review_state_tombstoned")
+    assert rejected_review_tombstone is True
 
 
 def test_lease_acquire_creates_lease_and_assigns_units(tmp: Path) -> None:
@@ -8161,6 +8290,42 @@ def test_lease_acquire_rejects_when_any_unit_already_leased(tmp: Path) -> None:
     assert second["acquired"] is False
     assert second["reason"] == "lease_unit_already_assigned"
     assert _lease_unit_states(log_root, repo_key, [second_unit])[second_unit] == "available"
+
+
+def test_lease_acquire_rejects_tombstoned_unit(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    tombstoned_unit = unit_ids[0]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute(
+            """
+            UPDATE units
+               SET is_tombstoned=1,
+                   tombstoned_at='2026-05-05T00:00:00Z',
+                   tombstone_reason='test_retired'
+             WHERE unit_id=?
+            """,
+            (tombstoned_unit,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-tomb",
+        run_id="lease-run-tomb",
+        reviewer_id="reviewer-a",
+        unit_ids=[tombstoned_unit],
+        log_root_override=log_root,
+    )
+
+    assert result["acquired"] is False
+    assert result["reason"] == "lease_unit_tombstoned"
+    assert result["conflicting_unit_ids"] == [tombstoned_unit]
+    assert _lease_unit_states(log_root, repo_key, [tombstoned_unit]) == {
+        tombstoned_unit: "available"
+    }
 
 
 def test_lease_acquire_prunes_stale_leases_first(tmp: Path) -> None:
