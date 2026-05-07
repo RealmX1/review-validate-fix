@@ -8001,8 +8001,8 @@ def _lease_participant_states(log_root: Path, repo_key: str, lease_id: str) -> d
         conn.close()
 
 
-def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
-    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+def test_tracker_schema_v2_migrates_lease_participants_table(tmp_path: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp_path)
     db_path = _alloc_db_path(log_root, repo_key)
     conn = _alloc_open_db(log_root, repo_key)
     try:
@@ -8025,9 +8025,12 @@ def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
     assert acquired["acquired"] is True
     conn = _alloc_open_db(log_root, repo_key)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == module.SCHEMA_VERSION
         table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='lease_participants'"
+        ).fetchone()
+        rvf_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='rvf_fix_attempts'"
         ).fetchone()
         index = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_lease_participants_state'"
@@ -8036,6 +8039,7 @@ def test_tracker_schema_v2_migrates_lease_participants_table(tmp: Path) -> None:
         conn.close()
     assert db_path.exists()
     assert table is not None
+    assert rvf_table is not None
     assert index is not None
 
 

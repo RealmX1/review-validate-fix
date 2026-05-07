@@ -28,7 +28,7 @@ from rvf_logging import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SQLITE_FILENAME = "tracker.sqlite3"
 EVENTS_FILENAME = "events.jsonl"
 META_FILENAME = "meta.json"
@@ -929,6 +929,74 @@ CREATE TABLE IF NOT EXISTS tombstones (
   expires_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tombstones_expires ON tombstones(expires_at);
+
+CREATE TABLE IF NOT EXISTS rvf_issues (
+  issue_key     TEXT PRIMARY KEY,
+  repo_key      TEXT NOT NULL,
+  run_id        TEXT NOT NULL,
+  issue_id      TEXT NOT NULL,
+  payload       TEXT NOT NULL,
+  source_refs   TEXT NOT NULL,
+  artifact_path TEXT,
+  state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE(run_id, issue_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_issues_run ON rvf_issues(run_id);
+
+CREATE TABLE IF NOT EXISTS rvf_fix_attempts (
+  attempt_id             TEXT PRIMARY KEY,
+  issue_key              TEXT NOT NULL,
+  repo_key               TEXT NOT NULL,
+  run_id                 TEXT NOT NULL,
+  issue_id               TEXT NOT NULL,
+  worktree_path          TEXT NOT NULL,
+  base_head              TEXT,
+  baseline_overlay_path  TEXT,
+  baseline_commit        TEXT,
+  fix_patch_path         TEXT,
+  status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+  result_payload         TEXT NOT NULL DEFAULT '{}',
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  started_at             TEXT,
+  stopped_at             TEXT,
+  applied_at             TEXT,
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_run ON rvf_fix_attempts(run_id);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_issue ON rvf_fix_attempts(issue_key);
+
+CREATE TABLE IF NOT EXISTS rvf_fix_patch_events (
+  patch_event_id TEXT PRIMARY KEY,
+  attempt_id     TEXT NOT NULL,
+  issue_key      TEXT NOT NULL,
+  repo_key       TEXT NOT NULL,
+  run_id         TEXT NOT NULL,
+  issue_id       TEXT NOT NULL,
+  path           TEXT NOT NULL,
+  op             TEXT NOT NULL,
+  call_id        TEXT,
+  trajectory_ref TEXT,
+  diff_ref       TEXT,
+  created_at     TEXT NOT NULL,
+  FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_attempt ON rvf_fix_patch_events(attempt_id);
+CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_run ON rvf_fix_patch_events(run_id);
+
+CREATE TABLE IF NOT EXISTS rvf_issue_patch_links (
+  issue_key      TEXT NOT NULL,
+  attempt_id     TEXT NOT NULL,
+  patch_event_id TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY(issue_key, attempt_id, patch_event_id),
+  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE,
+  FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+  FOREIGN KEY(patch_event_id) REFERENCES rvf_fix_patch_events(patch_event_id) ON DELETE CASCADE
+);
 """
 
 
@@ -994,10 +1062,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         return
     if version == 2:
         _migrate_schema_v2_to_v3(conn)
+        _migrate_schema_v3_to_v4(conn)
+        return
+    if version == 3:
+        _migrate_schema_v3_to_v4(conn)
         return
     if version == SCHEMA_VERSION:
         _ensure_manual_rvf_runs_schema(conn)
         _ensure_lease_participants_schema(conn)
+        _ensure_rvf_causality_schema(conn)
         return
     raise RuntimeError(f"unknown tracker schema version: {version}")
 
@@ -1046,6 +1119,87 @@ def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
 def _migrate_schema_v2_to_v3(conn: sqlite3.Connection) -> None:
     _ensure_manual_rvf_runs_schema(conn)
     _ensure_lease_participants_schema(conn)
+    conn.execute("PRAGMA user_version = 3")
+
+
+def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS rvf_issues (
+          issue_key     TEXT PRIMARY KEY,
+          repo_key      TEXT NOT NULL,
+          run_id        TEXT NOT NULL,
+          issue_id      TEXT NOT NULL,
+          payload       TEXT NOT NULL,
+          source_refs   TEXT NOT NULL,
+          artifact_path TEXT,
+          state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          UNIQUE(run_id, issue_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_issues_run ON rvf_issues(run_id);
+
+        CREATE TABLE IF NOT EXISTS rvf_fix_attempts (
+          attempt_id             TEXT PRIMARY KEY,
+          issue_key              TEXT NOT NULL,
+          repo_key               TEXT NOT NULL,
+          run_id                 TEXT NOT NULL,
+          issue_id               TEXT NOT NULL,
+          worktree_path          TEXT NOT NULL,
+          base_head              TEXT,
+          baseline_overlay_path  TEXT,
+          baseline_commit        TEXT,
+          fix_patch_path         TEXT,
+          status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+          result_payload         TEXT NOT NULL DEFAULT '{}',
+          created_at             TEXT NOT NULL,
+          updated_at             TEXT NOT NULL,
+          started_at             TEXT,
+          stopped_at             TEXT,
+          applied_at             TEXT,
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_run ON rvf_fix_attempts(run_id);
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_issue ON rvf_fix_attempts(issue_key);
+
+        CREATE TABLE IF NOT EXISTS rvf_fix_patch_events (
+          patch_event_id TEXT PRIMARY KEY,
+          attempt_id     TEXT NOT NULL,
+          issue_key      TEXT NOT NULL,
+          repo_key       TEXT NOT NULL,
+          run_id         TEXT NOT NULL,
+          issue_id       TEXT NOT NULL,
+          path           TEXT NOT NULL,
+          op             TEXT NOT NULL,
+          call_id        TEXT,
+          trajectory_ref TEXT,
+          diff_ref       TEXT,
+          created_at     TEXT NOT NULL,
+          FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_attempt ON rvf_fix_patch_events(attempt_id);
+        CREATE INDEX IF NOT EXISTS idx_rvf_fix_patch_events_run ON rvf_fix_patch_events(run_id);
+
+        CREATE TABLE IF NOT EXISTS rvf_issue_patch_links (
+          issue_key      TEXT NOT NULL,
+          attempt_id     TEXT NOT NULL,
+          patch_event_id TEXT NOT NULL,
+          created_at     TEXT NOT NULL,
+          PRIMARY KEY(issue_key, attempt_id, patch_event_id),
+          FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE,
+          FOREIGN KEY(attempt_id) REFERENCES rvf_fix_attempts(attempt_id) ON DELETE CASCADE,
+          FOREIGN KEY(patch_event_id) REFERENCES rvf_fix_patch_events(patch_event_id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    _ensure_rvf_causality_schema(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -4271,6 +4425,388 @@ def manual_takeover(
         }
         _emit_event(events_path, {"event": "manual_takeover_completed", **payload})
         return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+# -------------------------- RVF causality ledger --------------------------
+
+RVF_ATTEMPT_STATUSES = {
+    "prepared",
+    "started",
+    "fixed",
+    "false_positive",
+    "elevated",
+    "failed",
+    "applied",
+    "merge_conflict",
+}
+
+
+def _rvf_issue_key(run_id: str, issue_id: str) -> str:
+    return f"{safe_token(run_id)}:{safe_token(issue_id)}"
+
+
+def _json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _json_loads(raw: Any, fallback: Any) -> Any:
+    if not isinstance(raw, str) or not raw:
+        return fallback
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return fallback
+
+
+def _rvf_store(repo: str | Path, log_root_override: Path | None) -> tuple[Path, str, Path, Path, Path, Path]:
+    repo_resolved = Path(repo).expanduser().resolve()
+    key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
+    return repo_resolved, key, common_dir, directory, db_path, events_path
+
+
+def rvf_issue_upsert(
+    *,
+    repo: str | Path,
+    run_id: str,
+    issue_id: str,
+    payload: dict[str, Any],
+    artifact_path: str | Path | None = None,
+    source_refs: list[dict[str, Any]] | None = None,
+    state: str = "open",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if state not in {"open", "fixed", "false_positive", "elevated", "failed", "superseded"}:
+        raise ValueError("invalid RVF issue state")
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    issue_key = _rvf_issue_key(run_id, issue_id)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            existing = conn.execute(
+                "SELECT created_at FROM rvf_issues WHERE issue_key=?",
+                (issue_key,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now_iso
+            conn.execute(
+                """
+                INSERT INTO rvf_issues(
+                  issue_key, repo_key, run_id, issue_id, payload, source_refs,
+                  artifact_path, state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(issue_key) DO UPDATE SET
+                  payload=excluded.payload,
+                  source_refs=excluded.source_refs,
+                  artifact_path=excluded.artifact_path,
+                  state=excluded.state,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    issue_key,
+                    key,
+                    run_id,
+                    issue_id,
+                    _json_dumps(payload),
+                    _json_dumps(source_refs or []),
+                    str(artifact_path) if artifact_path is not None else None,
+                    state,
+                    created_at,
+                    now_iso,
+                ),
+            )
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": "upserted",
+            "issue_key": issue_key,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_issue_upserted", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_attempt_upsert(
+    *,
+    repo: str | Path,
+    run_id: str,
+    issue_id: str,
+    attempt_id: str,
+    worktree_path: str | Path,
+    base_head: str | None = None,
+    baseline_overlay_path: str | Path | None = None,
+    baseline_commit: str | None = None,
+    fix_patch_path: str | Path | None = None,
+    status: str = "prepared",
+    result_payload: dict[str, Any] | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    if status not in RVF_ATTEMPT_STATUSES:
+        raise ValueError("invalid RVF attempt status")
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    issue_key = _rvf_issue_key(run_id, issue_id)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            if conn.execute("SELECT 1 FROM rvf_issues WHERE issue_key=?", (issue_key,)).fetchone() is None:
+                raise ValueError(f"RVF issue does not exist: {issue_id}")
+            existing = conn.execute(
+                "SELECT created_at, started_at, stopped_at, applied_at FROM rvf_fix_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else now_iso
+            started_at = existing["started_at"] if existing is not None else None
+            stopped_at = existing["stopped_at"] if existing is not None else None
+            applied_at = existing["applied_at"] if existing is not None else None
+            if status == "started" and started_at is None:
+                started_at = now_iso
+            if status in {"fixed", "false_positive", "elevated", "failed"} and stopped_at is None:
+                stopped_at = now_iso
+            if status == "applied" and applied_at is None:
+                applied_at = now_iso
+            conn.execute(
+                """
+                INSERT INTO rvf_fix_attempts(
+                  attempt_id, issue_key, repo_key, run_id, issue_id, worktree_path,
+                  base_head, baseline_overlay_path, baseline_commit, fix_patch_path,
+                  status, result_payload, created_at, updated_at, started_at, stopped_at, applied_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(attempt_id) DO UPDATE SET
+                  worktree_path=excluded.worktree_path,
+                  base_head=COALESCE(excluded.base_head, rvf_fix_attempts.base_head),
+                  baseline_overlay_path=COALESCE(excluded.baseline_overlay_path, rvf_fix_attempts.baseline_overlay_path),
+                  baseline_commit=COALESCE(excluded.baseline_commit, rvf_fix_attempts.baseline_commit),
+                  fix_patch_path=COALESCE(excluded.fix_patch_path, rvf_fix_attempts.fix_patch_path),
+                  status=excluded.status,
+                  result_payload=excluded.result_payload,
+                  updated_at=excluded.updated_at,
+                  started_at=COALESCE(rvf_fix_attempts.started_at, excluded.started_at),
+                  stopped_at=COALESCE(rvf_fix_attempts.stopped_at, excluded.stopped_at),
+                  applied_at=COALESCE(rvf_fix_attempts.applied_at, excluded.applied_at)
+                """,
+                (
+                    attempt_id,
+                    issue_key,
+                    key,
+                    run_id,
+                    issue_id,
+                    str(worktree_path),
+                    base_head,
+                    str(baseline_overlay_path) if baseline_overlay_path is not None else None,
+                    baseline_commit,
+                    str(fix_patch_path) if fix_patch_path is not None else None,
+                    status,
+                    _json_dumps(result_payload or {}),
+                    created_at,
+                    now_iso,
+                    started_at,
+                    stopped_at,
+                    applied_at,
+                ),
+            )
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": status,
+            "attempt_id": attempt_id,
+            "issue_key": issue_key,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_fix_attempt_upserted", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_attempt_get(
+    *,
+    repo: str | Path,
+    attempt_id: str,
+    log_root_override: Path | None = None,
+) -> dict[str, Any] | None:
+    _repo, _key, _common_dir, directory, db_path, _events_path = _rvf_store(repo, log_root_override)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        row = conn.execute(
+            "SELECT * FROM rvf_fix_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = {key: row[key] for key in row.keys()}
+        payload["result_payload"] = _json_loads(payload.get("result_payload"), {})
+        payload["tracker_dir"] = str(directory)
+        return payload
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_patch_events_replace(
+    *,
+    repo: str | Path,
+    attempt_id: str,
+    events: list[dict[str, Any]],
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
+    now_iso = now or utc_now()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            attempt = conn.execute(
+                "SELECT issue_key, run_id, issue_id FROM rvf_fix_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise ValueError(f"RVF attempt does not exist: {attempt_id}")
+            issue_key = attempt["issue_key"]
+            run_id = attempt["run_id"]
+            issue_id = attempt["issue_id"]
+            conn.execute("DELETE FROM rvf_issue_patch_links WHERE attempt_id=?", (attempt_id,))
+            conn.execute("DELETE FROM rvf_fix_patch_events WHERE attempt_id=?", (attempt_id,))
+            written = 0
+            for index, event in enumerate(events):
+                path = str(event.get("path") or "").strip()
+                if not path:
+                    continue
+                patch_event_id = str(event.get("patch_event_id") or f"{attempt_id}:{index}:{safe_token(path)}")
+                conn.execute(
+                    """
+                    INSERT INTO rvf_fix_patch_events(
+                      patch_event_id, attempt_id, issue_key, repo_key, run_id, issue_id,
+                      path, op, call_id, trajectory_ref, diff_ref, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        patch_event_id,
+                        attempt_id,
+                        issue_key,
+                        key,
+                        run_id,
+                        issue_id,
+                        path,
+                        str(event.get("op") or "modified"),
+                        event.get("call_id") if isinstance(event.get("call_id"), str) else None,
+                        _json_dumps(event.get("trajectory_ref")) if event.get("trajectory_ref") is not None else None,
+                        _json_dumps(event.get("diff_ref")) if event.get("diff_ref") is not None else None,
+                        now_iso,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO rvf_issue_patch_links(issue_key, attempt_id, patch_event_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (issue_key, attempt_id, patch_event_id, now_iso),
+                )
+                written += 1
+        _ensure_meta(directory, _repo, common_dir, key)
+        result = {
+            "status": "recorded",
+            "attempt_id": attempt_id,
+            "patch_event_count": written,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+        _emit_event(events_path, {"event": "rvf_fix_patch_events_recorded", **result})
+        return result
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def rvf_causality_for_run(
+    *,
+    repo: str | Path,
+    run_id: str,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    _repo, _key, _common_dir, directory, db_path, _events_path = _rvf_store(repo, log_root_override)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        issue_rows = conn.execute(
+            "SELECT * FROM rvf_issues WHERE run_id=? ORDER BY issue_id",
+            (run_id,),
+        ).fetchall()
+        attempt_rows = conn.execute(
+            "SELECT * FROM rvf_fix_attempts WHERE run_id=? ORDER BY created_at, attempt_id",
+            (run_id,),
+        ).fetchall()
+        event_rows = conn.execute(
+            "SELECT * FROM rvf_fix_patch_events WHERE run_id=? ORDER BY created_at, patch_event_id",
+            (run_id,),
+        ).fetchall()
+        events_by_issue: dict[str, list[sqlite3.Row]] = {}
+        for row in event_rows:
+            events_by_issue.setdefault(row["issue_key"], []).append(row)
+        attempts = []
+        for row in attempt_rows:
+            payload = {key: row[key] for key in row.keys()}
+            payload["result_payload"] = _json_loads(payload.get("result_payload"), {})
+            attempts.append(payload)
+        patch_events = []
+        for row in event_rows:
+            payload = {key: row[key] for key in row.keys()}
+            payload["trajectory_ref"] = _json_loads(payload.get("trajectory_ref"), None)
+            payload["diff_ref"] = _json_loads(payload.get("diff_ref"), None)
+            patch_events.append(payload)
+        issues = []
+        for row in issue_rows:
+            payload = _json_loads(row["payload"], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            call_ids = [
+                event["call_id"]
+                for event in events_by_issue.get(row["issue_key"], [])
+                if isinstance(event["call_id"], str) and event["call_id"]
+            ]
+            fix_patch_paths = [
+                attempt["fix_patch_path"]
+                for attempt in attempts
+                if attempt["issue_key"] == row["issue_key"] and attempt.get("fix_patch_path")
+            ]
+            issue = {
+                **payload,
+                "issue_id": row["issue_id"],
+                "run_id": row["run_id"],
+                "state": row["state"],
+                "candidate_patch_call_ids": list(dict.fromkeys(call_ids)),
+                "fix_patch_paths": list(dict.fromkeys(fix_patch_paths)),
+                "source_refs": _json_loads(row["source_refs"], []),
+                "artifact_path": row["artifact_path"],
+            }
+            issues.append(issue)
+        return {
+            "status": "found" if issue_rows else "missing",
+            "run_id": run_id,
+            "issues": issues,
+            "fix_attempts": attempts,
+            "patch_events": patch_events,
+            "tracker_dir": str(directory),
+        }
     finally:
         if conn is not None:
             conn.close()
