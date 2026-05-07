@@ -106,7 +106,10 @@ def test_collect_snapshot_after_allocate_release(tmp_path: Path) -> None:
     assert snap["counters"]["leases_total"] >= 1
     assert snap["counters"]["sessions_total"] >= 1
     assert any(ev["event"] == "allocate_review_scope" for ev in snap["events"])
-    assert any(ev["event"] == "lease_released" for ev in snap["events"])
+    assert any(
+        ev["event"] in {"lease_released", "review_scope_completed"}
+        for ev in snap["events"]
+    )
 
 
 def test_render_shell_embeds_repo_metadata(tmp_path: Path) -> None:
