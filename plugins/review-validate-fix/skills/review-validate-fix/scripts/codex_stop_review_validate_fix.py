@@ -1535,6 +1535,15 @@ def freeze_cline_kanban_startup_artifacts(
     ]
     if parent_thread_path is not None:
         command.extend(["--transcript", str(parent_thread_path)])
+    tracker_scope_meta = getattr(ledger, "tracker_scope_meta", None)
+    tracker_scope_path = None
+    if isinstance(tracker_scope_meta, dict):
+        raw_tracker_scope_path = tracker_scope_meta.get("tracker_scope_path")
+        if isinstance(raw_tracker_scope_path, (str, Path)) and str(raw_tracker_scope_path).strip():
+            tracker_scope_path = Path(raw_tracker_scope_path).expanduser()
+            if not tracker_scope_path.exists():
+                raise RuntimeError(f"allocated tracker scope artifact missing: {tracker_scope_path}")
+            command.extend(["--tracker-scope", str(tracker_scope_path)])
     completed = subprocess.run(
         command,
         capture_output=True,
@@ -1578,6 +1587,7 @@ def freeze_cline_kanban_startup_artifacts(
             "worktree_bootstrap": metadata.get("worktree_bootstrap"),
             "review_env": metadata.get("review_env_file"),
             "review_agent_context": metadata.get("review_agent_context_file"),
+            "tracker_scope": str(tracker_scope_path) if tracker_scope_path is not None else None,
         },
         **stop_hook_rvf_state_fields(
             phase="prepare",

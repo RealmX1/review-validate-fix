@@ -4,7 +4,7 @@
 
 `docs/global-reviewed-diff-tracker-overhaul-plan.md` 是 RVF 的**数据/范围**侧：unit / lease / scope_hash / SQLite tracker / allocator / suppression。本文档独立出 RVF 的**派发/fork**侧：当 Stop hook（或 user 手动）触发 RVF 时，**用哪条路径起 review/validate/fix workflow，session 怎么 fork，worktree 怎么准备，参与方之间的 context 怎么流转**。
 
-两份 plan 的实现路径与依赖面不同，唯一耦合点是 tracker plan 的 Slice 6 (`--tracker-scope` 拼接) —— 一旦本 plan 落地，tracker scope path 自然进入 prep file 字段，但 Slice 6 在 tracker plan 自身的语境下也能先行 ship。
+两份 plan 的实现路径与依赖面不同，唯一耦合点是 tracker plan 的 Slice 6 (`--tracker-scope` 拼接)。当前 Cline Kanban 路径已先行 ship：Stop hook allocator 将 `tracker_scope_path` 存入 run ledger，startup prepare 调 `prepare_review_run.py --tracker-scope <path>`，并由 `tracker_scope.paths` 收窄 review packet、scope contract path allowlist 和 Kanban bootstrap diff。一旦本 plan 落地，tracker scope path 自然进入 prep file 字段，届时只需把路径来源从 ledger convention thin-refactor 到 prep file。
 
 ## 当前状态：4 个并存 flow
 
@@ -184,7 +184,7 @@ flowchart LR
 
 **截至 tracker plan Slice 5 已落地**：上表 "共享 facts" 全部 load-bearing。具体地——`lease.holder_kind ∈ {reviewer, validate-fix, manual}` 在 `lease_acquire` 公共 API 强约束（Slice 4）；`units.review_state` 在 lease release / sweep / manual takeover 三条路径上的状态机已有完整测试覆盖；`scope_hash` 在 `_compute_scope_hash` + `_manual_suppression_scope_probe` + `find_manual_rvf_run_for_scope_hash` + `evaluate_session_gate` 抑制路径已贯通。本 plan 的 prep file `rvf_run.tracker_scope_hash` 字段直接复用 `_compute_scope_hash` 的 sha256 形式，无需再生发新型态。
 
-**唯一耦合点**：tracker plan Slice 6 的"auto-flow fork prompt 拼 `--tracker-scope`"。本 plan 落地后，tracker scope path 自然进入 prep file 的 `rvf_run.tracker_scope_path` 字段。Slice 6 在 tracker plan 自身的语境下可先 ship（直接拼到 prompt 里），等本 plan 落地后再做一次 thin refactor 把 wiring 改成读 prep file。
+**唯一耦合点**：tracker plan Slice 6 的 `--tracker-scope` wiring。当前实现已在 tracker plan 自身语境下先 ship：`ledger.tracker_scope_meta.tracker_scope_path` → Cline Kanban startup prepare → `prepare_review_run.py --tracker-scope`，并把 `tracker_scope.paths` 用作 contract path allowlist 与 bootstrap diff 的来源。本 plan 落地后，tracker scope path 进入 prep file 的 `rvf_run.tracker_scope_path` 字段，再做一次 thin refactor 把 wiring 改成读 prep file。
 
 ## 验证策略
 
