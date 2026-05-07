@@ -340,6 +340,7 @@ def test_normalize_backend_from_env(tmp_path: Path) -> None:
         ({"CODEX_RVF_FORK_MODE": "kanban-followup"}, {}, "kanban-followup"),
         ({"CODEX_RVF_FORK_MODE": "kanban-message"}, {}, "kanban-followup"),
         ({"CODEX_RVF_FORK_MODE": "kanban-inject"}, {}, "kanban-followup"),
+        ({"CODEX_RVF_FORK_MODE": ""}, {}, ""),
         ({"CODEX_RVF_FORK_MODE": "surprise"}, {}, "surprise"),
     ]
     try:
@@ -348,12 +349,62 @@ def test_normalize_backend_from_env(tmp_path: Path) -> None:
                 os.environ.pop(name, None)
             os.environ.update(env)
             assert module.normalize_backend_from_env(event) == expected
+            if env.get("CODEX_RVF_FORK_MODE") == "":
+                assert module.fork_mode_selection_from_env() == "explicit"
     finally:
         for name, value in original.items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def test_dispatch_flow_helpers_lock_route_and_fallback_contract(tmp_path: Path) -> None:
+    module = load_hook_module()
+    flow = module.dispatch_flow
+
+    assert flow.backend_from_values(mode=None, fork_mode="auto", in_kanban_task=False) == "kanban"
+    assert flow.backend_from_values(mode=None, fork_mode="auto", in_kanban_task=True) == "kanban-followup"
+    assert flow.backend_from_values(mode=None, fork_mode="gui", in_kanban_task=False) == "gui"
+    assert flow.backend_from_values(mode=None, fork_mode="cline", in_kanban_task=False) == "kanban"
+    assert flow.backend_from_values(mode=None, fork_mode="kanban-message", in_kanban_task=False) == "kanban-followup"
+    assert flow.backend_from_values(mode=None, fork_mode="prepare", in_kanban_task=False) == "manual"
+    assert flow.backend_from_values(mode=None, fork_mode="", in_kanban_task=False) == ""
+    assert flow.backend_from_values(mode=None, fork_mode=None, in_kanban_task=False) == "kanban"
+    assert flow.backend_from_values(mode="off", fork_mode="auto", in_kanban_task=True) == "off"
+    assert flow.backend_from_values(mode="continuation", fork_mode="auto", in_kanban_task=True) == "report-only"
+    assert flow.backend_selection_mode_from_fork_mode("") == "explicit"
+    assert flow.backend_selection_mode_from_fork_mode(None) == "auto"
+    assert flow.backend_selection_mode_from_fork_mode("detect") == "auto"
+    assert flow.backend_selection_mode_from_fork_mode("cline-kanban") == "explicit"
+    assert flow.launch_mode_for_backend("kanban") == "cline-kanban"
+    assert flow.launch_mode_for_backend("gui") == "gui"
+
+    recoverable = {"status": "cline-kanban-unavailable", "error": "kanban unavailable"}
+    management_plane_error = {
+        "status": "cline-kanban-unavailable",
+        "error": "no listener pane belongs to tmux session `cline-kanban`; Stop the foreign listener",
+    }
+    assert flow.should_attempt_legacy_gui_fallback(
+        primary_result=recoverable,
+        backend_selection_mode="auto",
+        fallback_enabled=True,
+    )
+    assert not flow.should_attempt_legacy_gui_fallback(
+        primary_result=recoverable,
+        backend_selection_mode="explicit",
+        fallback_enabled=True,
+    )
+    assert not flow.should_attempt_legacy_gui_fallback(
+        primary_result=recoverable,
+        backend_selection_mode="auto",
+        fallback_enabled=False,
+    )
+    assert not flow.should_attempt_legacy_gui_fallback(
+        primary_result=management_plane_error,
+        backend_selection_mode="auto",
+        fallback_enabled=True,
+    )
 
 
 def test_parent_conversation_origin_prefers_app_server_chat_name(tmp_path: Path) -> None:
@@ -4973,6 +5024,7 @@ def main() -> int:
 
     tests = [
         test_normalize_backend_from_env,
+        test_dispatch_flow_helpers_lock_route_and_fallback_contract,
         test_parent_conversation_origin_prefers_app_server_chat_name,
         test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed,
         test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed,

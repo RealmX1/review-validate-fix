@@ -50,6 +50,11 @@ from session_label import (
     strip_codex_user_message_preamble,
     text_from_message_payload,
 )
+import rvf_dispatch_flow as dispatch_flow
+from rvf_dispatch_prompts import (
+    cline_kanban_artifact_reference_lines,
+    render_startup_scope_text,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -94,7 +99,6 @@ MANUAL_RVF_MARKER_KEYS = (
 MANUAL_RVF_MARKER_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "auto"
-AUTO_FORK_LAUNCH_MODES = {"auto", "detect", "fallback"}
 APP_SERVER_CLIENT_INFO = {
     "name": "review-validate-fix-stop-hook",
     "title": "review-validate-fix Stop hook",
@@ -1608,19 +1612,13 @@ def startup_scope_text(
     prompt_path: str,
     ledger: RunLedger,
 ) -> str:
-    transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
-    return (
-        "# Scope of Work: Cline Kanban RVF startup\n\n"
-        "本文件由 Stop hook 在创建 Cline Kanban task 前生成，用于冻结 task 启动时的 review 输入。\n\n"
-        f"- 目标仓库：`{cwd}`\n"
-        f"- parent session id：`{parent_session_id}`\n"
-        f"- parent transcript path：`{transcript}`\n"
-        f"- run id：`{ledger.run_id}`\n"
-        f"- run dir：`{ledger.run_dir}`\n"
-        f"- fork prompt：`{prompt_path}`\n\n"
-        "Kanban task 的 scope 只能以本 run artifacts 中已经生成的 scope.contract.json 作为最终 scope contract；"
-        "review packet、session manifest、workspace snapshot 和 worktree bootstrap 仅作为冻结证据、审计上下文或"
-        "重放输入。不要在排队后用实时 worktree 重新定义 scope。"
+    return render_startup_scope_text(
+        cwd=cwd,
+        parent_session_id=parent_session_id,
+        parent_thread_path=parent_thread_path,
+        prompt_path=prompt_path,
+        run_id=ledger.run_id,
+        run_dir=ledger.run_dir,
     )
 
 
@@ -1816,15 +1814,7 @@ def cline_kanban_task_prompt(
         'export RVF_REPO="$RVF_TASK_REPO"\n'
         f"python3 {shell_quote(str(apply_helper))} --metadata \"$RVF_WORKTREE_BOOTSTRAP\" --repo \"$RVF_REPO\"\n"
         "```\n\n"
-        "然后读取并复用已经冻结的 RVF artifacts；命令和说明中继续使用这些变量，不要重复展开 run artifacts 目录：\n"
-        "- review env: `$RVF_ARTIFACTS_DIR/review-env.sh`\n"
-        "- review agent context: `$RVF_ARTIFACTS_DIR/review-agent-context.md`\n"
-        "- scope contract: `$RVF_SCOPE_CONTRACT`\n"
-        "- review packet: `$RVF_REVIEW_PACKET`\n"
-        "- session manifest: `$RVF_SESSION_MANIFEST`\n"
-        "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
-        "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 只能以 `$RVF_SCOPE_CONTRACT` "
-        "为准，review packet 仅作为冻结 reviewer 输入，session manifest 只作为 ownership evidence 和 tracker 审计来源。"
+        f"{cline_kanban_artifact_reference_lines()}"
         "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py` 创建新的 run；"
         "本 task 已经复用上面的 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、"
         "summary 和 events 都必须继续写入该 installed plugin state run。"
@@ -2481,11 +2471,10 @@ def run_codex_fork(
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
-        if (
-            extra_summary
-            and extra_summary.get("backend_selection_mode") == "auto"
-            and cline_kanban_failure_allows_legacy_gui_fallback(result)
-            and legacy_gui_fallback_enabled()
+        if dispatch_flow.should_attempt_legacy_gui_fallback(
+            primary_result=result,
+            backend_selection_mode=(extra_summary or {}).get("backend_selection_mode"),
+            fallback_enabled=legacy_gui_fallback_enabled(),
         ):
             cline_failure = {
                 "status": result.get("status"),
@@ -3831,45 +3820,24 @@ def run_fork_experiment(
 
 
 def rvf_mode() -> str:
-    mode = os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE).strip().lower()
-    if mode in {"continuation", "continue", "block"}:
-        return "report"
-    if mode in {"off", "skip", "disabled", "disable"}:
-        return "off"
-    return "fork"
+    return dispatch_flow.rvf_mode_from_value(os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE))
 
 
 def normalize_backend_from_env(
     event: dict[str, Any] | None = None,
     mode_env_name: str = "CODEX_RVF_FORK_MODE",
 ) -> str:
-    mode = os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE).strip().lower()
-    if mode in {"off", "skip", "disabled", "disable"}:
-        return "off"
-    if mode in {"continuation", "continue", "block"}:
-        return "report-only"
-
-    fork_mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
-    if fork_mode in AUTO_FORK_LAUNCH_MODES:
-        if event is not None and current_kanban_task_id(event):
-            return "kanban-followup"
-        return "kanban"
-    if fork_mode in {"gui", "app-server", "appserver"}:
-        return "gui"
-    if fork_mode in {"cline-kanban", "cline", "kanban", "ck"}:
-        return "kanban"
-    if fork_mode in {"kanban-followup", "kanban-message", "kanban-inject"}:
-        return "kanban-followup"
-    if fork_mode in {"manual", "prepare", "prepared", "log-only"}:
-        return "manual"
-    if fork_mode == "dry-run":
-        return "dry-run"
-    return fork_mode
+    return dispatch_flow.backend_from_values(
+        mode=os.environ.get("CODEX_RVF_MODE", DEFAULT_RVF_MODE),
+        fork_mode=os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE),
+        in_kanban_task=bool(event is not None and current_kanban_task_id(event)),
+    )
 
 
 def fork_mode_selection_from_env(mode_env_name: str = "CODEX_RVF_FORK_MODE") -> str:
-    fork_mode = os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE).strip().lower()
-    return "auto" if fork_mode in AUTO_FORK_LAUNCH_MODES else "explicit"
+    return dispatch_flow.backend_selection_mode_from_fork_mode(
+        os.environ.get(mode_env_name, DEFAULT_FORK_LAUNCH_MODE)
+    )
 
 
 def legacy_gui_fallback_enabled() -> bool:
@@ -3877,22 +3845,11 @@ def legacy_gui_fallback_enabled() -> bool:
 
 
 def cline_kanban_failure_allows_legacy_gui_fallback(result: dict[str, Any]) -> bool:
-    if result.get("status") not in {"cline-kanban-unavailable", "cline-kanban-unconfigured"}:
-        return False
-    error = str(result.get("error") or "")
-    blocking_fragments = (
-        "no listener pane belongs to tmux session `cline-kanban`",
-        "Stop the foreign listener",
-    )
-    return not any(fragment in error for fragment in blocking_fragments)
+    return dispatch_flow.cline_kanban_failure_allows_legacy_gui_fallback(result)
 
 
 def launch_mode_for_backend(backend: str) -> str:
-    if backend == "kanban":
-        return "cline-kanban"
-    if backend == "gui":
-        return "gui"
-    return backend
+    return dispatch_flow.launch_mode_for_backend(backend)
 
 
 def fork_cwd_for_event(event: dict[str, Any], repo: str) -> str:
