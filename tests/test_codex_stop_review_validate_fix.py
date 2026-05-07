@@ -2260,8 +2260,13 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
     assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text
     assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' in prompt_text
+    assert "- scope contract: `$RVF_SCOPE_CONTRACT`" in prompt_text
     assert "- review packet: `$RVF_REVIEW_PACKET`" in prompt_text
     assert "- session manifest: `$RVF_SESSION_MANIFEST`" in prompt_text
+    assert "review scope 只能以 `$RVF_SCOPE_CONTRACT`" in prompt_text
+    assert "和 review packet 为准" not in prompt_text
+    assert "review packet 仅作为冻结 reviewer 输入" in prompt_text
+    assert "session manifest 只作为 ownership evidence" in prompt_text
     assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
     assert "rvf_handoff.py" in prompt_text
     assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' in prompt_text
@@ -2270,6 +2275,10 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert f"{artifacts_dir}/review-packet.md" not in prompt_text
     assert f"{artifacts_dir}/session-manifest.json" not in prompt_text
     assert f"{artifacts_dir}/worktree-bootstrap.json" not in prompt_text
+    startup_scope = (Path(artifacts_dir) / "headless-startup-scope-of-work.md").read_text(encoding="utf-8")
+    assert "scope 只能以本 run artifacts 中已经生成的 scope.contract.json" in startup_scope
+    assert "review packet、session manifest、workspace snapshot 和 worktree bootstrap 仅作为冻结证据" in startup_scope
+    assert "作为启动时 scope anchor" not in startup_scope
     task_title = create_argv[create_argv.index("--title") + 1]
     assert task_title.startswith("RVF from Codex parent-thread run ")
     assert " repo " not in task_title

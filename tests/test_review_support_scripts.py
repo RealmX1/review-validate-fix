@@ -2159,6 +2159,9 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
     assert "- review result writer: `$RVF_WRITE_REVIEW_RESULT`" in review_agent_context_text
     assert "- reviewer result artifact: `$RVF_REVIEW_RESULT`" in review_agent_context_text
+    assert "Scope precedence: read `$RVF_SCOPE_CONTRACT` first" in review_agent_context_text
+    assert "`primary_units` is non-empty" in review_agent_context_text
+    assert "not the final scope contract" in review_agent_context_text
     assert payload["scope_of_work_file"] not in review_agent_context_text
     assert payload["review_packet"] not in review_agent_context_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
@@ -2224,6 +2227,8 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp_path: Path) -> No
     assert "$RVF_CHECK_REVIEW_RESULT" in prompt
     assert "$RVF_REVIEW_RESULT" in prompt
     assert "$RVF_REPO" in prompt
+    assert "`primary_units` takes precedence over session manifest paths" in prompt
+    assert "not as the final scope contract" in prompt
     assert str(scope_contract) not in prompt
     assert str(context) not in prompt
     assert str(result_path) not in prompt

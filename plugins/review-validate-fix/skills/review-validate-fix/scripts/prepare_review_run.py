@@ -202,6 +202,8 @@ def review_agent_context_text(
             "- review result checker: `$RVF_CHECK_REVIEW_RESULT`",
             "- reviewer result artifact: `$RVF_REVIEW_RESULT` (set `RVF_REVIEWER_ID` before sourcing when launching multiple reviewers)",
             "",
+            "Scope precedence: read `$RVF_SCOPE_CONTRACT` first. If `primary_units` is non-empty, review that tracker unit scope; otherwise use `primary_files` plus scope-of-work. `$RVF_SESSION_MANIFEST` is ownership evidence and tracker audit context, not the final scope contract.",
+            "",
             "Use the variables above in commands and notes instead of expanding the run artifacts directory. The result artifact is protocol output and is the only file a review-only agent may write intentionally.",
         ]
     )

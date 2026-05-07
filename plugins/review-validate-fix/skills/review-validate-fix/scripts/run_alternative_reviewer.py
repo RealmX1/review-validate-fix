@@ -568,7 +568,10 @@ def build_prompt(
     if repo is not None:
         env_lines.append("- `RVF_REPO`: target repository. Use it as the repo path if `pwd` is not already the repo.")
     if scope_contract is not None:
-        env_lines.append("- `RVF_SCOPE_CONTRACT`: scope contract. Read it before reviewing and obey its scope boundaries.")
+        env_lines.append(
+            "- `RVF_SCOPE_CONTRACT`: scope contract. Read it before reviewing and obey its scope boundaries; "
+            "`primary_units` takes precedence over session manifest paths when present."
+        )
     if session_context is not None:
         env_lines.extend(
             [
@@ -605,7 +608,13 @@ def build_prompt(
             ]
         )
     if session_context is not None:
-        env_lines.append("- Do not use the entire git diff as full review scope unless the main agent explicitly requested full diff review.")
+        env_lines.append(
+            "- Do not use the entire git diff as full review scope unless the main agent explicitly requested full diff review."
+        )
+    if scope_contract is not None:
+        env_lines.append(
+            "- Treat the session manifest as ownership evidence and tracker audit context, not as the final scope contract."
+        )
     if len(env_lines) > 3:
         parts.append("\n".join(env_lines))
     parts.append(prompt_file.read_text(encoding="utf-8").strip())

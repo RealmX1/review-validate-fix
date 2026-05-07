@@ -334,32 +334,9 @@ def invoke_result(
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    for key in (
-        "CODEX_RVF_DEV_REPO",
-        "CODEX_RVF_INSTALLED_STOP_HOOK",
-        "CODEX_RVF_DEV_SYNC_STATE_DIR",
-        "CODEX_RVF_LOG_ROOT",
-        "CODEX_RVF_DEV_SYNC",
-        "CODEX_RVF_DEV_SYNC_INSTALL",
-        "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT",
-        "CODEX_RVF_CORRELATION_ID",
-        "CODEX_RVF_FORK_MODE",
-        "CODEX_RVF_RUN_DIR",
-        "CODEX_RVF_RUN_ID",
-        "CODEX_RVF_CLINE_KANBAN_START_CMD",
-        "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-        "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT",
-        "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION",
-        "CODEX_RVF_CLINE_KANBAN_BASE_REF",
-        "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED",
-        "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE",
-        "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE",
-        "CODEX_RVF_SUPPRESS",
-        "CODEX_RVF_SUPPRESS_STOP_HOOK",
-        "CODEX_RVF_OPEN_HANDOFF",
-        "CODEX_RVF_IDE_OPEN_CMD",
-    ):
-        env.pop(key, None)
+    for key in tuple(env):
+        if key.startswith("CODEX_RVF_") or key.startswith("KANBAN_") or key.startswith("CLINE_KANBAN_"):
+            env.pop(key, None)
     if dev_repo is not None:
         env["CODEX_RVF_DEV_REPO"] = str(dev_repo)
     env["HOME"] = str(state / "home")

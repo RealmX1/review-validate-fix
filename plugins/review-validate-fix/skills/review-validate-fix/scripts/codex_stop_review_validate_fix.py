@@ -1701,9 +1701,9 @@ def startup_scope_text(
         f"- run id：`{ledger.run_id}`\n"
         f"- run dir：`{ledger.run_dir}`\n"
         f"- fork prompt：`{prompt_path}`\n\n"
-        "Kanban task 必须以本 run artifacts 中已经生成的 review packet、session manifest、"
-        "workspace snapshot 和 worktree bootstrap 作为启动时 scope anchor；不要在排队后"
-        "用实时 worktree 重新定义 scope。"
+        "Kanban task 的 scope 只能以本 run artifacts 中已经生成的 scope.contract.json 作为最终 scope contract；"
+        "review packet、session manifest、workspace snapshot 和 worktree bootstrap 仅作为冻结证据、审计上下文或"
+        "重放输入。不要在排队后用实时 worktree 重新定义 scope。"
     )
 
 
@@ -1902,10 +1902,12 @@ def cline_kanban_task_prompt(
         "然后读取并复用已经冻结的 RVF artifacts；命令和说明中继续使用这些变量，不要重复展开 run artifacts 目录：\n"
         "- review env: `$RVF_ARTIFACTS_DIR/review-env.sh`\n"
         "- review agent context: `$RVF_ARTIFACTS_DIR/review-agent-context.md`\n"
+        "- scope contract: `$RVF_SCOPE_CONTRACT`\n"
         "- review packet: `$RVF_REVIEW_PACKET`\n"
         "- session manifest: `$RVF_SESSION_MANIFEST`\n"
         "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
-        "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 以 session manifest 和 review packet 为准。"
+        "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 只能以 `$RVF_SCOPE_CONTRACT` "
+        "为准，review packet 仅作为冻结 reviewer 输入，session manifest 只作为 ownership evidence 和 tracker 审计来源。"
         "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py` 创建新的 run；"
         "本 task 已经复用上面的 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、"
         "summary 和 events 都必须继续写入该 installed plugin state run。"
