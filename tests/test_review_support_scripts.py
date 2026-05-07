@@ -39,6 +39,8 @@ SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
 RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
+RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
+RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -68,6 +70,16 @@ def load_rvf_logging_module():
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load rvf_logging module")
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_prep_file_module():
+    spec = importlib.util.spec_from_file_location("rvf_prep_file", RVF_PREP_FILE)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_prep_file module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -115,6 +127,176 @@ def run(
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
+    prep = load_rvf_prep_file_module()
+    root = tmp_path / "prep-root"
+    now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+
+    written = prep.write_prep_file(
+        {
+            "origin_session_id": "session-a",
+            "origin_repo": str(tmp_path / "repo"),
+            "target_flow": "flow-2-branch",
+            "rvf_run": {
+                "run_id": "rvf-20260507T000000Z-test",
+                "tracker_scope_hash": "sha256:abc",
+            },
+        },
+        root=root,
+        token="0123456789abcdef",
+        now=now,
+        ttl_seconds=300,
+    )
+
+    assert written.token == "0123456789abcdef"
+    assert written.path == root / "0123456789abcdef.json"
+    assert written.payload["schema_version"] == 1
+    assert written.payload["created_at"] == "2026-05-07T00:00:00Z"
+    assert written.payload["expires_at"] == "2026-05-07T00:05:00Z"
+    assert written.path.stat().st_mode & 0o777 == 0o600
+
+    valid = prep.read_prep_file(
+        "0123456789abcdef",
+        root=root,
+        now=prep.parse_timestamp("2026-05-07T00:01:00Z"),
+    )
+    assert valid.status == "valid"
+    assert valid.payload["origin_session_id"] == "session-a"
+
+    expired = prep.read_prep_file(
+        "0123456789abcdef",
+        root=root,
+        now=prep.parse_timestamp("2026-05-07T00:06:00Z"),
+    )
+    assert expired.status == "expired"
+
+    removed = prep.sweep_stale(
+        root=root,
+        now=prep.parse_timestamp("2026-05-07T00:06:00Z"),
+    )
+    assert removed == [written.path]
+    assert not written.path.exists()
+
+
+def test_rvf_user_prompt_submit_detector_records_only_token_events(tmp_path: Path) -> None:
+    prep = load_rvf_prep_file_module()
+    root = tmp_path / "prep-root"
+    now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+    prep.write_prep_file(
+        {"origin_session_id": "session-a", "origin_repo": str(tmp_path), "target_flow": "flow-1-self-rising"},
+        root=root,
+        token="aaaaaaaaaaaaaaaa",
+        now=now,
+        ttl_seconds=300,
+    )
+
+    no_token = run(
+        [sys.executable, str(RVF_USER_PROMPT_SUBMIT), "--json", "--prep-root", str(root)],
+        input_text=json.dumps({"prompt": "ordinary prompt"}, ensure_ascii=False),
+    )
+    no_token_payload = json.loads(no_token.stdout)
+    assert no_token_payload["status"] == "no_token"
+    assert no_token_payload["continue"] is True
+    assert not (root / "diagnostics").exists()
+
+    valid = run(
+        [
+            sys.executable,
+            str(RVF_USER_PROMPT_SUBMIT),
+            "--json",
+            "--prep-root",
+            str(root),
+            "--now",
+            "2026-05-07T00:01:00Z",
+        ],
+        input_text=json.dumps(
+            {
+                "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                "cwd": str(tmp_path),
+                "hook_event_name": "UserPromptSubmit",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    valid_payload = json.loads(valid.stdout)
+    assert valid_payload["status"] == "valid"
+    assert valid_payload["continue"] is True
+    assert valid_payload["workflow_started"] is False
+    assert valid_payload["prep_file_path"] == str(root / "aaaaaaaaaaaaaaaa.json")
+
+    diagnostics_path = root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl"
+    diagnostics = read_jsonl(diagnostics_path)
+    assert len(diagnostics) == 1
+    assert diagnostics[0]["status"] == "valid"
+    assert diagnostics[0]["cwd"] == str(tmp_path)
+    assert "prompt" not in diagnostics[0]
+    assert diagnostics_path.parent.stat().st_mode & 0o777 == 0o700
+    assert diagnostics_path.stat().st_mode & 0o777 == 0o600
+
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "from transcript RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    transcript_result = run(
+        [
+            sys.executable,
+            str(RVF_USER_PROMPT_SUBMIT),
+            "--json",
+            "--prep-root",
+            str(root),
+            "--now",
+            "2026-05-07T00:01:00Z",
+        ],
+        input_text=json.dumps({"transcript_path": str(transcript)}, ensure_ascii=False),
+    )
+    transcript_payload = json.loads(transcript_result.stdout)
+    assert transcript_payload["status"] == "valid"
+    assert transcript_payload["prompt_source"] == "transcript_path"
+
+    actual_hook = run(
+        [
+            sys.executable,
+            str(RVF_USER_PROMPT_SUBMIT),
+            "--prep-root",
+            str(root),
+            "--now",
+            "2026-05-07T00:01:00Z",
+        ],
+        input_text=json.dumps({"prompt": "RVF_DISPATCH=token=aaaaaaaaaaaaaaaa"}, ensure_ascii=False),
+    )
+    assert actual_hook.stdout == ""
+    assert actual_hook.stderr == ""
+
+
+def test_rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bad_root = tmp_path / "not-a-directory"
+    bad_root.write_text("not a directory\n", encoding="utf-8")
+
+    actual_hook = run(
+        [
+            sys.executable,
+            str(RVF_USER_PROMPT_SUBMIT),
+            "--prep-root",
+            str(bad_root),
+        ],
+        input_text=json.dumps({"prompt": "RVF_DISPATCH=token=bbbbbbbbbbbbbbbb"}, ensure_ascii=False),
+    )
+    assert actual_hook.stdout == ""
+    assert actual_hook.stderr == ""
 
 
 def test_rvf_handoff_cli_opens_with_configured_editor(tmp_path: Path) -> None:
@@ -6069,6 +6251,15 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_handoff_cli_opens_with_configured_editor",
             lambda: test_rvf_handoff_cli_opens_with_configured_editor(root / "handoff-open"),
+        ),
+        ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
+        (
+            "rvf_user_prompt_submit_detector_records_only_token_events",
+            lambda: test_rvf_user_prompt_submit_detector_records_only_token_events(root / "prompt-submit"),
+        ),
+        (
+            "rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode",
+            lambda: test_rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode(root / "prompt-submit-fail"),
         ),
         ("check_review_output_lock_request", lambda: test_check_review_output_lock_request()),
         (

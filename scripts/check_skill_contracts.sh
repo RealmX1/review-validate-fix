@@ -403,6 +403,8 @@ required_files=(
   "scripts/cline_kanban_client.py"
   "scripts/cancel_rvf_run.py"
   "scripts/rvf_logging.py"
+  "scripts/rvf_prep_file.py"
+  "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
   "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
@@ -490,6 +492,8 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
   "$skill_dir/scripts/rvf_logging.py" \
+  "$skill_dir/scripts/rvf_prep_file.py" \
+  "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$skill_dir/scripts/session_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
