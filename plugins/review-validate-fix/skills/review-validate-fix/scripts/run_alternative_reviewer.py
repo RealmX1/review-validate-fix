@@ -247,6 +247,37 @@ def ensure_codex_json_command(command: list[str]) -> list[str]:
     return patched
 
 
+def ensure_codex_exec_add_dir(command: list[str], directory: Path) -> list[str]:
+    exec_index = codex_subcommand_index(command)
+    if exec_index is None:
+        return command
+
+    directory_arg = str(directory)
+    patched = list(command)
+    index = exec_index + 1
+    while index < len(patched):
+        item = patched[index]
+        if item == "--add-dir" and index + 1 < len(patched):
+            if Path(patched[index + 1]).expanduser() == directory:
+                return patched
+            index += 2
+            continue
+        if item.startswith("--add-dir="):
+            if Path(item.split("=", 1)[1]).expanduser() == directory:
+                return patched
+            index += 1
+            continue
+        index += 1
+
+    insert_at = len(patched)
+    for index in range(exec_index + 1, len(patched)):
+        if patched[index] == "-":
+            insert_at = index
+            break
+    patched[insert_at:insert_at] = ["--add-dir", directory_arg]
+    return patched
+
+
 def check_repo(repo: Path) -> None:
     completed = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -1381,6 +1412,8 @@ def main() -> int:
             command = ensure_claude_stream_json_command(command)
         if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(command):
             command = ensure_codex_json_command(command)
+        if is_codex_exec_command(command):
+            command = ensure_codex_exec_add_dir(command, ledger.run_dir)
     except Exception as exc:
         ledger.event(
             phase="review",

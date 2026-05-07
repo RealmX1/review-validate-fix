@@ -3456,6 +3456,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
     shim = tmp_path / "codex"
     sink = tmp_path / "argv.json"
     shim.write_text(
@@ -3492,6 +3493,8 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
             str(repo),
             "--review-packet",
             str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
         ],
         env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
@@ -3501,13 +3504,14 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["exec", "--json", "-"]
+    assert argv == ["exec", "--json", "--add-dir", str(run_dir.resolve()), "-"]
 
 
 def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
     shim = tmp_path / "codex"
     sink = tmp_path / "argv.json"
     shim.write_text(
@@ -3528,7 +3532,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
         tmp_path / "alternative-reviewer.json",
-        ["codex", "--ask-for-approval", "never", "exec"],
+        ["codex", "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
@@ -3544,6 +3548,8 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
             str(repo),
             "--review-packet",
             str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
         ],
         env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
@@ -3553,7 +3559,17 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
+    assert argv == [
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "--add-dir",
+        str(run_dir.resolve()),
+        "-",
+    ]
 
 
 def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) -> None:
