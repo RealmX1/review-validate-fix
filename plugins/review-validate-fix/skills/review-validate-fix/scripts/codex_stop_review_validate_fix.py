@@ -51,6 +51,7 @@ from session_label import (
     text_from_message_payload,
 )
 import rvf_dispatch_flow as dispatch_flow
+import rvf_prep_file
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     render_startup_scope_text,
@@ -1149,6 +1150,136 @@ def fork_review_validate_fix_prompt(
         "尝试用默认编辑器打开该 markdown 文件；Stop hook 仍会把 "
         "`RVF_HANDOFF_FILE` marker 作为兜底完成信号处理。"
     )
+
+
+def git_branch_name(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    completed = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    branch = completed.stdout.strip()
+    return branch or None
+
+
+def dispatch_prep_target_flow(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized in {"cline-kanban", "cline", "kanban", "ck"}:
+        return "flow-2-branch"
+    if normalized in {"kanban-followup", "kanban-message", "kanban-inject"}:
+        return "flow-1-self-rising"
+    return "flow-3-inplace"
+
+
+def dispatch_prep_summary_fields(
+    record: rvf_prep_file.PrepFileRecord,
+    *,
+    target_flow: str,
+) -> dict[str, Any]:
+    return {
+        "rvf_dispatch_token": record.token,
+        "rvf_dispatch_prep_file_path": str(record.path),
+        "rvf_dispatch_prep_status": "written",
+        "rvf_dispatch_target_flow": target_flow,
+    }
+
+
+def dispatch_prep_prompt_block(record: rvf_prep_file.PrepFileRecord) -> str:
+    return (
+        "RVF dispatch prep file:\n"
+        f"RVF_DISPATCH=token={record.token}\n"
+        f"RVF_PREP_FILE: {record.path}\n"
+        f"RVF_PREP_SCHEMA_VERSION: {rvf_prep_file.SCHEMA_VERSION}\n"
+        "目标 session 的 UserPromptSubmit hook 只做 token 校验；"
+        "agent 需要时可直接读取上面的 prep file。"
+    )
+
+
+def add_dispatch_prep_to_prompt(prompt: str, record: rvf_prep_file.PrepFileRecord) -> str:
+    if "RVF_DISPATCH=token=" in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{dispatch_prep_prompt_block(record)}"
+
+
+def write_dispatch_prep_file(
+    *,
+    ledger: RunLedger,
+    origin_session_id: str | None,
+    origin_repo: str | None,
+    origin_cwd: str | None,
+    target_flow: str,
+    target_worktree: str | None,
+    target_kanban_task_id: str | None = None,
+    target_session_id: str | None = None,
+    origin_metadata_path: str | None = None,
+    parent_thread_path: Path | None = None,
+) -> rvf_prep_file.PrepFileRecord:
+    tracker_scope_meta = getattr(ledger, "tracker_scope_meta", None)
+    tracker_scope_path = None
+    tracker_lease_id = None
+    tracker_scope_hash = None
+    if isinstance(tracker_scope_meta, dict):
+        tracker_scope_path = tracker_scope_meta.get("tracker_scope_path")
+        tracker_lease_id = tracker_scope_meta.get("lease_id")
+        tracker_scope_hash = tracker_scope_meta.get("scope_hash")
+    artifacts_dir = ledger.artifacts_dir
+    payload: dict[str, Any] = {
+        "origin_session_id": origin_session_id,
+        "origin_repo": origin_repo,
+        "origin_cwd": origin_cwd,
+        "origin_branch": git_branch_name(origin_repo),
+        "origin_transcript_path": str(parent_thread_path) if parent_thread_path is not None else None,
+        "origin_metadata_path": origin_metadata_path,
+        "target_flow": target_flow,
+        "target_worktree": target_worktree,
+        "target_kanban_task_id": target_kanban_task_id,
+        "target_session_id": target_session_id,
+        "rvf_run": {
+            "run_id": ledger.run_id,
+            "run_dir": str(ledger.run_dir),
+            "artifacts_dir": str(artifacts_dir),
+            "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
+            "tracker_scope_path": str(tracker_scope_path) if tracker_scope_path else None,
+            "tracker_lease_id": tracker_lease_id,
+            "tracker_scope_hash": tracker_scope_hash,
+        },
+        "handoff_expectations": {
+            "handoff_path": str(artifacts_dir / "handoff.md"),
+            "expected_artifacts": ["review-result.json", "merge-table.md", "handoff.md"],
+        },
+        "workflow_constraints": {
+            "pause_origin_edits": target_flow == "flow-2-branch",
+            "in_place_mode": target_flow != "flow-2-branch",
+        },
+    }
+    record = rvf_prep_file.write_prep_file(payload)
+    ledger.artifact(
+        "dispatch-prep-file.json",
+        {
+            "token": record.token,
+            "prep_file_path": str(record.path),
+            "target_flow": target_flow,
+            "payload": record.payload,
+        },
+    )
+    ledger.event(
+        phase="prepare",
+        event="dispatch_prep_file_written",
+        status="completed",
+        reason_code="dispatch_prep_file_written",
+        repo=origin_repo,
+        cwd=origin_cwd,
+        paths={"prep_file": str(record.path)},
+        target_flow=target_flow,
+        target_kanban_task_id=target_kanban_task_id,
+    )
+    return record
 
 
 def kanban_followup_review_validate_fix_prompt(
@@ -2331,6 +2462,7 @@ def run_codex_fork(
     ledger: RunLedger | None = None,
     extra_summary: dict[str, Any] | None = None,
     launch_mode: str | None = None,
+    origin_repo: str | None = None,
 ) -> dict[str, Any]:
     mode = (
         launch_mode
@@ -2371,6 +2503,18 @@ def run_codex_fork(
         parent_origin=parent_origin,
         origin_path=origin_path,
     )
+    target_flow = dispatch_prep_target_flow(mode)
+    dispatch_prep = write_dispatch_prep_file(
+        ledger=ledger,
+        origin_session_id=parent_session_id,
+        origin_repo=origin_repo or cwd,
+        origin_cwd=cwd,
+        target_flow=target_flow,
+        target_worktree=cwd,
+        origin_metadata_path=origin_path,
+        parent_thread_path=parent_thread_path,
+    )
+    effective_prompt = add_dispatch_prep_to_prompt(effective_prompt, dispatch_prep)
     prompt_path = ledger.artifact("fork.prompt.txt", effective_prompt)
     ledger.event(
         phase="fork",
@@ -2378,11 +2522,19 @@ def run_codex_fork(
         status="started",
         reason_code="fork_started",
         parent_thread_id=parent_session_id,
-        paths={"prompt": prompt_path} if prompt_path else {},
+        paths={
+            key: value
+            for key, value in {
+                "prompt": prompt_path,
+                "dispatch_prep_file": str(dispatch_prep.path),
+            }.items()
+            if value
+        },
         mode=mode,
         log_prefix=log_prefix,
     )
 
+    dispatch_prep_fields = dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow)
     result: dict[str, Any] = {
         "mode": mode,
         "log_prefix": log_prefix,
@@ -2400,6 +2552,7 @@ def run_codex_fork(
         "suppress_child_stop_hook": suppress_child_stop_hook,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        **dispatch_prep_fields,
     }
 
     if mode in {"manual", "prepare", "prepared", "log-only"}:
@@ -2592,6 +2745,8 @@ def run_codex_fork(
     event_paths: dict[str, Any] = {}
     if prompt_path:
         event_paths["prompt"] = prompt_path
+    if result.get("rvf_dispatch_prep_file_path"):
+        event_paths["dispatch_prep_file"] = result["rvf_dispatch_prep_file_path"]
     if result.get("parent_origin_path"):
         event_paths["origin"] = result["parent_origin_path"]
     if result.get("app_server_requests_path"):
@@ -3890,6 +4045,7 @@ def fork_review_validate_fix(
         parent_thread_path=parent_thread_path,
         fallback_failure_reason=fork_failure_report(repo),
         ledger=ledger,
+        origin_repo=repo,
     )
 
 
@@ -3971,6 +4127,22 @@ def launch_backend(
             source_origin=source_origin,
             origin_path=origin_path,
         )
+        dispatch_prep = write_dispatch_prep_file(
+            ledger=ledger,
+            origin_session_id=source_session_id,
+            origin_repo=decision.repo,
+            origin_cwd=cwd,
+            target_flow="flow-1-self-rising",
+            target_worktree=cwd,
+            target_kanban_task_id=task_id,
+            origin_metadata_path=origin_path,
+            parent_thread_path=source_thread_path,
+        )
+        prompt = add_dispatch_prep_to_prompt(prompt, dispatch_prep)
+        dispatch_prep_fields = dispatch_prep_summary_fields(
+            dispatch_prep,
+            target_flow="flow-1-self-rising",
+        )
         ledger.event(
             phase="fork",
             event="kanban_followup_started",
@@ -3985,6 +4157,7 @@ def launch_backend(
             cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
             cline_kanban_task_lookup=task_lookup,
             **source_origin_fields,
+            **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -4015,6 +4188,7 @@ def launch_backend(
                 cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
                 cline_kanban_task_lookup=task_lookup,
                 **source_origin_fields,
+                **dispatch_prep_fields,
                 error=error,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
@@ -4037,6 +4211,7 @@ def launch_backend(
                 cline_kanban_task_lookup=task_lookup,
                 error=error,
                 **source_origin_fields,
+                **dispatch_prep_fields,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
                     backend="kanban-followup",
@@ -4056,6 +4231,7 @@ def launch_backend(
             for key, value in {
                 "prompt": message_payload.get("prompt_path"),
                 "message_command": message_payload.get("command_artifact_path"),
+                "dispatch_prep_file": str(dispatch_prep.path),
             }.items()
             if value
         }
@@ -4077,6 +4253,7 @@ def launch_backend(
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             **source_origin_fields,
+            **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -4103,6 +4280,7 @@ def launch_backend(
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             kanban_followup_payload=message_payload,
             **source_origin_fields,
+            **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -4148,6 +4326,7 @@ def launch_backend(
             "backend": decision.backend,
             **(decision.summary_fields or {}),
         },
+        origin_repo=decision.repo,
     )
 
 

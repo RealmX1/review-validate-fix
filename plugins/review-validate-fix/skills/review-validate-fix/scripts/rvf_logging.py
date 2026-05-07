@@ -69,6 +69,10 @@ PRESERVED_SUMMARY_KEYS = {
     "rvf_session_manifest_path",
     "rvf_handoff_path",
     "rvf_completion_gate",
+    "rvf_dispatch_token",
+    "rvf_dispatch_prep_file_path",
+    "rvf_dispatch_prep_status",
+    "rvf_dispatch_target_flow",
 }
 RVF_STATE_PHASES = (
     "prepare",

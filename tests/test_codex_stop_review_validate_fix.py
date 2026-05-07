@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -218,6 +219,14 @@ def read_text_artifact(summary: dict[str, object], key: str) -> str:
 
 def prompt_text(summary: dict[str, object]) -> str:
     return read_text_artifact(summary, "prompt_path")
+
+
+def dispatch_prep_payload(summary: dict[str, object]) -> dict[str, object]:
+    path = summary.get("rvf_dispatch_prep_file_path")
+    assert isinstance(path, str), f"missing dispatch prep file path: {summary}"
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    assert isinstance(payload, dict)
+    return payload
 
 
 def app_server_requests(summary: dict[str, object]) -> list[dict[str, object]]:
@@ -2336,6 +2345,16 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert latest["parent_conversation_ref"] == "Codex parent-thread"
     assert latest["parent_codex_url"] == "codex://local/parent-thread"
     assert Path(latest["parent_origin_path"]).exists()
+    prep = dispatch_prep_payload(latest)
+    prep_token = prep["token"]
+    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
+    assert f"RVF_DISPATCH=token={prep_token}" in prompt_text
+    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt_text
+    assert prep["origin_session_id"] == "parent-thread"
+    assert Path(str(prep["origin_repo"])).resolve() == repo.resolve()
+    assert prep["target_flow"] == "flow-2-branch"
+    assert Path(str(prep["target_worktree"])).resolve() == repo.resolve()
+    assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "RVF_PARENT_CONVERSATION_REF: Codex parent-thread" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME: Codex parent-thread" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: session_ref_fallback" in prompt_text
@@ -2756,6 +2775,16 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert "RVF_PARENT_CODEX_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
     assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
     assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
+    prep = dispatch_prep_payload(latest)
+    prep_token = prep["token"]
+    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
+    assert f"RVF_DISPATCH=token={prep_token}" in prompt_text
+    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt_text
+    assert prep["origin_session_id"] == session_id
+    assert Path(str(prep["origin_repo"])).resolve() == repo.resolve()
+    assert prep["target_flow"] == "flow-1-self-rising"
+    assert prep["target_kanban_task_id"] == "task-77"
+    assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task" in prompt_text
     assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
     assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
@@ -4264,8 +4293,17 @@ def test_dirty_repo_fork_dry_run(tmp_path: Path) -> None:
     assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
     latest = latest_summary(state)
     prompt = prompt_text(latest)
+    prep = dispatch_prep_payload(latest)
+    prep_token = prep["token"]
+    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
     assert "$review-validate-fix" in prompt
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
+    assert f"RVF_DISPATCH=token={prep_token}" in prompt
+    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt
+    assert prep["origin_session_id"] == "00000000-0000-0000-0000-000000000003"
+    assert prep["origin_repo"] == str(dirty.resolve())
+    assert prep["target_flow"] == "flow-3-inplace"
+    assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert str(dirty) in prompt
     assert "RVF_STOP_HOOK: off" in prompt
     assert "会话控制元数据" in prompt
