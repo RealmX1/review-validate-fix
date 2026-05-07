@@ -210,9 +210,12 @@ def _compute_counters(snapshot: dict[str, Any]) -> dict[str, Any]:
     leases = snapshot["leases"]
     review_states: dict[str, int] = {}
     observed_states: dict[str, int] = {}
+    tombstone_states: dict[str, int] = {}
     for unit in units:
         review_states[unit["review_state"]] = review_states.get(unit["review_state"], 0) + 1
         observed_states[unit["observed_state"]] = observed_states.get(unit["observed_state"], 0) + 1
+        tombstone_key = "tombstoned" if unit.get("is_tombstoned") else "active"
+        tombstone_states[tombstone_key] = tombstone_states.get(tombstone_key, 0) + 1
     lease_states: dict[str, int] = {}
     for lease in leases:
         lease_states[lease["state"]] = lease_states.get(lease["state"], 0) + 1
@@ -222,6 +225,7 @@ def _compute_counters(snapshot: dict[str, Any]) -> dict[str, Any]:
         "units_total": len(units),
         "review_state": review_states,
         "observed_state": observed_states,
+        "tombstone_state": tombstone_states,
         "leases_total": len(leases),
         "lease_state": lease_states,
         "sessions_total": len(snapshot["sessions"]),
@@ -677,8 +681,9 @@ function hasUserSelection() {
   if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
   return sel.toString().length > 0;
 }
-const REVIEW_KIND = { available: 'ok', assigned: 'warn', reviewed: 'neutral', tombstoned: 'danger' };
+const REVIEW_KIND = { available: 'ok', assigned: 'warn', reviewed: 'neutral' };
 const OBSERVED_KIND = { dirty: 'warn', committed: 'ok', superseded: 'neutral' };
+const TOMBSTONE_KIND = { active: 'ok', tombstoned: 'danger' };
 const LEASE_KIND = { active: 'ok', paused: 'warn', completed: 'neutral', 'stale-released': 'danger', 'failed-released': 'danger' };
 
 function renderKpis(c) {
@@ -700,6 +705,7 @@ function renderKpis(c) {
   }
   cells.push(pillMap('review state', c.review_state, REVIEW_KIND));
   cells.push(pillMap('observed state', c.observed_state, OBSERVED_KIND));
+  cells.push(pillMap('unit lifecycle', c.tombstone_state, TOMBSTONE_KIND));
   cells.push(pillMap('lease state', c.lease_state, LEASE_KIND));
   $('kpi-strip').innerHTML = cells.join('');
 }
@@ -866,12 +872,13 @@ function renderUnits(snap, now) {
       + `<td>${esc(u.kind)}</td>`
       + `<td>${tag(u.observed_state, OBSERVED_KIND[u.observed_state] || 'neutral')}</td>`
       + `<td>${tag(u.review_state, REVIEW_KIND[u.review_state] || 'neutral')}</td>`
+      + `<td>${tag(u.is_tombstoned ? 'tombstoned' : 'active', u.is_tombstoned ? 'danger' : 'ok')}${u.tombstone_reason ? `<div class="muted" style="font-size:11px">${esc(u.tombstone_reason)}</div>` : ''}</td>`
       + `<td>${ownersCell(u)}</td>`
       + `<td>${leaseCell(u)}</td>`
       + `<td class="mono" title="${esc(u.last_observed_at)}">${esc(fmtAge(u.last_observed_at, now))}</td>`
       + `</tr>`;
   }).join('');
-  $('units-body').innerHTML = `<table class="t-units"><thead><tr><th>unit_id</th><th>path</th><th>worktree / branch</th><th>kind</th><th>observed</th><th>review</th><th>session owners</th><th>active lease</th><th>last obs</th></tr></thead><tbody>${rows}</tbody></table>`;
+  $('units-body').innerHTML = `<table class="t-units"><thead><tr><th>unit_id</th><th>path</th><th>worktree / branch</th><th>kind</th><th>observed</th><th>review</th><th>lifecycle</th><th>session owners</th><th>active lease</th><th>last obs</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderEvents(snap) {

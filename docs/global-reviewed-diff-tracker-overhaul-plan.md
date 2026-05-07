@@ -131,7 +131,10 @@ CREATE TABLE units (
   first_observed_at    TEXT NOT NULL,
   last_observed_at     TEXT NOT NULL,
   observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
-  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed','tombstoned')),
+  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed')),
+  is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
+  tombstoned_at        TEXT,
+  tombstone_reason     TEXT,
   FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
   FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
 );
@@ -139,6 +142,7 @@ CREATE INDEX idx_units_branch        ON units(branch_key, observed_state);
 CREATE INDEX idx_units_worktree      ON units(worktree_key, observed_state);
 CREATE INDEX idx_units_path          ON units(path);
 CREATE INDEX idx_units_review_state  ON units(review_state);
+CREATE INDEX idx_units_tombstone     ON units(is_tombstoned, review_state);
 CREATE INDEX idx_units_canonical     ON units(canonical_patch_hash);
 
 -- chat session assignment
@@ -403,7 +407,7 @@ probe 结果只写 tracker metadata 和 RunLedger，不进入 review packet、sc
 
 1. `git worktree list --porcelain`：不在列表里的 `worktrees.worktree_path` 标 `state='deleted'`，`UPDATE leases SET state='stale-released' WHERE session_id IN (SELECT session_id FROM sessions WHERE current_worktree_key=:wk)`，对应 `units` 因 `ON DELETE CASCADE` 跟随。
 2. `git for-each-ref refs/heads`：不在列表里的 `branches.refname` 标 `state='deleted'`；`session_units.assignment_kind='takeover'` 中引用其 unit 的项 invalidate（标 `transferred` 让 parent 重新看到）。
-3. tombstone：被 prune 的 unit / lease / session / branch / worktree row JSON snapshot 写 `tombstones`，默认保留 7 天供回溯。
+3. tombstone：被 prune 的 unit / lease / session / branch / worktree row JSON snapshot 写 `tombstones`，默认保留 7 天供回溯。`units.review_state` 不承载 tombstone 语义；unit row 通过 `is_tombstoned` / `tombstoned_at` / `tombstone_reason` 记录生命周期退休状态，从而保留退休前的 `available` / `assigned` / `reviewed` 事实。
 
 prune 不会因 `git status --porcelain` clean 删除 unit。clean 只表示当前 worktree overlay 没有 dirty diff —— commit 后 unit 仍在 `units` 表中以 `observed_state='committed'` + 不变的 `review_state` 存在。这是「commit ≠ clear」契约的实现。
 

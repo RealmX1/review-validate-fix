@@ -28,7 +28,7 @@ from rvf_logging import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SQLITE_FILENAME = "tracker.sqlite3"
 EVENTS_FILENAME = "events.jsonl"
 META_FILENAME = "meta.json"
@@ -828,7 +828,10 @@ CREATE TABLE IF NOT EXISTS units (
   first_observed_at    TEXT NOT NULL,
   last_observed_at     TEXT NOT NULL,
   observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
-  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed','tombstoned')),
+  review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed')),
+  is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
+  tombstoned_at        TEXT,
+  tombstone_reason     TEXT,
   FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
   FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
 );
@@ -836,6 +839,7 @@ CREATE INDEX IF NOT EXISTS idx_units_branch       ON units(branch_key, observed_
 CREATE INDEX IF NOT EXISTS idx_units_worktree     ON units(worktree_key, observed_state);
 CREATE INDEX IF NOT EXISTS idx_units_path         ON units(path);
 CREATE INDEX IF NOT EXISTS idx_units_review_state ON units(review_state);
+CREATE INDEX IF NOT EXISTS idx_units_tombstone    ON units(is_tombstoned, review_state);
 CREATE INDEX IF NOT EXISTS idx_units_canonical    ON units(canonical_patch_hash);
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -1063,11 +1067,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     if version == 2:
         _migrate_schema_v2_to_v3(conn)
         _migrate_schema_v3_to_v4(conn)
+        _migrate_schema_v4_to_v5(conn)
         return
     if version == 3:
         _migrate_schema_v3_to_v4(conn)
+        _migrate_schema_v4_to_v5(conn)
+        return
+    if version == 4:
+        _migrate_schema_v4_to_v5(conn)
         return
     if version == SCHEMA_VERSION:
+        _ensure_unit_tombstone_schema(conn)
         _ensure_manual_rvf_runs_schema(conn)
         _ensure_lease_participants_schema(conn)
         _ensure_rvf_causality_schema(conn)
@@ -1114,6 +1124,113 @@ def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
           ON lease_participants(lease_id, state)
         """
     )
+
+
+def _ensure_unit_tombstone_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(units)").fetchall()}
+    if "is_tombstoned" not in columns:
+        conn.execute(
+            "ALTER TABLE units ADD COLUMN is_tombstoned INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1))"
+        )
+    if "tombstoned_at" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN tombstoned_at TEXT")
+    if "tombstone_reason" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN tombstone_reason TEXT")
+    if _rebuild_units_without_legacy_tombstoned_review_state(conn):
+        return
+    conn.execute(
+        """
+        UPDATE units
+           SET is_tombstoned=1,
+               tombstone_reason=COALESCE(tombstone_reason, 'legacy_review_state_tombstoned')
+         WHERE review_state='tombstoned'
+        """
+    )
+    conn.execute(
+        "UPDATE units SET review_state='reviewed' WHERE review_state='tombstoned'"
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_units_tombstone
+          ON units(is_tombstoned, review_state)
+        """
+    )
+
+
+def _rebuild_units_without_legacy_tombstoned_review_state(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='units'"
+    ).fetchone()
+    table_sql = row["sql"] if row else ""
+    if "'tombstoned'" not in table_sql:
+        return False
+
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE units_v5 (
+              unit_id              TEXT PRIMARY KEY,
+              branch_key           TEXT,
+              worktree_key         TEXT NOT NULL,
+              path                 TEXT NOT NULL,
+              old_path             TEXT,
+              kind                 TEXT NOT NULL CHECK (kind IN
+                                     ('tracked_hunk','untracked_file','deleted_file','binary_file','path_only')),
+              change_type          TEXT NOT NULL CHECK (change_type IN ('add','modify','delete')),
+              preimage_blob        TEXT,
+              postimage_hash       TEXT,
+              hunk_header          TEXT,
+              canonical_patch_hash TEXT NOT NULL,
+              first_observed_at    TEXT NOT NULL,
+              last_observed_at     TEXT NOT NULL,
+              observed_state       TEXT NOT NULL CHECK (observed_state IN ('dirty','committed','superseded')),
+              review_state         TEXT NOT NULL CHECK (review_state IN ('available','assigned','reviewed')),
+              is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
+              tombstoned_at        TEXT,
+              tombstone_reason     TEXT,
+              FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
+              FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
+            );
+
+            INSERT INTO units_v5(
+                unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                first_observed_at, last_observed_at, observed_state, review_state,
+                is_tombstoned, tombstoned_at, tombstone_reason
+            )
+            SELECT
+                unit_id, branch_key, worktree_key, path, old_path, kind, change_type,
+                preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
+                first_observed_at, last_observed_at, observed_state,
+                CASE WHEN review_state='tombstoned' THEN 'reviewed' ELSE review_state END,
+                CASE WHEN review_state='tombstoned' THEN 1 ELSE COALESCE(is_tombstoned, 0) END,
+                tombstoned_at,
+                CASE
+                  WHEN review_state='tombstoned'
+                    THEN COALESCE(tombstone_reason, 'legacy_review_state_tombstoned')
+                  ELSE tombstone_reason
+                END
+              FROM units;
+
+            DROP TABLE units;
+            ALTER TABLE units_v5 RENAME TO units;
+            CREATE INDEX IF NOT EXISTS idx_units_branch       ON units(branch_key, observed_state);
+            CREATE INDEX IF NOT EXISTS idx_units_worktree     ON units(worktree_key, observed_state);
+            CREATE INDEX IF NOT EXISTS idx_units_path         ON units(path);
+            CREATE INDEX IF NOT EXISTS idx_units_review_state ON units(review_state);
+            CREATE INDEX IF NOT EXISTS idx_units_tombstone    ON units(is_tombstoned, review_state);
+            CREATE INDEX IF NOT EXISTS idx_units_canonical    ON units(canonical_patch_hash);
+            """
+        )
+    finally:
+        if foreign_keys:
+            conn.execute("PRAGMA foreign_keys = ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"tracker schema migration left foreign key violations: {violations!r}")
+    return True
 
 
 def _migrate_schema_v2_to_v3(conn: sqlite3.Connection) -> None:
@@ -1197,6 +1314,14 @@ def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    _ensure_rvf_causality_schema(conn)
+    conn.execute("PRAGMA user_version = 4")
+
+
+def _migrate_schema_v4_to_v5(conn: sqlite3.Connection) -> None:
+    _ensure_unit_tombstone_schema(conn)
     _ensure_manual_rvf_runs_schema(conn)
     _ensure_lease_participants_schema(conn)
     _ensure_rvf_causality_schema(conn)
@@ -1346,7 +1471,10 @@ def _upsert_unit(
             postimage_hash=COALESCE(excluded.postimage_hash, units.postimage_hash),
             hunk_header=COALESCE(excluded.hunk_header, units.hunk_header),
             last_observed_at=excluded.last_observed_at,
-            observed_state='dirty'
+            observed_state='dirty',
+            is_tombstoned=0,
+            tombstoned_at=NULL,
+            tombstone_reason=NULL
         """,
         (
             spec.unit_id,
@@ -1363,6 +1491,25 @@ def _upsert_unit(
             now,
             now,
         ),
+    )
+
+
+def _mark_unit_tombstoned_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    unit_id: str,
+    reason: str,
+    now_iso: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE units
+           SET is_tombstoned=1,
+               tombstoned_at=?,
+               tombstone_reason=?
+         WHERE unit_id=?
+        """,
+        (now_iso, reason, unit_id),
     )
 
 
@@ -1860,6 +2007,12 @@ def register_claims(
                     "UPDATE units SET observed_state='superseded' WHERE unit_id=?",
                     (orphan_unit_id,),
                 )
+                _mark_unit_tombstoned_in_txn(
+                    conn,
+                    unit_id=orphan_unit_id,
+                    reason="session_no_longer_owns",
+                    now_iso=now,
+                )
                 conn.execute(
                     """
                     INSERT INTO tombstones(kind, ref_id, reason, payload, retired_at, expires_at)
@@ -2242,6 +2395,26 @@ def _lease_existing_assigned_units_in_txn(
         SELECT unit_id
           FROM units
          WHERE review_state='assigned'
+           AND is_tombstoned=0
+           AND unit_id IN ({placeholders})
+        """,
+        tuple(unit_ids),
+    ).fetchall()
+    return sorted(row["unit_id"] for row in rows)
+
+
+def _lease_tombstoned_units_in_txn(
+    conn: sqlite3.Connection,
+    unit_ids: list[str],
+) -> list[str]:
+    if not unit_ids:
+        return []
+    placeholders = ",".join("?" for _ in unit_ids)
+    rows = conn.execute(
+        f"""
+        SELECT unit_id
+          FROM units
+         WHERE is_tombstoned=1
            AND unit_id IN ({placeholders})
         """,
         tuple(unit_ids),
@@ -2299,6 +2472,19 @@ def lease_acquire(
                     "lease_id": None,
                     "unit_ids": unit_ids,
                     "conflicting_unit_ids": assigned_conflicts,
+                    "stale_freed": stale_freed,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+            tombstoned_conflicts = _lease_tombstoned_units_in_txn(conn, unit_ids)
+            if tombstoned_conflicts:
+                return {
+                    "status": "conflict",
+                    "acquired": False,
+                    "reason": "lease_unit_tombstoned",
+                    "lease_id": None,
+                    "unit_ids": unit_ids,
+                    "conflicting_unit_ids": tombstoned_conflicts,
                     "stale_freed": stale_freed,
                     "repo_key": key,
                     "tracker_dir": str(directory),
@@ -2812,6 +2998,7 @@ def lease_release(
                     UPDATE units
                        SET review_state='available'
                      WHERE review_state='assigned'
+                       AND is_tombstoned=0
                        AND unit_id IN ({placeholders})
                     """,
                     tuple(unit_ids),
@@ -2999,6 +3186,7 @@ def complete_review_scope(
                         UPDATE units
                            SET review_state='reviewed'
                          WHERE review_state IN ('available','assigned','reviewed')
+                           AND is_tombstoned=0
                            AND unit_id IN ({reviewable_placeholders})
                         """,
                         tuple(reviewable_unit_ids),
@@ -3379,6 +3567,7 @@ def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
             UPDATE units
                SET review_state='available'
              WHERE review_state='assigned'
+               AND is_tombstoned=0
                AND unit_id IN ({unit_placeholders})
                AND unit_id NOT IN (
                    SELECT lu.unit_id
@@ -3516,6 +3705,7 @@ def _observe_and_upsert_units_in_txn(
              WHERE worktree_key=?
                AND observed_state='dirty'
                AND review_state IN ('available','assigned')
+               AND is_tombstoned=0
             """,
             (worktree_key,),
         ).fetchall()
@@ -3554,6 +3744,7 @@ def _takeover_transfer_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind='owned'
            AND u.review_state IN ('available','assigned')
+           AND u.is_tombstoned=0
            AND u.unit_id NOT IN (
                SELECT lu.unit_id
                  FROM lease_units lu
@@ -3607,6 +3798,7 @@ def _preview_takeover_candidate_unit_ids_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind='owned'
            AND u.review_state='available'
+           AND u.is_tombstoned=0
            AND u.observed_state IN ('dirty','committed')
          ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
@@ -3667,6 +3859,7 @@ def _collect_candidate_unit_ids_in_txn(
          WHERE su.session_id=?
            AND su.assignment_kind IN ('owned','takeover')
            AND u.review_state='available'
+           AND u.is_tombstoned=0
            AND u.observed_state IN ('dirty','committed')
          ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
@@ -3743,7 +3936,7 @@ def _create_lease_in_txn(
         )
     placeholders = ",".join("?" for _ in unit_ids)
     conn.execute(
-        f"UPDATE units SET review_state='assigned' WHERE unit_id IN ({placeholders})",
+        f"UPDATE units SET review_state='assigned' WHERE is_tombstoned=0 AND unit_id IN ({placeholders})",
         tuple(unit_ids),
     )
 
