@@ -1,6 +1,6 @@
 # Review Prompt
 
-主会话必须先写一份可确认的 scope-of-work / session context 文件，并把文件路径提供给两个 reviewer；不要把同一大段 scope 文本分别粘贴进两个 reviewer prompt。若当前 Codex transcript 可用，主会话还应提供 `scripts/session_manifest.py` 生成的 session manifest 文件路径。review packet 会内联同一份内容作为备份。scope-of-work 是主会话对本 turn 已完成工作的交接说明；session manifest 是机器提取的 ownership anchor；不要让 reviewer 只靠 `git diff HEAD` 猜 scope，也不要让 reviewer 把整个 diff 当作 full-scope analysis，除非主会话明确要求 full diff review。
+主会话必须先写一份可确认的 scope-of-work / session context 文件，并把文件路径提供给两个 reviewer；不要把同一大段 scope 文本分别粘贴进两个 reviewer prompt。若当前 Codex transcript 可用，主会话还应提供 `scripts/session_manifest.py` 生成的 session manifest 文件路径。review packet 会内联同一份内容作为备份。scope-of-work 是主会话对本 turn 已完成工作的交接说明；`scope.contract.json` 是机器可读的冻结范围合同；session manifest 是机器提取的 ownership evidence。不要让 reviewer 只靠 `git diff HEAD` 猜 scope，也不要让 reviewer 把整个 diff 当作 full-scope analysis，除非主会话明确要求 full diff review。
 
 ```markdown
 ## Session context（主会话注入）
@@ -28,7 +28,7 @@ pass_type: review_only
 
 你的审查必须发生在主会话提供的目标 repo / worktree cwd 中。不要默认使用 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree；如果你发现当前工作目录不在目标 repo 内，读取文件和运行命令时必须显式使用目标 repo 路径。
 
-审查范围以主会话提供的 scope-of-work / session context 和 session manifest 为准，而不是整个 `git diff HEAD`。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；只审查 manifest owned paths、scope 内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。diff/status/file read 是核实证据，不是默认扩大范围的授权。
+审查范围以主会话提供的 `scope.contract.json` 和 scope-of-work / session context 为准，而不是整个 `git diff HEAD`。先读取 `$RVF_SCOPE_CONTRACT`：如果 `primary_units` 非空，按 tracker unit / tracker scope 审查；否则按 `primary_files`、scope-of-work 和显式 manual scope 审查。session manifest 只用于理解 ownership evidence、背景 WIP 和 tracker splice，不是最终范围合同。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；只审查合同范围内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。diff/status/file read 是核实证据，不是默认扩大范围的授权。
 
 你处于 `pass_type: review_only` / no-direct-write review 阶段。这是终点，不是完整 `$review-validate-fix` 流程：
 - 可以读取仓库、搜索代码、运行测试、lint、typecheck、build 或复现命令。
@@ -43,12 +43,12 @@ pass_type: review_only
 - 不要进入 validate/fix，不要修复问题，不要生成 handoff。
 - 不要输出 `RVF_HANDOFF_FILE`，不要输出 handoff 摘要，不要把自己描述成已完成 `$review-validate-fix`。
 - 如果外层上下文提到 research marathon、checkpoint、no-handoff 或普通研究任务，仍按本 `review_only` 契约输出；不要升级为 full mode。
-- 你应收到 scope-of-work 文件路径、session manifest 文件路径（如果可用），以及包含 `## Session Context` / `## Session Manifest` 的 self-contained review packet。优先读取 scope-of-work 文件和 session manifest，把它们当作审查入口和 scope/intent 锚点；packet 是备份和未跟踪文件索引，仍可读取仓库和运行验证命令来补充判断。
-- 你应收到 `scope.contract.json`。把其中的 `primary_files`、`background_files`、`protected_files` 和 `scope_hash` 当作机器可读 scope anchor；review 阶段不得修改任何文件。
+- 你应收到 scope-of-work 文件路径、`scope.contract.json` 路径、session manifest 文件路径（如果可用），以及包含 `## Session Context` / `## Tracker Scope` / `## Session Manifest` 的 self-contained review packet。优先读取 `scope.contract.json` 和 scope-of-work 文件，把它们当作审查入口和 scope/intent 锚点；packet 是备份和未跟踪文件索引，仍可读取仓库和运行验证命令来补充判断。
+- 你应收到 `scope.contract.json`。把其中的 `primary_units`（如果非空）、`tracker_lease_id`、`tracker_scope_hash`、`primary_files`、`background_files`、`protected_files` 和 `scope_hash` 当作机器可读 scope anchor；review 阶段不得修改任何文件。
 - 遵守 review packet 的 `## Excluded Paths`。这些前缀可能来自 `.review-validate-fix-ignore` 或主会话传入的 `--exclude-path-prefix`；不要主动读取、概括、分析或报告这些路径下的内容，除非主会话在本轮明确要求审查该路径。
 - 普通 double-review 不读取 `artifacts/reviewers/`、`artifacts/merge/`、`artifacts/validate-fix/` 或其他 reviewer outputs。若 prompt 已直接包含另一路 reviewer 的 finding/summary 或 `<subagent_notification>`，用 `$RVF_WRITE_REVIEW_RESULT context-request --out "$RVF_REVIEW_RESULT" --need prior-output --reason need-clean-review-context` 写 request artifact，让主会话用 clean context 重试。
 
-scope-of-work 文件 / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。packet 内的 `## Session Manifest` 是 session ownership 锚点；`unattributed_dirty_paths` 是背景 WIP，除非被 session-owned 改动直接连带影响，否则不要主动分析、概括或报告。你必须结合 packet 内的 `## Git Status` / `## Session-Owned Git Diff` / `## Full Git Diff HEAD (Evidence Only)`、文件读取和必要命令独立 verify；如需补跑 status/diff，必须遵守 packet 的 `## Excluded Paths` 等效过滤，不能重新暴露被排除路径。但不要只靠 git diff 推断 scope；当 diff 范围和 scope-of-work / session manifest 不一致时，优先判断差异是否是背景 WIP、遗漏交接或 scope 内改动的直接连带影响。除非主会话明确要求 full diff review，不要主动分析、概括或报告 scope 之外的历史 WIP。
+scope-of-work 文件 / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。`scope.contract.json` 是本轮最终范围合同；packet 内的 `## Tracker Scope` / `## Allocated Git Diff` 是 `primary_units` 的可读审计；`## Session Manifest` 是 session ownership evidence。`unattributed_dirty_paths` 是背景 WIP，除非被合同范围内改动直接连带影响，否则不要主动分析、概括或报告。你必须结合 packet 内的 `## Git Status` / `## Allocated Git Diff` 或 legacy `## Session-Owned Git Diff` / `## Full Git Diff HEAD (Evidence Only)`、文件读取和必要命令独立 verify；如需补跑 status/diff，必须遵守 packet 的 `## Excluded Paths` 等效过滤，不能重新暴露被排除路径。但不要只靠 git diff 推断 scope；当 diff 范围和 scope-of-work / scope contract / session manifest 不一致时，优先判断差异是否是背景 WIP、遗漏交接或 scope 内改动的直接连带影响。除非主会话明确要求 full diff review，不要主动分析、概括或报告 scope 之外的历史 WIP。
 
 Artifact 输出契约必须严格遵守：
 - 先运行 `python3 "$RVF_WRITE_REVIEW_RESULT" --help` 确认用法。
@@ -62,7 +62,7 @@ Artifact 输出契约必须严格遵守：
 
 不要概括代码做了什么。不要复述 diff。不要恭维。不要提与 bug 无关的改进。
 
-先看 scope-of-work 文件、session manifest（如果有）和带有 session context 的 review packet；packet 已包含按 `## Excluded Paths` 过滤后的 status/diff。需要补充证据时，可以读取具体文件或运行必要命令；若补跑 git status/diff，必须使用相同排除规则。未跟踪文件必须来自过滤后的 status / review packet，不能因为 `git diff HEAD` 看不到就忽略；但未被 session manifest 或 scope-of-work 标为本 turn 工作的 diff，不应自动进入审查范围。
+先看 `scope.contract.json`、scope-of-work 文件、session manifest（如果有）和带有 session context 的 review packet；packet 已包含按 `## Excluded Paths` 过滤后的 status/diff。需要补充证据时，可以读取具体文件或运行必要命令；若补跑 git status/diff，必须使用相同排除规则。未跟踪文件必须来自过滤后的 status / review packet，不能因为 `git diff HEAD` 看不到就忽略；但未被 scope contract 或 scope-of-work 标为本 turn 工作的 diff，不应自动进入审查范围。
 ```
 
 ## Artifact 解析规则

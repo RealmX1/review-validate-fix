@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rvf_logging import RunLedger, start_run
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
+from rvf_analyze_advisory import RVF_ANALYZE_FOLLOWUP_MARKER, surface_rvf_analyze_advisory
 from session_manifest import build_manifest
 
 
@@ -1272,6 +1273,12 @@ def main() -> int:
                     decision_kind="dispatcher-handoff",
                 )
                 surface_finalize_record_errors(ledger, finalize_record, payload=payload)
+                surface_rvf_analyze_advisory(
+                    event=event,
+                    ledger=ledger,
+                    payload=payload,
+                    finalize_record=finalize_record,
+                )
             except Exception as exc:
                 ledger.event(
                     phase="handoff",
@@ -1283,6 +1290,22 @@ def main() -> int:
                 )
             emit(payload)
             return 0
+    latest_user = latest_user_message_from_event(event)
+    if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
+        ledger.event(
+            phase="dev-sync",
+            event="rvf_analyze_followup_trigger_skipped",
+            status="skipped",
+            reason_code="rvf_analyze_followup_trigger_turn",
+            message="rvf-analyze follow-up trigger turn; skipping dispatcher sync and installed hook",
+        )
+        return emit_terminal_payload(
+            ledger,
+            status="skipped",
+            reason_code="rvf_analyze_followup_trigger_turn",
+            message="rvf-analyze follow-up trigger turn; skipped dispatcher sync and installed hook",
+            detail="检测到 RVF analyze follow-up trigger，已跳过主 RVF 自动触发。",
+        )
     sync_needed, reason, repo = should_sync(event)
     if not sync_needed:
         ledger.event(

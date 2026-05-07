@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,20 @@ import diff_tracker
 
 
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:>>?|1>|2>|&>)\s*(?P<path>[^&|;\s]+)")
+
+
+@dataclass(frozen=True)
+class PatchHunk:
+    path: str
+    operation: str
+    mutations: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CurrentHunk:
+    path: str
+    anchor: diff_tracker.HunkAnchor
+    mutations: tuple[str, ...]
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -136,37 +151,56 @@ def payload_tool_input(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def parse_apply_patch(repo: Path, patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
+def parse_apply_patch_details(
+    repo: Path,
+    patch_text: str,
+    line_number: int,
+) -> tuple[list[dict[str, Any]], set[str], dict[str, list[PatchHunk]]]:
     operations: list[dict[str, Any]] = []
     paths: set[str] = set()
+    hunks: dict[str, list[PatchHunk]] = {}
     current: dict[str, Any] | None = None
+    current_path: str | None = None
+    current_operation: str | None = None
+    current_mutations: list[str] = []
+
+    def flush_hunk() -> None:
+        nonlocal current_mutations
+        if current_path is not None and current_operation is not None and current_mutations:
+            hunks.setdefault(current_path, []).append(
+                PatchHunk(
+                    path=current_path,
+                    operation=current_operation,
+                    mutations=tuple(current_mutations),
+                )
+            )
+        current_mutations = []
+
+    def begin_file(operation: str, raw_path: str) -> str | None:
+        nonlocal current, current_path, current_operation
+        flush_hunk()
+        rel = normalize_repo_path(repo, raw_path)
+        if rel is None:
+            current = None
+            current_path = None
+            current_operation = None
+            return None
+        current = {"operation": operation, "path": rel, "line_number": line_number}
+        operations.append(current)
+        paths.add(rel)
+        current_path = rel
+        current_operation = operation
+        return rel
+
     for raw_line in patch_text.splitlines():
         if raw_line.startswith("*** Add File: "):
-            rel = normalize_repo_path(repo, raw_line.removeprefix("*** Add File: "))
-            if rel is None:
-                current = None
-                continue
-            current = {"operation": "add", "path": rel, "line_number": line_number}
-            operations.append(current)
-            paths.add(rel)
+            begin_file("add", raw_line.removeprefix("*** Add File: "))
             continue
         if raw_line.startswith("*** Delete File: "):
-            rel = normalize_repo_path(repo, raw_line.removeprefix("*** Delete File: "))
-            if rel is None:
-                current = None
-                continue
-            current = {"operation": "delete", "path": rel, "line_number": line_number}
-            operations.append(current)
-            paths.add(rel)
+            begin_file("delete", raw_line.removeprefix("*** Delete File: "))
             continue
         if raw_line.startswith("*** Update File: "):
-            rel = normalize_repo_path(repo, raw_line.removeprefix("*** Update File: "))
-            if rel is None:
-                current = None
-                continue
-            current = {"operation": "update", "path": rel, "line_number": line_number}
-            operations.append(current)
-            paths.add(rel)
+            begin_file("update", raw_line.removeprefix("*** Update File: "))
             continue
         if raw_line.startswith("*** Move to: ") and current is not None:
             rel = normalize_repo_path(repo, raw_line.removeprefix("*** Move to: "))
@@ -174,6 +208,25 @@ def parse_apply_patch(repo: Path, patch_text: str, line_number: int) -> tuple[li
                 continue
             current["move_to"] = rel
             paths.add(rel)
+            flush_hunk()
+            current_path = rel
+            current_operation = "update"
+            continue
+        if raw_line.startswith("@@"):
+            flush_hunk()
+            continue
+        if current_path is None:
+            continue
+        if raw_line.startswith("+++") or raw_line.startswith("---"):
+            continue
+        if raw_line.startswith("+") or raw_line.startswith("-"):
+            current_mutations.append(raw_line)
+    flush_hunk()
+    return operations, paths, hunks
+
+
+def parse_apply_patch(repo: Path, patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
+    operations, paths, _hunks = parse_apply_patch_details(repo, patch_text, line_number)
     return operations, paths
 
 
@@ -254,6 +307,307 @@ def dedupe_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def parse_record_timestamp(record: dict[str, Any]) -> datetime | None:
+    value = record.get("timestamp")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def head_commit(repo: Path) -> str | None:
+    try:
+        return str(run_git(repo, ["rev-parse", "--verify", "HEAD"])).strip() or None
+    except RuntimeError:
+        return None
+
+
+def head_committed_at(repo: Path) -> datetime | None:
+    try:
+        raw = str(run_git(repo, ["show", "-s", "--format=%cI", "HEAD"])).strip()
+    except RuntimeError:
+        return None
+    if not raw:
+        return None
+    return parse_record_timestamp({"timestamp": raw})
+
+
+def exec_success_call_ids(records: list[dict[str, Any]]) -> set[str]:
+    successful: set[str] = set()
+    for record in records:
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("type") != "exec_command_end":
+            continue
+        call_id = payload.get("call_id")
+        if isinstance(call_id, str) and payload.get("exit_code") == 0:
+            successful.add(call_id)
+    return successful
+
+
+def is_git_commit_command(repo: Path, command: str, workdir: Path | None) -> bool:
+    if workdir is None:
+        return False
+    tokens = command_tokens(command)
+    if not tokens:
+        return False
+    for index, token in enumerate(tokens):
+        if token != "git":
+            continue
+        cursor = index + 1
+        while cursor < len(tokens):
+            candidate = tokens[cursor]
+            if candidate in {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}:
+                cursor += 2
+                continue
+            if candidate.startswith("-"):
+                cursor += 1
+                continue
+            if candidate == "commit":
+                return True
+            break
+    return False
+
+
+def tool_name_for_record(record: dict[str, Any]) -> str | None:
+    payload = record.get("payload")
+    return payload_tool_name(payload) if isinstance(payload, dict) else None
+
+
+def should_include_tool_record(
+    record: dict[str, Any],
+    *,
+    cutoff_line_number: int | None,
+    cutoff_timestamp: datetime | None,
+    include_all: bool,
+) -> bool:
+    if include_all:
+        return True
+    line_number = record.get("_line_number")
+    if cutoff_line_number is not None and isinstance(line_number, int):
+        return line_number > cutoff_line_number
+    timestamp = parse_record_timestamp(record)
+    if cutoff_timestamp is not None and timestamp is not None:
+        return timestamp > cutoff_timestamp
+    return True
+
+
+def ownership_baseline(
+    repo: Path,
+    records: list[dict[str, Any]],
+    *,
+    include_all: bool,
+) -> tuple[dict[str, Any], int | None, datetime | None, list[str]]:
+    head = head_commit(repo)
+    committed_at = head_committed_at(repo)
+    warnings: list[str] = []
+    if include_all:
+        return (
+            {
+                "mode": "include_all_transcript_ownership",
+                "head": head,
+                "head_committed_at": committed_at.isoformat() if committed_at is not None else None,
+                "cutoff_line_number": None,
+                "cutoff_reason": "disabled_by_cli",
+                "included_tool_record_count": 0,
+                "ignored_tool_record_count": 0,
+            },
+            None,
+            None,
+            warnings,
+        )
+
+    successful_call_ids = exec_success_call_ids(records)
+    cutoff_line: int | None = None
+    for record in records:
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload_tool_name(payload) != "exec_command":
+            continue
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or call_id not in successful_call_ids:
+            continue
+        args_text = payload_tool_input(payload)
+        if not args_text:
+            continue
+        args = parse_exec_arguments(args_text)
+        cmd = args.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            continue
+        raw_workdir = args.get("workdir") if isinstance(args.get("workdir"), str) else None
+        resolved_workdir = command_workdir(repo, raw_workdir)
+        if is_git_commit_command(repo, cmd, resolved_workdir):
+            line = record.get("_line_number")
+            cutoff_line = int(line) if isinstance(line, int) else cutoff_line
+
+    if cutoff_line is not None:
+        return (
+            {
+                "mode": "line_cutoff",
+                "head": head,
+                "head_committed_at": committed_at.isoformat() if committed_at is not None else None,
+                "cutoff_line_number": cutoff_line,
+                "cutoff_reason": "last_successful_repo_local_git_commit",
+                "included_tool_record_count": 0,
+                "ignored_tool_record_count": 0,
+            },
+            cutoff_line,
+            None,
+            warnings,
+        )
+
+    has_tool_timestamps = any(
+        tool_name_for_record(record) in {"apply_patch", "exec_command"} and parse_record_timestamp(record) is not None
+        for record in records
+    )
+    if committed_at is not None and has_tool_timestamps:
+        return (
+            {
+                "mode": "head_commit_time",
+                "head": head,
+                "head_committed_at": committed_at.isoformat(),
+                "cutoff_line_number": None,
+                "cutoff_reason": "head_committed_at",
+                "included_tool_record_count": 0,
+                "ignored_tool_record_count": 0,
+            },
+            None,
+            committed_at,
+            warnings,
+        )
+
+    warnings.append(
+        "ownership_baseline_fallback: transcript has no successful git commit cutoff and no comparable tool timestamps; using full-transcript ownership"
+    )
+    return (
+        {
+            "mode": "legacy_full_transcript",
+            "head": head,
+            "head_committed_at": committed_at.isoformat() if committed_at is not None else None,
+            "cutoff_line_number": None,
+            "cutoff_reason": "missing_commit_cutoff_and_tool_timestamps",
+            "included_tool_record_count": 0,
+            "ignored_tool_record_count": 0,
+        },
+        None,
+        None,
+        warnings,
+    )
+
+
+def current_diff_hunks(repo: Path, path: str) -> list[CurrentHunk]:
+    try:
+        diff = run_git(repo, ["diff", "-U3", "--no-color", "HEAD", "--", path])
+    except RuntimeError:
+        return []
+    if not isinstance(diff, str) or not diff:
+        return []
+    hunks: list[CurrentHunk] = []
+    pending_header: tuple[tuple[int, int], tuple[int, int], str] | None = None
+    pending_header_line = ""
+    context_lines: list[str] = []
+    mutation_lines: list[str] = []
+    in_hunk = False
+
+    def flush() -> None:
+        if pending_header is None or not mutation_lines:
+            return
+        old_range, new_range, _ = pending_header
+        hunks.append(
+            CurrentHunk(
+                path=path,
+                anchor=diff_tracker.HunkAnchor(
+                    header=diff_tracker._normalize_header(pending_header_line),
+                    context_hash=diff_tracker._context_hash(context_lines),
+                    old_range=old_range,
+                    new_range=new_range,
+                ),
+                mutations=tuple(mutation_lines),
+            )
+        )
+
+    for raw_line in diff.splitlines():
+        if raw_line.startswith("@@"):
+            flush()
+            parsed = diff_tracker._hunk_header_parts(raw_line)
+            if parsed is None:
+                pending_header = None
+                pending_header_line = ""
+                context_lines = []
+                mutation_lines = []
+                in_hunk = False
+                continue
+            pending_header = parsed
+            pending_header_line = raw_line
+            context_lines = []
+            mutation_lines = []
+            in_hunk = True
+            continue
+        if not in_hunk or pending_header is None:
+            continue
+        if raw_line.startswith("+++") or raw_line.startswith("---"):
+            continue
+        if raw_line.startswith("+") or raw_line.startswith("-"):
+            mutation_lines.append(raw_line)
+            continue
+        if len(context_lines) < 3:
+            context_lines.append(raw_line)
+    flush()
+    return hunks
+
+
+def live_apply_patch_units(
+    repo: Path,
+    patch_hunks_by_path: dict[str, list[PatchHunk]],
+    dirty: set[str],
+) -> list[tuple[diff_tracker.OwnedUnit, str]]:
+    units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    current_cache: dict[str, list[CurrentHunk]] = {}
+    for path, patch_hunks in patch_hunks_by_path.items():
+        if path not in dirty:
+            continue
+        current = current_cache.setdefault(path, current_diff_hunks(repo, path))
+        path_matched = False
+        for patch_hunk in patch_hunks:
+            patch_mutations = set(patch_hunk.mutations)
+            if not patch_mutations:
+                continue
+            for current_hunk in current:
+                if not patch_mutations.issubset(set(current_hunk.mutations)):
+                    continue
+                key = (path, "hunk", current_hunk.anchor.header)
+                if key not in seen:
+                    seen.add(key)
+                    units.append(
+                        (
+                            diff_tracker.OwnedUnit(path=path, unit="hunk", hunk_anchor=current_hunk.anchor),
+                            "apply_patch",
+                        )
+                    )
+                path_matched = True
+        if path_matched:
+            continue
+        # Adds/deletes and untracked update-style test fixtures can have no
+        # parseable git diff hunk. Use path-level ownership only when the
+        # current diff has no hunks at all; if hunks exist but none matched,
+        # treat the apply_patch hunk as no longer live.
+        if not current or any(item.operation in {"add", "delete"} for item in patch_hunks):
+            key = (path, "path", "")
+            if key not in seen:
+                seen.add(key)
+                units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "apply_patch"))
+    return units
+
+
 def build_manifest(
     repo: Path,
     transcript: Path,
@@ -261,14 +615,25 @@ def build_manifest(
     tracker_enabled: bool = True,
     tracker_run_id: str | None = None,
     tracker_log_root: Path | None = None,
+    include_all_transcript_ownership: bool = False,
 ) -> dict[str, Any]:
     root = git_root(repo)
     records = parse_jsonl(transcript)
+    baseline, cutoff_line_number, cutoff_timestamp, baseline_warnings = ownership_baseline(
+        root,
+        records,
+        include_all=include_all_transcript_ownership,
+    )
     owned_paths: set[str] = set()
-    apply_patch_paths: set[str] = set()
     apply_patch_operations: list[dict[str, Any]] = []
     command_candidates: list[dict[str, Any]] = []
     command_events: list[dict[str, Any]] = []
+    dirty = dirty_paths(root)
+    dirty_set = set(dirty)
+    live_owned_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    live_exec_paths: set[str] = set()
+    included_tool_record_count = 0
+    ignored_tool_record_count = 0
 
     for record in records:
         payload = record.get("payload")
@@ -279,10 +644,23 @@ def build_manifest(
             patch_text = payload_tool_input(payload)
             if not patch_text:
                 continue
-            operations, paths = parse_apply_patch(root, patch_text, int(record.get("_line_number", 0)))
+            operations, paths, patch_hunks = parse_apply_patch_details(
+                root,
+                patch_text,
+                int(record.get("_line_number", 0)),
+            )
             apply_patch_operations.extend(operations)
             owned_paths.update(paths)
-            apply_patch_paths.update(paths)
+            if should_include_tool_record(
+                record,
+                cutoff_line_number=cutoff_line_number,
+                cutoff_timestamp=cutoff_timestamp,
+                include_all=include_all_transcript_ownership,
+            ):
+                included_tool_record_count += 1
+                live_owned_units.extend(live_apply_patch_units(root, patch_hunks, dirty_set))
+            else:
+                ignored_tool_record_count += 1
             continue
         if tool_name != "exec_command":
             continue
@@ -314,34 +692,70 @@ def build_manifest(
                 for item in candidates
             )
             owned_paths.update(str(item["path"]) for item in candidates)
+            if should_include_tool_record(
+                record,
+                cutoff_line_number=cutoff_line_number,
+                cutoff_timestamp=cutoff_timestamp,
+                include_all=include_all_transcript_ownership,
+            ):
+                included_tool_record_count += 1
+                for item in candidates:
+                    path = str(item["path"])
+                    if path in dirty_set:
+                        live_exec_paths.add(path)
+            else:
+                ignored_tool_record_count += 1
         command_events.append(event)
 
-    dirty = dirty_paths(root)
-    owned_dirty = sorted(path for path in dirty if path in owned_paths)
-    unattributed_dirty = sorted(path for path in dirty if path not in owned_paths)
+    seen_live_units: set[tuple[str, str, str]] = set()
+    deduped_live_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    for owned_unit, evidence in live_owned_units:
+        key = (
+            owned_unit.path,
+            owned_unit.unit,
+            owned_unit.hunk_anchor.header if owned_unit.hunk_anchor is not None else "",
+        )
+        if key in seen_live_units:
+            continue
+        seen_live_units.add(key)
+        deduped_live_units.append((owned_unit, evidence))
+    for path in sorted(live_exec_paths):
+        key = (path, "path", "")
+        if key in seen_live_units:
+            continue
+        seen_live_units.add(key)
+        deduped_live_units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "exec_command"))
+
+    owned_dirty = sorted({owned_unit.path for owned_unit, _evidence in deduped_live_units if owned_unit.path in dirty_set})
+    unattributed_dirty = sorted(path for path in dirty if path not in set(owned_dirty))
     session_id = session_id_from_records(records)
+    baseline["included_tool_record_count"] = included_tool_record_count
+    baseline["ignored_tool_record_count"] = ignored_tool_record_count
 
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
     if tracker_enabled and owned_dirty:
         owned_dirty_set = set(owned_dirty)
-        tracker_apply_patch_paths = apply_patch_paths & owned_dirty_set
-        tracker_exec_only_paths = owned_dirty_set - tracker_apply_patch_paths
+        tracker_apply_patch_paths = {
+            owned_unit.path
+            for owned_unit, evidence in deduped_live_units
+            if evidence == "apply_patch" and owned_unit.path in owned_dirty_set
+        }
+        tracker_exec_only_paths = {
+            owned_unit.path
+            for owned_unit, evidence in deduped_live_units
+            if evidence == "exec_command" and owned_unit.path in owned_dirty_set
+        }
         register_session_id = session_id or (tracker_run_id or f"transcript-{transcript.name}")
-        units = diff_tracker._build_owned_units(
-            root,
-            owned_paths=owned_dirty,
-            apply_patch_paths=tracker_apply_patch_paths,
-            exec_only_paths=tracker_exec_only_paths,
-        )
         tracker_units = [
             {
-                "path": unit.path,
-                "unit": unit.unit,
+                "path": owned_unit.path,
+                "unit": owned_unit.unit,
                 "evidence": evidence,
-                "hunk_anchor": unit.hunk_anchor.to_dict() if unit.hunk_anchor is not None else None,
+                "hunk_anchor": owned_unit.hunk_anchor.to_dict() if owned_unit.hunk_anchor is not None else None,
             }
-            for unit, evidence in units
+            for owned_unit, evidence in deduped_live_units
+            if owned_unit.path in owned_dirty_set
         ]
         result = diff_tracker.register_claims(
             repo=root,
@@ -352,6 +766,11 @@ def build_manifest(
             owned_paths=owned_dirty,
             apply_patch_paths=tracker_apply_patch_paths,
             exec_only_paths=tracker_exec_only_paths,
+            owned_units_override=[
+                (owned_unit, evidence)
+                for owned_unit, evidence in deduped_live_units
+                if owned_unit.path in owned_dirty_set
+            ],
             log_root_override=tracker_log_root,
         )
         tracker_payload = result.to_dict()
@@ -369,6 +788,7 @@ def build_manifest(
         "transcript": str(transcript.resolve()),
         "session_id": session_id,
         "confidence": "medium" if apply_patch_operations else "low",
+        "ownership_baseline": baseline,
         "owned_paths": sorted(owned_paths),
         "owned_dirty_paths": owned_dirty,
         "unattributed_dirty_paths": unattributed_dirty,
@@ -378,6 +798,7 @@ def build_manifest(
         "tracker": tracker_payload,
         "warnings": [
             "Transcript-derived command side effects are conservative hints; without Pre/Post tool snapshots, shell writes cannot be fully attributed.",
+            *baseline_warnings,
         ],
     }
 
@@ -396,6 +817,11 @@ def main() -> int:
         "--tracker-run-id",
         help="Associate tracker claims with this RVF run id; falls back to environment / no run id.",
     )
+    parser.add_argument(
+        "--include-all-transcript-ownership",
+        action="store_true",
+        help="Debug compatibility mode: derive ownership from the full transcript instead of filtering at the live HEAD baseline.",
+    )
     args = parser.parse_args()
 
     try:
@@ -407,6 +833,7 @@ def main() -> int:
             transcript,
             tracker_enabled=not args.no_tracker,
             tracker_run_id=args.tracker_run_id,
+            include_all_transcript_ownership=args.include_all_transcript_ownership,
         )
     except Exception as exc:
         return fail(str(exc), 2)

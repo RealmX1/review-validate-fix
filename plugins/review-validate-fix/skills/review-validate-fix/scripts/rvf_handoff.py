@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import RunLedger, rvf_state_fields, safe_token
+from rvf_logging import RunLedger, log_root, rvf_state_fields, safe_token
 
 
 HANDOFF_FILE_MARKER = "RVF_HANDOFF_FILE"
@@ -179,6 +179,67 @@ def open_handoff_file(path: Path) -> dict[str, Any]:
     }
 
 
+def _handoff_path_digest(handoff_path: Path) -> str:
+    return hashlib.sha256(str(handoff_path).encode("utf-8")).hexdigest()[:12]
+
+
+def _opened_marker_path(root: Path, handoff_path: Path) -> Path:
+    return root / "handoff-opened" / f"{_handoff_path_digest(handoff_path)}.json"
+
+
+def _write_json_marker(path: Path, payload: dict[str, Any]) -> tuple[bool, dict[str, str] | None]:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return False, {
+            "kind": "log_unavailable",
+            "operation": "handoff_marker",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return True, None
+
+
+def _manual_open_marker_root(path: Path) -> Path | None:
+    if any(os.environ.get(key) for key in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR")):
+        return log_root()
+    run_dir = os.environ.get("CODEX_RVF_RUN_DIR")
+    if run_dir and run_dir.strip():
+        run_dir_path = Path(run_dir).expanduser()
+        if run_dir_path.parent.name == "runs":
+            return run_dir_path.parent.parent
+        return log_root()
+    if (
+        path.parent.name == "artifacts"
+        and path.parent.parent.parent.name == "runs"
+    ):
+        return path.parent.parent.parent.parent
+    return None
+
+
+def _record_manual_open(path: Path, open_result: dict[str, Any]) -> dict[str, Any]:
+    marker_root = _manual_open_marker_root(path)
+    if marker_root is None:
+        return {"marker_written": False, "reason": "no_rvf_log_context"}
+    if open_result.get("opened") is not True:
+        return {"marker_written": False, "reason": "not_opened"}
+    marker_path = _opened_marker_path(marker_root, path)
+    marker_payload = {
+        "source": "manual_open",
+        "handoff_path": str(path),
+        "open_result": open_result,
+    }
+    marker_written, marker_error = _write_json_marker(marker_path, marker_payload)
+    return {
+        "marker_path": str(marker_path),
+        "marker_written": marker_written,
+        "marker_error": marker_error,
+    }
+
+
 def manual_open_handoff_payload(path: Path) -> dict[str, Any]:
     valid, reason = validate_handoff_path(path)
     if not valid:
@@ -190,21 +251,22 @@ def manual_open_handoff_payload(path: Path) -> dict[str, Any]:
         }
     resolved = path.expanduser().resolve()
     open_result = open_handoff_file(resolved)
+    marker_result = _record_manual_open(resolved, open_result)
     return {
         "valid": True,
         "handoff_path": str(resolved),
         "opened": bool(open_result.get("opened")),
         "reason": open_result.get("reason"),
         "open_result": open_result,
+        "manual_open_marker": marker_result,
     }
 
 
 def _advised_marker_path(ledger: RunLedger, session_id: str, handoff_path: Path) -> Path:
-    digest = hashlib.sha256(str(handoff_path).encode("utf-8")).hexdigest()[:12]
     return (
         ledger.root
         / "handoff-advised"
-        / f"{safe_token(session_id)}.{digest}.json"
+        / f"{safe_token(session_id)}.{_handoff_path_digest(handoff_path)}.json"
     )
 
 
@@ -249,43 +311,44 @@ def handoff_completion_payload(
     }
     session_id = str(event.get("session_id") or "unknown-session")
     marker_path = _advised_marker_path(ledger, session_id, resolved)
+    opened_marker_path = _opened_marker_path(ledger.root, resolved)
     marker_written = False
     marker_error: dict[str, str] | None = None
     already_advised = marker_path.exists()
+    already_opened = opened_marker_path.exists()
     open_result: dict[str, Any]
-    if already_advised:
+    if already_advised or already_opened:
         open_result = {
             "enabled": handoff_open_enabled(),
             "opened": False,
-            "reason": "already_advised",
+            "reason": "already_advised" if already_advised else "already_opened",
         }
     else:
         open_result = open_handoff_file(resolved)
-        try:
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.write_text(
-                json.dumps(
-                    {
-                        "session_id": session_id,
-                        "handoff_path": str(resolved),
-                        "open_result": open_result,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+        marker_payload = {
+            "session_id": session_id,
+            "handoff_path": str(resolved),
+            "open_result": open_result,
+        }
+        marker_written, marker_error = _write_json_marker(marker_path, marker_payload)
+        if marker_error is not None:
+            ledger._diagnose("handoff_marker", OSError(marker_error["error"]))
+        if open_result.get("opened") is True:
+            opened_written, opened_error = _write_json_marker(
+                opened_marker_path,
+                {
+                    "source": "handoff_advisory",
+                    **marker_payload,
+                },
             )
-            marker_written = True
-        except OSError as exc:
-            marker_error = {
-                "kind": "log_unavailable",
-                "operation": "handoff_marker",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            ledger._diagnose("handoff_marker", exc)
+            if not opened_written and marker_error is None:
+                marker_error = opened_error
+                ledger._diagnose(
+                    "handoff_opened_marker",
+                    OSError(opened_error["error"] if opened_error else "unknown error"),
+                )
 
-    status = "completed" if open_result.get("opened") or already_advised else "warning"
+    status = "completed" if open_result.get("opened") or already_advised or already_opened else "warning"
     ledger.event(
         phase="handoff",
         event="handoff_file_ready",
@@ -293,12 +356,17 @@ def handoff_completion_payload(
         reason_code="handoff_file_ready",
         level="info" if status == "completed" else "warn",
         session_id=session_id,
-        paths={"handoff": str(resolved), "marker": str(marker_path)},
+        paths={
+            "handoff": str(resolved),
+            "marker": str(marker_path),
+            "opened_marker": str(opened_marker_path),
+        },
         handoff_open_enabled=open_result.get("enabled"),
         handoff_open_result=open_result,
         marker_written=marker_written,
         marker_error=marker_error,
         already_advised=already_advised,
+        already_opened=already_opened,
         **rvf_state_fields(
             phase="complete",
             **previous_state_fields,
@@ -311,7 +379,7 @@ def handoff_completion_payload(
         message += "。自动打开已禁用。"
     elif open_result.get("opened"):
         message += "。已尝试自动打开。"
-    elif already_advised:
+    elif already_advised or already_opened:
         message += "。此前已处理过该 handoff。"
     else:
         message += "。自动打开失败，详情见 summary。"
@@ -324,9 +392,11 @@ def handoff_completion_payload(
         handoff_open_enabled=open_result.get("enabled"),
         handoff_open_result=open_result,
         marker_path=str(marker_path),
+        opened_marker_path=str(opened_marker_path),
         marker_written=marker_written,
         marker_error=marker_error,
         already_advised=already_advised,
+        already_opened=already_opened,
         **rvf_state_fields(
             phase="complete",
             **previous_state_fields,

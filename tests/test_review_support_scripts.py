@@ -215,8 +215,8 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
         "*** Begin Patch\n"
         "*** Update File: tracked.txt\n"
         "@@\n"
-        "-base\n"
-        "+base edited by session\n"
+        " base\n"
+        "+change\n"
         "*** Add File: owned-new.txt\n"
         "+owned\n"
         "*** Delete File: removed.txt\n"
@@ -224,12 +224,12 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
     )
     records = [
         {
-            "timestamp": "2026-04-27T00:00:00.000Z",
+            "timestamp": "2999-04-27T00:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": "session-tracking-test", "cwd": str(repo)},
         },
         {
-            "timestamp": "2026-04-27T00:00:01.000Z",
+            "timestamp": "2999-04-27T00:00:01.000Z",
             "type": "response_item",
             "payload": {
                 "type": "custom_tool_call",
@@ -239,7 +239,7 @@ def write_codex_transcript(path: Path, repo: Path) -> Path:
             },
         },
         {
-            "timestamp": "2026-04-27T00:00:02.000Z",
+            "timestamp": "2999-04-27T00:00:02.000Z",
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -788,6 +788,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         tests_dir.mkdir()
         for name in (
             "test_install_to_codex.py",
+            "test_rvf_handoff_intake.py",
             "test_review_support_scripts.py",
             "test_codex_stop_hook_dispatcher.py",
             "test_codex_stop_review_validate_fix.py",
@@ -826,9 +827,10 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         records = [json.loads(line) for line in timing_path.read_text(encoding="utf-8").splitlines()]
 
     assert completed.returncode == 0
-    assert [record["execution_mode"] for record in records] == ["parallel"] * 11
+    assert [record["execution_mode"] for record in records] == ["parallel"] * 12
     assert {record["label"] for record in records} == {
         "tests: install_to_codex",
+        "tests: rvf_handoff_intake",
         "tests: review_support_scripts shard 1/4",
         "tests: review_support_scripts shard 2/4",
         "tests: review_support_scripts shard 3/4",
@@ -1361,6 +1363,226 @@ def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp_path: 
     assert manifest["command_path_candidates"][0]["reason"] == "shell_redirect"
 
 
+def test_session_manifest_does_not_claim_post_commit_same_path_background_dirty(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    transcript = tmp_path / "session.jsonl"
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {"timestamp": "2020-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "S"}},
+        {
+            "timestamp": "2020-01-01T00:00:01Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-old"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit owned change"], cwd=repo)
+    (repo / "a.txt").write_text("background\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["owned_paths"] == ["a.txt"]
+    assert manifest["owned_dirty_paths"] == []
+    assert manifest["unattributed_dirty_paths"] == ["a.txt"]
+    assert manifest["ownership_baseline"]["mode"] == "head_commit_time"
+    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
+
+
+def test_session_manifest_claims_apply_patch_after_commit_cutoff(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    old_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    new_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " owned\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": old_patch}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": json.dumps({"cmd": "git commit -m owned", "workdir": str(repo)}),
+                "call_id": "commit-call",
+            },
+        },
+        {"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "commit-call", "exit_code": 0}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": new_patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "owned"], cwd=repo)
+    (repo / "a.txt").write_text("owned\nnew\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["owned_paths"] == ["a.txt"]
+    assert manifest["owned_dirty_paths"] == ["a.txt"]
+    assert manifest["unattributed_dirty_paths"] == []
+    assert manifest["ownership_baseline"]["mode"] == "line_cutoff"
+    assert manifest["ownership_baseline"]["included_tool_record_count"] == 1
+    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
+
+
+def test_session_manifest_only_claims_matching_apply_patch_hunk(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n"
+        "keep\n"
+        "middle\n"
+        "keep\n"
+        "bottom\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " bottom\n"
+        "+session-owned\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text(
+        "top\n"
+        "background\n"
+        "middle\n"
+        "keep\n"
+        "bottom\n"
+        "session-owned\n",
+        encoding="utf-8",
+    )
+    log_root = tmp_path / "state"
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+            ],
+            env=env,
+        ).stdout
+    )
+
+    owned_units = manifest["tracker"]["owned_units"]
+    assert manifest["owned_dirty_paths"] == ["a.txt"]
+    assert len(owned_units) == 1
+    assert owned_units[0]["unit"] == "hunk"
+    assert "session-owned" in run(["git", "diff", "HEAD", "--", "a.txt"], cwd=repo).stdout
+
+
+def test_session_manifest_legacy_timestampless_transcript_fallback_warns(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: tracked.txt\n"
+        "@@\n"
+        "-base\n"
+        "+base\n"
+        "+legacy\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "legacy-session"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["ownership_baseline"]["mode"] == "legacy_full_transcript"
+    assert any("ownership_baseline_fallback" in warning for warning in manifest["warnings"])
+
+
 def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     docs = repo / "docs"
@@ -1369,12 +1591,12 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Pat
     transcript = tmp_path / "session.jsonl"
     records = [
         {
-            "timestamp": "2026-04-27T00:00:00.000Z",
+            "timestamp": "2999-04-27T00:00:00.000Z",
             "type": "session_meta",
             "payload": {"id": "session-subdir-test", "cwd": str(repo)},
         },
         {
-            "timestamp": "2026-04-27T00:00:01.000Z",
+            "timestamp": "2999-04-27T00:00:01.000Z",
             "type": "response_item",
             "payload": {
                 "type": "function_call",
@@ -1561,6 +1783,98 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> N
     assert payload["session_owned_path_count"] >= 3
     assert payload["owned_untracked_count"] == 1
     assert payload["background_untracked_count"] >= 2
+
+
+def test_build_packet_filters_session_owned_diff_to_tracker_hunk(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n" + "\n".join(f"keep-{index}" for index in range(20)) + "\nbottom\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    (repo / "a.txt").write_text(
+        "top\n"
+        "background\n"
+        + "\n".join(f"keep-{index}" for index in range(20))
+        + "\nbottom\n"
+        + "session-owned\n",
+        encoding="utf-8",
+    )
+    diff_text = run(["git", "diff", "-U3", "HEAD", "--", "a.txt"], cwd=repo).stdout
+    selected_header: str | None = None
+    current_header: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            current_header = line
+        if "+session-owned" in line:
+            selected_header = current_header
+            break
+    assert selected_header is not None
+
+    context = tmp_path / "context.md"
+    context.write_text("session context\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repo": str(repo.resolve()),
+                "session_id": "S",
+                "confidence": "medium",
+                "owned_paths": ["a.txt"],
+                "owned_dirty_paths": ["a.txt"],
+                "unattributed_dirty_paths": [],
+                "tracker": {
+                    "status": "ok",
+                    "session_id": "S",
+                    "tracker_scope": {
+                        "unit_ids": ["unit-session"],
+                        "lease_id": "lse-test",
+                        "scope_hash": "sha256:" + "a" * 64,
+                        "paths": ["a.txt"],
+                        "hunks": [
+                            {
+                                "unit_id": "unit-session",
+                                "path": "a.txt",
+                                "hunk_header": selected_header,
+                            }
+                        ],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
+
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    session_owned_diff = packet_text.split("## Full Git Diff HEAD", 1)[0]
+    assert "+session-owned" in session_owned_diff
+    assert "+background" not in session_owned_diff
+    assert "+background" in packet_text
 
 
 def test_build_packet_rejects_session_manifest_for_different_repo(tmp_path: Path) -> None:
@@ -1845,6 +2159,9 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
     assert "- review result writer: `$RVF_WRITE_REVIEW_RESULT`" in review_agent_context_text
     assert "- reviewer result artifact: `$RVF_REVIEW_RESULT`" in review_agent_context_text
+    assert "Scope precedence: read `$RVF_SCOPE_CONTRACT` first" in review_agent_context_text
+    assert "`primary_units` is non-empty" in review_agent_context_text
+    assert "not the final scope contract" in review_agent_context_text
     assert payload["scope_of_work_file"] not in review_agent_context_text
     assert payload["review_packet"] not in review_agent_context_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
@@ -1910,6 +2227,8 @@ def test_alternative_reviewer_prompt_uses_session_env_refs(tmp_path: Path) -> No
     assert "$RVF_CHECK_REVIEW_RESULT" in prompt
     assert "$RVF_REVIEW_RESULT" in prompt
     assert "$RVF_REPO" in prompt
+    assert "`primary_units` takes precedence over session manifest paths" in prompt
+    assert "not as the final scope contract" in prompt
     assert str(scope_contract) not in prompt
     assert str(context) not in prompt
     assert str(result_path) not in prompt
@@ -3142,6 +3461,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
     shim = tmp_path / "codex"
     sink = tmp_path / "argv.json"
     shim.write_text(
@@ -3178,6 +3498,8 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
             str(repo),
             "--review-packet",
             str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
         ],
         env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
@@ -3187,13 +3509,14 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["exec", "--json", "-"]
+    assert argv == ["exec", "--json", "--add-dir", str(run_dir.resolve()), "-"]
 
 
 def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
     shim = tmp_path / "codex"
     sink = tmp_path / "argv.json"
     shim.write_text(
@@ -3214,7 +3537,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
     shim.chmod(0o755)
     config = write_alternative_reviewer_config(
         tmp_path / "alternative-reviewer.json",
-        ["codex", "--ask-for-approval", "never", "exec"],
+        ["codex", "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write"],
         idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
@@ -3230,6 +3553,8 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
             str(repo),
             "--review-packet",
             str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
         ],
         env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
         capture_output=True,
@@ -3239,7 +3564,17 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["--ask-for-approval", "never", "exec", "--json", "-"]
+    assert argv == [
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "--add-dir",
+        str(run_dir.resolve()),
+        "-",
+    ]
 
 
 def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) -> None:
@@ -5810,6 +6145,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_session_manifest_extracts_apply_patch_and_command_candidates(root / "session-manifest"),
         ),
         (
+            "session_manifest_does_not_claim_post_commit_same_path_background_dirty",
+            lambda: test_session_manifest_does_not_claim_post_commit_same_path_background_dirty(
+                root / "session-manifest-post-commit"
+            ),
+        ),
+        (
+            "session_manifest_claims_apply_patch_after_commit_cutoff",
+            lambda: test_session_manifest_claims_apply_patch_after_commit_cutoff(
+                root / "session-manifest-commit-cutoff"
+            ),
+        ),
+        (
+            "session_manifest_only_claims_matching_apply_patch_hunk",
+            lambda: test_session_manifest_only_claims_matching_apply_patch_hunk(
+                root / "session-manifest-live-hunk"
+            ),
+        ),
+        (
+            "session_manifest_legacy_timestampless_transcript_fallback_warns",
+            lambda: test_session_manifest_legacy_timestampless_transcript_fallback_warns(
+                root / "session-manifest-legacy-fallback"
+            ),
+        ),
+        (
             "session_manifest_resolves_exec_paths_from_command_workdir",
             lambda: test_session_manifest_resolves_exec_paths_from_command_workdir(
                 root / "session-manifest-workdir"
@@ -5824,6 +6183,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "build_packet_uses_session_manifest_as_scope_anchor",
             lambda: test_build_packet_uses_session_manifest_as_scope_anchor(root / "packet-manifest"),
+        ),
+        (
+            "build_packet_filters_session_owned_diff_to_tracker_hunk",
+            lambda: test_build_packet_filters_session_owned_diff_to_tracker_hunk(
+                root / "packet-tracker-hunk"
+            ),
         ),
         (
             "build_packet_rejects_session_manifest_for_different_repo",
@@ -6362,12 +6727,28 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_lease_refresh_returns_expired_when_past_ttl(root / "lease-T5"),
         ),
         (
-            "lease_release_returns_units_to_available",
-            lambda: test_lease_release_returns_units_to_available(root / "lease-T6"),
+            "lease_release_completed_marks_units_reviewed",
+            lambda: test_lease_release_completed_marks_units_reviewed(root / "lease-T6"),
         ),
         (
             "lease_release_idempotent",
             lambda: test_lease_release_idempotent(root / "lease-T7"),
+        ),
+        (
+            "complete_review_scope_unions_contract_and_lease_units",
+            lambda: test_complete_review_scope_unions_contract_and_lease_units(root / "lease-T7a"),
+        ),
+        (
+            "complete_review_scope_does_not_complete_failed_released_lease",
+            lambda: test_complete_review_scope_does_not_complete_failed_released_lease(root / "lease-T7c"),
+        ),
+        (
+            "complete_review_scope_supersedes_overlapping_active_lease",
+            lambda: test_complete_review_scope_supersedes_overlapping_active_lease(root / "lease-T7d"),
+        ),
+        (
+            "complete_review_scope_keeps_different_scope_active_lease",
+            lambda: test_complete_review_scope_keeps_different_scope_active_lease(root / "lease-T7e"),
         ),
         (
             "lease_participants_finish_does_not_release_shared_lease",
@@ -7632,7 +8013,7 @@ def test_lease_refresh_returns_expired_when_past_ttl(tmp: Path) -> None:
     assert refreshed["reason"] == "lease_expired_before_refresh"
 
 
-def test_lease_release_returns_units_to_available(tmp: Path) -> None:
+def test_lease_release_completed_marks_units_reviewed(tmp: Path) -> None:
     module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
     acquired = module.lease_acquire(
         repo=repo,
@@ -7648,7 +8029,7 @@ def test_lease_release_returns_units_to_available(tmp: Path) -> None:
         log_root_override=log_root,
     )
     assert released["released"] is True
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
 
 
 def test_lease_release_idempotent(tmp: Path) -> None:
@@ -7664,8 +8045,128 @@ def test_lease_release_idempotent(tmp: Path) -> None:
     first = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
     second = module.lease_release(repo=repo, lease_id=acquired["lease_id"], log_root_override=log_root)
     assert first["released"] is True
-    assert second["released"] is False
-    assert second["reason"] == "lease_not_found"
+    assert second["released"] is True
+    assert second["reason"] == "lease_already_completed"
+
+
+def test_complete_review_scope_unions_contract_and_lease_units(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    assert len(unit_ids) >= 2
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-complete-union",
+        run_id="lease-run-complete-union",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:2],
+        log_root_override=log_root,
+    )
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 0
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:2]) == {
+        unit_ids[0]: "reviewed",
+        unit_ids[1]: "reviewed",
+    }
+
+
+def test_complete_review_scope_does_not_complete_failed_released_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-complete-failed",
+        run_id="lease-run-complete-failed",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    failed = module.lease_release(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        reason="failed",
+        log_root_override=log_root,
+    )
+    assert failed["released"] is True
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=acquired["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is False
+    assert completed["reason"] == "lease_failed_released"
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "failed-released"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_complete_review_scope_supersedes_overlapping_active_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    stale = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-stale-complete",
+        run_id="lease-run-stale-complete",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    swept = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:02Z",
+    )
+    assert [item["lease_id"] for item in swept] == [stale["lease_id"]]
+    active = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-overlap-complete",
+        run_id="lease-run-overlap-complete",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert active["acquired"] is True
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=stale["lease_id"],
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert active["lease_id"] in completed["superseded_active_lease_ids"]
+    assert _lease_unit_count(log_root, repo_key, active["lease_id"]) == 0
+    assert dict(_lease_rows(log_root, repo_key))[active["lease_id"]] == "completed"
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
+
+
+def test_complete_review_scope_keeps_different_scope_active_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    active = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-overlap-different-scope",
+        run_id="lease-run-overlap-different-scope",
+        reviewer_id="reviewer-b",
+        unit_ids=unit_ids[:1],
+        log_root_override=log_root,
+    )
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-old-lease",
+        unit_ids=unit_ids[:1],
+        scope_hash="different-old-scope",
+        run_id="old-run",
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True
+    assert completed["unit_ids"] == []
+    assert completed["blocked_active_lease_ids"] == [active["lease_id"]]
+    assert dict(_lease_rows(log_root, repo_key))[active["lease_id"]] == "active"
+    assert _lease_unit_count(log_root, repo_key, active["lease_id"]) == 1
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "assigned"}
 
 
 def test_lease_participants_finish_does_not_release_shared_lease(tmp: Path) -> None:
@@ -7726,7 +8227,7 @@ def test_lease_participants_finish_does_not_release_shared_lease(tmp: Path) -> N
     )
     assert released["released"] is True
     assert _lease_unit_count(log_root, repo_key, acquired["lease_id"]) == 0
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
 
 
 def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
@@ -7845,7 +8346,7 @@ def test_run_alternative_reviewer_releases_lease_on_normal_exit(tmp: Path) -> No
         reviewer_code=clean_review_result_python(),
     )
     assert completed.returncode == 0, completed.stderr
-    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+    assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "reviewed"}
     assert _lease_rows(log_root, repo_key)[-1][1] == "completed"
 
 

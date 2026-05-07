@@ -222,22 +222,46 @@ def _release_tracker_lease(
     lease_id = contract.get("tracker_lease_id")
     if not isinstance(lease_id, str) or not lease_id:
         return None
+    primary_units_raw = contract.get("primary_units")
+    primary_units = [
+        item.strip()
+        for item in primary_units_raw
+        if isinstance(item, str) and item.strip()
+    ] if isinstance(primary_units_raw, list) else []
+    scope_hash = contract.get("tracker_scope_hash")
+    if not isinstance(scope_hash, str) or not scope_hash:
+        scope_hash = None
+    run_id = contract.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        run_id = None
 
     import diff_tracker  # noqa: WPS433
 
     log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
     log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
     release_reason = "failed" if decision_kind in {"cancelled", "cancel", "interrupted"} else "completed"
-    result = diff_tracker.lease_release(
-        repo=repo,
-        lease_id=lease_id,
-        reason=release_reason,
-        log_root_override=log_root_override,
-    )
+    if release_reason == "completed":
+        result = diff_tracker.complete_review_scope(
+            repo=repo,
+            lease_id=lease_id,
+            unit_ids=primary_units,
+            scope_hash=scope_hash,
+            run_id=run_id,
+            reason=release_reason,
+            log_root_override=log_root_override,
+        )
+    else:
+        result = diff_tracker.lease_release(
+            repo=repo,
+            lease_id=lease_id,
+            reason=release_reason,
+            log_root_override=log_root_override,
+        )
     return {
         "scope_contract_path": str(contract_path),
         "lease_id": lease_id,
         "release_reason": release_reason,
+        "primary_unit_count": len(primary_units),
         **result,
     }
 

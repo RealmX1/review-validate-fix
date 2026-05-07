@@ -193,6 +193,9 @@ run_parallel_test_steps() {
   labels+=("tests: install_to_codex")
   scripts+=("$tests_dir/test_install_to_codex.py")
   args+=("")
+  labels+=("tests: rvf_handoff_intake")
+  scripts+=("$tests_dir/test_rvf_handoff_intake.py")
+  args+=("")
   local shard_index
   for ((shard_index = 0; shard_index < review_support_shards; shard_index++)); do
     if [ "$review_support_shards" -eq 1 ]; then
@@ -400,6 +403,7 @@ required_files=(
   "scripts/cline_kanban_client.py"
   "scripts/cancel_rvf_run.py"
   "scripts/rvf_logging.py"
+  "scripts/rvf_handoff_intake.py"
   "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
@@ -416,6 +420,7 @@ for file in "${required_files[@]}"; do
 done
 
 repo_required_files=(
+  "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -423,6 +428,7 @@ repo_required_files=(
   "tests/test_codex_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
   "tests/test_review_support_scripts.py"
+  "tests/test_rvf_handoff_intake.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -484,6 +490,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
   "$skill_dir/scripts/rvf_logging.py" \
+  "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$skill_dir/scripts/session_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
@@ -491,7 +498,8 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
   "$tests_dir/test_codex_stop_review_validate_fix.py" \
   "$tests_dir/test_install_to_codex.py" \
-  "$tests_dir/test_review_support_scripts.py"
+  "$tests_dir/test_review_support_scripts.py" \
+  "$tests_dir/test_rvf_handoff_intake.py"
 
 run_parallel_test_steps
 
@@ -513,6 +521,10 @@ require_literal "references/handoff-template.md" 'handoff.md'
 require_literal "references/handoff-template.md" 'RVF_HANDOFF_FILE'
 require_literal "references/handoff-template.md" 'Reviewers：'
 require_literal "references/handoff-template.md" 'Validate/fixers：'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'rvf_handoff_intake.py'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" '即使最终没有采纳 RVF run 提出的任何 suggestion'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'rvf_worktree_differs_from_current'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'intake_hints'
 require_literal "SKILL.md" 'handoff.md'
 require_literal "SKILL.md" 'RVF_HANDOFF_FILE'
 require_literal "SKILL.md" 'reviewers 和 validate/fixers'
