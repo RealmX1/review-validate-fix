@@ -59,10 +59,20 @@ def with_env(updates: dict[str, str | None], callback) -> None:
 
 def rvf_hooks(data: dict[str, object]) -> list[dict[str, object]]:
     hooks: list[dict[str, object]] = []
-    for group in data["hooks"]["Stop"]:
+    for group in data["hooks"].get("Stop", []):
         for hook in group["hooks"]:
             command = hook.get("command") if isinstance(hook, dict) else None
             if isinstance(command, str) and "review-validate-fix" in command:
+                hooks.append(hook)
+    return hooks
+
+
+def rvf_user_prompt_hooks(data: dict[str, object]) -> list[dict[str, object]]:
+    hooks: list[dict[str, object]] = []
+    for group in data["hooks"].get("UserPromptSubmit", []):
+        for hook in group.get("hooks", []):
+            command = hook.get("command") if isinstance(hook, dict) else None
+            if isinstance(command, str) and "rvf_user_prompt_submit.py" in command:
                 hooks.append(hook)
     return hooks
 
@@ -122,6 +132,65 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     assert "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180" in command
     assert "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60" in command
     assert "python3 /tmp/other.py" in json.dumps(data)
+
+
+def test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> None:
+    module = load_installer_module()
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True)
+    hooks_path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": "python3 /tmp/stop.py"}]}
+                    ],
+                    "UserPromptSubmit": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 /old/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+                                },
+                                {"type": "command", "command": "python3 /tmp/other_prompt_hook.py"},
+                            ]
+                        },
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 /stale/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+                                }
+                            ]
+                        },
+                    ],
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def run_test() -> None:
+        module.configure_user_prompt_submit_hook(
+            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+        )
+
+    with_fake_home(module, tmp_path, run_test)
+
+    data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    matching = rvf_user_prompt_hooks(data)
+    assert len(matching) == 1
+    command = matching[0]["command"]
+    assert "rvf_user_prompt_submit.py" in command
+    assert str(tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix") in command
+    assert "codex_stop_hook" not in command
+    assert "CODEX_RVF_MODE" not in command
+    assert matching[0]["timeout"] == 5
+    assert "python3 /tmp/other_prompt_hook.py" in json.dumps(data)
+    assert "python3 /tmp/stop.py" in json.dumps(data)
 
 
 def test_configure_stop_hook_adds_dispatcher_when_missing(tmp_path: Path) -> None:
@@ -807,9 +876,39 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert "enabled = true" in codex_config
 
 
+def test_main_can_configure_user_prompt_submit_hook(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-user-prompt-submit-hook",
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+
+    plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    matching = rvf_user_prompt_hooks(hooks_data)
+    assert len(matching) == 1
+    assert str(plugin_skill / "scripts" / "rvf_user_prompt_submit.py") in matching[0]["command"]
+    assert not rvf_hooks(hooks_data)
+
+
 def main() -> int:
     tests = [
         test_configure_stop_hook_deduplicates_existing_rvf_hooks,
+        test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks,
         test_configure_stop_hook_adds_dispatcher_when_missing,
         test_configure_stop_hook_can_write_cline_kanban_mode,
         test_configure_stop_hook_can_write_kanban_followup_mode,
@@ -830,6 +929,7 @@ def main() -> int:
         test_main_syncs_legacy_only_setup_into_empty_plugin_cache,
         test_main_syncs_legacy_config_over_default_plugin_cache,
         test_main_installs_plugin_and_configures_stop_hook,
+        test_main_can_configure_user_prompt_submit_hook,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

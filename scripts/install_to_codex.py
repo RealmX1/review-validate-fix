@@ -479,6 +479,60 @@ def configure_stop_hook(
     return hooks_path
 
 
+def configure_user_prompt_submit_hook(plugin_skill_dir: Path) -> Path:
+    hooks_path = Path.home() / ".codex" / "hooks.json"
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    if hooks_path.exists():
+        data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    else:
+        data = {"hooks": {}}
+
+    hooks = data.setdefault("hooks", {})
+    prompt_groups = hooks.setdefault("UserPromptSubmit", [])
+    detector = plugin_skill_dir / "scripts" / "rvf_user_prompt_submit.py"
+    entry = {
+        "type": "command",
+        "command": f"python3 {shlex.quote(str(detector))}",
+        "timeout": 5,
+    }
+
+    target_group: dict[str, object] | None = None
+    cleaned_prompt_groups: list[dict[str, object]] = []
+    for group in prompt_groups:
+        if not isinstance(group, dict):
+            continue
+        group_hooks = group.get("hooks")
+        if not isinstance(group_hooks, list):
+            group["hooks"] = []
+            cleaned_prompt_groups.append(group)
+            continue
+
+        kept_hooks = []
+        removed_rvf_hook = False
+        for existing in group_hooks:
+            command_value = existing.get("command") if isinstance(existing, dict) else None
+            is_rvf_hook = isinstance(command_value, str) and "rvf_user_prompt_submit.py" in command_value
+            if is_rvf_hook:
+                removed_rvf_hook = True
+                if target_group is None:
+                    target_group = group
+                continue
+            kept_hooks.append(existing)
+
+        if removed_rvf_hook and target_group is group:
+            kept_hooks.append(entry)
+        group["hooks"] = kept_hooks
+        if kept_hooks:
+            cleaned_prompt_groups.append(group)
+
+    hooks["UserPromptSubmit"] = cleaned_prompt_groups
+    if target_group is None:
+        cleaned_prompt_groups.append({"hooks": [entry]})
+
+    hooks_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return hooks_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="把本仓库 plugin 安装到 Codex 本机 plugin 空间。")
     parser.add_argument(
@@ -495,6 +549,11 @@ def main() -> int:
         "--configure-stop-hook",
         action="store_true",
         help="更新 ~/.codex/hooks.json，让 Stop hook 先经 plugin 内 router 选择 stable/dev channel，再调用对应 dispatcher。",
+    )
+    parser.add_argument(
+        "--configure-user-prompt-submit-hook",
+        action="store_true",
+        help="更新 ~/.codex/hooks.json，为 RVF dispatch token 注册 UserPromptSubmit detector；不启动 review workflow。",
     )
     parser.add_argument(
         "--fork-mode",
@@ -614,6 +673,9 @@ def main() -> int:
                 args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
             )
             installed.append(f"stop hook: {hooks_path}")
+        if args.configure_user_prompt_submit_hook:
+            hooks_path = configure_user_prompt_submit_hook(dst / PLUGIN_SKILL_REL)
+            installed.append(f"user prompt submit hook: {hooks_path}")
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2
