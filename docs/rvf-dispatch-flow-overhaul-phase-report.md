@@ -9,13 +9,15 @@ flowchart LR
   A[Slice C<br/>Flow 3 diagnostic] --> B[Slice D<br/>prep file + token dispatch]
   B --> C[Slice E<br/>Flow 2 worktree handoff]
   C --> D[Slice F<br/>prep TTL/collision finish]
-  D --> E[Later<br/>in-place mode docs + cline-kanban external slices]
+  D --> E[Slice G<br/>tracker-scope prep source]
+  E --> H[Later<br/>cline-kanban external slices]
 
   A:::done
   B:::done
   C:::done
-  D:::next
-  E:::todo
+  D:::done
+  E:::done
+  H:::todo
 
   classDef done fill:#dff6dd,stroke:#2f7d32,color:#0f2f13;
   classDef next fill:#fff4ce,stroke:#9a6b00,color:#3b2a00;
@@ -75,6 +77,44 @@ Files:
 - `tests/test_review_support_scripts.py`
 - `tests/test_codex_stop_review_validate_fix.py`
 
+## Slice F: Prep TTL And Collision Finish
+
+Before:
+- Dispatch prep files used a random 16-hex token, but the write path could replace an existing file if a token collision or stale file was present.
+- TTL cleanup existed as a helper-level API, but dispatch did not run it before writing a new prep file.
+- Collision behavior was implicit and therefore hard to review from tests.
+
+After:
+- Prep file creation is no-clobber: an existing valid prep file is preserved.
+- Generated-token collisions retry with a fresh token; explicit-token collisions fail unless the existing file is already stale.
+- Dispatch writing now sweeps stale prep files first and records `dispatch_prep_file_sweep_completed` when anything is removed.
+- Tests cover explicit collision failure, stale-token reuse, generated-token retry, parent directory/file permissions, and dispatch-level stale sweep.
+- The plan now documents Flow 2 pause-origin expectations, in-place mode semantics, and Kanban-unavailable troubleshooting.
+
+Files:
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_prep_file.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py`
+- `tests/test_review_support_scripts.py`
+- `tests/test_codex_stop_review_validate_fix.py`
+- `docs/rvf-dispatch-flow-overhaul-plan.md`
+
+## Slice G: Tracker-Scope Prep Source
+
+Before:
+- The allocator stashed `tracker_scope_path` on `ledger.tracker_scope_meta`.
+- Cline Kanban startup prepare read that ledger convention directly when deciding whether to pass `prepare_review_run.py --tracker-scope`.
+- The prep file already carried `rvf_run.tracker_scope_path`, but it was not the canonical dispatch boundary for this wiring.
+
+After:
+- `freeze_cline_kanban_startup_artifacts()` now reads tracker-scope from the dispatch prep payload.
+- The allocator ledger meta remains an internal staging record used while writing prep, but startup dispatch consumes `rvf_run.tracker_scope_path`.
+- Tests assert the startup prepare command's `--tracker-scope` value matches the prep file path.
+
+Files:
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py`
+- `tests/test_codex_stop_review_validate_fix.py`
+- `docs/rvf-dispatch-flow-overhaul-plan.md`
+
 ## Verification
 
 Last verified commands:
@@ -87,11 +127,9 @@ bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 ```
 
-All commands above passed in this worktree.
+All commands above passed in this worktree after Slice G. The first `check_skill_contracts.sh`
+run hit the existing short-timeout external reviewer idle-timeout flake; the immediate rerun passed.
 
 ## Remaining Work
 
-- Slice F: tighten prep file TTL sweep/collision handling around the dispatch flow, not just the prep file helper.
-- Add explicit user docs for in-place mode and Kanban unavailable troubleshooting.
-- Optional thin refactor: once prep file is the canonical dispatch context, make tracker-scope wiring read from `rvf_run.tracker_scope_path` instead of `ledger.tracker_scope_meta` convention.
 - External Cline Kanban slices A/B remain outside this repository unless that repo is available in the workspace.

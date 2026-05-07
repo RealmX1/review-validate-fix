@@ -13,6 +13,7 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 DEFAULT_TTL_SECONDS = 300
+DEFAULT_TOKEN_WRITE_ATTEMPTS = 8
 TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
 ENV_PREP_ROOT = "CODEX_RVF_PREP_ROOT"
 PROTECTED_UPDATE_FIELDS = frozenset({"schema_version", "token", "created_at", "expires_at"})
@@ -86,14 +87,47 @@ def prep_file_path(token: str, root: str | Path | None = None) -> Path:
     return prep_root(root) / f"{validate_token(token)}.json"
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+
+
+def _write_json_tmp(path: Path, payload: dict[str, Any]) -> Path:
+    _ensure_parent_dir(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     data = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(data)
+        return tmp
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_create_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = _write_json_tmp(path, payload)
+    try:
+        os.link(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    tmp.unlink()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    tmp = _write_json_tmp(path, payload)
+    try:
         tmp.replace(path)
     except Exception:
         try:
@@ -116,21 +150,45 @@ def write_prep_file(
     if ttl_seconds <= 0:
         raise PrepFileError("prep file ttl_seconds must be positive")
 
-    normalized_token = validate_token(token or generate_token())
+    explicit_token = token is not None
+    max_attempts = 1 if explicit_token else DEFAULT_TOKEN_WRITE_ATTEMPTS
     created_at = (now or utc_now()).astimezone(timezone.utc)
-    expires_at = created_at + timedelta(seconds=ttl_seconds)
-    normalized_payload = dict(payload)
-    normalized_payload.update(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "token": normalized_token,
-            "created_at": format_timestamp(created_at),
-            "expires_at": format_timestamp(expires_at),
-        }
-    )
-    path = prep_file_path(normalized_token, root)
-    _atomic_write_json(path, normalized_payload)
-    return PrepFileRecord(token=normalized_token, path=path, payload=normalized_payload)
+    last_collision: FileExistsError | None = None
+    for _attempt in range(max_attempts):
+        normalized_token = validate_token(token or generate_token())
+        expires_at = created_at + timedelta(seconds=ttl_seconds)
+        normalized_payload = dict(payload)
+        normalized_payload.update(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "token": normalized_token,
+                "created_at": format_timestamp(created_at),
+                "expires_at": format_timestamp(expires_at),
+            }
+        )
+        path = prep_file_path(normalized_token, root)
+        try:
+            _atomic_create_json(path, normalized_payload)
+            return PrepFileRecord(token=normalized_token, path=path, payload=normalized_payload)
+        except FileExistsError as exc:
+            last_collision = exc
+            lookup = read_prep_file(normalized_token, root=root, now=created_at)
+            if lookup.status != "valid":
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                try:
+                    _atomic_create_json(path, normalized_payload)
+                    return PrepFileRecord(token=normalized_token, path=path, payload=normalized_payload)
+                except FileExistsError as retry_exc:
+                    last_collision = retry_exc
+            if explicit_token:
+                raise PrepFileError(f"prep file token already exists: {normalized_token}") from exc
+            continue
+    raise PrepFileError(
+        f"failed to allocate a unique RVF dispatch token after {max_attempts} attempts"
+    ) from last_collision
 
 
 def update_prep_file(

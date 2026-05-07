@@ -2211,6 +2211,22 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
+    prep_root = tmp_path / "prep-root"
+    prep_root.mkdir()
+    stale_prep = prep_root / "cccccccccccccccc.json"
+    stale_prep.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "token": "cccccccccccccccc",
+                "created_at": "2026-05-07T00:00:00Z",
+                "expires_at": "2026-05-07T00:00:01Z",
+                "origin_session_id": "old-session",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     fake_client = tmp_path / "fake_cline_kanban_client.py"
     client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
@@ -2237,6 +2253,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
             "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
             "CODEX_RVF_SUPPRESS_STOP_HOOK",
+            "CODEX_RVF_PREP_ROOT",
             "FAKE_CLIENT_CALLS",
         )
     }
@@ -2254,6 +2271,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
         os.environ["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
+        os.environ["CODEX_RVF_PREP_ROOT"] = str(prep_root)
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
         payload = module.run_codex_fork(
@@ -2361,6 +2379,15 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert prep["target_kanban_task_id"] == "task-123"
     assert latest["rvf_dispatch_target_worktree"] == "/tmp/task-worktree"
     assert latest["rvf_dispatch_target_kanban_task_id"] == "task-123"
+    assert not stale_prep.exists()
+    sweep_events = [
+        event
+        for event in latest_events(state)
+        if event.get("event") == "dispatch_prep_file_sweep_completed"
+    ]
+    assert sweep_events
+    assert sweep_events[-1]["removed_count"] == 1
+    assert sweep_events[-1]["removed_paths"] == [str(stale_prep)]
     assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "RVF_PARENT_CONVERSATION_REF: Codex parent-thread" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME: Codex parent-thread" in prompt_text
@@ -4162,6 +4189,17 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-started"
     assert latest["cline_kanban_task_id"] == "task-reenabled"
+    prep = dispatch_prep_payload(latest)
+    prep_tracker_scope = prep["rvf_run"]["tracker_scope_path"]
+    assert isinstance(prep_tracker_scope, str)
+    assert prep_tracker_scope.endswith("artifacts/tracker-scope.json")
+    startup_command = json.loads(
+        (Path(latest["artifacts_dir"]) / "cline-kanban-startup-prepare-command.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    command = startup_command["command"]
+    assert command[command.index("--tracker-scope") + 1] == prep_tracker_scope
     startup_metadata = read_json_artifact(latest, "startup_prepare_metadata_path")
     assert isinstance(startup_metadata, dict)
     assert startup_metadata["input_tracker_scope_file"].endswith("artifacts/inputs/tracker-scope.json")

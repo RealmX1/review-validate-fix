@@ -156,6 +156,61 @@ def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
     assert written.payload["created_at"] == "2026-05-07T00:00:00Z"
     assert written.payload["expires_at"] == "2026-05-07T00:05:00Z"
     assert written.path.stat().st_mode & 0o777 == 0o600
+    assert written.path.parent.stat().st_mode & 0o777 == 0o700
+
+    try:
+        prep.write_prep_file(
+            {"origin_session_id": "session-collision", "origin_repo": str(tmp_path)},
+            root=root,
+            token="0123456789abcdef",
+            now=prep.parse_timestamp("2026-05-07T00:00:10Z"),
+            ttl_seconds=300,
+        )
+    except prep.PrepFileError as exc:
+        assert "already exists" in str(exc)
+    else:
+        raise AssertionError("expected explicit token collision to fail")
+    assert json.loads(written.path.read_text(encoding="utf-8"))["origin_session_id"] == "session-a"
+
+    stale = prep.write_prep_file(
+        {"origin_session_id": "old-session", "origin_repo": str(tmp_path)},
+        root=root,
+        token="bbbbbbbbbbbbbbbb",
+        now=prep.parse_timestamp("2026-05-07T00:00:00Z"),
+        ttl_seconds=1,
+    )
+    reused = prep.write_prep_file(
+        {"origin_session_id": "new-session", "origin_repo": str(tmp_path)},
+        root=root,
+        token="bbbbbbbbbbbbbbbb",
+        now=prep.parse_timestamp("2026-05-07T00:00:02Z"),
+        ttl_seconds=1000,
+    )
+    assert reused.path == stale.path
+    assert reused.payload["origin_session_id"] == "new-session"
+
+    existing_generated = prep.write_prep_file(
+        {"origin_session_id": "generated-existing", "origin_repo": str(tmp_path)},
+        root=root,
+        token="ffffffffffffffff",
+        now=now,
+        ttl_seconds=1000,
+    )
+    original_generate_token = prep.generate_token
+    generated_tokens = iter(["ffffffffffffffff", "eeeeeeeeeeeeeeee"])
+    try:
+        prep.generate_token = lambda: next(generated_tokens)
+        generated = prep.write_prep_file(
+            {"origin_session_id": "generated-retry", "origin_repo": str(tmp_path)},
+            root=root,
+            now=now,
+            ttl_seconds=1000,
+        )
+    finally:
+        prep.generate_token = original_generate_token
+    assert existing_generated.path.exists()
+    assert generated.token == "eeeeeeeeeeeeeeee"
+    assert generated.payload["origin_session_id"] == "generated-retry"
 
     valid = prep.read_prep_file(
         "0123456789abcdef",

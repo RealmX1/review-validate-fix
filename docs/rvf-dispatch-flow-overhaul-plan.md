@@ -4,7 +4,7 @@
 
 `docs/global-reviewed-diff-tracker-overhaul-plan.md` 是 RVF 的**数据/范围**侧：unit / lease / scope_hash / SQLite tracker / allocator / suppression。本文档独立出 RVF 的**派发/fork**侧：当 Stop hook（或 user 手动）触发 RVF 时，**用哪条路径起 review/validate/fix workflow，session 怎么 fork，worktree 怎么准备，参与方之间的 context 怎么流转**。
 
-两份 plan 的实现路径与依赖面不同，唯一耦合点是 tracker plan 的 Slice 6 (`--tracker-scope` 拼接)。当前 Cline Kanban 路径已先行 ship：Stop hook allocator 将 `tracker_scope_path` 存入 run ledger，startup prepare 调 `prepare_review_run.py --tracker-scope <path>`，并由 `tracker_scope.paths` 收窄 review packet、scope contract path allowlist 和 Kanban bootstrap diff。一旦本 plan 落地，tracker scope path 自然进入 prep file 字段，届时只需把路径来源从 ledger convention thin-refactor 到 prep file。
+两份 plan 的实现路径与依赖面不同，唯一耦合点是 tracker plan 的 Slice 6 (`--tracker-scope` 拼接)。当前 Cline Kanban 路径已先行 ship：Stop hook allocator 将 `tracker_scope_path` 写入 dispatch prep file 的 `rvf_run.tracker_scope_path`，startup prepare 调 `prepare_review_run.py --tracker-scope <path>`，并由 `tracker_scope.paths` 收窄 review packet、scope contract path allowlist 和 Kanban bootstrap diff。
 
 ## 当前状态：4 个并存 flow
 
@@ -170,7 +170,7 @@ flowchart LR
 | **C** | RVF plugin Stop hook 拆分 + flow_dispatcher + flow 3 fallback systemMessage | A 字段就位（仅消费侧）；**Flow 3 默认诊断态已落地，legacy GUI fallback 需显式 opt-in** |
 | **D** | RVF plugin UserPromptSubmit hook + prep_file 机制 + token-based dispatch | C 已落地；prep file / token detector / installer 注册 / fork prompt metadata 已落地 |
 | **E** | Flow 2 worktree env setup（搬运未 commit work + pause-main 系统消息）| C, D 已落地；worktree bootstrap 已搬运 session-owned dirty work，prep file 已回填真实 `workspace_path`，父会话 systemMessage 已提示暂停 origin 编辑 |
-| **F** | Sweep prep file TTL + collision handling 收尾 | D 已落地 |
+| **F** | Sweep prep file TTL + collision handling 收尾 | D 已落地；dispatch 写入前 stale sweep、no-clobber create、generated-token retry 已落地 |
 | **Future** | Inter-agent communication（同 base-ref 多 agent）；UI git graph preview 高级化；auto-fork-to-PR 模式 | 不在本 plan 范围 |
 
 依赖序：A → C / D 并行 → E → F。B 与主线独立可推迟。
@@ -186,7 +186,7 @@ flowchart LR
 
 **截至 tracker plan Slice 5 已落地**：上表 "共享 facts" 全部 load-bearing。具体地——`lease.holder_kind ∈ {reviewer, validate-fix, manual}` 在 `lease_acquire` 公共 API 强约束（Slice 4）；`units.review_state` 在 lease release / sweep / manual takeover 三条路径上的状态机已有完整测试覆盖；`scope_hash` 在 `_compute_scope_hash` + `_manual_suppression_scope_probe` + `find_manual_rvf_run_for_scope_hash` + `evaluate_session_gate` 抑制路径已贯通。本 plan 的 prep file `rvf_run.tracker_scope_hash` 字段直接复用 `_compute_scope_hash` 的 sha256 形式，无需再生发新型态。
 
-**唯一耦合点**：tracker plan Slice 6 的 `--tracker-scope` wiring。当前实现已在 tracker plan 自身语境下先 ship：`ledger.tracker_scope_meta.tracker_scope_path` → Cline Kanban startup prepare → `prepare_review_run.py --tracker-scope`，并把 `tracker_scope.paths` 用作 contract path allowlist 与 bootstrap diff 的来源。本 plan 落地后，tracker scope path 进入 prep file 的 `rvf_run.tracker_scope_path` 字段，再做一次 thin refactor 把 wiring 改成读 prep file。
+**唯一耦合点**：tracker plan Slice 6 的 `--tracker-scope` wiring。当前实现已经薄重构为：allocator ledger meta → dispatch prep file `rvf_run.tracker_scope_path` → Cline Kanban startup prepare → `prepare_review_run.py --tracker-scope`。也就是说 ledger meta 只作为写 prep 前的内部 staging convention；跨 dispatch 边界的 canonical 来源是 prep file。
 
 ## 验证策略
 
@@ -198,6 +198,20 @@ flowchart LR
 - **Token 误触发**：用户 prompt 含 `RVF_DISPATCH=token=fake` 字面量 → hook 校验 prep file 不存在 → 静默放行。
 - **TTL sweep**：手工写 prep file `expires_at` 设为过去 → sweep 跑完 → file 已删。
 - **双端兼容性**：codex flow 2 + Claude Code flow 1 各自走通。
+
+## 用户操作语义
+
+### Flow 2 branch mode
+
+当 Stop hook 通过 Cline Kanban 创建新 task/worktree 时，origin session 会收到 `pause_origin_edits=true` 和目标 workspace 路径。此时用户应暂停在 origin worktree 继续编辑，等 forked RVF session 输出 `RVF_HANDOFF_FILE` 后再合并或取回变更。这个约束只用于 branch worktree 模式，目的是避免 parent 与 fork 对同一批 dirty work 同时推进。
+
+### In-place mode
+
+显式选择 in-place / manual / prepare 类路径时，dispatch prep 会把 `workflow_constraints.in_place_mode=true` 写入 prep file，并把当前 cwd 作为 `target_worktree`。该模式不创建新 worktree、不搬运 dirty work，也不会发送暂停 origin 编辑提示；适合用户明确想在当前 session/current tree 内完成 RVF，或 Cline Kanban 不参与的本地调试。
+
+### Kanban unavailable
+
+`CODEX_RVF_FORK_MODE=auto` 下 Cline Kanban 不可用时，RVF 默认进入诊断态并报告 `cline-kanban-unavailable` / `cline-kanban-unconfigured`。不再静默创建 legacy GUI fork。需要临时恢复旧行为时必须显式设置 `CODEX_RVF_AUTO_LEGACY_GUI_FALLBACK=1`，或者显式使用 `CODEX_RVF_FORK_MODE=gui`；否则应先检查 Cline Kanban listener、`kanban` CLI、task command 和 configured base-ref。
 
 ## 不在本 plan scope
 

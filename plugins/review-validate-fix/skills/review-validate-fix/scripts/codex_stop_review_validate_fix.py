@@ -1213,6 +1213,16 @@ def add_dispatch_prep_to_prompt(prompt: str, record: rvf_prep_file.PrepFileRecor
     return f"{prompt.rstrip()}\n\n{dispatch_prep_prompt_block(record)}"
 
 
+def dispatch_prep_tracker_scope_path(record: rvf_prep_file.PrepFileRecord) -> Path | None:
+    rvf_run = record.payload.get("rvf_run")
+    if not isinstance(rvf_run, dict):
+        return None
+    raw_path = rvf_run.get("tracker_scope_path")
+    if not isinstance(raw_path, (str, Path)) or not str(raw_path).strip():
+        return None
+    return Path(raw_path).expanduser()
+
+
 def write_dispatch_prep_file(
     *,
     ledger: RunLedger,
@@ -1264,6 +1274,19 @@ def write_dispatch_prep_file(
             "in_place_mode": target_flow != "flow-2-branch",
         },
     }
+    swept_paths = rvf_prep_file.sweep_stale()
+    if swept_paths:
+        ledger.event(
+            phase="prepare",
+            event="dispatch_prep_file_sweep_completed",
+            status="completed",
+            reason_code="dispatch_prep_file_sweep_completed",
+            repo=origin_repo,
+            cwd=origin_cwd,
+            paths={"prep_root": str(rvf_prep_file.prep_root())},
+            removed_count=len(swept_paths),
+            removed_paths=[str(path) for path in swept_paths],
+        )
     record = rvf_prep_file.write_prep_file(payload)
     ledger.artifact(
         "dispatch-prep-file.json",
@@ -1818,6 +1841,7 @@ def freeze_cline_kanban_startup_artifacts(
     parent_thread_path: Path | None,
     prompt_path: str,
     ledger: RunLedger,
+    dispatch_prep: rvf_prep_file.PrepFileRecord,
 ) -> dict[str, Any]:
     scope_path = ledger.artifact(
         "headless-startup-scope-of-work.md",
@@ -1847,15 +1871,11 @@ def freeze_cline_kanban_startup_artifacts(
     ]
     if parent_thread_path is not None:
         command.extend(["--transcript", str(parent_thread_path)])
-    tracker_scope_meta = getattr(ledger, "tracker_scope_meta", None)
-    tracker_scope_path = None
-    if isinstance(tracker_scope_meta, dict):
-        raw_tracker_scope_path = tracker_scope_meta.get("tracker_scope_path")
-        if isinstance(raw_tracker_scope_path, (str, Path)) and str(raw_tracker_scope_path).strip():
-            tracker_scope_path = Path(raw_tracker_scope_path).expanduser()
-            if not tracker_scope_path.exists():
-                raise RuntimeError(f"allocated tracker scope artifact missing: {tracker_scope_path}")
-            command.extend(["--tracker-scope", str(tracker_scope_path)])
+    tracker_scope_path = dispatch_prep_tracker_scope_path(dispatch_prep)
+    if tracker_scope_path is not None:
+        if not tracker_scope_path.exists():
+            raise RuntimeError(f"dispatch prep tracker scope artifact missing: {tracker_scope_path}")
+        command.extend(["--tracker-scope", str(tracker_scope_path)])
     completed = subprocess.run(
         command,
         capture_output=True,
@@ -2034,6 +2054,7 @@ def start_cline_kanban_task(
     *,
     cwd: str,
     prompt_path: str,
+    dispatch_prep: rvf_prep_file.PrepFileRecord,
     parent_session_id: str,
     parent_thread_path: Path | None,
     parent_origin: dict[str, Any],
@@ -2050,6 +2071,7 @@ def start_cline_kanban_task(
         parent_thread_path=parent_thread_path,
         prompt_path=prompt_path,
         ledger=ledger,
+        dispatch_prep=dispatch_prep,
     )
     task_prompt = cline_kanban_task_prompt(
         cwd=cwd,
@@ -2665,6 +2687,7 @@ def run_codex_fork(
                 task_payload = start_cline_kanban_task(
                     cwd=cwd,
                     prompt_path=prompt_path,
+                    dispatch_prep=dispatch_prep,
                     parent_session_id=parent_session_id,
                     parent_thread_path=parent_thread_path,
                     parent_origin=parent_origin,
