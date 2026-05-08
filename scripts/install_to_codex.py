@@ -835,7 +835,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--cline-kanban-worktree-mode",
-        choices=["branch", "main", "inplace"],
+        choices=["branch", "inplace"],
         default=None,
         help="持久写入 CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE；默认 branch。",
     )

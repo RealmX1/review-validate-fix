@@ -4547,6 +4547,7 @@ def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
         env=env,
     )
     assert json.loads(ensure.stdout)["started"] is False
+    prep_file = tmp_path / "dispatch-prep.json"
     create = run([
         sys.executable,
         str(CLINE_KANBAN_CLIENT),
@@ -4563,6 +4564,12 @@ def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
         "RVF test",
         "--agent-id",
         "codex",
+        "--parent-session-id",
+        "parent-session",
+        "--worktree-mode",
+        "branch",
+        "--prep-file-path",
+        str(prep_file),
     ], env=env)
     assert json.loads(create.stdout)["task_id"] == "task-1"
     started = run([
@@ -4575,8 +4582,12 @@ def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
         task_cmd,
         "--task-id",
         "task-1",
+        "--worktree-mode",
+        "inplace",
     ], env=env)
-    assert json.loads(started.stdout)["status"] == "started"
+    started_payload = json.loads(started.stdout)
+    assert started_payload["status"] == "started"
+    assert Path(started_payload["workspace_path"]).resolve() == repo.resolve()
     prompt_file = tmp_path / "prompt.md"
     prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
     message = run([
@@ -4598,15 +4609,123 @@ def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
     ], env=env)
     assert json.loads(message.stdout)["message_id"] == "msg-1"
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert [entry["argv"][0] for entry in recorded] == ["list", "create", "start", "message"]
-    assert [entry["port"] for entry in recorded] == ["45678", "45678", "45678", "45678"]
+    assert [entry["argv"][0] for entry in recorded] == ["list", "create", "start", "list", "message"]
+    assert [entry["port"] for entry in recorded] == ["45678", "45678", "45678", "45678", "45678"]
     create_call = recorded[1]["argv"]
     assert create_call[create_call.index("--title") + 1] == "RVF test"
     assert create_call[create_call.index("--agent-id") + 1] == "codex"
-    message_call = recorded[3]["argv"]
+    assert create_call[create_call.index("--parent-session-id") + 1] == "parent-session"
+    assert create_call[create_call.index("--worktree-mode") + 1] == "branch"
+    assert create_call[create_call.index("--prep-file-path") + 1] == str(prep_file.resolve())
+    start_call = recorded[2]["argv"]
+    assert start_call[start_call.index("--task-id") + 1] == "task-1"
+    message_call = recorded[4]["argv"]
     assert message_call[message_call.index("--task-id") + 1] == "task-1"
     assert message_call[message_call.index("--prompt-file") + 1] == str(prompt_file.resolve())
     assert message_call[message_call.index("--idempotency-key") + 1] == "run-1"
+
+
+def test_cline_kanban_client_rejects_main_worktree_mode(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CLINE_KANBAN_CLIENT),
+            "create",
+            "--repo",
+            str(repo),
+            "--base-ref",
+            "HEAD",
+            "--prompt",
+            "hello",
+            "--worktree-mode",
+            "main",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "invalid choice: 'main'" in completed.stderr
+
+
+def test_cline_kanban_client_start_task_uses_session_cwd_workspace(tmp_path: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = init_repo(tmp_path / "repo")
+    task_repo = init_repo(tmp_path / "task-worktree" / "repo")
+    fake_task = tmp_path / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "if sys.argv[1] == 'start':\n"
+        "    print(json.dumps({'ok': True, 'task': {'id': 'task-1', 'workspacePath': project_path}}))\n"
+        "elif sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
+        "        {'id': 'task-1', 'workspacePath': project_path, 'session': {'pid': 4242}}\n"
+        "    ]}))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    original_process_cwd = module.process_cwd
+    try:
+        module.process_cwd = lambda pid: task_repo if pid == 4242 else None
+        payload = module.start_task(
+            task_cmd=f"{sys.executable} {fake_task}",
+            repo=repo,
+            task_id="task-1",
+            worktree_mode="branch",
+        )
+    finally:
+        module.process_cwd = original_process_cwd
+
+    assert payload["task_id"] == "task-1"
+    assert Path(payload["workspace_path"]).resolve() == task_repo.resolve()
+    assert Path(payload["project_path"]).resolve() == repo.resolve()
+    assert payload["workspace_path_source"] == "task_session_cwd"
+
+
+def test_cline_kanban_client_branch_mode_rejects_parent_project_workspace(tmp_path: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = init_repo(tmp_path / "repo")
+    fake_task = tmp_path / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        "if sys.argv[1] == 'start':\n"
+        "    print(json.dumps({'ok': True, 'task': {'id': 'task-1', 'workspacePath': project_path}}))\n"
+        "elif sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
+        "        {'id': 'task-1', 'workspacePath': project_path, 'session': None}\n"
+        "    ]}))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    original_timeout = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT")
+    try:
+        os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT"] = "0"
+        module.start_task(
+            task_cmd=f"{sys.executable} {fake_task}",
+            repo=repo,
+            task_id="task-1",
+            worktree_mode="branch",
+        )
+    except module.KanbanError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("expected branch mode parent project workspace to be rejected")
+    finally:
+        if original_timeout is None:
+            os.environ.pop("CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT", None)
+        else:
+            os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT"] = original_timeout
+
+    assert "parent project path in branch mode" in message
+    assert str(repo) in message
 
 
 def test_cline_kanban_client_message_accepts_response_without_task_id(tmp_path: Path) -> None:
@@ -6800,6 +6919,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "cline_kanban_client_create_and_start_task",
             lambda: test_cline_kanban_client_create_and_start_task(root / "cline-kanban-client"),
+        ),
+        (
+            "cline_kanban_client_rejects_main_worktree_mode",
+            lambda: test_cline_kanban_client_rejects_main_worktree_mode(
+                root / "cline-kanban-main-worktree-mode"
+            ),
+        ),
+        (
+            "cline_kanban_client_start_task_uses_session_cwd_workspace",
+            lambda: test_cline_kanban_client_start_task_uses_session_cwd_workspace(
+                root / "cline-kanban-session-cwd"
+            ),
+        ),
+        (
+            "cline_kanban_client_branch_mode_rejects_parent_project_workspace",
+            lambda: test_cline_kanban_client_branch_mode_rejects_parent_project_workspace(
+                root / "cline-kanban-parent-workspace"
+            ),
         ),
         (
             "cline_kanban_client_message_accepts_response_without_task_id",

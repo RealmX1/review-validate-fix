@@ -494,6 +494,36 @@ def test_main_persists_cline_review_options(tmp_path: Path) -> None:
     assert "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE=1" in command
 
 
+def test_main_rejects_cline_kanban_worktree_mode_main(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        def call_main() -> None:
+            try:
+                module.main()
+            except SystemExit as exc:
+                assert exc.code == 2
+            else:
+                raise AssertionError("expected argparse to reject --cline-kanban-worktree-mode main")
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--cline-kanban-worktree-mode",
+                "main",
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+    assert not (home / ".codex" / "hooks.json").exists()
+
+
 def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     module = load_installer_module()
     src = tmp_path / "src"
@@ -1011,6 +1041,7 @@ def main() -> int:
         test_main_persists_cline_connection_env,
         test_main_drops_legacy_npx_kanban_defaults_from_env,
         test_main_persists_cline_review_options,
+        test_main_rejects_cline_kanban_worktree_mode_main,
         test_copy_tree_preserves_nested_plugin_setup,
         test_copy_tree_excludes_dev_only_paths,
         test_ensure_codex_plugin_enabled_updates_user_config,

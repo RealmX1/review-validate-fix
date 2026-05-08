@@ -82,6 +82,8 @@ FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
+CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
+DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
 KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -1168,10 +1170,21 @@ def git_branch_name(cwd: str | None) -> str | None:
     return branch or None
 
 
-def dispatch_prep_target_flow(mode: str) -> str:
+def cline_kanban_worktree_mode_from_env() -> str:
+    raw = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", DEFAULT_CLINE_KANBAN_WORKTREE_MODE)
+    value = (raw or DEFAULT_CLINE_KANBAN_WORKTREE_MODE).strip().lower()
+    if not value:
+        return DEFAULT_CLINE_KANBAN_WORKTREE_MODE
+    if value not in CLINE_KANBAN_WORKTREE_MODES:
+        allowed = ", ".join(sorted(CLINE_KANBAN_WORKTREE_MODES))
+        raise ValueError(f"invalid CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE={raw!r}; expected one of: {allowed}")
+    return value
+
+
+def dispatch_prep_target_flow(mode: str, *, cline_kanban_worktree_mode: str | None = None) -> str:
     normalized = mode.strip().lower()
     if normalized in {"cline-kanban", "cline", "kanban", "ck"}:
-        return "flow-2-branch"
+        return "flow-2-inplace" if cline_kanban_worktree_mode == "inplace" else "flow-2-branch"
     if normalized in {"kanban-followup", "kanban-message", "kanban-inject"}:
         return "flow-1-self-rising"
     return "flow-3-inplace"
@@ -1356,10 +1369,20 @@ def update_dispatch_prep_file(
 
 def cline_kanban_workspace_path(*payloads: dict[str, Any]) -> str | None:
     for payload in payloads:
-        for key in ("workspace_path", "workspacePath"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
+        candidates = [payload]
+        task = payload.get("task")
+        if isinstance(task, dict):
+            candidates.append(task)
+        for candidate in candidates:
+            for key in ("workspace_path", "workspacePath"):
+                value = candidate.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            workspace = candidate.get("workspace")
+            if isinstance(workspace, dict):
+                value = workspace.get("path")
+                if isinstance(value, str) and value.strip():
+                    return value
     return None
 
 
@@ -2095,6 +2118,7 @@ def start_cline_kanban_task(
     tmux_session = os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", DEFAULT_CLINE_KANBAN_TMUX_SESSION)
     base_ref = os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF", "").strip() or git_head(cwd)
     agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+    worktree_mode = cline_kanban_worktree_mode_from_env()
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
     start_in_plan_mode = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"))
@@ -2145,6 +2169,12 @@ def start_cline_kanban_task(
         task_title,
         "--agent-id",
         agent_id,
+        "--parent-session-id",
+        parent_session_id,
+        "--worktree-mode",
+        worktree_mode,
+        "--prep-file-path",
+        str(dispatch_prep.path),
     ]
     if start_in_plan_mode:
         create_command.append("--start-in-plan-mode")
@@ -2177,6 +2207,8 @@ def start_cline_kanban_task(
         task_cmd,
         "--task-id",
         task_id,
+        "--worktree-mode",
+        worktree_mode,
     ]
     start_completed = subprocess.run(start_command, capture_output=True, text=True, env=env, check=False)
     start_payload = parse_json_command_output(start_completed, label="Cline Kanban task start")
@@ -2191,10 +2223,15 @@ def start_cline_kanban_task(
         },
     )
     metadata = startup_prepare.get("metadata") if isinstance(startup_prepare.get("metadata"), dict) else {}
-    workspace_path = cline_kanban_workspace_path(create_payload, start_payload)
+    workspace_path = cline_kanban_workspace_path(start_payload, create_payload)
     if workspace_path is None:
         raise RuntimeError(
-            "Cline Kanban task create/start response did not include workspace_path/workspacePath"
+            "Cline Kanban task create/start response did not include task execution workspace_path/workspacePath"
+        )
+    if worktree_mode != "inplace" and _same_existing_path(Path(workspace_path), Path(cwd)):
+        raise RuntimeError(
+            "Cline Kanban task create/start resolved workspace_path to the parent project path "
+            f"in {worktree_mode} mode; expected the task execution worktree"
         )
     return {
         "cline_kanban_task_id": task_id,
@@ -2208,6 +2245,8 @@ def start_cline_kanban_task(
         "cline_kanban_start_cmd": start_cmd,
         "cline_kanban_tmux_session": tmux_session,
         "cline_kanban_agent_id": agent_id,
+        "cline_kanban_worktree_mode": worktree_mode,
+        "cline_kanban_prep_file_path": str(dispatch_prep.path),
         "cline_kanban_auto_review_enabled": auto_review_enabled,
         "cline_kanban_auto_review_mode": auto_review_mode if auto_review_enabled else None,
         "workspace_path": workspace_path,
@@ -2588,7 +2627,15 @@ def run_codex_fork(
         parent_origin=parent_origin,
         origin_path=origin_path,
     )
-    target_flow = dispatch_prep_target_flow(mode)
+    cline_kanban_worktree_mode = (
+        cline_kanban_worktree_mode_from_env()
+        if mode in {"cline-kanban", "cline", "kanban", "ck"}
+        else None
+    )
+    target_flow = dispatch_prep_target_flow(
+        mode,
+        cline_kanban_worktree_mode=cline_kanban_worktree_mode,
+    )
     dispatch_prep = write_dispatch_prep_file(
         ledger=ledger,
         origin_session_id=parent_session_id,
@@ -2637,6 +2684,7 @@ def run_codex_fork(
         "suppress_child_stop_hook": suppress_child_stop_hook,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "cline_kanban_worktree_mode": cline_kanban_worktree_mode,
         **dispatch_prep_fields,
     }
 
@@ -2920,15 +2968,26 @@ def run_codex_fork(
     elif status == "cline-kanban-started":
         workspace = result.get("workspace_path")
         workspace_line = f" workspace={workspace}." if isinstance(workspace, str) and workspace else ""
-        detail = (
-            "pause_origin_edits=true"
-            + (f",workspace={workspace}" if isinstance(workspace, str) and workspace else "")
-        )
-        message = (
-            "Cline Kanban RVF task was created and started."
-            f"{workspace_line} Flow 2 branch mode 已使用独立 task worktree；"
-            "请暂停在 origin worktree 继续编辑，等 RVF_HANDOFF_FILE 返回后再合并。"
-        )
+        if result.get("rvf_dispatch_target_flow") == "flow-2-inplace":
+            detail = (
+                "pause_origin_edits=false"
+                + (f",workspace={workspace}" if isinstance(workspace, str) and workspace else "")
+            )
+            message = (
+                "Cline Kanban RVF task was created and started."
+                f"{workspace_line} Flow 2 inplace mode 使用当前 worktree；"
+                "无需暂停 origin worktree 编辑。"
+            )
+        else:
+            detail = (
+                "pause_origin_edits=true"
+                + (f",workspace={workspace}" if isinstance(workspace, str) and workspace else "")
+            )
+            message = (
+                "Cline Kanban RVF task was created and started."
+                f"{workspace_line} Flow 2 branch mode 已使用独立 task worktree；"
+                "请暂停在 origin worktree 继续编辑，等 RVF_HANDOFF_FILE 返回后再合并。"
+            )
     elif status == "cline-kanban-unconfigured":
         detail = None
         message = str(result.get("error") or "Cline Kanban RVF mode is not configured.")

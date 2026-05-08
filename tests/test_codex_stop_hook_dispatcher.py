@@ -1751,6 +1751,7 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
             "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT": "120",
             "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION": "rvf-test-kanban",
             "CODEX_RVF_CLINE_KANBAN_BASE_REF": "main",
+            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE": "inplace",
             "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED": "1",
             "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE": "commit",
             "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE": "1",
@@ -1769,6 +1770,7 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     assert "--cline-kanban-start-timeout 120" in install_args
     assert "--cline-kanban-tmux-session rvf-test-kanban" in install_args
     assert "--cline-kanban-base-ref main" in install_args
+    assert "--cline-kanban-worktree-mode inplace" in install_args
     assert "--cline-kanban-auto-review-enabled 1" in install_args
     assert "--cline-kanban-auto-review-mode commit" in install_args
     assert "--cline-kanban-start-in-plan-mode 1" in install_args

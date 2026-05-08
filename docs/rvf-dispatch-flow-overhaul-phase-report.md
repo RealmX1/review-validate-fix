@@ -10,14 +10,16 @@ flowchart LR
   B --> C[Slice E<br/>Flow 2 worktree handoff]
   C --> D[Slice F<br/>prep TTL/collision finish]
   D --> E[Slice G<br/>tracker-scope prep source]
-  E --> H[Later<br/>cline-kanban external slices]
+  E --> F[Slice H<br/>Cline Kanban Slice A RVF wiring]
+  F --> H[Later<br/>live flow 2 integration]
 
   A:::done
   B:::done
   C:::done
   D:::done
   E:::done
-  H:::todo
+  F:::done
+  H:::next
 
   classDef done fill:#dff6dd,stroke:#2f7d32,color:#0f2f13;
   classDef next fill:#fff4ce,stroke:#9a6b00,color:#3b2a00;
@@ -115,21 +117,48 @@ Files:
 - `tests/test_codex_stop_review_validate_fix.py`
 - `docs/rvf-dispatch-flow-overhaul-plan.md`
 
+## Slice H: Cline Kanban Slice A RVF Wiring
+
+Before:
+- Cline Kanban 外部 Slice A 已支持 `parent-session-id` / `worktree-mode` / `prep-file-path`，但 RVF 仍只传 `base-ref`、prompt、title 和 agent id。
+- RVF 的 Cline Kanban 路径固定记录为 `flow-2-branch`，没有办法显式验证 flow-2-inplace。
+- Stop hook 安装同步不会保留 Cline Kanban worktree mode 配置。
+
+After:
+- `cline_kanban_client.py create` 透传 `--parent-session-id`、`--worktree-mode`、`--prep-file-path`。
+- `start_cline_kanban_task()` 默认传 `worktree-mode=branch`，并把 prep file path 与 parent session id 一起交给 Cline Kanban。
+- 新增 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 配置；inplace 时 prep file 记录 `target_flow=flow-2-inplace`、`workflow_constraints.pause_origin_edits=false`。
+- installer / dev sync 会保留 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE`。
+
+Files:
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/cline_kanban_client.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py`
+- `scripts/install_to_codex.py`
+- `tests/test_codex_stop_review_validate_fix.py`
+- `tests/test_review_support_scripts.py`
+- `tests/test_codex_stop_hook_dispatcher.py`
+- `tests/test_install_to_codex.py`
+- `docs/rvf-dispatch-flow-overhaul-plan.md`
+
 ## Verification
 
 Last verified commands:
 
 ```sh
-python3 -m py_compile plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_prep_file.py plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_logging.py
+python3 -m py_compile plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_prep_file.py plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_logging.py plugins/review-validate-fix/skills/review-validate-fix/scripts/cline_kanban_client.py plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py scripts/install_to_codex.py
 python3 tests/test_codex_stop_review_validate_fix.py
 python3 tests/test_review_support_scripts.py --shard-count 6 --shard-index 0
+python3 tests/test_codex_stop_hook_dispatcher.py
+python3 tests/test_install_to_codex.py
 bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 ```
 
-All commands above passed in this worktree after Slice G. The first `check_skill_contracts.sh`
-run hit the existing short-timeout external reviewer idle-timeout flake; the immediate rerun passed.
+Slice H 后，上述命令均已在当前 worktree 通过。
 
 ## Remaining Work
 
-- External Cline Kanban slices A/B remain outside this repository unless that repo is available in the workspace.
+- Live flow-2-branch 联调：真实 `kanban task create --parent-session-id ... --worktree-mode branch --prep-file-path ...` 后确认 Codex fork 继承父 transcript。
+- Live flow-2-inplace 联调：真实 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 后确认不创建/删除 worktree，且 startShellSession 不 fork worktree。
+- External Cline Kanban Slice B UI base-ref dropdown 仍可推迟。

@@ -668,6 +668,7 @@ def installer_args_from_env() -> list[str]:
             ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", "--cline-kanban-start-timeout"),
             ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", "--cline-kanban-tmux-session"),
             ("CODEX_RVF_CLINE_KANBAN_BASE_REF", "--cline-kanban-base-ref"),
+            ("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", "--cline-kanban-worktree-mode"),
             ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED", "--cline-kanban-auto-review-enabled"),
             ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "--cline-kanban-auto-review-mode"),
             ("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE", "--cline-kanban-start-in-plan-mode"),

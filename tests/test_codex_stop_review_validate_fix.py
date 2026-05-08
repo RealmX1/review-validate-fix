@@ -265,6 +265,29 @@ def load_workspace_snapshot_module():
     return module
 
 
+def test_cline_kanban_worktree_mode_rejects_main_env(tmp_path: Path) -> None:
+    module = load_hook_module()
+    original = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE")
+    try:
+        os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "main"
+        try:
+            module.cline_kanban_worktree_mode_from_env()
+        except ValueError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=main to be rejected")
+    finally:
+        if original is None:
+            os.environ.pop("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", None)
+        else:
+            os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = original
+
+    assert "invalid CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE" in message
+    assert "branch" in message
+    assert "inplace" in message
+    assert "main" not in message.split("expected one of:", 1)[-1]
+
+
 def seed_finalize_run_dir(
     *,
     state: Path,
@@ -2252,6 +2275,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
             "CODEX_RVF_CLINE_KANBAN_CLIENT",
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
             "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
+            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
             "CODEX_RVF_SUPPRESS_STOP_HOOK",
             "CODEX_RVF_PREP_ROOT",
             "FAKE_CLIENT_CALLS",
@@ -2312,6 +2336,8 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         "complete",
     ]
     assert latest["cline_kanban_task_id"] == "task-123"
+    assert latest["cline_kanban_worktree_mode"] == "branch"
+    assert latest["cline_kanban_prep_file_path"] == latest["rvf_dispatch_prep_file_path"]
     assert latest["workspace_path"] == "/tmp/task-worktree"
     assert "app_server_requests_path" not in latest
     assert Path(latest["startup_prepare_metadata_path"]).exists()
@@ -2325,6 +2351,9 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     create_argv = calls[1]["argv"]
     assert "--base-ref" in create_argv
     assert "--prompt" in create_argv
+    assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
+    assert create_argv[create_argv.index("--worktree-mode") + 1] == "branch"
+    assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
     assert "RVF_CLINE_KANBAN_TASK" in prompt_text
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
@@ -2405,6 +2434,93 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert suppression_marker["run_id"] == latest["run_id"]
 
 
+def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        f"    print(json.dumps({{'task_id': 'task-inplace', 'workspacePath': {str(repo)!r}}}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-inplace', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+    original_env = {
+        key: os.environ.get(key)
+        for key in (
+            "CODEX_RVF_STATE_DIR",
+            "CODEX_RVF_FORK_MODE",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
+            "FAKE_CLIENT_CALLS",
+        )
+    }
+    original_lookup = module.parent_thread_name_from_app_server
+    try:
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "inplace"
+        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
+        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            parent_thread_path=transcript,
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    assert "pause_origin_edits=true" not in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-started"
+    assert latest["cline_kanban_worktree_mode"] == "inplace"
+    assert latest["workspace_path"] == str(repo)
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    create_argv = calls[1]["argv"]
+    assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
+    assert create_argv[create_argv.index("--worktree-mode") + 1] == "inplace"
+    assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
+    prep = dispatch_prep_payload(latest)
+    assert prep["target_flow"] == "flow-2-inplace"
+    assert prep["target_worktree"] == str(repo)
+    assert prep["target_kanban_task_id"] == "task-inplace"
+    assert prep["workflow_constraints"] == {
+        "pause_origin_edits": False,
+        "in_place_mode": True,
+    }
+
+
 def test_cline_kanban_mode_requires_workspace_path(tmp_path: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
@@ -2463,11 +2579,81 @@ def test_cline_kanban_mode_requires_workspace_path(tmp_path: Path) -> None:
     assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-unavailable"
-    assert "workspace_path/workspacePath" in latest["error"]
+    assert "task execution workspace_path/workspacePath" in latest["error"]
     assert "workspace_path" not in latest
     assert latest["rvf_dispatch_target_worktree"] is None
     prep = dispatch_prep_payload(latest)
     assert prep["target_worktree"] is None
+
+
+def test_cline_kanban_workspace_path_reads_nested_task_workspace_path(tmp_path: Path) -> None:
+    module = load_hook_module()
+
+    assert module.cline_kanban_workspace_path(
+        {"task": {"workspacePath": "/tmp/task-worktree"}},
+    ) == "/tmp/task-worktree"
+
+
+def test_cline_kanban_branch_mode_rejects_parent_project_workspace(tmp_path: Path) -> None:
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import json, sys\n"
+        "action = sys.argv[1]\n"
+        "if action == 'ensure':\n"
+        "    print(json.dumps({'ok': True, 'started': False}))\n"
+        "elif action == 'create':\n"
+        f"    print(json.dumps({{'task_id': 'task-parent-workspace', 'task': {{'id': 'task-parent-workspace', 'workspacePath': {str(repo)!r}}}}}))\n"
+        "elif action == 'start':\n"
+        "    print(json.dumps({'task_id': 'task-parent-workspace', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {action}')\n",
+        encoding="utf-8",
+    )
+    original_env = {
+        key: os.environ.get(key)
+        for key in (
+            "CODEX_RVF_STATE_DIR",
+            "CODEX_RVF_FORK_MODE",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT",
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+        )
+    }
+    original_lookup = module.parent_thread_name_from_app_server
+    try:
+        module.parent_thread_name_from_app_server = lambda *_: {
+            "name": None,
+            "thread_found": False,
+            "source": "test",
+            "reason": "disabled-in-test",
+        }
+        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
+        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
+        payload = module.run_codex_fork(
+            parent_session_id="parent-thread",
+            cwd=str(repo),
+            prompt="$review-validate-fix",
+            log_prefix="review-validate-fix-fork",
+            parent_thread_path=transcript,
+        )
+    finally:
+        module.parent_thread_name_from_app_server = original_lookup
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "cline-kanban-unavailable"
+    assert "parent project path" in latest["error"]
+    assert "workspace_path" not in latest
 
 
 def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
@@ -5292,11 +5478,15 @@ def main() -> int:
         test_restart_bridge_stops_existing_listener_before_relaunch,
         test_bridge_app_server_error_restarts_bridge_once,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
+        test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place,
         test_cline_kanban_mode_requires_workspace_path,
+        test_cline_kanban_workspace_path_reads_nested_task_workspace_path,
+        test_cline_kanban_branch_mode_rejects_parent_project_workspace,
         test_auto_mode_creates_cline_kanban_task_by_default,
         test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback,
         test_auto_mode_can_opt_into_legacy_gui_as_backup_of_backup,
         test_auto_mode_reports_stale_kanban_listener_without_gui_fallback,
+        test_cline_kanban_worktree_mode_rejects_main_env,
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
