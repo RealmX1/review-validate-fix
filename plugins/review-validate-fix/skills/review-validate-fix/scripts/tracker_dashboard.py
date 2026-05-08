@@ -492,6 +492,15 @@ header button.frozen { background: rgba(111, 177, 252, 0.2); border-color: var(-
 section { margin-top: 14px; }
 section h2 { font-size: 13px; font-weight: 600; color: var(--accent); margin: 0 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
 section h2 .count { color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px; }
+.section-title-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 0 0 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+.section-title-row h2 { margin: 0; padding: 0; border: 0; }
+.panel > .section-title-row { margin: 0; padding: 6px 10px; background: var(--bg-2); border-bottom: 1px solid var(--border); }
+.unit-controls { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 500; }
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; background: var(--bg-2); }
+.segmented button { appearance: none; border: 0; border-left: 1px solid var(--border); background: transparent; color: var(--muted); padding: 2px 7px; font: inherit; cursor: pointer; }
+.segmented button:first-child { border-left: 0; }
+.segmented button.active { background: rgba(111, 177, 252, 0.18); color: var(--accent); }
+.segmented button:hover { background: var(--panel-2); color: var(--text); }
 
 .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 @media (max-width: 1180px) { .row-3 { grid-template-columns: 1fr 1fr; } }
@@ -594,7 +603,21 @@ table.t-events th:nth-child(3), table.t-events td:nth-child(3) { width: auto; }
     <section class="panel"><h2>Active leases <span class="count" id="count-leases"></span></h2><div id="leases-body"></div></section>
     <section class="panel"><h2>Manual RVF runs <span class="count" id="count-manual"></span></h2><div id="manual-body"></div></section>
   </div>
-  <section class="panel"><h2>Units <span class="count" id="count-units"></span></h2><div id="units-body"></div></section>
+  <section class="panel">
+    <div class="section-title-row">
+      <h2>Units <span class="count" id="count-units"></span></h2>
+      <div class="unit-controls">
+        <span>superseded</span>
+        <span class="segmented" id="superseded-mode">
+          <button type="button" data-mode="time">time</button>
+          <button type="button" data-mode="path">path</button>
+          <button type="button" data-mode="hidden">hidden</button>
+          <button type="button" data-mode="expanded">expanded</button>
+        </span>
+      </div>
+    </div>
+    <div id="units-body"></div>
+  </section>
   <section class="panel"><h2>Recent events <span class="count" id="count-events"></span></h2><div id="events-body"></div></section>
 </div>
 <script>
@@ -607,6 +630,18 @@ let lastSnapshot = null;
 let lastFetchedAt = null;
 let lastError = null;
 let frozenNow = null;
+function readStoredSupersededMode() {
+  try { return localStorage.getItem('rvf-tracker-superseded-mode') || 'time'; }
+  catch (_) { return 'time'; }
+}
+function writeStoredSupersededMode(mode) {
+  try { localStorage.setItem('rvf-tracker-superseded-mode', mode); }
+  catch (_) {}
+}
+let supersededMode = readStoredSupersededMode();
+if (supersededMode === 'grouped') supersededMode = 'time';
+if (!['time', 'path', 'hidden', 'expanded'].includes(supersededMode)) supersededMode = 'time';
+const SUPERSEDED_TIME_GAP_MS = 10 * 60 * 1000;
 
 function effectiveNow() {
   if (serverFrozen && lastSnapshot && lastSnapshot.generated_at) {
@@ -643,6 +678,15 @@ function fmtDur(sec) {
   if (sec < 3600) return Math.floor(sec/60) + 'm' + String(sec%60).padStart(2, '0') + 's';
   if (sec < 86400) return Math.floor(sec/3600) + 'h' + String(Math.floor((sec%3600)/60)).padStart(2, '0') + 'm';
   return Math.floor(sec/86400) + 'd' + String(Math.floor((sec%86400)/3600)).padStart(2, '0') + 'h';
+}
+function latestIso(a, b) {
+  if (!a) return b || '';
+  if (!b) return a || '';
+  const at = new Date(a).getTime();
+  const bt = new Date(b).getTime();
+  if (isNaN(at)) return b;
+  if (isNaN(bt)) return a;
+  return bt > at ? b : a;
 }
 function shortHash(s, n) {
   if (!s) return '-';
@@ -816,7 +860,11 @@ function renderManual(snap, now) {
 
 function renderUnits(snap, now) {
   const units = snap.units || [];
-  $('count-units').textContent = '(' + units.length + ')';
+  const supersededCount = units.filter(u => u.observed_state === 'superseded').length;
+  $('count-units').textContent = '(' + units.length + (supersededCount ? ' · ' + supersededCount + ' superseded ' + supersededMode : '') + ')';
+  for (const btn of document.querySelectorAll('#superseded-mode button')) {
+    btn.classList.toggle('active', btn.dataset.mode === supersededMode);
+  }
   if (!units.length) { $('units-body').innerHTML = '<div class="empty">none</div>'; return; }
   const sessionsById = {};
   for (const s of (snap.sessions || [])) sessionsById[s.session_id] = s;
@@ -864,7 +912,26 @@ function renderUnits(snap, now) {
     const trailing = ` ${kindPill(l.holder_kind)} ${tag(eta, etaKind)}${sharedTag}`;
     return sessionRefCell(sessionsById, l.session_id, { trailing });
   }
-  const rows = units.map(u => {
+  function groupPathsCell(group) {
+    const paths = Array.from(new Set(group.units.map(u => u.path).filter(Boolean))).sort();
+    const title = paths.join('\n');
+    if (!paths.length) return '<span class="muted">-</span>';
+    if (group.groupKind === 'path') {
+      const rep = group.rep;
+      return `<span class="path-trunc" title="${esc(rep.path)}">${esc(rep.path)}</span>${rep.old_path ? `<div class="muted" style="font-size:11px" title="from ${esc(rep.old_path)}">← ${esc(rep.old_path)}</div>` : ''}`;
+    }
+    const preview = paths.slice(0, 3).map(p => `<div class="path-trunc" title="${esc(p)}">${esc(p)}</div>`).join('');
+    const more = paths.length > 3 ? `<div class="muted" style="font-size:11px">+${paths.length - 3} more</div>` : '';
+    return `<div title="${esc(title)}"><div>${tag(paths.length + ' paths', 'neutral')}</div>${preview}${more}</div>`;
+  }
+  function groupLocCell(group) {
+    if (group.groupKind === 'path') return locCell(group.rep);
+    const worktrees = new Set(group.units.map(u => u.worktree_key || '').filter(Boolean));
+    const branches = new Set(group.units.map(u => u.branch_key || '').filter(Boolean));
+    if (worktrees.size === 1 && branches.size <= 1) return locCell(group.rep);
+    return `<div class="cell-2row"><div>${esc(worktrees.size || 0)} worktrees</div><div class="muted" style="font-size:11px">${esc(branches.size || 0)} branches</div></div>`;
+  }
+  function unitRow(u) {
     return `<tr>`
       + `<td>${fullIdSpan(u.unit_id)}</td>`
       + `<td><span class="path-trunc" title="${esc(u.path)}">${esc(u.path)}</span>${u.old_path ? `<div class="muted" style="font-size:11px" title="from ${esc(u.old_path)}">← ${esc(u.old_path)}</div>` : ''}</td>`
@@ -877,7 +944,118 @@ function renderUnits(snap, now) {
       + `<td>${leaseCell(u)}</td>`
       + `<td class="mono" title="${esc(u.last_observed_at)}">${esc(fmtAge(u.last_observed_at, now))}</td>`
       + `</tr>`;
-  }).join('');
+  }
+  function supersededGroupRow(group) {
+    const rep = group.rep;
+    const ids = group.units.map(u => u.unit_id).filter(Boolean);
+    const kinds = {};
+    const reviews = {};
+    let tombstoned = 0;
+    for (const u of group.units) {
+      kinds[u.kind || 'unknown'] = (kinds[u.kind || 'unknown'] || 0) + 1;
+      reviews[u.review_state || 'unknown'] = (reviews[u.review_state || 'unknown'] || 0) + 1;
+      if (u.is_tombstoned) tombstoned += 1;
+    }
+    const kindText = Object.keys(kinds).sort().map(k => `${esc(k)} x${kinds[k]}`).join('<br>');
+    const reviewCell = Object.keys(reviews).sort().map(k => tag(k + '=' + reviews[k], REVIEW_KIND[k] || 'neutral')).join(' ');
+    const lifecycle = tombstoned
+      ? tag('tombstoned=' + tombstoned, 'danger') + (tombstoned < group.units.length ? ' ' + tag('active=' + (group.units.length - tombstoned), 'ok') : '')
+      : tag('active=' + group.units.length, 'ok');
+    const title = ids.join('\n');
+    const label = group.groupKind === 'time'
+      ? `${group.units.length} superseded · ${esc(fmtAge(group.last_observed_at, now))} last-observed burst`
+      : `${group.units.length} superseded`;
+    return `<tr>`
+      + `<td><span class="id-trunc mono" title="${esc(title)}">${label}</span></td>`
+      + `<td>${groupPathsCell(group)}</td>`
+      + `<td>${groupLocCell(group)}</td>`
+      + `<td>${kindText}</td>`
+      + `<td>${tag('superseded', 'neutral')}</td>`
+      + `<td>${reviewCell}</td>`
+      + `<td>${lifecycle}</td>`
+      + `<td>${ownersCell(rep)}</td>`
+      + `<td>${leaseCell(rep)}</td>`
+      + `<td class="mono" title="${esc(group.last_observed_at)}">${esc(fmtAge(group.last_observed_at, now))}</td>`
+      + `</tr>`;
+  }
+  function displayItem(html, lastObservedAt, ordinal) {
+    return { html, lastObservedAt: lastObservedAt || '', ordinal };
+  }
+  function displaySort(a, b) {
+    const at = new Date(a.lastObservedAt).getTime();
+    const bt = new Date(b.lastObservedAt).getTime();
+    if (!isNaN(at) && !isNaN(bt) && bt !== at) return bt - at;
+    if (isNaN(at) && !isNaN(bt)) return 1;
+    if (!isNaN(at) && isNaN(bt)) return -1;
+    return a.ordinal - b.ordinal;
+  }
+  function supersededPathGroups(superseded) {
+    const groups = {};
+    let groupOrdinal = 0;
+    for (const u of superseded) {
+      const key = [u.worktree_key || '', u.branch_key || '', u.path || '', u.old_path || ''].join('\u0000');
+      const existing = groups[key];
+      if (existing) {
+        existing.units.push(u);
+        existing.last_observed_at = latestIso(existing.last_observed_at, u.last_observed_at);
+      } else {
+        groups[key] = { groupKind: 'path', rep: u, units: [u], last_observed_at: u.last_observed_at || '', ordinal: groupOrdinal++ };
+      }
+    }
+    return Object.values(groups);
+  }
+  function supersededTimeGroups(superseded) {
+    const sorted = superseded.slice().sort((a, b) => {
+      const at = new Date(a.last_observed_at || '').getTime();
+      const bt = new Date(b.last_observed_at || '').getTime();
+      if (!isNaN(at) && !isNaN(bt) && bt !== at) return bt - at;
+      if (isNaN(at) && !isNaN(bt)) return 1;
+      if (!isNaN(at) && isNaN(bt)) return -1;
+      return String(a.path || '').localeCompare(String(b.path || ''));
+    });
+    const groups = [];
+    for (const u of sorted) {
+      const t = new Date(u.last_observed_at || '').getTime();
+      const last = groups[groups.length - 1];
+      const lastT = last ? new Date(last.oldest_observed_at || '').getTime() : NaN;
+      if (last && !isNaN(t) && !isNaN(lastT) && Math.abs(lastT - t) <= SUPERSEDED_TIME_GAP_MS) {
+        last.units.push(u);
+        last.oldest_observed_at = u.last_observed_at || last.oldest_observed_at;
+        last.last_observed_at = latestIso(last.last_observed_at, u.last_observed_at);
+      } else {
+        groups.push({
+          groupKind: 'time',
+          rep: u,
+          units: [u],
+          last_observed_at: u.last_observed_at || '',
+          oldest_observed_at: u.last_observed_at || '',
+          ordinal: groups.length,
+        });
+      }
+    }
+    return groups;
+  }
+  const displayRows = [];
+  let ordinal = 0;
+  if (supersededMode === 'expanded') {
+    for (const u of units) displayRows.push(displayItem(unitRow(u), u.last_observed_at, ordinal++));
+  } else {
+    const superseded = [];
+    for (const u of units) {
+      if (u.observed_state !== 'superseded') {
+        displayRows.push(displayItem(unitRow(u), u.last_observed_at, ordinal++));
+        continue;
+      }
+      if (supersededMode === 'hidden') continue;
+      superseded.push(u);
+    }
+    const groups = supersededMode === 'path' ? supersededPathGroups(superseded) : supersededTimeGroups(superseded);
+    for (const group of groups) {
+      displayRows.push(displayItem(supersededGroupRow(group), group.last_observed_at, ordinal++));
+    }
+  }
+  const rows = displayRows.sort(displaySort).map(item => item.html).join('');
+  if (!rows) { $('units-body').innerHTML = '<div class="empty">none in current superseded mode</div>'; return; }
   $('units-body').innerHTML = `<table class="t-units"><thead><tr><th>unit_id</th><th>path</th><th>worktree / branch</th><th>kind</th><th>observed</th><th>review</th><th>lifecycle</th><th>session owners</th><th>active lease</th><th>last obs</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -984,6 +1162,15 @@ $('download-btn').addEventListener('click', () => {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 });
+for (const btn of document.querySelectorAll('#superseded-mode button')) {
+  btn.addEventListener('click', () => {
+    const mode = btn.dataset.mode || 'time';
+    if (!['time', 'path', 'hidden', 'expanded'].includes(mode)) return;
+    supersededMode = mode;
+    writeStoredSupersededMode(mode);
+    redraw();
+  });
+}
 tick();
 setInterval(tick, POLL_MS);
 setInterval(redraw, REDRAW_MS);

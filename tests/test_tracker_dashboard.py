@@ -121,6 +121,11 @@ def test_render_shell_embeds_repo_metadata(tmp_path: Path) -> None:
     assert "POLL_MS = 3000" in html
     assert "freeze-btn" in html
     assert "download-btn" in html
+    assert "superseded-mode" in html
+    assert 'data-mode="time"' in html
+    assert 'data-mode="path"' in html
+    assert 'data-mode="hidden"' in html
+    assert 'data-mode="expanded"' in html
     assert "/api/snapshot" in html
 
 
