@@ -36,6 +36,15 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 - `~/.codex/config.toml`
 - `~/.codex/hooks.json`
 
+installer 还会写入部署日志，用于追踪「哪些 plugin 状态已经被部署」以及「部署时对应哪个 RVF trajectory / analysis run」：
+
+- `~/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/deployments.jsonl`
+- `~/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/latest-deployment.json`
+- `~/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/deployments.jsonl`
+- `~/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json`
+
+每条记录应至少包含 source git HEAD/branch/status、runtime hash、安装目标、hook 选项，以及 `CODEX_RVF_RUN_DIR` / latest RVF run pointer 中可解析出的 run summary 和 analysis artifact paths。
+
 ## Post-Deploy Checks
 
 验证 installed runtime，而不是只验证 source checkout：
@@ -44,6 +53,8 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 test -f /Users/bominzhang/plugins/review-validate-fix/.codex-plugin/plugin.json
 test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
 python3 -m py_compile /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
+test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/latest-deployment.json
+test -f /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json
 ```
 
 如果部署的是具体功能改动，还要检查 installed 版本中的相关文件。示例：
@@ -63,4 +74,4 @@ rg -n "SCHEMA_VERSION|ANALYSIS_SCHEMA_VERSION" \
 - 部署会复制无关的未提交 plugin/runtime 改动。
 - 用户要求 stable deployment，但 checkout 不在预期 branch/tag/commit。
 
-最终回复中说明 installer 输出摘要、post-deploy checks，以及哪些 dirty paths 被有意保留未动。
+最终回复中说明 installer 输出摘要、post-deploy checks、deploy log 路径，以及哪些 dirty paths 被有意保留未动。

@@ -295,6 +295,7 @@ def test_configure_stop_hook_can_write_cline_kanban_review_options(tmp_path: Pat
             tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
             "cline-kanban",
             cline_kanban_base_ref="main",
+            cline_kanban_worktree_mode="inplace",
             cline_kanban_auto_review_enabled="1",
             cline_kanban_auto_review_mode="pr",
             cline_kanban_start_in_plan_mode="1",
@@ -305,6 +306,7 @@ def test_configure_stop_hook_can_write_cline_kanban_review_options(tmp_path: Pat
     data = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     command = rvf_hooks(data)[0]["command"]
     assert "CODEX_RVF_CLINE_KANBAN_BASE_REF=main" in command
+    assert "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace" in command
     assert "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED=1" in command
     assert "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE=pr" in command
     assert "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE=1" in command
@@ -876,6 +878,96 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert "enabled = true" in codex_config
 
 
+def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+    run_dir = tmp_path / "rvf-run"
+    analysis_dir = run_dir / "artifacts" / "analysis"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "summary.md").write_text("# analysis\n", encoding="utf-8")
+    (analysis_dir / "causality.json").write_text("{}\n", encoding="utf-8")
+    (run_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "rvf-run-1",
+                "status": "completed",
+                "reason_code": "handoff_ready",
+                "parent_thread_id": "thread-1",
+                "rvf_backend": "kanban-task",
+                "rvf_state_phase": "complete",
+                "rvf_handoff_path": str(run_dir / "handoff.md"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "cline-kanban",
+            ],
+            call_main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env(
+            {
+                "CODEX_RVF_RUN_ID": "rvf-run-1",
+                "CODEX_RVF_RUN_DIR": str(run_dir),
+                "CODEX_SESSION_ID": "session-1",
+            },
+            run_main,
+        ),
+    )
+
+    plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    cache_skill = (
+        home
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "local-codex-plugins"
+        / "rvf"
+        / module.plugin_version()
+        / "skills"
+        / "review-validate-fix"
+    )
+    plugin_latest = plugin_skill / "state" / "deployments" / "latest-deployment.json"
+    plugin_history = plugin_skill / "state" / "deployments" / "deployments.jsonl"
+    cache_latest = cache_skill / "state" / "deployments" / "latest-deployment.json"
+    payload = json.loads(plugin_latest.read_text(encoding="utf-8"))
+
+    assert plugin_history.exists()
+    assert len(plugin_history.read_text(encoding="utf-8").splitlines()) == 1
+    assert cache_latest.exists()
+    assert payload["kind"] == "rvf-local-deploy"
+    assert payload["plugin"]["name"] == "rvf"
+    assert payload["plugin"]["version"] == module.plugin_version()
+    assert payload["source"]["repo"] == str(module.ROOT)
+    assert payload["runtime_hashes"]["plugin"]["value"]
+    assert payload["runtime_hashes"]["cache"]["value"]
+    assert Path(payload["destinations"]["plugin_skill"]) == plugin_skill.resolve()
+    assert payload["options"]["configure_stop_hook"] is True
+    assert payload["options"]["fork_mode"] == "cline-kanban"
+    assert payload["rvf_sessions"]["env"]["CODEX_SESSION_ID"] == "session-1"
+    assert payload["rvf_sessions"]["current_run"]["run_id"] == "rvf-run-1"
+    assert payload["rvf_sessions"]["current_run"]["analysis_paths"]["summary_md"] == str(
+        analysis_dir / "summary.md"
+    )
+
+
 def test_main_can_configure_user_prompt_submit_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
@@ -929,6 +1021,7 @@ def main() -> int:
         test_main_syncs_legacy_only_setup_into_empty_plugin_cache,
         test_main_syncs_legacy_config_over_default_plugin_cache,
         test_main_installs_plugin_and_configures_stop_hook,
+        test_main_records_deploy_log_with_rvf_context,
         test_main_can_configure_user_prompt_submit_hook,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:

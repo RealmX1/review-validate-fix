@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +22,10 @@ PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
 DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
 PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
+DEPLOY_LOG_REL = Path("state") / "deployments"
+DEPLOY_HISTORY_FILE = "deployments.jsonl"
+DEPLOY_LATEST_FILE = "latest-deployment.json"
+DEPLOY_LOG_VERSION = 1
 LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
     "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
     "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
@@ -71,6 +79,231 @@ def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str |
     if LEGACY_DEFAULT_CLINE_KANBAN_ENV.get(name) == text:
         return None
     return text
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def run_text(command: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def git_metadata() -> dict[str, Any]:
+    status_short = (run_text(["git", "status", "--short"]) or "").splitlines()
+    return {
+        "repo": str(ROOT),
+        "head": run_text(["git", "rev-parse", "HEAD"]),
+        "branch": run_text(["git", "branch", "--show-current"]),
+        "describe": run_text(["git", "describe", "--always", "--dirty", "--tags"]),
+        "status_short": status_short,
+        "dirty": bool(status_short),
+    }
+
+
+def read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def deployment_file_digest(root: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    if not root.exists():
+        return {
+            "algorithm": "sha256",
+            "value": None,
+            "file_count": 0,
+            "byte_count": 0,
+            "root": str(root),
+        }
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        rel = path.relative_to(root)
+        if is_dev_only_path(rel) or is_preserved(rel, PRESERVE_IN_PLUGIN):
+            continue
+        if any(part in IGNORE_NAMES for part in rel.parts) or path.name.endswith(".pyc"):
+            continue
+        data = path.read_bytes()
+        digest.update(str(rel).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+        file_count += 1
+        byte_count += len(data)
+    return {
+        "algorithm": "sha256",
+        "value": digest.hexdigest(),
+        "file_count": file_count,
+        "byte_count": byte_count,
+        "root": str(root),
+        "excluded": ["state/", "config/alternative-reviewer.json", "dev-only paths", "*.pyc"],
+    }
+
+
+def summarize_rvf_run(run_dir: Path | None) -> dict[str, Any] | None:
+    if run_dir is None:
+        return None
+    summary_path = run_dir.expanduser() / "summary.json"
+    summary = read_json_object(summary_path)
+    if summary is None:
+        return {"run_dir": str(run_dir.expanduser()), "summary_path": str(summary_path), "available": False}
+    keys = [
+        "run_id",
+        "status",
+        "reason_code",
+        "started_at",
+        "ended_at",
+        "updated_at",
+        "parent_thread_id",
+        "parent_session_id",
+        "session_id",
+        "rvf_backend",
+        "rvf_state_phase",
+        "rvf_handoff_path",
+    ]
+    compact = {key: summary.get(key) for key in keys if summary.get(key) is not None}
+    compact["run_dir"] = str(run_dir.expanduser())
+    compact["summary_path"] = str(summary_path)
+    compact["available"] = True
+    analysis_dir = run_dir.expanduser() / "artifacts" / "analysis"
+    if analysis_dir.exists():
+        compact["analysis_paths"] = {
+            "summary_md": str(analysis_dir / "summary.md"),
+            "causality_json": str(analysis_dir / "causality.json"),
+        }
+    return compact
+
+
+def latest_run_from_root(root: Path) -> dict[str, Any] | None:
+    latest_path = root.expanduser() / "latest.json"
+    latest = read_json_object(latest_path)
+    if latest is None:
+        return None
+    payload = {
+        "latest_path": str(latest_path),
+        "pointer": latest,
+    }
+    summary_path = latest.get("summary_path")
+    if isinstance(summary_path, str) and summary_path.strip():
+        payload["summary"] = summarize_rvf_run(Path(summary_path).expanduser().parent)
+    return payload
+
+
+def rvf_session_context(plugin_skill_dir: Path) -> dict[str, Any]:
+    env_keys = [
+        "CODEX_RVF_RUN_ID",
+        "CODEX_RVF_RUN_DIR",
+        "RVF_RUN_ID",
+        "RVF_RUN_DIR",
+        "CODEX_RVF_LOG_ROOT",
+        "CODEX_RVF_STATE_DIR",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+    ]
+    env = {key: os.environ[key] for key in env_keys if os.environ.get(key)}
+    run_dir_text = env.get("CODEX_RVF_RUN_DIR") or env.get("RVF_RUN_DIR")
+    roots: list[Path] = []
+    for key in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR"):
+        value = os.environ.get(key)
+        if value and value.strip():
+            roots.append(Path(value).expanduser())
+    roots.append(plugin_skill_dir / "state")
+
+    seen: set[str] = set()
+    latest_runs = []
+    for root in roots:
+        root_key = str(root)
+        if root_key in seen:
+            continue
+        seen.add(root_key)
+        latest = latest_run_from_root(root)
+        if latest is not None:
+            latest_runs.append(latest)
+    return {
+        "env": env,
+        "current_run": summarize_rvf_run(Path(run_dir_text).expanduser()) if run_dir_text else None,
+        "latest_runs": latest_runs,
+    }
+
+
+def build_deploy_log_entry(
+    *,
+    dst: Path,
+    plugin_cache: Path,
+    configure_stop_hook_enabled: bool,
+    configure_user_prompt_submit_hook_enabled: bool,
+    fork_mode: str,
+    preserve_local_config: bool,
+    replace_setup_config: bool,
+) -> dict[str, Any]:
+    plugin_skill_dir = dst / PLUGIN_SKILL_REL
+    cache_skill_dir = plugin_cache / PLUGIN_SKILL_REL
+    return {
+        "version": DEPLOY_LOG_VERSION,
+        "kind": "rvf-local-deploy",
+        "deployed_at": utc_now(),
+        "plugin": {
+            "name": PLUGIN_NAME,
+            "directory_name": PLUGIN_DIR_NAME,
+            "version": plugin_version(),
+        },
+        "source": git_metadata(),
+        "runtime_hashes": {
+            "plugin": deployment_file_digest(dst),
+            "cache": deployment_file_digest(plugin_cache),
+        },
+        "destinations": {
+            "plugin": str(dst),
+            "plugin_skill": str(plugin_skill_dir),
+            "plugin_cache": str(plugin_cache),
+            "cache_skill": str(cache_skill_dir),
+            "codex_config": str(Path.home() / ".codex" / "config.toml"),
+            "hooks": str(Path.home() / ".codex" / "hooks.json"),
+            "marketplace": str(Path.home() / ".agents" / "plugins" / "marketplace.json"),
+        },
+        "options": {
+            "configure_stop_hook": configure_stop_hook_enabled,
+            "configure_user_prompt_submit_hook": configure_user_prompt_submit_hook_enabled,
+            "fork_mode": normalize_fork_mode(fork_mode),
+            "preserve_local_config": preserve_local_config,
+            "replace_setup_config": replace_setup_config,
+        },
+        "rvf_sessions": rvf_session_context(plugin_skill_dir),
+    }
+
+
+def write_deploy_log(entry: dict[str, Any], skill_dirs: list[Path]) -> list[Path]:
+    written: list[Path] = []
+    for skill_dir in skill_dirs:
+        log_dir = skill_dir / DEPLOY_LOG_REL
+        log_dir.mkdir(parents=True, exist_ok=True)
+        history = log_dir / DEPLOY_HISTORY_FILE
+        with history.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        latest = log_dir / DEPLOY_LATEST_FILE
+        tmp = latest.with_name(f".{latest.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(entry, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(latest)
+        written.append(history)
+        written.append(latest)
+    return written
 
 
 def remove_unpreserved(dst: Path, preserved: set[Path], base: Path = Path()) -> None:
@@ -375,6 +608,7 @@ def configure_stop_hook(
     cline_kanban_start_timeout: str | None = None,
     cline_kanban_tmux_session: str | None = None,
     cline_kanban_base_ref: str | None = None,
+    cline_kanban_worktree_mode: str | None = None,
     cline_kanban_auto_review_enabled: str | None = None,
     cline_kanban_auto_review_mode: str | None = None,
     cline_kanban_start_in_plan_mode: str | None = None,
@@ -412,6 +646,7 @@ def configure_stop_hook(
             ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", cline_kanban_start_timeout),
             ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", cline_kanban_tmux_session),
             ("CODEX_RVF_CLINE_KANBAN_BASE_REF", cline_kanban_base_ref),
+            ("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", cline_kanban_worktree_mode),
             ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED", cline_kanban_auto_review_enabled),
             ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", cline_kanban_auto_review_mode),
             ("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE", cline_kanban_start_in_plan_mode),
@@ -599,6 +834,12 @@ def main() -> int:
         help="持久写入 CODEX_RVF_CLINE_KANBAN_BASE_REF；未提供时 Stop hook 使用当前 HEAD。",
     )
     parser.add_argument(
+        "--cline-kanban-worktree-mode",
+        choices=["branch", "main", "inplace"],
+        default=None,
+        help="持久写入 CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE；默认 branch。",
+    )
+    parser.add_argument(
         "--cline-kanban-auto-review-enabled",
         default=None,
         help="持久写入 CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED；默认 0。",
@@ -664,6 +905,7 @@ def main() -> int:
                 args.cline_kanban_start_timeout or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT"),
                 args.cline_kanban_tmux_session or os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION"),
                 args.cline_kanban_base_ref or os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"),
+                args.cline_kanban_worktree_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"),
                 args.cline_kanban_auto_review_enabled or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"),
                 args.cline_kanban_auto_review_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE"),
                 args.cline_kanban_start_in_plan_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"),
@@ -676,6 +918,22 @@ def main() -> int:
         if args.configure_user_prompt_submit_hook:
             hooks_path = configure_user_prompt_submit_hook(dst / PLUGIN_SKILL_REL)
             installed.append(f"user prompt submit hook: {hooks_path}")
+        deploy_log_paths = write_deploy_log(
+            build_deploy_log_entry(
+                dst=dst,
+                plugin_cache=plugin_cache,
+                configure_stop_hook_enabled=args.configure_stop_hook,
+                configure_user_prompt_submit_hook_enabled=args.configure_user_prompt_submit_hook,
+                fork_mode=args.fork_mode,
+                preserve_local_config=preserve,
+                replace_setup_config=args.replace_setup_config,
+            ),
+            [dst / PLUGIN_SKILL_REL, plugin_cache / PLUGIN_SKILL_REL],
+        )
+        installed.append(
+            "deploy log: "
+            + ", ".join(str(path) for path in deploy_log_paths if path.name == DEPLOY_LATEST_FILE)
+        )
     except Exception as exc:
         print(f"安装失败: {exc}", file=sys.stderr)
         return 2
