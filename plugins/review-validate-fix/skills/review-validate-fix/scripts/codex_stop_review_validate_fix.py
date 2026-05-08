@@ -1994,6 +1994,7 @@ def cline_kanban_task_prompt(
     parent_origin: dict[str, Any],
     ledger: RunLedger,
     startup_prepare: dict[str, Any],
+    worktree_mode: str,
 ) -> str:
     del startup_prepare
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
@@ -2004,6 +2005,39 @@ def cline_kanban_task_prompt(
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
     handoff_helper = DEFAULT_HANDOFF_HELPER
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
+    if worktree_mode == "inplace":
+        worktree_instructions = (
+            "你运行在 Cline Kanban task 的 inplace 模式中。执行 repo 是当前父 worktree；"
+            "如果需要绝对路径，使用 `git rev-parse --show-toplevel`。不要重放 worktree bootstrap；"
+            "本 task 与父会话共享同一个 dirty worktree，bootstrap artifacts 仅作冻结证据。\n\n"
+            "如需 shell 环境，可只加载已生成的 review env：\n\n"
+            "```sh\n"
+            f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
+            f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
+            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
+            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
+            '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
+            "```\n\n"
+        )
+    else:
+        worktree_instructions = (
+            "你运行在 Cline Kanban 为本 task 创建的独立 git worktree 中。执行 repo 是当前 task worktree；"
+            "如果需要绝对路径，使用 `git rev-parse --show-toplevel`。上面的父 repo 仅作 metadata，"
+            "不要回到父 worktree 运行 review/validate/fix。开始任何 review/validate/fix 前，必须先把父会话的 "
+            "session-owned 未提交改动重放到当前 worktree：\n\n"
+            "```sh\n"
+            'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
+            f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
+            f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
+            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
+            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
+            '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
+            'export RVF_REPO="$RVF_TASK_REPO"\n'
+            f"python3 {shell_quote(str(apply_helper))} --metadata \"$RVF_WORKTREE_BOOTSTRAP\" --repo \"$RVF_REPO\"\n"
+            "```\n\n"
+        )
     return (
         "$review-validate-fix\n\n"
         f"{RVF_FORK_MARKER}\n"
@@ -2031,21 +2065,7 @@ def cline_kanban_task_prompt(
         f"- open: `{parent_codex_url}`\n"
         f"- transcript: `{transcript}`\n"
         f"- origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`\n\n"
-        "你运行在 Cline Kanban 为本 task 创建的独立 git worktree 中。执行 repo 是当前 task worktree；"
-        "如果需要绝对路径，使用 `git rev-parse --show-toplevel`。上面的父 repo 仅作 metadata，"
-        "不要回到父 worktree 运行 review/validate/fix。开始任何 review/validate/fix 前，必须先把父会话的 "
-        "session-owned 未提交改动重放到当前 worktree：\n\n"
-        "```sh\n"
-        'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
-        f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
-        f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
-        f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
-        'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
-        'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
-        '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
-        'export RVF_REPO="$RVF_TASK_REPO"\n'
-        f"python3 {shell_quote(str(apply_helper))} --metadata \"$RVF_WORKTREE_BOOTSTRAP\" --repo \"$RVF_REPO\"\n"
-        "```\n\n"
+        f"{worktree_instructions}"
         f"{cline_kanban_artifact_reference_lines()}"
         "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py` 创建新的 run；"
         "本 task 已经复用上面的 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、"
@@ -2096,6 +2116,7 @@ def start_cline_kanban_task(
         ledger=ledger,
         dispatch_prep=dispatch_prep,
     )
+    worktree_mode = cline_kanban_worktree_mode_from_env()
     task_prompt = cline_kanban_task_prompt(
         cwd=cwd,
         prompt_path=prompt_path,
@@ -2104,6 +2125,7 @@ def start_cline_kanban_task(
         parent_origin=parent_origin,
         ledger=ledger,
         startup_prepare=startup_prepare,
+        worktree_mode=worktree_mode,
     )
     task_prompt_path = ledger.artifact("cline-kanban-task.prompt.md", task_prompt)
     if not task_prompt_path:
@@ -2118,7 +2140,6 @@ def start_cline_kanban_task(
     tmux_session = os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", DEFAULT_CLINE_KANBAN_TMUX_SESSION)
     base_ref = os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF", "").strip() or git_head(cwd)
     agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
-    worktree_mode = cline_kanban_worktree_mode_from_env()
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
     start_in_plan_mode = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"))

@@ -30,6 +30,7 @@ LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
     "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
     "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
 }
+CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 
 PRESERVE_IN_PLUGIN = {
     PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
@@ -77,6 +78,15 @@ def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str |
     if not text:
         return None
     if LEGACY_DEFAULT_CLINE_KANBAN_ENV.get(name) == text:
+        return None
+    return text
+
+
+def normalized_cline_kanban_worktree_mode(value: str | None) -> str | None:
+    text = (value or "").strip().lower()
+    if not text:
+        return None
+    if text not in CLINE_KANBAN_WORKTREE_MODES:
         return None
     return text
 
@@ -616,6 +626,7 @@ def configure_stop_hook(
     ide_open_cmd: str | None = None,
 ) -> Path:
     fork_mode = normalize_fork_mode(fork_mode)
+    cline_kanban_worktree_mode = normalized_cline_kanban_worktree_mode(cline_kanban_worktree_mode)
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     if hooks_path.exists():
@@ -905,7 +916,10 @@ def main() -> int:
                 args.cline_kanban_start_timeout or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT"),
                 args.cline_kanban_tmux_session or os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION"),
                 args.cline_kanban_base_ref or os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF"),
-                args.cline_kanban_worktree_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"),
+                args.cline_kanban_worktree_mode
+                or normalized_cline_kanban_worktree_mode(
+                    os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE")
+                ),
                 args.cline_kanban_auto_review_enabled or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"),
                 args.cline_kanban_auto_review_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE"),
                 args.cline_kanban_start_in_plan_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"),

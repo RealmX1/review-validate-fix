@@ -4687,6 +4687,40 @@ def test_cline_kanban_client_start_task_uses_session_cwd_workspace(tmp_path: Pat
     assert payload["workspace_path_source"] == "task_session_cwd"
 
 
+def test_cline_kanban_client_branch_mode_prefers_task_workspace_over_project_path(tmp_path: Path) -> None:
+    module = load_cline_kanban_client_module()
+    repo = init_repo(tmp_path / "repo")
+    task_repo = init_repo(tmp_path / "task-worktree" / "repo")
+    fake_task = tmp_path / "fake_kanban_task.py"
+    fake_task.write_text(
+        "import json, sys\n"
+        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
+        f"task_path = {str(task_repo)!r}\n"
+        "if sys.argv[1] == 'start':\n"
+        "    print(json.dumps({'ok': True, 'projectPath': project_path, 'task': {\n"
+        "        'id': 'task-1', 'workspacePath': task_path\n"
+        "    }}))\n"
+        "elif sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
+        "        {'id': 'task-1', 'workspacePath': task_path, 'session': None}\n"
+        "    ]}))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    payload = module.start_task(
+        task_cmd=f"{sys.executable} {fake_task}",
+        repo=repo,
+        task_id="task-1",
+        worktree_mode="branch",
+    )
+
+    assert Path(payload["workspace_path"]).resolve() == task_repo.resolve()
+    assert Path(payload["project_path"]).resolve() == repo.resolve()
+    assert payload["workspace_path_source"] == "task_payload_workspace_path"
+
+
 def test_cline_kanban_client_branch_mode_rejects_parent_project_workspace(tmp_path: Path) -> None:
     module = load_cline_kanban_client_module()
     repo = init_repo(tmp_path / "repo")
@@ -6930,6 +6964,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "cline_kanban_client_start_task_uses_session_cwd_workspace",
             lambda: test_cline_kanban_client_start_task_uses_session_cwd_workspace(
                 root / "cline-kanban-session-cwd"
+            ),
+        ),
+        (
+            "cline_kanban_client_branch_mode_prefers_task_workspace_over_project_path",
+            lambda: test_cline_kanban_client_branch_mode_prefers_task_workspace_over_project_path(
+                root / "cline-kanban-task-workspace"
             ),
         ),
         (

@@ -2511,6 +2511,13 @@ def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) 
     assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
     assert create_argv[create_argv.index("--worktree-mode") + 1] == "inplace"
     assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
+    prompt_text = create_argv[create_argv.index("--prompt") + 1]
+    assert "inplace 模式" in prompt_text
+    assert "不要重放 worktree bootstrap" in prompt_text
+    assert "独立 git worktree" not in prompt_text
+    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' not in prompt_text
+    assert "apply_worktree_bootstrap.py" not in prompt_text
+    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' not in prompt_text
     prep = dispatch_prep_payload(latest)
     assert prep["target_flow"] == "flow-2-inplace"
     assert prep["target_worktree"] == str(repo)

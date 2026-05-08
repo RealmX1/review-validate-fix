@@ -524,6 +524,37 @@ def test_main_rejects_cline_kanban_worktree_mode_main(tmp_path: Path) -> None:
     assert not (home / ".codex" / "hooks.json").exists()
 
 
+def test_main_ignores_invalid_cline_kanban_worktree_mode_env(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+
+    def run_main() -> None:
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--configure-stop-hook",
+                "--fork-mode",
+                "cline-kanban",
+            ],
+            module.main,
+        )
+
+    with_fake_home(
+        module,
+        home,
+        lambda: with_env({"CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE": "main"}, run_main),
+    )
+
+    command = rvf_hooks(
+        json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+    )[0]["command"]
+    assert "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=main" not in command
+    assert "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=" not in command
+
+
 def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     module = load_installer_module()
     src = tmp_path / "src"

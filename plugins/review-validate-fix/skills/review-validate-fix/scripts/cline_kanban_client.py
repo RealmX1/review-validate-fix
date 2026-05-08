@@ -306,6 +306,39 @@ def payload_workspace_path_candidates(payload: dict[str, Any]) -> list[Path]:
     return candidates
 
 
+def payload_direct_workspace_path(payload: dict[str, Any]) -> Path | None:
+    for key in ("workspacePath", "workspace_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    workspace = payload.get("workspace")
+    if isinstance(workspace, dict):
+        value = workspace.get("path")
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    return None
+
+
+def payload_direct_project_path(payload: dict[str, Any]) -> Path | None:
+    for key in ("projectPath", "project_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return Path(value).expanduser()
+    return None
+
+
+def payload_project_path_from_payloads(*payloads: dict[str, Any]) -> Path | None:
+    for payload in payloads:
+        project_path = payload_direct_project_path(payload)
+        if project_path is not None:
+            return project_path
+    for payload in payloads:
+        workspace_path = payload_direct_workspace_path(payload)
+        if workspace_path is not None:
+            return workspace_path
+    return None
+
+
 def git_toplevel(path: Path) -> Path | None:
     completed = run_command(
         ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
@@ -379,17 +412,23 @@ def task_execution_workspace_path(
         if workspace is not None:
             return workspace, "start_task_session_cwd", payload_workspace_path(start_task)
 
-    project_workspace = payload_workspace_path(start_payload)
-    if project_workspace is None and task is not None:
-        project_workspace = payload_workspace_path(task)
-    if project_workspace is None:
-        project_workspace = payload_workspace_path(list_payload)
+    payloads_for_project_path = [start_payload, list_payload]
+    project_path = payload_project_path_from_payloads(*payloads_for_project_path)
 
     if worktree_mode == "inplace":
-        return project_workspace or repo, "inplace_project_path", project_workspace or repo
-    if project_workspace is not None:
-        return project_workspace, "payload_workspace_path", project_workspace
-    return None, None, project_workspace
+        return project_path or repo, "inplace_project_path", project_path or repo
+    if task is not None:
+        workspace = payload_direct_workspace_path(task)
+        if workspace is not None:
+            return workspace, "task_payload_workspace_path", project_path
+    if isinstance(start_task, dict):
+        workspace = payload_direct_workspace_path(start_task)
+        if workspace is not None:
+            return workspace, "start_task_payload_workspace_path", project_path
+    workspace = payload_direct_workspace_path(start_payload)
+    if workspace is not None:
+        return workspace, "start_payload_workspace_path", project_path
+    return None, None, project_path
 
 
 def workspace_resolve_timeout_seconds() -> float:
