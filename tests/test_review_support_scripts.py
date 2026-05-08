@@ -1893,6 +1893,81 @@ def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Pat
     assert "docs/note.md" not in manifest["unattributed_dirty_paths"]
 
 
+def test_session_manifest_claims_claude_write_tool_paths(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("base\nclaude\n", encoding="utf-8")
+    notebook = repo / "analysis.ipynb"
+    notebook.write_text('{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}\n', encoding="utf-8")
+    run(["git", "add", "analysis.ipynb"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add notebook"], cwd=repo)
+    notebook.write_text('{"cells":[{"cell_type":"code"}],"metadata":{},"nbformat":4,"nbformat_minor":5}\n', encoding="utf-8")
+    (repo / "background.txt").write_text("background\n", encoding="utf-8")
+    transcript = tmp_path / "claude-session.jsonl"
+    records = [
+        {"timestamp": "2999-04-27T00:00:00.000Z", "sessionId": "claude-session-1"},
+        {
+            "timestamp": "2999-04-27T00:00:01.000Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": str(repo / "tracked.txt"),
+                            "old_string": "base\n",
+                            "new_string": "base\nclaude\n",
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "timestamp": "2999-04-27T00:00:02.000Z",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "NotebookEdit",
+                        "input": {
+                            "notebook_path": str(notebook),
+                            "new_source": "print('rvf')",
+                            "cell_type": "code",
+                        },
+                    }
+                ]
+            },
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["session_id"] == "claude-session-1"
+    assert manifest["confidence"] == "medium"
+    assert manifest["owned_paths"] == ["analysis.ipynb", "tracked.txt"]
+    assert manifest["owned_dirty_paths"] == ["analysis.ipynb", "tracked.txt"]
+    assert "background.txt" in manifest["unattributed_dirty_paths"]
+    assert "new.txt" in manifest["unattributed_dirty_paths"]
+    assert manifest["claude_write_events"] == [
+        {"line_number": 2, "name": "Edit", "path": "tracked.txt"},
+        {"line_number": 3, "name": "NotebookEdit", "path": "analysis.ipynb"},
+    ]
+    assert manifest["ownership_baseline"]["mode"] == "head_commit_time"
+    assert manifest["ownership_baseline"]["included_tool_record_count"] == 2
+
+
 def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     transcript = tmp_path / "claude-session.jsonl"
@@ -6462,6 +6537,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "session_manifest_resolves_exec_paths_from_command_workdir",
             lambda: test_session_manifest_resolves_exec_paths_from_command_workdir(
                 root / "session-manifest-workdir"
+            ),
+        ),
+        (
+            "session_manifest_claims_claude_write_tool_paths",
+            lambda: test_session_manifest_claims_claude_write_tool_paths(
+                root / "session-manifest-claude-write"
             ),
         ),
         (

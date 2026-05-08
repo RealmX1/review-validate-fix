@@ -17,6 +17,7 @@ import diff_tracker
 
 
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:>>?|1>|2>|&>)\s*(?P<path>[^&|;\s]+)")
+CLAUDE_WRITE_TOOL_NAMES = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,10 @@ def session_id_from_records(records: list[dict[str, Any]]) -> str | None:
         payload = record.get("payload")
         if isinstance(payload, dict) and isinstance(payload.get("id"), str):
             return payload["id"]
+    for record in records:
+        session_id = record.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            return session_id
     return None
 
 
@@ -149,6 +154,32 @@ def payload_tool_input(payload: dict[str, Any]) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def claude_tool_uses(record: dict[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        item
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "tool_use" and isinstance(item.get("name"), str)
+    ]
+
+
+def claude_write_path(repo: Path, item: dict[str, Any]) -> str | None:
+    if item.get("name") not in CLAUDE_WRITE_TOOL_NAMES:
+        return None
+    tool_input = item.get("input")
+    if not isinstance(tool_input, dict):
+        return None
+    file_path = tool_input.get("notebook_path" if item.get("name") == "NotebookEdit" else "file_path")
+    if not isinstance(file_path, str):
+        return None
+    return normalize_repo_path(repo, file_path)
 
 
 def parse_apply_patch_details(
@@ -383,6 +414,12 @@ def tool_name_for_record(record: dict[str, Any]) -> str | None:
     return payload_tool_name(payload) if isinstance(payload, dict) else None
 
 
+def has_timestamp_comparable_tool(record: dict[str, Any]) -> bool:
+    if tool_name_for_record(record) in {"apply_patch", "exec_command"}:
+        return True
+    return any(item.get("name") in CLAUDE_WRITE_TOOL_NAMES for item in claude_tool_uses(record))
+
+
 def should_include_tool_record(
     record: dict[str, Any],
     *,
@@ -465,8 +502,7 @@ def ownership_baseline(
         )
 
     has_tool_timestamps = any(
-        tool_name_for_record(record) in {"apply_patch", "exec_command"} and parse_record_timestamp(record) is not None
-        for record in records
+        has_timestamp_comparable_tool(record) and parse_record_timestamp(record) is not None for record in records
     )
     if committed_at is not None and has_tool_timestamps:
         return (
@@ -628,6 +664,7 @@ def build_manifest(
     apply_patch_operations: list[dict[str, Any]] = []
     command_candidates: list[dict[str, Any]] = []
     command_events: list[dict[str, Any]] = []
+    claude_write_events: list[dict[str, Any]] = []
     dirty = dirty_paths(root)
     dirty_set = set(dirty)
     live_owned_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
@@ -637,10 +674,9 @@ def build_manifest(
 
     for record in records:
         payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        tool_name = payload_tool_name(payload)
+        tool_name = payload_tool_name(payload) if isinstance(payload, dict) else None
         if tool_name == "apply_patch":
+            assert isinstance(payload, dict)
             patch_text = payload_tool_input(payload)
             if not patch_text:
                 continue
@@ -663,7 +699,33 @@ def build_manifest(
                 ignored_tool_record_count += 1
             continue
         if tool_name != "exec_command":
+            for item in claude_tool_uses(record):
+                name = item.get("name")
+                path = claude_write_path(root, item)
+                if path is None:
+                    continue
+                event = {
+                    "line_number": record.get("_line_number"),
+                    "name": name,
+                    "path": path,
+                }
+                claude_write_events.append(event)
+                owned_paths.add(path)
+                if should_include_tool_record(
+                    record,
+                    cutoff_line_number=cutoff_line_number,
+                    cutoff_timestamp=cutoff_timestamp,
+                    include_all=include_all_transcript_ownership,
+                ):
+                    included_tool_record_count += 1
+                    if path in dirty_set:
+                        live_owned_units.append(
+                            (diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "claude_write")
+                        )
+                else:
+                    ignored_tool_record_count += 1
             continue
+        assert isinstance(payload, dict)
         args_text = payload_tool_input(payload)
         if not args_text:
             continue
@@ -744,7 +806,7 @@ def build_manifest(
         tracker_exec_only_paths = {
             owned_unit.path
             for owned_unit, evidence in deduped_live_units
-            if evidence == "exec_command" and owned_unit.path in owned_dirty_set
+            if evidence in {"exec_command", "claude_write"} and owned_unit.path in owned_dirty_set
         }
         register_session_id = session_id or (tracker_run_id or f"transcript-{transcript.name}")
         tracker_units = [
@@ -787,7 +849,7 @@ def build_manifest(
         "repo": str(root),
         "transcript": str(transcript.resolve()),
         "session_id": session_id,
-        "confidence": "medium" if apply_patch_operations else "low",
+        "confidence": "medium" if apply_patch_operations or claude_write_events else "low",
         "ownership_baseline": baseline,
         "owned_paths": sorted(owned_paths),
         "owned_dirty_paths": owned_dirty,
@@ -795,6 +857,7 @@ def build_manifest(
         "apply_patch_operations": apply_patch_operations,
         "command_path_candidates": command_candidates,
         "command_events": command_events,
+        "claude_write_events": claude_write_events,
         "tracker": tracker_payload,
         "warnings": [
             "Transcript-derived command side effects are conservative hints; without Pre/Post tool snapshots, shell writes cannot be fully attributed.",
