@@ -978,10 +978,10 @@ def test_check_rejects_invalid_severity(tmp_path: Path) -> None:
 def test_check_skill_contracts_requires_validate_fix_request_literals() -> None:
     script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
     for literal in (
-        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_STANDARD_REQUEST'",
-        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_MEASUREMENT_REQUEST'",
-        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_SUBTASK_REQUEST'",
-        "require_literal \"references/validate-then-fix-prompt.md\" 'RVF_CONTEXT_REQUEST'",
+        "require_literal \"prompts/validate-fix.md\" 'RVF_STANDARD_REQUEST'",
+        "require_literal \"prompts/validate-fix.md\" 'RVF_MEASUREMENT_REQUEST'",
+        "require_literal \"prompts/validate-fix.md\" 'RVF_SUBTASK_REQUEST'",
+        "require_literal \"prompts/validate-fix.md\" 'RVF_CONTEXT_REQUEST'",
     ):
         assert literal in script
 

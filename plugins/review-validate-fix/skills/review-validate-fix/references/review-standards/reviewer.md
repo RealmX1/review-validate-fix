@@ -1,6 +1,6 @@
 # Reviewer Standards
 
-本文件是 `pass_type: review_only` 子代理使用的标准。它补充 `references/review-prompt.md`，但不改变 reviewer result artifact 契约。
+本文件是 `pass_type: review_only` 子代理使用的标准。它补充 `prompts/reviewer.md`，但不改变 reviewer result artifact 契约。
 
 ## 审查目标
 

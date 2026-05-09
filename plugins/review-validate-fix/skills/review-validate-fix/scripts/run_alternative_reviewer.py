@@ -21,7 +21,7 @@ from rvf_logging import start_run
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = SKILL_DIR / "config" / "alternative-reviewer.json"
-DEFAULT_PROMPT = SKILL_DIR / "references" / "review-prompt.md"
+DEFAULT_PROMPT = SKILL_DIR / "prompts" / "reviewer.md"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"

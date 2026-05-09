@@ -1,6 +1,6 @@
 # Validate/Fix Standards
 
-本文件是 `pass_type: validate_fix` 子代理使用的标准。它补充 `references/validate-then-fix-prompt.md`，不改变 verdict 契约。
+本文件是 `pass_type: validate_fix` 子代理使用的标准。它补充 `prompts/validate-fix.md`，不改变 verdict 契约。
 
 ## 验证顺序
 

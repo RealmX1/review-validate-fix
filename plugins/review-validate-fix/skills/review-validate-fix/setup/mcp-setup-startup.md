@@ -24,9 +24,9 @@
 
 1. 先确认该 agent 的调用方式是否真实可用：检查命令、MCP server、配置文件或 wrapper，但不要写死 vendor 名称。
 2. 记录一个稳定 label，例如 `alternative-reviewer:<agent-name>`。label 用于主会话来源记录；不要传给 validate/fix 子代理。
-3. 确认它能接收 `references/review-prompt.md` 的完整 prompt，并能在目标 repo 中运行 `git status --short`、`git diff HEAD` 和必要文件读取。
+3. 确认它能接收 `prompts/reviewer.md` 的完整 prompt，并能在目标 repo 中运行 `git status --short`、`git diff HEAD` 和必要文件读取。
 4. 如果需要新脚本或配置，保持通用：参数化 agent 命令、工作目录、prompt 文件、输出文件，不要把实现绑定到某个单一 agent。
-5. 更新 `SKILL.md`、`references/review-merge-policy.md`、`references/handoff-template.md` 或相关脚本时，保持 “Codex reviewer + arbitrary alternative reviewer” 的抽象。
+5. 更新 `SKILL.md`、`prompts/reviewer.md`、`references/review-merge-policy.md`、`references/handoff-template.md` 或相关脚本时，保持 “Codex reviewer + arbitrary alternative reviewer” 的抽象。
 
 ## 用户没有已知 agent 时
 
@@ -43,7 +43,7 @@ fallback 行为：
 
 - 不降级为单 reviewer。
 - 并行启动两个 Codex-native 子代理来模拟 santa-method double review。
-- 两个子代理使用同一份 `references/review-prompt.md` 和同一份 session context，彼此不看对方输出。
+- 两个子代理使用同一份 `prompts/reviewer.md` 和同一份 session context，彼此不看对方输出。
 - 来源标签使用两个独立来源，例如 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
 - validate/fix 子代理仍然只接收 source-agnostic issue context。
 - 如果用户之后配置了真实 alternative reviewer，运行期可切回 `codex-reviewer` + `alternative-reviewer:<agent-name>`；不需要改动 review/validate/fix 的问题契约。
