@@ -1,11 +1,11 @@
 ---
 name: review-validate-fix
-description: Use only when the user explicitly invokes $review-validate-fix or asks for the RVF post-work loop with review_only, validate_fix, skip-review, or no-handoff modes.
+description: Use only when the user explicitly invokes $review-validate-fix, /review-validate-fix, or :review-validate-fix, or asks for the RVF post-work loop with review_only, validate_fix, skip-review, or no-handoff modes.
 ---
 
 # Review Validate Fix
 
-本 skill 只处理显式 `$review-validate-fix` 调用。`agents/openai.yaml` 的 `policy.allow_implicit_invocation` 必须保持 `false`。
+本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用。`agents/openai.yaml` 的 `policy.allow_implicit_invocation` 必须保持 `false`。
 
 不要因为上下文提到 review、fix、handoff 或 Stop hook 就自动启动 RVF。
 

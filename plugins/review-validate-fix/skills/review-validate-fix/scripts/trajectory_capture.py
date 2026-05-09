@@ -68,7 +68,11 @@ SCHEMA_VERSION = 1
 LARGE_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
 
 RVF_SKILL_TRIGGER = "$review-validate-fix"
-RVF_START_TRIGGERS = (RVF_SKILL_TRIGGER,)
+RVF_START_TRIGGERS = (
+    RVF_SKILL_TRIGGER,
+    "/review-validate-fix",
+    ":review-validate-fix",
+)
 
 
 def _utc_now() -> str:

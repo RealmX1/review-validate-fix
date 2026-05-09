@@ -94,7 +94,7 @@ def test_find_rvf_start_ignores_legacy_kanban_marker_without_skill_trigger(tmp_p
     assert capture.find_rvf_start_in_jsonl(rollout) is None
 
 
-def test_find_rvf_start_ignores_slash_and_colon_aliases_without_skill_trigger(tmp_path: Path) -> None:
+def test_find_rvf_start_accepts_slash_and_colon_aliases(tmp_path: Path) -> None:
     capture = _load("trajectory_capture")
     rollout = tmp_path / "rollout.jsonl"
     _write_jsonl(
@@ -112,7 +112,10 @@ def test_find_rvf_start_ignores_slash_and_colon_aliases_without_skill_trigger(tm
             ),
         ],
     )
-    assert capture.find_rvf_start_in_jsonl(rollout) is None
+    cut = capture.find_rvf_start_in_jsonl(rollout)
+    assert cut is not None
+    assert cut.marker_matched == ":review-validate-fix"
+    assert cut.line_index == 3
 
 
 def test_find_rvf_start_ignores_non_user_messages_with_triggers(tmp_path: Path) -> None:
