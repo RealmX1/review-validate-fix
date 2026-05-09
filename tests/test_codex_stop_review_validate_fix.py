@@ -2439,12 +2439,13 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
     assert "rvf_handoff.py" in prompt_text
     assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' in prompt_text
-    assert "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py`" in prompt_text
+    assert "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py`" not in prompt_text
+    assert "由 UserPromptSubmit hook 调用 shared prepare 入口" in prompt_text
     artifacts_dir = latest["artifacts_dir"]
     assert f"{artifacts_dir}/review-packet.md" not in prompt_text
     assert f"{artifacts_dir}/session-manifest.json" not in prompt_text
     assert f"{artifacts_dir}/worktree-bootstrap.json" not in prompt_text
-    startup_scope = (Path(artifacts_dir) / "headless-startup-scope-of-work.md").read_text(encoding="utf-8")
+    startup_scope = (Path(artifacts_dir) / "startup-scope-of-work.md").read_text(encoding="utf-8")
     assert "scope 只能以本 run artifacts 中已经生成的 scope.contract.json" in startup_scope
     assert "review packet、session manifest、workspace snapshot 和 worktree bootstrap 仅作为冻结证据" in startup_scope
     assert "作为启动时 scope anchor" not in startup_scope
@@ -2490,6 +2491,24 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert suppression_marker["task_id"] == "task-123"
     assert suppression_marker["suppress_stop_hook"] is True
     assert suppression_marker["run_id"] == latest["run_id"]
+    # Regression for the freeze/update race: after Cline Kanban dispatch the
+    # prep file on disk must still carry the shared_workflow_state that
+    # freeze_cline_kanban_dispatch_artifacts wrote. Previously the caller
+    # held a stale dispatch_prep record and update_dispatch_prep_file would
+    # merge over it, wiping shared_workflow_state. update_dispatch_prep_file
+    # now reloads the prep payload from disk before merging.
+    final_prep_path = Path(latest["rvf_dispatch_prep_file_path"])
+    final_prep_payload = json.loads(final_prep_path.read_text(encoding="utf-8"))
+    final_state = final_prep_payload.get("rvf_run", {}).get("shared_workflow_state")
+    assert isinstance(final_state, dict), final_prep_payload
+    assert final_state.get("status") == "completed"
+    assert final_state.get("rvf_backend") == "kanban-task"
+    assert final_state.get("target_flow") == "flow-2-branch"
+    # The same payload must reflect the post-task update_dispatch_prep_file
+    # write (target_worktree / target_kanban_task_id), proving the merge ran
+    # against the freshly reloaded payload rather than a pre-freeze copy.
+    assert final_prep_payload.get("target_worktree") == "/tmp/task-worktree"
+    assert final_prep_payload.get("target_kanban_task_id") == "task-123"
 
 
 def test_cline_kanban_automatic_task_ignores_base_ref_and_worktree_env(tmp_path: Path) -> None:
@@ -4458,7 +4477,7 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
     tracker_scope_payload = json.loads(Path(prep_tracker_scope).read_text(encoding="utf-8"))
     assert tracker_scope_payload["lease_ttl_seconds"] > 0
     startup_command = json.loads(
-        (Path(latest["artifacts_dir"]) / "cline-kanban-startup-prepare-command.json").read_text(
+        (Path(latest["artifacts_dir"]) / "cline-kanban-dispatch-prepare-command.json").read_text(
             encoding="utf-8"
         )
     )

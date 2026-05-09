@@ -1,6 +1,6 @@
 # RVF Dispatch Flow Overhaul Phase Report
 
-本文档记录 `docs/rvf-dispatch-flow-overhaul-plan.md` 的本轮实现进度。代码仍在当前 detached worktree 中，尚未提交；提交前应先跑 RVF review。
+本文档记录 `docs/rvf-dispatch-flow-overhaul-plan.md` 的实现进度。Slice A–I 全部落地；剩下的是真实环境联调（live flow-2 / Cline Kanban Slice B UI），无代码阻塞。
 
 ## Current Status
 
@@ -11,7 +11,8 @@ flowchart LR
   C --> D[Slice F<br/>prep TTL/collision finish]
   D --> E[Slice G<br/>tracker-scope prep source]
   E --> F[Slice H<br/>Cline Kanban Slice A RVF wiring]
-  F --> H[Later<br/>live flow 2 integration]
+  F --> G[Slice I<br/>post-user-prompt shared workflow]
+  G --> H[Later<br/>live flow 2 integration]
 
   A:::done
   B:::done
@@ -19,12 +20,42 @@ flowchart LR
   D:::done
   E:::done
   F:::done
+  G:::done
   H:::next
 
   classDef done fill:#dff6dd,stroke:#2f7d32,color:#0f2f13;
   classDef next fill:#fff4ce,stroke:#9a6b00,color:#3b2a00;
   classDef todo fill:#eef2f7,stroke:#64748b,color:#1f2937;
 ```
+
+## Slice I: Post-User-Prompt Shared Workflow
+
+Before:
+- `rvf_user_prompt_submit.py` only validated dispatch tokens and wrote diagnostics; it did not start the RVF workflow.
+- `codex_stop_review_validate_fix.py` called `prepare_review_run.py` from Stop hook via `freeze_cline_kanban_startup_artifacts()` and the Cline Kanban task prompt explicitly told the target session not to rerun prepare.
+- Manual `/review-validate-fix`, same-session self-injection, and fork+prompt all relied on SKILL.md "正常入口" steps to manually invoke `prepare_review_run.py` (the gate, scope-of-work, prepare command, primary/background flags, env sourcing).
+- Startup scope-of-work artifact lived at `headless-startup-scope-of-work.md`.
+
+After:
+- `prepare_review_run.prepare_run_from_prep_file(prep, *, timeout_seconds=60)` is a new in-process shared entry. It reads prep payload, picks repo / transcript / tracker_scope / target_flow → backend, writes `startup-scope-of-work.md` stub if missing, runs `prepare_run` under a 60s `ThreadPoolExecutor` timeout, and writes `rvf_run.shared_workflow_state` (`pending|completed|failed|timeout` + artifacts dict) back via `update_prep_file()`. Idempotent on `status="completed"`.
+- `rvf_user_prompt_submit.py::inspect_user_prompt_submit()` decision tree by origin marker:
+  - token → validate prep, run shared workflow when not yet completed; cached completed = skip + `user_prompt_submit_shared_workflow_skipped` diagnostic.
+  - `RVF_FORKED_REVIEW_VALIDATE_FIX` / `RVF_CLINE_KANBAN_TASK` / `RVF_KANBAN_FOLLOWUP_TRIGGER` without token → diagnostic `dispatch_marker_without_token`, no prep created.
+  - any of `$/-/:review-validate-fix` triggers without origin marker → manual: hook creates prep file (`target_flow=flow-manual`, `dispatch_origin=post_user_prompt_manual`) under a fresh `start_run("user-prompt-submit-manual", ...)`, then runs shared workflow.
+  - else → `no_token` early exit.
+- `freeze_cline_kanban_startup_artifacts()` → `freeze_cline_kanban_dispatch_artifacts()`. Still runs full prepare in origin worktree (worktree bootstrap must capture origin dirty work in time), and now writes `shared_workflow_state.status="completed"` into the prep payload so the task-session UserPromptSubmit hook sees a cache hit and skips. The frozen-prepare command artifact is renamed to `cline-kanban-dispatch-prepare-command.json` / `cline-kanban-dispatch-prepare.json`; the ledger event becomes `cline_kanban_dispatch_prepared`.
+- `cline_kanban_task_prompt(...)` no longer instructs the agent "do not rerun `prepare_review_run.py`"; it tells the agent to `cat $RVF_PREP_FILE` and confirm `shared_workflow_state.status == "completed"`. `RVF_PREP_FILE` is also embedded in the task prompt header alongside other `RVF_*` env references.
+- `render_startup_scope_text(...)` was generalized into `dispatch_scope_of_work_text(target_flow, ...)` covering `flow-2-branch`, `flow-2-inplace`, `flow-1-self-rising`, `flow-3-inplace`, `flow-manual`. The artifact filename is normalized to `startup-scope-of-work.md`.
+- `SKILL.md` "正常入口" gains a Hook-prepared default path (cat prep file, source review-env, skip manual gate / prepare) plus a Fallback for `failed` / `timeout` / `pending` states.
+
+Files:
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/prepare_review_run.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_dispatch_prompts.py`
+- `plugins/review-validate-fix/skills/review-validate-fix/SKILL.md`
+- `tests/test_review_support_scripts.py`
+- `tests/test_codex_stop_review_validate_fix.py`
 
 ## Slice C: Flow 3 Diagnostic
 
@@ -108,7 +139,7 @@ Before:
 - The prep file already carried `rvf_run.tracker_scope_path`, but it was not the canonical dispatch boundary for this wiring.
 
 After:
-- `freeze_cline_kanban_startup_artifacts()` now reads tracker-scope from the dispatch prep payload.
+- `freeze_cline_kanban_dispatch_artifacts()` now reads tracker-scope from the dispatch prep payload.
 - The allocator ledger meta remains an internal staging record used while writing prep, but startup dispatch consumes `rvf_run.tracker_scope_path`.
 - Tests assert the startup prepare command's `--tracker-scope` value matches the prep file path.
 
@@ -144,22 +175,26 @@ Files:
 
 ## Verification
 
-Last verified commands:
+Last verified commands (Slice I):
 
 ```sh
-python3 -m py_compile plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_prep_file.py plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_logging.py plugins/review-validate-fix/skills/review-validate-fix/scripts/cline_kanban_client.py plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py scripts/install_to_codex.py
+python3 -m py_compile \
+  plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py \
+  plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_prep_file.py \
+  plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py \
+  plugins/review-validate-fix/skills/review-validate-fix/scripts/prepare_review_run.py
+python3 tests/test_review_support_scripts.py
 python3 tests/test_codex_stop_review_validate_fix.py
-python3 tests/test_review_support_scripts.py --shard-count 6 --shard-index 0
 python3 tests/test_codex_stop_hook_dispatcher.py
 python3 tests/test_install_to_codex.py
 bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
+git diff --check
 ```
 
-Slice H 后，上述命令均已在当前 worktree 通过。
+Slice I 后上述命令在当前 worktree (`/Users/bominzhang/.cline/worktrees/94a82/review-validate-fix`) 全部通过。
 
 ## Remaining Work
-
 - Live flow-2-branch 联调：真实 `kanban task create --parent-session-id ... --worktree-mode branch --prep-file-path ...` 后确认 Codex fork 继承父 transcript。
 - Live flow-2-inplace 联调：真实 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 后确认不创建/删除 worktree，且 startShellSession 不 fork worktree。
 - External Cline Kanban Slice B UI base-ref dropdown 仍可推迟。

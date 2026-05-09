@@ -11,6 +11,12 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 ## 正常入口
 
+**Hook-prepared 路径（默认）**：进入会话第一条用户消息若含 `RVF_DISPATCH=token=...` 或显式触发字面量（`/review-validate-fix`、`$review-validate-fix`、`:review-validate-fix`），UserPromptSubmit hook 会自动调用 shared prepare 入口（`prepare_review_run.prepare_run_from_prep_file()`）。开始任何工作前先 `cat $RVF_PREP_FILE`（或在 hook 输出的 `prep_file_path` 上 `cat`），确认 `rvf_run.shared_workflow_state.status == "completed"` 且 `artifacts` 字段齐全；齐全则**跳过**下方第 1 / 5 / 6 步，直接 source `$RVF_REVIEW_ENV` 并按既有模式继续。Hook 自动写过的 `startup-scope-of-work.md` 是最小 stub，主会话仍必须用真实 reasoning 内容覆盖该文件或新写一份 scope-of-work（步骤 3）。
+
+> Manual same-session 触发（`/review-validate-fix` 等字面量在已激活的对话里直接发出）走的也是这条路径，但因为 hook 不修改用户 prompt、也不向 agent 进程导出 `$RVF_PREP_FILE`，hook 会通过 `hookSpecificOutput.additionalContext` 把 `prep_file` 路径与 `shared_workflow_state.status` 注入到主会话上下文里。看到 `RVF dispatch prep (post-user-prompt manual auto-prep): - prep_file: …` 这段提示后再 `cat` 该 prep 文件、source 其中的 `review_env`，然后按既有 review 流程继续。
+
+**Fallback / 无 hook 路径**（hook 失败、`shared_workflow_state.status` 是 `failed` / `timeout` / `pending`，或环境无 hook 注册）：
+
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
 2. 如果仓库 clean，只有用户本轮明确给出 manual review scope 时才继续；否则中文说明没有可审查改动并结束。
 3. 写一份 scope-of-work / session context 文件，说明用户意图、本轮实际完成的工作或 manual scope、需要审查的文件、逐文件编辑明细、已跑验证、关键取舍和不确定点。

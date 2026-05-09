@@ -55,7 +55,7 @@ import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
-    render_startup_scope_text,
+    dispatch_scope_of_work_text,
 )
 
 
@@ -1358,7 +1358,22 @@ def update_dispatch_prep_file(
     }
     if not updates:
         return record
-    updated = rvf_prep_file.update_prep_file(record, updates)
+    # Reload latest payload from disk so freeze-side writes (notably
+    # `rvf_run.shared_workflow_state` written by
+    # freeze_cline_kanban_dispatch_artifacts) survive merging via this stale
+    # caller-held record. update_prep_file() does a shallow merge over
+    # `record.payload`, so without this reload we'd silently overwrite any
+    # field the freeze step wrote after this caller obtained `record`.
+    fresh = rvf_prep_file.read_prep_file(record.token)
+    if fresh.status == "valid" and fresh.payload is not None:
+        base_record = rvf_prep_file.PrepFileRecord(
+            token=fresh.token,
+            path=fresh.path,
+            payload=dict(fresh.payload),
+        )
+    else:
+        base_record = record
+    updated = rvf_prep_file.update_prep_file(base_record, updates)
     ledger.artifact(
         "dispatch-prep-file.json",
         {
@@ -1853,25 +1868,7 @@ def current_kanban_project_path(event: dict[str, Any], fallback: str) -> str:
     return value or fallback
 
 
-def startup_scope_text(
-    *,
-    cwd: str,
-    parent_session_id: str,
-    parent_thread_path: Path | None,
-    prompt_path: str,
-    ledger: RunLedger,
-) -> str:
-    return render_startup_scope_text(
-        cwd=cwd,
-        parent_session_id=parent_session_id,
-        parent_thread_path=parent_thread_path,
-        prompt_path=prompt_path,
-        run_id=ledger.run_id,
-        run_dir=ledger.run_dir,
-    )
-
-
-def freeze_cline_kanban_startup_artifacts(
+def freeze_cline_kanban_dispatch_artifacts(
     *,
     cwd: str,
     parent_session_id: str,
@@ -1879,17 +1876,18 @@ def freeze_cline_kanban_startup_artifacts(
     prompt_path: str,
     ledger: RunLedger,
     dispatch_prep: rvf_prep_file.PrepFileRecord,
+    target_flow: str,
 ) -> dict[str, Any]:
-    scope_path = ledger.artifact(
-        "headless-startup-scope-of-work.md",
-        startup_scope_text(
-            cwd=cwd,
-            parent_session_id=parent_session_id,
-            parent_thread_path=parent_thread_path,
-            prompt_path=prompt_path,
-            ledger=ledger,
-        ),
+    scope_text = dispatch_scope_of_work_text(
+        target_flow=target_flow,
+        cwd=cwd,
+        parent_session_id=parent_session_id,
+        parent_thread_path=parent_thread_path,
+        prompt_path=prompt_path,
+        run_id=ledger.run_id,
+        run_dir=ledger.run_dir,
     )
+    scope_path = ledger.artifact("startup-scope-of-work.md", scope_text)
     if not scope_path:
         raise RuntimeError("failed to write Cline Kanban startup scope artifact")
     command = [
@@ -1921,7 +1919,7 @@ def freeze_cline_kanban_startup_artifacts(
         check=False,
     )
     ledger.artifact(
-        "cline-kanban-startup-prepare-command.json",
+        "cline-kanban-dispatch-prepare-command.json",
         {
             "command": command,
             "returncode": completed.returncode,
@@ -1933,18 +1931,18 @@ def freeze_cline_kanban_startup_artifacts(
         raise RuntimeError(
             completed.stderr.strip()
             or completed.stdout.strip()
-            or "failed to freeze Cline Kanban startup review artifacts"
+            or "failed to freeze Cline Kanban dispatch review artifacts"
         )
     try:
         metadata = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"invalid Cline Kanban startup prepare JSON: {completed.stdout!r}") from exc
-    metadata_path = ledger.artifact("cline-kanban-startup-prepare.json", metadata)
+        raise RuntimeError(f"invalid Cline Kanban dispatch prepare JSON: {completed.stdout!r}") from exc
+    metadata_path = ledger.artifact("cline-kanban-dispatch-prepare.json", metadata)
     ledger.event(
         phase="prepare",
-        event="cline_kanban_startup_artifacts_frozen",
+        event="cline_kanban_dispatch_prepared",
         status="completed",
-        reason_code="startup_artifacts_frozen",
+        reason_code="cline_kanban_dispatch_prepared",
         repo=cwd,
         cwd=cwd,
         paths={
@@ -1957,7 +1955,9 @@ def freeze_cline_kanban_startup_artifacts(
             "review_env": metadata.get("review_env_file"),
             "review_agent_context": metadata.get("review_agent_context_file"),
             "tracker_scope": str(tracker_scope_path) if tracker_scope_path is not None else None,
+            "dispatch_prep_file": str(dispatch_prep.path),
         },
+        target_flow=target_flow,
         **stop_hook_rvf_state_fields(
             phase="prepare",
             backend="kanban-task",
@@ -1965,7 +1965,36 @@ def freeze_cline_kanban_startup_artifacts(
             prepare_metadata=metadata,
         ),
     )
-    return {"metadata_path": metadata_path, "metadata": metadata}
+    now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    completed_state = {
+        "started_at": now_iso,
+        "completed_at": now_iso,
+        "status": "completed",
+        "target_flow": target_flow,
+        "target_repo": cwd,
+        "rvf_backend": "kanban-task",
+        "run_id": metadata.get("run_id"),
+        "run_dir": metadata.get("run_dir"),
+        "artifacts": {
+            "scope_contract": metadata.get("scope_contract"),
+            "review_packet": metadata.get("review_packet"),
+            "review_packet_metadata": metadata.get("review_packet_metadata"),
+            "review_env": metadata.get("review_env_file"),
+            "review_agent_context": metadata.get("review_agent_context_file"),
+            "worktree_bootstrap": metadata.get("worktree_bootstrap"),
+            "session_manifest": metadata.get("session_manifest_file"),
+            "scope_of_work": metadata.get("scope_of_work_file"),
+        },
+    }
+    new_rvf_run = dict(dispatch_prep.payload.get("rvf_run") or {})
+    new_rvf_run["shared_workflow_state"] = completed_state
+    updated_record = rvf_prep_file.update_prep_file(dispatch_prep, {"rvf_run": new_rvf_run})
+    return {
+        "metadata_path": metadata_path,
+        "metadata": metadata,
+        "scope_of_work_path": scope_path,
+        "dispatch_prep_record": updated_record,
+    }
 
 
 def git_head(cwd: str) -> str:
@@ -2007,10 +2036,9 @@ def cline_kanban_task_prompt(
     parent_thread_path: Path | None,
     parent_origin: dict[str, Any],
     ledger: RunLedger,
-    startup_prepare: dict[str, Any],
+    dispatch_prep: rvf_prep_file.PrepFileRecord,
     worktree_mode: str,
 ) -> str:
-    del startup_prepare
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
     parent_conversation_ref = str(parent_origin.get("label") or "<unknown Codex conversation>")
     parent_conversation_source = str(parent_origin.get("name_source") or "<unknown>")
@@ -2072,7 +2100,9 @@ def cline_kanban_task_prompt(
         "RVF_REVIEW_ENV: $RVF_ARTIFACTS_DIR/review-env.sh\n"
         "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
         "RVF_ORIGIN_METADATA: $RVF_ARTIFACTS_DIR/origin.json\n"
-        "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n\n"
+        "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n"
+        f"RVF_DISPATCH=token={dispatch_prep.token}\n"
+        f"RVF_PREP_FILE: {dispatch_prep.path}\n\n"
         "Original Codex conversation trace:\n"
         f"- name/ref: `{parent_conversation_ref}`\n"
         f"- name source: `{parent_conversation_source}`\n"
@@ -2081,9 +2111,11 @@ def cline_kanban_task_prompt(
         f"- origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`\n\n"
         f"{worktree_instructions}"
         f"{cline_kanban_artifact_reference_lines()}"
-        "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py` 创建新的 run；"
-        "本 task 已经复用上面的 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、"
-        "summary 和 events 都必须继续写入该 installed plugin state run。"
+        "本 task 由 UserPromptSubmit hook 调用 shared prepare 入口生成 review-env、scope.contract、review packet 等。"
+        "开始任何 review/validate/fix 前，先 `cat $RVF_PREP_FILE` 确认 `rvf_run.shared_workflow_state.status == \"completed\"` 且 "
+        "`artifacts` 字段齐全；齐全则跳过手动跑 `prepare_review_run.py`，直接 source `$RVF_REVIEW_ENV` 继续既有模式。"
+        "若 `shared_workflow_state.status` 是 `failed` / `timeout` / `pending`，再按 SKILL.md fallback 手动跑 prepare。"
+        "本 task 已经复用 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、summary 和 events 都必须继续写入该 installed plugin state run。"
         "Handoff 默认开启时，必须持续维护 "
         "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
@@ -2092,11 +2124,11 @@ def cline_kanban_task_prompt(
         "最终回复前必须先运行：\n\n"
         "```sh\n"
         f"python3 {shell_quote(str(handoff_helper))} open \"$RVF_ARTIFACTS_DIR/handoff.md\"\n"
-        "```\n\n"
-        "原始 fork prompt 如下，仅作兼容元数据：\n\n"
-        "```text\n"
-        f"{original_prompt.rstrip()}\n"
-        "```\n"
+        # "```\n\n"
+        # "原始 fork prompt 如下，仅作兼容元数据：\n\n"
+        # "```text\n"
+        # f"{original_prompt.rstrip()}\n"
+        # "```\n"
     )
 
 
@@ -2124,14 +2156,19 @@ def start_cline_kanban_task(
 ) -> dict[str, Any]:
     del model, reasoning_effort
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
-    startup_prepare = freeze_cline_kanban_startup_artifacts(
+    target_flow = dispatch_prep_target_flow("cline-kanban", cline_kanban_worktree_mode=worktree_mode)
+    startup_prepare = freeze_cline_kanban_dispatch_artifacts(
         cwd=cwd,
         parent_session_id=parent_session_id,
         parent_thread_path=parent_thread_path,
         prompt_path=prompt_path,
         ledger=ledger,
         dispatch_prep=dispatch_prep,
+        target_flow=target_flow,
     )
+    updated_prep = startup_prepare.get("dispatch_prep_record")
+    if isinstance(updated_prep, rvf_prep_file.PrepFileRecord):
+        dispatch_prep = updated_prep
     task_prompt = cline_kanban_task_prompt(
         cwd=cwd,
         prompt_path=prompt_path,
@@ -2139,7 +2176,7 @@ def start_cline_kanban_task(
         parent_thread_path=parent_thread_path,
         parent_origin=parent_origin,
         ledger=ledger,
-        startup_prepare=startup_prepare,
+        dispatch_prep=dispatch_prep,
         worktree_mode=worktree_mode,
     )
     task_prompt_path = ledger.artifact("cline-kanban-task.prompt.md", task_prompt)

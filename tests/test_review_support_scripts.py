@@ -84,6 +84,22 @@ def load_rvf_prep_file_module():
     return module
 
 
+def load_rvf_user_prompt_submit_module():
+    # Ensure rvf_prep_file and other dependencies are importable from SCRIPT_DIR
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    load_rvf_prep_file_module()
+    spec = importlib.util.spec_from_file_location(
+        "rvf_user_prompt_submit", RVF_USER_PROMPT_SUBMIT
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_user_prompt_submit module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_check_plugin_contracts_module():
     spec = importlib.util.spec_from_file_location(
         "rvf_check_plugin_contracts",
@@ -262,7 +278,373 @@ def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
     assert not written.path.exists()
 
 
-def test_rvf_user_prompt_submit_detector_records_only_token_events(tmp_path: Path) -> None:
+def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> None:
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        record = prep.write_prep_file(
+            {
+                "origin_session_id": "session-a",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-test", "run_dir": str(tmp_path / "run")},
+            },
+            root=root,
+            token="aaaaaaaaaaaaaaaa",
+            now=now,
+            ttl_seconds=300,
+        )
+
+        prepare_calls: list[dict[str, object]] = []
+
+        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            assert record_arg.token == record.token
+            prepare_calls.append(
+                {
+                    "token": record_arg.token,
+                    "timeout_seconds": timeout_seconds,
+                    "excerpt": user_prompt_excerpt,
+                }
+            )
+            state = {
+                "started_at": "2026-05-07T00:01:00Z",
+                "completed_at": "2026-05-07T00:01:01Z",
+                "status": "completed",
+                "target_flow": record_arg.payload.get("target_flow"),
+                "artifacts": {"review_env": "/tmp/review-env.sh"},
+            }
+            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
+            return state
+
+        # Replace the lazy-imported prepare_run_from_prep_file with a stub.
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            no_token_payload = submit.inspect_user_prompt_submit(
+                {"prompt": "ordinary prompt"}, prep_root=root
+            )
+            assert no_token_payload["status"] == "no_token"
+            assert no_token_payload["continue"] is True
+            assert prepare_calls == []
+
+            valid_payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:00Z",
+            )
+            assert valid_payload["status"] == "valid"
+            assert valid_payload["workflow_started"] is True
+            assert valid_payload["shared_workflow_state"]["status"] == "completed"
+            assert valid_payload["prep_file_path"] == str(root / "aaaaaaaaaaaaaaaa.json")
+            assert len(prepare_calls) == 1
+
+            # Idempotent: state is now completed, second invocation should not re-run prepare.
+            second_payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:30Z",
+            )
+            assert second_payload["status"] == "valid"
+            assert second_payload["workflow_started"] is False
+            assert second_payload["shared_workflow_state"]["status"] == "completed"
+            assert len(prepare_calls) == 1, "second call should be cached"
+
+            diagnostics_path = root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl"
+            diagnostics = read_jsonl(diagnostics_path)
+            statuses = [event["status"] for event in diagnostics]
+            assert "valid" in statuses
+            assert any(
+                event.get("event") == "user_prompt_submit_shared_workflow_skipped"
+                for event in diagnostics
+            )
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_marker_without_token(tmp_path: Path) -> None:
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    payload = submit.inspect_user_prompt_submit(
+        {
+            "prompt": "Stop hook fork prompt body referencing RVF_FORKED_REVIEW_VALIDATE_FIX without token",
+            "cwd": str(tmp_path),
+            "hook_event_name": "UserPromptSubmit",
+        },
+        prep_root=root,
+    )
+    assert payload["status"] == "dispatch_marker_without_token"
+    assert payload["origin_marker"] == "fork"
+    assert payload["continue"] is True
+
+
+def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
+    try:
+        captured: list[dict[str, object]] = []
+
+        def fake_prepare(record, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            captured.append(
+                {
+                    "token": record.token,
+                    "target_flow": record.payload.get("target_flow"),
+                    "dispatch_origin": record.payload.get("dispatch_origin"),
+                    "excerpt": user_prompt_excerpt,
+                }
+            )
+            state = {
+                "started_at": "2026-05-07T00:00:00Z",
+                "completed_at": "2026-05-07T00:00:01Z",
+                "status": "completed",
+                "target_flow": record.payload.get("target_flow"),
+                "artifacts": {},
+            }
+            new_rvf_run = dict(record.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "/review-validate-fix please review my work",
+                    "cwd": str(repo),
+                    "session_id": "manual-session",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+            )
+            assert payload["status"] == "manual_prep_created"
+            assert payload["dispatch_origin"] == "post_user_prompt_manual"
+            assert payload["workflow_started"] is True
+            assert payload["shared_workflow_state"]["status"] == "completed"
+            assert len(captured) == 1
+            assert captured[0]["target_flow"] == "flow-manual"
+            assert captured[0]["dispatch_origin"] == "post_user_prompt_manual"
+            # Prep file must exist on disk under the configured root.
+            prep_path = root / f"{payload['token']}.json"
+            assert prep_path.is_file()
+            # Manual same-session path must inject the prep file path back into
+            # the agent context via hookSpecificOutput.additionalContext.
+            assert "hookSpecificOutput" in payload
+            hook_specific = payload["hookSpecificOutput"]
+            assert hook_specific["hookEventName"] == "UserPromptSubmit"
+            additional_context = hook_specific["additionalContext"]
+            assert "RVF dispatch prep" in additional_context
+            assert str(prep_path) in additional_context
+            assert "shared_workflow_state.status: completed" in additional_context
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_path: Path) -> None:
+    """Quoted/embedded references to the trigger literal must not create a manual prep."""
+
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+
+    # A normal-conversation reference to the trigger literal (preceded by a
+    # word character, not whitespace/start-of-line) must not fire. Without the
+    # word-boundary regex, plain substring matching would fire here.
+    embedded_payloads = [
+        "see RVF_DOC[/review-validate-fix] for details",
+        "FOO/review-validate-fix BAR",
+        "x:review-validate-fix",
+        "abc$review-validate-fixyz",
+    ]
+    for prompt in embedded_payloads:
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": prompt,
+                "cwd": str(tmp_path),
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+        )
+        assert payload["status"] == "no_token", (prompt, payload)
+        assert "hookSpecificOutput" not in payload
+
+    # detect_manual_trigger should also positively recognize the legitimate
+    # trigger forms (line-start or whitespace-prefixed).
+    assert submit.detect_manual_trigger("/review-validate-fix") is True
+    assert submit.detect_manual_trigger("$review-validate-fix") is True
+    assert submit.detect_manual_trigger(":review-validate-fix") is True
+    assert submit.detect_manual_trigger("please run /review-validate-fix now") is True
+    assert submit.detect_manual_trigger("first line\n/review-validate-fix") is True
+    # And reject quoted / embedded uses.
+    assert submit.detect_manual_trigger("see /review-validate-fixtool docs") is False
+    assert submit.detect_manual_trigger("FOO/review-validate-fix BAR") is False
+    assert submit.detect_manual_trigger("RVF_DOC[/review-validate-fix]") is False
+
+
+def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tmp_path: Path) -> None:
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-a",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-fail", "run_dir": str(tmp_path / "run")},
+            },
+            root=root,
+            token="cccccccccccccccc",
+            now=now,
+            ttl_seconds=300,
+        )
+
+        def boom(record, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            raise RuntimeError("prepare boom")
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = boom
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "go RVF_DISPATCH=token=cccccccccccccccc",
+                    "cwd": str(tmp_path),
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:00Z",
+            )
+            assert payload["continue"] is True
+            assert payload["workflow_started"] is False
+            assert payload["shared_workflow_state"]["status"] == "failed"
+            assert "prepare boom" in payload["shared_workflow_state"]["error"]
+            # The prep file on disk must reflect the failed state.
+            stored = json.loads((root / "cccccccccccccccc.json").read_text(encoding="utf-8"))
+            assert stored["rvf_run"]["shared_workflow_state"]["status"] == "failed"
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) -> None:
+    """Verify TimeoutError unblocks the hook even when the worker is still running.
+
+    Regression: previous implementation used ``with ThreadPoolExecutor(...)``,
+    whose ``__exit__`` defaults to ``wait=True``, so a timeout exception still
+    blocked until the worker finished. The fix manages the executor manually
+    and calls ``shutdown(wait=False, cancel_futures=True)`` on timeout.
+    """
+
+    prep = load_rvf_prep_file_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "README.md"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+
+    now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+    record = prep.write_prep_file(
+        {
+            "origin_session_id": "session-a",
+            "origin_repo": str(repo),
+            "origin_cwd": str(repo),
+            "target_worktree": str(repo),
+            "target_flow": "flow-manual",
+            "rvf_run": {
+                "run_id": "rvf-timeout-test",
+                "run_dir": str(tmp_path / "rvf-state" / "runs" / "rvf-timeout-test"),
+            },
+        },
+        root=root,
+        token="dddddddddddddddd",
+        now=now,
+        ttl_seconds=3600,
+    )
+
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import importlib
+
+    prepare_module = importlib.import_module("prepare_review_run")
+    original_prepare_run = prepare_module.prepare_run
+
+    def slow_prepare_run(**_: object) -> dict[str, object]:
+        # Sleep well past our 1-second timeout to prove that the wrapper does
+        # not block on shutdown.
+        time.sleep(5.0)
+        return {"run_id": "should-never-finish"}
+
+    prepare_module.prepare_run = slow_prepare_run
+    try:
+        start = time.monotonic()
+        state = prepare_module.prepare_run_from_prep_file(
+            record,
+            timeout_seconds=1.0,
+            base_dir=tmp_path / "base",
+        )
+        elapsed = time.monotonic() - start
+    finally:
+        prepare_module.prepare_run = original_prepare_run
+
+    # Wall-clock must reflect the 1s timeout, not the 5s worker sleep. Allow
+    # generous slack for slow CI but still well below the worker's 5s sleep.
+    assert elapsed < 3.0, f"prepare_run_from_prep_file blocked for {elapsed:.2f}s"
+    assert state["status"] == "timeout", state
+    assert "1s timeout" in state["error"]
+
+    # Prep file on disk must reflect the timeout state.
+    stored = json.loads((root / "dddddddddddddddd.json").read_text(encoding="utf-8"))
+    assert stored["rvf_run"]["shared_workflow_state"]["status"] == "timeout"
+
+
+def test_rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     root = tmp_path / "prep-root"
     now = prep.parse_timestamp("2026-05-07T00:00:00Z")
@@ -273,81 +655,6 @@ def test_rvf_user_prompt_submit_detector_records_only_token_events(tmp_path: Pat
         now=now,
         ttl_seconds=300,
     )
-
-    no_token = run(
-        [sys.executable, str(RVF_USER_PROMPT_SUBMIT), "--json", "--prep-root", str(root)],
-        input_text=json.dumps({"prompt": "ordinary prompt"}, ensure_ascii=False),
-    )
-    no_token_payload = json.loads(no_token.stdout)
-    assert no_token_payload["status"] == "no_token"
-    assert no_token_payload["continue"] is True
-    assert not (root / "diagnostics").exists()
-
-    valid = run(
-        [
-            sys.executable,
-            str(RVF_USER_PROMPT_SUBMIT),
-            "--json",
-            "--prep-root",
-            str(root),
-            "--now",
-            "2026-05-07T00:01:00Z",
-        ],
-        input_text=json.dumps(
-            {
-                "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                "cwd": str(tmp_path),
-                "hook_event_name": "UserPromptSubmit",
-            },
-            ensure_ascii=False,
-        ),
-    )
-    valid_payload = json.loads(valid.stdout)
-    assert valid_payload["status"] == "valid"
-    assert valid_payload["continue"] is True
-    assert valid_payload["workflow_started"] is False
-    assert valid_payload["prep_file_path"] == str(root / "aaaaaaaaaaaaaaaa.json")
-
-    diagnostics_path = root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl"
-    diagnostics = read_jsonl(diagnostics_path)
-    assert len(diagnostics) == 1
-    assert diagnostics[0]["status"] == "valid"
-    assert diagnostics[0]["cwd"] == str(tmp_path)
-    assert "prompt" not in diagnostics[0]
-    assert diagnostics_path.parent.stat().st_mode & 0o777 == 0o700
-    assert diagnostics_path.stat().st_mode & 0o777 == 0o600
-
-    transcript = tmp_path / "transcript.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {
-                    "type": "user_message",
-                    "message": "from transcript RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                },
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    transcript_result = run(
-        [
-            sys.executable,
-            str(RVF_USER_PROMPT_SUBMIT),
-            "--json",
-            "--prep-root",
-            str(root),
-            "--now",
-            "2026-05-07T00:01:00Z",
-        ],
-        input_text=json.dumps({"transcript_path": str(transcript)}, ensure_ascii=False),
-    )
-    transcript_payload = json.loads(transcript_result.stdout)
-    assert transcript_payload["status"] == "valid"
-    assert transcript_payload["prompt_source"] == "transcript_path"
-
     actual_hook = run(
         [
             sys.executable,
@@ -357,7 +664,7 @@ def test_rvf_user_prompt_submit_detector_records_only_token_events(tmp_path: Pat
             "--now",
             "2026-05-07T00:01:00Z",
         ],
-        input_text=json.dumps({"prompt": "RVF_DISPATCH=token=aaaaaaaaaaaaaaaa"}, ensure_ascii=False),
+        input_text=json.dumps({"prompt": "ordinary prompt without trigger"}, ensure_ascii=False),
     )
     assert actual_hook.stdout == ""
     assert actual_hook.stderr == ""
@@ -6581,8 +6888,32 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
         (
-            "rvf_user_prompt_submit_detector_records_only_token_events",
-            lambda: test_rvf_user_prompt_submit_detector_records_only_token_events(root / "prompt-submit"),
+            "rvf_user_prompt_submit_dispatches_shared_workflow",
+            lambda: test_rvf_user_prompt_submit_dispatches_shared_workflow(root / "prompt-submit-token"),
+        ),
+        (
+            "rvf_user_prompt_submit_marker_without_token",
+            lambda: test_rvf_user_prompt_submit_marker_without_token(root / "prompt-submit-marker"),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare",
+            lambda: test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(root / "prompt-submit-manual"),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger",
+            lambda: test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(root / "prompt-submit-substring"),
+        ),
+        (
+            "rvf_user_prompt_submit_failed_prepare_records_state_without_blocking",
+            lambda: test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(root / "prompt-submit-failed"),
+        ),
+        (
+            "prepare_run_from_prep_file_timeout_returns_immediately",
+            lambda: test_prepare_run_from_prep_file_timeout_returns_immediately(root / "prepare-run-timeout"),
+        ),
+        (
+            "rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode",
+            lambda: test_rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode(root / "prompt-submit-silent"),
         ),
         (
             "rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode",

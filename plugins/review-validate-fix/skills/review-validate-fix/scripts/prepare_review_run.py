@@ -14,8 +14,21 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import concurrent.futures
 import diff_tracker
+import rvf_prep_file
+from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
+
+
+SHARED_WORKFLOW_DEFAULT_TIMEOUT_SECONDS = 60.0
+TARGET_FLOW_BACKEND = {
+    "flow-2-branch": "kanban-task",
+    "flow-2-inplace": "kanban-task",
+    "flow-1-self-rising": "kanban-followup",
+    "flow-3-inplace": "manual",
+    "flow-manual": "manual",
+}
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -889,6 +902,174 @@ def prepare_run(
         **result,
     )
     return result
+
+
+def _shared_workflow_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_prep_target_repo(payload: dict[str, Any]) -> Path:
+    target_worktree = payload.get("target_worktree")
+    if isinstance(target_worktree, str) and target_worktree.strip():
+        candidate = Path(target_worktree).expanduser()
+        if candidate.exists() and (candidate / ".git").exists():
+            return candidate.resolve()
+    for key in ("origin_cwd", "origin_repo"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            candidate = Path(value).expanduser()
+            if candidate.exists():
+                return candidate.resolve()
+    raise ValueError("prep payload missing target_worktree / origin_cwd / origin_repo")
+
+
+def _shared_workflow_artifacts(result: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        "scope_contract": result.get("scope_contract"),
+        "review_packet": result.get("review_packet"),
+        "review_packet_metadata": result.get("review_packet_metadata"),
+        "review_env": result.get("review_env_file"),
+        "review_agent_context": result.get("review_agent_context_file"),
+        "worktree_bootstrap": result.get("worktree_bootstrap"),
+        "session_manifest": result.get("session_manifest_file"),
+        "scope_of_work": result.get("scope_of_work_file"),
+    }
+
+
+def prepare_run_from_prep_file(
+    prep: rvf_prep_file.PrepFileRecord,
+    *,
+    transcript_override: Path | None = None,
+    extra_primary_files: list[str] | None = None,
+    extra_background_files: list[str] | None = None,
+    timeout_seconds: float = SHARED_WORKFLOW_DEFAULT_TIMEOUT_SECONDS,
+    base_dir: Path | None = None,
+    user_prompt_excerpt: str | None = None,
+) -> dict[str, Any]:
+    """Run prepare_run driven by the dispatch prep file. Idempotent on shared_workflow_state.
+
+    Returns the prep payload's shared_workflow_state dict (after possibly updating the prep
+    file). Raises on prep schema problems; prepare_run errors are caught and recorded as
+    status=failed without raising.
+    """
+    payload = dict(prep.payload)
+    rvf_run = payload.get("rvf_run") if isinstance(payload.get("rvf_run"), dict) else {}
+    existing_state = rvf_run.get("shared_workflow_state") if isinstance(rvf_run, dict) else None
+    if isinstance(existing_state, dict) and existing_state.get("status") == "completed":
+        return dict(existing_state)
+
+    target_flow = str(payload.get("target_flow") or "")
+    rvf_backend = TARGET_FLOW_BACKEND.get(target_flow, "manual")
+    rvf_run_id = rvf_run.get("run_id") if isinstance(rvf_run, dict) else None
+    rvf_run_dir_raw = rvf_run.get("run_dir") if isinstance(rvf_run, dict) else None
+    rvf_run_dir = Path(rvf_run_dir_raw).expanduser() if isinstance(rvf_run_dir_raw, str) and rvf_run_dir_raw else None
+    tracker_scope_raw = rvf_run.get("tracker_scope_path") if isinstance(rvf_run, dict) else None
+    tracker_scope = Path(tracker_scope_raw).expanduser() if isinstance(tracker_scope_raw, str) and tracker_scope_raw else None
+
+    target_repo = _resolve_prep_target_repo(payload)
+
+    transcript_path: Path | None = None
+    transcript_candidate = transcript_override
+    if transcript_candidate is None:
+        for key in ("origin_transcript_path", "parent_thread_path"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                transcript_candidate = Path(value).expanduser()
+                break
+    if transcript_candidate is not None and transcript_candidate.exists():
+        transcript_path = transcript_candidate.resolve()
+
+    artifacts_dir = rvf_run_dir / "artifacts" if rvf_run_dir is not None else None
+    scope_of_work_path: Path | None = None
+    if artifacts_dir is not None:
+        candidate = artifacts_dir / "startup-scope-of-work.md"
+        if candidate.exists():
+            scope_of_work_path = candidate
+    if scope_of_work_path is None and artifacts_dir is not None:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        scope_text = dispatch_scope_of_work_text(
+            target_flow=target_flow,
+            cwd=str(target_repo),
+            parent_session_id=str(payload.get("origin_session_id") or ""),
+            parent_thread_path=transcript_path,
+            prompt_path=None,
+            run_id=str(rvf_run_id or ""),
+            run_dir=rvf_run_dir,
+            user_prompt_excerpt=user_prompt_excerpt,
+        )
+        candidate = artifacts_dir / "startup-scope-of-work.md"
+        candidate.write_text(scope_text, encoding="utf-8")
+        scope_of_work_path = candidate
+
+    base_dir_path = base_dir or default_base_dir()
+    started_at = _shared_workflow_now()
+    state: dict[str, Any] = {
+        "started_at": started_at,
+        "status": "pending",
+        "target_flow": target_flow,
+        "target_repo": str(target_repo),
+        "rvf_backend": rvf_backend,
+    }
+
+    def _runner() -> dict[str, Any]:
+        return prepare_run(
+            repo=target_repo,
+            session_context=scope_of_work_path,
+            session_manifest=None,
+            transcript=transcript_path,
+            base_dir=base_dir_path,
+            max_file_bytes=200_000,
+            max_packet_bytes=0,
+            primary_files=list(extra_primary_files or []),
+            background_files=list(extra_background_files or []),
+            exclude_path_prefixes=[],
+            allow_missing_session_context=False,
+            rvf_run_id=rvf_run_id,
+            rvf_run_dir=rvf_run_dir,
+            rvf_backend=rvf_backend,
+            tracker_scope=tracker_scope,
+        )
+
+    completed_state = state
+    # Manage executor manually so a TimeoutError can return immediately. Using
+    # `with ThreadPoolExecutor(...)` blocks at __exit__ until the worker thread
+    # finishes, defeating the timeout. Cancelling pending futures and asking
+    # shutdown not to wait lets the hook unblock; the background thread (which
+    # may still be running prepare_run) is allowed to finish on its own.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_runner)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        completed_state = {
+            **state,
+            "status": "completed",
+            "completed_at": _shared_workflow_now(),
+            "artifacts": _shared_workflow_artifacts(result),
+            "run_id": result.get("run_id"),
+            "run_dir": result.get("run_dir"),
+        }
+        executor.shutdown(wait=True)
+    except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
+        completed_state = {
+            **state,
+            "status": "timeout",
+            "completed_at": _shared_workflow_now(),
+            "error": f"prepare_run exceeded {timeout_seconds:.0f}s timeout",
+        }
+    except Exception as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        completed_state = {
+            **state,
+            "status": "failed",
+            "completed_at": _shared_workflow_now(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    new_rvf_run = dict(rvf_run) if isinstance(rvf_run, dict) else {}
+    new_rvf_run["shared_workflow_state"] = completed_state
+    rvf_prep_file.update_prep_file(prep, {"rvf_run": new_rvf_run})
+    return completed_state
 
 
 def main() -> int:

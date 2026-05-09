@@ -85,6 +85,19 @@ flowchart LR
   N --> O[Invoke RVF skill<br/>standardized workflow]
 ```
 
+### Slice I 已落地：post-user-prompt hook 是统一 prepare 入口
+
+UserPromptSubmit hook (`rvf_user_prompt_submit.py`) 现在按 origin marker 识别 dispatch source 并自动调用 shared prepare 入口 (`prepare_review_run.prepare_run_from_prep_file()`，60 秒 in-process timeout)：
+
+| Hook 看到的输入 | 行为 |
+|---|---|
+| `RVF_DISPATCH=token=<hex16>` | 校验 prep file → `shared_workflow_state.status=completed` 时跳过；否则跑 prepare 并写回。 |
+| 含 `RVF_FORKED_REVIEW_VALIDATE_FIX` / `RVF_CLINE_KANBAN_TASK` / `RVF_KANBAN_FOLLOWUP_TRIGGER` 但缺 token | 视为 dispatch 异常，写 `dispatch_marker_without_token` diagnostic，不创建 prep。 |
+| 缺所有 origin marker 但匹配 `$review-validate-fix` / `/review-validate-fix` / `:review-validate-fix` | 识别为 manual：hook 自创 prep file（`target_flow=flow-manual`、`dispatch_origin=post_user_prompt_manual`）→ 跑 prepare → agent 直接 `cat $RVF_PREP_FILE` 拿 artifacts。 |
+| 其它 | `status=no_token` 早退。 |
+
+Cline Kanban 自动 dispatch 路径下，Stop hook 仍负责一次性 freeze（`freeze_cline_kanban_dispatch_artifacts()`）：写 `startup-scope-of-work.md`、调 `prepare_review_run.py` 跑完整 prepare（review-packet、scope.contract、worktree-bootstrap）、把 `shared_workflow_state.status=completed` 写入 prep payload。理由：worktree bootstrap 必须在 origin worktree 当时 dirty work 还在时立即捕获，无法搬到 task worktree 内的 hook 里 rebuild。这条与 Slice I 的"统一入口"目标不冲突，因为 task session 的 UserPromptSubmit hook 仍调同一个 `prepare_run_from_prep_file()`，看到 cached `completed` 状态立即返回；manual、followup、fork+prompt 等其它路径走 hook 真正跑 prepare 的分支。
+
 ### Prep file schema
 
 ```json
@@ -173,9 +186,10 @@ flowchart LR
 | **F** | Sweep prep file TTL + collision handling 收尾 | D 已落地；dispatch 写入前 stale sweep、no-clobber create、generated-token retry 已落地 |
 | **G** | Tracker-scope prep source | tracker Slice 6 已落地；Cline Kanban startup prepare 现在从 prep file 读取 `rvf_run.tracker_scope_path` |
 | **H** | RVF 对接 Cline Kanban Slice A CLI 契约 | 外部 cline-kanban Slice A 已落地；RVF create 现在传 `parent-session-id` / `worktree-mode` / `prep-file-path`。Stop hook 自动 Cline Kanban task 固定使用当前 origin worktree 的 exact `HEAD` 作为 `--base-ref`，并固定 `worktree-mode=branch`，不再让安装时残留的 base-ref / worktree-mode 配置参与自动 routing 决策。 |
+| **I** | Post-user-prompt shared workflow：post-user-prompt hook 通过 origin marker 识别 dispatch source（token / fork / kanban-task / kanban-followup / manual），统一调用 `prepare_run_from_prep_file()` 完成 prepare 与 prep payload 回写。`headless-startup-scope-of-work.md` 重命名为 `startup-scope-of-work.md`；`freeze_cline_kanban_startup_artifacts()` → `freeze_cline_kanban_dispatch_artifacts()`，仍在 Stop hook 内捕获 origin dirty work 并写 `shared_workflow_state.status=completed`，task session 的 hook 看到 cached completed 即跳过；manual / followup / fork+prompt 由 hook 现场跑 prepare。SKILL.md 加 hook-prepared 默认路径 + fallback。 | **已落地。**详细 before/after 见 phase report。 |
 | **Future** | Inter-agent communication（同 base-ref 多 agent）；UI git graph preview 高级化；auto-fork-to-PR 模式 | 不在本 plan 范围 |
 
-依赖序：A → C / D 并行 → E → F → G → H。B 与主线独立可推迟。
+依赖序：A → C / D 并行 → E → F → G → H → I。B 与主线独立可推迟。
 
 ## 与 global-reviewed-diff-tracker plan 的关系
 
