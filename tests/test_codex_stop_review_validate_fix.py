@@ -330,7 +330,7 @@ def write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
             "type": "event_msg",
             "payload": {
                 "type": "user_message",
-                "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+                "message": "go $review-validate-fix",
             },
         },
         {"type": "event_msg", "payload": {"type": "agent_message", "message": "running rvf"}},
@@ -1374,6 +1374,64 @@ def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp
     assert summary["reason_code"] == "manual_scope_already_completed"
     assert summary["manual_rvf_run_id"] == "manual-db-run"
     assert summary["tracker_scope_hash"] == scope_hash
+
+
+def test_manual_scope_suppression_sweeps_expired_lease_before_probe(tmp: Path) -> None:
+    module = load_hook_module()
+    diff_tracker = sys.modules["diff_tracker"]
+    repo = init_repo_with_head(tmp / "dirty")
+    transcript = tmp / "session.jsonl"
+    write_apply_patch_transcript(transcript, repo, session_id="sess-manual-stale")
+    state = tmp / "state"
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state)
+        event = {"cwd": str(repo), "transcript_path": str(transcript)}
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        module.refresh_global_diff_tracker(context, ledger)
+        first = module.allocate_auto_review_scope(context, ledger, dry_run=False)
+        assert first is None
+        meta = getattr(ledger, "tracker_scope_meta", None)
+        assert isinstance(meta, dict)
+        tracker_dir = Path(meta["tracker_dir"])
+        lease_id = meta["tracker_lease_id"]
+        scope_hash = meta["tracker_scope_hash"]
+        conn = sqlite3.connect(str(tracker_dir / "tracker.sqlite3"))
+        try:
+            conn.execute(
+                "UPDATE leases SET expires_at='1970-01-01T00:00:00Z' WHERE lease_id=?",
+                (lease_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        diff_tracker.record_manual_rvf_run(
+            repo=repo,
+            session_id="manual-stale-session",
+            run_id="manual-stale-run",
+            scope_hash=scope_hash,
+            completed_at="2026-05-05T00:00:00Z",
+            log_root_override=state,
+        )
+
+        next_ledger = _make_test_ledger(module, state)
+        gated = module.allocate_auto_review_scope(context, next_ledger, dry_run=False)
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+
+    assert gated is not None
+    assert "manual_scope_already_completed" in gated.get("systemMessage", "")
+    summary = summary_from_payload(gated)
+    assert summary["manual_rvf_run_id"] == "manual-stale-run"
+    conn = sqlite3.connect(str(tracker_dir / "tracker.sqlite3"))
+    try:
+        row = conn.execute("SELECT state FROM leases WHERE lease_id=?", (lease_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row == ("stale-released",)
 
 
 def test_manual_scope_suppression_does_not_transfer_parent_takeover_units(tmp: Path) -> None:
@@ -2434,12 +2492,13 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert suppression_marker["run_id"] == latest["run_id"]
 
 
-def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) -> None:
+def test_cline_kanban_automatic_task_ignores_base_ref_and_worktree_env(tmp_path: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
     fake_client = tmp_path / "fake_cline_kanban_client.py"
     client_calls = tmp_path / "client-calls.jsonl"
+    workspace = tmp_path / "task-worktree"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
@@ -2448,9 +2507,9 @@ def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) 
         "if action == 'ensure':\n"
         "    print(json.dumps({'ok': True, 'started': False}))\n"
         "elif action == 'create':\n"
-        f"    print(json.dumps({{'task_id': 'task-inplace', 'workspacePath': {str(repo)!r}}}))\n"
+        f"    print(json.dumps({{'task_id': 'task-auto', 'workspacePath': {str(workspace)!r}}}))\n"
         "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-inplace', 'status': 'started'}))\n"
+        f"    print(json.dumps({{'task_id': 'task-auto', 'status': 'started', 'workspacePath': {str(workspace)!r}}}))\n"
         "else:\n"
         "    raise SystemExit(f'unexpected action {action}')\n",
         encoding="utf-8",
@@ -2462,6 +2521,7 @@ def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) 
             "CODEX_RVF_FORK_MODE",
             "CODEX_RVF_CLINE_KANBAN_CLIENT",
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+            "CODEX_RVF_CLINE_KANBAN_BASE_REF",
             "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
             "FAKE_CLIENT_CALLS",
         )
@@ -2478,6 +2538,7 @@ def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) 
         os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
+        os.environ["CODEX_RVF_CLINE_KANBAN_BASE_REF"] = "stale-user-selected-branch"
         os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "inplace"
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
@@ -2497,34 +2558,40 @@ def test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place(tmp_path: Path) 
                 os.environ[key] = value
 
     assert "reason=cline_kanban_task_started" in payload["systemMessage"]
-    assert "pause_origin_edits=true" not in payload["systemMessage"]
+    assert "pause_origin_edits=true" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "cline-kanban-started"
-    assert latest["cline_kanban_worktree_mode"] == "inplace"
-    assert latest["workspace_path"] == str(repo)
+    assert latest["cline_kanban_worktree_mode"] == "branch"
+    assert latest["workspace_path"] == str(workspace)
     calls = [
         json.loads(line)
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     create_argv = calls[1]["argv"]
+    expected_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert create_argv[create_argv.index("--base-ref") + 1] == expected_head
     assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
-    assert create_argv[create_argv.index("--worktree-mode") + 1] == "inplace"
+    assert create_argv[create_argv.index("--worktree-mode") + 1] == "branch"
     assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
-    assert "inplace 模式" in prompt_text
-    assert "不要重放 worktree bootstrap" in prompt_text
-    assert "独立 git worktree" not in prompt_text
-    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' not in prompt_text
-    assert "apply_worktree_bootstrap.py" not in prompt_text
-    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' not in prompt_text
+    assert "独立 git worktree" in prompt_text
+    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
+    assert "apply_worktree_bootstrap.py" in prompt_text
+    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' in prompt_text
     prep = dispatch_prep_payload(latest)
-    assert prep["target_flow"] == "flow-2-inplace"
-    assert prep["target_worktree"] == str(repo)
-    assert prep["target_kanban_task_id"] == "task-inplace"
+    assert prep["target_flow"] == "flow-2-branch"
+    assert prep["target_worktree"] == str(workspace)
+    assert prep["target_kanban_task_id"] == "task-auto"
     assert prep["workflow_constraints"] == {
-        "pause_origin_edits": False,
-        "in_place_mode": True,
+        "pause_origin_edits": True,
+        "in_place_mode": False,
     }
 
 
@@ -4386,6 +4453,10 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
     prep_tracker_scope = prep["rvf_run"]["tracker_scope_path"]
     assert isinstance(prep_tracker_scope, str)
     assert prep_tracker_scope.endswith("artifacts/tracker-scope.json")
+    assert prep["rvf_run"]["tracker_lease_id"]
+    assert prep["rvf_run"]["tracker_scope_hash"]
+    tracker_scope_payload = json.loads(Path(prep_tracker_scope).read_text(encoding="utf-8"))
+    assert tracker_scope_payload["lease_ttl_seconds"] > 0
     startup_command = json.loads(
         (Path(latest["artifacts_dir"]) / "cline-kanban-startup-prepare-command.json").read_text(
             encoding="utf-8"
@@ -5465,6 +5536,7 @@ def main() -> int:
         test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl,
         test_kanban_followup_without_task_id_does_not_allocate_review_scope,
         test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
+        test_manual_scope_suppression_sweeps_expired_lease_before_probe,
         test_manual_scope_suppression_does_not_transfer_parent_takeover_units,
         test_evaluate_session_gate_file_marker_takes_precedence_over_db_marker,
         test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails,
@@ -5485,7 +5557,7 @@ def main() -> int:
         test_restart_bridge_stops_existing_listener_before_relaunch,
         test_bridge_app_server_error_restarts_bridge_once,
         test_cline_kanban_mode_creates_and_starts_task_with_same_run,
-        test_cline_kanban_inplace_mode_marks_dispatch_prep_in_place,
+        test_cline_kanban_automatic_task_ignores_base_ref_and_worktree_env,
         test_cline_kanban_mode_requires_workspace_path,
         test_cline_kanban_workspace_path_reads_nested_task_workspace_path,
         test_cline_kanban_branch_mode_rejects_parent_project_workspace,

@@ -110,7 +110,7 @@ def test_cancel_run_invokes_finalize_and_writes_lock(
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir, log_root = _bootstrap_run(tmp_path, repo, run_id="rvf-cancel-1")
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
     monkeypatch.delenv("CODEX_RVF_RUN_DIR", raising=False)
@@ -133,7 +133,7 @@ def test_cancel_after_normal_finalize_keeps_first_lock(
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir, log_root = _bootstrap_run(tmp_path, repo, run_id="rvf-cancel-2")
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
     monkeypatch.delenv("CODEX_RVF_RUN_DIR", raising=False)

@@ -7283,6 +7283,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_lease_refresh_returns_expired_when_past_ttl(root / "lease-T5"),
         ),
         (
+            "heartbeat_refreshes_tracker_lease_and_records_backend",
+            lambda: test_heartbeat_refreshes_tracker_lease_and_records_backend(root / "lease-T5b"),
+        ),
+        (
+            "heartbeat_treats_same_second_expiry_as_expired",
+            lambda: test_heartbeat_treats_same_second_expiry_as_expired(root / "lease-T5c"),
+        ),
+        (
             "lease_release_completed_marks_units_reviewed",
             lambda: test_lease_release_completed_marks_units_reviewed(root / "lease-T6"),
         ),
@@ -7313,6 +7321,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "sweep_stale_releases_expired_active_leases",
             lambda: test_sweep_stale_releases_expired_active_leases(root / "lease-T8"),
+        ),
+        (
+            "sweep_stale_releases_same_second_expired_lease",
+            lambda: test_sweep_stale_releases_same_second_expired_lease(root / "lease-T8b"),
         ),
         (
             "sweep_stale_no_op_when_all_active_leases_fresh",
@@ -8709,6 +8721,64 @@ def test_lease_refresh_returns_expired_when_past_ttl(tmp: Path) -> None:
     assert refreshed["reason"] == "lease_expired_before_refresh"
 
 
+def test_heartbeat_refreshes_tracker_lease_and_records_backend(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-heartbeat",
+        run_id="lease-run-heartbeat",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=60,
+        log_root_override=log_root,
+    )
+    heartbeat = module.heartbeat(
+        repo,
+        session_id="lease-sess-heartbeat",
+        run_id="lease-run-heartbeat",
+        lease_id=acquired["lease_id"],
+        ttl_seconds=120,
+        rvf_state_phase="prepare",
+        rvf_backend="kanban-task",
+        log_root_override=log_root,
+    )
+    assert heartbeat["status"] == "ok"
+    assert heartbeat["lease_refreshed"] is True
+    assert heartbeat["lease_refresh_reason"] == "lease_refreshed"
+    events = read_jsonl(_alloc_events_path(log_root, repo_key))
+    latest = [event for event in events if event.get("event") == "heartbeat"][-1]
+    assert latest["rvf_state_phase"] == "prepare"
+    assert latest["rvf_backend"] == "kanban-task"
+    assert latest["tracker_lease_id"] == acquired["lease_id"]
+    assert latest["lease_refreshed"] is True
+
+
+def test_heartbeat_treats_same_second_expiry_as_expired(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-heartbeat-edge",
+        run_id="lease-run-heartbeat-edge",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    heartbeat = module.heartbeat(
+        repo,
+        session_id="lease-sess-heartbeat-edge",
+        run_id="lease-run-heartbeat-edge",
+        lease_id=acquired["lease_id"],
+        ttl_seconds=60,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:01.500000Z",
+    )
+    assert heartbeat["status"] == "ok"
+    assert heartbeat["lease_refreshed"] is False
+    assert heartbeat["lease_refresh_reason"] == "lease_expired_before_refresh"
+
+
 def test_lease_release_completed_marks_units_reviewed(tmp: Path) -> None:
     module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
     acquired = module.lease_acquire(
@@ -8957,6 +9027,27 @@ def test_sweep_stale_releases_expired_active_leases(tmp: Path) -> None:
     assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "stale-released"
     assert _lease_participant_states(log_root, repo_key, acquired["lease_id"]) == {"reviewer-a": "failed"}
     assert _lease_unit_states(log_root, repo_key, unit_ids[:1]) == {unit_ids[0]: "available"}
+
+
+def test_sweep_stale_releases_same_second_expired_lease(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    acquired = module.lease_acquire(
+        repo=repo,
+        session_id="lease-sess-sweep-edge",
+        run_id="lease-run-sweep-edge",
+        reviewer_id="reviewer-a",
+        unit_ids=unit_ids[:1],
+        lease_ttl_seconds=1,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:00Z",
+    )
+    released = module.sweep_stale(
+        repo=repo,
+        log_root_override=log_root,
+        now="2026-05-05T00:00:01.500000Z",
+    )
+    assert [item["lease_id"] for item in released] == [acquired["lease_id"]]
+    assert dict(_lease_rows(log_root, repo_key))[acquired["lease_id"]] == "stale-released"
 
 
 def test_sweep_stale_no_op_when_all_active_leases_fresh(tmp: Path) -> None:

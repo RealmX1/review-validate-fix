@@ -1952,7 +1952,7 @@ def register_claims(
                 events_path=events_path,
             )
 
-            now = utc_now()
+            now = _tracker_now_iso()
             branch_key = _upsert_branch(conn, branch_value, now) if branch_value else None
             worktree_key = _upsert_worktree(conn, worktree_value, branch_key, None, now)
             _upsert_session(conn, session_id, worktree_key, now)
@@ -2220,7 +2220,12 @@ def heartbeat(
     *,
     session_id: str,
     run_id: str | None,
+    lease_id: str | None = None,
+    ttl_seconds: int | None = None,
+    rvf_state_phase: str = "review",
+    rvf_backend: str | None = None,
     log_root_override: Path | None = None,
+    now: str | None = None,
 ) -> dict[str, Any]:
     if _disabled():
         return {"status": "disabled"}
@@ -2242,6 +2247,9 @@ def heartbeat(
 
     conn: sqlite3.Connection | None = None
     updated = 0
+    lease_refreshed = False
+    lease_refresh_reason: str | None = None
+    lease_expires_at: str | None = None
     try:
         conn = _open_conn(db_path)
         migration_finalize: Callable[[], None] | None = None
@@ -2255,7 +2263,7 @@ def heartbeat(
                 conn=conn,
                 events_path=events_path,
             )
-            now = utc_now()
+            now = _tracker_now_iso(now)
             cur = conn.execute(
                 "UPDATE sessions SET last_seen_at=? WHERE session_id=?",
                 (now, session_id),
@@ -2276,6 +2284,32 @@ def heartbeat(
                     "UPDATE session_units SET run_id=?, last_seen_at=? WHERE session_id=?",
                     (run_id, now, session_id),
                 )
+            if lease_id:
+                ttl = _lease_ttl_seconds(ttl_seconds)
+                lease_expires_at = _datetime_to_iso(
+                    (_iso_to_datetime(now) or datetime.now(timezone.utc)) + timedelta(seconds=ttl)
+                )
+                row = conn.execute(
+                    "SELECT state, expires_at FROM leases WHERE lease_id=?",
+                    (lease_id,),
+                ).fetchone()
+                if row is None or row["state"] != "active":
+                    lease_refresh_reason = "lease_not_found"
+                    lease_expires_at = None
+                elif row["expires_at"] <= now:
+                    lease_refresh_reason = "lease_expired_before_refresh"
+                    lease_expires_at = row["expires_at"]
+                else:
+                    conn.execute(
+                        """
+                        UPDATE leases
+                           SET last_activity_at=?, expires_at=?, ttl_seconds=?
+                         WHERE lease_id=?
+                        """,
+                        (now, lease_expires_at, ttl, lease_id),
+                    )
+                    lease_refreshed = True
+                    lease_refresh_reason = "lease_refreshed"
         if migration_finalize is not None:
             try:
                 migration_finalize()
@@ -2285,9 +2319,15 @@ def heartbeat(
             events_path,
             {
                 "event": "heartbeat",
+                "rvf_state_phase": rvf_state_phase,
+                "rvf_backend": rvf_backend,
                 "session_id": session_id,
                 "run_id": run_id,
                 "updated_unit_count": updated,
+                "tracker_lease_id": lease_id,
+                "lease_refreshed": lease_refreshed,
+                "lease_refresh_reason": lease_refresh_reason,
+                "lease_expires_at": lease_expires_at,
             },
         )
         return {
@@ -2295,6 +2335,9 @@ def heartbeat(
             "repo_key": key,
             "tracker_dir": str(directory),
             "updated_claim_count": updated,
+            "lease_refreshed": lease_refreshed,
+            "lease_refresh_reason": lease_refresh_reason,
+            "lease_expires_at": lease_expires_at,
         }
     except sqlite3.OperationalError as exc:
         if _is_lock_busy(exc):
@@ -2442,7 +2485,7 @@ def lease_acquire(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     ttl_seconds = _lease_ttl_seconds(lease_ttl_seconds)
     conn: sqlite3.Connection | None = None
     try:
@@ -2552,7 +2595,7 @@ def lease_refresh(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     ttl = _lease_ttl_seconds(ttl_seconds)
     expires_at = _datetime_to_iso((_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl))
     conn: sqlite3.Connection | None = None
@@ -2683,7 +2726,7 @@ def lease_participant_join(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -2770,7 +2813,7 @@ def lease_participant_refresh(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     ttl = _lease_ttl_seconds(ttl_seconds)
     expires_at = _datetime_to_iso((_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl))
     conn: sqlite3.Connection | None = None
@@ -2874,7 +2917,7 @@ def lease_participant_finish(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     participant_state = _participant_state_for_reason(reason)
     conn: sqlite3.Connection | None = None
     try:
@@ -2968,7 +3011,7 @@ def lease_release(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -3071,7 +3114,7 @@ def complete_review_scope(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     contract_unit_ids = _normalize_unit_id_list(unit_ids)
     conn: sqlite3.Connection | None = None
     try:
@@ -3275,7 +3318,7 @@ def sweep_stale(
         repo,
         log_root_override,
     )
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     released: list[dict[str, Any]] = []
     try:
@@ -3342,7 +3385,7 @@ def lease_holder_for_unit(
     now: str | None = None,
 ) -> dict[str, Any] | None:
     _, _, directory, db_path, _, _ = _lease_repo_paths(repo, log_root_override)
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -3469,6 +3512,13 @@ def _datetime_to_iso(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _tracker_now_iso(value: str | None = None) -> str:
+    parsed = _iso_to_datetime(value or utc_now())
+    if parsed is None:
+        parsed = datetime.now(timezone.utc)
+    return _datetime_to_iso(parsed)
 
 
 def _list_dirty_paths(repo: Path) -> list[str]:
@@ -4064,7 +4114,7 @@ def allocate_review_scope(
 
     branch_value = _current_branch(repo_resolved)
     worktree_value = str(repo_resolved)
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     ttl_seconds = _lease_ttl_seconds(lease_ttl_seconds)
     holder_kind_value = holder_kind if holder_kind in {"reviewer", "validate-fix", "manual"} else "reviewer"
 
@@ -4202,6 +4252,7 @@ def allocate_review_scope(
                 scope_payload: dict[str, Any] = {
                     "unit_ids": surviving,
                     "lease_id": lease_id,
+                    "lease_ttl_seconds": ttl_seconds,
                     "scope_hash": scope_hash,
                     "paths": paths_list,
                     "hunks": hunks_list,
@@ -4474,7 +4525,7 @@ def find_manual_rvf_run_for_scope_hash(
     repo_resolved = Path(repo).expanduser().resolve()
     key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
     ttl_value = _manual_run_ttl_seconds(ttl_seconds)
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -4529,7 +4580,7 @@ def _manual_suppression_scope_probe(
 ) -> dict[str, Any]:
     repo_resolved = Path(repo).expanduser().resolve()
     key, _common_dir, directory, db_path, _events_path = _manual_tracker_store(repo_resolved, log_root_override)
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     conn: sqlite3.Connection | None = None
     try:
         conn = _open_conn(db_path)
@@ -4573,7 +4624,7 @@ def manual_takeover(
 ) -> dict[str, Any]:
     repo_resolved = Path(repo).expanduser().resolve()
     key, common_dir, directory, db_path, events_path = _manual_tracker_store(repo_resolved, log_root_override)
-    now_iso = now or utc_now()
+    now_iso = _tracker_now_iso(now)
     transferred: list[str] = []
     conn: sqlite3.Connection | None = None
     try:

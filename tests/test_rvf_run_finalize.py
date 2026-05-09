@@ -141,7 +141,7 @@ def test_finalize_run_writes_trajectory_and_diff_and_is_idempotent(tmp_path: Pat
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir = _make_run(tmp_path, repo, transcript)
     # mutate workspace so after diff has content
     (repo / "README.md").write_text("hello changed\n", encoding="utf-8")
@@ -184,7 +184,7 @@ def test_finalize_for_handoff_resolves_run_dir_from_handoff_path(tmp_path: Path)
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir = _make_run(tmp_path, repo, transcript)
     handoff = run_dir / "artifacts" / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
@@ -204,7 +204,7 @@ def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path,
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir = _make_run(tmp_path, repo, transcript)
     log_root = tmp_path / "state"
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
@@ -273,7 +273,7 @@ def test_finalize_run_marks_stale_tracker_scope_reviewed_from_contract_units(
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
-    _write_transcript(transcript, capture.RVF_FORK_MARKER)
+    _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir = _make_run(tmp_path, repo, transcript)
     log_root = tmp_path / "state"
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))

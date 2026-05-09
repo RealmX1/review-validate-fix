@@ -35,6 +35,7 @@ from diff_tracker import (
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
+    sweep_stale,
 )
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
@@ -1181,6 +1182,19 @@ def cline_kanban_worktree_mode_from_env() -> str:
     return value
 
 
+def automatic_cline_kanban_worktree_mode() -> str:
+    return DEFAULT_CLINE_KANBAN_WORKTREE_MODE
+
+
+def automatic_cline_kanban_base_ref(cwd: str) -> str | None:
+    if not cwd:
+        return None
+    try:
+        return git_head(cwd)
+    except Exception:
+        return None
+
+
 def dispatch_prep_target_flow(mode: str, *, cline_kanban_worktree_mode: str | None = None) -> str:
     normalized = mode.strip().lower()
     if normalized in {"cline-kanban", "cline", "kanban", "ck"}:
@@ -1255,8 +1269,8 @@ def write_dispatch_prep_file(
     tracker_scope_hash = None
     if isinstance(tracker_scope_meta, dict):
         tracker_scope_path = tracker_scope_meta.get("tracker_scope_path")
-        tracker_lease_id = tracker_scope_meta.get("lease_id")
-        tracker_scope_hash = tracker_scope_meta.get("scope_hash")
+        tracker_lease_id = tracker_scope_meta.get("tracker_lease_id") or tracker_scope_meta.get("lease_id")
+        tracker_scope_hash = tracker_scope_meta.get("tracker_scope_hash") or tracker_scope_meta.get("scope_hash")
     artifacts_dir = ledger.artifacts_dir
     payload: dict[str, Any] = {
         "origin_session_id": origin_session_id,
@@ -2105,6 +2119,8 @@ def start_cline_kanban_task(
     task_title: str,
     model: str | None,
     reasoning_effort: str | None,
+    base_ref: str,
+    worktree_mode: str,
 ) -> dict[str, Any]:
     del model, reasoning_effort
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
@@ -2116,7 +2132,6 @@ def start_cline_kanban_task(
         ledger=ledger,
         dispatch_prep=dispatch_prep,
     )
-    worktree_mode = cline_kanban_worktree_mode_from_env()
     task_prompt = cline_kanban_task_prompt(
         cwd=cwd,
         prompt_path=prompt_path,
@@ -2138,7 +2153,6 @@ def start_cline_kanban_task(
         str(DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS),
     )
     tmux_session = os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", DEFAULT_CLINE_KANBAN_TMUX_SESSION)
-    base_ref = os.environ.get("CODEX_RVF_CLINE_KANBAN_BASE_REF", "").strip() or git_head(cwd)
     agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
@@ -2649,7 +2663,12 @@ def run_codex_fork(
         origin_path=origin_path,
     )
     cline_kanban_worktree_mode = (
-        cline_kanban_worktree_mode_from_env()
+        automatic_cline_kanban_worktree_mode()
+        if mode in {"cline-kanban", "cline", "kanban", "ck"}
+        else None
+    )
+    cline_kanban_base_ref = (
+        automatic_cline_kanban_base_ref(cwd)
         if mode in {"cline-kanban", "cline", "kanban", "ck"}
         else None
     )
@@ -2743,6 +2762,13 @@ def run_codex_fork(
                     "error": "CODEX_RVF_FORK_MODE=cline-kanban requires a target repo cwd.",
                 }
             )
+        elif not cline_kanban_base_ref:
+            result.update(
+                {
+                    "status": "cline-kanban-unconfigured",
+                    "error": "CODEX_RVF_FORK_MODE=cline-kanban requires a resolvable current HEAD.",
+                }
+            )
         elif not prompt_path:
             result.update(
                 {
@@ -2764,6 +2790,8 @@ def run_codex_fork(
                     task_title=task_title,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    base_ref=cline_kanban_base_ref,
+                    worktree_mode=cline_kanban_worktree_mode or DEFAULT_CLINE_KANBAN_WORKTREE_MODE,
                 )
                 dispatch_prep = update_dispatch_prep_file(
                     ledger=ledger,
@@ -4756,6 +4784,47 @@ def auto_review_lease_ttl_seconds(context: dict[str, Any]) -> int | None:
     return None
 
 
+def sweep_stale_tracker_leases(
+    *,
+    repo_path: Path,
+    context: dict[str, Any],
+    ledger: RunLedger,
+    dry_run: bool,
+) -> list[dict[str, Any]]:
+    try:
+        released = sweep_stale(repo=repo_path)
+    except Exception as exc:
+        ledger.event(
+            phase="gate",
+            event="tracker_stale_sweep_failed",
+            status="failed",
+            reason_code="tracker_stale_sweep_failed",
+            repo=str(repo_path),
+            cwd=context.get("cwd"),
+            session_id=context.get("session_id"),
+            dry_run=dry_run,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return []
+    ledger.event(
+        phase="gate",
+        event="tracker_stale_sweep_completed",
+        status="completed",
+        reason_code="tracker_stale_sweep_completed",
+        repo=str(repo_path),
+        cwd=context.get("cwd"),
+        session_id=context.get("session_id"),
+        dry_run=dry_run,
+        released_count=len(released),
+        released_lease_ids=[
+            item.get("lease_id")
+            for item in released
+            if isinstance(item, dict) and isinstance(item.get("lease_id"), str)
+        ],
+    )
+    return released
+
+
 def allocate_auto_review_scope(
     context: dict[str, Any],
     ledger: RunLedger,
@@ -4842,6 +4911,12 @@ def allocate_auto_review_scope(
         parent_session_id = None
     lease_ttl_seconds = auto_review_lease_ttl_seconds(context)
     try:
+        sweep_stale_tracker_leases(
+            repo_path=repo_path,
+            context=context,
+            ledger=ledger,
+            dry_run=dry_run,
+        )
         manual_probe = _manual_suppression_scope_probe(
             repo=repo_path,
             session_id=session_id,

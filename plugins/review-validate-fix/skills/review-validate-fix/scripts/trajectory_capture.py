@@ -2,8 +2,8 @@
 """把一次 RVF run 的轨迹捕获成结构化产物。
 
 切分逻辑（plan v2）:
-- 同会话场景：父 codex rollout 中包含 RVF 起点 marker，按行/字节切片成
-  pre-rvf 与 post-rvf。
+- 同会话场景：父 codex rollout 中包含 RVF 手动触发文本的最近一条
+  user message 作为 RVF 起点，按行/字节切片成 pre-rvf 与 post-rvf。
 - 分叉会话场景：通过 `<run_dir>/artifacts/origin.json` 取父会话 rollout 路径，
   整份作为 pre-rvf；当前 fork 会话 rollout 整份作为 post-rvf。
 
@@ -67,13 +67,8 @@ from trajectory_distill import (  # noqa: E402
 SCHEMA_VERSION = 1
 LARGE_FILE_BYTES = 200 * 1024 * 1024  # 200 MB
 
-RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
-KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
-RVF_PROMPT_MARKERS = (
-    "RVF_FORK_EXPERIMENT",
-    "RVF_HANDOFF_FILE",
-)
-DEFAULT_MARKERS = (RVF_FORK_MARKER, KANBAN_FOLLOWUP_MARKER, *RVF_PROMPT_MARKERS)
+RVF_SKILL_TRIGGER = "$review-validate-fix"
+RVF_START_TRIGGERS = (RVF_SKILL_TRIGGER,)
 
 
 def _utc_now() -> str:
@@ -167,16 +162,15 @@ def _codex_user_message_text(record: dict[str, Any]) -> str | None:
 def find_rvf_start_in_jsonl(
     path: Path,
     *,
-    markers: tuple[str, ...] = DEFAULT_MARKERS,
     since_timestamp: str | None = None,
 ) -> CutPoint | None:
-    """扫 JSONL，找首个 user message 文本含 markers 中任意 marker 的位置。
+    """扫 JSONL，找最近一条包含 RVF 手动触发文本的 user message。
 
     返回该 user message **行**的 cut point；pre = [0, byte_offset)，post = [byte_offset, end)。
 
     ``since_timestamp``（ISO8601 UTC 字符串，例如 ``"2026-05-04T04:18:29Z"``）：仅匹配
-    ``record["timestamp"] >= since_timestamp`` 的 marker 行。用于同会话连续两次 RVF
-    的场景——第二次 finalize 不应把第一次的 marker 当 cut。本仓库 timestamp
+    ``record["timestamp"] >= since_timestamp`` 的 trigger 行。用于同会话连续两次 RVF
+    的场景——第二次 finalize 不应把第一次的 RVF trigger 当 cut。本仓库 timestamp
     统一带 ``Z`` 后缀的 UTC ISO8601，字典序即时间序，无需 datetime 解析。
 
     Host 耦合：此函数透过 ``_codex_user_message_text`` 解析 user message，
@@ -184,6 +178,7 @@ def find_rvf_start_in_jsonl(
     应当新增 ``find_rvf_start_in_claude_jsonl`` 平行实现而非在此扩展。
     """
     last_index = -1
+    latest: CutPoint | None = None
     for line_index, byte_start, _byte_end, record in _iter_jsonl_with_offsets(path):
         last_index = line_index
         if record is None:
@@ -191,21 +186,23 @@ def find_rvf_start_in_jsonl(
         text = _codex_user_message_text(record)
         if not text:
             continue
-        matched = next((marker for marker in markers if marker in text), None)
+        matched = next((trigger for trigger in RVF_START_TRIGGERS if trigger in text), None)
         if matched is None:
             continue
         ts = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
         if since_timestamp is not None:
             if ts is None or ts < since_timestamp:
                 continue
-        return CutPoint(
+        latest = CutPoint(
             line_index=line_index,
             byte_offset=byte_start,
             timestamp=ts,
             marker_matched=matched,
             line_count_total=last_index + 1,  # tentative; updated below if more lines follow
         )
-    return None
+    if latest is None:
+        return None
+    return dataclasses.replace(latest, line_count_total=last_index + 1)
 
 
 def _count_lines(path: Path) -> int:

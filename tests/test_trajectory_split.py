@@ -63,7 +63,7 @@ def test_find_rvf_start_with_marker(tmp_path: Path) -> None:
             _user_event("plain question, no marker"),
             _agent_message("answer 1"),
             _user_event(
-                f"please run {capture.RVF_FORK_MARKER} now",
+                f"please run\n{capture.RVF_SKILL_TRIGGER}\nwith extra scope details",
                 ts="2026-05-04T00:00:10Z",
             ),
             _agent_message("acknowledged"),
@@ -71,7 +71,7 @@ def test_find_rvf_start_with_marker(tmp_path: Path) -> None:
     )
     cut = capture.find_rvf_start_in_jsonl(rollout)
     assert cut is not None
-    assert cut.marker_matched == capture.RVF_FORK_MARKER
+    assert cut.marker_matched == capture.RVF_SKILL_TRIGGER
     assert cut.line_index == 3
     # pre + post bytes round-trip the original
     pre = rollout.read_bytes()[: cut.byte_offset]
@@ -81,20 +81,60 @@ def test_find_rvf_start_with_marker(tmp_path: Path) -> None:
     assert pre.endswith(b"\n")
 
 
-def test_find_rvf_start_kanban_marker(tmp_path: Path) -> None:
+def test_find_rvf_start_ignores_legacy_kanban_marker_without_skill_trigger(tmp_path: Path) -> None:
     capture = _load("trajectory_capture")
     rollout = tmp_path / "rollout.jsonl"
     _write_jsonl(
         rollout,
         [
             {"timestamp": "t0", "type": "session_meta", "payload": {"id": "s2"}},
-            _user_event(f"trigger via {capture.KANBAN_FOLLOWUP_MARKER}"),
+            _user_event("trigger via RVF_KANBAN_FOLLOWUP_TRIGGER"),
         ],
     )
-    cut = capture.find_rvf_start_in_jsonl(rollout)
-    assert cut is not None
-    assert cut.marker_matched == capture.KANBAN_FOLLOWUP_MARKER
-    assert cut.line_index == 1
+    assert capture.find_rvf_start_in_jsonl(rollout) is None
+
+
+def test_find_rvf_start_ignores_slash_and_colon_aliases_without_skill_trigger(tmp_path: Path) -> None:
+    capture = _load("trajectory_capture")
+    rollout = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        rollout,
+        [
+            {"timestamp": "t0", "type": "session_meta", "payload": {"id": "s3"}},
+            _user_event(
+                "/review-validate-fix:review-validate-fix review this scope",
+                ts="2026-05-04T00:00:10Z",
+            ),
+            _agent_message("first running", ts="2026-05-04T00:00:11Z"),
+            _user_event(
+                "resume :review-validate-fix with more context",
+                ts="2026-05-04T00:00:20Z",
+            ),
+        ],
+    )
+    assert capture.find_rvf_start_in_jsonl(rollout) is None
+
+
+def test_find_rvf_start_ignores_non_user_messages_with_triggers(tmp_path: Path) -> None:
+    capture = _load("trajectory_capture")
+    rollout = tmp_path / "rollout.jsonl"
+    _write_jsonl(
+        rollout,
+        [
+            {"timestamp": "t0", "type": "session_meta", "payload": {"id": "s4"}},
+            _agent_message("I may mention /review-validate-fix in an explanation."),
+            {
+                "timestamp": "2026-05-04T00:00:12Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "$review-validate-fix should not match here",
+                },
+            },
+        ],
+    )
+    assert capture.find_rvf_start_in_jsonl(rollout) is None
 
 
 def test_find_rvf_start_returns_none_when_no_marker(tmp_path: Path) -> None:
@@ -119,7 +159,7 @@ def test_capture_run_same_session_slice(tmp_path: Path) -> None:
             {"timestamp": "t0", "type": "session_meta", "payload": {"id": "session-A"}},
             _user_event("background work"),
             _agent_message("ok"),
-            _user_event(f"start {capture.RVF_FORK_MARKER}"),
+            _user_event(f"start {capture.RVF_SKILL_TRIGGER}"),
             _agent_message("running RVF..."),
         ],
     )
@@ -136,10 +176,10 @@ def test_capture_run_same_session_slice(tmp_path: Path) -> None:
     assert pre.exists() and post.exists()
     # 字节级互补
     assert pre.read_bytes() + post.read_bytes() == transcript.read_bytes()
-    # pre 不含 marker
-    assert capture.RVF_FORK_MARKER.encode("utf-8") not in pre.read_bytes()
-    # post 必含 marker
-    assert capture.RVF_FORK_MARKER.encode("utf-8") in post.read_bytes()
+    # pre 不含 trigger
+    assert capture.RVF_SKILL_TRIGGER.encode("utf-8") not in pre.read_bytes()
+    # post 必含 trigger
+    assert capture.RVF_SKILL_TRIGGER.encode("utf-8") in post.read_bytes()
     # 蒸馏文件存在
     distilled = run_dir / "artifacts" / "trajectory" / "rvf" / "trajectory.jsonl"
     assert distilled.exists()
@@ -154,7 +194,7 @@ def test_capture_run_forked_session_full_copies(tmp_path: Path) -> None:
         child_transcript,
         [
             {"timestamp": "t0", "type": "session_meta", "payload": {"id": "child-session"}},
-            _user_event(f"forked: {capture.RVF_FORK_MARKER}"),
+            _user_event(f"forked: {capture.RVF_SKILL_TRIGGER}"),
             _agent_message("running"),
         ],
     )
@@ -188,17 +228,17 @@ def test_find_rvf_start_with_since_timestamp_skips_earlier_marker(tmp_path: Path
         rollout,
         [
             {"timestamp": "2026-05-04T00:00:00Z", "type": "session_meta", "payload": {"id": "s"}},
-            _user_event(f"first run: {capture.RVF_FORK_MARKER}", ts="2026-05-04T01:00:00Z"),
+            _user_event(f"first run: {capture.RVF_SKILL_TRIGGER}", ts="2026-05-04T01:00:00Z"),
             _agent_message("first done", ts="2026-05-04T01:30:00Z"),
             _user_event("intermezzo, no marker", ts="2026-05-04T02:00:00Z"),
-            _user_event(f"second run: {capture.RVF_FORK_MARKER}", ts="2026-05-04T03:00:00Z"),
+            _user_event(f"second run: {capture.RVF_SKILL_TRIGGER}", ts="2026-05-04T03:00:00Z"),
             _agent_message("second running", ts="2026-05-04T03:01:00Z"),
         ],
     )
-    # 不传 since_timestamp 时应命中第一段
+    # 不传 since_timestamp 时也应命中最近一段
     naive = capture.find_rvf_start_in_jsonl(rollout)
     assert naive is not None
-    assert naive.timestamp == "2026-05-04T01:00:00Z"
+    assert naive.timestamp == "2026-05-04T03:00:00Z"
     # 传 since_timestamp 在两段之间时应跳过第一段、命中第二段
     bounded = capture.find_rvf_start_in_jsonl(
         rollout, since_timestamp="2026-05-04T02:30:00Z"
@@ -216,12 +256,12 @@ def test_capture_run_same_session_picks_run_specific_marker(tmp_path: Path) -> N
         [
             {"timestamp": "2026-05-04T00:00:00Z", "type": "session_meta", "payload": {"id": "S"}},
             _user_event(
-                f"first RVF: {capture.RVF_FORK_MARKER}", ts="2026-05-04T01:00:00Z"
+                f"first RVF: {capture.RVF_SKILL_TRIGGER}", ts="2026-05-04T01:00:00Z"
             ),
             _agent_message("first done", ts="2026-05-04T01:30:00Z"),
             _user_event("background chat", ts="2026-05-04T02:00:00Z"),
             _user_event(
-                f"second RVF: {capture.RVF_FORK_MARKER}", ts="2026-05-04T03:00:00Z"
+                f"second RVF: {capture.RVF_SKILL_TRIGGER}", ts="2026-05-04T03:00:00Z"
             ),
             _agent_message("running second", ts="2026-05-04T03:00:01Z"),
         ],
@@ -248,8 +288,8 @@ def test_capture_run_same_session_picks_run_specific_marker(tmp_path: Path) -> N
     pre_bytes = (
         run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
     ).read_bytes()
-    assert post_bytes.count(capture.RVF_FORK_MARKER.encode("utf-8")) == 1
-    assert pre_bytes.count(capture.RVF_FORK_MARKER.encode("utf-8")) == 1
+    assert post_bytes.count(capture.RVF_SKILL_TRIGGER.encode("utf-8")) == 1
+    assert pre_bytes.count(capture.RVF_SKILL_TRIGGER.encode("utf-8")) == 1
     assert pre_bytes + post_bytes == transcript.read_bytes()
 
 
@@ -266,7 +306,7 @@ def test_capture_run_summary_and_manifests_carry_host_fields(tmp_path: Path) -> 
                 "payload": {"id": "S", "originator": "Codex Desktop"},
             },
             _user_event("intro"),
-            _user_event(f"start {capture.RVF_FORK_MARKER}"),
+            _user_event(f"start {capture.RVF_SKILL_TRIGGER}"),
             _agent_message("running"),
         ],
     )
@@ -307,7 +347,7 @@ def test_capture_run_summary_host_when_originator_missing(tmp_path: Path) -> Non
         transcript,
         [
             {"timestamp": "t0", "type": "session_meta", "payload": {"id": "S"}},
-            _user_event(f"go {capture.RVF_FORK_MARKER}"),
+            _user_event(f"go {capture.RVF_SKILL_TRIGGER}"),
         ],
     )
     run_dir = tmp_path / "rvf-run"

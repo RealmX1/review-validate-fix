@@ -292,8 +292,8 @@ def load_tracker_scope(path: Path) -> dict[str, Any]:
     (non-empty string), scope_hash (64-hex or "sha256:<64-hex>"), paths (list of
     strings, may be empty).
 
-    Optional keys: hunks (list of dicts), source_session_id (str),
-    takeover_from_session_id (str).
+    Optional keys: lease_ttl_seconds (int), hunks (list of dicts),
+    source_session_id (str), takeover_from_session_id (str).
 
     Unknown keys are tolerated and passed through unchanged so future allocator
     versions can extend the payload without re-touching this consumer.
@@ -684,6 +684,11 @@ def prepare_run(
         background_scope_files = normalized_scope_list(background_files + non_allocated_dirty)
         contract_primary_units: list[str] | None = sorted(set(tracker_scope_payload["unit_ids"]))
         contract_tracker_lease_id: str | None = tracker_scope_payload["lease_id"]
+        contract_tracker_lease_ttl_seconds: int | None = (
+            tracker_scope_payload.get("lease_ttl_seconds")
+            if isinstance(tracker_scope_payload.get("lease_ttl_seconds"), int)
+            else None
+        )
         contract_tracker_scope_hash: str | None = tracker_scope_payload["scope_hash"]
     else:
         primary_scope_files = normalized_scope_list(
@@ -694,6 +699,7 @@ def prepare_run(
         )
         contract_primary_units = None
         contract_tracker_lease_id = None
+        contract_tracker_lease_ttl_seconds = None
         contract_tracker_scope_hash = None
     protected_files = background_scope_files
     created_at = datetime.now(timezone.utc).isoformat()
@@ -747,6 +753,10 @@ def prepare_run(
                             root,
                             session_id=heartbeat_session,
                             run_id=ledger.run_id,
+                            lease_id=contract_tracker_lease_id,
+                            ttl_seconds=contract_tracker_lease_ttl_seconds,
+                            rvf_state_phase="prepare",
+                            rvf_backend=canonical_backend,
                         )
                     except Exception:
                         pass

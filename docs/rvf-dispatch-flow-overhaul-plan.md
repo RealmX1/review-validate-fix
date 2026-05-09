@@ -172,7 +172,7 @@ flowchart LR
 | **E** | Flow 2 worktree env setup（搬运未 commit work + pause-main 系统消息）| C, D 已落地；worktree bootstrap 已搬运 session-owned dirty work，prep file 已回填真实 `workspace_path`，父会话 systemMessage 已提示暂停 origin 编辑 |
 | **F** | Sweep prep file TTL + collision handling 收尾 | D 已落地；dispatch 写入前 stale sweep、no-clobber create、generated-token retry 已落地 |
 | **G** | Tracker-scope prep source | tracker Slice 6 已落地；Cline Kanban startup prepare 现在从 prep file 读取 `rvf_run.tracker_scope_path` |
-| **H** | RVF 对接 Cline Kanban Slice A CLI 契约 | 外部 cline-kanban Slice A 已落地；RVF create 现在传 `parent-session-id` / `worktree-mode` / `prep-file-path`，默认 branch，可用 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 切到 flow-2-inplace |
+| **H** | RVF 对接 Cline Kanban Slice A CLI 契约 | 外部 cline-kanban Slice A 已落地；RVF create 现在传 `parent-session-id` / `worktree-mode` / `prep-file-path`。Stop hook 自动 Cline Kanban task 固定使用当前 origin worktree 的 exact `HEAD` 作为 `--base-ref`，并固定 `worktree-mode=branch`，不再让安装时残留的 base-ref / worktree-mode 配置参与自动 routing 决策。 |
 | **Future** | Inter-agent communication（同 base-ref 多 agent）；UI git graph preview 高级化；auto-fork-to-PR 模式 | 不在本 plan 范围 |
 
 依赖序：A → C / D 并行 → E → F → G → H。B 与主线独立可推迟。
@@ -209,7 +209,7 @@ flowchart LR
 
 ### In-place mode
 
-显式选择 in-place / manual / prepare 类路径时，dispatch prep 会把 `workflow_constraints.in_place_mode=true` 写入 prep file，并把当前 cwd 作为 `target_worktree`。Cline Kanban flow 2 可通过 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 持久或临时启用；该值会透传到 `kanban task create --worktree-mode inplace`，同时 RVF prep file 记录 `target_flow=flow-2-inplace`。该模式不创建新 worktree、不搬运 dirty work，也不会发送暂停 origin 编辑提示；适合用户明确想在当前 session/current tree 内完成 RVF，或 Cline Kanban 不参与的本地调试。
+显式选择 in-place / manual / prepare 类路径时，dispatch prep 会把 `workflow_constraints.in_place_mode=true` 写入 prep file，并把当前 cwd 作为 `target_worktree`。该模式不创建新 worktree、不搬运 dirty work，也不会发送暂停 origin 编辑提示；适合用户明确想在当前 session/current tree 内完成 RVF，或 Cline Kanban 不参与的本地调试。Stop hook 自动触发的 Cline Kanban new task 不走这个配置面：它固定创建 branch worktree，并以触发时 origin worktree 的 exact `HEAD` 作为 base ref，避免每次自动 RVF 都需要用户决定 fork 到哪个 branch/worktree。
 
 ### Kanban unavailable
 

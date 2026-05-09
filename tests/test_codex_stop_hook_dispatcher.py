@@ -721,7 +721,7 @@ def _write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
             "type": "event_msg",
             "payload": {
                 "type": "user_message",
-                "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+                "message": "go $review-validate-fix",
             },
         },
         {"type": "event_msg", "payload": {"type": "agent_message", "message": "running rvf"}},
@@ -870,7 +870,7 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
                         "type": "event_msg",
                         "payload": {
                             "type": "user_message",
-                            "message": "go RVF_FORKED_REVIEW_VALIDATE_FIX",
+                            "message": "go $review-validate-fix",
                         },
                     }
                 ),

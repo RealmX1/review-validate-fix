@@ -129,6 +129,7 @@ After:
 - `start_cline_kanban_task()` 默认传 `worktree-mode=branch`，并把 prep file path 与 parent session id 一起交给 Cline Kanban。
 - 新增 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=inplace` 配置；inplace 时 prep file 记录 `target_flow=flow-2-inplace`、`workflow_constraints.pause_origin_edits=false`。
 - installer / dev sync 会保留 `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE`。
+- Follow-up routing correction：Stop hook 自动 Cline Kanban new task 现在忽略安装时残留的 `CODEX_RVF_CLINE_KANBAN_BASE_REF` / `CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE`，固定使用触发时 origin worktree 的 exact `HEAD` 和 `worktree-mode=branch`。这样自动 RVF 不再要求用户在 branch/worktree 间做额外选择；in-place 只保留为非自动/手动调试语义。
 
 Files:
 - `plugins/review-validate-fix/skills/review-validate-fix/scripts/cline_kanban_client.py`
