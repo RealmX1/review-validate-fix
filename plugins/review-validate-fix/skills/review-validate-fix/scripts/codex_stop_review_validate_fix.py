@@ -509,6 +509,62 @@ def parent_thread_path_from_event(event: dict[str, Any]) -> Path | None:
     return None
 
 
+def parent_thread_path_for_origin(
+    event: dict[str, Any],
+    *,
+    ledger: RunLedger | None = None,
+    repo: str | None = None,
+    cwd: str | None = None,
+) -> Path | None:
+    """``parent_thread_path_from_event`` 的 origin.json 友好扩展版。
+
+    解析顺序：
+    1. ``parent_thread_path_from_event(event)`` — Codex ``session_meta`` 验证过
+       的路径；命中即返回（保持 Codex 既有行为）。
+    2. 退到 ``event_session_paths(event)`` 中任何 **存在** 的文件 —— 不要求
+       ``session_meta`` 命中，这样 Claude Code transcript（无 session_meta，
+       但 file 存在）也能被 origin.json 收录，让 trajectory_capture 后续能
+       探测到 host 与切片。
+    3. 若 event 完全没有 session path 字段 → emit 诊断 ledger event
+       ``origin_metadata_missing_transcript_path`` 便于事后定位。
+
+    与上层 ``parent_conversation_origin`` / ``write_dispatch_prep_file`` 解耦：
+    此 helper 只决定 transcript path，不影响 ``session_id`` / ``transcript_origin_label``
+    等下游字段（它们已经各自处理 None）。
+    """
+    primary = parent_thread_path_from_event(event)
+    if primary is not None:
+        return primary
+    for path in event_session_paths(event):
+        try:
+            expanded = path.expanduser()
+            if expanded.is_file():
+                resolved = expanded.resolve()
+                if ledger is not None:
+                    ledger.event(
+                        phase="prepare",
+                        event="origin_metadata_transcript_path_fallback",
+                        status="ok",
+                        reason_code="origin_metadata_transcript_path_fallback",
+                        repo=repo,
+                        cwd=cwd,
+                        paths={"transcript_path": str(resolved)},
+                    )
+                return resolved
+        except OSError:
+            continue
+    if ledger is not None and not list(event_session_paths(event)):
+        ledger.event(
+            phase="prepare",
+            event="origin_metadata_missing_transcript_path",
+            status="warning",
+            reason_code="origin_metadata_missing_transcript_path",
+            repo=repo,
+            cwd=cwd,
+        )
+    return None
+
+
 def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
     for path in event_session_paths(event):
         session_id = session_id_from_path(path.expanduser())
@@ -4315,8 +4371,13 @@ def fork_review_validate_fix(
     ledger: RunLedger | None = None,
 ) -> dict[str, Any]:
     parent_session_id = parent_thread_id_from_event(event) or ""
-    parent_thread_path = parent_thread_path_from_event(event)
     cwd = fork_cwd_for_event(event, repo)
+    parent_thread_path = parent_thread_path_for_origin(
+        event,
+        ledger=ledger,
+        repo=repo,
+        cwd=cwd,
+    )
     prompt = fork_review_validate_fix_prompt(parent_session_id, cwd, repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
@@ -4367,7 +4428,12 @@ def launch_backend(
         attempt_id = current_kanban_attempt_id(event)
         project_path = current_kanban_project_path(event, decision.repo)
         source_session_id = session_id_from_event(event) or parent_thread_id_from_event(event)
-        source_thread_path = parent_thread_path_from_event(event)
+        source_thread_path = parent_thread_path_for_origin(
+            event,
+            ledger=ledger,
+            repo=decision.repo,
+            cwd=cwd,
+        )
         source_name_lookup = parent_thread_name_from_app_server(source_session_id, cwd)
         codex_origin = parent_conversation_origin(
             parent_session_id=source_session_id,

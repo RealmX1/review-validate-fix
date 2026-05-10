@@ -17,23 +17,34 @@
 
 Host 耦合说明:
 - ``distill_codex_jsonl`` / ``_distill_codex_record`` / ``_codex_parse_apply_patch_fallback``
-  / ``_patch_lines_for_op`` / ``_patch_op_name`` 全部专门解析 **Codex** rollout
-  schema (``event_msg`` / ``response_item.function_call`` /
+  / ``_patch_lines_for_op`` / ``_patch_op_name`` 解析 **Codex** rollout schema
+  (``event_msg`` / ``response_item.function_call`` /
   ``response_item.custom_tool_call`` / ``apply_patch`` custom-format patch 等)。
-  当前 Codex 把 ``apply_patch`` 调用走 ``custom_tool_call`` (``payload.input``);
+  Codex 把 ``apply_patch`` 调用走 ``custom_tool_call`` (``payload.input``);
   ``exec_command`` 等仍走 ``function_call`` (``payload.arguments``); 两条路径
-  都要识别。同理 output 既可能是 ``function_call_output`` 也可能是
+  都识别。同理 output 既可能是 ``function_call_output`` 也可能是
   ``custom_tool_call_output``。
-- ``distill_reviewer_stream`` 解析 Claude Code stream-json (Claude Code 子进程
-  reviewer 的 stdout NDJSON)，与上面的 Codex 主轨迹解析无关。
-- 未来若要让 RVF 主流程跑在 Claude Code host 上，应平行实现
-  ``distill_claude_jsonl`` / ``_distill_claude_record`` 等而不是扩展 Codex 函数。
+- ``distill_claude_jsonl`` / ``_distill_claude_record`` /
+  ``_claude_tool_call_artifact_refs`` / ``_claude_message_text_blocks`` /
+  ``_extract_apply_patch_from_bash`` 解析 **Claude Code** transcript NDJSON
+  schema (``user`` / ``assistant`` / ``summary`` / ``system`` 等顶层 record;
+  ``message.content`` 列表内含 ``text`` / ``thinking`` / ``tool_use`` /
+  ``tool_result`` 等 block)。Claude ``Edit`` / ``Write`` / ``NotebookEdit``
+  没有行号信息，``artifact_refs.lines`` 写 None；``Bash`` 工具中检测
+  ``apply_patch`` heredoc 后复用 Codex patch 解析。
+- ``detect_transcript_format`` 按 transcript 文件首条非空 record 的 ``type``
+  字段探测 host；上层 ``trajectory_capture.capture_run`` 据此分派到对应
+  distiller。两条解析栈互不交叉——新增 host 时再加新的平行 ``_<host>_*``
+  实现。
+- ``distill_reviewer_stream`` 解析 Claude Code stream-json (子进程 reviewer
+  的 stdout NDJSON)，与主轨迹解析无关。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -45,12 +56,64 @@ from session_manifest import parse_apply_patch  # noqa: E402
 SCHEMA_VERSION = 1
 SUMMARY_MAX_BYTES = 2048
 
-HOST_KIND = "codex"
-"""单一 host kind 常量。整个 RVF 数据捕获栈当前只支持 Codex transcript schema；
-此常量被 trajectory_capture / subagent_capture / rvf_run_finalize 写进 manifest 与
-summary.json 的 ``host`` 字段，让事后分析者无需再从文件名 / 函数名等隐式信号推断
-host 来源。未来若要支持 Claude Code，应当在引入 ``_claude_*`` 平行解析器的同时
-新增独立的 host kind 常量并按 transcript 探测分派。"""
+HOST_CODEX = "codex"
+"""Codex rollout JSONL schema (``session_meta`` / ``turn_context`` / ``event_msg``
+/ ``response_item`` record types)。由 ``distill_codex_jsonl`` /
+``_distill_codex_record`` 等解析。"""
+
+HOST_CLAUDE = "claude_code"
+"""Claude Code transcript NDJSON schema (``user`` / ``assistant`` / ``summary``
+record types，无 ``payload`` 包裹)。由 ``distill_claude_jsonl`` /
+``_distill_claude_record`` 等解析。"""
+
+HOST_KIND = HOST_CODEX
+"""向后兼容别名。新代码请直接使用 ``HOST_CODEX`` / ``HOST_CLAUDE`` 二者之一。
+本常量保留是为了让早期写死 ``HOST_KIND="codex"`` 字面量的历史 import 点继续工作；
+所有新增 manifest / summary 写入路径都应当从 ``detect_transcript_format`` 结果决定。"""
+
+_FORMAT_DETECT_MAX_LINES = 32
+_CODEX_RECORD_TYPES = frozenset(
+    {"session_meta", "turn_context", "event_msg", "response_item"}
+)
+_CLAUDE_RECORD_TYPES = frozenset({"user", "assistant", "summary", "system"})
+
+
+def detect_transcript_format(path: Path) -> str | None:
+    """探测 transcript 文件的 schema host：``HOST_CODEX`` / ``HOST_CLAUDE`` / None。
+
+    读首 ``_FORMAT_DETECT_MAX_LINES`` 行非空 JSON-decodable record；命中 Codex
+    record types (``session_meta`` / ``turn_context`` / ``event_msg`` /
+    ``response_item``) 立即返回 ``HOST_CODEX``，命中 Claude record types
+    (``user`` / ``assistant`` / ``summary`` / ``system``) 立即返回 ``HOST_CLAUDE``。
+    全部读完仍未命中（空文件 / 异常 schema / 截断）→ 返回 None；调用方应当
+    fallback 到 ``HOST_CODEX`` 以保证既有 Codex-only 用例无回归。
+    """
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            scanned = 0
+            for raw in handle:
+                if scanned >= _FORMAT_DETECT_MAX_LINES:
+                    break
+                scanned += 1
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                rtype = record.get("type")
+                if rtype in _CODEX_RECORD_TYPES:
+                    return HOST_CODEX
+                if rtype in _CLAUDE_RECORD_TYPES:
+                    return HOST_CLAUDE
+    except OSError:
+        return None
+    return None
 
 
 def read_codex_originator(rollout_path: Path) -> str | None:
@@ -390,6 +453,297 @@ def _patch_op_name(operation: str | None) -> str:
     if operation == "delete":
         return "delete"
     return "edit"
+
+
+_HEREDOC_RE = re.compile(
+    r"<<\s*['\"]?(?P<token>[A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\n(?P<body>.*?)\n(?P=token)\s*$",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def _extract_apply_patch_from_bash(command: str) -> str | None:
+    """从 Bash ``apply_patch`` 调用中抽出 patch 文本。
+
+    支持两种形式：
+    - heredoc: ``apply_patch <<'EOF'\n*** Begin Patch...\nEOF``
+    - 内联 stdin: ``apply_patch '*** Begin Patch...\n*** End Patch'``
+    无 ``apply_patch`` 关键字 → 返回 None。
+    """
+    if "apply_patch" not in command:
+        return None
+    match = _HEREDOC_RE.search(command)
+    if match:
+        body = match.group("body")
+        if "*** Begin Patch" in body or "*** Add File:" in body or "*** Update File:" in body or "*** Delete File:" in body:
+            return body
+    if "*** Begin Patch" in command:
+        start = command.find("*** Begin Patch")
+        end = command.rfind("*** End Patch")
+        if end > start:
+            return command[start:end + len("*** End Patch")]
+    return None
+
+
+def _claude_tool_call_artifact_refs(
+    tool_name: str | None,
+    tool_input: Any,
+    *,
+    repo: Path | None,
+    line_number: int,
+) -> list[dict[str, Any]]:
+    """根据 Claude tool_use block 推断 ``artifact_refs``。
+
+    Claude 的 Edit / Write / NotebookEdit input 不含行号信息（与 Codex
+    apply_patch 不同），``lines`` 字段写 None；``Bash`` 检测 apply_patch
+    heredoc 后复用 Codex patch 解析。其他 tool 不产 artifact_refs。
+    """
+    if not isinstance(tool_input, dict):
+        return []
+    refs: list[dict[str, Any]] = []
+    if tool_name in {"Edit", "MultiEdit"}:
+        path_value = tool_input.get("file_path")
+        if isinstance(path_value, str) and path_value:
+            refs.append({"path": path_value, "lines": None, "op": "edit"})
+    elif tool_name == "Write":
+        path_value = tool_input.get("file_path")
+        if isinstance(path_value, str) and path_value:
+            refs.append({"path": path_value, "lines": None, "op": "create"})
+    elif tool_name == "NotebookEdit":
+        path_value = tool_input.get("notebook_path")
+        if isinstance(path_value, str) and path_value:
+            refs.append({"path": path_value, "lines": None, "op": "edit"})
+    elif tool_name == "Bash":
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            patch_text = _extract_apply_patch_from_bash(command)
+            if patch_text:
+                if repo is not None:
+                    ops, _ = parse_apply_patch(repo, patch_text, line_number)
+                else:
+                    ops, _ = _codex_parse_apply_patch_fallback(patch_text, line_number)
+                for op in ops:
+                    refs.append(
+                        {
+                            "path": op.get("path"),
+                            "lines": _patch_lines_for_op(patch_text, op.get("path")),
+                            "op": _patch_op_name(op.get("operation")),
+                        }
+                    )
+    return refs
+
+
+def _claude_message_text_blocks(content: Any) -> tuple[list[str], list[str]]:
+    """把 Claude message ``content`` 拆成 (text_parts, thinking_parts)。
+
+    string content → 全部归 text。list content → 按 ``type`` 字段分流：
+    ``text`` → text_parts；``thinking`` → thinking_parts；其他 (``tool_use``
+    / ``tool_result`` / ``image``) 由调用方单独成 record。
+    """
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    if isinstance(content, str):
+        if content:
+            text_parts.append(content)
+        return text_parts, thinking_parts
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "text":
+                value = block.get("text")
+                if isinstance(value, str) and value:
+                    text_parts.append(value)
+            elif bt == "thinking":
+                value = block.get("thinking")
+                if isinstance(value, str) and value:
+                    thinking_parts.append(value)
+    return text_parts, thinking_parts
+
+
+def _distill_claude_record(
+    record: dict[str, Any],
+    *,
+    repo: Path | None,
+    rollout_filename: str,
+    byte_offsets: list[int],
+) -> list[dict[str, Any]]:
+    """把单条 Claude Code NDJSON record 蒸馏成 0..N 条统一 trajectory record。
+
+    一条 ``assistant`` record 可能同时含 ``text`` / ``thinking`` / 多条
+    ``tool_use`` block，每个 block 都展开成独立 trajectory record；同样
+    ``user`` record 的 ``tool_result`` block 单独成 record。其余 record type
+    （``permission-mode`` / ``file-history-snapshot`` / ``ai-title`` / ``attachment``
+    / ``agent-name`` / ``last-prompt`` / ``queue-operation`` / ``stop-hook-feedback``
+    等）当前不抽取，返回空列表。
+    """
+    line_number = record.get("_line_number") or 0
+    raw_ref = {
+        "file": rollout_filename,
+        "line": line_number,
+        "byte_range": _byte_range_for_line(byte_offsets, line_number - 1),
+    }
+    ts = record.get("timestamp")
+    record_type = record.get("type")
+    base = {
+        "schema_version": SCHEMA_VERSION,
+        "ts": ts,
+        "source": "claude_code",
+        "raw_ref": raw_ref,
+    }
+    out: list[dict[str, Any]] = []
+
+    if record_type == "summary":
+        summary_text = record.get("summary")
+        if not isinstance(summary_text, str):
+            summary_text = ""
+        out.append(
+            {
+                **base,
+                "kind": "phase_marker",
+                "call_id": None,
+                "marker": "summary",
+                "summary": _truncate(summary_text or "<empty summary>"),
+                "artifact_refs": [],
+            }
+        )
+        return out
+
+    if record_type == "system":
+        subtype = record.get("subtype") or "system"
+        out.append(
+            {
+                **base,
+                "kind": "phase_marker",
+                "call_id": None,
+                "marker": f"system:{subtype}",
+                "summary": _truncate(json.dumps(record, ensure_ascii=False)),
+                "artifact_refs": [],
+            }
+        )
+        return out
+
+    if record_type not in ("user", "assistant"):
+        return out
+
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return out
+    role = message.get("role") or record_type
+    content = message.get("content")
+
+    text_parts, thinking_parts = _claude_message_text_blocks(content)
+
+    if thinking_parts and record_type == "assistant":
+        out.append(
+            {
+                **base,
+                "kind": "reasoning",
+                "call_id": None,
+                "summary": _truncate("\n\n".join(thinking_parts)),
+                "artifact_refs": [],
+            }
+        )
+
+    if text_parts:
+        out.append(
+            {
+                **base,
+                "kind": "message",
+                "role": role,
+                "call_id": None,
+                "summary": _truncate("\n\n".join(text_parts)),
+                "artifact_refs": [],
+            }
+        )
+
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type")
+            if bt == "tool_use":
+                tool_name = block.get("name")
+                tool_input = block.get("input")
+                summary_parts = [f"call {tool_name or '<unknown>'}"]
+                if isinstance(tool_input, dict):
+                    primitive = json.dumps(tool_input, ensure_ascii=False)
+                    summary_parts.append(_truncate(primitive, 256))
+                out.append(
+                    {
+                        **base,
+                        "kind": "tool_call",
+                        "tool": tool_name,
+                        "call_id": block.get("id"),
+                        "summary": _truncate(" ".join(summary_parts)),
+                        "artifact_refs": _claude_tool_call_artifact_refs(
+                            tool_name,
+                            tool_input,
+                            repo=repo,
+                            line_number=line_number,
+                        ),
+                    }
+                )
+            elif bt == "tool_result":
+                result_content = block.get("content")
+                if isinstance(result_content, list):
+                    parts: list[str] = []
+                    for sub in result_content:
+                        if isinstance(sub, dict):
+                            text = sub.get("text")
+                            if isinstance(text, str):
+                                parts.append(text)
+                    result_text = "\n".join(parts)
+                elif isinstance(result_content, str):
+                    result_text = result_content
+                else:
+                    result_text = ""
+                out.append(
+                    {
+                        **base,
+                        "kind": "tool_result",
+                        "tool": None,
+                        "call_id": block.get("tool_use_id"),
+                        "summary": _truncate(result_text),
+                        "artifact_refs": [],
+                    }
+                )
+    return out
+
+
+def distill_claude_jsonl(
+    *,
+    rollout_path: Path,
+    rollout_filename: str,
+    repo: Path | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Claude Code transcript NDJSON → 统一 trajectory schema。
+
+    与 ``distill_codex_jsonl`` 同签名同返回类型。一条 Claude record 可能
+    展开成多条 trajectory record（assistant 内含多个 tool_use 等），故内部
+    用 ``_distill_claude_record`` 返回 list 而非单条。
+    """
+    records, offsets = _read_jsonl_with_offsets(rollout_path)
+    distilled: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for record in records:
+        outs = _distill_claude_record(
+            record,
+            repo=repo,
+            rollout_filename=rollout_filename,
+            byte_offsets=offsets,
+        )
+        for out in outs:
+            kind = out.get("kind") or "unknown"
+            counts[kind] = counts.get(kind, 0) + 1
+            distilled.append(out)
+    index = {
+        "schema_version": SCHEMA_VERSION,
+        "rollout_file": rollout_filename,
+        "record_count": len(distilled),
+        "kind_counts": counts,
+    }
+    return distilled, index
 
 
 def distill_codex_jsonl(

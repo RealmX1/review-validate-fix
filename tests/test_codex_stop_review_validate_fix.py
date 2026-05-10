@@ -5678,6 +5678,67 @@ def test_log_unavailable_does_not_break_hook_payload(tmp_path: Path) -> None:
     assert "log_unavailable=true" in payload["systemMessage"]
 
 
+def test_parent_thread_path_for_origin_returns_codex_validated_path(tmp_path: Path) -> None:
+    module = load_hook_module()
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "codex-sess"}}) + "\n",
+        encoding="utf-8",
+    )
+    event = {"transcript_path": str(rollout)}
+    result = module.parent_thread_path_for_origin(event)
+    assert result == rollout.resolve()
+
+
+def _read_ledger_events(ledger) -> list[dict]:
+    events_path = Path(ledger.events_path)
+    if not events_path.exists():
+        return []
+    out: list[dict] = []
+    for raw in events_path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            out.append(json.loads(raw))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def test_parent_thread_path_for_origin_falls_back_to_existing_file(tmp_path: Path) -> None:
+    """Claude transcript：file 存在但 session_meta 校验失败 → 走 fallback。"""
+    module = load_hook_module()
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "permission-mode", "permissionMode": "plan", "sessionId": "claude"})
+        + "\n",
+        encoding="utf-8",
+    )
+    event = {"transcript_path": str(transcript)}
+    ledger = module.start_run(component="stop-hook-test", run_dir=tmp_path / "run")
+    result = module.parent_thread_path_for_origin(
+        event, ledger=ledger, repo=str(tmp_path), cwd=str(tmp_path)
+    )
+    assert result == transcript.resolve()
+    events = _read_ledger_events(ledger)
+    assert any(
+        e.get("event") == "origin_metadata_transcript_path_fallback" for e in events
+    )
+
+
+def test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty(tmp_path: Path) -> None:
+    module = load_hook_module()
+    ledger = module.start_run(component="stop-hook-test", run_dir=tmp_path / "run")
+    result = module.parent_thread_path_for_origin(
+        {}, ledger=ledger, repo=str(tmp_path), cwd=str(tmp_path)
+    )
+    assert result is None
+    events = _read_ledger_events(ledger)
+    assert any(
+        e.get("event") == "origin_metadata_missing_transcript_path" for e in events
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
