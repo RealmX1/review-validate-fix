@@ -123,6 +123,10 @@ def test_render_shell_embeds_repo_metadata(tmp_path: Path) -> None:
     assert "selectionRenderDeferredSince" in html
     assert "freeze-btn" in html
     assert "download-btn" in html
+    assert 'class="table-scroll sessions-scroll"' in html
+    assert "sessions-scroll" in html
+    assert "--sessions-row-height" in html
+    assert "var(--sessions-row-height) * 10" in html
     assert "superseded-mode" in html
     assert 'data-mode="time"' in html
     assert 'data-mode="path"' in html

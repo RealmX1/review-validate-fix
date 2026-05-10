@@ -529,6 +529,15 @@ td.num { text-align: right; }
 .path-trunc { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cell-2row { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .cell-2row > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.table-scroll { overflow-x: auto; }
+.sessions-scroll {
+  --sessions-header-height: 27px;
+  --sessions-row-height: 40px;
+  max-height: calc(var(--sessions-header-height) + (var(--sessions-row-height) * 10));
+  overflow-y: auto;
+}
+.sessions-scroll table.t-sessions thead th { position: sticky; top: 0; z-index: 1; }
+.sessions-scroll table.t-sessions tbody tr { height: var(--sessions-row-height); }
 .owners-list { display: flex; flex-direction: column; gap: 6px; }
 .ownr { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .ownr > * { min-width: 0; }
@@ -804,7 +813,7 @@ function renderSessions(snap, now) {
     }
     return `<tr><td title="${esc(title)}">${primary}</td><td>${pills.join(' ')}</td><td>${kindCell}</td><td class="mono" title="${esc(s.last_seen_at)}">${esc(fmtAge(s.last_seen_at, now))}</td></tr>`;
   }).join('');
-  $('sessions-body').innerHTML = `<table class="t-sessions"><thead><tr><th>session_id</th><th>units</th><th>held lease</th><th>last seen</th></tr></thead><tbody>${rows}</tbody></table>`;
+  $('sessions-body').innerHTML = `<div class="table-scroll sessions-scroll"><table class="t-sessions"><thead><tr><th>session_id</th><th>units</th><th>held lease</th><th>last seen</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderLeases(snap, now) {
