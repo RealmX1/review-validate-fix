@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ DEPLOY_LOG_REL = Path("state") / "deployments"
 DEPLOY_HISTORY_FILE = "deployments.jsonl"
 DEPLOY_LATEST_FILE = "latest-deployment.json"
 DEPLOY_LOG_VERSION = 1
+DEPLOY_STAMP_RE = re.compile(r"\s+\[deployed [^\]]+\]$")
 LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
     "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
     "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
@@ -122,6 +124,63 @@ def git_metadata() -> dict[str, Any]:
         "status_short": status_short,
         "dirty": bool(status_short),
     }
+
+
+def deploy_version_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    head = metadata.get("head")
+    source_head = head if isinstance(head, str) and head.strip() else None
+    short_head = source_head[:12] if source_head else "unknown"
+    dirty = bool(metadata.get("dirty"))
+    heading_label = f"{short_head}-dirty" if dirty else short_head
+    return {
+        "source_head": source_head,
+        "source_short_head": short_head,
+        "dirty": dirty,
+        "heading_label": heading_label,
+    }
+
+
+def stamp_skill_heading_text(text: str, heading_label: str) -> str:
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    for index, line in enumerate(lines):
+        newline = ""
+        content = line
+        if content.endswith("\r\n"):
+            newline = "\r\n"
+            content = content[:-2]
+        elif content.endswith("\n"):
+            newline = "\n"
+            content = content[:-1]
+        if not content.startswith("# "):
+            continue
+        base = DEPLOY_STAMP_RE.sub("", content)
+        lines[index] = f"{base} [deployed {heading_label}]{newline}"
+        return "".join(lines)
+    return text
+
+
+def stamp_skill_heading(path: Path, heading_label: str) -> bool:
+    text = path.read_text(encoding="utf-8")
+    stamped = stamp_skill_heading_text(text, heading_label)
+    if stamped == text:
+        return False
+    path.write_text(stamped, encoding="utf-8")
+    return True
+
+
+def stamp_deployed_skill_headings(plugin_roots: list[Path], deploy_version: dict[str, Any]) -> list[Path]:
+    heading_label = str(deploy_version.get("heading_label") or "unknown")
+    stamped: list[Path] = []
+    for root in plugin_roots:
+        skills_dir = root / "skills"
+        if not skills_dir.is_dir():
+            continue
+        for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+            if stamp_skill_heading(skill_md, heading_label):
+                stamped.append(skill_md)
+    return stamped
 
 
 def read_json_object(path: Path) -> dict[str, Any] | None:
@@ -257,6 +316,8 @@ def build_deploy_log_entry(
     *,
     dst: Path,
     plugin_cache: Path,
+    source_metadata: dict[str, Any],
+    deploy_version: dict[str, Any],
     configure_stop_hook_enabled: bool,
     configure_user_prompt_submit_hook_enabled: bool,
     fork_mode: str,
@@ -274,7 +335,8 @@ def build_deploy_log_entry(
             "directory_name": PLUGIN_DIR_NAME,
             "version": plugin_version(),
         },
-        "source": git_metadata(),
+        "source": source_metadata,
+        "deploy_version": deploy_version,
         "runtime_hashes": {
             "plugin": deployment_file_digest(dst),
             "cache": deployment_file_digest(plugin_cache),
@@ -890,9 +952,16 @@ def main() -> int:
         removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
         removed_legacy_plugin_cache = remove_legacy_plugin_cache()
+        source_metadata = git_metadata()
+        deploy_version = deploy_version_from_metadata(source_metadata)
+        stamped_skill_paths = stamp_deployed_skill_headings([dst, plugin_cache], deploy_version)
         installed.append(f"plugin: {dst}")
         installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
+        installed.append(
+            "deploy version stamp: "
+            f"{deploy_version['heading_label']} ({len(stamped_skill_paths)} SKILL.md files)"
+        )
         if removed_legacy_skill:
             installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
         if removed_legacy_plugin_cache:
@@ -936,6 +1005,8 @@ def main() -> int:
             build_deploy_log_entry(
                 dst=dst,
                 plugin_cache=plugin_cache,
+                source_metadata=source_metadata,
+                deploy_version=deploy_version,
                 configure_stop_hook_enabled=args.configure_stop_hook,
                 configure_user_prompt_submit_hook_enabled=args.configure_user_prompt_submit_hook,
                 fork_mode=args.fork_mode,

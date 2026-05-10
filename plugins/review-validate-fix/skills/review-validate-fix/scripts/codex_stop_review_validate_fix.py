@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, log_root, normalize_rvf_backend, rvf_state_fields, start_run
+from rvf_logging import (
+    RunLedger,
+    log_root,
+    normalize_rvf_backend,
+    rvf_state_fields,
+    skill_deploy_metadata,
+    start_run,
+)
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
@@ -735,6 +742,16 @@ def parent_origin_summary_fields(
     }
 
 
+def plugin_deploy_prompt_block() -> str:
+    metadata = skill_deploy_metadata(SKILL_DIR)
+    deploy_label = metadata.get("deploy_label") or "unknown"
+    skill_heading = metadata.get("skill_heading") or "<unknown>"
+    return (
+        f"RVF_PLUGIN_DEPLOY: {deploy_label}\n"
+        f"RVF_PLUGIN_SKILL_HEADING: {skill_heading}\n"
+    )
+
+
 def add_parent_origin_to_rvf_fork_prompt(
     prompt: str,
     *,
@@ -1133,6 +1150,7 @@ def fork_review_validate_fix_prompt(
     return (
         "$review-validate-fix\n\n"
         f"{RVF_FORK_MARKER}\n"
+        f"{plugin_deploy_prompt_block()}"
         f"RVF_PARENT_SESSION_ID: {parent_session_id}\n"
         f"RVF_PARENT_CWD: {cwd_line}\n"
         f"RVF_TARGET_REPO: {repo}\n\n"
@@ -1279,6 +1297,7 @@ def write_dispatch_prep_file(
         "origin_branch": git_branch_name(origin_repo),
         "origin_transcript_path": str(parent_thread_path) if parent_thread_path is not None else None,
         "origin_metadata_path": origin_metadata_path,
+        "plugin_deploy": skill_deploy_metadata(SKILL_DIR),
         "target_flow": target_flow,
         "target_worktree": target_worktree,
         "target_kanban_task_id": target_kanban_task_id,
@@ -1434,6 +1453,7 @@ def kanban_followup_review_validate_fix_prompt(
     return (
         "$review-validate-fix\n\n"
         f"{KANBAN_FOLLOWUP_MARKER}\n"
+        f"{plugin_deploy_prompt_block()}"
         f"RVF_RUN_ID: {ledger.run_id}\n"
         f"RVF_TARGET_REPO: {target_repo}\n"
         f"RVF_CURRENT_TASK_ID: {task_id}\n"
@@ -2084,6 +2104,7 @@ def cline_kanban_task_prompt(
         "$review-validate-fix\n\n"
         f"{RVF_FORK_MARKER}\n"
         f"{CLINE_KANBAN_TASK_MARKER}\n"
+        f"{plugin_deploy_prompt_block()}"
         "RVF_TARGET_REPO: .\n"
         f"RVF_PARENT_REPO: {cwd}\n"
         f"RVF_PARENT_CWD: {cwd}\n"

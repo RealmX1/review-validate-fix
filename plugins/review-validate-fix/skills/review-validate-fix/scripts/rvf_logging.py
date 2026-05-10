@@ -75,7 +75,11 @@ PRESERVED_SUMMARY_KEYS = {
     "rvf_dispatch_target_flow",
     "rvf_dispatch_target_worktree",
     "rvf_dispatch_target_kanban_task_id",
+    "rvf_plugin_deploy",
+    "rvf_plugin_skill_heading",
+    "plugin_deploy",
 }
+DEPLOY_STAMP_RE = re.compile(r"\[deployed (?P<label>[^\]]+)\]")
 RVF_STATE_PHASES = (
     "prepare",
     "review",
@@ -133,6 +137,29 @@ def compact_timestamp() -> str:
 def safe_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
     return token.strip("-")[:80] or "rvf"
+
+
+def skill_deploy_metadata(skill_dir: Path | None = None) -> dict[str, Any]:
+    resolved_skill_dir = skill_dir or SKILL_DIR
+    skill_md = resolved_skill_dir / "SKILL.md"
+    heading: str | None = None
+    deploy_label: str | None = None
+    try:
+        for line in skill_md.read_text(encoding="utf-8").splitlines():
+            if line.startswith("# "):
+                heading = line.strip()
+                match = DEPLOY_STAMP_RE.search(heading)
+                if match:
+                    deploy_label = match.group("label")
+                break
+    except OSError:
+        pass
+    return {
+        "deploy_label": deploy_label,
+        "skill_heading": heading,
+        "skill_md": str(skill_md),
+        "skill_dir": str(resolved_skill_dir),
+    }
 
 
 def normalize_rvf_backend(value: str | None) -> str | None:
@@ -465,6 +492,10 @@ class RunLedger:
             "artifacts_dir": str(self.artifacts_dir),
         }
         payload.update(fields)
+        plugin_deploy = skill_deploy_metadata(SKILL_DIR)
+        payload.setdefault("plugin_deploy", plugin_deploy)
+        payload.setdefault("rvf_plugin_deploy", plugin_deploy.get("deploy_label"))
+        payload.setdefault("rvf_plugin_skill_heading", plugin_deploy.get("skill_heading"))
         previous = _read_json_object(self.summary_path)
         for key in PRESERVED_SUMMARY_KEYS:
             if key not in payload or payload.get(key) is None:

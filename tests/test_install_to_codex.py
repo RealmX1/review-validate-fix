@@ -77,6 +77,37 @@ def rvf_user_prompt_hooks(data: dict[str, object]) -> list[dict[str, object]]:
     return hooks
 
 
+def first_h1(path: Path) -> str:
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("# "):
+            return line
+    raise AssertionError(f"missing H1: {path}")
+
+
+def deployed_heading_label(module) -> str:
+    return module.deploy_version_from_metadata(module.git_metadata())["heading_label"]
+
+
+def assert_deployed_skill_stamps(module, plugin_root: Path, heading_label: str) -> None:
+    skill_files = sorted((plugin_root / "skills").glob("*/SKILL.md"))
+    assert skill_files
+    for skill_md in skill_files:
+        assert first_h1(skill_md).endswith(f" [deployed {heading_label}]")
+
+
+def test_stamp_skill_heading_text_is_idempotent(tmp_path: Path) -> None:
+    del tmp_path
+    module = load_installer_module()
+    source = "---\nname: demo\n---\n\n# Demo Skill\n\nBody\n"
+
+    stamped = module.stamp_skill_heading_text(source, "abc123")
+    assert "# Demo Skill [deployed abc123]\n" in stamped
+    assert stamped.startswith("---\nname: demo\n---\n\n")
+    assert module.stamp_skill_heading_text(stamped, "def456") == (
+        "---\nname: demo\n---\n\n# Demo Skill [deployed def456]\n\nBody\n"
+    )
+
+
 def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> None:
     module = load_installer_module()
     hooks_path = tmp_path / ".codex" / "hooks.json"
@@ -915,7 +946,14 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
     assert not (plugin_skill / "scripts" / "install_to_codex.py").exists()
     assert not (cache_skill / "scripts" / "install_to_codex.py").exists()
-    assert (cache_skill / "SKILL.md").read_text(encoding="utf-8") == (
+    heading_label = deployed_heading_label(module)
+    assert_deployed_skill_stamps(module, home / "plugins" / "review-validate-fix", heading_label)
+    assert_deployed_skill_stamps(
+        module,
+        home / ".codex" / "plugins" / "cache" / "local-codex-plugins" / "rvf" / module.plugin_version(),
+        heading_label,
+    )
+    assert "[deployed " not in (
         module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert (cache_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
@@ -1017,6 +1055,12 @@ def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
     assert payload["plugin"]["name"] == "rvf"
     assert payload["plugin"]["version"] == module.plugin_version()
     assert payload["source"]["repo"] == str(module.ROOT)
+    assert payload["deploy_version"]["heading_label"] == first_h1(plugin_skill / "SKILL.md").rsplit(
+        "[deployed ", 1
+    )[1].rstrip("]")
+    assert first_h1(cache_skill / "SKILL.md").endswith(
+        f" [deployed {payload['deploy_version']['heading_label']}]"
+    )
     assert payload["runtime_hashes"]["plugin"]["value"]
     assert payload["runtime_hashes"]["cache"]["value"]
     assert Path(payload["destinations"]["plugin_skill"]) == plugin_skill.resolve()
@@ -1060,6 +1104,7 @@ def test_main_can_configure_user_prompt_submit_hook(tmp_path: Path) -> None:
 
 def main() -> int:
     tests = [
+        test_stamp_skill_heading_text_is_idempotent,
         test_configure_stop_hook_deduplicates_existing_rvf_hooks,
         test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks,
         test_configure_stop_hook_adds_dispatcher_when_missing,

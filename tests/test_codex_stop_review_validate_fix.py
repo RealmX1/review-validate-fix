@@ -265,6 +265,33 @@ def load_workspace_snapshot_module():
     return module
 
 
+def test_plugin_deploy_metadata_is_in_prompt_and_summary(tmp_path: Path) -> None:
+    module = load_hook_module()
+    logging_module = sys.modules["rvf_logging"]
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Review Validate Fix [deployed abc123def456]\n\nBody\n",
+        encoding="utf-8",
+    )
+    original_hook_skill_dir = module.SKILL_DIR
+    original_logging_skill_dir = logging_module.SKILL_DIR
+    try:
+        module.SKILL_DIR = skill_dir
+        logging_module.SKILL_DIR = skill_dir
+        prompt_block = module.plugin_deploy_prompt_block()
+        assert "RVF_PLUGIN_DEPLOY: abc123def456\n" in prompt_block
+        assert "RVF_PLUGIN_SKILL_HEADING: # Review Validate Fix [deployed abc123def456]\n" in prompt_block
+
+        ledger = module.start_run(component="stop-hook", run_dir=tmp_path / "run")
+        summary = ledger.summary(status="completed", reason_code="test")
+        assert summary["rvf_plugin_deploy"] == "abc123def456"
+        assert summary["plugin_deploy"]["skill_heading"] == "# Review Validate Fix [deployed abc123def456]"
+    finally:
+        module.SKILL_DIR = original_hook_skill_dir
+        logging_module.SKILL_DIR = original_logging_skill_dir
+
+
 def test_cline_kanban_worktree_mode_rejects_main_env(tmp_path: Path) -> None:
     module = load_hook_module()
     original = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE")
@@ -5530,6 +5557,7 @@ def main() -> int:
         raise SystemExit("--shard-index must be in [0, shard-count)")
 
     tests = [
+        test_plugin_deploy_metadata_is_in_prompt_and_summary,
         test_normalize_backend_from_env,
         test_dispatch_flow_helpers_lock_route_and_fallback_contract,
         test_parent_conversation_origin_prefers_app_server_chat_name,
