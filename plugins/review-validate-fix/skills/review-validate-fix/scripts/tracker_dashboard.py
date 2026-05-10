@@ -568,9 +568,10 @@ table.t-units th:nth-child(3), table.t-units td:nth-child(3) { width: 180px; }
 table.t-units th:nth-child(4), table.t-units td:nth-child(4) { width: 110px; }
 table.t-units th:nth-child(5), table.t-units td:nth-child(5) { width: 90px; }
 table.t-units th:nth-child(6), table.t-units td:nth-child(6) { width: 90px; }
-table.t-units th:nth-child(7), table.t-units td:nth-child(7) { width: 22%; }
+table.t-units th:nth-child(7), table.t-units td:nth-child(7) { width: 105px; }
 table.t-units th:nth-child(8), table.t-units td:nth-child(8) { width: 22%; }
-table.t-units th:nth-child(9), table.t-units td:nth-child(9) { width: 90px; }
+table.t-units th:nth-child(9), table.t-units td:nth-child(9) { width: 120px; }
+table.t-units th:nth-child(10), table.t-units td:nth-child(10) { width: 90px; }
 table.t-units td { white-space: normal; vertical-align: top; }
 table.t-units td:nth-child(1), table.t-units td:nth-child(2) { white-space: nowrap; }
 
@@ -623,6 +624,7 @@ table.t-events th:nth-child(3), table.t-events td:nth-child(3) { width: auto; }
 <script>
 const POLL_MS = __POLL_MS__;
 const REDRAW_MS = 1000;
+const SELECTION_RENDER_GRACE_MS = 60 * 1000;
 const $ = (id) => document.getElementById(id);
 let frozen = false;
 let serverFrozen = false;
@@ -630,6 +632,7 @@ let lastSnapshot = null;
 let lastFetchedAt = null;
 let lastError = null;
 let frozenNow = null;
+let selectionRenderDeferredSince = null;
 function readStoredSupersededMode() {
   try { return localStorage.getItem('rvf-tracker-superseded-mode') || 'time'; }
   catch (_) { return 'time'; }
@@ -1135,7 +1138,13 @@ function redraw() {
       $('last-update').textContent = ago <= 0 ? 'fetched just now' : ('fetched ' + ago + 's ago');
     }
   }
-  if (hasUserSelection()) return;
+  if (hasUserSelection()) {
+    if (selectionRenderDeferredSince == null) selectionRenderDeferredSince = Date.now();
+    if (Date.now() - selectionRenderDeferredSince < SELECTION_RENDER_GRACE_MS) return;
+    selectionRenderDeferredSince = null;
+  } else {
+    selectionRenderDeferredSince = null;
+  }
   renderAll(lastSnapshot);
 }
 $('freeze-btn').addEventListener('click', () => {

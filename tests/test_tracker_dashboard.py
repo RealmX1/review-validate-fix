@@ -119,6 +119,8 @@ def test_render_shell_embeds_repo_metadata(tmp_path: Path) -> None:
     assert "my-repo-key" in html
     assert "/abs/path/to/repo" in html
     assert "POLL_MS = 3000" in html
+    assert "SELECTION_RENDER_GRACE_MS = 60 * 1000" in html
+    assert "selectionRenderDeferredSince" in html
     assert "freeze-btn" in html
     assert "download-btn" in html
     assert "superseded-mode" in html
@@ -127,6 +129,9 @@ def test_render_shell_embeds_repo_metadata(tmp_path: Path) -> None:
     assert 'data-mode="hidden"' in html
     assert 'data-mode="expanded"' in html
     assert "/api/snapshot" in html
+    assert "table.t-units th:nth-child(7), table.t-units td:nth-child(7) { width: 105px; }" in html
+    assert "table.t-units th:nth-child(10), table.t-units td:nth-child(10) { width: 90px; }" in html
+    assert "table.t-units th:nth-child(7), table.t-units td:nth-child(7) { width: 22%; }" not in html
 
 
 def test_cli_snapshot_json_writes_file(tmp_path: Path) -> None:
