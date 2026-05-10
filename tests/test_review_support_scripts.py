@@ -1498,7 +1498,9 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
     )
 
 
-def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp_path: Path) -> None:
+def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
+    tmp_path: Path,
+) -> None:
     module = load_rvf_logging_module()
     installed_skill = tmp_path / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     installed_skill.mkdir(parents=True)
@@ -1515,12 +1517,33 @@ def test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(tmp_path:
         / "skills"
         / "review-validate-fix"
     )
+    dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
 
     original = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
     os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
     try:
         assert module.default_log_root_for_skill_dir(cline_skill) == installed_skill / "state"
-        dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
+        assert module.default_log_root_for_skill_dir(dev_skill) == installed_skill / "state"
+        assert (
+            module.default_log_root_for_skill_dir(installed_skill) == installed_skill / "state"
+        )
+    finally:
+        if original is None:
+            os.environ.pop("CODEX_RVF_INSTALLED_SKILL_DIR", None)
+        else:
+            os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = original
+
+
+def test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
+    tmp_path: Path,
+) -> None:
+    module = load_rvf_logging_module()
+    installed_skill = tmp_path / "home" / "plugins" / "missing" / "skills" / "review-validate-fix"
+    dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
+
+    original = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
+    try:
         assert module.default_log_root_for_skill_dir(dev_skill) == dev_skill / "state"
     finally:
         if original is None:
@@ -6975,9 +6998,15 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_logging_cline_worktree_defaults_to_installed_plugin_state",
-            lambda: test_rvf_logging_cline_worktree_defaults_to_installed_plugin_state(
-                root / "cline-worktree-log-root"
+            "rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state",
+            lambda: test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
+                root / "non-canonical-log-root"
+            ),
+        ),
+        (
+            "rvf_logging_falls_back_to_skill_dir_state_when_install_missing",
+            lambda: test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
+                root / "skill-dir-fallback-state"
             ),
         ),
         (

@@ -187,6 +187,29 @@ def _opened_marker_path(root: Path, handoff_path: Path) -> Path:
     return root / "handoff-opened" / f"{_handoff_path_digest(handoff_path)}.json"
 
 
+def _kanban_context_for_handoff(handoff_path: Path) -> dict[str, Any] | None:
+    origin_path = handoff_path.parent / "origin.json"
+    if not origin_path.is_file():
+        return None
+    try:
+        data = json.loads(origin_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("source_kind") != "cline-kanban-task":
+        return None
+    task_id = data.get("kanban_task_id")
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return None
+    context: dict[str, Any] = {"kanban_task_id": task_id.strip()}
+    for key in ("kanban_attempt_id", "kanban_task_title", "kanban_task_title_source"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            context[key] = value.strip()
+    return context
+
+
 def _write_json_marker(path: Path, payload: dict[str, Any]) -> tuple[bool, dict[str, str] | None]:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,11 +250,14 @@ def _record_manual_open(path: Path, open_result: dict[str, Any]) -> dict[str, An
     if open_result.get("opened") is not True:
         return {"marker_written": False, "reason": "not_opened"}
     marker_path = _opened_marker_path(marker_root, path)
-    marker_payload = {
-        "source": "manual_open",
+    kanban_context = _kanban_context_for_handoff(path)
+    marker_payload: dict[str, Any] = {
+        "source": "kanban_followup" if kanban_context else "manual_open",
         "handoff_path": str(path),
         "open_result": open_result,
     }
+    if kanban_context:
+        marker_payload["kanban"] = kanban_context
     marker_written, marker_error = _write_json_marker(marker_path, marker_payload)
     return {
         "marker_path": str(marker_path),
@@ -334,12 +360,16 @@ def handoff_completion_payload(
         if marker_error is not None:
             ledger._diagnose("handoff_marker", OSError(marker_error["error"]))
         if open_result.get("opened") is True:
+            kanban_context = _kanban_context_for_handoff(resolved)
+            opened_payload: dict[str, Any] = {
+                "source": "kanban_followup" if kanban_context else "handoff_advisory",
+                **marker_payload,
+            }
+            if kanban_context:
+                opened_payload["kanban"] = kanban_context
             opened_written, opened_error = _write_json_marker(
                 opened_marker_path,
-                {
-                    "source": "handoff_advisory",
-                    **marker_payload,
-                },
+                opened_payload,
             )
             if not opened_written and marker_error is None:
                 marker_error = opened_error

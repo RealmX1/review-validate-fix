@@ -374,6 +374,12 @@ def build_packet(
         "",
         "All paths below are relative to the repository root. This packet is the review input; reviewers should use the provided scope-of-work file as the scope anchor and use this packet as evidence.",
         "",
+        "## Runtime environment notes",
+        "",
+        "- Reviewer/validator subagents may run inside RVF task worktrees where `.venv` is a symlink to the parent worktree. If `.venv/bin/python` cannot import the modules under review, prefer `python3 -m <module>` against the system interpreter or create a temporary venv in the task worktree; do NOT depend on the parent worktree's `.venv`.",
+        "- For Python tests, prefer `python3 -m pytest <target>`. Direct `pytest` may be missing on PATH inside a fresh task worktree.",
+        "- Do not invoke validation under `~/Documents/GitHub/...` checkout state; runtime state is canonical at `~/plugins/review-validate-fix/skills/review-validate-fix/state/`.",
+        "",
     ]
 
     if primary_files or background_files:

@@ -5063,6 +5063,138 @@ def test_manual_handoff_open_suppresses_followup_advisory_open(tmp_path: Path) -
     assert opener_log.read_text(encoding="utf-8").splitlines() == [str(handoff.resolve())]
 
 
+def test_manual_open_marker_records_kanban_followup_when_origin_is_kanban(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    artifacts = state / "runs" / "rvf-kanban" / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    handoff = artifacts / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    (artifacts / "origin.json").write_text(
+        json.dumps(
+            {
+                "source_kind": "cline-kanban-task",
+                "kanban_task_id": "task-77",
+                "kanban_attempt_id": "attempt-9",
+                "kanban_task_title": "kanban followup demo",
+            }
+        ),
+        encoding="utf-8",
+    )
+    opener_log = tmp_path / "opened.txt"
+    opener = tmp_path / "open_handoff.py"
+    opener.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
+        encoding="utf-8",
+    )
+    opener.chmod(0o755)
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_"):
+            env.pop(name, None)
+    env["CODEX_RVF_IDE_OPEN_CMD"] = str(opener)
+
+    completed = subprocess.run(
+        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    payload = parse_json(completed.stdout)
+    assert payload["opened"] is True
+    marker_path = Path(payload["manual_open_marker"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["source"] == "kanban_followup"
+    assert marker["kanban"]["kanban_task_id"] == "task-77"
+    assert marker["kanban"]["kanban_attempt_id"] == "attempt-9"
+    assert marker["kanban"]["kanban_task_title"] == "kanban followup demo"
+
+
+def test_manual_open_marker_keeps_manual_open_when_origin_missing(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    artifacts = state / "runs" / "rvf-plain" / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    handoff = artifacts / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    opener_log = tmp_path / "opened.txt"
+    opener = tmp_path / "open_handoff.py"
+    opener.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
+        encoding="utf-8",
+    )
+    opener.chmod(0o755)
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_"):
+            env.pop(name, None)
+    env["CODEX_RVF_IDE_OPEN_CMD"] = str(opener)
+
+    completed = subprocess.run(
+        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    payload = parse_json(completed.stdout)
+    marker_path = Path(payload["manual_open_marker"]["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["source"] == "manual_open"
+    assert "kanban" not in marker
+
+
+def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    (run_dir / "artifacts" / "origin.json").write_text(
+        json.dumps(
+            {
+                "source_kind": "cline-kanban-task",
+                "kanban_task_id": "task-88",
+                "kanban_attempt_id": "attempt-2",
+                "kanban_task_title": "advisory kanban demo",
+            }
+        ),
+        encoding="utf-8",
+    )
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    opener_marker = tmp_path / "opened.txt"
+    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        )[0]
+    )
+    summary = summary_from_payload(payload)
+    assert summary["handoff_open_result"]["opened"] is True
+    opened_marker_path = Path(summary["opened_marker_path"])
+    marker = json.loads(opened_marker_path.read_text(encoding="utf-8"))
+    assert marker["source"] == "kanban_followup"
+    assert marker["kanban"]["kanban_task_id"] == "task-88"
+    assert marker["kanban"]["kanban_attempt_id"] == "attempt-2"
+
+
 def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
@@ -5656,6 +5788,9 @@ def main() -> int:
         test_stop_event_log_path_is_not_used_as_fork_rollout_path,
         test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
+        test_manual_open_marker_records_kanban_followup_when_origin_is_kanban,
+        test_manual_open_marker_keeps_manual_open_when_origin_missing,
+        test_handoff_advisory_marker_records_kanban_followup,
         test_handoff_advisory_surfaces_finalize_record_errors,
         test_handoff_advisory_surfaces_manual_rvf_analyze_trigger,
         test_handoff_advisory_injects_rvf_analyze_in_kanban_task,

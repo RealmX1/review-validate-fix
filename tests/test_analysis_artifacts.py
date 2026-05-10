@@ -514,6 +514,7 @@ def test_scaffold_summary_md_has_all_required_headers(tmp_path: Path) -> None:
         "## Reviewer 发现",
         "## 工作区改动",
         "## 待 LLM 补全的叙事",
+        "## Follow-up 建议",
     ):
         assert header in text, f"missing header: {header}"
     assert "<!-- TODO(rvf-analyze):" in text
@@ -605,6 +606,75 @@ def test_scaffold_causality_json_empty_when_sources_missing(tmp_path: Path) -> N
     assert payload["issues"] == []
     assert payload["patches"] == []
     assert payload["run_id"] is None
+    assert "causality_ledger_missing" not in payload["diagnostics"]
+
+
+def test_scaffold_causality_json_clean_path_does_not_emit_ledger_missing(
+    tmp_path: Path,
+) -> None:
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    out_path = run_dir / "artifacts" / "analysis" / "causality.json"
+    mod.scaffold_causality_json(inputs, stats, out_path)
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert "causality_ledger_missing" not in payload["diagnostics"]
+
+
+def test_scaffold_summary_classifies_changed_paths_against_scope_contract(
+    tmp_path: Path,
+) -> None:
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)
+    inputs_dir = run_dir / "artifacts" / "inputs"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = run_dir / "artifacts" / "review-packet.metadata.json"
+    metadata_path.write_text(
+        json.dumps({"session_owned_paths": ["session/b.py"]}),
+        encoding="utf-8",
+    )
+    (inputs_dir / "scope.contract.json").write_text(
+        json.dumps(
+            {
+                "fix_allowlist": ["allowed/a.py"],
+                "primary_files": ["allowed/a.py"],
+                "review_packet_metadata_path": str(metadata_path),
+                "canonical_scope": {
+                    "fix_allowlist": ["allowed/a.py"],
+                    "primary_files": ["allowed/a.py"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    diff_path = run_dir / "artifacts" / "workspace-diff.json"
+    diff_path.write_text(
+        json.dumps(
+            {
+                "head_before": "abc",
+                "head_after": "abc",
+                "changed_paths": [
+                    "allowed/a.py",
+                    "session/b.py",
+                    "background/c.py",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    out_path = run_dir / "artifacts" / "analysis" / "summary.md"
+    mod.scaffold_summary_md(inputs, stats, out_path)
+    text = out_path.read_text(encoding="utf-8")
+    assert "changed_paths × scope contract:" in text
+    assert "`in_fix_allowlist` (1):" in text
+    assert "`session_owned` (1):" in text
+    assert "`background_wip` (1):" in text
+    assert "    - `allowed/a.py`" in text
+    assert "    - `session/b.py`" in text
+    assert "    - `background/c.py`" in text
 
 
 # --------------------------------------------------------------------------- #

@@ -236,14 +236,6 @@ def new_event_id() -> str:
     return f"evt-{secrets.token_hex(8)}"
 
 
-def _is_cline_worktree_path(path: Path) -> bool:
-    parts = path.expanduser().parts
-    return any(
-        parts[index] == ".cline" and index + 1 < len(parts) and parts[index + 1] == "worktrees"
-        for index in range(len(parts))
-    )
-
-
 def installed_plugin_skill_dir() -> Path:
     configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
     if configured and configured.strip():
@@ -254,8 +246,7 @@ def installed_plugin_skill_dir() -> Path:
 def default_log_root_for_skill_dir(skill_dir: Path) -> Path:
     installed_skill_dir = installed_plugin_skill_dir()
     if (
-        _is_cline_worktree_path(skill_dir)
-        and installed_skill_dir != skill_dir
+        installed_skill_dir != skill_dir
         and (installed_skill_dir / "SKILL.md").is_file()
     ):
         return installed_skill_dir / "state"

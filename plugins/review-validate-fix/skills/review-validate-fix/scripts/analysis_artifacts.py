@@ -133,6 +133,55 @@ def _repo_from_summary(summary_path: Path | None) -> Path | None:
     return Path(value).expanduser().resolve()
 
 
+def _classify_changed_paths(inputs: AnalysisInputs) -> dict[str, list[str]] | None:
+    diff_payload = _safe_load_json(inputs.workspace_diff_json)
+    if not isinstance(diff_payload, dict):
+        return None
+    changed = diff_payload.get("changed_paths")
+    if not isinstance(changed, list):
+        return None
+    paths = [item for item in changed if isinstance(item, str) and item.strip()]
+    if not paths:
+        return None
+
+    contract_path = inputs.run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    contract_payload = _safe_load_json(contract_path)
+    if not isinstance(contract_payload, dict):
+        return None
+
+    def _string_set(value: Any) -> set[str]:
+        if not isinstance(value, list):
+            return set()
+        return {item for item in value if isinstance(item, str) and item.strip()}
+
+    fix_allowlist = _string_set(contract_payload.get("fix_allowlist"))
+    session_owned = _string_set(contract_payload.get("primary_files"))
+    canonical = contract_payload.get("canonical_scope")
+    if isinstance(canonical, dict):
+        fix_allowlist |= _string_set(canonical.get("fix_allowlist"))
+        session_owned |= _string_set(canonical.get("primary_files"))
+    metadata_path = contract_payload.get("review_packet_metadata_path")
+    if isinstance(metadata_path, str) and metadata_path.strip():
+        metadata_payload = _safe_load_json(Path(metadata_path))
+        if isinstance(metadata_payload, dict):
+            session_owned |= _string_set(metadata_payload.get("session_owned_paths"))
+            session_owned |= _string_set(metadata_payload.get("session_owned_dirty_paths"))
+
+    buckets: dict[str, list[str]] = {
+        "in_fix_allowlist": [],
+        "session_owned": [],
+        "background_wip": [],
+    }
+    for path in paths:
+        if path in fix_allowlist:
+            buckets["in_fix_allowlist"].append(path)
+        elif path in session_owned:
+            buckets["session_owned"].append(path)
+        else:
+            buckets["background_wip"].append(path)
+    return buckets
+
+
 def _rel_or_abs(path: Path | None, run_dir: Path) -> str:
     """运行目录内的路径以相对路径展示，否则保留绝对路径。
 
@@ -564,8 +613,20 @@ def scaffold_summary_md(
     lines.append(f"- head_before: `{stats.workspace_head_before or '-'}`")
     lines.append(f"- head_after: `{stats.workspace_head_after or '-'}`")
     lines.append(f"- changed_paths: `{stats.workspace_changed_path_count}`")
+
+    classification = _classify_changed_paths(inputs)
+    if classification is not None:
+        lines.append("- changed_paths × scope contract:")
+        for label in ("in_fix_allowlist", "session_owned", "background_wip"):
+            members = classification.get(label, [])
+            if not members:
+                lines.append(f"  - `{label}`: -")
+                continue
+            lines.append(f"  - `{label}` ({len(members)}):")
+            for path in members:
+                lines.append(f"    - `{path}`")
     lines.append("")
-    lines.append(_todo("总结 RVF 真正改了哪些文件 / 哪些是新增 vs 修改 vs 删除，并指出与 issue 的对应关系"))
+    lines.append(_todo("总结 RVF 真正改了哪些文件 / 哪些是新增 vs 修改 vs 删除，并指出与 issue 的对应关系；workspace-diff 包含背景 WIP 时以 `in_fix_allowlist` 为本轮真实修复范围"))
     lines.append("")
 
     # 待 LLM 补全的叙事
@@ -573,7 +634,14 @@ def scaffold_summary_md(
     lines.append("")
     lines.append(_todo("在这里给出整体故事线：哪些 issue 真的转化成了 patch、哪些没有、为什么；本次 RVF 是否值得"))
     lines.append("")
-    lines.append(_todo("如果发现可改进的 prompt / 工具行为，列出 follow-up 建议"))
+
+    # Follow-up 建议：固定章节，便于 grep 收集（即使本次没有也写「无」）
+    lines.append("## Follow-up 建议")
+    lines.append("")
+    lines.append(
+        "<!-- TODO(rvf-analyze): 列出本次暴露的 prompt/工具/契约改进；无则写「无」。"
+        " 维持本节标题不变，方便 `grep '^## Follow-up'` 机器化收集。 -->"
+    )
     lines.append("")
 
     text = "\n".join(lines).rstrip() + "\n"
@@ -725,8 +793,6 @@ def scaffold_causality_json(
             import diff_tracker  # noqa: WPS433
 
             ledger = diff_tracker.rvf_causality_for_run(repo=repo, run_id=stats.run_id)
-            if ledger.get("status") != "found":
-                diagnostics.append("causality_ledger_missing")
         except Exception as exc:  # noqa: BLE001 - scaffold must not fail analysis.
             diagnostics.append(f"causality_ledger_read_failed: {type(exc).__name__}: {exc}")
             ledger = None

@@ -46,6 +46,7 @@ pass_type: validate_fix
 - 子代理只接收 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
 - 子代理还应接收同一份 `scope.contract.json` 路径、`scope_hash` 和 `fix_allowlist`；验证包之外的 dirty changes 视为并行工作，除非主会话明确扩大 scope，否则不处理、不清理。
 - 派发子代理前，主会话应把 canonical issue 写成 JSON artifact，运行 `rvf_fix_issue.py upsert --repo "$RVF_REPO" --run-dir "$RVF_RUN_DIR" --issue-file <issue.json>`，再运行 `rvf_fix_attempt.py prepare --repo "$RVF_REPO" --run-dir "$RVF_RUN_DIR" --issue-id <issue_id>`。子代理 prompt 必须包含 `attempt_id`、attempt worktree path、`RVF_RUN_DIR` 和原始主 repo path；子代理 cwd 应切到 attempt worktree。
+- 主会话自己执行 validate/fix 的允许例外（见上文）也必须先运行 `rvf_fix_issue.py upsert` 把 canonical issue 写入 ledger，再用 `rvf_fix_attempt.py prepare/start/stop/apply` 走完同样的 attempt 链路。主 agent 自审 finding 不能跳过 ledger upsert：causality 与 `$rvf-analyze` scaffold 都依赖 ledger；遗漏会让 analyze 阶段没有 finding 承载结构，并把所有 patch 重新归因到 trajectory fallback。
 - 子代理返回后，主会话用 `rvf_fix_attempt.py apply --attempt-id <attempt_id> --target-repo "$RVF_REPO"` 将该 attempt 的 `fix.patch` 合回主 RVF worktree；若返回 `merge_conflict`，记录为该 attempt 的未合并状态，不得手工搬运后伪装为已归因 patch。
 - 子代理可以用 `RVF_*_REQUEST` 请求缺失标准、测量、受控子任务或上下文，但 request 本身不是 verdict，不得进入最终结果。
 
