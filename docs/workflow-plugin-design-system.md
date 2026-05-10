@@ -178,11 +178,11 @@ observed -> diagnosed -> fix-proposed -> fixed -> validated -> deployed -> obser
 }
 ```
 
-### 7. Diagnostic Scripts Beat Runtime Archaeology
+### 7. Diagnostic Surfaces Beat Runtime Archaeology
 
 维护者不应通过阅读 runtime code 才能判断一次 workflow 为什么这么走。
 
-RVF 已经形成这个方向：
+RVF 已经形成这个方向，但这个原则不应被理解为“每个复杂 `if` 都要单独维护一个诊断脚本”。诊断面的价值不是创造第二事实源，而是提供一个可重复、可测试的解释器：它读取 canonical artifacts，然后说明一次 gate 为什么做出某个决定。
 
 - `diagnose_stop_hook_scope.py` 用 summary 诊断 scope gate。
 - `diagnose_codex_fork.py` 用 dry-run 写 requests。
@@ -190,14 +190,15 @@ RVF 已经形成这个方向：
 
 推广规则：
 
-- 每个复杂 gate 都必须有 diagnostic script。
+- high-impact、难复现、输入来自多个 runtime artifact 的 gate，应该有 deterministic diagnostic surface；script 是默认形态，但不是唯一形态。
 - diagnostic 输入应是 summary / ledger / artifact path，而不是要求用户重放完整环境。
+- diagnostic 应尽量复用 gate 的 parser / helper；如果复制 runtime decision tree，它就会变成维护负担。
 - diagnostic 输出同时给人读 summary 和机器读 JSON。
-- flow analyzer 报修或改进 signal 时，直接引用 diagnostic output。
+- flow analyzer 报修或改进 signal 时，可以引用 diagnostic output，而不是重新解析散 prose。
 
-### 8. Lease, Scope, Ownership Are Separate Concepts
+### 8. Scope, Lease, Ownership Are Control-Plane Concepts
 
-RVF tracker 的最大架构收益之一，是把 session ownership、reviewer lease、scope allocation、observed unit 和 review completion 拆开。
+RVF tracker 的核心收益不是成为实时协作平台，也不是替代 transcript / trajectory。它的持久价值在于作为 repo-level control plane，把 session ownership、reviewer lease、scope allocation、observed unit 和 review completion 拆开，并把 review/fix 范围从 prompt 推断收敛到 scope contract。
 
 历史经验：
 
@@ -214,6 +215,8 @@ RVF tracker 的最大架构收益之一，是把 session ownership、reviewer le
 - scope 表示“本次 workflow 允许处理的边界”。
 - completion 表示“某个 protocol 已完成并被记录”。
 - tombstone / superseded 表示“观测对象生命周期变化”，不能混作 completion。
+- diff tracker 不应扩张成 trajectory source；transcript / trajectory 对“agent 做了什么”更完整。
+- 在 per-task worktree 默认路径下，tracker 应聚焦 scope allocation、duplicate suppression、review-state persistence 和 merge/conflict signaling。
 
 ### 9. Dispatch Is A Data Plane, Prompt Is A Control Surface
 
@@ -250,16 +253,6 @@ RVF dispatch overhaul 的核心经验是：prompt 可以携带 token，但真正
 - deploy 后检查 installed file、installed compile、installed deploy log、installed stamp。
 - deploy log 必须关联 source git state、runtime hash、hook option、run summary 和 analysis artifact paths。
 - source canonical 文件不带 deploy stamp；安装产物才带。
-
-### 11. Backward Compatibility Is Temporary Work
-
-项目尚未分发时，兼容旧路径是开发期脚手架，不应长期进入主合同。
-
-RVF 已经多次通过删除 legacy references 降低复杂度。后续原则：
-
-- 兼容代码必须有明确移除条件。
-- 兼容路径验证完成后，在 commit 前清理或记录到 gitignored `dev_backward_compatibility/`。
-- 文档应标注兼容层，不把兼容行为写成新设计的默认行为。
 
 ## Commit-Derived Lessons
 
@@ -342,6 +335,10 @@ deploy log 已经存在，但还没有把后续 observation 回写成 confidence
 - deploy 后注册需要观察的问题。
 - Stop hook、dashboard、diagnostic script、local deploy post-check 都可以 append observation。
 - 默认 3 次成功 retire，失败转 regressed。
+
+## Maintenance Notes
+
+Backward compatibility work is a project hygiene concern, not a core workflow insight. Because RVF is not distributed yet, temporary compatibility paths should remain explicit, short-lived, and removed or archived before commit when they are only development scaffolding.
 
 ## Recommended Implementation Slices
 
