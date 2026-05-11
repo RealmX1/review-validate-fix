@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rvf_bootstrap_confirm
 import rvf_prep_file
-from rvf_logging import start_run
+from rvf_logging import log_root, start_run
 from session_label import text_from_message_payload
 
 
@@ -235,12 +236,81 @@ def _existing_shared_workflow_state(payload: dict[str, Any]) -> dict[str, Any] |
     return None
 
 
+def _bootstrap_confirm_state_root(state_root: str | Path | None) -> Path:
+    if state_root is not None:
+        return Path(state_root).expanduser()
+    return log_root()
+
+
+def _handle_bootstrap_confirmation(
+    event: dict[str, Any],
+    prompt: str | None,
+    *,
+    state_root: Path,
+) -> dict[str, Any] | None:
+    session_id = event.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    marker = rvf_bootstrap_confirm.read_marker(state_root, session_id.strip())
+    if marker is None:
+        rvf_bootstrap_confirm.sweep_expired(state_root)
+        return None
+    if rvf_bootstrap_confirm.marker_is_expired(marker):
+        rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
+        rvf_bootstrap_confirm.sweep_expired(state_root)
+        return {
+            "continue": True,
+            "status": "bootstrap_confirm_expired",
+            "workflow_started": False,
+            "systemMessage": (
+                "review-validate-fix: 上一次 bootstrap 确认 marker 已过期，已自动清理。"
+                "若仍需触发 RVF，请重新调用。"
+            ),
+        }
+    if rvf_bootstrap_confirm.is_yes_literal(prompt):
+        rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
+        try:
+            import codex_stop_review_validate_fix as stop_hook  # noqa: PLC0415
+
+            task_payload = stop_hook.resume_dispatch_from_confirmation_marker(marker)
+            return {
+                "continue": True,
+                "status": "bootstrap_confirm_resumed",
+                "workflow_started": True,
+                "systemMessage": (
+                    "review-validate-fix: 已收到 yes 确认，bootstrap dispatch 已恢复。"
+                ),
+                "resume_payload": task_payload,
+            }
+        except Exception as exc:
+            return {
+                "continue": True,
+                "status": "bootstrap_confirm_resume_failed",
+                "workflow_started": False,
+                "systemMessage": (
+                    "review-validate-fix: bootstrap dispatch 恢复失败："
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+    rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
+    return {
+        "continue": True,
+        "status": "bootstrap_confirm_cancelled",
+        "workflow_started": False,
+        "systemMessage": (
+            "review-validate-fix: 未严格匹配 yes/Yes/YES，bootstrap dispatch 已取消。"
+            "本次用户 prompt 将按正常流程处理。"
+        ),
+    }
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
     prep_root: str | Path | None = None,
     now: str | None = None,
     shared_workflow_timeout_seconds: float = 60.0,
+    bootstrap_confirm_state_root: str | Path | None = None,
 ) -> dict[str, Any]:
     prompt, prompt_source = prompt_text_from_event(event)
     base_payload: dict[str, Any] = {
@@ -248,6 +318,11 @@ def inspect_user_prompt_submit(
         "workflow_started": False,
         "prompt_source": prompt_source,
     }
+    confirm_root = _bootstrap_confirm_state_root(bootstrap_confirm_state_root)
+    confirm_result = _handle_bootstrap_confirmation(event, prompt, state_root=confirm_root)
+    if confirm_result is not None:
+        confirm_result.setdefault("prompt_source", prompt_source)
+        return confirm_result
     if prompt is None:
         return {**base_payload, "status": "no_prompt"}
 
@@ -486,6 +561,11 @@ def main() -> int:
         help="Hard timeout for in-process shared prepare execution (seconds).",
     )
     parser.add_argument("--json", action="store_true", help="Emit detector result JSON. Actual hook mode stays silent.")
+    parser.add_argument(
+        "--bootstrap-confirm-state-root",
+        default=None,
+        help="Override RVF state root for bootstrap-confirmation marker lookup (tests only).",
+    )
     args = parser.parse_args()
 
     result = inspect_user_prompt_submit(
@@ -493,9 +573,17 @@ def main() -> int:
         prep_root=args.prep_root,
         now=args.now,
         shared_workflow_timeout_seconds=args.shared_workflow_timeout_seconds,
+        bootstrap_confirm_state_root=args.bootstrap_confirm_state_root,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    elif isinstance(result.get("systemMessage"), str) and result.get("systemMessage"):
+        print(
+            json.dumps(
+                {"continue": bool(result.get("continue", True)), "systemMessage": result["systemMessage"]},
+                ensure_ascii=False,
+            )
+        )
     elif "hookSpecificOutput" in result:
         # Manual same-session path needs to surface the prep file path back to
         # the main agent. The harness reads `hookSpecificOutput.additionalContext`

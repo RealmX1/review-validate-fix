@@ -60,10 +60,20 @@ from session_label import (
 )
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
+import rvf_bootstrap_confirm
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
 )
+
+
+class BootstrapConfirmationRequired(Exception):
+    """Raised when bootstrap dispatch is blocked pending user yes/Yes/YES confirmation."""
+
+    def __init__(self, decision: rvf_bootstrap_confirm.Decision, marker_path: Path):
+        self.decision = decision
+        self.marker_path = marker_path
+        super().__init__(decision.reason)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -2216,6 +2226,211 @@ def cline_kanban_client_env(ledger: RunLedger) -> dict[str, str]:
     return env
 
 
+def parent_origin_is_kanban_task(parent_origin: dict[str, Any] | None) -> bool:
+    if not isinstance(parent_origin, dict):
+        return False
+    for key in ("kanban_task_id", "cline_kanban_task_id"):
+        value = parent_origin.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def resume_dispatch_from_confirmation_marker(
+    marker_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-run the Cline Kanban dispatch flow after a user-confirmed bootstrap.
+
+    Reads the persisted dispatch context, re-loads the prep file, and calls the
+    same Cline Kanban entry point with ``skip_freeze=True`` and ``skip_size_check=True``
+    so freeze artifacts already on disk are reused and the user is not re-prompted.
+    """
+    context = marker_payload.get("dispatch_context")
+    if not isinstance(context, dict):
+        raise ValueError("confirmation marker missing dispatch_context")
+    token = marker_payload.get("token") or context.get("token")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("confirmation marker missing token")
+    lookup = rvf_prep_file.read_prep_file(token)
+    if lookup.status != "valid" or lookup.payload is None:
+        raise ValueError(f"prep file lookup failed: {lookup.status} ({lookup.error})")
+    dispatch_prep = rvf_prep_file.PrepFileRecord(
+        token=lookup.token, path=lookup.path, payload=dict(lookup.payload)
+    )
+    run_id = context.get("run_id")
+    run_dir = context.get("run_dir")
+    cwd = str(context.get("cwd") or "")
+    if not cwd:
+        raise ValueError("dispatch_context missing cwd")
+    ledger = start_run(
+        "stop-hook-resume",
+        repo=cwd,
+        cwd=cwd,
+        run_id=run_id if isinstance(run_id, str) else None,
+        run_dir=Path(run_dir) if isinstance(run_dir, str) and run_dir else None,
+    )
+    parent_origin = context.get("parent_origin") if isinstance(context.get("parent_origin"), dict) else {}
+    parent_thread_path_raw = context.get("parent_thread_path")
+    parent_thread_path = (
+        Path(parent_thread_path_raw)
+        if isinstance(parent_thread_path_raw, str) and parent_thread_path_raw
+        else None
+    )
+    worktree_mode = str(context.get("worktree_mode") or DEFAULT_CLINE_KANBAN_WORKTREE_MODE)
+    task_payload = start_cline_kanban_task(
+        cwd=cwd,
+        prompt_path=str(context.get("prompt_path") or ""),
+        dispatch_prep=dispatch_prep,
+        parent_session_id=str(context.get("parent_session_id") or ""),
+        parent_thread_path=parent_thread_path,
+        parent_origin=parent_origin,
+        ledger=ledger,
+        task_title=str(context.get("task_title") or "RVF"),
+        model=None,
+        reasoning_effort=None,
+        base_ref=str(context.get("base_ref") or ""),
+        worktree_mode=worktree_mode,
+        skip_freeze=True,
+        skip_size_check=True,
+    )
+    target_flow = dispatch_prep_target_flow("cline-kanban", cline_kanban_worktree_mode=worktree_mode)
+    update_dispatch_prep_file(
+        ledger=ledger,
+        record=dispatch_prep,
+        target_flow=target_flow,
+        target_worktree=(
+            str(task_payload.get("workspace_path"))
+            if isinstance(task_payload.get("workspace_path"), str)
+            else None
+        ),
+        target_kanban_task_id=(
+            str(task_payload.get("cline_kanban_task_id"))
+            if isinstance(task_payload.get("cline_kanban_task_id"), str)
+            else None
+        ),
+    )
+    return task_payload
+
+
+_PREP_EXPIRY_BUFFER_SECONDS = 60
+
+
+def _refresh_prep_file_expiry_for_confirm_marker(
+    *,
+    prep_path: Path,
+    marker_path: Path,
+) -> None:
+    """Bump prep file ``expires_at`` so it outlives the bootstrap-confirm marker.
+
+    Prep file TTL (default 300s) starts at dispatch prepare; the confirm marker
+    TTL (default 300s) starts later, after freeze. Without this refresh the
+    prep file expires before the marker, so a user who replies ``yes`` inside
+    the marker's TTL window can still fail resume with ``expired`` prep lookup.
+    We rewrite the prep file JSON in place with a refreshed ``expires_at``
+    derived from the marker's own ``expires_at`` + a small buffer.
+    """
+    try:
+        marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    marker_expires_at = marker_payload.get("expires_at") if isinstance(marker_payload, dict) else None
+    if not isinstance(marker_expires_at, (int, float)):
+        return
+    target_ts = float(marker_expires_at) + _PREP_EXPIRY_BUFFER_SECONDS
+    try:
+        prep_payload = json.loads(prep_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(prep_payload, dict):
+        return
+    new_expires_at = rvf_prep_file.format_timestamp(
+        datetime.fromtimestamp(target_ts, tz=timezone.utc)
+    )
+    prep_payload["expires_at"] = new_expires_at
+    try:
+        prep_path.write_text(
+            json.dumps(prep_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def maybe_block_dispatch_on_bootstrap_size(
+    *,
+    ledger: RunLedger,
+    startup_prepare: dict[str, Any],
+    dispatch_prep: rvf_prep_file.PrepFileRecord,
+    parent_session_id: str,
+    parent_thread_path: Path | None,
+    parent_origin: dict[str, Any],
+    cwd: str,
+    task_title: str,
+    base_ref: str,
+    worktree_mode: str,
+    prompt_path: str,
+) -> None:
+    metadata = startup_prepare.get("metadata") if isinstance(startup_prepare.get("metadata"), dict) else {}
+    bootstrap_payload = metadata.get("worktree_bootstrap_metadata")
+    if not isinstance(bootstrap_payload, dict):
+        return
+    exempt = parent_origin_is_kanban_task(parent_origin)
+    decision = rvf_bootstrap_confirm.compute_decision(
+        bootstrap_payload,
+        exempt_kanban_followup=exempt,
+    )
+    rvf_bootstrap_confirm.sweep_expired(state_dir())
+    if decision.exempt and decision.bootstrap_kind == "full-dirty":
+        ledger.event(
+            phase="fork",
+            event="bootstrap_confirm_exempt",
+            status="advisory",
+            reason_code="bootstrap_confirm_exempt",
+            repo=cwd,
+            cwd=cwd,
+            cline_kanban_task_id=parent_origin.get("kanban_task_id") if isinstance(parent_origin, dict) else None,
+            **decision.to_summary(),
+        )
+        return
+    if not decision.needs_confirmation:
+        return
+    dispatch_context = {
+        "cwd": cwd,
+        "prompt_path": str(prompt_path),
+        "parent_session_id": parent_session_id,
+        "parent_thread_path": str(parent_thread_path) if parent_thread_path else None,
+        "parent_origin": parent_origin,
+        "task_title": task_title,
+        "base_ref": base_ref,
+        "worktree_mode": worktree_mode,
+        "dispatch_prep_file_path": str(dispatch_prep.path),
+        "run_id": ledger.run_id,
+        "run_dir": str(ledger.run_dir),
+    }
+    marker = rvf_bootstrap_confirm.write_marker(
+        state_dir(),
+        session_id=parent_session_id or "unknown-session",
+        token=dispatch_prep.token,
+        decision=decision,
+        dispatch_context=dispatch_context,
+    )
+    _refresh_prep_file_expiry_for_confirm_marker(
+        prep_path=dispatch_prep.path,
+        marker_path=marker,
+    )
+    ledger.event(
+        phase="fork",
+        event="bootstrap_confirm_required",
+        status="blocked",
+        reason_code="bootstrap_confirm_required",
+        repo=cwd,
+        cwd=cwd,
+        paths={"confirmation_marker": str(marker)},
+        **decision.to_summary(),
+    )
+    raise BootstrapConfirmationRequired(decision, marker)
+
+
 def start_cline_kanban_task(
     *,
     cwd: str,
@@ -2230,22 +2445,55 @@ def start_cline_kanban_task(
     reasoning_effort: str | None,
     base_ref: str,
     worktree_mode: str,
+    skip_freeze: bool = False,
+    skip_size_check: bool = False,
 ) -> dict[str, Any]:
     del model, reasoning_effort
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
     target_flow = dispatch_prep_target_flow("cline-kanban", cline_kanban_worktree_mode=worktree_mode)
-    startup_prepare = freeze_cline_kanban_dispatch_artifacts(
-        cwd=cwd,
-        parent_session_id=parent_session_id,
-        parent_thread_path=parent_thread_path,
-        prompt_path=prompt_path,
-        ledger=ledger,
-        dispatch_prep=dispatch_prep,
-        target_flow=target_flow,
-    )
-    updated_prep = startup_prepare.get("dispatch_prep_record")
-    if isinstance(updated_prep, rvf_prep_file.PrepFileRecord):
-        dispatch_prep = updated_prep
+    if skip_freeze:
+        existing_state = dispatch_prep.payload.get("rvf_run") if isinstance(dispatch_prep.payload, dict) else None
+        existing_shared = existing_state.get("shared_workflow_state") if isinstance(existing_state, dict) else None
+        run_dir_str = ledger.run_dir if ledger.run_dir is not None else None
+        metadata_path_guess = Path(run_dir_str) / "artifacts" / "cline-kanban-dispatch-prepare.json" if run_dir_str else None
+        metadata: dict[str, Any] = {}
+        if metadata_path_guess and metadata_path_guess.exists():
+            try:
+                metadata = json.loads(metadata_path_guess.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+        if not metadata and isinstance(existing_shared, dict):
+            artifacts = existing_shared.get("artifacts")
+            if isinstance(artifacts, dict):
+                metadata = {**existing_shared, **artifacts}
+        startup_prepare = {"metadata": metadata, "metadata_path": str(metadata_path_guess) if metadata_path_guess else None}
+    else:
+        startup_prepare = freeze_cline_kanban_dispatch_artifacts(
+            cwd=cwd,
+            parent_session_id=parent_session_id,
+            parent_thread_path=parent_thread_path,
+            prompt_path=prompt_path,
+            ledger=ledger,
+            dispatch_prep=dispatch_prep,
+            target_flow=target_flow,
+        )
+        updated_prep = startup_prepare.get("dispatch_prep_record")
+        if isinstance(updated_prep, rvf_prep_file.PrepFileRecord):
+            dispatch_prep = updated_prep
+    if not skip_size_check:
+        maybe_block_dispatch_on_bootstrap_size(
+            ledger=ledger,
+            startup_prepare=startup_prepare,
+            dispatch_prep=dispatch_prep,
+            parent_session_id=parent_session_id,
+            parent_thread_path=parent_thread_path,
+            parent_origin=parent_origin,
+            cwd=cwd,
+            task_title=task_title,
+            base_ref=base_ref,
+            worktree_mode=worktree_mode,
+            prompt_path=prompt_path,
+        )
     task_prompt = cline_kanban_task_prompt(
         cwd=cwd,
         prompt_path=prompt_path,
@@ -2931,6 +3179,19 @@ def run_codex_fork(
                         **dispatch_prep_summary_fields(dispatch_prep, target_flow=target_flow),
                     }
                 )
+            except BootstrapConfirmationRequired as confirm_exc:
+                system_message = rvf_bootstrap_confirm.format_system_message(
+                    confirm_exc.decision,
+                    marker_path=confirm_exc.marker_path,
+                )
+                result.update(
+                    {
+                        "status": "bootstrap-confirm-required",
+                        "bootstrap_confirm_marker_path": str(confirm_exc.marker_path),
+                        "bootstrap_confirm_decision": confirm_exc.decision.to_summary(),
+                        "system_message": system_message,
+                    }
+                )
             except Exception as exc:
                 result.update(
                     {
@@ -3055,6 +3316,8 @@ def run_codex_fork(
         reason_code = "cline_kanban_unconfigured"
     elif status == "cline-kanban-unavailable":
         reason_code = "cline_kanban_unavailable"
+    elif status == "bootstrap-confirm-required":
+        reason_code = "bootstrap_confirm_required"
 
     event_paths: dict[str, Any] = {}
     if prompt_path:
@@ -3102,6 +3365,19 @@ def run_codex_fork(
         ledger.event(
             phase="fork",
             event="prepared",
+            status=str(status),
+            reason_code=reason_code,
+            parent_thread_id=parent_session_id,
+            paths=event_paths,
+            mode=mode,
+        )
+    elif status == "bootstrap-confirm-required":
+        marker_path_str = result.get("bootstrap_confirm_marker_path")
+        if isinstance(marker_path_str, str) and marker_path_str:
+            event_paths["confirmation_marker"] = marker_path_str
+        ledger.event(
+            phase="fork",
+            event="bootstrap_confirm_blocked",
             status=str(status),
             reason_code=reason_code,
             parent_thread_id=parent_session_id,
@@ -3157,6 +3433,12 @@ def run_codex_fork(
     elif status == "cline-kanban-unavailable":
         detail = None
         message = str(result.get("error") or "Cline Kanban is unavailable; task was not started.")
+    elif status == "bootstrap-confirm-required":
+        detail = None
+        message = str(
+            result.get("system_message")
+            or "review-validate-fix: bootstrap dirty 量超阈，已暂停 dispatch；请回复 yes/Yes/YES 继续或其他内容取消。"
+        )
     elif status in {"desktop-control-unavailable-report", "desktop-control-unavailable-fail"}:
         detail = None
         report_reason = result.get("report_reason")
@@ -3187,6 +3469,14 @@ def run_codex_fork(
                     backend_raw=backend_raw,
                 )
             )
+    if status == "bootstrap-confirm-required":
+        ledger.summary(
+            status=str(status),
+            reason_code=reason_code,
+            message=message,
+            **summary_fields,
+        )
+        return {"continue": True, "systemMessage": message}
     return ledger.hook_payload(
         status=str(status),
         reason_code=reason_code,

@@ -438,7 +438,43 @@ def copy_bootstrap_path(source: Path, target: Path) -> None:
             shutil.rmtree(target)
         shutil.copytree(source, target)
     else:
-        shutil.copy2(source, target)
+        shutil.copy2(source, target, follow_symlinks=False)
+
+
+def _ignore_prefix_matches(path: str, exclude_prefixes: list[str]) -> bool:
+    normalized = path.strip().replace("\\", "/").lstrip("/")
+    for raw in exclude_prefixes:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        prefix = raw.strip().replace("\\", "/").lstrip("/")
+        if prefix.endswith("/"):
+            if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
+                return True
+        else:
+            if normalized == prefix or normalized.startswith(prefix + "/"):
+                return True
+    return False
+
+
+def _path_bootstrap_bytes(repo: Path, rel_path: str) -> int:
+    target = repo / rel_path
+    try:
+        if target.is_symlink():
+            return 0
+        if target.is_file():
+            return target.stat().st_size
+        if target.is_dir():
+            total = 0
+            for child in target.rglob("*"):
+                if child.is_file() and not child.is_symlink():
+                    try:
+                        total += child.stat().st_size
+                    except OSError:
+                        continue
+            return total
+    except OSError:
+        return 0
+    return 0
 
 
 def build_worktree_bootstrap(
@@ -448,13 +484,39 @@ def build_worktree_bootstrap(
     packet_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     if packet_metadata.get("tracker_scope_present"):
-        owned_dirty = normalized_scope_list(metadata_list(packet_metadata.get("tracker_scope_paths")))
+        session_owned_dirty = normalized_scope_list(metadata_list(packet_metadata.get("tracker_scope_paths")))
     else:
-        owned_dirty = [
-            path
-            for path in packet_metadata.get("session_owned_dirty_paths", [])
-            if isinstance(path, str) and path.strip()
-        ]
+        session_owned_dirty = normalized_scope_list(
+            metadata_list(packet_metadata.get("session_owned_dirty_paths"))
+        )
+    unattributed_dirty = normalized_scope_list(
+        metadata_list(packet_metadata.get("unattributed_dirty_paths"))
+    )
+    exclude_prefixes = [
+        prefix
+        for prefix in metadata_list(packet_metadata.get("excluded_path_prefixes"))
+        if isinstance(prefix, str) and prefix.strip()
+    ]
+
+    filtered_session_owned: list[str] = []
+    filtered_unattributed: list[str] = []
+    ignored_paths: list[str] = []
+    for path in session_owned_dirty:
+        if _ignore_prefix_matches(path, exclude_prefixes):
+            ignored_paths.append(path)
+        else:
+            filtered_session_owned.append(path)
+    for path in unattributed_dirty:
+        if _ignore_prefix_matches(path, exclude_prefixes):
+            ignored_paths.append(path)
+            continue
+        if path in filtered_session_owned:
+            continue
+        filtered_unattributed.append(path)
+
+    owned_dirty = normalized_scope_list(filtered_session_owned + filtered_unattributed)
+    bootstrap_kind = "full-dirty" if filtered_unattributed else "session-owned-only"
+
     patch_path = artifact_dir / "worktree-bootstrap.patch"
     files_dir = artifact_dir / "worktree-bootstrap-files"
     bootstrap_path = artifact_dir / "worktree-bootstrap.json"
@@ -479,6 +541,9 @@ def build_worktree_bootstrap(
         copy_bootstrap_path(source, stored_path)
         untracked_files.append({"path": rel_path, "stored_path": str(stored_path)})
 
+    unattributed_bytes = sum(_path_bootstrap_bytes(repo, path) for path in filtered_unattributed)
+    total_bootstrap_bytes = sum(_path_bootstrap_bytes(repo, path) for path in owned_dirty)
+
     head = str(run_git(repo, ["rev-parse", "HEAD"])).strip()
     payload = {
         "repo": str(repo),
@@ -486,8 +551,15 @@ def build_worktree_bootstrap(
         "patch_file": str(patch_path),
         "files_dir": str(files_dir),
         "owned_dirty_paths": owned_dirty,
+        "session_owned_dirty_paths": filtered_session_owned,
+        "unattributed_dirty_paths": filtered_unattributed,
+        "ignored_dirty_paths": sorted(set(ignored_paths)),
         "tracked_paths": tracked_paths,
         "untracked_files": untracked_files,
+        "bootstrap_kind": bootstrap_kind,
+        "unattributed_path_count": len(filtered_unattributed),
+        "unattributed_bytes": unattributed_bytes,
+        "total_bootstrap_bytes": total_bootstrap_bytes,
         "apply_helper": str(SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"),
     }
     bootstrap_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

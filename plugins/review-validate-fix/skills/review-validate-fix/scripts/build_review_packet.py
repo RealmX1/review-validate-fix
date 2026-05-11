@@ -379,6 +379,7 @@ def build_packet(
         "- Reviewer/validator subagents may run inside RVF task worktrees where `.venv` is a symlink to the parent worktree. If `.venv/bin/python` cannot import the modules under review, prefer `python3 -m <module>` against the system interpreter or create a temporary venv in the task worktree; do NOT depend on the parent worktree's `.venv`.",
         "- For Python tests, prefer `python3 -m pytest <target>`. Direct `pytest` may be missing on PATH inside a fresh task worktree.",
         "- Do not invoke validation under `~/Documents/GitHub/...` checkout state; runtime state is canonical at `~/plugins/review-validate-fix/skills/review-validate-fix/state/`.",
+        "- 本 review-packet 反映 RVF dispatch 触发瞬间 origin worktree 的 dirty snapshot；origin 之后的继续编辑不会回流到本 task worktree。`unattributed dirty paths` 列于下方仅作上下文，**不属于本轮 review 范围**。",
         "",
     ]
 

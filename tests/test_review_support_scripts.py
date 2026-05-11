@@ -5170,12 +5170,76 @@ def test_prepare_review_run_writes_worktree_bootstrap(tmp_path: Path) -> None:
     payload = json.loads(completed.stdout)
     bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
     assert bootstrap["tracked_paths"] == ["tracked.txt"]
-    assert [item["path"] for item in bootstrap["untracked_files"]] == ["owned.txt"]
-    assert "background.txt" not in json.dumps(bootstrap)
+    # Full-dirty bootstrap: both session-owned and unattributed untracked files
+    # are now copied; background.txt is part of the bootstrap snapshot too.
+    assert sorted(item["path"] for item in bootstrap["untracked_files"]) == [
+        "background.txt",
+        "owned.txt",
+    ]
+    assert bootstrap["bootstrap_kind"] == "full-dirty"
+    assert bootstrap["session_owned_dirty_paths"] == ["owned.txt", "tracked.txt"]
+    assert bootstrap["unattributed_dirty_paths"] == ["background.txt"]
+    assert bootstrap["unattributed_path_count"] == 1
     assert "tracked.txt" in Path(payload["worktree_bootstrap_patch"]).read_text(encoding="utf-8")
     clean = tmp_path / "clean"
     run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp_path)
     run(["git", "apply", "--check", str(payload["worktree_bootstrap_patch"])], cwd=clean)
+
+
+def test_prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
+    (repo / "tracked.txt").write_text("base\n\n", encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "blank context"], cwd=repo)
+    (repo / "tracked.txt").write_text("changed\n\n", encoding="utf-8")
+    (repo / "dist").mkdir()
+    (repo / "dist" / "build.js").write_text("compiled\n", encoding="utf-8")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "lib.js").write_text("vendor\n", encoding="utf-8")
+    (repo / "owned.txt").write_text("real owned\n", encoding="utf-8")
+    (repo / ".review-validate-fix-ignore").write_text("dist/\nnode_modules/\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "repo": str(repo),
+                "owned_paths": ["tracked.txt", "owned.txt"],
+                "owned_dirty_paths": ["tracked.txt", "owned.txt"],
+                "unattributed_dirty_paths": ["dist/build.js", "node_modules/lib.js"],
+                "confidence": "high",
+            }
+        ),
+        encoding="utf-8",
+    )
+    context = tmp_path / "context.md"
+    context.write_text("scope\n", encoding="utf-8")
+    completed = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--session-manifest",
+            str(manifest),
+        ]
+    )
+    payload = json.loads(completed.stdout)
+    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
+    paths_in_bootstrap = set(bootstrap["owned_dirty_paths"])
+    assert "dist/build.js" not in paths_in_bootstrap
+    assert "node_modules/lib.js" not in paths_in_bootstrap
+    assert "owned.txt" in paths_in_bootstrap
+    assert "tracked.txt" in paths_in_bootstrap
+    assert bootstrap["bootstrap_kind"] == "session-owned-only"
+    # Both ignored paths land in ignored_dirty_paths for transparency.
+    ignored = set(bootstrap.get("ignored_dirty_paths") or [])
+    assert "dist/build.js" in ignored
+    assert "node_modules/lib.js" in ignored
 
 
 def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
