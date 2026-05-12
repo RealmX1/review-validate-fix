@@ -1,0 +1,4 @@
+interface:
+  display_name: "RVF Tracker Dashboard Session"
+  short_description: "Refresh the RVF tracker dashboard in place"
+  default_prompt: "Use $rvf-tracker-dashboard-session to update the local RVF tracker dashboard while keeping the same port."
