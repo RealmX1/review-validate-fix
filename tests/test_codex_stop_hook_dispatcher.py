@@ -213,6 +213,67 @@ def write_plan_then_normal_transcript(path: Path) -> Path:
     return path
 
 
+def write_codex_goal_transcript(
+    path: Path,
+    *,
+    status: str | None = "active",
+    originator: str | None = "Codex Desktop",
+    cli_version: str | None = "0.130.0",
+    subagent: bool = False,
+    continuation: bool = True,
+    user_mentions_continuation: bool = False,
+) -> Path:
+    meta: dict[str, object] = {"id": "codex-goal-session", "cwd": str(path.parent)}
+    if originator is not None:
+        meta["originator"] = originator
+    if cli_version is not None:
+        meta["cli_version"] = cli_version
+    if subagent:
+        meta["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": "parent-session"}}}
+
+    records = [{"type": "session_meta", "payload": meta}]
+    if continuation:
+        records.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "Continue working toward the active thread goal.\n\nObjective: test",
+                },
+            }
+        )
+    if user_mentions_continuation:
+        records.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Please test literal Continue working toward the active thread goal text.",
+                },
+            }
+        )
+    if status is not None:
+        records.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "thread_id": "codex-goal-session",
+                    "turn_id": "turn",
+                    "goal": {
+                        "threadId": "codex-goal-session",
+                        "objective": "test",
+                        "status": status,
+                        "tokensUsed": 0,
+                    },
+                },
+            }
+        )
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    return path
+
+
 def write_failing_installed_hook(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1114,6 +1175,143 @@ def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) 
     summary = latest_summary(state)
     assert summary["status"] == "skipped"
     assert summary["reason_code"] == "plan_operation"
+
+
+def test_codex_goal_mode_skips_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    write_fake_dev_scripts(repo, marker)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="active")
+    state = tmp_path / "state"
+
+    completed = invoke_result(
+        {
+            "cwd": str(repo),
+            "session_id": "codex-goal-session",
+            "turn_id": "turn",
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+            "last_assistant_message": "Implementation complete.",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["continue"] is True
+    assert "reason=codex_goal_mode" in payload["systemMessage"]
+    assert completed.stderr == ""
+    assert not (marker / "sync-ran").exists()
+    assert not (marker / "install-ran").exists()
+    assert not (marker / "hook-input.json").exists()
+    summary = latest_summary(state)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "codex_goal_mode"
+    assert summary["goal_status"] == "active"
+    assert summary["temporary_fix"] is True
+
+
+def test_non_codex_goal_like_transcript_runs_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_codex_goal_transcript(
+        tmp_path / "session.jsonl",
+        originator="Claude Code",
+        cli_version=None,
+        status="active",
+    )
+    event = {
+        "cwd": str(repo),
+        "session_id": "not-codex-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+    }
+
+    stdout = invoke(event, dev_repo=None, hook=hook, state=tmp_path / "state")
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_codex_goal_mode_subagent_runs_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="active", subagent=True)
+    event = {
+        "cwd": str(repo),
+        "session_id": "codex-goal-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+    }
+
+    stdout = invoke(event, dev_repo=None, hook=hook, state=tmp_path / "state")
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_codex_user_text_goal_marker_without_status_runs_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_codex_goal_transcript(
+        tmp_path / "session.jsonl",
+        status=None,
+        continuation=False,
+        user_mentions_continuation=True,
+    )
+    event = {
+        "cwd": str(repo),
+        "session_id": "codex-goal-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+    }
+
+    stdout = invoke(event, dev_repo=None, hook=hook, state=tmp_path / "state")
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
+
+
+def test_codex_completed_goal_runs_installed_hook(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker)
+    transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="complete")
+    event = {
+        "cwd": str(repo),
+        "session_id": "codex-goal-session",
+        "turn_id": "turn",
+        "hook_event_name": "Stop",
+        "transcript_path": str(transcript),
+    }
+
+    stdout = invoke(event, dev_repo=None, hook=hook, state=tmp_path / "state")
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
+    assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
 def test_literal_plan_markers_in_completion_do_not_skip_hook(tmp_path: Path) -> None:
@@ -2221,6 +2419,11 @@ def main() -> int:
         test_post_analyze_quiet_marker_consumed_by_dispatcher_when_artifacts_ready,
         test_post_analyze_quiet_marker_failopen_in_dispatcher_when_artifacts_missing,
         test_plan_operation_skips_before_dev_sync_or_installed_hook,
+        test_codex_goal_mode_skips_before_dev_sync_or_installed_hook,
+        test_non_codex_goal_like_transcript_runs_installed_hook,
+        test_codex_goal_mode_subagent_runs_installed_hook,
+        test_codex_user_text_goal_marker_without_status_runs_installed_hook,
+        test_codex_completed_goal_runs_installed_hook,
         test_literal_plan_markers_in_completion_do_not_skip_hook,
         test_prior_plan_output_does_not_suppress_future_turn,
         test_session_hook_off_still_syncs_before_running_installed_hook,

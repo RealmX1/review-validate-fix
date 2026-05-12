@@ -818,6 +818,13 @@ def event_marks_plan_operation(event: dict[str, Any]) -> bool:
     return text_marks_plan_operation(latest_assistant_message_from_event(event))
 
 
+def detect_codex_goal_mode_context(event: dict[str, Any]) -> dict[str, Any] | None:
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    from codex_stop_review_validate_fix import codex_goal_mode_context_from_event
+
+    return codex_goal_mode_context_from_event(event)
+
+
 def is_session_hook_control_event(event: dict[str, Any]) -> bool:
     latest_user = latest_user_message_from_event(event)
     if not latest_user:
@@ -1257,6 +1264,24 @@ def main() -> int:
             reason_code="suppressed",
             message="CODEX_RVF suppress env requested; skipped dispatcher and installed hook",
             detail="检测到 suppress 环境变量，已跳过 RVF Stop hook。",
+        )
+    codex_goal_mode = detect_codex_goal_mode_context(event)
+    if codex_goal_mode is not None:
+        ledger.event(
+            phase="dev-sync",
+            event="codex_goal_mode_skipped",
+            status="skipped",
+            reason_code="codex_goal_mode",
+            message="Codex main session is in /goal mode; skipping dispatcher and installed hook",
+            **codex_goal_mode,
+        )
+        return emit_terminal_payload(
+            ledger,
+            status="skipped",
+            reason_code="codex_goal_mode",
+            message="Codex main session is in /goal mode; skipped dispatcher and installed hook",
+            detail="检测到 Codex /goal mode，临时跳过 RVF Stop hook。",
+            **codex_goal_mode,
         )
     if event_marks_plan_operation(event):
         ledger.event(

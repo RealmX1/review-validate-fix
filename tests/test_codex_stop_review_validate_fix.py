@@ -109,6 +109,69 @@ def write_assistant_handoff_transcript(path: Path, handoff: Path) -> Path:
     return path
 
 
+def write_codex_goal_transcript(
+    path: Path,
+    repo: Path,
+    *,
+    status: str | None = "active",
+    session_id: str = "codex-goal-session",
+    originator: str | None = "Codex Desktop",
+    cli_version: str | None = "0.130.0",
+    subagent: bool = False,
+    continuation: bool = True,
+    user_mentions_continuation: bool = False,
+) -> Path:
+    meta: dict[str, object] = {"id": session_id, "cwd": str(repo)}
+    if originator is not None:
+        meta["originator"] = originator
+    if cli_version is not None:
+        meta["cli_version"] = cli_version
+    if subagent:
+        meta["source"] = {"subagent": {"thread_spawn": {"parent_thread_id": "parent-session"}}}
+
+    records = [{"type": "session_meta", "payload": meta}]
+    if continuation:
+        records.append(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "Continue working toward the active thread goal.\n\nObjective: test",
+                },
+            }
+        )
+    if user_mentions_continuation:
+        records.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Please test literal Continue working toward the active thread goal text.",
+                },
+            }
+        )
+    if status is not None:
+        records.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "thread_id": session_id,
+                    "turn_id": "turn",
+                    "goal": {
+                        "threadId": session_id,
+                        "objective": "test",
+                        "status": status,
+                        "tokensUsed": 0,
+                    },
+                },
+            }
+        )
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    return path
+
+
 def write_fake_opener(path: Path, marker: Path, *, fail: bool = False) -> Path:
     path.write_text(
         "#!/usr/bin/env python3\n"
@@ -890,6 +953,78 @@ def test_stop_hook_active_skips(tmp_path: Path) -> None:
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
     payload = assert_skip_reason(stdout, "stop_hook_active=true")
     assert "detail=Codex 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
+
+
+def test_codex_goal_mode_skips_direct_stop_hook(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", dirty, status="active")
+    state = tmp_path / "state"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "codex-goal-session",
+            "turn_id": "turn",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=codex_goal_mode" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["status"] == "skipped"
+    assert summary["reason_code"] == "codex_goal_mode"
+    assert summary["goal_status"] == "active"
+    assert summary["temporary_fix"] is True
+    assert latest_summary(state)["reason_code"] == "codex_goal_mode"
+
+
+def test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook(
+    tmp_path: Path,
+) -> None:
+    clean = init_repo(tmp_path / "clean", dirty=False)
+    transcript = write_codex_goal_transcript(
+        tmp_path / "session.jsonl",
+        clean,
+        status=None,
+        continuation=False,
+        user_mentions_continuation=True,
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(clean),
+            "session_id": "codex-goal-session",
+            "turn_id": "turn",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+        }
+    )
+
+    payload = assert_skip_reason(stdout, "clean")
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "clean_repo"
+
+
+def test_codex_completed_goal_does_not_skip_direct_stop_hook(tmp_path: Path) -> None:
+    clean = init_repo(tmp_path / "clean", dirty=False)
+    transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", clean, status="complete")
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(clean),
+            "session_id": "codex-goal-session",
+            "turn_id": "turn",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+        }
+    )
+
+    payload = assert_skip_reason(stdout, "clean")
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "clean_repo"
 
 
 def test_env_suppression_skips(tmp_path: Path) -> None:
@@ -5886,6 +6021,9 @@ def main() -> int:
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
         test_diagnose_codex_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
+        test_codex_goal_mode_skips_direct_stop_hook,
+        test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook,
+        test_codex_completed_goal_does_not_skip_direct_stop_hook,
         test_env_suppression_skips,
         test_prompt_suppression_marker_skips,
         test_prior_cline_kanban_task_marker_skips_after_later_user_message,
