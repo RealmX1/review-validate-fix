@@ -29,7 +29,13 @@ from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
+    current_kanban_task_id,
     surface_rvf_analyze_advisory,
+)
+from post_analyze_quiet import (
+    clear_post_analyze_quiet_marker,
+    post_analyze_workflow_complete,
+    read_post_analyze_quiet_marker,
 )
 from session_manifest import build_manifest
 from diff_tracker import (
@@ -6082,6 +6088,38 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     error={"kind": type(exc).__name__, "message": str(exc)},
                 )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    quiet_task_id = current_kanban_task_id(event)
+    quiet_session_id = session_hook_id_from_event(event)
+    quiet_marker = read_post_analyze_quiet_marker(
+        task_id=quiet_task_id,
+        session_id=quiet_session_id,
+    )
+    if quiet_marker is not None:
+        removed_paths = clear_post_analyze_quiet_marker(
+            task_id=quiet_task_id,
+            session_id=quiet_session_id,
+        )
+        if post_analyze_workflow_complete(quiet_marker):
+            return skip_decision(
+                "上一轮 RVF + $rvf-analyze 工作流已完整结束（analysis artifacts 已就绪）；"
+                "本次 Stop 一次性跳过自动 RVF dispatch，等待显式触发再开新一轮。",
+                ledger,
+                "post_analyze_workflow_complete",
+                cwd=cwd,
+                backend="kanban-followup" if quiet_task_id else "manual",
+                consumed_post_analyze_quiet_marker=quiet_marker,
+                consumed_post_analyze_quiet_marker_paths=removed_paths,
+            )
+        ledger.event(
+            phase="dev-sync",
+            event="post_analyze_quiet_marker_failopen",
+            status="skipped",
+            reason_code="post_analyze_quiet_marker_failopen",
+            message="post-analyze quiet marker 已消费但 analyze artifacts 未就绪，fail-open 继续既有 RVF 逻辑。",
+            consumed_post_analyze_quiet_marker=quiet_marker,
+            consumed_post_analyze_quiet_marker_paths=removed_paths,
+        )
 
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
         return skip_decision(

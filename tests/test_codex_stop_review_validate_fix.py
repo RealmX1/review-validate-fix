@@ -3714,6 +3714,124 @@ def test_rvf_analyze_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> N
     assert latest["reason_code"] == "rvf_analyze_followup_trigger_turn"
 
 
+def _seed_post_analyze_quiet_marker(
+    *,
+    state: Path,
+    task_id: str,
+    armed_at: str,
+    analyze_run_dir: Path,
+    seed_artifacts: bool,
+) -> Path:
+    """直接写一份 post-analyze quiet marker 文件，模拟上一次 stop hook 注入完成。
+
+    用 safe_token 等价规则 (`safe_token` strip 非法字符后保留下来) 算文件名，
+    与 post_analyze_quiet._task_path 保持一致。
+    """
+    quiet_dir = state / "post-analyze-quiet"
+    quiet_dir.mkdir(parents=True, exist_ok=True)
+    # task_id 已是简单 ascii，safe_token 不会改写它，可以直接用。
+    marker = quiet_dir / f"task-{task_id}.json"
+    summary_md = analyze_run_dir / "artifacts" / "analysis" / "summary.md"
+    causality_json = analyze_run_dir / "artifacts" / "analysis" / "causality.json"
+    if seed_artifacts:
+        summary_md.parent.mkdir(parents=True, exist_ok=True)
+        summary_md.write_text("# seeded\n", encoding="utf-8")
+        causality_json.write_text("{}\n", encoding="utf-8")
+        # 把 mtime 推到 armed_at 之后 5 秒，确保 freshness 检查通过。
+        ts = time.time()
+        os.utime(summary_md, (ts, ts))
+        os.utime(causality_json, (ts, ts))
+    marker.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "armed_at": armed_at,
+                "armed_run_id": "rvf-prev-run",
+                "armed_handoff_path": str(analyze_run_dir / "artifacts" / "handoff.md"),
+                "analyze_run_dir": str(analyze_run_dir),
+                "analyze_summary_md": str(summary_md),
+                "analyze_causality_json": str(causality_json),
+                "kanban_task_id": task_id,
+                "kanban_attempt_id": "attempt-prev",
+                "parent_session_id": None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
+def test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    analyze_run_dir = tmp_path / "prev-run"
+    armed_at = "2026-05-12T00:00:00Z"  # 1 年前 timestamp，artifact mtime 现在写一定更新
+
+    marker_path = _seed_post_analyze_quiet_marker(
+        state=state,
+        task_id="task-T1",
+        armed_at=armed_at,
+        analyze_run_dir=analyze_run_dir,
+        seed_artifacts=True,
+    )
+    assert marker_path.exists()
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "session_id": "session-T1",
+            "last_user_message": "ok thanks, looks fine to me",
+        },
+        extra_env={"KANBAN_TASK_ID": "task-T1"},
+        state_dir=state,
+    )
+    payload = parse_json(stdout)
+    assert "reason=post_analyze_workflow_complete" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "post_analyze_workflow_complete"
+    # marker 必须在 consume 后被删除（一次性语义）。
+    assert not marker_path.exists()
+
+
+def test_post_analyze_quiet_marker_failopen_when_artifacts_missing(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    analyze_run_dir = tmp_path / "prev-run-missing"
+    armed_at = "2026-05-12T00:00:00Z"
+
+    marker_path = _seed_post_analyze_quiet_marker(
+        state=state,
+        task_id="task-T2",
+        armed_at=armed_at,
+        analyze_run_dir=analyze_run_dir,
+        seed_artifacts=False,  # 没生成 analysis artifacts，模拟用户岔开了 analyze
+    )
+    assert marker_path.exists()
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "session_id": "session-T2",
+            "last_user_message": "ok thanks, looks fine to me",
+        },
+        extra_env={"KANBAN_TASK_ID": "task-T2"},
+        state_dir=state,
+    )
+    payload = parse_json(stdout)
+    latest = latest_summary(state)
+    # fail-open: 一次性 marker 已消费，本次回到既有逻辑（不会再因 quiet marker 跳过）。
+    assert "reason=post_analyze_workflow_complete" not in payload.get("systemMessage", "")
+    assert latest["reason_code"] != "post_analyze_workflow_complete"
+    # marker 仍然必须被清理掉（一次性语义）。
+    assert not marker_path.exists()
+
+
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp_path / "repo")
@@ -5326,6 +5444,11 @@ def test_handoff_advisory_injects_rvf_analyze_in_kanban_task(tmp_path: Path) -> 
     assert call["argv"][0] == "message"
     assert "--source" in call["argv"]
     assert "rvf-analyze" in call["argv"]
+    # advisory 注入成功后必须写一份 post-analyze quiet marker，供下一次 Stop 一次性消费。
+    assert summary.get("post_analyze_quiet_marker_status") == "armed"
+    marker_path = Path(summary["post_analyze_quiet_marker_path"])
+    assert marker_path.exists()
+    assert marker_path.name.startswith("task-task-99")
 
 
 def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
@@ -5817,6 +5940,8 @@ def main() -> int:
         test_kanban_followup_mode_without_task_id_reports_without_fallback,
         test_kanban_followup_trigger_marker_skips_one_turn,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
+        test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready,
+        test_post_analyze_quiet_marker_failopen_when_artifacts_missing,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,

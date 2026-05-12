@@ -21,6 +21,143 @@ DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_TASK_CMD = "kanban task"
 RVF_ANALYZE_FOLLOWUP_MARKER = "RVF_KANBAN_ANALYZE_TRIGGER"
 
+from post_analyze_quiet import write_post_analyze_quiet_marker
+
+
+# 与 codex_stop_review_validate_fix.SESSION_PATH_KEYS 保持一致，便于 advisory 在
+# 没有显式 session_id 字段时回退到 transcript 文件解析。Inline 一份是为了避免
+# advisory 反向 import codex_stop_review_validate_fix 造成循环（主 hook 已经
+# import 本模块）。
+_SESSION_PATH_KEYS = (
+    "transcript_path",
+    "session_path",
+    "conversation_path",
+    "log_path",
+    "session_file",
+)
+
+
+def _session_id_from_transcript(path: Path) -> str | None:
+    """从 Codex 风格 jsonl 头部 session_meta 中解析 session id。
+
+    与 codex_stop_review_validate_fix.session_id_from_path 等价：最多扫描前 20
+    行，找到 ``type == "session_meta"`` 即返回 ``payload.id``。Claude Code
+    transcript 通常没有 session_meta 头，此函数会返回 None，由调用方决定后续
+    行为（fail-open）。
+
+    除 ``OSError`` 外，还会吞掉 ``UnicodeDecodeError``：dispatcher 的
+    session_manifest_failed 测试会传入 ``\\xff`` 二进制 transcript 作为
+    fixture，advisory 在 dispatcher quiet-gate 解析 session_id 时不应抛 utf-8
+    异常打断后续守护流程。
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for _ in range(20):
+                try:
+                    line = handle.readline()
+                except UnicodeDecodeError:
+                    return None
+                if not line:
+                    return None
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                if isinstance(payload, dict):
+                    value = payload.get("id")
+                    if isinstance(value, str) and value:
+                        return value
+                return None
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def parent_session_id_from_event(event: dict[str, Any]) -> str | None:
+    """从 Stop hook event 中提取 parent session id，覆盖 codex 与 claude-code 命名。
+
+    解析顺序与 codex_stop_review_validate_fix.session_hook_id_from_event 保持
+    对称：先尝试 event 字段（claude-code Stop hook 通常带 session_id；codex 各
+    种 thread/parent/conversation 别名也覆盖），再回退到 transcript 路径里的
+    ``session_meta.id``，让 advisory 写 marker 时与主 hook 读 marker 时使用同
+    一份 key，避免 key 不一致导致的 marker miss。
+    """
+    candidates = (
+        "session_id",
+        "sessionId",
+        "thread_id",
+        "threadId",
+        "parent_session_id",
+        "parent_thread_id",
+        "parentSessionId",
+        "parentThreadId",
+        "conversation_id",
+        "conversationId",
+    )
+    for key in candidates:
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # transcript fallback —— 与主 hook 的 session_id_from_event /
+    # parent_thread_id_from_event 行为一致：扫 event 中所有 session path 字段，
+    # 第一个能解析出 session_meta.id 的 transcript 文件即返回。
+    for key in _SESSION_PATH_KEYS:
+        raw = event.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            expanded = Path(raw).expanduser()
+        except (OSError, ValueError):
+            continue
+        session_id = _session_id_from_transcript(expanded)
+        if session_id:
+            return session_id
+    return None
+
+
+def _arm_post_analyze_quiet_marker_safe(
+    *,
+    event: dict[str, Any],
+    ledger: Any,
+    finalize_record: dict[str, Any] | None,
+    analysis: dict[str, str],
+    task_id: str | None,
+    attempt_id: str | None,
+) -> dict[str, Any]:
+    """写一次性 quiet marker。返回 ledger event 用 metadata；失败也不抛。"""
+    session_id = parent_session_id_from_event(event)
+    armed_run_id = getattr(ledger, "run_id", None) or "unknown"
+    handoff_path = None
+    if isinstance(finalize_record, dict):
+        candidate = finalize_record.get("handoff_path") or finalize_record.get("handoff")
+        if isinstance(candidate, str) and candidate:
+            handoff_path = candidate
+    try:
+        marker_path = write_post_analyze_quiet_marker(
+            task_id=task_id,
+            session_id=session_id,
+            armed_run_id=armed_run_id,
+            armed_handoff_path=handoff_path,
+            analyze_run_dir=analysis["run_dir"],
+            analyze_summary_md=analysis["summary_md_path"],
+            analyze_causality_json=analysis["causality_json_path"],
+            kanban_attempt_id=attempt_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — marker 失败绝不阻断 advisory 主路径。
+        return {
+            "post_analyze_quiet_marker_status": "write-failed",
+            "post_analyze_quiet_marker_error": f"{type(exc).__name__}: {exc}",
+        }
+    if marker_path is None:
+        return {"post_analyze_quiet_marker_status": "no-key-available"}
+    return {
+        "post_analyze_quiet_marker_status": "armed",
+        "post_analyze_quiet_marker_path": str(marker_path),
+    }
+
 
 def _event_or_env_text(
     event: dict[str, Any],
@@ -245,12 +382,21 @@ def surface_rvf_analyze_advisory(
             )
         except Exception as exc:  # noqa: BLE001 - advisory must not fail finalize/handoff.
             error = f"{type(exc).__name__}: {exc}"
+            marker_info = _arm_post_analyze_quiet_marker_safe(
+                event=event,
+                ledger=ledger,
+                finalize_record=finalize_record,
+                analysis=analysis,
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
             fields = {
                 **base_fields,
                 "rvf_analyze_status": "kanban-injection-failed",
                 "rvf_analyze_error": error,
                 "rvf_analyze_kanban_task_id": task_id,
                 "rvf_analyze_kanban_attempt_id": attempt_id,
+                **marker_info,
             }
             ledger.event(
                 phase="analysis",
@@ -265,6 +411,14 @@ def surface_rvf_analyze_advisory(
             _append_system_message(payload, f"rvf_analyze=manual_required; trigger={trigger}")
             return fields
 
+        marker_info = _arm_post_analyze_quiet_marker_safe(
+            event=event,
+            ledger=ledger,
+            finalize_record=finalize_record,
+            analysis=analysis,
+            task_id=message_payload.get("task_id") or task_id,
+            attempt_id=message_payload.get("attempt_id") or attempt_id,
+        )
         fields = {
             **base_fields,
             "rvf_analyze_status": "kanban-injected",
@@ -277,6 +431,7 @@ def surface_rvf_analyze_advisory(
             ),
             "rvf_analyze_followup_prompt_path": message_payload.get("prompt_path"),
             "rvf_analyze_followup_command_path": message_payload.get("command_artifact_path"),
+            **marker_info,
         }
         ledger.event(
             phase="analysis",
@@ -289,9 +444,18 @@ def surface_rvf_analyze_advisory(
         _append_system_message(payload, "rvf_analyze=kanban_injected")
         return fields
 
+    marker_info = _arm_post_analyze_quiet_marker_safe(
+        event=event,
+        ledger=ledger,
+        finalize_record=finalize_record,
+        analysis=analysis,
+        task_id=task_id,
+        attempt_id=None,
+    )
     fields = {
         **base_fields,
         "rvf_analyze_status": "manual-required",
+        **marker_info,
     }
     ledger.event(
         phase="analysis",
