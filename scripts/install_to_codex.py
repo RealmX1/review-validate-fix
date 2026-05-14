@@ -17,12 +17,13 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR_NAME = "review-validate-fix"
-PLUGIN_NAME = "rvf"
+PLUGIN_NAME = "review-validate-fix"
 PLUGIN_SRC = ROOT / "plugins" / PLUGIN_DIR_NAME
 PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
 DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
-PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
+PLUGIN_MANIFEST = ROOT / ".codex-plugin" / "plugin.json"
+PLUGIN_MANIFEST_REL = Path(".codex-plugin") / "plugin.json"
 DEPLOY_LOG_REL = Path("state") / "deployments"
 DEPLOY_HISTORY_FILE = "deployments.jsonl"
 DEPLOY_LATEST_FILE = "latest-deployment.json"
@@ -458,23 +459,6 @@ def copy_legacy_config_if_safe(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def remove_legacy_codex_skill_dir(plugin_skill_dir: Path, preserve_local_config: bool) -> Path | None:
-    legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
-    if not legacy.exists() and not legacy.is_symlink():
-        return None
-    if preserve_local_config:
-        copy_legacy_config_if_safe(
-            legacy / "config" / "alternative-reviewer.json",
-            plugin_skill_dir / "config" / "alternative-reviewer.json",
-        )
-        copy_missing_tree(legacy / "state", plugin_skill_dir / "state")
-    if legacy.is_symlink() or legacy.is_file():
-        legacy.unlink()
-    else:
-        shutil.rmtree(legacy)
-    return legacy
-
-
 def plugin_version() -> str:
     data = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
     version = data.get("version")
@@ -499,40 +483,6 @@ def plugin_config_id() -> str:
     return f"{PLUGIN_NAME}@{marketplace_name()}"
 
 
-def legacy_plugin_config_ids() -> set[str]:
-    return {
-        f"{SKILL_NAME}@{DEFAULT_MARKETPLACE_NAME}",
-        f"{SKILL_NAME}@{marketplace_name()}",
-    }
-
-
-def remove_plugin_sections(lines: list[str], plugin_ids: set[str]) -> list[str]:
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].strip()
-        matched = False
-        for plugin_id in plugin_ids:
-            if stripped == f'[plugins."{plugin_id}"]':
-                matched = True
-                index += 1
-                while index < len(lines):
-                    next_stripped = lines[index].strip()
-                    if next_stripped.startswith("[") and next_stripped.endswith("]"):
-                        break
-                    index += 1
-                break
-        if matched:
-            while output and not output[-1].strip():
-                output.pop()
-            if index < len(lines) and output and output[-1].strip():
-                output.append("\n")
-            continue
-        output.append(lines[index])
-        index += 1
-    return output
-
-
 def ensure_codex_plugin_enabled() -> Path:
     config_path = Path.home() / ".codex" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -541,7 +491,6 @@ def ensure_codex_plugin_enabled() -> Path:
     lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True) if config_path.exists() else []
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
-    lines = remove_plugin_sections(lines, legacy_plugin_config_ids())
 
     start: int | None = None
     for index, line in enumerate(lines):
@@ -608,7 +557,7 @@ def update_marketplace(plugin_parent: Path) -> Path:
         plugin
         for plugin in plugins
         if not (
-            plugin.get("name") in {PLUGIN_NAME, SKILL_NAME}
+            plugin.get("name") == PLUGIN_NAME
             or (
                 isinstance(plugin.get("source"), dict)
                 and plugin["source"].get("path") == source_path
@@ -652,15 +601,11 @@ def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Pa
     return cache_dir
 
 
-def remove_legacy_plugin_cache() -> Path | None:
-    legacy_cache = Path.home() / ".codex" / "plugins" / "cache" / marketplace_name() / SKILL_NAME
-    if not legacy_cache.exists() and not legacy_cache.is_symlink():
-        return None
-    if legacy_cache.is_symlink() or legacy_cache.is_file():
-        legacy_cache.unlink()
-    else:
-        shutil.rmtree(legacy_cache)
-    return legacy_cache
+def deploy_codex_manifest(dst_root: Path) -> Path:
+    target = dst_root / PLUGIN_MANIFEST_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PLUGIN_MANIFEST, target)
+    return target
 
 
 def normalize_fork_mode(value: str) -> str:
@@ -846,7 +791,7 @@ def main() -> int:
     parser.add_argument(
         "--plugin-parent",
         default=str(Path.home() / "plugins"),
-        help="plugin 父目录；默认安装到 ~/plugins/review-validate-fix 并由 marketplace entry rvf 指向。",
+        help="plugin 父目录；默认安装到 ~/plugins/review-validate-fix 并由 marketplace entry review-validate-fix 指向。",
     )
     parser.add_argument(
         "--replace-setup-config",
@@ -947,11 +892,11 @@ def main() -> int:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / PLUGIN_DIR_NAME
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
+        deploy_codex_manifest(dst)
         marketplace = update_marketplace(parent)
         plugin_config = ensure_codex_plugin_enabled()
-        removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
-        removed_legacy_plugin_cache = remove_legacy_plugin_cache()
+        deploy_codex_manifest(plugin_cache)
         source_metadata = git_metadata()
         deploy_version = deploy_version_from_metadata(source_metadata)
         stamped_skill_paths = stamp_deployed_skill_headings([dst, plugin_cache], deploy_version)
@@ -962,10 +907,6 @@ def main() -> int:
             "deploy version stamp: "
             f"{deploy_version['heading_label']} ({len(stamped_skill_paths)} SKILL.md files)"
         )
-        if removed_legacy_skill:
-            installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
-        if removed_legacy_plugin_cache:
-            installed.append(f"removed legacy Codex plugin cache: {removed_legacy_plugin_cache}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:

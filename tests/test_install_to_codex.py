@@ -646,9 +646,6 @@ def test_ensure_codex_plugin_enabled_updates_user_config(tmp_path: Path) -> None
                 'model = "gpt-5.5"',
                 "",
                 '[plugins."review-validate-fix@local-codex-plugins"]',
-                "enabled = true",
-                "",
-                '[plugins."rvf@local-codex-plugins"]',
                 "enabled = false",
                 "",
                 '[projects."/tmp/repo"]',
@@ -662,14 +659,14 @@ def test_ensure_codex_plugin_enabled_updates_user_config(tmp_path: Path) -> None
     with_fake_home(module, home, lambda: module.ensure_codex_plugin_enabled())
 
     text = config_path.read_text(encoding="utf-8")
-    assert '[plugins."review-validate-fix@local-codex-plugins"]' not in text
-    assert '[plugins."rvf@local-codex-plugins"]' in text
+    assert '[plugins."review-validate-fix@local-codex-plugins"]' in text
     assert "enabled = true" in text
+    assert "enabled = false" not in text
     assert '[projects."/tmp/repo"]' in text
     assert 'trust_level = "trusted"' in text
 
 
-def test_ensure_codex_plugin_enabled_removes_custom_marketplace_legacy_config(
+def test_ensure_codex_plugin_enabled_in_custom_marketplace(
     tmp_path: Path,
 ) -> None:
     module = load_installer_module()
@@ -686,9 +683,6 @@ def test_ensure_codex_plugin_enabled_removes_custom_marketplace_legacy_config(
         "\n".join(
             [
                 '[plugins."review-validate-fix@custom-codex-plugins"]',
-                "enabled = true",
-                "",
-                '[plugins."rvf@custom-codex-plugins"]',
                 "enabled = false",
             ]
         )
@@ -699,9 +693,9 @@ def test_ensure_codex_plugin_enabled_removes_custom_marketplace_legacy_config(
     with_fake_home(module, home, lambda: module.ensure_codex_plugin_enabled())
 
     text = config_path.read_text(encoding="utf-8")
-    assert '[plugins."review-validate-fix@custom-codex-plugins"]' not in text
-    assert '[plugins."rvf@custom-codex-plugins"]' in text
+    assert '[plugins."review-validate-fix@custom-codex-plugins"]' in text
     assert "enabled = true" in text
+    assert "enabled = false" not in text
 
 
 def test_update_marketplace_replaces_old_rvf_entry_by_path(tmp_path: Path) -> None:
@@ -740,169 +734,22 @@ def test_update_marketplace_replaces_old_rvf_entry_by_path(tmp_path: Path) -> No
 
     data = json.loads(marketplace_path.read_text(encoding="utf-8"))
     plugin_names = [plugin["name"] for plugin in data["plugins"]]
-    assert plugin_names == ["other", "rvf"]
+    assert plugin_names == ["other", "review-validate-fix"]
     rvf_entry = data["plugins"][1]
     assert rvf_entry["source"]["path"] == "./plugins/review-validate-fix"
-
-
-def test_remove_legacy_plugin_cache_removes_old_plugin_id(tmp_path: Path) -> None:
-    module = load_installer_module()
-    home = tmp_path / "home"
-    legacy_cache = (
-        home
-        / ".codex"
-        / "plugins"
-        / "cache"
-        / "local-codex-plugins"
-        / "review-validate-fix"
-    )
-    legacy_cache.mkdir(parents=True)
-    (legacy_cache / "old.txt").write_text("old cache\n", encoding="utf-8")
-
-    def run_test() -> None:
-        removed = module.remove_legacy_plugin_cache()
-        assert removed == legacy_cache
-
-    with_fake_home(module, home, run_test)
-
-    assert not legacy_cache.exists()
-
-
-def test_remove_legacy_codex_skill_dir_removes_broken_symlink(tmp_path: Path) -> None:
-    module = load_installer_module()
-    home = tmp_path / "home"
-    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
-    legacy_skill.parent.mkdir(parents=True)
-    legacy_skill.symlink_to(home / "missing-legacy-skill")
-
-    def run_test() -> None:
-        removed = module.remove_legacy_codex_skill_dir(
-            home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
-            True,
-        )
-        assert removed == legacy_skill
-
-    with_fake_home(module, home, run_test)
-
-    assert not legacy_skill.exists()
-    assert not legacy_skill.is_symlink()
-
-
-def test_main_syncs_legacy_only_setup_into_empty_plugin_cache(tmp_path: Path) -> None:
-    module = load_installer_module()
-    home = tmp_path / "home"
-    plugin_parent = home / "plugins"
-    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
-    legacy_config = legacy_skill / "config"
-    legacy_state = legacy_skill / "state"
-    legacy_config.mkdir(parents=True)
-    legacy_state.mkdir(parents=True)
-    (legacy_config / "alternative-reviewer.json").write_text("legacy-only config\n", encoding="utf-8")
-    (legacy_state / "run.json").write_text("legacy-only state\n", encoding="utf-8")
-
-    def run_main() -> None:
-        def call_main() -> None:
-            assert module.main() == 0
-
-        with_argv(
-            [
-                "install_to_codex.py",
-                "--plugin-parent",
-                str(plugin_parent),
-            ],
-            call_main,
-        )
-
-    with_fake_home(module, home, run_main)
-
-    plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
-    cache_skill = (
-        home
-        / ".codex"
-        / "plugins"
-        / "cache"
-        / "local-codex-plugins"
-        / "rvf"
-        / module.plugin_version()
-        / "skills"
-        / "review-validate-fix"
-    )
-    assert (plugin_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
-        "legacy-only config\n"
-    )
-    assert (plugin_skill / "state" / "run.json").read_text(encoding="utf-8") == "legacy-only state\n"
-    assert (cache_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
-        "legacy-only config\n"
-    )
-    assert (cache_skill / "state" / "run.json").read_text(encoding="utf-8") == "legacy-only state\n"
-    assert not legacy_skill.exists()
-
-
-def test_main_syncs_legacy_config_over_default_plugin_cache(tmp_path: Path) -> None:
-    module = load_installer_module()
-    home = tmp_path / "home"
-    plugin_parent = home / "plugins"
-    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
-    legacy_config = legacy_skill / "config"
-    legacy_config.mkdir(parents=True)
-    (legacy_config / "alternative-reviewer.json").write_text("legacy-over-default config\n", encoding="utf-8")
-    cache_skill = (
-        home
-        / ".codex"
-        / "plugins"
-        / "cache"
-        / "local-codex-plugins"
-        / "rvf"
-        / module.plugin_version()
-        / "skills"
-        / "review-validate-fix"
-    )
-    cache_config = cache_skill / "config"
-    cache_config.mkdir(parents=True)
-    (cache_config / "alternative-reviewer.json").write_bytes(
-        (module.PLUGIN_SRC / module.PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json").read_bytes()
-    )
-
-    def run_main() -> None:
-        def call_main() -> None:
-            assert module.main() == 0
-
-        with_argv(
-            [
-                "install_to_codex.py",
-                "--plugin-parent",
-                str(plugin_parent),
-            ],
-            call_main,
-        )
-
-    with_fake_home(module, home, run_main)
-
-    assert (cache_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
-        "legacy-over-default config\n"
-    )
-    assert not legacy_skill.exists()
 
 
 def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
     plugin_parent = home / "plugins"
-    legacy_skill = home / ".codex" / "skills" / "review-validate-fix"
-    legacy_config = legacy_skill / "config"
-    legacy_state = legacy_skill / "state"
-    legacy_config.mkdir(parents=True)
-    legacy_state.mkdir(parents=True)
-    (legacy_skill / "SKILL.md").write_text("legacy skill\n", encoding="utf-8")
-    (legacy_config / "alternative-reviewer.json").write_text("local legacy config\n", encoding="utf-8")
-    (legacy_state / "run.json").write_text("local legacy state\n", encoding="utf-8")
     cache_skill = (
         home
         / ".codex"
         / "plugins"
         / "cache"
         / "local-codex-plugins"
-        / "rvf"
+        / "review-validate-fix"
         / module.plugin_version()
         / "skills"
         / "review-validate-fix"
@@ -911,19 +758,9 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     cache_state = cache_skill / "state"
     cache_config.mkdir(parents=True)
     cache_state.mkdir(parents=True)
-    (cache_skill / "SKILL.md").write_text("stale cached skill\n", encoding="utf-8")
+    (cache_skill / "SKILL.md").write_text("preexisting cached skill\n", encoding="utf-8")
     (cache_config / "alternative-reviewer.json").write_text("local cache config\n", encoding="utf-8")
     (cache_state / "run.json").write_text("local cache state\n", encoding="utf-8")
-    old_plugin_cache = (
-        home
-        / ".codex"
-        / "plugins"
-        / "cache"
-        / "local-codex-plugins"
-        / "review-validate-fix"
-    )
-    old_plugin_cache.mkdir(parents=True)
-    (old_plugin_cache / "old.txt").write_text("old plugin cache\n", encoding="utf-8")
 
     def run_main() -> None:
         def call_main() -> None:
@@ -942,29 +779,37 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     with_fake_home(module, home, run_main)
 
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
+    plugin_root = home / "plugins" / "review-validate-fix"
+    cache_root = (
+        home
+        / ".codex"
+        / "plugins"
+        / "cache"
+        / "local-codex-plugins"
+        / "review-validate-fix"
+        / module.plugin_version()
+    )
     assert (plugin_skill / "SKILL.md").exists()
     assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
     assert not (plugin_skill / "scripts" / "install_to_codex.py").exists()
     assert not (cache_skill / "scripts" / "install_to_codex.py").exists()
+    assert (plugin_root / ".codex-plugin" / "plugin.json").exists()
+    assert (cache_root / ".codex-plugin" / "plugin.json").exists()
+    assert json.loads(
+        (plugin_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )["name"] == "review-validate-fix"
+    assert json.loads(
+        (cache_root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )["name"] == "review-validate-fix"
     heading_label = deployed_heading_label(module)
-    assert_deployed_skill_stamps(module, home / "plugins" / "review-validate-fix", heading_label)
-    assert_deployed_skill_stamps(
-        module,
-        home / ".codex" / "plugins" / "cache" / "local-codex-plugins" / "rvf" / module.plugin_version(),
-        heading_label,
-    )
+    assert_deployed_skill_stamps(module, plugin_root, heading_label)
+    assert_deployed_skill_stamps(module, cache_root, heading_label)
     assert "[deployed " not in (
         module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert (cache_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
     assert (cache_config / "alternative-reviewer.json").read_text(encoding="utf-8") == "local cache config\n"
     assert (cache_state / "run.json").read_text(encoding="utf-8") == "local cache state\n"
-    assert not old_plugin_cache.exists()
-    assert not legacy_skill.exists()
-    assert (plugin_skill / "config" / "alternative-reviewer.json").read_text(encoding="utf-8") == (
-        "local legacy config\n"
-    )
-    assert (plugin_skill / "state" / "run.json").read_text(encoding="utf-8") == "local legacy state\n"
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
@@ -973,7 +818,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert "CODEX_RVF_FORK_MODE=auto" in matching[0]["command"]
     assert matching[0]["statusMessage"] == "Review-Validate-Fix：选择通道并运行停止检查"
     codex_config = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
-    assert '[plugins."rvf@local-codex-plugins"]' in codex_config
+    assert '[plugins."review-validate-fix@local-codex-plugins"]' in codex_config
     assert "enabled = true" in codex_config
 
 
@@ -1038,7 +883,7 @@ def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
         / "plugins"
         / "cache"
         / "local-codex-plugins"
-        / "rvf"
+        / "review-validate-fix"
         / module.plugin_version()
         / "skills"
         / "review-validate-fix"
@@ -1052,7 +897,7 @@ def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
     assert len(plugin_history.read_text(encoding="utf-8").splitlines()) == 1
     assert cache_latest.exists()
     assert payload["kind"] == "rvf-local-deploy"
-    assert payload["plugin"]["name"] == "rvf"
+    assert payload["plugin"]["name"] == "review-validate-fix"
     assert payload["plugin"]["version"] == module.plugin_version()
     assert payload["source"]["repo"] == str(module.ROOT)
     assert payload["deploy_version"]["heading_label"] == first_h1(plugin_skill / "SKILL.md").rsplit(
@@ -1121,12 +966,8 @@ def main() -> int:
         test_copy_tree_preserves_nested_plugin_setup,
         test_copy_tree_excludes_dev_only_paths,
         test_ensure_codex_plugin_enabled_updates_user_config,
-        test_ensure_codex_plugin_enabled_removes_custom_marketplace_legacy_config,
+        test_ensure_codex_plugin_enabled_in_custom_marketplace,
         test_update_marketplace_replaces_old_rvf_entry_by_path,
-        test_remove_legacy_plugin_cache_removes_old_plugin_id,
-        test_remove_legacy_codex_skill_dir_removes_broken_symlink,
-        test_main_syncs_legacy_only_setup_into_empty_plugin_cache,
-        test_main_syncs_legacy_config_over_default_plugin_cache,
         test_main_installs_plugin_and_configures_stop_hook,
         test_main_records_deploy_log_with_rvf_context,
         test_main_can_configure_user_prompt_submit_hook,

@@ -1,0 +1,22 @@
+{
+  "name": "review-validate-fix",
+  "version": "0.1.0",
+  "description": "Run a post-work double-review, validate/fix, and handoff loop for Claude Code workspaces.",
+  "author": {
+    "name": "Bomin Zhang",
+    "email": "30303853+RealmX1@users.noreply.github.com",
+    "url": "https://github.com/RealmX1"
+  },
+  "homepage": "https://github.com/RealmX1/review-validate-fix",
+  "repository": "https://github.com/RealmX1/review-validate-fix",
+  "license": "UNLICENSED",
+  "keywords": [
+    "claude-code",
+    "skill",
+    "plugin",
+    "review",
+    "validation",
+    "handoff"
+  ],
+  "skills": "./plugins/review-validate-fix/skills/"
+}
