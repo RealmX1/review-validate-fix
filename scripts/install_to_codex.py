@@ -23,6 +23,17 @@ PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
 SKILL_NAME = "review-validate-fix"
 DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
 PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
+CLAUDE_MARKETPLACE_NAME = "review-validate-fix-local"
+CLAUDE_PLUGIN_CONFIG_ID = f"{PLUGIN_DIR_NAME}@{CLAUDE_MARKETPLACE_NAME}"
+CLAUDE_MARKETPLACE_ROOT_REL = Path(".claude") / "local-marketplaces" / PLUGIN_DIR_NAME
+CLAUDE_PLUGIN_REL = Path("plugins") / PLUGIN_DIR_NAME
+CLAUDE_CACHE_ROOT_REL = (
+    Path(".claude")
+    / "plugins"
+    / "cache"
+    / CLAUDE_MARKETPLACE_NAME
+    / PLUGIN_DIR_NAME
+)
 DEPLOY_LOG_REL = Path("state") / "deployments"
 DEPLOY_HISTORY_FILE = "deployments.jsonl"
 DEPLOY_LATEST_FILE = "latest-deployment.json"
@@ -316,6 +327,7 @@ def build_deploy_log_entry(
     *,
     dst: Path,
     plugin_cache: Path,
+    claude_paths: dict[str, Path] | None,
     source_metadata: dict[str, Any],
     deploy_version: dict[str, Any],
     configure_stop_hook_enabled: bool,
@@ -349,10 +361,15 @@ def build_deploy_log_entry(
             "codex_config": str(Path.home() / ".codex" / "config.toml"),
             "hooks": str(Path.home() / ".codex" / "hooks.json"),
             "marketplace": str(Path.home() / ".agents" / "plugins" / "marketplace.json"),
+            "claude_plugin_marketplace": str(claude_paths["marketplace"]) if claude_paths else None,
+            "claude_plugin_cache": str(claude_paths["cache"]) if claude_paths else None,
+            "claude_settings": str(claude_paths["settings"]) if claude_paths else None,
+            "claude_installed_plugins": str(claude_paths["installed_plugins"]) if claude_paths else None,
         },
         "options": {
             "configure_stop_hook": configure_stop_hook_enabled,
             "configure_user_prompt_submit_hook": configure_user_prompt_submit_hook_enabled,
+            "sync_claude_plugin": claude_paths is not None,
             "fork_mode": normalize_fork_mode(fork_mode),
             "preserve_local_config": preserve_local_config,
             "replace_setup_config": replace_setup_config,
@@ -481,6 +498,121 @@ def plugin_version() -> str:
     if not isinstance(version, str) or not version.strip():
         raise ValueError(f"plugin manifest missing version: {PLUGIN_MANIFEST}")
     return version
+
+
+def claude_marketplace_root() -> Path:
+    return Path.home() / CLAUDE_MARKETPLACE_ROOT_REL
+
+
+def claude_marketplace_plugin_path() -> Path:
+    return claude_marketplace_root() / CLAUDE_PLUGIN_REL
+
+
+def claude_cache_plugin_path() -> Path:
+    return Path.home() / CLAUDE_CACHE_ROOT_REL / plugin_version()
+
+
+def claude_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def claude_installed_plugins_path() -> Path:
+    return Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+
+
+def claude_plugin_enabled_or_installed() -> bool:
+    settings = read_json_object(claude_settings_path()) or {}
+    enabled_plugins = settings.get("enabledPlugins")
+    if isinstance(enabled_plugins, dict) and enabled_plugins.get(CLAUDE_PLUGIN_CONFIG_ID) is True:
+        return True
+    marketplaces = settings.get("extraKnownMarketplaces")
+    if isinstance(marketplaces, dict) and CLAUDE_MARKETPLACE_NAME in marketplaces:
+        return True
+
+    installed = read_json_object(claude_installed_plugins_path()) or {}
+    plugins = installed.get("plugins")
+    if isinstance(plugins, dict) and CLAUDE_PLUGIN_CONFIG_ID in plugins:
+        return True
+
+    if claude_marketplace_plugin_path().exists():
+        return True
+    cache_root = Path.home() / CLAUDE_CACHE_ROOT_REL
+    return cache_root.exists()
+
+
+def update_claude_settings() -> Path:
+    path = claude_settings_path()
+    data = read_json_object(path) or {}
+    enabled = data.setdefault("enabledPlugins", {})
+    if not isinstance(enabled, dict):
+        enabled = {}
+        data["enabledPlugins"] = enabled
+    enabled[CLAUDE_PLUGIN_CONFIG_ID] = True
+
+    marketplaces = data.setdefault("extraKnownMarketplaces", {})
+    if not isinstance(marketplaces, dict):
+        marketplaces = {}
+        data["extraKnownMarketplaces"] = marketplaces
+    marketplaces[CLAUDE_MARKETPLACE_NAME] = {
+        "source": {
+            "source": "directory",
+            "path": str(claude_marketplace_root()),
+        }
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def update_claude_installed_plugins(cache_plugin: Path) -> Path:
+    path = claude_installed_plugins_path()
+    data = read_json_object(path) or {}
+    data["version"] = 2
+    plugins = data.setdefault("plugins", {})
+    if not isinstance(plugins, dict):
+        plugins = {}
+        data["plugins"] = plugins
+
+    existing_entries = plugins.get(CLAUDE_PLUGIN_CONFIG_ID)
+    existing = (
+        existing_entries[0]
+        if isinstance(existing_entries, list)
+        and existing_entries
+        and isinstance(existing_entries[0], dict)
+        else {}
+    )
+    now = utc_now()
+    record = dict(existing)
+    record.update(
+        {
+            "scope": record.get("scope") or "user",
+            "installPath": str(cache_plugin),
+            "version": plugin_version(),
+            "installedAt": record.get("installedAt") or now,
+            "lastUpdated": now,
+        }
+    )
+    plugins[CLAUDE_PLUGIN_CONFIG_ID] = [record]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def sync_claude_plugin(plugin_src: Path, preserve_local_config: bool) -> dict[str, Path]:
+    marketplace_plugin = claude_marketplace_plugin_path()
+    cache_plugin = claude_cache_plugin_path()
+    copy_tree(plugin_src, marketplace_plugin, PRESERVE_IN_PLUGIN, preserve_local_config)
+    copy_tree(plugin_src, cache_plugin, PRESERVE_IN_PLUGIN, preserve_local_config)
+    settings = update_claude_settings()
+    installed_plugins = update_claude_installed_plugins(cache_plugin)
+    return {
+        "marketplace": marketplace_plugin,
+        "cache": cache_plugin,
+        "settings": settings,
+        "installed_plugins": installed_plugins,
+    }
 
 
 def marketplace_name() -> str:
@@ -864,6 +996,16 @@ def main() -> int:
         help="更新 ~/.codex/hooks.json，为 RVF dispatch token 注册 UserPromptSubmit detector；不启动 review workflow。",
     )
     parser.add_argument(
+        "--sync-claude-plugin",
+        action="store_true",
+        help="强制同步 Claude Code local marketplace/cache，并启用 review-validate-fix@review-validate-fix-local。",
+    )
+    parser.add_argument(
+        "--skip-claude-plugin",
+        action="store_true",
+        help="跳过 Claude Code plugin 同步；默认在检测到已有 Claude RVF 安装时自动同步。",
+    )
+    parser.add_argument(
         "--fork-mode",
         choices=[
             "gui",
@@ -952,12 +1094,24 @@ def main() -> int:
         removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
         removed_legacy_plugin_cache = remove_legacy_plugin_cache()
+        sync_claude = (not args.skip_claude_plugin) and (
+            args.sync_claude_plugin or claude_plugin_enabled_or_installed()
+        )
+        claude_paths = sync_claude_plugin(PLUGIN_SRC, preserve) if sync_claude else None
         source_metadata = git_metadata()
         deploy_version = deploy_version_from_metadata(source_metadata)
-        stamped_skill_paths = stamp_deployed_skill_headings([dst, plugin_cache], deploy_version)
+        stamp_roots = [dst, plugin_cache]
+        if claude_paths is not None:
+            stamp_roots.extend([claude_paths["marketplace"], claude_paths["cache"]])
+        stamped_skill_paths = stamp_deployed_skill_headings(stamp_roots, deploy_version)
         installed.append(f"plugin: {dst}")
         installed.append(f"Codex plugin enabled: {plugin_config}")
         installed.append(f"plugin cache: {plugin_cache}")
+        if claude_paths is not None:
+            installed.append(f"Claude plugin marketplace: {claude_paths['marketplace']}")
+            installed.append(f"Claude plugin cache: {claude_paths['cache']}")
+            installed.append(f"Claude settings: {claude_paths['settings']}")
+            installed.append(f"Claude installed plugins: {claude_paths['installed_plugins']}")
         installed.append(
             "deploy version stamp: "
             f"{deploy_version['heading_label']} ({len(stamped_skill_paths)} SKILL.md files)"
@@ -1005,6 +1159,7 @@ def main() -> int:
             build_deploy_log_entry(
                 dst=dst,
                 plugin_cache=plugin_cache,
+                claude_paths=claude_paths,
                 source_metadata=source_metadata,
                 deploy_version=deploy_version,
                 configure_stop_hook_enabled=args.configure_stop_hook,

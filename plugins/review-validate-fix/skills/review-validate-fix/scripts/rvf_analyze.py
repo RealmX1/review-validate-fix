@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,7 @@ from orphan_detect import (  # noqa: E402
     classify_run,
     write_interrupted_marker,
 )
+from post_analyze_quiet import write_post_analyze_quiet_marker  # noqa: E402
 from rvf_logging import log_root  # noqa: E402
 
 EXIT_OK = 0
@@ -104,6 +107,84 @@ def _classification_payload(classification: Classification) -> dict[str, Any]:
         "has_finalize_lock": classification.has_finalize_lock,
         "has_interrupted_marker": classification.has_interrupted_marker,
         "detected_at": classification.detected_at,
+    }
+
+
+def _run_log_root(run_dir: Path) -> Path:
+    if run_dir.parent.name == "runs":
+        return run_dir.parent.parent
+    return log_root()
+
+
+def _read_run_summary(run_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _first_text(values: list[Any]) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _quiet_task_id(summary: dict[str, Any]) -> str | None:
+    return _first_text(
+        [
+            os.environ.get("KANBAN_TASK_ID"),
+            os.environ.get("CLINE_KANBAN_TASK_ID"),
+            os.environ.get("KANBAN_HOOK_TASK_ID"),
+            summary.get("cline_kanban_task_id"),
+            summary.get("parent_kanban_task_id"),
+            summary.get("kanban_task_id"),
+        ]
+    )
+
+
+def _quiet_session_id(summary: dict[str, Any]) -> str | None:
+    return _first_text(
+        [
+            os.environ.get("CODEX_SESSION_ID"),
+            os.environ.get("CLAUDE_SESSION_ID"),
+            summary.get("session_id"),
+            summary.get("parent_thread_id"),
+            summary.get("parent_session_id"),
+        ]
+    )
+
+
+def _arm_manual_post_analyze_quiet_marker(
+    *,
+    run_dir: Path,
+    classification: Classification,
+    summary_md_path: Path,
+    causality_json_path: Path,
+    armed_at: str | None = None,
+) -> dict[str, Any]:
+    root = _run_log_root(run_dir)
+    summary = _read_run_summary(run_dir)
+    task_id = _quiet_task_id(summary)
+    session_id = _quiet_session_id(summary)
+    marker = write_post_analyze_quiet_marker(
+        task_id=task_id,
+        session_id=session_id,
+        armed_run_id=f"rvf-analyze:{classification.run_id or run_dir.name}",
+        armed_handoff_path=None,
+        analyze_run_dir=str(run_dir),
+        analyze_summary_md=str(summary_md_path),
+        analyze_causality_json=str(causality_json_path),
+        armed_at=armed_at,
+        root=root,
+    )
+    return {
+        "status": "armed" if marker is not None else "skipped_no_context",
+        "marker_path": str(marker) if marker is not None else None,
+        "root": str(root),
+        "task_id": task_id,
+        "session_id": session_id,
     }
 
 
@@ -205,7 +286,15 @@ def analyze(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
             extra={"forced_through_running": True},
         )
 
+    quiet_armed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     scaffold = scaffold_run(run_dir)
+    quiet_marker = _arm_manual_post_analyze_quiet_marker(
+        run_dir=run_dir,
+        classification=classification,
+        summary_md_path=Path(scaffold["summary_md_path"]),
+        causality_json_path=Path(scaffold["causality_json_path"]),
+        armed_at=quiet_armed_at,
+    )
 
     payload: dict[str, Any] = {
         "status": "ok",
@@ -213,6 +302,10 @@ def analyze(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "user_decision": decision_chosen,
         "summary_md_path": str(scaffold["summary_md_path"]),
         "causality_json_path": str(scaffold["causality_json_path"]),
+        "post_analyze_quiet_marker_status": quiet_marker["status"],
+        "post_analyze_quiet_marker_path": quiet_marker["marker_path"],
+        "post_analyze_quiet_marker_root": quiet_marker["root"],
+        "post_analyze_quiet_marker_armed_at": quiet_armed_at,
         "stats": scaffold["stats_dict"],
     }
     if finalize_record is not None:

@@ -238,6 +238,28 @@ def codex_json_enabled(command: list[str]) -> bool:
     return "--json" in command
 
 
+def codex_hooks_disabled(command: list[str]) -> bool:
+    for index, item in enumerate(command):
+        if item == "--disable" and index + 1 < len(command) and command[index + 1] == "hooks":
+            return True
+        if item == "--disable=hooks":
+            return True
+        if item == "-c" and index + 1 < len(command) and command[index + 1] == "features.hooks=false":
+            return True
+        if item == "-c=features.hooks=false":
+            return True
+    return False
+
+
+def ensure_codex_hooks_disabled_command(command: list[str]) -> list[str]:
+    exec_index = codex_subcommand_index(command)
+    if exec_index is None or codex_hooks_disabled(command):
+        return list(command)
+    patched = list(command)
+    patched[exec_index:exec_index] = ["--disable", "hooks"]
+    return patched
+
+
 def ensure_codex_json_command(command: list[str]) -> list[str]:
     patched = list(command)
     if "--json" not in patched:
@@ -1420,6 +1442,7 @@ def main() -> int:
         if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
             command = ensure_claude_stream_json_command(command)
         if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(command):
+            command = ensure_codex_hooks_disabled_command(command)
             command = ensure_codex_json_command(command)
         if is_codex_exec_command(command):
             command = ensure_codex_exec_add_dir(command, ledger.run_dir)

@@ -4178,7 +4178,15 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["exec", "--json", "--add-dir", str(run_dir.resolve()), "-"]
+    assert argv == [
+        "--disable",
+        "hooks",
+        "exec",
+        "--json",
+        "--add-dir",
+        str(run_dir.resolve()),
+        "-",
+    ]
 
 
 def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_path: Path) -> None:
@@ -4236,6 +4244,8 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
     assert argv == [
         "--ask-for-approval",
         "never",
+        "--disable",
+        "hooks",
         "exec",
         "--sandbox",
         "workspace-write",
@@ -4244,6 +4254,15 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
         str(run_dir.resolve()),
         "-",
     ]
+
+
+def test_alternative_reviewer_codex_hooks_disable_is_not_duplicated() -> None:
+    module = load_alternative_reviewer_module()
+    command = ["codex", "--disable", "hooks", "exec", "--json", "-"]
+    assert module.ensure_codex_hooks_disabled_command(command) == command
+    assert module.ensure_codex_hooks_disabled_command(
+        ["codex", "--disable=hooks", "exec", "--json", "-"]
+    ) == ["codex", "--disable=hooks", "exec", "--json", "-"]
 
 
 def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) -> None:
@@ -7306,6 +7325,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_alternative_reviewer_codex_exec_after_global_options_is_patched(
                 root / "alternative-codex-global-options"
             ),
+        ),
+        (
+            "alternative_reviewer_codex_hooks_disable_is_not_duplicated",
+            lambda: test_alternative_reviewer_codex_hooks_disable_is_not_duplicated(),
         ),
         (
             "alternative_reviewer_sets_codex_stop_hook_suppress_env",

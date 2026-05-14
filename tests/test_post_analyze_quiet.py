@@ -62,6 +62,15 @@ def test_marker_paths_prefers_task_then_session(tmp_path: Path) -> None:
     assert empty == []
 
 
+def test_marker_paths_can_use_explicit_root(tmp_path: Path) -> None:
+    _isolate_state(tmp_path / "default")
+    import post_analyze_quiet as paq
+
+    explicit_root = tmp_path / "explicit-state"
+    paths = paq.marker_paths(task_id="abc", session_id="sess-x", root=explicit_root)
+    assert all(str(path).startswith(str(explicit_root / "post-analyze-quiet")) for path in paths)
+
+
 def test_write_then_read_returns_marker(tmp_path: Path) -> None:
     _isolate_state(tmp_path)
     import post_analyze_quiet as paq
@@ -163,6 +172,23 @@ def test_workflow_complete_false_when_missing_artifact(tmp_path: Path) -> None:
     assert paq.post_analyze_workflow_complete(marker) is False
 
 
+def test_workflow_complete_false_when_summary_still_has_todo(tmp_path: Path) -> None:
+    _isolate_state(tmp_path)
+    import post_analyze_quiet as paq
+
+    armed_ts = time.time() - 30
+    _, summary_md, causality_json = _seed_artifacts(tmp_path, mtime=armed_ts + 10)
+    summary_md.write_text("<!-- TODO(rvf-analyze): fill narrative -->\n", encoding="utf-8")
+    marker = {
+        "armed_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(armed_ts)
+        ),
+        "analyze_summary_md": str(summary_md),
+        "analyze_causality_json": str(causality_json),
+    }
+    assert paq.post_analyze_workflow_complete(marker) is False
+
+
 def test_workflow_complete_false_when_artifact_older_than_armed_at(tmp_path: Path) -> None:
     _isolate_state(tmp_path)
     import post_analyze_quiet as paq
@@ -203,11 +229,13 @@ def main() -> int:
 
     tests = [
         test_marker_paths_prefers_task_then_session,
+        test_marker_paths_can_use_explicit_root,
         test_write_then_read_returns_marker,
         test_write_returns_none_when_no_key,
         test_clear_removes_marker,
         test_workflow_complete_true_when_artifacts_fresh,
         test_workflow_complete_false_when_missing_artifact,
+        test_workflow_complete_false_when_summary_still_has_todo,
         test_workflow_complete_false_when_artifact_older_than_armed_at,
         test_workflow_complete_false_when_marker_malformed,
     ]

@@ -25,28 +25,33 @@ SUBDIR_NAME = "post-analyze-quiet"
 MARKER_VERSION = 1
 
 
-def _quiet_root() -> Path:
-    return log_root() / SUBDIR_NAME
+def _quiet_root(root: Path | None = None) -> Path:
+    return (root.expanduser() if root is not None else log_root()) / SUBDIR_NAME
 
 
-def _task_path(task_id: str) -> Path:
-    return _quiet_root() / f"task-{safe_token(task_id)}.json"
+def _task_path(task_id: str, root: Path | None = None) -> Path:
+    return _quiet_root(root) / f"task-{safe_token(task_id)}.json"
 
 
-def _session_path(session_id: str) -> Path:
-    return _quiet_root() / f"sess-{safe_token(session_id)}.json"
+def _session_path(session_id: str, root: Path | None = None) -> Path:
+    return _quiet_root(root) / f"sess-{safe_token(session_id)}.json"
 
 
-def marker_paths(*, task_id: str | None, session_id: str | None) -> list[Path]:
+def marker_paths(
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    root: Path | None = None,
+) -> list[Path]:
     """返回该上下文下可能持有 marker 的所有候选路径。
 
     task_id 优先；若两者都缺则返回空列表，调用方应据此跳过写/读。
     """
     paths: list[Path] = []
     if task_id:
-        paths.append(_task_path(task_id))
+        paths.append(_task_path(task_id, root))
     if session_id:
-        paths.append(_session_path(session_id))
+        paths.append(_session_path(session_id, root))
     return paths
 
 
@@ -79,13 +84,15 @@ def write_post_analyze_quiet_marker(
     analyze_causality_json: str,
     kanban_attempt_id: str | None = None,
     armed_at: str | None = None,
+    root: Path | None = None,
 ) -> Path | None:
     """写入 marker。优先用 task_id；无 task_id 时退回 session_id；都无返回 None。
 
     set point 在 ``rvf_analyze_advisory.surface_rvf_analyze_advisory`` 注入
-    follow-up（无论 kanban-injection 成功 / 失败 / manual fallback）之后调用。
+    follow-up（无论 kanban-injection 成功 / 失败 / manual fallback）之后，或
+    manual ``$rvf-analyze`` deterministic scaffold 时调用。
     """
-    paths = marker_paths(task_id=task_id, session_id=session_id)
+    paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
     if not paths:
         return None
     timestamp = armed_at or datetime.now(timezone.utc).isoformat().replace(
@@ -112,9 +119,10 @@ def read_post_analyze_quiet_marker(
     *,
     task_id: str | None,
     session_id: str | None,
+    root: Path | None = None,
 ) -> dict[str, Any] | None:
     """读取 marker；找到第一个匹配就返回，不做副作用。"""
-    for path in marker_paths(task_id=task_id, session_id=session_id):
+    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
         data = _read_json(path)
         if data is not None:
             data.setdefault("_marker_path", str(path))
@@ -126,13 +134,14 @@ def clear_post_analyze_quiet_marker(
     *,
     task_id: str | None,
     session_id: str | None,
+    root: Path | None = None,
 ) -> list[str]:
     """删除该上下文下的所有 marker（task 与 session 各一）。
 
     返回被实际删除的文件路径列表（用于 ledger 记录）。
     """
     removed: list[str] = []
-    for path in marker_paths(task_id=task_id, session_id=session_id):
+    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -163,9 +172,10 @@ def post_analyze_workflow_complete(marker: dict[str, Any] | None) -> bool:
     """判断 marker 对应的 RVF + $rvf-analyze 工作流是否已完整结束。
 
     判定标准：``analyze_summary_md`` 与 ``analyze_causality_json`` 两个文件都
-    存在，且 mtime 严格大于 ``armed_at`` 时间戳。任一缺失 / mtime 早于
-    armed_at → False，调用方应按一次性消费语义丢弃 marker 并继续既有 RVF
-    逻辑（fail-open）。
+    存在，mtime 严格大于 ``armed_at`` 时间戳，summary 已移除
+    ``TODO(rvf-analyze)``，且 causality 是有效 JSON object。任一条件不满足 →
+    False，调用方应按一次性消费语义丢弃 marker 并继续既有 RVF 逻辑
+    （fail-open）。
     """
     if not isinstance(marker, dict):
         return False
@@ -183,4 +193,16 @@ def post_analyze_workflow_complete(marker: dict[str, Any] | None) -> bool:
             return False
         if stat.st_mtime <= armed_ts:
             return False
+    try:
+        summary_text = Path(summary_path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if "TODO(rvf-analyze)" in summary_text:
+        return False
+    try:
+        causality = json.loads(Path(causality_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(causality, dict):
+        return False
     return True

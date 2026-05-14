@@ -977,6 +977,136 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert "enabled = true" in codex_config
 
 
+def test_main_syncs_existing_claude_plugin_install(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+    settings_path = home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "enabledPlugins": {
+                    "review-validate-fix@review-validate-fix-local": True,
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+
+    marketplace_plugin = (
+        home
+        / ".claude"
+        / "local-marketplaces"
+        / "review-validate-fix"
+        / "plugins"
+        / "review-validate-fix"
+    )
+    cache_plugin = (
+        home
+        / ".claude"
+        / "plugins"
+        / "cache"
+        / "review-validate-fix-local"
+        / "review-validate-fix"
+        / module.plugin_version()
+    )
+    for root in (marketplace_plugin, cache_plugin):
+        assert (root / ".claude-plugin" / "plugin.json").exists()
+        assert (root / "hooks" / "hooks.json").exists()
+        assert (root / "hooks" / "stop.py").exists()
+        assert (root / "commands" / "review-validate-fix.md").exists()
+        assert (
+            root
+            / "skills"
+            / "review-validate-fix"
+            / "scripts"
+            / "post_analyze_quiet.py"
+        ).exists()
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["enabledPlugins"]["review-validate-fix@review-validate-fix-local"] is True
+    assert settings["extraKnownMarketplaces"]["review-validate-fix-local"]["source"]["path"] == str(
+        home / ".claude" / "local-marketplaces" / "review-validate-fix"
+    )
+    installed = json.loads(
+        (home / ".claude" / "plugins" / "installed_plugins.json").read_text(encoding="utf-8")
+    )
+    record = installed["plugins"]["review-validate-fix@review-validate-fix-local"][0]
+    assert record["installPath"] == str(cache_plugin)
+    assert record["version"] == module.plugin_version()
+    assert record["lastUpdated"]
+
+
+def test_main_can_skip_claude_plugin_sync(tmp_path: Path) -> None:
+    module = load_installer_module()
+    home = tmp_path / "home"
+    plugin_parent = home / "plugins"
+    settings_path = home / ".claude" / "settings.json"
+    settings_path.parent.mkdir(parents=True)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "enabledPlugins": {
+                    "review-validate-fix@review-validate-fix-local": True,
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def run_main() -> None:
+        def call_main() -> None:
+            assert module.main() == 0
+
+        with_argv(
+            [
+                "install_to_codex.py",
+                "--plugin-parent",
+                str(plugin_parent),
+                "--skip-claude-plugin",
+            ],
+            call_main,
+        )
+
+    with_fake_home(module, home, run_main)
+
+    assert not (
+        home
+        / ".claude"
+        / "plugins"
+        / "cache"
+        / "review-validate-fix-local"
+        / "review-validate-fix"
+        / module.plugin_version()
+    ).exists()
+    assert not (
+        home
+        / ".claude"
+        / "local-marketplaces"
+        / "review-validate-fix"
+        / "plugins"
+        / "review-validate-fix"
+    ).exists()
+
+
 def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
@@ -1128,6 +1258,8 @@ def main() -> int:
         test_main_syncs_legacy_only_setup_into_empty_plugin_cache,
         test_main_syncs_legacy_config_over_default_plugin_cache,
         test_main_installs_plugin_and_configures_stop_hook,
+        test_main_syncs_existing_claude_plugin_install,
+        test_main_can_skip_claude_plugin_sync,
         test_main_records_deploy_log_with_rvf_context,
         test_main_can_configure_user_prompt_submit_hook,
     ]

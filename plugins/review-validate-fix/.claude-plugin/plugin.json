@@ -1,0 +1,26 @@
+{
+  "name": "review-validate-fix",
+  "version": "0.1.0",
+  "description": "Run a post-work double-review, validate/fix, and handoff loop for Claude Code and Cline Kanban workspaces.",
+  "author": {
+    "name": "Bomin Zhang",
+    "email": "30303853+RealmX1@users.noreply.github.com",
+    "url": "https://github.com/RealmX1"
+  },
+  "homepage": "https://github.com/RealmX1/review-validate-fix",
+  "repository": "https://github.com/RealmX1/review-validate-fix",
+  "license": "UNLICENSED",
+  "keywords": [
+    "claude-code",
+    "cline-kanban",
+    "review",
+    "validation",
+    "handoff"
+  ],
+  "skills": [
+    "./skills/"
+  ],
+  "commands": [
+    "./commands/"
+  ]
+}
