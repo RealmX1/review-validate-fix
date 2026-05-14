@@ -23,6 +23,8 @@
 
 ## ② Plugin-id 漂移 —— 在不同 host 上叫不同名字
 
+> **本仓库当前正是该反模式的样本**：`plugins/review-validate-fix/.codex-plugin/plugin.json` 的 `name` 字段为 `"rvf"`，与 Claude Code 侧设计 id `review-validate-fix` 不一致。修正动作归入 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**，详见 [`06-rvf-application.md`](06-rvf-application.md) "当前 RVF 现状" 段。
+
 ### 症状
 - Claude Code 上叫 `review-validate-fix`，Codex 上叫 `rvf`，OpenCode 上叫 `code-review-loop`。
 - 用户在不同 host 上看到的命令/skill 名也对不上。

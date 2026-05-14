@@ -2,7 +2,7 @@
 
 > 切片设计原则：每个切片有**入口**（明确触发动作）、**出口**（明确验收条件）、**回滚成本** < 该切片本身。
 >
-> 顺序：切片之间存在依赖；S0 是前置；S1/S2 可并行；S3 依赖 S2；S4 依赖 S0–S3。
+> 顺序：切片之间存在依赖；S0 是前置；S1/S2 可并行；S3 依赖 S1+S2；S4 依赖 S0–S3。
 >
 > ⚠ 本文件仅描述切片**形态**，不替代实际 issue / plan 文档。真要落地时按 RVF 的工作流（capability planning / implementation plan）走。
 
@@ -122,12 +122,12 @@ S0–S3 完成。
 
 ```
         S0  (统一 id + 顶层目录)
-        ├─→ S1 (NormalizedTranscript)
-        └─→ S2 (invoke_subagent)
-               ↓
-              S3 (Codex adapter)
-               ↓
-              S4 (文档 + 矩阵 + sync 工具)
+        ├─→ S1 (NormalizedTranscript) ──┐
+        └─→ S2 (invoke_subagent) ───────┤
+                                        ↓
+                                      S3 (Codex adapter)
+                                        ↓
+                                      S4 (文档 + 矩阵 + sync 工具)
 ```
 
 S1 与 S2 之间无依赖，可并行；S3 等 S2（subagent）也等 S1（transcript）；S4 等前三个。

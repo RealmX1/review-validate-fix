@@ -66,7 +66,7 @@
 **架构**：Pattern B（单源 → 翻译器 → 多 host）。
 
 **核验事实（2026-05-12）**：
-- 存在一类将 Claude Code 插件结构翻译为 Codex plugin 结构的转换器项目（具体仓库名见 [`appendix-sources.md`](appendix-sources.md)）。
+- 存在一类将 Claude Code 插件结构翻译为 Codex plugin 结构的转换器项目（公开仓库具体名字会随时间漂移，本指南不收录，参见 [`appendix-sources.md`](appendix-sources.md) D 节立场说明）。
 - 这类项目本身不是一个跨 host 插件，而是 **跨 host 翻译工具**：以 Claude Code plugin 为输入，输出 Codex plugin 目录。
 
 **含义**：
@@ -80,7 +80,7 @@
 
 **核验事实（2026-05-12）**：
 - 官网 `/specification` 页公布 skill 文档标准：frontmatter 必含 `name`、`description`，可选 `license`、`compatibility`、`metadata`、`allowed-tools`。
-- 已声明的 client 实现超过 30 个（具体名单见 [`appendix-sources.md`](appendix-sources.md)），含多种 IDE 与 agent 框架。
+- 已声明的 client 实现超过 30 个，含多种 IDE 与 agent 框架（具体名单随生态更新，本指南不收录，参见 [`appendix-sources.md`](appendix-sources.md) E 节）。
 
 **含义**：
 - 这是当前最接近"事实标准"的 skill 文档协议层。

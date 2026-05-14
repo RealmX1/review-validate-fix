@@ -9,12 +9,13 @@
 ## 当前 RVF 现状（事实描述）
 
 - 仓库内已存在 `plugins/review-validate-fix/`，主要面向 Claude Code 侧的 plugin 形态。
+- 仓库内**已存在单份嵌套 Codex manifest**：`plugins/review-validate-fix/.codex-plugin/plugin.json`，其 `name` 字段为 `"rvf"`（**不是** `"review-validate-fix"`），且嵌套在 `plugins/review-validate-fix/` 下而非 repo-root。**尚无** repo-root 级别的 `.claude-plugin/plugin.json`。
 - Stop hook 调度链：`codex_stop_hook_router.py → codex_stop_hook_dispatcher.py → codex_stop_review_validate_fix.py`。它能同时面向 Codex 与 Claude Code 两栈进行 transcript 解析与 reviewer 触发。
 - transcript 解析按 `HOST_CODEX="codex"` / `HOST_CLAUDE="claude_code"` 两栈分流。
 - skill 文档：`review-validate-fix:review-validate-fix` 已经是 Claude Code 一等公民；Codex 侧通过 skill 文档 + Stop hook 间接绑定。
 - 仍有 backward compatibility / dev-only 改动残留（按 AGENTS.md 要求，commit 前应清理至 `dev_backward_compatibility/`）。
 
-结论：RVF 实际上已经走在 **Pattern A** 路径（多 host 共存 + 共享逻辑），但 core ↔ adapter 边界尚未显式化。
+结论：RVF 已经**局部触及 Pattern A 思路**（已有单份 Codex manifest，多 host 共存的 shape 已具雏形），但尚未完成 —— core ↔ adapter 边界未显式化，且当前的嵌套 manifest 形态与本指南推荐的"repo-root 双 manifest + 统一 plugin id"形态尚有差距。具体来说，本仓库当前同时正落在 [`04-anti-patterns.md`](04-anti-patterns.md) **反模式 ②（Plugin-id 漂移：Codex manifest 叫 `rvf`，但 Claude Code 侧设计 id 为 `review-validate-fix`）** 的样本上；对齐路径见 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**（统一 plugin id + 决定 manifest 位置）。
 
 ---
 
@@ -58,6 +59,17 @@ review-validate-fix/
 └── dev_backward_compatibility/    # .gitignore；commit 前清理日志
 ```
 
+### 当前形态 vs 建议形态：迁移取舍
+
+仓库当前形态：`plugins/review-validate-fix/.codex-plugin/plugin.json (name="rvf")`，**嵌套**在 `plugins/review-validate-fix/` 下，且**无** repo-root `.claude-plugin/plugin.json`。
+
+与上面建议形态的差距，至少包含：
+1. **manifest 位置**：嵌套在 `plugins/review-validate-fix/` 下 vs 建议位于 repo-root。
+2. **plugin id 漂移**：Codex manifest `name="rvf"` vs 建议统一为 `review-validate-fix`（参见 [`04`](04-anti-patterns.md) 反模式 ②）。
+3. **缺失 Claude Code manifest**：当前没有 `.claude-plugin/plugin.json`，需要补齐才能形成"双 manifest + 同 id"的 Pattern A 完整形态。
+
+这三步迁移工作归入 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**（统一 plugin id + 双 manifest 位置）。本指南其余章节中"建议形态"的描述都以 S0 完成后的形态为前提。
+
 ---
 
 ## Claude Code 最小集（必须）
@@ -100,10 +112,10 @@ review-validate-fix/
 |---|---|---|---|---|
 | Claude Code | ✅ Native | ✅ Native | ✅ Native | **Native** |
 | Codex CLI | ✅ Native | ⚠ 需 `register_hooks.py` | ✅ Native（via codex exec） | **Instruction-backed**（hook 维度） |
-| Codex GUI fork | ✅ Native | ⚠ 同 CLI | ✅ Native | 同 CLI |
-| OpenCode | ✅ Native（via `agentskills.io`） | ❌ | ❌ | **Reference-only** |
-| Cursor | ✅ Native（via `agentskills.io`） | ❌ | ❌ | **Reference-only** |
-| Hermes / OpenClaw | ✅ Native（via `agentskills.io`） | ❌ | ❌ | **Reference-only** |
+| Codex GUI fork（私有） | ⚠ 未核验；推测同 CLI | ⚠ 未核验；推测同 CLI | ⚠ 未核验；推测同 CLI | **未核验**（见 [`02`](02-verified-landscape.md) "未核验或部分核验"） |
+| OpenCode | ✅ via `agentskills.io` | ❌ | ❌ | **Reference-only** |
+| Cursor | ✅ via `agentskills.io` | ❌ | ❌ | **Reference-only** |
+| Hermes / OpenClaw | ✅ via `agentskills.io` | ❌ | ❌ | **Reference-only** |
 
 矩阵直接放进未来的 `README.md` / `docs/architecture/cross-harness.md`，参考 ECC 的做法（[`02`](02-verified-landscape.md) B 节）。
 
