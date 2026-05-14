@@ -31,7 +31,7 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 这会更新本机 stable channel：
 
 - `~/plugins/review-validate-fix`
-- `~/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0`
+- `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0`
 - `~/.agents/plugins/marketplace.json`
 - `~/.codex/config.toml`
 - `~/.codex/hooks.json`
@@ -40,8 +40,8 @@ installer 还会写入部署日志，用于追踪「哪些 plugin 状态已经�
 
 - `~/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/deployments.jsonl`
 - `~/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/latest-deployment.json`
-- `~/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/deployments.jsonl`
-- `~/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json`
+- `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/review-validate-fix/state/deployments/deployments.jsonl`
+- `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json`
 
 每条记录应至少包含 source git HEAD/branch/status、runtime hash、安装目标、hook 选项，以及 `CODEX_RVF_RUN_DIR` / latest RVF run pointer 中可解析出的 run summary 和 analysis artifact paths。
 
@@ -56,9 +56,9 @@ test -f /Users/bominzhang/plugins/review-validate-fix/.codex-plugin/plugin.json
 test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
 python3 -m py_compile /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
 test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/latest-deployment.json
-test -f /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json
+test -f /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json
 rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/plugins/review-validate-fix/skills/*/SKILL.md
-rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/rvf/0.1.0/skills/*/SKILL.md
+rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/*/SKILL.md
 ```
 
 如果部署的是具体功能改动，还要检查 installed 版本中的相关文件。示例：

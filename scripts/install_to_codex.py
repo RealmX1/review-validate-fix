@@ -17,12 +17,12 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_DIR_NAME = "review-validate-fix"
-PLUGIN_NAME = "rvf"
+PLUGIN_NAME = "review-validate-fix"
 PLUGIN_SRC = ROOT / "plugins" / PLUGIN_DIR_NAME
 PLUGIN_SKILL_REL = Path("skills") / "review-validate-fix"
-SKILL_NAME = "review-validate-fix"
 DEFAULT_MARKETPLACE_NAME = "local-codex-plugins"
 PLUGIN_MANIFEST = PLUGIN_SRC / ".codex-plugin" / "plugin.json"
+CLAUDE_MARKETPLACE_SRC = ROOT / ".claude-plugin" / "marketplace.json"
 CLAUDE_MARKETPLACE_NAME = "review-validate-fix-local"
 CLAUDE_PLUGIN_CONFIG_ID = f"{PLUGIN_DIR_NAME}@{CLAUDE_MARKETPLACE_NAME}"
 CLAUDE_MARKETPLACE_ROOT_REL = Path(".claude") / "local-marketplaces" / PLUGIN_DIR_NAME
@@ -362,6 +362,9 @@ def build_deploy_log_entry(
             "hooks": str(Path.home() / ".codex" / "hooks.json"),
             "marketplace": str(Path.home() / ".agents" / "plugins" / "marketplace.json"),
             "claude_plugin_marketplace": str(claude_paths["marketplace"]) if claude_paths else None,
+            "claude_marketplace_metadata": (
+                str(claude_paths["marketplace_metadata"]) if claude_paths else None
+            ),
             "claude_plugin_cache": str(claude_paths["cache"]) if claude_paths else None,
             "claude_settings": str(claude_paths["settings"]) if claude_paths else None,
             "claude_installed_plugins": str(claude_paths["installed_plugins"]) if claude_paths else None,
@@ -475,23 +478,6 @@ def copy_legacy_config_if_safe(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def remove_legacy_codex_skill_dir(plugin_skill_dir: Path, preserve_local_config: bool) -> Path | None:
-    legacy = Path.home() / ".codex" / "skills" / SKILL_NAME
-    if not legacy.exists() and not legacy.is_symlink():
-        return None
-    if preserve_local_config:
-        copy_legacy_config_if_safe(
-            legacy / "config" / "alternative-reviewer.json",
-            plugin_skill_dir / "config" / "alternative-reviewer.json",
-        )
-        copy_missing_tree(legacy / "state", plugin_skill_dir / "state")
-    if legacy.is_symlink() or legacy.is_file():
-        legacy.unlink()
-    else:
-        shutil.rmtree(legacy)
-    return legacy
-
-
 def plugin_version() -> str:
     data = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
     version = data.get("version")
@@ -600,15 +586,28 @@ def update_claude_installed_plugins(cache_plugin: Path) -> Path:
     return path
 
 
+def sync_claude_marketplace_metadata() -> Path:
+    if not CLAUDE_MARKETPLACE_SRC.is_file():
+        raise FileNotFoundError(
+            f"missing source marketplace metadata: {CLAUDE_MARKETPLACE_SRC}"
+        )
+    dst = claude_marketplace_root() / ".claude-plugin" / "marketplace.json"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(CLAUDE_MARKETPLACE_SRC, dst)
+    return dst
+
+
 def sync_claude_plugin(plugin_src: Path, preserve_local_config: bool) -> dict[str, Path]:
     marketplace_plugin = claude_marketplace_plugin_path()
     cache_plugin = claude_cache_plugin_path()
     copy_tree(plugin_src, marketplace_plugin, PRESERVE_IN_PLUGIN, preserve_local_config)
     copy_tree(plugin_src, cache_plugin, PRESERVE_IN_PLUGIN, preserve_local_config)
+    marketplace_metadata = sync_claude_marketplace_metadata()
     settings = update_claude_settings()
     installed_plugins = update_claude_installed_plugins(cache_plugin)
     return {
         "marketplace": marketplace_plugin,
+        "marketplace_metadata": marketplace_metadata,
         "cache": cache_plugin,
         "settings": settings,
         "installed_plugins": installed_plugins,
@@ -631,40 +630,6 @@ def plugin_config_id() -> str:
     return f"{PLUGIN_NAME}@{marketplace_name()}"
 
 
-def legacy_plugin_config_ids() -> set[str]:
-    return {
-        f"{SKILL_NAME}@{DEFAULT_MARKETPLACE_NAME}",
-        f"{SKILL_NAME}@{marketplace_name()}",
-    }
-
-
-def remove_plugin_sections(lines: list[str], plugin_ids: set[str]) -> list[str]:
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        stripped = lines[index].strip()
-        matched = False
-        for plugin_id in plugin_ids:
-            if stripped == f'[plugins."{plugin_id}"]':
-                matched = True
-                index += 1
-                while index < len(lines):
-                    next_stripped = lines[index].strip()
-                    if next_stripped.startswith("[") and next_stripped.endswith("]"):
-                        break
-                    index += 1
-                break
-        if matched:
-            while output and not output[-1].strip():
-                output.pop()
-            if index < len(lines) and output and output[-1].strip():
-                output.append("\n")
-            continue
-        output.append(lines[index])
-        index += 1
-    return output
-
-
 def ensure_codex_plugin_enabled() -> Path:
     config_path = Path.home() / ".codex" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -673,7 +638,6 @@ def ensure_codex_plugin_enabled() -> Path:
     lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True) if config_path.exists() else []
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
-    lines = remove_plugin_sections(lines, legacy_plugin_config_ids())
 
     start: int | None = None
     for index, line in enumerate(lines):
@@ -740,7 +704,7 @@ def update_marketplace(plugin_parent: Path) -> Path:
         plugin
         for plugin in plugins
         if not (
-            plugin.get("name") in {PLUGIN_NAME, SKILL_NAME}
+            plugin.get("name") == PLUGIN_NAME
             or (
                 isinstance(plugin.get("source"), dict)
                 and plugin["source"].get("path") == source_path
@@ -782,17 +746,6 @@ def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Pa
             cache_dir / PLUGIN_SKILL_REL / "state",
         )
     return cache_dir
-
-
-def remove_legacy_plugin_cache() -> Path | None:
-    legacy_cache = Path.home() / ".codex" / "plugins" / "cache" / marketplace_name() / SKILL_NAME
-    if not legacy_cache.exists() and not legacy_cache.is_symlink():
-        return None
-    if legacy_cache.is_symlink() or legacy_cache.is_file():
-        legacy_cache.unlink()
-    else:
-        shutil.rmtree(legacy_cache)
-    return legacy_cache
 
 
 def normalize_fork_mode(value: str) -> str:
@@ -1091,9 +1044,7 @@ def main() -> int:
         copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         plugin_config = ensure_codex_plugin_enabled()
-        removed_legacy_skill = remove_legacy_codex_skill_dir(dst / PLUGIN_SKILL_REL, preserve)
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
-        removed_legacy_plugin_cache = remove_legacy_plugin_cache()
         sync_claude = (not args.skip_claude_plugin) and (
             args.sync_claude_plugin or claude_plugin_enabled_or_installed()
         )
@@ -1109,6 +1060,7 @@ def main() -> int:
         installed.append(f"plugin cache: {plugin_cache}")
         if claude_paths is not None:
             installed.append(f"Claude plugin marketplace: {claude_paths['marketplace']}")
+            installed.append(f"Claude marketplace metadata: {claude_paths['marketplace_metadata']}")
             installed.append(f"Claude plugin cache: {claude_paths['cache']}")
             installed.append(f"Claude settings: {claude_paths['settings']}")
             installed.append(f"Claude installed plugins: {claude_paths['installed_plugins']}")
@@ -1116,10 +1068,6 @@ def main() -> int:
             "deploy version stamp: "
             f"{deploy_version['heading_label']} ({len(stamped_skill_paths)} SKILL.md files)"
         )
-        if removed_legacy_skill:
-            installed.append(f"removed legacy Codex skill directory: {removed_legacy_skill}")
-        if removed_legacy_plugin_cache:
-            installed.append(f"removed legacy Codex plugin cache: {removed_legacy_plugin_cache}")
         installed.append(f"marketplace: {marketplace}")
 
         if args.configure_stop_hook:

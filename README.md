@@ -1,6 +1,8 @@
 # Review Validate Fix
 
-这是 `$review-validate-fix` Codex workflow 的源仓库。仓库只维护 Codex plugin：`plugins/review-validate-fix/` 是唯一 canonical 交付形态，其中的 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 `rvf@local-codex-plugins`，并清理旧的 `~/.codex/skills/review-validate-fix` 目录及旧同名 plugin enablement/cache，避免 Codex GUI/CLI 出现两个同名入口。
+这是 `$review-validate-fix` workflow 的源仓库。仓库同时是 Claude Code 与 Codex 的本机 marketplace，承载一个跨 harness plugin：`plugins/review-validate-fix/`。其中 `skills/review-validate-fix/` 是运行期 skill 内容。安装器会启用 Codex 侧 `review-validate-fix@local-codex-plugins` slot 与 Claude Code 侧 `review-validate-fix@review-validate-fix-local` slot。
+
+本仓库形态遵循 `docs/multi-harness-plugin-guideline/` 推荐的 Pattern A，并采用其 **(M+N) Marketplace + Nested manifest** 变体——repo-root `.claude-plugin/marketplace.json` 列出 plugin；plugin manifest 留在 `plugins/review-validate-fix/.{claude,codex}-plugin/` nested 位置。这与指南 06 隐含的 (P+R) 「repo=plugin」字面形态不同；具体落点见仓库结构。
 
 ## 当前结论
 
@@ -17,20 +19,30 @@ Cline Kanban task 必须在独立 worktree/checkpoint 中重放当前 session-ow
 | 维度 | 当前策略 |
 | --- | --- |
 | canonical 源码 | `plugins/review-validate-fix/skills/review-validate-fix/` |
-| 本机安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` plugin enablement；安装时会删除旧 `~/.codex/skills/review-validate-fix` 目录 |
-| 触发方式 | plugin 暴露 `$review-validate-fix` skill，`agents/openai.yaml` 控制隐式调用 |
-| 废弃路径 | 仓库内旧 `skill/review-validate-fix/` 源码树 |
+| 形态 | (M+N) Marketplace + Nested manifest：repo-root `.claude-plugin/marketplace.json` 列出 plugin；plugin manifest 在 `plugins/review-validate-fix/.claude-plugin/plugin.json` 与 `plugins/review-validate-fix/.codex-plugin/plugin.json` |
+| Codex 安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` 中 `[plugins."review-validate-fix@local-codex-plugins"]`、Codex marketplace cache `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/<version>/` |
+| Claude Code 安装位置 | `~/.claude/local-marketplaces/review-validate-fix/.claude-plugin/marketplace.json` 与 `plugins/review-validate-fix/`、Claude Code cache `~/.claude/plugins/cache/review-validate-fix-local/review-validate-fix/<version>/`、`~/.claude/settings.json` 中 `enabledPlugins["review-validate-fix@review-validate-fix-local"]` + `extraKnownMarketplaces["review-validate-fix-local"]` |
+| 触发方式 | plugin 暴露 `$review-validate-fix` skill 与 `/review-validate-fix` command；`agents/openai.yaml` 控制隐式调用；Claude Code 走 Stop hook 转发到 Codex core（路径 C） |
+| 跨 harness 抽象 | `core/`（host-agnostic 业务核心，S1/S2 落点）+ `adapters/{claude_code,codex}/`（host-specific 实装），见各自 README |
 
 ## 仓库结构
 
 ```text
-plugins/review-validate-fix/               # Codex plugin 包装层
-plugins/review-validate-fix/.codex-plugin/plugin.json
+.claude-plugin/marketplace.json            # 源仓库 marketplace 文件：列出本仓库提供的 plugin（(M+N) 关键文件）
+plugins/review-validate-fix/               # plugin payload（marketplace.json 中 source 指向这里）
+plugins/review-validate-fix/.claude-plugin/plugin.json   # Claude Code 侧 nested plugin manifest
+plugins/review-validate-fix/.codex-plugin/plugin.json    # Codex 侧 nested plugin manifest
+plugins/review-validate-fix/hooks/{hooks.json,stop.py}   # Claude Code Stop hook（路径 C：转发 Codex core）
+plugins/review-validate-fix/commands/review-validate-fix.md  # Claude Code slash command
 plugins/review-validate-fix/skills/review-validate-fix/
                                             # canonical skill 内容，人工修改这里
+core/                                      # host-agnostic 业务核心（S1/S2 落点，见 core/README.md）
+adapters/                                  # host-specific 实装目录骨架（见 adapters/README.md）
+adapters/claude_code/                      # Claude Code adapter；transcript/subagent 落点
+adapters/codex/                            # Codex adapter；transcript/subagent 落点
 scripts/check_plugin_contracts.py          # 仓库级契约检查入口，委托 check_skill_contracts.sh
 scripts/check_skill_contracts.sh           # 覆盖 plugin runtime、安装脚本和 tests/ 的契约检查
-scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间
+scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间 + 同步 Claude Code marketplace
 tests/                                     # 开发和契约测试；不随 plugin runtime 分发
 plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
@@ -99,7 +111,9 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py
 ```
 
-安装会把包装层复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry `rvf`，在 `~/.codex/config.toml` 写入 `[plugins."rvf@local-codex-plugins"] enabled = true`，并删除旧 `~/.codex/skills/review-validate-fix` 目录、旧 `[plugins."review-validate-fix@local-codex-plugins"]` enablement 和旧 plugin cache。plugin id 与 skill 名刻意不同：`$review-validate-fix` 应只作为 skill mention 出现，避免 Codex CLI 同时展示同名 `[Plugin]` 与 `[Skill]` 候选。删除前会尽量把旧目录里的本机 `config/alternative-reviewer.json` 与 `state/` 迁到 installed plugin skill，避免保留第二个同名 skill 造成 GUI picker 重复。
+安装会把 plugin payload 复制到 `~/plugins/review-validate-fix`，在 `~/.agents/plugins/marketplace.json` 中登记本机 plugin entry `review-validate-fix`，在 `~/.codex/config.toml` 写入 `[plugins."review-validate-fix@local-codex-plugins"] enabled = true`，写 Codex marketplace cache 到 `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/<version>/`。如果检测到本机已存在 Claude Code plugin install（或显式传 `--sync-claude-plugin`），还会把源仓库 `.claude-plugin/marketplace.json` 同步到 `~/.claude/local-marketplaces/review-validate-fix/.claude-plugin/marketplace.json`、把 plugin payload 同步到该 marketplace 的 `plugins/review-validate-fix/` 与 Claude Code cache `~/.claude/plugins/cache/review-validate-fix-local/review-validate-fix/<version>/`，并维护 `~/.claude/settings.json` 与 `~/.claude/plugins/installed_plugins.json` 中的对应条目。
+
+> 历史 layout 注意：曾经使用 `rvf` 作为 Codex plugin id（slot `rvf@local-codex-plugins`、cache `~/.codex/plugins/cache/local-codex-plugins/rvf/<version>/`）。本仓库未分发，rename 不附带兼容代码——清理动作由 `dev_backward_compatibility/2026-05-14-s0-v2-*.md` 与 `dev_backward_compatibility/2026-05-14-s0-bc-removal.md` 记录，需要手动 `rm -rf` 旧路径并删除 `~/.codex/config.toml` 中旧 `[plugins."rvf@local-codex-plugins"]` section。
 
 配置 Codex Stop hook：
 

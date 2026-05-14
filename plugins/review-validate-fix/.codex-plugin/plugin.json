@@ -1,5 +1,5 @@
 {
-  "name": "rvf",
+  "name": "review-validate-fix",
   "version": "0.1.0",
   "description": "Run a post-work double-review, validate/fix, and handoff loop for Codex workspaces.",
   "author": {

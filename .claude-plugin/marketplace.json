@@ -1,0 +1,23 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "review-validate-fix-local",
+  "description": "Local RVF Claude Code plugin built from the review-validate-fix workspace.",
+  "owner": {
+    "name": "Bomin Zhang",
+    "email": "30303853+RealmX1@users.noreply.github.com"
+  },
+  "plugins": [
+    {
+      "name": "review-validate-fix",
+      "description": "Run the RVF post-work double-review, validate/fix, handoff, and Cline Kanban follow-up workflow from Claude Code.",
+      "author": {
+        "name": "Bomin Zhang",
+        "email": "30303853+RealmX1@users.noreply.github.com",
+        "url": "https://github.com/RealmX1"
+      },
+      "category": "development",
+      "source": "./plugins/review-validate-fix",
+      "homepage": "https://github.com/RealmX1/review-validate-fix"
+    }
+  ]
+}
