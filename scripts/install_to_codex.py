@@ -931,7 +931,7 @@ def main() -> int:
     parser.add_argument(
         "--plugin-parent",
         default=str(Path.home() / "plugins"),
-        help="plugin 父目录；默认安装到 ~/plugins/review-validate-fix 并由 marketplace entry rvf 指向。",
+        help="plugin 父目录；默认安装到 ~/plugins/review-validate-fix 并由 marketplace entry review-validate-fix 指向。",
     )
     parser.add_argument(
         "--replace-setup-config",
