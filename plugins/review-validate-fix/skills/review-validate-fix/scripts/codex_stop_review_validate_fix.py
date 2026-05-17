@@ -48,6 +48,7 @@ from diff_tracker import (
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
+    lease_release,
     sweep_stale,
 )
 from cline_kanban_client import (
@@ -5352,6 +5353,121 @@ def auto_review_lease_ttl_seconds(context: dict[str, Any]) -> int | None:
     return None
 
 
+REASON_PATCH_OWNERSHIP_INCOMPLETE = "patch_ownership_incomplete"
+
+
+def _patch_ownership_expected(manifest: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(manifest, dict):
+        return {"unit_ids": [], "paths": [], "unresolved": []}
+    ownership = manifest.get("patch_ownership")
+    if not isinstance(ownership, dict):
+        return {"unit_ids": [], "paths": [], "unresolved": []}
+    return {
+        "unit_ids": _string_list(ownership.get("expected_apply_patch_unit_ids")),
+        "paths": _string_list(ownership.get("expected_apply_patch_paths")),
+        "unresolved": (
+            [item for item in ownership.get("unresolved_owned_patch_hunks", []) if isinstance(item, dict)]
+            if isinstance(ownership.get("unresolved_owned_patch_hunks"), list)
+            else []
+        ),
+    }
+
+
+def _allocated_unit_ids_from_result(result: dict[str, Any]) -> list[str]:
+    scope = result.get("scope")
+    if isinstance(scope, dict):
+        return _string_list(scope.get("unit_ids"))
+    return _string_list(result.get("unit_ids"))
+
+
+def _allocated_paths_from_result(result: dict[str, Any]) -> list[str]:
+    scope = result.get("scope")
+    if isinstance(scope, dict):
+        return _string_list(scope.get("paths"))
+    return _string_list(result.get("paths"))
+
+
+def patch_ownership_incomplete_details(
+    manifest: dict[str, Any] | None,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    expected = _patch_ownership_expected(manifest)
+    expected_unit_ids = set(expected["unit_ids"])
+    allocated_unit_ids = set(_allocated_unit_ids_from_result(result))
+    missing_unit_ids = sorted(expected_unit_ids - allocated_unit_ids)
+    expected_paths = set(expected["paths"])
+    allocated_paths = set(_allocated_paths_from_result(result))
+    missing_paths = sorted(expected_paths - allocated_paths)
+    unresolved = expected["unresolved"]
+    if not unresolved and not missing_unit_ids:
+        return None
+    return {
+        "reason_code": REASON_PATCH_OWNERSHIP_INCOMPLETE,
+        "unresolved_owned_patch_hunks": unresolved,
+        "missing_apply_patch_unit_ids": missing_unit_ids,
+        "missing_apply_patch_paths": missing_paths,
+        "expected_apply_patch_unit_count": len(expected_unit_ids),
+        "allocated_unit_count": len(allocated_unit_ids),
+    }
+
+
+def patch_ownership_incomplete_skip_payload(
+    *,
+    context: dict[str, Any],
+    ledger: RunLedger,
+    result: dict[str, Any],
+    details: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    repo = context.get("repo")
+    session_id = context.get("session_id")
+    lease_id = result.get("lease_id")
+    release_result: dict[str, Any] | None = None
+    if isinstance(lease_id, str) and lease_id and isinstance(repo, str) and repo:
+        try:
+            release_result = lease_release(
+                repo=repo,
+                lease_id=lease_id,
+                reason=REASON_PATCH_OWNERSHIP_INCOMPLETE,
+            )
+        except Exception as exc:
+            release_result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    event_details = dict(details)
+    event_details.pop("reason_code", None)
+    ledger.event(
+        phase="gate",
+        event=REASON_PATCH_OWNERSHIP_INCOMPLETE,
+        status="skipped",
+        reason_code=REASON_PATCH_OWNERSHIP_INCOMPLETE,
+        repo=repo,
+        cwd=context.get("cwd"),
+        session_id=session_id,
+        dry_run=dry_run,
+        tracker_lease_id=lease_id,
+        tracker_scope_hash=result.get("scope_hash"),
+        lease_release_result=release_result,
+        **event_details,
+    )
+    if dry_run:
+        return {
+            "would_proceed": False,
+            "candidate_unit_count": result.get("candidate_unit_count", 0),
+            "result": result,
+            "reason": REASON_PATCH_OWNERSHIP_INCOMPLETE,
+            "patch_ownership": details,
+        }
+    return skip_payload(
+        "patch ownership incomplete; skipped RVF fork/review so a partial tracker scope is not reported as clean.",
+        ledger,
+        REASON_PATCH_OWNERSHIP_INCOMPLETE,
+        repo=repo,
+        session_id=session_id,
+        tracker_lease_id=lease_id,
+        tracker_scope_hash=result.get("scope_hash"),
+        patch_ownership=details,
+    )
+
+
 def sweep_stale_tracker_leases(
     *,
     repo_path: Path,
@@ -5478,6 +5594,14 @@ def allocate_auto_review_scope(
     if parent_session_id == session_id:
         parent_session_id = None
     lease_ttl_seconds = auto_review_lease_ttl_seconds(context)
+    manifest = context.get("manifest")
+    patch_ownership = manifest.get("patch_ownership") if isinstance(manifest, dict) else None
+    transcript_max_line_number = (
+        patch_ownership.get("transcript_max_line_number")
+        if isinstance(patch_ownership, dict)
+        and isinstance(patch_ownership.get("transcript_max_line_number"), int)
+        else None
+    )
     try:
         sweep_stale_tracker_leases(
             repo_path=repo_path,
@@ -5540,7 +5664,17 @@ def allocate_auto_review_scope(
                 dry_run=True,
                 auto_claim_observed=False,
                 lease_ttl_seconds=lease_ttl_seconds,
+                transcript_max_line_number=transcript_max_line_number,
             )
+            incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
+            if incomplete is not None:
+                return patch_ownership_incomplete_skip_payload(
+                    context=context,
+                    ledger=ledger,
+                    result=result,
+                    details=incomplete,
+                    dry_run=True,
+                )
             status = result.get("status")
             if status == "dry_run":
                 return {
@@ -5564,6 +5698,7 @@ def allocate_auto_review_scope(
             holder_kind="reviewer",
             dry_run=dry_run,
             lease_ttl_seconds=lease_ttl_seconds,
+            transcript_max_line_number=transcript_max_line_number,
             # Auto Stop-hook attribution comes from
             # `refresh_global_diff_tracker` → `build_manifest` →
             # `register_claims`; auto-claim here would broaden scope past
@@ -5591,6 +5726,15 @@ def allocate_auto_review_scope(
         )
 
     status = result.get("status")
+    incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
+    if incomplete is not None and status in {"allocated", "dry_run", "empty"}:
+        return patch_ownership_incomplete_skip_payload(
+            context=context,
+            ledger=ledger,
+            result=result,
+            details=incomplete,
+            dry_run=dry_run,
+        )
     if status == "allocated":
         scope_payload = result.get("scope")
         artifact_path = ledger.artifact("tracker-scope.json", scope_payload) if scope_payload else None

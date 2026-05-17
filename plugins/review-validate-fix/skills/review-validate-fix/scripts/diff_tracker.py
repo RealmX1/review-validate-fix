@@ -28,7 +28,7 @@ from rvf_logging import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_FILENAME = "tracker.sqlite3"
 EVENTS_FILENAME = "events.jsonl"
 META_FILENAME = "meta.json"
@@ -775,6 +775,11 @@ def _unit_specs_for_owned(
     ]
 
 
+def unit_ids_for_owned_unit(repo: Path, owned_unit: OwnedUnit) -> list[str]:
+    """Return current tracker unit ids represented by an OwnedUnit hint."""
+    return [spec.unit_id for spec in _unit_specs_for_owned(repo.resolve(), owned_unit)]
+
+
 # -------------------------- SQLite plumbing --------------------------
 
 DDL = r"""
@@ -872,6 +877,37 @@ CREATE TABLE IF NOT EXISTS session_units (
 CREATE INDEX IF NOT EXISTS idx_session_units_unit ON session_units(unit_id);
 CREATE INDEX IF NOT EXISTS idx_session_units_kind ON session_units(assignment_kind);
 
+CREATE TABLE IF NOT EXISTS edit_claims (
+  claim_id                 TEXT PRIMARY KEY,
+  session_id               TEXT NOT NULL,
+  run_id                   TEXT,
+  tool_name                TEXT NOT NULL,
+  call_id                  TEXT,
+  transcript_line_number   INTEGER,
+  path                     TEXT NOT NULL,
+  hunk_index               INTEGER,
+  operation                TEXT,
+  status                   TEXT NOT NULL CHECK (status IN ('pending','reviewed','superseded')),
+  latest_user_line_number  INTEGER,
+  latest_user_message      TEXT,
+  created_at               TEXT NOT NULL,
+  last_seen_at             TEXT NOT NULL,
+  reviewed_at              TEXT,
+  FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_edit_claims_session_status ON edit_claims(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_edit_claims_path ON edit_claims(path);
+CREATE INDEX IF NOT EXISTS idx_edit_claims_line ON edit_claims(transcript_line_number);
+
+CREATE TABLE IF NOT EXISTS edit_claim_units (
+  claim_id TEXT NOT NULL,
+  unit_id  TEXT NOT NULL,
+  PRIMARY KEY (claim_id, unit_id),
+  FOREIGN KEY (claim_id) REFERENCES edit_claims(claim_id) ON DELETE CASCADE,
+  FOREIGN KEY (unit_id)  REFERENCES units(unit_id)        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_edit_claim_units_unit ON edit_claim_units(unit_id);
+
 CREATE TABLE IF NOT EXISTS manual_rvf_runs (
   session_id   TEXT NOT NULL,
   run_id       TEXT NOT NULL,
@@ -891,6 +927,7 @@ CREATE TABLE IF NOT EXISTS leases (
   state             TEXT NOT NULL CHECK (state IN
                        ('active','paused','completed','stale-released','failed-released')),
   ttl_seconds       INTEGER NOT NULL,
+  transcript_max_line_number INTEGER,
   created_at        TEXT NOT NULL,
   last_activity_at  TEXT NOT NULL,
   expires_at        TEXT NOT NULL,
@@ -1068,19 +1105,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         _migrate_schema_v2_to_v3(conn)
         _migrate_schema_v3_to_v4(conn)
         _migrate_schema_v4_to_v5(conn)
+        _migrate_schema_v5_to_v6(conn)
         return
     if version == 3:
         _migrate_schema_v3_to_v4(conn)
         _migrate_schema_v4_to_v5(conn)
+        _migrate_schema_v5_to_v6(conn)
         return
     if version == 4:
         _migrate_schema_v4_to_v5(conn)
+        _migrate_schema_v5_to_v6(conn)
+        return
+    if version == 5:
+        _migrate_schema_v5_to_v6(conn)
         return
     if version == SCHEMA_VERSION:
         _ensure_unit_tombstone_schema(conn)
         _ensure_manual_rvf_runs_schema(conn)
+        _ensure_lease_watermark_schema(conn)
         _ensure_lease_participants_schema(conn)
         _ensure_rvf_causality_schema(conn)
+        _ensure_edit_claim_schema(conn)
         return
     raise RuntimeError(f"unknown tracker schema version: {version}")
 
@@ -1098,6 +1143,12 @@ def _ensure_manual_rvf_runs_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def _ensure_lease_watermark_schema(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(leases)").fetchall()}
+    if "transcript_max_line_number" not in columns:
+        conn.execute("ALTER TABLE leases ADD COLUMN transcript_max_line_number INTEGER")
 
 
 def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
@@ -1122,6 +1173,43 @@ def _ensure_lease_participants_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_lease_participants_state
           ON lease_participants(lease_id, state)
+        """
+    )
+
+
+def _ensure_edit_claim_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS edit_claims (
+          claim_id                 TEXT PRIMARY KEY,
+          session_id               TEXT NOT NULL,
+          run_id                   TEXT,
+          tool_name                TEXT NOT NULL,
+          call_id                  TEXT,
+          transcript_line_number   INTEGER,
+          path                     TEXT NOT NULL,
+          hunk_index               INTEGER,
+          operation                TEXT,
+          status                   TEXT NOT NULL CHECK (status IN ('pending','reviewed','superseded')),
+          latest_user_line_number  INTEGER,
+          latest_user_message      TEXT,
+          created_at               TEXT NOT NULL,
+          last_seen_at             TEXT NOT NULL,
+          reviewed_at              TEXT,
+          FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_edit_claims_session_status ON edit_claims(session_id, status);
+        CREATE INDEX IF NOT EXISTS idx_edit_claims_path ON edit_claims(path);
+        CREATE INDEX IF NOT EXISTS idx_edit_claims_line ON edit_claims(transcript_line_number);
+
+        CREATE TABLE IF NOT EXISTS edit_claim_units (
+          claim_id TEXT NOT NULL,
+          unit_id  TEXT NOT NULL,
+          PRIMARY KEY (claim_id, unit_id),
+          FOREIGN KEY (claim_id) REFERENCES edit_claims(claim_id) ON DELETE CASCADE,
+          FOREIGN KEY (unit_id)  REFERENCES units(unit_id)        ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_edit_claim_units_unit ON edit_claim_units(unit_id);
         """
     )
 
@@ -1235,6 +1323,7 @@ def _rebuild_units_without_legacy_tombstoned_review_state(conn: sqlite3.Connecti
 
 def _migrate_schema_v2_to_v3(conn: sqlite3.Connection) -> None:
     _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_watermark_schema(conn)
     _ensure_lease_participants_schema(conn)
     conn.execute("PRAGMA user_version = 3")
 
@@ -1315,6 +1404,7 @@ def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
 
 def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
     _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_watermark_schema(conn)
     _ensure_lease_participants_schema(conn)
     _ensure_rvf_causality_schema(conn)
     conn.execute("PRAGMA user_version = 4")
@@ -1323,8 +1413,19 @@ def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
 def _migrate_schema_v4_to_v5(conn: sqlite3.Connection) -> None:
     _ensure_unit_tombstone_schema(conn)
     _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_watermark_schema(conn)
     _ensure_lease_participants_schema(conn)
     _ensure_rvf_causality_schema(conn)
+    conn.execute("PRAGMA user_version = 5")
+
+
+def _migrate_schema_v5_to_v6(conn: sqlite3.Connection) -> None:
+    _ensure_unit_tombstone_schema(conn)
+    _ensure_manual_rvf_runs_schema(conn)
+    _ensure_lease_watermark_schema(conn)
+    _ensure_lease_participants_schema(conn)
+    _ensure_rvf_causality_schema(conn)
+    _ensure_edit_claim_schema(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -1544,6 +1645,107 @@ def _upsert_session_unit(
         (session_id, unit_id, now, run_id, branch, worktree, evidence, now),
     )
     return not existed
+
+
+def _string_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _unit_ids_from_claim_payload(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _upsert_edit_claims_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    run_id: str | None,
+    edit_claims: list[dict[str, Any]],
+    now: str,
+) -> int:
+    inserted_or_updated = 0
+    for claim in edit_claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = _string_or_none(claim.get("claim_id"))
+        path = _string_or_none(claim.get("path"))
+        tool_name = _string_or_none(claim.get("tool_name")) or "unknown"
+        if claim_id is None or path is None:
+            continue
+        call_id = _string_or_none(claim.get("call_id"))
+        operation = _string_or_none(claim.get("operation"))
+        transcript_line_number = _int_or_none(claim.get("transcript_line_number"))
+        hunk_index = _int_or_none(claim.get("hunk_index"))
+        latest_user_line_number = _int_or_none(claim.get("latest_user_line_number"))
+        latest_user_message = _string_or_none(claim.get("latest_user_message"))
+        claim_run_id = _string_or_none(claim.get("run_id")) or run_id
+
+        conn.execute(
+            """
+            INSERT INTO edit_claims(
+                claim_id, session_id, run_id, tool_name, call_id,
+                transcript_line_number, path, hunk_index, operation, status,
+                latest_user_line_number, latest_user_message,
+                created_at, last_seen_at, reviewed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, NULL)
+            ON CONFLICT(claim_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                run_id=COALESCE(excluded.run_id, edit_claims.run_id),
+                tool_name=excluded.tool_name,
+                call_id=COALESCE(excluded.call_id, edit_claims.call_id),
+                transcript_line_number=COALESCE(excluded.transcript_line_number, edit_claims.transcript_line_number),
+                path=excluded.path,
+                hunk_index=COALESCE(excluded.hunk_index, edit_claims.hunk_index),
+                operation=COALESCE(excluded.operation, edit_claims.operation),
+                status=CASE
+                    WHEN edit_claims.status='reviewed' THEN 'reviewed'
+                    ELSE 'pending'
+                END,
+                latest_user_line_number=COALESCE(excluded.latest_user_line_number, edit_claims.latest_user_line_number),
+                latest_user_message=COALESCE(excluded.latest_user_message, edit_claims.latest_user_message),
+                last_seen_at=excluded.last_seen_at
+            """,
+            (
+                claim_id,
+                session_id,
+                claim_run_id,
+                tool_name,
+                call_id,
+                transcript_line_number,
+                path,
+                hunk_index,
+                operation,
+                latest_user_line_number,
+                latest_user_message,
+                now,
+                now,
+            ),
+        )
+        conn.execute("DELETE FROM edit_claim_units WHERE claim_id=?", (claim_id,))
+        for unit_id in _unit_ids_from_claim_payload(claim.get("mapped_unit_ids")):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO edit_claim_units(claim_id, unit_id)
+                VALUES (?, ?)
+                """,
+                (claim_id, unit_id),
+            )
+        inserted_or_updated += 1
+    return inserted_or_updated
 
 
 # -------------------------- Phase 1 → SQLite migration --------------------------
@@ -2092,6 +2294,166 @@ def register_claims(
             },
         )
         return RegisterResult(status="error", repo_key=key, tracker_dir=str(directory))
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def register_edit_claims(
+    *,
+    repo: Path,
+    session_id: str,
+    run_id: str | None,
+    edit_claims: list[dict[str, Any]],
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    repo_resolved = repo.resolve()
+    if _disabled():
+        return {"status": "disabled"}
+    if is_bare_repo(repo_resolved):
+        return {"status": "unsupported_repo"}
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        return {"status": "unsupported_repo"}
+    if not edit_claims:
+        return {"status": "no_claims", "registered_count": 0}
+
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    directory.mkdir(parents=True, exist_ok=True)
+    db_path = directory / SQLITE_FILENAME
+    events_path = directory / EVENTS_FILENAME
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            now = _tracker_now_iso()
+            branch_value = _current_branch(repo_resolved)
+            branch_key = _upsert_branch(conn, branch_value, now) if branch_value else None
+            worktree_key = _upsert_worktree(conn, str(repo_resolved), branch_key, None, now)
+            _upsert_session(conn, session_id, worktree_key, now)
+            registered_count = _upsert_edit_claims_in_txn(
+                conn,
+                session_id=session_id,
+                run_id=run_id,
+                edit_claims=edit_claims,
+                now=now,
+            )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "edit_claims_registered",
+                "session_id": session_id,
+                "run_id": run_id,
+                "registered_count": registered_count,
+            },
+        )
+        return {
+            "status": "ok",
+            "registered_count": registered_count,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    except sqlite3.OperationalError as exc:
+        if _is_lock_busy(exc):
+            _emit_event(
+                events_path,
+                {
+                    "event": "edit_claims_register_lock_timeout",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "claim_count": len(edit_claims),
+                },
+            )
+            return {"status": "lock_timeout", "repo_key": key, "tracker_dir": str(directory)}
+        _emit_event(
+            events_path,
+            {
+                "event": "edit_claims_register_failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "claim_count": len(edit_claims),
+                "error": repr(exc),
+            },
+        )
+        return {"status": "error", "repo_key": key, "tracker_dir": str(directory)}
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        _emit_event(
+            events_path,
+            {
+                "event": "edit_claims_register_failed",
+                "session_id": session_id,
+                "run_id": run_id,
+                "claim_count": len(edit_claims),
+                "error": repr(exc),
+            },
+        )
+        return {"status": "error", "repo_key": key, "tracker_dir": str(directory)}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
+def latest_transcript_watermark(
+    *,
+    repo: Path,
+    session_id: str,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    repo_resolved = repo.resolve()
+    if _disabled():
+        return {"status": "disabled", "transcript_max_line_number": None}
+    if not session_id:
+        return {"status": "missing_session_id", "transcript_max_line_number": None}
+    if is_bare_repo(repo_resolved):
+        return {"status": "unsupported_repo", "transcript_max_line_number": None}
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        return {"status": "unsupported_repo", "transcript_max_line_number": None}
+
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    db_path = directory / SQLITE_FILENAME
+    if not db_path.exists():
+        return {
+            "status": "no_tracker_db",
+            "repo_key": key,
+            "tracker_dir": str(directory),
+            "session_id": session_id,
+            "transcript_max_line_number": None,
+        }
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        row = conn.execute(
+            """
+            SELECT MAX(transcript_max_line_number) AS transcript_max_line_number
+              FROM leases
+             WHERE session_id=?
+               AND state IN ('active','paused','completed')
+               AND transcript_max_line_number IS NOT NULL
+            """,
+            (session_id,),
+        ).fetchone()
+        value = row["transcript_max_line_number"] if row is not None else None
+        return {
+            "status": "ok",
+            "repo_key": key,
+            "tracker_dir": str(directory),
+            "session_id": session_id,
+            "transcript_max_line_number": int(value) if value is not None else None,
+        }
     finally:
         if conn is not None:
             try:
@@ -3262,6 +3624,36 @@ def complete_review_scope(
                     """,
                     (now_iso, lease_id),
                 )
+            reviewed_edit_claim_count = 0
+            if reviewable_unit_ids:
+                claim_placeholders = ",".join("?" for _ in reviewable_unit_ids)
+                cur = conn.execute(
+                    f"""
+                    UPDATE edit_claims
+                       SET status='reviewed',
+                           reviewed_at=?,
+                           last_seen_at=?
+                     WHERE status='pending'
+                       AND claim_id IN (
+                           SELECT DISTINCT claim_id
+                             FROM edit_claim_units
+                            WHERE unit_id IN ({claim_placeholders})
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM edit_claim_units ecu_all
+                             LEFT JOIN units u ON u.unit_id = ecu_all.unit_id
+                            WHERE ecu_all.claim_id = edit_claims.claim_id
+                              AND (
+                                  u.unit_id IS NULL
+                                  OR u.review_state <> 'reviewed'
+                                  OR u.is_tombstoned <> 0
+                              )
+                       )
+                    """,
+                    (now_iso, now_iso, *reviewable_unit_ids),
+                )
+                reviewed_edit_claim_count = cur.rowcount or 0
 
         _ensure_meta(directory, repo_resolved, common_dir, key)
         if prior_state == "completed":
@@ -3282,6 +3674,7 @@ def complete_review_scope(
                 "scope_hash": effective_scope_hash,
                 "previous_lease_state": prior_state,
                 "completed_unit_count": len(reviewable_unit_ids),
+                "reviewed_edit_claim_count": reviewed_edit_claim_count,
                 "superseded_active_lease_ids": superseded_active_lease_ids,
                 "blocked_active_lease_ids": blocked_active_lease_ids,
                 "reason_code": completed_reason,
@@ -3295,6 +3688,7 @@ def complete_review_scope(
             "release_state": "completed",
             "unit_ids": reviewable_unit_ids,
             "released_unit_count": len(reviewable_unit_ids),
+            "reviewed_edit_claim_count": reviewed_edit_claim_count,
             "scope_hash": effective_scope_hash,
             "run_id": effective_run_id,
             "previous_lease_state": prior_state,
@@ -3522,12 +3916,18 @@ def _tracker_now_iso(value: str | None = None) -> str:
 
 
 def _list_dirty_paths(repo: Path) -> list[str]:
-    """Return the sorted unique set of paths reported by `git status -z`.
+    """Return the sorted unique set of paths reported by `git status -z -uall`.
     Renames surface as two halves (old + new) — both are emitted so the
     observation step can classify each side independently. The pathspec
-    branch used by `_classify_path` then deduplicates per path."""
+    branch used by `_classify_path` then deduplicates per path.
+
+    `-uall` is required so untracked directories expand to file paths. A
+    directory-level `?? path/` row cannot be mapped back to edit-claim units for
+    files created under that directory, and would make live untracked units look
+    superseded during allocator observation.
+    """
     try:
-        raw = _run_git(repo, ["status", "--porcelain=v1", "-z"])
+        raw = _run_git(repo, ["status", "--porcelain=v1", "-z", "-uall"])
     except RuntimeError:
         return []
     if not raw:
@@ -3903,17 +4303,31 @@ def _collect_candidate_unit_ids_in_txn(
 ) -> list[str]:
     rows = conn.execute(
         """
-        SELECT su.unit_id
-          FROM session_units su
-          JOIN units u ON u.unit_id = su.unit_id
-         WHERE su.session_id=?
-           AND su.assignment_kind IN ('owned','takeover')
+        SELECT DISTINCT u.unit_id, u.path, u.hunk_header
+          FROM units u
+         WHERE (
+               EXISTS (
+                   SELECT 1
+                     FROM session_units su
+                    WHERE su.unit_id = u.unit_id
+                      AND su.session_id=?
+                      AND su.assignment_kind IN ('owned','takeover')
+               )
+               OR EXISTS (
+                   SELECT 1
+                     FROM edit_claim_units ecu
+                     JOIN edit_claims ec ON ec.claim_id = ecu.claim_id
+                    WHERE ecu.unit_id = u.unit_id
+                      AND ec.session_id=?
+                      AND ec.status='pending'
+               )
+           )
            AND u.review_state='available'
            AND u.is_tombstoned=0
            AND u.observed_state IN ('dirty','committed')
          ORDER BY u.path, u.hunk_header IS NULL, u.hunk_header, u.unit_id
         """,
-        (session_id,),
+        (session_id, session_id),
     ).fetchall()
     return [row["unit_id"] for row in rows]
 
@@ -3955,6 +4369,7 @@ def _create_lease_in_txn(
     unit_ids: list[str],
     ttl_seconds: int,
     now_iso: str,
+    transcript_max_line_number: int | None = None,
 ) -> None:
     expires_dt = (_iso_to_datetime(now_iso) or datetime.now(timezone.utc)) + timedelta(seconds=ttl_seconds)
     expires_at = _datetime_to_iso(expires_dt)
@@ -3962,9 +4377,9 @@ def _create_lease_in_txn(
         """
         INSERT INTO leases(
             lease_id, session_id, run_id, reviewer_id, holder_kind, scope_hash,
-            state, ttl_seconds, created_at, last_activity_at, expires_at
+            state, ttl_seconds, transcript_max_line_number, created_at, last_activity_at, expires_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
         """,
         (
             lease_id,
@@ -3974,6 +4389,7 @@ def _create_lease_in_txn(
             holder_kind,
             scope_hash,
             ttl_seconds,
+            transcript_max_line_number,
             now_iso,
             now_iso,
             expires_at,
@@ -4064,6 +4480,7 @@ def allocate_review_scope(
     log_root_override: Path | None = None,
     now: str | None = None,
     auto_claim_observed: bool = True,
+    transcript_max_line_number: int | None = None,
 ) -> dict[str, Any]:
     """Producer half of the global reviewed-diff tracker.
 
@@ -4247,12 +4664,14 @@ def allocate_review_scope(
                     unit_ids=surviving,
                     ttl_seconds=ttl_seconds,
                     now_iso=now_iso,
+                    transcript_max_line_number=transcript_max_line_number,
                 )
                 paths_list, hunks_list = _collect_paths_and_hunks_in_txn(conn, surviving)
                 scope_payload: dict[str, Any] = {
                     "unit_ids": surviving,
                     "lease_id": lease_id,
                     "lease_ttl_seconds": ttl_seconds,
+                    "transcript_max_line_number": transcript_max_line_number,
                     "scope_hash": scope_hash,
                     "paths": paths_list,
                     "hunks": hunks_list,
@@ -4308,6 +4727,7 @@ def allocate_review_scope(
                     "leased_excluded_count": leased_excluded_count,
                     "stale_freed": committed_payload["stale_freed"],
                     "takeover_from_session_id": committed_payload["takeover_from"],
+                    "transcript_max_line_number": transcript_max_line_number,
                     "reason_code": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
                     "reason_code_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
                 },
@@ -4324,6 +4744,7 @@ def allocate_review_scope(
                 "scope_hash": committed_payload["scope_hash"],
                 "candidate_unit_count": candidate_unit_count,
                 "leased_excluded_count": leased_excluded_count,
+                "transcript_max_line_number": transcript_max_line_number,
                 "repo_key": key,
                 "tracker_dir": str(directory),
             }
@@ -4339,6 +4760,7 @@ def allocate_review_scope(
                     "unit_count": len(committed_payload["unit_ids"]),
                     "paths": committed_payload["paths"],
                     "leased_excluded_count": leased_excluded_count,
+                    "transcript_max_line_number": transcript_max_line_number,
                     "reason_code": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
                     "reason_code_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
                 },
@@ -4353,6 +4775,8 @@ def allocate_review_scope(
                 "scope_path": None,
                 "lease_id": None,
                 "scope_hash": committed_payload["scope_hash"],
+                "unit_ids": committed_payload["unit_ids"],
+                "paths": committed_payload["paths"],
                 "candidate_unit_count": candidate_unit_count,
                 "leased_excluded_count": leased_excluded_count,
                 "repo_key": key,

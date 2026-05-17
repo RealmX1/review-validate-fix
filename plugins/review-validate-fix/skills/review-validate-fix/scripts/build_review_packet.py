@@ -422,6 +422,38 @@ def build_packet(
         else:
             lines.append("(none)")
         lines.append("")
+        patch_ownership = session_manifest.get("patch_ownership")
+        if isinstance(patch_ownership, dict):
+            unresolved = patch_ownership.get("unresolved_owned_patch_hunks")
+            expected_paths = string_list(patch_ownership.get("expected_apply_patch_paths"))
+            expected_units = string_list(patch_ownership.get("expected_apply_patch_unit_ids"))
+            lines.extend(
+                [
+                    "Patch ownership audit:",
+                    f"- transcript max line: `{patch_ownership.get('transcript_max_line_number') or '(none)'}`",
+                    f"- expected apply_patch paths: `{len(expected_paths)}`",
+                    f"- expected apply_patch units: `{len(expected_units)}`",
+                    f"- unresolved owned patch hunks: `{len(unresolved) if isinstance(unresolved, list) else 0}`",
+                    "",
+                ]
+            )
+        edit_claims = session_manifest.get("edit_claims")
+        if isinstance(edit_claims, list):
+            latest_user_lines = sorted(
+                {
+                    item.get("latest_user_line_number")
+                    for item in edit_claims
+                    if isinstance(item, dict) and isinstance(item.get("latest_user_line_number"), int)
+                }
+            )
+            lines.extend(
+                [
+                    "Edit claim audit:",
+                    f"- edit claim count: `{len(edit_claims)}`",
+                    f"- latest user context line count: `{len(latest_user_lines)}`",
+                    "",
+                ]
+            )
 
     if tracker_scope is not None:
         lines.extend(
@@ -432,6 +464,7 @@ def build_packet(
                 "",
                 f"- lease id: `{tracker_scope['lease_id']}`",
                 f"- scope hash: `{tracker_scope['scope_hash']}`",
+                f"- transcript max line: `{tracker_scope.get('transcript_max_line_number') or '(none)'}`",
             ]
         )
         source_session = tracker_scope.get("source_session_id")

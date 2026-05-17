@@ -7,6 +7,7 @@ import importlib.util
 import os
 import signal
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -2139,6 +2140,429 @@ def test_session_manifest_only_claims_matching_apply_patch_hunk(tmp_path: Path) 
     assert len(owned_units) == 1
     assert owned_units[0]["unit"] == "hunk"
     assert "session-owned" in run(["git", "diff", "HEAD", "--", "a.txt"], cwd=repo).stdout
+
+
+def test_session_manifest_records_edit_claim_user_context(tmp_path: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " base\n"
+        "+claimed\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "first request"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "keep the claimed line"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("base\nclaimed\n", encoding="utf-8")
+    log_root = tmp_path / "logs"
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--tracker-run-id",
+                "run-1",
+            ],
+            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
+        ).stdout
+    )
+
+    assert len(manifest["edit_claims"]) == 1
+    claim = manifest["edit_claims"][0]
+    assert claim["path"] == "a.txt"
+    assert claim["call_id"] == "patch-1"
+    assert claim["latest_user_message"] == "keep the claimed line"
+    assert claim["latest_user_line_number"] == 3
+    assert claim["mapped_unit_ids"]
+    assert manifest["edit_claim_registration"]["status"] == "ok"
+    assert manifest["edit_claim_registration"]["registered_count"] == 1
+
+    tracker_dir = Path(manifest["tracker"]["tracker_dir"])
+    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT claim_id, session_id, call_id, path, status, latest_user_line_number, latest_user_message
+              FROM edit_claims
+            """
+        ).fetchone()
+        assert row is not None
+        assert row["session_id"] == "S"
+        assert row["call_id"] == "patch-1"
+        assert row["path"] == "a.txt"
+        assert row["status"] == "pending"
+        assert row["latest_user_line_number"] == 3
+        assert row["latest_user_message"] == "keep the claimed line"
+        unit_count = conn.execute(
+            "SELECT COUNT(*) FROM edit_claim_units WHERE claim_id=?",
+            (row["claim_id"],),
+        ).fetchone()[0]
+        assert unit_count == len(claim["mapped_unit_ids"])
+        conn.execute("DELETE FROM session_units WHERE session_id='S'")
+
+    allocated = module.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="review-run",
+        reviewer_id="reviewer-1",
+        log_root_override=log_root,
+        transcript_max_line_number=4,
+    )
+    assert allocated["status"] == "allocated"
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=allocated["lease_id"],
+        unit_ids=allocated["scope"]["unit_ids"],
+        scope_hash=allocated["scope_hash"],
+        run_id="review-run",
+        log_root_override=log_root,
+    )
+    assert completed["status"] == "released"
+    assert completed["reviewed_edit_claim_count"] == 1
+    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
+        status = conn.execute("SELECT status FROM edit_claims").fetchone()[0]
+        assert status == "reviewed"
+
+
+def test_session_manifest_records_codex_message_user_context(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " base\n"
+        "+claimed\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "codex message user context"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("base\nclaimed\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    assert manifest["apply_patch_operations"][0]["latest_user_line_number"] == 2
+    assert manifest["apply_patch_operations"][0]["latest_user_message"] == "codex message user context"
+    claim = manifest["edit_claims"][0]
+    assert claim["latest_user_line_number"] == 2
+    assert claim["latest_user_message"] == "codex message user context"
+
+
+def test_complete_review_scope_waits_for_all_edit_claim_units(tmp_path: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    (repo / "b.txt").write_text("b\n", encoding="utf-8")
+    run(["git", "add", "a.txt", "b.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    (repo / "a.txt").write_text("a\nclaimed-a\n", encoding="utf-8")
+    (repo / "b.txt").write_text("b\nclaimed-b\n", encoding="utf-8")
+    log_root = tmp_path / "logs"
+    registered = module.register_claims(
+        repo=repo,
+        session_id="S",
+        run_id="run-1",
+        worktree=repo,
+        branch=None,
+        owned_paths=["a.txt", "b.txt"],
+        apply_patch_paths={"a.txt", "b.txt"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert registered.status == "ok"
+    unit_a = module.unit_ids_for_owned_unit(repo, module.OwnedUnit(path="a.txt", unit="path", hunk_anchor=None))[0]
+    unit_b = module.unit_ids_for_owned_unit(repo, module.OwnedUnit(path="b.txt", unit="path", hunk_anchor=None))[0]
+    edit_registered = module.register_edit_claims(
+        repo=repo,
+        session_id="S",
+        run_id="run-1",
+        edit_claims=[
+            {
+                "claim_id": "edit-two-units",
+                "tool_name": "apply_patch",
+                "call_id": "patch-1",
+                "transcript_line_number": 10,
+                "path": "a.txt",
+                "hunk_index": 1,
+                "operation": "update",
+                "mapped_unit_ids": [unit_a, unit_b],
+                "latest_user_line_number": 2,
+                "latest_user_message": "change both files",
+            }
+        ],
+        log_root_override=log_root,
+    )
+    assert edit_registered["status"] == "ok"
+
+    first = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-lease-a",
+        unit_ids=[unit_a],
+        scope_hash="sha256:first",
+        run_id="review-a",
+        log_root_override=log_root,
+    )
+    assert first["status"] == "released"
+    assert first["reviewed_edit_claim_count"] == 0
+    tracker_dir = Path(first["tracker_dir"])
+    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
+        assert conn.execute("SELECT status FROM edit_claims WHERE claim_id='edit-two-units'").fetchone()[0] == "pending"
+
+    second = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-lease-b",
+        unit_ids=[unit_b],
+        scope_hash="sha256:second",
+        run_id="review-b",
+        log_root_override=log_root,
+    )
+    assert second["status"] == "released"
+    assert second["reviewed_edit_claim_count"] == 1
+    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
+        assert conn.execute("SELECT status FROM edit_claims WHERE claim_id='edit-two-units'").fetchone()[0] == "reviewed"
+
+
+def test_session_manifest_suppresses_unresolved_without_tracker_watermark(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("base\nbackground\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--no-tracker",
+            ]
+        ).stdout
+    )
+
+    unresolved = manifest["patch_ownership"]["unresolved_owned_patch_hunks"]
+    assert manifest["owned_dirty_paths"] == []
+    assert manifest["unattributed_dirty_paths"] == ["a.txt"]
+    assert unresolved == []
+
+
+def test_session_manifest_reports_unresolved_apply_patch_hunk_after_tracker_watermark(tmp_path: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    (repo / "a.txt").write_text("base\nleased\n", encoding="utf-8")
+    log_root = tmp_path / "logs"
+    seeded = module.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="run-1",
+        reviewer_id="reviewer-1",
+        log_root_override=log_root,
+        transcript_max_line_number=1,
+    )
+    assert seeded["status"] == "allocated"
+
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        "-base\n"
+        "+owned\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "event_msg", "payload": {"note": "prior turn"}},
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("base\nbackground\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--tracker-run-id",
+                "run-2",
+            ],
+            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
+        ).stdout
+    )
+
+    unresolved = manifest["patch_ownership"]["unresolved_owned_patch_hunks"]
+    assert len(unresolved) == 1
+    assert unresolved[0]["path"] == "a.txt"
+    assert unresolved[0]["call_id"] == "patch-1"
+    assert unresolved[0]["reason"] == "no_current_diff_hunk_contains_patch_mutations"
+
+
+def test_session_manifest_uses_tracker_transcript_watermark(tmp_path: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "a.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "a.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    (repo / "a.txt").write_text("base\nold\n", encoding="utf-8")
+    log_root = tmp_path / "logs"
+    first = module.allocate_review_scope(
+        repo=repo,
+        session_id="S",
+        run_id="run-1",
+        reviewer_id="reviewer-1",
+        log_root_override=log_root,
+        transcript_max_line_number=2,
+    )
+    assert first["status"] == "allocated"
+
+    old_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " base\n"
+        "+old\n"
+        "*** End Patch\n"
+    )
+    new_patch = (
+        "*** Begin Patch\n"
+        "*** Update File: a.txt\n"
+        "@@\n"
+        " base\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+    transcript = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": "S"}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": old_patch}},
+        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": new_patch}},
+    ]
+    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    (repo / "a.txt").write_text("base\nnew\n", encoding="utf-8")
+
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(SESSION_MANIFEST),
+                "--repo",
+                str(repo),
+                "--transcript",
+                str(transcript),
+                "--tracker-run-id",
+                "run-2",
+            ],
+            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
+        ).stdout
+    )
+
+    assert manifest["ownership_baseline"]["tracker_transcript_max_line_number"] == 2
+    assert manifest["ownership_baseline"]["included_tool_record_count"] == 1
+    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
+    assert manifest["patch_ownership"]["transcript_max_line_number"] == 3
+    assert manifest["patch_ownership"]["expected_apply_patch_paths"] == ["a.txt"]
 
 
 def test_session_manifest_legacy_timestampless_transcript_fallback_warns(tmp_path: Path) -> None:
@@ -7124,6 +7548,42 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "session_manifest_records_edit_claim_user_context",
+            lambda: test_session_manifest_records_edit_claim_user_context(
+                root / "session-manifest-edit-claim-user-context"
+            ),
+        ),
+        (
+            "session_manifest_records_codex_message_user_context",
+            lambda: test_session_manifest_records_codex_message_user_context(
+                root / "session-manifest-codex-message-user-context"
+            ),
+        ),
+        (
+            "complete_review_scope_waits_for_all_edit_claim_units",
+            lambda: test_complete_review_scope_waits_for_all_edit_claim_units(
+                root / "complete-review-scope-edit-claim-units"
+            ),
+        ),
+        (
+            "session_manifest_suppresses_unresolved_without_tracker_watermark",
+            lambda: test_session_manifest_suppresses_unresolved_without_tracker_watermark(
+                root / "session-manifest-unresolved-no-watermark"
+            ),
+        ),
+        (
+            "session_manifest_reports_unresolved_apply_patch_hunk_after_tracker_watermark",
+            lambda: test_session_manifest_reports_unresolved_apply_patch_hunk_after_tracker_watermark(
+                root / "session-manifest-unresolved-with-watermark"
+            ),
+        ),
+        (
+            "session_manifest_uses_tracker_transcript_watermark",
+            lambda: test_session_manifest_uses_tracker_transcript_watermark(
+                root / "session-manifest-tracker-watermark"
+            ),
+        ),
+        (
             "session_manifest_legacy_timestampless_transcript_fallback_warns",
             lambda: test_session_manifest_legacy_timestampless_transcript_fallback_warns(
                 root / "session-manifest-legacy-fallback"
@@ -7597,6 +8057,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_allocate_review_scope_empty_returns_no_unassigned_review_scope(root / "alloc-T2"),
         ),
         (
+            "allocate_review_scope_preserves_untracked_file_under_new_directory",
+            lambda: test_allocate_review_scope_preserves_untracked_file_under_new_directory(root / "alloc-T2b"),
+        ),
+        (
             "allocate_review_scope_excludes_active_leased_units",
             lambda: test_allocate_review_scope_excludes_active_leased_units(root / "alloc-T3"),
         ),
@@ -7748,6 +8212,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "complete_review_scope_unions_contract_and_lease_units",
             lambda: test_complete_review_scope_unions_contract_and_lease_units(root / "lease-T7a"),
+        ),
+        (
+            "complete_review_scope_keeps_partial_edit_claim_pending",
+            lambda: test_complete_review_scope_keeps_partial_edit_claim_pending(root / "lease-T7a-partial-claim"),
         ),
         (
             "complete_review_scope_does_not_complete_failed_released_lease",
@@ -7963,6 +8431,56 @@ def test_allocate_review_scope_empty_returns_no_unassigned_review_scope(tmp: Pat
     assert result["reason"] == "no_unassigned_review_scope"
     assert result["reason_legacy_alias"] == "no_session_owned_dirty"
     assert not output_scope.exists()
+
+
+def test_allocate_review_scope_preserves_untracked_file_under_new_directory(tmp: Path) -> None:
+    module = load_diff_tracker_module()
+    repo = init_repo(tmp / "repo")
+    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
+    (repo / "new.txt").unlink()
+    nested = repo / "newdir" / "file.md"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("# New file\n\nowned by apply_patch\n", encoding="utf-8")
+    log_root = tmp / "logs"
+
+    registered = module.register_claims(
+        repo=repo,
+        session_id="sess-untracked-dir",
+        run_id="run-register",
+        worktree=repo,
+        branch=None,
+        owned_paths=["newdir/file.md"],
+        apply_patch_paths={"newdir/file.md"},
+        exec_only_paths=set(),
+        log_root_override=log_root,
+    )
+    assert registered.status == "ok"
+
+    allocated = module.allocate_review_scope(
+        repo=repo,
+        session_id="sess-untracked-dir",
+        run_id="run-allocate",
+        reviewer_id="reviewer-untracked-dir",
+        log_root_override=log_root,
+    )
+
+    assert allocated["status"] == "allocated"
+    assert allocated["scope"]["paths"] == ["newdir/file.md"]
+    repo_key = allocated["repo_key"]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = conn.execute(
+            """
+            SELECT path, kind, observed_state, review_state
+              FROM units
+             WHERE path IN ('newdir/file.md', 'newdir/')
+             ORDER BY path, kind
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    assert ("newdir/file.md", "untracked_file", "dirty", "assigned") in rows
+    assert all(row[0] != "newdir/" for row in rows)
 
 
 def test_allocate_review_scope_excludes_active_leased_units(tmp: Path) -> None:
@@ -9285,6 +9803,65 @@ def test_complete_review_scope_unions_contract_and_lease_units(tmp: Path) -> Non
         unit_ids[0]: "reviewed",
         unit_ids[1]: "reviewed",
     }
+
+
+def test_complete_review_scope_keeps_partial_edit_claim_pending(tmp: Path) -> None:
+    module, repo, log_root, unit_ids, repo_key = _lease_seed(tmp)
+    assert len(unit_ids) >= 2
+
+    registered = module.register_edit_claims(
+        repo=repo,
+        session_id="claim-sess-partial",
+        run_id="claim-run-partial",
+        edit_claims=[
+            {
+                "claim_id": "claim-partial-units",
+                "path": "a.txt",
+                "tool_name": "apply_patch",
+                "mapped_unit_ids": unit_ids[:2],
+            }
+        ],
+        log_root_override=log_root,
+    )
+    assert registered["status"] == "ok"
+
+    first = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-partial-lease-a",
+        unit_ids=unit_ids[:1],
+        scope_hash="partial-scope-a",
+        run_id="partial-run-a",
+        log_root_override=log_root,
+    )
+    assert first["released"] is True
+    assert first["reviewed_edit_claim_count"] == 0
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        status = conn.execute(
+            "SELECT status FROM edit_claims WHERE claim_id='claim-partial-units'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert status == "pending"
+
+    second = module.complete_review_scope(
+        repo=repo,
+        lease_id="missing-partial-lease-b",
+        unit_ids=unit_ids[1:2],
+        scope_hash="partial-scope-b",
+        run_id="partial-run-b",
+        log_root_override=log_root,
+    )
+    assert second["released"] is True
+    assert second["reviewed_edit_claim_count"] == 1
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        status = conn.execute(
+            "SELECT status FROM edit_claims WHERE claim_id='claim-partial-units'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert status == "reviewed"
 
 
 def test_complete_review_scope_does_not_complete_failed_released_lease(tmp: Path) -> None:
