@@ -391,6 +391,7 @@ def write_scope_contract(
     primary_units: list[str] | None = None,
     tracker_lease_id: str | None = None,
     tracker_scope_hash: str | None = None,
+    tracker_transcript_max_line_number: int | None = None,
 ) -> dict[str, Any]:
     canonical_scope = {
         "version": SCOPE_CONTRACT_VERSION,
@@ -419,6 +420,7 @@ def write_scope_contract(
         "primary_units": primary_units,
         "tracker_lease_id": tracker_lease_id,
         "tracker_scope_hash": tracker_scope_hash,
+        "tracker_transcript_max_line_number": tracker_transcript_max_line_number,
         "start_snapshot_path": str(start_snapshot_path),
         "review_packet_path": str(review_packet_path),
         "session_manifest_path": str(session_manifest_path) if session_manifest_path is not None else None,
@@ -775,6 +777,11 @@ def prepare_run(
             else None
         )
         contract_tracker_scope_hash: str | None = tracker_scope_payload["scope_hash"]
+        contract_tracker_transcript_max_line_number: int | None = (
+            tracker_scope_payload.get("transcript_max_line_number")
+            if isinstance(tracker_scope_payload.get("transcript_max_line_number"), int)
+            else None
+        )
     else:
         primary_scope_files = normalized_scope_list(
             primary_files + metadata_list(metadata.get("session_owned_paths")) + manual_dirty_paths
@@ -786,6 +793,7 @@ def prepare_run(
         contract_tracker_lease_id = None
         contract_tracker_lease_ttl_seconds = None
         contract_tracker_scope_hash = None
+        contract_tracker_transcript_max_line_number = None
     protected_files = background_scope_files
     created_at = datetime.now(timezone.utc).isoformat()
     scope_contract = write_scope_contract(
@@ -808,6 +816,7 @@ def prepare_run(
         primary_units=contract_primary_units,
         tracker_lease_id=contract_tracker_lease_id,
         tracker_scope_hash=contract_tracker_scope_hash,
+        tracker_transcript_max_line_number=contract_tracker_transcript_max_line_number,
     )
     bootstrap = build_worktree_bootstrap(
         repo=root,

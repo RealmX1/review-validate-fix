@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -25,6 +26,11 @@ class PatchHunk:
     path: str
     operation: str
     mutations: tuple[str, ...]
+    line_number: int
+    hunk_index: int
+    call_id: str | None = None
+    latest_user_line_number: int | None = None
+    latest_user_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,39 @@ class CurrentHunk:
     path: str
     anchor: diff_tracker.HunkAnchor
     mutations: tuple[str, ...]
+
+
+@dataclass
+class PatchOwnershipCoverage:
+    units: list[tuple[diff_tracker.OwnedUnit, str]]
+    covered_hunks: list[dict[str, Any]]
+    path_fallback_hunks: list[dict[str, Any]]
+    unresolved_hunks: list[dict[str, Any]]
+
+
+def patch_hunk_event(
+    patch_hunk: PatchHunk,
+    *,
+    reason: str,
+    current_hunk: CurrentHunk | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "path": patch_hunk.path,
+        "operation": patch_hunk.operation,
+        "line_number": patch_hunk.line_number,
+        "hunk_index": patch_hunk.hunk_index,
+        "reason": reason,
+        "mutation_count": len(patch_hunk.mutations),
+    }
+    if patch_hunk.call_id:
+        event["call_id"] = patch_hunk.call_id
+    if patch_hunk.latest_user_line_number is not None:
+        event["latest_user_line_number"] = patch_hunk.latest_user_line_number
+    if patch_hunk.latest_user_message:
+        event["latest_user_message"] = patch_hunk.latest_user_message
+    if current_hunk is not None:
+        event["hunk_anchor"] = current_hunk.anchor.to_dict()
+    return event
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -156,6 +195,47 @@ def payload_tool_input(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _content_to_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        pieces: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                pieces.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+                elif isinstance(item.get("content"), str):
+                    pieces.append(str(item["content"]))
+        text = "\n".join(piece for piece in pieces if piece)
+        return text or None
+    return None
+
+
+def user_message_from_record(record: dict[str, Any]) -> str | None:
+    payload = record.get("payload")
+    if isinstance(payload, dict) and payload.get("type") == "user_message":
+        text = _content_to_text(payload.get("message"))
+        if text:
+            return text
+    if isinstance(payload, dict) and payload.get("type") == "message" and payload.get("role") == "user":
+        text = _content_to_text(payload.get("content"))
+        if text:
+            return text
+    message = record.get("message")
+    if isinstance(message, dict) and message.get("role") == "user":
+        text = _content_to_text(message.get("content"))
+        if text:
+            return text
+    if record.get("type") == "user":
+        text = _content_to_text(record.get("content"))
+        if text:
+            return text
+    return None
+
+
 def claude_tool_uses(record: dict[str, Any]) -> list[dict[str, Any]]:
     message = record.get("message")
     if not isinstance(message, dict):
@@ -186,6 +266,8 @@ def parse_apply_patch_details(
     repo: Path,
     patch_text: str,
     line_number: int,
+    call_id: str | None = None,
+    latest_user_context: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str], dict[str, list[PatchHunk]]]:
     operations: list[dict[str, Any]] = []
     paths: set[str] = set()
@@ -194,33 +276,57 @@ def parse_apply_patch_details(
     current_path: str | None = None
     current_operation: str | None = None
     current_mutations: list[str] = []
+    current_hunk_index = 0
 
     def flush_hunk() -> None:
-        nonlocal current_mutations
+        nonlocal current_mutations, current_hunk_index
         if current_path is not None and current_operation is not None and current_mutations:
+            current_hunk_index += 1
+            latest_user_line_number = (
+                latest_user_context.get("line_number") if isinstance(latest_user_context, dict) else None
+            )
+            latest_user_message = (
+                latest_user_context.get("message") if isinstance(latest_user_context, dict) else None
+            )
             hunks.setdefault(current_path, []).append(
                 PatchHunk(
                     path=current_path,
                     operation=current_operation,
                     mutations=tuple(current_mutations),
+                    line_number=line_number,
+                    hunk_index=current_hunk_index,
+                    call_id=call_id,
+                    latest_user_line_number=latest_user_line_number if isinstance(latest_user_line_number, int) else None,
+                    latest_user_message=latest_user_message if isinstance(latest_user_message, str) else None,
                 )
             )
         current_mutations = []
 
     def begin_file(operation: str, raw_path: str) -> str | None:
-        nonlocal current, current_path, current_operation
+        nonlocal current, current_path, current_operation, current_hunk_index
         flush_hunk()
         rel = normalize_repo_path(repo, raw_path)
         if rel is None:
             current = None
             current_path = None
             current_operation = None
+            current_hunk_index = 0
             return None
         current = {"operation": operation, "path": rel, "line_number": line_number}
+        if call_id:
+            current["call_id"] = call_id
+        if isinstance(latest_user_context, dict):
+            latest_user_line_number = latest_user_context.get("line_number")
+            latest_user_message = latest_user_context.get("message")
+            if isinstance(latest_user_line_number, int):
+                current["latest_user_line_number"] = latest_user_line_number
+            if isinstance(latest_user_message, str):
+                current["latest_user_message"] = latest_user_message
         operations.append(current)
         paths.add(rel)
         current_path = rel
         current_operation = operation
+        current_hunk_index = 0
         return rel
 
     for raw_line in patch_text.splitlines():
@@ -259,6 +365,30 @@ def parse_apply_patch_details(
 def parse_apply_patch(repo: Path, patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
     operations, paths, _hunks = parse_apply_patch_details(repo, patch_text, line_number)
     return operations, paths
+
+
+def edit_claim_id(
+    *,
+    session_id: str | None,
+    call_id: str | None,
+    line_number: int | None,
+    path: str,
+    hunk_index: int | None,
+    operation: str | None,
+) -> str:
+    payload = json.dumps(
+        {
+            "session_id": session_id,
+            "call_id": call_id,
+            "line_number": line_number,
+            "path": path,
+            "hunk_index": hunk_index,
+            "operation": operation,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "edit-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def parse_exec_arguments(arguments: str) -> dict[str, Any]:
@@ -604,8 +734,13 @@ def live_apply_patch_units(
     repo: Path,
     patch_hunks_by_path: dict[str, list[PatchHunk]],
     dirty: set[str],
-) -> list[tuple[diff_tracker.OwnedUnit, str]]:
+    *,
+    report_unresolved: bool = False,
+) -> PatchOwnershipCoverage:
     units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    covered_hunks: list[dict[str, Any]] = []
+    path_fallback_hunks: list[dict[str, Any]] = []
+    unresolved_hunks: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     current_cache: dict[str, list[CurrentHunk]] = {}
     for path, patch_hunks in patch_hunks_by_path.items():
@@ -620,6 +755,13 @@ def live_apply_patch_units(
             for current_hunk in current:
                 if not patch_mutations.issubset(set(current_hunk.mutations)):
                     continue
+                covered_hunks.append(
+                    patch_hunk_event(
+                        patch_hunk,
+                        reason="matched_current_diff_hunk",
+                        current_hunk=current_hunk,
+                    )
+                )
                 key = (path, "hunk", current_hunk.anchor.header)
                 if key not in seen:
                     seen.add(key)
@@ -630,6 +772,15 @@ def live_apply_patch_units(
                         )
                     )
                 path_matched = True
+                break
+            else:
+                if report_unresolved and current and patch_hunk.operation not in {"add", "delete"}:
+                    unresolved_hunks.append(
+                        patch_hunk_event(
+                            patch_hunk,
+                            reason="no_current_diff_hunk_contains_patch_mutations",
+                        )
+                    )
         if path_matched:
             continue
         # Adds/deletes and untracked update-style test fixtures can have no
@@ -637,11 +788,102 @@ def live_apply_patch_units(
         # current diff has no hunks at all; if hunks exist but none matched,
         # treat the apply_patch hunk as no longer live.
         if not current or any(item.operation in {"add", "delete"} for item in patch_hunks):
+            for item in patch_hunks:
+                path_fallback_hunks.append(patch_hunk_event(item, reason="path_level_fallback"))
             key = (path, "path", "")
             if key not in seen:
                 seen.add(key)
                 units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "apply_patch"))
-    return units
+    return PatchOwnershipCoverage(
+        units=units,
+        covered_hunks=covered_hunks,
+        path_fallback_hunks=path_fallback_hunks,
+        unresolved_hunks=unresolved_hunks,
+    )
+
+
+def build_edit_claims(
+    *,
+    session_id: str | None,
+    tracker_units: list[dict[str, Any]],
+    patch_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unit_ids_by_hunk: dict[tuple[str, str], list[str]] = {}
+    unit_ids_by_path: dict[str, list[str]] = {}
+    for entry in tracker_units:
+        if entry.get("evidence") != "apply_patch":
+            continue
+        path = entry.get("path")
+        if not isinstance(path, str):
+            continue
+        unit_ids = [
+            unit_id
+            for unit_id in entry.get("unit_ids", [])
+            if isinstance(unit_id, str)
+        ]
+        if not unit_ids:
+            continue
+        unit_ids_by_path.setdefault(path, [])
+        for unit_id in unit_ids:
+            if unit_id not in unit_ids_by_path[path]:
+                unit_ids_by_path[path].append(unit_id)
+        anchor = entry.get("hunk_anchor")
+        header = anchor.get("header") if isinstance(anchor, dict) else None
+        if isinstance(header, str):
+            key = (path, header)
+            unit_ids_by_hunk.setdefault(key, [])
+            for unit_id in unit_ids:
+                if unit_id not in unit_ids_by_hunk[key]:
+                    unit_ids_by_hunk[key].append(unit_id)
+
+    claims: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in patch_events:
+        path = event.get("path")
+        if not isinstance(path, str):
+            continue
+        anchor = event.get("hunk_anchor")
+        header = anchor.get("header") if isinstance(anchor, dict) else None
+        mapped_unit_ids = (
+            unit_ids_by_hunk.get((path, header), [])
+            if isinstance(header, str)
+            else unit_ids_by_path.get(path, [])
+        )
+        line_number = event.get("line_number")
+        hunk_index = event.get("hunk_index")
+        operation = event.get("operation")
+        call_id = event.get("call_id")
+        claim_id = edit_claim_id(
+            session_id=session_id,
+            call_id=call_id if isinstance(call_id, str) else None,
+            line_number=line_number if isinstance(line_number, int) else None,
+            path=path,
+            hunk_index=hunk_index if isinstance(hunk_index, int) else None,
+            operation=operation if isinstance(operation, str) else None,
+        )
+        if claim_id in seen:
+            continue
+        seen.add(claim_id)
+        claim: dict[str, Any] = {
+            "claim_id": claim_id,
+            "session_id": session_id,
+            "tool_name": "apply_patch",
+            "call_id": call_id,
+            "transcript_line_number": line_number,
+            "path": path,
+            "hunk_index": hunk_index,
+            "operation": operation,
+            "mapped_unit_ids": mapped_unit_ids,
+            "status": "pending",
+        }
+        latest_user_line_number = event.get("latest_user_line_number")
+        latest_user_message = event.get("latest_user_message")
+        if isinstance(latest_user_line_number, int):
+            claim["latest_user_line_number"] = latest_user_line_number
+        if isinstance(latest_user_message, str):
+            claim["latest_user_message"] = latest_user_message
+        claims.append(claim)
+    return claims
 
 
 def build_manifest(
@@ -655,11 +897,30 @@ def build_manifest(
 ) -> dict[str, Any]:
     root = git_root(repo)
     records = parse_jsonl(transcript)
+    session_id = session_id_from_records(records)
     baseline, cutoff_line_number, cutoff_timestamp, baseline_warnings = ownership_baseline(
         root,
         records,
         include_all=include_all_transcript_ownership,
     )
+    tracker_watermark: dict[str, Any] = {"status": "skipped"}
+    tracker_cutoff_line: int | None = None
+    if tracker_enabled and session_id and not include_all_transcript_ownership:
+        tracker_watermark = diff_tracker.latest_transcript_watermark(
+            repo=root,
+            session_id=session_id,
+            log_root_override=tracker_log_root,
+        )
+        candidate_line = tracker_watermark.get("transcript_max_line_number")
+        if isinstance(candidate_line, int):
+            tracker_cutoff_line = candidate_line
+            prior_cutoff_line = cutoff_line_number
+            cutoff_line_number = max(cutoff_line_number or 0, tracker_cutoff_line)
+            cutoff_timestamp = None
+            baseline["tracker_transcript_max_line_number"] = tracker_cutoff_line
+            baseline["cutoff_line_number"] = cutoff_line_number
+            if prior_cutoff_line is None or tracker_cutoff_line > prior_cutoff_line:
+                baseline["cutoff_reason"] = "tracker_transcript_watermark"
     owned_paths: set[str] = set()
     apply_patch_operations: list[dict[str, Any]] = []
     command_candidates: list[dict[str, Any]] = []
@@ -671,8 +932,20 @@ def build_manifest(
     live_exec_paths: set[str] = set()
     included_tool_record_count = 0
     ignored_tool_record_count = 0
+    included_tool_line_numbers: list[int] = []
+    patch_covered_hunks: list[dict[str, Any]] = []
+    patch_fallback_hunks: list[dict[str, Any]] = []
+    unresolved_owned_patch_hunks: list[dict[str, Any]] = []
+    latest_user_context: dict[str, Any] | None = None
 
     for record in records:
+        user_message = user_message_from_record(record)
+        if user_message is not None:
+            line_number = record.get("_line_number")
+            latest_user_context = {
+                "line_number": line_number if isinstance(line_number, int) else None,
+                "message": user_message,
+            }
         payload = record.get("payload")
         tool_name = payload_tool_name(payload) if isinstance(payload, dict) else None
         if tool_name == "apply_patch":
@@ -684,6 +957,8 @@ def build_manifest(
                 root,
                 patch_text,
                 int(record.get("_line_number", 0)),
+                payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
+                latest_user_context=latest_user_context,
             )
             apply_patch_operations.extend(operations)
             owned_paths.update(paths)
@@ -694,7 +969,18 @@ def build_manifest(
                 include_all=include_all_transcript_ownership,
             ):
                 included_tool_record_count += 1
-                live_owned_units.extend(live_apply_patch_units(root, patch_hunks, dirty_set))
+                if isinstance(record.get("_line_number"), int):
+                    included_tool_line_numbers.append(int(record["_line_number"]))
+                coverage = live_apply_patch_units(
+                    root,
+                    patch_hunks,
+                    dirty_set,
+                    report_unresolved=tracker_cutoff_line is not None,
+                )
+                live_owned_units.extend(coverage.units)
+                patch_covered_hunks.extend(coverage.covered_hunks)
+                patch_fallback_hunks.extend(coverage.path_fallback_hunks)
+                unresolved_owned_patch_hunks.extend(coverage.unresolved_hunks)
             else:
                 ignored_tool_record_count += 1
             continue
@@ -718,6 +1004,8 @@ def build_manifest(
                     include_all=include_all_transcript_ownership,
                 ):
                     included_tool_record_count += 1
+                    if isinstance(record.get("_line_number"), int):
+                        included_tool_line_numbers.append(int(record["_line_number"]))
                     if path in dirty_set:
                         live_owned_units.append(
                             (diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "claude_write")
@@ -761,6 +1049,8 @@ def build_manifest(
                 include_all=include_all_transcript_ownership,
             ):
                 included_tool_record_count += 1
+                if isinstance(record.get("_line_number"), int):
+                    included_tool_line_numbers.append(int(record["_line_number"]))
                 for item in candidates:
                     path = str(item["path"])
                     if path in dirty_set:
@@ -790,9 +1080,9 @@ def build_manifest(
 
     owned_dirty = sorted({owned_unit.path for owned_unit, _evidence in deduped_live_units if owned_unit.path in dirty_set})
     unattributed_dirty = sorted(path for path in dirty if path not in set(owned_dirty))
-    session_id = session_id_from_records(records)
     baseline["included_tool_record_count"] = included_tool_record_count
     baseline["ignored_tool_record_count"] = ignored_tool_record_count
+    transcript_max_line_number = max(included_tool_line_numbers) if included_tool_line_numbers else None
 
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
@@ -815,6 +1105,7 @@ def build_manifest(
                 "unit": owned_unit.unit,
                 "evidence": evidence,
                 "hunk_anchor": owned_unit.hunk_anchor.to_dict() if owned_unit.hunk_anchor is not None else None,
+                "unit_ids": diff_tracker.unit_ids_for_owned_unit(root, owned_unit),
             }
             for owned_unit, evidence in deduped_live_units
             if owned_unit.path in owned_dirty_set
@@ -843,6 +1134,38 @@ def build_manifest(
     else:
         tracker_payload = {"status": "no_owned_dirty_paths"}
 
+    expected_apply_patch_unit_ids = sorted(
+        {
+            unit_id
+            for entry in tracker_units
+            if entry.get("evidence") == "apply_patch"
+            for unit_id in entry.get("unit_ids", [])
+            if isinstance(unit_id, str)
+        }
+    )
+    expected_apply_patch_paths = sorted(
+        {
+            str(entry.get("path"))
+            for entry in tracker_units
+            if entry.get("evidence") == "apply_patch" and isinstance(entry.get("path"), str)
+        }
+    )
+    edit_claims = build_edit_claims(
+        session_id=session_id,
+        tracker_units=tracker_units,
+        patch_events=[*patch_covered_hunks, *patch_fallback_hunks],
+    )
+    edit_claim_registration: dict[str, Any] = {"status": "skipped"}
+
+    if tracker_enabled and tracker_payload.get("status") == "ok" and edit_claims:
+        edit_claim_registration = diff_tracker.register_edit_claims(
+            repo=root,
+            session_id=session_id or (tracker_run_id or f"transcript-{transcript.name}"),
+            run_id=tracker_run_id,
+            edit_claims=edit_claims,
+            log_root_override=tracker_log_root,
+        )
+
     return {
         "version": 1,
         "generated": datetime.now(timezone.utc).isoformat(),
@@ -858,6 +1181,17 @@ def build_manifest(
         "command_path_candidates": command_candidates,
         "command_events": command_events,
         "claude_write_events": claude_write_events,
+        "patch_ownership": {
+            "tracker_watermark": tracker_watermark,
+            "transcript_max_line_number": transcript_max_line_number,
+            "covered_hunks": patch_covered_hunks,
+            "path_fallback_hunks": patch_fallback_hunks,
+            "unresolved_owned_patch_hunks": unresolved_owned_patch_hunks,
+            "expected_apply_patch_paths": expected_apply_patch_paths,
+            "expected_apply_patch_unit_ids": expected_apply_patch_unit_ids,
+        },
+        "edit_claims": edit_claims,
+        "edit_claim_registration": edit_claim_registration,
         "tracker": tracker_payload,
         "warnings": [
             "Transcript-derived command side effects are conservative hints; without Pre/Post tool snapshots, shell writes cannot be fully attributed.",

@@ -1396,6 +1396,57 @@ def test_allocate_auto_review_scope_writes_artifact_when_scope_present(tmp: Path
     assert meta["tracker_scope_hash"] is not None
 
 
+def test_patch_ownership_incomplete_detects_partial_tracker_scope(tmp: Path) -> None:
+    module = load_hook_module()
+    manifest = {
+        "patch_ownership": {
+            "expected_apply_patch_paths": ["board-card.tsx", "delete-task-dialog.tsx"],
+            "expected_apply_patch_unit_ids": ["unit-board", "unit-dialog"],
+            "unresolved_owned_patch_hunks": [],
+        }
+    }
+    result = {
+        "status": "allocated",
+        "scope": {
+            "unit_ids": ["unit-dialog"],
+            "paths": ["delete-task-dialog.tsx"],
+        },
+    }
+
+    details = module.patch_ownership_incomplete_details(manifest, result)
+
+    assert details is not None
+    assert details["reason_code"] == "patch_ownership_incomplete"
+    assert details["missing_apply_patch_unit_ids"] == ["unit-board"]
+    assert details["missing_apply_patch_paths"] == ["board-card.tsx"]
+
+
+def test_patch_ownership_incomplete_skip_payload_does_not_duplicate_reason_code(tmp: Path) -> None:
+    module = load_hook_module()
+    ledger = _make_test_ledger(module, tmp / "state")
+    details = {
+        "reason_code": "patch_ownership_incomplete",
+        "unresolved_owned_patch_hunks": [],
+        "missing_apply_patch_unit_ids": ["unit-board"],
+        "missing_apply_patch_paths": ["board-card.tsx"],
+        "expected_apply_patch_unit_count": 2,
+        "allocated_unit_count": 1,
+    }
+
+    payload = module.patch_ownership_incomplete_skip_payload(
+        context={"repo": str(tmp), "cwd": str(tmp), "session_id": "S"},
+        ledger=ledger,
+        result={"scope_hash": "sha256:test", "candidate_unit_count": 1},
+        details=details,
+        dry_run=False,
+    )
+
+    summary = summary_from_payload(payload)
+    assert summary["reason_code"] == "patch_ownership_incomplete"
+    events_text = ledger.events_path.read_text(encoding="utf-8")
+    assert "patch_ownership_incomplete" in events_text
+
+
 def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "dirty")
@@ -2077,16 +2128,19 @@ def test_socket_probe_requires_websocket_upgrade(tmp_path: Path) -> None:
 
 
 def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     module = load_hook_module()
     state = tmp_path / "state"
     desktop_socket = tmp_path / "missing-control.sock"
     bridge_socket = tmp_path / "missing-bridge.sock"
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
     original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
     original_bridge_socket_path = module.bridge_socket_path
     original_ensure_bridge = module.ensure_bridge_app_server
     try:
+        os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "bridge"
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
@@ -2106,6 +2160,10 @@ def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
             parent_thread_path=None,
         )
     finally:
+        if original_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original_log_root
         if original_state_dir is None:
             os.environ.pop("CODEX_RVF_STATE_DIR", None)
         else:
@@ -2126,10 +2184,12 @@ def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
 
 
 def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     module = load_hook_module()
     state = tmp_path / "state"
     desktop_socket = tmp_path / "missing-control.sock"
     bridge_socket = tmp_path / "missing-bridge.sock"
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
@@ -2137,6 +2197,7 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_
     original_bridge_socket_path = module.bridge_socket_path
     original_ensure_bridge = module.ensure_bridge_app_server
     try:
+        os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "report"
         module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
@@ -2155,6 +2216,10 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_
             fallback_failure_reason="visible fork failure",
         )
     finally:
+        if original_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original_log_root
         if original_state_dir is None:
             os.environ.pop("CODEX_RVF_STATE_DIR", None)
         else:
@@ -6034,6 +6099,8 @@ def main() -> int:
         test_evaluate_session_gate_suppresses_on_manual_marker,
         test_legacy_session_scope_gate_payload_used_when_tracker_disabled,
         test_allocate_auto_review_scope_writes_artifact_when_scope_present,
+        test_patch_ownership_incomplete_detects_partial_tracker_scope,
+        test_patch_ownership_incomplete_skip_payload_does_not_duplicate_reason_code,
         test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl,
         test_kanban_followup_without_task_id_does_not_allocate_review_scope,
         test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
@@ -6140,7 +6207,18 @@ def main() -> int:
             if args.shard_count <= 1 or index % args.shard_count == args.shard_index
         ]
         for test in selected:
-            test(root / test.__name__)
+            codex_rvf_env = {
+                key: value
+                for key, value in os.environ.items()
+                if key.startswith("CODEX_RVF_")
+            }
+            try:
+                test(root / test.__name__)
+            finally:
+                for key in tuple(os.environ):
+                    if key.startswith("CODEX_RVF_"):
+                        os.environ.pop(key, None)
+                os.environ.update(codex_rvf_env)
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
         if args.shard_count > 1
