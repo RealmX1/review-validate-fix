@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "label": "alternative-reviewer:claude-code",
   "command": [
     "claude",
