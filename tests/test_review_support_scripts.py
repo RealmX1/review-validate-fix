@@ -125,6 +125,17 @@ def load_cline_kanban_client_module():
     return module
 
 
+def load_check_review_output_module():
+    spec = importlib.util.spec_from_file_location(
+        "rvf_check_review_output", CHECK_REVIEW_OUTPUT
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load check_review_output module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def run(
     cmd: list[str],
     cwd: Path | None = None,
@@ -1794,273 +1805,131 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
     assert payload["issue_count"] == 1
     assert payload["continuation_line_count"] == 1
 
-    extensionless_numbered = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. Dockerfile:3 合法 issue 可以引用没有扩展名的文件。\n",
+    cro = load_check_review_output_module()
+
+    extensionless_payload = cro.classify(
+        "1. Dockerfile:3 合法 issue 可以引用没有扩展名的文件。\n"
     )
-    extensionless_payload = json.loads(extensionless_numbered.stdout)
     assert extensionless_payload["valid"] is True
     assert extensionless_payload["issue_count"] == 1
 
-    invalid = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. apps/foo.ts 这条缺少行号\n续行不能补足 path:line\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert invalid.returncode != 0
+    assert cro.classify(
+        "1. apps/foo.ts 这条缺少行号\n续行不能补足 path:line\n"
+    )["valid"] is False
 
-    misplaced_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. 这里先写说明，再引用 plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert misplaced_path_line.returncode != 0
+    assert cro.classify(
+        "1. 这里先写说明，再引用 plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n"
+    )["valid"] is False
 
-    english_misplaced_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. explanation before plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert english_misplaced_path_line.returncode != 0
+    assert cro.classify(
+        "1. explanation before plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44\n"
+    )["valid"] is False
 
-    prose_see_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. See plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert prose_see_path_line.returncode != 0
+    assert cro.classify(
+        "1. See plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n"
+    )["valid"] is False
 
-    prose_in_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. in plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert prose_in_path_line.returncode != 0
+    assert cro.classify(
+        "1. in plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 misplaced path\n"
+    )["valid"] is False
 
-    prose_because_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. Because a.py:1 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert prose_because_path_line.returncode != 0
+    assert cro.classify("1. Because a.py:1 misplaced path\n")["valid"] is False
 
-    chinese_because_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. 因为 a.py:1 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert chinese_because_path_line.returncode != 0
+    assert cro.classify("1. 因为 a.py:1 misplaced path\n")["valid"] is False
 
-    chinese_file_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. 文件 a.py:1 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert chinese_file_path_line.returncode != 0
+    assert cro.classify("1. 文件 a.py:1 misplaced path\n")["valid"] is False
 
-    prose_note_colon_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. Note: a.py:1 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert prose_note_colon_path_line.returncode != 0
+    assert cro.classify("1. Note: a.py:1 misplaced path\n")["valid"] is False
 
-    prose_warning_path_line = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. warning a.py:1 misplaced path\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert prose_warning_path_line.returncode != 0
+    assert cro.classify("1. warning a.py:1 misplaced path\n")["valid"] is False
 
-    invalid_extensionless = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input=(
-            "1. plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 valid issue\n"
-            "Dockerfile:2 missing numbered prefix\n"
-            "Makefile:10 missing numbered prefix\n"
-        ),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert invalid_extensionless.returncode != 0
+    assert cro.classify(
+        "1. plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:44 valid issue\n"
+        "Dockerfile:2 missing numbered prefix\n"
+        "Makefile:10 missing numbered prefix\n"
+    )["valid"] is False
 
-    unnumbered_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nb.py:2 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nb.py:2 第二条问题但缺少编号\n"
+    )["valid"] is False
 
-    unnumbered_no_extension_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nMakefile:2 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_no_extension_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nMakefile:2 第二条问题但缺少编号\n"
+    )["valid"] is False
 
-    malformed_numbered_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\n2) b.py:2 第二条编号格式错误\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert malformed_numbered_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\n2) b.py:2 第二条编号格式错误\n"
+    )["valid"] is False
 
-    malformed_numbered_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\n2) 第二条编号格式错误\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert malformed_numbered_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\n2) 第二条编号格式错误\n"
+    )["valid"] is False
 
-    spaced_path = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. slide-versions/claude cowork 1/deck.txt:2 含空格路径仍是合法 path:line。\n",
+    spaced_payload = cro.classify(
+        "1. slide-versions/claude cowork 1/deck.txt:2 含空格路径仍是合法 path:line。\n"
     )
-    spaced_payload = json.loads(spaced_path.stdout)
     assert spaced_payload["valid"] is True
     assert spaced_payload["issue_count"] == 1
 
-    spaced_root_component = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. my dir/file.py:2 根目录组件含空格仍是合法 path:line。\n",
+    spaced_root_payload = cro.classify(
+        "1. my dir/file.py:2 根目录组件含空格仍是合法 path:line。\n"
     )
-    spaced_root_payload = json.loads(spaced_root_component.stdout)
     assert spaced_root_payload["valid"] is True
     assert spaced_root_payload["issue_count"] == 1
 
-    colon_path = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. foo:bar.py:2 路径名含冒号时应使用最后的 :line 作为行号。\n",
+    colon_payload = cro.classify(
+        "1. foo:bar.py:2 路径名含冒号时应使用最后的 :line 作为行号。\n"
     )
-    colon_payload = json.loads(colon_path.stdout)
     assert colon_payload["valid"] is True
     assert colon_payload["issue_count"] == 1
 
-    unicode_root_path = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. 设计 文档.md:3 非 ASCII 根路径也应支持。\n",
+    unicode_root_payload = cro.classify(
+        "1. 设计 文档.md:3 非 ASCII 根路径也应支持。\n"
     )
-    unicode_root_payload = json.loads(unicode_root_path.stdout)
     assert unicode_root_payload["valid"] is True
     assert unicode_root_payload["issue_count"] == 1
 
-    repeated_path_line = run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input_text="1. a.py:1 causes b.py:2 to fail when both paths are involved.\n",
+    repeated_payload = cro.classify(
+        "1. a.py:1 causes b.py:2 to fail when both paths are involved.\n"
     )
-    repeated_payload = json.loads(repeated_path_line.stdout)
     assert repeated_payload["valid"] is True
     assert repeated_payload["issue_count"] == 1
 
-    chinese_no_issue_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\n没有问题\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert chinese_no_issue_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\n没有问题\n"
+    )["valid"] is False
 
-    fix_summary_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\n修复说明：已修改文件\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert fix_summary_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\n修复说明：已修改文件\n"
+    )["valid"] is False
 
-    handoff_completion_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nRVF_HANDOFF_FILE: /tmp/rvf-handoff.md\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert handoff_completion_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nRVF_HANDOFF_FILE: /tmp/rvf-handoff.md\n"
+    )["valid"] is False
 
-    handoff_reviewers_summary_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nReviewers：NO_ISSUES\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert handoff_reviewers_summary_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nReviewers：NO_ISSUES\n"
+    )["valid"] is False
 
-    handoff_validate_fixers_summary_continuation = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nValidate/fixers：REAL fixed\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert handoff_validate_fixers_summary_continuation.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nValidate/fixers：REAL fixed\n"
+    )["valid"] is False
 
-    unnumbered_spaced_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nmy file.py:2 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_spaced_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nmy file.py:2 第二条问题但缺少编号\n"
+    )["valid"] is False
 
-    unnumbered_spaced_dir_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nmy dir/file.py:2 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_spaced_dir_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nmy dir/file.py:2 第二条问题但缺少编号\n"
+    )["valid"] is False
 
-    unnumbered_colon_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\nfoo:bar.py:2 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_colon_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\nfoo:bar.py:2 第二条问题但缺少编号\n"
+    )["valid"] is False
 
-    unnumbered_unicode_issue = subprocess.run(
-        [sys.executable, str(CHECK_REVIEW_OUTPUT), "--json"],
-        input="1. a.py:1 第一条问题\n设计 文档.md:3 第二条问题但缺少编号\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert unnumbered_unicode_issue.returncode != 0
+    assert cro.classify(
+        "1. a.py:1 第一条问题\n设计 文档.md:3 第二条问题但缺少编号\n"
+    )["valid"] is False
 
 
 def test_build_packet_metadata_and_scope(tmp_path: Path) -> None:
