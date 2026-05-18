@@ -11,3 +11,5 @@ dev_backward_compatibility/
 tmp/
 
 .claude/
+
+docs/multi-harness plugin research

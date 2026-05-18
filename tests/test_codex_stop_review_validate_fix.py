@@ -38,6 +38,19 @@ def run(cmd: list[str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def restore_env_var(name: str, original_value: str | None) -> None:
+    if original_value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = original_value
+
+
+def isolate_codex_session_index(tmp_path: Path) -> str | None:
+    original = os.environ.get("CODEX_SESSION_INDEX_PATH")
+    os.environ["CODEX_SESSION_INDEX_PATH"] = str(tmp_path / "empty-session-index.jsonl")
+    return original
+
+
 def init_repo(path: Path, dirty: bool) -> Path:
     path.mkdir(parents=True)
     run(["git", "init", "-q"], path)
@@ -585,12 +598,16 @@ def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(t
         encoding="utf-8",
     )
 
-    origin = module.parent_conversation_origin(
-        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-        parent_thread_path=transcript,
-        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-    )
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
 
     assert origin["label"] == '"for the path in RVF hook fork to cline kanban, we need way t"'
     assert origin["name_source"] == "first_user_prompt_fallback"
@@ -634,12 +651,16 @@ def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unna
         encoding="utf-8",
     )
 
-    origin = module.parent_conversation_origin(
-        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-        parent_thread_path=transcript,
-        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-    )
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
 
     expected_excerpt = module.single_line_excerpt(
         user_prompt,
@@ -688,18 +709,68 @@ def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_u
         encoding="utf-8",
     )
 
-    origin = module.parent_conversation_origin(
-        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-        parent_thread_path=transcript,
-        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-        name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-    )
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
 
     assert origin["label"] == f'"{user_prompt}"'
     assert "AGENTS.md instructions" not in origin["task_title"]
 
 
-def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp_path: Path) -> None:
+def test_parent_conversation_origin_uses_session_index_when_chat_lookup_fails(tmp_path: Path) -> None:
+    module = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    transcript = tmp_path / f"rollout-2026-05-01T11-25-17-{session_id}.jsonl"
+    session_index = tmp_path / "session_index.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": session_id},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "this prompt is lower priority"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_index.write_text(
+        json.dumps({"id": session_id, "thread_name": "Trace original chat names"})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    original_session_index = os.environ.get("CODEX_SESSION_INDEX_PATH")
+    try:
+        os.environ["CODEX_SESSION_INDEX_PATH"] = str(session_index)
+        origin = module.parent_conversation_origin(
+            parent_session_id=session_id,
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
+
+    assert origin["label"] == "Trace original chat names"
+    assert origin["name_source"] == "session_index_thread_name"
+    assert origin["task_title"] == "RVF from Trace original chat names run 562915ad"
+
+
+def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_lookup_fails(tmp_path: Path) -> None:
     module = load_hook_module()
     tmp_path.mkdir(parents=True, exist_ok=True)
     transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
@@ -714,19 +785,56 @@ def test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails(tmp_p
         + json.dumps(
             {
                 "type": "event_msg",
-                "payload": {"type": "user_message", "message": "this prompt must not be quoted"},
+                "payload": {"type": "user_message", "message": "this prompt should be quoted"},
             }
         )
         + "\n",
         encoding="utf-8",
     )
 
-    origin = module.parent_conversation_origin(
-        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-        parent_thread_path=transcript,
-        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-        name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
+
+    assert origin["label"] == '"this prompt should be quoted"'
+    assert origin["name_source"] == "first_user_prompt_fallback"
+    assert origin["task_title"] == 'RVF from "this prompt should be quoted" run 562915ad'
+
+
+def test_parent_conversation_origin_uses_stable_ref_when_prompt_fallback_unavailable(
+    tmp_path: Path,
+) -> None:
+    module = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
+
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
+            parent_thread_path=transcript,
+            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
+            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
 
     assert origin["label"] == "Codex 2026-05-01T11-25-17 019de191"
     assert origin["name_source"] == "session_ref_fallback"
@@ -6182,7 +6290,9 @@ def main() -> int:
         test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed,
         test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed,
         test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed,
-        test_parent_conversation_origin_uses_stable_ref_when_chat_lookup_fails,
+        test_parent_conversation_origin_uses_session_index_when_chat_lookup_fails,
+        test_parent_conversation_origin_quotes_first_user_prompt_when_chat_lookup_fails,
+        test_parent_conversation_origin_uses_stable_ref_when_prompt_fallback_unavailable,
         test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,

@@ -804,12 +804,33 @@ def quoted_prompt_session_name(path: Path | None) -> str | None:
     return f'"{excerpt}"'
 
 
-def name_lookup_confirms_unnamed_thread(name_lookup: dict[str, Any] | None) -> bool:
-    return bool(
-        isinstance(name_lookup, dict)
-        and name_lookup.get("thread_found") is True
-        and not name_lookup.get("name")
-    )
+def codex_session_index_path() -> Path:
+    override = os.environ.get("CODEX_SESSION_INDEX_PATH")
+    if override and override.strip():
+        return Path(override).expanduser()
+    return Path.home() / ".codex" / "session_index.jsonl"
+
+
+def session_index_thread_name(session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    path = codex_session_index_path()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    match: str | None = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("id") != session_id:
+            continue
+        thread_name = record.get("thread_name")
+        if isinstance(thread_name, str) and thread_name.strip():
+            match = thread_name.strip()
+    return match
 
 
 def parent_conversation_origin(
@@ -826,7 +847,10 @@ def parent_conversation_origin(
     transcript_path = str(parent_thread_path) if parent_thread_path is not None else None
     name_source = "app_server_name"
     label = parent_thread_name.strip() if isinstance(parent_thread_name, str) else ""
-    if not label and name_lookup_confirms_unnamed_thread(name_lookup):
+    if not label:
+        label = session_index_thread_name(session_id) or ""
+        name_source = "session_index_thread_name" if label else "session_ref_fallback"
+    if not label:
         label = quoted_prompt_session_name(parent_thread_path) or ""
         name_source = "first_user_prompt_fallback" if label else "session_ref_fallback"
     if not label:
