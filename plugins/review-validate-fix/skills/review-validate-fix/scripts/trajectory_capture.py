@@ -41,12 +41,16 @@ schema，按 transcript 文件首条 record type 探测（``trajectory_distill.d
 用例无回归。两个解析器栈互不交叉——新增 host 时应当加新的 ``_<host>_*``
 平行实现而非扩展任一现有解析器。
 
-已知未覆盖（deferred follow-up）：Cline Kanban dispatch（flow-2-branch /
-flow-2-inplace）场景下 stop hook event 给的是 parent Codex transcript，
-但实际想看的是 task agent 的 Claude transcript；需 prep file 显式回填
-``child_session_id`` 并由 capture_run 主动定位。前置依赖见 plan 第 4 阶段
-（cline-kanban schema 暴露 claudeSessionId 或 RVF 加 Claude Code install
-脚本）。本模块当前只能捕获 same-session（含 Claude）与 forked Codex 父子。
+Cline Kanban dispatch（flow-2-branch / flow-2-inplace）覆盖：触发 capture
+的 stop hook event 只知道 parent Codex transcript，但被 dispatch 的 task
+agent（Claude Code）的 UserPromptSubmit hook 会把自己的 ``child_session_id``
+/ ``child_transcript_path`` 自回填进 ``<run_dir>/artifacts/origin.json``
+（持久通道，不依赖短 TTL 的 prep file）。``capture_run`` 读到 origin.json
+的 child 字段后即把 child Claude transcript 作为 post、parent Codex
+transcript 作为 pre，复用既有 forked 分支产出正确轨迹。该 hook 由 Claude
+plugin 自带的 ``hooks/hooks.json``（UserPromptSubmit）触发，无需独立 install
+脚本。因此本模块现可捕获 same-session（含 Claude）、forked Codex 父子、以及
+Cline Kanban Codex→Claude 跨 host dispatch。
 """
 
 from __future__ import annotations
@@ -594,6 +598,32 @@ def capture_run(
     event = event or {}
     current_transcript = _resolve_current_transcript(event)
     event_session_id = event.get("session_id") if isinstance(event.get("session_id"), str) else None
+
+    # Cline Kanban dispatch（flow-2-branch / flow-2-inplace）：触发 capture 的
+    # stop hook event 只知道 parent Codex transcript，但被 dispatch 的 task
+    # agent 的 UserPromptSubmit hook 已把自己的 child_session_id /
+    # child_transcript_path 自回填进 origin.json。优先采用 child（task agent）
+    # transcript，让下方 forked 分支捕获真正的 RVF 工作而非父会话 dispatch 前
+    # 的对话。仅当 origin.json 显式带 child 字段、child transcript 存在、且
+    # child_session_id ≠ parent(origin.session_id) 时生效——因此 same-session
+    # manual / followup 与既有 Codex forked 路径（origin.json 无 child 字段）
+    # 行为完全不变。
+    if isinstance(origin, dict):
+        child_tp = origin.get("child_transcript_path")
+        child_sid = origin.get("child_session_id")
+        origin_sid = origin.get("session_id")
+        if (
+            isinstance(child_tp, str)
+            and child_tp.strip()
+            and isinstance(child_sid, str)
+            and child_sid.strip()
+            and child_sid.strip()
+            != (origin_sid.strip() if isinstance(origin_sid, str) else None)
+        ):
+            child_path = Path(child_tp).expanduser()
+            if child_path.is_file():
+                current_transcript = child_path.resolve()
+                event_session_id = child_sid.strip()
 
     # 探测 transcript host schema：post 走 current_transcript，pre 走 parent_transcript
     # （forked 场景）或 current_transcript 本身（same-session 切片）。探测失败 fallback

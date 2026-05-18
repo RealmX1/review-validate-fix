@@ -304,6 +304,139 @@ def _handle_bootstrap_confirmation(
     }
 
 
+def _event_transcript_path(event: dict[str, Any]) -> Path | None:
+    raw = (
+        event.get("transcript_path")
+        or event.get("conversation_path")
+        or event.get("session_path")
+    )
+    if isinstance(raw, str) and raw.strip():
+        candidate = Path(raw).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _backfill_child_session(
+    record: rvf_prep_file.PrepFileRecord,
+    event: dict[str, Any],
+    *,
+    prep_root: str | Path | None,
+) -> tuple[rvf_prep_file.PrepFileRecord, dict[str, Any]]:
+    """Self-backfill the dispatched task agent's session into the prep + origin.
+
+    When the UserPromptSubmit hook fires *inside* a dispatched task agent whose
+    session differs from the recorded origin — Cline Kanban flow-2-branch /
+    flow-2-inplace *and* flow-1-self-rising / kanban-followup (each runs in its
+    own Claude session) — the parent Stop hook only knows its own transcript, so
+    ``trajectory_capture.capture_run`` would slice the wrong conversation. Here
+    we record the task agent's ``child_session_id`` / ``child_transcript_path``
+    into:
+
+    1. the prep payload — ledger trail + idempotency;
+    2. the persistent ``origin.json`` — the channel ``capture_run`` reads
+       long after the short-TTL prep file has been swept.
+
+    Conservative + idempotent: acts only when the current session id is present
+    and differs from ``origin_session_id`` (so same-session manual / followup
+    dispatch is untouched). Returns the possibly-updated prep record + a debug
+    dict (also emitted as a prep diagnostic).
+
+    Ordering assumption: the parent Stop hook writes ``origin.json`` and spawns
+    the task agent *before* the task agent can submit a token-bearing prompt, so
+    by the time this runs the parent's ``origin.json`` is fully written; the
+    merge here only adds child keys and preserves parent keys. A corrupt/partial
+    read still fails closed (caught → ``origin_write_error`` → capture falls back
+    to parent transcript, no regression).
+    """
+    debug: dict[str, Any] = {"backfilled": False}
+    child_session_id = event.get("session_id")
+    if not isinstance(child_session_id, str) or not child_session_id.strip():
+        debug["skip_reason"] = "no_child_session_id"
+        return record, debug
+    child_session_id = child_session_id.strip()
+    origin_session_id = record.payload.get("origin_session_id")
+    if not isinstance(origin_session_id, str) or not origin_session_id.strip():
+        debug["skip_reason"] = "no_origin_session_id"
+        return record, debug
+    if child_session_id == origin_session_id.strip():
+        debug["skip_reason"] = "same_session"
+        return record, debug
+
+    child_transcript = _event_transcript_path(event)
+    child_transcript_str = str(child_transcript) if child_transcript is not None else None
+    debug.update(
+        {
+            "child_session_id": child_session_id,
+            "child_transcript_path": child_transcript_str,
+        }
+    )
+
+    if (
+        record.payload.get("child_session_id") != child_session_id
+        or record.payload.get("child_transcript_path") != child_transcript_str
+    ):
+        try:
+            record = rvf_prep_file.update_prep_file(
+                record,
+                {
+                    "child_session_id": child_session_id,
+                    "child_transcript_path": child_transcript_str,
+                },
+            )
+        except (OSError, rvf_prep_file.PrepFileError) as exc:
+            debug["prep_update_error"] = f"{type(exc).__name__}: {exc}"
+
+    origin_path_raw = record.payload.get("origin_metadata_path")
+    origin_path: Path | None = None
+    if isinstance(origin_path_raw, str) and origin_path_raw.strip():
+        origin_path = Path(origin_path_raw).expanduser()
+    else:
+        rvf_run = record.payload.get("rvf_run")
+        if isinstance(rvf_run, dict):
+            run_dir = rvf_run.get("run_dir")
+            if isinstance(run_dir, str) and run_dir.strip():
+                origin_path = Path(run_dir).expanduser() / "artifacts" / "origin.json"
+
+    if origin_path is not None and origin_path.is_file():
+        try:
+            origin_payload = json.loads(origin_path.read_text(encoding="utf-8"))
+            if not isinstance(origin_payload, dict):
+                origin_payload = {}
+            if (
+                origin_payload.get("child_session_id") != child_session_id
+                or origin_payload.get("child_transcript_path") != child_transcript_str
+            ):
+                origin_payload["child_session_id"] = child_session_id
+                origin_payload["child_transcript_path"] = child_transcript_str
+                # Reuse rvf_prep_file's atomic writer (O_EXCL tmp + random
+                # suffix + replace + failure cleanup) rather than a weaker
+                # ad-hoc one — single source of truth for atomic JSON IO.
+                rvf_prep_file._atomic_write_json(origin_path, origin_payload)
+            debug["backfilled"] = True
+            debug["origin_path"] = str(origin_path)
+        except (OSError, json.JSONDecodeError) as exc:
+            debug["origin_write_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        debug["skip_reason"] = "origin_metadata_unavailable"
+        if origin_path is not None:
+            debug["origin_missing"] = str(origin_path)
+
+    try:
+        rvf_prep_file.append_diagnostic(
+            root=prep_root,
+            token=record.token,
+            record={
+                "event": "user_prompt_submit_child_session_backfill",
+                "status": "ok" if debug.get("backfilled") else "skipped",
+                **{key: value for key, value in debug.items() if key != "backfilled"},
+            },
+        )
+    except (OSError, rvf_prep_file.PrepFileError):
+        pass
+    return record, debug
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
@@ -370,6 +503,10 @@ def inspect_user_prompt_submit(
             token=lookup.token, path=lookup.path, payload=dict(lookup.payload)
         )
         dispatch_origin = str(lookup.payload.get("dispatch_origin") or "stop_hook")
+        record, child_debug = _backfill_child_session(record, event, prep_root=prep_root)
+        if child_debug.get("backfilled"):
+            payload["child_session_id"] = child_debug.get("child_session_id")
+            payload["child_transcript_path"] = child_debug.get("child_transcript_path")
     elif origin_marker is not None:
         # Marker without token is an inconsistent state: dispatch should always set token.
         try:

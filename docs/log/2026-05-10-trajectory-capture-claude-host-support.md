@@ -90,3 +90,86 @@ bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 git diff --check
 ```
+
+---
+
+## Phase 4 Outcome（2026-05-18 · child_session_id wiring，Option C）
+
+原 plan 把 Phase 4 列为 deferred，前置依赖写作 path (a) cline-kanban schema 暴露
+`claudeSessionId` / path (b) 新建 `install_to_claude.py`。复核 `b94c7d6` 实代码后
+该前提**已过期**：`scripts/install_to_codex.py` 早已含完整 Claude plugin 安装管线
+（`update_claude_settings` / `sync_claude_marketplace_metadata` /
+`update_claude_installed_plugins`），真实缺口仅是 **Claude 端未注册
+UserPromptSubmit hook**。Claude 与 Codex 是两套不同 hook 投递机制：Codex 走
+`~/.codex/hooks.json`（安装器写入），Claude 走 plugin 自带的
+`plugins/review-validate-fix/hooks/hooks.json`（marketplace 同步时由
+`install_to_codex.py` 的 `copytree` 一并携带；现存 Claude Stop hook 正是走这条路）。
+
+故落地走 **Option C（plugin hooks 清单，零安装器 / 零 settings.json 改动）**：
+
+- `hooks/hooks.json` 增 `UserPromptSubmit` 块（`timeout: 90`）；新增
+  `hooks/user_prompt_submit.py` shim（仿 `stop.py`：读 stdin event、补
+  source/cwd 默认、subprocess delegate 到 `rvf_user_prompt_submit.py`、
+  fail-open；超时 env `CLAUDE_RVF_USER_PROMPT_HOOK_TIMEOUT` 默认 85）。
+- `rvf_user_prompt_submit.py`：token 路径新增 `_backfill_child_session()`。
+  guard = 当前 `event.session_id` 存在且 ≠ `prep.origin_session_id`
+  （same-session manual / followup 不受影响、行为不变）。回填
+  `child_session_id` / `child_transcript_path` 进 ① prep payload
+  （`update_prep_file`，ledger trail + 幂等）② **持久 `origin.json`**
+  （`origin_metadata_path` 或 `rvf_run.run_dir`/artifacts/origin.json）。
+  选 origin.json 而非 prep 作功能通道：prep TTL 仅 300s，capture 时
+  （task agent 跑完 RVF，常 >5min）prep 已被 `sweep_stale` 清掉。
+- `trajectory_capture.capture_run`：`_read_origin` 后若 origin.json 带
+  `child_session_id`/`child_transcript_path`、child≠`origin.session_id`、
+  child transcript 文件存在 → override `current_transcript`=child、
+  `event_session_id`=child_session_id → 既有 `forked` 判定自然为真 →
+  复用既有 forked 分支（pre=parent Codex 全量、post=child Claude 全量、
+  `post_host_kind` 自动探测=claude_code）。零新分支；docstring 已从
+  「已知未覆盖」改写为「Cline Kanban dispatch 覆盖」。
+- `rvf_prep_file.py` **未改**：payload 自由 dict，`update_prep_file` 任意
+  合并，新键不在 `PROTECTED_UPDATE_FIELDS`，无 schema 强校验。
+
+### 已知限制 / 后续
+
+- Cline Kanban task agent 必须以装好 RVF marketplace plugin 的 Claude Code
+  运行（与现存 Stop hook 同前提）；未装则 UserPromptSubmit hook 不触发，
+  capture 退回原行为（parent transcript），无回归但 child 轨迹缺失。
+- live flow-2 联调（真跑 dirty repo → 父 Stop hook → Cline Kanban task →
+  task agent RVF 全链路验证 child 轨迹非空）仍未做，列为下一队列项。
+- rollout 文件名 `rollout.codex.jsonl` 改名 cleanup 仍未做（独立 commit）。
+- **Codex/Claude UserPromptSubmit timeout 不对称（既有，非本变更引入）**：
+  Codex 侧 `install_to_codex.py::configure_user_prompt_submit_hook` 写入
+  `~/.codex/hooks.json` 的 `"timeout": 5`，而 Claude 侧本变更给 90s（shim
+  85s / shared prepare 60s）。Slice I 让 UserPromptSubmit 承担同步 prepare
+  后，Codex 5s 在 in-process prepare（最长 60s）期间会被 harness 杀掉——
+  Phase 4 让 Claude 侧 UserPromptSubmit 承担实质 backfill 工作，放大了该不
+  对称的运维困惑面。本变更未改动 Codex 路径；Codex 侧 timeout 评估属 Slice I
+  残留议题，建议后续单独处理。
+
+### 改动文件
+
+`plugins/review-validate-fix/hooks/hooks.json`、
+`plugins/review-validate-fix/hooks/user_prompt_submit.py`（新）、
+`plugins/.../scripts/rvf_user_prompt_submit.py`、
+`plugins/.../scripts/trajectory_capture.py`（+docstring）、
+`tests/test_review_support_scripts.py`、
+`tests/test_trajectory_capture_claude_dispatch.py`。
+
+### 验证（2026-05-18，全绿）
+
+```sh
+python3 -m py_compile \
+  plugins/.../scripts/{trajectory_capture,trajectory_distill,codex_stop_review_validate_fix,rvf_user_prompt_submit,rvf_prep_file}.py \
+  plugins/review-validate-fix/hooks/{user_prompt_submit,stop}.py
+/opt/homebrew/bin/python3 -m pytest -q \
+  tests/test_trajectory_capture_claude_dispatch.py \
+  tests/test_trajectory_distill_claude.py \
+  tests/test_trajectory_distill.py tests/test_trajectory_split.py   # 40 passed
+python3 tests/test_review_support_scripts.py        # incl. 2 new cases
+python3 tests/test_codex_stop_review_validate_fix.py
+python3 tests/test_codex_stop_hook_dispatcher.py
+bash scripts/check_skill_contracts.sh
+python3 scripts/check_plugin_contracts.py
+git diff --check
+```
+未 commit，等用户 `/review-validate-fix` 自审后再决定提交。

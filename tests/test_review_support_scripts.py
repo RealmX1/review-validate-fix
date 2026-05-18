@@ -569,6 +569,212 @@ def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tm
         os.environ.pop("CODEX_RVF_PREP_ROOT", None)
 
 
+def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
+    """Option C: the Claude plugin's own hooks/hooks.json must declare both
+    Stop and UserPromptSubmit (no installer / settings.json mutation needed),
+    and the UserPromptSubmit shim must exist and compile."""
+    import py_compile
+
+    hooks_json = ROOT / "plugins" / "review-validate-fix" / "hooks" / "hooks.json"
+    data = json.loads(hooks_json.read_text(encoding="utf-8"))
+    hooks = data["hooks"]
+    assert "Stop" in hooks, "Stop hook regression"
+
+    ups_groups = hooks.get("UserPromptSubmit")
+    assert isinstance(ups_groups, list) and ups_groups, "UserPromptSubmit not declared"
+    commands = [
+        entry.get("command")
+        for group in ups_groups
+        for entry in group.get("hooks", [])
+    ]
+    assert any(
+        isinstance(cmd, str)
+        and "${CLAUDE_PLUGIN_ROOT}" in cmd
+        and "hooks/user_prompt_submit.py" in cmd
+        for cmd in commands
+    ), f"UserPromptSubmit command not wired to the shim: {commands}"
+
+    shim = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
+    assert shim.is_file(), "hooks/user_prompt_submit.py missing"
+    py_compile.compile(str(shim), doraise=True)
+
+
+def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
+    """Cline Kanban dispatch: the task agent's UserPromptSubmit hook must
+    self-backfill child_session_id / child_transcript_path into both the prep
+    payload and the persistent origin.json, and skip when same-session."""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
+
+        run_dir = tmp_path / "run"
+        (run_dir / "artifacts").mkdir(parents=True)
+        origin_json = run_dir / "artifacts" / "origin.json"
+        origin_json.write_text(
+            json.dumps(
+                {"session_id": "parent-codex", "transcript_path": "/parent/codex.jsonl"}
+            ),
+            encoding="utf-8",
+        )
+        child_transcript = tmp_path / "child_claude.jsonl"
+        child_transcript.write_text("{}\n", encoding="utf-8")
+
+        prep.write_prep_file(
+            {
+                "origin_session_id": "parent-codex",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "origin_metadata_path": str(origin_json),
+                "target_flow": "flow-2-branch",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-kanban", "run_dir": str(run_dir)},
+            },
+            root=root,
+            token="dddddddddddddddd",
+            now=now,
+            ttl_seconds=300,
+        )
+
+        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            state = {
+                "started_at": "2026-05-07T00:01:00Z",
+                "completed_at": "2026-05-07T00:01:01Z",
+                "status": "completed",
+                "artifacts": {"review_env": "/tmp/review-env.sh"},
+            }
+            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "task: RVF_DISPATCH=token=dddddddddddddddd",
+                    "cwd": str(tmp_path),
+                    "session_id": "child-claude",
+                    "transcript_path": str(child_transcript),
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:00Z",
+            )
+            assert payload["status"] == "valid"
+            assert payload["child_session_id"] == "child-claude"
+            assert payload["child_transcript_path"] == str(child_transcript.resolve())
+
+            # Persistent channel: origin.json merged child fields, parent intact.
+            merged_origin = json.loads(origin_json.read_text(encoding="utf-8"))
+            assert merged_origin["session_id"] == "parent-codex"
+            assert merged_origin["transcript_path"] == "/parent/codex.jsonl"
+            assert merged_origin["child_session_id"] == "child-claude"
+            assert merged_origin["child_transcript_path"] == str(child_transcript.resolve())
+
+            # Prep payload also records the child fields.
+            stored = json.loads((root / "dddddddddddddddd.json").read_text(encoding="utf-8"))
+            assert stored["child_session_id"] == "child-claude"
+            assert stored["child_transcript_path"] == str(child_transcript.resolve())
+
+            diagnostics = read_jsonl(root / "diagnostics" / "dddddddddddddddd.jsonl")
+            assert any(
+                event.get("event") == "user_prompt_submit_child_session_backfill"
+                and event.get("status") == "ok"
+                for event in diagnostics
+            )
+
+            # Same-session guard: child == origin → no backfill.
+            same_origin = run_dir / "artifacts" / "origin-same.json"
+            same_origin.write_text(
+                json.dumps({"session_id": "same-sess"}), encoding="utf-8"
+            )
+            prep.write_prep_file(
+                {
+                    "origin_session_id": "same-sess",
+                    "origin_repo": str(tmp_path),
+                    "origin_cwd": str(tmp_path),
+                    "origin_metadata_path": str(same_origin),
+                    "target_flow": "flow-manual",
+                    "target_worktree": str(tmp_path),
+                    "rvf_run": {"run_id": "rvf-same", "run_dir": str(run_dir)},
+                },
+                root=root,
+                token="eeeeeeeeeeeeeeee",
+                now=now,
+                ttl_seconds=300,
+            )
+            same_payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "again RVF_DISPATCH=token=eeeeeeeeeeeeeeee",
+                    "cwd": str(tmp_path),
+                    "session_id": "same-sess",
+                    "transcript_path": str(child_transcript),
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:00Z",
+            )
+            assert same_payload["status"] == "valid"
+            assert "child_session_id" not in same_payload
+            same_origin_after = json.loads(same_origin.read_text(encoding="utf-8"))
+            assert "child_session_id" not in same_origin_after
+
+            # Fallback: no origin_metadata_path → derive origin.json from
+            # rvf_run.run_dir. Also: missing child transcript → null path.
+            run_dir2 = tmp_path / "run2"
+            (run_dir2 / "artifacts").mkdir(parents=True)
+            (run_dir2 / "artifacts" / "origin.json").write_text(
+                json.dumps({"session_id": "parent2"}), encoding="utf-8"
+            )
+            prep.write_prep_file(
+                {
+                    "origin_session_id": "parent2",
+                    "origin_repo": str(tmp_path),
+                    "origin_cwd": str(tmp_path),
+                    "target_flow": "flow-2-inplace",
+                    "target_worktree": str(tmp_path),
+                    "rvf_run": {"run_id": "rvf-fb", "run_dir": str(run_dir2)},
+                },
+                root=root,
+                token="ffffffffffffffff",
+                now=now,
+                ttl_seconds=300,
+            )
+            fb_payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "fb RVF_DISPATCH=token=ffffffffffffffff",
+                    "cwd": str(tmp_path),
+                    "session_id": "child2",
+                    "transcript_path": str(tmp_path / "does_not_exist.jsonl"),
+                },
+                prep_root=root,
+                now="2026-05-07T00:01:00Z",
+            )
+            assert fb_payload["status"] == "valid"
+            assert fb_payload["child_session_id"] == "child2"
+            assert fb_payload["child_transcript_path"] is None
+            fb_origin = json.loads(
+                (run_dir2 / "artifacts" / "origin.json").read_text(encoding="utf-8")
+            )
+            assert fb_origin["session_id"] == "parent2"
+            assert fb_origin["child_session_id"] == "child2"
+            assert fb_origin["child_transcript_path"] is None
+            fb_stored = json.loads((root / "ffffffffffffffff.json").read_text(encoding="utf-8"))
+            assert fb_stored["child_session_id"] == "child2"
+            assert fb_stored["child_transcript_path"] is None
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
 def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) -> None:
     """Verify TimeoutError unblocks the hook even when the worker is still running.
 
@@ -7436,6 +7642,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_user_prompt_submit_failed_prepare_records_state_without_blocking",
             lambda: test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(root / "prompt-submit-failed"),
+        ),
+        (
+            "claude_plugin_hooks_declare_user_prompt_submit",
+            lambda: test_claude_plugin_hooks_declare_user_prompt_submit(),
+        ),
+        (
+            "rvf_user_prompt_submit_backfills_child_session",
+            lambda: test_rvf_user_prompt_submit_backfills_child_session(root / "prompt-submit-child"),
         ),
         (
             "prepare_run_from_prep_file_timeout_returns_immediately",
