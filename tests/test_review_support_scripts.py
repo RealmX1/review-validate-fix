@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import functools
 import json
 import importlib.util
 import os
 import signal
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -921,16 +924,34 @@ def test_rvf_handoff_cli_opens_with_configured_editor(tmp_path: Path) -> None:
     assert marker.read_text(encoding="utf-8") == str(handoff.resolve())
 
 
+@functools.lru_cache(maxsize=1)
+def _repo_template() -> Path:
+    """Build the canonical repo once per process; callers copy it.
+
+    A plain `git init` repo stores no absolute worktree path in
+    `.git/config`, so a filesystem copy reproduces byte-identical repo
+    state (history, baked identity, dirty `tracked.txt`/untracked
+    `new.txt`) without re-spawning git per test.
+    """
+    base = Path(tempfile.mkdtemp(prefix="rvf-repo-template-"))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    template = base / "repo"
+    template.mkdir(parents=True)
+    run(["git", "init", "-q"], cwd=template)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=template)
+    run(["git", "config", "user.name", "RVF Test"], cwd=template)
+    (template / "tracked.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=template)
+    run(["git", "commit", "-q", "-m", "base"], cwd=template)
+    (template / "tracked.txt").write_text("base\nchange\n", encoding="utf-8")
+    (template / "new.txt").write_text("new\n", encoding="utf-8")
+    return template
+
+
 def init_repo(path: Path) -> Path:
-    path.mkdir(parents=True)
-    run(["git", "init", "-q"], cwd=path)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=path)
-    run(["git", "config", "user.name", "RVF Test"], cwd=path)
-    (path / "tracked.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "tracked.txt"], cwd=path)
-    run(["git", "commit", "-q", "-m", "base"], cwd=path)
-    (path / "tracked.txt").write_text("base\nchange\n", encoding="utf-8")
-    (path / "new.txt").write_text("new\n", encoding="utf-8")
+    # `copytree` runs `os.makedirs(path)` (creates parents, errors if
+    # `path` exists) — same contract as the former `path.mkdir(parents=True)`.
+    shutil.copytree(_repo_template(), path, symlinks=True)
     return path
 
 
