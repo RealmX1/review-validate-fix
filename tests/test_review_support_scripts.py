@@ -8497,6 +8497,20 @@ def selected_test_cases(
     return [case for index, case in enumerate(cases) if index % shard_count == shard_index]
 
 
+def _timing_sink() -> Path | None:
+    raw = os.environ.get("RVF_TEST_TIMING_JSONL")
+    return Path(raw) if raw else None
+
+
+def _record_timing(sink: Path, name: str, duration_ms: int, status: str) -> None:
+    record = {"name": name, "duration_ms": duration_ms, "status": status}
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    with sink.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
@@ -8514,8 +8528,21 @@ def main() -> int:
             shard_count=args.shard_count,
             shard_index=args.shard_index,
         )
-        for _, test_case in cases:
-            test_case()
+        timing_sink = _timing_sink()
+        for name, test_case in cases:
+            if timing_sink is None:
+                test_case()
+                continue
+            started = time.perf_counter()
+            status = "completed"
+            try:
+                test_case()
+            except BaseException:
+                status = "failed"
+                raise
+            finally:
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                _record_timing(timing_sink, name, duration_ms, status)
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
         if args.shard_count > 1
