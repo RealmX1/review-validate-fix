@@ -33,8 +33,10 @@ from rvf_analyze_advisory import (
     surface_rvf_analyze_advisory,
 )
 from post_analyze_quiet import (
+    WORKFLOW_COMPLETE,
+    WORKFLOW_PENDING,
     clear_post_analyze_quiet_marker,
-    post_analyze_workflow_complete,
+    post_analyze_workflow_status,
     read_post_analyze_quiet_marker,
 )
 from session_manifest import build_manifest
@@ -2107,6 +2109,258 @@ def current_kanban_project_path(event: dict[str, Any], fallback: str) -> str:
         ("kanban_project_path", "kanbanProjectPath", "project_path", "projectPath"),
     )
     return value or fallback
+
+
+def current_kanban_workspace_path(event: dict[str, Any]) -> str | None:
+    return event_or_env_text(
+        event,
+        (
+            "KANBAN_WORKSPACE_PATH",
+            "CLINE_KANBAN_WORKSPACE_PATH",
+            "KANBAN_TASK_WORKSPACE_PATH",
+            "CLINE_KANBAN_TASK_WORKSPACE_PATH",
+            "KANBAN_WORKTREE_PATH",
+            "CLINE_KANBAN_WORKTREE_PATH",
+        ),
+        (
+            "kanban_workspace_path",
+            "kanbanWorkspacePath",
+            "workspace_path",
+            "workspacePath",
+            "task_workspace_path",
+            "taskWorkspacePath",
+            "worktree_path",
+            "worktreePath",
+        ),
+    )
+
+
+def git_toplevel_or_none(path: Path) -> Path | None:
+    completed = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return Path(value).expanduser().resolve() if value else None
+
+
+def _task_workspace_from_mapping(value: dict[str, Any]) -> str | None:
+    for key in ("workspace_path", "workspacePath"):
+        candidate = value.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    workspace = value.get("workspace")
+    if isinstance(workspace, dict):
+        candidate = workspace.get("path")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def kanban_task_workspace_from_payload(payload: dict[str, Any], task_id: str) -> str | None:
+    expected = task_id.strip()
+    if not expected:
+        return None
+    for candidate in _iter_nested_dicts(payload):
+        if _task_id_from_mapping(candidate) != expected:
+            continue
+        workspace = _task_workspace_from_mapping(candidate)
+        if workspace:
+            return workspace
+    return None
+
+
+def lookup_kanban_task_workspace_from_state(
+    *,
+    task_id: str,
+    project_path: str | None,
+) -> dict[str, Any]:
+    workspaces_dir = cline_kanban_state_dir() / "workspaces"
+    checked: list[str] = []
+    matches: list[dict[str, str]] = []
+    errors: list[str] = []
+    if not workspaces_dir.is_dir():
+        return {"workspace_path": None, "source": "kanban_state_missing", "checked": checked}
+    for sessions_path in sorted(workspaces_dir.glob("*/sessions.json")):
+        checked.append(str(sessions_path))
+        try:
+            payload = json.loads(sessions_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{sessions_path}: {type(exc).__name__}: {exc}")
+            continue
+        sessions = payload.values() if isinstance(payload, dict) else []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_task_id = session.get("taskId") or session.get("task_id") or session.get("id")
+            if session_task_id != task_id:
+                continue
+            workspace = _task_workspace_from_mapping(session)
+            if workspace:
+                matches.append({"workspace_path": workspace, "sessions_path": str(sessions_path)})
+
+    unique = []
+    seen: set[str] = set()
+    for match in matches:
+        resolved = str(Path(match["workspace_path"]).expanduser().resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append({**match, "workspace_path": resolved})
+    if len(unique) == 1:
+        return {
+            "workspace_path": unique[0]["workspace_path"],
+            "source": "kanban_state_session_workspace",
+            "checked": checked,
+            "matches": unique,
+            "errors": errors,
+        }
+    return {
+        "workspace_path": None,
+        "source": "kanban_state_ambiguous" if unique else "kanban_state_missing_task_workspace",
+        "checked": checked,
+        "matches": unique,
+        "errors": errors,
+        "project_path": project_path,
+    }
+
+
+def lookup_cline_kanban_task_workspace(
+    *,
+    project_path: str,
+    task_id: str,
+    ledger: RunLedger,
+) -> dict[str, Any]:
+    direct = current_kanban_workspace_path({})
+    if direct:
+        return {"workspace_path": direct, "source": "kanban_workspace_env"}
+    client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
+    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+    command = [
+        sys.executable,
+        str(client),
+        "list",
+        "--repo",
+        project_path,
+        "--task-cmd",
+        task_cmd,
+    ]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **ledger.env()},
+        check=False,
+    )
+    artifact = ledger.artifact(
+        "kanban-followup-workspace-lookup.json",
+        {
+            "command": command,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        },
+    )
+    if completed.returncode == 0:
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            return {
+                "workspace_path": None,
+                "source": "cline_kanban_workspace_lookup_invalid_json",
+                "artifact": artifact,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if isinstance(payload, dict):
+            workspace = kanban_task_workspace_from_payload(payload, task_id)
+            if workspace:
+                return {
+                    "workspace_path": workspace,
+                    "source": "cline_kanban_task_list_workspace",
+                    "artifact": artifact,
+                }
+    state_lookup = lookup_kanban_task_workspace_from_state(task_id=task_id, project_path=project_path)
+    state_lookup["task_list_lookup"] = {
+        "artifact": artifact,
+        "returncode": completed.returncode,
+        "error": completed.stderr.strip() or completed.stdout.strip(),
+    }
+    return state_lookup
+
+
+def kanban_task_workspace_guard_payload(
+    *,
+    event: dict[str, Any],
+    cwd: str | None,
+    ledger: RunLedger,
+) -> dict[str, Any] | None:
+    task_id = current_kanban_task_id(event)
+    if not (task_id and cwd):
+        return None
+    cwd_root = git_toplevel_or_none(Path(cwd).expanduser())
+    if cwd_root is None:
+        return None
+    direct_workspace = current_kanban_workspace_path(event)
+    lookup: dict[str, Any]
+    if direct_workspace:
+        lookup = {"workspace_path": direct_workspace, "source": "kanban_workspace_event"}
+    else:
+        project_path = current_kanban_project_path(event, str(cwd_root))
+        lookup = lookup_cline_kanban_task_workspace(
+            project_path=project_path,
+            task_id=task_id,
+            ledger=ledger,
+        )
+    raw_workspace = lookup.get("workspace_path")
+    if not isinstance(raw_workspace, str) or not raw_workspace.strip():
+        ledger.event(
+            phase="gate",
+            event="kanban_task_workspace_guard_unresolved",
+            status="warning",
+            reason_code="kanban_task_workspace_unresolved",
+            cwd=cwd,
+            kanban_task_id=task_id,
+            cwd_git_root=str(cwd_root),
+            workspace_lookup=lookup,
+        )
+        return None
+    workspace_root = git_toplevel_or_none(Path(raw_workspace).expanduser()) or Path(raw_workspace).expanduser().resolve()
+    if _same_existing_path(cwd_root, workspace_root):
+        ledger.event(
+            phase="gate",
+            event="kanban_task_workspace_guard_matched",
+            status="completed",
+            reason_code="kanban_task_workspace_matched",
+            cwd=cwd,
+            kanban_task_id=task_id,
+            cwd_git_root=str(cwd_root),
+            kanban_task_workspace=str(workspace_root),
+            workspace_lookup=lookup,
+        )
+        return None
+    return skip_payload(
+        "当前 Stop event 位于 Cline Kanban task，但 cwd/git root 与该 task 的执行 worktree 不一致；"
+        "已跳过自动 RVF，避免审查 unrelated dirty repo。",
+        ledger,
+        "kanban_task_workspace_mismatch",
+        repo=str(cwd_root),
+        cwd=cwd,
+        backend="kanban-followup",
+        kanban_task_id=task_id,
+        cwd_git_root=str(cwd_root),
+        kanban_task_workspace=str(workspace_root),
+        workspace_lookup=lookup,
+        **stop_hook_rvf_state_fields(
+            phase="complete",
+            backend="kanban-followup",
+            backend_raw="kanban-followup",
+            completion_gate="kanban_task_workspace_mismatch",
+        ),
+    )
 
 
 def freeze_cline_kanban_dispatch_artifacts(
@@ -6400,11 +6654,12 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
         session_id=quiet_session_id,
     )
     if quiet_marker is not None:
-        removed_paths = clear_post_analyze_quiet_marker(
-            task_id=quiet_task_id,
-            session_id=quiet_session_id,
-        )
-        if post_analyze_workflow_complete(quiet_marker):
+        quiet_status = post_analyze_workflow_status(quiet_marker)
+        if quiet_status == WORKFLOW_COMPLETE:
+            removed_paths = clear_post_analyze_quiet_marker(
+                task_id=quiet_task_id,
+                session_id=quiet_session_id,
+            )
             return skip_decision(
                 "上一轮 RVF + $rvf-analyze 工作流已完整结束（analysis artifacts 已就绪）；"
                 "本次 Stop 一次性跳过自动 RVF dispatch，等待显式触发再开新一轮。",
@@ -6415,14 +6670,29 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 consumed_post_analyze_quiet_marker=quiet_marker,
                 consumed_post_analyze_quiet_marker_paths=removed_paths,
             )
+        if quiet_status == WORKFLOW_PENDING:
+            return skip_decision(
+                "上一轮 RVF 的 $rvf-analyze 仍在进行（analysis artifacts 尚未完成）；"
+                "本次 Stop 跳过自动 RVF dispatch，并保留 pending marker。",
+                ledger,
+                "post_analyze_workflow_pending",
+                cwd=cwd,
+                backend="kanban-followup" if quiet_task_id else "manual",
+                post_analyze_quiet_marker=quiet_marker,
+            )
+        removed_paths = clear_post_analyze_quiet_marker(
+            task_id=quiet_task_id,
+            session_id=quiet_session_id,
+        )
         ledger.event(
             phase="dev-sync",
-            event="post_analyze_quiet_marker_failopen",
+            event="post_analyze_quiet_marker_consumed_incomplete",
             status="skipped",
-            reason_code="post_analyze_quiet_marker_failopen",
-            message="post-analyze quiet marker 已消费但 analyze artifacts 未就绪，fail-open 继续既有 RVF 逻辑。",
+            reason_code=f"post_analyze_workflow_{quiet_status}",
+            message="post-analyze quiet marker 已过期或无效，消费 marker 后继续既有 RVF 逻辑。",
             consumed_post_analyze_quiet_marker=quiet_marker,
             consumed_post_analyze_quiet_marker_paths=removed_paths,
+            post_analyze_workflow_status=quiet_status,
         )
 
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
@@ -6726,6 +6996,14 @@ def main() -> int:
         provider_health_decision = provider_health_guard_decision(decision, event, ledger)
         if provider_health_decision is not None and provider_health_decision.payload is not None:
             emit(provider_health_decision.payload)
+            return 0
+        workspace_guard_payload = kanban_task_workspace_guard_payload(
+            event=event,
+            cwd=decision.cwd,
+            ledger=ledger,
+        )
+        if workspace_guard_payload is not None:
+            emit(workspace_guard_payload)
             return 0
         emit(launch_backend(decision, event, ledger))
         return 0

@@ -1097,12 +1097,13 @@ def test_post_analyze_quiet_marker_consumed_by_dispatcher_when_artifacts_ready(
     assert not (marker_root / "hook-input.json").exists()
 
 
-def test_post_analyze_quiet_marker_failopen_in_dispatcher_when_artifacts_missing(
+def test_post_analyze_quiet_marker_pending_in_dispatcher_when_artifacts_missing(
     tmp_path: Path,
 ) -> None:
-    """dispatcher 命中 quiet-marker 但 analyze artifacts 未就绪 → marker 一次性消
-    费后继续既有逻辑。dispatcher 在 dev-sync 路径上会照常 forward 到 installed
-    hook（fake hook 写 hook-input.json 验证 forward 发生）。"""
+    """dispatcher 命中 fresh quiet-marker 但 analyze artifacts 未就绪 → 保留 marker，
+    跳过自动 RVF，不 forward 到 installed hook。"""
+    import time as _time
+
     repo = init_repo(tmp_path / "rvf")
     marker_root = tmp_path / "marker"
     marker_root.mkdir()
@@ -1114,7 +1115,7 @@ def test_post_analyze_quiet_marker_failopen_in_dispatcher_when_artifacts_missing
     marker_file = _seed_dispatcher_quiet_marker(
         state=state,
         task_id="task-D2",
-        armed_at="2026-05-12T00:00:00Z",
+        armed_at=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
         analyze_run_dir=analyze_run_dir,
         seed_artifacts=False,
     )
@@ -1134,10 +1135,48 @@ def test_post_analyze_quiet_marker_failopen_in_dispatcher_when_artifacts_missing
     )
 
     payload = json.loads(stdout)
-    # fail-open：不应该用 post_analyze_workflow_complete 作为 skip 原因。
-    assert "reason=post_analyze_workflow_complete" not in payload["systemMessage"]
-    # 一次性：marker 仍然必须被 dispatcher 删除。
+    assert "reason=post_analyze_workflow_pending" in payload["systemMessage"]
+    assert marker_file.exists()
+    assert not (marker_root / "hook-input.json").exists()
+
+
+def test_post_analyze_quiet_marker_stale_in_dispatcher_continues_existing_flow(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "rvf")
+    marker_root = tmp_path / "marker"
+    marker_root.mkdir()
+    write_fake_dev_scripts(repo, marker_root)
+    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    write_fake_installed_hook(hook, marker_root)
+    state = tmp_path / "state"
+    analyze_run_dir = tmp_path / "prev-run-stale"
+    marker_file = _seed_dispatcher_quiet_marker(
+        state=state,
+        task_id="task-D3",
+        armed_at="2026-05-12T00:00:00Z",
+        analyze_run_dir=analyze_run_dir,
+        seed_artifacts=False,
+    )
+    assert marker_file.exists()
+
+    stdout = invoke(
+        {
+            "cwd": str(repo),
+            "hook_event_name": "Stop",
+            "session_id": "session-D3",
+            "last_user_message": "ok thanks",
+        },
+        dev_repo=repo,
+        hook=hook,
+        state=state,
+        extra_env={"KANBAN_TASK_ID": "task-D3"},
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "real hook ran"
     assert not marker_file.exists()
+    assert (marker_root / "hook-input.json").exists()
 
 
 def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) -> None:
@@ -2417,7 +2456,8 @@ def main() -> int:
         test_handoff_marker_finalizes_run_artifacts_forked_session,
         test_rvf_analyze_followup_trigger_skips_dispatcher_sync,
         test_post_analyze_quiet_marker_consumed_by_dispatcher_when_artifacts_ready,
-        test_post_analyze_quiet_marker_failopen_in_dispatcher_when_artifacts_missing,
+        test_post_analyze_quiet_marker_pending_in_dispatcher_when_artifacts_missing,
+        test_post_analyze_quiet_marker_stale_in_dispatcher_continues_existing_flow,
         test_plan_operation_skips_before_dev_sync_or_installed_hook,
         test_codex_goal_mode_skips_before_dev_sync_or_installed_hook,
         test_non_codex_goal_like_transcript_runs_installed_hook,

@@ -154,9 +154,10 @@ def test_workflow_complete_true_when_artifacts_fresh(tmp_path: Path) -> None:
         "analyze_causality_json": str(causality_json),
     }
     assert paq.post_analyze_workflow_complete(marker) is True
+    assert paq.post_analyze_workflow_status(marker) == paq.WORKFLOW_COMPLETE
 
 
-def test_workflow_complete_false_when_missing_artifact(tmp_path: Path) -> None:
+def test_workflow_status_pending_when_missing_artifact(tmp_path: Path) -> None:
     _isolate_state(tmp_path)
     import post_analyze_quiet as paq
 
@@ -170,9 +171,13 @@ def test_workflow_complete_false_when_missing_artifact(tmp_path: Path) -> None:
         "analyze_causality_json": str(tmp_path / "missing.json"),
     }
     assert paq.post_analyze_workflow_complete(marker) is False
+    assert (
+        paq.post_analyze_workflow_status(marker, now_ts=armed_ts + 60, pending_ttl=3600)
+        == paq.WORKFLOW_PENDING
+    )
 
 
-def test_workflow_complete_false_when_summary_still_has_todo(tmp_path: Path) -> None:
+def test_workflow_status_pending_when_summary_still_has_todo(tmp_path: Path) -> None:
     _isolate_state(tmp_path)
     import post_analyze_quiet as paq
 
@@ -187,9 +192,13 @@ def test_workflow_complete_false_when_summary_still_has_todo(tmp_path: Path) -> 
         "analyze_causality_json": str(causality_json),
     }
     assert paq.post_analyze_workflow_complete(marker) is False
+    assert (
+        paq.post_analyze_workflow_status(marker, now_ts=armed_ts + 60, pending_ttl=3600)
+        == paq.WORKFLOW_PENDING
+    )
 
 
-def test_workflow_complete_false_when_artifact_older_than_armed_at(tmp_path: Path) -> None:
+def test_workflow_status_pending_when_artifact_older_than_armed_at(tmp_path: Path) -> None:
     _isolate_state(tmp_path)
     import post_analyze_quiet as paq
 
@@ -204,6 +213,29 @@ def test_workflow_complete_false_when_artifact_older_than_armed_at(tmp_path: Pat
         "analyze_causality_json": str(causality_json),
     }
     assert paq.post_analyze_workflow_complete(marker) is False
+    assert (
+        paq.post_analyze_workflow_status(marker, now_ts=armed_ts + 60, pending_ttl=3600)
+        == paq.WORKFLOW_PENDING
+    )
+
+
+def test_workflow_status_stale_after_pending_ttl(tmp_path: Path) -> None:
+    _isolate_state(tmp_path)
+    import post_analyze_quiet as paq
+
+    armed_ts = time.time() - 7200
+    _, summary_md, _causality_json = _seed_artifacts(tmp_path, mtime=armed_ts + 10)
+    marker = {
+        "armed_at": time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(armed_ts)
+        ),
+        "analyze_summary_md": str(summary_md),
+        "analyze_causality_json": str(tmp_path / "missing.json"),
+    }
+    assert (
+        paq.post_analyze_workflow_status(marker, now_ts=armed_ts + 7200, pending_ttl=3600)
+        == paq.WORKFLOW_STALE
+    )
 
 
 def test_workflow_complete_false_when_marker_malformed(tmp_path: Path) -> None:
@@ -215,6 +247,8 @@ def test_workflow_complete_false_when_marker_malformed(tmp_path: Path) -> None:
     assert paq.post_analyze_workflow_complete(
         {"armed_at": "not-a-timestamp", "analyze_summary_md": "x", "analyze_causality_json": "y"}
     ) is False
+    assert paq.post_analyze_workflow_status(None) == paq.WORKFLOW_INVALID
+    assert paq.post_analyze_workflow_status({}) == paq.WORKFLOW_INVALID
 
 
 def main() -> int:
@@ -234,9 +268,10 @@ def main() -> int:
         test_write_returns_none_when_no_key,
         test_clear_removes_marker,
         test_workflow_complete_true_when_artifacts_fresh,
-        test_workflow_complete_false_when_missing_artifact,
-        test_workflow_complete_false_when_summary_still_has_todo,
-        test_workflow_complete_false_when_artifact_older_than_armed_at,
+        test_workflow_status_pending_when_missing_artifact,
+        test_workflow_status_pending_when_summary_still_has_todo,
+        test_workflow_status_pending_when_artifact_older_than_armed_at,
+        test_workflow_status_stale_after_pending_ttl,
         test_workflow_complete_false_when_marker_malformed,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -4,15 +4,17 @@
 约束：
 - 仅在 dispatcher / Stop hook 在 finalize handoff 后注入 ``$rvf-analyze``
   follow-up 的那个 Stop event 写入 marker；
-- 由紧接着的下一次 Stop hook 读取并消费（read + delete = consume）；
+- 由后续 Stop hook 读取；complete/stale/invalid 会消费，pending 会保留；
 - 消费时若 analyze artifacts (summary.md, causality.json) 已 ready 且 mtime
   在 ``armed_at`` 之后，则视为 RVF + analyze 工作流完整结束，跳过下一次自动
-  RVF dispatch；否则一次性消费、原样回落到既有逻辑。
+  RVF dispatch；若 artifacts 尚未 ready 且 marker 未过期，则视为 analyze
+  仍在进行，继续跳过自动 RVF dispatch。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +25,11 @@ from rvf_logging import log_root, safe_token
 
 SUBDIR_NAME = "post-analyze-quiet"
 MARKER_VERSION = 1
+DEFAULT_PENDING_TTL_SECONDS = 6 * 60 * 60
+WORKFLOW_COMPLETE = "complete"
+WORKFLOW_PENDING = "pending"
+WORKFLOW_STALE = "stale"
+WORKFLOW_INVALID = "invalid"
 
 
 def _quiet_root(root: Path | None = None) -> Path:
@@ -168,23 +175,21 @@ def _parse_armed_at(value: Any) -> float | None:
     return dt.timestamp()
 
 
-def post_analyze_workflow_complete(marker: dict[str, Any] | None) -> bool:
-    """判断 marker 对应的 RVF + $rvf-analyze 工作流是否已完整结束。
+def pending_ttl_seconds() -> float:
+    value = os.environ.get("CODEX_RVF_POST_ANALYZE_PENDING_TTL_SECONDS")
+    if value is None or not value.strip():
+        return float(DEFAULT_PENDING_TTL_SECONDS)
+    try:
+        ttl = float(value)
+    except ValueError:
+        return float(DEFAULT_PENDING_TTL_SECONDS)
+    return max(0.0, ttl)
 
-    判定标准：``analyze_summary_md`` 与 ``analyze_causality_json`` 两个文件都
-    存在，mtime 严格大于 ``armed_at`` 时间戳，summary 已移除
-    ``TODO(rvf-analyze)``，且 causality 是有效 JSON object。任一条件不满足 →
-    False，调用方应按一次性消费语义丢弃 marker 并继续既有 RVF 逻辑
-    （fail-open）。
-    """
-    if not isinstance(marker, dict):
-        return False
+
+def _artifacts_complete(marker: dict[str, Any], armed_ts: float) -> bool:
     summary_path = marker.get("analyze_summary_md")
     causality_path = marker.get("analyze_causality_json")
     if not (isinstance(summary_path, str) and isinstance(causality_path, str)):
-        return False
-    armed_ts = _parse_armed_at(marker.get("armed_at"))
-    if armed_ts is None:
         return False
     for raw in (summary_path, causality_path):
         try:
@@ -203,6 +208,35 @@ def post_analyze_workflow_complete(marker: dict[str, Any] | None) -> bool:
         causality = json.loads(Path(causality_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if not isinstance(causality, dict):
-        return False
-    return True
+    return isinstance(causality, dict)
+
+
+def post_analyze_workflow_status(
+    marker: dict[str, Any] | None,
+    *,
+    now_ts: float | None = None,
+    pending_ttl: float | None = None,
+) -> str:
+    """返回 marker 对应工作流状态：complete / pending / stale / invalid。"""
+    if not isinstance(marker, dict):
+        return WORKFLOW_INVALID
+    armed_ts = _parse_armed_at(marker.get("armed_at"))
+    if armed_ts is None:
+        return WORKFLOW_INVALID
+    if _artifacts_complete(marker, armed_ts):
+        return WORKFLOW_COMPLETE
+    current_ts = datetime.now(timezone.utc).timestamp() if now_ts is None else now_ts
+    ttl = pending_ttl_seconds() if pending_ttl is None else max(0.0, pending_ttl)
+    if current_ts - armed_ts <= ttl:
+        return WORKFLOW_PENDING
+    return WORKFLOW_STALE
+
+
+def post_analyze_workflow_complete(marker: dict[str, Any] | None) -> bool:
+    """判断 marker 对应的 RVF + $rvf-analyze 工作流是否已完整结束。
+
+    判定标准：``analyze_summary_md`` 与 ``analyze_causality_json`` 两个文件都
+    存在，mtime 严格大于 ``armed_at`` 时间戳，summary 已移除
+    ``TODO(rvf-analyze)``，且 causality 是有效 JSON object。
+    """
+    return post_analyze_workflow_status(marker) == WORKFLOW_COMPLETE

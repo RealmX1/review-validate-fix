@@ -22,8 +22,10 @@ from rvf_analyze_advisory import (
     surface_rvf_analyze_advisory,
 )
 from post_analyze_quiet import (
+    WORKFLOW_COMPLETE,
+    WORKFLOW_PENDING,
     clear_post_analyze_quiet_marker,
-    post_analyze_workflow_complete,
+    post_analyze_workflow_status,
     read_post_analyze_quiet_marker,
 )
 from session_manifest import build_manifest
@@ -1333,18 +1335,13 @@ def main() -> int:
         task_id=quiet_task_id,
         session_id=quiet_session_id,
     )
-    # 一次性 quiet-gate：marker 命中即就地消费，与 main stop hook 对称。Dispatcher
-    # 在后续多条短路路径（RVF_ANALYZE_FOLLOWUP_MARKER text-skip、sync_not_needed、
-    # session 没有 owned dirty 等）都可能 emit_terminal_payload + return，而不再
-    # delegate 给 installed hook；若 dispatcher 不在 read 时就 clear，marker 会
-    # 在这些 fail-open 分支下永远留存，破坏 one-shot 语义。
-    # 双侧 clear 用 unlink(missing_ok=True)，无论哪一侧先到都不会冲突。
     if quiet_marker is not None:
-        consumed_paths = clear_post_analyze_quiet_marker(
-            task_id=quiet_task_id,
-            session_id=quiet_session_id,
-        )
-        if post_analyze_workflow_complete(quiet_marker):
+        quiet_status = post_analyze_workflow_status(quiet_marker)
+        if quiet_status == WORKFLOW_COMPLETE:
+            consumed_paths = clear_post_analyze_quiet_marker(
+                task_id=quiet_task_id,
+                session_id=quiet_session_id,
+            )
             ledger.event(
                 phase="dev-sync",
                 event="post_analyze_quiet_marker_consumed",
@@ -1362,14 +1359,35 @@ def main() -> int:
                 detail="检测到 post-analyze quiet marker，已就地消费并跳过 dispatcher dev sync 与 installed stop hook。",
                 consumed_post_analyze_quiet_marker_paths=consumed_paths,
             )
+        if quiet_status == WORKFLOW_PENDING:
+            ledger.event(
+                phase="dev-sync",
+                event="post_analyze_quiet_marker_pending",
+                status="skipped",
+                reason_code="post_analyze_workflow_pending",
+                message="post-analyze quiet marker 仍在等待 analyze artifacts 完成；dispatcher 跳过自动 RVF 并保留 marker。",
+                post_analyze_quiet_marker=quiet_marker,
+            )
+            return emit_terminal_payload(
+                ledger,
+                status="skipped",
+                reason_code="post_analyze_workflow_pending",
+                message="post-analyze workflow is still pending; dispatcher skipped sync and installed hook",
+                detail="检测到 $rvf-analyze 尚未完成，已跳过本次自动 RVF，并保留 pending marker。",
+            )
+        consumed_paths = clear_post_analyze_quiet_marker(
+            task_id=quiet_task_id,
+            session_id=quiet_session_id,
+        )
         ledger.event(
             phase="dev-sync",
-            event="post_analyze_quiet_marker_failopen",
+            event="post_analyze_quiet_marker_consumed_incomplete",
             status="skipped",
-            reason_code="post_analyze_quiet_marker_failopen",
-            message="post-analyze quiet marker 已就地消费但 analyze artifacts 未就绪，dispatcher fail-open 继续既有流程。",
+            reason_code=f"post_analyze_workflow_{quiet_status}",
+            message="post-analyze quiet marker 已过期或无效，dispatcher 消费 marker 后继续既有流程。",
             consumed_post_analyze_quiet_marker=quiet_marker,
             consumed_post_analyze_quiet_marker_paths=consumed_paths,
+            post_analyze_workflow_status=quiet_status,
         )
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
         ledger.event(

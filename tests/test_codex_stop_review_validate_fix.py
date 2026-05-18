@@ -3374,7 +3374,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata'}]}))\n"
+        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
         "elif sys.argv[1] == 'message':\n"
         "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued', 'checkpoint_id': 'checkpoint-1'}))\n"
         "else:\n"
@@ -3430,8 +3430,8 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [call["argv"][0] for call in calls] == ["list", "message"]
-    message_argv = calls[1]["argv"]
+    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
+    message_argv = calls[2]["argv"]
     assert "--task-id" in message_argv
     assert message_argv[message_argv.index("--task-id") + 1] == "task-77"
     assert "--attempt-id" in message_argv
@@ -3554,8 +3554,8 @@ def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [call["argv"][0] for call in calls] == ["list", "message"]
-    prompt_path = Path(calls[1]["argv"][calls[1]["argv"].index("--prompt-file") + 1])
+    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
+    prompt_path = Path(calls[2]["argv"][calls[2]["argv"].index("--prompt-file") + 1])
     prompt_text = prompt_path.read_text(encoding="utf-8")
     assert f"RVF_PARENT_CONVERSATION_REF: {expected_title}" in prompt_text
     assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_board_lookup" in prompt_text
@@ -3733,7 +3733,7 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
         "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77', 'title': 'Subdir follow-up'}]}))\n"
+        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Subdir follow-up', 'workspacePath': {str(repo)!r}}}]}}))\n"
         "elif sys.argv[1] == 'message':\n"
         "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
         "else:\n"
@@ -3775,10 +3775,10 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
         for line in client_calls.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert [call["argv"][0] for call in calls] == ["list", "message"]
+    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
     list_argv = calls[0]["argv"]
     assert list_argv[list_argv.index("--repo") + 1] == str(repo.resolve())
-    message_argv = calls[1]["argv"]
+    message_argv = calls[2]["argv"]
     assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
 
 
@@ -3998,11 +3998,11 @@ def test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready(tmp_path:
     assert not marker_path.exists()
 
 
-def test_post_analyze_quiet_marker_failopen_when_artifacts_missing(tmp_path: Path) -> None:
+def test_post_analyze_quiet_marker_pending_when_artifacts_missing(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     state = tmp_path / "state"
     analyze_run_dir = tmp_path / "prev-run-missing"
-    armed_at = "2026-05-12T00:00:00Z"
+    armed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     marker_path = _seed_post_analyze_quiet_marker(
         state=state,
@@ -4025,11 +4025,113 @@ def test_post_analyze_quiet_marker_failopen_when_artifacts_missing(tmp_path: Pat
     )
     payload = parse_json(stdout)
     latest = latest_summary(state)
-    # fail-open: 一次性 marker 已消费，本次回到既有逻辑（不会再因 quiet marker 跳过）。
-    assert "reason=post_analyze_workflow_complete" not in payload.get("systemMessage", "")
-    assert latest["reason_code"] != "post_analyze_workflow_complete"
-    # marker 仍然必须被清理掉（一次性语义）。
+    assert "reason=post_analyze_workflow_pending" in payload.get("systemMessage", "")
+    assert latest["reason_code"] == "post_analyze_workflow_pending"
+    assert marker_path.exists()
+
+
+def test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    analyze_run_dir = tmp_path / "prev-run-stale"
+    marker_path = _seed_post_analyze_quiet_marker(
+        state=state,
+        task_id="task-T3",
+        armed_at="2026-05-12T00:00:00Z",
+        analyze_run_dir=analyze_run_dir,
+        seed_artifacts=False,
+    )
+    assert marker_path.exists()
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "session_id": "session-T3",
+            "last_user_message": "ok thanks, looks fine to me",
+        },
+        extra_env={"KANBAN_TASK_ID": "task-T3"},
+        state_dir=state,
+    )
+    payload = parse_json(stdout)
+    latest = latest_summary(state)
+    assert "reason=post_analyze_workflow_pending" not in payload.get("systemMessage", "")
+    assert latest["reason_code"] != "post_analyze_workflow_pending"
     assert not marker_path.exists()
+
+
+def test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    task_workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+    state = tmp_path / "state"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "session_id": "session-task-mismatch",
+            "last_user_message": "ordinary stop",
+        },
+        extra_env={
+            "KANBAN_TASK_ID": "task-W1",
+            "KANBAN_WORKSPACE_PATH": str(task_workspace),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    latest = latest_summary(state)
+    assert "reason=kanban_task_workspace_mismatch" in payload["systemMessage"]
+    assert latest["reason_code"] == "kanban_task_workspace_mismatch"
+    assert latest["cwd_git_root"] == str(dirty.resolve())
+    assert latest["kanban_task_workspace"] == str(task_workspace.resolve())
+
+
+def test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    task_workspace = init_repo(tmp_path / "task-workspace", dirty=False)
+    state = tmp_path / "state"
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-W2', 'workspacePath': {str(task_workspace)!r}}}]}}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "session_id": "session-task-lookup-mismatch",
+            "last_user_message": "ordinary stop",
+        },
+        extra_env={
+            "KANBAN_TASK_ID": "task-W2",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    latest = latest_summary(state)
+    assert "reason=kanban_task_workspace_mismatch" in payload["systemMessage"]
+    assert latest["reason_code"] == "kanban_task_workspace_mismatch"
+    assert latest["cwd_git_root"] == str(dirty.resolve())
+    assert latest["kanban_task_workspace"] == str(task_workspace.resolve())
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [call["argv"][0] for call in calls] == ["list"]
 
 
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:
@@ -6146,7 +6248,10 @@ def main() -> int:
         test_kanban_followup_trigger_marker_skips_one_turn,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
         test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready,
-        test_post_analyze_quiet_marker_failopen_when_artifacts_missing,
+        test_post_analyze_quiet_marker_pending_when_artifacts_missing,
+        test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues,
+        test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo,
+        test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,
         test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation,
         test_missing_desktop_control_fail_policy_reports,
