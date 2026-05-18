@@ -9,7 +9,7 @@
   "kind": "tool_call" | "tool_result" | "message" | "reasoning" | "phase_marker",
   "call_id": "...",
   "summary": "短文本",
-  "raw_ref": {"file": "rollout.codex.jsonl", "line": 12, "byte_range": [a, b]},
+  "raw_ref": {"file": "rollout.jsonl", "line": 12, "byte_range": [a, b]},
   "artifact_refs": [{"path": "...", "lines": [42, 58], "op": "edit|create|delete"}]
 }
 

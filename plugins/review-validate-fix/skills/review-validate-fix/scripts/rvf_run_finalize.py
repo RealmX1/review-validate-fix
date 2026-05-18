@@ -162,8 +162,8 @@ def _duration_seconds(start: Any, end: Any) -> float | None:
 
 
 def _usage_summary(run_dir: Path) -> dict[str, Any]:
-    pre_rollout = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
-    rvf_rollout = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre_rollout = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
+    rvf_rollout = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     pre_records = _rollout_token_usage(pre_rollout)
     rvf_records = _rollout_token_usage(rvf_rollout)
     baseline = pre_records[-1]["total"] if pre_records else {key: 0 for key in TOKEN_USAGE_KEYS}
@@ -178,9 +178,9 @@ def _usage_summary(run_dir: Path) -> dict[str, Any]:
     )
     return {
         "schema_version": 1,
-        "source": "artifacts/trajectory/rvf/rollout.codex.jsonl",
+        "source": "artifacts/trajectory/rvf/rollout.jsonl",
         "baseline_source": (
-            "artifacts/trajectory/pre-rvf/rollout.codex.jsonl"
+            "artifacts/trajectory/pre-rvf/rollout.jsonl"
             if pre_records
             else None
         ),

@@ -832,8 +832,8 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     lock = run_dir / "artifacts" / ".finalize.lock"
     assert lock.exists(), "finalize lock should be written"
     traj_dir = run_dir / "artifacts" / "trajectory"
-    pre = traj_dir / "pre-rvf" / "rollout.codex.jsonl"
-    post = traj_dir / "rvf" / "rollout.codex.jsonl"
+    pre = traj_dir / "pre-rvf" / "rollout.jsonl"
+    post = traj_dir / "rvf" / "rollout.jsonl"
     assert pre.exists() and post.exists()
     assert pre.read_bytes() + post.read_bytes() == transcript.read_bytes()
     distilled = traj_dir / "rvf" / "trajectory.jsonl"
@@ -967,8 +967,8 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
         extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
     )
 
-    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert pre.read_bytes() == parent_transcript.read_bytes()
     assert post.read_bytes() == child_transcript.read_bytes()
     pre_manifest = json.loads(

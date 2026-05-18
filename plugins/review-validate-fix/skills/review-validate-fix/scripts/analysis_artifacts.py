@@ -232,7 +232,7 @@ def discover_inputs(run_dir: Path) -> AnalysisInputs:
     rvf_traj_dir = artifacts / "trajectory" / "rvf"
     trajectory_jsonl = rvf_traj_dir / "trajectory.jsonl"
     trajectory_index_json = rvf_traj_dir / "trajectory.index.json"
-    rvf_rollout_jsonl = rvf_traj_dir / "rollout.codex.jsonl"
+    rvf_rollout_jsonl = rvf_traj_dir / "rollout.jsonl"
 
     pre_rvf_dir = artifacts / "trajectory" / "pre-rvf"
     pre_manifest = pre_rvf_dir / "manifest.json"

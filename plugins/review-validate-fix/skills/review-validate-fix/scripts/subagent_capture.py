@@ -220,7 +220,7 @@ def capture_subagent(
     缺失 / 过大时只写 manifest 指针，不抛异常。
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_rollout = dst_dir / "rollout.codex.jsonl"
+    dst_rollout = dst_dir / "rollout.jsonl"
     dst_manifest = dst_dir / "manifest.json"
 
     src = find_subagent_rollout(spawn.agent_id, sessions_root=sessions_root)
@@ -254,14 +254,14 @@ def capture_subagent(
 
     distill_index: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "rollout_file": "rollout.codex.jsonl",
+        "rollout_file": "rollout.jsonl",
         "record_count": 0,
         "kind_counts": {},
     }
     try:
         distilled, distill_index = distill_codex_jsonl(
             rollout_path=dst_rollout,
-            rollout_filename="rollout.codex.jsonl",
+            rollout_filename="rollout.jsonl",
             repo=repo,
         )
         write_jsonl(distilled, dst_dir / "trajectory.jsonl")

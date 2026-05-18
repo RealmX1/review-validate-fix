@@ -208,7 +208,7 @@ def test_capture_subagent_writes_rollout_manifest_and_distill(tmp_path: Path) ->
     assert manifest["spawn"]["role"] == "worker"
     assert manifest["distill_status"] == "ok"
 
-    rollout_copy = dst_dir / "rollout.codex.jsonl"
+    rollout_copy = dst_dir / "rollout.jsonl"
     traj = dst_dir / "trajectory.jsonl"
     index = dst_dir / "trajectory.index.json"
     manifest_path = dst_dir / "manifest.json"
@@ -249,7 +249,7 @@ def test_capture_subagent_missing_rollout_writes_pointer_only(tmp_path: Path) ->
     assert manifest["host_originator"] is None
     assert (dst_dir / "manifest.json").is_file()
     # No rollout file written when source missing.
-    assert not (dst_dir / "rollout.codex.jsonl").exists()
+    assert not (dst_dir / "rollout.jsonl").exists()
     assert not (dst_dir / "trajectory.jsonl").exists()
 
 

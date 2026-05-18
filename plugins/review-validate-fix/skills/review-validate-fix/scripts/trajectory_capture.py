@@ -10,15 +10,15 @@
 产物布局:
 <run_dir>/artifacts/trajectory/
 ├── pre-rvf/
-│   ├── rollout.codex.jsonl           # 切片或拷贝（视场景）
+│   ├── rollout.jsonl           # 切片或拷贝（视场景）
 │   └── manifest.json                 # source_kind / sha256 / 行范围 / cut_marker
 └── rvf/
-    ├── rollout.codex.jsonl
-    ├── rollout.codex.manifest.json
+    ├── rollout.jsonl
+    ├── rollout.manifest.json
     ├── trajectory.jsonl              # 蒸馏后统一 schema
     ├── trajectory.index.json         # 反向索引
     ├── reviewers/<id>/{trajectory.jsonl, trajectory.manifest.json}
-    └── subagents/<agent_id>/{rollout.codex.jsonl, trajectory.jsonl,
+    └── subagents/<agent_id>/{rollout.jsonl, trajectory.jsonl,
                               trajectory.index.json, manifest.json}
                                        # spawn_agent 子代理（reviewer / validate-fix
                                        # 等）独立 rollout 拷贝 + 蒸馏；spawn metadata
@@ -663,7 +663,7 @@ def capture_run(
         post_kind = "forked-target-full"
         pre_manifest = _write_full_copy(
             src=parent_transcript,
-            dst_jsonl=pre_dir / "rollout.codex.jsonl",
+            dst_jsonl=pre_dir / "rollout.jsonl",
             dst_manifest=pre_dir / "manifest.json",
             source_kind=pre_kind,
             source_session_id=parent_session_id,
@@ -673,8 +673,8 @@ def capture_run(
         if current_transcript is not None:
             post_manifest = _write_full_copy(
                 src=current_transcript,
-                dst_jsonl=rvf_dir / "rollout.codex.jsonl",
-                dst_manifest=rvf_dir / "rollout.codex.manifest.json",
+                dst_jsonl=rvf_dir / "rollout.jsonl",
+                dst_manifest=rvf_dir / "rollout.manifest.json",
                 source_kind=post_kind,
                 source_session_id=event_session_id,
                 host_kind=post_host_kind,
@@ -688,7 +688,7 @@ def capture_run(
                 "source_session_id": event_session_id,
                 "generated_at": _utc_now(),
             }
-            (rvf_dir / "rollout.codex.manifest.json").write_text(
+            (rvf_dir / "rollout.manifest.json").write_text(
                 json.dumps(post_manifest, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
@@ -724,7 +724,7 @@ def capture_run(
                 pre_host_kind = post_host_kind  # 同 transcript，同 host
                 pre_manifest = _write_pre_slice(
                     src=current_transcript,
-                    dst_jsonl=pre_dir / "rollout.codex.jsonl",
+                    dst_jsonl=pre_dir / "rollout.jsonl",
                     dst_manifest=pre_dir / "manifest.json",
                     cut=cut,
                     source_kind=pre_kind,
@@ -733,8 +733,8 @@ def capture_run(
                 )
                 post_manifest = _write_post_slice(
                     src=current_transcript,
-                    dst_jsonl=rvf_dir / "rollout.codex.jsonl",
-                    dst_manifest=rvf_dir / "rollout.codex.manifest.json",
+                    dst_jsonl=rvf_dir / "rollout.jsonl",
+                    dst_manifest=rvf_dir / "rollout.manifest.json",
                     cut=cut,
                     source_session_id=event_session_id,
                     host_kind=post_host_kind,
@@ -758,8 +758,8 @@ def capture_run(
                 post_kind = "same-session-full"
                 post_manifest = _write_full_copy(
                     src=current_transcript,
-                    dst_jsonl=rvf_dir / "rollout.codex.jsonl",
-                    dst_manifest=rvf_dir / "rollout.codex.manifest.json",
+                    dst_jsonl=rvf_dir / "rollout.jsonl",
+                    dst_manifest=rvf_dir / "rollout.manifest.json",
                     source_kind=post_kind,
                     source_session_id=event_session_id,
                     host_kind=post_host_kind,
@@ -783,32 +783,32 @@ def capture_run(
                 "source_kind": "none",
                 "generated_at": _utc_now(),
             }
-            (rvf_dir / "rollout.codex.manifest.json").write_text(
+            (rvf_dir / "rollout.manifest.json").write_text(
                 json.dumps(post_manifest, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
 
-    # 蒸馏 post-rvf：按 post_host_kind 选 distiller。注意 rollout 文件名仍写
-    # rollout.codex.jsonl（历史包袱，下游 reader 假定该名）；schema 区分体现在
-    # manifest 的 host 字段。Plan 已记 TODO，将在独立 cleanup commit 改名。
+    # 蒸馏 post-rvf：按 post_host_kind 选 distiller。rollout 文件名统一为
+    # host-中性的 rollout.jsonl（Codex / Claude 共用同名）；host 区分由
+    # manifest 的 host 字段表达。
     distill_index: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "rollout_file": "rollout.codex.jsonl",
+        "rollout_file": "rollout.jsonl",
         "record_count": 0,
         "kind_counts": {},
     }
-    rvf_rollout = rvf_dir / "rollout.codex.jsonl"
+    rvf_rollout = rvf_dir / "rollout.jsonl"
     if rvf_rollout.exists():
         if post_host_kind == HOST_CLAUDE:
             distilled, distill_index = distill_claude_jsonl(
                 rollout_path=rvf_rollout,
-                rollout_filename="rollout.codex.jsonl",
+                rollout_filename="rollout.jsonl",
                 repo=repo,
             )
         else:
             distilled, distill_index = distill_codex_jsonl(
                 rollout_path=rvf_rollout,
-                rollout_filename="rollout.codex.jsonl",
+                rollout_filename="rollout.jsonl",
                 repo=repo,
             )
         write_jsonl(distilled, rvf_dir / "trajectory.jsonl")
@@ -832,9 +832,9 @@ def capture_run(
 
     # Summary-level host: 取 post 轨迹的 host_kind（capture_run 入口已探测过，
     # 此处沿用而非重新探测）。host_originator 优先取 post rollout（即 RVF 自身
-    # 轨迹）；同会话 slice 与 forked-target 都会写出 rvf/rollout.codex.jsonl，
+    # 轨迹）；同会话 slice 与 forked-target 都会写出 rvf/rollout.jsonl，
     # 可直接读取；缺失时退到 post_manifest.host_originator / pre_manifest.host_originator。
-    rvf_rollout_for_host = rvf_dir / "rollout.codex.jsonl"
+    rvf_rollout_for_host = rvf_dir / "rollout.jsonl"
     summary_host_meta = _host_meta(
         rvf_rollout_for_host if rvf_rollout_for_host.exists() else None,
         host_kind=post_host_kind,

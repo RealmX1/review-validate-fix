@@ -174,8 +174,8 @@ def test_capture_run_same_session_slice(tmp_path: Path) -> None:
     )
     assert summary["pre_rvf_source_kind"] == "same-session-slice"
     assert summary["post_rvf_source_kind"] == "same-session-slice"
-    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert pre.exists() and post.exists()
     # 字节级互补
     assert pre.read_bytes() + post.read_bytes() == transcript.read_bytes()
@@ -218,8 +218,8 @@ def test_capture_run_forked_session_full_copies(tmp_path: Path) -> None:
     )
     assert summary["pre_rvf_source_kind"] == "forked-source-full"
     assert summary["post_rvf_source_kind"] == "forked-target-full"
-    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert pre.read_bytes() == parent_transcript.read_bytes()
     assert post.read_bytes() == child_transcript.read_bytes()
 
@@ -286,10 +286,10 @@ def test_capture_run_same_session_picks_run_specific_marker(tmp_path: Path) -> N
     assert pre_manifest["cut"]["timestamp"] == "2026-05-04T03:00:00Z"
     # post 应包含第二段 marker，且第一段 marker 行被切到 pre 里
     post_bytes = (
-        run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+        run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     ).read_bytes()
     pre_bytes = (
-        run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
+        run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
     ).read_bytes()
     assert post_bytes.count(capture.RVF_SKILL_TRIGGER.encode("utf-8")) == 1
     assert pre_bytes.count(capture.RVF_SKILL_TRIGGER.encode("utf-8")) == 1
@@ -333,7 +333,7 @@ def test_capture_run_summary_and_manifests_carry_host_fields(tmp_path: Path) -> 
             / "artifacts"
             / "trajectory"
             / "rvf"
-            / "rollout.codex.manifest.json"
+            / "rollout.manifest.json"
         ).read_text(encoding="utf-8")
     )
     assert pre_manifest["host"] == "codex"
@@ -382,5 +382,5 @@ def test_capture_run_no_marker_falls_back_to_full_post(tmp_path: Path) -> None:
     )
     assert summary["pre_rvf_source_kind"] == "none"
     assert summary["post_rvf_source_kind"] == "same-session-full"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert post.read_bytes() == transcript.read_bytes()
