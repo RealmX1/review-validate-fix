@@ -4139,7 +4139,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp_path: Path) 
     marker = tmp_path / "child-survived.txt"
     child_code = (
         "import pathlib, time; "
-        "time.sleep(2.0); "
+        "time.sleep(1.0); "
         f"pathlib.Path({str(marker)!r}).write_text('survived', encoding='utf-8')"
     )
     parent_code = (
@@ -4172,7 +4172,11 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp_path: Path) 
     )
     assert completed.returncode == 124
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-    time.sleep(2.3)
+    # Wait past the (now 1s) child sleep so a *surviving* child would have
+    # written the marker; the process-group kill at the ~0.5s idle timeout
+    # happens regardless of the child's sleep length, so the proof and its
+    # margin are unchanged.
+    time.sleep(1.3)
     assert not marker.exists()
 
 
