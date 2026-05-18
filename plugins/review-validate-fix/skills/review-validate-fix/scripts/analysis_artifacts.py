@@ -626,7 +626,7 @@ def scaffold_summary_md(
             for path in members:
                 lines.append(f"    - `{path}`")
     lines.append("")
-    lines.append(_todo("总结 RVF 真正改了哪些文件 / 哪些是新增 vs 修改 vs 删除，并指出与 issue 的对应关系；workspace-diff 包含背景 WIP 时以 `in_fix_allowlist` 为本轮真实修复范围"))
+    lines.append(_todo("总结 RVF 真正改了哪些文件 / 哪些是新增 vs 修改 vs 删除，并指出与 issue 的对应关系；workspace-diff 包含背景 WIP 时以 `in_fix_allowlist` 和 attempt `scope_expansion.expanded_paths` 作为本轮真实修复范围"))
     lines.append("")
 
     # 待 LLM 补全的叙事

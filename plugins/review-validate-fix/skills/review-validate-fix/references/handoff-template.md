@@ -109,6 +109,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
   - 分组理由：<共享根因、同一文件区域、同一测试路径、同一决策前提，或“单独验证，因为...”>
   - 执行：<validate/fix 子代理名；若触发允许本地执行的窄例外，写“本地执行：<原因>”>
   - 结果：<fixed / false_positive / elevated / failed；来自 `rvf_fix_attempt.py stop` ledger>
+  - scope expansion：<无，或列出 allowlist 外实际修复路径 + `--scope-expansion-reason`；不得把 protected/background/excluded 路径写成已修复>
 
 ## Issue 处理结果
 
@@ -116,6 +117,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
   - 来源：<codex-reviewer / alternative-reviewer:<agent-name> / codex-mimic-reviewer-a / codex-mimic-reviewer-b / user-supplied-skip-review / 多个来源；仅 handoff 审计用，未传给 validate/fix 子代理>
   - 问题：<1-2 句说明实际出了什么错>
   - 修复：<1-2 句说明做了什么>
+  - scope expansion：<若修复修改了 fix_allowlist 外路径，列路径和原因；否则写“无”>
 - **[false_positive]** `路径:行号` - <短标题>
   - 来源：<codex-reviewer / alternative-reviewer:<agent-name> / codex-mimic-reviewer-a / codex-mimic-reviewer-b / user-supplied-skip-review / 多个来源>
   - 驳回：<1-2 句说明为何不成立>

@@ -154,6 +154,38 @@ def _scope_fix_allowlist(run_dir: Path) -> list[str]:
     return _safe_relative_paths([item for item in raw if isinstance(item, str)])
 
 
+def _scope_contract(run_dir: Path) -> dict[str, Any]:
+    path = _scope_contract_path(run_dir)
+    if path is None:
+        return {}
+    return _read_json(path)
+
+
+def _scope_list(contract: dict[str, Any], key: str) -> list[str]:
+    raw = contract.get(key)
+    if not isinstance(raw, list):
+        canonical = contract.get("canonical_scope")
+        if isinstance(canonical, dict):
+            raw = canonical.get(key)
+    if not isinstance(raw, list):
+        return []
+    return _safe_relative_paths([item for item in raw if isinstance(item, str)])
+
+
+def _prefix_matches(path: str, prefixes: list[str]) -> bool:
+    normalized = path.strip().replace("\\", "/").lstrip("/")
+    for raw in prefixes:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        prefix = raw.strip().replace("\\", "/").lstrip("/")
+        if prefix.endswith("/"):
+            if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
+                return True
+        elif normalized == prefix or normalized.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def _attempt_boundary(issue_paths: list[str], fix_allowlist: list[str]) -> list[str]:
     return list(dict.fromkeys([*issue_paths, *fix_allowlist]))
 
@@ -311,6 +343,24 @@ def _intent_to_add_untracked(repo: Path, paths: list[str]) -> None:
         _run(repo, ["add", "-N", "--", *paths], check=True)
 
 
+def _dirty_paths(repo: Path, paths: list[str]) -> list[str]:
+    args = ["status", "--porcelain", "-z"]
+    if paths:
+        args.extend(["--", *paths])
+    raw = _run(repo, args, check=True).stdout
+    dirty: list[str] = []
+    entries = [item for item in raw.split("\0") if item]
+    for entry in entries:
+        if len(entry) < 4:
+            continue
+        path = entry[3:]
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[-1]
+        if _is_safe_relative_path(path):
+            dirty.append(path)
+    return list(dict.fromkeys(dirty))
+
+
 def _changed_paths(repo: Path, paths: list[str]) -> list[dict[str, str]]:
     args = ["diff", "--name-status", "HEAD"]
     if paths:
@@ -331,6 +381,63 @@ def _changed_paths(repo: Path, paths: list[str]) -> list[dict[str, str]]:
             op = "modified"
         out.append({"path": path, "op": op})
     return out
+
+
+def _scope_expansion_metadata(
+    *,
+    changed: list[dict[str, str]],
+    boundary_paths: list[str],
+    declared_paths: list[str],
+    reason: str | None,
+    scope_contract: dict[str, Any],
+) -> dict[str, Any]:
+    boundary = set(boundary_paths)
+    changed_outside = [item["path"] for item in changed if item["path"] not in boundary]
+    declared = set(declared_paths)
+    expanded_paths = [path for path in changed_outside if path in declared]
+    undeclared_paths = [path for path in changed_outside if path not in declared]
+    blocked_prefixes = _scope_list(scope_contract, "excluded_path_prefixes")
+    protected_patterns = _scope_list(scope_contract, "protected_files") + _scope_list(scope_contract, "background_files")
+    protected_paths = set(protected_patterns)
+    blocked_paths = [
+        path
+        for path in expanded_paths
+        if path in protected_paths or _prefix_matches(path, protected_patterns) or _prefix_matches(path, blocked_prefixes)
+    ]
+    return {
+        "expanded_paths": expanded_paths,
+        "declared_paths": declared_paths,
+        "undeclared_paths": undeclared_paths,
+        "blocked_paths": blocked_paths,
+        "reason": (reason or "").strip(),
+    }
+
+
+def _validate_scope_expansion(status: str, metadata: dict[str, Any]) -> None:
+    if status != "fixed":
+        return
+    expanded_paths = metadata["expanded_paths"]
+    undeclared_paths = metadata["undeclared_paths"]
+    blocked_paths = metadata["blocked_paths"]
+    reason = metadata["reason"]
+    if undeclared_paths:
+        joined = ", ".join(undeclared_paths)
+        raise ValueError(
+            "fixed attempt has undeclared allowlist-external changes; "
+            f"pass --scope-expansion-path for each intended path or clean them first: {joined}"
+        )
+    if expanded_paths and not reason:
+        joined = ", ".join(expanded_paths)
+        raise ValueError(
+            "fixed attempt expands validate/fix scope but no reason was provided; "
+            f"pass --scope-expansion-reason: {joined}"
+        )
+    if blocked_paths:
+        joined = ", ".join(blocked_paths)
+        raise ValueError(
+            "fixed attempt expands into protected/background/excluded paths; "
+            f"elevate instead of applying this patch: {joined}"
+        )
 
 
 def _sync_issue_state(
@@ -366,17 +473,27 @@ def command_stop(args: argparse.Namespace) -> int:
             _safe_relative_paths(attempt.get("issue_paths", [])),
             _safe_relative_paths(attempt.get("fix_allowlist", [])),
         )
-    _intent_to_add_untracked(worktree, boundary_paths)
+    _intent_to_add_untracked(worktree, [])
+    all_changed = _changed_paths(worktree, [])
+    scope_expansion = _scope_expansion_metadata(
+        changed=all_changed,
+        boundary_paths=boundary_paths,
+        declared_paths=_safe_relative_paths(args.scope_expansion_path or []),
+        reason=args.scope_expansion_reason,
+        scope_contract=_scope_contract(run_dir),
+    )
+    patch_paths = list(dict.fromkeys([*boundary_paths, *scope_expansion["expanded_paths"]]))
     fix_patch = _attempt_dir(run_dir, args.attempt_id) / "fix.patch"
     patch_args = ["diff", "--binary", "HEAD"]
-    if boundary_paths:
-        patch_args.extend(["--", *boundary_paths])
+    if patch_paths:
+        patch_args.extend(["--", *patch_paths])
     patch_text = _run(worktree, patch_args, check=True).stdout
-    fix_patch.write_text(patch_text, encoding="utf-8")
-    changed = _changed_paths(worktree, boundary_paths)
     status = args.status
     if status == "auto":
         status = "fixed" if patch_text.strip() else "false_positive"
+    _validate_scope_expansion(status, scope_expansion)
+    fix_patch.write_text(patch_text, encoding="utf-8")
+    changed = _changed_paths(worktree, patch_paths)
     result_payload = {}
     if args.result_file:
         result_payload = _read_json(Path(args.result_file).expanduser().resolve())
@@ -388,10 +505,22 @@ def command_stop(args: argparse.Namespace) -> int:
         "status": status,
         "fix_patch_path": str(fix_patch),
         "changed_paths": changed,
+        "all_changed_paths": all_changed,
+        "patch_paths": patch_paths,
+        "scope_expansion": scope_expansion,
         "result_payload": result_payload,
     }
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "result.json", result)
-    attempt.update({"status": status, "fix_patch_path": str(fix_patch), "changed_paths": changed})
+    attempt.update(
+        {
+            "status": status,
+            "fix_patch_path": str(fix_patch),
+            "changed_paths": changed,
+            "all_changed_paths": all_changed,
+            "patch_paths": patch_paths,
+            "scope_expansion": scope_expansion,
+        }
+    )
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
     log_root = Path(args.log_root).expanduser().resolve() if args.log_root else None
     diff_tracker.rvf_attempt_upsert(
@@ -436,10 +565,25 @@ def command_apply(args: argparse.Namespace) -> int:
     fix_patch = Path(attempt.get("fix_patch_path") or _attempt_dir(run_dir, args.attempt_id) / "fix.patch").resolve()
     if not fix_patch.is_file():
         raise ValueError(f"fix patch not found: {fix_patch}")
-    apply_result = _run(repo, ["apply", "--whitespace=nowarn", str(fix_patch)], check=False)
-    status = "applied" if apply_result.returncode == 0 else "merge_conflict"
+    scope_expansion = attempt.get("scope_expansion")
+    expanded_paths = []
+    if isinstance(scope_expansion, dict):
+        expanded_paths = _safe_relative_paths(scope_expansion.get("expanded_paths", []))
+    expanded_dirty_paths = _dirty_paths(repo, expanded_paths) if expanded_paths else []
+    if expanded_dirty_paths:
+        apply_result = subprocess.CompletedProcess(
+            args=["git", "apply", "--whitespace=nowarn", str(fix_patch)],
+            returncode=4,
+            stdout="",
+            stderr="scope expansion paths are dirty in target repo: " + ", ".join(expanded_dirty_paths),
+        )
+        status = "scope_expansion_conflict"
+    else:
+        apply_result = _run(repo, ["apply", "--whitespace=nowarn", str(fix_patch)], check=False)
+        status = "applied" if apply_result.returncode == 0 else "merge_conflict"
     attempt["status"] = status
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
+    tracker_status = "merge_conflict" if status == "scope_expansion_conflict" else status
     diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
@@ -447,8 +591,9 @@ def command_apply(args: argparse.Namespace) -> int:
         attempt_id=args.attempt_id,
         worktree_path=attempt["worktree_path"],
         fix_patch_path=fix_patch,
-        status=status,
+        status=tracker_status,
         result_payload={
+            "status": status,
             "apply_returncode": apply_result.returncode,
             "stdout": apply_result.stdout,
             "stderr": apply_result.stderr,
@@ -457,7 +602,11 @@ def command_apply(args: argparse.Namespace) -> int:
     )
     payload = {"attempt_id": args.attempt_id, "status": status, "stderr": apply_result.stderr}
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    return 0 if status == "applied" else 3
+    if status == "applied":
+        return 0
+    if status == "scope_expansion_conflict":
+        return 4
+    return 3
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -506,6 +655,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
     )
     stop.add_argument("--result-file", default=None)
+    stop.add_argument(
+        "--scope-expansion-path",
+        action="append",
+        default=[],
+        help="Allow one validate/fix patch path outside the original issue/fix_allowlist boundary. Repeat as needed.",
+    )
+    stop.add_argument(
+        "--scope-expansion-reason",
+        default=None,
+        help="Required with --status fixed when allowlist-external paths are included in the patch.",
+    )
     stop.add_argument("--log-root", default=None)
     stop.set_defaults(func=command_stop)
 

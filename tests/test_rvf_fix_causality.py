@@ -57,7 +57,16 @@ def _init_repo(path: Path) -> Path:
     return path
 
 
-def _write_scope_contract(run_dir: Path, repo: Path, run_id: str, fix_allowlist: list[str]) -> None:
+def _write_scope_contract(
+    run_dir: Path,
+    repo: Path,
+    run_id: str,
+    fix_allowlist: list[str],
+    *,
+    background_files: list[str] | None = None,
+    protected_files: list[str] | None = None,
+    excluded_path_prefixes: list[str] | None = None,
+) -> None:
     path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -67,7 +76,15 @@ def _write_scope_contract(run_dir: Path, repo: Path, run_id: str, fix_allowlist:
                 "repo": str(repo),
                 "run_id": run_id,
                 "fix_allowlist": fix_allowlist,
-                "canonical_scope": {"fix_allowlist": fix_allowlist},
+                "background_files": background_files or [],
+                "protected_files": protected_files or [],
+                "excluded_path_prefixes": excluded_path_prefixes or [],
+                "canonical_scope": {
+                    "fix_allowlist": fix_allowlist,
+                    "background_files": background_files or [],
+                    "protected_files": protected_files or [],
+                    "excluded_path_prefixes": excluded_path_prefixes or [],
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -82,6 +99,9 @@ def _run_dir(
     repo: Path,
     run_id: str = "rvf-test-run",
     fix_allowlist: list[str] | None = None,
+    background_files: list[str] | None = None,
+    protected_files: list[str] | None = None,
+    excluded_path_prefixes: list[str] | None = None,
 ) -> Path:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -89,7 +109,15 @@ def _run_dir(
         json.dumps({"run_id": run_id, "repo": str(repo)}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    _write_scope_contract(run_dir, repo, run_id, fix_allowlist or ["README.md"])
+    _write_scope_contract(
+        run_dir,
+        repo,
+        run_id,
+        fix_allowlist or ["README.md"],
+        background_files=background_files,
+        protected_files=protected_files,
+        excluded_path_prefixes=excluded_path_prefixes,
+    )
     return run_dir
 
 
@@ -304,7 +332,7 @@ def test_attempt_baseline_includes_allowlisted_dirty_files(tmp_path: Path) -> No
     assert _git(worktree, "status", "--porcelain") == ""
 
 
-def test_attempt_stop_excludes_out_of_boundary_changes_from_patch(tmp_path: Path) -> None:
+def test_attempt_stop_includes_declared_scope_expansion(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     (repo / "outside.txt").write_text("outside base\n", encoding="utf-8")
     _git(repo, "add", "outside.txt")
@@ -336,7 +364,6 @@ def test_attempt_stop_excludes_out_of_boundary_changes_from_patch(tmp_path: Path
     worktree = Path(prepared["worktree_path"])
     (worktree / "README.md").write_text("hello fixed\n", encoding="utf-8")
     (worktree / "outside.txt").write_text("outside changed\n", encoding="utf-8")
-    (worktree / "scratch.tmp").write_text("temporary\n", encoding="utf-8")
 
     stopped = _json_output(
         _run(
@@ -350,6 +377,10 @@ def test_attempt_stop_excludes_out_of_boundary_changes_from_patch(tmp_path: Path
                 str(run_dir),
                 "--status",
                 "fixed",
+                "--scope-expansion-path",
+                "outside.txt",
+                "--scope-expansion-reason",
+                "README fix must update its linked fixture",
                 "--log-root",
                 str(log_root),
             ]
@@ -357,10 +388,254 @@ def test_attempt_stop_excludes_out_of_boundary_changes_from_patch(tmp_path: Path
     )
     patch_text = Path(stopped["fix_patch_path"]).read_text(encoding="utf-8")
 
-    assert stopped["changed_paths"] == [{"op": "modified", "path": "README.md"}]
+    assert stopped["changed_paths"] == [
+        {"op": "modified", "path": "README.md"},
+        {"op": "modified", "path": "outside.txt"},
+    ]
+    assert stopped["scope_expansion"]["expanded_paths"] == ["outside.txt"]
+    assert stopped["scope_expansion"]["reason"] == "README fix must update its linked fixture"
     assert "hello fixed" in patch_text
-    assert "outside.txt" not in patch_text
-    assert "scratch.tmp" not in patch_text
+    assert "outside changed" in patch_text
+
+
+def test_attempt_stop_rejects_undeclared_scope_expansion(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "outside.txt").write_text("outside base\n", encoding="utf-8")
+    _git(repo, "add", "outside.txt")
+    _git(repo, "commit", "-q", "-m", "add outside")
+    run_dir = _run_dir(tmp_path, repo, fix_allowlist=["README.md"])
+    log_root = tmp_path / "state"
+    issue = _issue_file(tmp_path)
+    (repo / "README.md").write_text("hello user\n", encoding="utf-8")
+    _upsert_issue(repo, run_dir, issue, log_root)
+
+    prepared = _json_output(
+        _run(
+            [
+                sys.executable,
+                str(ATTEMPT_SCRIPT),
+                "prepare",
+                "--repo",
+                str(repo),
+                "--run-dir",
+                str(run_dir),
+                "--issue-id",
+                "RVF-G1",
+                "--log-root",
+                str(log_root),
+            ]
+        )
+    )
+    worktree = Path(prepared["worktree_path"])
+    (worktree / "README.md").write_text("hello fixed\n", encoding="utf-8")
+    (worktree / "outside.txt").write_text("outside changed\n", encoding="utf-8")
+
+    stopped = _run(
+        [
+            sys.executable,
+            str(ATTEMPT_SCRIPT),
+            "stop",
+            "--attempt-id",
+            prepared["attempt_id"],
+            "--run-dir",
+            str(run_dir),
+            "--status",
+            "fixed",
+            "--log-root",
+            str(log_root),
+        ],
+        check=False,
+    )
+
+    assert stopped.returncode == 2
+    assert "undeclared allowlist-external changes" in stopped.stderr
+
+
+def test_attempt_stop_rejects_scope_expansion_without_reason(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "outside.txt").write_text("outside base\n", encoding="utf-8")
+    _git(repo, "add", "outside.txt")
+    _git(repo, "commit", "-q", "-m", "add outside")
+    run_dir = _run_dir(tmp_path, repo, fix_allowlist=["README.md"])
+    log_root = tmp_path / "state"
+    issue = _issue_file(tmp_path)
+    (repo / "README.md").write_text("hello user\n", encoding="utf-8")
+    _upsert_issue(repo, run_dir, issue, log_root)
+
+    prepared = _json_output(
+        _run(
+            [
+                sys.executable,
+                str(ATTEMPT_SCRIPT),
+                "prepare",
+                "--repo",
+                str(repo),
+                "--run-dir",
+                str(run_dir),
+                "--issue-id",
+                "RVF-G1",
+                "--log-root",
+                str(log_root),
+            ]
+        )
+    )
+    worktree = Path(prepared["worktree_path"])
+    (worktree / "README.md").write_text("hello fixed\n", encoding="utf-8")
+    (worktree / "outside.txt").write_text("outside changed\n", encoding="utf-8")
+
+    stopped = _run(
+        [
+            sys.executable,
+            str(ATTEMPT_SCRIPT),
+            "stop",
+            "--attempt-id",
+            prepared["attempt_id"],
+            "--run-dir",
+            str(run_dir),
+            "--status",
+            "fixed",
+            "--scope-expansion-path",
+            "outside.txt",
+            "--log-root",
+            str(log_root),
+        ],
+        check=False,
+    )
+
+    assert stopped.returncode == 2
+    assert "no reason was provided" in stopped.stderr
+
+
+def test_attempt_stop_rejects_protected_scope_expansion(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "outside.txt").write_text("outside base\n", encoding="utf-8")
+    _git(repo, "add", "outside.txt")
+    _git(repo, "commit", "-q", "-m", "add outside")
+    run_dir = _run_dir(tmp_path, repo, fix_allowlist=["README.md"], protected_files=["outside.txt"])
+    log_root = tmp_path / "state"
+    issue = _issue_file(tmp_path)
+    (repo / "README.md").write_text("hello user\n", encoding="utf-8")
+    _upsert_issue(repo, run_dir, issue, log_root)
+
+    prepared = _json_output(
+        _run(
+            [
+                sys.executable,
+                str(ATTEMPT_SCRIPT),
+                "prepare",
+                "--repo",
+                str(repo),
+                "--run-dir",
+                str(run_dir),
+                "--issue-id",
+                "RVF-G1",
+                "--log-root",
+                str(log_root),
+            ]
+        )
+    )
+    worktree = Path(prepared["worktree_path"])
+    (worktree / "README.md").write_text("hello fixed\n", encoding="utf-8")
+    (worktree / "outside.txt").write_text("outside changed\n", encoding="utf-8")
+
+    stopped = _run(
+        [
+            sys.executable,
+            str(ATTEMPT_SCRIPT),
+            "stop",
+            "--attempt-id",
+            prepared["attempt_id"],
+            "--run-dir",
+            str(run_dir),
+            "--status",
+            "fixed",
+            "--scope-expansion-path",
+            "outside.txt",
+            "--scope-expansion-reason",
+            "README fix must update its linked fixture",
+            "--log-root",
+            str(log_root),
+        ],
+        check=False,
+    )
+
+    assert stopped.returncode == 2
+    assert "protected/background/excluded paths" in stopped.stderr
+
+
+def test_attempt_apply_rejects_dirty_scope_expansion_target(tmp_path: Path) -> None:
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "outside.txt").write_text("outside base\n", encoding="utf-8")
+    _git(repo, "add", "outside.txt")
+    _git(repo, "commit", "-q", "-m", "add outside")
+    run_dir = _run_dir(tmp_path, repo, fix_allowlist=["README.md"])
+    log_root = tmp_path / "state"
+    issue = _issue_file(tmp_path)
+    (repo / "README.md").write_text("hello user\n", encoding="utf-8")
+    _upsert_issue(repo, run_dir, issue, log_root)
+
+    prepared = _json_output(
+        _run(
+            [
+                sys.executable,
+                str(ATTEMPT_SCRIPT),
+                "prepare",
+                "--repo",
+                str(repo),
+                "--run-dir",
+                str(run_dir),
+                "--issue-id",
+                "RVF-G1",
+                "--log-root",
+                str(log_root),
+            ]
+        )
+    )
+    worktree = Path(prepared["worktree_path"])
+    (worktree / "README.md").write_text("hello fixed\n", encoding="utf-8")
+    (worktree / "outside.txt").write_text("outside changed\n", encoding="utf-8")
+    _run(
+        [
+            sys.executable,
+            str(ATTEMPT_SCRIPT),
+            "stop",
+            "--attempt-id",
+            prepared["attempt_id"],
+            "--run-dir",
+            str(run_dir),
+            "--status",
+            "fixed",
+            "--scope-expansion-path",
+            "outside.txt",
+            "--scope-expansion-reason",
+            "README fix must update its linked fixture",
+            "--log-root",
+            str(log_root),
+        ]
+    )
+    (repo / "outside.txt").write_text("outside user dirty\n", encoding="utf-8")
+
+    applied = _run(
+        [
+            sys.executable,
+            str(ATTEMPT_SCRIPT),
+            "apply",
+            "--attempt-id",
+            prepared["attempt_id"],
+            "--target-repo",
+            str(repo),
+            "--run-dir",
+            str(run_dir),
+            "--log-root",
+            str(log_root),
+        ],
+        check=False,
+    )
+
+    assert applied.returncode == 4
+    payload = _json_output(applied)
+    assert payload["status"] == "scope_expansion_conflict"
+    assert "outside.txt" in payload["stderr"]
 
 
 def test_parallel_attempts_conflict_on_second_apply(tmp_path: Path) -> None:
