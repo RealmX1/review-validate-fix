@@ -53,10 +53,10 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 ## Validate / Fix
 
 - `kind: no_issues` 进入 clean path。
-- `kind: issues` 进入 validate/fix；每条 issue 先验证，再判定 `REAL`、`FALSE_POSITIVE` 或 `ELEVATE`。
+- `kind: issues` 进入 validate/fix；每条 issue 先验证，再通过 `rvf_fix_attempt.py stop --status fixed|false_positive|elevated|failed` 写入完成状态。
 - 默认 `full` 流程中，只要有可解析 issue list，主会话必须至少启动一个 `validate_fix` 子代理，除非平台没有子代理接口、用户明确要求本地执行，或只剩机械收尾。
 - 按根因、文件区域、测试路径或决策前提把 issue 分组；最终汇总要说明 validate/fix 分组和结果。
-- `ELEVATE` verdict 必须包含 `elevation-detail` fenced block；可用 `scripts/parse_elevation_detail.py` 解析。
+- `--status elevated` 必须通过 `--result-file <elevation-detail.json>` 写入升级详情；自然语言 final 只作日志。
 
 ## Handoff
 

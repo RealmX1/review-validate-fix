@@ -17,7 +17,7 @@
 ## 关键不变量
 
 - reviewer 完成态只能是 `kind: no_issues` 或 `kind: issues` result artifact。
-- validate/fix verdict 仍只能是 `REAL`、`FALSE_POSITIVE` 或 `ELEVATE`。
+- validate/fix 完成状态只能通过 `rvf_fix_attempt.py stop --status fixed|false_positive|elevated|failed` 写入。
 - request contract 是非完成态，不得和完成态混写。
 - 子任务默认由主会话 spawn，以保留 run ledger、scope 和来源标签。
 - nested subagent 只有在平台能继承 run id、scope、manifest、packet 和限制时才可启用，且最多一层。

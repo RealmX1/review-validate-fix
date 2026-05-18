@@ -17,7 +17,7 @@
 收到 reviewer 或 validate/fix 子代理的 request 后：
 
 1. 校验 request artifact 格式。
-2. 确认 request 没有混入 `kind: no_issues`、issue 或 verdict。
+2. 确认 request 没有混入 `kind: no_issues`、issue 或 validate/fix 完成状态。
 3. 判断 request 是否在当前 scope 内。
 4. 判断相关命令是否需要 `scripts/command_lock.py`。
 5. 决定满足、驳回、spawn 子任务或升级给用户。
@@ -33,7 +33,7 @@ request 本身不得进入 review merge table。只有 requester 重试后的 `k
 
 主会话 spawn 的所有 RVF 子代理都默认使用当前可用的最佳模型，并显式设置 `reasoning_effort=high`。这包括 Codex-native reviewer、Codex-only fallback reviewer、validate/fix 子代理，以及为 `RVF_*_REQUEST` 派生的受控子任务。若当前接口不支持传入 model / reasoning effort，或用户、平台、本轮运行环境明确限制，主会话必须把降级原因写入 run ledger、handoff 和最终汇总。
 
-等待 validate/fix 子代理时，主会话应使用宽松时间窗口：首次等待用数分钟级到平台允许的较长 `wait_agent` / 等价等待，必要时重复等待；不要用短超时把测试、构建或实际修复中的正常静默误判成失败。等待期间可以准备不依赖最终 patch 的 merge table、验证计划，以及 handoff enabled 或 handoff 文件已存在时的 pending 字段，但不得替子代理提前给 verdict 或接管修复。
+等待 validate/fix 子代理时，主会话应使用宽松时间窗口：首次等待用数分钟级到平台允许的较长 `wait_agent` / 等价等待，必要时重复等待；不要用短超时把测试、构建或实际修复中的正常静默误判成失败。等待期间可以准备不依赖最终 patch 的 merge table、验证计划，以及 handoff enabled 或 handoff 文件已存在时的 pending 字段，但不得替子代理提前写入完成状态或接管修复。
 
 如果宽松等待到期仍未完成，主会话必须先发非侵入式 progress probe：询问当前阶段、已读文件、已修改或计划修改路径、正在跑的验证、阻塞点和预计下一步。probe 不能扩大 scope、改变验证包、注入 reviewer 来源或要求提前结束；probe 结果必须作为 liveness / audit metadata 写入 run ledger 和 validate/fix 分组审计表；只有 handoff enabled 或 handoff 文件已存在时，才同步写入 handoff，再决定继续等待、补上下文、处理 request 或升级。
 

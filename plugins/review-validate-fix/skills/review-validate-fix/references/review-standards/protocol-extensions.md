@@ -1,6 +1,6 @@
 # Protocol Extensions
 
-本文定义 RVF 子代理可用的非完成态 request contract。reviewer request 通过 `$RVF_WRITE_REVIEW_RESULT` 写入 `$RVF_REVIEW_RESULT`；request 只表示“当前子代理需要主会话提供受控协助”，不是 review 结论，也不是 validate/fix verdict。
+本文定义 RVF 子代理可用的非完成态 request contract。reviewer request 通过 `$RVF_WRITE_REVIEW_RESULT` 写入 `$RVF_REVIEW_RESULT`；request 只表示“当前子代理需要主会话提供受控协助”，不是 review 结论，也不是 validate/fix 完成状态。
 
 ## 完成态保持不变
 
@@ -9,11 +9,12 @@ Reviewer 完成态 artifact：
 - `kind: no_issues`
 - `kind: issues`，每条 issue 含 `path`、`line`、`message`
 
-Validate/fix 完成态：
+Validate/fix 完成态由 `rvf_fix_attempt.py stop` 写入：
 
-- `REAL`
-- `FALSE_POSITIVE`
-- `ELEVATE`
+- `--status fixed`
+- `--status false_positive`
+- `--status elevated`
+- `--status failed`
 
 ## 非完成态 request
 
@@ -57,6 +58,6 @@ python3 "$RVF_WRITE_REVIEW_RESULT" context-request --out "$RVF_REVIEW_RESULT" \
 
 - request artifact 不得和 `kind: no_issues` 混写。
 - request artifact 不得和 issue 混写。
-- request 不得和 validate/fix verdict 混写。
+- request 不得和 validate/fix 完成状态混写；request 阶段不得运行 `rvf_fix_attempt.py stop`。
 - request 可以有多条，但必须都在同一个 `kind: request` artifact 的 `requests` array 中。
 - 主会话必须处理 request 后让 requester 重试完成态输出。
