@@ -8236,8 +8236,11 @@ def main() -> int:
         "--jobs",
         type=int,
         default=1,
-        help="parallel worker processes (default 1 = serial; "
-        "the contract orchestrator never sets this)",
+        help="parallel worker processes (default 1 = serial; the "
+        "contract orchestrator never sets this). Best-effort dev "
+        "accelerator: keep jobs <= cpu/2 — workers also spawn "
+        "subprocess children, and a few reviewer tests use a fixed "
+        "idle timeout that can starve under oversubscription.",
     )
     args = parser.parse_args()
     if args.shard_count < 1:
@@ -8246,6 +8249,15 @@ def main() -> int:
         raise SystemExit("--shard-index must be in [0, shard-count)")
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
+    if args.jobs > 1:
+        _cpu = os.cpu_count() or 2
+        if args.jobs * 2 > _cpu:
+            print(
+                f"warning: --jobs {args.jobs} oversubscribes ~{_cpu} cores "
+                f"(workers spawn subprocess children); timeout-coupled "
+                f"reviewer tests may flake. Recommended: --jobs <= {_cpu // 2}.",
+                file=sys.stderr,
+            )
 
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
