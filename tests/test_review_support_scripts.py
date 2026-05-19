@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
 import functools
 import json
 import importlib.util
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 
@@ -8329,15 +8331,46 @@ def _record_timing(sink: Path, name: str, duration_ms: int, status: str) -> None
         )
 
 
+def _run_case_by_name(
+    root_str: str, name: str
+) -> tuple[str, bool, str | None, int]:
+    """Worker: rebuild the registry (lambdas aren't picklable) and run
+    one case by name in an isolated process."""
+    cases = dict(review_support_test_cases(Path(root_str)))
+    started = time.perf_counter()
+    try:
+        cases[name]()
+        ok, tb = True, None
+    except BaseException:
+        ok, tb = False, traceback.format_exc()
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    return name, ok, tb, duration_ms
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="parallel worker processes (default 1 = serial; "
+        "the contract orchestrator never sets this)",
+    )
     args = parser.parse_args()
     if args.shard_count < 1:
         raise SystemExit("--shard-count must be >= 1")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("--shard-index must be in [0, shard-count)")
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be >= 1")
+
+    suffix = (
+        f" shard {args.shard_index + 1}/{args.shard_count}"
+        if args.shard_count > 1
+        else ""
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
@@ -8347,25 +8380,52 @@ def main() -> int:
             shard_index=args.shard_index,
         )
         timing_sink = _timing_sink()
-        for name, test_case in cases:
-            if timing_sink is None:
-                test_case()
-                continue
-            started = time.perf_counter()
-            status = "completed"
-            try:
-                test_case()
-            except BaseException:
-                status = "failed"
-                raise
-            finally:
-                duration_ms = int((time.perf_counter() - started) * 1000)
-                _record_timing(timing_sink, name, duration_ms, status)
-    suffix = (
-        f" shard {args.shard_index + 1}/{args.shard_count}"
-        if args.shard_count > 1
-        else ""
-    )
+
+        if args.jobs <= 1:
+            for name, test_case in cases:
+                if timing_sink is None:
+                    test_case()
+                    continue
+                started = time.perf_counter()
+                status = "completed"
+                try:
+                    test_case()
+                except BaseException:
+                    status = "failed"
+                    raise
+                finally:
+                    duration_ms = int((time.perf_counter() - started) * 1000)
+                    _record_timing(timing_sink, name, duration_ms, status)
+        else:
+            results: dict[str, tuple[bool, str | None, int]] = {}
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.jobs
+            ) as pool:
+                futures = [
+                    pool.submit(_run_case_by_name, str(root), name)
+                    for name, _ in cases
+                ]
+                for fut in concurrent.futures.as_completed(futures):
+                    name, ok, tb, duration_ms = fut.result()
+                    results[name] = (ok, tb, duration_ms)
+            # Report/record in original registry order so failures and
+            # the timing JSONL are deterministic regardless of completion
+            # order.
+            if timing_sink is not None:
+                for name, _ in cases:
+                    ok, _tb, duration_ms = results[name]
+                    _record_timing(
+                        timing_sink,
+                        name,
+                        duration_ms,
+                        "completed" if ok else "failed",
+                    )
+            for name, _ in cases:
+                ok, tb, _duration_ms = results[name]
+                if not ok:
+                    raise AssertionError(
+                        f"test case {name!r} failed:\n{tb}"
+                    )
     print(f"review support script tests OK{suffix}")
     return 0
 
