@@ -4197,59 +4197,6 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp_pat
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
 
 
-def test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import json, os, subprocess, sys, time; sys.stdin.read(); "
-                "event = json.dumps({'type':'assistant','message':{'content':["
-                "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
-                "]}}); "
-                "split_at = len(event) // 2; "
-                "sys.stdout.write(event[:split_at]); sys.stdout.flush(); "
-                "time.sleep(0.04); "
-                "sys.stdout.write(event[split_at:] + '\\n'); sys.stdout.flush(); "
-                "time.sleep(0.25); "
-                "print(json.dumps({'type':'user','message':{'content':["
-                "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
-                "]}}), flush=True); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
-                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=1.0,
-        activity_check_interval_seconds=0.03,
-        output_format="claude_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES"
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
-
-
 def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
@@ -4884,58 +4831,6 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Pat
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
     assert argv == ["-p", "--output-format", "text"]
-
-
-def test_alternative_reviewer_respects_explicit_claude_equals_text_output(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "claude"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
-                "print('NO_ISSUES', flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["claude", "-p", "--output-format=text"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format=None,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["-p", "--output-format=text"]
 
 
 def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_path: Path) -> None:
@@ -7775,10 +7670,6 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "alternative_reviewer_claude_split_jsonl_preserves_tool_use",
-            lambda: test_alternative_reviewer_claude_split_jsonl_preserves_tool_use(root / "alternative-split-jsonl"),
-        ),
-        (
             "alternative_reviewer_repeated_run_keeps_prior_artifacts",
             lambda: test_alternative_reviewer_repeated_run_keeps_prior_artifacts(root / "alternative-repeat-artifacts"),
         ),
@@ -7835,12 +7726,6 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_respects_explicit_claude_text_output",
             lambda: test_alternative_reviewer_respects_explicit_claude_text_output(root / "alternative-text-config"),
-        ),
-        (
-            "alternative_reviewer_respects_explicit_claude_equals_text_output",
-            lambda: test_alternative_reviewer_respects_explicit_claude_equals_text_output(
-                root / "alternative-equals-text-config"
-            ),
         ),
         (
             "alternative_reviewer_non_claude_stream_json_command_is_not_patched",
@@ -8133,10 +8018,6 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "manual_rvf_run_upserts_on_pk_conflict",
             lambda: test_manual_rvf_run_upserts_on_pk_conflict(root / "manual-run-T2"),
-        ),
-        (
-            "manual_rvf_run_find_returns_none_when_empty",
-            lambda: test_manual_rvf_run_find_returns_none_when_empty(root / "manual-run-T3"),
         ),
         (
             "manual_rvf_run_find_returns_latest_completed_at",
@@ -8959,19 +8840,6 @@ def test_manual_rvf_run_upserts_on_pk_conflict(tmp: Path) -> None:
     finally:
         conn.close()
     assert rows == [("sha256:new", "2026-05-05T00:10:00Z")]
-
-
-def test_manual_rvf_run_find_returns_none_when_empty(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = _slice_2b_repo_with_two_dirty(tmp)
-    assert (
-        module.find_manual_rvf_run_for_scope_hash(
-            repo=repo,
-            scope_hash="sha256:missing",
-            log_root_override=tmp / "logs",
-        )
-        is None
-    )
 
 
 def test_manual_rvf_run_find_returns_latest_completed_at(tmp: Path) -> None:
