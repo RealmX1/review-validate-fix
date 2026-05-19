@@ -8,7 +8,6 @@ import functools
 import json
 import importlib.util
 import os
-import signal
 import shlex
 import shutil
 import sqlite3
