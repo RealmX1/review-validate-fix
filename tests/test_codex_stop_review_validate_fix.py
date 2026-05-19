@@ -15,6 +15,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from _rvf_test_support.repo import templated_repo
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (
@@ -59,6 +61,7 @@ def init_repo(path: Path, dirty: bool) -> Path:
     return path
 
 
+@templated_repo
 def init_repo_with_head(path: Path) -> Path:
     repo = init_repo(path, dirty=False)
     run(["git", "config", "user.email", "rvf@example.test"], repo)

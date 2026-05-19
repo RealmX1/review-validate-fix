@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _rvf_test_support.repo import templated_repo
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (
@@ -33,6 +35,7 @@ def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) 
     return completed
 
 
+@templated_repo
 def init_repo(path: Path) -> Path:
     path.mkdir(parents=True)
     run(["git", "init", "-q"], cwd=path)
