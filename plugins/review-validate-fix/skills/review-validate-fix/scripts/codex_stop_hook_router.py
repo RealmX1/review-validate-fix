@@ -26,6 +26,7 @@ SESSION_PATH_KEYS = (
 )
 SESSION_HOOK_CHANNEL_CONTROL_KEY = "RVF_STOP_HOOK_CHANNEL"
 VALID_CHANNELS = {"stable", "dev"}
+# 绝对兜底；正常默认走 ``default_channel()``，dev terms 满足时优先 dev。
 DEFAULT_CHANNEL = "stable"
 
 
@@ -220,13 +221,30 @@ def parse_channel_control(text: str | None) -> str | None:
     return None
 
 
+def default_channel() -> tuple[str, str]:
+    """选 dev 当且仅当 dev terms 满足；否则 stable。
+
+    "dev terms 满足" = ``target_for_channel("dev")`` 能解析出一个真实存在的
+    target file（即 ``CODEX_RVF_DEV_STOP_HOOK`` 或 ``CODEX_RVF_DEV_REPO``
+    其中之一配置正确）。session 显式 channel marker（``RVF_STOP_HOOK_CHANNEL:
+    stable|dev``）仍可覆盖本默认。
+
+    返回 ``(channel, source)``：source ∈ {``"dev-default"``,
+    ``"stable-default"``}，用于 ledger / 诊断可视化。
+    """
+    target, _ = target_for_channel("dev")
+    if target is not None and target.is_file():
+        return "dev", "dev-default"
+    return DEFAULT_CHANNEL, "stable-default"
+
+
 def channel_from_state(session_id: str | None) -> tuple[str, str]:
     if not session_id:
-        return DEFAULT_CHANNEL, "default"
+        return default_channel()
     value = read_state(session_id).get("channel")
     if isinstance(value, str) and value in VALID_CHANNELS:
         return value, "session-marker"
-    return DEFAULT_CHANNEL, "default"
+    return default_channel()
 
 
 def set_channel(session_id: str, action: str, latest_user: str | None) -> tuple[str, Path]:
@@ -238,7 +256,8 @@ def set_channel(session_id: str, action: str, latest_user: str | None) -> tuple[
         state.pop("channel_updated_at", None)
         if set(state) > {"session_id"}:
             state["channel_updated_at"] = datetime.now(timezone.utc).isoformat()
-        return DEFAULT_CHANNEL, maybe_remove_empty_state(session_id, state)
+        resolved, _ = default_channel()
+        return resolved, maybe_remove_empty_state(session_id, state)
 
     state.update(
         {
@@ -481,7 +500,7 @@ def main() -> int:
         cwd=str(cwd) if isinstance(cwd, str) else None,
     )
     if event is None:
-        channel, source = DEFAULT_CHANNEL, "default"
+        channel, source = default_channel()
         target, error = target_for_channel(channel)
         if target is None:
             return emit_terminal_payload(
@@ -557,7 +576,10 @@ def main() -> int:
                 control_action=action,
             )
         channel, state_marker_path = set_channel(session_id, action, latest_user)
-        source = "latest-user-message" if action != "default" else "default"
+        if action == "default":
+            _, source = default_channel()
+        else:
+            source = "latest-user-message"
         ledger.event(
             phase="router",
             event="session_channel_control",

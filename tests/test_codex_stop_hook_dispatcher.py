@@ -495,7 +495,13 @@ def latest_summary(state: Path) -> dict[str, object]:
     return json.loads(Path(str(pointer["summary_path"])).read_text(encoding="utf-8"))
 
 
-def test_router_defaults_to_stable_even_in_dev_repo(tmp_path: Path) -> None:
+def test_router_defaults_to_dev_when_dev_terms_apply(tmp_path: Path) -> None:
+    """dev terms 满足时 router 默认走 dev 通道。
+
+    "dev terms 满足" = ``CODEX_RVF_DEV_STOP_HOOK`` 或 ``CODEX_RVF_DEV_REPO``
+    解析出一个真实存在的 target file。这里 ``dev_hook`` 已经写入磁盘，
+    ``invoke_router`` 也把 ``CODEX_RVF_DEV_STOP_HOOK`` 注入 env。
+    """
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
@@ -514,6 +520,40 @@ def test_router_defaults_to_stable_even_in_dev_repo(tmp_path: Path) -> None:
         dev_hook=dev_hook,
         state=tmp_path / "state",
         extra_env={"CODEX_RVF_DEV_REPO": str(repo)},
+    )
+
+    payload = json.loads(stdout)
+    assert payload["systemMessage"] == "dev hook ran"
+    assert (marker / "dev-input.json").exists()
+    assert not (marker / "stable-input.json").exists()
+    dev_env = json.loads((marker / "dev-env.json").read_text(encoding="utf-8"))
+    assert dev_env["selected_channel"] == "dev"
+    assert dev_env["dev_sync"] == "1"
+    assert dev_env["dev_sync_install"] == "0"
+
+
+def test_router_defaults_to_stable_when_dev_terms_do_not_apply(tmp_path: Path) -> None:
+    """dev terms 不满足时 router 默认走 stable（``DEFAULT_CHANNEL`` fallback）。
+
+    "dev terms 不满足" = 既没有 ``CODEX_RVF_DEV_STOP_HOOK``，也没有
+    ``CODEX_RVF_DEV_REPO``（这里通过传 ``dev_hook=None`` 让
+    ``invoke_router`` 不注入 ``CODEX_RVF_DEV_STOP_HOOK``）。
+    """
+    repo = init_repo(tmp_path / "rvf")
+    marker = tmp_path / "marker"
+    marker.mkdir()
+    stable_hook = tmp_path / "stable" / "hook.py"
+    write_fake_router_target(stable_hook, marker, "stable")
+
+    stdout = invoke_router_stdout(
+        {
+            "cwd": str(repo),
+            "session_id": "router-stable-fallback",
+            "last_user_message": "ordinary work in RVF repo",
+        },
+        stable_hook=stable_hook,
+        dev_hook=None,
+        state=tmp_path / "state",
     )
 
     payload = json.loads(stdout)
@@ -577,6 +617,13 @@ def test_router_channel_dev_marker_routes_current_and_later_stops(tmp_path: Path
 
 
 def test_router_channel_default_clears_session_marker(tmp_path: Path) -> None:
+    """``default`` 指令清除 session marker，本次后续走 auto-resolved default。
+
+    auto-resolved default 由 ``default_channel()`` 决定：dev terms 满足时
+    走 dev，否则走 stable。本测试的 fixture 同时配置了 stable + dev hook
+    （dev terms 满足）——所以 ``default`` 清除 marker 后 resolved channel
+    应当是 dev，而非以前硬编码的 stable。
+    """
     repo = init_repo(tmp_path / "repo")
     marker = tmp_path / "marker"
     marker.mkdir()
@@ -608,7 +655,7 @@ def test_router_channel_default_clears_session_marker(tmp_path: Path) -> None:
     )
 
     payload = json.loads(stdout)
-    assert payload["systemMessage"] == "stable hook ran"
+    assert payload["systemMessage"] == "dev hook ran"
     assert not (state / "session-hook" / "router-default-clear.json").exists()
 
 
@@ -2445,7 +2492,8 @@ def main() -> int:
         raise SystemExit("--shard-index must be in [0, shard-count)")
 
     tests = [
-        test_router_defaults_to_stable_even_in_dev_repo,
+        test_router_defaults_to_dev_when_dev_terms_apply,
+        test_router_defaults_to_stable_when_dev_terms_do_not_apply,
         test_router_channel_dev_marker_routes_current_and_later_stops,
         test_router_channel_default_clears_session_marker,
         test_router_channel_status_reports_gate_and_channel,
