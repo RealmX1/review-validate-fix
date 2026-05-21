@@ -599,6 +599,77 @@ def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
     py_compile.compile(str(shim), doraise=True)
 
 
+def _load_claude_ups_shim_module():
+    """以模块方式加载 hooks/user_prompt_submit.py（shim 是脚本，但可读取
+    它的 ``_is_codex_invocation`` 等顶层函数做单元测试）。"""
+    import importlib.util
+
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
+    spec = importlib.util.spec_from_file_location("rvf_claude_ups_shim", shim_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_claude_plugin_shim_detects_codex_invocation() -> None:
+    """``_is_codex_invocation`` 守卫：在 Codex 转写路径上返回 True；在
+    Claude 转写路径 / 缺路径时返回 False（保守，未知按 Claude 跑）。"""
+    shim = _load_claude_ups_shim_module()
+
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.codex/sessions/2026/05/21/rollout-XYZ.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"conversation_path": "/Users/me/.codex/sessions/anywhere/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_path": "/Users/me/.codex/sessions/2026/05/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_file": "/Users/me/.codex/sessions/some/leaf.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.claude/projects/-encoded/session.jsonl"}
+    ) is False
+    # 缺所有路径键 → False（保守，按 Claude 跑）
+    assert shim._is_codex_invocation({}) is False
+    # 路径键值非 str → False
+    assert shim._is_codex_invocation({"transcript_path": None}) is False
+    assert shim._is_codex_invocation({"transcript_path": 12345}) is False
+
+
+def test_claude_plugin_shim_codex_invocation_noop(tmp_path: Path) -> None:
+    """端到端：用 Codex 转写路径的 event 调 shim，应静默退出（stdout 空，
+    退出码 0，且不写任何 prep file）。"""
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
+    prep_root = tmp_path / "prep-root"
+    prep_root.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "CODEX_RVF_PREP_ROOT": str(prep_root),
+        "CODEX_RVF_LOG_ROOT": str(tmp_path / "log-root"),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+    }
+    event = {
+        "prompt": "/review-validate-fix",
+        "session_id": "codex-session-abc",
+        "cwd": str(tmp_path),
+        "transcript_path": "/Users/bominzhang/.codex/sessions/2026/05/21/rollout-fake.jsonl",
+    }
+    completed = subprocess.run(
+        [sys.executable, str(shim_path)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "", f"expected silent no-op, got stdout={completed.stdout!r}"
+    # 无 prep file 写入（如果 core 跑了就会写）
+    assert not any(prep_root.iterdir()), "prep root should be empty after Codex no-op"
+
+
 def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
     """Cline Kanban dispatch: the task agent's UserPromptSubmit hook must
     self-backfill child_session_id / child_transcript_path into both the prep
@@ -7646,6 +7717,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "claude_plugin_hooks_declare_user_prompt_submit",
             lambda: test_claude_plugin_hooks_declare_user_prompt_submit(),
+        ),
+        (
+            "claude_plugin_shim_detects_codex_invocation",
+            lambda: test_claude_plugin_shim_detects_codex_invocation(),
+        ),
+        (
+            "claude_plugin_shim_codex_invocation_noop",
+            lambda: test_claude_plugin_shim_codex_invocation_noop(root / "shim-codex-noop"),
         ),
         (
             "rvf_user_prompt_submit_backfills_child_session",
