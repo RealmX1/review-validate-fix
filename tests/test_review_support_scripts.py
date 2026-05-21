@@ -611,6 +611,17 @@ def _load_claude_ups_shim_module():
     return module
 
 
+def _load_claude_stop_shim_module():
+    """同 ``_load_claude_ups_shim_module``，但加载 hooks/stop.py。"""
+    import importlib.util
+
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "stop.py"
+    spec = importlib.util.spec_from_file_location("rvf_claude_stop_shim", shim_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_claude_plugin_shim_detects_codex_invocation() -> None:
     """``_is_codex_invocation`` 守卫：在 Codex 转写路径上返回 True；在
     Claude 转写路径 / 缺路径时返回 False（保守，未知按 Claude 跑）。"""
@@ -668,6 +679,56 @@ def test_claude_plugin_shim_codex_invocation_noop(tmp_path: Path) -> None:
     assert completed.stdout == "", f"expected silent no-op, got stdout={completed.stdout!r}"
     # 无 prep file 写入（如果 core 跑了就会写）
     assert not any(prep_root.iterdir()), "prep root should be empty after Codex no-op"
+
+
+def test_claude_plugin_stop_shim_detects_codex_invocation() -> None:
+    """``hooks/stop.py`` 的 ``_is_codex_invocation`` 守卫与 UPS shim 同款：
+    Codex 转写路径返回 True；Claude 转写路径 / 缺路径时返回 False。"""
+    shim = _load_claude_stop_shim_module()
+
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.codex/sessions/2026/05/22/rollout-XYZ.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_file": "/Users/me/.codex/sessions/anywhere/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.claude/projects/-encoded/session.jsonl"}
+    ) is False
+    assert shim._is_codex_invocation({}) is False
+    assert shim._is_codex_invocation({"transcript_path": None}) is False
+    assert shim._is_codex_invocation({"transcript_path": 12345}) is False
+
+
+def test_claude_plugin_stop_shim_codex_invocation_noop(tmp_path: Path) -> None:
+    """端到端：用 Codex 转写路径的 event 调 Stop shim，应静默退出（stdout
+    空，退出码 0，且不调起 RVF 核心）。如果核心被调起，CODEX_RVF_LOG_ROOT
+    指向的 log 目录会有 run dir 写入；空目录证明守卫生效。"""
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "stop.py"
+    log_root = tmp_path / "log-root"
+    log_root.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "CODEX_RVF_LOG_ROOT": str(log_root),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+    }
+    event = {
+        "session_id": "codex-session-stop-abc",
+        "cwd": str(tmp_path),
+        "transcript_path": "/Users/bominzhang/.codex/sessions/2026/05/22/rollout-fake.jsonl",
+    }
+    completed = subprocess.run(
+        [sys.executable, str(shim_path)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "", f"expected silent no-op, got stdout={completed.stdout!r}"
+    # 守卫生效则核心未被调起，log_root 下不会创建任何 run 子目录
+    assert not any(log_root.iterdir()), "log root should be empty after Codex no-op"
 
 
 def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
@@ -7725,6 +7786,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "claude_plugin_shim_codex_invocation_noop",
             lambda: test_claude_plugin_shim_codex_invocation_noop(root / "shim-codex-noop"),
+        ),
+        (
+            "claude_plugin_stop_shim_detects_codex_invocation",
+            lambda: test_claude_plugin_stop_shim_detects_codex_invocation(),
+        ),
+        (
+            "claude_plugin_stop_shim_codex_invocation_noop",
+            lambda: test_claude_plugin_stop_shim_codex_invocation_noop(root / "stop-shim-codex-noop"),
         ),
         (
             "rvf_user_prompt_submit_backfills_child_session",
