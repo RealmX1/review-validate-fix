@@ -71,6 +71,7 @@ import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
 from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+import rvf_parent_context
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -112,6 +113,16 @@ CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
 CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
+# 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
+# artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
+PARENT_CONTEXT_ENV = "CODEX_RVF_PARENT_CONTEXT"
+"""开关：默认开启；设 ``0`` / ``false`` / ``no`` / ``off`` 关闭父对话 context 生成。"""
+PARENT_CONTEXT_MAX_BYTES_ENV = "CODEX_RVF_PARENT_CONTEXT_MAX_BYTES"
+"""总字节上限覆盖；缺省用 rvf_parent_context.DEFAULT_MAX_BYTES (64KB)，超限保留最近内容。"""
+PARENT_CONTEXT_ARTIFACT_NAME = "parent-conversation-context.md"
+"""run artifacts 中父对话 context 的文件名，与 task prompt / review-env 引用一致。"""
+PARENT_CONTEXT_PROMPT_KEY = "RVF_PARENT_CONVERSATION_CONTEXT"
+"""task prompt / review-env 中标记父对话 context 路径的键名。"""
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
 KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -353,6 +364,79 @@ def provider_health_timeout_seconds() -> float:
 
 def codex_bin() -> str:
     return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
+
+
+def parent_context_enabled() -> bool:
+    """父会话对话 context 注入是否开启（默认开启，``CODEX_RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
+    return not is_falsey(os.environ.get(PARENT_CONTEXT_ENV))
+
+
+def parent_context_max_bytes() -> int:
+    """父对话 context 总字节预算；非法/缺省回退 rvf_parent_context.DEFAULT_MAX_BYTES。"""
+    raw = os.environ.get(PARENT_CONTEXT_MAX_BYTES_ENV)
+    if raw is None or not raw.strip():
+        return rvf_parent_context.DEFAULT_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return rvf_parent_context.DEFAULT_MAX_BYTES
+    return value if value > 0 else rvf_parent_context.DEFAULT_MAX_BYTES
+
+
+def freeze_parent_conversation_context(
+    *,
+    parent_thread_path: Path | None,
+    ledger: RunLedger,
+    cwd: str,
+) -> str | None:
+    """渲染父会话对话 context 并写进 run artifacts；返回 artifact 路径或 None。
+
+    完全 fail-open：开关关闭、父 transcript 缺失、渲染为空、写入失败任意一种都
+    返回 None 且不抛异常——绝不阻塞 dispatch。
+    """
+    if not parent_context_enabled():
+        return None
+    if parent_thread_path is None:
+        return None
+    try:
+        blob = rvf_parent_context.render_parent_context(
+            parent_thread_path,
+            max_bytes=parent_context_max_bytes(),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-open，不阻塞 dispatch
+        ledger.event(
+            phase="prepare",
+            event="parent_conversation_context_failed",
+            status="warning",
+            reason_code="parent_conversation_context_render_error",
+            repo=cwd,
+            cwd=cwd,
+            error=str(exc),
+        )
+        return None
+    if not blob:
+        return None
+    header = (
+        "# 父会话对话 Context（仅作 review 背景）\n\n"
+        f"- 来源 transcript：`{parent_thread_path}`\n"
+        "- 用途：让本 child agent 在 review 前了解父会话的对话/推理脉络。\n"
+        "- 边界：**仅作背景**，不得用本文件重定义 review scope；scope 仍以 "
+        "`$RVF_SCOPE_CONTRACT` 为准。Codex reasoning 加密，标 `<encrypted reasoning>`；"
+        "tool 输出已轻压缩。\n\n"
+        "---\n\n"
+    )
+    artifact_path = ledger.artifact(PARENT_CONTEXT_ARTIFACT_NAME, header + blob)
+    if artifact_path:
+        ledger.event(
+            phase="prepare",
+            event="parent_conversation_context_frozen",
+            status="completed",
+            reason_code="parent_conversation_context_frozen",
+            repo=cwd,
+            cwd=cwd,
+            paths={"parent_conversation_context": artifact_path},
+        )
+    return artifact_path
 
 
 def safe_state_key(value: str) -> str:
@@ -2458,6 +2542,13 @@ def freeze_cline_kanban_dispatch_artifacts(
     scope_path = ledger.artifact("startup-scope-of-work.md", scope_text)
     if not scope_path:
         raise RuntimeError("failed to write Cline Kanban startup scope artifact")
+    # 父会话对话 context（fail-open；缺失/关闭不阻塞 dispatch）。child 通过
+    # task prompt 的 RVF_PARENT_CONVERSATION_CONTEXT 标记从 run artifacts 读取。
+    freeze_parent_conversation_context(
+        parent_thread_path=parent_thread_path,
+        ledger=ledger,
+        cwd=cwd,
+    )
     command = [
         sys.executable,
         str(DEFAULT_PREPARE_REVIEW_RUN),
@@ -2615,6 +2706,20 @@ def cline_kanban_task_prompt(
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
     handoff_helper = DEFAULT_HANDOFF_HELPER
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
+    # 父会话对话 context artifact 可能在 freeze 期写入（fail-open，可能缺失）。
+    # 仅当文件确实存在时，才在 prompt 里加 RVF_PARENT_CONVERSATION_CONTEXT 标记与引用，
+    # 用 $RVF_ARTIFACTS_DIR 相对形式与其它 artifact 引用保持一致。
+    parent_context_path = ledger.artifact_path(PARENT_CONTEXT_ARTIFACT_NAME)
+    parent_context_ref = (
+        f"$RVF_ARTIFACTS_DIR/{PARENT_CONTEXT_ARTIFACT_NAME}"
+        if parent_context_path.exists()
+        else None
+    )
+    parent_context_marker_line = (
+        f"{PARENT_CONTEXT_PROMPT_KEY}: {parent_context_ref}\n"
+        if parent_context_ref is not None
+        else ""
+    )
     if worktree_mode == "inplace":
         worktree_instructions = (
             "你运行在 Cline Kanban task 的 inplace 模式中。执行 repo 是当前父 worktree；"
@@ -2666,6 +2771,7 @@ def cline_kanban_task_prompt(
         f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
         f"RVF_PARENT_TRANSCRIPT_PATH: {transcript}\n"
         f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
+        f"{parent_context_marker_line}"
         "RVF_REVIEW_ENV: $RVF_ARTIFACTS_DIR/review-env.sh\n"
         "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
         "RVF_ORIGIN_METADATA: $RVF_ARTIFACTS_DIR/origin.json\n"
@@ -2679,7 +2785,7 @@ def cline_kanban_task_prompt(
         f"- transcript: `{transcript}`\n"
         f"- origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`\n\n"
         f"{worktree_instructions}"
-        f"{cline_kanban_artifact_reference_lines()}"
+        f"{cline_kanban_artifact_reference_lines(parent_conversation_context_ref=parent_context_ref)}"
         "本 task 由 UserPromptSubmit hook 调用 shared prepare 入口生成 review-env、scope.contract、review packet 等。"
         "开始任何 review/validate/fix 前，先 `cat $RVF_PREP_FILE` 确认 `rvf_run.shared_workflow_state.status == \"completed\"` 且 "
         "`artifacts` 字段齐全；齐全则跳过手动跑 `prepare_review_run.py`，直接 source `$RVF_REVIEW_ENV` 继续既有模式。"

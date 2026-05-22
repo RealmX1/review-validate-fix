@@ -98,7 +98,21 @@ def dispatch_scope_of_work_text(
     )
 
 
-def cline_kanban_artifact_reference_lines() -> str:
+def cline_kanban_artifact_reference_lines(
+    *,
+    parent_conversation_context_ref: str | None = None,
+) -> str:
+    parent_context_line = ""
+    parent_context_hint = ""
+    if parent_conversation_context_ref:
+        parent_context_line = (
+            f"- 父会话对话 context: `{parent_conversation_context_ref}`（仅作背景，可在 review 前先读）\n"
+        )
+        parent_context_hint = (
+            "本 child 是全新会话、看不到父会话对话，故 review 前可先读父会话对话 context "
+            f"`{parent_conversation_context_ref}` 了解脉络；它仅作背景，"
+            "**不得**用它重定义 scope（scope 仍以 `$RVF_SCOPE_CONTRACT` 为准）。"
+        )
     return (
         "然后读取并复用已经冻结的 RVF artifacts；命令和说明中继续使用这些变量，不要重复展开 run artifacts 目录：\n"
         "- review env: `$RVF_ARTIFACTS_DIR/review-env.sh`\n"
@@ -106,7 +120,10 @@ def cline_kanban_artifact_reference_lines() -> str:
         "- scope contract: `$RVF_SCOPE_CONTRACT`\n"
         "- review packet: `$RVF_REVIEW_PACKET`\n"
         "- session manifest: `$RVF_SESSION_MANIFEST`\n"
-        "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n\n"
+        "- worktree bootstrap: `$RVF_WORKTREE_BOOTSTRAP`\n"
+        f"{parent_context_line}"
+        "\n"
         "不得用 Kanban worktree 当前实时 diff 重新定义 scope；review scope 只能以 `$RVF_SCOPE_CONTRACT` "
         "为准，review packet 仅作为冻结 reviewer 输入，session manifest 只作为 ownership evidence 和 tracker 审计来源。"
+        f"{parent_context_hint}"
     )
