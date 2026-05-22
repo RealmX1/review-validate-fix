@@ -6272,6 +6272,34 @@ def test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty(tmp_pat
     )
 
 
+def test_resolve_cline_kanban_agent_id_mirrors_parent_harness(tmp_path: Path) -> None:
+    hook = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    codex_tx = tmp_path / "rollout-codex.jsonl"
+    codex_tx.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "sid-codex"}}) + "\n",
+        encoding="utf-8",
+    )
+    claude_tx = tmp_path / "claude.jsonl"
+    claude_tx.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "hi"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    os.environ.pop("CODEX_RVF_CLINE_KANBAN_AGENT_ID", None)
+    # 默认镜像父 harness：Codex transcript → codex；Claude transcript → claude。
+    assert hook.resolve_cline_kanban_agent_id(codex_tx) == "codex"
+    assert hook.resolve_cline_kanban_agent_id(claude_tx) == "claude"
+    # 父 transcript 为 None / 缺失 / 未知格式 → 退回历史默认 codex（零回归）。
+    assert hook.resolve_cline_kanban_agent_id(None) == "codex"
+    assert hook.resolve_cline_kanban_agent_id(tmp_path / "missing.jsonl") == "codex"
+    # 显式 env 钉死优先级最高，可选任意合法 harness（即便父是其它 harness）。
+    os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "cline"
+    assert hook.resolve_cline_kanban_agent_id(codex_tx) == "cline"
+    assert hook.resolve_cline_kanban_agent_id(claude_tx) == "cline"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
@@ -6413,6 +6441,7 @@ def main() -> int:
         test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo,
         test_missing_cwd_skips_and_requests_target_repo,
         test_log_unavailable_does_not_break_hook_payload,
+        test_resolve_cline_kanban_agent_id_mirrors_parent_harness,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)

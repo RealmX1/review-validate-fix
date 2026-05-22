@@ -70,6 +70,7 @@ from session_label import (
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
+from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -1800,6 +1801,53 @@ def is_codex_agent_id(agent_id: str | None) -> bool:
     )
 
 
+# ⚠️ cline-kanban 的 `kanban task create --agent-id <id>` 决定该 task 用哪个 executor
+# 跑（合法值：cline | claude | codex | droid | gemini | opencode | default）。
+# RVF dispatch 只要传 `--agent-id`，就**覆盖了 cline-kanban 自身的默认 executor 选择**
+# （cline-kanban 不传时会用它自己的 default profile）。
+#
+# 默认策略：镜像父（main agent）所用 harness。理由——同 executor fork
+# （codex→codex / claude→claude）既能直接复用父会话上下文，又能命中 prompt cache；
+# 跨 executor 时虽然仍可从对方 log/session 抽取通用 context，但 prompt cache 命中会
+# 不可控地丢失。因此默认不再硬钉 "codex"，而是跟随父 harness。
+# 仍保留 CODEX_RVF_CLINE_KANBAN_AGENT_ID 显式钉死某个 fix harness 的能力（优先级最高）。
+def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
+    """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
+
+    复用 ``trajectory_distill.detect_transcript_format`` 做 host 识别：
+    Claude Code transcript → ``claude``；Codex rollout → ``codex``；
+    无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
+    保证既有 Codex-only 用例零回归。
+    """
+    if parent_thread_path is not None:
+        try:
+            host_kind = detect_transcript_format(parent_thread_path)
+        except Exception:
+            host_kind = None
+        if host_kind == HOST_CLAUDE:
+            return "claude"
+        if host_kind == HOST_CODEX:
+            return "codex"
+    return "codex"
+
+
+def resolve_cline_kanban_agent_id(
+    parent_thread_path: Path | None,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    """解析 cline-kanban task 的 agent_id。
+
+    优先级：显式 ``CODEX_RVF_CLINE_KANBAN_AGENT_ID`` 钉死 > 镜像父 harness > ``codex`` 兜底。
+    provider-health 门与实际 create 站点共用此函数，避免两处对 executor 的判断漂移。
+    """
+    environ = env if env is not None else os.environ
+    pinned = (environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID") or "").strip()
+    if pinned:
+        return pinned
+    return default_cline_kanban_agent_id(parent_thread_path)
+
+
 def provider_health_requirements(
     decision: StopDecision,
     event: dict[str, Any],
@@ -1815,7 +1863,9 @@ def provider_health_requirements(
         ]
 
     if decision.backend == "kanban":
-        agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+        # 与 start_cline_kanban_task 的 create 站点共用 resolver：默认镜像父 harness，
+        # 父 transcript 用 host-agnostic 的 parent_thread_path_for_origin（也能识别 Claude）。
+        agent_id = resolve_cline_kanban_agent_id(parent_thread_path_for_origin(event))
         if is_codex_agent_id(agent_id):
             return [
                 ProviderHealthRequirement(
@@ -1836,8 +1886,7 @@ def provider_health_requirements(
                 ("KANBAN_AGENT_ID", "CLINE_KANBAN_AGENT_ID"),
                 ("kanban_agent_id", "kanbanAgentId", "agent_id", "agentId"),
             )
-            or os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip()
-            or "codex"
+            or resolve_cline_kanban_agent_id(parent_thread_path_for_origin(event))
         )
         if is_codex_agent_id(agent_id):
             return [
@@ -2948,7 +2997,10 @@ def start_cline_kanban_task(
         str(DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS),
     )
     tmux_session = os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", DEFAULT_CLINE_KANBAN_TMUX_SESSION)
-    agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+    # 传给 cline-kanban 的 --agent-id 会覆盖其默认 executor 选择；默认镜像父
+    # （main agent）harness 以复用 context + prompt cache，CODEX_RVF_CLINE_KANBAN_AGENT_ID
+    # 可显式钉死某个 fix harness。详见 resolve_cline_kanban_agent_id 注释。
+    agent_id = resolve_cline_kanban_agent_id(parent_thread_path)
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
     start_in_plan_mode = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"))
