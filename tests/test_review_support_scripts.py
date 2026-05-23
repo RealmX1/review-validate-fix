@@ -858,8 +858,12 @@ def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
             same_origin_after = json.loads(same_origin.read_text(encoding="utf-8"))
             assert "child_session_id" not in same_origin_after
 
-            # Fallback: no origin_metadata_path → derive origin.json from
-            # rvf_run.run_dir. Also: missing child transcript → null path.
+            # Layer 1 (declared, not-yet-flushed): no origin_metadata_path →
+            # derive origin.json from rvf_run.run_dir. The child's first
+            # UserPromptSubmit names the transcript before the host flushes it;
+            # the declared path is recorded (non-null) and flagged
+            # not-yet-existent rather than dropped — capture_run re-checks
+            # .is_file() at the child's Stop, by when it exists.
             run_dir2 = tmp_path / "run2"
             (run_dir2 / "artifacts").mkdir(parents=True)
             (run_dir2 / "artifacts" / "origin.json").write_text(
@@ -879,28 +883,91 @@ def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
                 now=now,
                 ttl_seconds=300,
             )
+            declared_missing = tmp_path / "does_not_exist.jsonl"
             fb_payload = submit.inspect_user_prompt_submit(
                 {
                     "prompt": "fb RVF_DISPATCH=token=ffffffffffffffff",
                     "cwd": str(tmp_path),
                     "session_id": "child2",
-                    "transcript_path": str(tmp_path / "does_not_exist.jsonl"),
+                    "transcript_path": str(declared_missing),
                 },
                 prep_root=root,
                 now="2026-05-07T00:01:00Z",
             )
             assert fb_payload["status"] == "valid"
             assert fb_payload["child_session_id"] == "child2"
-            assert fb_payload["child_transcript_path"] is None
+            assert fb_payload["child_transcript_path"] == str(declared_missing.resolve())
             fb_origin = json.loads(
                 (run_dir2 / "artifacts" / "origin.json").read_text(encoding="utf-8")
             )
             assert fb_origin["session_id"] == "parent2"
             assert fb_origin["child_session_id"] == "child2"
-            assert fb_origin["child_transcript_path"] is None
+            assert fb_origin["child_transcript_path"] == str(declared_missing.resolve())
             fb_stored = json.loads((root / "ffffffffffffffff.json").read_text(encoding="utf-8"))
             assert fb_stored["child_session_id"] == "child2"
-            assert fb_stored["child_transcript_path"] is None
+            assert fb_stored["child_transcript_path"] == str(declared_missing.resolve())
+            fb_diags = read_jsonl(root / "diagnostics" / "ffffffffffffffff.jsonl")
+            assert any(
+                ev.get("event") == "user_prompt_submit_child_session_backfill"
+                and ev.get("transcript_source") == "declared"
+                and ev.get("child_transcript_exists") is False
+                for ev in fb_diags
+            )
+
+            # Layer 2 (derived from session_id): event carries NO transcript
+            # path at all; the child is Claude, so reconstruct
+            # <CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<sid>.jsonl — taken only
+            # because that project dir already exists (flush-independent signal).
+            claude_home = tmp_path / "claude-home"
+            run_dir3 = tmp_path / "run3"
+            (run_dir3 / "artifacts").mkdir(parents=True)
+            (run_dir3 / "artifacts" / "origin.json").write_text(
+                json.dumps({"session_id": "parent3"}), encoding="utf-8"
+            )
+            prep.write_prep_file(
+                {
+                    "origin_session_id": "parent3",
+                    "origin_repo": str(tmp_path),
+                    "origin_cwd": str(tmp_path),
+                    "target_flow": "flow-2-branch",
+                    "target_worktree": str(tmp_path),
+                    "rvf_run": {"run_id": "rvf-derive", "run_dir": str(run_dir3)},
+                },
+                root=root,
+                token="0000000000000000",
+                now=now,
+                ttl_seconds=300,
+            )
+            child3_cwd = str(tmp_path / "child-cwd")
+            project_dir = claude_home / "projects" / submit._claude_project_slug(child3_cwd)
+            project_dir.mkdir(parents=True)
+            expected_derived = (project_dir / "child3.jsonl").resolve()
+            os.environ["CLAUDE_CONFIG_DIR"] = str(claude_home)
+            try:
+                d_payload = submit.inspect_user_prompt_submit(
+                    {
+                        "prompt": "derive RVF_DISPATCH=token=0000000000000000",
+                        "cwd": child3_cwd,
+                        "session_id": "child3",
+                    },
+                    prep_root=root,
+                    now="2026-05-07T00:01:00Z",
+                )
+            finally:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            assert d_payload["status"] == "valid"
+            assert d_payload["child_session_id"] == "child3"
+            assert d_payload["child_transcript_path"] == str(expected_derived)
+            d_origin = json.loads(
+                (run_dir3 / "artifacts" / "origin.json").read_text(encoding="utf-8")
+            )
+            assert d_origin["child_transcript_path"] == str(expected_derived)
+            d_diags = read_jsonl(root / "diagnostics" / "0000000000000000.jsonl")
+            assert any(
+                ev.get("event") == "user_prompt_submit_child_session_backfill"
+                and ev.get("transcript_source") == "derived"
+                for ev in d_diags
+            )
         finally:
             prepare_module.prepare_run_from_prep_file = original_prepare
     finally:

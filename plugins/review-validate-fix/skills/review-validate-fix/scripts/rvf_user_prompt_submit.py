@@ -304,17 +304,72 @@ def _handle_bootstrap_confirmation(
     }
 
 
-def _event_transcript_path(event: dict[str, Any]) -> Path | None:
+def _claude_projects_root() -> Path:
+    """Root holding Claude Code 的 per-project transcript 目录。
+
+    尊重 ``CLAUDE_CONFIG_DIR``（Claude Code 把整棵 ``~/.claude`` 树迁到那里），
+    否则回落 ``~/.claude``。transcript 落在
+    ``<root>/projects/<cwd-slug>/<session-id>.jsonl``。
+    """
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = (
+        Path(base.strip()).expanduser()
+        if isinstance(base, str) and base.strip()
+        else Path("~/.claude").expanduser()
+    )
+    return root / "projects"
+
+
+def _claude_project_slug(cwd: str) -> str:
+    """Claude Code 的 project 目录 slug：cwd 里每个 ``/`` 与 ``.`` → ``-``。"""
+    return re.sub(r"[/.]", "-", cwd)
+
+
+def _resolve_child_transcript_path(
+    event: dict[str, Any], *, child_session_id: str
+) -> tuple[Path | None, dict[str, Any]]:
+    """确定性解析被 dispatch 的 child agent transcript 路径。
+
+    返回 ``(path, info)``。即使文件尚未落盘也给出 child transcript 位置——child
+    的*首条* UserPromptSubmit 时 host 已为 transcript 命名但可能还没写出。
+    ``capture_run`` 会在 capture 时（child 自身 Stop，那时文件必存在）重新
+    ``.is_file()`` 校验，因此记录一个"尚未存在但即将存在"的路径是安全的，且
+    严格优于 ``None``（旧行为让持久 ``origin.json`` 对 child 拓扑失明）。
+
+    解析顺序（fail-safe，绝不臆造路径）：
+      1. *declared* —— host 在 hook payload 里上报的 ``transcript_path`` /
+         ``conversation_path`` / ``session_path``（Claude 与 Codex 均会带），
+         即便尚未落盘也采用。
+      2. *derived* —— 仅 Claude，且无 declared 路径时：重建
+         ``<claude-projects>/<cwd-slug>/<session-id>.jsonl``，仅当该 project
+         目录已存在（与 flush 无关的 Claude 信号）才采用，否则返回 ``None``。
+    """
+    info: dict[str, Any] = {}
     raw = (
         event.get("transcript_path")
         or event.get("conversation_path")
         or event.get("session_path")
     )
     if isinstance(raw, str) and raw.strip():
-        candidate = Path(raw).expanduser()
-        if candidate.exists():
-            return candidate.resolve()
-    return None
+        candidate = Path(raw.strip()).expanduser().resolve()
+        info["transcript_source"] = "declared"
+        info["child_transcript_exists"] = candidate.is_file()
+        return candidate, info
+
+    cwd = event.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        project_dir = _claude_projects_root() / _claude_project_slug(cwd.strip())
+        if project_dir.is_dir():
+            derived = (project_dir / f"{child_session_id}.jsonl").resolve()
+            info["transcript_source"] = "derived"
+            info["child_transcript_exists"] = derived.is_file()
+            return derived, info
+        info["transcript_source"] = "derive_skipped_no_project_dir"
+        info["derive_candidate_dir"] = str(project_dir)
+        return None, info
+
+    info["transcript_source"] = "unavailable"
+    return None, info
 
 
 def _backfill_child_session(
@@ -363,12 +418,15 @@ def _backfill_child_session(
         debug["skip_reason"] = "same_session"
         return record, debug
 
-    child_transcript = _event_transcript_path(event)
+    child_transcript, transcript_info = _resolve_child_transcript_path(
+        event, child_session_id=child_session_id
+    )
     child_transcript_str = str(child_transcript) if child_transcript is not None else None
     debug.update(
         {
             "child_session_id": child_session_id,
             "child_transcript_path": child_transcript_str,
+            **transcript_info,
         }
     )
 
