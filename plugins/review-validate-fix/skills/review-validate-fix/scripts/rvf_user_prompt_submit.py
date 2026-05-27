@@ -36,6 +36,13 @@ RVF_MANUAL_TRIGGER_RE = re.compile(
     r"(?:^|\s)[\$/:]review-validate-fix\b",
     re.MULTILINE,
 )
+# manual 触发可内联指定 review scope：`/review-validate-fix scope: a.py b.py`。
+# 取首个 `scope:`（行首或空白前缀，避免命中 `telescope:` 之类）之后直到行尾的
+# 内容作为 primary 文件清单。大小写不敏感；建议把 `scope:` 放在该行末尾。
+RVF_MANUAL_SCOPE_RE = re.compile(
+    r"(?:^|\s)scope:\s*(.+)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _latest_user_message_from_transcript(path: Path) -> str | None:
@@ -102,6 +109,29 @@ def detect_origin_marker(text: str) -> str | None:
 
 def detect_manual_trigger(text: str) -> bool:
     return bool(RVF_MANUAL_TRIGGER_RE.search(text))
+
+
+def parse_manual_scope_directive(prompt: str | None) -> list[str]:
+    """从 manual 触发串里解析内联 ``scope:`` 指令。
+
+    语法：``/review-validate-fix scope: a.py b.py``——取首个 ``scope:`` 之后直到
+    行尾的内容，按空白 / 逗号切分成 primary 文件清单，并去掉包裹引号。路径
+    规范化（去 ``./`` 前缀、反斜杠归一、去重排序）交给下游 ``prepare_run`` 的
+    ``normalized_scope_list``，本函数只负责切分。无 ``scope:`` 时返回空列表。
+
+    注意：``scope:`` 取到行尾，故该行 ``scope:`` 之后的普通文字也会被当成文件；
+    约定把 ``scope:`` 放在行末（或单独成行）。
+    """
+    if not prompt:
+        return []
+    match = RVF_MANUAL_SCOPE_RE.search(prompt)
+    if match is None:
+        return []
+    tokens = (
+        token.strip().strip("'\"")
+        for token in re.split(r"[,\s]+", match.group(1).strip())
+    )
+    return [token for token in tokens if token]
 
 
 def _resolve_cwd(event: dict[str, Any]) -> tuple[str, bool]:
@@ -215,6 +245,7 @@ def _run_shared_workflow(
     record: rvf_prep_file.PrepFileRecord,
     user_prompt_excerpt: str | None,
     timeout_seconds: float,
+    extra_primary_files: list[str] | None = None,
 ) -> dict[str, Any]:
     """Import prepare_review_run lazily to avoid pulling diff_tracker on early-exit paths."""
     import prepare_review_run  # noqa: PLC0415 - intentional lazy import
@@ -223,6 +254,7 @@ def _run_shared_workflow(
         record,
         timeout_seconds=timeout_seconds,
         user_prompt_excerpt=user_prompt_excerpt,
+        extra_primary_files=extra_primary_files,
     )
 
 
@@ -525,6 +557,9 @@ def inspect_user_prompt_submit(
     record: rvf_prep_file.PrepFileRecord | None = None
     dispatch_origin: str | None = None
     payload: dict[str, Any] = {**base_payload}
+    # manual 路径解析出的内联 scope（primary 文件），喂给 shared workflow；
+    # 其它 dispatch 路径保持空（scope 由 Stop hook / prep payload 决定）。
+    manual_extra_primary_files: list[str] = []
 
     if token is not None:
         lookup_now = rvf_prep_file.parse_timestamp(now) if now else None
@@ -595,6 +630,7 @@ def inspect_user_prompt_submit(
         try:
             record, debug = _create_manual_prep_file(event=event, prompt=prompt)
             dispatch_origin = "post_user_prompt_manual"
+            manual_extra_primary_files = parse_manual_scope_directive(prompt)
             payload.update(
                 {
                     "status": "manual_prep_created",
@@ -604,6 +640,8 @@ def inspect_user_prompt_submit(
                     "manual_dispatch_debug": debug,
                 }
             )
+            if manual_extra_primary_files:
+                payload["manual_scope_files"] = manual_extra_primary_files
         except Exception as exc:
             return {
                 **payload,
@@ -658,6 +696,7 @@ def inspect_user_prompt_submit(
             record=record,
             user_prompt_excerpt=prompt[:2000] if prompt else None,
             timeout_seconds=shared_workflow_timeout_seconds,
+            extra_primary_files=manual_extra_primary_files or None,
         )
     except Exception as exc:
         result_state = {
@@ -698,6 +737,7 @@ def inspect_user_prompt_submit(
         additional_context = _manual_additional_context_text(
             prep_file_path=str(record.path),
             shared_workflow_state=result_state,
+            scope_files=manual_extra_primary_files or None,
         )
         payload["hookSpecificOutput"] = {
             "hookEventName": "UserPromptSubmit",
@@ -710,6 +750,7 @@ def _manual_additional_context_text(
     *,
     prep_file_path: str,
     shared_workflow_state: dict[str, Any],
+    scope_files: list[str] | None = None,
 ) -> str:
     status = shared_workflow_state.get("status")
     artifacts = shared_workflow_state.get("artifacts") if isinstance(shared_workflow_state, dict) else None
@@ -723,6 +764,10 @@ def _manual_additional_context_text(
     ]
     if isinstance(review_env, str) and review_env:
         lines.append(f"- review_env: {review_env}")
+    if scope_files:
+        # 触发串里的 `scope:` 已把这些文件作为 primary scope 注入 scope.contract；
+        # 提示 agent 无需再手动指定，仍可按需覆盖 scope-of-work。
+        lines.append(f"- inline scope (primary): {', '.join(scope_files)}")
     lines.append(
         "- next: source the review env, then `cat $RVF_PREP_FILE` for full payload."
     )

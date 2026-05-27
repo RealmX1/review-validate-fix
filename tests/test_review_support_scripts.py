@@ -475,6 +475,81 @@ def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_pa
         os.environ.pop("CODEX_RVF_LOG_ROOT", None)
 
 
+def test_parse_manual_scope_directive_variants() -> None:
+    """`scope:` 指令解析：空白/逗号分隔、去引号、大小写不敏感、行内/跨行、无 scope。"""
+    submit = load_rvf_user_prompt_submit_module()
+    parse = submit.parse_manual_scope_directive
+    assert parse("/review-validate-fix scope: src/a.py src/b.py") == ["src/a.py", "src/b.py"]
+    assert parse("/review-validate-fix scope: src/a.py, src/b.py") == ["src/a.py", "src/b.py"]
+    assert parse('/review-validate-fix scope: "src/a.py"') == ["src/a.py"]
+    assert parse("/review-validate-fix SCOPE: src/a.py") == ["src/a.py"]
+    assert parse("/review-validate-fix\nscope: src/a.py") == ["src/a.py"]
+    assert parse("/review-validate-fix please review my work") == []
+    # `telescope:` 之类的子串不得被当成指令（要求行首或空白前缀）。
+    assert parse("just talking about telescope: lens here") == []
+    assert parse("") == []
+    assert parse(None) == []
+
+
+def test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(tmp_path: Path) -> None:
+    """manual 触发内联 `scope:` → 解析出的 primary 文件作为 extra_primary_files 传入 prepare。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
+    try:
+        captured: list[dict[str, object]] = []
+
+        def fake_prepare(
+            record, *, timeout_seconds=60.0, user_prompt_excerpt=None, extra_primary_files=None, **_
+        ):
+            captured.append({"extra_primary_files": extra_primary_files})
+            state = {
+                "started_at": "2026-05-07T00:00:00Z",
+                "completed_at": "2026-05-07T00:00:01Z",
+                "status": "completed",
+                "artifacts": {},
+            }
+            new_rvf_run = dict(record.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "/review-validate-fix please review scope: src/a.py, src/b.py",
+                    "cwd": str(repo),
+                    "session_id": "manual-scope-session",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+            )
+            assert payload["status"] == "manual_prep_created"
+            assert payload["workflow_started"] is True
+            assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
+            assert len(captured) == 1
+            assert captured[0]["extra_primary_files"] == ["src/a.py", "src/b.py"]
+            additional_context = payload["hookSpecificOutput"]["additionalContext"]
+            assert "inline scope (primary): src/a.py, src/b.py" in additional_context
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+
+
 def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_path: Path) -> None:
     """Quoted/embedded references to the trigger literal must not create a manual prep."""
 
@@ -7833,6 +7908,16 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare",
             lambda: test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(root / "prompt-submit-manual"),
+        ),
+        (
+            "parse_manual_scope_directive_variants",
+            lambda: test_parse_manual_scope_directive_variants(),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_scope_directive_passes_primary_files",
+            lambda: test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(
+                root / "prompt-submit-manual-scope"
+            ),
         ),
         (
             "rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger",
