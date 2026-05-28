@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import socket
 import subprocess
-import sys
 import time
 import urllib.request
 from pathlib import Path
