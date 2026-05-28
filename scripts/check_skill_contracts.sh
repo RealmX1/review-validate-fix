@@ -426,6 +426,8 @@ done
 
 repo_required_files=(
   "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
+  "plugins/review-validate-fix/commands/rvf-land.md"
+  "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -535,6 +537,10 @@ require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" '即使最终没有采纳 RVF run 提出的任何 suggestion'
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'rvf_worktree_differs_from_current'
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'intake_hints'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-land.md" 'rvf-land bundled skill not found'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_handoff_intake.py'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_worktree_differs_from_current'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不自动运行 base-branch-sync'
 require_literal "SKILL.md" '本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用'
 require_literal "SKILL.md" 'policy.allow_implicit_invocation'
 require_literal "SKILL.md" 'Scope-of-work 不要只列 created/modified/deleted 文件'
