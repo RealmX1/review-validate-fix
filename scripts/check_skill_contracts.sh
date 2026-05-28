@@ -859,6 +859,29 @@ forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy stand''alone 
 forbid_repo_literal "scripts/install_to_codex.py" 'Review Validate Fix CLI Launch''er'
 forbid_repo_literal "scripts/install_to_codex.py" 'stand''alone'
 
+# S1: NormalizedTranscript + transcript adapter 拆分 + vendor-on-install 哨兵 bootstrap。
+require_repo_file ".rvf-pyroot"
+require_repo_file "core/transcript/models.py"
+require_repo_file "core/transcript/io.py"
+require_repo_file "adapters/codex/transcript.py"
+require_repo_file "adapters/claude_code/transcript.py"
+require_repo_file "tests/test_normalized_transcript.py"
+require_repo_file "tests/test_vendored_payload_import.py"
+require_repo_literal "core/transcript/models.py" 'class TranscriptRecord'
+require_repo_literal "core/transcript/models.py" 'class NormalizedTranscript'
+require_repo_literal "scripts/install_to_codex.py" 'def vendor_pyroot'
+require_repo_literal "scripts/install_to_codex.py" 'def deploy_payload'
+require_repo_literal "scripts/install_to_codex.py" 'deploy_payload(PLUGIN_SRC'
+require_repo_literal "scripts/install_to_codex.py" '.rvf-pyroot'
+# vendor-on-install 单一收口：从 PLUGIN_SRC 产 payload 只能走 deploy_payload（带 vendor_pyroot）。
+forbid_repo_literal "scripts/install_to_codex.py" 'copy_tree(PLUGIN_SRC'
+require_file "scripts/_rvf_pyroot.py"
+require_literal "scripts/_rvf_pyroot.py" '.rvf-pyroot'
+require_literal "scripts/trajectory_distill.py" 'import _rvf_pyroot'
+require_literal "scripts/trajectory_distill.py" 'from core.transcript'
+require_literal "scripts/trajectory_distill.py" 'from adapters.codex.transcript import'
+require_literal "scripts/trajectory_distill.py" 'from adapters.claude_code.transcript import'
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'

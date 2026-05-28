@@ -445,6 +445,38 @@ def copy_tree(src: Path, dst: Path, preserved: set[Path], preserve_local_config:
     merge_tree(src, dst, effective_preserve)
 
 
+def vendor_pyroot(dst: Path) -> None:
+    """把 repo-root ``core/`` + ``adapters/`` + ``.rvf-pyroot`` 哨兵 vendor 进部署
+    payload 根 ``dst``。
+
+    源真相留在 repo 顶层（``core/`` / ``adapters/`` 不在 ``PLUGIN_SRC`` 内，
+    ``copy_tree`` 永远不会带上它们）；部署时把它们内嵌进 payload，使部署后的
+    scripts 能 ``import core.* / adapters.*``——靠 ``_rvf_pyroot.py`` 哨兵自底向上
+    定位本 ``dst`` 根。漏掉这步 → 部署后运行期 ``ModuleNotFoundError``，而 repo
+    测试仍全绿（漂移），所以 ``deploy_payload`` 把它与 ``copy_tree`` 构造上绑死。
+    """
+    for sub in ("core", "adapters"):
+        src_pkg = ROOT / sub
+        if not src_pkg.is_dir():
+            raise FileNotFoundError(src_pkg)
+        dst_pkg = dst / sub
+        if dst_pkg.exists():
+            shutil.rmtree(dst_pkg)
+        shutil.copytree(src_pkg, dst_pkg, ignore=ignore)
+    shutil.copyfile(ROOT / ".rvf-pyroot", dst / ".rvf-pyroot")
+
+
+def deploy_payload(src: Path, dst: Path, preserved: set[Path], preserve_local_config: bool) -> None:
+    """部署 plugin payload 的**单一收口**：``copy_tree`` + ``vendor_pyroot``。
+
+    所有「从源 plugin 树产出一份新 payload」的路径都必须走这里，确保 core/adapters/
+    哨兵随 payload 一并 vendor。下游再从已 vendored 的 ``dst`` 拷贝（codex cache /
+    claude marketplace+cache）即自动继承，无需重复 vendor。
+    """
+    copy_tree(src, dst, preserved, preserve_local_config)
+    vendor_pyroot(dst)
+
+
 def copy_missing_tree(src: Path, dst: Path) -> None:
     if not src.exists():
         return
@@ -1041,14 +1073,17 @@ def main() -> int:
     try:
         parent = Path(args.plugin_parent).expanduser().resolve()
         dst = parent / PLUGIN_DIR_NAME
-        copy_tree(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
+        # A：唯一主动 vendor 点——产出 dst 同时把 core/adapters/哨兵内嵌。
+        deploy_payload(PLUGIN_SRC, dst, PRESERVE_IN_PLUGIN, preserve)
         marketplace = update_marketplace(parent)
         plugin_config = ensure_codex_plugin_enabled()
+        # B：codex cache 从已 vendored 的 dst 拷贝，自动继承 vendoring。
         plugin_cache = sync_codex_plugin_cache(dst, preserve)
         sync_claude = (not args.skip_claude_plugin) and (
             args.sync_claude_plugin or claude_plugin_enabled_or_installed()
         )
-        claude_paths = sync_claude_plugin(PLUGIN_SRC, preserve) if sync_claude else None
+        # C/D：claude marketplace+cache 也从 dst 拷贝（单 vendor 点收口），自动继承。
+        claude_paths = sync_claude_plugin(dst, preserve) if sync_claude else None
         source_metadata = git_metadata()
         deploy_version = deploy_version_from_metadata(source_metadata)
         stamp_roots = [dst, plugin_cache]
