@@ -126,6 +126,192 @@ def load_cline_kanban_client_module():
     return module
 
 
+def load_rvf_analyze_thread_module():
+    # rvf_analyze_thread top-level imports rvf_logging / trajectory_distill，且
+    # launch_detached_analyze_thread 会 lazy import rvf_analyze_advisory，全部需
+    # 要 SCRIPT_DIR 在 sys.path 上才能解析；以真实模块名注册进 sys.modules，让
+    # advisory 的 `from rvf_analyze_thread import ...` 命中同一实例。
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_analyze_thread", SCRIPT_DIR / "rvf_analyze_thread.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_analyze_thread module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_fake_tmux_script(path: Path) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "calls = os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "stderr = os.environ.get('FAKE_TMUX_STDERR')\n"
+        "if stderr:\n"
+        "    sys.stderr.write(stderr)\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+class _AnalyzeLedgerStub:
+    run_id = "rvf-unit"
+
+    def env(self) -> dict[str, str]:
+        return {}
+
+
+def _seed_analysis_payload(run_dir: Path) -> dict[str, str]:
+    analysis_dir = run_dir / "artifacts" / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    summary = analysis_dir / "summary.md"
+    causality = analysis_dir / "causality.json"
+    summary.write_text("# scaffold\n<!-- TODO(rvf-analyze): fill -->\n", encoding="utf-8")
+    causality.write_text(json.dumps({"issues": []}) + "\n", encoding="utf-8")
+    return {
+        "run_dir": str(run_dir),
+        "summary_md_path": str(summary),
+        "causality_json_path": str(causality),
+    }
+
+
+def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> None:
+    module = load_rvf_analyze_thread_module()
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CLAUDE)
+    assert uses_stdin is True
+    assert Path(argv[0]).name == "claude"
+    assert "-p" in argv
+    assert "--permission-mode" in argv and "acceptEdits" in argv
+    assert "--output-format" in argv and "stream-json" in argv
+    # analyze agent 必须能解析 $rvf-analyze slash command 并 Edit 文件。
+    assert "--disable-slash-commands" not in argv
+
+
+def test_rvf_analyze_thread_builds_codex_command(_root: Path | None = None) -> None:
+    module = load_rvf_analyze_thread_module()
+    argv, uses_stdin = module.build_analyze_command(module.HOST_CODEX)
+    assert uses_stdin is True
+    assert Path(argv[0]).name == "codex"
+    assert "exec" in argv
+    assert argv[-1] == "-"
+    assert "--sandbox" in argv and "workspace-write" in argv
+    # 未知 host 兜底到 codex 向量。
+    fallback_argv, _ = module.build_analyze_command("totally-unknown-host")
+    assert fallback_argv == argv
+
+
+def test_rvf_analyze_thread_select_host(root: Path) -> None:
+    module = load_rvf_analyze_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    claude_t = root / "claude.jsonl"
+    claude_t.write_text(json.dumps({"type": "user", "message": {"role": "user"}}) + "\n", encoding="utf-8")
+    codex_t = root / "codex.jsonl"
+    codex_t.write_text(json.dumps({"type": "session_meta", "payload": {"id": "s"}}) + "\n", encoding="utf-8")
+
+    assert module.select_host({"transcript_path": str(claude_t)}) == module.HOST_CLAUDE
+    assert module.select_host({"transcript_path": str(codex_t)}) == module.HOST_CODEX
+    # transcript 缺失 → 兜底 codex。
+    assert module.select_host({}) == module.HOST_CODEX
+    assert module.select_host({"transcript_path": str(root / "missing.jsonl")}) == module.HOST_CODEX
+
+
+def test_rvf_analyze_thread_status_file_schema(root: Path) -> None:
+    module = load_rvf_analyze_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = root / "runs" / "rvf-unit"
+    analysis = _seed_analysis_payload(run_dir)
+    analysis_dir = Path(analysis["summary_md_path"]).parent
+    fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
+    tmux_calls = root / "tmux-calls.jsonl"
+
+    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    try:
+        result = module.launch_detached_analyze_thread(
+            event={},
+            ledger=_AnalyzeLedgerStub(),
+            analysis=analysis,
+            finalize_record=None,
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert result["launch_status"] == "launched"
+    assert result["tmux_session"] == "rvf-analyze-rvf-unit"
+
+    status = json.loads((analysis_dir / ".analyze-thread.status.json").read_text(encoding="utf-8"))
+    expected_keys = {
+        "schema_version",
+        "run_dir",
+        "run_name",
+        "host",
+        "tmux_session",
+        "command",
+        "pid",
+        "started_at",
+        "armed_at",
+        "returncode",
+        "finished_at",
+        "launch_status",
+        "error",
+    }
+    assert expected_keys <= set(status)
+    assert status["schema_version"] == 1
+    assert status["launch_status"] == "launched"
+    # 锁与冻结 prompt 落盘；fake tmux 恰好被调一次。
+    assert (analysis_dir / ".analyze-thread.lock").exists()
+    assert (analysis_dir / ".analyze-thread.prompt.md").exists()
+    assert len(tmux_calls.read_text(encoding="utf-8").splitlines()) == 1
+    # 切忌触碰 summary/causality（COMPLETE 判定靠它们 mtime）。
+    assert "TODO(rvf-analyze)" in Path(analysis["summary_md_path"]).read_text(encoding="utf-8")
+
+
+def test_rvf_analyze_thread_lock_blocks_second_launch(root: Path) -> None:
+    module = load_rvf_analyze_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    run_dir = root / "runs" / "rvf-unit"
+    analysis = _seed_analysis_payload(run_dir)
+    fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
+    tmux_calls = root / "tmux-calls.jsonl"
+
+    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    try:
+        first = module.launch_detached_analyze_thread(
+            event={}, ledger=_AnalyzeLedgerStub(), analysis=analysis, finalize_record=None
+        )
+        second = module.launch_detached_analyze_thread(
+            event={}, ledger=_AnalyzeLedgerStub(), analysis=analysis, finalize_record=None
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    assert first["launch_status"] == "launched"
+    # 每 run O_EXCL 锁：第二次命中 already_running，不再启动 tmux。
+    assert second["launch_status"] == "already_running"
+    assert len(tmux_calls.read_text(encoding="utf-8").splitlines()) == 1
+
+
 def load_check_review_output_module():
     spec = importlib.util.spec_from_file_location(
         "rvf_check_review_output", CHECK_REVIEW_OUTPUT
@@ -8482,6 +8668,26 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "lease_acquire_concurrent_writers_serialize",
             lambda: test_lease_acquire_concurrent_writers_serialize(root / "lease-T13"),
+        ),
+        (
+            "rvf_analyze_thread_builds_claude_command",
+            lambda: test_rvf_analyze_thread_builds_claude_command(),
+        ),
+        (
+            "rvf_analyze_thread_builds_codex_command",
+            lambda: test_rvf_analyze_thread_builds_codex_command(),
+        ),
+        (
+            "rvf_analyze_thread_select_host",
+            lambda: test_rvf_analyze_thread_select_host(root / "analyze-thread-host"),
+        ),
+        (
+            "rvf_analyze_thread_status_file_schema",
+            lambda: test_rvf_analyze_thread_status_file_schema(root / "analyze-thread-status"),
+        ),
+        (
+            "rvf_analyze_thread_lock_blocks_second_launch",
+            lambda: test_rvf_analyze_thread_lock_blocks_second_launch(root / "analyze-thread-lock"),
         ),
     ]
 

@@ -220,6 +220,10 @@ def invoke(
         )
     if extra_env is not None:
         env.update(extra_env)
+    # 默认把 detached analyze 线程的 tmux 指向假 tmux，避免任意触发 handoff→
+    # advisory 路径的测试在后台真的拉起 analyze agent；需要断言 tmux 行为的
+    # 测试自行传入 CODEX_RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
+    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -456,6 +460,40 @@ def write_same_session_transcript_with_marker(path: Path, repo: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def write_fake_tmux(path: Path) -> Path:
+    """写一个假 tmux：记录 argv + 关键 env 到 FAKE_TMUX_CALLS，按
+    FAKE_TMUX_RETURNCODE / FAKE_TMUX_STDERR 配置退出码与 stderr。
+
+    它**不会**真的执行被包裹的 shell command（不启动 analyze agent），
+    因此 detached 线程的 prompt/status/lock 由 launcher 自己（在 hook 进程内）
+    落盘，agent 永远不会真正运行。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "calls = os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({\n"
+        "            'argv': sys.argv[1:],\n"
+        "            'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'),\n"
+        "            'analyze_thread': os.environ.get('CODEX_RVF_ANALYZE_THREAD'),\n"
+        "        }) + '\\n')\n"
+        "stderr = os.environ.get('FAKE_TMUX_STDERR')\n"
+        "if stderr:\n"
+        "    sys.stderr.write(stderr)\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+# 进程级默认假 tmux：invoke() 在测试未显式覆盖时用它，确保没有测试会在后台
+# 真的启动 detached analyze agent。
+_DEFAULT_FAKE_TMUX = write_fake_tmux(Path(tempfile.gettempdir()) / "rvf_codex_stop_default_fake_tmux.py")
 
 
 def test_normalize_backend_from_env(tmp_path: Path) -> None:
@@ -6030,7 +6068,7 @@ def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> Non
     assert any(event["event"] == "finalize_completed_with_errors" for event in events)
 
 
-def test_handoff_advisory_surfaces_manual_rvf_analyze_trigger(tmp_path: Path) -> None:
+def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> None:
     state = tmp_path / "state"
     repo = init_repo_with_head(tmp_path / "repo")
     run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
@@ -6038,54 +6076,8 @@ def test_handoff_advisory_surfaces_manual_rvf_analyze_trigger(tmp_path: Path) ->
         tmp_path / "rollout.jsonl",
         repo,
     )
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(repo),
-                "session_id": "child-session",
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
-            },
-            state_dir=state,
-            extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
-        )[0]
-    )
-
-    assert "rvf_analyze=manual_required" in payload["systemMessage"]
-    assert f"$rvf-analyze {run_dir.resolve()}" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["rvf_analyze_status"] == "manual-required"
-    assert summary["rvf_analyze_run_dir"] == str(run_dir.resolve())
-    assert summary["rvf_analyze_summary_md_path"].endswith("/artifacts/analysis/summary.md")
-    assert summary["rvf_analyze_causality_json_path"].endswith("/artifacts/analysis/causality.json")
-    assert (run_dir / "artifacts" / "analysis" / "summary.md").is_file()
-    assert (run_dir / "artifacts" / "analysis" / "causality.json").is_file()
-    events = latest_events(state)
-    assert any(event["event"] == "rvf_analyze_manual_advisory" for event in events)
-
-
-def test_handoff_advisory_injects_rvf_analyze_in_kanban_task(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    repo = init_repo_with_head(tmp_path / "repo")
-    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
-    transcript = write_same_session_transcript_with_marker(
-        tmp_path / "rollout.jsonl",
-        repo,
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-99', 'attempt_id': 'attempt-3', 'message_id': 'msg-analyze', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
 
     payload = parse_json(
         invoke(
@@ -6099,34 +6091,195 @@ def test_handoff_advisory_injects_rvf_analyze_in_kanban_task(tmp_path: Path) -> 
             state_dir=state,
             extra_env={
                 "CODEX_RVF_OPEN_HANDOFF": "0",
-                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-                "KANBAN_TASK_ID": "task-99",
-                "KANBAN_ATTEMPT_ID": "attempt-3",
-                "KANBAN_PROJECT_PATH": str(repo),
-                "FAKE_CLIENT_CALLS": str(client_calls),
+                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "FAKE_TMUX_CALLS": str(tmux_calls),
             },
         )[0]
     )
 
-    assert "rvf_analyze=kanban_injected" in payload["systemMessage"]
+    assert "rvf_analyze=thread_launched" in payload["systemMessage"]
     summary = summary_from_payload(payload)
-    assert summary["rvf_analyze_status"] == "kanban-injected"
-    assert summary["rvf_analyze_kanban_task_id"] == "task-99"
-    assert summary["rvf_analyze_kanban_attempt_id"] == "attempt-3"
-    assert summary["rvf_analyze_kanban_message_id"] == "msg-analyze"
-    prompt_text = Path(summary["rvf_analyze_followup_prompt_path"]).read_text(encoding="utf-8")
+    assert summary["rvf_analyze_status"] == "thread-launched"
+    assert summary["rvf_analyze_thread_launch_status"] == "launched"
+    # 父 transcript 是 Codex rollout → host=codex。
+    assert summary["rvf_analyze_thread_host"] == "codex"
+    session = summary["rvf_analyze_thread_session"]
+    assert session == f"rvf-analyze-{run_dir.name}"
+
+    # 假 tmux 收到 new-session -d -s <session> <shell>。
+    call = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])
+    assert call["argv"][:4] == ["new-session", "-d", "-s", session]
+
+    analysis_dir = Path(summary["rvf_analyze_summary_md_path"]).parent
+    prompt_text = (analysis_dir / ".analyze-thread.prompt.md").read_text(encoding="utf-8")
     assert f"$rvf-analyze {run_dir.resolve()}" in prompt_text
     assert "RVF_KANBAN_ANALYZE_TRIGGER" in prompt_text
-    call = json.loads(client_calls.read_text(encoding="utf-8").splitlines()[0])
-    assert call["argv"][0] == "message"
-    assert "--source" in call["argv"]
-    assert "rvf-analyze" in call["argv"]
-    # advisory 注入成功后必须写一份 post-analyze quiet marker，供下一次 Stop 一次性消费。
+
+    status = json.loads((analysis_dir / ".analyze-thread.status.json").read_text(encoding="utf-8"))
+    assert status["schema_version"] == 1
+    assert status["launch_status"] == "launched"
+    assert status["host"] == "codex"
+    assert isinstance(status["command"], list) and "exec" in status["command"]
+
+    # PENDING quiet marker 照常 arm，供下一次 Stop 自动判 COMPLETE。
     assert summary.get("post_analyze_quiet_marker_status") == "armed"
-    marker_path = Path(summary["post_analyze_quiet_marker_path"])
-    assert marker_path.exists()
-    assert marker_path.name.startswith("task-task-99")
+    assert Path(summary["post_analyze_quiet_marker_path"]).exists()
+
+    events = latest_events(state)
+    assert any(event["event"] == "rvf_analyze_thread_launched" for event in events)
+
+
+def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
+
+    parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_OPEN_HANDOFF": "0",
+                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "FAKE_TMUX_CALLS": str(tmux_calls),
+            },
+        )[0]
+    )
+
+    call = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])
+    # 自抑制 lynchpin：spawn 进程 env 带两个自抑制变量。
+    assert call["suppress"] == "1"
+    assert call["analyze_thread"] == "1"
+    # 同样把 export 烘进 tmux 内 shell，保证不依赖 tmux server env。
+    shell_command = call["argv"][4]
+    assert "export CODEX_RVF_SUPPRESS_STOP_HOOK=1" in shell_command
+    assert "export CODEX_RVF_ANALYZE_THREAD=1" in shell_command
+
+
+def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "last_assistant_message": "background analyze done",
+        },
+        state_dir=state,
+        extra_env={
+            "CODEX_RVF_ANALYZE_THREAD": "1",
+            "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+            "FAKE_TMUX_CALLS": str(tmux_calls),
+        },
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=rvf_analyze_thread_self_stop" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "rvf_analyze_thread_self_stop"
+    # 早退守卫短路所有 gate：不应启动任何新线程 / fork。
+    assert not tmux_calls.exists()
+
+
+def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_OPEN_HANDOFF": "0",
+                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "FAKE_TMUX_CALLS": str(tmux_calls),
+                "FAKE_TMUX_RETURNCODE": "1",
+                "FAKE_TMUX_STDERR": "duplicate session: rvf-analyze-rvf-child",
+            },
+        )[0]
+    )
+
+    # tmux 报 duplicate session → 视为幂等成功，仍是 thread-launched。
+    assert "rvf_analyze=thread_launched" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["rvf_analyze_status"] == "thread-launched"
+    assert summary["rvf_analyze_thread_launch_status"] == "already_running"
+    analysis_dir = Path(summary["rvf_analyze_summary_md_path"]).parent
+    status = json.loads((analysis_dir / ".analyze-thread.status.json").read_text(encoding="utf-8"))
+    assert status["launch_status"] == "already_running"
+
+
+def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    transcript = write_same_session_transcript_with_marker(
+        tmp_path / "rollout.jsonl",
+        repo,
+    )
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
+
+    payload = parse_json(
+        invoke(
+            {
+                "cwd": str(repo),
+                "session_id": "child-session",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
+            },
+            state_dir=state,
+            extra_env={
+                "CODEX_RVF_OPEN_HANDOFF": "0",
+                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "FAKE_TMUX_CALLS": str(tmux_calls),
+                "FAKE_TMUX_RETURNCODE": "3",
+                "FAKE_TMUX_STDERR": "tmux: command failed for unknown reason",
+            },
+        )[0]
+    )
+
+    # tmux 非零（非 duplicate）→ thread-launch-failed，但 handoff payload 仍返回。
+    assert payload.get("systemMessage")
+    assert "rvf_analyze=manual_required" in payload["systemMessage"]
+    summary = summary_from_payload(payload)
+    assert summary["rvf_analyze_status"] == "thread-launch-failed"
+    assert summary["rvf_analyze_thread_launch_status"] == "launch_failed"
+    assert summary.get("rvf_analyze_error")
+    # PENDING marker 仍 armed（用户可手动 $rvf-analyze 收尾）。
+    assert summary.get("post_analyze_quiet_marker_status") == "armed"
+    events = latest_events(state)
+    assert any(event["event"] == "rvf_analyze_thread_launch_failed" for event in events)
 
 
 def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
@@ -6698,8 +6851,11 @@ def main() -> int:
         test_manual_open_marker_keeps_manual_open_when_origin_missing,
         test_handoff_advisory_marker_records_kanban_followup,
         test_handoff_advisory_surfaces_finalize_record_errors,
-        test_handoff_advisory_surfaces_manual_rvf_analyze_trigger,
-        test_handoff_advisory_injects_rvf_analyze_in_kanban_task,
+        test_handoff_advisory_launches_detached_analyze_thread,
+        test_analyze_thread_env_sets_suppress_stop_hook,
+        test_analyze_thread_self_stop_is_suppressed,
+        test_analyze_thread_idempotent_when_session_exists,
+        test_analyze_thread_launch_failure_does_not_break_handoff,
         test_handoff_advisory_respects_open_disabled,
         test_handoff_advisory_records_open_failure,
         test_suppress_env_skips_handoff_marker_before_advisory,

@@ -147,6 +147,30 @@ def write_fake_opener(path: Path, marker: Path) -> Path:
     return path
 
 
+def write_fake_tmux(path: Path) -> Path:
+    """假 tmux：记录 argv 到 FAKE_TMUX_CALLS，按 FAKE_TMUX_RETURNCODE 退出。
+
+    不真正执行被包裹的 shell（不启动 analyze agent），让 detached 线程在测试里
+    只走 launcher 的 prompt/status/lock 落盘，不产生真实后台进程。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "calls = os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+# 进程级默认假 tmux：invoke_result()/invoke_router() 在测试未显式覆盖时用它。
+_DEFAULT_FAKE_TMUX = write_fake_tmux(Path(tempfile.gettempdir()) / "rvf_dispatcher_default_fake_tmux.py")
+
+
 def write_assistant_handoff_transcript(path: Path, handoff: Path) -> Path:
     path.write_text(
         json.dumps(
@@ -405,6 +429,8 @@ def invoke_result(
     env["CODEX_RVF_LOG_ROOT"] = str(state)
     if extra_env:
         env.update(extra_env)
+    # 默认假 tmux：避免触发 handoff→advisory 的测试在后台真的拉起 analyze agent。
+    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
     return subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -460,6 +486,7 @@ def invoke_router(
     env["CODEX_RVF_LOG_ROOT"] = str(state)
     if extra_env:
         env.update(extra_env)
+    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
     return subprocess.run(
         [sys.executable, str(ROUTER_SCRIPT)],
         input=json.dumps(event),
@@ -858,6 +885,8 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     (repo / ".rvf-seed").write_text("seed\nchanged\n", encoding="utf-8")
     opener_marker = tmp_path / "opened.txt"
     opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
 
     event = {
         "cwd": str(repo),
@@ -872,7 +901,11 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
         dev_repo=repo,
         hook=hook,
         state=state,
-        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        extra_env={
+            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+            "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+            "FAKE_TMUX_CALLS": str(tmux_calls),
+        },
     )
 
     # finalize artifacts in the seeded run_dir
@@ -894,10 +927,14 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     summary_payload = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary_payload.get("finalize", {}).get("decision_kind") == "dispatcher-handoff"
     payload = json.loads(stdout)
-    assert "rvf_analyze=manual_required" in payload["systemMessage"]
+    assert "rvf_analyze=thread_launched" in payload["systemMessage"]
     hook_summary = latest_summary(state)
-    assert hook_summary["rvf_analyze_status"] == "manual-required"
+    assert hook_summary["rvf_analyze_status"] == "thread-launched"
+    assert hook_summary["rvf_analyze_thread_launch_status"] == "launched"
     assert hook_summary["rvf_analyze_run_dir"] == str(run_dir.resolve())
+    # 假 tmux 收到 detached new-session 调用。
+    call = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])
+    assert call["argv"][:3] == ["new-session", "-d", "-s"]
 
 
 def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:

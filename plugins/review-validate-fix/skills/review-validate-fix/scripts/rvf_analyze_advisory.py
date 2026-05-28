@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-"""RVF finalize 后的 ``$rvf-analyze`` follow-up 提示/注入。
+"""RVF finalize 后的 ``$rvf-analyze`` 后台线程派发。
 
-这个模块只处理 finalize 已经生成 deterministic analysis scaffold 之后的
-用户可见提醒或 Cline Kanban 原生 task 内 follow-up 注入；它不直接运行
-``rvf_analyze.py``，也不触发 LLM skill。
+这个模块只处理 finalize 已经生成 deterministic analysis scaffold 之后的收尾：
+arm 一次性 ``post_analyze_quiet`` PENDING marker，并把 analyze 的 LLM 补全步骤
+通过 ``rvf_analyze_thread.launch_detached_analyze_thread`` 派进一个 detached
+tmux 线程后台运行。它不直接运行 ``rvf_analyze.py``，也不在当前会话内同步触发
+LLM skill —— 原会话/task finalize 完即可 idle，无需等待 analyze 完成。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 
-SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
-DEFAULT_CLINE_KANBAN_TASK_CMD = "kanban task"
 RVF_ANALYZE_FOLLOWUP_MARKER = "RVF_KANBAN_ANALYZE_TRIGGER"
 
 from post_analyze_quiet import write_post_analyze_quiet_marker
+from rvf_analyze_thread import launch_detached_analyze_thread
 
 
 # 与 codex_stop_review_validate_fix.SESSION_PATH_KEYS 保持一致，便于 advisory 在
@@ -191,15 +189,6 @@ def current_kanban_attempt_id(event: dict[str, Any]) -> str | None:
     )
 
 
-def current_kanban_project_path(event: dict[str, Any], fallback: str | None) -> str | None:
-    value = _event_or_env_text(
-        event,
-        ("KANBAN_PROJECT_PATH", "CLINE_KANBAN_PROJECT_PATH"),
-        ("kanban_project_path", "kanbanProjectPath", "project_path", "projectPath"),
-    )
-    return value or fallback
-
-
 def _analysis_payload(finalize_record: dict[str, Any] | None) -> dict[str, str] | None:
     if not isinstance(finalize_record, dict):
         return None
@@ -269,78 +258,6 @@ def _append_system_message(payload: dict[str, Any], note: str) -> None:
         payload["systemMessage"] = f"{message}; {note}"
 
 
-def _run_kanban_message(
-    *,
-    ledger: Any,
-    analysis: dict[str, str],
-    task_id: str,
-    project_path: str,
-    attempt_id: str | None,
-) -> dict[str, Any]:
-    client = Path(os.environ.get("CODEX_RVF_CLINE_KANBAN_CLIENT", str(DEFAULT_CLINE_KANBAN_CLIENT))).expanduser()
-    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
-    prompt = rvf_analyze_followup_prompt(analysis)
-    prompt_path = ledger.artifact("rvf-analyze-followup.prompt.md", prompt)
-    if not prompt_path:
-        raise RuntimeError("failed to write rvf-analyze follow-up prompt artifact")
-    idempotency_key = f"rvf-analyze:{Path(analysis['run_dir']).name}"
-    command = [
-        sys.executable,
-        str(client),
-        "message",
-        "--repo",
-        project_path,
-        "--task-cmd",
-        task_cmd,
-        "--task-id",
-        task_id,
-        "--prompt-file",
-        prompt_path,
-        "--source",
-        "rvf-analyze",
-        "--idempotency-key",
-        idempotency_key,
-    ]
-    if attempt_id:
-        command.extend(["--attempt-id", attempt_id])
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        env={**os.environ, **ledger.env()},
-        check=False,
-    )
-    command_path = ledger.artifact(
-        "rvf-analyze-followup-message.json",
-        {
-            "command": command,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        },
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "Cline Kanban task message failed")
-    try:
-        result = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"invalid Cline Kanban task message JSON: {completed.stdout!r}") from exc
-    if not isinstance(result, dict):
-        raise RuntimeError(f"invalid Cline Kanban task message payload: {result!r}")
-    message_id = str(result.get("message_id") or result.get("messageId") or "").strip()
-    if not message_id:
-        raise RuntimeError(f"Cline Kanban task message response did not include message_id: {result!r}")
-    result["message_id"] = message_id
-    result.setdefault("task_id", task_id)
-    if attempt_id:
-        result.setdefault("attempt_id", attempt_id)
-    result["prompt_path"] = prompt_path
-    result["command_artifact_path"] = command_path
-    result["project_path"] = project_path
-    result["task_cmd"] = task_cmd
-    return result
-
-
 def surface_rvf_analyze_advisory(
     *,
     event: dict[str, Any],
@@ -348,10 +265,17 @@ def surface_rvf_analyze_advisory(
     payload: dict[str, Any],
     finalize_record: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """在 Stop hook handoff 完成 payload 上追加 ``$rvf-analyze`` 后续动作。
+    """finalize handoff 完成后，把 ``$rvf-analyze`` 派进 detached tmux 后台线程。
 
-    Cline Kanban task 内直接注入真实 follow-up 用户消息；非 Kanban native
-    session 只在 hook payload 与 summary 里提示用户手动触发。
+    不再向当前会话/Kanban task 注入 follow-up 用户消息：arm 一次性 PENDING
+    quiet marker 后，调 ``launch_detached_analyze_thread`` 在
+    ``rvf-analyze-<run_name>`` tmux session 里 detached 跑 analyze agent，原会话
+    finalize 完即可 idle。手动 ``$rvf-analyze`` 路径不受影响。
+
+    PENDING marker 照常 arm（keyed task_id / session_id）：analyze 线程补全
+    artifacts 后，由父会话下一次 Stop 依据 artifacts mtime 自动判定 COMPLETE。
+    launch 失败按 fail-open 处理（``thread-launch-failed``），不阻断 handoff，
+    用户可手动 ``$rvf-analyze`` 收尾。
     """
     analysis = _analysis_payload(finalize_record)
     if analysis is None:
@@ -365,84 +289,7 @@ def surface_rvf_analyze_advisory(
         "rvf_analyze_trigger": trigger,
     }
     task_id = current_kanban_task_id(event)
-    fallback_project = finalize_record.get("repo") if isinstance(finalize_record, dict) else None
-    if not isinstance(fallback_project, str) or not fallback_project:
-        fallback_project = event.get("cwd") if isinstance(event.get("cwd"), str) else None
-    project_path = current_kanban_project_path(event, fallback_project)
-
-    if task_id and project_path:
-        attempt_id = current_kanban_attempt_id(event)
-        try:
-            message_payload = _run_kanban_message(
-                ledger=ledger,
-                analysis=analysis,
-                task_id=task_id,
-                project_path=project_path,
-                attempt_id=attempt_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - advisory must not fail finalize/handoff.
-            error = f"{type(exc).__name__}: {exc}"
-            marker_info = _arm_post_analyze_quiet_marker_safe(
-                event=event,
-                ledger=ledger,
-                finalize_record=finalize_record,
-                analysis=analysis,
-                task_id=task_id,
-                attempt_id=attempt_id,
-            )
-            fields = {
-                **base_fields,
-                "rvf_analyze_status": "kanban-injection-failed",
-                "rvf_analyze_error": error,
-                "rvf_analyze_kanban_task_id": task_id,
-                "rvf_analyze_kanban_attempt_id": attempt_id,
-                **marker_info,
-            }
-            ledger.event(
-                phase="analysis",
-                event="rvf_analyze_followup_failed",
-                status="warning",
-                reason_code="rvf_analyze_followup_failed",
-                level="warn",
-                error=error,
-                **fields,
-            )
-            _merge_summary(ledger, fields)
-            _append_system_message(payload, f"rvf_analyze=manual_required; trigger={trigger}")
-            return fields
-
-        marker_info = _arm_post_analyze_quiet_marker_safe(
-            event=event,
-            ledger=ledger,
-            finalize_record=finalize_record,
-            analysis=analysis,
-            task_id=message_payload.get("task_id") or task_id,
-            attempt_id=message_payload.get("attempt_id") or attempt_id,
-        )
-        fields = {
-            **base_fields,
-            "rvf_analyze_status": "kanban-injected",
-            "rvf_analyze_kanban_task_id": message_payload.get("task_id"),
-            "rvf_analyze_kanban_attempt_id": message_payload.get("attempt_id"),
-            "rvf_analyze_kanban_message_id": message_payload.get("message_id"),
-            "rvf_analyze_kanban_turn_id": message_payload.get("turn_id") or message_payload.get("turnId"),
-            "rvf_analyze_kanban_checkpoint_id": (
-                message_payload.get("checkpoint_id") or message_payload.get("checkpointId")
-            ),
-            "rvf_analyze_followup_prompt_path": message_payload.get("prompt_path"),
-            "rvf_analyze_followup_command_path": message_payload.get("command_artifact_path"),
-            **marker_info,
-        }
-        ledger.event(
-            phase="analysis",
-            event="rvf_analyze_followup_injected",
-            status="completed",
-            reason_code="rvf_analyze_followup_injected",
-            **fields,
-        )
-        _merge_summary(ledger, fields)
-        _append_system_message(payload, "rvf_analyze=kanban_injected")
-        return fields
+    attempt_id = current_kanban_attempt_id(event)
 
     marker_info = _arm_post_analyze_quiet_marker_safe(
         event=event,
@@ -450,18 +297,73 @@ def surface_rvf_analyze_advisory(
         finalize_record=finalize_record,
         analysis=analysis,
         task_id=task_id,
-        attempt_id=None,
+        attempt_id=attempt_id,
     )
+
+    try:
+        thread_info = launch_detached_analyze_thread(
+            event=event,
+            ledger=ledger,
+            analysis=analysis,
+            finalize_record=finalize_record,
+        )
+    except Exception as exc:  # noqa: BLE001 - 启动失败绝不阻断 finalize/handoff。
+        thread_info = {
+            "launch_status": "launch_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    launch_status = thread_info.get("launch_status")
+    launched = launch_status in ("launched", "already_running")
+
+    thread_fields: dict[str, Any] = {
+        "rvf_analyze_thread_launch_status": launch_status,
+        "rvf_analyze_thread_session": thread_info.get("tmux_session"),
+        "rvf_analyze_thread_host": thread_info.get("host"),
+        "rvf_analyze_thread_status_path": thread_info.get("status_path"),
+        "rvf_analyze_thread_log_path": thread_info.get("log_path"),
+        "rvf_analyze_thread_prompt_path": thread_info.get("prompt_path"),
+        "rvf_analyze_thread_command": thread_info.get("command"),
+        "rvf_analyze_thread_returncode": thread_info.get("returncode"),
+    }
+    if task_id:
+        thread_fields["rvf_analyze_kanban_task_id"] = task_id
+    if attempt_id:
+        thread_fields["rvf_analyze_kanban_attempt_id"] = attempt_id
+
+    if launched:
+        fields = {
+            **base_fields,
+            "rvf_analyze_status": "thread-launched",
+            **thread_fields,
+            **marker_info,
+        }
+        ledger.event(
+            phase="analysis",
+            event="rvf_analyze_thread_launched",
+            status="completed",
+            reason_code="rvf_analyze_thread_launched",
+            **fields,
+        )
+        _merge_summary(ledger, fields)
+        _append_system_message(payload, "rvf_analyze=thread_launched")
+        return fields
+
+    error = thread_info.get("error")
     fields = {
         **base_fields,
-        "rvf_analyze_status": "manual-required",
+        "rvf_analyze_status": "thread-launch-failed",
+        "rvf_analyze_error": error,
+        **thread_fields,
         **marker_info,
     }
     ledger.event(
         phase="analysis",
-        event="rvf_analyze_manual_advisory",
-        status="completed",
-        reason_code="rvf_analyze_manual_required",
+        event="rvf_analyze_thread_launch_failed",
+        status="warning",
+        reason_code="rvf_analyze_thread_launch_failed",
+        level="warn",
+        error=error,
         **fields,
     )
     _merge_summary(ledger, fields)

@@ -158,6 +158,10 @@ SUPPRESS_ENV_NAMES = (
     "CODEX_RVF_SUPPRESS",
     "CODEX_RVF_SUPPRESS_STOP_HOOK",
 )
+# detached $rvf-analyze 线程注入的标记 env。语义上与 SUPPRESS_ENV_NAMES 区分开：
+# 这是「这是 analyze 线程自己的 Stop event」的显式信号，用于 evaluate_stop_event
+# 早退守卫，短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF。
+CODEX_RVF_ANALYZE_THREAD = "CODEX_RVF_ANALYZE_THREAD"
 CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
 CODEX_GOAL_INCOMPLETE_STATUSES = {
     "active",
@@ -7070,6 +7074,16 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             "stop_hook_active",
             cwd=cwd,
             detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
+        )
+
+    if is_truthy(os.environ.get(CODEX_RVF_ANALYZE_THREAD)):
+        return skip_decision(
+            "检测到 CODEX_RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
+            "$rvf-analyze 后台线程自身，短路所有 gate 跳过，避免后台 analyze "
+            "递归触发新一轮 RVF。",
+            ledger,
+            "rvf_analyze_thread_self_stop",
+            cwd=cwd,
         )
 
     codex_goal_mode = codex_goal_mode_context_from_event(event)
