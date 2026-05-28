@@ -882,6 +882,15 @@ require_literal "scripts/trajectory_distill.py" 'from core.transcript'
 require_literal "scripts/trajectory_distill.py" 'from adapters.codex.transcript import'
 require_literal "scripts/trajectory_distill.py" 'from adapters.claude_code.transcript import'
 
+# S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
+require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
+require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'
+require_literal "scripts/analysis_artifacts.py" 'trajectory_window_start'
+# A1 反模式护栏：write-op 计数不得回退成按 host 工具名 == "apply_patch" 判断。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/analysis_artifacts.py" '== "apply_patch"'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_write_op_count_normalizes_claude_edit_write_multiedit'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_same_session_full_windows_to_rvf_subinterval'
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'

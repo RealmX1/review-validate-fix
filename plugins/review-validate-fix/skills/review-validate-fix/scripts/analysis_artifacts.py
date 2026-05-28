@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -78,14 +79,16 @@ class ScaffoldStats:
     post_rvf_source_kind: str | None
     trajectory_record_count: int
     trajectory_kind_counts: dict[str, int]
-    patch_event_count: int  # 主 rollout 内 apply_patch 数
+    patch_event_count: int  # 主 rollout 内 write-op 数（apply_patch / Edit / Write / MultiEdit 归一）
     subagent_count: int
-    subagent_patch_event_count: int  # 所有 subagent rollouts 内 apply_patch 数合计
+    subagent_patch_event_count: int  # 所有 subagent rollouts 内 write-op 数合计
     reviewer_count: int
     reviewer_issue_counts: dict[str, int]
     workspace_changed_path_count: int
     workspace_head_before: str | None
     workspace_head_after: str | None
+    # same-session-full 自审时 RVF 子区间的 ts 下界；None 表示未窗口化（全量计数）。
+    trajectory_window_start: str | None
 
 
 # --------------------------------------------------------------------------- #
@@ -319,31 +322,78 @@ def _extract_review_issues(payload: Any) -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _is_write_op(record: dict[str, Any]) -> bool:
+    """host-无关 write-op 判据：产生 ``artifact_refs`` 的 tool_call。
+
+    覆盖 Codex ``apply_patch`` 与 Claude ``Edit`` / ``Write`` / ``MultiEdit`` /
+    ``NotebookEdit``——蒸馏时这些工具都落非空 ``artifact_refs``，而 Read / Grep /
+    无 patch 的 Bash 等只读工具不落。刻意**不按 host 工具名**判断（否则 Claude 等
+    非 Codex host 的 write-op 会被漏算——见 04-anti-patterns ②「core 消费 host
+    工具名」）。每条 write-op record 计 1，与 ``artifact_refs`` 文件个数无关。
+    """
+    if record.get("kind") != "tool_call":
+        return False
+    refs = record.get("artifact_refs")
+    return isinstance(refs, list) and len(refs) > 0
+
+
+def _run_id_timestamp(run_id: str | None) -> str | None:
+    """从 ``rvf-YYYYMMDDTHHMMSSZ-...`` run_id 提取 ISO8601 UTC 时间戳。"""
+    if not isinstance(run_id, str):
+        return None
+    m = re.match(r"rvf-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z", run_id)
+    if not m:
+        return None
+    y, mo, d, hh, mm, ss = m.groups()
+    return f"{y}-{mo}-{d}T{hh}:{mm}:{ss}Z"
+
+
+def _rvf_window_start(summary_payload: dict[str, Any], run_id: str | None) -> str | None:
+    """``same-session-full`` 自审时 RVF 子区间的 ts 下界。
+
+    ``flow-1-self-rising`` 下整段会话（含触发前数日/数周的实现工作）被当成 RVF
+    自身轨迹，计数严重失真。这里复用 capture 端 ``find_rvf_start_in_*_jsonl`` 同款
+    信号——``summary.json::timestamp``（RVF prepare 时刻）——作为窗口下界；缺失时
+    退化到 run_id 内嵌时间戳。返回 None 表示无可用下界（不窗口化、退回全量计数）。
+    """
+    ts = summary_payload.get("timestamp")
+    if isinstance(ts, str) and ts:
+        return ts
+    return _run_id_timestamp(run_id)
+
+
 def _count_trajectory(
     inputs: AnalysisInputs,
+    *,
+    window_start: str | None = None,
 ) -> tuple[int, dict[str, int], int]:
     """返回 (record_count, kind_counts, patch_event_count)。
 
-    优先信任 ``trajectory.index.json`` 给出的总计数 / kind_counts；缺失或损坏时
-    降级到逐行扫描 ``trajectory.jsonl``。``patch_event_count`` 始终需要扫描原始
-    NDJSON 才能识别（index 没拆出来）。
+    非窗口化时优先信任 ``trajectory.index.json`` 的总计数 / kind_counts；缺失或损坏
+    时降级到逐行扫描 ``trajectory.jsonl``。``patch_event_count``（write-op 数）始终
+    需要扫描原始 NDJSON 才能识别（index 没拆出来）。
+
+    ``window_start`` 非空时（``same-session-full`` 自审子区间）**必须重扫**原始
+    NDJSON 并只计 ``ts >= window_start`` 的 record——index.json 计的是整段会话全量，
+    会把触发前工作算进来，故此时不信任 index。
     """
     record_count = 0
     kind_counts: dict[str, int] = {}
     patch_event_count = 0
 
-    index_payload = _safe_load_json(inputs.trajectory_index_json)
-    if isinstance(index_payload, dict):
-        rc = index_payload.get("record_count")
-        if isinstance(rc, int) and rc >= 0:
-            record_count = rc
-        kc = index_payload.get("kind_counts")
-        if isinstance(kc, dict):
-            kind_counts = {
-                str(k): int(v)
-                for k, v in kc.items()
-                if isinstance(v, (int, bool)) and not isinstance(v, bool)
-            }
+    if window_start is None:
+        index_payload = _safe_load_json(inputs.trajectory_index_json)
+        if isinstance(index_payload, dict):
+            rc = index_payload.get("record_count")
+            if isinstance(rc, int) and rc >= 0:
+                record_count = rc
+            kc = index_payload.get("kind_counts")
+            if isinstance(kc, dict):
+                kind_counts = {
+                    str(k): int(v)
+                    for k, v in kc.items()
+                    if isinstance(v, (int, bool)) and not isinstance(v, bool)
+                }
 
     traj = inputs.trajectory_jsonl
     if traj is None:
@@ -352,17 +402,14 @@ def _count_trajectory(
     fallback_record_count = 0
     fallback_kind_counts: dict[str, int] = {}
     for record in _iter_jsonl(traj):
+        if window_start is not None and (record.get("ts") or "") < window_start:
+            continue
         fallback_record_count += 1
         kind = record.get("kind")
         if isinstance(kind, str):
             fallback_kind_counts[kind] = fallback_kind_counts.get(kind, 0) + 1
-        if (
-            kind == "tool_call"
-            and record.get("tool") == "apply_patch"
-        ):
-            refs = record.get("artifact_refs")
-            if isinstance(refs, list) and len(refs) > 0:
-                patch_event_count += 1
+        if _is_write_op(record):
+            patch_event_count += 1
 
     if record_count == 0:
         record_count = fallback_record_count
@@ -413,19 +460,21 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
     if not isinstance(post_kind, str):
         post_kind = None
 
-    record_count, kind_counts, patch_event_count = _count_trajectory(inputs)
+    window_start = (
+        _rvf_window_start(summary_payload, run_id)
+        if post_kind == "same-session-full"
+        else None
+    )
+    record_count, kind_counts, patch_event_count = _count_trajectory(
+        inputs, window_start=window_start
+    )
 
     subagent_patch_event_count = 0
     for subagent in inputs.subagents:
         if subagent.trajectory_jsonl is None:
             continue
         for record in _iter_jsonl(subagent.trajectory_jsonl):
-            if record.get("kind") != "tool_call":
-                continue
-            if record.get("tool") != "apply_patch":
-                continue
-            refs = record.get("artifact_refs")
-            if isinstance(refs, list) and refs:
+            if _is_write_op(record):
                 subagent_patch_event_count += 1
 
     reviewer_issue_counts: dict[str, int] = {}
@@ -479,6 +528,7 @@ def gather_stats(inputs: AnalysisInputs) -> ScaffoldStats:
         workspace_changed_path_count=changed_path_count,
         workspace_head_before=head_before,
         workspace_head_after=head_after,
+        trajectory_window_start=window_start,
     )
 
 
@@ -557,13 +607,18 @@ def scaffold_summary_md(
     )
     lines.append(f"- post_rvf_source_kind: `{stats.post_rvf_source_kind or '-'}`")
     lines.append(f"- 总记录数: `{stats.trajectory_record_count}`")
+    if stats.trajectory_window_start:
+        lines.append(
+            f"  （same-session-full：计数已按 RVF 子区间 ts ≥ "
+            f"`{stats.trajectory_window_start}` 窗口化，已排除触发前实现工作）"
+        )
     lines.append(
         f"- 各 kind 计数: {_format_kind_counts(stats.trajectory_kind_counts)}"
     )
-    lines.append(f"- apply_patch 事件（主 rollout）: `{stats.patch_event_count}`")
+    lines.append(f"- write-op 事件（主 rollout）: `{stats.patch_event_count}`")
     lines.append(
         f"- spawn_agent 子代理: `{stats.subagent_count}`；"
-        f"子代理 apply_patch 合计: `{stats.subagent_patch_event_count}`"
+        f"子代理 write-op 合计: `{stats.subagent_patch_event_count}`"
     )
     if inputs.subagents:
         lines.append("- 子代理 trajectory:")
@@ -715,23 +770,28 @@ def _patches_from_trajectory(
     traj_path: Path,
     *,
     source_agent_id: str | None,
+    window_start: str | None = None,
 ) -> list[dict[str, Any]]:
-    """从一份蒸馏 trajectory.jsonl 中抽出 ``apply_patch`` tool_calls。
+    """从一份蒸馏 trajectory.jsonl 中抽出 write-op tool_calls。
+
+    write-op 判据为 host-无关的 :func:`_is_write_op`（覆盖 Codex ``apply_patch`` 与
+    Claude ``Edit`` / ``Write`` / ``MultiEdit`` 等），``tool`` 字段保留 record 原始
+    工具名（不再硬编码 ``apply_patch``），以便 Claude-host 的 patch 也接得上
+    call_id（handoff B / candidate_patch_call_ids 主轨迹部分）。
 
     ``source_agent_id`` = ``None`` 表示主 RVF rollout；非空表示某个 spawn_agent
     子代理的 rollout（reviewer / validate-fix 等）。每条 patch 都标 source 字段，
     后续 LLM agent 才能区分 "造成 bug 的 main-agent patch" vs "修 bug 的
-    validate-fix subagent patch"。
+    validate-fix subagent patch"。``window_start`` 仅用于主 rollout 的
+    same-session-full 子区间裁剪（只取 ``ts >= window_start``）。
     """
     out: list[dict[str, Any]] = []
     for record in _iter_jsonl(traj_path):
-        if record.get("kind") != "tool_call":
+        if window_start is not None and (record.get("ts") or "") < window_start:
             continue
-        if record.get("tool") != "apply_patch":
+        if not _is_write_op(record):
             continue
         refs = record.get("artifact_refs")
-        if not isinstance(refs, list) or not refs:
-            continue
         clean_refs: list[dict[str, Any]] = []
         for ref in refs:
             if not isinstance(ref, dict):
@@ -753,7 +813,7 @@ def _patches_from_trajectory(
             {
                 "call_id": record.get("call_id"),
                 "ts": record.get("ts"),
-                "tool": "apply_patch",
+                "tool": record.get("tool"),
                 "artifact_refs": clean_refs,
                 "trajectory_line": line_no,
                 "source_agent_id": source_agent_id,
@@ -762,10 +822,20 @@ def _patches_from_trajectory(
     return out
 
 
-def _collect_patches(inputs: AnalysisInputs) -> list[dict[str, Any]]:
+def _collect_patches(
+    inputs: AnalysisInputs,
+    *,
+    window_start: str | None = None,
+) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if inputs.trajectory_jsonl is not None:
-        out.extend(_patches_from_trajectory(inputs.trajectory_jsonl, source_agent_id=None))
+        out.extend(
+            _patches_from_trajectory(
+                inputs.trajectory_jsonl,
+                source_agent_id=None,
+                window_start=window_start,
+            )
+        )
     for subagent in inputs.subagents:
         if subagent.trajectory_jsonl is None:
             continue
@@ -814,7 +884,7 @@ def scaffold_causality_json(
         "issues": issues,
         "fix_attempts": ledger.get("fix_attempts", []) if isinstance(ledger, dict) else [],
         "patch_events": ledger.get("patch_events", []) if isinstance(ledger, dict) else [],
-        "patches": _collect_patches(inputs),
+        "patches": _collect_patches(inputs, window_start=stats.trajectory_window_start),
     }
     _atomic_write_json(out_path, payload)
     return out_path
@@ -846,6 +916,7 @@ def scaffold_run(run_dir: Path) -> dict[str, Any]:
             "post_rvf_source_kind": stats.post_rvf_source_kind,
             "trajectory_record_count": stats.trajectory_record_count,
             "trajectory_kind_counts": dict(stats.trajectory_kind_counts),
+            "trajectory_window_start": stats.trajectory_window_start,
             "patch_event_count": stats.patch_event_count,
             "subagent_count": stats.subagent_count,
             "subagent_patch_event_count": stats.subagent_patch_event_count,
