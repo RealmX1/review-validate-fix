@@ -1,43 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 import time
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_DIR = (
-    ROOT
-    / "plugins"
-    / "review-validate-fix"
-    / "skills"
-    / "review-validate-fix"
-    / "scripts"
-)
-
-
-def _load(name: str, path: Path):
-    if str(SCRIPT_DIR) not in sys.path:
-        sys.path.insert(0, str(SCRIPT_DIR))
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise AssertionError(f"failed to load {name}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+from _rvf_test_support.loader import load_script_module as _load
 
 
 def _confirm():
-    return _load("rvf_bootstrap_confirm", SCRIPT_DIR / "rvf_bootstrap_confirm.py")
+    return _load("rvf_bootstrap_confirm")
 
 
 def _user_prompt_submit():
-    _load("rvf_prep_file", SCRIPT_DIR / "rvf_prep_file.py")
-    return _load("rvf_user_prompt_submit", SCRIPT_DIR / "rvf_user_prompt_submit.py")
+    _load("rvf_prep_file")
+    return _load("rvf_user_prompt_submit")
 
 
 def _bootstrap_payload(*, kind: str, unattributed: list[str], unattributed_bytes: int, total: int = None):

@@ -16,22 +16,12 @@
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_DIR = (
-    ROOT
-    / "plugins"
-    / "review-validate-fix"
-    / "skills"
-    / "review-validate-fix"
-    / "scripts"
-)
-sys.path.insert(0, str(SCRIPT_DIR))
+from _rvf_test_support.loader import load_script_module as _load
 
-import rvf_parent_context as rpc  # noqa: E402
+rpc = _load("rvf_parent_context")
 
 
 def _write_jsonl(path: Path, records: list[dict]) -> None:
