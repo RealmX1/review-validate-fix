@@ -490,6 +490,81 @@ def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_pa
         os.environ.pop("CODEX_RVF_LOG_ROOT", None)
 
 
+def test_parse_manual_scope_directive_variants() -> None:
+    """`scope:` 指令解析：空白/逗号分隔、去引号、大小写不敏感、行内/跨行、无 scope。"""
+    submit = load_rvf_user_prompt_submit_module()
+    parse = submit.parse_manual_scope_directive
+    assert parse("/review-validate-fix scope: src/a.py src/b.py") == ["src/a.py", "src/b.py"]
+    assert parse("/review-validate-fix scope: src/a.py, src/b.py") == ["src/a.py", "src/b.py"]
+    assert parse('/review-validate-fix scope: "src/a.py"') == ["src/a.py"]
+    assert parse("/review-validate-fix SCOPE: src/a.py") == ["src/a.py"]
+    assert parse("/review-validate-fix\nscope: src/a.py") == ["src/a.py"]
+    assert parse("/review-validate-fix please review my work") == []
+    # `telescope:` 之类的子串不得被当成指令（要求行首或空白前缀）。
+    assert parse("just talking about telescope: lens here") == []
+    assert parse("") == []
+    assert parse(None) == []
+
+
+def test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(tmp_path: Path) -> None:
+    """manual 触发内联 `scope:` → 解析出的 primary 文件作为 extra_primary_files 传入 prepare。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
+    try:
+        captured: list[dict[str, object]] = []
+
+        def fake_prepare(
+            record, *, timeout_seconds=60.0, user_prompt_excerpt=None, extra_primary_files=None, **_
+        ):
+            captured.append({"extra_primary_files": extra_primary_files})
+            state = {
+                "started_at": "2026-05-07T00:00:00Z",
+                "completed_at": "2026-05-07T00:00:01Z",
+                "status": "completed",
+                "artifacts": {},
+            }
+            new_rvf_run = dict(record.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "/review-validate-fix please review scope: src/a.py, src/b.py",
+                    "cwd": str(repo),
+                    "session_id": "manual-scope-session",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+            )
+            assert payload["status"] == "manual_prep_created"
+            assert payload["workflow_started"] is True
+            assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
+            assert len(captured) == 1
+            assert captured[0]["extra_primary_files"] == ["src/a.py", "src/b.py"]
+            additional_context = payload["hookSpecificOutput"]["additionalContext"]
+            assert "inline scope (primary): src/a.py, src/b.py" in additional_context
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+
+
 def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_path: Path) -> None:
     """Quoted/embedded references to the trigger literal must not create a manual prep."""
 
@@ -612,6 +687,138 @@ def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
     shim = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
     assert shim.is_file(), "hooks/user_prompt_submit.py missing"
     py_compile.compile(str(shim), doraise=True)
+
+
+def _load_claude_ups_shim_module():
+    """以模块方式加载 hooks/user_prompt_submit.py（shim 是脚本，但可读取
+    它的 ``_is_codex_invocation`` 等顶层函数做单元测试）。"""
+    import importlib.util
+
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
+    spec = importlib.util.spec_from_file_location("rvf_claude_ups_shim", shim_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_claude_stop_shim_module():
+    """同 ``_load_claude_ups_shim_module``，但加载 hooks/stop.py。"""
+    import importlib.util
+
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "stop.py"
+    spec = importlib.util.spec_from_file_location("rvf_claude_stop_shim", shim_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_claude_plugin_shim_detects_codex_invocation() -> None:
+    """``_is_codex_invocation`` 守卫：在 Codex 转写路径上返回 True；在
+    Claude 转写路径 / 缺路径时返回 False（保守，未知按 Claude 跑）。"""
+    shim = _load_claude_ups_shim_module()
+
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.codex/sessions/2026/05/21/rollout-XYZ.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"conversation_path": "/Users/me/.codex/sessions/anywhere/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_path": "/Users/me/.codex/sessions/2026/05/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_file": "/Users/me/.codex/sessions/some/leaf.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.claude/projects/-encoded/session.jsonl"}
+    ) is False
+    # 缺所有路径键 → False（保守，按 Claude 跑）
+    assert shim._is_codex_invocation({}) is False
+    # 路径键值非 str → False
+    assert shim._is_codex_invocation({"transcript_path": None}) is False
+    assert shim._is_codex_invocation({"transcript_path": 12345}) is False
+
+
+def test_claude_plugin_shim_codex_invocation_noop(tmp_path: Path) -> None:
+    """端到端：用 Codex 转写路径的 event 调 shim，应静默退出（stdout 空，
+    退出码 0，且不写任何 prep file）。"""
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "user_prompt_submit.py"
+    prep_root = tmp_path / "prep-root"
+    prep_root.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "CODEX_RVF_PREP_ROOT": str(prep_root),
+        "CODEX_RVF_LOG_ROOT": str(tmp_path / "log-root"),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+    }
+    event = {
+        "prompt": "/review-validate-fix",
+        "session_id": "codex-session-abc",
+        "cwd": str(tmp_path),
+        "transcript_path": "/Users/bominzhang/.codex/sessions/2026/05/21/rollout-fake.jsonl",
+    }
+    completed = subprocess.run(
+        [sys.executable, str(shim_path)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "", f"expected silent no-op, got stdout={completed.stdout!r}"
+    # 无 prep file 写入（如果 core 跑了就会写）
+    assert not any(prep_root.iterdir()), "prep root should be empty after Codex no-op"
+
+
+def test_claude_plugin_stop_shim_detects_codex_invocation() -> None:
+    """``hooks/stop.py`` 的 ``_is_codex_invocation`` 守卫与 UPS shim 同款：
+    Codex 转写路径返回 True；Claude 转写路径 / 缺路径时返回 False。"""
+    shim = _load_claude_stop_shim_module()
+
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.codex/sessions/2026/05/22/rollout-XYZ.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"session_file": "/Users/me/.codex/sessions/anywhere/file.jsonl"}
+    ) is True
+    assert shim._is_codex_invocation(
+        {"transcript_path": "/Users/me/.claude/projects/-encoded/session.jsonl"}
+    ) is False
+    assert shim._is_codex_invocation({}) is False
+    assert shim._is_codex_invocation({"transcript_path": None}) is False
+    assert shim._is_codex_invocation({"transcript_path": 12345}) is False
+
+
+def test_claude_plugin_stop_shim_codex_invocation_noop(tmp_path: Path) -> None:
+    """端到端：用 Codex 转写路径的 event 调 Stop shim，应静默退出（stdout
+    空，退出码 0，且不调起 RVF 核心）。如果核心被调起，CODEX_RVF_LOG_ROOT
+    指向的 log 目录会有 run dir 写入；空目录证明守卫生效。"""
+    shim_path = ROOT / "plugins" / "review-validate-fix" / "hooks" / "stop.py"
+    log_root = tmp_path / "log-root"
+    log_root.mkdir(parents=True, exist_ok=True)
+    env = {
+        **os.environ,
+        "CODEX_RVF_LOG_ROOT": str(log_root),
+        "CLAUDE_PROJECT_DIR": str(tmp_path),
+    }
+    event = {
+        "session_id": "codex-session-stop-abc",
+        "cwd": str(tmp_path),
+        "transcript_path": "/Users/bominzhang/.codex/sessions/2026/05/22/rollout-fake.jsonl",
+    }
+    completed = subprocess.run(
+        [sys.executable, str(shim_path)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "", f"expected silent no-op, got stdout={completed.stdout!r}"
+    # 守卫生效则核心未被调起，log_root 下不会创建任何 run 子目录
+    assert not any(log_root.iterdir()), "log root should be empty after Codex no-op"
 
 
 def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
@@ -741,8 +948,12 @@ def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
             same_origin_after = json.loads(same_origin.read_text(encoding="utf-8"))
             assert "child_session_id" not in same_origin_after
 
-            # Fallback: no origin_metadata_path → derive origin.json from
-            # rvf_run.run_dir. Also: missing child transcript → null path.
+            # Layer 1 (declared, not-yet-flushed): no origin_metadata_path →
+            # derive origin.json from rvf_run.run_dir. The child's first
+            # UserPromptSubmit names the transcript before the host flushes it;
+            # the declared path is recorded (non-null) and flagged
+            # not-yet-existent rather than dropped — capture_run re-checks
+            # .is_file() at the child's Stop, by when it exists.
             run_dir2 = tmp_path / "run2"
             (run_dir2 / "artifacts").mkdir(parents=True)
             (run_dir2 / "artifacts" / "origin.json").write_text(
@@ -762,28 +973,91 @@ def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
                 now=now,
                 ttl_seconds=300,
             )
+            declared_missing = tmp_path / "does_not_exist.jsonl"
             fb_payload = submit.inspect_user_prompt_submit(
                 {
                     "prompt": "fb RVF_DISPATCH=token=ffffffffffffffff",
                     "cwd": str(tmp_path),
                     "session_id": "child2",
-                    "transcript_path": str(tmp_path / "does_not_exist.jsonl"),
+                    "transcript_path": str(declared_missing),
                 },
                 prep_root=root,
                 now="2026-05-07T00:01:00Z",
             )
             assert fb_payload["status"] == "valid"
             assert fb_payload["child_session_id"] == "child2"
-            assert fb_payload["child_transcript_path"] is None
+            assert fb_payload["child_transcript_path"] == str(declared_missing.resolve())
             fb_origin = json.loads(
                 (run_dir2 / "artifacts" / "origin.json").read_text(encoding="utf-8")
             )
             assert fb_origin["session_id"] == "parent2"
             assert fb_origin["child_session_id"] == "child2"
-            assert fb_origin["child_transcript_path"] is None
+            assert fb_origin["child_transcript_path"] == str(declared_missing.resolve())
             fb_stored = json.loads((root / "ffffffffffffffff.json").read_text(encoding="utf-8"))
             assert fb_stored["child_session_id"] == "child2"
-            assert fb_stored["child_transcript_path"] is None
+            assert fb_stored["child_transcript_path"] == str(declared_missing.resolve())
+            fb_diags = read_jsonl(root / "diagnostics" / "ffffffffffffffff.jsonl")
+            assert any(
+                ev.get("event") == "user_prompt_submit_child_session_backfill"
+                and ev.get("transcript_source") == "declared"
+                and ev.get("child_transcript_exists") is False
+                for ev in fb_diags
+            )
+
+            # Layer 2 (derived from session_id): event carries NO transcript
+            # path at all; the child is Claude, so reconstruct
+            # <CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<sid>.jsonl — taken only
+            # because that project dir already exists (flush-independent signal).
+            claude_home = tmp_path / "claude-home"
+            run_dir3 = tmp_path / "run3"
+            (run_dir3 / "artifacts").mkdir(parents=True)
+            (run_dir3 / "artifacts" / "origin.json").write_text(
+                json.dumps({"session_id": "parent3"}), encoding="utf-8"
+            )
+            prep.write_prep_file(
+                {
+                    "origin_session_id": "parent3",
+                    "origin_repo": str(tmp_path),
+                    "origin_cwd": str(tmp_path),
+                    "target_flow": "flow-2-branch",
+                    "target_worktree": str(tmp_path),
+                    "rvf_run": {"run_id": "rvf-derive", "run_dir": str(run_dir3)},
+                },
+                root=root,
+                token="0000000000000000",
+                now=now,
+                ttl_seconds=300,
+            )
+            child3_cwd = str(tmp_path / "child-cwd")
+            project_dir = claude_home / "projects" / submit._claude_project_slug(child3_cwd)
+            project_dir.mkdir(parents=True)
+            expected_derived = (project_dir / "child3.jsonl").resolve()
+            os.environ["CLAUDE_CONFIG_DIR"] = str(claude_home)
+            try:
+                d_payload = submit.inspect_user_prompt_submit(
+                    {
+                        "prompt": "derive RVF_DISPATCH=token=0000000000000000",
+                        "cwd": child3_cwd,
+                        "session_id": "child3",
+                    },
+                    prep_root=root,
+                    now="2026-05-07T00:01:00Z",
+                )
+            finally:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            assert d_payload["status"] == "valid"
+            assert d_payload["child_session_id"] == "child3"
+            assert d_payload["child_transcript_path"] == str(expected_derived)
+            d_origin = json.loads(
+                (run_dir3 / "artifacts" / "origin.json").read_text(encoding="utf-8")
+            )
+            assert d_origin["child_transcript_path"] == str(expected_derived)
+            d_diags = read_jsonl(root / "diagnostics" / "0000000000000000.jsonl")
+            assert any(
+                ev.get("event") == "user_prompt_submit_child_session_backfill"
+                and ev.get("transcript_source") == "derived"
+                for ev in d_diags
+            )
         finally:
             prepare_module.prepare_run_from_prep_file = original_prepare
     finally:
@@ -7350,6 +7624,16 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(root / "prompt-submit-manual"),
         ),
         (
+            "parse_manual_scope_directive_variants",
+            lambda: test_parse_manual_scope_directive_variants(),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_scope_directive_passes_primary_files",
+            lambda: test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(
+                root / "prompt-submit-manual-scope"
+            ),
+        ),
+        (
             "rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger",
             lambda: test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(root / "prompt-submit-substring"),
         ),
@@ -7360,6 +7644,22 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "claude_plugin_hooks_declare_user_prompt_submit",
             lambda: test_claude_plugin_hooks_declare_user_prompt_submit(),
+        ),
+        (
+            "claude_plugin_shim_detects_codex_invocation",
+            lambda: test_claude_plugin_shim_detects_codex_invocation(),
+        ),
+        (
+            "claude_plugin_shim_codex_invocation_noop",
+            lambda: test_claude_plugin_shim_codex_invocation_noop(root / "shim-codex-noop"),
+        ),
+        (
+            "claude_plugin_stop_shim_detects_codex_invocation",
+            lambda: test_claude_plugin_stop_shim_detects_codex_invocation(),
+        ),
+        (
+            "claude_plugin_stop_shim_codex_invocation_noop",
+            lambda: test_claude_plugin_stop_shim_codex_invocation_noop(root / "stop-shim-codex-noop"),
         ),
         (
             "rvf_user_prompt_submit_backfills_child_session",

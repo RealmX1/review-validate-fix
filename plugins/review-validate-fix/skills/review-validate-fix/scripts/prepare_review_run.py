@@ -91,6 +91,7 @@ def review_env_exports(
     tracker_repo_key: str | None = None,
     tracker_scope_path: Path | None = None,
     rvf_backend: str | None = None,
+    parent_context_path: Path | None = None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
         "RVF_REPO": str(repo),
@@ -126,6 +127,10 @@ def review_env_exports(
         env["RVF_TRACKER_REPO_KEY"] = tracker_repo_key
     if tracker_scope_path is not None:
         env["RVF_TRACKER_SCOPE"] = str(tracker_scope_path)
+    # 父会话对话 context（fail-open，可能缺失）。仅在 artifact 存在时导出，
+    # 与 cline-kanban task prompt 的 RVF_PARENT_CONVERSATION_CONTEXT 标记一致。
+    if parent_context_path is not None and parent_context_path.exists():
+        env["RVF_PARENT_CONVERSATION_CONTEXT"] = str(parent_context_path)
 
     lines = [
         "# Source this file in review subprocesses to avoid repeating long RVF paths.",
@@ -176,6 +181,13 @@ def review_env_exports(
             lines.append('export RVF_TRACKER_SCOPE="$RVF_INPUTS_DIR/tracker-scope.json"')
         else:
             lines.append(f"export RVF_TRACKER_SCOPE={shlex.quote(str(tracker_scope_path))}")
+    if "RVF_PARENT_CONVERSATION_CONTEXT" in env:
+        if parent_context_path == artifacts_dir / "parent-conversation-context.md":
+            lines.append('export RVF_PARENT_CONVERSATION_CONTEXT="$RVF_ARTIFACTS_DIR/parent-conversation-context.md"')
+        else:
+            lines.append(
+                f"export RVF_PARENT_CONVERSATION_CONTEXT={shlex.quote(env['RVF_PARENT_CONVERSATION_CONTEXT'])}"
+            )
     lines.append("")
     return env, "\n".join(lines)
 
@@ -872,6 +884,7 @@ def prepare_run(
         tracker_repo_key=tracker_repo_key_value,
         tracker_scope_path=resolved_input_tracker_scope_path,
         rvf_backend=canonical_backend,
+        parent_context_path=artifact_dir / "parent-conversation-context.md",
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
     review_agent_context = review_agent_context_text(

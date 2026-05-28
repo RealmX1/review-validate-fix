@@ -39,6 +39,14 @@ from post_analyze_quiet import (
     post_analyze_workflow_status,
     read_post_analyze_quiet_marker,
 )
+from kanban_followup_lock import (
+    STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
+    acquire_marker as acquire_kanban_followup_lock,
+    clear_marker as clear_kanban_followup_lock,
+    marker_status as kanban_followup_lock_status,
+    read_marker as read_kanban_followup_lock,
+    write_marker as write_kanban_followup_lock,
+)
 from session_manifest import build_manifest
 from diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
@@ -70,6 +78,8 @@ from session_label import (
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
+from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+import rvf_parent_context
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -111,6 +121,16 @@ CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
 CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
+# 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
+# artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
+PARENT_CONTEXT_ENV = "CODEX_RVF_PARENT_CONTEXT"
+"""开关：默认开启；设 ``0`` / ``false`` / ``no`` / ``off`` 关闭父对话 context 生成。"""
+PARENT_CONTEXT_MAX_BYTES_ENV = "CODEX_RVF_PARENT_CONTEXT_MAX_BYTES"
+"""总字节上限覆盖；缺省用 rvf_parent_context.DEFAULT_MAX_BYTES (64KB)，超限保留最近内容。"""
+PARENT_CONTEXT_ARTIFACT_NAME = "parent-conversation-context.md"
+"""run artifacts 中父对话 context 的文件名，与 task prompt / review-env 引用一致。"""
+PARENT_CONTEXT_PROMPT_KEY = "RVF_PARENT_CONVERSATION_CONTEXT"
+"""task prompt / review-env 中标记父对话 context 路径的键名。"""
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
 KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
@@ -352,6 +372,79 @@ def provider_health_timeout_seconds() -> float:
 
 def codex_bin() -> str:
     return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
+
+
+def parent_context_enabled() -> bool:
+    """父会话对话 context 注入是否开启（默认开启，``CODEX_RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
+    return not is_falsey(os.environ.get(PARENT_CONTEXT_ENV))
+
+
+def parent_context_max_bytes() -> int:
+    """父对话 context 总字节预算；非法/缺省回退 rvf_parent_context.DEFAULT_MAX_BYTES。"""
+    raw = os.environ.get(PARENT_CONTEXT_MAX_BYTES_ENV)
+    if raw is None or not raw.strip():
+        return rvf_parent_context.DEFAULT_MAX_BYTES
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        return rvf_parent_context.DEFAULT_MAX_BYTES
+    return value if value > 0 else rvf_parent_context.DEFAULT_MAX_BYTES
+
+
+def freeze_parent_conversation_context(
+    *,
+    parent_thread_path: Path | None,
+    ledger: RunLedger,
+    cwd: str,
+) -> str | None:
+    """渲染父会话对话 context 并写进 run artifacts；返回 artifact 路径或 None。
+
+    完全 fail-open：开关关闭、父 transcript 缺失、渲染为空、写入失败任意一种都
+    返回 None 且不抛异常——绝不阻塞 dispatch。
+    """
+    if not parent_context_enabled():
+        return None
+    if parent_thread_path is None:
+        return None
+    try:
+        blob = rvf_parent_context.render_parent_context(
+            parent_thread_path,
+            max_bytes=parent_context_max_bytes(),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-open，不阻塞 dispatch
+        ledger.event(
+            phase="prepare",
+            event="parent_conversation_context_failed",
+            status="warning",
+            reason_code="parent_conversation_context_render_error",
+            repo=cwd,
+            cwd=cwd,
+            error=str(exc),
+        )
+        return None
+    if not blob:
+        return None
+    header = (
+        "# 父会话对话 Context（仅作 review 背景）\n\n"
+        f"- 来源 transcript：`{parent_thread_path}`\n"
+        "- 用途：让本 child agent 在 review 前了解父会话的对话/推理脉络。\n"
+        "- 边界：**仅作背景**，不得用本文件重定义 review scope；scope 仍以 "
+        "`$RVF_SCOPE_CONTRACT` 为准。Codex reasoning 加密，标 `<encrypted reasoning>`；"
+        "tool 输出已轻压缩。\n\n"
+        "---\n\n"
+    )
+    artifact_path = ledger.artifact(PARENT_CONTEXT_ARTIFACT_NAME, header + blob)
+    if artifact_path:
+        ledger.event(
+            phase="prepare",
+            event="parent_conversation_context_frozen",
+            status="completed",
+            reason_code="parent_conversation_context_frozen",
+            repo=cwd,
+            cwd=cwd,
+            paths={"parent_conversation_context": artifact_path},
+        )
+    return artifact_path
 
 
 def safe_state_key(value: str) -> str:
@@ -1800,6 +1893,53 @@ def is_codex_agent_id(agent_id: str | None) -> bool:
     )
 
 
+# ⚠️ cline-kanban 的 `kanban task create --agent-id <id>` 决定该 task 用哪个 executor
+# 跑（合法值：cline | claude | codex | droid | gemini | opencode | default）。
+# RVF dispatch 只要传 `--agent-id`，就**覆盖了 cline-kanban 自身的默认 executor 选择**
+# （cline-kanban 不传时会用它自己的 default profile）。
+#
+# 默认策略：镜像父（main agent）所用 harness。理由——同 executor fork
+# （codex→codex / claude→claude）既能直接复用父会话上下文，又能命中 prompt cache；
+# 跨 executor 时虽然仍可从对方 log/session 抽取通用 context，但 prompt cache 命中会
+# 不可控地丢失。因此默认不再硬钉 "codex"，而是跟随父 harness。
+# 仍保留 CODEX_RVF_CLINE_KANBAN_AGENT_ID 显式钉死某个 fix harness 的能力（优先级最高）。
+def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
+    """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
+
+    复用 ``trajectory_distill.detect_transcript_format`` 做 host 识别：
+    Claude Code transcript → ``claude``；Codex rollout → ``codex``；
+    无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
+    保证既有 Codex-only 用例零回归。
+    """
+    if parent_thread_path is not None:
+        try:
+            host_kind = detect_transcript_format(parent_thread_path)
+        except Exception:
+            host_kind = None
+        if host_kind == HOST_CLAUDE:
+            return "claude"
+        if host_kind == HOST_CODEX:
+            return "codex"
+    return "codex"
+
+
+def resolve_cline_kanban_agent_id(
+    parent_thread_path: Path | None,
+    *,
+    env: dict[str, str] | None = None,
+) -> str:
+    """解析 cline-kanban task 的 agent_id。
+
+    优先级：显式 ``CODEX_RVF_CLINE_KANBAN_AGENT_ID`` 钉死 > 镜像父 harness > ``codex`` 兜底。
+    provider-health 门与实际 create 站点共用此函数，避免两处对 executor 的判断漂移。
+    """
+    environ = env if env is not None else os.environ
+    pinned = (environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID") or "").strip()
+    if pinned:
+        return pinned
+    return default_cline_kanban_agent_id(parent_thread_path)
+
+
 def provider_health_requirements(
     decision: StopDecision,
     event: dict[str, Any],
@@ -1815,7 +1955,9 @@ def provider_health_requirements(
         ]
 
     if decision.backend == "kanban":
-        agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+        # 与 start_cline_kanban_task 的 create 站点共用 resolver：默认镜像父 harness，
+        # 父 transcript 用 host-agnostic 的 parent_thread_path_for_origin（也能识别 Claude）。
+        agent_id = resolve_cline_kanban_agent_id(parent_thread_path_for_origin(event))
         if is_codex_agent_id(agent_id):
             return [
                 ProviderHealthRequirement(
@@ -1836,8 +1978,7 @@ def provider_health_requirements(
                 ("KANBAN_AGENT_ID", "CLINE_KANBAN_AGENT_ID"),
                 ("kanban_agent_id", "kanbanAgentId", "agent_id", "agentId"),
             )
-            or os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip()
-            or "codex"
+            or resolve_cline_kanban_agent_id(parent_thread_path_for_origin(event))
         )
         if is_codex_agent_id(agent_id):
             return [
@@ -2135,6 +2276,93 @@ def current_kanban_project_path(event: dict[str, Any], fallback: str) -> str:
     return value or fallback
 
 
+def kanban_followup_lock_session_id(event: dict[str, Any]) -> str | None:
+    return session_hook_id_from_event(event) or session_id_from_event(event) or parent_thread_id_from_event(event)
+
+
+def clear_kanban_followup_lock_for_event(
+    event: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    cwd: str | None,
+    handoff_path: str | None = None,
+) -> list[str]:
+    task_id = current_kanban_task_id(event)
+    session_id = kanban_followup_lock_session_id(event)
+    removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    if removed:
+        ledger.event(
+            phase="complete",
+            event="kanban_followup_in_progress_cleared",
+            status="completed",
+            reason_code="kanban_followup_handoff_complete",
+            cwd=cwd,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            handoff_path=handoff_path,
+            removed_kanban_followup_in_progress_marker_paths=removed,
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                handoff_path=handoff_path,
+                completion_gate="handoff_file_ready",
+            ),
+        )
+    return removed
+
+
+def kanban_followup_in_progress_decision(
+    event: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    cwd: str | None,
+) -> StopDecision | None:
+    task_id = current_kanban_task_id(event)
+    session_id = kanban_followup_lock_session_id(event)
+    marker = read_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    if marker is None:
+        return None
+
+    status = kanban_followup_lock_status(marker)
+    marker_path = marker.get("_marker_path")
+    if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+        return skip_decision(
+            "已有 Cline Kanban RVF follow-up 仍在进行；"
+            "本次 Stop hook 跳过自动 RVF dispatch，避免在上一轮 handoff 完成前创建新 RVF。",
+            ledger,
+            "kanban_followup_in_progress",
+            cwd=cwd,
+            backend="kanban-followup",
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker=marker,
+            kanban_followup_in_progress_marker_path=marker_path,
+            active_rvf_run_id=marker.get("run_id"),
+            active_rvf_run_dir=marker.get("run_dir"),
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_in_progress",
+            ),
+        )
+
+    removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    ledger.event(
+        phase="gate",
+        event="kanban_followup_in_progress_marker_consumed_incomplete",
+        status="completed",
+        reason_code=f"kanban_followup_in_progress_{status}",
+        cwd=cwd,
+        cline_kanban_task_id=task_id,
+        session_id=session_id,
+        kanban_followup_in_progress_marker=marker,
+        consumed_kanban_followup_in_progress_marker_paths=removed,
+    )
+    return None
+
+
 def current_kanban_workspace_path(event: dict[str, Any]) -> str | None:
     return event_or_env_text(
         event,
@@ -2409,6 +2637,13 @@ def freeze_cline_kanban_dispatch_artifacts(
     scope_path = ledger.artifact("startup-scope-of-work.md", scope_text)
     if not scope_path:
         raise RuntimeError("failed to write Cline Kanban startup scope artifact")
+    # 父会话对话 context（fail-open；缺失/关闭不阻塞 dispatch）。child 通过
+    # task prompt 的 RVF_PARENT_CONVERSATION_CONTEXT 标记从 run artifacts 读取。
+    freeze_parent_conversation_context(
+        parent_thread_path=parent_thread_path,
+        ledger=ledger,
+        cwd=cwd,
+    )
     command = [
         sys.executable,
         str(DEFAULT_PREPARE_REVIEW_RUN),
@@ -2566,6 +2801,20 @@ def cline_kanban_task_prompt(
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
     handoff_helper = DEFAULT_HANDOFF_HELPER
     original_prompt = Path(prompt_path).read_text(encoding="utf-8")
+    # 父会话对话 context artifact 可能在 freeze 期写入（fail-open，可能缺失）。
+    # 仅当文件确实存在时，才在 prompt 里加 RVF_PARENT_CONVERSATION_CONTEXT 标记与引用，
+    # 用 $RVF_ARTIFACTS_DIR 相对形式与其它 artifact 引用保持一致。
+    parent_context_path = ledger.artifact_path(PARENT_CONTEXT_ARTIFACT_NAME)
+    parent_context_ref = (
+        f"$RVF_ARTIFACTS_DIR/{PARENT_CONTEXT_ARTIFACT_NAME}"
+        if parent_context_path.exists()
+        else None
+    )
+    parent_context_marker_line = (
+        f"{PARENT_CONTEXT_PROMPT_KEY}: {parent_context_ref}\n"
+        if parent_context_ref is not None
+        else ""
+    )
     if worktree_mode == "inplace":
         worktree_instructions = (
             "你运行在 Cline Kanban task 的 inplace 模式中。执行 repo 是当前父 worktree；"
@@ -2617,6 +2866,7 @@ def cline_kanban_task_prompt(
         f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
         f"RVF_PARENT_TRANSCRIPT_PATH: {transcript}\n"
         f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
+        f"{parent_context_marker_line}"
         "RVF_REVIEW_ENV: $RVF_ARTIFACTS_DIR/review-env.sh\n"
         "RVF_REVIEW_AGENT_CONTEXT: $RVF_ARTIFACTS_DIR/review-agent-context.md\n"
         "RVF_ORIGIN_METADATA: $RVF_ARTIFACTS_DIR/origin.json\n"
@@ -2630,7 +2880,7 @@ def cline_kanban_task_prompt(
         f"- transcript: `{transcript}`\n"
         f"- origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`\n\n"
         f"{worktree_instructions}"
-        f"{cline_kanban_artifact_reference_lines()}"
+        f"{cline_kanban_artifact_reference_lines(parent_conversation_context_ref=parent_context_ref)}"
         "本 task 由 UserPromptSubmit hook 调用 shared prepare 入口生成 review-env、scope.contract、review packet 等。"
         "开始任何 review/validate/fix 前，先 `cat $RVF_PREP_FILE` 确认 `rvf_run.shared_workflow_state.status == \"completed\"` 且 "
         "`artifacts` 字段齐全；齐全则跳过手动跑 `prepare_review_run.py`，直接 source `$RVF_REVIEW_ENV` 继续既有模式。"
@@ -2948,7 +3198,10 @@ def start_cline_kanban_task(
         str(DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS),
     )
     tmux_session = os.environ.get("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", DEFAULT_CLINE_KANBAN_TMUX_SESSION)
-    agent_id = os.environ.get("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "codex").strip() or "codex"
+    # 传给 cline-kanban 的 --agent-id 会覆盖其默认 executor 选择；默认镜像父
+    # （main agent）harness 以复用 context + prompt cache，CODEX_RVF_CLINE_KANBAN_AGENT_ID
+    # 可显式钉死某个 fix harness。详见 resolve_cline_kanban_agent_id 注释。
+    agent_id = resolve_cline_kanban_agent_id(parent_thread_path)
     auto_review_enabled = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"))
     auto_review_mode = os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit").strip() or "commit"
     start_in_plan_mode = is_truthy(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"))
@@ -5218,6 +5471,134 @@ def launch_backend(
             dispatch_prep,
             target_flow="flow-1-self-rising",
         )
+
+        in_progress_marker_path: str | None = None
+        try:
+            acquire_result = acquire_kanban_followup_lock(
+                task_id=task_id,
+                session_id=source_session_id,
+                run_id=ledger.run_id,
+                run_dir=str(ledger.run_dir),
+                repo=decision.repo,
+                cwd=cwd,
+                attempt_id=attempt_id,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_in_progress_acquire_failed",
+                status="skipped",
+                reason_code="kanban_followup_lock_unavailable",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                error=error,
+                **source_origin_fields,
+                **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                    completion_gate="kanban_followup_lock_unavailable",
+                ),
+            )
+            return ledger.hook_payload(
+                status="skipped",
+                reason_code="kanban_followup_lock_unavailable",
+                message=(
+                    "Cline Kanban follow-up RVF dispatch skipped because the "
+                    f"in-progress lock could not be acquired: {error}"
+                ),
+                repo=decision.repo,
+                cwd=cwd,
+                backend=decision.backend,
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                error=error,
+                **source_origin_fields,
+                **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                    completion_gate="kanban_followup_lock_unavailable",
+                ),
+            )
+        in_progress_marker_path = str(acquire_result.path) if acquire_result.path is not None else None
+        if not acquire_result.acquired:
+            marker = acquire_result.marker
+            marker_path = str(acquire_result.path) if acquire_result.path is not None else None
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_in_progress_blocked",
+                status="skipped",
+                reason_code="kanban_followup_in_progress",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                active_rvf_run_id=marker.get("run_id") if isinstance(marker, dict) else None,
+                active_rvf_run_dir=marker.get("run_dir") if isinstance(marker, dict) else None,
+                **source_origin_fields,
+                **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                    completion_gate="kanban_followup_in_progress",
+                ),
+            )
+            return ledger.hook_payload(
+                status="skipped",
+                reason_code="kanban_followup_in_progress",
+                message=(
+                    "Cline Kanban RVF follow-up is already in progress for this "
+                    "task/session; skipped creating another follow-up user message."
+                ),
+                repo=decision.repo,
+                cwd=cwd,
+                backend=decision.backend,
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                active_rvf_run_id=marker.get("run_id") if isinstance(marker, dict) else None,
+                active_rvf_run_dir=marker.get("run_dir") if isinstance(marker, dict) else None,
+                **source_origin_fields,
+                **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                    completion_gate="kanban_followup_in_progress",
+                ),
+            )
+        if in_progress_marker_path is not None:
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_in_progress_acquired",
+                status="armed",
+                reason_code="kanban_followup_in_progress_acquired",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                kanban_followup_in_progress_marker_path=in_progress_marker_path,
+                **source_origin_fields,
+                **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                ),
+            )
         ledger.event(
             phase="fork",
             event="kanban_followup_started",
@@ -5249,6 +5630,7 @@ def launch_backend(
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
+            removed_lock_paths = clear_kanban_followup_lock(task_id=task_id, session_id=source_session_id)
             ledger.event(
                 phase="fork",
                 event="kanban_followup_failed",
@@ -5264,6 +5646,7 @@ def launch_backend(
                 cline_kanban_task_lookup=task_lookup,
                 **source_origin_fields,
                 **dispatch_prep_fields,
+                removed_kanban_followup_in_progress_marker_paths=removed_lock_paths,
                 error=error,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
@@ -5284,9 +5667,65 @@ def launch_backend(
                 cline_kanban_task_title=source_origin.get("kanban_task_title"),
                 cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
                 cline_kanban_task_lookup=task_lookup,
+                removed_kanban_followup_in_progress_marker_paths=removed_lock_paths,
                 error=error,
                 **source_origin_fields,
                 **dispatch_prep_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw=decision.backend,
+                ),
+            )
+
+        try:
+            marker_path = write_kanban_followup_lock(
+                task_id=task_id,
+                session_id=source_session_id,
+                run_id=ledger.run_id,
+                run_dir=str(ledger.run_dir),
+                repo=decision.repo,
+                cwd=cwd,
+                attempt_id=attempt_id,
+                message_id=message_payload.get("message_id"),
+                turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+                prompt_path=message_payload.get("prompt_path"),
+            )
+            in_progress_marker_path = str(marker_path) if marker_path is not None else None
+            if in_progress_marker_path is not None:
+                ledger.event(
+                    phase="fork",
+                    event="kanban_followup_in_progress_armed",
+                    status="armed",
+                    reason_code="kanban_followup_in_progress_armed",
+                    repo=decision.repo,
+                    cwd=cwd,
+                    mode="kanban-followup",
+                    cline_kanban_task_id=task_id,
+                    cline_kanban_attempt_id=attempt_id,
+                    cline_kanban_message_id=message_payload.get("message_id"),
+                    cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+                    kanban_followup_in_progress_marker_path=in_progress_marker_path,
+                    **source_origin_fields,
+                    **dispatch_prep_fields,
+                    **stop_hook_rvf_state_fields(
+                        phase="prepare",
+                        backend="kanban-followup",
+                        backend_raw=decision.backend,
+                    ),
+                )
+        except Exception as exc:
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_in_progress_arm_failed",
+                status="warning",
+                reason_code="kanban_followup_in_progress_arm_failed",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                cline_kanban_attempt_id=attempt_id,
+                error=f"{type(exc).__name__}: {exc}",
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
                     backend="kanban-followup",
@@ -5329,6 +5768,7 @@ def launch_backend(
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             **source_origin_fields,
             **dispatch_prep_fields,
+            kanban_followup_in_progress_marker_path=in_progress_marker_path,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -5354,6 +5794,7 @@ def launch_backend(
             cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             kanban_followup_payload=message_payload,
+            kanban_followup_in_progress_marker_path=in_progress_marker_path,
             **source_origin_fields,
             **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(
@@ -6669,7 +7110,17 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     level="warn",
                     error={"kind": type(exc).__name__, "message": str(exc)},
                 )
+            clear_kanban_followup_lock_for_event(
+                event,
+                ledger,
+                cwd=cwd,
+                handoff_path=str(handoff_path_value),
+            )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    in_progress_decision = kanban_followup_in_progress_decision(event, ledger, cwd=cwd)
+    if in_progress_decision is not None:
+        return in_progress_decision
 
     quiet_task_id = current_kanban_task_id(event)
     quiet_session_id = session_hook_id_from_event(event)

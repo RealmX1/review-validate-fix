@@ -40,11 +40,11 @@ plugin 只装 Codex）。
 
 ## 兼容性说明
 
-1. **rollout 文件名沿用 `rollout.codex.jsonl`** —— 即便实际是 Claude
-   transcript。这是临时折衷：`subagent_capture.py` 等下游 reader 假定该
-   文件名；schema host 通过 `manifest.host` 字段表达。**TODO**（plan 已记录）：
-   未来单独 cleanup commit 改名为 `rollout.host.jsonl` 或 `rollout.jsonl`，
-   并同步所有 reader / 测试 fixture / 文档引用。
+1. **rollout 文件名已 host-中性化（2026-05-19 cleanup commit 完成）** ——
+   产物文件统一为 `rollout.jsonl` / `rollout.manifest.json`（原
+   `rollout.codex.jsonl` / `rollout.codex.manifest.json`）；Codex / Claude
+   共用同名，host 区分仍由 `manifest.host` 字段表达。`subagent_capture.py`
+   等下游 reader 与全部测试 fixture / 文档引用已同步。
 2. **`HOST_KIND` 兼容别名**：保留 `HOST_KIND = HOST_CODEX` 直到所有 import
    点改完。新代码请使用 `HOST_CODEX` / `HOST_CLAUDE`。
 3. **Claude `host_originator` 始终为 None** —— Claude transcript 没有 Codex
@@ -136,7 +136,9 @@ UserPromptSubmit hook**。Claude 与 Codex 是两套不同 hook 投递机制：C
   capture 退回原行为（parent transcript），无回归但 child 轨迹缺失。
 - live flow-2 联调（真跑 dirty repo → 父 Stop hook → Cline Kanban task →
   task agent RVF 全链路验证 child 轨迹非空）仍未做，列为下一队列项。
-- rollout 文件名 `rollout.codex.jsonl` 改名 cleanup 仍未做（独立 commit）。
+- ~~rollout 文件名改名 cleanup~~ 已完成（2026-05-19 独立 commit：
+  `rollout.codex.jsonl` → `rollout.jsonl`，`rollout.codex.manifest.json`
+  → `rollout.manifest.json`）。
 - **Codex/Claude UserPromptSubmit timeout 不对称（既有，非本变更引入）**：
   Codex 侧 `install_to_codex.py::configure_user_prompt_submit_hook` 写入
   `~/.codex/hooks.json` 的 `"timeout": 5`，而 Claude 侧本变更给 90s（shim
@@ -173,3 +175,23 @@ python3 scripts/check_plugin_contracts.py
 git diff --check
 ```
 未 commit，等用户 `/review-validate-fix` 自审后再决定提交。
+
+## Phase 4 后续 · Codex plugin-loader 双装修复（2026-05-22）
+
+Phase 4 Option C 把 UserPromptSubmit 加入 plugin-bundled `plugins/review-validate-fix/hooks/hooks.json` 时，**未预料 Codex plugin loader 也会加载该文件并注册 hook handler**。证据来自 `~/.codex/config.toml` 的 `[hooks.state]` 表：
+
+```
+[hooks.state."review-validate-fix@local-codex-plugins:hooks/hooks.json:user_prompt_submit:0:0"]
+[hooks.state."review-validate-fix@local-codex-plugins:hooks/hooks.json:stop:0:0"]
+```
+
+与 `install_to_codex.py` 写入 `~/.codex/hooks.json` 的对应 RVF entry 平行执行——**同一次 Codex UserPromptSubmit / Stop 事件触发两次 RVF**。UPS 端表现为同一 prompt 产出两份 prep file（一份默认 skill state log_root、一份 Claude shim 注入的 `~/.claude/rvf` log_root）；Stop 端表现为 auto-trigger 时同时启动两个 Cline Kanban task（同一 parent session、同秒内）。
+
+修法：给两个 plugin-bundled shim 顶部都加 `_is_codex_invocation(event)` 守卫，按事件里 transcript/conversation/session/session_file 路径键是否含 `/.codex/sessions/` 判定；命中即静默 `return 0`，让 Codex 端 `~/.codex/hooks.json` 那条直调核心的 entry 独自处理。保守策略：未匹配时按 Claude 路径跑（旧 Claude Code 行为不变）。
+
+受影响 commit：
+
+- `6c6ff47` — UPS：`plugins/review-validate-fix/hooks/user_prompt_submit.py` 加守卫 + `tests/test_review_support_scripts.py` 两条新测试
+- 本 commit — Stop：`plugins/review-validate-fix/hooks/stop.py` 加同款守卫 + `tests/test_review_support_scripts.py` 两条新测试
+
+副带修正：上述 `## 已知限制 / 后续`（line 132 起）中"Codex/Claude UserPromptSubmit timeout 不对称"那条仍有效；本次修复与 timeout 无关。

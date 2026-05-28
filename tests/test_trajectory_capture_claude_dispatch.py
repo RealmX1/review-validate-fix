@@ -95,8 +95,8 @@ def test_capture_run_claude_same_session_slice(tmp_path: Path) -> None:
     assert summary["host"] == capture.HOST_CLAUDE
     assert summary["pre_rvf_source_kind"] == "same-session-slice"
     assert summary["post_rvf_source_kind"] == "same-session-slice"
-    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.codex.jsonl"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert pre.exists() and post.exists()
     assert pre.read_bytes() + post.read_bytes() == transcript.read_bytes()
     pre_manifest = json.loads(
@@ -108,7 +108,7 @@ def test_capture_run_claude_same_session_slice(tmp_path: Path) -> None:
             / "artifacts"
             / "trajectory"
             / "rvf"
-            / "rollout.codex.manifest.json"
+            / "rollout.manifest.json"
         ).read_text()
     )
     assert pre_manifest["host"] == capture.HOST_CLAUDE
@@ -144,7 +144,7 @@ def test_capture_run_claude_same_session_full_when_no_marker(tmp_path: Path) -> 
     assert summary["host"] == capture.HOST_CLAUDE
     assert summary["pre_rvf_source_kind"] == "none"
     assert summary["post_rvf_source_kind"] == "same-session-full"
-    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.codex.jsonl"
+    post = run_dir / "artifacts" / "trajectory" / "rvf" / "rollout.jsonl"
     assert post.read_bytes() == transcript.read_bytes()
     distilled = run_dir / "artifacts" / "trajectory" / "rvf" / "trajectory.jsonl"
     lines = [
@@ -203,7 +203,7 @@ def test_capture_run_forked_mixed_host_codex_parent_claude_child(tmp_path: Path)
             / "artifacts"
             / "trajectory"
             / "rvf"
-            / "rollout.codex.manifest.json"
+            / "rollout.manifest.json"
         ).read_text()
     )
     assert pre_manifest["host"] == capture.HOST_CODEX
@@ -278,7 +278,7 @@ def test_capture_run_kanban_dispatch_prefers_child_from_origin(tmp_path: Path) -
             / "artifacts"
             / "trajectory"
             / "rvf"
-            / "rollout.codex.manifest.json"
+            / "rollout.manifest.json"
         ).read_text()
     )
     assert pre_manifest["host"] == capture.HOST_CODEX

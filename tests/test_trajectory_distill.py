@@ -66,7 +66,7 @@ def test_distill_function_call_apply_patch_records_artifact_refs(tmp_path: Path)
     )
     distilled, index = distill.distill_codex_jsonl(
         rollout_path=rollout,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     kinds = [item["kind"] for item in distilled]
@@ -122,7 +122,7 @@ def test_distill_custom_tool_call_apply_patch_records_artifact_refs(tmp_path: Pa
     )
     distilled, index = distill.distill_codex_jsonl(
         rollout_path=rollout,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     patch_call = next(item for item in distilled if item["kind"] == "tool_call")
@@ -160,7 +160,7 @@ def test_distill_exec_command_summary_includes_cmd(tmp_path: Path) -> None:
     )
     distilled, _ = distill.distill_codex_jsonl(
         rollout_path=rollout,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     assert distilled[0]["kind"] == "tool_call"
@@ -186,7 +186,7 @@ def test_distill_reasoning_redacts_encrypted_blob(tmp_path: Path) -> None:
     )
     distilled, _ = distill.distill_codex_jsonl(
         rollout_path=rollout,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     assert distilled[0]["kind"] == "reasoning"

@@ -255,7 +255,7 @@ def test_distill_claude_jsonl_basic_kinds(tmp_path: Path) -> None:
     )
     distilled, index = distill.distill_claude_jsonl(
         rollout_path=transcript,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     kinds = [r["kind"] for r in distilled]
@@ -281,7 +281,7 @@ def test_distill_claude_jsonl_basic_kinds(tmp_path: Path) -> None:
     assert {r["call_id"] for r in results} == {"toolu_1", "toolu_2"}
 
     assert index["record_count"] == len(distilled)
-    assert index["rollout_file"] == "rollout.codex.jsonl"
+    assert index["rollout_file"] == "rollout.jsonl"
     assert index["kind_counts"]["tool_call"] == 2
 
 
@@ -312,7 +312,7 @@ def test_distill_claude_bash_apply_patch_extracts_artifact_refs(tmp_path: Path) 
     )
     distilled, _ = distill.distill_claude_jsonl(
         rollout_path=transcript,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     bash_calls = [r for r in distilled if r.get("tool") == "Bash"]
@@ -336,7 +336,7 @@ def test_distill_claude_jsonl_skips_unknown_record_types(tmp_path: Path) -> None
     )
     distilled, index = distill.distill_claude_jsonl(
         rollout_path=transcript,
-        rollout_filename="rollout.codex.jsonl",
+        rollout_filename="rollout.jsonl",
         repo=None,
     )
     # 应当只有 user message 一条

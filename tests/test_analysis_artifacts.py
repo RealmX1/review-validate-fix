@@ -70,7 +70,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "source": "codex",
             "kind": "phase_marker",
             "marker": "session_meta",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 1, "byte_range": [0, 10]},
+            "raw_ref": {"file": "rollout.jsonl", "line": 1, "byte_range": [0, 10]},
             "summary": "session_meta",
             "artifact_refs": [],
         },
@@ -80,7 +80,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "source": "codex",
             "kind": "message",
             "role": "user",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 2},
+            "raw_ref": {"file": "rollout.jsonl", "line": 2},
             "summary": "user msg",
             "artifact_refs": [],
         },
@@ -91,7 +91,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "kind": "tool_call",
             "tool": "exec_command",
             "call_id": "exec-1",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 3},
+            "raw_ref": {"file": "rollout.jsonl", "line": 3},
             "summary": "ls",
             "artifact_refs": [],
         },
@@ -102,7 +102,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "kind": "tool_call",
             "tool": "apply_patch",
             "call_id": "patch-A",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 4},
+            "raw_ref": {"file": "rollout.jsonl", "line": 4},
             "summary": "apply_patch",
             "artifact_refs": [
                 {"path": "src/foo.py", "lines": [1, 8], "op": "edit"},
@@ -115,7 +115,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "kind": "tool_call",
             "tool": "apply_patch",
             "call_id": "patch-B",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 5},
+            "raw_ref": {"file": "rollout.jsonl", "line": 5},
             "summary": "apply_patch",
             "artifact_refs": [
                 {"path": "src/bar.py", "lines": [10, 12], "op": "create"},
@@ -129,7 +129,7 @@ def _trajectory_records() -> list[dict[str, Any]]:
             "kind": "tool_call",
             "tool": "apply_patch",
             "call_id": "patch-empty",
-            "raw_ref": {"file": "rollout.codex.jsonl", "line": 6},
+            "raw_ref": {"file": "rollout.jsonl", "line": 6},
             "summary": "apply_patch (no refs)",
             "artifact_refs": [],
         },
@@ -158,7 +158,7 @@ def _build_run(tmp_path: Path, *, with_summary: bool = True) -> Path:
         rvf_dir / "trajectory.index.json",
         {
             "schema_version": 1,
-            "rollout_file": "rollout.codex.jsonl",
+            "rollout_file": "rollout.jsonl",
             "record_count": 6,
             "kind_counts": {
                 "phase_marker": 1,
@@ -167,7 +167,7 @@ def _build_run(tmp_path: Path, *, with_summary: bool = True) -> Path:
             },
         },
     )
-    (rvf_dir / "rollout.codex.jsonl").write_text("placeholder\n", encoding="utf-8")
+    (rvf_dir / "rollout.jsonl").write_text("placeholder\n", encoding="utf-8")
 
     # pre-rvf manifest
     pre_dir = artifacts / "trajectory" / "pre-rvf"
@@ -425,7 +425,7 @@ def test_collect_patches_merges_subagent_patches_and_tags_source(tmp_path: Path)
                 "kind": "tool_call",
                 "tool": "apply_patch",
                 "call_id": "subagent_patch_1",
-                "raw_ref": {"file": "rollout.codex.jsonl", "line": 12},
+                "raw_ref": {"file": "rollout.jsonl", "line": 12},
                 "summary": "fix patch",
                 "artifact_refs": [
                     {"path": "src/foo.py", "lines": [5, 5], "op": "edit"},
