@@ -1,10 +1,15 @@
-"""Codex host 子代理发现 adapter。
+"""Codex host 子代理 adapter（观测侧发现 + 调用侧 argv 构造）。
 
-Codex 主会话通过内置工具 ``spawn_agent`` 派生子代理（reviewer / validate-fix
-等），每个子代理拥有独立 session_id 和 ``~/.codex/sessions/.../rollout-*-<id>.jsonl``。
-本模块封装「如何在 Codex 主 rollout 里发现 spawn、如何在 Codex sessions 目录里
-定位子代理 rollout」这两件 host 耦合的事；通用的 copy/distill/manifest 骨架在
-``subagent_capture`` facade，host 中性。
+**观测侧**：Codex 主会话通过内置工具 ``spawn_agent`` 派生子代理（reviewer /
+validate-fix 等），每个子代理拥有独立 session_id 和
+``~/.codex/sessions/.../rollout-*-<id>.jsonl``。本模块封装「如何在 Codex 主
+rollout 里发现 spawn、如何在 Codex sessions 目录里定位子代理 rollout」这两件
+host 耦合的事；通用的 copy/distill/manifest 骨架在 ``subagent_capture`` facade，
+host 中性。
+
+**调用侧**：``build_analyze_command`` 给出 Codex headless analyze 调用的 argv
+形态（``codex … exec -``）。按 host 选哪个 adapter 的分派留在 skill facade
+（``rvf_analyze_thread.build_analyze_command``）。
 """
 
 from __future__ import annotations
@@ -15,7 +20,30 @@ from typing import Any
 
 import _rvf_pyroot  # noqa: F401  — 确保 pyroot 在 sys.path 上，供 core.* import
 
-from core.subagents.models import SpawnRecord, iter_jsonl_dicts  # noqa: E402
+from core.subagents.models import InvokeCommand, SpawnRecord, iter_jsonl_dicts  # noqa: E402
+
+
+def build_analyze_command(*, codex_bin: str) -> InvokeCommand:
+    """Codex headless analyze 调用向量：``codex --ask-for-approval never
+    --sandbox workspace-write exec -``，prompt 走 stdin。
+
+    ``codex_bin`` 由调用方（skill facade）解析后传入，使本 adapter 不耦合 RVF 的
+    ``CODEX_RVF_CODEX_BIN`` env 约定。``--sandbox workspace-write`` 允许 analyze
+    agent Edit ``summary.md`` / ``causality.json``；末元素 ``-`` 表示从 stdin 读
+    prompt。
+    """
+    return InvokeCommand(
+        argv=[
+            codex_bin,
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            "workspace-write",
+            "exec",
+            "-",
+        ],
+        uses_stdin=True,
+    )
 
 
 def codex_sessions_root() -> Path:

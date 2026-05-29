@@ -34,8 +34,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import safe_token
-from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+# 自举 SCRIPT_DIR 上 sys.path（与 subagent_capture 同款），保证下列 sibling 与
+# _rvf_pyroot import 在任何加载上下文（脚本运行 / 被 advisory import / 测试经
+# canonical loader spec 加载）下都解析得到。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 adapters.* import
+
+from rvf_logging import safe_token  # noqa: E402
+from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
+
+from adapters.codex.subagent import (  # noqa: E402
+    build_analyze_command as _codex_build_analyze_command,
+)
+from adapters.claude_code.subagent import (  # noqa: E402
+    build_analyze_command as _claude_build_analyze_command,
+)
 
 
 STATUS_SCHEMA_VERSION = 1
@@ -116,33 +130,21 @@ def select_host(event: dict[str, Any]) -> str:
 def build_analyze_command(host: str) -> tuple[list[str], bool]:
     """返回 ``(argv, uses_stdin)``：headless analyze agent 的调用向量。
 
-    prompt 一律走 stdin（``cat <prompt> | <argv>``），因此 ``uses_stdin`` 当前两
-    个 host 都为 True。关键约束：**绝不**对 claude 追加
-    ``--disable-slash-commands``——analyze agent 需要解析 ``$rvf-analyze`` slash
-    command 并 Edit ``analysis/summary.md`` / ``causality.json`` 两个文件。
+    本函数是**调用侧 host 分派 facade**：按 ``host`` 选 ``adapters/<host>/
+    subagent.py`` 的 ``build_analyze_command`` 构造各自的 argv，与观测侧
+    ``subagent_capture`` 的分派形态对称。返回 ``(argv, uses_stdin)`` tuple 形态保持
+    不变——``launch_detached_analyze_thread`` 等下游无需改动。
+
+    prompt 一律走 stdin（``cat <prompt> | <argv>``），故 ``uses_stdin`` 两 host 都为
+    True。未知 host 兜底到 Codex 向量，与 ``select_host`` 的兜底约定一致。
+    bin 由本层解析（``claude_bin()`` / ``codex_bin()``）后传入 adapter，使 adapter
+    不耦合 RVF 的 ``CODEX_RVF_*_BIN`` env 约定。
     """
     if host == HOST_CLAUDE:
-        argv = [
-            claude_bin(),
-            "-p",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "acceptEdits",
-        ]
-        return argv, True
-    # HOST_CODEX（含未知 host 的兜底）
-    argv = [
-        codex_bin(),
-        "--ask-for-approval",
-        "never",
-        "--sandbox",
-        "workspace-write",
-        "exec",
-        "-",
-    ]
-    return argv, True
+        command = _claude_build_analyze_command(claude_bin=claude_bin())
+    else:  # HOST_CODEX（含未知 host 的兜底）
+        command = _codex_build_analyze_command(codex_bin=codex_bin())
+    return command.argv, command.uses_stdin
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

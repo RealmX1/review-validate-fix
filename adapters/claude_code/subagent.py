@@ -1,7 +1,7 @@
-"""Claude Code host 子代理发现 adapter。
+"""Claude Code host 子代理 adapter（观测侧发现 + 调用侧 argv 构造）。
 
-Claude Code 主会话通过 ``Task``/``Agent`` 工具派生子代理；每个子代理的 transcript
-被持久化为父会话同名目录下的独立文件：
+**观测侧**：Claude Code 主会话通过 ``Task``/``Agent`` 工具派生子代理；每个子代理
+的 transcript 被持久化为父会话同名目录下的独立文件：
 
     ~/.claude/projects/<proj>/<session-uuid>.jsonl          # 父会话 transcript
     ~/.claude/projects/<proj>/<session-uuid>/subagents/agent-<id>.jsonl  # 子代理
@@ -15,6 +15,10 @@ host 耦合的事；通用 copy/distill/manifest 骨架在 ``subagent_capture`` 
 独立落盘文件——因此发现入口是**原始父 transcript 路径**（``original_transcript``）
 而非捕获到 run 目录的副本；缺失时优雅返回空（例如 forked-target 场景拿不到原始
 会话目录）。
+
+**调用侧**：``build_analyze_command`` 给出 Claude headless analyze 调用的 argv
+形态（``claude -p --output-format stream-json …``）。按 host 选哪个 adapter 的
+分派留在 skill facade（``rvf_analyze_thread.build_analyze_command``）。
 """
 
 from __future__ import annotations
@@ -24,7 +28,31 @@ from typing import Any
 
 import _rvf_pyroot  # noqa: F401  — 确保 pyroot 在 sys.path 上，供 core.* import
 
-from core.subagents.models import SpawnRecord, iter_jsonl_dicts  # noqa: E402
+from core.subagents.models import InvokeCommand, SpawnRecord, iter_jsonl_dicts  # noqa: E402
+
+
+def build_analyze_command(*, claude_bin: str) -> InvokeCommand:
+    """Claude headless analyze 调用向量：``claude -p --output-format stream-json
+    --verbose --permission-mode acceptEdits``，prompt 走 stdin。
+
+    ``claude_bin`` 由调用方（skill facade）解析后传入，使本 adapter 不耦合 RVF 的
+    ``CODEX_RVF_CLAUDE_BIN`` env 约定。**关键约束**：绝不追加
+    ``--disable-slash-commands``——analyze agent 需解析 ``$rvf-analyze`` slash
+    command 并 Edit ``summary.md`` / ``causality.json``；``acceptEdits`` 放行这些
+    写入。
+    """
+    return InvokeCommand(
+        argv=[
+            claude_bin,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "acceptEdits",
+        ],
+        uses_stdin=True,
+    )
 
 
 def read_claude_originator(rollout_path: Path) -> str | None:  # noqa: ARG001

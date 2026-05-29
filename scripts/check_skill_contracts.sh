@@ -912,6 +912,15 @@ require_repo_literal "tests/test_claude_subagent_capture.py" 'test_capture_all_s
 require_literal "scripts/analysis_artifacts.py" 'def _enrich_candidate_patch_call_ids'
 require_repo_literal "tests/test_analysis_artifacts.py" 'test_enrich_candidate_patch_call_ids_links_event_path_to_subagent_call_id'
 
+# S2-invoke：headless 子代理调用向量 host 分派下沉 adapter（observe-side 对称）。
+require_repo_file "tests/test_invoke_subagent.py"
+require_repo_literal "core/subagents/models.py" 'class InvokeCommand'
+require_repo_literal "adapters/codex/subagent.py" 'def build_analyze_command'
+require_repo_literal "adapters/claude_code/subagent.py" 'def build_analyze_command'
+require_literal "scripts/rvf_analyze_thread.py" '_codex_build_analyze_command'
+require_literal "scripts/rvf_analyze_thread.py" '_claude_build_analyze_command'
+require_repo_literal "tests/test_invoke_subagent.py" 'test_facade_dispatches_by_host_and_preserves_tuple_shape'
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'
