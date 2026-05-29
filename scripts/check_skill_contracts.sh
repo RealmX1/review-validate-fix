@@ -891,6 +891,27 @@ forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scri
 require_repo_literal "tests/test_analysis_artifacts.py" 'test_write_op_count_normalizes_claude_edit_write_multiedit'
 require_repo_literal "tests/test_analysis_artifacts.py" 'test_same_session_full_windows_to_rvf_subinterval'
 
+# S2 / handoff A2：子代理捕获 host 归一（Codex glob → adapter；Claude Task 子代理发现）。
+require_repo_file "core/subagents/models.py"
+require_repo_file "adapters/codex/subagent.py"
+require_repo_file "adapters/claude_code/subagent.py"
+require_repo_file "tests/test_claude_subagent_capture.py"
+require_repo_literal "core/subagents/models.py" 'class SpawnRecord'
+require_repo_literal "adapters/codex/subagent.py" 'def codex_sessions_root'
+require_repo_literal "adapters/codex/subagent.py" 'def resolve_subagents'
+require_repo_literal "adapters/claude_code/subagent.py" 'def resolve_subagents'
+require_repo_literal "adapters/claude_code/subagent.py" 'agent-*.jsonl'
+require_literal "scripts/subagent_capture.py" 'host_kind'
+require_literal "scripts/subagent_capture.py" 'original_transcript'
+require_literal "scripts/trajectory_capture.py" 'original_transcript=current_transcript'
+# A2 反模式护栏：Codex sessions 布局已移入 adapter，facade 不得再写死该路径。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/subagent_capture.py" '.codex/sessions'
+require_repo_literal "tests/test_claude_subagent_capture.py" 'test_capture_all_subagents_claude_discovers_and_distills'
+
+# S2 / handoff B：candidate_patch_call_ids 由子代理 write-op call_id 只读补全。
+require_literal "scripts/analysis_artifacts.py" 'def _enrich_candidate_patch_call_ids'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_enrich_candidate_patch_call_ids_links_event_path_to_subagent_call_id'
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'

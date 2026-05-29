@@ -848,6 +848,61 @@ def _collect_patches(
     return out
 
 
+def _enrich_candidate_patch_call_ids(
+    issues: list[dict[str, Any]],
+    patch_events: list[dict[str, Any]],
+    patches: list[dict[str, Any]],
+) -> None:
+    """把每个 issue 的 ``candidate_patch_call_ids`` 由轨迹 write-op call_id 补全（handoff B）。
+
+    ledger 的 ``rvf_fix_patch_events`` 只记 ``{path, op}``、``call_id`` 恒 null
+    （fix attempt stop 时子代理 trajectory 尚未蒸馏，拿不到 call_id），故
+    ``rvf_causality_for_run`` 组装出的 per-issue ``candidate_patch_call_ids`` 为空。
+    但到 analyze 阶段，子代理 trajectory 已被捕获蒸馏、其 write-op call_id 已收进
+    ``patches[]``（S1.5/A2 让 patch 携带真实 ``call_id`` + ``artifact_refs``）。
+
+    本函数纯只读关联：按 ``path`` 把 patch_event 接到 ``patches[]`` 里触过同一
+    路径的 write-op call_id，写回 issue 的 ``candidate_patch_call_ids``。不改 DB、
+    不改 ``rvf_fix_attempt``。是 best-effort 路径归因——同一路径被多个 write-op
+    触及时收全部候选，narrative LLM 再细分。
+    """
+    if not issues or not patch_events or not patches:
+        return
+    # path -> 触过该路径的 write-op call_id（保序去重）。
+    path_to_calls: dict[str, list[str]] = {}
+    for patch in patches:
+        call_id = patch.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        for ref in patch.get("artifact_refs") or []:
+            ref_path = ref.get("path") if isinstance(ref, dict) else None
+            if not isinstance(ref_path, str) or not ref_path:
+                continue
+            calls = path_to_calls.setdefault(ref_path, [])
+            if call_id not in calls:
+                calls.append(call_id)
+    if not path_to_calls:
+        return
+    # issue_id -> 其 fix patch_events 触过的路径集合。
+    paths_by_issue: dict[str, list[str]] = {}
+    for event in patch_events:
+        issue_id = event.get("issue_id")
+        path = event.get("path")
+        if isinstance(issue_id, str) and isinstance(path, str) and path:
+            paths_by_issue.setdefault(issue_id, []).append(path)
+    for issue in issues:
+        issue_id = issue.get("issue_id")
+        if not isinstance(issue_id, str):
+            continue
+        existing = issue.get("candidate_patch_call_ids")
+        candidates = list(existing) if isinstance(existing, list) else []
+        for path in paths_by_issue.get(issue_id, []):
+            for call_id in path_to_calls.get(path, []):
+                if call_id not in candidates:
+                    candidates.append(call_id)
+        issue["candidate_patch_call_ids"] = candidates
+
+
 def scaffold_causality_json(
     inputs: AnalysisInputs,
     stats: ScaffoldStats,
@@ -876,6 +931,12 @@ def scaffold_causality_json(
         for issue in issues:
             issue.setdefault("candidate_patch_call_ids", [])
 
+    patch_events = ledger.get("patch_events", []) if isinstance(ledger, dict) else []
+    patches = _collect_patches(inputs, window_start=stats.trajectory_window_start)
+    # handoff B：用已捕获子代理 trajectory 的 write-op call_id 补全 per-issue
+    # candidate_patch_call_ids（DB 侧 call_id 恒 null，故在此只读关联）。
+    _enrich_candidate_patch_call_ids(issues, patch_events, patches)
+
     payload = {
         "schema_version": ANALYSIS_SCHEMA_VERSION,
         "run_id": stats.run_id,
@@ -883,8 +944,8 @@ def scaffold_causality_json(
         "diagnostics": diagnostics,
         "issues": issues,
         "fix_attempts": ledger.get("fix_attempts", []) if isinstance(ledger, dict) else [],
-        "patch_events": ledger.get("patch_events", []) if isinstance(ledger, dict) else [],
-        "patches": _collect_patches(inputs, window_start=stats.trajectory_window_start),
+        "patch_events": patch_events,
+        "patches": patches,
     }
     _atomic_write_json(out_path, payload)
     return out_path

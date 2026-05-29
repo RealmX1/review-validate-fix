@@ -952,3 +952,69 @@ def test_window_start_falls_back_to_run_id_timestamp(tmp_path: Path) -> None:
     stats = mod.gather_stats(inputs)
     assert stats.trajectory_window_start == "2026-05-28T12:00:00Z"
     assert stats.trajectory_record_count == 3
+
+
+# --------------------------------------------------------------------------- #
+# handoff B：candidate_patch_call_ids 由子代理 write-op call_id 只读补全
+# --------------------------------------------------------------------------- #
+
+
+def test_enrich_candidate_patch_call_ids_links_event_path_to_subagent_call_id() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [
+        {"issue_id": "issue-1", "candidate_patch_call_ids": []},
+        {"issue_id": "issue-2", "candidate_patch_call_ids": []},
+    ]
+    # ledger patch_events 只带 path/op、call_id 恒 null（DB 侧现状）。
+    patch_events = [
+        {"issue_id": "issue-1", "path": "src/foo.py", "op": "modified", "call_id": None},
+        {"issue_id": "issue-2", "path": "src/bar.py", "op": "modified", "call_id": None},
+    ]
+    # patches[] 来自已捕获子代理 trajectory，携带真实 call_id + artifact_refs。
+    patches = [
+        {
+            "call_id": "sub_call_foo",
+            "tool": "Edit",
+            "source_agent_id": "agent-aaa",
+            "artifact_refs": [{"path": "src/foo.py", "lines": None, "op": "modified"}],
+        },
+        {
+            "call_id": "sub_call_bar",
+            "tool": "apply_patch",
+            "source_agent_id": "agent-bbb",
+            "artifact_refs": [{"path": "src/bar.py", "lines": None, "op": "modified"}],
+        },
+    ]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    by_id = {issue["issue_id"]: issue["candidate_patch_call_ids"] for issue in issues}
+    assert by_id["issue-1"] == ["sub_call_foo"]
+    assert by_id["issue-2"] == ["sub_call_bar"]
+
+
+def test_enrich_candidate_patch_call_ids_collects_multiple_and_dedups() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [{"issue_id": "issue-1", "candidate_patch_call_ids": []}]
+    patch_events = [
+        {"issue_id": "issue-1", "path": "src/foo.py", "op": "modified"},
+        {"issue_id": "issue-1", "path": "src/baz.py", "op": "added"},
+    ]
+    patches = [
+        {"call_id": "c1", "artifact_refs": [{"path": "src/foo.py"}]},
+        {"call_id": "c2", "artifact_refs": [{"path": "src/baz.py"}]},
+        # 同路径第二次 write-op：另一个 call_id 也应作为候选收入。
+        {"call_id": "c3", "artifact_refs": [{"path": "src/foo.py"}]},
+        # 重复 call_id 不应翻倍。
+        {"call_id": "c1", "artifact_refs": [{"path": "src/foo.py"}]},
+    ]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    assert issues[0]["candidate_patch_call_ids"] == ["c1", "c3", "c2"]
+
+
+def test_enrich_candidate_patch_call_ids_noop_without_matching_path() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [{"issue_id": "issue-1", "candidate_patch_call_ids": []}]
+    patch_events = [{"issue_id": "issue-1", "path": "src/foo.py", "op": "modified"}]
+    # write-op 触的是别的路径 → 不归因。
+    patches = [{"call_id": "c1", "artifact_refs": [{"path": "src/other.py"}]}]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    assert issues[0]["candidate_patch_call_ids"] == []

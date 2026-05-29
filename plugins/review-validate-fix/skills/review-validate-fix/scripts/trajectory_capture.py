@@ -819,15 +819,19 @@ def capture_run(
 
     reviewer_summaries = _capture_reviewers(artifacts_dir=artifacts_dir, out_dir=rvf_dir)
 
-    # 抓取 spawn_agent 子代理 rollouts。reviewer / validate-fix 子代理走 Codex
-    # 内置 spawn_agent，独立 session_id；它们的 apply_patch 不会出现在主 rollout，
-    # 必须从 ~/.codex/sessions/ 拉回来才能让 causality.json 看到真正的 fix patch。
+    # 抓取子代理 transcript（host 归一，S2/handoff A2）。子代理内部的 write-op
+    # 不出现在主轨迹，必须各自拉回来才能让 causality.json / subagent_patch_event_count
+    # 看到真正的 fix patch。Codex 经主 rollout 的 spawn_agent + ~/.codex/sessions glob；
+    # Claude 经原始父 transcript 同名目录 <uuid>/subagents/。host 分派在
+    # subagent_capture facade，故此处按 post_host_kind 传 host_kind 与原始 transcript。
     subagent_manifests: list[dict[str, Any]] = []
     if rvf_rollout.exists():
         subagent_manifests = capture_all_subagents(
             main_rollout_path=rvf_rollout,
             dst_root=rvf_dir / "subagents",
             repo=repo,
+            host_kind=post_host_kind,
+            original_transcript=current_transcript,
         )
 
     # Summary-level host: 取 post 轨迹的 host_kind（capture_run 入口已探测过，
