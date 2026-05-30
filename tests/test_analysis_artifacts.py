@@ -529,7 +529,8 @@ def test_scaffold_summary_md_writes_run_id_and_counts(tmp_path: Path) -> None:
     reviewer_start = text.index("## Reviewer 发现")
     rvf_block = text[rvf_start:reviewer_start]
     assert "6" in rvf_block
-    assert "apply_patch" in rvf_block.lower() or "apply_patch" in rvf_block
+    # 标签已 host-中性化（write-op 归一），不再写死 apply_patch
+    assert "write-op" in rvf_block
     # 各 kind 的计数也应出现
     assert "tool_call" in rvf_block
 
@@ -725,6 +726,7 @@ def test_scaffold_summary_md_atomic_replace(tmp_path: Path) -> None:
         workspace_changed_path_count=0,
         workspace_head_before=None,
         workspace_head_after=None,
+        trajectory_window_start=None,
     )
     mod.scaffold_summary_md(inputs, stats_b, out_path)
     second_text = out_path.read_text(encoding="utf-8")
@@ -735,3 +737,284 @@ def test_scaffold_summary_md_atomic_replace(tmp_path: Path) -> None:
     # No leftover .tmp file in the analysis directory.
     leftover = list(out_path.parent.glob(".*.tmp"))
     assert leftover == []
+
+
+# --------------------------------------------------------------------------- #
+# S1.5 / A1 — host-无关 write-op 归一计数（Claude Edit/Write/MultiEdit）
+# --------------------------------------------------------------------------- #
+
+
+def _build_claude_run(
+    tmp_path: Path,
+    *,
+    records: list[dict[str, Any]],
+    post_kind: str = "same-session-slice",
+    timestamp: str | None = None,
+    run_id: str = "rvf-20260528T120000Z-claude",
+    write_index: bool = False,
+) -> Path:
+    """最小 Claude-host run：summary + trajectory（无 index，强制扫描计数）。"""
+    run_dir = tmp_path / "claude-run"
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    summary: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "completed",
+        "finalize": {
+            "schema_version": 1,
+            "decision_kind": "handoff",
+            "started_at": "2026-05-28T12:01:00Z",
+            "completed_at": "2026-05-28T12:05:00Z",
+            "trajectory": {
+                "pre_rvf_source_kind": post_kind,
+                "post_rvf_source_kind": post_kind,
+            },
+        },
+    }
+    if timestamp is not None:
+        summary["timestamp"] = timestamp
+    _write_json(run_dir / "summary.json", summary)
+    rvf_dir = artifacts / "trajectory" / "rvf"
+    rvf_dir.mkdir(parents=True)
+    _write_jsonl(rvf_dir / "trajectory.jsonl", records)
+    if write_index:
+        # index 故意给"错"的全量计数，用来证明窗口化时被忽略。
+        _write_json(
+            rvf_dir / "trajectory.index.json",
+            {"schema_version": 1, "record_count": len(records), "kind_counts": {}},
+        )
+    return run_dir
+
+
+def _claude_write_op(ts: str, tool: str, call_id: str, path: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ts": ts,
+        "source": "claude",
+        "kind": "tool_call",
+        "tool": tool,
+        "call_id": call_id,
+        "raw_ref": {"file": "transcript.jsonl", "line": 0},
+        "summary": f"{tool} {path}",
+        "artifact_refs": [{"path": path, "lines": None, "op": "edit"}],
+    }
+
+
+def _claude_readonly(ts: str, tool: str, call_id: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "ts": ts,
+        "source": "claude",
+        "kind": "tool_call",
+        "tool": tool,
+        "call_id": call_id,
+        "raw_ref": {"file": "transcript.jsonl", "line": 0},
+        "summary": tool,
+        "artifact_refs": [],
+    }
+
+
+def test_write_op_count_normalizes_claude_edit_write_multiedit(tmp_path: Path) -> None:
+    """A1: Claude Edit/Write/MultiEdit 计入 write-op；Read/Bash(无 patch) 不计。"""
+    mod = _load("analysis_artifacts")
+    records = [
+        _claude_write_op("2026-05-28T12:02:01Z", "Edit", "toolu_edit", "src/a.py"),
+        _claude_write_op("2026-05-28T12:02:02Z", "Write", "toolu_write", "src/b.py"),
+        _claude_write_op("2026-05-28T12:02:03Z", "MultiEdit", "toolu_multi", "src/c.py"),
+        _claude_readonly("2026-05-28T12:02:04Z", "Read", "toolu_read"),
+        _claude_readonly("2026-05-28T12:02:05Z", "Bash", "toolu_bash"),
+    ]
+    run_dir = _build_claude_run(tmp_path, records=records)
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    # 3 个 Claude write-op 被计入（旧逻辑 tool=="apply_patch" 会得 0）。
+    assert stats.patch_event_count == 3
+    assert stats.trajectory_window_start is None  # same-session-slice → 不窗口化
+
+    out_path = run_dir / "artifacts" / "analysis" / "causality.json"
+    mod.scaffold_causality_json(inputs, stats, out_path)
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    patches = payload["patches"]
+    assert len(patches) == 3
+    # patches 保留真实工具名（不再硬编码 apply_patch）+ 真实 call_id（handoff B 主轨迹）。
+    by_call = {p["call_id"]: p for p in patches}
+    assert by_call["toolu_edit"]["tool"] == "Edit"
+    assert by_call["toolu_write"]["tool"] == "Write"
+    assert by_call["toolu_multi"]["tool"] == "MultiEdit"
+    assert "toolu_read" not in by_call
+    assert "toolu_bash" not in by_call
+
+
+def test_write_op_count_codex_apply_patch_unchanged(tmp_path: Path) -> None:
+    """A1 回归护栏：纯 Codex apply_patch fixture 计数与改造前一致（仍 == 2）。"""
+    mod = _load("analysis_artifacts")
+    run_dir = _build_run(tmp_path)  # Codex fixture: 2 apply_patch w/ refs + 1 empty
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    assert stats.patch_event_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# S1.5 / C — same-session-full 子区间窗口化计数
+# --------------------------------------------------------------------------- #
+
+
+def _windowed_records() -> list[dict[str, Any]]:
+    """2 条触发前（2026-05-01）+ 3 条窗口内（2026-05-28T12:30+）。"""
+    return [
+        {
+            "schema_version": 1,
+            "ts": "2026-05-01T00:00:00Z",
+            "source": "claude",
+            "kind": "message",
+            "role": "user",
+            "raw_ref": {"file": "t.jsonl", "line": 0},
+            "summary": "pre-trigger impl work",
+            "artifact_refs": [],
+        },
+        _claude_write_op("2026-05-01T00:01:00Z", "Edit", "pre_edit", "old/x.py"),
+        {
+            "schema_version": 1,
+            "ts": "2026-05-28T12:30:00Z",
+            "source": "claude",
+            "kind": "message",
+            "role": "assistant",
+            "raw_ref": {"file": "t.jsonl", "line": 0},
+            "summary": "rvf subflow",
+            "artifact_refs": [],
+        },
+        _claude_write_op("2026-05-28T12:31:00Z", "Edit", "rvf_edit_1", "fix/a.py"),
+        _claude_write_op("2026-05-28T12:32:00Z", "Write", "rvf_write_1", "fix/b.py"),
+    ]
+
+
+def test_same_session_full_windows_to_rvf_subinterval(tmp_path: Path) -> None:
+    """C: same-session-full 时只计 ts ≥ summary.timestamp 的 RVF 子区间。"""
+    mod = _load("analysis_artifacts")
+    run_dir = _build_claude_run(
+        tmp_path,
+        records=_windowed_records(),
+        post_kind="same-session-full",
+        timestamp="2026-05-28T12:00:00Z",
+        write_index=True,  # index 给全量 5，证明窗口化时被忽略
+    )
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    assert stats.trajectory_window_start == "2026-05-28T12:00:00Z"
+    # 只计窗口内 3 条（2 触发前被排除），不是 index 的 5。
+    assert stats.trajectory_record_count == 3
+    assert stats.trajectory_kind_counts == {"message": 1, "tool_call": 2}
+    # 窗口内 2 个 write-op（pre_edit 被排除）。
+    assert stats.patch_event_count == 2
+
+    out_path = run_dir / "artifacts" / "analysis" / "causality.json"
+    mod.scaffold_causality_json(inputs, stats, out_path)
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    call_ids = {p["call_id"] for p in payload["patches"]}
+    assert call_ids == {"rvf_edit_1", "rvf_write_1"}
+    assert "pre_edit" not in call_ids
+
+    # summary.md 应注明窗口化。
+    summary_md = run_dir / "artifacts" / "analysis" / "summary.md"
+    mod.scaffold_summary_md(inputs, stats, summary_md)
+    text = summary_md.read_text(encoding="utf-8")
+    assert "窗口化" in text
+    assert "2026-05-28T12:00:00Z" in text
+
+
+def test_same_session_slice_not_windowed(tmp_path: Path) -> None:
+    """控制组：非 same-session-full 不窗口化，全量计数。"""
+    mod = _load("analysis_artifacts")
+    run_dir = _build_claude_run(
+        tmp_path,
+        records=_windowed_records(),
+        post_kind="same-session-slice",
+        timestamp="2026-05-28T12:00:00Z",
+    )
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    assert stats.trajectory_window_start is None
+    assert stats.trajectory_record_count == 5  # 全量
+    assert stats.patch_event_count == 3  # 全部 write-op（含触发前 pre_edit）
+
+
+def test_window_start_falls_back_to_run_id_timestamp(tmp_path: Path) -> None:
+    """C 退化：summary 无 timestamp 时用 run_id 内嵌时间戳作窗口下界。"""
+    mod = _load("analysis_artifacts")
+    run_dir = _build_claude_run(
+        tmp_path,
+        records=_windowed_records(),
+        post_kind="same-session-full",
+        timestamp=None,
+        run_id="rvf-20260528T120000Z-claude",
+    )
+    inputs = mod.discover_inputs(run_dir)
+    stats = mod.gather_stats(inputs)
+    assert stats.trajectory_window_start == "2026-05-28T12:00:00Z"
+    assert stats.trajectory_record_count == 3
+
+
+# --------------------------------------------------------------------------- #
+# handoff B：candidate_patch_call_ids 由子代理 write-op call_id 只读补全
+# --------------------------------------------------------------------------- #
+
+
+def test_enrich_candidate_patch_call_ids_links_event_path_to_subagent_call_id() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [
+        {"issue_id": "issue-1", "candidate_patch_call_ids": []},
+        {"issue_id": "issue-2", "candidate_patch_call_ids": []},
+    ]
+    # ledger patch_events 只带 path/op、call_id 恒 null（DB 侧现状）。
+    patch_events = [
+        {"issue_id": "issue-1", "path": "src/foo.py", "op": "modified", "call_id": None},
+        {"issue_id": "issue-2", "path": "src/bar.py", "op": "modified", "call_id": None},
+    ]
+    # patches[] 来自已捕获子代理 trajectory，携带真实 call_id + artifact_refs。
+    patches = [
+        {
+            "call_id": "sub_call_foo",
+            "tool": "Edit",
+            "source_agent_id": "agent-aaa",
+            "artifact_refs": [{"path": "src/foo.py", "lines": None, "op": "modified"}],
+        },
+        {
+            "call_id": "sub_call_bar",
+            "tool": "apply_patch",
+            "source_agent_id": "agent-bbb",
+            "artifact_refs": [{"path": "src/bar.py", "lines": None, "op": "modified"}],
+        },
+    ]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    by_id = {issue["issue_id"]: issue["candidate_patch_call_ids"] for issue in issues}
+    assert by_id["issue-1"] == ["sub_call_foo"]
+    assert by_id["issue-2"] == ["sub_call_bar"]
+
+
+def test_enrich_candidate_patch_call_ids_collects_multiple_and_dedups() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [{"issue_id": "issue-1", "candidate_patch_call_ids": []}]
+    patch_events = [
+        {"issue_id": "issue-1", "path": "src/foo.py", "op": "modified"},
+        {"issue_id": "issue-1", "path": "src/baz.py", "op": "added"},
+    ]
+    patches = [
+        {"call_id": "c1", "artifact_refs": [{"path": "src/foo.py"}]},
+        {"call_id": "c2", "artifact_refs": [{"path": "src/baz.py"}]},
+        # 同路径第二次 write-op：另一个 call_id 也应作为候选收入。
+        {"call_id": "c3", "artifact_refs": [{"path": "src/foo.py"}]},
+        # 重复 call_id 不应翻倍。
+        {"call_id": "c1", "artifact_refs": [{"path": "src/foo.py"}]},
+    ]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    assert issues[0]["candidate_patch_call_ids"] == ["c1", "c3", "c2"]
+
+
+def test_enrich_candidate_patch_call_ids_noop_without_matching_path() -> None:
+    mod = _load("analysis_artifacts")
+    issues = [{"issue_id": "issue-1", "candidate_patch_call_ids": []}]
+    patch_events = [{"issue_id": "issue-1", "path": "src/foo.py", "op": "modified"}]
+    # write-op 触的是别的路径 → 不归因。
+    patches = [{"call_id": "c1", "artifact_refs": [{"path": "src/other.py"}]}]
+    mod._enrich_candidate_patch_call_ids(issues, patch_events, patches)
+    assert issues[0]["candidate_patch_call_ids"] == []

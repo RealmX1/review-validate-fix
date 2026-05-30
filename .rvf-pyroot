@@ -1,0 +1,6 @@
+# RVF import-root 哨兵。
+# 标记“同时含 core/ 与 adapters/ 的 Python import 根”。
+# _rvf_pyroot.py 自底向上寻找含本哨兵 + core/ 的目录并加入 sys.path，
+# 使 import core.* / adapters.* 在 repo、已部署 payload、kanban worktree、测试
+# 四种上下文下走同一条码路。install_to_codex.py 的 vendor_pyroot 会把本文件
+# 连同 core/ + adapters/ 一并 vendor 进每个部署 payload 根。

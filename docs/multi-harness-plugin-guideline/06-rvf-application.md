@@ -6,16 +6,18 @@
 
 ---
 
-## 当前 RVF 现状（事实描述）
+## 当前 RVF 现状（事实描述，已对齐 S0 v2–S3）
 
-- 仓库内已存在 `plugins/review-validate-fix/`，主要面向 Claude Code 侧的 plugin 形态。
-- 仓库内**已存在单份嵌套 Codex manifest**：`plugins/review-validate-fix/.codex-plugin/plugin.json`，其 `name` 字段为 `"rvf"`（**不是** `"review-validate-fix"`），且嵌套在 `plugins/review-validate-fix/` 下而非 repo-root。**尚无** repo-root 级别的 `.claude-plugin/plugin.json`。
-- Stop hook 调度链：`codex_stop_hook_router.py → codex_stop_hook_dispatcher.py → codex_stop_review_validate_fix.py`。它能同时面向 Codex 与 Claude Code 两栈进行 transcript 解析与 reviewer 触发。
-- transcript 解析按 `HOST_CODEX="codex"` / `HOST_CLAUDE="claude_code"` 两栈分流。
-- skill 文档：`review-validate-fix:review-validate-fix` 已经是 Claude Code 一等公民；Codex 侧通过 skill 文档 + Stop hook 间接绑定。
-- 仍有 backward compatibility / dev-only 改动残留（按 AGENTS.md 要求，commit 前应清理至 `dev_backward_compatibility/`）。
+> 本段早期版本描述的是「Codex manifest 叫 `rvf`、缺 marketplace.json、core↔adapter 未显式化」的旧形态。自 S0 v2 起这些已逐切片闭合；以下为**当前 as-built 形态**。权威的 as-built 矩阵见 [`docs/architecture/cross-harness.md`](../architecture/cross-harness.md)。
 
-结论：RVF 已经**局部触及 Pattern A 思路**（已有单份 Codex manifest，多 host 共存的 shape 已具雏形），但尚未完成 —— core ↔ adapter 边界未显式化，且当前的嵌套 manifest 形态与本指南推荐的"repo-root 双 manifest + 统一 plugin id"形态尚有差距。具体来说，本仓库当前同时正落在 [`04-anti-patterns.md`](04-anti-patterns.md) **反模式 ②（Plugin-id 漂移：Codex manifest 叫 `rvf`，但 Claude Code 侧设计 id 为 `review-validate-fix`）** 的样本上；对齐路径见 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**（统一 plugin id + 决定 manifest 位置）。
+- 仓库内 `plugins/review-validate-fix/` 是跨 harness plugin payload，同时被 Claude Code 与 Codex 的本机 marketplace 枚举。
+- **两份 nested plugin manifest 的 `name` 已统一为 `"review-validate-fix"`**（S0 v2 消除反模式 ②）：`plugins/review-validate-fix/.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json` 同 id；版本均 `0.1.0`。
+- **采用 (M+N) Marketplace + Nested 变体**：repo-root `.claude-plugin/marketplace.json`（S0 v2 补齐）列出 plugin，`plugins[0].source` 指向 `./plugins/review-validate-fix`；plugin manifest 留在 nested 位置。这是对指南「repo-root 双 manifest」字面形态的有意偏离，理由见下「Pattern A 的 marketplace 变体」节。
+- Stop hook 调度链：`codex_stop_hook_router.py → codex_stop_hook_dispatcher.py → codex_stop_review_validate_fix.py`，同时面向 Codex 与 Claude Code 两栈。Claude Code 侧经 `hooks/{stop.py,user_prompt_submit.py}` 薄 shim 转发到该 core（路径 C，trigger-only）；两入口共享单一 host-ownership 契约 `hooks/_claude_hook_entry.py`（S3 守卫单源化）。
+- **core ↔ adapter 边界已显式化**：transcript 解析（`core/transcript/` + `adapters/{codex,claude_code}/transcript.py`，S1）、write-op 计数与子区间窗口（S1.5）、子代理捕获与调用向量（`core/subagents/` + 各 adapter，S2）均 host-agnostic，不消费 host 工具名、不硬编码 host 布局。`HOST_CODEX="codex"` / `HOST_CLAUDE="claude_code"` 仍是 adapter 分派常量。
+- skill 文档：`review-validate-fix` 是 Claude Code 一等公民（plugin 暴露 3 command + 5 skill）；Codex 侧通过 plugin manifest + 安装器注册的 `~/.codex/hooks.json` 绑定。
+
+结论：RVF 已**完成 Pattern A 落地的 (M+N) 变体**——统一 plugin id、补齐 marketplace.json、显式 core↔adapter 边界。已**脱离** [`04-anti-patterns.md`](04-anti-patterns.md) **反模式 ②（Plugin-id 漂移）** 的样本（自 S0 v2 起）。manifest 字段一致性由 `scripts/sync-manifest.sh` fail-fast 守护（S4）。
 
 ---
 
@@ -59,16 +61,24 @@ review-validate-fix/
 └── dev_backward_compatibility/    # .gitignore；commit 前清理日志
 ```
 
-### 当前形态 vs 建议形态：迁移取舍
+### Pattern A 的 marketplace 变体：(M+N) vs (P+R)
 
-仓库当前形态：`plugins/review-validate-fix/.codex-plugin/plugin.json (name="rvf")`，**嵌套**在 `plugins/review-validate-fix/` 下，且**无** repo-root `.claude-plugin/plugin.json`。
+上面的"建议目录形态"把 plugin manifest 画在 **repo-root**（`.claude-plugin/plugin.json` + `.codex-plugin/plugin.json`），隐含「**repo = 单个 plugin**」（记作 **(P+R)**：Plugin + Repo 同体）。本仓库**有意不走这个字面形态**，而走 **(M+N)：Marketplace + Nested manifest**：
 
-与上面建议形态的差距，至少包含：
-1. **manifest 位置**：嵌套在 `plugins/review-validate-fix/` 下 vs 建议位于 repo-root。
-2. **plugin id 漂移**：Codex manifest `name="rvf"` vs 建议统一为 `review-validate-fix`（参见 [`04`](04-anti-patterns.md) 反模式 ②）。
-3. **缺失 Claude Code manifest**：当前没有 `.claude-plugin/plugin.json`，需要补齐才能形成"双 manifest + 同 id"的 Pattern A 完整形态。
+| | (P+R)：repo = plugin | **(M+N)：marketplace 持 plugin（本仓库）** |
+|---|---|---|
+| plugin manifest | repo-root `.{claude,codex}-plugin/plugin.json` | nested `plugins/review-validate-fix/.{claude,codex}-plugin/plugin.json` |
+| marketplace 文件 | 无 | repo-root `.claude-plugin/marketplace.json` 列出 plugin |
+| repo-root 还承载 | 仅 plugin 资产 | plugin payload + `core/` + `adapters/` + 安装器 + 测试/契约套件 |
 
-这三步迁移工作归入 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**（统一 plugin id + 双 manifest 位置）。本指南其余章节中"建议形态"的描述都以 S0 完成后的形态为前提。
+**何时用哪种**：
+
+- 仓库只发一个 plugin、没有独立工程层 → (P+R) 更简单，manifest 抬到 repo-root 即可。
+- 仓库同时是 marketplace、带 host-agnostic 工程代码（`core/`/`adapters/`）、独立安装/测试栈，或未来可能再挂别的 plugin → **(M+N)**，让 plugin payload 与工程层物理分离。
+
+**本仓库为什么选 (M+N)**：repo-root 需要承载 `core/`、`adapters/`、`scripts/install_to_codex.py`、契约/测试套件——这些不属于任何单个 plugin payload。若按 (P+R) 把 plugin manifest 抬到 repo-root，会把「marketplace + 工程层 + plugin」三层身份压在同一目录、污染 plugin 边界。(M+N) 把 plugin 收在 `plugins/review-validate-fix/` 子树、用 repo-root marketplace.json 枚举它，既让两 host 的 marketplace 机制识别到 plugin，又保持工程层干净。
+
+这一变体的对齐工作已在 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0 v2** 完成（统一 plugin id + 补 marketplace.json + 立 core/adapters 骨架）。完整 as-built 形态、兼容性矩阵与 manifest 一致性守护（`scripts/sync-manifest.sh`）见 [`docs/architecture/cross-harness.md`](../architecture/cross-harness.md)。
 
 ---
 

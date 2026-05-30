@@ -483,6 +483,8 @@ do
   run_step "shell syntax: $script" bash -n "$skill_dir/$script"
 done
 run_step "shell syntax: scripts/check_skill_contracts.sh" bash -n "$repo_root/scripts/check_skill_contracts.sh"
+run_step "shell syntax: scripts/sync-manifest.sh" bash -n "$repo_root/scripts/sync-manifest.sh"
+run_step "manifest sync: scripts/sync-manifest.sh" bash "$repo_root/scripts/sync-manifest.sh"
 
 run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
@@ -762,6 +764,9 @@ require_repo_literal "scripts/install_to_codex.py" 'latest-deployment.json'
 require_repo_literal "scripts/install_to_codex.py" 'rvf-local-deploy'
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_records_deploy_log_with_rvf_context'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'deployments/latest-deployment.json'
+# vendor-on-install post-deploy 校验固化进 rvf-local-deploy SKILL（防 vendored payload 静默漂移：检查全过但运行期 ModuleNotFoundError）
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'trajectory_distill.py -h'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'core/subagents/models.py'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
 require_literal "scripts/codex_stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
 require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_write_cline_kanban_mode'
@@ -858,6 +863,97 @@ forbid_repo_literal "plugins/review-validate-fix/.codex-plugin/plugin.json" '"na
 forbid_repo_literal "scripts/install_to_codex.py" 'migrated legacy stand''alone setup'
 forbid_repo_literal "scripts/install_to_codex.py" 'Review Validate Fix CLI Launch''er'
 forbid_repo_literal "scripts/install_to_codex.py" 'stand''alone'
+
+# S1: NormalizedTranscript + transcript adapter 拆分 + vendor-on-install 哨兵 bootstrap。
+require_repo_file ".rvf-pyroot"
+require_repo_file "core/transcript/models.py"
+require_repo_file "core/transcript/io.py"
+require_repo_file "adapters/codex/transcript.py"
+require_repo_file "adapters/claude_code/transcript.py"
+require_repo_file "tests/test_normalized_transcript.py"
+require_repo_file "tests/test_vendored_payload_import.py"
+require_repo_literal "core/transcript/models.py" 'class TranscriptRecord'
+require_repo_literal "core/transcript/models.py" 'class NormalizedTranscript'
+require_repo_literal "scripts/install_to_codex.py" 'def vendor_pyroot'
+require_repo_literal "scripts/install_to_codex.py" 'def deploy_payload'
+require_repo_literal "scripts/install_to_codex.py" 'deploy_payload(PLUGIN_SRC'
+require_repo_literal "scripts/install_to_codex.py" '.rvf-pyroot'
+# vendor-on-install 单一收口：从 PLUGIN_SRC 产 payload 只能走 deploy_payload（带 vendor_pyroot）。
+forbid_repo_literal "scripts/install_to_codex.py" 'copy_tree(PLUGIN_SRC'
+require_file "scripts/_rvf_pyroot.py"
+require_literal "scripts/_rvf_pyroot.py" '.rvf-pyroot'
+require_literal "scripts/trajectory_distill.py" 'import _rvf_pyroot'
+require_literal "scripts/trajectory_distill.py" 'from core.transcript'
+require_literal "scripts/trajectory_distill.py" 'from adapters.codex.transcript import'
+require_literal "scripts/trajectory_distill.py" 'from adapters.claude_code.transcript import'
+
+# S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
+require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
+require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'
+require_literal "scripts/analysis_artifacts.py" 'trajectory_window_start'
+# A1 反模式护栏：write-op 计数不得回退成按 host 工具名 == "apply_patch" 判断。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/analysis_artifacts.py" '== "apply_patch"'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_write_op_count_normalizes_claude_edit_write_multiedit'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_same_session_full_windows_to_rvf_subinterval'
+
+# S2 / handoff A2：子代理捕获 host 归一（Codex glob → adapter；Claude Task 子代理发现）。
+require_repo_file "core/subagents/models.py"
+require_repo_file "adapters/codex/subagent.py"
+require_repo_file "adapters/claude_code/subagent.py"
+require_repo_file "tests/test_claude_subagent_capture.py"
+require_repo_literal "core/subagents/models.py" 'class SpawnRecord'
+require_repo_literal "adapters/codex/subagent.py" 'def codex_sessions_root'
+require_repo_literal "adapters/codex/subagent.py" 'def resolve_subagents'
+require_repo_literal "adapters/claude_code/subagent.py" 'def resolve_subagents'
+require_repo_literal "adapters/claude_code/subagent.py" 'agent-*.jsonl'
+require_literal "scripts/subagent_capture.py" 'host_kind'
+require_literal "scripts/subagent_capture.py" 'original_transcript'
+require_literal "scripts/trajectory_capture.py" 'original_transcript=current_transcript'
+# A2 反模式护栏：Codex sessions 布局已移入 adapter，facade 不得再写死该路径。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/subagent_capture.py" '.codex/sessions'
+require_repo_literal "tests/test_claude_subagent_capture.py" 'test_capture_all_subagents_claude_discovers_and_distills'
+
+# S2 / handoff B：candidate_patch_call_ids 由子代理 write-op call_id 只读补全。
+require_literal "scripts/analysis_artifacts.py" 'def _enrich_candidate_patch_call_ids'
+require_repo_literal "tests/test_analysis_artifacts.py" 'test_enrich_candidate_patch_call_ids_links_event_path_to_subagent_call_id'
+
+# S2-invoke：headless 子代理调用向量 host 分派下沉 adapter（observe-side 对称）。
+require_repo_file "tests/test_invoke_subagent.py"
+require_repo_literal "core/subagents/models.py" 'class InvokeCommand'
+require_repo_literal "adapters/codex/subagent.py" 'def build_analyze_command'
+require_repo_literal "adapters/claude_code/subagent.py" 'def build_analyze_command'
+require_literal "scripts/rvf_analyze_thread.py" '_codex_build_analyze_command'
+require_literal "scripts/rvf_analyze_thread.py" '_claude_build_analyze_command'
+require_repo_literal "tests/test_invoke_subagent.py" 'test_facade_dispatches_by_host_and_preserves_tuple_shape'
+
+# S3 / handoff G：Claude hook 双入口共享单一 host-ownership 契约（守卫单源化）。
+require_repo_file "plugins/review-validate-fix/hooks/_claude_hook_entry.py"
+require_repo_literal "plugins/review-validate-fix/hooks/_claude_hook_entry.py" 'def is_foreign_invocation'
+require_repo_literal "plugins/review-validate-fix/hooks/_claude_hook_entry.py" 'def run_claude_hook'
+require_repo_literal "plugins/review-validate-fix/hooks/stop.py" 'from _claude_hook_entry import run_claude_hook'
+require_repo_literal "plugins/review-validate-fix/hooks/user_prompt_submit.py" 'from _claude_hook_entry import run_claude_hook'
+# G 守卫单源化护栏：两入口不得再各持一份复制的 _is_codex_invocation。
+forbid_repo_literal "plugins/review-validate-fix/hooks/stop.py" '_is_codex_invocation'
+forbid_repo_literal "plugins/review-validate-fix/hooks/user_prompt_submit.py" '_is_codex_invocation'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_detects_foreign_invocation'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_dispatches_claude_invocation'
+
+# S4：跨 harness 兼容性矩阵 + manifest sync 工具 + 指南 marketplace 变体注。
+require_repo_file "scripts/sync-manifest.sh"
+require_repo_file "docs/architecture/cross-harness.md"
+# sync-manifest 守护的不变量名/version/source 与"description 不强校验相等"的设计取舍。
+require_repo_literal "scripts/sync-manifest.sh" '.plugins[0].source // ""'
+require_repo_literal "scripts/sync-manifest.sh" 'plugin id 漂移'
+require_repo_literal "scripts/sync-manifest.sh" 'version 漂移'
+require_repo_literal "docs/architecture/cross-harness.md" 'Adapter-backed'
+require_repo_literal "docs/architecture/cross-harness.md" '(M+N)'
+# README 与指南 06 须链入 as-built 矩阵、并对齐脱离反模式 ② 的现状。
+require_repo_literal "README.md" 'docs/architecture/cross-harness.md'
+require_repo_literal "README.md" '跨 harness 支持'
+require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md" 'Pattern A 的 marketplace 变体'
+require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md" '已对齐 S0 v2'
+# 反模式 ② 已脱离：04 不得再宣称本仓库"当前正是该反模式的样本"。
+forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '本仓库当前正是该反模式的样本'
 
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'

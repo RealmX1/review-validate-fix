@@ -23,7 +23,7 @@
 
 ## ② Plugin-id 漂移 —— 在不同 host 上叫不同名字
 
-> **本仓库当前正是该反模式的样本**：`plugins/review-validate-fix/.codex-plugin/plugin.json` 的 `name` 字段为 `"rvf"`，与 Claude Code 侧设计 id `review-validate-fix` 不一致。修正动作归入 [`07-implementation-slices.md`](07-implementation-slices.md) 的 **S0**，详见 [`06-rvf-application.md`](06-rvf-application.md) "当前 RVF 现状" 段。
+> **本仓库曾是该反模式的样本，已于 S0 v2 脱离**：`plugins/review-validate-fix/.codex-plugin/plugin.json` 的 `name` 一度为 `"rvf"`，与 Claude Code 侧 id `review-validate-fix` 不一致；现已统一为 `"review-validate-fix"`，并由 `scripts/sync-manifest.sh` fail-fast 守护三份 manifest 的 `name` 恒等。修正过程见 [`06-rvf-application.md`](06-rvf-application.md) "当前 RVF 现状" 段与 [`../../docs/architecture/cross-harness.md`](../architecture/cross-harness.md)。
 
 ### 症状
 - Claude Code 上叫 `review-validate-fix`，Codex 上叫 `rvf`，OpenCode 上叫 `code-review-loop`。
