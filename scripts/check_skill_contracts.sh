@@ -921,6 +921,18 @@ require_literal "scripts/rvf_analyze_thread.py" '_codex_build_analyze_command'
 require_literal "scripts/rvf_analyze_thread.py" '_claude_build_analyze_command'
 require_repo_literal "tests/test_invoke_subagent.py" 'test_facade_dispatches_by_host_and_preserves_tuple_shape'
 
+# S3 / handoff G：Claude hook 双入口共享单一 host-ownership 契约（守卫单源化）。
+require_repo_file "plugins/review-validate-fix/hooks/_claude_hook_entry.py"
+require_repo_literal "plugins/review-validate-fix/hooks/_claude_hook_entry.py" 'def is_foreign_invocation'
+require_repo_literal "plugins/review-validate-fix/hooks/_claude_hook_entry.py" 'def run_claude_hook'
+require_repo_literal "plugins/review-validate-fix/hooks/stop.py" 'from _claude_hook_entry import run_claude_hook'
+require_repo_literal "plugins/review-validate-fix/hooks/user_prompt_submit.py" 'from _claude_hook_entry import run_claude_hook'
+# G 守卫单源化护栏：两入口不得再各持一份复制的 _is_codex_invocation。
+forbid_repo_literal "plugins/review-validate-fix/hooks/stop.py" '_is_codex_invocation'
+forbid_repo_literal "plugins/review-validate-fix/hooks/user_prompt_submit.py" '_is_codex_invocation'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_detects_foreign_invocation'
+require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_dispatches_claude_invocation'
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'
