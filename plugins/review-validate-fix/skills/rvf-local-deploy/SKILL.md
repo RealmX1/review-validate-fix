@@ -10,7 +10,7 @@ description: 当在 review-validate-fix 仓库中，用户要求 deploy、local 
 ## Preconditions
 
 - 从仓库根目录工作：`/Users/bominzhang/Documents/GitHub/review-validate-fix`。
-- 把 `plugins/review-validate-fix/` 视为唯一 canonical plugin source。
+- 把 `plugins/review-validate-fix/` 视为 canonical plugin payload source；此外 repo 顶层 `core/`（host-agnostic 核心）与 `adapters/`（各 host adapter）也是 canonical source，部署时由 installer 的 `deploy_payload` / `vendor_pyroot` vendored 进每个 payload 根（连同 `.rvf-pyroot` 哨兵）。
 - 不要从 `~/plugins/review-validate-fix` 或 `~/.codex/plugins/cache/...` 部署；这些是安装产物。
 - 先检查 `git status --short`。plugin/deployment scope 外的 background WIP 可以保持 dirty；但除非用户明确要求部署 dirty worktree，不要部署未提交的 plugin/runtime 改动。
 
@@ -60,6 +60,21 @@ test -f /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/review-valida
 rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/plugins/review-validate-fix/skills/*/SKILL.md
 rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/*/SKILL.md
 ```
+
+还要验证 **vendor-on-install** 的 vendored payload 真落地——这是 S1 引入的运行期不变量：部署后的 `trajectory_distill.py` 经 `_rvf_pyroot` 哨兵依赖 vendored 的 `core/` + `adapters/` + `.rvf-pyroot`。若 vendoring 静默失败，会出现「部署检查全过、运行期 `ModuleNotFoundError`」（正是 vendor-on-install 要消灭的漂移；部署前门 `check_plugin_contracts.py` 对此零感知）：
+
+```bash
+# vendored core/adapters + 哨兵已落进 payload 根
+test -f /Users/bominzhang/plugins/review-validate-fix/.rvf-pyroot
+test -f /Users/bominzhang/plugins/review-validate-fix/core/transcript/models.py
+test -f /Users/bominzhang/plugins/review-validate-fix/core/subagents/models.py
+test -f /Users/bominzhang/plugins/review-validate-fix/adapters/codex/subagent.py
+test -f /Users/bominzhang/plugins/review-validate-fix/adapters/claude_code/subagent.py
+# import-smoke：deployed facade 经哨兵 bootstrap 能 import vendored core（exit 0 = vendoring + bootstrap 健康）
+python3 /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_distill.py -h >/dev/null
+```
+
+任一 vendored 校验失败 = 部署损坏（vendoring / bootstrap 没生效），不要当成功收尾；重跑 `install_to_codex.py` 或排查 `deploy_payload` / `vendor_pyroot`。
 
 如果部署的是具体功能改动，还要检查 installed 版本中的相关文件。示例：
 
