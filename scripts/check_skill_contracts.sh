@@ -483,6 +483,8 @@ do
   run_step "shell syntax: $script" bash -n "$skill_dir/$script"
 done
 run_step "shell syntax: scripts/check_skill_contracts.sh" bash -n "$repo_root/scripts/check_skill_contracts.sh"
+run_step "shell syntax: scripts/sync-manifest.sh" bash -n "$repo_root/scripts/sync-manifest.sh"
+run_step "manifest sync: scripts/sync-manifest.sh" bash "$repo_root/scripts/sync-manifest.sh"
 
 run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
@@ -932,6 +934,23 @@ forbid_repo_literal "plugins/review-validate-fix/hooks/stop.py" '_is_codex_invoc
 forbid_repo_literal "plugins/review-validate-fix/hooks/user_prompt_submit.py" '_is_codex_invocation'
 require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_detects_foreign_invocation'
 require_repo_literal "tests/test_review_support_scripts.py" 'test_claude_hook_entry_dispatches_claude_invocation'
+
+# S4：跨 harness 兼容性矩阵 + manifest sync 工具 + 指南 marketplace 变体注。
+require_repo_file "scripts/sync-manifest.sh"
+require_repo_file "docs/architecture/cross-harness.md"
+# sync-manifest 守护的不变量名/version/source 与"description 不强校验相等"的设计取舍。
+require_repo_literal "scripts/sync-manifest.sh" '.plugins[0].source // ""'
+require_repo_literal "scripts/sync-manifest.sh" 'plugin id 漂移'
+require_repo_literal "scripts/sync-manifest.sh" 'version 漂移'
+require_repo_literal "docs/architecture/cross-harness.md" 'Adapter-backed'
+require_repo_literal "docs/architecture/cross-harness.md" '(M+N)'
+# README 与指南 06 须链入 as-built 矩阵、并对齐脱离反模式 ② 的现状。
+require_repo_literal "README.md" 'docs/architecture/cross-harness.md'
+require_repo_literal "README.md" '跨 harness 支持'
+require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md" 'Pattern A 的 marketplace 变体'
+require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md" '已对齐 S0 v2'
+# 反模式 ② 已脱离：04 不得再宣称本仓库"当前正是该反模式的样本"。
+forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '本仓库当前正是该反模式的样本'
 
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'

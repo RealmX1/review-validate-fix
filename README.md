@@ -4,6 +4,16 @@
 
 本仓库形态遵循 `docs/multi-harness-plugin-guideline/` 推荐的 Pattern A，并采用其 **(M+N) Marketplace + Nested manifest** 变体——repo-root `.claude-plugin/marketplace.json` 列出 plugin；plugin manifest 留在 `plugins/review-validate-fix/.{claude,codex}-plugin/` nested 位置。这与指南 06 隐含的 (P+R) 「repo=plugin」字面形态不同；具体落点见仓库结构。
 
+## 跨 harness 支持
+
+as-built 兼容性矩阵、(M+N) vs (P+R) 区别、core ↔ adapter 边界与 plugin payload 实测枚举见 [`docs/architecture/cross-harness.md`](docs/architecture/cross-harness.md)；通用原则见 [`docs/multi-harness-plugin-guideline/`](docs/multi-harness-plugin-guideline/)。一句话现状：
+
+- **Claude Code** = Adapter-backed（trigger-only, bridged to Codex core）：`Stop` + `UserPromptSubmit` 两个 hook 入口为薄 shim，转发到 Codex core 脚本（路径 C），不重写 review 逻辑。
+- **Codex CLI** = Native（hook 由 `install_to_codex.py --configure-stop-hook` 注册进 `~/.codex/hooks.json`）。
+- **OpenCode / Cursor / Hermes / OpenClaw** = Reference-only（仅 `agentskills.io` skill 文档，不接线 hook/subagent）。
+
+分析/归因层已 host-agnostic：transcript 解析（`core/transcript/` + `adapters/{codex,claude_code}/transcript.py`）、write-op 计数、子代理捕获与调用向量（`core/subagents/` + 各 adapter）均不消费 host 工具名或硬编码 host 布局。三份 manifest 的 `name`/`version`/`source` 一致性由 `scripts/sync-manifest.sh` fail-fast 守护。
+
 ## 当前结论
 
 Codex 可以接受 plugin。这个 workflow 仍以 plugin 作为唯一维护源；plugin 通过 `.codex-plugin/plugin.json` 声明能力，并携带 `skills/review-validate-fix/` 作为实际运行内容。当前 Codex CLI 的 slash 菜单与 Codex GUI 的 skill picker 行为并不完全一致；安装脚本只负责安装并启用 plugin，不再通过同名本机 skill 目录伪造第二个入口。人工修改仍只进入 plugin skill 源码。
@@ -23,7 +33,7 @@ Cline Kanban task 必须在独立 worktree/checkpoint 中重放当前 session-ow
 | Codex 安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` 中 `[plugins."review-validate-fix@local-codex-plugins"]`、Codex marketplace cache `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/<version>/` |
 | Claude Code 安装位置 | `~/.claude/local-marketplaces/review-validate-fix/.claude-plugin/marketplace.json` 与 `plugins/review-validate-fix/`、Claude Code cache `~/.claude/plugins/cache/review-validate-fix-local/review-validate-fix/<version>/`、`~/.claude/settings.json` 中 `enabledPlugins["review-validate-fix@review-validate-fix-local"]` + `extraKnownMarketplaces["review-validate-fix-local"]` |
 | 触发方式 | plugin 暴露 `$review-validate-fix` skill 与 `/review-validate-fix` command；`agents/openai.yaml` 控制隐式调用；Claude Code 走 Stop hook 转发到 Codex core（路径 C） |
-| 跨 harness 抽象 | `core/`（host-agnostic 业务核心，S1/S2 落点）+ `adapters/{claude_code,codex}/`（host-specific 实装），见各自 README |
+| 跨 harness 抽象 | `core/`（host-agnostic：`transcript/`=S1、`subagents/`=S2）+ `adapters/{claude_code,codex}/`（host-specific transcript/subagent 实装）；hook host-ownership 契约 `hooks/_claude_hook_entry.py`=S3。as-built 矩阵见 [`docs/architecture/cross-harness.md`](docs/architecture/cross-harness.md) |
 
 ## 仓库结构
 
@@ -32,14 +42,19 @@ Cline Kanban task 必须在独立 worktree/checkpoint 中重放当前 session-ow
 plugins/review-validate-fix/               # plugin payload（marketplace.json 中 source 指向这里）
 plugins/review-validate-fix/.claude-plugin/plugin.json   # Claude Code 侧 nested plugin manifest
 plugins/review-validate-fix/.codex-plugin/plugin.json    # Codex 侧 nested plugin manifest
-plugins/review-validate-fix/hooks/{hooks.json,stop.py}   # Claude Code Stop hook（路径 C：转发 Codex core）
-plugins/review-validate-fix/commands/review-validate-fix.md  # Claude Code slash command
+plugins/review-validate-fix/hooks/hooks.json             # 注册 Stop + UserPromptSubmit 两个 Claude Code hook
+plugins/review-validate-fix/hooks/stop.py                # Stop hook 薄 shim（路径 C：转发 Codex core）
+plugins/review-validate-fix/hooks/user_prompt_submit.py  # UserPromptSubmit hook 薄 shim
+plugins/review-validate-fix/hooks/_claude_hook_entry.py  # 两入口共享的单一 host-ownership 契约（S3，stdlib-only）
+plugins/review-validate-fix/commands/                    # 3 个 slash command：review-validate-fix / rvf-handoff-commit / rvf-land
+plugins/review-validate-fix/skills/                      # 5 个 skill：review-validate-fix / rvf-analyze / rvf-handoff-intake / rvf-land / rvf-local-deploy
 plugins/review-validate-fix/skills/review-validate-fix/
-                                            # canonical skill 内容，人工修改这里
-core/                                      # host-agnostic 业务核心（S1/S2 落点，见 core/README.md）
-adapters/                                  # host-specific 实装目录骨架（见 adapters/README.md）
-adapters/claude_code/                      # Claude Code adapter；transcript/subagent 落点
-adapters/codex/                            # Codex adapter；transcript/subagent 落点
+                                            # 主工作流 canonical skill 内容，人工修改这里
+core/transcript/                           # host-agnostic NormalizedTranscript / TranscriptRecord（S1）
+core/subagents/                            # host-agnostic SpawnRecord / InvokeCommand（S2）
+adapters/claude_code/{transcript.py,subagent.py}  # Claude 栈实装（transcript 解析 + 子代理发现/调用向量）
+adapters/codex/{transcript.py,subagent.py}        # Codex 栈实装（归一基线）
+scripts/sync-manifest.sh                   # 校验三份 manifest 的 name/version/source 一致（S4）
 scripts/check_plugin_contracts.py          # 仓库级契约检查入口，委托 check_skill_contracts.sh
 scripts/check_skill_contracts.sh           # 覆盖 plugin runtime、安装脚本和 tests/ 的契约检查
 scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间 + 同步 Claude Code marketplace
