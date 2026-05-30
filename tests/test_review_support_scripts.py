@@ -189,7 +189,7 @@ def test_rvf_analyze_thread_builds_claude_command(_root: Path | None = None) -> 
     assert uses_stdin is True
     assert Path(argv[0]).name == "claude"
     assert "-p" in argv
-    assert "--permission-mode" in argv and "acceptEdits" in argv
+    assert "--permission-mode" in argv and "bypassPermissions" in argv
     assert "--output-format" in argv and "stream-json" in argv
     # analyze agent 必须能解析 $rvf-analyze slash command 并 Edit 文件。
     assert "--disable-slash-commands" not in argv

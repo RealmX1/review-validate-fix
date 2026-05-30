@@ -120,6 +120,12 @@ def build_analyze_command(host: str) -> tuple[list[str], bool]:
     个 host 都为 True。关键约束：**绝不**对 claude 追加
     ``--disable-slash-commands``——analyze agent 需要解析 ``$rvf-analyze`` slash
     command 并 Edit ``analysis/summary.md`` / ``causality.json`` 两个文件。
+
+    permission-mode 选 ``bypassPermissions``：``acceptEdits`` 只放行 Edit、不放
+    Read / Bash，而 rvf-analyze skill 要 Read reference 文档、要 Bash 跑确定性
+    后端脚本——headless 又没人弹窗批准，会让 agent 干净退 0 但零产出（见线上
+    rvf-20260530T185312Z-...-30a814b9 的 ``.analyze-thread.log`` permission_denials
+    证据）。codex 侧 ``--ask-for-approval never`` 已是同效力。
     """
     if host == HOST_CLAUDE:
         argv = [
@@ -129,7 +135,7 @@ def build_analyze_command(host: str) -> tuple[list[str], bool]:
             "stream-json",
             "--verbose",
             "--permission-mode",
-            "acceptEdits",
+            "bypassPermissions",
         ]
         return argv, True
     # HOST_CODEX（含未知 host 的兜底）
