@@ -107,6 +107,7 @@ python3 scripts/check_plugin_contracts.py --timing-report /tmp/rvf-contract-timi
 - `tests/test_review_support_scripts.py`：加入 `review_support_test_cases(root)`。
 - `tests/test_codex_stop_review_validate_fix.py`：加入 `main()` 里的 `tests` 列表。
 - `tests/test_codex_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
+- `tests/test_review_reopen_marker.py`：rescope marker（失败再入）单测，加入 `main()` 里的 `tests` 列表；该文件已登记进 `check_skill_contracts.sh` 的合约门 runner，新增测试函数务必同步进 `tests` 列表，否则静默假绿。
 
 新测试应继续使用传入的 `tmp` / `tmp_path` 派生独立目录，避免共享固定路径、端口、全局环境或可长期存在的进程。确实需要临时修改 `os.environ`、模块 monkeypatch、socket/port、sleep/timeout 的测试，必须在 `finally` 中恢复状态；这类测试在高并发下容易成为 flake，应优先使用更宽松的超时边界，或放在默认不拆分的测试组中。
 

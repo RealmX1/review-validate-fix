@@ -2117,6 +2117,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         for name in (
             "test_install_to_codex.py",
             "test_rvf_handoff_intake.py",
+            "test_review_reopen_marker.py",
             "test_review_support_scripts.py",
             "test_codex_stop_hook_dispatcher.py",
             "test_codex_stop_review_validate_fix.py",
@@ -2155,10 +2156,11 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         records = [json.loads(line) for line in timing_path.read_text(encoding="utf-8").splitlines()]
 
     assert completed.returncode == 0
-    assert [record["execution_mode"] for record in records] == ["parallel"] * 12
+    assert [record["execution_mode"] for record in records] == ["parallel"] * 13
     assert {record["label"] for record in records} == {
         "tests: install_to_codex",
         "tests: rvf_handoff_intake",
+        "tests: review_reopen_marker",
         "tests: review_support_scripts shard 1/4",
         "tests: review_support_scripts shard 2/4",
         "tests: review_support_scripts shard 3/4",
@@ -8725,6 +8727,22 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "lease_acquire_concurrent_writers_serialize",
             lambda: test_lease_acquire_concurrent_writers_serialize(root / "lease-T13"),
+        ),
+        (
+            "invalidate_reviewed_units_for_run_reopens_and_is_idempotent",
+            lambda: test_invalidate_reviewed_units_for_run_reopens_and_is_idempotent(root / "reopen-T1"),
+        ),
+        (
+            "invalidate_reviewed_units_for_run_is_run_scoped",
+            lambda: test_invalidate_reviewed_units_for_run_is_run_scoped(root / "reopen-T2"),
+        ),
+        (
+            "invalidate_reviewed_units_for_run_excludes_tombstoned",
+            lambda: test_invalidate_reviewed_units_for_run_excludes_tombstoned(root / "reopen-T3"),
+        ),
+        (
+            "latest_reviewed_run_for_worktree_resolution",
+            lambda: test_latest_reviewed_run_for_worktree_resolution(root / "reopen-T4"),
         ),
         (
             "rvf_analyze_thread_builds_claude_command",

@@ -3702,6 +3702,188 @@ def complete_review_scope(
             conn.close()
 
 
+def invalidate_reviewed_units_for_run(
+    *,
+    repo: str | Path,
+    run_id: str,
+    reason: str = "failed_impl_reentry",
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Reopen (`reviewed` → `available`) the still-present units a given RVF run
+    reviewed, so a follow-up review re-covers the *whole* implementation — not
+    just the redo's delta.
+
+    Run-scoped on purpose: only units whose `session_units.run_id` equals
+    ``run_id`` are touched. Units the redo *changed* already became fresh
+    ``available`` units via content-hash identity (the old unit went
+    ``superseded``); this reopens the ones the redo left **untouched** but the
+    failed implementation run had marked ``reviewed``. The union of the two is
+    the full "first implementation ∪ fix" scope.
+
+    Deliberately narrow — never broadcasts beyond the target run:
+    - other runs' ``reviewed`` units stay reviewed (no worktree/session sweep);
+    - ``superseded`` / tombstoned units are excluded (``is_tombstoned=0`` and
+      ``observed_state IN ('dirty','committed')``);
+    - units currently held by a still-active lease are skipped (never yanked out
+      from under a running reviewer), reported under
+      ``skipped_active_lease_unit_ids``.
+
+    Idempotent: a second call finds nothing left in ``reviewed`` for the run and
+    returns ``status='noop'``.
+    """
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = _tracker_now_iso(now)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            candidate_rows = conn.execute(
+                """
+                SELECT DISTINCT u.unit_id
+                  FROM session_units su
+                  JOIN units u ON u.unit_id = su.unit_id
+                 WHERE su.run_id = ?
+                   AND u.review_state = 'reviewed'
+                   AND u.is_tombstoned = 0
+                   AND u.observed_state IN ('dirty','committed')
+                """,
+                (run_id,),
+            ).fetchall()
+            candidate_unit_ids = sorted(row["unit_id"] for row in candidate_rows)
+            reopened_unit_ids: list[str] = []
+            skipped_active_lease_unit_ids: list[str] = []
+            if candidate_unit_ids:
+                held = set(
+                    _lease_active_unit_conflicts_in_txn(conn, candidate_unit_ids, now_iso)
+                )
+                skipped_active_lease_unit_ids = sorted(held)
+                reopened_unit_ids = [uid for uid in candidate_unit_ids if uid not in held]
+                if reopened_unit_ids:
+                    placeholders = ",".join("?" for _ in reopened_unit_ids)
+                    conn.execute(
+                        f"""
+                        UPDATE units
+                           SET review_state='available'
+                         WHERE review_state='reviewed'
+                           AND is_tombstoned=0
+                           AND unit_id IN ({placeholders})
+                        """,
+                        tuple(reopened_unit_ids),
+                    )
+                    # Maintain complete_review_scope's invariant (a claim is
+                    # `reviewed` iff all its units are reviewed+present): any
+                    # edit_claim that touches a reopened unit is no longer fully
+                    # reviewed, so revert it to `pending`.
+                    conn.execute(
+                        f"""
+                        UPDATE edit_claims
+                           SET status='pending',
+                               reviewed_at=NULL,
+                               last_seen_at=?
+                         WHERE status='reviewed'
+                           AND claim_id IN (
+                               SELECT DISTINCT claim_id
+                                 FROM edit_claim_units
+                                WHERE unit_id IN ({placeholders})
+                           )
+                        """,
+                        (now_iso, *reopened_unit_ids),
+                    )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "review_scope_reopened_for_run",
+                "rvf_state_phase": "review",
+                "run_id": run_id,
+                "reason_code": reason,
+                "candidate_unit_count": len(candidate_unit_ids),
+                "reopened_unit_count": len(reopened_unit_ids),
+                "skipped_active_lease_unit_ids": skipped_active_lease_unit_ids,
+            },
+        )
+        return {
+            "status": "reopened" if reopened_unit_ids else "noop",
+            "run_id": run_id,
+            "reason": reason,
+            "reopened_unit_ids": reopened_unit_ids,
+            "reopened_unit_count": len(reopened_unit_ids),
+            "candidate_unit_count": len(candidate_unit_ids),
+            "skipped_active_lease_unit_ids": skipped_active_lease_unit_ids,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def latest_reviewed_run_for_worktree(
+    *,
+    repo: str | Path,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve the most recent RVF run that left still-present ``reviewed`` units
+    in *this* worktree.
+
+    Used by ``rvf_rescope.py`` to pick ``target_run_id`` when the user did not
+    paste an RVF handoff. Worktree-scoped (``units.worktree_key`` of the current
+    repo path) so a sibling worktree's runs never leak in; ordered by the most
+    recent ``session_units.assigned_at`` for the run. Returns ``run_id=None`` when
+    no reviewed run is found.
+    """
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    worktree = _worktree_key(str(repo_resolved))
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        row = conn.execute(
+            """
+            SELECT su.run_id AS run_id,
+                   MAX(su.assigned_at) AS recent_at,
+                   COUNT(*) AS reviewed_unit_count
+              FROM session_units su
+              JOIN units u ON u.unit_id = su.unit_id
+             WHERE u.worktree_key = ?
+               AND su.run_id IS NOT NULL
+               AND u.review_state = 'reviewed'
+               AND u.is_tombstoned = 0
+               AND u.observed_state IN ('dirty','committed')
+             GROUP BY su.run_id
+             ORDER BY recent_at DESC
+             LIMIT 1
+            """,
+            (worktree,),
+        ).fetchone()
+        if row is None or not row["run_id"]:
+            return {
+                "status": "not_found",
+                "run_id": None,
+                "worktree_key": worktree,
+                "repo_key": key,
+                "tracker_dir": str(directory),
+            }
+        return {
+            "status": "found",
+            "run_id": row["run_id"],
+            "recent_at": row["recent_at"],
+            "reviewed_unit_count": row["reviewed_unit_count"],
+            "worktree_key": worktree,
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def sweep_stale(
     *,
     repo: str | Path,
@@ -5583,6 +5765,30 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
     )
+    reopen = subparsers.add_parser(
+        "reopen-run-scope",
+        help="Reopen (reviewed→available) the still-present units a given run reviewed.",
+    )
+    reopen.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    reopen.add_argument("--run-id", required=True, help="target_run_id to reopen.")
+    reopen.add_argument("--reason", default="failed_impl_reentry")
+    reopen.add_argument("--print-result", action="store_true")
+    reopen.add_argument(
+        "--log-root",
+        default=None,
+        help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
+    )
+    latest_run = subparsers.add_parser(
+        "latest-reviewed-run",
+        help="Print the most recent RVF run that left reviewed units in this worktree.",
+    )
+    latest_run.add_argument("--repo", required=True, help="Path to the target repo / worktree.")
+    latest_run.add_argument("--print-result", action="store_true")
+    latest_run.add_argument(
+        "--log-root",
+        default=None,
+        help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
+    )
     return parser
 
 
@@ -5643,6 +5849,24 @@ def _main(argv: list[str] | None = None) -> int:
             parent_session_id=args.parent_session_id,
             current_session_id=args.current_session_id,
             run_id=args.run_id,
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "reopen-run-scope":
+        result = invalidate_reviewed_units_for_run(
+            repo=Path(args.repo).expanduser().resolve(),
+            run_id=args.run_id,
+            reason=args.reason,
+            log_root_override=log_root_override,
+        )
+        if args.print_result:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if args.subcommand == "latest-reviewed-run":
+        result = latest_reviewed_run_for_worktree(
+            repo=Path(args.repo).expanduser().resolve(),
             log_root_override=log_root_override,
         )
         if args.print_result:

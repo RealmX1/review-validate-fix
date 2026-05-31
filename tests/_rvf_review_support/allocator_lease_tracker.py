@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 # Injected by the aggregator (tests/test_review_support_scripts.py).
-__all__ = ['test_allocate_review_scope_busy_timeout_degrades', 'test_allocate_review_scope_concurrent_writers_serialize', 'test_allocate_review_scope_disable_env_short_circuits', 'test_allocate_review_scope_dry_run_does_not_create_lease', 'test_allocate_review_scope_emits_valid_tracker_scope_json', 'test_allocate_review_scope_empty_returns_no_unassigned_review_scope', 'test_allocate_review_scope_excludes_active_leased_units', 'test_allocate_review_scope_inserts_lease_and_marks_units_assigned', 'test_allocate_review_scope_output_consumed_by_prepare_run', 'test_allocate_review_scope_preserves_untracked_file_under_new_directory', 'test_allocate_review_scope_prunes_stale_leases_first', 'test_allocate_review_scope_writes_paths_and_hunks', 'test_allocator_event_appended_to_events_jsonl', 'test_complete_review_scope_does_not_complete_failed_released_lease', 'test_complete_review_scope_keeps_different_scope_active_lease', 'test_complete_review_scope_keeps_partial_edit_claim_pending', 'test_complete_review_scope_supersedes_overlapping_active_lease', 'test_complete_review_scope_unions_contract_and_lease_units', 'test_fork_first_stop_takeover_transfers_unleased_units', 'test_fork_takeover_skips_actively_leased_units', 'test_heartbeat_refreshes_tracker_lease_and_records_backend', 'test_heartbeat_treats_same_second_expiry_as_expired', 'test_lease_acquire_concurrent_writers_serialize', 'test_lease_acquire_creates_lease_and_assigns_units', 'test_lease_acquire_prunes_stale_leases_first', 'test_lease_acquire_rejects_tombstoned_unit', 'test_lease_acquire_rejects_when_any_unit_already_leased', 'test_lease_participants_finish_does_not_release_shared_lease', 'test_lease_refresh_extends_expires_at', 'test_lease_refresh_returns_expired_when_past_ttl', 'test_lease_release_completed_marks_units_reviewed', 'test_lease_release_idempotent', 'test_manual_rvf_run_ensures_table_for_existing_v2_db', 'test_manual_rvf_run_find_respects_ttl', 'test_manual_rvf_run_find_returns_latest_completed_at', 'test_manual_rvf_run_inserts_row_and_emits_event', 'test_manual_rvf_run_upserts_on_pk_conflict', 'test_manual_takeover_cli_records_takeover', 'test_manual_takeover_rejects_missing_parent_session', 'test_manual_takeover_skips_actively_leased_units', 'test_manual_takeover_transfers_unleased_units', 'test_record_manual_run_cli_writes_row', 'test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge', 'test_run_alternative_reviewer_releases_lease_on_normal_exit', 'test_run_alternative_reviewer_releases_lease_on_timeout', 'test_run_alternative_reviewer_shared_lease_does_not_release_on_exit', 'test_run_alternative_reviewer_sigterm_kills_child_before_release', 'test_scope_hash_is_sha256_of_sorted_unit_ids', 'test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease', 'test_sweep_stale_no_op_when_all_active_leases_fresh', 'test_sweep_stale_releases_expired_active_leases', 'test_sweep_stale_releases_same_second_expired_lease', 'test_tracker_schema_v2_migrates_lease_participants_table', 'test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state']
+__all__ = ['test_allocate_review_scope_busy_timeout_degrades', 'test_allocate_review_scope_concurrent_writers_serialize', 'test_allocate_review_scope_disable_env_short_circuits', 'test_allocate_review_scope_dry_run_does_not_create_lease', 'test_allocate_review_scope_emits_valid_tracker_scope_json', 'test_allocate_review_scope_empty_returns_no_unassigned_review_scope', 'test_allocate_review_scope_excludes_active_leased_units', 'test_allocate_review_scope_inserts_lease_and_marks_units_assigned', 'test_allocate_review_scope_output_consumed_by_prepare_run', 'test_allocate_review_scope_preserves_untracked_file_under_new_directory', 'test_allocate_review_scope_prunes_stale_leases_first', 'test_allocate_review_scope_writes_paths_and_hunks', 'test_allocator_event_appended_to_events_jsonl', 'test_complete_review_scope_does_not_complete_failed_released_lease', 'test_complete_review_scope_keeps_different_scope_active_lease', 'test_complete_review_scope_keeps_partial_edit_claim_pending', 'test_complete_review_scope_supersedes_overlapping_active_lease', 'test_complete_review_scope_unions_contract_and_lease_units', 'test_fork_first_stop_takeover_transfers_unleased_units', 'test_fork_takeover_skips_actively_leased_units', 'test_heartbeat_refreshes_tracker_lease_and_records_backend', 'test_heartbeat_treats_same_second_expiry_as_expired', 'test_invalidate_reviewed_units_for_run_reopens_and_is_idempotent', 'test_invalidate_reviewed_units_for_run_is_run_scoped', 'test_invalidate_reviewed_units_for_run_excludes_tombstoned', 'test_latest_reviewed_run_for_worktree_resolution', 'test_lease_acquire_concurrent_writers_serialize', 'test_lease_acquire_creates_lease_and_assigns_units', 'test_lease_acquire_prunes_stale_leases_first', 'test_lease_acquire_rejects_tombstoned_unit', 'test_lease_acquire_rejects_when_any_unit_already_leased', 'test_lease_participants_finish_does_not_release_shared_lease', 'test_lease_refresh_extends_expires_at', 'test_lease_refresh_returns_expired_when_past_ttl', 'test_lease_release_completed_marks_units_reviewed', 'test_lease_release_idempotent', 'test_manual_rvf_run_ensures_table_for_existing_v2_db', 'test_manual_rvf_run_find_respects_ttl', 'test_manual_rvf_run_find_returns_latest_completed_at', 'test_manual_rvf_run_inserts_row_and_emits_event', 'test_manual_rvf_run_upserts_on_pk_conflict', 'test_manual_takeover_cli_records_takeover', 'test_manual_takeover_rejects_missing_parent_session', 'test_manual_takeover_skips_actively_leased_units', 'test_manual_takeover_transfers_unleased_units', 'test_record_manual_run_cli_writes_row', 'test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge', 'test_run_alternative_reviewer_releases_lease_on_normal_exit', 'test_run_alternative_reviewer_releases_lease_on_timeout', 'test_run_alternative_reviewer_shared_lease_does_not_release_on_exit', 'test_run_alternative_reviewer_sigterm_kills_child_before_release', 'test_scope_hash_is_sha256_of_sorted_unit_ids', 'test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease', 'test_sweep_stale_no_op_when_all_active_leases_fresh', 'test_sweep_stale_releases_expired_active_leases', 'test_sweep_stale_releases_same_second_expired_lease', 'test_tracker_schema_v2_migrates_lease_participants_table', 'test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state']
 
 
 def inject(**deps: object) -> None:
@@ -2089,3 +2089,141 @@ def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:
         payloads.append(json.loads(stdout.strip().splitlines()[-1]))
     assert sum(1 for payload in payloads if payload["acquired"]) == 1
     assert sum(1 for payload in payloads if not payload["acquired"]) == 1
+
+
+# --- failed-impl-reentry: run-scoped reviewed→available reopen (Plan phase A) ---
+
+
+def _reopen_seed(tmp: Path, *, run_id: str = "R1") -> tuple[object, Path, Path, str, list[str]]:
+    """Build a 2-dirty-file repo, then allocate (non-dry) + complete so both
+    units end up ``reviewed`` under ``run_id`` with ``session_units.run_id`` set.
+    Returns (module, repo, log_root, repo_key, unit_ids)."""
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    allocated = module.allocate_review_scope(
+        repo=repo,
+        session_id="reopen-impl",
+        run_id=run_id,
+        reviewer_id="reviewer-a",
+        dry_run=False,
+        log_root_override=log_root,
+    )
+    assert allocated["status"] == "allocated", allocated
+    repo_key = allocated["repo_key"]
+    completed = module.complete_review_scope(
+        repo=repo,
+        lease_id=allocated["lease_id"],
+        log_root_override=log_root,
+    )
+    assert completed["released"] is True, completed
+    unit_ids = sorted(completed["unit_ids"])
+    assert len(unit_ids) >= 2, unit_ids
+    states = _lease_unit_states(log_root, repo_key, unit_ids)
+    assert set(states.values()) == {"reviewed"}, states
+    return module, repo, log_root, repo_key, unit_ids
+
+
+def test_invalidate_reviewed_units_for_run_reopens_and_is_idempotent(tmp: Path) -> None:
+    module, repo, log_root, repo_key, unit_ids = _reopen_seed(tmp, run_id="R1")
+    result = module.invalidate_reviewed_units_for_run(
+        repo=repo, run_id="R1", log_root_override=log_root
+    )
+    assert result["status"] == "reopened", result
+    assert sorted(result["reopened_unit_ids"]) == unit_ids
+    assert result["reopened_unit_count"] == len(unit_ids)
+    states = _lease_unit_states(log_root, repo_key, unit_ids)
+    assert set(states.values()) == {"available"}, states
+
+    records = read_jsonl(_alloc_events_path(log_root, repo_key))
+    reopened = [r for r in records if r.get("event") == "review_scope_reopened_for_run"]
+    assert reopened, records
+    assert reopened[-1]["run_id"] == "R1"
+    assert reopened[-1]["reopened_unit_count"] == len(unit_ids)
+    assert reopened[-1]["reason_code"] == "failed_impl_reentry"
+    assert reopened[-1]["rvf_state_phase"] == "review"
+
+    second = module.invalidate_reviewed_units_for_run(
+        repo=repo, run_id="R1", log_root_override=log_root
+    )
+    assert second["status"] == "noop", second
+    assert second["reopened_unit_count"] == 0
+    assert _lease_unit_states(log_root, repo_key, unit_ids) == states
+
+
+def test_invalidate_reviewed_units_for_run_is_run_scoped(tmp: Path) -> None:
+    module, repo, log_root, repo_key, unit_ids = _reopen_seed(tmp, run_id="R1")
+    other_unit = unit_ids[-1]
+    r1_units = unit_ids[:-1]
+    # Simulate `other_unit` having been reviewed by a *different* run; the
+    # reopen must never broadcast beyond the target run.
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute(
+            "UPDATE session_units SET run_id='R-other' WHERE unit_id=?", (other_unit,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = module.invalidate_reviewed_units_for_run(
+        repo=repo, run_id="R1", log_root_override=log_root
+    )
+    assert sorted(result["reopened_unit_ids"]) == sorted(r1_units), result
+    states = _lease_unit_states(log_root, repo_key, unit_ids)
+    assert states[other_unit] == "reviewed", states
+    for uid in r1_units:
+        assert states[uid] == "available", states
+
+
+def test_invalidate_reviewed_units_for_run_excludes_tombstoned(tmp: Path) -> None:
+    module, repo, log_root, repo_key, unit_ids = _reopen_seed(tmp, run_id="R1")
+    gone = unit_ids[-1]
+    live = unit_ids[:-1]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE units SET is_tombstoned=1 WHERE unit_id=?", (gone,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = module.invalidate_reviewed_units_for_run(
+        repo=repo, run_id="R1", log_root_override=log_root
+    )
+    assert result["candidate_unit_count"] == len(live), result
+    assert sorted(result["reopened_unit_ids"]) == sorted(live), result
+    states = _lease_unit_states(log_root, repo_key, unit_ids)
+    assert states[gone] == "reviewed", states
+    for uid in live:
+        assert states[uid] == "available", states
+
+
+def test_latest_reviewed_run_for_worktree_resolution(tmp: Path) -> None:
+    module, repo, log_root, repo_key, unit_ids = _reopen_seed(tmp, run_id="R1")
+    found = module.latest_reviewed_run_for_worktree(repo=repo, log_root_override=log_root)
+    assert found["status"] == "found", found
+    assert found["run_id"] == "R1"
+    assert found["reviewed_unit_count"] == len(unit_ids)
+
+    # A later run (greater assigned_at) reviewing one unit wins the ordering.
+    later_unit = unit_ids[-1]
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute(
+            "UPDATE session_units SET run_id='R-late', assigned_at='2099-01-01T00:00:00Z' "
+            "WHERE unit_id=?",
+            (later_unit,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    picked = module.latest_reviewed_run_for_worktree(repo=repo, log_root_override=log_root)
+    assert picked["status"] == "found", picked
+    assert picked["run_id"] == "R-late", picked
+
+    # After both runs are reopened, no reviewed run remains in this worktree.
+    module.invalidate_reviewed_units_for_run(repo=repo, run_id="R1", log_root_override=log_root)
+    module.invalidate_reviewed_units_for_run(repo=repo, run_id="R-late", log_root_override=log_root)
+    empty = module.latest_reviewed_run_for_worktree(repo=repo, log_root_override=log_root)
+    assert empty["status"] == "not_found", empty
+    assert empty["run_id"] is None

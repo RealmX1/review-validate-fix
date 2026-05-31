@@ -196,6 +196,9 @@ run_parallel_test_steps() {
   labels+=("tests: rvf_handoff_intake")
   scripts+=("$tests_dir/test_rvf_handoff_intake.py")
   args+=("")
+  labels+=("tests: review_reopen_marker")
+  scripts+=("$tests_dir/test_review_reopen_marker.py")
+  args+=("")
   local shard_index
   for ((shard_index = 0; shard_index < review_support_shards; shard_index++)); do
     if [ "$review_support_shards" -eq 1 ]; then
@@ -427,7 +430,12 @@ done
 repo_required_files=(
   "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
   "plugins/review-validate-fix/commands/rvf-land.md"
+  "plugins/review-validate-fix/commands/rvf-reopen.md"
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
+  "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
+  "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py"
+  "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
+  "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -435,6 +443,7 @@ repo_required_files=(
   "tests/test_codex_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
   "tests/test_review_support_scripts.py"
+  "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
 )
 
@@ -506,10 +515,14 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
+  "$skill_dir/scripts/diff_tracker.py" \
+  "$skill_dir/scripts/review_reopen_marker.py" \
+  "$skill_dir/scripts/rvf_rescope.py" \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
   "$tests_dir/test_codex_stop_review_validate_fix.py" \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_review_support_scripts.py" \
+  "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py"
 
 run_parallel_test_steps
@@ -543,6 +556,13 @@ require_repo_literal "plugins/review-validate-fix/commands/rvf-land.md" 'rvf-lan
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_handoff_intake.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_worktree_differs_from_current'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不自动运行 base-branch-sync'
+# 失败再入 $rvf-reopen command/skill + 确定性后端脚本（防部署门漂移、漏部署）
+require_repo_literal "plugins/review-validate-fix/commands/rvf-reopen.md" 'rvf-reopen bundled skill not found'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py" 'def resolve_target_run_id'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py" 'def invalidate_reviewed_units_for_run'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'review_scope_reopened_for_failed_impl'
 require_literal "SKILL.md" '本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用'
 require_literal "SKILL.md" 'policy.allow_implicit_invocation'
 require_literal "SKILL.md" 'Scope-of-work 不要只列 created/modified/deleted 文件'

@@ -4429,6 +4429,246 @@ def test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues(tmp_pa
     assert not marker_path.exists()
 
 
+def _dirty_repo_with_units_for_reopen(path: Path) -> Path:
+    """A git repo with one committed-then-modified file + one untracked file,
+    so a real allocate yields review units."""
+    path.mkdir(parents=True)
+    run(["git", "init", "-q"], path)
+    run(["git", "config", "user.email", "rvf@example.test"], path)
+    run(["git", "config", "user.name", "rvf-test"], path)
+    (path / "impl.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "impl.txt"], path)
+    run(["git", "commit", "-q", "-m", "impl base"], path)
+    (path / "impl.txt").write_text("base\nimplementation change\n", encoding="utf-8")
+    (path / "impl_extra.txt").write_text("new implementation file\n", encoding="utf-8")
+    return path
+
+
+def _seed_reviewed_run_for_reopen(state: Path, repo: Path, run_id: str) -> str:
+    """allocate + lease-release via the diff_tracker CLI so `run_id` leaves
+    durable `reviewed` units under `state` log root. Returns repo_key."""
+    diff_tracker = SCRIPT.with_name("diff_tracker.py")
+    alloc = subprocess.run(
+        [
+            sys.executable, str(diff_tracker), "allocate-review-scope",
+            "--repo", str(repo), "--session-id", "reopen-impl-S",
+            "--run-id", run_id, "--reviewer-id", "rev-a",
+            "--log-root", str(state), "--print-result",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    alloc_res = json.loads(alloc.stdout.strip().splitlines()[-1])
+    assert alloc_res["status"] == "allocated", alloc_res
+    rel = subprocess.run(
+        [
+            sys.executable, str(diff_tracker), "lease-release",
+            "--repo", str(repo), "--lease-id", alloc_res["lease_id"],
+            "--log-root", str(state), "--print-result",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    rel_res = json.loads(rel.stdout.strip().splitlines()[-1])
+    assert rel_res["released"] is True, rel_res
+    return alloc_res["repo_key"]
+
+
+def _seed_review_reopen_marker(state: Path, task_id: str, target_run_id: str, repo: Path) -> Path:
+    """Write a review-reopen marker file directly, mirroring rvf_rescope arm."""
+    marker_dir = state / "review-reopen-pending"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / f"task-{task_id}.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "pending_reopen",
+                "armed_at": "2026-05-31T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "ttl_seconds": 21600,
+                "target_run_id": target_run_id,
+                "repo": str(repo),
+                "reason": "failed_impl_reentry",
+                "source": "test",
+                "kanban_task_id": task_id,
+                "parent_session_id": None,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return marker
+
+
+def _reviewed_count_for_run(db: Path, run_id: str) -> int:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM session_units su JOIN units u ON u.unit_id=su.unit_id "
+            "WHERE su.run_id=? AND u.review_state='reviewed' AND u.is_tombstoned=0",
+            (run_id,),
+        ).fetchone()
+        return int(row[0])
+    finally:
+        conn.close()
+
+
+def test_review_reopen_marker_reopens_run_scope_before_dispatch(tmp_path: Path) -> None:
+    repo = _dirty_repo_with_units_for_reopen(tmp_path / "dirty")
+    state = tmp_path / "state"
+    run_id = "rvf-20260530T144027Z-stop-hook-06127eaf"
+    repo_key = _seed_reviewed_run_for_reopen(state, repo, run_id)
+    db = state / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+
+    before = _reviewed_count_for_run(db, run_id)
+    assert before >= 1, "seed should leave reviewed units for the target run"
+
+    marker = _seed_review_reopen_marker(state, "reopent1", run_id, repo)
+    assert marker.exists()
+
+    invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": "session-reopen-1",
+            "last_user_message": "ok, continuing",
+        },
+        extra_env={"KANBAN_TASK_ID": "reopent1"},
+        state_dir=state,
+    )
+
+    # 一次性语义：marker 被消费删除。
+    assert not marker.exists(), "rescope marker should be consumed by the Stop hook"
+
+    # run-scoped reopen：该实现 run 的 units 不再是 reviewed（翻回 available/assigned）。
+    after = _reviewed_count_for_run(db, run_id)
+    assert after == 0, f"target run units should be reopened: before={before} after={after}"
+
+    # ledger 落账 review_scope_reopened_for_failed_impl，且指明 target_run_id。
+    events = latest_events(state)
+    reopened = [e for e in events if e.get("event") == "review_scope_reopened_for_failed_impl"]
+    assert reopened, [e.get("event") for e in events]
+    assert reopened[-1]["target_run_id"] == run_id
+    assert reopened[-1]["reopened_unit_count"] == before
+
+
+def test_review_reopen_marker_stale_is_discarded_without_reopen(tmp_path: Path) -> None:
+    repo = _dirty_repo_with_units_for_reopen(tmp_path / "dirty")
+    state = tmp_path / "state"
+    run_id = "rvf-20260530T144027Z-stop-hook-06127eaf"
+    repo_key = _seed_reviewed_run_for_reopen(state, repo, run_id)
+    db = state / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+    before = _reviewed_count_for_run(db, run_id)
+    assert before >= 1
+
+    # 过期 marker：expires_at 在过去 → stale，应被消费但不重开。
+    marker_dir = state / "review-reopen-pending"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / "task-reopent2.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "pending_reopen",
+                "armed_at": "2000-01-01T00:00:00Z",
+                "expires_at": "2000-01-01T06:00:00Z",
+                "ttl_seconds": 21600,
+                "target_run_id": run_id,
+                "repo": str(repo),
+                "reason": "failed_impl_reentry",
+                "source": "test",
+                "kanban_task_id": "reopent2",
+                "parent_session_id": None,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": "session-reopen-2",
+            "last_user_message": "ok, continuing",
+        },
+        extra_env={"KANBAN_TASK_ID": "reopent2"},
+        state_dir=state,
+    )
+
+    # stale marker 被消费，但 reviewed units 未被重开。
+    assert not marker.exists()
+    assert _reviewed_count_for_run(db, run_id) == before
+    events = latest_events(state)
+    discarded = [e for e in events if e.get("event") == "review_reopen_marker_discarded"]
+    assert discarded, [e.get("event") for e in events]
+    assert discarded[-1]["reason_code"] == "review_reopen_stale"
+
+
+def _seed_followup_lock(state: Path, task_id: str, run_id: str) -> Path:
+    """Write an active kanban-followup in-progress lock file directly."""
+    lock_dir = state / "kanban-followup-in-progress"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock = lock_dir / f"task-{task_id}.json"
+    lock.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-31T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "ttl_seconds": 21600,
+                "kanban_task_id": task_id,
+                "run_id": run_id,
+                "run_dir": f"/x/runs/{run_id}",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return lock
+
+
+def test_review_reopen_reconciles_abandoned_followup_lock(tmp_path: Path) -> None:
+    repo = _dirty_repo_with_units_for_reopen(tmp_path / "dirty")
+    state = tmp_path / "state"
+    impl_run_id = "rvf-20260530T144027Z-stop-hook-06127eaf"  # 失败实现 run（rescope 目标）
+    abandoned_followup = "rvf-20260530T162907Z-stop-hook-d2cde44a"  # 被放弃的 followup run
+    repo_key = _seed_reviewed_run_for_reopen(state, repo, impl_run_id)
+    db = state / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
+    before = _reviewed_count_for_run(db, impl_run_id)
+    assert before >= 1
+
+    # 一把仍 active 的 followup 锁（属被放弃 run），原本会 6h 空转阻塞下次 dispatch。
+    lock = _seed_followup_lock(state, "reopent3", abandoned_followup)
+    marker = _seed_review_reopen_marker(state, "reopent3", impl_run_id, repo)
+    assert lock.exists() and marker.exists()
+
+    invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": "session-reopen-3",
+            "last_user_message": "ok, continuing",
+        },
+        extra_env={"KANBAN_TASK_ID": "reopent3"},
+        state_dir=state,
+    )
+
+    # active rescope marker 在场 → 放弃 run 的 followup 锁被 reconcile（清理），
+    # 不再阻塞；rescope marker 被消费；该实现 run 的 units 被全量重开。
+    assert not lock.exists(), "abandoned followup lock should be reconciled away"
+    assert not marker.exists(), "rescope marker should be consumed"
+    assert _reviewed_count_for_run(db, impl_run_id) == 0
+
+    events = latest_events(state)
+    names = [e.get("event") for e in events]
+    reconciled = [e for e in events if e.get("event") == "kanban_followup_lock_reconciled_for_reopen"]
+    assert reconciled, names
+    assert reconciled[-1]["reconciled_blocking_run_id"] == abandoned_followup
+    assert reconciled[-1]["reopen_target_run_id"] == impl_run_id
+    assert any(e.get("event") == "review_scope_reopened_for_failed_impl" for e in events), names
+
+
 def test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     task_workspace = init_repo(tmp_path / "task-workspace", dirty=False)
@@ -6812,6 +7052,9 @@ def main() -> int:
         test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready,
         test_post_analyze_quiet_marker_pending_when_artifacts_missing,
         test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues,
+        test_review_reopen_marker_reopens_run_scope_before_dispatch,
+        test_review_reopen_marker_stale_is_discarded_without_reopen,
+        test_review_reopen_reconciles_abandoned_followup_lock,
         test_kanban_task_workspace_mismatch_skips_unrelated_dirty_repo,
         test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env,
         test_cline_kanban_mode_marks_unavailable_when_task_start_fails,

@@ -58,8 +58,15 @@ from diff_tracker import (
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
+    invalidate_reviewed_units_for_run,
     lease_release,
     sweep_stale,
+)
+from review_reopen_marker import (
+    STATUS_ACTIVE as REVIEW_REOPEN_ACTIVE,
+    clear_review_reopen_marker,
+    read_review_reopen_marker,
+    review_reopen_status,
 )
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
@@ -2331,9 +2338,46 @@ def kanban_followup_in_progress_decision(
     status = kanban_followup_lock_status(marker)
     marker_path = marker.get("_marker_path")
     if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+        blocking_run_id = marker.get("run_id")
+        # 锁卫生：若上游 agent 经 $rvf-reopen 明确武装了 rescope marker（失败再入），
+        # 当前这把仍 active 的 followup 锁属于被放弃的那一轮 cycle（其 run 与 rescope
+        # 的 target_run_id 不同），应 reconcile 掉、让下游 reopen + 全量重审继续，
+        # 而不是被它 6h 空转阻塞（治原 R1.5 式 squat）。仅在确有 active rescope
+        # marker 且锁非 rescope 目标 run 时清理，绝不误清正在跑的 followup。
+        reopen_marker = read_review_reopen_marker(
+            task_id=task_id,
+            session_id=session_hook_id_from_event(event),
+        )
+        reopen_target_run_id = (
+            reopen_marker.get("target_run_id") if isinstance(reopen_marker, dict) else None
+        )
+        if (
+            reopen_marker is not None
+            and review_reopen_status(reopen_marker) == REVIEW_REOPEN_ACTIVE
+            and blocking_run_id != reopen_target_run_id
+        ):
+            removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+            ledger.event(
+                phase="gate",
+                event="kanban_followup_lock_reconciled_for_reopen",
+                status="completed",
+                reason_code="kanban_followup_lock_reconciled_for_failed_impl_reentry",
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                reconciled_blocking_run_id=blocking_run_id,
+                reopen_target_run_id=reopen_target_run_id,
+                kanban_followup_in_progress_marker=marker,
+                removed_kanban_followup_in_progress_marker_paths=removed_lock,
+            )
+            return None
         return skip_decision(
-            "已有 Cline Kanban RVF follow-up 仍在进行；"
-            "本次 Stop hook 跳过自动 RVF dispatch，避免在上一轮 handoff 完成前创建新 RVF。",
+            "已有 Cline Kanban RVF follow-up 仍在进行"
+            f"（阻塞 run_id={blocking_run_id or '<unknown>'}，"
+            f"armed_at={marker.get('armed_at') or '<unknown>'}，"
+            f"run_dir={marker.get('run_dir') or '<unknown>'}）；"
+            "本次 Stop hook 跳过自动 RVF dispatch，避免在上一轮 handoff 完成前创建新 RVF。"
+            "若该 followup 实际已被放弃，可经 $rvf-reopen 武装 rescope state 以 reconcile 掉它。",
             ledger,
             "kanban_followup_in_progress",
             cwd=cwd,
@@ -2342,8 +2386,10 @@ def kanban_followup_in_progress_decision(
             session_id=session_id,
             kanban_followup_in_progress_marker=marker,
             kanban_followup_in_progress_marker_path=marker_path,
-            active_rvf_run_id=marker.get("run_id"),
+            active_rvf_run_id=blocking_run_id,
             active_rvf_run_dir=marker.get("run_dir"),
+            active_rvf_armed_at=marker.get("armed_at"),
+            active_rvf_turn_id=marker.get("turn_id"),
             **stop_hook_rvf_state_fields(
                 phase="complete",
                 backend="kanban-followup",
@@ -2365,6 +2411,82 @@ def kanban_followup_in_progress_decision(
         consumed_kanban_followup_in_progress_marker_paths=removed,
     )
     return None
+
+
+def consume_review_reopen_marker(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+    *,
+    cwd: str | None,
+) -> dict[str, Any] | None:
+    """失败再入：在 dirty-route 即将 dispatch / allocate 前消费 rescope marker。
+
+    若 marker active → 按 ``target_run_id`` 把「最近一次刚经过 RVF 的实现 run」
+    仍存在的 ``reviewed`` units 翻回 ``available``（run-scoped，**绝不广播**到其它 run
+    或全 worktree），使紧接着的 allocate（本进程或 kanban-followup 后台 run 的 refresh+
+    allocate）自然得到「该实现 units ∪ 本次 fix delta」全量重审；随后 consume marker。
+    ``stale`` / ``invalid`` 也消费但不重开。best-effort：tracker 异常不阻断 Stop 主流程。
+    """
+    task_id = current_kanban_task_id(event)
+    session_id = session_hook_id_from_event(event)
+    marker = read_review_reopen_marker(task_id=task_id, session_id=session_id)
+    if marker is None:
+        return None
+
+    status = review_reopen_status(marker)
+    target_run_id = marker.get("target_run_id")
+
+    if status != REVIEW_REOPEN_ACTIVE:
+        removed = clear_review_reopen_marker(task_id=task_id, session_id=session_id)
+        ledger.event(
+            phase="gate",
+            event="review_reopen_marker_discarded",
+            status="completed",
+            reason_code=f"review_reopen_{status}",
+            cwd=cwd,
+            repo=repo,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            target_run_id=target_run_id,
+            review_reopen_marker=marker,
+            consumed_review_reopen_marker_paths=removed,
+        )
+        return None
+
+    reopen_result: dict[str, Any] | None = None
+    reopen_error: dict[str, str] | None = None
+    if target_run_id:
+        try:
+            reopen_result = invalidate_reviewed_units_for_run(
+                repo=repo,
+                run_id=target_run_id,
+                reason="failed_impl_reentry",
+            )
+        except Exception as exc:  # best-effort：绝不因 tracker 异常打断 Stop 主流程
+            reopen_error = {"kind": type(exc).__name__, "message": str(exc)}
+
+    removed = clear_review_reopen_marker(task_id=task_id, session_id=session_id)
+    ledger.event(
+        phase="gate",
+        event="review_scope_reopened_for_failed_impl",
+        status="completed" if reopen_error is None else "warning",
+        reason_code="failed_impl_reentry",
+        level="warn" if reopen_error is not None else "info",
+        cwd=cwd,
+        repo=repo,
+        cline_kanban_task_id=task_id,
+        session_id=session_id,
+        target_run_id=target_run_id,
+        run_id_source=marker.get("source"),
+        reopened_unit_count=(reopen_result or {}).get("reopened_unit_count"),
+        reopened_unit_ids=(reopen_result or {}).get("reopened_unit_ids"),
+        candidate_unit_count=(reopen_result or {}).get("candidate_unit_count"),
+        review_reopen_marker=marker,
+        consumed_review_reopen_marker_paths=removed,
+        error=reopen_error,
+    )
+    return reopen_result
 
 
 def current_kanban_workspace_path(event: dict[str, Any]) -> str | None:
@@ -7279,6 +7401,13 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                     repo=cwd_result.repo,
                     cwd=cwd,
                 )
+
+            # 失败再入：若上游 agent 经 $rvf-reopen 武装了 rescope marker，在 allocate /
+            # kanban-followup launch 之前按 target_run_id 把那次实现仍存在的 reviewed
+            # units 翻回 available（run-scoped），使本轮 RVF 全量重审「实现 ∪ fix」。
+            # precheck 已做 tracker refresh；此处翻转的 DB 状态会被紧接着的本进程
+            # allocate 或 kanban-followup 后台 run 的 refresh+allocate 一并 reconcile。
+            consume_review_reopen_marker(event, cwd_result.repo, ledger, cwd=cwd)
 
             route_candidate_paths = (
                 session_precheck.route_paths

@@ -64,6 +64,13 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 - 最终回复前调用 `scripts/rvf_handoff.py open <handoff.md>`；最终回复第一行输出 `RVF_HANDOFF_FILE: <绝对路径>`，后面只用 1-3 句中文概括 reviewers 和 validate/fixers 的结果。
 - Handoff 只写确认过的事实，不把背景 WIP 或其他 session 的改动混成本轮工作。
 
+## 拿 handoff 回到实现起点后的两条再入分支
+
+用户把 RVF handoff 拿回「早先实现刚完成那一刻」时，成功判据是「**实现本身是否达成原始目标**」（用户实测决定，**与 RVF 的 fix 是否达标无关**），据此分两条互斥分支：
+
+- **实现达标** → `$rvf-land`：在同一 worktree sanity-check future-self 已应用的修复并提交；不启动新的 review。
+- **实现未达标 / 有问题**（用户带失败信号回来，无论是否粘贴 handoff）→ `$rvf-reopen`：先按「最近一次刚经过 RVF 的那次实现 run」武装一次性 rescope state（`scripts/rvf_rescope.py arm`），再修用户暴露的问题；修复带来的新增改动会让下一次 Stop 全量重审「该实现 units ∪ 本次 fix delta」（run-scoped 重开，不波及无关已审工作）。详见 `skills/rvf-reopen/SKILL.md`。
+
 ## 文档分层
 
 - `prompts/`：脚本直接传给 reviewer 和 validate/fix 子代理的 self-contained prompt。
