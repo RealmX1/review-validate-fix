@@ -231,6 +231,9 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
             errors.append("no_issues result must not include issues")
         if requests:
             errors.append("no_issues result must not include requests")
+        audit_summary = payload.get("audit_summary")
+        if not isinstance(audit_summary, str) or not audit_summary.strip():
+            errors.append("no_issues result must include a non-empty audit_summary")
     elif kind == "issues":
         if not issues:
             errors.append("issues result must include at least one issue")
@@ -249,6 +252,7 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
         "request_count": len(requests) if not errors and kind == "request" else 0,
         "request_types": sorted(set(request_types)) if not errors and kind == "request" else [],
         "lock_request_count": request_types.count("lock_request") if not errors and kind == "request" else 0,
+        "audit_summary": payload.get("audit_summary") if not errors and kind == "no_issues" else None,
         "issues": issues if not errors and kind == "issues" else [],
         "requests": requests if not errors and kind == "request" else [],
         "errors": errors,

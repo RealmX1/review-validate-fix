@@ -1533,7 +1533,7 @@ def clean_review_result_python(*, stdout: str = "artifact written") -> str:
         "import os, subprocess, sys; "
         "sys.stdin.read(); "
         "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
         f"print({stdout!r})"
     )
 
@@ -1714,13 +1714,23 @@ def test_review_result_artifact_no_issues_and_issues(tmp_path: Path) -> None:
     env["RVF_RUN_DIR"] = str(tmp_path / "run")
 
     run(
-        [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(clean)],
+        [
+            sys.executable,
+            str(WRITE_REVIEW_RESULT),
+            "no-issues",
+            "--out",
+            str(clean),
+            "--audit-summary",
+            "审了 src/foo.ts 与 Dockerfile 改动及其边界，未发现 correctness 问题。",
+        ],
         env=env,
     )
     clean_check = run([sys.executable, str(CHECK_REVIEW_RESULT), str(clean), "--json"])
     clean_payload = json.loads(clean_check.stdout)
     assert clean_payload["valid"] is True
     assert clean_payload["kind"] == "no_issues"
+    assert clean_payload["audit_summary"].strip()
+    assert json.loads(clean.read_text(encoding="utf-8"))["audit_summary"].strip()
 
     issues = tmp_path / "run" / "artifacts" / "reviewers" / "b" / "review-result.json"
     run(
@@ -1773,6 +1783,57 @@ def test_review_result_artifact_no_issues_and_issues(tmp_path: Path) -> None:
     assert issue_payload["issues"][0]["severity"] == "high"
     assert issue_payload["issues"][1]["kind"] == "REAL"
     assert issue_payload["issues"][1]["severity"] == "medium"
+
+
+def test_no_issues_requires_audit_summary(tmp_path: Path) -> None:
+    """no_issues 必须带非空 audit_summary：写入层强制必填，校验层拒绝缺失/空白，正常路径会被 surface。"""
+    env = os.environ.copy()
+    env["RVF_RUN_DIR"] = str(tmp_path / "run")
+    out = tmp_path / "run" / "artifacts" / "reviewers" / "a" / "review-result.json"
+
+    # 1) 写入层：缺 --audit-summary 必须失败
+    missing = subprocess.run(
+        [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(out)],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert missing.returncode != 0
+    assert "audit-summary" in (missing.stderr + missing.stdout)
+
+    # 2) 写入层：空白 audit_summary 必须失败
+    blank = subprocess.run(
+        [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(out),
+         "--audit-summary", "   "],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert blank.returncode != 0
+
+    # 3) 校验层：手写一个缺 audit_summary 的 no_issues artifact 必须被判违规
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps({
+            "schema_version": 1, "kind": "no_issues",
+            "created_at": "2026-05-30T00:00:00+00:00",
+            "issues": [], "requests": [],
+        }) + "\n", encoding="utf-8",
+    )
+    rejected = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(out), "--json"],
+        capture_output=True, text=True, check=False,
+    )
+    payload = json.loads(rejected.stdout)
+    assert payload["valid"] is False
+    assert any("audit_summary" in e for e in payload["errors"])
+
+    # 4) 正常路径：带 audit_summary 写入并通过校验，且被 surface 出来
+    run(
+        [sys.executable, str(WRITE_REVIEW_RESULT), "no-issues", "--out", str(out),
+         "--audit-summary", "逐函数核对 docstring 与边界，确认无 correctness 回归。"],
+        env=env,
+    )
+    ok = json.loads(run([sys.executable, str(CHECK_REVIEW_RESULT), str(out), "--json"]).stdout)
+    assert ok["valid"] is True
+    assert ok["kind"] == "no_issues"
+    assert "docstring" in ok["audit_summary"]
 
 
 def test_review_result_artifact_requests_and_scope_exclusions(tmp_path: Path) -> None:
@@ -1908,6 +1969,8 @@ def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp_path: Path
             "no-issues",
             "--out",
             str(tmp_path / "outside.json"),
+            "--audit-summary",
+            "审了改动，无问题。",
         ],
         env=env,
         capture_output=True,
@@ -3899,7 +3962,7 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
         "assert os.environ['RVF_REVIEW_RESULT']; "
         "import subprocess; "
         "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
         "print('artifact written')"
     )
     config = write_alternative_reviewer_config(
@@ -3950,7 +4013,7 @@ def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp_path:
         f"assert Path({str(token)!r}).read_text(encoding='utf-8') == 'ready'; "
         f"Path({str(order)!r}).write_text(Path({str(order)!r}).read_text(encoding='utf-8') + 'reviewer\\n', encoding='utf-8'); "
         "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
         "print('artifact written')"
     )
     config = write_alternative_reviewer_config(
@@ -4638,7 +4701,7 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp_path: Path) ->
                 "import os, subprocess, sys, time; sys.stdin.read(); "
                 "[print(f'tick-{i}', flush=True) or time.sleep(0.08) for i in range(4)]; "
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
                 "print('NO_ISSUES', flush=True)"
             ),
         ],
@@ -4686,7 +4749,7 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp_pat
                 "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
                 "]}}), flush=True); "
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
@@ -4876,7 +4939,7 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp_path: Path)
                 "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}), flush=True); "
                 "time.sleep(0.08); "
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
                 "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
@@ -4918,7 +4981,7 @@ def test_alternative_reviewer_codex_json_extracts_agent_message(tmp_path: Path) 
                 "import json, os, subprocess, sys; sys.stdin.read(); "
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'working'}}), flush=True); "
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)"
             ),
         ],
@@ -4960,7 +5023,7 @@ def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(t
                 "import json, os, subprocess, sys; sys.stdin.read(); "
                 "print('non-json warning line', flush=True); "
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True); "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
                 "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'NO_ISSUES'}}), flush=True)"
             ),
         ],
@@ -5056,7 +5119,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
             ]
         )
@@ -5119,7 +5182,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
             ]
         )
@@ -5197,7 +5260,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
                 "}))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
             ]
         )
@@ -5256,7 +5319,7 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp_path: Pa
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
             ]
         )
@@ -5313,7 +5376,7 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Pat
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print('NO_ISSUES', flush=True)",
             ]
         )
@@ -5365,7 +5428,7 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_
                 "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
                 "sys.stdin.read()",
                 "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT']], check=True)",
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
                 "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
             ]
         )
@@ -7930,6 +7993,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "review_result_artifact_no_issues_and_issues",
             lambda: test_review_result_artifact_no_issues_and_issues(root / "review-result-basic"),
+        ),
+        (
+            "no_issues_requires_audit_summary",
+            lambda: test_no_issues_requires_audit_summary(root / "no-issues-audit-summary"),
         ),
         (
             "review_result_artifact_requests_and_scope_exclusions",

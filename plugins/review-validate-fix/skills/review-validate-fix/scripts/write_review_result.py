@@ -93,6 +93,7 @@ def optional_fields(args: argparse.Namespace, names: tuple[str, ...]) -> dict[st
 
 def command_no_issues(args: argparse.Namespace) -> int:
     payload = base_payload("no_issues")
+    payload["audit_summary"] = args.audit_summary.strip()
     write_payload(Path(args.out), payload)
     return 0
 
@@ -237,7 +238,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     no_issues = subparsers.add_parser("no-issues", help="Write a clean review result.")
     no_issues.add_argument("--out", required=True, help="Review result artifact path.")
-    no_issues.set_defaults(func=command_no_issues, required_fields=())
+    no_issues.add_argument(
+        "--audit-summary",
+        required=True,
+        help=(
+            "1-3 句中文：实际审了哪些代码/逻辑、核对了哪些 docstring/契约/边界、"
+            "排除了哪些风险类别。这是 clean 结论的可追溯依据，不要写“跑了测试通过”这类绿测试确认。"
+        ),
+    )
+    no_issues.set_defaults(func=command_no_issues, required_fields=("audit_summary",))
 
     issue = subparsers.add_parser("issue", help="Append an issue to the result artifact.")
     issue.add_argument("--out", required=True, help="Review result artifact path.")

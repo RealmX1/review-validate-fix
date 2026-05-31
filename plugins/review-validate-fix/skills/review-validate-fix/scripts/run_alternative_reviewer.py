@@ -619,7 +619,7 @@ def build_prompt(
                 "- `RVF_WRITE_REVIEW_RESULT`: script for writing the canonical review result artifact.",
                 "- `RVF_CHECK_REVIEW_RESULT`: script for validating the canonical artifact before final response.",
                 '- Example: `python3 "$RVF_COMMAND_LOCK" --repo "$RVF_REPO" --name <stable-lock-name> -- <command ...>`',
-                '- Result example: `python3 "$RVF_WRITE_REVIEW_RESULT" no-issues --out "$RVF_REVIEW_RESULT"`',
+                '- Result example: `python3 "$RVF_WRITE_REVIEW_RESULT" no-issues --out "$RVF_REVIEW_RESULT" --audit-summary "<what you actually audited and ruled out>"`',
             ]
         )
     if result_path is not None:
