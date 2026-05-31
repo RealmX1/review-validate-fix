@@ -1,0 +1,600 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RVF：Theseus 的第一个真实承载对象</title>
+<style>
+  /* ── 设计令牌：克制、清晰、研究风 ── */
+  :root{
+    --bg:#e9ebee;          /* 舞台底色 */
+    --slide:#ffffff;       /* 单页底色 */
+    --ink:#1b2430;         /* 主文字 */
+    --ink-soft:#5c6675;    /* 次级文字 */
+    --ink-faint:#98a1ac;   /* 弱文字 */
+    --line:#d9dee4;        /* 细线 */
+    --accent:#2c6e8f;      /* 主强调（沉静蓝绿） */
+    --accent-2:#a8593f;    /* 次强调（赭，少量） */
+    --accent-soft:#e8f1f4; /* 强调浅填充 */
+    --ground:#f3f5f7;      /* 底层块填充 */
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;}
+  body{
+    font-family:var(--sans);
+    color:var(--ink);
+    background:var(--bg);
+    -webkit-font-smoothing:antialiased;
+    overflow:hidden;
+  }
+
+  /* ── 舞台与缩放 ── */
+  .stage{position:fixed;inset:0;overflow:hidden;}
+  .deck{
+    position:absolute;left:50%;top:50%;
+    width:1280px;height:720px;
+    transform:translate(-50%,-50%) scale(1);
+    transform-origin:center center;
+  }
+  .slide{
+    position:absolute;inset:0;
+    background:var(--slide);
+    padding:60px 80px 52px;
+    display:none;flex-direction:column;
+    border-radius:4px;
+    box-shadow:0 20px 60px rgba(20,30,45,.14);
+  }
+  .slide.active{display:flex;}
+
+  /* ── 通用版式 ── */
+  .kicker{
+    font-family:var(--mono);
+    font-size:14px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--accent);font-weight:600;
+  }
+  h1{font-size:42px;line-height:1.16;margin:14px 0 4px;font-weight:680;letter-spacing:-.01em;}
+  .rule{height:3px;width:54px;background:var(--accent);border-radius:2px;margin:14px 0 22px;}
+  code{font-family:var(--mono);font-size:.88em;color:var(--accent);font-weight:600;letter-spacing:0;}
+
+  ul.b{list-style:none;margin:0;padding:0;}
+  ul.b li{
+    position:relative;padding-left:24px;margin:16px 0;
+    font-size:23px;line-height:1.5;color:var(--ink);
+  }
+  ul.b li::before{
+    content:"";position:absolute;left:0;top:12px;
+    width:9px;height:9px;border-radius:2px;background:var(--accent);
+  }
+  ul.b li small{display:block;font-size:16px;color:var(--ink-soft);margin-top:3px;}
+
+  /* 两栏布局 */
+  .cols{display:flex;gap:50px;flex:1;align-items:center;}
+  .col-text{flex:1.04;min-width:0;}
+  .col-text ul.b li{font-size:21px;margin:14px 0;}
+  .col-diag{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;}
+
+  /* 顶部要点 + 下方全宽图 */
+  .stacked{flex:1;display:flex;flex-direction:column;}
+  .diag-full{margin-top:26px;display:flex;flex-direction:column;align-items:center;justify-content:center;flex:1;}
+
+  /* 页脚 */
+  .foot{
+    display:flex;justify-content:space-between;align-items:center;
+    margin-top:auto;padding-top:18px;
+    font-family:var(--mono);font-size:12.5px;color:var(--ink-faint);letter-spacing:.04em;
+  }
+
+  /* ── 标题页 ── */
+  .title-slide{justify-content:center;}
+  .title-slide h1{font-size:56px;margin:18px 0 10px;}
+  .lead{font-size:21px;line-height:1.6;color:var(--ink-soft);max-width:880px;}
+  .lead .hi{color:var(--ink);font-weight:600;}
+
+  /* timeline（设计演化时间线） */
+  .timeline{position:relative;display:flex;margin-top:46px;}
+  .timeline::before{
+    content:"";position:absolute;top:6px;left:8.3%;right:8.3%;height:2px;background:var(--line);
+  }
+  .tl{flex:1;text-align:center;position:relative;padding-top:24px;}
+  .tl .dot{
+    position:absolute;top:0;left:50%;transform:translateX(-50%);
+    width:14px;height:14px;border-radius:50%;background:#fff;border:2.5px solid var(--accent);z-index:2;
+  }
+  .tl.future .dot{border-style:dashed;border-color:var(--ink-faint);}
+  .tl .t{font-size:15px;color:var(--ink);line-height:1.3;}
+  .tl .n{font-family:var(--mono);font-size:11px;color:var(--ink-faint);}
+  .tl.future .t{color:var(--ink-soft);}
+
+  /* ── 流程框（loop / 演化 / 范围） ── */
+  .flow{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;}
+  .fbox{
+    display:inline-flex;flex-direction:column;align-items:center;gap:3px;
+    border:1.6px solid var(--line);border-radius:10px;background:#fff;
+    padding:14px 20px;font-size:19px;font-weight:600;color:var(--ink);min-width:96px;
+  }
+  .fbox small{font-size:13px;font-weight:400;color:var(--ink-soft);}
+  .fbox.accent{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
+  .fbox.term{border-color:var(--accent-2);color:var(--accent-2);}
+  .fbox.sm{font-size:17px;padding:11px 16px;min-width:0;}
+  .fbox.card{border-color:var(--accent);background:var(--accent-soft);align-items:flex-start;}
+  .fbox.muted{color:var(--ink-faint);}
+  .farrow{font-family:var(--mono);font-size:18px;color:var(--accent);font-weight:700;white-space:nowrap;}
+  .struck{text-decoration:line-through;text-decoration-color:var(--accent-2);}
+
+  /* loop 的 ∏ 形迭代桥 */
+  .loopwrap{width:100%;max-width:860px;}
+  .loop-bridge{
+    height:34px;margin:0 19% 0 33%;
+    border:2px solid var(--accent);border-bottom:none;border-radius:12px 12px 0 0;
+    position:relative;
+  }
+  .loop-bridge span{
+    position:absolute;top:-13px;left:50%;transform:translateX(-50%);
+    background:var(--slide);padding:0 10px;white-space:nowrap;
+    color:var(--accent);font-size:14px;
+  }
+
+  /* ── 层级图（layer） ── */
+  .layers{display:flex;flex-direction:column;gap:11px;width:100%;}
+  .layers.tight{margin-top:18px;}
+  .layer{border:1.6px solid var(--line);border-radius:11px;background:#fff;padding:15px 20px;}
+  .layer .l-title{font-size:19px;font-weight:600;display:flex;align-items:center;gap:10px;}
+  .layer .l-meta{font-family:var(--mono);font-size:13.5px;color:var(--ink-soft);margin-top:5px;}
+  .layer.accent{border-color:var(--accent);background:var(--accent-soft);}
+  .layer.accent .l-title{color:var(--accent);}
+  .layer.dashed{border-style:dashed;}
+  .layer.ground{background:var(--ground);}
+  .tag{
+    font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.04em;
+    color:var(--accent);background:#fff;border:1px solid var(--accent);
+    border-radius:999px;padding:2px 9px;
+  }
+
+  /* ── 范围 / 责任 ── */
+  .scope{width:100%;max-width:840px;display:flex;flex-direction:column;align-items:center;gap:20px;}
+  .lanes-wrap{display:flex;flex-direction:column;align-items:center;gap:8px;}
+  .share-up{font-size:15px;color:var(--ink-soft);}
+  .lanes{display:flex;gap:12px;}
+  .ochip{
+    border:1.4px solid var(--line);border-radius:999px;background:#fff;
+    padding:7px 16px;font-family:var(--mono);font-size:14px;color:var(--ink-soft);
+  }
+
+  /* ── 状态轨 + ledger ── */
+  .states{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:22px;}
+  .state{
+    border:1.6px solid var(--line);border-radius:9px;background:#fff;
+    padding:10px 14px;font-size:16px;font-weight:600;color:var(--ink-soft);
+  }
+  .state.done{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
+  .states i{font-family:var(--mono);color:var(--accent);font-style:normal;font-weight:700;}
+  .ledger{border:1.6px solid var(--line);border-radius:11px;overflow:hidden;}
+  .led-head{
+    background:var(--ground);padding:9px 16px;font-family:var(--mono);font-size:13px;
+    letter-spacing:.05em;color:var(--ink-soft);border-bottom:1.6px solid var(--line);
+  }
+  .led-row{padding:10px 16px;font-size:16px;color:var(--ink);border-bottom:1px solid var(--line);}
+  .led-row:last-child{border-bottom:none;}
+  .led-row b{font-family:var(--mono);color:var(--accent);font-weight:600;font-size:14px;}
+
+  /* ── 未来架构 ── */
+  .arch{width:100%;display:flex;flex-direction:column;align-items:center;gap:6px;}
+  .arch-layer{width:100%;border-radius:12px;padding:16px 20px;}
+  .arch-layer.future{border:2px dashed var(--accent);background:var(--accent-soft);}
+  .arch-layer.seed{border:1.6px solid var(--accent-2);background:#fff;}
+  .al-head{font-size:18px;font-weight:680;color:var(--accent);margin-bottom:12px;}
+  .arch-layer.seed .al-head{color:var(--accent-2);margin-bottom:0;}
+  .al-grid{display:flex;flex-wrap:wrap;gap:9px;}
+  .arch-up{font-family:var(--mono);font-size:13.5px;color:var(--ink-soft);padding:4px 0;}
+
+  /* ── 双向交换（Theseus ⇄ RVF） ── */
+  .exchange{width:100%;max-width:420px;margin:0 auto;display:flex;flex-direction:column;}
+  .ex-node{border:1.8px solid var(--accent);border-radius:13px;padding:14px 18px;text-align:center;background:#fff;}
+  .ex-node.platform{background:var(--accent-soft);}
+  .ex-node .en-title{font-size:20px;font-weight:680;color:var(--accent);}
+  .ex-node .en-sub{font-size:14px;color:var(--ink-soft);margin-top:3px;}
+  .ex-conn{display:flex;justify-content:center;gap:34px;padding:11px 0;}
+  .ex-arm{display:flex;flex-direction:column;align-items:center;text-align:center;
+          font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);line-height:1.4;}
+  .ex-arm .glyph{font-size:22px;font-weight:700;color:var(--accent);line-height:1;}
+  .ex-arm.down .glyph{color:var(--accent-2);}
+  .ex-arm .lab{font-weight:700;color:var(--accent);letter-spacing:.04em;margin:2px 0 3px;}
+  .ex-arm .lab.alt{color:var(--accent-2);}
+
+  /* 控制面演化：虚线框变体 + 分线标注 */
+  .fbox.dashed{border-style:dashed;}
+  .cp-sep{margin-top:14px;font-family:var(--mono);font-size:12.5px;color:var(--ink-faint);letter-spacing:.03em;}
+
+  /* ── 总结弧 ── */
+  .arc{display:flex;align-items:center;justify-content:center;gap:26px;margin:8px 0 18px;}
+  .arc .big{
+    border:1.8px solid var(--line);border-radius:14px;padding:20px 30px;
+    font-size:24px;font-weight:680;text-align:center;color:var(--ink-soft);min-width:200px;
+  }
+  .arc .big.now{border-color:var(--accent);background:var(--accent-soft);color:var(--accent);}
+  .arc .ar{font-family:var(--mono);font-size:26px;color:var(--accent);font-weight:700;}
+  .transform-line{text-align:center;font-size:19px;color:var(--ink);}
+  .transform-line code{font-size:.92em;}
+  .next-line{text-align:center;font-family:var(--mono);font-size:14px;color:var(--ink-faint);margin-top:10px;letter-spacing:.04em;}
+
+  /* ── HUD（屏外控制条） ── */
+  .hud{
+    position:fixed;left:0;right:0;bottom:0;height:38px;z-index:30;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:0 18px;font-family:var(--mono);font-size:12.5px;color:var(--ink-soft);
+    pointer-events:none;
+  }
+  .hud .hint{letter-spacing:.04em;color:var(--ink-faint);}
+  .hud .nav{display:flex;align-items:center;gap:6px;pointer-events:auto;}
+  .hud button{
+    font-family:var(--mono);font-size:14px;color:var(--ink-soft);
+    background:#fff;border:1px solid var(--line);border-radius:7px;
+    width:30px;height:26px;cursor:pointer;line-height:1;
+  }
+  .hud button:hover{border-color:var(--accent);color:var(--accent);}
+  .hud .count{min-width:64px;text-align:right;color:var(--ink);}
+  .progress{position:fixed;left:0;top:0;height:3px;background:var(--accent);width:0;z-index:31;transition:width .25s ease;}
+
+  /* ── 备注条 ── */
+  .notebar{
+    position:fixed;left:0;right:0;bottom:0;z-index:25;
+    background:#fff;border-top:3px solid var(--accent);
+    box-shadow:0 -8px 30px rgba(20,30,45,.10);
+    padding:16px 26px 20px;display:none;
+  }
+  body.notes-on .notebar{display:block;}
+  .notebar .nb-label{
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);font-weight:600;margin-bottom:6px;
+  }
+  .notebar .nb-body{font-size:17px;line-height:1.55;color:var(--ink);max-width:1000px;}
+  .note-src{display:none;}
+
+  /* ── 打印（导出 PDF / 讲义） ── */
+  @media print{
+    body{overflow:visible;background:#fff;}
+    .stage{position:static;overflow:visible;}
+    .deck{position:static;transform:none !important;width:100%;height:auto;left:auto;top:auto;}
+    .slide{display:flex !important;position:relative;inset:auto;height:96vh;
+           box-shadow:none;page-break-after:always;border:1px solid var(--line);}
+    .hud,.notebar,.progress{display:none !important;}
+    .note-src{display:block;margin-top:16px;padding-top:12px;border-top:1px dashed var(--line);
+              font-size:14px;color:var(--ink-soft);}
+    .note-src::before{content:"备注：";font-weight:600;color:var(--accent);}
+  }
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+<div class="stage" id="stage">
+  <div class="deck" id="deck">
+
+    <!-- ════ Slide 1 · 标题 ════ -->
+    <section class="slide title-slide">
+      <div class="kicker">Project Theseus · RVF 设计演化与定位</div>
+      <h1>RVF：Theseus 的第一个真实承载对象</h1>
+      <div class="rule"></div>
+      <p class="lead">
+        <span class="hi">Project Theseus</span> 是一个「众筹数据 → 迭代 AI 能力」的平台；
+        <span class="hi">Review-Validate-Fix</span> 是它的第一个真实承载对象（target）。<br>
+        RVF 不是单纯的代码审查工具，而是一个把 agent 工作过程<span class="hi">结构化</span>的 workflow。<br>
+        核心问题：AI 完成工作后，如何被<span class="hi">观察、审查、修复与交接</span>？
+      </p>
+      <div class="timeline">
+        <div class="tl"><div class="dot"></div><div class="t">Skill</div><div class="n">起点</div></div>
+        <div class="tl"><div class="dot"></div><div class="t">Workflow Plugin</div><div class="n">形态</div></div>
+        <div class="tl"><div class="dot"></div><div class="t">Scope 一等对象</div><div class="n">范围</div></div>
+        <div class="tl"><div class="dot"></div><div class="t">Ledger / Handoff</div><div class="n">状态</div></div>
+        <div class="tl"><div class="dot"></div><div class="t">思迹 控制面</div><div class="n">过渡</div></div>
+        <div class="tl future"><div class="dot"></div><div class="t">独立 Kanban</div><div class="n">未来</div></div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">RVF 的价值不在于"再跑一个 reviewer"，而在于把 agent 工作从聊天结果变成一个可治理对象——这正是它能作为 Theseus target 的前提。</div>
+    </section>
+
+    <!-- ════ Slide 2 · 起点 ════ -->
+    <section class="slide">
+      <div class="kicker">01 · 起点</div>
+      <h1>起点：Post-work Quality Loop</h1>
+      <div class="rule"></div>
+      <div class="stacked">
+        <ul class="b">
+          <li>最初目标：AI 完成工作后，自动进入 review → validate → fix → handoff</li>
+          <li>审查不依赖主 agent 的自觉，也不依赖聊天记忆</li>
+          <li>每次工作都留下可复盘的<strong>范围、证据与交接材料</strong></li>
+        </ul>
+        <div class="diag-full">
+          <div class="loopwrap">
+            <div class="loop-bridge"><span>↺ 未通过则回到 Validate 迭代</span></div>
+            <div class="flow">
+              <span class="fbox">Review</span>
+              <span class="farrow">→</span>
+              <span class="fbox accent">Validate</span>
+              <span class="farrow">→</span>
+              <span class="fbox">Fix</span>
+              <span class="farrow">→</span>
+              <span class="fbox term">Handoff<small>交接下一棒</small></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">这是 RVF 最早的设计核心：为 AI 工作补上一个明确的质量闭环。</div>
+    </section>
+
+    <!-- ════ Slide 3 · 形态演化 ════ -->
+    <section class="slide">
+      <div class="kicker">02 · 形态演化</div>
+      <h1>从 Skill 到 Workflow Plugin</h1>
+      <div class="rule"></div>
+      <div class="cols">
+        <div class="col-text">
+          <ul class="b">
+            <li>从单个 skill 演化为跨 <code>Codex</code> / <code>Claude Code</code> / manual path 的 workflow plugin</li>
+            <li>agent-facing instruction 只描述<strong>入口与边界</strong></li>
+            <li>真正状态由 scripts、artifacts、<code>ledger</code>、<code>scope contract</code> 持有</li>
+          </ul>
+        </div>
+        <div class="col-diag">
+          <div class="flow" style="justify-content:flex-start;margin-bottom:6px;">
+            <span class="fbox sm">单个 Skill</span>
+            <span class="farrow">→</span>
+            <span class="fbox sm accent">Workflow Plugin</span>
+          </div>
+          <div class="layers tight">
+            <div class="layer">
+              <div class="l-title">agent-facing instruction</div>
+              <div class="l-meta">只描述入口与边界（thin）</div>
+            </div>
+            <div class="layer ground">
+              <div class="l-title">真实状态 = 可检查的 artifacts</div>
+              <div class="l-meta">scripts · artifacts · ledger · scope contract</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">关键转变：workflow state 不再存在 prompt 里，而存在可检查的 artifacts 中。</div>
+    </section>
+
+    <!-- ════ Slide 4 · 范围 ════ -->
+    <section class="slide">
+      <div class="kicker">03 · 范围</div>
+      <h1>范围成为一等对象</h1>
+      <div class="rule"></div>
+      <div class="stacked">
+        <ul class="b">
+          <li>不再默认把 <code>git diff</code> 当作审查真相</li>
+          <li>每次 review 都<strong>冻结 scope</strong>，形成 <code>scope contract</code> / review packet</li>
+          <li>为多 session、多 worktree、多 agent 协作提供基础</li>
+        </ul>
+        <div class="diag-full">
+          <div class="scope">
+            <div class="flow">
+              <span class="fbox sm muted"><span class="struck">git diff</span><small>不再默认 = 审查真相</small></span>
+              <span class="farrow">冻结 →</span>
+              <span class="fbox card">Scope Contract / Review Packet<small>每次 review 冻结的范围</small></span>
+            </div>
+            <div class="lanes-wrap">
+              <div class="share-up">↑ 共享同一冻结范围，明确"谁负责哪段工作"</div>
+              <div class="lanes">
+                <span class="ochip">多 session</span>
+                <span class="ochip">多 worktree</span>
+                <span class="ochip">多 agent</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">Theseus 要管理的不只是任务，还包括"谁对哪一段工作负责"。RVF 先把这个问题显式化。</div>
+    </section>
+
+    <!-- ════ Slide 5 · 状态与交接 ════ -->
+    <section class="slide">
+      <div class="kicker">04 · 状态与交接</div>
+      <h1>状态、证据与交接</h1>
+      <div class="rule"></div>
+      <div class="cols">
+        <div class="col-text">
+          <ul class="b">
+            <li><code>run ledger</code> 记录 workflow 生命周期</li>
+            <li>reviewer 输出、validate/fix 结果、<code>handoff</code> 都成为可审查 artifact</li>
+            <li>"完成 / 已审查 / 已修复 / 可交接"被拆成不同状态</li>
+          </ul>
+        </div>
+        <div class="col-diag">
+          <div class="states">
+            <span class="state">完成</span><i>→</i>
+            <span class="state">已审查</span><i>→</i>
+            <span class="state">已修复</span><i>→</i>
+            <span class="state done">可交接</span>
+          </div>
+          <div class="ledger">
+            <div class="led-head">RUN LEDGER · 生命周期</div>
+            <div class="led-row"><b>reviewer</b> 输出</div>
+            <div class="led-row"><b>validate / fix</b> 结果</div>
+            <div class="led-row"><b>handoff</b> 材料</div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">AI 工作不再是聊天结束就消失，而是留下可追踪、可验证、可复用的过程记录——这种结构化记录，正是 Theseus 众筹与能力评估需要的信号。</div>
+    </section>
+
+    <!-- ════ Slide 6 · 系统定位：RVF 作为 Theseus 的 target ════ -->
+    <section class="slide">
+      <div class="kicker">05 · 系统定位</div>
+      <h1>RVF：Theseus 的第一个真实 target</h1>
+      <div class="rule"></div>
+      <div class="cols">
+        <div class="col-text">
+          <ul class="b">
+            <li><strong>Project Theseus</strong>：众筹数据 → 迭代 AI 能力 的平台</li>
+            <li>RVF 是它的第一个真实 <code>target</code>——因为 agent 工作已被结构化为<strong>可治理对象</strong></li>
+            <li>关系是<strong>双向</strong>的：RVF 既是能力评估的<strong>信号来源</strong>，也是能力落地的<strong>试验场</strong></li>
+          </ul>
+        </div>
+        <div class="col-diag">
+          <div class="exchange">
+            <div class="ex-node platform">
+              <div class="en-title">Project Theseus</div>
+              <div class="en-sub">众筹数据 → 迭代 AI 能力</div>
+            </div>
+            <div class="ex-conn">
+              <div class="ex-arm up">
+                <span class="glyph">↑</span>
+                <span class="lab">数据源</span>
+                <span>结构化工作记录<br>众筹 / 评测信号</span>
+              </div>
+              <div class="ex-arm down">
+                <span class="glyph">↓</span>
+                <span class="lab alt">试验场</span>
+                <span>迭代出的 AI 能力<br>回真实 workload 验证</span>
+              </div>
+            </div>
+            <div class="ex-node">
+              <div class="en-title">RVF · 第一个真实 target</div>
+              <div class="en-sub">可观察 / 可治理的 agent workflow</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">Theseus 要迭代 AI 能力，需要一个可观察、可评判、可落地的真实对象。RVF 把一次性聊天工作变成可治理 workflow，正好充当这个 target：上行提供信号，下行承接能力。</div>
+    </section>
+
+    <!-- ════ Slide 7 · 控制面：当前过渡 → 未来独立 ════ -->
+    <section class="slide">
+      <div class="kicker">06 · 控制面</div>
+      <h1>控制面：当前过渡 → 未来独立</h1>
+      <div class="rule"></div>
+      <div class="cols">
+        <div class="col-text">
+          <ul class="b">
+            <li>当前用<strong>思迹 / Cline Kanban</strong> 作过渡控制面：task、worktree、checkpoint、diff viewer、follow-up</li>
+            <li>把 review / fix 从主会话<strong>分离</strong>出来，让 workflow 先真实跑起来</li>
+            <li>未来走向<strong>独立 Kanban</strong>：管理 task、agent session、review scope、handoff、checkpoint、人类决策</li>
+            <li>这条控制面演化与 <strong>Project Theseus 是两条独立的线</strong></li>
+          </ul>
+        </div>
+        <div class="col-diag">
+          <div class="flow" style="justify-content:flex-start;margin-bottom:11px;">
+            <span class="fbox sm dashed muted">思迹 / Cline Kanban<small>当前过渡 · 可替换</small></span>
+            <span class="farrow">→</span>
+            <span class="fbox sm accent">独立 Kanban<small>未来控制面</small></span>
+          </div>
+          <div class="layers tight" style="margin-top:0;">
+            <div class="layer">
+              <div class="l-title">RVF Workflow</div>
+              <div class="l-meta">review → validate → fix → handoff（脱离主会话）</div>
+            </div>
+            <div class="layer ground">
+              <div class="l-title">Worktrees · Repo · Artifacts</div>
+            </div>
+          </div>
+          <div class="cp-sep">控制面这条线 ≠ Project Theseus（众筹 AI 能力平台）</div>
+        </div>
+      </div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">思迹 / Cline Kanban 提供现成的可视化、worktree 与 checkpoint 表面，让 RVF 的 workflow 先真实跑起来；未来 RVF 自己的控制面会走向独立 Kanban。这条控制面演化是 RVF 工程线，和 Theseus 这个能力平台是两回事。</div>
+    </section>
+
+    <!-- ════ Slide 8 · 总结 ════ -->
+    <section class="slide title-slide">
+      <div class="kicker">总结</div>
+      <h1>从一次性聊天，到可治理的 target</h1>
+      <div class="rule"></div>
+      <div class="arc">
+        <div class="big">一次性聊天产物<br><span style="font-size:15px;font-weight:400;">review / fix 结果</span></div>
+        <div class="ar">→</div>
+        <div class="big now">可治理 workflow<br><span style="font-size:15px;font-weight:400;">Theseus 的真实 target</span></div>
+      </div>
+      <p class="transform-line">RVF 把 AI 工作从 <code>聊天产物</code> 变成 <code>可治理 workflow</code>，从而能被 Theseus 迭代。</p>
+      <ul class="b" style="max-width:920px;margin:20px auto 0;">
+        <li>RVF 是 Project Theseus（众筹 AI 能力平台）的第一个真实 target——既是<strong>信号来源</strong>，也是<strong>试验场</strong></li>
+        <li>控制面（思迹 → 独立 Kanban）是另一条<strong>独立</strong>的演化线，不属于 Theseus</li>
+      </ul>
+      <div class="next-line">RVF = 让「众筹数据迭代 AI 能力」拥有一个可观察、可评判、可落地的真实对象</div>
+      <div class="foot"><span>Review-Validate-Fix × Project Theseus</span><span class="pageno"></span></div>
+      <div class="note-src">一句话：RVF 是 Theseus 早期最小的真实标的，它让「众筹数据迭代 AI 能力」第一次有了一个可观察、可评判、可落地的对象；而控制面（思迹 → 独立 Kanban）是与 Theseus 平行的另一条工程线。</div>
+    </section>
+
+  </div>
+</div>
+
+<div class="notebar"><div class="nb-label">Speaker Note · 备注</div><div class="nb-body" id="nbBody"></div></div>
+
+<div class="hud">
+  <span class="hint">← / → 翻页 · S 备注 · F 全屏</span>
+  <span class="nav">
+    <button id="prev" aria-label="上一页">‹</button>
+    <span class="count" id="count">01 / 08</span>
+    <button id="next" aria-label="下一页">›</button>
+  </span>
+</div>
+
+<script>
+  const deck=document.getElementById('deck');
+  const stage=document.getElementById('stage');
+  const slides=[...document.querySelectorAll('.slide')];
+  const count=document.getElementById('count');
+  const progress=document.getElementById('progress');
+  const nbBody=document.getElementById('nbBody');
+  const total=slides.length;
+  let i=0;
+
+  // 给每页打上页码（用于打印讲义）
+  slides.forEach((s,k)=>{
+    const p=s.querySelector('.pageno');
+    if(p) p.textContent=String(k+1).padStart(2,'0')+' / '+String(total).padStart(2,'0');
+  });
+
+  function fit(){
+    const notesH=document.body.classList.contains('notes-on')?150:0;
+    const availH=window.innerHeight-notesH;
+    const s=Math.min((window.innerWidth-48)/1280,(availH-48)/720);
+    deck.style.left=(window.innerWidth/2)+'px';
+    deck.style.top=(availH/2)+'px';
+    deck.style.transform='translate(-50%,-50%) scale('+s+')';
+  }
+
+  function render(){
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    count.textContent=String(i+1).padStart(2,'0')+' / '+String(total).padStart(2,'0');
+    progress.style.width=((i+1)/total*100)+'%';
+    const src=slides[i].querySelector('.note-src');
+    nbBody.textContent=src?src.textContent:'';
+  }
+  function go(n){ i=Math.max(0,Math.min(total-1,n)); render(); }
+
+  document.getElementById('next').addEventListener('click',e=>{e.stopPropagation();go(i+1);});
+  document.getElementById('prev').addEventListener('click',e=>{e.stopPropagation();go(i-1);});
+
+  // 点击翻页：左 1/4 上一页，其余下一页
+  stage.addEventListener('click',e=>{
+    if(e.clientX < window.innerWidth*0.25) go(i-1); else go(i+1);
+  });
+
+  document.addEventListener('keydown',e=>{
+    switch(e.key){
+      case 'ArrowRight': case 'PageDown': case ' ': case 'ArrowDown': e.preventDefault(); go(i+1); break;
+      case 'ArrowLeft': case 'PageUp': case 'ArrowUp': e.preventDefault(); go(i-1); break;
+      case 'Home': go(0); break;
+      case 'End': go(total-1); break;
+      case 's': case 'S':
+        document.body.classList.toggle('notes-on'); fit(); break;
+      case 'f': case 'F':
+        if(!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+        else document.exitFullscreen?.();
+        break;
+    }
+  });
+
+  window.addEventListener('resize',fit);
+  fit(); render();
+</script>
+</body>
+</html>
