@@ -540,6 +540,9 @@ def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> No
             assert no_token_payload["status"] == "no_token"
             assert no_token_payload["continue"] is True
             assert prepare_calls == []
+            # 普通 prompt：既无 user-facing systemMessage，也无 model-facing additionalContext。
+            assert "systemMessage" not in no_token_payload
+            assert "hookSpecificOutput" not in no_token_payload
 
             valid_payload = submit.inspect_user_prompt_submit(
                 {
@@ -555,6 +558,10 @@ def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> No
             assert valid_payload["shared_workflow_state"]["status"] == "completed"
             assert valid_payload["prep_file_path"] == str(root / "aaaaaaaaaaaaaaaa.json")
             assert len(prepare_calls) == 1
+            # token 派发成功：给用户可见行（含 run_id），但**不**给 agent additionalContext。
+            assert isinstance(valid_payload.get("systemMessage"), str)
+            assert "rvf-test" in valid_payload["systemMessage"]
+            assert "hookSpecificOutput" not in valid_payload
 
             # Idempotent: state is now completed, second invocation should not re-run prepare.
             second_payload = submit.inspect_user_prompt_submit(
@@ -569,6 +576,10 @@ def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> No
             assert second_payload["workflow_started"] is False
             assert second_payload["shared_workflow_state"]["status"] == "completed"
             assert len(prepare_calls) == 1, "second call should be cached"
+            # already_completed 幂等路径同样给用户可见行、无 additionalContext。
+            assert isinstance(second_payload.get("systemMessage"), str)
+            assert "rvf-test" in second_payload["systemMessage"]
+            assert "hookSpecificOutput" not in second_payload
 
             diagnostics_path = root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl"
             diagnostics = read_jsonl(diagnostics_path)
@@ -598,6 +609,10 @@ def test_rvf_user_prompt_submit_marker_without_token(tmp_path: Path) -> None:
     assert payload["status"] == "dispatch_marker_without_token"
     assert payload["origin_marker"] == "fork"
     assert payload["continue"] is True
+    # 自注入近失：给用户一条可见诊断行，但不给 agent additionalContext。
+    assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
+    assert "fork" in payload["systemMessage"]
+    assert "hookSpecificOutput" not in payload
 
 
 def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
@@ -669,6 +684,12 @@ def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_pa
             assert "RVF dispatch prep" in additional_context
             assert str(prep_path) in additional_context
             assert "shared_workflow_state.status: completed" in additional_context
+            # 成功触发须同时给用户一条可见 systemMessage（user-facing，不进模型
+            # 上下文），与上面 model-facing 的 additionalContext **共存**。
+            assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
+            assert "RVF UPS" in payload["systemMessage"]
+            assert "post_user_prompt_manual" in payload["systemMessage"]
+            assert "status=completed" in payload["systemMessage"]
         finally:
             prepare_module.prepare_run_from_prep_file = original_prepare
     finally:
@@ -1409,7 +1430,11 @@ def test_rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode(tmp_path: P
     assert actual_hook.stderr == ""
 
 
-def test_rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode(tmp_path: Path) -> None:
+def test_rvf_user_prompt_submit_dispatch_no_prep_emits_user_visible_systemMessage(tmp_path: Path) -> None:
+    # 端到端真子进程（非 --json）：prompt 带 dispatch token 但 prep 不可读（坏
+    # root）。选项 C 下此路径改为对**用户**可见（stdout 含 systemMessage），但
+    # **不**注入模型上下文（无 hookSpecificOutput）。证明 main() 的合并 emit 会
+    # 把 user-facing systemMessage 打到 stdout，而 token 路径不泄漏 additionalContext。
     tmp_path.mkdir(parents=True, exist_ok=True)
     bad_root = tmp_path / "not-a-directory"
     bad_root.write_text("not a directory\n", encoding="utf-8")
@@ -1423,8 +1448,37 @@ def test_rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode(tmp
         ],
         input_text=json.dumps({"prompt": "RVF_DISPATCH=token=bbbbbbbbbbbbbbbb"}, ensure_ascii=False),
     )
-    assert actual_hook.stdout == ""
     assert actual_hook.stderr == ""
+    payload = json.loads(actual_hook.stdout)
+    assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
+    assert "bbbbbbbbbbbbbbbb" in payload["systemMessage"]
+    assert "hookSpecificOutput" not in payload
+    assert payload.get("continue") is True
+
+
+def test_rvf_user_prompt_submit_render_hook_payload_merges_channels(tmp_path: Path) -> None:
+    # 直接单测 main() 抽出的纯合并函数：systemMessage（user-facing）与
+    # hookSpecificOutput（model-facing）共存、各自单独、二者皆无 → 静默(None)。
+    # 确定性、不跑真 prepare —— 覆盖旧互斥 elif 会丢 manual additionalContext 的回归。
+    submit = load_rvf_user_prompt_submit_module()
+    render = submit._render_hook_payload
+
+    hook_block = {"hookEventName": "UserPromptSubmit", "additionalContext": "ctx"}
+    # 1) 两通道并存（manual 成功路径）：合并、不互相顶掉。
+    both = render({"systemMessage": "RVF UPS：派发已就绪", "hookSpecificOutput": hook_block, "continue": True})
+    assert both is not None
+    assert both["systemMessage"] == "RVF UPS：派发已就绪"
+    assert both["hookSpecificOutput"] == hook_block
+    assert both["continue"] is True
+    # 2) 仅 systemMessage（token 派发 / marker / invalid）：user-facing 行，无 hook 块。
+    sys_only = render({"systemMessage": "RVF UPS：自注入 marker 'fork' 无 token"})
+    assert sys_only == {"continue": True, "systemMessage": "RVF UPS：自注入 marker 'fork' 无 token"}
+    # 3) 仅 hookSpecificOutput：保留并补 continue。
+    hook_only = render({"hookSpecificOutput": hook_block})
+    assert hook_only == {"hookSpecificOutput": hook_block, "continue": True}
+    # 4) 普通 prompt：两者皆无 → None → 不打印 → 静默。
+    assert render({"status": "no_token", "continue": True}) is None
+    assert render({"systemMessage": ""}) is None
 
 
 def test_rvf_handoff_cli_opens_with_configured_editor(tmp_path: Path) -> None:
@@ -7982,8 +8036,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode(root / "prompt-submit-silent"),
         ),
         (
-            "rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode",
-            lambda: test_rvf_user_prompt_submit_diagnostic_failure_stays_silent_in_hook_mode(root / "prompt-submit-fail"),
+            "rvf_user_prompt_submit_dispatch_no_prep_emits_user_visible_systemMessage",
+            lambda: test_rvf_user_prompt_submit_dispatch_no_prep_emits_user_visible_systemMessage(
+                root / "prompt-submit-no-prep"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_render_hook_payload_merges_channels",
+            lambda: test_rvf_user_prompt_submit_render_hook_payload_merges_channels(root / "prompt-submit-render"),
         ),
         ("check_review_output_lock_request", lambda: test_check_review_output_lock_request()),
         (

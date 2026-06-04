@@ -591,6 +591,11 @@ def inspect_user_prompt_submit(
         except (OSError, rvf_prep_file.PrepFileError) as exc:
             payload["diagnostic_error"] = str(exc)
         if lookup.status != "valid" or lookup.payload is None:
+            # dispatch token 在场但 prep 缺失 / 过期 / 不可读：给用户一条可见诊断行
+            # （user-facing systemMessage，不进模型上下文），磁盘 diagnostics 已另记。
+            payload["systemMessage"] = _trigger_system_message(
+                kind="dispatch_no_prep", token=token, status=lookup.status
+            )
             return payload
         record = rvf_prep_file.PrepFileRecord(
             token=lookup.token, path=lookup.path, payload=dict(lookup.payload)
@@ -625,6 +630,10 @@ def inspect_user_prompt_submit(
             **payload,
             "status": "dispatch_marker_without_token",
             "origin_marker": origin_marker,
+            # 自注入近失（marker 在场却无 token）：user-facing 诊断行。
+            "systemMessage": _trigger_system_message(
+                kind="marker_without_token", marker=origin_marker
+            ),
         }
     elif is_manual:
         try:
@@ -672,6 +681,14 @@ def inspect_user_prompt_submit(
             payload.setdefault("diagnostic_path", str(diag_path))
         except (OSError, rvf_prep_file.PrepFileError) as exc:
             payload["diagnostic_error"] = str(exc)
+        # 该 prep 已 RVF 过、本次未重跑：user-facing 可见行（token 派发 + manual 皆可达）。
+        payload["systemMessage"] = _trigger_system_message(
+            kind="already_completed",
+            dispatch_origin=dispatch_origin,
+            token=record.token,
+            run_id=(record.payload.get("rvf_run") or {}).get("run_id"),
+            status=existing_state.get("status"),
+        )
         return payload
 
     started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -743,6 +760,16 @@ def inspect_user_prompt_submit(
             "hookEventName": "UserPromptSubmit",
             "additionalContext": additional_context,
         }
+    # 成功路径（token 派发 + manual 在此汇合）：每个触发都给用户一条可见 systemMessage。
+    # manual 同时保留上面的 additionalContext（model-facing）；token 派发仅此 user-facing 行。
+    _state_status = result_state.get("status") if isinstance(result_state, dict) else None
+    payload["systemMessage"] = _trigger_system_message(
+        kind="success" if _state_status == "completed" else "failed",
+        dispatch_origin=dispatch_origin,
+        token=record.token,
+        run_id=(record.payload.get("rvf_run") or {}).get("run_id"),
+        status=_state_status,
+    )
     return payload
 
 
@@ -772,6 +799,79 @@ def _manual_additional_context_text(
         "- next: source the review env, then `cat $RVF_PREP_FILE` for full payload."
     )
     return "\n".join(lines)
+
+
+def _trigger_system_message(
+    *,
+    kind: str,
+    dispatch_origin: str | None = None,
+    token: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    marker: str | None = None,
+) -> str:
+    """构造一行 **user-facing** 的 RVF 触发状态串（用作 ``systemMessage``）。
+
+    受众语义（已从 Claude Code 2.1.x bundle 字面实证）：``systemMessage`` =
+    "Display a message to the user (all hooks)" —— **只对用户可见、不注入模型
+    上下文**。因此每个 RVF 触发都用它给用户留一条可见痕迹，而不污染 agent
+    的上下文。manual 路径另用 ``hookSpecificOutput.additionalContext``
+    （"Text injected into model context"）把 prep 路径喂给同会话 agent
+    （见 ``_manual_additional_context_text``）—— 这是「选择性 agent 可见」。
+
+    ``kind``：
+    - ``success``：token 派发 / manual prepare 成功就绪。
+    - ``failed``：prepare 已跑但 run 状态非 completed（failed / timeout）。
+    - ``already_completed``：同一 prep 已 RVF 过，本次未重跑。
+    - ``dispatch_no_prep``：prompt 带 dispatch token 但 prep 缺失 / 过期 / 不可读。
+    - ``marker_without_token``：自注入 origin marker 却无 token（不一致态）。
+    """
+    run_ref = run_id or "—"
+    origin = dispatch_origin or "—"
+    tok = token or "—"
+    if kind == "success":
+        return (
+            f"RVF UPS：派发已就绪 · origin={origin} · run={run_ref} · "
+            f"status={status or 'completed'} · token={tok}"
+        )
+    if kind == "failed":
+        return (
+            f"RVF UPS：派发已跑但未就绪 · origin={origin} · run={run_ref} · "
+            f"status={status or '—'} · token={tok}"
+        )
+    if kind == "already_completed":
+        return (
+            f"RVF UPS：该 prep 已 RVF 过、本次未重跑 · origin={origin} · "
+            f"run={run_ref} · token={tok}"
+        )
+    if kind == "dispatch_no_prep":
+        return (
+            f"RVF UPS：检测到 dispatch token={tok} 但 prep "
+            f"{status or 'unavailable'}（缺失 / 过期 / 不可读），未跑"
+        )
+    if kind == "marker_without_token":
+        return f"RVF UPS：自注入 marker '{marker or '—'}' 无 token（不一致态），未派发"
+    return f"RVF UPS：{kind}"
+
+
+def _render_hook_payload(result: dict[str, Any]) -> dict[str, Any] | None:
+    """把 inspect 结果折成 hook-mode 要打印的合并 JSON（或 ``None`` = 静默）。
+
+    ``systemMessage``（user-facing —— 每个 RVF 触发都对用户可见、不注入模型
+    上下文）与 ``hookSpecificOutput.additionalContext``（model-facing —— manual
+    路径把 prep 路径喂给同会话 agent）可在同一 JSON **共存**。改自旧的互斥
+    elif（旧逻辑里 systemMessage 会顶掉 manual 的 additionalContext）。二者皆无
+    时返回 ``None``（普通 prompt → 不打印 → 静默）。抽成纯函数便于直接单测。
+    """
+    out: dict[str, Any] = {}
+    system_message = result.get("systemMessage")
+    if isinstance(system_message, str) and system_message:
+        out["continue"] = bool(result.get("continue", True))
+        out["systemMessage"] = system_message
+    if "hookSpecificOutput" in result:
+        out["hookSpecificOutput"] = result["hookSpecificOutput"]
+        out.setdefault("continue", True)
+    return out or None
 
 
 def read_event_stdin() -> dict[str, Any]:
@@ -817,25 +917,10 @@ def main() -> int:
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
-    elif isinstance(result.get("systemMessage"), str) and result.get("systemMessage"):
-        print(
-            json.dumps(
-                {"continue": bool(result.get("continue", True)), "systemMessage": result["systemMessage"]},
-                ensure_ascii=False,
-            )
-        )
-    elif "hookSpecificOutput" in result:
-        # Manual same-session path needs to surface the prep file path back to
-        # the main agent. The harness reads `hookSpecificOutput.additionalContext`
-        # from a hook's stdout JSON and injects it as additional context. We
-        # only emit this payload when something explicitly populated
-        # `hookSpecificOutput`; non-manual paths still stay silent in hook mode.
-        print(
-            json.dumps(
-                {"hookSpecificOutput": result["hookSpecificOutput"]},
-                ensure_ascii=False,
-            )
-        )
+        return 0
+    out = _render_hook_payload(result)
+    if out is not None:
+        print(json.dumps(out, ensure_ascii=False))
     return 0
 
 
