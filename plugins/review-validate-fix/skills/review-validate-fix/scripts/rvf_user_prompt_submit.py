@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kanban_followup_lock
 import rvf_bootstrap_confirm
 import rvf_prep_file
 from rvf_logging import log_root, start_run
@@ -527,6 +528,79 @@ def _backfill_child_session(
     return record, debug
 
 
+def arm_kanban_followup_lock_on_delivery(
+    event: dict[str, Any],
+    record: rvf_prep_file.PrepFileRecord,
+    *,
+    prep_root: str | Path | None = None,
+) -> str | None:
+    """投递确认时才 arm kanban-followup in-progress 锁（delivery-confirmed arm）。
+
+    这是把锁的 arm 从 Stop hook（dispatch 时乐观预 arm）移到这里的核心。本 hook 只有在
+    Cline Kanban 注入的 follow-up trigger **真正成为一个 prompt**（投递落地）时才会 fire，
+    所以在此 arm 才能保证锁只为「agent 真的接手了的那一轮 follow-up」存在。若投递静默失败
+    （例如 /compact 在注入 turn 落地前重置了会话），本 hook 不 fire → 不 arm → 不会留下纯
+    TTL 锁空转、挡住后续自动 dispatch（治本 squat）。锁的读侧（Stop 的
+    ``kanban_followup_in_progress_decision``）与 handoff 清锁保持不变。
+
+    锁主键是 task_id（task-path），故 ``target_kanban_task_id`` 的一致性是关键——它取自 prep
+    payload（权威，与 Stop hook 旧 arm 用的同一来源）。run/repo/cwd 同样取自 prep。
+    best-effort：缺 task_id 则不 arm；任何异常都不阻断本次 prompt（只记 diagnostic）。
+    锁根路径走 ``kanban_followup_lock`` 的默认解析（``CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
+    env 或 ``~/.rvf``），与 Stop hook 读/清侧一致。
+    """
+    payload = record.payload
+    task_id = payload.get("target_kanban_task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return None
+    task_id = task_id.strip()
+    rvf_run = payload.get("rvf_run")
+    rvf_run = rvf_run if isinstance(rvf_run, dict) else {}
+    session_id = payload.get("origin_session_id") or event.get("session_id")
+    repo = payload.get("origin_repo")
+    cwd = payload.get("origin_cwd") or event.get("cwd")
+    try:
+        marker_path = kanban_followup_lock.write_marker(
+            task_id=task_id,
+            session_id=session_id if isinstance(session_id, str) and session_id.strip() else None,
+            run_id=str(rvf_run.get("run_id") or ""),
+            run_dir=str(rvf_run.get("run_dir") or ""),
+            repo=repo if isinstance(repo, str) else None,
+            cwd=cwd if isinstance(cwd, str) else None,
+        )
+    except Exception as exc:  # best-effort：绝不阻断 prompt
+        try:
+            rvf_prep_file.append_diagnostic(
+                root=prep_root,
+                token=record.token,
+                record={
+                    "event": "user_prompt_submit_kanban_followup_arm_failed",
+                    "status": "warning",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "kanban_task_id": task_id,
+                },
+            )
+        except (OSError, rvf_prep_file.PrepFileError):
+            pass
+        return None
+    marker_str = str(marker_path) if marker_path is not None else None
+    try:
+        rvf_prep_file.append_diagnostic(
+            root=prep_root,
+            token=record.token,
+            record={
+                "event": "user_prompt_submit_kanban_followup_armed",
+                "status": "armed",
+                "kanban_task_id": task_id,
+                "run_id": rvf_run.get("run_id"),
+                "marker_path": marker_str,
+            },
+        )
+    except (OSError, rvf_prep_file.PrepFileError):
+        pass
+    return marker_str
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
@@ -605,6 +679,15 @@ def inspect_user_prompt_submit(
         if child_debug.get("backfilled"):
             payload["child_session_id"] = child_debug.get("child_session_id")
             payload["child_transcript_path"] = child_debug.get("child_transcript_path")
+        # 投递确认即 arm kanban-followup in-progress 锁：只有 Cline Kanban 注入的 follow-up
+        # trigger 真正成为 prompt（即本 hook fire）时才上锁，替代 Stop hook 旧的「dispatch
+        # 即乐观预 arm」。投递静默失败则本 hook 不 fire → 不 arm → 无 squat。
+        if KANBAN_FOLLOWUP_MARKER in prompt:
+            armed_marker_path = arm_kanban_followup_lock_on_delivery(
+                event, record, prep_root=prep_root
+            )
+            if armed_marker_path:
+                payload["kanban_followup_in_progress_marker_path"] = armed_marker_path
     elif origin_marker is not None:
         # Marker without token is an inconsistent state: dispatch should always set token.
         try:

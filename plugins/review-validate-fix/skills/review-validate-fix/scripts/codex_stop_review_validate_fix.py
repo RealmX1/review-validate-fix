@@ -41,11 +41,9 @@ from post_analyze_quiet import (
 )
 from kanban_followup_lock import (
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
-    acquire_marker as acquire_kanban_followup_lock,
     clear_marker as clear_kanban_followup_lock,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
-    write_marker as write_kanban_followup_lock,
 )
 from session_manifest import build_manifest
 from diff_tracker import (
@@ -5598,133 +5596,16 @@ def launch_backend(
             target_flow="flow-1-self-rising",
         )
 
+        # in-progress 锁的 arm 已移交给目标 session 的 UserPromptSubmit hook
+        # （rvf_user_prompt_submit.arm_kanban_followup_lock_on_delivery）：只有当注入的
+        # follow-up trigger **真正以 prompt 落地**（投递被证明）时才上锁，而不再像旧设计
+        # 那样在 dispatch 这一刻乐观地预先 arm。旧设计在投递前就 arm，一旦投递静默失败
+        # （例如 /compact 在注入 turn 落地前重置了会话），就会留下一把纯 TTL 锁空转 6h、
+        # 挡住后续自动 dispatch（squat）。读侧的 kanban_followup_in_progress_decision 与
+        # handoff 清锁保持不变。
+        # 残留权衡（按用户选择接受）：dispatch→delivery 在途窗口内若再触发一次 Stop，
+        # 可能重复 dispatch 一条 follow-up——投递成功时该窗口为亚秒级；投递失败时本就需要重发。
         in_progress_marker_path: str | None = None
-        try:
-            acquire_result = acquire_kanban_followup_lock(
-                task_id=task_id,
-                session_id=source_session_id,
-                run_id=ledger.run_id,
-                run_dir=str(ledger.run_dir),
-                repo=decision.repo,
-                cwd=cwd,
-                attempt_id=attempt_id,
-            )
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            ledger.event(
-                phase="fork",
-                event="kanban_followup_in_progress_acquire_failed",
-                status="skipped",
-                reason_code="kanban_followup_lock_unavailable",
-                repo=decision.repo,
-                cwd=cwd,
-                mode="kanban-followup",
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                error=error,
-                **source_origin_fields,
-                **dispatch_prep_fields,
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                    completion_gate="kanban_followup_lock_unavailable",
-                ),
-            )
-            return ledger.hook_payload(
-                status="skipped",
-                reason_code="kanban_followup_lock_unavailable",
-                message=(
-                    "Cline Kanban follow-up RVF dispatch skipped because the "
-                    f"in-progress lock could not be acquired: {error}"
-                ),
-                repo=decision.repo,
-                cwd=cwd,
-                backend=decision.backend,
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                error=error,
-                **source_origin_fields,
-                **dispatch_prep_fields,
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                    completion_gate="kanban_followup_lock_unavailable",
-                ),
-            )
-        in_progress_marker_path = str(acquire_result.path) if acquire_result.path is not None else None
-        if not acquire_result.acquired:
-            marker = acquire_result.marker
-            marker_path = str(acquire_result.path) if acquire_result.path is not None else None
-            ledger.event(
-                phase="fork",
-                event="kanban_followup_in_progress_blocked",
-                status="skipped",
-                reason_code="kanban_followup_in_progress",
-                repo=decision.repo,
-                cwd=cwd,
-                mode="kanban-followup",
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                kanban_followup_in_progress_marker=marker,
-                kanban_followup_in_progress_marker_path=marker_path,
-                active_rvf_run_id=marker.get("run_id") if isinstance(marker, dict) else None,
-                active_rvf_run_dir=marker.get("run_dir") if isinstance(marker, dict) else None,
-                **source_origin_fields,
-                **dispatch_prep_fields,
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                    completion_gate="kanban_followup_in_progress",
-                ),
-            )
-            return ledger.hook_payload(
-                status="skipped",
-                reason_code="kanban_followup_in_progress",
-                message=(
-                    "Cline Kanban RVF follow-up is already in progress for this "
-                    "task/session; skipped creating another follow-up user message."
-                ),
-                repo=decision.repo,
-                cwd=cwd,
-                backend=decision.backend,
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                kanban_followup_in_progress_marker=marker,
-                kanban_followup_in_progress_marker_path=marker_path,
-                active_rvf_run_id=marker.get("run_id") if isinstance(marker, dict) else None,
-                active_rvf_run_dir=marker.get("run_dir") if isinstance(marker, dict) else None,
-                **source_origin_fields,
-                **dispatch_prep_fields,
-                **stop_hook_rvf_state_fields(
-                    phase="complete",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                    completion_gate="kanban_followup_in_progress",
-                ),
-            )
-        if in_progress_marker_path is not None:
-            ledger.event(
-                phase="fork",
-                event="kanban_followup_in_progress_acquired",
-                status="armed",
-                reason_code="kanban_followup_in_progress_acquired",
-                repo=decision.repo,
-                cwd=cwd,
-                mode="kanban-followup",
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                kanban_followup_in_progress_marker_path=in_progress_marker_path,
-                **source_origin_fields,
-                **dispatch_prep_fields,
-                **stop_hook_rvf_state_fields(
-                    phase="prepare",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                ),
-            )
         ledger.event(
             phase="fork",
             event="kanban_followup_started",
@@ -5756,7 +5637,7 @@ def launch_backend(
             )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            removed_lock_paths = clear_kanban_followup_lock(task_id=task_id, session_id=source_session_id)
+            # 不再在 dispatch 处 arm 锁，故注入失败时无锁可清（arm 已移交 UserPromptSubmit）。
             ledger.event(
                 phase="fork",
                 event="kanban_followup_failed",
@@ -5772,7 +5653,6 @@ def launch_backend(
                 cline_kanban_task_lookup=task_lookup,
                 **source_origin_fields,
                 **dispatch_prep_fields,
-                removed_kanban_followup_in_progress_marker_paths=removed_lock_paths,
                 error=error,
                 **stop_hook_rvf_state_fields(
                     phase="prepare",
@@ -5793,7 +5673,6 @@ def launch_backend(
                 cline_kanban_task_title=source_origin.get("kanban_task_title"),
                 cline_kanban_task_title_source=source_origin.get("kanban_task_title_source"),
                 cline_kanban_task_lookup=task_lookup,
-                removed_kanban_followup_in_progress_marker_paths=removed_lock_paths,
                 error=error,
                 **source_origin_fields,
                 **dispatch_prep_fields,
@@ -5804,61 +5683,8 @@ def launch_backend(
                 ),
             )
 
-        try:
-            marker_path = write_kanban_followup_lock(
-                task_id=task_id,
-                session_id=source_session_id,
-                run_id=ledger.run_id,
-                run_dir=str(ledger.run_dir),
-                repo=decision.repo,
-                cwd=cwd,
-                attempt_id=attempt_id,
-                message_id=message_payload.get("message_id"),
-                turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
-                prompt_path=message_payload.get("prompt_path"),
-            )
-            in_progress_marker_path = str(marker_path) if marker_path is not None else None
-            if in_progress_marker_path is not None:
-                ledger.event(
-                    phase="fork",
-                    event="kanban_followup_in_progress_armed",
-                    status="armed",
-                    reason_code="kanban_followup_in_progress_armed",
-                    repo=decision.repo,
-                    cwd=cwd,
-                    mode="kanban-followup",
-                    cline_kanban_task_id=task_id,
-                    cline_kanban_attempt_id=attempt_id,
-                    cline_kanban_message_id=message_payload.get("message_id"),
-                    cline_kanban_turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
-                    kanban_followup_in_progress_marker_path=in_progress_marker_path,
-                    **source_origin_fields,
-                    **dispatch_prep_fields,
-                    **stop_hook_rvf_state_fields(
-                        phase="prepare",
-                        backend="kanban-followup",
-                        backend_raw=decision.backend,
-                    ),
-                )
-        except Exception as exc:
-            ledger.event(
-                phase="fork",
-                event="kanban_followup_in_progress_arm_failed",
-                status="warning",
-                reason_code="kanban_followup_in_progress_arm_failed",
-                repo=decision.repo,
-                cwd=cwd,
-                mode="kanban-followup",
-                cline_kanban_task_id=task_id,
-                cline_kanban_attempt_id=attempt_id,
-                error=f"{type(exc).__name__}: {exc}",
-                **stop_hook_rvf_state_fields(
-                    phase="prepare",
-                    backend="kanban-followup",
-                    backend_raw=decision.backend,
-                ),
-            )
-
+        # 旧设计在此把 message_id/turn_id 回写进 in-progress 锁；现在 arm 由目标 session
+        # 的 UserPromptSubmit hook 在投递落地时完成，这里不再写锁。
         raw_status = str(message_payload.get("status") or "").strip().lower()
         status = (
             "kanban-followup-started"

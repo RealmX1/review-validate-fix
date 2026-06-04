@@ -3572,13 +3572,10 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert latest["cline_kanban_attempt_id"] == "attempt-9"
     assert latest["cline_kanban_message_id"] == "msg-77"
     assert latest["cline_kanban_checkpoint_id"] == "checkpoint-1"
-    marker_path = Path(str(latest["kanban_followup_in_progress_marker_path"]))
-    assert marker_path.exists()
-    marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker_payload["kanban_task_id"] == "task-77"
-    assert marker_payload["kanban_attempt_id"] == "attempt-9"
-    assert marker_payload["run_id"] == latest["run_id"]
-    assert marker_payload["message_id"] == "msg-77"
+    # 新契约：Stop dispatch 不再 arm in-progress 锁；arm 已移交目标 session 的
+    # UserPromptSubmit hook，仅在注入的 follow-up trigger 真正投递落地时才上锁。
+    # 因此 dispatch 这一刻没有 marker 被写出（治本 squat：投递静默失败不留空转锁）。
+    assert latest.get("kanban_followup_in_progress_marker_path") is None
     assert latest["cline_kanban_task_title"] == "Fix RVF follow-up source metadata"
     assert latest["cline_kanban_task_title_source"] == "cline_kanban_task_lookup"
     assert latest["parent_thread_id"] == session_id
@@ -4187,63 +4184,61 @@ def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: 
 def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots(
     tmp_path: Path,
 ) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    transcript = tmp_path / "rollout-2026-05-21T19-05-11-session-shared.jsonl"
+    # 新契约：Stop dispatch 不再 arm 锁（arm 移交 UserPromptSubmit 投递确认）。本测试
+    # 模拟「上一轮 follow-up trigger 已投递落地、UPS 已在共享 lock root arm」之后，
+    # 另一个 state dir 的 Stop 仍被该共享锁（按 task_id、跨 state root）挡住、不重复
+    # dispatch——即读侧（kanban_followup_in_progress_decision）的跨 state-root 共享语义
+    # 在新 arm 模型下保持不变。
+    repo = init_repo(tmp_path / "repo", dirty=True)
     session_id = "session-shared"
-    write_apply_patch_transcript(transcript, repo, session_id=session_id)
     shared_lock_root = tmp_path / "shared-followup-lock"
-    state_a = tmp_path / "state-a"
-    state_b = tmp_path / "state-b"
+    shared_lock_root.mkdir(parents=True)
+    # 直接写一份 marker，等价于 UPS 在投递确认时 arm 的结果（env 模式：marker 直接落在
+    # CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
+    marker_path = shared_lock_root / "task-task-shared.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-06-04T02:29:26Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-shared",
+                "session_id": session_id,
+                "run_id": "rvf-delivered",
+                "run_dir": str(tmp_path / "delivered-run"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     fake_client = tmp_path / "fake_cline_kanban_client.py"
     client_calls = tmp_path / "client-calls.jsonl"
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-shared', 'title': 'Shared lock task', 'workspacePath': {str(repo)!r}}}]}}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-shared', 'attempt_id': 'attempt-shared', 'message_id': 'msg-shared', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        "print(json.dumps({'task_id': 'task-shared', 'message_id': 'should-not-enqueue'}))\n",
         encoding="utf-8",
     )
-    common_env = {
-        "CODEX_RVF_FORK_MODE": "kanban-followup",
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-        "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
-        "KANBAN_TASK_ID": "task-shared",
-        "KANBAN_ATTEMPT_ID": "attempt-shared",
-        "KANBAN_PROJECT_PATH": str(repo),
-        "FAKE_CLIENT_CALLS": str(client_calls),
-    }
-
-    stdout_a, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-        },
-        extra_env=common_env,
-        state_dir=state_a,
-    )
-    assert "reason=kanban_followup_enqueued" in parse_json(stdout_a)["systemMessage"]
-    latest_a = latest_summary(state_a)
-    marker_path = shared_lock_root / "task-task-shared.json"
-    assert latest_a["kanban_followup_in_progress_marker_path"] == str(marker_path)
-    assert marker_path.exists()
+    state_b = tmp_path / "state-b"
 
     stdout_b, _ = invoke(
         {
             "cwd": str(repo),
             "stop_hook_active": False,
             "session_id": session_id,
-            "transcript_path": str(transcript),
+            "last_user_message": "继续推进实现。",
         },
-        extra_env=common_env,
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
+            "KANBAN_TASK_ID": "task-shared",
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
         state_dir=state_b,
     )
 
@@ -4252,14 +4247,10 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
     latest_b = latest_summary(state_b)
     assert latest_b["status"] == "skipped"
     assert latest_b["reason_code"] == "kanban_followup_in_progress"
-    assert latest_b["active_rvf_run_id"] == latest_a["run_id"]
+    assert latest_b["active_rvf_run_id"] == "rvf-delivered"
     assert latest_b["kanban_followup_in_progress_marker_path"] == str(marker_path)
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls].count("message") == 1
+    # 读侧短路发生在任何 kanban client 调用之前：不会有 list / message。
+    assert not client_calls.exists()
 
 
 def test_rvf_analyze_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:

@@ -615,6 +615,112 @@ def test_rvf_user_prompt_submit_marker_without_token(tmp_path: Path) -> None:
     assert "hookSpecificOutput" not in payload
 
 
+def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: Path) -> None:
+    """UPS hook 在 kanban-followup trigger 真正投递落地时 arm in-progress 锁；非 followup 不 arm。
+
+    这是把锁的 arm 从 Stop hook（dispatch 时乐观预 arm）移到 UserPromptSubmit 的核心回归：
+    只有注入的 follow-up trigger 真的成为一个 prompt（即本 hook fire）才上锁，治本 squat。
+    """
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    lock_root = tmp_path / "followup-lock"
+    prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
+    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    try:
+        now = prep.parse_timestamp("2026-06-04T00:00:00Z")
+        # kanban-followup 风格 prep：target_kanban_task_id + flow-1-self-rising + run 信息。
+        # 预置 shared_workflow_state=completed，使 inspect 在 arm 之后短路返回（无需 stub prepare）。
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-fu",
+                "origin_repo": str(tmp_path / "repo"),
+                "origin_cwd": str(tmp_path / "repo"),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path / "repo"),
+                "target_kanban_task_id": "task-fu",
+                "rvf_run": {
+                    "run_id": "rvf-fu-delivered",
+                    "run_dir": str(tmp_path / "run"),
+                    "shared_workflow_state": {"status": "completed"},
+                },
+            },
+            root=root,
+            token="bbbbbbbbbbbbbbbb",
+            now=now,
+            ttl_seconds=300,
+        )
+        # 投递落地的 follow-up prompt：同时带 dispatch token 与 kanban-followup marker。
+        followup_prompt = (
+            "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER\n"
+            "RVF_DISPATCH=token=bbbbbbbbbbbbbbbb\n"
+        )
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": followup_prompt,
+                "cwd": str(tmp_path / "repo"),
+                "session_id": "session-fu",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+            now="2026-06-04T00:01:00Z",
+        )
+        assert payload["status"] == "valid"
+        marker_path = lock_root / "task-task-fu.json"
+        assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
+        assert marker_path.exists()
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert marker["state"] == "in_progress"
+        assert marker["kanban_task_id"] == "task-fu"
+        assert marker["run_id"] == "rvf-fu-delivered"
+        assert marker["expires_at"] > marker["armed_at"]
+
+        # 负例：带 token 但**非** kanban-followup（无 RVF_KANBAN_FOLLOWUP_TRIGGER，这里是 fork）
+        # → 不 arm followup 锁。
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-fu",
+                "origin_repo": str(tmp_path / "repo"),
+                "origin_cwd": str(tmp_path / "repo"),
+                "target_flow": "flow-2-branch",
+                "target_kanban_task_id": "task-other",
+                "rvf_run": {
+                    "run_id": "rvf-other",
+                    "run_dir": str(tmp_path / "run2"),
+                    "shared_workflow_state": {"status": "completed"},
+                },
+            },
+            root=root,
+            token="cccccccccccccccc",
+            now=now,
+            ttl_seconds=300,
+        )
+        other_payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "RVF_FORKED_REVIEW_VALIDATE_FIX\nRVF_DISPATCH=token=cccccccccccccccc",
+                "cwd": str(tmp_path / "repo"),
+                "session_id": "session-fu",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+            now="2026-06-04T00:01:00Z",
+        )
+        assert other_payload["status"] == "valid"
+        assert "kanban_followup_in_progress_marker_path" not in other_payload
+        assert not (lock_root / "task-task-other.json").exists()
+    finally:
+        if prev_prep is None:
+            os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
+        if prev_lock is None:
+            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+
+
 def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -7980,6 +8086,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_user_prompt_submit_marker_without_token",
             lambda: test_rvf_user_prompt_submit_marker_without_token(root / "prompt-submit-marker"),
+        ),
+        (
+            "rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery",
+            lambda: test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(
+                root / "prompt-submit-followup-arm"
+            ),
         ),
         (
             "rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare",
