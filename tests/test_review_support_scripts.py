@@ -721,6 +721,54 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
             os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
 
 
+def test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(tmp_path: Path) -> None:
+    """RVF 采纳 vendored codex_invoked_skill：结构化检测命中正则漏掉的命名空间形态。
+
+    `$rvf:review-validate-fix` 的 `:review-validate-fix` 前缀非词边界，旧锚定正则 MISS；
+    经 rollout text_elements 的结构化读取能命中。回退正则对 Claude / 缺 transcript 仍有效。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    # 该 vendored 模块必须可被 RVF 加载（否则结构化路径静默退化）。
+    assert submit.codex_invoked_skill is not None
+
+    tmp_path.mkdir(parents=True, exist_ok=True)  # registry 传入的子目录可能尚未创建
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "$rvf:review-validate-fix",
+                    "text_elements": [
+                        {"byte_range": {"start": 0, "end": 24}, "placeholder": "$rvf:review-validate-fix"}
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    namespaced = "$rvf:review-validate-fix"
+    # 旧正则确实漏掉命名空间形态：
+    assert submit.detect_manual_trigger(namespaced) is False
+    # 结构化路径（rollout text_elements）命中它：
+    event = {
+        "transcript_path": str(rollout),
+        "prompt": namespaced,
+        "hook_event_name": "UserPromptSubmit",
+    }
+    assert submit._review_validate_fix_manually_invoked(event, namespaced) is True
+    # 回退正则在无 rollout（Claude / 缺 transcript）时仍生效：
+    assert submit._review_validate_fix_manually_invoked(
+        {"prompt": "$review-validate-fix"}, "$review-validate-fix"
+    ) is True
+    # 散文里提到不构成触发（锚定 + 无 rollout 命中）：
+    assert submit._review_validate_fix_manually_invoked(
+        {}, "document the review-validate-fix tool"
+    ) is False
+
+
 def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -8091,6 +8139,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery",
             lambda: test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(
                 root / "prompt-submit-followup-arm"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_structured_manual_detection_catches_namespaced",
+            lambda: test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(
+                root / "prompt-submit-structured-manual"
             ),
         ),
         (

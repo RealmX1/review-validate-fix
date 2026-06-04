@@ -17,6 +17,14 @@ import rvf_prep_file
 from rvf_logging import log_root, start_run
 from session_label import text_from_message_payload
 
+try:
+    # Vendored single-file copy (see its header). Gives a structured "which skill
+    # did the user explicitly invoke" read from the Codex rollout — catches forms
+    # the anchored regex misses (notably the namespaced `$rvf:review-validate-fix`).
+    import codex_invoked_skill
+except Exception:  # pragma: no cover - stay resilient if the vendor is absent
+    codex_invoked_skill = None
+
 
 DISPATCH_TOKEN_RE = re.compile(r"\bRVF_DISPATCH=token=([0-9A-Fa-f]{16})\b")
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
@@ -110,6 +118,25 @@ def detect_origin_marker(text: str) -> str | None:
 
 def detect_manual_trigger(text: str) -> bool:
     return bool(RVF_MANUAL_TRIGGER_RE.search(text))
+
+
+def _review_validate_fix_manually_invoked(event: dict[str, Any], prompt: str) -> bool:
+    """是否本轮用户显式触发了 review-validate-fix（manual 路径判定）。
+
+    结构化优先（Codex）：经 vendored ``codex_invoked_skill`` 从 rollout transcript 的
+    ``user_message.text_elements`` 读取显式 ``$skill`` 调用——这能命中锚定正则漏掉的
+    命名空间形态 ``$rvf:review-validate-fix``（``:review-validate-fix`` 前缀非词边界，
+    旧正则 MISS）。随后回退到 :func:`detect_manual_trigger`（Claude / text_elements 不可用 /
+    ``/prompts:`` 菜单形态 / 当前 turn 尚未落盘）。best-effort：结构化读取异常绝不阻断，
+    直接回退正则。
+    """
+    if codex_invoked_skill is not None:
+        try:
+            if codex_invoked_skill.was_skill_invoked(event, "review-validate-fix"):
+                return True
+        except Exception:  # pragma: no cover - 结构化读取永不阻断
+            pass
+    return detect_manual_trigger(prompt)
 
 
 def parse_manual_scope_directive(prompt: str | None) -> list[str]:
@@ -625,7 +652,7 @@ def inspect_user_prompt_submit(
 
     token = dispatch_token_from_text(prompt)
     origin_marker = detect_origin_marker(prompt) if token is None else None
-    is_manual = token is None and origin_marker is None and detect_manual_trigger(prompt)
+    is_manual = token is None and origin_marker is None and _review_validate_fix_manually_invoked(event, prompt)
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
     record: rvf_prep_file.PrepFileRecord | None = None
