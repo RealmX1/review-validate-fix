@@ -854,7 +854,7 @@ def test_main_syncs_existing_claude_plugin_install(tmp_path: Path) -> None:
         assert (root / ".claude-plugin" / "plugin.json").exists()
         assert (root / "hooks" / "hooks.json").exists()
         assert (root / "hooks" / "stop.py").exists()
-        assert (root / "commands" / "review-validate-fix.md").exists()
+        assert (root / "commands" / "rvf-handoff-commit.md").exists()
         assert (
             root
             / "skills"

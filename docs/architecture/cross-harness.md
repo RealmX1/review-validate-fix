@@ -33,7 +33,7 @@
 
 | Host | skill / command | hook（trigger） | subagent | transcript / 归因分析 | 等级 |
 |---|---|---|---|---|---|
-| **Claude Code** | ✅ Native（plugin 已安装：3 command + 5 skill） | ✅ Trigger-only：`Stop` + `UserPromptSubmit` 两入口转发到 Codex core（路径 C） | ➖ 捕获侧 host-agnostic（S2：Claude `Task` 子代理被发现/计数）；调用侧不在 Claude 内启 `Task`（review 经 Kanban / 转发执行） | ✅ host-agnostic（S1 distill 两栈 + S1.5 write-op 归一 + S2 子代理归一） | **Adapter-backed（trigger-only, bridged to Codex core）** |
+| **Claude Code** | ✅ Native（plugin 已安装：1 command + 6 skill） | ✅ Trigger-only：`Stop` + `UserPromptSubmit` 两入口转发到 Codex core（路径 C） | ➖ 捕获侧 host-agnostic（S2：Claude `Task` 子代理被发现/计数）；调用侧不在 Claude 内启 `Task`（review 经 Kanban / 转发执行） | ✅ host-agnostic（S1 distill 两栈 + S1.5 write-op 归一 + S2 子代理归一） | **Adapter-backed（trigger-only, bridged to Codex core）** |
 | **Codex CLI** | ✅ Native（plugin 已安装） | ⚠ Installer-registered：装到 `~/.codex/hooks.json`（Codex 不扫 plugin 根，见反模式 ③）；router→dispatcher→core | ✅ Native（analyzer 经 `codex exec`；reviewer 经外部 config 命令） | ✅ host-agnostic（Codex 栈为归一基线） | **Native（hook 由安装器注册）** |
 | **Codex GUI fork（私有）** | ⚠ 未核验，推测同 CLI | ⚠ legacy backup-of-backup（仅 Kanban 不可用时） | ⚠ 未核验 | ⚠ 未核验 | **未核验 / legacy fallback** |
 | **OpenCode** | ✅ via `agentskills.io` skill 文档 | ❌ | ❌ | ❌ | **Reference-only** |
@@ -61,23 +61,24 @@
 | `hooks/user_prompt_submit.py` | UserPromptSubmit hook 薄 shim（inner timeout 默认 85s） |
 | `hooks/_claude_hook_entry.py` | 两入口共享的单一 host-ownership 契约（S3）：`is_foreign_invocation` 守卫 + `run_claude_hook` 转发流程；stdlib-only 保 fail-open |
 
-**Commands（3 个 slash command）**
+**Commands（1 个 slash command）**
 
 | 命令 | 用途 |
 |---|---|
-| `commands/review-validate-fix.md` | 启动 RVF double-review / validate-fix / handoff 主工作流 |
-| `commands/rvf-handoff-commit.md` | 分析 RVF handoff、采纳有效修复或已审工作、验证并提交 |
-| `commands/rvf-land.md` | 收尾同一 worktree 中 future-self 已应用的 RVF 工作（不自动 base-branch-sync） |
+| `commands/rvf-handoff-commit.md` | 分析 RVF handoff、采纳有效修复或已审工作、验证并提交（自带完整 intake 工作流，无同名 skill） |
 
-**Skills（5 个 skill）**
+> 历史上还有 `review-validate-fix.md` / `rvf-land.md` / `rvf-reopen.md` 三个薄 shim 命令；它们只是「resolve skill 目录 + 读 SKILL.md」，与同名 skill 抢占同一个 `review-validate-fix:<name>` 注册 key（其一会静默 shadow 另一）。已删除，改由原生 namespaced skill `/review-validate-fix:<name>` 承接——这正是各 SKILL.md frontmatter 写的预期触发方式。删除同时消除了 Claude 桌面 app slash 菜单里这三者的 broken 裸名条目（裸名落到 dispatcher 的 `Unknown command` 分支）。
+
+**Skills（6 个 skill）**
 
 | skill | 用途 |
 |---|---|
 | `skills/review-validate-fix/` | RVF 主工作流的 canonical 运行内容 |
 | `skills/rvf-analyze/` | finalized run 的只读复盘（叙事 + issue↔patch 归因）；不启新 review |
 | `skills/rvf-handoff-intake/` | handoff 接入：决定采纳哪些建议、验证、暂存相关文件、提交 |
-| `skills/rvf-land/` | rvf-land 命令的实现体 |
+| `skills/rvf-land/` | 收尾同一 worktree 中 future-self 已应用的 RVF 工作（namespaced skill 即入口） |
 | `skills/rvf-local-deploy/` | 从当前 checkout 部署/安装到本机 Codex plugin cache + 配置 stable hook |
+| `skills/rvf-reopen/` | 失败再入：按最近一次已 RVF 的实现 run 武装一次性 rescope state（namespaced skill 即入口） |
 
 > `plugin.json` 用目录 glob（Claude `commands:["./commands/"]` / `skills:["./skills/"]`；Codex `skills:"./skills/"`）自动发现，**新增命令/skill 无需改 manifest**；但本矩阵、README 维护模型与 `sync-manifest` 的枚举须随实测更新。
 

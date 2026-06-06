@@ -429,8 +429,6 @@ done
 
 repo_required_files=(
   "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
-  "plugins/review-validate-fix/commands/rvf-land.md"
-  "plugins/review-validate-fix/commands/rvf-reopen.md"
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py"
@@ -552,12 +550,11 @@ require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" '即使最终没有采纳 RVF run 提出的任何 suggestion'
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'rvf_worktree_differs_from_current'
 require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'intake_hints'
-require_repo_literal "plugins/review-validate-fix/commands/rvf-land.md" 'rvf-land bundled skill not found'
+# $rvf-land 入口已统一为 namespaced skill（薄 shim command 已删，见 docs/architecture/cross-harness.md §3）
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_handoff_intake.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_worktree_differs_from_current'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不自动运行 base-branch-sync'
-# 失败再入 $rvf-reopen command/skill + 确定性后端脚本（防部署门漂移、漏部署）
-require_repo_literal "plugins/review-validate-fix/commands/rvf-reopen.md" 'rvf-reopen bundled skill not found'
+# 失败再入 $rvf-reopen skill + 确定性后端脚本（防部署门漂移、漏部署）；入口已统一为 namespaced skill
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py" 'def resolve_target_run_id'

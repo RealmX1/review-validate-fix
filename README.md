@@ -32,7 +32,7 @@ Cline Kanban task 必须在独立 worktree/checkpoint 中重放当前 session-ow
 | 形态 | (M+N) Marketplace + Nested manifest：repo-root `.claude-plugin/marketplace.json` 列出 plugin；plugin manifest 在 `plugins/review-validate-fix/.claude-plugin/plugin.json` 与 `plugins/review-validate-fix/.codex-plugin/plugin.json` |
 | Codex 安装位置 | `~/plugins/review-validate-fix`、`~/.agents/plugins/marketplace.json`、`~/.codex/config.toml` 中 `[plugins."review-validate-fix@local-codex-plugins"]`、Codex marketplace cache `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/<version>/` |
 | Claude Code 安装位置 | `~/.claude/local-marketplaces/review-validate-fix/.claude-plugin/marketplace.json` 与 `plugins/review-validate-fix/`、Claude Code cache `~/.claude/plugins/cache/review-validate-fix-local/review-validate-fix/<version>/`、`~/.claude/settings.json` 中 `enabledPlugins["review-validate-fix@review-validate-fix-local"]` + `extraKnownMarketplaces["review-validate-fix-local"]` |
-| 触发方式 | plugin 暴露 `$review-validate-fix` skill 与 `/review-validate-fix` command；`agents/openai.yaml` 控制隐式调用；Claude Code 走 Stop hook 转发到 Codex core（路径 C） |
+| 触发方式 | plugin 暴露 `$review-validate-fix` skill 与 namespaced skill slash 入口（Claude Code 形如 `/review-validate-fix:review-validate-fix`、`/review-validate-fix:rvf-land`）；`agents/openai.yaml` 控制隐式调用；Claude Code 走 Stop hook 转发到 Codex core（路径 C） |
 | 跨 harness 抽象 | `core/`（host-agnostic：`transcript/`=S1、`subagents/`=S2）+ `adapters/{claude_code,codex}/`（host-specific transcript/subagent 实装）；hook host-ownership 契约 `hooks/_claude_hook_entry.py`=S3。as-built 矩阵见 [`docs/architecture/cross-harness.md`](docs/architecture/cross-harness.md) |
 
 ## 仓库结构
@@ -46,8 +46,8 @@ plugins/review-validate-fix/hooks/hooks.json             # 注册 Stop + UserPro
 plugins/review-validate-fix/hooks/stop.py                # Stop hook 薄 shim（路径 C：转发 Codex core）
 plugins/review-validate-fix/hooks/user_prompt_submit.py  # UserPromptSubmit hook 薄 shim
 plugins/review-validate-fix/hooks/_claude_hook_entry.py  # 两入口共享的单一 host-ownership 契约（S3，stdlib-only）
-plugins/review-validate-fix/commands/                    # 3 个 slash command：review-validate-fix / rvf-handoff-commit / rvf-land
-plugins/review-validate-fix/skills/                      # 5 个 skill：review-validate-fix / rvf-analyze / rvf-handoff-intake / rvf-land / rvf-local-deploy
+plugins/review-validate-fix/commands/                    # 1 个 slash command：rvf-handoff-commit（其余入口已由同名 namespaced skill 承接）
+plugins/review-validate-fix/skills/                      # 6 个 skill：review-validate-fix / rvf-analyze / rvf-handoff-intake / rvf-land / rvf-local-deploy / rvf-reopen
 plugins/review-validate-fix/skills/review-validate-fix/
                                             # 主工作流 canonical skill 内容，人工修改这里
 core/transcript/                           # host-agnostic NormalizedTranscript / TranscriptRecord（S1）
