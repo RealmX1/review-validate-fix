@@ -46,6 +46,7 @@ RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
+KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -99,6 +100,21 @@ def load_rvf_user_prompt_submit_module():
     )
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load rvf_user_prompt_submit module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_kanban_followup_lock_module():
+    # kanban_followup_lock 依赖 ``from rvf_logging import safe_token``，需 SCRIPT_DIR 在 path 上。
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "kanban_followup_lock", KANBAN_FOLLOWUP_LOCK
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load kanban_followup_lock module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -710,6 +726,147 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
         assert other_payload["status"] == "valid"
         assert "kanban_followup_in_progress_marker_path" not in other_payload
         assert not (lock_root / "task-task-other.json").exists()
+    finally:
+        if prev_prep is None:
+            os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
+        if prev_lock is None:
+            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+
+
+def test_kanban_followup_pending_marker_round_trip(tmp_path: Path) -> None:
+    """dispatched-unconfirmed(pending) marker：write/read/clear(token 防误清)/stale/与 in-progress 物理隔离。
+
+    pending 记录「dispatch 已发、尚未确认落地」；UPS arm 落地时按 token 清，超时则下次 Stop 据其重投。
+    """
+    k = load_kanban_followup_lock_module()
+    root = tmp_path / "lock-root"
+    path = k.write_pending_marker(
+        task_id="bf042",
+        session_id="s1",
+        run_id="run-x",
+        run_dir=str(tmp_path / "run-x"),
+        repo="/repo",
+        cwd="/repo",
+        token="deadbeefdeadbeef",
+        delivery_channel="terminal",
+        message_id="terminal:bf042:run-x",
+        root=root,
+    )
+    assert path is not None and path.exists()
+    # 与 in-progress marker 物理隔离：pending 落在独立子目录，不会同名互相覆盖。
+    assert path.parent.name == k.PENDING_SUBDIR_NAME
+    marker = k.read_pending_marker(task_id="bf042", root=root)
+    assert marker is not None
+    assert marker["state"] == k.PENDING_STATE == "dispatched_unconfirmed"
+    assert marker["token"] == "deadbeefdeadbeef"
+    assert marker["delivery_channel"] == "terminal"
+    assert k.pending_status(marker) == k.STATUS_ACTIVE
+    # token 防误清：一条迟到的旧投递确认（不同 token）不得清掉这把新 pending。
+    assert k.clear_pending_marker(task_id="bf042", token="other", root=root) == []
+    assert k.read_pending_marker(task_id="bf042", root=root) is not None
+    # 正确 token 清掉。
+    removed = k.clear_pending_marker(task_id="bf042", token="deadbeefdeadbeef", root=root)
+    assert removed == [str(path)]
+    assert not path.exists()
+    assert k.read_pending_marker(task_id="bf042", root=root) is None
+    # stale 判定：TTL=0 → 立即过期。
+    prev_ttl = os.environ.get(k.PENDING_TTL_ENV)
+    os.environ[k.PENDING_TTL_ENV] = "0"
+    try:
+        k.write_pending_marker(
+            task_id="t2",
+            session_id=None,
+            run_id="r",
+            run_dir="d",
+            repo=None,
+            cwd=None,
+            token="t",
+            delivery_channel="terminal",
+            root=root,
+        )
+        stale = k.read_pending_marker(task_id="t2", root=root)
+        assert k.pending_status(stale) == k.STATUS_STALE
+    finally:
+        if prev_ttl is None:
+            os.environ.pop(k.PENDING_TTL_ENV, None)
+        else:
+            os.environ[k.PENDING_TTL_ENV] = prev_ttl
+
+
+def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> None:
+    """投递落地：UPS arm in-progress 锁的同时，按 token 清掉 Stop 写的 pending(dispatched-unconfirmed)。
+
+    这样投递真正落地后，下一次该 task 的 Stop 不会把那条 pending 误判为静默丢投而重投。
+    """
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    k = load_kanban_followup_lock_module()
+    root = tmp_path / "prep-root"
+    lock_root = tmp_path / "followup-lock"
+    prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
+    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    try:
+        now = prep.parse_timestamp("2026-06-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-fu",
+                "origin_repo": str(tmp_path / "repo"),
+                "origin_cwd": str(tmp_path / "repo"),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path / "repo"),
+                "target_kanban_task_id": "task-fu",
+                "rvf_run": {
+                    "run_id": "rvf-fu-delivered",
+                    "run_dir": str(tmp_path / "run"),
+                    "shared_workflow_state": {"status": "completed"},
+                },
+            },
+            root=root,
+            token="dddddddddddddddd",
+            now=now,
+            ttl_seconds=300,
+        )
+        # 预置 Stop 在「未确认投递」时写下的 pending（同 token、同 task）。
+        pending_path = k.write_pending_marker(
+            task_id="task-fu",
+            session_id="session-fu",
+            run_id="rvf-fu-delivered",
+            run_dir=str(tmp_path / "run"),
+            repo=str(tmp_path / "repo"),
+            cwd=str(tmp_path / "repo"),
+            token="dddddddddddddddd",
+            delivery_channel="terminal",
+            message_id="terminal:task-fu:rvf-fu-delivered",
+        )
+        assert pending_path is not None and pending_path.exists()
+        followup_prompt = (
+            "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER\n"
+            "RVF_DISPATCH=token=dddddddddddddddd\n"
+        )
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": followup_prompt,
+                "cwd": str(tmp_path / "repo"),
+                "session_id": "session-fu",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+            now="2026-06-07T00:01:00Z",
+        )
+        assert payload["status"] == "valid"
+        # in-progress 锁已 arm（投递落地的权威信号）。
+        marker_path = lock_root / "task-task-fu.json"
+        assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
+        assert marker_path.exists()
+        # 同 token 的 pending 已被清。
+        assert not pending_path.exists()
+        assert k.read_pending_marker(task_id="task-fu") is None
     finally:
         if prev_prep is None:
             os.environ.pop("CODEX_RVF_PREP_ROOT", None)
@@ -8299,6 +8456,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery",
             lambda: test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(
                 root / "prompt-submit-followup-arm"
+            ),
+        ),
+        (
+            "kanban_followup_pending_marker_round_trip",
+            lambda: test_kanban_followup_pending_marker_round_trip(
+                root / "kanban-followup-pending"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_clears_pending_on_delivery",
+            lambda: test_rvf_user_prompt_submit_clears_pending_on_delivery(
+                root / "prompt-submit-followup-pending-clear"
             ),
         ),
         (
