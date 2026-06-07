@@ -235,10 +235,18 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_sto
 
 Expected RVF result:
 
-- `systemMessage` includes `reason=kanban_followup_enqueued` or `reason=kanban_followup_started`.
-- RVF run summary contains `backend: "kanban-followup"`.
+- `systemMessage` includes one of `reason=kanban_followup_started` (app-server 可确认投递),
+  `reason=kanban_followup_enqueued` (排队回执), or
+  `reason=kanban_followup_dispatched_unconfirmed`（terminal fallback 投递——`message_id` 以
+  `terminal:` 开头、dispatch 时无 app-server socket、消息未必成为真实 turn；此时 RVF 诚实上报
+  「未确认」并写 dispatched-unconfirmed pending marker 供后续对账，而非谎报已注入）。
+- RVF run summary contains `backend: "kanban-followup"`、`kanban_followup_delivery_channel`
+  (`app-server` / `terminal`)、`kanban_followup_delivery_confirmed`，未确认时还有
+  `kanban_followup_pending_marker_path`。
 - RVF run summary contains `cline_kanban_task_id` and `cline_kanban_message_id`.
-- Kanban task conversation receives a new `$review-validate-fix` user message.
+- Kanban task conversation receives a new `$review-validate-fix` user message。投递落地时目标
+  session 的 UserPromptSubmit hook 会 arm in-progress 锁并按 token 清掉对应 pending（权威
+  确认）；若 terminal 投递静默丢失，pending 永不被清，下一次该 task 的 Stop 会判定丢投并重投。
 
 ## Maintenance Notes
 

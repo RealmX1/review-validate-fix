@@ -3636,6 +3636,219 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert calls[1]["suppress"] is None
 
 
+def test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pending(
+    tmp_path: Path,
+) -> None:
+    """terminal fallback 投递（message_id 以 ``terminal:`` 开头）→ 诚实上报 dispatched-unconfirmed + 写 pending。
+
+    无 app-server socket 时外部 CLI 走 terminal fallback、返回乐观 ``status:started``，但消息未必
+    成为真实 turn。RVF 不再谎报 injected/started，而是 dispatched-unconfirmed，并写 pending 供对账。
+    """
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
+    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    write_apply_patch_transcript(transcript, repo, session_id=session_id)
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'terminal:task-77:rvf-run', 'turn_id': '3', 'status': 'started', 'checkpoint_id': 'checkpoint-1'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": session_id,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_ATTEMPT_ID": "attempt-9",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "kanban-followup-dispatched-unconfirmed"
+    assert latest["kanban_followup_delivery_channel"] == "terminal"
+    assert latest["kanban_followup_delivery_confirmed"] is False
+    # dispatch 这一刻仍不 arm in-progress 锁（arm 仍归 UPS）。
+    assert latest.get("kanban_followup_in_progress_marker_path") is None
+    # 写了 pending marker，内容自洽（state / token / channel）。
+    pending_path = latest.get("kanban_followup_pending_marker_path")
+    assert isinstance(pending_path, str) and Path(pending_path).exists()
+    pending = json.loads(Path(pending_path).read_text(encoding="utf-8"))
+    assert pending["state"] == "dispatched_unconfirmed"
+    assert pending["delivery_channel"] == "terminal"
+    prep_token = dispatch_prep_payload(latest)["token"]
+    assert pending["token"] == prep_token
+    assert pending["kanban_task_id"] == "task-77"
+
+
+def test_kanban_followup_active_pending_skips_redispatch(tmp_path: Path) -> None:
+    """active pending（dispatch→delivery 在途窗口内）→ 本次 Stop 跳过重复 dispatch，避免双注入。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    pending_path = pending_dir / "task-task-active.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "dispatched_unconfirmed",
+                "dispatched_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-active",
+                "session_id": "session-active",
+                "run_id": "rvf-inflight",
+                "token": "inflighttoken000",
+                "delivery_channel": "terminal",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "print(json.dumps({'task_id': 'task-active', 'message_id': 'should-not-enqueue'}))\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "stop_hook_active": False,
+            "last_user_message": "测试在途窗口去重。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "KANBAN_TASK_ID": "task-active",
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_dispatch_in_flight" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "kanban_followup_dispatch_in_flight"
+    # 跳过发生在任何 kanban client 调用之前。
+    assert not client_calls.exists()
+    # pending 仍在（未被清，等其落地或超时）。
+    assert pending_path.exists()
+
+
+def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) -> None:
+    """stale pending（在途窗口已过仍未确认）→ 判定上次静默丢投：上报 + 清旧 pending + 放行重投。"""
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
+    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
+    write_apply_patch_transcript(transcript, repo, session_id=session_id)
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    pending_path = pending_dir / "task-task-77.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "dispatched_unconfirmed",
+                "dispatched_at": "2026-05-01T00:00:00Z",
+                "expires_at": "2026-05-01T00:00:00Z",
+                "kanban_task_id": "task-77",
+                "session_id": session_id,
+                "run_id": "rvf-dropped",
+                "token": "oldtokenold00000",
+                "delivery_channel": "terminal",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "if sys.argv[1] == 'list':\n"
+        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
+        "elif sys.argv[1] == 'message':\n"
+        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'terminal:task-77:rvf-redispatch', 'turn_id': '4', 'status': 'started'}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": session_id,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_ATTEMPT_ID": "attempt-9",
+            "KANBAN_PROJECT_PATH": str(repo),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    parse_json(stdout)
+    latest = latest_summary(state)
+    # 没有被 pending 挡住——重投真的发生（terminal 再投 → 又是 unconfirmed）。
+    assert latest["status"] == "kanban-followup-dispatched-unconfirmed"
+    assert client_calls.exists()
+    actions = [json.loads(line)["argv"][0] for line in client_calls.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert "message" in actions
+    # 上报了「上次静默丢投」事件。
+    assert any(
+        event.get("event") == "kanban_followup_prior_dispatch_unconfirmed"
+        for event in latest_events(state)
+    )
+    # 旧 pending 被新 dispatch 覆盖为新 token。
+    assert pending_path.exists()
+    refreshed = json.loads(pending_path.read_text(encoding="utf-8"))
+    assert refreshed["token"] != "oldtokenold00000"
+    assert refreshed["token"] == dispatch_prep_payload(latest)["token"]
+
+
 def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -> None:
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
@@ -7029,6 +7242,9 @@ def main() -> int:
         test_cline_kanban_mode_without_transcript_fail_closes_before_task_start,
         test_cline_kanban_mode_blocks_expired_codex_login_before_task_start,
         test_kanban_followup_mode_injects_current_task_message,
+        test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pending,
+        test_kanban_followup_active_pending_skips_redispatch,
+        test_kanban_followup_stale_pending_redispatches_and_reports,
         test_kanban_followup_title_falls_back_to_local_board_state,
         test_kanban_followup_title_ignores_unrelated_board_with_same_task_id,
         test_kanban_followup_title_uses_session_matched_board_state,

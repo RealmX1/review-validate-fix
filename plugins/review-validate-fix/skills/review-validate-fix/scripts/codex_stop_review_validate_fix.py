@@ -44,6 +44,10 @@ from kanban_followup_lock import (
     clear_marker as clear_kanban_followup_lock,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
+    clear_pending_marker as clear_kanban_followup_pending,
+    pending_status as kanban_followup_pending_status,
+    read_pending_marker as read_kanban_followup_pending,
+    write_pending_marker as write_kanban_followup_pending,
 )
 from session_manifest import build_manifest
 from diff_tracker import (
@@ -2289,6 +2293,20 @@ def kanban_followup_lock_session_id(event: dict[str, Any]) -> str | None:
     return session_hook_id_from_event(event) or session_id_from_event(event) or parent_thread_id_from_event(event)
 
 
+def _kanban_followup_delivery_channel(message_id: Any) -> str:
+    """从 Cline Kanban message_id 推断投递通道（用于诚实上报）。
+
+    ``terminal:`` 前缀来自外部 ``kanban task message`` CLI 在**无 app-server socket**时的
+    terminal fallback——它返回乐观的 ``status:started`` 回执，但消息未必成为真实 prompt turn
+    （目标 session 处于 awaiting_review / 已停止时尤甚），故视为「未确认投递」。其余形态视为经
+    app-server 的可确认投递。``terminal:`` 并非必然失败，只是 dispatch 这一刻尚不能确认落地；
+    落地的权威信号是目标 session 的 UserPromptSubmit hook（arm in-progress 锁）。
+    """
+    if isinstance(message_id, str) and message_id.strip().lower().startswith("terminal:"):
+        return "terminal"
+    return "app-server"
+
+
 def clear_kanban_followup_lock_for_event(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2299,7 +2317,10 @@ def clear_kanban_followup_lock_for_event(
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
     removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
-    if removed:
+    # handoff 完成顺带清掉残留 pending（对称卫生）：正常路径投递落地时 UPS arm 已清，
+    # 这里兜底处理「同 token pending 因故未被清」的尾巴。
+    removed_pending = clear_kanban_followup_pending(task_id=task_id)
+    if removed or removed_pending:
         ledger.event(
             phase="complete",
             event="kanban_followup_in_progress_cleared",
@@ -2310,6 +2331,7 @@ def clear_kanban_followup_lock_for_event(
             session_id=session_id,
             handoff_path=handoff_path,
             removed_kanban_followup_in_progress_marker_paths=removed,
+            removed_kanban_followup_pending_marker_paths=removed_pending,
             **stop_hook_rvf_state_fields(
                 phase="complete",
                 backend="kanban-followup",
@@ -2319,6 +2341,65 @@ def clear_kanban_followup_lock_for_event(
             ),
         )
     return removed
+
+
+def _kanban_followup_pending_decision(
+    event: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    cwd: str | None,
+) -> StopDecision | None:
+    """无 in-progress 锁时，按 dispatched-unconfirmed(pending) marker 做对账。
+
+    - pending 仍 active（在途窗口内）：上一条 follow-up 刚 dispatch、尚未确认落地，本次 Stop
+      暂不重复 dispatch 以免双注入；窗口由 pending TTL 限定（默认 15min），落地时 UPS arm 会
+      按 token 清掉它。
+    - pending 已 stale（在途窗口已过仍未确认）：上一条 follow-up 静默丢投——上报
+      ``kanban_followup_prior_dispatch_unconfirmed``、清 pending，并放行（返回 None）让正常流程重投。
+    - 无 pending：返回 None，照常 dispatch。
+    """
+    pending = read_kanban_followup_pending(task_id=task_id)
+    if pending is None:
+        return None
+    status = kanban_followup_pending_status(pending)
+    pending_path = pending.get("_marker_path")
+    if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+        return skip_decision(
+            "上一条 Cline Kanban RVF follow-up 刚 dispatch、尚未确认落地"
+            f"（token={pending.get('token') or '<unknown>'}，"
+            f"channel={pending.get('delivery_channel') or '<unknown>'}，"
+            f"dispatched_at={pending.get('dispatched_at') or '<unknown>'}）；"
+            "本次 Stop 暂不重复 dispatch，待其落地或在途窗口超时后再处理。",
+            ledger,
+            "kanban_followup_dispatch_in_flight",
+            cwd=cwd,
+            backend="kanban-followup",
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_pending_marker=pending,
+            kanban_followup_pending_marker_path=pending_path,
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_dispatch_in_flight",
+            ),
+        )
+    removed = clear_kanban_followup_pending(task_id=task_id)
+    ledger.event(
+        phase="gate",
+        event="kanban_followup_prior_dispatch_unconfirmed",
+        status="completed",
+        reason_code="kanban_followup_prior_dispatch_unconfirmed",
+        cwd=cwd,
+        cline_kanban_task_id=task_id,
+        session_id=session_id,
+        kanban_followup_pending_marker=pending,
+        removed_kanban_followup_pending_marker_paths=removed,
+    )
+    return None
 
 
 def kanban_followup_in_progress_decision(
@@ -2331,7 +2412,11 @@ def kanban_followup_in_progress_decision(
     session_id = kanban_followup_lock_session_id(event)
     marker = read_kanban_followup_lock(task_id=task_id, session_id=session_id)
     if marker is None:
-        return None
+        # 无 in-progress 锁（从未落地或已 handoff 清掉）→ 转交 pending 对账：判断上一条
+        # dispatch 是否在途（去重）或已静默丢投（重投）。
+        return _kanban_followup_pending_decision(
+            event, ledger, task_id=task_id, session_id=session_id, cwd=cwd
+        )
 
     status = kanban_followup_lock_status(marker)
     marker_path = marker.get("_marker_path")
@@ -5686,12 +5771,43 @@ def launch_backend(
         # 旧设计在此把 message_id/turn_id 回写进 in-progress 锁；现在 arm 由目标 session
         # 的 UserPromptSubmit hook 在投递落地时完成，这里不再写锁。
         raw_status = str(message_payload.get("status") or "").strip().lower()
-        status = (
-            "kanban-followup-started"
-            if raw_status in {"started", "running", "in_progress", "in-progress"}
-            else "kanban-followup-enqueued"
-        )
+        message_id = message_payload.get("message_id")
+        delivery_channel = _kanban_followup_delivery_channel(message_id)
+        delivery_confirmed = delivery_channel == "app-server"
+        if raw_status in {"started", "running", "in_progress", "in-progress"}:
+            # app-server（可确认）→ started；terminal fallback（未确认）→ dispatched-unconfirmed，
+            # 诚实表达「已交付但未确认成为真实 turn」，不再谎报 injected。
+            status = (
+                "kanban-followup-started"
+                if delivery_confirmed
+                else "kanban-followup-dispatched-unconfirmed"
+            )
+        else:
+            status = "kanban-followup-enqueued"
         reason_code = status.replace("-", "_")
+        # 未确认投递（terminal / 非 started 回执）写 pending marker，作为「dispatch 已发、尚未
+        # 确认落地」的对账依据：UPS arm 落地时按 token 清掉它；超时仍在 → 下次 Stop 判定上次
+        # 静默丢投并放行重投，同时 active 期间为 dispatch→delivery 在途窗口提供去重保护。
+        pending_marker_path: str | None = None
+        if not delivery_confirmed:
+            try:
+                pending_path = write_kanban_followup_pending(
+                    task_id=message_payload.get("task_id") or task_id,
+                    session_id=source_session_id,
+                    run_id=str(ledger.run_id),
+                    run_dir=str(ledger.run_dir),
+                    repo=decision.repo,
+                    cwd=cwd,
+                    token=dispatch_prep.token,
+                    delivery_channel=delivery_channel,
+                    attempt_id=message_payload.get("attempt_id") or attempt_id,
+                    message_id=message_id if isinstance(message_id, str) else None,
+                    turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+                    prompt_path=message_payload.get("prompt_path"),
+                )
+                pending_marker_path = str(pending_path) if pending_path else None
+            except Exception:  # best-effort：写 pending 失败不阻断 dispatch 上报
+                pending_marker_path = None
         paths = {
             key: value
             for key, value in {
@@ -5721,6 +5837,9 @@ def launch_backend(
             **source_origin_fields,
             **dispatch_prep_fields,
             kanban_followup_in_progress_marker_path=in_progress_marker_path,
+            kanban_followup_delivery_channel=delivery_channel,
+            kanban_followup_delivery_confirmed=delivery_confirmed,
+            kanban_followup_pending_marker_path=pending_marker_path,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -5730,7 +5849,16 @@ def launch_backend(
         return ledger.hook_payload(
             status=status,
             reason_code=reason_code,
-            message="Cline Kanban follow-up user message was injected.",
+            message=(
+                "Cline Kanban follow-up user message was injected."
+                if delivery_confirmed
+                else (
+                    "Cline Kanban follow-up 已经 terminal fallback 交给 Kanban，但未确认成为真实 "
+                    "turn（dispatch 时无 app-server socket / 目标 session 可能已停止）；"
+                    "请打开或恢复该 task，让排队中的 $review-validate-fix 被消费。"
+                    "若未落地，下一次该 task 的 Stop 会判定丢投并自动重投。"
+                )
+            ),
             repo=decision.repo,
             cwd=cwd,
             backend=decision.backend,
@@ -5747,6 +5875,9 @@ def launch_backend(
             cline_kanban_checkpoint_id=message_payload.get("checkpoint_id") or message_payload.get("checkpointId"),
             kanban_followup_payload=message_payload,
             kanban_followup_in_progress_marker_path=in_progress_marker_path,
+            kanban_followup_delivery_channel=delivery_channel,
+            kanban_followup_delivery_confirmed=delivery_confirmed,
+            kanban_followup_pending_marker_path=pending_marker_path,
             **source_origin_fields,
             **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(

@@ -611,6 +611,15 @@ def arm_kanban_followup_lock_on_delivery(
             pass
         return None
     marker_str = str(marker_path) if marker_path is not None else None
+    # 投递落地即解除 pending（按 token 防误清）：Stop 在「未确认投递」时写了 pending marker，
+    # 本 hook fire 证明注入的 follow-up trigger 真的成为了 prompt → 清掉 pending，使下一次 Stop
+    # 不会把它误判为静默丢投而重投。best-effort：清 pending 失败绝不阻断本次 prompt。
+    try:
+        removed_pending = kanban_followup_lock.clear_pending_marker(
+            task_id=task_id, token=record.token
+        )
+    except Exception:
+        removed_pending = []
     try:
         rvf_prep_file.append_diagnostic(
             root=prep_root,
@@ -621,6 +630,7 @@ def arm_kanban_followup_lock_on_delivery(
                 "kanban_task_id": task_id,
                 "run_id": rvf_run.get("run_id"),
                 "marker_path": marker_str,
+                "removed_pending_marker_paths": removed_pending,
             },
         )
     except (OSError, rvf_prep_file.PrepFileError):

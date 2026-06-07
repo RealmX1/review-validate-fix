@@ -322,3 +322,171 @@ def marker_status(
     if armed_ts is None:
         return STATUS_INVALID
     return STATUS_ACTIVE if current_ts - armed_ts <= ttl_seconds() else STATUS_STALE
+
+
+# ---------------------------------------------------------------------------
+# dispatched-unconfirmed (pending) marker family
+#
+# 与 in-progress 锁并列、物理隔离的一族 marker：在 Stop hook **dispatch 一条 follow-up**
+# 时写入（state=``dispatched_unconfirmed``），表示「已交给 Cline Kanban、但尚未确认成为真实
+# turn」。投递落地的权威信号是目标 session 的 UserPromptSubmit hook（arm in-progress 锁），
+# 它会按 token 清掉对应 pending；若投递静默丢失（如经 terminal fallback 注入到一个已停止的
+# session），pending 永不被清，下一次 Stop 据其判定「上次静默丢投」并放行重投。pending 还
+# 顺带恢复了 dispatch→delivery 在途窗口的去重保护（active pending 期间短暂跳过重复 dispatch）。
+# ---------------------------------------------------------------------------
+
+PENDING_SUBDIR_NAME = "kanban-followup-dispatched"
+PENDING_STATE = "dispatched_unconfirmed"
+DEFAULT_PENDING_TTL_SECONDS = 15 * 60
+PENDING_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_PENDING_TTL_SECONDS"
+
+
+def _pending_root(root: Path | None = None) -> Path:
+    if root is not None:
+        return root.expanduser() / PENDING_SUBDIR_NAME
+    raw = os.environ.get(LOCK_ROOT_ENV)
+    if raw and raw.strip():
+        # in-progress 锁把该 env 视为「直接就是 in-progress 目录」；pending 在其下另起子目录，
+        # 与 in-progress marker 物理隔离，避免同名 task-*.json 互相覆盖。
+        return Path(raw).expanduser() / PENDING_SUBDIR_NAME
+    return Path.home() / ".rvf" / PENDING_SUBDIR_NAME
+
+
+def _pending_task_path(task_id: str, root: Path | None = None) -> Path:
+    return _pending_root(root) / f"task-{safe_token(task_id)}.json"
+
+
+def pending_ttl_seconds() -> float:
+    raw = os.environ.get(PENDING_TTL_ENV)
+    if raw is None or not raw.strip():
+        return float(DEFAULT_PENDING_TTL_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_PENDING_TTL_SECONDS)
+    return max(0.0, value)
+
+
+def pending_marker_payload(
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    run_id: str,
+    run_dir: str,
+    repo: str | None,
+    cwd: str | None,
+    token: str | None,
+    delivery_channel: str | None,
+    attempt_id: str | None = None,
+    message_id: str | None = None,
+    turn_id: str | None = None,
+    prompt_path: str | None = None,
+) -> dict[str, Any]:
+    ttl = pending_ttl_seconds()
+    return {
+        "marker_version": MARKER_VERSION,
+        "state": PENDING_STATE,
+        "dispatched_at": _iso_now(),
+        "expires_at": _iso_after(ttl),
+        "ttl_seconds": ttl,
+        "kanban_task_id": task_id,
+        "kanban_attempt_id": attempt_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "repo": repo,
+        "cwd": cwd,
+        "token": token,
+        "delivery_channel": delivery_channel,
+        "message_id": message_id,
+        "turn_id": turn_id,
+        "prompt_path": prompt_path,
+    }
+
+
+def write_pending_marker(
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    run_id: str,
+    run_dir: str,
+    repo: str | None,
+    cwd: str | None,
+    token: str | None,
+    delivery_channel: str | None,
+    attempt_id: str | None = None,
+    message_id: str | None = None,
+    turn_id: str | None = None,
+    prompt_path: str | None = None,
+    root: Path | None = None,
+) -> Path | None:
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return None
+    payload = pending_marker_payload(
+        task_id=task_id,
+        session_id=session_id,
+        run_id=run_id,
+        run_dir=run_dir,
+        repo=repo,
+        cwd=cwd,
+        token=token,
+        delivery_channel=delivery_channel,
+        attempt_id=attempt_id,
+        message_id=message_id,
+        turn_id=turn_id,
+        prompt_path=prompt_path,
+    )
+    target = _pending_task_path(task_id, root)
+    _atomic_write(target, payload)
+    return target
+
+
+def read_pending_marker(
+    *,
+    task_id: str | None,
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return None
+    path = _pending_task_path(task_id, root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict):
+        payload.setdefault("_marker_path", str(path))
+        return payload
+    return None
+
+
+def clear_pending_marker(
+    *,
+    task_id: str | None,
+    token: str | None = None,
+    root: Path | None = None,
+) -> list[str]:
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return []
+    # token 防误清：若磁盘上的 pending 已被一条更新的 dispatch（不同 token）覆盖，
+    # 一条迟到的旧投递确认不应清掉这把仍未确认的新 pending。
+    if token is not None:
+        existing = read_pending_marker(task_id=task_id, root=root)
+        if isinstance(existing, dict):
+            stored = existing.get("token")
+            if isinstance(stored, str) and stored and stored != token:
+                return []
+    path = _pending_task_path(task_id, root)
+    try:
+        path.unlink()
+    except (FileNotFoundError, OSError):
+        return []
+    return [str(path)]
+
+
+def pending_status(
+    marker: dict[str, Any] | None,
+    *,
+    now_ts: float | None = None,
+) -> str:
+    # pending payload 始终带 ``expires_at``，故可直接复用 ``marker_status`` 的过期判定。
+    return marker_status(marker, now_ts=now_ts)
