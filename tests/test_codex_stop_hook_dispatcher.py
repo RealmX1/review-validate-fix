@@ -136,11 +136,13 @@ def write_fake_router_target(path: Path, marker: Path, label: str) -> None:
     )
 
 
-def write_fake_opener(path: Path, marker: Path) -> Path:
+def write_fake_notifier(path: Path, log: Path) -> Path:
+    """假 terminal-notifier：把每次调用的 argv 以 JSON 行追加到 log。"""
     path.write_text(
         "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(marker)!r}).write_text(sys.argv[-1], encoding='utf-8')\n",
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(log)!r}).open('a', encoding='utf-8')."
+        "write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n",
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -169,6 +171,18 @@ def write_fake_tmux(path: Path) -> Path:
 
 # 进程级默认假 tmux：invoke_result()/invoke_router() 在测试未显式覆盖时用它。
 _DEFAULT_FAKE_TMUX = write_fake_tmux(Path(tempfile.gettempdir()) / "rvf_dispatcher_default_fake_tmux.py")
+
+
+def _write_noop_notifier(path: Path) -> Path:
+    path.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+# 进程级默认假 notifier：确保没有测试会在真机弹出真实 OS 通知。
+_DEFAULT_FAKE_NOTIFIER = _write_noop_notifier(
+    Path(tempfile.gettempdir()) / "rvf_dispatcher_default_fake_notifier.py"
+)
 
 
 def write_assistant_handoff_transcript(path: Path, handoff: Path) -> Path:
@@ -431,6 +445,7 @@ def invoke_result(
         env.update(extra_env)
     # 默认假 tmux：避免触发 handoff→advisory 的测试在后台真的拉起 analyze agent。
     env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     return subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -487,6 +502,7 @@ def invoke_router(
     if extra_env:
         env.update(extra_env)
     env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     return subprocess.run(
         [sys.executable, str(ROUTER_SCRIPT)],
         input=json.dumps(event),
@@ -749,8 +765,8 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
     handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
     handoff.parent.mkdir(parents=True)
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
 
     event = {
         "cwd": str(repo),
@@ -764,7 +780,7 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
     )
 
     payload = json.loads(stdout)
@@ -772,7 +788,12 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
-    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
     summary = latest_summary(tmp_path / "state")
     assert summary["handoff_path"] == str(handoff.resolve())
 
@@ -883,8 +904,6 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     )
     # mutate workspace so workspace_diff has a real change
     (repo / ".rvf-seed").write_text("seed\nchanged\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
     fake_tmux = write_fake_tmux(tmp_path / "fake_tmux.py")
     tmux_calls = tmp_path / "tmux-calls.jsonl"
 
@@ -902,7 +921,6 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
         hook=hook,
         state=state,
         extra_env={
-            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
             "CODEX_RVF_TMUX_BIN": str(fake_tmux),
             "FAKE_TMUX_CALLS": str(tmux_calls),
         },
@@ -966,7 +984,6 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
         dev_repo=repo,
         hook=hook,
         state=state,
-        extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
     )
 
     payload = json.loads(stdout)
@@ -1033,7 +1050,6 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
         ),
         encoding="utf-8",
     )
-    opener = write_fake_opener(tmp_path / "open_handoff.py", tmp_path / "opened.txt")
 
     event = {
         "cwd": str(repo),
@@ -1048,7 +1064,6 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
         dev_repo=repo,
         hook=hook,
         state=state,
-        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
     )
 
     pre = run_dir / "artifacts" / "trajectory" / "pre-rvf" / "rollout.jsonl"
@@ -1654,8 +1669,8 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
     write_fake_installed_hook(hook, marker)
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
 
     completed = invoke_result(
         {
@@ -1669,7 +1684,7 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
         state=tmp_path / "state",
         extra_env={
             "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+            "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         },
     )
 
@@ -1681,7 +1696,7 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
     summary = latest_summary(tmp_path / "state")
     assert summary["status"] == "skipped"
     assert summary["reason_code"] == "suppressed"
-    assert not opener_marker.exists()
+    assert not notifier_log.exists()
     assert not (marker / "sync-ran").exists()
     assert not (marker / "install-ran").exists()
     assert not (marker / "hook-input.json").exists()
@@ -2213,8 +2228,6 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
             "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED": "1",
             "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE": "commit",
             "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE": "1",
-            "CODEX_RVF_OPEN_HANDOFF": "0",
-            "CODEX_RVF_IDE_OPEN_CMD": "code -r",
         },
     )
 
@@ -2232,8 +2245,6 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     assert "--cline-kanban-auto-review-enabled 1" in install_args
     assert "--cline-kanban-auto-review-mode commit" in install_args
     assert "--cline-kanban-start-in-plan-mode 1" in install_args
-    assert "--no-open-handoff" in install_args
-    assert "--ide-open-cmd code -r" in install_args
 
 
 def test_hook_config_drops_legacy_npx_kanban_defaults(tmp_path: Path) -> None:

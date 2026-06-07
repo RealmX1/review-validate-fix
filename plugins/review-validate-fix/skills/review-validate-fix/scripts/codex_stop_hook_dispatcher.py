@@ -654,18 +654,6 @@ def installer_args_from_env() -> list[str]:
     ).strip()
     if not fork_mode:
         fork_mode = ""
-    open_handoff = (
-        hook_env.get("CODEX_RVF_OPEN_HANDOFF")
-        or os.environ.get("CODEX_RVF_OPEN_HANDOFF", "")
-    ).strip()
-    if open_handoff and open_handoff.lower() in {"0", "false", "no", "n", "off", "disabled"}:
-        args.append("--no-open-handoff")
-    ide_open_cmd = (
-        hook_env.get("CODEX_RVF_IDE_OPEN_CMD")
-        or os.environ.get("CODEX_RVF_IDE_OPEN_CMD", "")
-    ).strip()
-    if ide_open_cmd:
-        args.extend(["--ide-open-cmd", ide_open_cmd])
     if not fork_mode:
         return args
     if fork_mode in {"cline", "kanban", "ck"}:
@@ -1302,7 +1290,7 @@ def main() -> int:
         )
     handoff_path_value = handoff_path_from_event(event)
     if handoff_path_value is not None:
-        payload = handoff_completion_payload(event, ledger)
+        payload = handoff_completion_payload(event, ledger, cwd=cwd)
         if payload is not None:
             try:
                 finalize_record = finalize_for_handoff(

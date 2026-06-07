@@ -114,7 +114,6 @@ DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
-DEFAULT_HANDOFF_HELPER = SKILL_DIR / "scripts" / "rvf_handoff.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
 DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
 DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
@@ -1515,10 +1514,8 @@ def fork_review_validate_fix_prompt(
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
         "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
         "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
-        "handoff 文件内容。最终回复前先运行 "
-        f"`python3 {shell_quote(str(DEFAULT_HANDOFF_HELPER))} open <handoff.md 绝对路径>` "
-        "尝试用默认编辑器打开该 markdown 文件；Stop hook 仍会把 "
-        "`RVF_HANDOFF_FILE` marker 作为兜底完成信号处理。"
+        "handoff 文件内容。Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，"
+        "run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）。"
     )
 
 
@@ -1828,10 +1825,8 @@ def kanban_followup_review_validate_fix_prompt(
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
         "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
         "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
-        "handoff 文件内容。最终回复前先运行 "
-        f"`python3 {shell_quote(str(DEFAULT_HANDOFF_HELPER))} open <handoff.md 绝对路径>` "
-        "尝试用默认编辑器打开该 markdown 文件；Stop hook 仍会把 "
-        "`RVF_HANDOFF_FILE` marker 作为兜底完成信号处理。"
+        "handoff 文件内容。Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，"
+        "run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）。"
     )
 
 
@@ -2923,8 +2918,6 @@ def cline_kanban_task_prompt(
     parent_codex_url = str(parent_origin.get("codex_url") or "<unavailable>")
     parent_transcript_file = str(parent_origin.get("transcript_file") or "<unknown>")
     apply_helper = SKILL_DIR / "scripts" / "apply_worktree_bootstrap.py"
-    handoff_helper = DEFAULT_HANDOFF_HELPER
-    original_prompt = Path(prompt_path).read_text(encoding="utf-8")
     # 父会话对话 context artifact 可能在 freeze 期写入（fail-open，可能缺失）。
     # 仅当文件确实存在时，才在 prompt 里加 RVF_PARENT_CONVERSATION_CONTEXT 标记与引用，
     # 用 $RVF_ARTIFACTS_DIR 相对形式与其它 artifact 引用保持一致。
@@ -3015,14 +3008,8 @@ def cline_kanban_task_prompt(
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
         "RVF run id 和 origin metadata path。最终回复第一行输出 "
         "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。"
-        "最终回复前必须先运行：\n\n"
-        "```sh\n"
-        f"python3 {shell_quote(str(handoff_helper))} open \"$RVF_ARTIFACTS_DIR/handoff.md\"\n"
-        # "```\n\n"
-        # "原始 fork prompt 如下，仅作兼容元数据：\n\n"
-        # "```text\n"
-        # f"{original_prompt.rstrip()}\n"
-        # "```\n"
+        "Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，run 结束时发送 OS 系统"
+        "通知（kanban 来源的通知点击后可打开对应 task；不再自动用编辑器打开 handoff）。"
     )
 
 
@@ -7048,7 +7035,7 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
 
     handoff_path_value = handoff_path_from_event(event)
     if handoff_path_value is not None:
-        payload = handoff_completion_payload(event, ledger)
+        payload = handoff_completion_payload(event, ledger, cwd=cwd)
         if payload is not None:
             try:
                 finalize_record = finalize_for_handoff(

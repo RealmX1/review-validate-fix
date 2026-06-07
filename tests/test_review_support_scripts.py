@@ -1635,30 +1635,174 @@ def test_rvf_user_prompt_submit_render_hook_payload_merges_channels(tmp_path: Pa
     assert render({"systemMessage": ""}) is None
 
 
-def test_rvf_handoff_cli_opens_with_configured_editor(tmp_path: Path) -> None:
+def _load_rvf_handoff_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_handoff
+
+    return rvf_handoff
+
+
+def _write_fake_notifier(path: Path, log: Path, *, fail: bool = False) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(log)!r}).open('a', encoding='utf-8')."
+        "write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n"
+        + ("sys.exit(5)\n" if fail else ""),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_rvf_handoff_cli_notify(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    marker = tmp_path / "opened.txt"
-    opener = tmp_path / "open_handoff.py"
-    opener.write_text(
-        "import os, pathlib, sys\n"
-        "pathlib.Path(os.environ['RVF_OPEN_MARKER']).write_text(sys.argv[1], encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    env = {
-        **os.environ,
-        "CODEX_RVF_IDE_OPEN_CMD": f"{shlex.quote(sys.executable)} {shlex.quote(str(opener))}",
-        "RVF_OPEN_MARKER": str(marker),
-    }
+    notifier_log = tmp_path / "notify.log"
+    notifier = _write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
+    env = {**os.environ, "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)}
 
-    completed = run([sys.executable, str(RVF_HANDOFF), "open", str(handoff)], env=env)
+    completed = run(
+        [
+            sys.executable,
+            str(RVF_HANDOFF),
+            "notify",
+            str(handoff),
+            "--task-url",
+            "http://127.0.0.1:3484/repo?task=t1",
+            "--summary",
+            "两个 reviewer 通过",
+        ],
+        env=env,
+    )
     payload = json.loads(completed.stdout)
 
     assert payload["valid"] is True
-    assert payload["opened"] is True
+    assert payload["notified"] is True
     assert payload["handoff_path"] == str(handoff.resolve())
-    assert marker.read_text(encoding="utf-8") == str(handoff.resolve())
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("-message") + 1] == "两个 reviewer 通过"
+    assert calls[0][calls[0].index("-open") + 1] == "http://127.0.0.1:3484/repo?task=t1"
+
+
+def test_rvf_handoff_marker_tail_and_summary() -> None:
+    mod = _load_rvf_handoff_module()
+    text = "前置废话\nRVF_HANDOFF_FILE: /tmp/h.md\n两个 reviewer 通过；1 项已修复。"
+    tail = mod.handoff_marker_tail(text)
+    assert tail == "RVF_HANDOFF_FILE: /tmp/h.md\n两个 reviewer 通过；1 项已修复。"
+    assert mod._notification_summary(tail) == "两个 reviewer 通过；1 项已修复。"
+    # 多个 marker → 取最后一个起的尾段。
+    multi = "RVF_HANDOFF_FILE: /a.md\n旧\nRVF_HANDOFF_FILE: /b.md\n新结论"
+    assert mod.handoff_marker_tail(multi) == "RVF_HANDOFF_FILE: /b.md\n新结论"
+    assert mod.handoff_marker_tail("没有 marker") is None
+
+
+def test_rvf_handoff_resolve_kanban_task_url(tmp_path: Path) -> None:
+    mod = _load_rvf_handoff_module()
+    home = tmp_path / "home"
+    index = home / ".cline" / "kanban" / "workspaces" / "index.json"
+    index.parent.mkdir(parents=True)
+    repo = "/Users/x/Documents/GitHub/review-validate-fix"
+    index.write_text(
+        json.dumps({"repoPathToId": {repo: "review-validate-fix"}}),
+        encoding="utf-8",
+    )
+    saved_home = os.environ.get("HOME")
+    saved_port = os.environ.pop("KANBAN_RUNTIME_PORT", None)
+    os.environ["HOME"] = str(home)
+    try:
+        # index 命中。
+        assert mod.workspace_id_for_repo(repo) == "review-validate-fix"
+        assert (
+            mod.resolve_kanban_task_url(repo, "task-1")
+            == "http://127.0.0.1:3484/review-validate-fix?task=task-1"
+        )
+        # index 缺失 → kebab basename 兜底。
+        assert mod.workspace_id_for_repo("/Users/x/Some-Other Repo") == "some-other-repo"
+        # 缺 project_path / task_id → None。
+        assert mod.resolve_kanban_task_url(None, "t") is None
+        assert mod.resolve_kanban_task_url(repo, None) is None
+    finally:
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        if saved_port is not None:
+            os.environ["KANBAN_RUNTIME_PORT"] = saved_port
+
+
+def test_rvf_handoff_notify_requires_terminal_notifier(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mod = _load_rvf_handoff_module()
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("# handoff\n", encoding="utf-8")
+    saved_which = mod.shutil.which
+    saved_bin = os.environ.pop(mod.TERMINAL_NOTIFIER_BIN_ENV, None)
+    try:
+        mod.shutil.which = lambda name: None
+        result = mod.notify_handoff_ready(
+            handoff_path=handoff, summary_text=None, task_url=None, group_ref="r"
+        )
+        assert result["notified"] is False
+        # darwin 上缺二进制 → 显式 missing；非 darwin 且无 override → unsupported-platform。
+        if sys.platform == "darwin":
+            assert result["reason"] == "terminal-notifier-missing"
+        else:
+            assert result["reason"] == "unsupported-platform"
+    finally:
+        mod.shutil.which = saved_which
+        if saved_bin is not None:
+            os.environ[mod.TERMINAL_NOTIFIER_BIN_ENV] = saved_bin
+
+
+def test_rvf_handoff_maybe_trigger_kanban_notification(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mod = _load_rvf_handoff_module()
+    ctx = {"kanban_task_id": "task-9"}
+    saved = os.environ.pop(mod.KANBAN_NOTIFY_CMD_ENV, None)
+    try:
+        # 未配置 → 守护性 no-op。
+        assert mod.maybe_trigger_kanban_notification(
+            task_url="u", copy_text="c", kanban_context=ctx, project_path=None
+        ) == {"triggered": False, "reason": "kanban-notify-not-configured"}
+        # 配置后 → 运行命令，把 context 经 stdin(JSON) + env 传入。
+        out = tmp_path / "trigger.json"
+        recorder = tmp_path / "recorder.py"
+        recorder.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            f"pathlib.Path({str(out)!r}).write_text("
+            "sys.stdin.read() + '|' + os.environ.get('RVF_KANBAN_TASK_ID', ''), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        recorder.chmod(0o755)
+        os.environ[mod.KANBAN_NOTIFY_CMD_ENV] = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(recorder))}"
+        )
+        result = mod.maybe_trigger_kanban_notification(
+            task_url="http://x/repo?task=task-9",
+            copy_text="尾段",
+            kanban_context=ctx,
+            project_path=None,
+        )
+        assert result["triggered"] is True
+        body, task_id = out.read_text(encoding="utf-8").split("|")
+        parsed = json.loads(body)
+        assert parsed["task_id"] == "task-9"
+        assert parsed["copy_text"] == "尾段"
+        assert task_id == "task-9"
+    finally:
+        if saved is None:
+            os.environ.pop(mod.KANBAN_NOTIFY_CMD_ENV, None)
+        else:
+            os.environ[mod.KANBAN_NOTIFY_CMD_ENV] = saved
 
 
 @functools.lru_cache(maxsize=1)
@@ -8123,8 +8267,24 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
-            "rvf_handoff_cli_opens_with_configured_editor",
-            lambda: test_rvf_handoff_cli_opens_with_configured_editor(root / "handoff-open"),
+            "rvf_handoff_cli_notify",
+            lambda: test_rvf_handoff_cli_notify(root / "handoff-notify"),
+        ),
+        (
+            "rvf_handoff_marker_tail_and_summary",
+            lambda: test_rvf_handoff_marker_tail_and_summary(),
+        ),
+        (
+            "rvf_handoff_resolve_kanban_task_url",
+            lambda: test_rvf_handoff_resolve_kanban_task_url(root / "handoff-url"),
+        ),
+        (
+            "rvf_handoff_notify_requires_terminal_notifier",
+            lambda: test_rvf_handoff_notify_requires_terminal_notifier(root / "handoff-missing"),
+        ),
+        (
+            "rvf_handoff_maybe_trigger_kanban_notification",
+            lambda: test_rvf_handoff_maybe_trigger_kanban_notification(root / "handoff-kanban-trigger"),
         ),
         ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
         (

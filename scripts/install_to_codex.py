@@ -801,8 +801,6 @@ def configure_stop_hook(
     cline_kanban_auto_review_enabled: str | None = None,
     cline_kanban_auto_review_mode: str | None = None,
     cline_kanban_start_in_plan_mode: str | None = None,
-    open_handoff: bool = True,
-    ide_open_cmd: str | None = None,
 ) -> Path:
     fork_mode = normalize_fork_mode(fork_mode)
     cline_kanban_worktree_mode = normalized_cline_kanban_worktree_mode(cline_kanban_worktree_mode)
@@ -824,11 +822,6 @@ def configure_stop_hook(
         f"CODEX_RVF_STABLE_STOP_HOOK={shlex.quote(str(stable_dispatcher))}",
         f"CODEX_RVF_DEV_STOP_HOOK={shlex.quote(str(dev_dispatcher))}",
     ]
-    if not open_handoff:
-        env_parts.append("CODEX_RVF_OPEN_HANDOFF=0")
-    ide_open_text = (ide_open_cmd or "").strip()
-    if ide_open_text:
-        env_parts.append(f"CODEX_RVF_IDE_OPEN_CMD={shlex.quote(ide_open_text)}")
     if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
         for name, value in (
             ("CODEX_RVF_CLINE_KANBAN_START_CMD", cline_kanban_start_cmd),
@@ -1055,16 +1048,6 @@ def main() -> int:
         default=None,
         help="持久写入 CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE；默认 0。",
     )
-    parser.add_argument(
-        "--no-open-handoff",
-        action="store_true",
-        help="持久写入 CODEX_RVF_OPEN_HANDOFF=0，关闭 RVF 完成时自动打开 handoff.md。",
-    )
-    parser.add_argument(
-        "--ide-open-cmd",
-        default=None,
-        help="持久写入 CODEX_RVF_IDE_OPEN_CMD；用于指定打开 handoff.md 的 coding agent IDE 命令。",
-    )
     args = parser.parse_args()
 
     preserve = not args.replace_setup_config
@@ -1129,10 +1112,6 @@ def main() -> int:
                 args.cline_kanban_auto_review_enabled or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED"),
                 args.cline_kanban_auto_review_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE"),
                 args.cline_kanban_start_in_plan_mode or os.environ.get("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE"),
-                not args.no_open_handoff
-                and os.environ.get("CODEX_RVF_OPEN_HANDOFF", "").strip().lower()
-                not in {"0", "false", "no", "n", "off", "disabled"},
-                args.ide_open_cmd or os.environ.get("CODEX_RVF_IDE_OPEN_CMD"),
             )
             installed.append(f"stop hook: {hooks_path}")
         if args.configure_user_prompt_submit_hook:

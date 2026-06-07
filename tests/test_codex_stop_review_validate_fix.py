@@ -188,11 +188,13 @@ def write_codex_goal_transcript(
     return path
 
 
-def write_fake_opener(path: Path, marker: Path, *, fail: bool = False) -> Path:
+def write_fake_notifier(path: Path, log: Path, *, fail: bool = False) -> Path:
+    """假 terminal-notifier：把每次调用的 argv 以 JSON 行追加到 log，按 fail 决定退出码。"""
     path.write_text(
         "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(marker)!r}).write_text(sys.argv[-1], encoding='utf-8')\n"
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(log)!r}).open('a', encoding='utf-8')."
+        "write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n"
         + ("sys.exit(5)\n" if fail else ""),
         encoding="utf-8",
     )
@@ -224,6 +226,9 @@ def invoke(
     # advisory 路径的测试在后台真的拉起 analyze agent；需要断言 tmux 行为的
     # 测试自行传入 CODEX_RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
     env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    # 默认把 terminal-notifier 指向无副作用的假 notifier，确保没有测试会在真机弹出
+    # 真实 OS 通知；需要断言通知行为的测试自行传入 CODEX_RVF_TERMINAL_NOTIFIER_BIN。
+    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -494,6 +499,18 @@ def write_fake_tmux(path: Path) -> Path:
 # 进程级默认假 tmux：invoke() 在测试未显式覆盖时用它，确保没有测试会在后台
 # 真的启动 detached analyze agent。
 _DEFAULT_FAKE_TMUX = write_fake_tmux(Path(tempfile.gettempdir()) / "rvf_codex_stop_default_fake_tmux.py")
+
+
+def _write_noop_notifier(path: Path) -> Path:
+    path.write_text("#!/usr/bin/env python3\nraise SystemExit(0)\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+# 进程级默认假 notifier：invoke() 在测试未显式覆盖时用它，确保没有测试会真的弹 OS 通知。
+_DEFAULT_FAKE_NOTIFIER = _write_noop_notifier(
+    Path(tempfile.gettempdir()) / "rvf_codex_stop_default_fake_notifier.py"
+)
 
 
 def test_normalize_backend_from_env(tmp_path: Path) -> None:
@@ -2823,8 +2840,10 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert "review packet 仅作为冻结 reviewer 输入" in prompt_text
     assert "session manifest 只作为 ownership evidence" in prompt_text
     assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
-    assert "rvf_handoff.py" in prompt_text
-    assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' in prompt_text
+    # 不再指示 agent 手动打开 handoff；改由 Stop hook 在 run 结束时发 OS 系统通知。
+    assert "rvf_handoff.py" not in prompt_text
+    assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' not in prompt_text
+    assert "OS 系统" in prompt_text
     assert "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py`" not in prompt_text
     assert "由 UserPromptSubmit hook 调用 shared prepare 入口" in prompt_text
     artifacts_dir = latest["artifacts_dir"]
@@ -5986,8 +6005,8 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
     handoff.parent.mkdir(parents=True, exist_ok=True)
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
     fork_prompt = (
         "$review-validate-fix\n\n"
         "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
@@ -6007,7 +6026,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
         invoke(
             event,
             state_dir=state,
-            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert "decision" not in payload
@@ -6017,18 +6036,34 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     assert summary["rvf_state_phase"] == "complete"
     assert summary["rvf_completion_gate"] == "handoff_file_ready"
     assert summary["rvf_handoff_path"] == str(handoff.resolve())
-    assert summary["handoff_open_result"]["opened"] is True
-    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
+    assert summary["handoff_notify_result"]["notified"] is True
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
+    assert "-title" in calls[0] and "RVF" in calls[0]
+    # 非 kanban 来源 → 信息-only，不带 -open。
+    assert "-open" not in calls[0]
+    assert summary["handoff_task_url"] is None
 
     stdout, _ = invoke(
         event,
         state_dir=state,
-        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
     )
     payload = parse_json(stdout)
     summary = summary_from_payload(payload)
-    assert summary["already_advised"] is True
-    assert summary["handoff_open_result"]["reason"] == "already_advised"
+    assert summary["already_notified"] is True
+    assert summary["handoff_notify_result"]["reason"] == "already_notified"
+    # 去重：第二次 Stop 不应再调用 notifier。
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
 
 
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
@@ -6066,7 +6101,7 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
             "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
         },
         state_dir=state,
-        extra_env={"CODEX_RVF_OPEN_HANDOFF": "0", "KANBAN_TASK_ID": "task-active"},
+        extra_env={"KANBAN_TASK_ID": "task-active"},
     )
 
     payload = parse_json(stdout)
@@ -6074,146 +6109,6 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
     assert not marker_path.exists()
     events = latest_events(state)
     assert any(event.get("event") == "kanban_followup_in_progress_cleared" for event in events)
-
-
-def test_manual_handoff_open_suppresses_followup_advisory_open(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
-    handoff.parent.mkdir(parents=True, exist_ok=True)
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_log = tmp_path / "opened.txt"
-    opener = tmp_path / "open_handoff.py"
-    opener.write_text(
-        "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
-        encoding="utf-8",
-    )
-    opener.chmod(0o755)
-    env = os.environ.copy()
-    for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
-            env.pop(name, None)
-    env.update(
-        {
-            "CODEX_RVF_IDE_OPEN_CMD": str(opener),
-        }
-    )
-
-    completed = subprocess.run(
-        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
-    )
-    manual_payload = parse_json(completed.stdout)
-    assert manual_payload["opened"] is True
-    assert manual_payload["manual_open_marker"]["marker_written"] is True
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(tmp_path),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
-        },
-        state_dir=state,
-        extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
-    )
-    payload = parse_json(stdout)
-    summary = summary_from_payload(payload)
-    assert summary["already_opened"] is True
-    assert summary["handoff_open_result"]["reason"] == "already_opened"
-    assert opener_log.read_text(encoding="utf-8").splitlines() == [str(handoff.resolve())]
-
-
-def test_manual_open_marker_records_kanban_followup_when_origin_is_kanban(
-    tmp_path: Path,
-) -> None:
-    state = tmp_path / "state"
-    artifacts = state / "runs" / "rvf-kanban" / "artifacts"
-    artifacts.mkdir(parents=True, exist_ok=True)
-    handoff = artifacts / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    (artifacts / "origin.json").write_text(
-        json.dumps(
-            {
-                "source_kind": "cline-kanban-task",
-                "kanban_task_id": "task-77",
-                "kanban_attempt_id": "attempt-9",
-                "kanban_task_title": "kanban followup demo",
-            }
-        ),
-        encoding="utf-8",
-    )
-    opener_log = tmp_path / "opened.txt"
-    opener = tmp_path / "open_handoff.py"
-    opener.write_text(
-        "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
-        encoding="utf-8",
-    )
-    opener.chmod(0o755)
-    env = os.environ.copy()
-    for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
-            env.pop(name, None)
-    env["CODEX_RVF_IDE_OPEN_CMD"] = str(opener)
-
-    completed = subprocess.run(
-        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
-    )
-    payload = parse_json(completed.stdout)
-    assert payload["opened"] is True
-    marker_path = Path(payload["manual_open_marker"]["marker_path"])
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker["source"] == "kanban_followup"
-    assert marker["kanban"]["kanban_task_id"] == "task-77"
-    assert marker["kanban"]["kanban_attempt_id"] == "attempt-9"
-    assert marker["kanban"]["kanban_task_title"] == "kanban followup demo"
-
-
-def test_manual_open_marker_keeps_manual_open_when_origin_missing(
-    tmp_path: Path,
-) -> None:
-    state = tmp_path / "state"
-    artifacts = state / "runs" / "rvf-plain" / "artifacts"
-    artifacts.mkdir(parents=True, exist_ok=True)
-    handoff = artifacts / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_log = tmp_path / "opened.txt"
-    opener = tmp_path / "open_handoff.py"
-    opener.write_text(
-        "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(opener_log)!r}).open('a', encoding='utf-8').write(sys.argv[-1] + '\\n')\n",
-        encoding="utf-8",
-    )
-    opener.chmod(0o755)
-    env = os.environ.copy()
-    for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
-            env.pop(name, None)
-    env["CODEX_RVF_IDE_OPEN_CMD"] = str(opener)
-
-    completed = subprocess.run(
-        [sys.executable, str(RVF_HANDOFF), "open", str(handoff)],
-        capture_output=True,
-        text=True,
-        check=True,
-        env=env,
-    )
-    payload = parse_json(completed.stdout)
-    marker_path = Path(payload["manual_open_marker"]["marker_path"])
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert marker["source"] == "manual_open"
-    assert "kanban" not in marker
 
 
 def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None:
@@ -6235,8 +6130,8 @@ def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None
         tmp_path / "rollout.jsonl",
         repo,
     )
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
 
     payload = parse_json(
         invoke(
@@ -6248,16 +6143,27 @@ def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     summary = summary_from_payload(payload)
-    assert summary["handoff_open_result"]["opened"] is True
-    opened_marker_path = Path(summary["opened_marker_path"])
-    marker = json.loads(opened_marker_path.read_text(encoding="utf-8"))
-    assert marker["source"] == "kanban_followup"
+    assert summary["handoff_notify_result"]["notified"] is True
+    # kanban 来源 → 解析出 task URL，notifier 命令带 -open <url>（点击打开 task）。
+    task_url = summary["handoff_task_url"]
+    assert task_url == "http://127.0.0.1:3484/repo?task=task-88"
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
+    assert "-open" in calls[0]
+    assert calls[0][calls[0].index("-open") + 1] == task_url
+    marker_path = Path(summary["marker_path"])
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker["kanban"]["kanban_task_id"] == "task-88"
     assert marker["kanban"]["kanban_attempt_id"] == "attempt-2"
+    assert marker["task_url"] == task_url
 
 
 def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> None:
@@ -6283,7 +6189,6 @@ def test_handoff_advisory_surfaces_finalize_record_errors(tmp_path: Path) -> Non
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_OPEN_HANDOFF": "0"},
         )[0]
     )
 
@@ -6321,7 +6226,6 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_OPEN_HANDOFF": "0",
                 "CODEX_RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
@@ -6382,7 +6286,6 @@ def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_OPEN_HANDOFF": "0",
                 "CODEX_RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
@@ -6450,7 +6353,6 @@ def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_OPEN_HANDOFF": "0",
                 "CODEX_RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "1",
@@ -6491,7 +6393,6 @@ def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) ->
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_OPEN_HANDOFF": "0",
                 "CODEX_RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "3",
@@ -6513,13 +6414,13 @@ def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) ->
     assert any(event["event"] == "rvf_analyze_thread_launch_failed" for event in events)
 
 
-def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
+def test_handoff_advisory_records_notify_failure(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log, fail=True)
 
     payload = parse_json(
         invoke(
@@ -6530,43 +6431,28 @@ def test_handoff_advisory_respects_open_disabled(tmp_path: Path) -> None:
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={
-                "CODEX_RVF_OPEN_HANDOFF": "0",
-                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
-            },
+            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
-    summary = summary_from_payload(payload)
-    assert summary["handoff_open_enabled"] is False
-    assert summary["handoff_open_result"]["reason"] == "disabled"
-    assert not opener_marker.exists()
-
-
-def test_handoff_advisory_records_open_failure(tmp_path: Path) -> None:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    state = tmp_path / "state"
-    handoff = tmp_path / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker, fail=True)
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(tmp_path),
-                "session_id": "child-session",
-                "stop_hook_active": False,
-                "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
-            },
-            state_dir=state,
-            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
-        )[0]
-    )
+    # 通知失败不阻断 run；handoff 仍被认定 ready（continue=True），但记为 warning。
     assert payload["continue"] is True
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
     summary = summary_from_payload(payload)
-    assert summary["handoff_open_result"]["opened"] is False
-    assert summary["handoff_open_result"]["reason"] == "command_failed"
-    assert opener_marker.read_text(encoding="utf-8") == str(handoff.resolve())
+    assert summary["handoff_notify_result"]["notified"] is False
+    assert summary["handoff_notify_result"]["reason"] == "command_failed"
+    # ledger event 记为 warning（通知硬依赖失败要可见），但 hook 仍放行。
+    events = latest_events(state)
+    assert any(
+        ev.get("event") == "handoff_file_ready" and ev.get("status") == "warning"
+        for ev in events
+    )
+    # notifier 确实被调用过（只是退出码非零）。
+    calls = [
+        json.loads(line)
+        for line in notifier_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
 
 
 def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> None:
@@ -6574,8 +6460,8 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
     state = tmp_path / "state"
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
 
     payload = parse_json(
         invoke(
@@ -6588,7 +6474,7 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
             state_dir=state,
             extra_env={
                 "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
+                "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
             },
         )[0]
     )
@@ -6598,8 +6484,8 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
     summary = latest_summary(state)
     assert summary["status"] == "skipped"
     assert summary["reason_code"] == "suppressed"
-    assert not opener_marker.exists()
-    assert not (state / "handoff-advised").exists()
+    assert not notifier_log.exists()
+    assert not (state / "handoff-notified").exists()
 
 
 def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -> None:
@@ -6607,8 +6493,8 @@ def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -
     state = tmp_path / "state"
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener_marker = tmp_path / "opened.txt"
-    opener = write_fake_opener(tmp_path / "open_handoff.py", opener_marker)
+    notifier_log = tmp_path / "notify.log"
+    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
 
     payload = parse_json(
         invoke(
@@ -6619,13 +6505,13 @@ def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_IDE_OPEN_CMD": str(opener)},
+            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert payload["continue"] is True
     assert "reason=stop_hook_active" in payload["systemMessage"]
-    assert not opener_marker.exists()
-    assert not (state / "handoff-advised").exists()
+    assert not notifier_log.exists()
+    assert not (state / "handoff-notified").exists()
 
 
 def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -> None:
@@ -6633,7 +6519,6 @@ def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -
     state = tmp_path / "state"
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
-    opener = write_fake_opener(tmp_path / "open_handoff.py", tmp_path / "opened.txt")
 
     payload = parse_json(
         invoke(
@@ -6647,7 +6532,6 @@ def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -
             extra_env={
                 "CODEX_RVF_MODE": "fork",
                 "CODEX_RVF_FORK_MODE": "dry-run",
-                "CODEX_RVF_IDE_OPEN_CMD": str(opener),
             },
         )[0]
     )
@@ -6677,7 +6561,7 @@ def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp_path: Path) ->
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-advised").exists()
+    assert not (state / "handoff-notified").exists()
 
 
 def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -> None:
@@ -6700,7 +6584,7 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -
         state_dir=state,
     )
     assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-advised").exists()
+    assert not (state / "handoff-notified").exists()
 
 
 def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
@@ -7081,8 +6965,6 @@ def main() -> int:
         test_dirty_repo_continuation_mode_reports_removed_fallback,
         test_forked_rvf_session_gets_programmatic_handoff_advisory,
         test_handoff_file_clears_kanban_followup_in_progress_marker,
-        test_manual_open_marker_records_kanban_followup_when_origin_is_kanban,
-        test_manual_open_marker_keeps_manual_open_when_origin_missing,
         test_handoff_advisory_marker_records_kanban_followup,
         test_handoff_advisory_surfaces_finalize_record_errors,
         test_handoff_advisory_launches_detached_analyze_thread,
@@ -7090,8 +6972,7 @@ def main() -> int:
         test_analyze_thread_self_stop_is_suppressed,
         test_analyze_thread_idempotent_when_session_exists,
         test_analyze_thread_launch_failure_does_not_break_handoff,
-        test_handoff_advisory_respects_open_disabled,
-        test_handoff_advisory_records_open_failure,
+        test_handoff_advisory_records_notify_failure,
         test_suppress_env_skips_handoff_marker_before_advisory,
         test_stop_hook_active_skips_handoff_marker_before_advisory,
         test_handoff_marker_in_dirty_repo_does_not_create_new_fork,

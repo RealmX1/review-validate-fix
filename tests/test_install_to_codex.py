@@ -343,63 +343,6 @@ def test_configure_stop_hook_can_write_cline_kanban_review_options(tmp_path: Pat
     assert "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE=1" in command
 
 
-def test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd(tmp_path: Path) -> None:
-    module = load_installer_module()
-
-    def run_test() -> None:
-        module.configure_stop_hook(
-            tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix",
-            open_handoff=False,
-            ide_open_cmd="code -r",
-        )
-
-    with_fake_home(module, tmp_path, run_test)
-
-    command = rvf_hooks(
-        json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    )[0]["command"]
-    assert "CODEX_RVF_OPEN_HANDOFF=0" in command
-    assert "CODEX_RVF_IDE_OPEN_CMD='code -r'" in command
-
-
-def test_main_persists_handoff_open_env(tmp_path: Path) -> None:
-    module = load_installer_module()
-    home = tmp_path / "home"
-    plugin_parent = home / "plugins"
-
-    def run_main() -> None:
-        def call_main() -> None:
-            assert module.main() == 0
-
-        with_argv(
-            [
-                "install_to_codex.py",
-                "--plugin-parent",
-                str(plugin_parent),
-                "--configure-stop-hook",
-            ],
-            call_main,
-        )
-
-    with_fake_home(
-        module,
-        home,
-        lambda: with_env(
-            {
-                "CODEX_RVF_OPEN_HANDOFF": "0",
-                "CODEX_RVF_IDE_OPEN_CMD": "code -r",
-            },
-            run_main,
-        ),
-    )
-
-    command = rvf_hooks(
-        json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
-    )[0]["command"]
-    assert "CODEX_RVF_OPEN_HANDOFF=0" in command
-    assert "CODEX_RVF_IDE_OPEN_CMD='code -r'" in command
-
-
 def test_main_persists_cline_connection_env(tmp_path: Path) -> None:
     module = load_installer_module()
     home = tmp_path / "home"
@@ -1105,8 +1048,6 @@ def main() -> int:
         test_configure_stop_hook_can_write_kanban_followup_mode,
         test_configure_stop_hook_can_write_cline_kanban_connection_env,
         test_configure_stop_hook_can_write_cline_kanban_review_options,
-        test_configure_stop_hook_can_disable_handoff_open_and_write_ide_cmd,
-        test_main_persists_handoff_open_env,
         test_main_persists_cline_connection_env,
         test_main_drops_legacy_npx_kanban_defaults_from_env,
         test_main_persists_cline_review_options,
