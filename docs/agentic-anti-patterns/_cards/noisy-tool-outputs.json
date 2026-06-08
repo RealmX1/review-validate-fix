@@ -1,0 +1,32 @@
+{
+  "id": "noisy-tool-outputs",
+  "name_cn": "噪声 / 非结构化工具输出",
+  "name_en": "Noisy / Unstructured Tool Outputs",
+  "group_id": "g3",
+  "order": 11,
+  "definition": "工具把自由散文、原始 HTML/日志或未经裁剪的大段文本直接回填给 agent，而不是结构化、按需精简、含明确字段的数据，迫使模型事后从噪声里猜测结构并自行解析。",
+  "why_harmful": "模型对非结构化观测的推理会退化：要么臆造字段结构、误读散文里的数值/日期，要么把大量无关噪声塞进上下文，与任务提示争夺注意力并随响应变长而降低准确率；同时这些 token 本可用于推理或后续工具调用，于是下游决策建立在被错误解析、被稀释的观测之上。",
+  "symptoms": [
+    "工具返回体是大段散文或未过滤的原始响应（整页 HTML、完整日志、未分页的列表），而非定义好的 JSON/schema",
+    "agent 在工具结果后用文本「猜」字段（如把散文里的金额/日期/状态解析错），出现解析型幻觉",
+    "单次工具调用回填的 token 异常大，且其中大部分内容（低层标识符、原始元数据、无关字段）与当前任务无关",
+    "同一工具在不同调用间返回格式不一致，下游解析逻辑或 agent 频繁踩空、反复重试",
+    "缺少分页、字段裁剪、过滤与摘要选项，工具只能整块吐出全部原始数据，无 concise/detailed 之类的精简档位"
+  ],
+  "mitigation": "让工具返回 schema 化、可分页、可过滤、可裁剪的结构化结果而非长篇散文；只回填与任务相关的高信号字段（用语义化名称替代 uuid/mime_type 等低层标识符），并提供 concise/detailed 等响应格式档位与合理默认值，以控制信噪比与 token 占用，使下游解析确定可预测。",
+  "sources": [
+    {
+      "label": "Anthropic — Writing Effective Tools for AI Agents",
+      "url": "https://www.anthropic.com/engineering/writing-tools-for-agents"
+    },
+    {
+      "label": "Bhagya Rana — 7 LangChain Tooling Anti-Patterns That Melt Agents (#5: Ambiguous tool outputs / a wall of prose)",
+      "url": "https://medium.com/@bhagyarana80/7-langchain-tooling-anti-patterns-that-melt-agents-3588643e9644"
+    },
+    {
+      "label": "Firecrawl — Agent Tools: Building Effective Capabilities for AI Systems",
+      "url": "https://www.firecrawl.dev/blog/agent-tools"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

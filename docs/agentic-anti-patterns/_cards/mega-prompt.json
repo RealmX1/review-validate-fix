@@ -1,0 +1,32 @@
+{
+  "id": "mega-prompt",
+  "name_cn": "单体巨型 Prompt",
+  "name_en": "Monolithic Mega-Prompt",
+  "group_id": "g2",
+  "order": 6,
+  "definition": "把上百条指令、条件分支与边角情形全部塞进单个 prompt，并期望模型像确定性程序一样逐条精确执行。",
+  "why_harmful": "随着指令变长，模型的注意力被稀释：受「lost in the middle」与位置敏感性影响，处于中段与末尾的约束更易被压缩、重新解读或重新排序而遭忽略；同时模型无法跨数百步可靠地维护内部状态。结果是非确定性执行、规则互相冲突，且出错后无法定位到底是哪一条指令被违反。",
+  "symptoms": [
+    "system/instruction prompt 已膨胀到数百行，且不断有人往同一段里追加「还要记得…」的补丁条款",
+    "同一份 prompt 里出现互相矛盾或重复的规则（例如既要求「永远先确认」又要求「直接执行」）",
+    "可复现地观测到 prompt 末尾或中段的指令被忽略，而开头的指令被遵守（位置敏感的遗漏）",
+    "出 bug 时无法回答「模型违反了哪一条指令」，因为规则没有编号、没有拆成独立可测单元",
+    "对单条规则的微小改动会意外改变不相关步骤的行为（无隔离、牵一发动全身）"
+  ],
+  "mitigation": "把巨型 prompt 拆成职责单一、可组合的小 prompt 或子 agent/工具，用代码或工作流引擎而非自然语言承载确定性的控制流与条件逻辑；对每条关键指令做独立可测，并按需「just-in-time」动态注入而非一次性全量堆叠。",
+  "sources": [
+    {
+      "label": "Allen Chan — AI Agent Anti-Patterns (Part 1): Monolithic Mega-Prompt",
+      "url": "https://achan2013.medium.com/ai-agent-anti-patterns-part-1-architectural-pitfalls-that-break-enterprise-agents-before-they-32d211dded43"
+    },
+    {
+      "label": "Anthropic — Effective context engineering for AI agents",
+      "url": "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    },
+    {
+      "label": "Liu et al. — Lost in the Middle: How Language Models Use Long Contexts (TACL 2024)",
+      "url": "https://arxiv.org/abs/2307.03172"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

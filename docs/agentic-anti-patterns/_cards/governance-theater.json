@@ -1,0 +1,32 @@
+{
+  "id": "governance-theater",
+  "name_cn": "治理表演 / 名义监督",
+  "name_en": "Governance Theater / Nominal Oversight",
+  "group_id": "g5",
+  "order": 21,
+  "definition": "人名义上「在环」（human-in-the-loop）负责审批，却缺乏理解 agent 推理所需的上下文、能力、时间或真实干预权，使审批沦为橡皮图章，只提供合规外观（oversight facade）而非真实把关。",
+  "why_harmful": "受自动化偏见（automation bias）驱动，审批人倾向于不加批判地默认 agent 输出「通常是对的」；这类监督只转移了问责却未增加把关，错误照样通过，反而制造「已有人审过」的虚假信心。学术界指出，仅有可解释性／透明并不足以构成有意义的监督——还须同时具备观察力（observability）与及时干预力（intervention）。",
+  "symptoms": [
+    "审批 UI 只展示结论或 diff 摘要，不暴露 agent 的推理链、依据数据、置信度或备选方案，人无从判断对错（信息不对称）",
+    "审批耗时统计异常短（如平均几秒即点「批准」）、批准率接近 100%，几乎不见驳回或要求修改的记录",
+    "审批人无真正的延迟／否决／拦截／回滚权限或时间窗口，点「拒绝」也无法在伤害发生前阻止动作落地",
+    "默认值为「同意」、超时自动通过，或一次批量批准成百上千条而非逐条评估，人沦为「延迟层」而非把关层",
+    "缺乏升级（escalation）路径与权责说明：审批人承担问责却无能力实际停止系统，且组织文化使「提出异议」显得代价高昂"
+  ],
+  "mitigation": "让监督「有意义」：向人暴露 agent 的推理、依据、置信度与影响范围（可观察性），给足评估时间并对齐激励（避免一味奖励速度），赋予预先授权的延迟／否决／回滚权力与清晰升级路径（可干预性），并把人力集中到高风险动作而非全部动作，避免疲劳式橡皮图章。",
+  "sources": [
+    {
+      "label": "Zhu 等 (AI and Ethics, Springer, 2026) — Designing meaningful human oversight in AI",
+      "url": "https://link.springer.com/article/10.1007/s43681-026-01147-7"
+    },
+    {
+      "label": "AlignX — Designing Human-in-the-Loop for Agentic Workflows",
+      "url": "https://medium.com/@AlignX_AI/designing-human-in-the-loop-for-agentic-workflows-079faec737ed"
+    },
+    {
+      "label": "Meaningful Human Oversight of AI: Beyond Rubber-Stamping (aicareer governance)",
+      "url": "https://governance.aicareer.pro/blog/meaningful-human-oversight-of-ai"
+    }
+  ],
+  "evidence_strength": "新兴/单源观点"
+}

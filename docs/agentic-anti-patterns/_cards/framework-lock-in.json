@@ -1,0 +1,33 @@
+{
+  "id": "framework-lock-in",
+  "name_cn": "框架锁定 / 过早抽象",
+  "name_en": "Framework Lock-in & Premature Abstraction",
+  "group_id": "g1",
+  "order": 4,
+  "definition": "把核心 agent 逻辑（prompt、控制流、工具执行）紧耦合到某个 agent 框架，或在需求尚未稳定时就引入厚重抽象层，导致你看不见也改不动模型真正收到的指令与实际执行循环。",
+  "why_harmful": "调试时要穿透好几层框架抽象才能搞清 agent 为何乱调 API 或陷入死循环，本该几分钟的修复变成半天的「考古」；想换模型、换框架或精调 prompt/控制流时迁移成本极高，因为关键可控点（提示词、循环、停止条件）被框架黑箱吞掉，只能靠 hack 绕行。",
+  "symptoms": [
+    "无法直接查看或逐字修改最终发给 LLM 的完整 prompt，它由框架在内部拼装",
+    "agent 的循环与停止条件由框架的「黑箱」loop 决定，团队无法在工具选择与执行之间插入校验、人工审批或暂停",
+    "排查一个 bug 要逐层钻进框架源码，错误堆栈深达多层封装且信息量很低",
+    "切换底层模型或框架需要重写大量业务逻辑，而不是改几行配置",
+    "为绕开框架限制写了一堆 monkey-patch / 私有 API hack，抽象反而成了阻碍",
+    "在工作流量与成本尚不明确时就先选了重型框架，用约束换便利却为时过早"
+  ],
+  "mitigation": "拥有自己的 prompt 与控制流（own your prompts / own your control flow）：把框架当作可替换的薄工具而非架构地基，将工具调用建模为「LLM 产出结构化输出 + 由确定性代码执行」，并保留对提示词、循环与停止点的直接掌控。多数可靠的生产级 agent 其实大部分是普通软件，只在少数关键决策点交给 LLM。",
+  "sources": [
+    {
+      "label": "HumanLayer — 12-Factor Agents (Factor 2: Own your prompts / Factor 8: Own your control flow)",
+      "url": "https://www.humanlayer.dev/blog/12-factor-agents"
+    },
+    {
+      "label": "Towards Data Science — Why AI Engineers Are Moving Beyond LangChain to Native Agent Architectures",
+      "url": "https://towardsdatascience.com/why-ai-engineers-are-moving-beyond-langchain-to-native-agent-architectures/"
+    },
+    {
+      "label": "Jarosław Wasowski — 7 AI Agent Anti-Patterns That Kill Production Projects",
+      "url": "https://medium.com/@wasowski.jarek/7-ai-agent-anti-patterns-that-kill-production-projects-architecture-guide-3bb1a409902e"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

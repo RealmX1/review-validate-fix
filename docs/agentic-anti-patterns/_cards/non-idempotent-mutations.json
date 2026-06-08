@@ -1,0 +1,36 @@
+{
+  "id": "non-idempotent-mutations",
+  "name_cn": "非幂等副作用工具",
+  "name_en": "Non-Idempotent Mutations",
+  "group_id": "g3",
+  "order": 13,
+  "definition": "会改变外部状态的工具（发邮件、建工单、下单扣款、写数据库）没有幂等键，agent 或 orchestrator 重试同一调用时服务端把它当成新请求再执行一次，叠加出重复副作用。",
+  "why_harmful": "网络超时多发生在响应回程而非动作本身——请求其实已被服务端处理，只是回执丢失。在「请求成功但响应丢失」或 orchestrator 整轮重试的失败模式下，已执行过的写操作会被再次触发，造成重复邮件/工单/扣款/重复行记录；同时轨迹重放会再次产生真实副作用而非命中已执行结果，使运行不确定、难以复现与审计。",
+  "symptoms": [
+    "改状态的工具签名里没有 idempotency_key / request_id 之类去重参数，重试直接二次执行",
+    "线上出现重复工单、重复邮件、重复支付或重复行记录，且都对应同一逻辑意图（同一 task/turn）",
+    "重跑或重放一段 agent 轨迹会再次产生真实副作用，而非命中已执行结果",
+    "对外部 API 审计发现其支持 Idempotency-Key 头（如 Stripe、SendGrid），但工具封装未传入或未把该键持久化",
+    "重试逻辑（含 orchestrator 整轮重试、max_retry_limit、异常重投）与副作用工具之间没有任何去重表/补偿屏障（如 crewAI #5802 暴露的：task 失败重试时已执行过的 @tool 函数会再次 fire）"
+  ],
+  "mitigation": "为每个副作用工具从稳定输入（如 turn_id+tool_name 或参数哈希）派生确定性幂等键，并在执行前写入持久化去重存储（独立于内存与 agent 上下文，跨进程有效）；外部 API 支持幂等头就透传，不支持就用自建幂等代理包裹；对不可天然幂等的写操作配套补偿事务（CreateOrder 成功而 ChargeCard 失败时按逆序运行可重入的 CancelOrder），并设定重试预算上限。",
+  "sources": [
+    {
+      "label": "crewAI Issue #5802 — Tool re-execution on task retry has no idempotency guard (duplicate payments, emails, trades possible)",
+      "url": "https://github.com/crewAIInc/crewAI/issues/5802"
+    },
+    {
+      "label": "Kaushal/Neurobyte — 7 Patterns That Make Agent Retries Idempotent, Not Duplicative",
+      "url": "https://medium.com/@kaushalsinh73/7-patterns-that-make-agent-retries-idempotent-not-duplicative-f57bc70018b7"
+    },
+    {
+      "label": "DZone — Idempotency in AI Tools: The Most Expensive Thing Teams Forget",
+      "url": "https://dzone.com/articles/idempotency-in-ai-tools-most-expensive-mistake"
+    },
+    {
+      "label": "MightyBot — Designing Fault-Tolerant AI Agent Pipelines: Idempotency, Retries, and State Management",
+      "url": "https://mightybot.ai/blog/fault-tolerant-ai-agent-pipelines/"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

@@ -1,0 +1,28 @@
+{
+  "id": "poor-tool-design",
+  "name_cn": "拙劣工具设计",
+  "name_en": "Poor Tool Design / Unclear Contracts",
+  "group_id": "g3",
+  "order": 10,
+  "definition": "工具的描述含糊、命名空间混乱、缺少调用示例、参数语义与必填约束不清，把本应面向 agent 设计的契约写成了面向人类工程师的 API 文档——而 agent 与确定性系统之间的工具调用本质上是一份「契约」，必须能被 agent 无歧义地解读和使用。",
+  "why_harmful": "工具描述是 agent 在多个工具间做选择时的主要决策依据；描述含糊会让 agent 无法可靠判断该用哪个工具、参数怎么填，导致选错工具、传错参数、反复重试。实证表明仅微调工具描述/示例往往就能显著提升正确调用率（Anthropic 在 SWE-bench Verified 上经此把错误率大幅降低；学术研究中重写工具描述使多步任务成功率从 33.5% 提升到 44.6%），说明这类损失多半本可通过改进契约而非改模型来避免。",
+  "symptoms": [
+    "工具 description 只有一句泛泛的功能名，没有说明何时该用、何时不该用，也没有给出调用示例",
+    "参数 schema 缺少类型/枚举/必填标注，或用 data、input、options、user 这类无语义的参数名（而非 user_id 这种无歧义命名）",
+    "不同工具共享含糊的命名前缀、缺乏清晰 namespace，agent 在相近工具间频繁混淆、跨边界误用",
+    "工具返回的错误信息是底层栈或裸状态码，未给出 agent 可据以纠正下一步动作的可读指引",
+    "对照 eval 的失败轨迹显示：仅改写工具描述/示例（不改模型）就让该工具的正确调用率明显跳升"
+  ],
+  "mitigation": "面向 agent 而非人类来设计工具：清晰的命名空间与工具边界、明确的「何时用/参数约束/局限」、内嵌调用示例与可读的错误反馈、用严格数据模型约束输入输出；并以「原型—评测—协作」循环让模型在真实任务上实测后，依据失败轨迹反复迭代工具描述与 schema。",
+  "sources": [
+    {
+      "label": "Anthropic — Writing Effective Tools for AI Agents",
+      "url": "https://www.anthropic.com/engineering/writing-tools-for-agents"
+    },
+    {
+      "label": "Learning to Rewrite Tool Descriptions for Reliable LLM-Agent Tool Use (arXiv)",
+      "url": "https://arxiv.org/abs/2602.20426"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

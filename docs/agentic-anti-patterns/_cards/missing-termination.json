@@ -1,0 +1,32 @@
+{
+  "id": "missing-termination",
+  "name_cn": "缺终止条件 / 无限循环",
+  "name_en": "Missing Termination / Infinite Loops",
+  "group_id": "g4",
+  "order": 14,
+  "definition": "Agent 的终止条件缺失、含糊或永远无法成立，导致它在没有实质进展的情况下不断生成新步骤。常见有四类：硬循环（同一动作用完全相同的参数机械重复）、软循环（仅微调参数在等价状态间打转，却产不出新信息）、重试循环（对同一失败反复重试，甚至多层重试逻辑叠加放大调用数）、语义循环（成功判据本身定义不清，agent 反复改写计划、复述已知信息，永远判不出「完成」）。",
+  "why_harmful": "运行时无法区分「有用的工作」和「无进展的重复」，单个请求会持续旋转几十步直至超时，既阻塞流程又把每一步都变成一次完整的模型/工具调用，时间与成本被无界放大；失控时可在几分钟内烧掉大量 API 费用，甚至被外部诱发而形成事实上的拒绝服务。",
+  "symptoms": [
+    "trace 中同一工具被用完全相同的参数（相同 tool+args 签名）连续调用多次（agentpatterns 给出的典型信号）",
+    "单个任务的步数远超历史中位数，例如平时约 5 步的请求跑到 20+ 步仍未收敛，最终以 timeout 或 max_steps_reached 结束",
+    "step 计数随时间持续上涨却没有新的状态产出（无新文件、无新工具结果、planner 输出在等价表述间反复），token 成本上升但产出质量不变",
+    "成功判据是「直到足够好/全面/正确」这类未量化的自然语言，代码里找不到可机判的 stop 谓词或 max_iterations 上限",
+    "进程没有 step/迭代上限、no-progress 检测或 wall-clock deadline，只能靠外部 kill 终止"
+  ],
+  "mitigation": "为每个 agent loop 显式设置可机判的终止条件、最大迭代步数与 wall-clock 超时，并加入「无进展检测」（如重复动作签名、重复状态哈希、同一工具连续失败 N 次即中断），检测应是结果感知的（相同输入产出不同结果不算重复，以降低误报）；把模糊的成功判据改写成可量化、可程序化校验的条件，并在循环触顶前向模型注入预算压力提示或回退到人工升级。",
+  "sources": [
+    {
+      "label": "Agent Patterns — Infinite Agent Loop: when an AI agent does not stop",
+      "url": "https://www.agentpatterns.tech/en/failures/infinite-loop"
+    },
+    {
+      "label": "Future AGI — What Is an Infinite Loop? (Glossary)",
+      "url": "https://futureagi.com/glossary/infinite-loop/"
+    },
+    {
+      "label": "AWS / DEV Community — How to Prevent AI Agent Reasoning Loops from Wasting Tokens",
+      "url": "https://dev.to/aws/how-to-prevent-ai-agent-reasoning-loops-from-wasting-tokens-2652"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

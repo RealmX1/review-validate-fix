@@ -1,0 +1,32 @@
+{
+  "id": "incomplete-verification",
+  "name_cn": "验证缺失 / 不完整 / 错误",
+  "name_en": "No / Incomplete / Incorrect Verification",
+  "group_id": "g6",
+  "order": 25,
+  "definition": "agent 系统缺少质量检查层，或验证层虽存在却只做表面检查、未核对任务的关键正确性，导致任务被过早判定完成或错误地「通过」。对应 MAST（多智能体系统失败分类法）中「任务验证」失败类别 FC3，含三个子模式：过早终止（FM-3.1）、验证缺失或不完整（FM-3.2）、错误验证（FM-3.3）。",
+  "why_harmful": "表层验证会放过深层缺陷：例如代码只要能编译、能跑完流程就被判定成功，但实际逻辑或运行时仍是错的，使错误成果一路流向下游或用户，且团队误以为任务已可靠完成。MAST 论文指出，仅依赖最终阶段、低层次的检查是不充分的——审查者可能只确认代码能编译，却从不核对程序是否真正满足了用户需求。",
+  "symptoms": [
+    "验证器只检查「能否编译 / 是否有返回 / 是否非空」等表面信号，不针对任务真实规约（如游戏规则、业务约束）做断言",
+    "agent 在没有运行测试、没有复核中间产物的情况下就宣布任务完成（对应 FM-3.1 过早终止）",
+    "验证全部通过但产物仍带运行时 bug——MAST 中 ChatDev 生成的国际象棋程序「通过全部验证轮次却含运行时 bug（如接受格式不合法的走子）」即典型情形",
+    "存在 reviewer/critic 角色，但其反馈永远是「看起来不错」，从不要求修改或回退，缺少否决权或交叉核对的痕迹（对应 FM-3.3 错误验证）",
+    "缺少端到端的执行/回放校验，关键事实（数值、引用、文件是否真写入）从未被独立核对，导致错误不被发现地向下传播"
+  ],
+  "mitigation": "为 agent 系统配置真正核查关键正确性的验证层：基于任务规约写可执行断言、实际运行并校验产物、让 critic 拥有真实否决权与交叉核对能力，并在不满足成功标准时阻止终止而非乐观通过。MAST 进一步建议采用多层次（而非仅最终阶段、低层次）的验证机制。",
+  "sources": [
+    {
+      "label": "Cemri et al. — Why Do Multi-Agent LLM Systems Fail? (MAST, arXiv 2503.13657)",
+      "url": "https://arxiv.org/abs/2503.13657"
+    },
+    {
+      "label": "MAST — Multi-Agent Systems Failure Taxonomy (GitHub)",
+      "url": "https://github.com/multi-agent-systems-failure-taxonomy/MAST"
+    },
+    {
+      "label": "MAST — UC Berkeley Sky Computing Lab 项目页",
+      "url": "https://sky.cs.berkeley.edu/project/mast/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

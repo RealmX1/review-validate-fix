@@ -1,0 +1,32 @@
+{
+  "id": "spec-role-disobedience",
+  "name_cn": "规范 / 角色违背",
+  "name_en": "Specification & Role Disobedience",
+  "group_id": "g7",
+  "order": 29,
+  "definition": "MAST 失败分类的第一大类（FC1，系统设计 / 规范类，System Design Issues）：agent 不遵守任务规范或越出、偏离既定角色职责，并伴随重复已执行的步骤、以及丢失对话历史 / 上下文。该类失败发生在执行阶段，但根因常追溯到执行前的系统设计选择（角色与工作流划分、prompt 规范、状态管理）。",
+  "why_harmful": "agent 无视任务约束（FM-1.1，约 11.8%）会直接产出违反要求的结果；越权扮演他者角色（FM-1.2，约 1.5%）破坏多 agent 分工与权责边界；步骤重复（FM-1.3，约 15.7%，是 FC1 内最高频、也是 MAST 全表中最常见的失败模式之一）会让系统空转、绕圈、反复犯同一错误而不收敛；丢失对话历史（FM-1.4，约 2.8%，表现为上下文被意外截断、退回到更早的会话状态）会让 agent 忘记已确定的事实并重复推导。根因常在系统设计（角色 / 工作流划分、prompt 规范、状态管理）而非单纯模型能力。",
+  "symptoms": [
+    "明确写在任务 / 约束里的要求（输出格式、禁止项、必须步骤）在最终产物中被违反，且 trace 里看不到 agent 对该约束的任何引用（违背任务规范 FM-1.1）",
+    "某个被指派为特定角色（如『审阅者』『CPO』）的 agent 执行了不属于它的动作，或越过应有的会签 / 共识直接终止流程，行为像是另一个角色（违背角色规范 FM-1.2）",
+    "同一工具调用、同一搜索、同一段推理在 trace 中反复出现且无新进展，循环在相同状态间打转，导致延迟或错误（步骤重复 FM-1.3）",
+    "后续轮次 agent 表现得像忘了前面已确定的事实 / 决定，重新询问或重新推导已有结论；常见于上下文窗口溢出或摘要丢信息，trace 越长越容易『忘记』最初在处理的任务（丢失对话历史 FM-1.4）",
+    "多个 agent 的角色 prompt / 职责边界含糊重叠，或缺少终止 / 收敛条件，使系统在设计层面就容易诱发上述重复与越权"
+  ],
+  "mitigation": "在系统设计阶段就明确划分每个 agent 的角色与职责边界，把任务规范固化为可校验的约束并加入显式验证步骤；用持久化状态 / 外部记忆与去重的进度跟踪防止步骤重复；不要在 agent 之间直接传递原始对话历史，改用结构化摘要与显式状态对象做上下文管理以避免历史丢失；必要时设置明确的终止 / 收敛条件。",
+  "sources": [
+    {
+      "label": "Cemri et al. (UC Berkeley, IBM Research) — Why Do Multi-Agent LLM Systems Fail? (MAST, FC1 System Design Issues：FM-1.1 disobey task spec / FM-1.2 disobey role spec / FM-1.3 step repetition / FM-1.4 loss of conversation history)",
+      "url": "https://arxiv.org/abs/2503.13657"
+    },
+    {
+      "label": "multi-agent-systems-failure-taxonomy/MAST — 官方代码与数据仓库（MAST taxonomy 定义、示例与 MAST-Data 1600+ 标注 trace）",
+      "url": "https://github.com/multi-agent-systems-failure-taxonomy/MAST"
+    },
+    {
+      "label": "UCB-MAST — Why Do Enterprise Agents Fail? Insights from IT-Bench using MAST（官方 Notion 说明站）",
+      "url": "https://ucb-mast.notion.site/"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

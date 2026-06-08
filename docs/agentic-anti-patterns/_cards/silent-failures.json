@@ -1,0 +1,37 @@
+{
+  "id": "silent-failures",
+  "name_cn": "静默失败 / 吞异常",
+  "name_en": "Silent Failures / Error Swallowing",
+  "group_id": "g4",
+  "order": 18,
+  "definition": "Agent 捕获异常却不记录、不处理而照常继续，或用表层处理（默认值、跳过步骤、200 OK）掩盖真正的失败；程序不崩溃、不抛错、测试不变红、监控不报警，真相在数步乃至数小时后才以缺失根因的形态浮现。",
+  "why_harmful": "最危险的失败长得像成功——任务「完成」并返回结果、表面一切正常，但输出是错的且无任何告警；agent 还会自信地把残缺或错误的工作上报为成功，使其自述信号不可信。这是最难发现、往往代价最高的失败模式：发现越晚，下游被污染越广，等暴露时根因已被冲掉、难以回溯（典型如夜间管道因 API 改版静默写入空记录，修代码一小时、回补两周数据要一个月）。",
+  "symptoms": [
+    "代码里存在 catch 块只 pass / 返回默认值、既不记日志也不重抛（典型的「吞异常工厂」）",
+    "函数对「空结果」与「出错」返回相同的值，调用方无法区分正常的空与失败",
+    "工具调用返回 200/非空但内容为空或错误，agent 不做校验直接当成有效结果继续",
+    "失败步骤在 trace 里没有对应的 error/warning 日志，只能从下游异常结果反推上游早已出错",
+    "出现「步骤被静默跳过」「缺失结果被默认值替代」却没有任何状态标记或告警的情况",
+    "本应随操作变化的指标却纹丝不动，或结果正确率与系统健康指标背离：监控显示「全绿/无报错」，但人工抽检发现产物实质错误"
+  ],
+  "mitigation": "异常要么有意义地处理、要么重抛，绝不静默吞掉；对工具输出做显式有效性校验而非只看状态码，把「成功」定义为内容正确而非未抛错，并为跳过/降级/默认值路径打上可观测的标记与告警。关键是建立独立于 agent 自身的验证层（测试、类型检查、输出校验器、critic/评审 agent、部署门禁），让 agent 自信的自述必须通过它没写的检查，把潜在的静默失败转化为「响亮」的失败。",
+  "sources": [
+    {
+      "label": "AI Pattern Book — Silent Failure (Encyclopedia of Agentic Coding Patterns)",
+      "url": "https://aipatternbook.com/silent-failure"
+    },
+    {
+      "label": "jztan — AI Agent Error Handling: 5 Patterns to Catch Silent Failures",
+      "url": "https://blog.jztan.com/ai-agent-error-handling-patterns/"
+    },
+    {
+      "label": "Wikipedia — Error hiding (error/exception swallowing)",
+      "url": "https://en.wikipedia.org/wiki/Error_hiding"
+    },
+    {
+      "label": "arXiv — Characterizing Faults in Agentic AI: A Taxonomy of Types, Symptoms, and Root Causes",
+      "url": "https://arxiv.org/pdf/2603.06847"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

@@ -1,0 +1,36 @@
+{
+  "id": "invisible-state",
+  "name_cn": "隐形状态 / 复合误差",
+  "name_en": "Invisible State & Compound Error",
+  "group_id": "g2",
+  "order": 8,
+  "definition": "让 agent 仅靠（会随轮次增长而被压缩、截断、改写的）对话历史与工具输出去隐式「记住」已经做过什么，而不维护一个显式、结构化、可查询的状态对象作为唯一事实来源。",
+  "why_harmful": "状态藏在会话文本里时，模型只是对历史做有损近似而非精确跟踪：长线程会丢弃早先上下文、工具结果被摘要改写、约束与已下的决定悄然蒸发。于是模型重复已完成的步骤、前后自相矛盾，单步的小误差未被纠正即被下一步当作输入，在多步流程中逐轮累积放大，最终偏离目标、无法复现也无法回溯。",
+  "symptoms": [
+    "agent 在多步任务中重复执行已完成的步骤（如重复创建同名文件、重复调用同一写操作、重新拉取已获取的数据）",
+    "随着历史变长或被 compact，早先确立的约束/决定悄然丢失，后续行为与之矛盾",
+    "判断「某步是否已完成」只能靠扫描对话文本，而没有可查询的进度/状态字段",
+    "一步的小错误未被纠正即被后续步骤当作输入，误差沿流程逐轮累积放大（compound / cascading error）",
+    "中断后恢复任务时无法可靠续接，因为没有可序列化、可重放的外部状态；失败也难以复现，因为没人说得清当时状态是什么"
+  ],
+  "mitigation": "把进度、已完成步骤、关键决定与约束落到 agent 上下文之外的显式状态对象（结构化数据字段 / 任务清单 / 持久化外部存储 / NOTES.md 式结构化笔记）作为唯一事实来源，每步前读取、每步后更新；让 agent 读写结构化字段而非靠推断历史，从而使流程可校验、可恢复、可幂等重放，并把误差在累积前就拦下。",
+  "sources": [
+    {
+      "label": "Allen Chan — AI Agent Anti-Patterns (Part 1): Invisible State",
+      "url": "https://achan2013.medium.com/ai-agent-anti-patterns-part-1-architectural-pitfalls-that-break-enterprise-agents-before-they-32d211dded43"
+    },
+    {
+      "label": "Anthropic — Effective context engineering for AI agents（结构化笔记 / 持久化记忆 / compaction 取舍）",
+      "url": "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    },
+    {
+      "label": "Atlan — AI Agent Harness Failures: 13 Anti-Patterns（Invisible State 列为 Tier 1 架构级反模式）",
+      "url": "https://atlan.com/know/agent-harness-failures-anti-patterns/"
+    },
+    {
+      "label": "Zartis — The Compounding Errors Problem: Why Multi-Agent Systems Fail and the Architecture That Fixes It",
+      "url": "https://www.zartis.com/the-compounding-errors-problem-why-multi-agent-systems-fail-and-the-architecture-that-fixes-it/"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

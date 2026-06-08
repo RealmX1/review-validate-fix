@@ -1,0 +1,32 @@
+{
+  "id": "unnecessary-multi-agent",
+  "name_cn": "无谓多智能体",
+  "name_en": "Unnecessary Multi-Agent Complexity",
+  "group_id": "g1",
+  "order": 3,
+  "definition": "在单 agent 足以胜任时仍拆成多个并行/协作 agent；尤其是未先诊断单 agent 失败的根因，就用「多加几个 agent」来掩盖问题。",
+  "why_harmful": "并行子 agent 之间上下文隔离、各自隐含的决策相互冲突，会把脆弱的协调失败叠加到原本的任务失败之上，使系统更不可靠、更难调试。",
+  "symptoms": [
+    "子 agent 之间只传递结论性消息，看不到彼此完整的执行轨迹（trace），导致基于不同隐含假设各干各的",
+    "并行产出的成果风格/口径不一致，需要额外一轮合并去调和冲突（典型如各子 agent 对同一设计做了互斥决定）",
+    "引入多 agent 前没有任何关于单 agent 究竟在哪一步、为何失败的诊断记录",
+    "系统大量时间花在 agent 间协调/重试，而非真正推进任务",
+    "去掉编排层、退回单 agent 顺序执行后，端到端成功率反而上升或持平"
+  ],
+  "mitigation": "默认单线程、上下文连续的单 agent；先定位单 agent 的真实失败根因再针对性修复。确需多 agent 时，保证共享完整上下文与轨迹、让决策可对齐（例如让写操作保持单线程），而非简单并行分包。",
+  "sources": [
+    {
+      "label": "Cognition — Don't Build Multi-Agents",
+      "url": "https://cognition.ai/blog/dont-build-multi-agents"
+    },
+    {
+      "label": "Anthropic — Building Effective Agents",
+      "url": "https://www.anthropic.com/research/building-effective-agents"
+    },
+    {
+      "label": "GitHub Blog — Multi-agent workflows often fail. Here's how to engineer ones that don't.",
+      "url": "https://github.blog/ai-and-ml/generative-ai/multi-agent-workflows-often-fail-heres-how-to-engineer-ones-that-dont/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

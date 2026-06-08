@@ -1,0 +1,32 @@
+{
+  "id": "runaway-cost",
+  "name_cn": "失控成本 / Token 爆炸",
+  "name_en": "Runaway Cost / Token Explosion",
+  "group_id": "g4",
+  "order": 17,
+  "definition": "由循环、上下文无界累积、反复重试或并行子 agent 扇出导致 token 消耗在多次调用间无界增长。每一次单独的模型调用看似合法，聚合后却变得不合理——一次跑飞就能在数小时内烧掉远超预期的预算。其本质是「单步有效」与「整条 trace 病态」的脱节：因为每次 LLM 调用是无状态的，agent 通常把全部历史和工具输出重新塞进每一步提示，步数越多放大倍数越高。",
+  "why_harmful": "缺少按 trace 的 token 预算监控与限流时，单个失控会话即可造成巨额账单，且往往直到收到发票才被发现。典型放大链是：planner 不断扩大查询、把上一轮工具输出整段累积进下一轮提示、且成功判据未量化（如「直到引用足够全面」）而永不终止，于是上下文随步数膨胀、调用量乘积式增长。业界已多次记录此类事故——从单个 agent 几小时内烧掉数千美元，到企业级在缺乏任何支出管控时单月烧掉数百万美元级别的账单。",
+  "symptoms": [
+    "单次 run 的累计 token / 费用比同类任务高出一个数量级（如平时约 $0.08 的任务跑到 $12+）",
+    "上下文随步数近似二次增长——每轮把上一轮的工具输出整段拼进新提示，prompt 长度持续膨胀（同一会话内 prompt token 单调上升）",
+    "成本曲线在没有相应业务量增长的情况下陡升（cost velocity 异常，可与正常流量增长区分开）",
+    "并行子 agent 扇出无上限，子任务数 × 各自上下文使总调用量乘积式放大",
+    "系统缺少 per-task / per-trace token 预算、BudgetExceeded 熔断或模型降级回退，只能事后看账单才发现"
+  ],
+  "mitigation": "为每个任务 / 会话 / trace 设置 token 与成本预算并配 cost circuit breaker（超限即抛出 BudgetExceeded 并中止），分层设阈（如软告警→约束模式降级模型→硬拒绝）；结合上下文裁剪 / 摘要、分层模型路由（按步用最便宜可用模型）、对子 agent 扇出与单 trace 步数的硬上限，以及实时 per-trace 成本可观测与滚动预测，把发现时机从「看账单」提前到「运行中」。",
+  "sources": [
+    {
+      "label": "Future AGI — What Is Runaway Cost? (Glossary)",
+      "url": "https://futureagi.com/glossary/runaway-cost/"
+    },
+    {
+      "label": "TrueFoundry — The Agentic Token Explosion in CI/CD: Attribute, Budget, Control",
+      "url": "https://www.truefoundry.com/blog/the-agentic-token-explosion-in-ci-cd"
+    },
+    {
+      "label": "TechCrunch — The token bill comes due: Inside the industry scramble to manage AI’s runaway costs",
+      "url": "https://techcrunch.com/2026/06/05/the-token-bill-comes-due-inside-the-industry-scramble-to-manage-ais-runaway-costs/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

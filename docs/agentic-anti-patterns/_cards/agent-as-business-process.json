@@ -1,0 +1,32 @@
+{
+  "id": "agent-as-business-process",
+  "name_cn": "把业务流程交给 agent",
+  "name_en": "Agent-as-Business-Process Fallacy",
+  "group_id": "g1",
+  "order": 5,
+  "definition": "用概率式 agent 去「近似」本应由确定执行保证的业务流程——那些需要可审计、可回滚、合规、关键分支强制的流程图与状态机。agent 会沿图走「看似最合理」的路径，而非「被要求」的路径。",
+  "why_harmful": "agent 是在「近似」流程而非执行流程，会走貌似合理但不被允许的路径；它没有原生的流程状态机概念——没有强制的状态转移、没有失败回滚、没有可保证的审计追踪。在多约束叠加时即便前沿模型也只有约 70–80% 的步级准确率，约束增至 5 个以上时甚至跌破 50%，对受监管、需审计追踪的多步流程不可接受。",
+  "symptoms": [
+    "本应强制的状态转移（如「未审批不得放款」）只写在 prompt 里靠模型自觉，没有代码层硬约束",
+    "无法给出确定的审计追踪：同一案例的执行路径每次不同，事后难以复盘或向监管举证合规（SOX/HIPAA/GDPR 等）",
+    "关键分支偶尔被跳过或走错，且只能靠加更多 prompt 约束来「降低概率」而非杜绝",
+    "出错后没有干净的回滚/补偿点，因为流程状态散落在模型对话上下文里而非显式状态机",
+    "随着业务规则（约束）增多，端到端正确率随之下降而非保持稳定"
+  ],
+  "mitigation": "分离关注点：用显式状态机/workflow 引擎承载受控的流程图，强制状态转移、确定性分支与合规日志，并以工作流的状态对象（而非模型上下文窗口）作为唯一真相源；只把开放式推理交给 agent，让它作为受约束图内的一个步骤/工具行动，而不是充当流程本身。",
+  "sources": [
+    {
+      "label": "Allen Chan — AI Agent Anti-Patterns (Architectural Pitfalls)",
+      "url": "https://achan2013.medium.com/ai-agent-anti-patterns-part-1-architectural-pitfalls-that-break-enterprise-agents-before-they-32d211dded43"
+    },
+    {
+      "label": "Anthropic — Building Effective Agents (workflows vs agents)",
+      "url": "https://www.anthropic.com/research/building-effective-agents"
+    },
+    {
+      "label": "Google Cloud — Choose a design pattern for your agentic AI system",
+      "url": "https://docs.cloud.google.com/architecture/choose-design-pattern-agentic-ai-system"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

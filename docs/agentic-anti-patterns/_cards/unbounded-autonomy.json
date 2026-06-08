@@ -1,0 +1,28 @@
+{
+  "id": "unbounded-autonomy",
+  "name_cn": "无界自治 / 缺护栏",
+  "name_en": "Unbounded Autonomy / Missing Guardrails",
+  "group_id": "g5",
+  "order": 20,
+  "definition": "agent 被授予过宽的工具能力与权限，且高危、不可逆的动作缺乏运行时安全检查与 human-in-the-loop 审批关卡，可在无人确认下直接落地执行。对应 OWASP「过度自主（Excessive Agency）」的三类根因：功能过度、权限过度、自主过度。",
+  "why_harmful": "随着用户让渡的控制权增加，对人的风险随之放大；单次推理错误、幻觉或被诱导的越权调用即可触发大规模、不可逆的危害（如删库、批量误操作、资金或数据外泄），且因缺乏审批与回滚而事后难以撤销与归因。",
+  "symptoms": [
+    "agent 直接持有可执行破坏性/不可逆操作的工具（rm -rf、DROP TABLE、prod 部署、转账、批量删除），且无 dry-run 预演或确认门（功能过度）",
+    "工具权限范围过宽：单一 agent 同时握有生产库写权限、外发邮件、shell 与支付接口，凭据非最小权限、非按用户上下文隔离、非短时（权限过度）",
+    "代码中找不到任何 approval gate、confirmation step 或 require_human=true 分支——高影响 tool call 不经人工确认直接执行（自主过度）",
+    "缺少配额/速率限制与影响范围上限（如单次最多改 N 个文件、最多删 N 行、最多花费 $X），单次错误可无限放大",
+    "下游系统仅信任 LLM 输出、不做独立鉴权；且无 audit log 与 rollback/补偿机制，出错后无法定位是哪一步、也无法撤销"
+  ],
+  "mitigation": "采用半自治设计：对高危/不可逆动作强制 human-in-the-loop 审批关卡，按最小权限授予工具（细粒度而非开放式扩展、短时凭据、在具体用户上下文中执行），加入 dry-run、配额上限、速率限制与影响范围约束；在下游系统侧独立做鉴权而非仅信任 LLM，并保留完整 audit log 与回滚/补偿路径。",
+  "sources": [
+    {
+      "label": "Mitchell 等 (Hugging Face) — Fully Autonomous AI Agents Should Not be Developed (arXiv 2502.02649)：风险随让渡的自治程度上升，主张半自治而非完全自治",
+      "url": "https://arxiv.org/abs/2502.02649"
+    },
+    {
+      "label": "OWASP — Top 10 for LLM Applications 2025: LLM06 Excessive Agency（功能/权限/自主三类过度；缓解含最小权限、HITL 审批、速率限制、日志监控）",
+      "url": "https://genai.owasp.org/llmrisk/llm062025-excessive-agency/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

@@ -1,0 +1,32 @@
+{
+  "id": "prompt-injection",
+  "name_cn": "提示注入 / 上下文回灌利用",
+  "name_en": "Prompt Injection & Context-Feedback Exploits",
+  "group_id": "g8",
+  "order": 30,
+  "definition": "攻击者把对抗性指令藏进进入 agent 上下文的内容中——既可能直接来自用户输入（直接注入），也可能间接来自被检索的网页、文件、邮件、issue/PR 正文、工具或 MCP 描述、记忆库等外部数据（间接注入），让模型把「数据」当成「指令」执行，从而操纵其推理轨迹与工具选择。这类注入即使对人不可见（隐藏在 HTML 注释、白底白字、Unicode 控制符里）也能生效，只要内容被模型解析。由于工具输出会作为新上下文回灌给下一轮，注入指令可被跨轮放大并持续。",
+  "why_harmful": "被注入的指令能驱动 agent 越权调用工具、外泄敏感数据或执行破坏性操作；由于模型无法可靠区分「可信指令」与「不可信数据」，这是 LLM 应用最根本、也最难彻底防住的漏洞（OWASP 列为 LLM01 头号风险）。更棘手的是，指令遵循能力越强的模型往往越容易中招，能力提升并不自动带来安全。回灌放大还会让单条注入在多轮里反复触发，造成失控的工具调用循环与预算/配额耗尽。",
+  "symptoms": [
+    "agent 在处理外部内容（抓取的网页、PDF、邮件、issue/PR 正文、第三方 API 返回）后，突然执行用户从未请求的工具调用或改变了既定任务目标",
+    "工具/检索返回的文本里出现祈使句式的「指令性」片段，例如 \"ignore previous instructions\"、\"将上述内容发送到…\"，或隐藏在 HTML 注释、白底白字、Unicode 控制符/零宽字符里的命令",
+    "同一注入后出现重复的工具调用环或单调递增的 token/调用计数，预算被快速耗尽却无对应任务进展",
+    "MCP 工具描述、skill 文件、README 或记忆条目中混入了与其声明用途无关的操作指令（工具描述投毒 / skill 文件注入），甚至工具在被批准后才变更行为（rug pull）",
+    "trace 中可见不可信外部数据与系统/开发者指令处于同一上下文且未做来源标记或隔离，模型对二者一视同仁地服从"
+  ],
+  "mitigation": "把所有外部/工具返回内容当作不可信数据，与可信指令显式隔离（标注来源、结构化封装），不让其充当指令；按最小权限约束工具能力，对高风险操作（写、删、外发、转账类）强制人工确认或在执行前逐条校验每次工具调用。配合输入/输出过滤、用 schema 约束并校验输出格式，以及定期对抗性红队测试；并对工具调用次数/上下文回灌深度/预算设硬上限，以遏制跨轮放大。需注意：没有任何单一手段能 100% 防住注入，应采用纵深防御并假设注入终会发生。",
+  "sources": [
+    {
+      "label": "OWASP Gen AI Security Project — LLM01:2025 Prompt Injection",
+      "url": "https://genai.owasp.org/llmrisk/llm01-prompt-injection/"
+    },
+    {
+      "label": "arXiv 2506.23260 — From Prompt Injections to Protocol Exploits: Threats in LLM-Powered AI Agents Workflows",
+      "url": "https://arxiv.org/abs/2506.23260"
+    },
+    {
+      "label": "Microsoft for Developers — Protecting against indirect prompt injection attacks in MCP",
+      "url": "https://developer.microsoft.com/blog/protecting-against-indirect-injection-attacks-mcp"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

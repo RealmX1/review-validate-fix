@@ -1,0 +1,28 @@
+{
+  "id": "hallucinated-tool-use",
+  "name_cn": "工具 / 参数幻觉",
+  "name_en": "Hallucinated Tool Use",
+  "group_id": "g3",
+  "order": 12,
+  "definition": "agent 调用根本不存在的工具、为存在的工具编造参数，或捏造 ID、引用、返回值等数据；学界将其分为「工具选择幻觉」（选错或在错误时机调用工具）与「工具使用幻觉」（参数错误、字段非法或凭空生成结果）两类。",
+  "why_harmful": "幻觉调用会引发任务执行错误、额外的计算开销并降低系统可靠性；更危险的是它常常静默失败，后续步骤基于捏造的数据继续决策，错误被层层放大且难以溯源。",
+  "symptoms": [
+    "trace 中出现工具注册表里不存在的工具名调用，或对真实工具传入 schema 不允许的参数 / 字段 / 类型",
+    "agent 引用了从未由任何工具返回过的 ID、URL、记录或数值（无对应工具结果可溯源）",
+    "工具返回报错或空结果后，agent 不暴露失败，而是径直编造一个「看起来合理」的结果继续往下走",
+    "在工具实际不可用、缺参数或应澄清时，模型仍强行调用而非选择「暂缓 / 追问 / 改选工具」",
+    "对 agent 输出中的引用做随机抽样核验，发现其在真实数据源 / 工具返回里并不存在"
+  ],
+  "mitigation": "通过可靠性对齐扩展动作空间，允许模型在不确定时暂缓调用、请求澄清或动态改选工具（如 Relign 框架引入的 indecisive actions）；同时在执行层强校验工具名与参数 schema、拒绝非法调用，并把工具失败如实回传而非吞掉。",
+  "sources": [
+    {
+      "label": "arXiv 2412.04141 — Reducing Tool Hallucination via Reliability Alignment (Xu et al.)",
+      "url": "https://arxiv.org/abs/2412.04141"
+    },
+    {
+      "label": "arXiv 2509.18970 — LLM-based Agents Suffer from Hallucinations: A Survey of Taxonomy, Methods, and Directions",
+      "url": "https://arxiv.org/abs/2509.18970"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

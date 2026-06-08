@@ -1,0 +1,1603 @@
+{
+  "total_commits": 185,
+  "coverage": {
+    "missing-observability": [
+      {
+        "hash": "45cd2e1d3",
+        "subject": "feat: 为 command lock 增加 run ledger 日志",
+        "confidence": "high",
+        "rationale": "为 command lock 增加结构化 run ledger 事件（lock_wait_started/acquired/timeout/released 及 status/reason_code/wait_duration），把锁等待与持有这一原本不可见的状态变为可检索 trace，使 lock_timeout 等失败可观测、可对账。"
+      },
+      {
+        "hash": "0fd6e6bc6",
+        "subject": "feat: 启用外部 reviewer 活动监控",
+        "confidence": "high",
+        "rationale": "新增 ClaudeStreamActivityMonitor 识别 reviewer 正在跑长命令以免误触 idle-timeout，并加入 max_runtime 硬墙；既给 reviewer 子进程显式 wall-clock 终止上限，又对其活动状态做可观测，防止无界空转与误杀。"
+      },
+      {
+        "hash": "bfba92208",
+        "subject": "fix: 保留重复 external reviewer artifacts",
+        "confidence": "med",
+        "rationale": "reviewer 的 prompt/stdout/stderr/normalized artifact 改用 unique 写入，避免重跑时覆盖前一次产物，保住可回放的 trace 不被静默冲掉。"
+      },
+      {
+        "hash": "1c217b782",
+        "subject": "feat: 提升 Vibe-Kanban RVF 运行可见性",
+        "confidence": "high",
+        "rationale": "将后台 Vibe-Kanban runner 的 Codex item 事件流解析为可读 progress 摘要（phase/elapsed/状态），治理长时后台 RVF run 的 trace 盲区。"
+      },
+      {
+        "hash": "2e51b2b7e",
+        "subject": "fix: skip RVF fork for empty session scope",
+        "confidence": "high",
+        "rationale": "加入 session-scope gate：无 session-owned dirty paths 即跳过 RVF fork（避免对空 scope 起无谓 review run），transcript 不可读时跳过而非 fail-open，并落 gate 事件可观测。"
+      },
+      {
+        "hash": "4b40e7998",
+        "subject": "fix: trace RVF kanban origin conversations",
+        "confidence": "low",
+        "rationale": "把 origin metadata（thread name/首条 prompt、codex://local thread id、transcript path）记录进 task prompt、RunLedger summary 与 handoff，提升 run 溯源可观测性，但偏 traceability 元数据故信心低。"
+      },
+      {
+        "hash": "7fcea681c",
+        "subject": "fix: propagate parent conversation origin metadata",
+        "confidence": "low",
+        "rationale": "传播父会话 origin metadata 以保留 run 溯源，与 4b40e79 同属可观测性/溯源补强，信心低。"
+      },
+      {
+        "hash": "07a20dc93",
+        "subject": "feat(rvf): 在 run 终态捕获 trajectory 与 workspace diff",
+        "confidence": "high",
+        "rationale": "RVF 终态一次性写出 pre/post trajectory.jsonl、reviewer 子轨迹与 workspace-diff（含 cancel 路径），并以 .finalize.lock + since_timestamp 保证幂等且不把上次 marker 误当本 run cut，补齐可回放 trace。"
+      },
+      {
+        "hash": "9a64316e4",
+        "subject": "feat(rvf): /rvf-analyze deterministic backend (orphan detect, analysis scaffold, CLI)",
+        "confidence": "med",
+        "rationale": "新增确定性 orphan_detect（finalized/running/orphan_candidate/cancel_without_lock/half_broken 分类）与 analysis 脚手架/CLI，防御式解析对缺失/畸形输入不抛错，把 run 终态从不可见变为可分类、可复盘。"
+      },
+      {
+        "hash": "85ef67db7",
+        "subject": "fix(rvf): distill apply_patch under custom_tool_call schema",
+        "confidence": "high",
+        "rationale": "旧 distill 只识别 function_call，导致 custom_tool_call 形态的 apply_patch 事件全被漏检、causality.json::patches 永远为空，本次扩展识别两类 schema 让 patch 时间线可被 $rvf-analyze 复盘，修复轨迹/可观测性的静默缺失。"
+      },
+      {
+        "hash": "059c21c2e",
+        "subject": "feat(rvf): capture spawn_agent subagent rollouts in trajectory",
+        "confidence": "high",
+        "rationale": "子代理 rollout 落在独立 session、主 RVF rollout 看不到其 apply_patch，导致 causality.json 永远缺『真正修复 patch』；新增 subagent_capture 把子代理 rollout 蒸馏进 trajectory，补齐多代理执行的端到端 trace 可见性。"
+      },
+      {
+        "hash": "e146c2a37",
+        "subject": "feat(rvf): register host kind explicitly in trajectory artifacts",
+        "confidence": "med",
+        "rationale": "之前 host 只隐式靠文件名/函数名标识，未来 Claude Code variant 会『装作 Codex』写产物且无结构化失败信号；显式把 host/host_originator 写进各 manifest 与 finalize，让分析层不必瞎猜 orchestrator。"
+      },
+      {
+        "hash": "8f62b84e1",
+        "subject": "feat(rvf): land Slice 4 lease lifecycle public API + reviewer heartbeat",
+        "confidence": "med",
+        "rationale": "实现 lease acquire/refresh/release/sweep_stale 显式租约生命周期+reviewer heartbeat 心跳，用持久化租约状态防止并发重复审同一单元，并以心跳暴露 reviewer liveness。"
+      },
+      {
+        "hash": "47c8caea7",
+        "subject": "feat: finalize 后自动生成 rvf-analyze scaffold",
+        "confidence": "low",
+        "rationale": "finalize 后自动产出 rvf-analyze scaffold，为每次 run 提供事后复盘脚手架，弱化可观测性/复盘缺位，但主要是新功能。"
+      },
+      {
+        "hash": "e0e8e4acf",
+        "subject": "docs: clarify validate/fix subagent wait probes",
+        "confidence": "med",
+        "rationale": "明确要求等 validate/fix 子代理用宽松超时、不得把『还在处理』当超时失败，到期先发非侵入式 progress probe 并把结果写进 run ledger/审计表，防止过早误判失败并补齐子代理 liveness 可见性。"
+      },
+      {
+        "hash": "45eea87e0",
+        "subject": "feat(rvf): add tracker_dashboard live web UI + frozen snapshot mode",
+        "confidence": "med",
+        "rationale": "新增 global reviewed-diff tracker 的本地 HTTP 实时/冻结/快照 dashboard，把 SQLite+JSONL 中的租约/单元/eta 状态可视化，提升 tracker 状态的可观测性。"
+      },
+      {
+        "hash": "29adc6c8f",
+        "subject": "feat: route plan docs outside full RVF",
+        "confidence": "low",
+        "rationale": "把计划/纯文档变更路由到轻量 Plan/Doc scaffold 而非完整 RVF，避免对确定性文档变更套用重量级 agentic review；并在 finalize 确定性写出 usage summary，二者分别弱化过度智能体化与可观测性缺位。"
+      },
+      {
+        "hash": "2aed341e9",
+        "subject": "feat(rvf): 添加 Stop hook scope 诊断脚本",
+        "confidence": "high",
+        "rationale": "新增只读诊断脚本专门排查 no_session_owned_dirty、manifest 未写入 tracker、transcript 归属缺口与 installed/runtime 版本漂移，补齐 Stop hook 的可观测/可复现能力。"
+      },
+      {
+        "hash": "762dc7a38",
+        "subject": "Fix Kanban follow-up task title origin",
+        "confidence": "low",
+        "rationale": "修正 follow-up task title/origin 派生并带 fallback、把 provenance 字段透传进 summary/handoff，主要改善来源可追溯性。"
+      },
+      {
+        "hash": "c7ff84ae6",
+        "subject": "Record Kanban task ids in RVF handoff origin",
+        "confidence": "low",
+        "rationale": "把 Kanban task ids 记入 handoff origin，补充 provenance 元数据以便排障追溯。"
+      },
+      {
+        "hash": "eedf76b6b",
+        "subject": "fix(rvf): allow codex reviewer to write run artifacts",
+        "confidence": "low",
+        "rationale": "为 codex exec 注入 --add-dir 让 sandbox reviewer 能写 canonical review-result artifact，否则评审结果无法落盘留痕。"
+      },
+      {
+        "hash": "fe833f1a3",
+        "subject": "feat(rvf): tracker dashboard polish + v3 lease participants surface",
+        "confidence": "med",
+        "rationale": "dashboard surface lease participants 提升可观测，且把 OperationalError catch 收窄到 no such table/column 使真实 DB 错误浮现而非被当成空列表掩盖。"
+      },
+      {
+        "hash": "bbc03c24d",
+        "subject": "feat(rvf): stamp local deploy skill versions",
+        "confidence": "med",
+        "rationale": "在 installed/缓存的 skill heading 写入 deployed commit 前缀，stop hook 从 loaded SKILL.md 解析 deploy metadata，使已启动 session 实际使用的 plugin 版本可观测、可区分（针对 deploy-lag 盲区）。"
+      },
+      {
+        "hash": "0ef296493",
+        "subject": "feat(rvf): capture trajectories from claude code transcripts",
+        "confidence": "high",
+        "rationale": "根因措辞「fed Claude NDJSON to the Codex parser and silently dropped every record, leaving trajectory.jsonl empty and breaking issue→patch causality」——既是静默丢弃记录的 silent-failure，又恢复了 Claude-host 下的 trajectory 可观测性。"
+      },
+      {
+        "hash": "0804cb62e",
+        "subject": "feat(rvf): 跨 host dispatch trajectory 自回填 child session（Phase 4 / Option C）",
+        "confidence": "med",
+        "rationale": "根因「父 Stop hook event 只知 parent transcript，trajectory 捕获错对象」，通过自回填 child session 让正确的执行轨迹被捕获，修复了 trace 指向错对象的可观测性缺口。"
+      },
+      {
+        "hash": "9dc007b8f",
+        "subject": "fix(rvf): 硬化 child_transcript_path 两层确定性 backfill",
+        "confidence": "med",
+        "rationale": "根因是 .exists() 门槛把 child transcript 路径写成 null 使「持久 origin.json 对 child 拓扑失明」，两层 fail-safe 解析恢复对 child 轨迹的可见性，且 Layer 2「绝不臆造路径」避免捏造。"
+      },
+      {
+        "hash": "b1f4530cb",
+        "subject": "refactor(rvf): host-agnostic write-op counting + same-session-full window (S1.5)",
+        "confidence": "low",
+        "rationale": "把 write-op 计数从硬编码 apply_patch 归一到 host 无关谓词，使 Claude Edit/Write/MultiEdit 也被计入分析归因层，闭合 host 间 write-op 漏计的可观测/归因缺口。"
+      },
+      {
+        "hash": "b083f65dc",
+        "subject": "feat(rvf): host-agnostic subagent capture + candidate_patch_call_ids enrichment (S2 observe-first)",
+        "confidence": "med",
+        "rationale": "S2 observe-first 明确「关闭 Claude-host 子代理可观测性盲区」，新增 host 中性子代理捕获并在 analysis 层补全 candidate_patch_call_ids，使子代理 write-op 可追溯。"
+      },
+      {
+        "hash": "556d02b54",
+        "subject": "feat(rvf): no_issues review result 强制必填 audit_summary (Option A)",
+        "confidence": "high",
+        "rationale": "明言关闭「clean 结论无推理留痕、事后无法区分真实审查与橡皮图章」的可观测性缺口，强制 reviewer 留下审查依据以防名义监督/表层验证。"
+      },
+      {
+        "hash": "2f29aece1",
+        "subject": "feat(rvf): UPS hook 每个触发都给用户可见 systemMessage（user-facing / agent 选择性可见）",
+        "confidence": "med",
+        "rationale": "根因触发「只落盘、in-band 静默，用户看不到 UPS hook 在工作」，为五条触发路径注入 user-facing systemMessage 提升对 hook 活动的可见性。"
+      },
+      {
+        "hash": "209e5bc28",
+        "subject": "Improve RVF stop hook skip diagnostics",
+        "confidence": "high",
+        "rationale": "为每条 skip 路径补 skip_payload 显式上报跳过原因（递归 stop_hook_active、已是 fork、subagent、session disabled、clean repo 等），既提升可观测性，又以「检测到 stop_hook_active=true 已跳过避免递归」「已是 fork 会等最终 handoff 不再 fork」充当防递归/防重复触发的终止条件。"
+      },
+      {
+        "hash": "429778d73",
+        "subject": "Add RVF stop hook dispatcher sync",
+        "confidence": "high",
+        "rationale": "引入 dispatcher 作为 hook 稳定入口：先同步并 check-contracts，「只有同步和 contract check 成功后才转交 installed hook；如果同步失败，跳过 fork gate 并在 systemMessage 写出失败原因和日志路径，避免继续使用 stale installed skill」——以显式失败上报替代静默用旧版。"
+      },
+      {
+        "hash": "10b9e5cbe",
+        "subject": "Fix RVF fork GUI visibility fallback",
+        "confidence": "high",
+        "rationale": "处理 GUI fork「写了 session 文件但 GUI 不可见」的盲点：加 gui_visibility 校验、open-GUI-fork 重试与 bridge unverified policy（continuation/manual/fail），在不可见时显式标注 desktop-control-unavailable 状态而非让 fork 静默不可见地通过。"
+      },
+      {
+        "hash": "9e41941d8",
+        "subject": "fix: stop rvf continuation fallback",
+        "confidence": "high",
+        "rationale": "移除 Stop continuation fallback，根因是「continuation 不会创建真正的新用户 prompt，只作为 hook system context 出现在当前轨迹中，因此不能作为 fallback」；GUI fork 不可用时改为只用 systemMessage 诚实报告并停止自动 review，而非伪装成已运行的 review。"
+      },
+      {
+        "hash": "c697c41e2",
+        "subject": "fix: handle handoff marker log failures",
+        "confidence": "high",
+        "rationale": "为 handoff marker 写入加 OSError 捕获：失败时记 log_unavailable 诊断（level=warn）并在 payload 暴露 marker_error/marker_written，而不是让写日志失败静默吞掉或拖垮整个 hook。"
+      }
+    ],
+    "invisible-state": [
+      {
+        "hash": "45cd2e1d3",
+        "subject": "feat: 为 command lock 增加 run ledger 日志",
+        "confidence": "high",
+        "rationale": "为 command lock 增加结构化 run ledger 事件（lock_wait_started/acquired/timeout/released 及 status/reason_code/wait_duration），把锁等待与持有这一原本不可见的状态变为可检索 trace，使 lock_timeout 等失败可观测、可对账。"
+      },
+      {
+        "hash": "8c7bfe3f8",
+        "subject": "fix: 加固 RVF Stop hook 与 Vibe runner 安全边界",
+        "confidence": "high",
+        "rationale": "按 commit「避免 fail-open」：transcript 缺失/不可读时跳过 dev sync 与 installed hook（fail-closed）；取消 run 时校验 run id/命令匹配以免 stale runner_pid 误杀进程；冻结启动时 prepare metadata 避免 queued/running 后 scope 漂移。"
+      },
+      {
+        "hash": "63b321cb9",
+        "subject": "feat: persist rvf handoff artifacts",
+        "confidence": "high",
+        "rationale": "把 handoff 从仅存于对话的 <handoff-context> blob 改为 run-scoped 持久化 handoff.md artifact，并在建新 review fork 前检测 RVF_HANDOFF_FILE 完成标记（含 _advised_marker 幂等去重）以停止后续自动 fork。"
+      },
+      {
+        "hash": "29a03c8e7",
+        "subject": "fix: 修复 Cline Kanban RVF 启动与 bootstrap 契约",
+        "confidence": "med",
+        "rationale": "主体是 Vibe→Cline Kanban 迁移，但同时引入 freeze 启动时 scope anchor artifact 防排队后 scope 漂移、bootstrap base_ref 不匹配即拒绝、路径越界守卫，并以 reason_code 诚实上报 unavailable/unconfigured 而非静默。"
+      },
+      {
+        "hash": "18c000e7a",
+        "subject": "feat: harden RVF orchestration",
+        "confidence": "high",
+        "rationale": "引入带 dirty-snapshot 内容哈希+TTL 的 manual RVF session marker（显式持久化状态，避免对已审同一 dirty 状态重复 fork）、reviewer 活动探针失败阈值与 max_runtime 等无进展/硬终止条件，及 RVF_SCOPE_CONTRACT 要求 reviewer 遵守 scope 边界。"
+      },
+      {
+        "hash": "1dd427953",
+        "subject": "fix: 防止 RVF 认证失效和 Kanban suppress 外溢",
+        "confidence": "high",
+        "rationale": "新增 provider health guard，检测 codex 登录过期/未认证即 fail-close \"阻止 RVF 自动启动，避免创建会立即失败的\"run；并把 suppress 改为 per-task 持久化标记修正跨 task suppress 外溢的隐形状态。"
+      },
+      {
+        "hash": "f086234bc",
+        "subject": "fix: preserve RVF kanban run handoff state",
+        "confidence": "med",
+        "rationale": "让 Kanban RVF task 复用 canonical installed-plugin run ledger 并导出 CODEX_RVF run metadata（统一唯一 run 状态真相、log-root 不落到 task worktree），且要求子代理 high-effort 时\"不得静默降级\"必须记录原因。"
+      },
+      {
+        "hash": "12c0f6be5",
+        "subject": "feat(rvf): unify state tracking across RVF backends",
+        "confidence": "high",
+        "rationale": "让 manual / kanban-followup / kanban-task 共享同一套显式 rvf_state summary 字段（backend/phase/scope 来源固定为 prepare 阶段冻结产物而非后续 live diff），把隐式状态归一为可查询的显式状态对象。"
+      },
+      {
+        "hash": "3f62fc19b",
+        "subject": "feat(rvf): land global reviewed-diff tracker phase 1",
+        "confidence": "high",
+        "rationale": "新增 repo 级共享 reviewed-diff tracker（hunk 级显式状态目录 + 跨 session 冲突 section + register_claims 注册），并收紧异常写诊断事件，让跨 session 已审 diff 成为唯一可查询事实源、避免重复审同一改动。"
+      },
+      {
+        "hash": "ba4cb5d39",
+        "subject": "feat(rvf): land Slice 2-A SQLite + JSONL diff tracker backend",
+        "confidence": "high",
+        "rationale": "把 diff tracker 后端换成 SQLite+JSONL 并用 canonical_patch_hash 做 unit 身份、幂等迁移、WAL first-writer race 重试与连接清理修复，强化跨进程显式状态的并发安全与幂等。"
+      },
+      {
+        "hash": "8ea9a35ea",
+        "subject": "feat(rvf): land Slice 2-B tracker_scope consumer surface",
+        "confidence": "med",
+        "rationale": "新增 --tracker-scope 入参 + strict validator + path-limited 'Allocated Git Diff'，把审查范围绑定到冻结的 tracker_scope 确定性边界，防止 reviewer 超出分配范围、并保持 scope_hash 派生稳定。"
+      },
+      {
+        "hash": "b04ca15c6",
+        "subject": "fix(rvf): rvf_analyze CLI hardening + marker pre-finalize state",
+        "confidence": "med",
+        "rationale": "为 lazy_finalize 失败设专用 exit code（避免对已答问题重复追问）、收紧 resolve_run_dir 要求 summary.json 防止往 /tmp 等非 RVF 路径误写 artifact，并在 marker 记录 pre_finalize_classification 保住触发救援的状态。"
+      },
+      {
+        "hash": "6addd822e",
+        "subject": "feat(rvf): land Slice 3 allocator CLI + 4-function gate split",
+        "confidence": "med",
+        "rationale": "在单个 BEGIN IMMEDIATE 内做 lease 原子分配+排除 active-leased 单元，把 review scope 落成显式持久化租约状态；并让 refresh 在 build_manifest 抛错时返回 error sentinel 触发 session_manifest_failed fail-loud，对齐既有可观测性契约。"
+      },
+      {
+        "hash": "8f62b84e1",
+        "subject": "feat(rvf): land Slice 4 lease lifecycle public API + reviewer heartbeat",
+        "confidence": "med",
+        "rationale": "实现 lease acquire/refresh/release/sweep_stale 显式租约生命周期+reviewer heartbeat 心跳，用持久化租约状态防止并发重复审同一单元，并以心跳暴露 reviewer liveness。"
+      },
+      {
+        "hash": "112f09354",
+        "subject": "fix(rvf): repair Slice 4 lease release edge cases",
+        "confidence": "med",
+        "rationale": "修复 stale lease pruning 误释放 fresh active lease 持有单元的竞态，并在 SIGTERM 时先终止活跃 reviewer 子进程再释放租约，消除租约状态错乱与子进程泄漏。"
+      },
+      {
+        "hash": "fbe08e61f",
+        "subject": "feat(rvf): land Slice 5 manual RVF tracker flow",
+        "confidence": "med",
+        "rationale": "record_manual_rvf_run + scope_hash 抑制让 allocate_auto_review_scope 跳过已手动审过的 scope，用持久化 manual run 记录避免对同一 scope 重复触发 review（步骤重复/重复工作）。"
+      },
+      {
+        "hash": "d3ddccf06",
+        "subject": "fix: 修复共享 reviewer lease 生命周期",
+        "confidence": "high",
+        "rationale": "为共享 reviewer lease 引入 lease_participants 显式状态表，并在 release 与 stale-prune 时对称推进 participant 状态，修复 lease 生命周期状态隐形/不收敛。"
+      },
+      {
+        "hash": "3b9e7586e",
+        "subject": "fix: wire tracker scope into Cline Kanban prepare",
+        "confidence": "low",
+        "rationale": "把 tracker scope（primary/background/protected）确定性接入 prepare，让 review packet 范围绑定显式 tracker 状态而非靠推断，属轻度 scope 状态显式化。"
+      },
+      {
+        "hash": "cc13a1e32",
+        "subject": "fix(rvf): avoid duplicate handoff opens",
+        "confidence": "high",
+        "rationale": "用 handoff-opened marker 去重，避免同一 handoff 的「打开/advise」副作用被重复触发，并以显式 marker 记录已打开状态。"
+      },
+      {
+        "hash": "00e73fcde",
+        "subject": "fix(rvf): complete kanban follow-up tracker scopes",
+        "confidence": "med",
+        "rationale": "为 kanban-followup 补 lease TTL 并完成 tracker scope，且在缺 task id 时 fail-close 报 kanban_followup_missing_task_id 而非静默继续。"
+      },
+      {
+        "hash": "a5dd0fc6c",
+        "subject": "feat(rvf): 注入 rvf-analyze follow-up",
+        "confidence": "med",
+        "rationale": "analyze follow-up trigger turn 跳过主 RVF 自动触发以避免递归（终止/防循环），并修正 session_manifest 基于 commit cutoff 的归属避免误归属已提交 session edit。"
+      },
+      {
+        "hash": "989173ab5",
+        "subject": "feat(rvf): add dispatch prep file substrate",
+        "confidence": "low",
+        "rationale": "新增带 token/TTL/sweep 的 prep file substrate，TTL+sweep 清理过期 prep 状态防止陈旧累积，并确保 diagnostic append 失败不破坏 hook 静默通过语义。"
+      },
+      {
+        "hash": "4ac5d7141",
+        "subject": "feat(rvf): add issue-scoped fix causality ledger",
+        "confidence": "med",
+        "rationale": "把 issue/fix/patch causality 落成 tracker schema v4 可查询 ledger，并让 terminal attempt status 同步回 rvf_issues.state、stop 只导出边界内 patch，用显式结构化状态替代隐式推断。"
+      },
+      {
+        "hash": "7b337558d",
+        "subject": "feat(rvf): harden dispatch prep worktree metadata",
+        "confidence": "med",
+        "rationale": "create/start 响应缺 workspace_path 时改为 raise RuntimeError 而非静默回退到 cwd，并把 target_worktree/kanban_task_id 显式写入 prep file 状态。"
+      },
+      {
+        "hash": "28c320ea2",
+        "subject": "fix: split unit tombstone lifecycle from review state",
+        "confidence": "low",
+        "rationale": "采纳 reviewer 发现：v4→v5 迁移只 ALTER 会保留旧 CHECK 仍允许 review_state='tombstoned'，重建表并拆分出独立 tombstone lifecycle 字段，修正状态模型；偏 schema 正确性，反模式映射较弱。"
+      },
+      {
+        "hash": "f4890a6e2",
+        "subject": "feat(rvf): harden dispatch prep flow",
+        "confidence": "med",
+        "rationale": "新增 prep-file sweep_stale 清理过期记录防 squat、O_EXCL/hardlink 原子创建避免 token 冲突，并在 tracker scope artifact 缺失时 raise 而非静默继续。"
+      },
+      {
+        "hash": "472ad1b22",
+        "subject": "fix: 识别 Claude NotebookEdit 写入归因",
+        "confidence": "low",
+        "rationale": "修复 NotebookEdit 用 notebook_path 而非 file_path 导致 .ipynb 写入落入 unattributed_dirty_paths 的归因丢失，让改动正确进入可追踪状态。"
+      },
+      {
+        "hash": "cb41b14d2",
+        "subject": "fix(rvf): stabilize tracker leases and kanban routing",
+        "confidence": "med",
+        "rationale": "新增 sweep_stale_tracker_leases 释放过期 lease 防 squat、加 lease heartbeat/TTL 刷新与 expired-before-refresh 检查，并在 HEAD 不可解析时返回 cline-kanban-unconfigured 而非静默继续，给 stale lease 设上界。"
+      },
+      {
+        "hash": "78473f8ae",
+        "subject": "feat(rvf): land Slice I post-user-prompt shared workflow",
+        "confidence": "med",
+        "rationale": "prepare_run_from_prep_file 加 60s in-process 超时（ThreadPoolExecutor cancel-on-timeout），并以 shared_workflow_state.status='completed' 做幂等、merge 前从磁盘 reload 最新 payload 避免 stale-record 覆盖，给入口加终止条件与显式幂等状态。"
+      },
+      {
+        "hash": "29ffe3b90",
+        "subject": "feat(rvf): land plan v3.2 workflow polish (P5/P0/P8/P2/P3/P4/P7)",
+        "confidence": "med",
+        "rationale": "P0 把 runtime state 重定向到 canonical state 路径以「stop dual-writes」、P8 停止对 clean-path 0-issue run 误报 causality_ledger_missing（status=missing 无 rows 是合法的），分别修隐形状态双写与误导性失败信号。"
+      },
+      {
+        "hash": "455aac4a3",
+        "subject": "feat(rvf): one-shot post-analyze quiet marker breaks RVF self-injection loop",
+        "confidence": "high",
+        "rationale": "根因是 $review-validate-fix↔$rvf-analyze 经 cline-kanban 注入的「自激回路」，用一次性 quiet marker（set/read/clear，双侧对称 clear 防 leak）作为终止条件断开循环。"
+      },
+      {
+        "hash": "b2542195d",
+        "subject": "Track turn-aware edit claims for RVF scope",
+        "confidence": "med",
+        "rationale": "新增 turn-aware edit claims / patch_ownership 审计与 patch_ownership_incomplete 门（unresolved 或缺 unit_ids 时 skip 并 release lease），用显式 scope 状态对账避免漏审 owned 改动，是隐形状态显式化 + 验证完整性把关。"
+      },
+      {
+        "hash": "fc411b063",
+        "subject": "docs(rvf): align validate-fix result contract",
+        "confidence": "med",
+        "rationale": "把 validate/fix 子代理结果契约改为「以 rvf_fix_attempt.py stop 写入的 ledger 为事实源，自然语言 final 只作日志」，即以显式持久化状态为唯一真相、不再轻信 agent 自述，防自述失真静默通过；但本 commit 仅同步 prompt/standards/模板/契约检查的文档与契约。"
+      },
+      {
+        "hash": "b94c7d6aa",
+        "subject": "Fix RVF analyze pending dispatch guard",
+        "confidence": "high",
+        "rationale": "引入 WORKFLOW_PENDING 状态：analyze artifacts 未就绪时 dispatcher 不再 fail-open 误把 marker 当已消费而继续跑自动 RVF，改为跳过并保留 pending marker 等对账，修 arm/clear 非对称导致的误触发回路。"
+      },
+      {
+        "hash": "5de0c59b0",
+        "subject": "fix(rvf): block overlapping kanban followups",
+        "confidence": "med",
+        "rationale": "用 task/session 维度的持久 in-progress marker（O_EXCL + TTL + stale takeover）阻止上一轮 handoff 完成前再创建新 RVF follow-up，既防重复 dispatch 副作用，又把「是否已在进行」落为可查询的显式状态而非靠推断。"
+      },
+      {
+        "hash": "a86dad75a",
+        "subject": "feat(rvf): 失败再入按 run 重开「最近一次已 RVF 的实现」units 全量重审",
+        "confidence": "med",
+        "rationale": "Item E reconcile 被放弃 run 的 followup 锁治「R1.5 式 6h 空转」属隐形状态；reopen 本身在「实现未达成原始目标」时按 run 全量重审，是 goal-consistency 与对未达标实现补做验证。"
+      },
+      {
+        "hash": "87e933895",
+        "subject": "fix(rvf): kanban-followup 锁改为投递确认时 arm（治本 squat）",
+        "confidence": "high",
+        "rationale": "把 dispatch 时乐观预 arm 改为投递被证明时才 arm，治本「投递静默失败留下纯 TTL 锁空转 6h 挡 dispatch」的锁 squat（arm/clear 非对称隐形状态 + 静默丢投）。"
+      },
+      {
+        "hash": "107e3836f",
+        "subject": "fix(rvf): kanban-followup terminal fallback 诚实上报 + 投递对账自愈",
+        "confidence": "high",
+        "rationale": "根因把 kanban CLI 乐观 terminal fallback 回执（status:started）当成「已注入」致 followup 静默丢投；改诚实降级上报+新增 pending marker 对账（stale 判定丢投并放行重投）自愈。"
+      },
+      {
+        "hash": "4cdf4c4ec",
+        "subject": "Harden review-validate-fix context handling",
+        "confidence": "high",
+        "rationale": "把 session context 改为结构化必填输入并写入 self-contained packet，明确「它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug，你必须独立 verify」，对抗盲信主会话自述（谄媚）、强制实质验证、并以显式工作说明替代「只靠 git diff 猜 scope」。"
+      },
+      {
+        "hash": "59960e85d",
+        "subject": "Add RVF session-scoped change tracking",
+        "confidence": "high",
+        "rationale": "用 session_manifest.py 从 transcript 生成显式 owned_paths/owned_dirty_paths/confidence 作为 review scope 的事实来源（替代「任何未提交改动都进 reviewer 上下文」的隐式状态），把 unattributed_dirty 排除以防 scope 漂移，且「manifest 无法生成时不应静默退回 whole-repo scope」要求显式说明而非默认降级。"
+      },
+      {
+        "hash": "00e73fcd6",
+        "subject": "fix(rvf): complete kanban follow-up tracker scopes",
+        "confidence": "med",
+        "rationale": "补全 reviewed-diff tracker 的 scope 收尾：complete_review_scope 保证「完成的 RVF scope 必须留下持久 reviewed unit 状态，即便长 run reviewer 让 lease 过期且 stale-sweep 已清掉 lease_units」，并新增 kanban-followup lease TTL=3600 防止长 RVF run 在 finalize 前被 stale sweep 释放——以全局 tracker 作为跨 session 事实来源、幂等地标记已审 diff（避免重复审查同段 diff）、并校准 lease 过期/stale 终止。"
+      }
+    ],
+    "missing-termination": [
+      {
+        "hash": "0fd6e6bc6",
+        "subject": "feat: 启用外部 reviewer 活动监控",
+        "confidence": "high",
+        "rationale": "新增 ClaudeStreamActivityMonitor 识别 reviewer 正在跑长命令以免误触 idle-timeout，并加入 max_runtime 硬墙；既给 reviewer 子进程显式 wall-clock 终止上限，又对其活动状态做可观测，防止无界空转与误杀。"
+      },
+      {
+        "hash": "63b321cb9",
+        "subject": "feat: persist rvf handoff artifacts",
+        "confidence": "high",
+        "rationale": "把 handoff 从仅存于对话的 <handoff-context> blob 改为 run-scoped 持久化 handoff.md artifact，并在建新 review fork 前检测 RVF_HANDOFF_FILE 完成标记（含 _advised_marker 幂等去重）以停止后续自动 fork。"
+      },
+      {
+        "hash": "2e51b2b7e",
+        "subject": "fix: skip RVF fork for empty session scope",
+        "confidence": "high",
+        "rationale": "加入 session-scope gate：无 session-owned dirty paths 即跳过 RVF fork（避免对空 scope 起无谓 review run），transcript 不可读时跳过而非 fail-open，并落 gate 事件可观测。"
+      },
+      {
+        "hash": "18c000e7a",
+        "subject": "feat: harden RVF orchestration",
+        "confidence": "high",
+        "rationale": "引入带 dirty-snapshot 内容哈希+TTL 的 manual RVF session marker（显式持久化状态，避免对已审同一 dirty 状态重复 fork）、reviewer 活动探针失败阈值与 max_runtime 等无进展/硬终止条件，及 RVF_SCOPE_CONTRACT 要求 reviewer 遵守 scope 边界。"
+      },
+      {
+        "hash": "a7f9e6713",
+        "subject": "fix(rvf): suppress stop hook for alternative reviewers",
+        "confidence": "med",
+        "rationale": "给 alternative reviewer 子进程注入 CODEX_RVF_SUPPRESS_STOP_HOOK=1，阻断 reviewer 自身触发 stop hook 再启动新一轮 RVF 的递归扇出。"
+      },
+      {
+        "hash": "a5dd0fc6c",
+        "subject": "feat(rvf): 注入 rvf-analyze follow-up",
+        "confidence": "med",
+        "rationale": "analyze follow-up trigger turn 跳过主 RVF 自动触发以避免递归（终止/防循环），并修正 session_manifest 基于 commit cutoff 的归属避免误归属已提交 session edit。"
+      },
+      {
+        "hash": "cb41b14d2",
+        "subject": "fix(rvf): stabilize tracker leases and kanban routing",
+        "confidence": "med",
+        "rationale": "新增 sweep_stale_tracker_leases 释放过期 lease 防 squat、加 lease heartbeat/TTL 刷新与 expired-before-refresh 检查，并在 HEAD 不可解析时返回 cline-kanban-unconfigured 而非静默继续，给 stale lease 设上界。"
+      },
+      {
+        "hash": "78473f8ae",
+        "subject": "feat(rvf): land Slice I post-user-prompt shared workflow",
+        "confidence": "med",
+        "rationale": "prepare_run_from_prep_file 加 60s in-process 超时（ThreadPoolExecutor cancel-on-timeout），并以 shared_workflow_state.status='completed' 做幂等、merge 前从磁盘 reload 最新 payload 避免 stale-record 覆盖，给入口加终止条件与显式幂等状态。"
+      },
+      {
+        "hash": "455aac4a3",
+        "subject": "feat(rvf): one-shot post-analyze quiet marker breaks RVF self-injection loop",
+        "confidence": "high",
+        "rationale": "根因是 $review-validate-fix↔$rvf-analyze 经 cline-kanban 注入的「自激回路」，用一次性 quiet marker（set/read/clear，双侧对称 clear 防 leak）作为终止条件断开循环。"
+      },
+      {
+        "hash": "d4b3b8c66",
+        "subject": "fix(rvf): 跳过 Codex goal mode 下的 Stop hook",
+        "confidence": "med",
+        "rationale": "检测 Codex /goal mode（goal status active/paused/budget-limited + continuation marker）即跳过 RVF Stop hook，避免 goal 持续运行期间反复触发 RVF 形成无终止的重复触发。"
+      },
+      {
+        "hash": "33efc317a",
+        "subject": "Fix RVF post-analyze quiet loop",
+        "confidence": "med",
+        "rationale": "新增 Claude Code hooks/stop.py wrapper（fail-open 委派到核心脚本）并完善 post_analyze_quiet marker 消费，延续断开 analyze↔review 自激回路的终止条件；wrapper 让 hook 控制流自有可改而非依赖框架黑箱。"
+      },
+      {
+        "hash": "b94c7d6aa",
+        "subject": "Fix RVF analyze pending dispatch guard",
+        "confidence": "high",
+        "rationale": "引入 WORKFLOW_PENDING 状态：analyze artifacts 未就绪时 dispatcher 不再 fail-open 误把 marker 当已消费而继续跑自动 RVF，改为跳过并保留 pending marker 等对账，修 arm/clear 非对称导致的误触发回路。"
+      },
+      {
+        "hash": "d0d6bda08",
+        "subject": "feat(rvf): 自动 analyze 改为 detached tmux 后台线程",
+        "confidence": "med",
+        "rationale": "改派后台线程并加 CODEX_RVF_ANALYZE_THREAD 早退守卫「避免后台 analyze 递归触发」（防自递归循环），以 O_EXCL 锁 + tmux duplicate 幂等防重复拉起同一 analyze。"
+      },
+      {
+        "hash": "72edad1c2",
+        "subject": "Initial review-validate-fix skill package",
+        "confidence": "high",
+        "rationale": "首版即以确定性 workflow 包裹 LLM review：check_review_output.py 强制 NO_ISSUES/issue 输出契约做独立验证层、双独立 reviewer + review-prompt 要求「不要恭维」「你依然要独立 verify」（反谄媚）、run_alternative_reviewer 的 idle activity timeout+kill+退出码124 给 review 设终止条件、command_lock.py 为会改共享状态的命令加并发去重护栏。"
+      },
+      {
+        "hash": "388662011",
+        "subject": "Harden review-validate-fix fork design",
+        "confidence": "med",
+        "rationale": "强化外部 reviewer 输出处理：从 Claude stream-json stdout 稳健提取最终 result 文本（extract_claude_stream_result）而非让下游猜结构，并配合 idle timeout / 退出码124；同时把 review 钉在独立 fork checkpoint。打标针对结构化解析与终止两点。"
+      },
+      {
+        "hash": "209e5bc28",
+        "subject": "Improve RVF stop hook skip diagnostics",
+        "confidence": "high",
+        "rationale": "为每条 skip 路径补 skip_payload 显式上报跳过原因（递归 stop_hook_active、已是 fork、subagent、session disabled、clean repo 等），既提升可观测性，又以「检测到 stop_hook_active=true 已跳过避免递归」「已是 fork 会等最终 handoff 不再 fork」充当防递归/防重复触发的终止条件。"
+      },
+      {
+        "hash": "00e73fcd6",
+        "subject": "fix(rvf): complete kanban follow-up tracker scopes",
+        "confidence": "med",
+        "rationale": "补全 reviewed-diff tracker 的 scope 收尾：complete_review_scope 保证「完成的 RVF scope 必须留下持久 reviewed unit 状态，即便长 run reviewer 让 lease 过期且 stale-sweep 已清掉 lease_units」，并新增 kanban-followup lease TTL=3600 防止长 RVF run 在 finalize 前被 stale sweep 释放——以全局 tracker 作为跨 session 事实来源、幂等地标记已审 diff（避免重复审查同段 diff）、并校准 lease 过期/stale 终止。"
+      }
+    ],
+    "silent-failures": [
+      {
+        "hash": "8c7bfe3f8",
+        "subject": "fix: 加固 RVF Stop hook 与 Vibe runner 安全边界",
+        "confidence": "high",
+        "rationale": "按 commit「避免 fail-open」：transcript 缺失/不可读时跳过 dev sync 与 installed hook（fail-closed）；取消 run 时校验 run id/命令匹配以免 stale runner_pid 误杀进程；冻结启动时 prepare metadata 避免 queued/running 后 scope 漂移。"
+      },
+      {
+        "hash": "e62f2beb3",
+        "subject": "fix: 限定 plan stop hook suppression 范围",
+        "confidence": "med",
+        "rationale": "改用锚定整段消息的正则判定 plan operation，避免完成态消息里仅出现字面 <proposed_plan> 标记就误把 Stop hook 整体静默跳过（review 被静默吞掉）。"
+      },
+      {
+        "hash": "2e51b2b7e",
+        "subject": "fix: skip RVF fork for empty session scope",
+        "confidence": "high",
+        "rationale": "加入 session-scope gate：无 session-owned dirty paths 即跳过 RVF fork（避免对空 scope 起无谓 review run），transcript 不可读时跳过而非 fail-open，并落 gate 事件可观测。"
+      },
+      {
+        "hash": "29a03c8e7",
+        "subject": "fix: 修复 Cline Kanban RVF 启动与 bootstrap 契约",
+        "confidence": "med",
+        "rationale": "主体是 Vibe→Cline Kanban 迁移，但同时引入 freeze 启动时 scope anchor artifact 防排队后 scope 漂移、bootstrap base_ref 不匹配即拒绝、路径越界守卫，并以 reason_code 诚实上报 unavailable/unconfigured 而非静默。"
+      },
+      {
+        "hash": "ba84b71ac",
+        "subject": "fix: 限定 RVF dev-only 自同步链",
+        "confidence": "med",
+        "rationale": "为自动 dev-sync 执行的脚本加 dev_repo_script 路径包含校验，脚本路径若 escaped dev repo 则抛错并落 invalid_dev_sync_script 失败事件，约束自动同步只能执行 dev repo 内既定脚本。"
+      },
+      {
+        "hash": "05eaf6454",
+        "subject": "fix: 修复契约检查静默模式",
+        "confidence": "med",
+        "rationale": "契约检查改为非 verbose 时捕获输出、失败时显式打印「契约检查失败」并回吐被捕获输出（run_step 包装每步），使验证门的失败不再淹没在静默/噪声里。"
+      },
+      {
+        "hash": "98a30dde8",
+        "subject": "refactor: 简化 RVF Stop hook 决策流程",
+        "confidence": "low",
+        "rationale": "拆为 evaluate_stop_event()+launch_backend() 并接收 kanban fail-close，失败路径\"只报告原因，不把 $review-validate-fix 作为当前 Stop continuation 注入父会话\"，避免把失败伪装成可继续；但主体是结构重构故信心偏低。"
+      },
+      {
+        "hash": "bfc0791af",
+        "subject": "fix: 收紧 Cline Kanban server 归属校验",
+        "confidence": "low",
+        "rationale": "统一解析 runtime port、拒绝 --port auto 与端口冲突，\"避免 listener cwd 校验被绕过或错查端口\"，防止把 RVF 静默调度到错误/外部 listener；属边界护栏故信心低。"
+      },
+      {
+        "hash": "1dd427953",
+        "subject": "fix: 防止 RVF 认证失效和 Kanban suppress 外溢",
+        "confidence": "high",
+        "rationale": "新增 provider health guard，检测 codex 登录过期/未认证即 fail-close \"阻止 RVF 自动启动，避免创建会立即失败的\"run；并把 suppress 改为 per-task 持久化标记修正跨 task suppress 外溢的隐形状态。"
+      },
+      {
+        "hash": "4573e4ef6",
+        "subject": "fix: 默认通过 Cline Kanban 启动 RVF Stop hook",
+        "confidence": "low",
+        "rationale": "默认走真实 Kanban、失败时\"只报告原因，不回退为 Stop continuation prompt\"（继续会误导主会话重跑），并对 stale bridge 仅\"终止旧 listener、重启 bridge 并重试一次\"做有界恢复；属可靠性护栏故信心低。"
+      },
+      {
+        "hash": "f086234bc",
+        "subject": "fix: preserve RVF kanban run handoff state",
+        "confidence": "med",
+        "rationale": "让 Kanban RVF task 复用 canonical installed-plugin run ledger 并导出 CODEX_RVF run metadata（统一唯一 run 状态真相、log-root 不落到 task worktree），且要求子代理 high-effort 时\"不得静默降级\"必须记录原因。"
+      },
+      {
+        "hash": "beb363d1c",
+        "subject": "feat: 添加结构化 reviewer result artifact (#3)",
+        "confidence": "high",
+        "rationale": "引入 schema 化 canonical reviewer result artifact 并用 check_review_result.py 强校验，artifact 缺失/损坏/schema invalid 一律 fail-close \"不静默当作 0 个问题\"；reviewer 子代理用 clean context、合并前互不串供，以结构化 result 取代散文裸名判定。"
+      },
+      {
+        "hash": "d6ae21127",
+        "subject": "fix: refresh alternative reviewer health before run",
+        "confidence": "med",
+        "rationale": "run 前对 alternative reviewer 执行 pre_run_health 健康检查，命令失败即记 reviewer_pre_run_health_failed 并按不可用处理，避免静默依赖一个实际不健康的 reviewer 产出。"
+      },
+      {
+        "hash": "a30a76946",
+        "subject": "fix(rvf): 阻止 stale Kanban listener 回退 GUI fork",
+        "confidence": "med",
+        "rationale": "auto 模式下当 Kanban 失败明确是 stale listener / wrong repo 这类可诊断管理面错误时直接报 cline_kanban_unavailable、不再 fail-open 回退 legacy GUI fork，避免在错误根因上叠加二次错误。"
+      },
+      {
+        "hash": "871cb2ad0",
+        "subject": "fix: reuse existing Cline Kanban runtime",
+        "confidence": "med",
+        "rationale": "task list 确认期望 workspace 时复用既有 Kanban runtime，并在端口已被 listener 占用时 fail-close 而非启动第二个 server，避免重复副作用与静默冲突。"
+      },
+      {
+        "hash": "3f62fc19b",
+        "subject": "feat(rvf): land global reviewed-diff tracker phase 1",
+        "confidence": "high",
+        "rationale": "新增 repo 级共享 reviewed-diff tracker（hunk 级显式状态目录 + 跨 session 冲突 section + register_claims 注册），并收紧异常写诊断事件，让跨 session 已审 diff 成为唯一可查询事实源、避免重复审同一改动。"
+      },
+      {
+        "hash": "ba4cb5d39",
+        "subject": "feat(rvf): land Slice 2-A SQLite + JSONL diff tracker backend",
+        "confidence": "high",
+        "rationale": "把 diff tracker 后端换成 SQLite+JSONL 并用 canonical_patch_hash 做 unit 身份、幂等迁移、WAL first-writer race 重试与连接清理修复，强化跨进程显式状态的并发安全与幂等。"
+      },
+      {
+        "hash": "afc2db74b",
+        "subject": "fix: require cline kanban tmux listener ownership",
+        "confidence": "med",
+        "rationale": "通过进程祖先链校验要求 tmux listener 归属本 Kanban runtime（is_cline_kanban_tmux_session ownership 检查），避免误把错误 repo/陌生 listener 当成有效 runtime 继续推进。"
+      },
+      {
+        "hash": "9a64316e4",
+        "subject": "feat(rvf): /rvf-analyze deterministic backend (orphan detect, analysis scaffold, CLI)",
+        "confidence": "med",
+        "rationale": "新增确定性 orphan_detect（finalized/running/orphan_candidate/cancel_without_lock/half_broken 分类）与 analysis 脚手架/CLI，防御式解析对缺失/畸形输入不抛错，把 run 终态从不可见变为可分类、可复盘。"
+      },
+      {
+        "hash": "b04ca15c6",
+        "subject": "fix(rvf): rvf_analyze CLI hardening + marker pre-finalize state",
+        "confidence": "med",
+        "rationale": "为 lazy_finalize 失败设专用 exit code（避免对已答问题重复追问）、收紧 resolve_run_dir 要求 summary.json 防止往 /tmp 等非 RVF 路径误写 artifact，并在 marker 记录 pre_finalize_classification 保住触发救援的状态。"
+      },
+      {
+        "hash": "85ef67db7",
+        "subject": "fix(rvf): distill apply_patch under custom_tool_call schema",
+        "confidence": "high",
+        "rationale": "旧 distill 只识别 function_call，导致 custom_tool_call 形态的 apply_patch 事件全被漏检、causality.json::patches 永远为空，本次扩展识别两类 schema 让 patch 时间线可被 $rvf-analyze 复盘，修复轨迹/可观测性的静默缺失。"
+      },
+      {
+        "hash": "0a9ec8a95",
+        "subject": "fix: detect Codex reviewer backend challenge",
+        "confidence": "high",
+        "rationale": "检测 Codex 返回 Cloudflare/backend challenge HTML 而非合法 review JSON 的情形，把原本 returncode=0 的『假成功』改判为 reviewer_codex_backend_challenge 显式失败，避免把错误输出当有效结果继续。"
+      },
+      {
+        "hash": "6addd822e",
+        "subject": "feat(rvf): land Slice 3 allocator CLI + 4-function gate split",
+        "confidence": "med",
+        "rationale": "在单个 BEGIN IMMEDIATE 内做 lease 原子分配+排除 active-leased 单元，把 review scope 落成显式持久化租约状态；并让 refresh 在 build_manifest 抛错时返回 error sentinel 触发 session_manifest_failed fail-loud，对齐既有可观测性契约。"
+      },
+      {
+        "hash": "e0e8e4acf",
+        "subject": "docs: clarify validate/fix subagent wait probes",
+        "confidence": "med",
+        "rationale": "明确要求等 validate/fix 子代理用宽松超时、不得把『还在处理』当超时失败，到期先发非侵入式 progress probe 并把结果写进 run ledger/审计表，防止过早误判失败并补齐子代理 liveness 可见性。"
+      },
+      {
+        "hash": "38322f71e",
+        "subject": "fix: classify read-only stop-hook sessions",
+        "confidence": "low",
+        "rationale": "在 whole-repo dirty-route 捷径前先跑 transcript-aware precheck，避免 background dirty 文件替只读 chat 会话决定 route type，纠正把只读会话误分类成 dirty 的错误信号并补 session_change_type 分类事件，但更偏 scope 门控修正而非典型静默失败。"
+      },
+      {
+        "hash": "00e73fcde",
+        "subject": "fix(rvf): complete kanban follow-up tracker scopes",
+        "confidence": "med",
+        "rationale": "为 kanban-followup 补 lease TTL 并完成 tracker scope，且在缺 task id 时 fail-close 报 kanban_followup_missing_task_id 而非静默继续。"
+      },
+      {
+        "hash": "fe833f1a3",
+        "subject": "feat(rvf): tracker dashboard polish + v3 lease participants surface",
+        "confidence": "med",
+        "rationale": "dashboard surface lease participants 提升可观测，且把 OperationalError catch 收窄到 no such table/column 使真实 DB 错误浮现而非被当成空列表掩盖。"
+      },
+      {
+        "hash": "7b337558d",
+        "subject": "feat(rvf): harden dispatch prep worktree metadata",
+        "confidence": "med",
+        "rationale": "create/start 响应缺 workspace_path 时改为 raise RuntimeError 而非静默回退到 cwd，并把 target_worktree/kanban_task_id 显式写入 prep file 状态。"
+      },
+      {
+        "hash": "f4890a6e2",
+        "subject": "feat(rvf): harden dispatch prep flow",
+        "confidence": "med",
+        "rationale": "新增 prep-file sweep_stale 清理过期记录防 squat、O_EXCL/hardlink 原子创建避免 token 冲突，并在 tracker scope artifact 缺失时 raise 而非静默继续。"
+      },
+      {
+        "hash": "cb41b14d2",
+        "subject": "fix(rvf): stabilize tracker leases and kanban routing",
+        "confidence": "med",
+        "rationale": "新增 sweep_stale_tracker_leases 释放过期 lease 防 squat、加 lease heartbeat/TTL 刷新与 expired-before-refresh 检查，并在 HEAD 不可解析时返回 cline-kanban-unconfigured 而非静默继续，给 stale lease 设上界。"
+      },
+      {
+        "hash": "29ffe3b90",
+        "subject": "feat(rvf): land plan v3.2 workflow polish (P5/P0/P8/P2/P3/P4/P7)",
+        "confidence": "med",
+        "rationale": "P0 把 runtime state 重定向到 canonical state 路径以「stop dual-writes」、P8 停止对 clean-path 0-issue run 误报 causality_ledger_missing（status=missing 无 rows 是合法的），分别修隐形状态双写与误导性失败信号。"
+      },
+      {
+        "hash": "0ef296493",
+        "subject": "feat(rvf): capture trajectories from claude code transcripts",
+        "confidence": "high",
+        "rationale": "根因措辞「fed Claude NDJSON to the Codex parser and silently dropped every record, leaving trajectory.jsonl empty and breaking issue→patch causality」——既是静默丢弃记录的 silent-failure，又恢复了 Claude-host 下的 trajectory 可观测性。"
+      },
+      {
+        "hash": "fc411b063",
+        "subject": "docs(rvf): align validate-fix result contract",
+        "confidence": "med",
+        "rationale": "把 validate/fix 子代理结果契约改为「以 rvf_fix_attempt.py stop 写入的 ledger 为事实源，自然语言 final 只作日志」，即以显式持久化状态为唯一真相、不再轻信 agent 自述，防自述失真静默通过；但本 commit 仅同步 prompt/standards/模板/契约检查的文档与契约。"
+      },
+      {
+        "hash": "b94c7d6aa",
+        "subject": "Fix RVF analyze pending dispatch guard",
+        "confidence": "high",
+        "rationale": "引入 WORKFLOW_PENDING 状态：analyze artifacts 未就绪时 dispatcher 不再 fail-open 误把 marker 当已消费而继续跑自动 RVF，改为跳过并保留 pending marker 等对账，修 arm/clear 非对称导致的误触发回路。"
+      },
+      {
+        "hash": "a4909750a",
+        "subject": "fix(rvf-test): warn on --jobs oversubscription; document safe ceiling",
+        "confidence": "med",
+        "rationale": "修正「Phase 4 用 |tail -1 掩盖了退出码、未检出超额订阅饿死的偶发失败」，加 stderr 告警让被吞掉的非零退出码与饿死条件显式可见。"
+      },
+      {
+        "hash": "d3fe8ad22",
+        "subject": "feat(rvf): manual 触发支持内联 scope: 指定 review primary 文件",
+        "confidence": "med",
+        "rationale": "主体是新功能，但随附修复「两个新测试此前只定义、未注册进 runner 用例表，从不执行（假绿）」，注册后让本应跑的校验真正运行，消除测试层的静默失败/假绿。"
+      },
+      {
+        "hash": "bd1e662b4",
+        "subject": "docs(rvf): rvf-local-deploy 加 vendored payload post-deploy 校验",
+        "confidence": "high",
+        "rationale": "根因「vendoring 静默失败会『检查全过、运行期 ModuleNotFoundError』」，新增 import-smoke post-deploy 校验把静默部署损坏转为响亮失败、不当成功收尾。"
+      },
+      {
+        "hash": "23700f4fa",
+        "subject": "fix(rvf): claude headless analyze 切到 bypassPermissions 模式",
+        "confidence": "high",
+        "rationale": "根因 headless agent 因权限被拒、干净退出 0「returncode=0 误判 success」零编辑却卡 PENDING 6h，是典型静默失败（成功长得像失败被吞）。"
+      },
+      {
+        "hash": "87e933895",
+        "subject": "fix(rvf): kanban-followup 锁改为投递确认时 arm（治本 squat）",
+        "confidence": "high",
+        "rationale": "把 dispatch 时乐观预 arm 改为投递被证明时才 arm，治本「投递静默失败留下纯 TTL 锁空转 6h 挡 dispatch」的锁 squat（arm/clear 非对称隐形状态 + 静默丢投）。"
+      },
+      {
+        "hash": "75ef23587",
+        "subject": "feat(rvf): manual 触发结构化检测改用 vendored codex-invoked-skill（命中命名空间形态）",
+        "confidence": "low",
+        "rationale": "修复 manual 触发的命名空间形态 $rvf:review-validate-fix 被锚定正则静默漏掉（MISS）的检测缺口，结构化优先+正则回退；best-effort 不阻断。"
+      },
+      {
+        "hash": "107e3836f",
+        "subject": "fix(rvf): kanban-followup terminal fallback 诚实上报 + 投递对账自愈",
+        "confidence": "high",
+        "rationale": "根因把 kanban CLI 乐观 terminal fallback 回执（status:started）当成「已注入」致 followup 静默丢投；改诚实降级上报+新增 pending marker 对账（stale 判定丢投并放行重投）自愈。"
+      },
+      {
+        "hash": "72edad1c2",
+        "subject": "Initial review-validate-fix skill package",
+        "confidence": "high",
+        "rationale": "首版即以确定性 workflow 包裹 LLM review：check_review_output.py 强制 NO_ISSUES/issue 输出契约做独立验证层、双独立 reviewer + review-prompt 要求「不要恭维」「你依然要独立 verify」（反谄媚）、run_alternative_reviewer 的 idle activity timeout+kill+退出码124 给 review 设终止条件、command_lock.py 为会改共享状态的命令加并发去重护栏。"
+      },
+      {
+        "hash": "429778d73",
+        "subject": "Add RVF stop hook dispatcher sync",
+        "confidence": "high",
+        "rationale": "引入 dispatcher 作为 hook 稳定入口：先同步并 check-contracts，「只有同步和 contract check 成功后才转交 installed hook；如果同步失败，跳过 fork gate 并在 systemMessage 写出失败原因和日志路径，避免继续使用 stale installed skill」——以显式失败上报替代静默用旧版。"
+      },
+      {
+        "hash": "10b9e5cbe",
+        "subject": "Fix RVF fork GUI visibility fallback",
+        "confidence": "high",
+        "rationale": "处理 GUI fork「写了 session 文件但 GUI 不可见」的盲点：加 gui_visibility 校验、open-GUI-fork 重试与 bridge unverified policy（continuation/manual/fail），在不可见时显式标注 desktop-control-unavailable 状态而非让 fork 静默不可见地通过。"
+      },
+      {
+        "hash": "59960e85d",
+        "subject": "Add RVF session-scoped change tracking",
+        "confidence": "high",
+        "rationale": "用 session_manifest.py 从 transcript 生成显式 owned_paths/owned_dirty_paths/confidence 作为 review scope 的事实来源（替代「任何未提交改动都进 reviewer 上下文」的隐式状态），把 unattributed_dirty 排除以防 scope 漂移，且「manifest 无法生成时不应静默退回 whole-repo scope」要求显式说明而非默认降级。"
+      },
+      {
+        "hash": "9e41941d8",
+        "subject": "fix: stop rvf continuation fallback",
+        "confidence": "high",
+        "rationale": "移除 Stop continuation fallback，根因是「continuation 不会创建真正的新用户 prompt，只作为 hook system context 出现在当前轨迹中，因此不能作为 fallback」；GUI fork 不可用时改为只用 systemMessage 诚实报告并停止自动 review，而非伪装成已运行的 review。"
+      },
+      {
+        "hash": "c697c41e2",
+        "subject": "fix: handle handoff marker log failures",
+        "confidence": "high",
+        "rationale": "为 handoff marker 写入加 OSError 捕获：失败时记 log_unavailable 诊断（level=warn）并在 payload 暴露 marker_error/marker_written，而不是让写日志失败静默吞掉或拖垮整个 hook。"
+      }
+    ],
+    "unbounded-autonomy": [
+      {
+        "hash": "8c7bfe3f8",
+        "subject": "fix: 加固 RVF Stop hook 与 Vibe runner 安全边界",
+        "confidence": "high",
+        "rationale": "按 commit「避免 fail-open」：transcript 缺失/不可读时跳过 dev sync 与 installed hook（fail-closed）；取消 run 时校验 run id/命令匹配以免 stale runner_pid 误杀进程；冻结启动时 prepare metadata 避免 queued/running 后 scope 漂移。"
+      },
+      {
+        "hash": "ba84b71ac",
+        "subject": "fix: 限定 RVF dev-only 自同步链",
+        "confidence": "med",
+        "rationale": "为自动 dev-sync 执行的脚本加 dev_repo_script 路径包含校验，脚本路径若 escaped dev repo 则抛错并落 invalid_dev_sync_script 失败事件，约束自动同步只能执行 dev repo 内既定脚本。"
+      },
+      {
+        "hash": "b04ca15c6",
+        "subject": "fix(rvf): rvf_analyze CLI hardening + marker pre-finalize state",
+        "confidence": "med",
+        "rationale": "为 lazy_finalize 失败设专用 exit code（避免对已答问题重复追问）、收紧 resolve_run_dir 要求 summary.json 防止往 /tmp 等非 RVF 路径误写 artifact，并在 marker 记录 pre_finalize_classification 保住触发救援的状态。"
+      },
+      {
+        "hash": "d8705a6d3",
+        "subject": "feat(rvf): full-dirty bootstrap + threshold confirmation gate",
+        "confidence": "med",
+        "rationale": "新增 Stop-hook confirmation gate，在 oversize bootstrap（≥10 路径或 ≥1MiB）时暂停 dispatch，仅在用户严格 yes 确认后恢复，是对高影响动作的 human-in-the-loop 审批门与影响范围上限。"
+      },
+      {
+        "hash": "dd55bdea7",
+        "subject": "Add session stop hook controls",
+        "confidence": "med",
+        "rationale": "新增 per-session 的 RVF_STOP_HOOK: off/on/status 开关，让用户能临时禁用当前会话的自动 Stop hook 触发，为自动 fork 自治加上用户可控的关停护栏（持久化于 state/session-hook/）。"
+      }
+    ],
+    "inter-agent-misalignment": [
+      {
+        "hash": "eb3e7bd46",
+        "subject": "feat: add RVF review standards pack",
+        "confidence": "high",
+        "rationale": "以「受控 request protocol 取代子代理自由输出长报告/自行扩大 scope 或猜测」：parser 对 RVF_*_REQUEST 做必填字段+枚举 schema 校验、拒绝 malformed 与混写 NO_ISSUES/issue list/handoff marker，强制结构化 inter-agent 契约且必须被主会话显式处理。"
+      }
+    ],
+    "noisy-tool-outputs": [
+      {
+        "hash": "eb3e7bd46",
+        "subject": "feat: add RVF review standards pack",
+        "confidence": "high",
+        "rationale": "以「受控 request protocol 取代子代理自由输出长报告/自行扩大 scope 或猜测」：parser 对 RVF_*_REQUEST 做必填字段+枚举 schema 校验、拒绝 malformed 与混写 NO_ISSUES/issue list/handoff marker，强制结构化 inter-agent 契约且必须被主会话显式处理。"
+      },
+      {
+        "hash": "beb363d1c",
+        "subject": "feat: 添加结构化 reviewer result artifact (#3)",
+        "confidence": "high",
+        "rationale": "引入 schema 化 canonical reviewer result artifact 并用 check_review_result.py 强校验，artifact 缺失/损坏/schema invalid 一律 fail-close \"不静默当作 0 个问题\"；reviewer 子代理用 clean context、合并前互不串供，以结构化 result 取代散文裸名判定。"
+      },
+      {
+        "hash": "28c3dd87b",
+        "subject": "feat(rvf): enforce kind/severity on reviewer issue artifact schema",
+        "confidence": "med",
+        "rationale": "把 reviewer issue 的 kind(REAL/NIT/ELEVATE)/severity(high/medium/low) 从隐式可选提升为写入与读取都强校验的必填字段，闭合 doc/schema gap、避免下游 LLM 再从自由文本里重新推导分类。"
+      },
+      {
+        "hash": "388662011",
+        "subject": "Harden review-validate-fix fork design",
+        "confidence": "med",
+        "rationale": "强化外部 reviewer 输出处理：从 Claude stream-json stdout 稳健提取最终 result 文本（extract_claude_stream_result）而非让下游猜结构，并配合 idle timeout / 退出码124；同时把 review 钉在独立 fork checkpoint。打标针对结构化解析与终止两点。"
+      }
+    ],
+    "incomplete-verification": [
+      {
+        "hash": "eb3e7bd46",
+        "subject": "feat: add RVF review standards pack",
+        "confidence": "high",
+        "rationale": "以「受控 request protocol 取代子代理自由输出长报告/自行扩大 scope 或猜测」：parser 对 RVF_*_REQUEST 做必填字段+枚举 schema 校验、拒绝 malformed 与混写 NO_ISSUES/issue list/handoff marker，强制结构化 inter-agent 契约且必须被主会话显式处理。"
+      },
+      {
+        "hash": "05eaf6454",
+        "subject": "fix: 修复契约检查静默模式",
+        "confidence": "med",
+        "rationale": "契约检查改为非 verbose 时捕获输出、失败时显式打印「契约检查失败」并回吐被捕获输出（run_step 包装每步），使验证门的失败不再淹没在静默/噪声里。"
+      },
+      {
+        "hash": "beb363d1c",
+        "subject": "feat: 添加结构化 reviewer result artifact (#3)",
+        "confidence": "high",
+        "rationale": "引入 schema 化 canonical reviewer result artifact 并用 check_review_result.py 强校验，artifact 缺失/损坏/schema invalid 一律 fail-close \"不静默当作 0 个问题\"；reviewer 子代理用 clean context、合并前互不串供，以结构化 result 取代散文裸名判定。"
+      },
+      {
+        "hash": "d6ae21127",
+        "subject": "fix: refresh alternative reviewer health before run",
+        "confidence": "med",
+        "rationale": "run 前对 alternative reviewer 执行 pre_run_health 健康检查，命令失败即记 reviewer_pre_run_health_failed 并按不可用处理，避免静默依赖一个实际不健康的 reviewer 产出。"
+      },
+      {
+        "hash": "fd364a33b",
+        "subject": "feat(rvf): add codex alternative reviewer config",
+        "confidence": "low",
+        "rationale": "新增独立 codex 评审后端配置，为 RVF 提供一个跨 host 的独立验证层（idle/probe/max_runtime 终止机制此前已存在），主要属新功能而非新增护栏。"
+      },
+      {
+        "hash": "28c3dd87b",
+        "subject": "feat(rvf): enforce kind/severity on reviewer issue artifact schema",
+        "confidence": "med",
+        "rationale": "把 reviewer issue 的 kind(REAL/NIT/ELEVATE)/severity(high/medium/low) 从隐式可选提升为写入与读取都强校验的必填字段，闭合 doc/schema gap、避免下游 LLM 再从自由文本里重新推导分类。"
+      },
+      {
+        "hash": "5561b3f9c",
+        "subject": "fix(tests): rename tmp fixture refs to tmp_path so suite collects",
+        "confidence": "high",
+        "rationale": "152+ 测试因 fixture 'tmp' not found 在 setup 阶段全 error、过去几个 commit 事实上从未真正执行（假绿），修复后 306 passed 才让验证层真正生效。"
+      },
+      {
+        "hash": "b2542195d",
+        "subject": "Track turn-aware edit claims for RVF scope",
+        "confidence": "med",
+        "rationale": "新增 turn-aware edit claims / patch_ownership 审计与 patch_ownership_incomplete 门（unresolved 或缺 unit_ids 时 skip 并 release lease），用显式 scope 状态对账避免漏审 owned 改动，是隐形状态显式化 + 验证完整性把关。"
+      },
+      {
+        "hash": "bc5797352",
+        "subject": "docs(rvf): publish cross-harness compatibility matrix + manifest sync tooling + marketplace variant addendum (S4)",
+        "confidence": "low",
+        "rationale": "主体为文档，但新增 sync-manifest.sh 以 jq fail-fast 校验三份 manifest 的 name/version/source 一致性，是防 manifest 漂移的可执行验证护栏。"
+      },
+      {
+        "hash": "bd1e662b4",
+        "subject": "docs(rvf): rvf-local-deploy 加 vendored payload post-deploy 校验",
+        "confidence": "high",
+        "rationale": "根因「vendoring 静默失败会『检查全过、运行期 ModuleNotFoundError』」，新增 import-smoke post-deploy 校验把静默部署损坏转为响亮失败、不当成功收尾。"
+      },
+      {
+        "hash": "a86dad75a",
+        "subject": "feat(rvf): 失败再入按 run 重开「最近一次已 RVF 的实现」units 全量重审",
+        "confidence": "med",
+        "rationale": "Item E reconcile 被放弃 run 的 followup 锁治「R1.5 式 6h 空转」属隐形状态；reopen 本身在「实现未达成原始目标」时按 run 全量重审，是 goal-consistency 与对未达标实现补做验证。"
+      },
+      {
+        "hash": "556d02b54",
+        "subject": "feat(rvf): no_issues review result 强制必填 audit_summary (Option A)",
+        "confidence": "high",
+        "rationale": "明言关闭「clean 结论无推理留痕、事后无法区分真实审查与橡皮图章」的可观测性缺口，强制 reviewer 留下审查依据以防名义监督/表层验证。"
+      },
+      {
+        "hash": "72edad1c2",
+        "subject": "Initial review-validate-fix skill package",
+        "confidence": "high",
+        "rationale": "首版即以确定性 workflow 包裹 LLM review：check_review_output.py 强制 NO_ISSUES/issue 输出契约做独立验证层、双独立 reviewer + review-prompt 要求「不要恭维」「你依然要独立 verify」（反谄媚）、run_alternative_reviewer 的 idle activity timeout+kill+退出码124 给 review 设终止条件、command_lock.py 为会改共享状态的命令加并发去重护栏。"
+      },
+      {
+        "hash": "4cdf4c4ec",
+        "subject": "Harden review-validate-fix context handling",
+        "confidence": "high",
+        "rationale": "把 session context 改为结构化必填输入并写入 self-contained packet，明确「它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug，你必须独立 verify」，对抗盲信主会话自述（谄媚）、强制实质验证、并以显式工作说明替代「只靠 git diff 猜 scope」。"
+      }
+    ],
+    "goal-drift": [
+      {
+        "hash": "18c000e7a",
+        "subject": "feat: harden RVF orchestration",
+        "confidence": "high",
+        "rationale": "引入带 dirty-snapshot 内容哈希+TTL 的 manual RVF session marker（显式持久化状态，避免对已审同一 dirty 状态重复 fork）、reviewer 活动探针失败阈值与 max_runtime 等无进展/硬终止条件，及 RVF_SCOPE_CONTRACT 要求 reviewer 遵守 scope 边界。"
+      },
+      {
+        "hash": "8ea9a35ea",
+        "subject": "feat(rvf): land Slice 2-B tracker_scope consumer surface",
+        "confidence": "med",
+        "rationale": "新增 --tracker-scope 入参 + strict validator + path-limited 'Allocated Git Diff'，把审查范围绑定到冻结的 tracker_scope 确定性边界，防止 reviewer 超出分配范围、并保持 scope_hash 派生稳定。"
+      },
+      {
+        "hash": "a86dad75a",
+        "subject": "feat(rvf): 失败再入按 run 重开「最近一次已 RVF 的实现」units 全量重审",
+        "confidence": "med",
+        "rationale": "Item E reconcile 被放弃 run 的 followup 锁治「R1.5 式 6h 空转」属隐形状态；reopen 本身在「实现未达成原始目标」时按 run 全量重审，是 goal-consistency 与对未达标实现补做验证。"
+      },
+      {
+        "hash": "59960e85d",
+        "subject": "Add RVF session-scoped change tracking",
+        "confidence": "high",
+        "rationale": "用 session_manifest.py 从 transcript 生成显式 owned_paths/owned_dirty_paths/confidence 作为 review scope 的事实来源（替代「任何未提交改动都进 reviewer 上下文」的隐式状态），把 unattributed_dirty 排除以防 scope 漂移，且「manifest 无法生成时不应静默退回 whole-repo scope」要求显式说明而非默认降级。"
+      }
+    ],
+    "cascading-failures": [
+      {
+        "hash": "4573e4ef6",
+        "subject": "fix: 默认通过 Cline Kanban 启动 RVF Stop hook",
+        "confidence": "low",
+        "rationale": "默认走真实 Kanban、失败时\"只报告原因，不回退为 Stop continuation prompt\"（继续会误导主会话重跑），并对 stale bridge 仅\"终止旧 listener、重启 bridge 并重试一次\"做有界恢复；属可靠性护栏故信心低。"
+      },
+      {
+        "hash": "a30a76946",
+        "subject": "fix(rvf): 阻止 stale Kanban listener 回退 GUI fork",
+        "confidence": "med",
+        "rationale": "auto 模式下当 Kanban 失败明确是 stale listener / wrong repo 这类可诊断管理面错误时直接报 cline_kanban_unavailable、不再 fail-open 回退 legacy GUI fork，避免在错误根因上叠加二次错误。"
+      },
+      {
+        "hash": "afc2db74b",
+        "subject": "fix: require cline kanban tmux listener ownership",
+        "confidence": "med",
+        "rationale": "通过进程祖先链校验要求 tmux listener 归属本 Kanban runtime（is_cline_kanban_tmux_session ownership 检查），避免误把错误 repo/陌生 listener 当成有效 runtime 继续推进。"
+      }
+    ],
+    "sycophancy": [
+      {
+        "hash": "beb363d1c",
+        "subject": "feat: 添加结构化 reviewer result artifact (#3)",
+        "confidence": "high",
+        "rationale": "引入 schema 化 canonical reviewer result artifact 并用 check_review_result.py 强校验，artifact 缺失/损坏/schema invalid 一律 fail-close \"不静默当作 0 个问题\"；reviewer 子代理用 clean context、合并前互不串供，以结构化 result 取代散文裸名判定。"
+      },
+      {
+        "hash": "72edad1c2",
+        "subject": "Initial review-validate-fix skill package",
+        "confidence": "high",
+        "rationale": "首版即以确定性 workflow 包裹 LLM review：check_review_output.py 强制 NO_ISSUES/issue 输出契约做独立验证层、双独立 reviewer + review-prompt 要求「不要恭维」「你依然要独立 verify」（反谄媚）、run_alternative_reviewer 的 idle activity timeout+kill+退出码124 给 review 设终止条件、command_lock.py 为会改共享状态的命令加并发去重护栏。"
+      },
+      {
+        "hash": "4cdf4c4ec",
+        "subject": "Harden review-validate-fix context handling",
+        "confidence": "high",
+        "rationale": "把 session context 改为结构化必填输入并写入 self-contained packet，明确「它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug，你必须独立 verify」，对抗盲信主会话自述（谄媚）、强制实质验证、并以显式工作说明替代「只靠 git diff 猜 scope」。"
+      }
+    ],
+    "runaway-cost": [
+      {
+        "hash": "a7f9e6713",
+        "subject": "fix(rvf): suppress stop hook for alternative reviewers",
+        "confidence": "med",
+        "rationale": "给 alternative reviewer 子进程注入 CODEX_RVF_SUPPRESS_STOP_HOOK=1，阻断 reviewer 自身触发 stop hook 再启动新一轮 RVF 的递归扇出。"
+      }
+    ],
+    "non-idempotent-mutations": [
+      {
+        "hash": "871cb2ad0",
+        "subject": "fix: reuse existing Cline Kanban runtime",
+        "confidence": "med",
+        "rationale": "task list 确认期望 workspace 时复用既有 Kanban runtime，并在端口已被 listener 占用时 fail-close 而非启动第二个 server，避免重复副作用与静默冲突。"
+      },
+      {
+        "hash": "3f62fc19b",
+        "subject": "feat(rvf): land global reviewed-diff tracker phase 1",
+        "confidence": "high",
+        "rationale": "新增 repo 级共享 reviewed-diff tracker（hunk 级显式状态目录 + 跨 session 冲突 section + register_claims 注册），并收紧异常写诊断事件，让跨 session 已审 diff 成为唯一可查询事实源、避免重复审同一改动。"
+      },
+      {
+        "hash": "ba4cb5d39",
+        "subject": "feat(rvf): land Slice 2-A SQLite + JSONL diff tracker backend",
+        "confidence": "high",
+        "rationale": "把 diff tracker 后端换成 SQLite+JSONL 并用 canonical_patch_hash 做 unit 身份、幂等迁移、WAL first-writer race 重试与连接清理修复，强化跨进程显式状态的并发安全与幂等。"
+      },
+      {
+        "hash": "07a20dc93",
+        "subject": "feat(rvf): 在 run 终态捕获 trajectory 与 workspace diff",
+        "confidence": "high",
+        "rationale": "RVF 终态一次性写出 pre/post trajectory.jsonl、reviewer 子轨迹与 workspace-diff（含 cancel 路径），并以 .finalize.lock + since_timestamp 保证幂等且不把上次 marker 误当本 run cut，补齐可回放 trace。"
+      },
+      {
+        "hash": "cc13a1e32",
+        "subject": "fix(rvf): avoid duplicate handoff opens",
+        "confidence": "high",
+        "rationale": "用 handoff-opened marker 去重，避免同一 handoff 的「打开/advise」副作用被重复触发，并以显式 marker 记录已打开状态。"
+      },
+      {
+        "hash": "78b6d615d",
+        "subject": "feat(rvf): attach dispatch prep metadata to fork flows",
+        "confidence": "low",
+        "rationale": "把 prep token/metadata 接入 fork flows，add_dispatch_prep_to_prompt 在 prompt 已含 token 时跳过，属对注入的轻度幂等保护；主体仍是功能 wiring。"
+      },
+      {
+        "hash": "6c6ff47b6",
+        "subject": "fix(rvf): Claude UPS shim 加 Codex-aware no-op 守卫",
+        "confidence": "med",
+        "rationale": "根因是同一 Codex prompt 被 plugin-bundled 与 install_to_codex 两条 UPS entry 平等执行致「双 UPS 注册…产出双 prep」，守卫令 shim no-op 以杜绝同一逻辑意图的重复副作用。"
+      },
+      {
+        "hash": "7236a740e",
+        "subject": "fix(rvf): Claude Stop shim 加 Codex-aware no-op 守卫",
+        "confidence": "med",
+        "rationale": "根因为同一 Codex Stop 事件经双装平行执行致「触发两次 RVF…产出两个 Cline Kanban task」，守卫 no-op 消除重复的 task create 副作用。"
+      },
+      {
+        "hash": "5de0c59b0",
+        "subject": "fix(rvf): block overlapping kanban followups",
+        "confidence": "med",
+        "rationale": "用 task/session 维度的持久 in-progress marker（O_EXCL + TTL + stale takeover）阻止上一轮 handoff 完成前再创建新 RVF follow-up，既防重复 dispatch 副作用，又把「是否已在进行」落为可查询的显式状态而非靠推断。"
+      },
+      {
+        "hash": "d0d6bda08",
+        "subject": "feat(rvf): 自动 analyze 改为 detached tmux 后台线程",
+        "confidence": "med",
+        "rationale": "改派后台线程并加 CODEX_RVF_ANALYZE_THREAD 早退守卫「避免后台 analyze 递归触发」（防自递归循环），以 O_EXCL 锁 + tmux duplicate 幂等防重复拉起同一 analyze。"
+      },
+      {
+        "hash": "72edad1c2",
+        "subject": "Initial review-validate-fix skill package",
+        "confidence": "high",
+        "rationale": "首版即以确定性 workflow 包裹 LLM review：check_review_output.py 强制 NO_ISSUES/issue 输出契约做独立验证层、双独立 reviewer + review-prompt 要求「不要恭维」「你依然要独立 verify」（反谄媚）、run_alternative_reviewer 的 idle activity timeout+kill+退出码124 给 review 设终止条件、command_lock.py 为会改共享状态的命令加并发去重护栏。"
+      },
+      {
+        "hash": "00e73fcd6",
+        "subject": "fix(rvf): complete kanban follow-up tracker scopes",
+        "confidence": "med",
+        "rationale": "补全 reviewed-diff tracker 的 scope 收尾：complete_review_scope 保证「完成的 RVF scope 必须留下持久 reviewed unit 状态，即便长 run reviewer 让 lease 过期且 stale-sweep 已清掉 lease_units」，并新增 kanban-followup lease TTL=3600 防止长 RVF run 在 finalize 前被 stale sweep 释放——以全局 tracker 作为跨 session 事实来源、幂等地标记已审 diff（避免重复审查同段 diff）、并校准 lease 过期/stale 终止。"
+      }
+    ],
+    "mega-prompt": [
+      {
+        "hash": "88e32c73c",
+        "subject": "refactor(rvf): split $rvf-analyze into sister skill",
+        "confidence": "low",
+        "rationale": "把事后复盘 mode 从主 SKILL.md 抽成独立 sister skill 并留分离声明，避免单体 SKILL 把 $rvf-analyze 误当窄模式处理，属对单体巨型 prompt/职责混淆的轻度分解，但主要是结构重构。"
+      },
+      {
+        "hash": "b6eb3ebe8",
+        "subject": "docs(rvf): slim skill instructions and split internals",
+        "confidence": "med",
+        "rationale": "把臃肿的 SKILL.md 指令瘦身并拆分到 internals/prompts/protocols 等专责文件，将单体巨型指令拆成职责单一可组合的片段。"
+      }
+    ],
+    "evaluation-neglect": [
+      {
+        "hash": "5561b3f9c",
+        "subject": "fix(tests): rename tmp fixture refs to tmp_path so suite collects",
+        "confidence": "high",
+        "rationale": "152+ 测试因 fixture 'tmp' not found 在 setup 阶段全 error、过去几个 commit 事实上从未真正执行（假绿），修复后 306 passed 才让验证层真正生效。"
+      }
+    ],
+    "over-agentification": [
+      {
+        "hash": "29adc6c8f",
+        "subject": "feat: route plan docs outside full RVF",
+        "confidence": "low",
+        "rationale": "把计划/纯文档变更路由到轻量 Plan/Doc scaffold 而非完整 RVF，避免对确定性文档变更套用重量级 agentic review；并在 finalize 确定性写出 usage summary，二者分别弱化过度智能体化与可观测性缺位。"
+      }
+    ],
+    "spec-role-disobedience": [
+      {
+        "hash": "fe4378056",
+        "subject": "fix(rvf): harden cline kanban dispatch followups",
+        "confidence": "low",
+        "rationale": "按 inplace/branch worktree_mode 分别给 task agent 明确『在哪个 worktree 跑 review/不要回父 worktree』的指令并校验 mode 取值，降低越界在错误工作区执行的概率；改动主要是 prompt 指令而非交付对账，映射较弱。"
+      }
+    ],
+    "framework-lock-in": [
+      {
+        "hash": "33efc317a",
+        "subject": "Fix RVF post-analyze quiet loop",
+        "confidence": "med",
+        "rationale": "新增 Claude Code hooks/stop.py wrapper（fail-open 委派到核心脚本）并完善 post_analyze_quiet marker 消费，延续断开 analyze↔review 自激回路的终止条件；wrapper 让 hook 控制流自有可改而非依赖框架黑箱。"
+      }
+    ],
+    "context-rot": [
+      {
+        "hash": "2c027cfdc",
+        "subject": "feat(rvf): dispatch 期向 cline-kanban child 注入父会话对话 context",
+        "confidence": "low",
+        "rationale": "新功能为主，但对注入的父会话 context 设字节预算（默认 64KB）+ 压 tool 输出 + 超限按剩余预算 _truncate_bytes 守住「字节<=上限」不变量，是对注入上下文体量的主动裁剪护栏。"
+      }
+    ],
+    "governance-theater": [
+      {
+        "hash": "556d02b54",
+        "subject": "feat(rvf): no_issues review result 强制必填 audit_summary (Option A)",
+        "confidence": "high",
+        "rationale": "明言关闭「clean 结论无推理留痕、事后无法区分真实审查与橡皮图章」的可观测性缺口，强制 reviewer 留下审查依据以防名义监督/表层验证。"
+      }
+    ]
+  },
+  "verdicts": {
+    "over-agentification": {
+      "id": "over-agentification",
+      "verdict": "designed-out",
+      "evidence": [
+        "docs/workflow-plugin-design-system.md:7 — 自我定位为 \"workflow plugin\"：agent workflow becomes mostly script-owned, artifact-driven, observable and self-verifying",
+        "docs/workflow-plugin-design-system.md:22 — 状态迁移由脚本和 append-only ledger 表达，agent prose 只负责解释和决策（确定性控制流在代码、LLM 只在决策点）",
+        "29adc6c8f docs/plan-doc-review-routing-scaffold.md — Stop hook 在 dirty gate 后做确定性保守分类，命中 plan_document_only 即跳过完整 RVF，把确定性 doc 工作路由出 agentic loop（教科书式 over-agentification 缓解）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py:1-60 — 631 行确定性 Python router 承载通道选择/会话 key/分类，而非交给 LLM 循环",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_run_finalize.py:1-12 — finalize 为幂等确定性入口（.finalize.lock 保护），轨迹/快照/summary 全由脚本写出",
+        "9a64316 + 47c8cae — /rvf-analyze deterministic backend 与 finalize 确定性 scaffold，持续把可固化步骤下沉到代码",
+        "脚本/prompt 比例：plugins 下 51 个 .py 脚本 vs 仅 7 个 SKILL.md（control flow 在代码，prompt 只承载开放式决策）"
+      ],
+      "rationale": "该反模式对 RVF 完全适用（它正是一套 hook + 子 agent 编排系统），但从架构起点就被规避：项目自我定位为 \"workflow plugin\"，确定性控制流（Stop hook 触发判定、通道路由、plan-doc 分类、幂等 finalize、append-only ledger 状态）全部落在 ~51 个 stdlib-Python 脚本里，LLM 仅在 review/validate/fix 这类真正开放式决策点被调用。样例 commit 29adc6c 正是把确定性 plan-doc 工作路由出完整 agentic loop 的典型缓解，9a64316/47c8cae 等继续把可固化步骤下沉到代码——「1 条主动治理」略低估了持续加固，但本质是一开始就 designed-out，无需修复型 commit。"
+    },
+    "god-agent": {
+      "id": "god-agent",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:37-44 「Agent 边界」显式拆职：主会话=orchestrator，reviewer 子代理用 self-contained reviewer.md（不读 SKILL.md、不继承父线程历史、不读另一路输出），validate/fix 子代理用 validate-fix.md 且只处理分配给自己的 issue 包",
+        "子代理 prompt 都很短且职责单一：reviewer.md=76 行、validate-fix.md=73 行；skill prompt 均 48-111 行；而非上千行巨型 prompt",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:33-44 reviewer 被限定为 review_only、不准调 patch/edit/write/stage/commit 类工具，唯一允许写入是 review-result artifact——工具集极窄而非庞杂加载",
+        "plugins/review-validate-fix/skills/review-validate-fix/agents/openai.yaml 仅 7 行（policy.allow_implicit_invocation:false），不存在挂载几十个工具的单一巨型 agent 配置",
+        "SKILL.md:42 与 core/README.md:1-9 把确定性步骤下沉到脚本/core（write_review_result.py、check_review_result.py、prepare_review_run.py、host-agnostic core/adapters）——即 god-agent mitigation 中「确定性步骤下沉到 workflow 层」",
+        "git log 显示 S0/S1/S2 刷 deliberate 拆分：e2f0e9a host-dispatch headless subagent invoke、b083f65 host-agnostic subagent capture、0b3b2af NormalizedTranscript + transcript adapter split、1736114 scaffold core/adapters"
+      ],
+      "rationale": "god-agent 对 RVF 这种 agent 编排系统是适用的（本可以把 review+validate+fix+handoff+dispatch 全塞进一个上千行巨型 prompt），但架构从一开始就按职责拆开：SKILL.md 明写「Agent 边界」——主会话做 router/orchestrator，reviewer 与 validate/fix 各用短且 self-contained 的 clean-context 子代理 prompt，确定性逻辑下沉到 scripts/core/adapters。这正是 god-agent 的教科书 mitigation，所以根本不存在需要「修复型」commit 的巨型 agent，0 治理计数是设计规避的结果而非盲区。"
+    },
+    "unnecessary-multi-agent": {
+      "id": "unnecessary-multi-agent",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:37-43 «Agent 边界»：主会话 supervisor + reviewer 子代理 + validate/fix 子代理 的职责清晰拆分，并非把单 agent 失败用『多加 agent』掩盖",
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:40 reviewer『不继承父线程历史，不读取另一路 reviewer 输出』——独立/隔离是 review 的刻意特性而非缺陷",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md «Merge Rules»/«Contract Gate»：对并行双 review 的口径冲突有显式、确定性的合并表+规则+contract gate，正是把反模式症状『需额外一轮合并调和冲突』工程化收口",
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:41,57-58 validate/fix 子代理只处理分配给自己的 canonical issue 包（按根因/文件区域分组）——写操作被切成互斥单包、单线程，对齐反模式 mitigation『让写操作保持单线程』",
+        "core/subagents/models.py:73-79 docstring 明确『reviewer/validate-fix/analyze 三者均不走统一 in-process runner』，且 grep 全 core 无 ThreadPool/asyncio/threading/multiprocessing——无失控并行 fan-out",
+        "core/subagents/models.py SpawnRecord 把 Codex spawn_agent 与 Claude Task 归一为可定位独立 transcript 的结构 + run ledger（README.md:221），共享完整轨迹/单一真相源，对齐反模式 mitigation『保证共享完整上下文与轨迹』"
+      ],
+      "rationale": "该反模式对 RVF 适用（它本就是 supervisor+双 reviewer+N 个 validate/fix 子代理的多 agent 系统），但 RVF 的多 agent 不是为掩盖单 agent 失败而堆砌：独立 review 天然需要互不污染的发散视角，这是刻意特性而非反模式所指的『无谓拆分』。更关键的是反模式点名的失败模式——并行口径冲突需额外合并、子代理各凭隐含假设、写操作互相冲突——已被 review-merge-policy 的确定性合并/contract gate、按 canonical 包切分的单线程写、以及共享 scope.contract/run ledger 从设计上逐条规避。因此 0 条『修复型』commit 是预期且正确的，没有需要事后治理的盲区。"
+    },
+    "framework-lock-in": {
+      "id": "framework-lock-in",
+      "verdict": "designed-out",
+      "evidence": [
+        "docs/agentic-anti-patterns/antipatterns-data.json:147-157 (definition/symptoms: 核心逻辑紧耦合到 agent 框架、prompt 由框架内部拼装看不见、loop/停止条件被黑箱吞掉、换模型/框架成本高)",
+        "依赖扫描: grep 全仓 *.py 对 langchain/langgraph/llama_index/crewai/autogen/openai/anthropic 等 agent 框架 import = 0 命中; 全部 top-level import 仅 stdlib + 本地模块 + pytest(仅测试)",
+        "core/README.md:7-9 显式设计约束: core 不得 import host SDK、不得 import subprocess、仅消费抽象类型(NormalizedTranscript/SubagentResult)，不识别具体 host",
+        "docs/multi-harness-plugin-guideline/05-adapter-contract.md:9 设计目标原文: 「把 adapter 整个删了之后，core 在新 host 上重写 adapter 应能立刻接通；core 不需要任何修改」",
+        "prompts 为可逐字编辑的纯 Markdown 而非框架内部拼装: plugins/.../skills/review-validate-fix/prompts/reviewer.md(76行)、prompts/validate-fix.md(73行)、references/review-prompt.md",
+        "控制流自有且确定性: rvf_dispatch_flow.py:12-83 纯函数 backend_from_values/should_attempt_legacy_gui_fallback 基于配置分支，停止条件由自写 hooks/stop.py + codex_stop_hook_router.py 掌控，非框架黑箱 loop",
+        "adapters/ 目录把 claude_code 与 codex 双 host 抽成可替换薄实现(adapters/README.md:3 6维契约)，git log 1736114/ef002d8/0b3b2af/e2f0e9a 的 S0–S4 cross-harness 重构主线即为 host/model 可移植性",
+        "git log: 历史中无 framework/langchain/lock-in/remove-abstraction 类「拆框架」修复 commit，因为从未引入重型框架，故无需反复治理(计数低不代表盲区)"
+      ],
+      "rationale": "该反模式对任何 agent 系统都原则上适用，但 RVF 从架构起点就把它规避掉了：全仓零 agent 框架依赖（仅 stdlib + 测试用 pytest），prompt 是可逐字编辑的纯 Markdown，控制流与停止条件是自写的确定性 Python（rvf_dispatch_flow + stop/router hooks），并通过强制的 core/adapter 边界(core 禁 import host SDK、adapter 可整删重写)实现双 host 可换。正因为「框架地基」根本不存在，无需「修复型」commit，约 1 条治理计数反映的是不可发生而非被忽视。"
+    },
+    "agent-as-business-process": {
+      "id": "agent-as-business-process",
+      "verdict": "designed-out",
+      "evidence": [
+        "docs/workflow-plugin-design-system.md:73 「成熟 workflow plugin 的状态迁移由脚本和 append-only ledger 表达，agent prose 只负责解释和决策」——逐字对应该反模式的 mitigation（显式状态机/ledger 承载流程，agent 只作图内一步）",
+        "docs/workflow-plugin-design-system.md Principle 3「Workflow State Is Not Prompt State」(标题处约第111行)：状态源必须是脚本/artifact/ledger/tracker/hook payload，不是 prompt",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:140-165 用代码层 REQUEST_TYPES/STANDARD_DOMAINS/SUBTASK_TYPES enum + scope-contract excluded_path_prefixes 强校验 reviewer 输出，非法即 reject（流程约束硬编码而非靠 prompt 自觉）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/command_lock.py:61-216 文件锁 acquire/release，确定性写出 lock_request/lock_acquired/lock_released 事件——并发与状态迁移在锁源头落 ledger",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_validate_fix_gate.sh:1-21 dirty gate 用 git status 退出码做确定性分支（CLEAN/NO_GIT/NOT_FOUND），不交给模型判断是否该跑",
+        "README.md:221 统一 run ledger：state/latest.json -> state/runs/<run_id>/summary.json + events.jsonl 作为审计追踪源，大文本落 artifacts/——确定的、可复盘的执行轨迹",
+        "commit 63f3a41 feat(rvf): add deterministic handoff intake / 9a64316 /rvf-analyze deterministic backend / 5178057 tracker scope contract guidance（review/fix 范围从 prompt 推断收敛到 scope.contract.json）——架构方向就是把流程从概率 agent 收敛到确定脚本",
+        "docs/workflow-plugin-design-system.md Principle 4「Commit Does Not Mean Cleared」给出显式 lifecycle 状态序列 observed->diagnosed->fix-proposed->fixed->validated->deployed->...->retired，即把 RVF 业务流程建模为显式状态机"
+      ],
+      "rationale": "该反模式对 RVF 这种多步 review→validate→fix 受控流程本质适用，但它从架构起点就被规避：review/validate/fix 的状态迁移、scope 边界、并发锁、审计追踪全部由确定性脚本（gate.sh、command_lock.py、check_review_result.py 的 enum/contract 校验）和 append-only run ledger（events.jsonl/summary.json）承载，scope.contract.json 而非 prompt 才是范围的唯一真相源，agent 只在受约束的图内做开放式推理。workflow-plugin-design-system.md 更把这套契约（Principle 3「Workflow State Is Not Prompt State」、Principle 4 显式 lifecycle 状态序列）逐字写成设计准则，正是该反模式 mitigation 的体现，因此 0 条「修复型」治理 commit 是因为它一开始就不存在需要修复的概率化业务流程，而非盲区。"
+    },
+    "mega-prompt": {
+      "id": "mega-prompt",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:74-82 — 显式『文档分层』把 prompts/protocols/references/internals/debug/setup 拆成按需读取的目录，并标注『正常 agent 不读』，即 just-in-time 注入而非一次性全量堆叠",
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:40-42 — reviewer/validate-fix 子代理用各自 self-contained prompt，明确『不读取本 SKILL.md，不继承父线程历史，不读取另一路 reviewer 输出』，把巨型 prompt 拆成职责单一的子 agent",
+        "plugins/review-validate-fix/skills/review-validate-fix/SKILL.md:42 — 『Review result protocol 的事实源是 scripts/write_review_result.py 和 check_review_result.py；自然语言 final prose 只作日志』——确定性控制流交给代码/schema 而非自然语言，正是 mitigation 所述",
+        "commit b6eb3eb 'docs(rvf): slim skill instructions and split internals' 把 SKILL.md 从 159 行砍到 68 行(git show b6eb3eb^ vs b6eb3eb)，并新增 internals/ protocols/ debug/ 分层目录",
+        "commit 88e32c7 'refactor(rvf): split $rvf-analyze into sister skill' 把事后复盘 mode 从主 SKILL.md 抽出为独立 sister skill，避免单 prompt 承载多模式",
+        "ls plugins/review-validate-fix/skills/review-validate-fix/ — prompts/reviewer.md(76行)、validate-fix.md(73行)、references/review-standards/ 6 个 subset 文件均为小颗粒、可组合 prompt，无任何数百行 monolith"
+      ],
+      "rationale": "该反模式对 RVF 高度适用——它本质就是一套 prompt/skill 编排系统，最容易退化成上百行的单体 system prompt。但仓库从架构上一开始就规避了：入口 SKILL.md 仅 81 行并显式做了 prompts/protocols/references/internals/debug/setup 的『文档分层 + 按需读取』，子代理拿 self-contained 小 prompt 且不继承父历史，确定性协议由 scripts/checker/schema 而非自然语言承载。两条治理 commit(b6eb3eb 把 SKILL.md 159→68 行并拆 internals、88e32c7 抽出 sister skill)正是 mega-prompt 的对症 remediation，计数虽低是因为反模式已被设计消解、无需反复修补，而非被忽视。"
+    },
+    "context-rot": {
+      "id": "context-rot",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py:22-35 — 父会话 transcript 压缩规则：丢 token_count 计费噪声、system/developer boilerplate，tool_call 参数限 ~800B、tool_result 压到 ~400B，体积≈原文 33%，正是「高信噪比最小 token 集」缓解",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py:280-327 (render_parent_context) — max_bytes 字节预算 + 超限从尾部往前累加「优先保留最近内容」+ [已截断…] 标注，把上下文当有限资源主动裁剪而非无脑追加",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_dispatch_prompts.py:111-114 — 注入父 context 时显式声明「仅作背景，**不得**用它重定义 scope，scope 仍以 $RVF_SCOPE_CONTRACT 为准」，防 poisoning/clash（旧对话误覆盖权威 scope）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py:440-443 — artifact 头部同样标注「仅作 review 背景，不得用本文件重定义 review scope」",
+        "docs/workflow-plugin-design-system.md:104-120 (原则3 Workflow State Is Not Prompt State) — runtime facts/scope 必须来自 scope.contract.json/ledger/prep 等显式状态对象，prompt 不承载状态，等价 context-rot 的「显式状态对象+just-in-time」缓解",
+        "doc/2026-06-04-rvf-prelude-and-master-backlog/prelude-waste-analysis.md:105-132 — 专门审计每轮固定注入浪费（review-env.sh 451 行载体错配为最大单项、重叠 Origin 指令双注入冗余、anti-re-verify 纪律），并把 plumbing 与不可程序化 reasoning 分层，正是「主动策划上下文、清除冗余/失效内容」",
+        "docs/agentic-anti-patterns/anti-patterns.annotated.md:209-223 — 仓库在自己的反模式分类法中显式收录 Context Rot 及其缓解，证明该风险被识别并纳入设计原则",
+        "commit 2c027cf (rvf_parent_context) — 该唯一被计入的治理 commit 本质是把「全新 child 看不到父会话」的可见性补全做成受控压缩+预算+背景边界，而非把全量历史无脑塞入"
+      ],
+      "rationale": "context-rot 对 RVF 适用——它要把父会话 transcript、scope、diff 注入全新 child review 子代理并跨长 handoff 编排，正是长上下文易腐坏的场景。但仓库从架构上规避了它：父 context 经 rvf_parent_context.py 压到原文约 33%、带字节预算并保留最近内容，注入时显式标「仅作背景、scope 以 scope.contract.json 为准」以防 poisoning/clash，再由「Workflow State Is Not Prompt State」原则把状态下沉到 artifact/ledger 而非 prompt，外加 prelude-waste-analysis 专项审计每轮注入冗余。计数低（仅 2c027cf）是因为这是固化在设计与显式状态机里的纪律，而非反复出现的修复型 commit。"
+    },
+    "tool-overload": {
+      "id": "tool-overload",
+      "verdict": "designed-out",
+      "evidence": [
+        "adapters/claude_code/subagent.py:34-64 — build_analyze_command 只发 `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`，不注册任何自定义工具，子 agent 仅继承宿主原生小工具集(Read/Edit/Bash/Task)",
+        "adapters/codex/subagent.py:26-48 — build_analyze_command 只发 `codex --ask-for-approval never --sandbox workspace-write exec -`，同样不挂载自定义工具清单",
+        "grep mcpServers|registerTool|@tool|FastMCP over core/adapters/plugins(*.py,*.json) 返回空 — RVF 不发布任何 MCP server 或工具注册表，不存在「几十/上百个重叠工具」的来源",
+        "grep allowed-tools/allowed_tools over plugins/.../skills(*.md, 排除 state/) 返回空 — 发布的 skill 是纯 prompt Markdown，未声明大批含糊重叠的工具",
+        "git log -i --grep='tool.?overload|tool.?soup|too many tool|工具过载|tool RAG|工具集' 返回空 — 历史无相关治理 commit，因为架构层面无此问题需治理",
+        "SKILL.md(review-validate-fix) 把确定性逻辑放到 scripts/*.py（如 prepare_review_run.py、review_validate_fix_gate.sh）由 agent 经 Bash 调用，而非作为 LLM 工具暴露 — own-your-control-flow，工具面天然极小"
+      ],
+      "rationale": "tool-overload 对「agent 编排」这类系统本身适用，但 RVF 从架构上规避了它：它不发布任何 MCP server 或自定义工具注册表，spawn 的 review/analyze 子 agent 只通过宿主 CLI 继承 Claude/Codex 原生的少量正交工具(Read/Edit/Bash/Task)，所有确定性逻辑下沉到 stdlib-Python 脚本经 Bash 调用而非注册成 LLM 工具。因此工具清单天然小而正交，从不存在「几十上百个重叠/僵尸工具挤占上下文」的触发条件，0 条治理 commit 是「无需修复」而非盲区。"
+    },
+    "poor-tool-design": {
+      "id": "poor-tool-design",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/write_review_result.py:256-266 — issue 子命令对 --kind/--severity 用 choices=sorted(ISSUE_KINDS)/required=True，且 help 直接内嵌「何时用」语义：'Issue kind: REAL (true bug/regression), NIT (cosmetic), ELEVATE (needs human design call)'，是面向 agent 而非人类的契约",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:108-153 — 返回机器+人类双可读、可据以纠正的校验错误（如 'issues[{index}].path is excluded by scope contract'、'must be one of: ...'），正是该反模式 mitigation 要求的 readable error feedback",
+        "plugins/review-validate-fix/skills/rvf-analyze/SKILL.md:frontmatter — 'Use when ... Read-only complement; never starts a new review, edits source, or generates handoff.md'，以及全部 skill 统一 rvf- 命名空间 + 'Use only when 显式调用 $...'，消除相近工具间歧义与跨边界误用",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:13-21 — sub-agent tool 调用契约用窄枚举 --status fixed|false_positive|elevated|failed，elevated 必须配 --result-file，并逐条说明每个枚举何时用",
+        "commit 28c3dd8 'enforce kind/severity on reviewer issue artifact schema' — 显式关闭「prompt 让 agent 分桶 REAL/NIT/ELEVATE 但 artifact 契约未强制，导致 agent 要从 message text 反推」的契约缺口，提升为 required+choices 双端校验，即该反模式的标准 mitigation",
+        "commit 556d02b / fc411b0 — no_issues 强制必填 audit_summary、对齐 validate-fix result 契约；属于 mitigation 中『按失败轨迹反复迭代 schema』的协作环",
+        "scripts/check_skill_contracts.sh:528-714 — require_literal 把这些 agent-facing 契约（枚举名、必填字段、命名空间 token）固化为确定性回归门，防止契约漂移"
+      ],
+      "rationale": "该反模式适用：RVF 的 reviewer/validate-fix 子代理通过 CLI 脚本作为「工具契约」与确定性系统交互，主 agent 又靠 skill description 在多 skill 间选择，正是 agent↔系统契约面。但它从设计上就被规避——脚本用 argparse choices/required/type 加内嵌「何时用」语义的 help，子命令与 rvf- 命名空间清晰，错误信息机器+人类双可读可纠正，全部由 check_skill_contracts.sh 固化为回归门。0 计数是因为这些工作被归为「schema/契约强制」（如 28c3dd8、556d02b）而非贴上 poor-tool-design 标签，本质是默认就把良构契约作为架构基线。"
+    },
+    "hallucinated-tool-use": {
+      "id": "hallucinated-tool-use",
+      "verdict": "designed-out",
+      "evidence": [
+        "docs/agentic-anti-patterns/antipatterns-data.json:401-415 — 该反模式定义（工具/参数幻觉：调用不存在的工具、编造参数、捏造 ID/引用/返回值；mitigation = 不确定时暂缓/改选 + 执行层强校验 schema、拒绝非法调用 + 工具失败如实回传）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:50-58,107-122,204-247 — 确定性执行层校验器：枚举白名单 (kind/type/domain/subtask_type/need/issue kind/severity)、拒绝绝对路径与 '..' 逃逸、拒绝混合状态、schema_version 校验，对应 mitigation「执行层强校验工具名与参数 schema、拒绝非法调用」",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:41-42,49 — reviewer 不确定/缺锁/缺上下文时必须停审写 request artifact 而非编造结论，等同 Relign 的 indecisive-action 扩展动作空间",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:23,75 — 机器可读状态只能来自 artifact（非 LLM 自然语言）；每条 issue 必须能追溯到真实 diff/未跟踪文件，直接封堵「捏造 ID/引用」",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/analysis_artifacts.py:851-903,936-938 — candidate_patch_call_ids 不信任 LLM 填写，而由捕获的子代理 trajectory 真实 write-op call_id 确定性反填，封堵「捏造 call_id/return value」",
+        "556d02b feat(rvf): no_issues review result 强制必填 audit_summary — clean 结论必须附实质审查依据，关闭橡皮图章式捏造「无问题」结果",
+        "28c3dd8 feat(rvf): enforce kind/severity on reviewer issue artifact schema; beb363d feat: 添加结构化 reviewer result artifact — 结构化产出+schema 强制的设计血统",
+        "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md:68 — 显式『不要凭空编造 run id』指令；107e383 kanban-followup terminal fallback 诚实上报 — 工具失败如实回传而非吞掉",
+        "RVF 无 MCP server、无自有 LLM 工具注册表（grep mcp/tool-registry 在 *.json/*.py 零命中）；tool-calling loop 由 host(Claude Code/Codex) 拥有，RVF 主体为确定性 stdlib-Python hooks+脚本"
+      ],
+      "rationale": "该反模式对 RVF 适用面很窄但真实：RVF 自身不向 LLM 暴露工具注册表（tool-loop 归 host 所有），但它消费 LLM 产出的结构化产物（reviewer result、causality 映射）并编排会幻觉的 host 子代理，捏造 ID/结果/非法字段的入口确实存在。而 RVF 从架构上就把它规避掉了：执行层有确定性 schema/枚举/路径校验器拒绝非法产出、reviewer 不确定时用 request artifact 暂缓而非编造、call_id 等引用由真实 trajectory 反填而非信任 LLM、issue 须可追溯真实 diff、clean 须附 audit_summary、工具失败诚实上报。这些是设计属性而非「修复型」commit，正好解释了约 0 条主动治理计数。"
+    },
+    "retry-storms": {
+      "id": "retry-storms",
+      "verdict": "not-applicable",
+      "evidence": [
+        "docs/agentic-anti-patterns/_cards/retry-storms.json:6 — 该模式定义要求「调用链上多个层次（HTTP客户端/网关/SDK/agent loop）各自独立配置激进或近乎无限的重试，相互嵌套放大 K^N」，并以拖垮共享下游服务、形成 thundering-herd 正反馈为本质危害。",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/run_alternative_reviewer.py:955 — reviewer 每次 dispatch 仅一次 subprocess.Popen 启动，由 idle/wall-clock timeout 看护（run_alternative_reviewer.py:981 while True 是 communicate 轮询而非失败重发），没有失败即重 spawn 的重试层。",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py:4948 — open_fork_in_codex_with_retries 单层有界：DEFAULT_OPEN_GUI_FORK_ATTEMPTS=3（line 123）+ 固定 5s 延迟（line 124），不嵌套。",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py:5423 — bridge app-server fork 失败后只 restart-then-retry 恰好一次（5427-5451），非循环、非多层叠乘。",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/cline_kanban_client.py:690 — kanban 的 while True 是带 deadline+0.25s sleep 的 workspace-path 轮询（等异步结果出现），并非对失败请求的重发；codex_stop_hook_dispatcher.py:188 的 for _ in range(20) 只是读 JSONL 前 20 行。",
+        "git log 201 条：仅 1 条提及 retry/backoff（ba4cb5d SQLite/JSONL busy 退避，diff_tracker.py:1075 单进程内 0.01→0.2s 退避锁），与跨层网络重试放大无关，无任何 retry-budget/jitter/circuit-breaker 治理 commit。"
+      ],
+      "rationale": "retry-storms 的成立前提是「多层独立重试嵌套放大 + 共享可被打挂的下游服务」，而 RVF 的下游全是本机单用户的 subprocess（codex/claude/kanban CLI）与本地 app-server unix socket，reviewer 每次 dispatch 只起一次进程、靠 timeout 看护、失败不重发；少数重试点（fork-open 3 次定时、bridge restart 一次）都是单层有界、无嵌套，K^N 放大机制根本无法形成。因此这是对该系统本质不适用，而非「被设计规避」或「真盲区」——0 条治理 commit 是符合预期的，不构成风险。"
+    },
+    "runaway-cost": {
+      "id": "runaway-cost",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/command_lock.py:65 — flock(LOCK_EX|LOCK_NB) repo-scoped single-flight，并发 RVF dispatch 直接 BlockingIOError 退出，杜绝同一 repo 上 review 叠跑的乘积式扇出",
+        "commit a7f9e6713 + run_alternative_reviewer.py 的 SUPPRESS_STOP_HOOK_ENV=\"CODEX_RVF_SUPPRESS_STOP_HOOK\"（main() 中 env[SUPPRESS_STOP_HOOK_ENV]=\"1\"）— 外部 reviewer 子进程的 Stop 不再回灌 hook，断开 reviewer→新一轮 review 递归",
+        "commit 455aac4 / 33efc31 + post_analyze_quiet.py:1-32 一次性 quiet marker —显式断开 $review-validate-fix ↔ $rvf-analyze 经 kanban 注入的自激回路（self-injection loop），codex_stop_review_validate_fix.py:7207-7256 在 Stop hook 消费 marker 后 skip 下一次自动 dispatch",
+        "codex_stop_review_validate_fix.py:169-172 CODEX_RVF_ANALYZE_THREAD 早退守卫，显式注释 “短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF”",
+        "rvf_parent_context.py:68-69 DEFAULT_MAX_BYTES=64*1024 + 302-338 超预算从尾部裁剪父对话 context —直接 bound “上下文无界累积”这一放大链；注入体积按字节预算硬截断而非随步数膨胀"
+      ],
+      "rationale": "该反模式适用：RVF 是 Stop-hook 驱动的自动 dispatcher，其本质风险正是「review 完成→Stop→再触发 review」的递归自激回路与父 context 无界累积——即定义里的「循环 + 上下文无界累积」放大链。但仓库在这条对它唯一可控的维度上做了密集的架构级规避：repo 级 single-flight flock 防并发扇出、reviewer 子进程 suppress-stop-hook 防 reviewer 自递归、一次性 post-analyze quiet marker 与 ANALYZE_THREAD 早退守卫断开 self-injection loop、父 context 64KB 字节预算硬截断。至于「per-trace token/美元预算 + BudgetExceeded 熔断」这一字面缓解项 RVF 并未实现，但 token 计费与限额属于宿主（Claude/Codex）控制面而非 RVF stdlib 插件的职责边界，故无需「修复型」commit——loop 这一真正归 RVF 管的爆炸向量已被设计性规避。"
+    },
+    "governance-theater": {
+      "id": "governance-theater",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/references/handoff-template.md:103-160 — 最终 handoff 强制逐条暴露问题/修复/驳回理由、来源归属、scope-expansion 披露、可在主会话重跑的 validation commands，以及带 A/B/C 权衡的『需要开发者决策的升级事项』——直击 governance-theater 的『审批 UI 只给 diff 摘要、信息不对称』症状",
+        "556d02b — feat(rvf): no_issues review result 强制必填 audit_summary (Option A)；commit message 明写『关闭 clean 结论无推理留痕、事后无法区分真实审查与橡皮图章』",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:234-236 — no_issues 缺失/空白 audit_summary 判为契约违规（强制 reviewer 留审查依据，反橡皮图章）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_bootstrap_confirm.py:259-293 — 确认门默认拒绝：必须严格回 `yes`，其余一律取消；marker 带 TTL(300s) 不会超时自动通过；format_system_message 把实际 paths/bytes/reason 暴露给人——直击『默认同意/超时自动通过』症状",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:16,51 — 两路 reviewer clean-context 独立并行审查，且明确 session context『不是免死金牌』必须独立 verify，对抗自动化偏见/谄媚式附和",
+        "d8705a6 — feat(rvf): full-dirty bootstrap + threshold confirmation gate（人确认门的引入 commit）"
+      ],
+      "rationale": "该反模式适用于 RVF——它本质是一套有人监督的审查系统，存在两处把关面（开发者对 handoff 的最终采纳、bootstrap 确认门）。但架构从一开始就系统性规避了治理表演的每个症状：handoff 强制暴露逐条推理/证据/可重跑校验命令/带权衡的升级项（非裸 diff 摘要），no_issues 必填 audit_summary 杜绝橡皮图章式 clean 结论，确认门默认拒绝+TTL+暴露实际范围杜绝『默认同意/超时通过』，双路 clean-context 独立 reviewer 且『session context 不是免死金牌』对抗自动化偏见。因此 201 条历史里仅约 1 条主动治理（556d02b）不是欠治理，而是该风险被设计性消解，那条只是边际加固。"
+    },
+    "sycophancy": {
+      "id": "sycophancy",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:63 — reviewer prompt 显式写「不要概括代码做了什么。不要复述 diff。不要恭维。」直接对抗谄媚倾向",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:50 — 「scope-of-work...不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug」要求 reviewer 独立 verify 而非附和主会话立场",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:5-13 — 强制两个独立 reviewer 用 clean context 并行、互不读对方输出（防 agent-to-agent 信心模仿/过早收敛）",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:69-78 / prompts/validate-fix.md:45 — Validation Prompt Boundary：发给 validate/fix 子代理的 issue 必须 source-agnostic，「不受来源模型声望、重复发现或分歧影响」",
+        "prompts/reviewer.md:70-71 + scripts/check_review_result.py:25 — canonical 结论只取 $RVF_REVIEW_RESULT artifact，reviewer final prose 仅作日志，使「流畅自信的附和措辞」无法成为完成信号",
+        "commit 556d02b — feat(rvf): no_issues review result 强制必填 audit_summary（漏计的第二条治理 commit），check_review_result.py:234-236 把空 audit_summary 判为契约违规，直接堵「宣称已通过/clean 却无可核验依据」橡皮图章症状",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/write_review_result.py:246 — audit-summary 提示「不要写『跑了测试通过』这类绿测试确认」，要求实质审查依据",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:14 + scripts/rvf_fix_attempt.py:654 — validate/fix 子代理拥有 false_positive 否决权，可驳回 reviewer finding 而非一律附和"
+      ],
+      "rationale": "谄媚循环对 RVF 这种双 host 多 agent review→validate→fix 链路本质高度适用（正是其复合放大的温床），但仓库从协议层就把分类法列出的几乎全部 mitigation 设计进了不可变契约：强制双独立 reviewer clean-context 并行且互不读输出、source-agnostic 派发以剥离声望偏置、canonical 结论只认机器可读 artifact 而非附和性 prose、reviewer prompt 明令「不要恭维」且声明主会话说明非免死金牌、validate/fix 持 false_positive 否决权。因此无需事后「修复型」治理。上一步计数还漏掉了 556d02b（强制必填 audit_summary 以堵橡皮图章），它是对同一 design-out 的加固而非补救。"
+    },
+    "evaluation-neglect": {
+      "id": "evaluation-neglect",
+      "verdict": "blind-spot",
+      "evidence": [
+        "docs/agentic-anti-patterns/antipatterns-data.json:788-802 (definition: 无 eval suite/真值标注就上线, 仅凭 vibes/一次性手动试玩; symptom: 无 eval/benchmark 目录, 改 prompt/换模型无前后对比数字, 无 regression gate)",
+        "5561b3f 唯一被计为治理的 commit 实为 plumbing 修复 (test_review_support/test_codex_stop 用 tmp 而非 tmp_path fixture 致 152 测试 setup 即 fail/假绿), 属确定性测试收集修复, 与 LLM 质量 eval 无关",
+        "tests/ 27 个文件全为 stdlib 确定性 plumbing 测试 (transcript 解析/dispatch/install/contract schema); git grep eval|benchmark|golden|regression 在 *.md/*.py 仅命中 test_normalized_transcript.py 的子串, 无任何 eval 套件/真值语料",
+        "556d02b feat(rvf): no_issues 强制 audit_summary —— 验证仅为 check_review_result 契约测试(断言字段必填非空, tests/test_review_support_scripts.py:2297 test_no_issues_requires_audit_summary)+提交体记录的『另以真实 reviewer 端到端确认』(一次性手动 run)+未沉淀的 exp1/exp2 实验, 正是 vibes/one-off 症状",
+        "其它 LLM 行为质量改动 (eb3e7bd review standards pack / 28c3dd8 enforce kind/severity / 823f767 remove reviewer system prompt) 同样无 review 准确率/漏报率指标或前后对比, 无 CI 质量门槛",
+        "plugins/review-validate-fix/skills/rvf-analyze/SKILL.md:1-20 rvf-analyze 仅对单次已 finalize run 做事后复盘(summary+causality scaffold), 显式『不启动新 review/不改源码』, 是 per-run post-mortem 而非跨 run regression eval, 且不 gate 任何发布"
+      ],
+      "rationale": "该反模式对 RVF 适用且相关：RVF 的核心价值是非确定性的 LLM review/validate/fix 判断质量(reviewer.md prompt、severity/audit_summary 契约会反复改动)，正是 eval 套件要保护的对象，却几乎未被治理。仓库只有覆盖确定性 plumbing 的 27 个单测与契约脚本，没有任何评测语料、真值标注、review 准确率指标或 regression gate；prompt/模型类改动(如 556d02b)的质量验证靠一次性『真实 reviewer 端到端确认』与未沉淀的 exp1/exp2，唯一被计入的 5561b3f 实为修测试假绿的 plumbing fix。因此换模型或调 reviewer prompt 引入的审查质量退步只会以主观感觉暴露，是真实盲区。"
+    },
+    "reward-hacking": {
+      "id": "reward-hacking",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:23 与 :70 —『你的最终自然语言 message 只是日志；机器可读状态必须来自 $RVF_REVIEW_RESULT artifact』『主会话只把 $RVF_REVIEW_RESULT 作为 canonical review result；reviewer final prose 只作为日志』：奖励信号与 agent 自述解耦",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:8 与 :27 —fixer 完成态必须来自 rvf_fix_attempt.py stop 写入的 attempt result，不能用 prose 宣告成功",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:229-236 —no_issues 结论强制要求非空 audit_summary，否则判契约违规（schema 层堵 rubber-stamp）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/write_review_result.py:244-247 与 reviewer.md:55 —audit_summary required，且明令『不要写“跑了测试通过”这类绿测试确认』",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-standards/validate-fix.md:16-17 —simplification『不得为了更简洁修改测试期望』、security『不得通过关闭安全控制解决问题』：直接禁止 specification-gaming 招式",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:50 —apply 阶段禁止手工搬运 patch 后『伪装为已归因 patch』；提供 false_positive/elevated/failed 等诚实非成功态",
+        "commit 556d02b —feat(rvf): no_issues 强制必填 audit_summary（Option A），commit 正文记录 exp1/exp2 实验后刻意否决 test-inhibition 规则（因测试是抓 bug 关键）",
+        "commit 107e383 —fix(rvf): kanban-followup terminal fallback 诚实上报，阻止把乐观假回执当成『已注入』成功"
+      ],
+      "rationale": "该模式对 RVF 高度适用——RVF 本身就是用 review/validate 信号驱动 fix 的自动化，agent 完全可能改测试、橡皮图章 clean、用 prose 假宣告成功来刷过验证门。但架构从一开始就把奖励信号与 agent 自述解耦（canonical 结果只认机器 artifact）、用 schema 强制 clean 结论附 audit_summary 并明禁『绿测试确认』话术、在 standards 里点名禁止改测试期望/关安全控制、并提供 false_positive/elevated 等诚实非成功态，属典型 designed-out；556d02b、107e383 还是被低估计数漏掉的两条主动治理 commit。"
+    },
+    "judge-bias": {
+      "id": "judge-bias",
+      "verdict": "designed-out",
+      "evidence": [
+        "docs/agentic-anti-patterns/antipatterns-data.json id=judge-bias: definition/why_harmful 指 LLM 当评委打分选优时受 position/verbosity/self-preference/不一致偏差污染选择循环",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:69-78 Validation Prompt Boundary：发给 validate/fix 的 issue 必须 source-agnostic，不写来自哪个 reviewer、不写「两个模型都认为」「只有某模型发现」、不传来源编号——明文目的是「不受来源模型声望、重复发现或分歧影响」（反 self-preference/声望偏差）",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:5-13 每轮两个独立 reviewer 并行、clean context、互不读对方输出；prompt 已含对方 finding 时写 context_request(need-clean-review-context) 重跑",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:11-14 validate 阶段第 1 步先独立读代码核实问题是否真实存在，可判 false_positive 不改文件——LLM 评委结论不闭环自证，由独立 validate + 可执行测试兜底",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:23,55,70-76 canonical 结论来自机器可读 $RVF_REVIEW_RESULT artifact，自然语言 prose 只当日志；no-issues 必填 audit_summary，禁报风格/冗长偏好——压制 verbosity 与不可追溯打分",
+        "git show 72edad1:.../review-merge-policy.md —— two-independent-reviewer + clean context + source-agnostic 边界在 Initial review-validate-fix skill package 首个 commit 即存在，非后期补救",
+        "git log -i --grep=randomiz/position bias/verbosit/best-of/score/rank 返回 0：RVF 不做候选答案打分/择优/best-of-N 选择，不存在受 position/verbosity 偏差污染的评分选择循环"
+      ],
+      "rationale": "judge-bias 对 RVF 适用（review 阶段本质是 LLM-as-judge 在判 bug 真伪），但 RVF 从首个 commit 起就用架构把它规避了：双独立 reviewer + clean context + 互不读对方输出抑制相互影响，source-agnostic 的 validate 边界明文剥离来源声望/重复/分歧（直击 self-preference 与冗长/位置偏差），且 review 不做候选打分择优、结论以机器可读 artifact 为准并由独立 validate 与可执行测试兜底而非评委闭环自证。因此 0 条治理 commit 是「设计上无需修复」，而非盲区。"
+    },
+    "inter-agent-misalignment": {
+      "id": "inter-agent-misalignment",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:69-78 — 'Validation Prompt Boundary' 强制发给 validate/fix 子代理的 issue context 必须 source-agnostic（不写来源 reviewer、不写'两个模型都认为'、不写编号），'这样 validate/fix 子代理只验证问题本身，不受来源模型声望、重复发现或分歧影响' = 针对 FM-2.5 忽视/被他者输入偏置",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:11,13 — 两个 reviewer 并行但 clean context，'不要互相读取对方输出'、'合并前 reviewer A 的 output 不得进入 reviewer B 的 prompt 或上下文'，prompt 若已混入对方 finding 则写 context_request(need-clean-review-context) 重试 = 防 FM-2.1 上下文污染/并行分歧",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:23,61,70 与 prompts/validate-fix.md:8,27 — '你的最终自然语言 message 只是日志；机器可读状态必须来自 $RVF_REVIEW_RESULT artifact' / canonical result 来自 rvf_fix_attempt.py stop 的 result.json+ledger 而非 prose = 直接针对 FM-2.6 推理-行动不一致（占比最高），把 canonical 状态从对话文本解耦到结构化 artifact",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:41-42,59 与 prompts/validate-fix.md:25 — 缺命令锁/标准/测量/上下文时必须写 RVF_*_REQUEST artifact 并停止，request 是非完成态、主会话满足后重试，不得自行编造假设继续 = 针对 FM-2.2 未澄清即行动",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:13-15 + review-merge-policy.md:33-46 — 每条 reviewer issue 进合并表得 processed_id 并逐条以 fixed/false_positive/elevated/failed 显式裁决（rvf_fix_attempt.py stop），无 issue 可被静默丢弃 = 针对 FM-2.5 忽视他者输入",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_output.py:15-186 — REQUEST_SPECS/FORBIDDEN_RE/classify() 把 reviewer→主会话 的消息约束成强 schema（必填字段、枚举、禁止混写 handoff/validate-fix marker），是 agent 间消息契约的可执行校验器",
+        "commit 72edad1 (Initial review-validate-fix skill package) 经 git log -S 'source-agnostic' 确认 source-agnostic 边界自首个 commit 即存在；18c000e 引入 clean context；beb363d (#3) 新增 write_review_result.py(284行)+check_review_result.py(268行) 把 canonical 状态结构化 = 反 misalignment 是地基设计而非事后补丁",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/handoff-template.md:50-161 + runtime-contracts.md:11 (rvf_logging run ledger) — handoff.md/scope.contract.json/run ledger 作为持久化共享状态，把决策/裁决/范围写成稳定字段在 agent/会话间传递，防 FM-2.1 重置丢共识与 FM-2.4 信息隐瞒"
+      ],
+      "rationale": "该反模式对 RVF 完全适用——它本质就是多 agent 系统（主会话→两路并行 reviewer→合并→validate/fix 子代理→handoff），FM-2.1~2.6 全部有触发面。但 RVF 从首个 commit 起就用「结构化机器可读消息契约 + 强校验 + 持久化共享状态」从架构上系统性规避了它：reviewer/validate-fix 之间不靠自然语言闲聊传递，canonical 状态一律走 artifact/ledger（解耦 prose 防 FM-2.6），跨 reviewer 强制 clean context 与 source-agnostic 边界（防 FM-2.1/2.5），缺信息必须写 RVF_*_REQUEST 而非编造假设（防 FM-2.2）。因此「仅约 1 条主动治理」不是盲区，而是缓解已固化进 prompt/parser/契约，无需反复打补丁式 commit。"
+    },
+    "spec-role-disobedience": {
+      "id": "spec-role-disobedience",
+      "verdict": "designed-out",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/check_review_result.py:54-58 + :108-110 + :229-246 — reviewer 角色契约在代码层校验：绝对路径/`..`逃逸/excluded path/clean·issue·request 混合态/缺 audit_summary 全部判 CONTRACT_VIOLATION（FM-1.1 disobey-task-spec 被运行时拦截而非静默放过）",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_fix_attempt.py:399-400 + :416-433 — _validate_scope_expansion 阻止 fixed attempt 携带未声明的 allowlist 外改动，并拒绝扩展进 protected_files/background_files/excluded_path_prefixes（FM-1.2 越权/越出角色职责在 gate 层硬约束）",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md:33-49 — review_only / no-direct-write 角色 spec：reviewer 只读、唯一允许写入是 protocol artifact，禁止 patch/edit/stage/commit/进入 validate-fix/生成 handoff",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/validate-fix.md:17-21 — fix 子代理 spec：只处理主会话分配的 issue、限定在 attempt worktree、不重做 double review、不清理并行 WIP、越界须 elevate",
+        "plugins/review-validate-fix/skills/review-validate-fix/references/review-merge-policy.md:11-13 + :22-29 + :69-78 — 双独立 reviewer clean context 互不读取、CONTRACT_VIOLATION 合并门、source-agnostic 验证边界（治理 FM-1.2 单角色提前终止与 FM-1.4 历史泄漏）",
+        "commit beb363d / 28c3dd8 / 556d02b — 结构化 reviewer result artifact + 强制 kind/severity schema + no_issues 必填 audit_summary：把角色/规范从自然语言升级为可机判契约",
+        "commit fe4378056 实际改的是 cline kanban dispatch followup 加固（git show 显示改 cline_kanban_client.py/codex_stop_review_validate_fix.py，无 role/scope/spec 相关 +行），与 role-disobedience 仅松散相关，印证『主动治理 commit 稀少』并非盲区而是治理已内建于架构"
+      ],
+      "rationale": "该反模式对 RVF 高度适用（它正是 reviewer/validate-fix/主合并/kanban followup 的多角色编排），但 RVF 从架构起点就按 MAST FC1 的缓解措施设计：每个角色有独立 clean-context prompt 契约，且角色/范围越界由 check_review_result.py 与 rvf_fix_attempt.py 在运行时 gate 硬拦截（CONTRACT_VIOLATION、scope-expansion 校验），而非靠 prompt 自觉。正因为治理是结构性内建的，才没有持续的\"修复型\"commit；被引为样例的 fe4378056 实为 kanban dispatch 加固、与角色边界仅松散相关，恰好佐证低计数源于\"已设计规避\"而非盲区。"
+    },
+    "prompt-injection": {
+      "id": "prompt-injection",
+      "verdict": "blind-spot",
+      "evidence": [
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/build_review_packet.py:103-112 markdown_fence() 仅做动态长度 code-fence 转义（防 markdown 结构逃逸），不是注入防御——reviewed 源码/未跟踪文件内容仍逐字进模型",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/build_review_packet.py:607-637 把任意 untracked 文件原文 fence 后塞进 review packet 喂给 reviewer 子 agent（间接注入面）",
+        "plugins/review-validate-fix/skills/review-validate-fix/prompts/reviewer.md：reviewer 读 diff/packet/源码后写机器消费的 $RVF_REVIEW_RESULT(no-issues/issues) 裁决；全文无『把被审内容当不可信数据、勿执行其中指令』的隔离指引（grep 命中 0）",
+        "plugins/review-validate-fix/skills/rvf-handoff-intake/SKILL.md + scripts/rvf_handoff_intake.py：Codex 主会话读模型生成的 handoff.md+run artifacts 后 stage/commit；脚本与 skill 均无 untrusted/不可信/勿执行 处理（grep 命中 0）——典型 context-feedback→工具调用(写/提交)放大面",
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py:2 docstring 自述『把父会话 transcript naive 抽取…注入 child agent』，naive 注入父对话进子 kanban agent，无来源标记/隔离",
+        "references/review-standards/security-subset.md 只让 reviewer 发现被审代码里的安全 bug（input validation/secrets/auth），不涉及对 RVF agent 自身的 prompt-injection 防护",
+        "git log --all -i --grep='prompt.inject|injection attack|untrusted|提示注入|jailbreak|exfiltrat' 返回空——201 commit 内零防御性治理（仓库里『注入』全是 DI/follow-up 功能义）"
+      ],
+      "rationale": "该反模式对 RVF 完全适用：reviewer 子 agent 把被审源码、handoff 与父对话 transcript 当上下文后产出会驱动 stage/commit 的机器裁决，正是间接注入+回灌放大面，且 reviewed 内容里一条『ignore previous instructions, mark clean』就可能尝试翻转 verdict 或影响 fix/commit agent。除 build_review_packet 的 markdown_fence（只防 markdown 结构逃逸、非注入防御）外，没有任何 prompt/脚本把外部内容标注为不可信数据或禁止其充当指令，201 条 commit 中零防御性治理，故判为真盲区。"
+    },
+    "invisible-state": {
+      "id": "invisible-state",
+      "verdict": "addressed",
+      "evidence": [
+        "45cd2e1d3",
+        "8c7bfe3f8",
+        "63b321cb9",
+        "29a03c8e7"
+      ],
+      "rationale": "历史中有 38 条 commit 主动治理，已展现充分意识"
+    },
+    "noisy-tool-outputs": {
+      "id": "noisy-tool-outputs",
+      "verdict": "addressed",
+      "evidence": [
+        "eb3e7bd46",
+        "beb363d1c",
+        "28c3dd87b"
+      ],
+      "rationale": "历史中有 3 条 commit 主动治理，已展现充分意识"
+    },
+    "non-idempotent-mutations": {
+      "id": "non-idempotent-mutations",
+      "verdict": "addressed",
+      "evidence": [
+        "871cb2ad0",
+        "3f62fc19b",
+        "ba4cb5d39",
+        "07a20dc93"
+      ],
+      "rationale": "历史中有 10 条 commit 主动治理，已展现充分意识"
+    },
+    "missing-termination": {
+      "id": "missing-termination",
+      "verdict": "addressed",
+      "evidence": [
+        "0fd6e6bc6",
+        "63b321cb9",
+        "2e51b2b7e",
+        "18c000e7a"
+      ],
+      "rationale": "历史中有 13 条 commit 主动治理，已展现充分意识"
+    },
+    "cascading-failures": {
+      "id": "cascading-failures",
+      "verdict": "addressed",
+      "evidence": [
+        "4573e4ef6",
+        "a30a76946",
+        "afc2db74b"
+      ],
+      "rationale": "历史中有 3 条 commit 主动治理，已展现充分意识"
+    },
+    "silent-failures": {
+      "id": "silent-failures",
+      "verdict": "addressed",
+      "evidence": [
+        "8c7bfe3f8",
+        "e62f2beb3",
+        "2e51b2b7e",
+        "29a03c8e7"
+      ],
+      "rationale": "历史中有 41 条 commit 主动治理，已展现充分意识"
+    },
+    "missing-observability": {
+      "id": "missing-observability",
+      "verdict": "addressed",
+      "evidence": [
+        "45cd2e1d3",
+        "0fd6e6bc6",
+        "bfba92208",
+        "1c217b782"
+      ],
+      "rationale": "历史中有 30 条 commit 主动治理，已展现充分意识"
+    },
+    "unbounded-autonomy": {
+      "id": "unbounded-autonomy",
+      "verdict": "addressed",
+      "evidence": [
+        "8c7bfe3f8",
+        "ba84b71ac",
+        "b04ca15c6",
+        "d8705a6d3"
+      ],
+      "rationale": "历史中有 4 条 commit 主动治理，已展现充分意识"
+    },
+    "goal-drift": {
+      "id": "goal-drift",
+      "verdict": "addressed",
+      "evidence": [
+        "18c000e7a",
+        "8ea9a35ea",
+        "a86dad75a"
+      ],
+      "rationale": "历史中有 3 条 commit 主动治理，已展现充分意识"
+    },
+    "incomplete-verification": {
+      "id": "incomplete-verification",
+      "verdict": "addressed",
+      "evidence": [
+        "eb3e7bd46",
+        "05eaf6454",
+        "beb363d1c",
+        "d6ae21127"
+      ],
+      "rationale": "历史中有 12 条 commit 主动治理，已展现充分意识"
+    }
+  }
+}

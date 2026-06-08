@@ -1,0 +1,33 @@
+{
+  "id": "missing-observability",
+  "name_cn": "可观测性缺失",
+  "name_en": "Missing Observability / Trace Blackouts",
+  "group_id": "g4",
+  "order": 19,
+  "definition": "缺乏结构化、可检索的端到端 trace 与指标，看不到逐步执行、工具调用、检索结果、延迟、token/成本与推理质量；故障无法复现，根因分析只能靠猜或在非结构化日志里大海捞针。",
+  "why_harmful": "没有 step-by-step 的执行可见性，就无法判断 agent 是真在按预期工作还是只是「进程没挂」；agent 本质非确定（同样输入可能走出不同的工具序列与输出），线上故障一旦缺失当时的 trace 就难以在本地复现，调试与回归极其低效，前述各类失控/静默/循环问题也因此被长期掩盖。",
+  "symptoms": [
+    "无法回放某次 run 的完整步骤序列——调用了哪些工具、检索到什么、推理在哪一步偏离都查不到",
+    "监控只有「进程存活」之类系统级信号，缺工具调用失败率、按工具的调用次数等 agent 级指标",
+    "线上报告的 bug 无法在本地/测试环境复现，因为没有捕获当时的输入、上下文与中间状态",
+    "缺少 per-step 的延迟与 token/成本归因，无法定位是哪一步在烧时间或烧钱",
+    "没有质量/eval 维度的度量（输出正确性、是否偏离意图），只能靠人工事后抽查",
+    "即便有日志也多为非结构化文本，无法按 user/session/错误类型/质量分检索，排障靠 grep 一堆日志"
+  ],
+  "mitigation": "为每个 agent run 接入结构化、可检索的端到端 tracing（按 trace/span 记录步骤、工具调用、检索结果、输入/输出、延迟与 token），辅以工具失败率等 agent 级指标和自动（LLM-as-judge）+人工结合的质量 eval，并支持按 user/session/错误类型/质量分过滤，使任意故障都能被检索、回放与复现。",
+  "sources": [
+    {
+      "label": "LangChain — AI Agent Observability: Tracing, Testing, and Improving Agents",
+      "url": "https://www.langchain.com/articles/agent-observability"
+    },
+    {
+      "label": "Langfuse — AI Agent Observability, Tracing & Evaluation",
+      "url": "https://langfuse.com/blog/2024-07-ai-agent-observability-with-langfuse"
+    },
+    {
+      "label": "Datadog — LLM / Agent Observability Documentation",
+      "url": "https://docs.datadoghq.com/llm_observability/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

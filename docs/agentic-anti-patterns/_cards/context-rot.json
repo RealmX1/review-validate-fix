@@ -1,0 +1,33 @@
+{
+  "id": "context-rot",
+  "name_cn": "上下文腐坏",
+  "name_en": "Context Rot",
+  "group_id": "g2",
+  "order": 7,
+  "definition": "模型输出质量随上下文变长而下降（且常是非均匀、非线性的）的现象；远在触及上下文窗口上限之前就会发生。常见表现包括 poisoning（早期幻觉被反复引用并污染后续推理）、distraction（过长历史压过模型训练所得的能力）、confusion（无关信息被误用于作答）、clash（上下文内自相矛盾的信息扰乱推理）与 lost-in-the-middle（位于长上下文中段的信息更易被忽视）。",
+  "why_harmful": "更大的上下文窗口并不等于更高的准确率：Chroma 对 18 个前沿模型的实测显示，即便是简单检索/复述任务，正确率也会随输入变长而下降。累积的错误会被一再引用、无关内容会稀释关键信号、矛盾信息会扰乱推理，导致 agent 在长会话或长文档任务中悄然失准且难以归因。",
+  "symptoms": [
+    "随对话/任务轮次增加，同一类问题的正确率明显下滑，而把无关历史裁掉后正确率回升",
+    "一次早期的幻觉（如错误的文件路径、虚构 API）在后续多轮里被反复当作既成事实引用",
+    "塞入大量工具定义或检索片段后，模型频繁选错工具或引用与任务无关的内容",
+    "关键约束放在长上下文中段时被忽略，放在开头或结尾则被遵守（lost-in-the-middle）",
+    "上下文内同时存在新旧两份相互矛盾的信息（如改过的需求与旧需求并存），模型在二者间摇摆",
+    "上下文远未触及窗口上限（如 200K 窗口仅用到几十 K）时质量就已下降，说明问题不是溢出而是腐坏"
+  ],
+  "mitigation": "把上下文当作有限资源主动策划：只注入当下任务所需的最小相关信息（追求高信噪比的最小 token 集），定期压缩/重写历史而非无脑追加，用显式状态对象与外部笔记保存进度、用按需检索（just-in-time retrieval）动态提供事实，并主动清除已失效或被否证的内容以防被反复引用。",
+  "sources": [
+    {
+      "label": "Drew Breunig — How Long Contexts Fail",
+      "url": "https://www.dbreunig.com/2025/06/22/how-contexts-fail-and-how-to-fix-them.html"
+    },
+    {
+      "label": "Chroma — Context Rot: How Increasing Input Tokens Impacts LLM Performance",
+      "url": "https://www.trychroma.com/research/context-rot"
+    },
+    {
+      "label": "Anthropic — Effective context engineering for AI agents",
+      "url": "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

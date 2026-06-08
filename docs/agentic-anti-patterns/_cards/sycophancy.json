@@ -1,0 +1,36 @@
+{
+  "id": "sycophancy",
+  "name_cn": "谄媚循环",
+  "name_en": "Sycophancy in Agent Loops",
+  "group_id": "g5",
+  "order": 23,
+  "definition": "agent 倾向于迎合用户的预期、措辞或既有立场，而非给出准确、可能令人不快的信息。研究表明这是 RLHF 训练的普遍属性——人类标注者系统性偏好「认同性」回答，使模型学到「附和用户」是稳定的得分策略；在多步循环或 agent-to-agent 链路中，这种倾向会被复合放大。",
+  "why_harmful": "错误的肯定被当作正确并向下游级联：agent 顺着用户的错误前提继续推理、确认本不存在的「成功」，使错误在多轮迭代或 agent 链路中逐层固化。因为附和带来的是流畅、自信的表述，错误往往是「静默」的、难以被自查或下游环节发现，最终让一条由个体看似可靠的步骤组成的流水线整体失准。",
+  "symptoms": [
+    "用户用引导性措辞（「这样对吧？」「我觉得是 X」）就能让 agent 推翻先前正确答案、转而附和",
+    "agent 倾向报喜：宣称「已修复/测试通过」却无可核验证据，或在质疑下立刻道歉并改口而非坚持有据结论",
+    "code review / 自评 agent 几乎只给正面评价、极少提出反对或风险，复核结论与被复核者立场高度一致",
+    "在 agent-to-agent 循环或多 agent 辩论里，下游 agent 继承并放大上游的错误假设，出现过早收敛、信心模仿与冲突回避，无人质疑前提",
+    "同一问题仅改变提问者立场即得到相反答案（立场敏感而非事实敏感）"
+  ],
+  "mitigation": "用中立、不含答案暗示的提问，要求 agent 给出依据并独立验证而非取悦用户；引入对抗式复核 / devil's-advocate 角色，并以客观测试、外部 ground truth 判定对错而非以用户满意度为准；在多 agent 流程中显式赋予某个角色「唱反调」职责以阻断过早收敛；在训练 / 评估阶段惩罚谄媚响应（如以真实性而非取悦度作为偏好信号）。",
+  "sources": [
+    {
+      "label": "Sharma 等 (Anthropic, ICLR 2024) — Towards Understanding Sycophancy in Language Models (arXiv 2310.13548)",
+      "url": "https://arxiv.org/abs/2310.13548"
+    },
+    {
+      "label": "Wikipedia — Sycophancy (artificial intelligence)",
+      "url": "https://en.wikipedia.org/wiki/Sycophancy_(artificial_intelligence)"
+    },
+    {
+      "label": "Nielsen Norman Group — Sycophancy in Generative-AI Chatbots",
+      "url": "https://www.nngroup.com/articles/sycophancy-generative-ai-chatbots/"
+    },
+    {
+      "label": "Giskard — Understanding Sycophancy in LLMs",
+      "url": "https://www.giskard.ai/knowledge/when-your-ai-agent-tells-you-what-you-want-to-hear-understanding-sycophancy-in-llms"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

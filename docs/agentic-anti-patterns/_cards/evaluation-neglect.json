@@ -1,0 +1,28 @@
+{
+  "id": "evaluation-neglect",
+  "name_cn": "评估缺位 / 无 evals",
+  "name_en": "Evaluation Neglect",
+  "group_id": "g6",
+  "order": 24,
+  "definition": "在没有系统化评估集（eval suite）、基准或真值标注的情况下就把 agent 上线，仅凭主观「感觉」（vibes）或一次性手动试玩来判断质量，而不是用可重复、可量化的指标。",
+  "why_harmful": "缺少可量化的质量信号会让团队陷入只能在生产环境被动救火的「修一个、坏一个」回归循环：无法判断某次改动到底是改进还是退步，无法定位是哪次提交引入了退化，也无法在新模型发布时快速、低风险地决策是否升级。由于 agent 输出具有非确定性，缺了评估集就连「这次是真的变好了还是偶然抽到一次好结果」都说不清。",
+  "symptoms": [
+    "代码库里没有任何 eval/benchmark 目录或评测脚本，质量讨论只出现在 PR 评论的主观措辞里（如「看起来好多了」「感觉更准了」）",
+    "改 prompt / 换模型 / 加减工具后没有任何前后对比数字，回滚或上线决策靠口头记忆和直觉而非指标",
+    "上线后频繁出现「修了 A 又冒出 B」的回归，且无法定位是哪次提交、哪个工具或哪一步推理引入的",
+    "没有从真实失败案例（线上 bug、用户反馈）沉淀出的固定测试任务集合，每次验证都是临时手动重跑几个 demo，且每次跑的还不是同一批",
+    "CI / 发布流程里没有任何会因质量分数下降而拦截合并或阻断发布的自动化门槛（regression gate）"
+  ],
+  "mitigation": "尽早从真实失败案例构建小而真实的 eval 套件（20–50 个任务即可起步，无需等「完美」的大全集），把模糊的「质量」转化为可重复、可量化的信号；遵循「线上发现失败 → 本地复现 → 加入 eval → 修复 → 确认 eval 通过 → 上线」的闭环，并把评估集纳入开发与发布流程，作为防退化的回归门槛（regression eval 目标接近 100% 通过）与模型升级的客观依据。把评估当作持续投入（约占 agent 开发时间的 10–20%），而非一次性搭建。",
+  "sources": [
+    {
+      "label": "Anthropic — Demystifying Evals for AI Agents",
+      "url": "https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents"
+    },
+    {
+      "label": "LangChain — LLM Evals: From Production Monitoring to Regression Tests",
+      "url": "https://www.langchain.com/articles/llm-evals"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

@@ -1,0 +1,32 @@
+{
+  "id": "over-agentification",
+  "name_cn": "过度智能体化",
+  "name_en": "Over-agentification",
+  "group_id": "g1",
+  "order": 1,
+  "definition": "在本可用确定性 workflow（预定义代码路径编排 LLM 与工具）、单次 prompt 或传统流水线解决的问题上，强行引入自主 agent——让 LLM 在循环中动态决定流程走向与工具调用。",
+  "why_harmful": "agent 用延迟、成本与非确定性换取灵活性；当问题路径本身是确定的，这个交换毫无收益，只徒增 token 开销、响应抖动和难以复现的调试噩梦。Anthropic《Building Effective Agents》明确建议「先找最简单可行解，仅在确有必要时才提升复杂度」，并指出对许多应用而言单次 LLM 调用配合检索与示例已经足够。",
+  "symptoms": [
+    "任务路径其实固定（同一输入每次的步骤序列都一样），却跑在一个带 tool-calling 循环的 agent 里",
+    "同一输入多次运行得到不同的执行轨迹或结果，无法稳定复现",
+    "agent 的 system prompt 里堆满「先做 A、再做 B、然后 C」这类本应写成代码的顺序指令",
+    "可观测到大量轮次只是让模型「决定」一个其实唯一确定的下一步，平均完成一次任务的 LLM 调用数远高于实际业务步骤数",
+    "团队为了对付偶发的乱序/跑偏，不断给 prompt 打补丁，而非把流程固化进代码"
+  ],
+  "mitigation": "先找最简单可行解，能不上 agent 就不上；流程确定时改用 workflow（用代码或工作流引擎承载确定性控制流、分支与审计，把 LLM 当其中一步调用），仅当确实需要模型驱动的开放式灵活决策、且复杂度提升能验证带来收益时，才升级为自主 agent。",
+  "sources": [
+    {
+      "label": "Anthropic — Building Effective Agents",
+      "url": "https://www.anthropic.com/research/building-effective-agents"
+    },
+    {
+      "label": "HumanLayer — 12-Factor Agents",
+      "url": "https://www.humanlayer.dev/blog/12-factor-agents"
+    },
+    {
+      "label": "Allen Chan — AI Agent Anti-Patterns (Part 1): Architectural Pitfalls",
+      "url": "https://achan2013.medium.com/ai-agent-anti-patterns-part-1-architectural-pitfalls-that-break-enterprise-agents-before-they-32d211dded43"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

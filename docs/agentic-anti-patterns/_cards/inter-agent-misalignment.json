@@ -1,0 +1,28 @@
+{
+  "id": "inter-agent-misalignment",
+  "name_cn": "智能体间错位",
+  "name_en": "Inter-Agent Misalignment",
+  "group_id": "g7",
+  "order": 28,
+  "definition": "MAST 失败分类的第二大类（FC2，占全部失败约 36.9%）：多个 agent 在运行时交互与协作时，因 agent 间关键信息流与协调断裂而产生的失败。其下含 6 个细分失败模式——对话重置（FM-2.1）、不澄清就按错误假设行动（FM-2.2）、任务偏离（FM-2.3）、信息隐瞒（FM-2.4）、忽视他者输入（FM-2.5），以及推理-行动不一致（FM-2.6）。",
+  "why_harmful": "每个 agent 局部看似合理，但整体协作崩坏：错误假设被无人质疑地推进、关键事实没有传递到需要它的 agent、声明的推理与实际调用的工具/动作对不上，最终交付偏离用户真正目标却无人察觉。该类失败尤其难以根治，因为不同根因（隐瞒、忽视、上下文过长、上下文管理不当）会产生相似的表面症状，仅靠通信协议常不足以解决。MAST 中『推理-行动不一致』(FM-2.6) 单项就占约 13.98%，是全分类中最高频的单一失败模式之一。",
+  "symptoms": [
+    "agent A 的输出/scratchpad 里已经得出某结论或拿到某关键数据，但发给 agent B 的消息中并未包含它，B 因此重复劳动或做出错误决策（信息隐瞒 FM-2.4）",
+    "某 agent 在 thinking/reasoning 段落里说『我应该先调用 X 再验证 Y』，但下一步实际调用的工具或写入的内容与该计划不符（推理-行动不一致 FM-2.6，占比最高）",
+    "上游 agent 明确给出反对意见或修正建议，下游 agent 的后续消息完全没有引用、反驳或采纳，照原计划继续（忽视他者输入 FM-2.5）",
+    "trace 中某处对话被截断/重新开始，system 或角色 prompt 被重复注入，先前协商出的共识在后续轮次消失（对话重置 FM-2.1）",
+    "面对缺失或歧义的输入，agent 不发澄清请求而是自行编造一个假设并据此行动（未澄清即行动 FM-2.2），偏离逐步累积、下游层层放大成与初始目标无关的产出（任务偏离 FM-2.3）"
+  ],
+  "mitigation": "在 agent 间建立显式、结构化的消息契约（强制传递关键事实、决策依据与不确定性），并加入交叉验证/质询环节让接收方必须显式回应而非忽略；对歧义输入设置『先澄清后行动』的硬约束，并通过共享的持久化状态/记忆避免对话重置丢失共识。MAST 作者亦指出此类失败往往需要 agent 具备更深的『社会性推理』能力，单纯优化上下文或通信协议常不足够。",
+  "sources": [
+    {
+      "label": "Cemri et al. (UC Berkeley & Intesa Sanpaolo) — Why Do Multi-Agent LLM Systems Fail? (MAST，FC2 Inter-Agent Misalignment，36.9%；FM-2.1~2.6)",
+      "url": "https://arxiv.org/abs/2503.13657"
+    },
+    {
+      "label": "MAST 官方工件仓库（论文脚注引用）— multi-agent-systems-failure-taxonomy/MAST：taxonomy 定义、标注数据集与 LLM-as-judge 标注流水线",
+      "url": "https://github.com/multi-agent-systems-failure-taxonomy/MAST"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

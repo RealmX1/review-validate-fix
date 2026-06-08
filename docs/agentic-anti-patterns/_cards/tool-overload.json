@@ -1,0 +1,33 @@
+{
+  "id": "tool-overload",
+  "name_cn": "工具过载",
+  "name_en": "Tool Overload / Tool Soup",
+  "group_id": "g3",
+  "order": 9,
+  "definition": "给单个 agent 一次性暴露过多（常见几十个，MCP 多服务器场景常突破上百个）功能重叠、命名含糊的工具，使工具描述本身大量挤占上下文，模型在「选哪个工具」上反复纠结甚至选错。",
+  "why_harmful": "工具集越大、越重叠，正确选工具的准确率越低、token 消耗越高：仅工具定义就可能吃掉数万 token，且模型频繁选错或在功能相近的工具间来回试错，导致任务延迟与成本同步上升、可靠性下降；极端情况下还会臆造不存在的工具或拼错参数。",
+  "symptoms": [
+    "system prompt / tool schema 段落里挂着几十个工具，且存在 search_docs、find_document、lookup_file 这类语义重叠、边界不清的命名",
+    "trace 中同一轮先调 A 工具拿到空/错结果，再改调功能相近的 B 工具重试，呈现明显的工具试错链",
+    "去掉或合并一批冷门/重叠工具后，eval 上的任务成功率不降反升",
+    "工具定义占用的 token 在整个 prompt 中占比过高（例如数万 token 仅用于罗列工具，挤占了对话与任务空间）",
+    "存在长期 0 调用或调用率极低的僵尸工具，却仍常驻在每次请求的工具清单里",
+    "偶尔出现模型调用清单中根本不存在的工具，或把一个工具的参数填进另一个工具的 schema"
+  ],
+  "mitigation": "保持小而正交的工具集（功能尽量不重叠、边界清晰），按意图/阶段动态加载或检索工具（如 tool RAG / 按需取 schema）而非一次性全暴露；为每个工具用「动词+宾语」命名并配一行清晰契约，对相关工具加命名空间前缀，合并或下线重叠与僵尸工具。",
+  "sources": [
+    {
+      "label": "Anthropic — Effective Context Engineering for AI Agents",
+      "url": "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+    },
+    {
+      "label": "Anthropic — Writing Effective Tools for AI Agents",
+      "url": "https://www.anthropic.com/engineering/writing-tools-for-agents"
+    },
+    {
+      "label": "WRITER Engineering — When too many tools become too much context (RAG-MCP)",
+      "url": "https://writer.com/engineering/rag-mcp/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

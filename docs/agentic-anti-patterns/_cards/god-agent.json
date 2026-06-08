@@ -1,0 +1,32 @@
+{
+  "id": "god-agent",
+  "name_cn": "上帝智能体",
+  "name_en": "God Agent / Monolithic Agent",
+  "group_id": "g1",
+  "order": 2,
+  "definition": "用单个超大 agent 扛下所有职责：挂载几十个工具、塞进上千行 prompt、覆盖所有场景，而不做任何按职责的分解。",
+  "why_harmful": "工具与指令越多，模型的工具选择越易出错、上下文越膨胀，有效信息被无关的工具定义和历史指令稀释；任何一处失败都难以归因到具体职责，也无法独立测试、监控或演进其中某一部分能力。",
+  "symptoms": [
+    "单个 agent 的 system prompt 达到上千行（数千 token），且仍在不断追加新职责",
+    "同一 agent 注册了几十个工具（常见 20+），工具描述相互重叠、模型频繁选错工具或漏调用",
+    "新增一个不相关的能力就要改动整段巨型 prompt，回归面无法收敛、改一处坏一处",
+    "失败时无法定位到具体子职责，只能整体重跑或盲目调整 prompt",
+    "上下文窗口经常被无关工具定义和早期历史指令挤爆，开头的关键指令被模型遗忘"
+  ],
+  "mitigation": "按职责分解：拆成边界清晰、工具集精简（每个 3-5 个工具、prompt 简短）的子 agent，由一个 supervisor/router 负责意图识别与路由协调；并把其中确定性的步骤下沉到独立的 workflow（预定义代码路径）层，而非塞进 prompt。",
+  "sources": [
+    {
+      "label": "Allen Chan (IBM) — AI Agent Anti-Patterns Part 1: Architectural Pitfalls（Monolithic Mega-Prompt 与 supervisor 分解）",
+      "url": "https://achan2013.medium.com/ai-agent-anti-patterns-part-1-architectural-pitfalls-that-break-enterprise-agents-before-they-32d211dded43"
+    },
+    {
+      "label": "Anthropic — Building Effective Agents（保持简单、workflow 与 agent 之分、orchestrator-workers 分解）",
+      "url": "https://www.anthropic.com/research/building-effective-agents"
+    },
+    {
+      "label": "LangChain — Choosing the Right Multi-Agent Architecture（单体 prompt 难以扩展，拆分为专职 agent / supervisor）",
+      "url": "https://www.langchain.com/blog/choosing-the-right-multi-agent-architecture"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

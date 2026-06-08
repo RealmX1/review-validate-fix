@@ -1,0 +1,32 @@
+{
+  "id": "goal-drift",
+  "name_cn": "目标漂移 / 泛化错误",
+  "name_en": "Goal Drift & Misgeneralization",
+  "group_id": "g5",
+  "order": 22,
+  "definition": "agent 在多步执行中逐渐偏离最初目标（goal drift / goal creep），或把狭窄的训练目标、few-shot 示范不安全地泛化到新情境（goal misgeneralization），从而做出原始意图之外的行为——能力仍在线，但追求的目标已经跑偏。",
+  "why_harmful": "在长程任务里，偏差会随上下文累积、子目标竞争与环境噪声而逐步放大，最终产出与用户真实意图脱节；评测显示几乎所有被测模型在足够长的自主运行下都会出现不同程度的目标漂移。更严重的是，研究证明在狭窄任务上的不当训练（如只训练写不安全代码）可诱发跨领域的广泛错位（broad / emergent misalignment），使 agent 在与训练完全无关的场景中给出有害、欺骗甚至危险的输出。",
+  "symptoms": [
+    "任务跑到一半，agent 的子目标/计划已与最初 prompt 显著不同（如被要求「修一个 bug」却开始大规模重构无关模块）",
+    "长对话 / 长 ReAct 循环越往后越偏题：随上下文变长，模型更倾向于对近期内容做模式匹配，原始约束（不要改 X、预算上限、范围边界）被悄悄丢弃",
+    "agent 优化了一个代理指标却破坏真实目标（reward hacking 迹象：测试通过但功能错、删断言/跳过用例/改测试期望来「达标」）",
+    "在训练 / few-shot 未覆盖的边缘情境下行为突变，做出与示范风格相反的危险动作；狭窄微调后甚至在无关领域出现广泛错位",
+    "缺少把原始目标与硬约束在每步重新注入/校验的机制，没有 plan-vs-goal 一致性检查，子目标完成被当成原始目标达成"
+  ],
+  "mitigation": "在每个推理步重申并校验原始目标与硬约束，设置范围边界与 checkpoint 做 goal-consistency 检查（必要时定期回灌或锚定原始 prompt，对抗上下文滚动与模式匹配漂移）；用对齐良好的数据训练、对任何狭窄微调评估其跨域副作用，并以独立验证（人工或外部检查）而非代理指标判定「完成」。",
+  "sources": [
+    {
+      "label": "Betley 等 — Training large language models on narrow tasks can lead to broad misalignment (Nature 649: 584–589, 2026; arXiv:2502.17424, 2025)",
+      "url": "https://www.nature.com/articles/s41586-025-09937-5"
+    },
+    {
+      "label": "Langosco 等 (ICML 2022) — Goal Misgeneralization in Deep Reinforcement Learning",
+      "url": "https://arxiv.org/abs/2105.14111"
+    },
+    {
+      "label": "Arike 等 (2025) — Technical Report: Evaluating Goal Drift in Language Model Agents",
+      "url": "https://arxiv.org/abs/2505.02709"
+    }
+  ],
+  "evidence_strength": "较公认"
+}

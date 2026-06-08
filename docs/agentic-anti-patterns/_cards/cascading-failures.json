@@ -1,0 +1,33 @@
+{
+  "id": "cascading-failures",
+  "name_cn": "级联失败 / 复合错误",
+  "name_en": "Cascading Failures",
+  "group_id": "g4",
+  "order": 16,
+  "definition": "单个工具、服务或 agent 的失败触发更大范围的连锁反应；在 agentic 场景里，agent 把上一步的错误输出当作有效输入继续推进，误差在长流程中不断复合、越来越难恢复。其本质特征是「传播与放大」——错误不被隔离在出错点，而是顺着 agent 间调用、共享记忆与反馈回路跨步骤、跨工作流扩散。",
+  "why_harmful": "系统往往不是瞬间崩溃，而是逐步把越来越多依赖拖下水（一个外部工具开始超时→agent 改走重试→重试洪峰拖垮 worker 池→数分钟后连无关工作流也开始降级）；同时由于 agent 间多以自然语言或松类型 JSON 通信，语义错误能通过格式校验被当成「合法数据」静默传播，一旦进入推理链就会被后续步骤当作事实复用，最终结果看似正常完成却已偏离。逐步累积还会放大失败概率：每步 85% 正确率的 10 步流程整链成功率仅约 20%。",
+  "symptoms": [
+    "故障从单点开始呈时间梯度蔓延：先是某工具超时 / 5xx / 限流，几分钟后无关 worker 与工作流也陆续降级",
+    "重试洪峰在过载实例间互相传导，出现「一台挂了→剩余实例负载升高→接连 crash-loop」的雪崩",
+    "上游 agent 把下游的错误响应、空结果或幻觉当成有效输入继续推理，错误在后续步骤被引用、放大",
+    "缺乏隔离边界：没有熔断器、超时、bulkhead 或队列上限，一个慢依赖耗尽共享线程 / 连接池",
+    "单独看每个 agent 都「正常」，问题藏在流经它们的数据里，需逐步回放 trace 才能定位首个出错节点",
+    "最终产物逻辑自洽却建立在早期某步的错误前提之上，看似成功实则结论失真"
+  ],
+  "mitigation": "用熔断、超时、bulkhead 与限流隔离故障边界，把重试集中在单一网关并配抖动退避，避免重试 / 负载跨边界传导耗尽共享资源；为每步、整段时长、工具调用数与花费设执行预算；在每步对下游输出做有效性 / 语义校验（fail fast 而非带着坏输入继续），降级时切「安全模式」并返回降级响应而非整链崩溃。",
+  "sources": [
+    {
+      "label": "Agent Patterns — Cascading Failures: When One Agent Failure Spreads",
+      "url": "https://www.agentpatterns.tech/en/failures/cascading-failures"
+    },
+    {
+      "label": "Google SRE Book — Addressing Cascading Failures (Ch. 22)",
+      "url": "https://sre.google/sre-book/addressing-cascading-failures/"
+    },
+    {
+      "label": "OWASP ASI08 — Cascading Failures in Agentic AI (Adversa security guide)",
+      "url": "https://adversa.ai/blog/cascading-failures-in-agentic-ai-complete-owasp-asi08-security-guide-2026/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

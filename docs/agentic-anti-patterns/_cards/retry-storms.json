@@ -1,0 +1,28 @@
+{
+  "id": "retry-storms",
+  "name_cn": "重试风暴",
+  "name_en": "Retry Storms",
+  "group_id": "g4",
+  "order": 15,
+  "definition": "调用链上的多个层次（HTTP 客户端、网关、SDK、agent loop）各自独立配置重试，且重试激进或近乎无限；由于各层重试相互嵌套，一次下游失败被层层相乘地放大成几十倍调用（深度 N、每层重试 K 次时放大约为 K^N）。",
+  "why_harmful": "当下游服务已经过载、限流或降级时，蜂拥而至的重试会持续占满它的资源、阻止其恢复，把一次瞬时故障演变成持续的不可用；这是一个正反馈回路——延迟升高触发更多重试、更多重试进一步推高延迟与失败率，既浪费资源又加剧问题本身（thundering herd / 级联故障）。",
+  "symptoms": [
+    "对端返回 503/超时/限流（429）后，上游请求量不降反升（QPS 在故障窗口内出现尖峰而非回落）",
+    "同一逻辑请求在 trace 里产生倍增的物理调用，且重试次数 ≈ 各层重试上限的乘积（如客户端×网关×agent 三层叠乘，K^N 放大）",
+    "代码/配置审查发现多层各自启用重试，却没有统一的重试预算（retry budget），也无 jitter 抖动或对 Retry-After 响应头的遵守",
+    "重试间隔固定或无退避，导致重试在时间上同步「成簇」打到同一台已降级实例（lockstep 重试涟漪）",
+    "服务恢复后仍被积压的重试压垮，反复进入「短暂恢复→再次被打挂」的振荡；监控可见对单一依赖/单一客户端 IP 的海量失败连接尖峰"
+  ],
+  "mitigation": "限制重试次数与总时长并采用带抖动的指数退避（full jitter）；遵守服务端 Retry-After 响应头；引入客户端级重试预算（如重试只允许占额外请求量的 10% 上限），在调用栈中只保留单一权威重试层（其余层不重试，对 4xx 等不可重试错误直接放弃）；并在网关用熔断（circuit breaker）、限流（throttling）与 bulkhead 隔离防止故障扩散。",
+  "sources": [
+    {
+      "label": "Microsoft Azure Architecture Center — Retry Storm Antipattern",
+      "url": "https://learn.microsoft.com/en-us/azure/architecture/antipatterns/retry-storm/"
+    },
+    {
+      "label": "Google SRE Book — Addressing Cascading Failures (retry budgets, randomized exponential backoff)",
+      "url": "https://sre.google/sre-book/addressing-cascading-failures/"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}

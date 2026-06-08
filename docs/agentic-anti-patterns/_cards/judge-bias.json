@@ -1,0 +1,32 @@
+{
+  "id": "judge-bias",
+  "name_cn": "LLM-as-Judge 偏差",
+  "name_en": "LLM-as-Judge Bias",
+  "group_id": "g6",
+  "order": 27,
+  "definition": "用 LLM 充当评委来打分 / 选优时，评判受位置偏差、冗长偏差、自我偏好（self-enhancement）、不一致等系统性偏差影响，与人工判断或客观真值未必对齐，且结果常不可复现。",
+  "why_harmful": "把这种未经校准的评判直接自动化进训练或选择循环（如 RLHF、奖励建模、模型 / prompt 选优），会让评委的偏差被优化目标放大并固化进模型行为，使「评估」本身从可信真值退化为带系统性误导的信号，且偏差与真实质量纠缠后极难事后剥离。",
+  "symptoms": [
+    "交换两个候选答案的呈现顺序会改变胜负判定（位置偏差），且评测未做顺序随机化 / 双向对称化打分",
+    "更长、更啰嗦的回答系统性地拿到更高分，而内容并不更正确或更有用（冗长偏差）",
+    "评委倾向给本模型家族 / 自己生成的输出更高分（自我偏好 / self-enhancement 偏差）",
+    "对同一对样本重复打分结果摇摆、温度 / 随机种子未固定、缺少自一致性或与人工标注的一致性（如 Cohen's kappa）指标",
+    "LLM 评委分数与人工标注或客观可验证真值的相关性从未被校准验证，却已直接驱动模型 / prompt / 数据的选择与上线"
+  ],
+  "mitigation": "把 LLM 评委当作需持续校准的测量工具而非真值：对位置偏差做顺序随机化与双向比较并取一致结果、控制 / 惩罚长度以抑制冗长偏差、用独立人工标注定期校准并报告与人审的一致性（kappa / 相关系数），固定温度与种子以保证可复现；对高风险或进入训练循环的决策，保留人审或客观可执行指标（单元测试、规则校验）作兜底，避免让单一 LLM 评委闭环自证。",
+  "sources": [
+    {
+      "label": "Gu et al. — A Survey on LLM-as-a-Judge (arXiv 2411.15594)",
+      "url": "https://arxiv.org/abs/2411.15594"
+    },
+    {
+      "label": "Zheng et al. — Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena (arXiv 2306.05685)",
+      "url": "https://arxiv.org/abs/2306.05685"
+    },
+    {
+      "label": "Li et al. — Justice or Prejudice? Quantifying Biases in LLM-as-a-Judge (arXiv 2410.02736)",
+      "url": "https://arxiv.org/abs/2410.02736"
+    }
+  ],
+  "evidence_strength": "跨多源公认"
+}
