@@ -84,6 +84,14 @@ rg -n "SCHEMA_VERSION|ANALYSIS_SCHEMA_VERSION" \
   /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/analysis_artifacts.py
 ```
 
+## 重启 Kanban listener（如适用）
+
+本 skill 只部署 plugin 文件，不重启任何运行进程。但若某次部署后确实需要重启 RVF 所拥有/复用的 Kanban listener（tmux 会话 `cline-kanban` / `cline-kanban-<port>`），**不要按进程名杀**（`pkill -f kanban` / `killall node` 会误杀同机并存的其它 kanban/mkanban/node listener），**也不要盲目重建 tmux 会话**（会丢失富交互 PATH）。正确做法：按端口反查唯一 PID，用 `kill -9 <pid>` 让 `while true` 监督脚本（`run-cline-kanban-<port>-service.sh`）原地重拉，PATH/cwd 经存活的监督进程继承。
+
+完整步骤、监督脚本退出码契约（130/143 永久停服、其它码 5s 重拉），以及 `kill -9 <pid>` 只命中单个 PID（不杀子进程/不杀进程组；子 agent 经 PTY 挂断二次退出，需 `pgrep -P` 单独核验）的机制说明，见：
+
+`~/.claude/skills/cline-kanban-local-deploy/references/kanban-runtime-upgrades.md` 的 "Preferred restart: supervised kill-by-PID" 一节。
+
 ## Failure Gates
 
 遇到以下情况时停止，不要安装：
