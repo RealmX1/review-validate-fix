@@ -18,6 +18,15 @@ from rvf_logging import log_root, start_run
 from session_label import text_from_message_payload
 
 try:
+    # 纯文本 handoff 识别复用：`RVF_RUN_RE`（run id 谓词）+ `parse_sections`
+    # （markdown 章节切分，无 IO）。仅用这两个无副作用函数判定「粘贴的是 handoff
+    # 正文」，**绝不**调 `build_payload`（它可能跑 git subprocess）。顶层 import
+    # 只引 stdlib，无 IO，可安全用于 UPS 检测热路径。缺省时降级为不做 handoff 识别。
+    import rvf_handoff_intake
+except Exception:  # pragma: no cover - handoff 识别可缺省降级
+    rvf_handoff_intake = None
+
+try:
     # Vendored single-file copy (see its header). Gives a structured "which skill
     # did the user explicitly invoke" read from the Codex rollout — catches forms
     # the anchored regex misses (notably the namespaced `$rvf:review-validate-fix`).
@@ -44,6 +53,28 @@ RVF_MANUAL_TRIGGERS = ("$review-validate-fix", "/review-validate-fix", ":review-
 RVF_MANUAL_TRIGGER_RE = re.compile(
     r"(?:^|\s)[\$/:]review-validate-fix\b",
     re.MULTILINE,
+)
+# 前导姊妹命令抑制（位置锚定 prompt 开头，容忍前导空白）。`rvf-land` /
+# `rvf-handoff-intake` / `rvf-reopen` / `rvf-analyze` 等姊妹 skill 明确「不启动新
+# review」，却常把含 `review-validate-fix` 字面量的 handoff 正文作为参数粘贴进来。
+# 主 skill 名是 `review-validate-fix`（不以 `rvf-` 开头），故本正则永不误吞真触发。
+# 容忍命名空间前缀 `rvf:` / `review-validate-fix:`。
+RVF_SIBLING_TRIGGER_RE = re.compile(
+    r"\s*[\$/:](?:rvf:|review-validate-fix:)?rvf-[a-z0-9][a-z0-9-]*\b",
+)
+# handoff/finalization 正文里高度独有的 markdown 章节标题（归一化为小写后做子串
+# 匹配）。与 RVF run id 共现时判定为「粘贴的 handoff 正文」。这些短语在「普通要求
+# 跑一次 review」的 prompt 里几乎不会作为章节标题出现，叠加 run id 共现可避免误伤
+# 只顺嘴提了个 run id 的合法 review 请求。
+RVF_HANDOFF_SECTION_MARKERS = (
+    "handoff intake hints",
+    "deterministic intake hints",
+    "validate/fix",
+    "处理结果",
+    "repo delta",
+    "继续指引",
+    "升级事项",
+    "本次 review",
 )
 # manual 触发可内联指定 review scope：`/review-validate-fix scope: a.py b.py`。
 # 取首个 `scope:`（行首或空白前缀，避免命中 `telescope:` 之类）之后直到行尾的
@@ -120,23 +151,101 @@ def detect_manual_trigger(text: str) -> bool:
     return bool(RVF_MANUAL_TRIGGER_RE.search(text))
 
 
-def _review_validate_fix_manually_invoked(event: dict[str, Any], prompt: str) -> bool:
-    """是否本轮用户显式触发了 review-validate-fix（manual 路径判定）。
+def _leading_sibling_command(text: str | None) -> bool:
+    """prompt 开头是否为 RVF 姊妹命令（``/rvf-land`` 等，位置锚定、纯文本、harness 无关）。"""
+    if not text:
+        return False
+    return RVF_SIBLING_TRIGGER_RE.match(text) is not None
+
+
+def _looks_like_handoff_body(text: str | None) -> bool:
+    """prompt 是否「看起来是粘贴的 RVF handoff/finalization 正文」（位置无关，纯文本）。
+
+    判据：含 RVF run id（``rvf_handoff_intake.RVF_RUN_RE``）**且** 含至少一个 handoff
+    独有的 markdown 章节标题（经 ``parse_sections`` 切出的 heading 命中
+    :data:`RVF_HANDOFF_SECTION_MARKERS`）。两条件叠加，避免误伤只顺嘴提了个 run id 的
+    合法 review 请求。只用 stdlib-only、无 IO 的两个函数；``rvf_handoff_intake`` 缺省时
+    直接返回 False（降级为不做识别）。
+    """
+    if rvf_handoff_intake is None or not text:
+        return False
+    try:
+        if not rvf_handoff_intake.RVF_RUN_RE.search(text):
+            return False
+        sections = rvf_handoff_intake.parse_sections(text)
+    except Exception:  # pragma: no cover - 识别失败永不阻断，按「非 handoff」处理
+        return False
+    for heading in sections:
+        normalized = heading.strip().lower()
+        if any(marker in normalized for marker in RVF_HANDOFF_SECTION_MARKERS):
+            return True
+    return False
+
+
+def _codex_sibling_skill_invoked(event: dict[str, Any]) -> bool:
+    """Codex 结构化加成：本轮显式调用的是 RVF 姊妹 skill（``rvf-*``）而非主 skill。
+
+    仅 Codex rollout 有 ``text_elements``；Claude / 缺 transcript 时返回 False。
+    best-effort：结构化读取异常绝不阻断。
+    """
+    if codex_invoked_skill is None:
+        return False
+    try:
+        skills = codex_invoked_skill.invoked_skills_from_event(event)
+    except Exception:  # pragma: no cover - 结构化读取永不阻断
+        return False
+    for skill in skills:
+        name = getattr(skill, "name", "") or ""
+        if name.startswith("rvf-"):
+            return True
+    return False
+
+
+def _manual_trigger_suppressed(event: dict[str, Any], prompt: str) -> bool:
+    """触发字面量在场，但应被抑制（识别为 handoff 正文 / 姊妹命令参数）。
+
+    三条抑制信号任一命中即抑制，全部位置无关（不依赖字面量在行首）：
+    1. 前导姊妹命令（``/rvf-land`` 等，纯文本）。
+    2. 粘贴的 handoff 正文（run id + handoff 章节标题，纯文本，捕获无前导命令的形态）。
+    3. Codex 结构化显式调用了姊妹 skill（仅 Codex，加成）。
+    """
+    if _leading_sibling_command(prompt):
+        return True
+    if _looks_like_handoff_body(prompt):
+        return True
+    if _codex_sibling_skill_invoked(event):
+        return True
+    return False
+
+
+def _classify_manual_trigger(event: dict[str, Any], prompt: str) -> str:
+    """判定本轮是否手动触发 review-validate-fix：``"manual"`` / ``"suppressed"`` / ``"none"``。
 
     结构化优先（Codex）：经 vendored ``codex_invoked_skill`` 从 rollout transcript 的
     ``user_message.text_elements`` 读取显式 ``$skill`` 调用——这能命中锚定正则漏掉的
     命名空间形态 ``$rvf:review-validate-fix``（``:review-validate-fix`` 前缀非词边界，
-    旧正则 MISS）。随后回退到 :func:`detect_manual_trigger`（Claude / text_elements 不可用 /
-    ``/prompts:`` 菜单形态 / 当前 turn 尚未落盘）。best-effort：结构化读取异常绝不阻断，
-    直接回退正则。
+    旧正则 MISS）；显式调用主 skill 本身即真 manual，最高优先。否则回退
+    :func:`detect_manual_trigger`（位置无关，保留以应对「输入框残留前缀把合法触发顶离行首」
+    的假阴）：无字面量 → ``"none"``；有字面量但被 :func:`_manual_trigger_suppressed`
+    识别为 handoff 正文 / 姊妹命令参数 → ``"suppressed"``；否则 → ``"manual"``。
+    best-effort：结构化读取异常绝不阻断，直接回退文本判定。
     """
     if codex_invoked_skill is not None:
         try:
             if codex_invoked_skill.was_skill_invoked(event, "review-validate-fix"):
-                return True
+                return "manual"
         except Exception:  # pragma: no cover - 结构化读取永不阻断
             pass
-    return detect_manual_trigger(prompt)
+    if not detect_manual_trigger(prompt):
+        return "none"
+    if _manual_trigger_suppressed(event, prompt):
+        return "suppressed"
+    return "manual"
+
+
+def _review_validate_fix_manually_invoked(event: dict[str, Any], prompt: str) -> bool:
+    """:func:`_classify_manual_trigger` 的 bool 投影（兼容既有调用方 / 测试）。"""
+    return _classify_manual_trigger(event, prompt) == "manual"
 
 
 def parse_manual_scope_directive(prompt: str | None) -> list[str]:
@@ -662,7 +771,12 @@ def inspect_user_prompt_submit(
 
     token = dispatch_token_from_text(prompt)
     origin_marker = detect_origin_marker(prompt) if token is None else None
-    is_manual = token is None and origin_marker is None and _review_validate_fix_manually_invoked(event, prompt)
+    manual_decision = (
+        _classify_manual_trigger(event, prompt)
+        if token is None and origin_marker is None
+        else "none"
+    )
+    is_manual = manual_decision == "manual"
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
     record: rvf_prep_file.PrepFileRecord | None = None
@@ -777,6 +891,16 @@ def inspect_user_prompt_submit(
                 "status": "manual_prep_failed",
                 "error": f"{type(exc).__name__}: {exc}",
             }
+    elif manual_decision == "suppressed":
+        # 触发字面量在场但识别为 handoff 正文 / 姊妹命令参数：不新建 manual prep、
+        # 不派发 review。给用户一条可见诊断行（user-facing systemMessage，不进模型
+        # 上下文），说明为何「看似带 review-validate-fix 字面量却没启动 review」，
+        # 并指明如何真正手动触发。这是用户「通知而非自注入」想法里 hook 真能做到的子集。
+        return {
+            **base_payload,
+            "status": "manual_trigger_suppressed",
+            "systemMessage": _trigger_system_message(kind="suppressed_handoff_literal"),
+        }
     else:
         return {**base_payload, "status": "no_token"}
 
@@ -945,6 +1069,8 @@ def _trigger_system_message(
     - ``already_completed``：同一 prep 已 RVF 过，本次未重跑。
     - ``dispatch_no_prep``：prompt 带 dispatch token 但 prep 缺失 / 过期 / 不可读。
     - ``marker_without_token``：自注入 origin marker 却无 token（不一致态）。
+    - ``suppressed_handoff_literal``：检测到 review-validate-fix 字面量但识别为 handoff
+      正文 / 姊妹命令参数，未启动 review。
     """
     run_ref = run_id or "—"
     origin = dispatch_origin or "—"
@@ -971,6 +1097,11 @@ def _trigger_system_message(
         )
     if kind == "marker_without_token":
         return f"RVF UPS：自注入 marker '{marker or '—'}' 无 token（不一致态），未派发"
+    if kind == "suppressed_handoff_literal":
+        return (
+            "RVF UPS：检测到 review-validate-fix 字面量，但识别为 handoff 正文 / 姊妹命令参数，"
+            "未启动 review；如需手动 review，请单独发送 $review-validate-fix / /review-validate-fix"
+        )
     return f"RVF UPS：{kind}"
 
 

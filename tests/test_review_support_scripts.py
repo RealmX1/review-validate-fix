@@ -1123,6 +1123,61 @@ def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_pa
     assert submit.detect_manual_trigger("RVF_DOC[/review-validate-fix]") is False
 
 
+def test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(tmp_path: Path) -> None:
+    """姊妹命令 / 粘贴的 handoff 正文里的 review-validate-fix 字面量不得启动新 review。
+
+    复现的 bug：`/rvf-land` + 粘贴 handoff 正文里出现 `/review-validate-fix` 字面量，
+    旧 `detect_manual_trigger`（对整段 prompt 任意位置匹配）误判为 manual，新建 manual
+    prep 并派发。修复后这类应被识别为 handoff 正文 / 姊妹命令参数而抑制，且抑制是
+    **位置无关**的；同时保留「输入框残留前缀把合法触发顶离行首」的假阴守卫。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+
+    run_id = "rvf-20260609T124718Z-user-prompt-submit-manual-412bcf4a"
+    handoff_body = (
+        "# Review-validate-fix 交接上下文\n\n"
+        "## 状态\n"
+        f"- run id: {run_id}\n\n"
+        "## Validate/fix 分组\n"
+        "- RVF-G1: 见 /review-validate-fix 工具说明\n\n"
+        "## 验证\n"
+        "- python3 -m pytest: ok\n"
+    )
+
+    # (a) 四个姊妹 skill 前导 + 含字面量的 handoff 正文 → 抑制（manual_trigger_suppressed），
+    #     不新建 prep、不注入 additionalContext，但给一条 user-facing systemMessage。
+    for sibling in ("/rvf-land", "$rvf-handoff-intake", ":rvf-reopen", "/rvf-analyze"):
+        prompt = f"{sibling}\n\n{handoff_body}"
+        payload = submit.inspect_user_prompt_submit(
+            {"prompt": prompt, "cwd": str(tmp_path), "hook_event_name": "UserPromptSubmit"},
+            prep_root=root,
+        )
+        assert payload["status"] == "manual_trigger_suppressed", (sibling, payload)
+        assert "hookSpecificOutput" not in payload, sibling
+        assert isinstance(payload.get("systemMessage"), str) and "未启动 review" in payload["systemMessage"]
+        assert submit._classify_manual_trigger({}, prompt) == "suppressed", sibling
+
+    # (c) 无前导命令、仅靠 run-id + handoff 章节 + 字面量的纯 handoff 正文 → 抑制。
+    assert submit._classify_manual_trigger({}, handoff_body) == "suppressed"
+
+    # (d) 裸触发仍是 manual。
+    assert submit._classify_manual_trigger({}, "/review-validate-fix") == "manual"
+    # (e) 输入框残留前缀把合法触发顶离行首 → 仍 manual（假阴守卫，位置无关）。
+    assert submit._classify_manual_trigger({}, "todo: 买牛奶\n/review-validate-fix") == "manual"
+    # (f) 合法 review 请求里顺嘴提了 run id 但无 handoff 章节 → 仍 manual（防过度抑制）。
+    runid_only = f"/review-validate-fix 请复核 run {run_id}"
+    assert submit._classify_manual_trigger({}, runid_only) == "manual"
+
+    # 纯文本谓词单测（位置无关）。
+    assert submit._leading_sibling_command("/rvf-land paste...") is True
+    assert submit._leading_sibling_command("   $rvf-reopen") is True
+    assert submit._leading_sibling_command("/review-validate-fix") is False
+    assert submit._looks_like_handoff_body(handoff_body) is True
+    assert submit._looks_like_handoff_body(f"提一句 {run_id} 没别的") is False
+
+
 def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -8493,6 +8548,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger",
             lambda: test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(root / "prompt-submit-substring"),
+        ),
+        (
+            "rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger",
+            lambda: test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(
+                root / "prompt-submit-handoff-literal"
+            ),
         ),
         (
             "rvf_user_prompt_submit_failed_prepare_records_state_without_blocking",
