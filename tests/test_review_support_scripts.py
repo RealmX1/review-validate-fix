@@ -6028,6 +6028,164 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_
     assert json.loads(sink.read_text(encoding="utf-8")) == ["--native-stream"]
 
 
+def test_alternative_reviewer_cursor_stream_json_extracts_result(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, subprocess, sys, time, json; sys.stdin.read(); "
+                "print(json.dumps({'type':'system','subtype':'init','model':'Composer 2.5'}), flush=True); "
+                "print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'working'}]}}), flush=True); "
+                "time.sleep(0.08); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
+                "print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'NO_ISSUES'}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="cursor_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def test_alternative_reviewer_cursor_command_not_claude_patched(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp_path / "cursor-agent"
+    sink = tmp_path / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
+                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        ["cursor-agent", "-p"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="cursor_stream_json",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    # ensure_cursor_stream_json_command 只补 print + stream-json，绝不注入 claude 专属 flag。
+    assert argv == ["-p", "--output-format", "stream-json"], argv
+    for claude_only_flag in (
+        "--include-hook-events",
+        "--include-partial-messages",
+        "--verbose",
+        "--disable-slash-commands",
+    ):
+        assert claude_only_flag not in argv, claude_only_flag
+
+
+def test_alternative_reviewer_cursor_autodetects_stream_json(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    shim = tmp_path / "cursor-agent"
+    sink = tmp_path / "argv.json"
+    shim.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os, subprocess, sys",
+                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
+                "sys.stdin.read()",
+                "print(json.dumps({'type':'system','subtype':'init'}), flush=True)",
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
+                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    # 故意不在 config 中写 output_format：依赖 is_cursor_print_command 自动判定为 cursor_stream_json。
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        ["cursor-agent", "-p"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format=None,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    # 若 autodetect 误判为 text，stdout 会含 init JSON 行；等于 NO_ISSUES 证明走了 result 提取。
+    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+    argv = json.loads(sink.read_text(encoding="utf-8"))
+    assert argv == ["-p", "--output-format", "stream-json"], argv
+
 
 def test_cline_kanban_client_detects_runtime_port() -> None:
     module = load_cline_kanban_client_module()
@@ -8911,6 +9069,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_claude_stream_json_extracts_result",
             lambda: test_alternative_reviewer_claude_stream_json_extracts_result(root / "alternative-stream-json"),
+        ),
+        (
+            "alternative_reviewer_cursor_stream_json_extracts_result",
+            lambda: test_alternative_reviewer_cursor_stream_json_extracts_result(root / "alternative-cursor-stream-json"),
+        ),
+        (
+            "alternative_reviewer_cursor_command_not_claude_patched",
+            lambda: test_alternative_reviewer_cursor_command_not_claude_patched(root / "alternative-cursor-command"),
+        ),
+        (
+            "alternative_reviewer_cursor_autodetects_stream_json",
+            lambda: test_alternative_reviewer_cursor_autodetects_stream_json(root / "alternative-cursor-autodetect"),
         ),
         (
             "alternative_reviewer_codex_json_extracts_agent_message",

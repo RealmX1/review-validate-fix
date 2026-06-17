@@ -38,11 +38,13 @@ CODEX_BACKEND_CHALLENGE_FLAG = "RVF_CODEX_BACKEND_CHALLENGE"
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
+OUTPUT_FORMAT_CURSOR_STREAM_JSON = "cursor_stream_json"
 SUPPRESS_STOP_HOOK_ENV = "CODEX_RVF_SUPPRESS_STOP_HOOK"
 SUPPORTED_OUTPUT_FORMATS = {
     OUTPUT_FORMAT_TEXT,
     OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
     OUTPUT_FORMAT_CODEX_JSON,
+    OUTPUT_FORMAT_CURSOR_STREAM_JSON,
 }
 CHILD_RVF_ENV_KEYS = {
     "RVF_RUN_DIR",
@@ -144,6 +146,14 @@ def is_claude_print_command(command: list[str]) -> bool:
     )
 
 
+def is_cursor_print_command(command: list[str]) -> bool:
+    # cursor-agent 的 headless 评审模式：`cursor-agent -p ...`。
+    # 只匹配真实二进制名 cursor-agent，避免误判其它名为 agent 的命令。
+    return bool(command) and Path(command[0]).name == "cursor-agent" and any(
+        item in {"-p", "--print"} for item in command
+    )
+
+
 def codex_subcommand_index(command: list[str]) -> int | None:
     if not command or Path(command[0]).name != "codex":
         return None
@@ -231,6 +241,34 @@ def ensure_claude_stream_json_command(command: list[str]) -> list[str]:
         patched.append("--verbose")
     if "--disable-slash-commands" not in patched:
         patched.append("--disable-slash-commands")
+    return patched
+
+
+def ensure_cursor_stream_json_command(command: list[str]) -> list[str]:
+    # 仅保证 print 模式 + stream-json 输出，使 bare cursor 配置也能被正常解析。
+    # 绝不注入 claude 专属 flag（--include-hook-events / --include-partial-messages /
+    # --verbose / --disable-slash-commands）——cursor-agent 不认识它们。
+    patched = list(command)
+    if not any(item in {"-p", "--print"} for item in patched):
+        patched.append("-p")
+    equals_index = next(
+        (
+            index
+            for index, item in enumerate(patched)
+            if item.startswith("--output-format=")
+        ),
+        None,
+    )
+    if equals_index is not None:
+        patched[equals_index] = "--output-format=stream-json"
+    elif "--output-format" in patched:
+        index = patched.index("--output-format")
+        if index + 1 < len(patched):
+            patched[index + 1] = "stream-json"
+        else:
+            patched.append("stream-json")
+    else:
+        patched.extend(["--output-format", "stream-json"])
     return patched
 
 
@@ -971,6 +1009,10 @@ def run_with_activity_timeout(
     consecutive_probe_failures = 0
     probe_history: list[dict[str, Any]] = []
     pending_input: str | None = input_text
+    # 已知限制：activity monitor 只解析 Claude 的 tool_use 块以在"长静默命令"期间抑制 idle 超时。
+    # cursor-agent stream-json 发的是 schema 不同的 tool_call 事件，故 cursor_stream_json
+    # 不挂 monitor——常规评审靠 stdout 增长刷新 idle-timeout 已足够，边角可调 idle_timeout_seconds /
+    # activity_probe 兜底。后续如需更精细可扩展 monitor 识别 cursor tool_call。
     stream_monitor = (
         ClaudeStreamActivityMonitor()
         if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON
@@ -1164,8 +1206,13 @@ def terminate_process_group(process: subprocess.Popen[str]) -> int:
         return signal.SIGKILL
 
 
-def extract_claude_stream_result(output: str) -> str:
-    """从 Claude Code stream-json stdout 中提取最终 result 文本。"""
+def extract_result_event_text(output: str) -> str:
+    """从 stream-json stdout 中提取最终 `{"type":"result","result":"…"}` 事件文本。
+
+    Claude Code 与 cursor-agent 的 stream-json 终止事件形状一致
+    （均为 type=="result" 且 result 为字符串），故两种 output_format 共用本提取逻辑。
+    找不到 result 事件时回退到原始 stdout。
+    """
 
     result: str | None = None
     for raw_line in output.splitlines():
@@ -1183,6 +1230,12 @@ def extract_claude_stream_result(output: str) -> str:
     if result is not None:
         return result.strip()
     return output.strip()
+
+
+def extract_claude_stream_result(output: str) -> str:
+    """从 Claude Code stream-json stdout 中提取最终 result 文本。"""
+
+    return extract_result_event_text(output)
 
 
 def text_parts_from_content(content: object) -> list[str]:
@@ -1431,6 +1484,14 @@ def main() -> int:
                 command = ensure_claude_stream_json_command(command)
             else:
                 output_format = OUTPUT_FORMAT_TEXT
+        elif output_format is None and is_cursor_print_command(command):
+            # claude_output_format_arg 只解析通用 --output-format flag，对 cursor 同样适用。
+            cli_output_format = claude_output_format_arg(command)
+            if cli_output_format in {None, "stream-json"}:
+                output_format = OUTPUT_FORMAT_CURSOR_STREAM_JSON
+                command = ensure_cursor_stream_json_command(command)
+            else:
+                output_format = OUTPUT_FORMAT_TEXT
         elif output_format is None and is_codex_exec_command(command):
             output_format = OUTPUT_FORMAT_CODEX_JSON if codex_json_enabled(command) else OUTPUT_FORMAT_TEXT
         elif output_format is None:
@@ -1441,6 +1502,8 @@ def main() -> int:
             )
         if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
             command = ensure_claude_stream_json_command(command)
+        if output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON and is_cursor_print_command(command):
+            command = ensure_cursor_stream_json_command(command)
         if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(command):
             command = ensure_codex_hooks_disabled_command(command)
             command = ensure_codex_json_command(command)
@@ -1747,6 +1810,8 @@ def main() -> int:
     output_error_reason: str | None = None
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
+    elif output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON:
+        stdout = extract_result_event_text(stdout)
     elif output_format == OUTPUT_FORMAT_CODEX_JSON:
         try:
             stdout = extract_codex_json_result(stdout)

@@ -28,6 +28,20 @@
 4. 如果需要新脚本或配置，保持通用：参数化 agent 命令、工作目录、prompt 文件、输出文件，不要把实现绑定到某个单一 agent。
 5. 更新 `SKILL.md`、`prompts/reviewer.md`、`references/review-merge-policy.md`、`references/handoff-template.md` 或相关脚本时，保持 “Codex reviewer + arbitrary alternative reviewer” 的抽象。
 
+## 仓库已自带的 alternative reviewer 模板
+
+无需从零写 config 的几个常见 agent，仓库已带模板，激活方式是把它传给 `run_alternative_reviewer.py --config <path>`（或经 setup 拷成 active 的 `config/alternative-reviewer.json`）：
+
+- `config/alternative-reviewer.json` — Claude Code，active 默认。
+- `config/alternative-reviewer.codex.json` — Codex CLI 模板。
+- `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。
+
+Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force --trust --sandbox disabled`，几个 flag 的理由：
+
+- `-p --output-format stream-json`：headless 打印模式 + 流式 JSON，终止事件 `{"type":"result","result":"…"}` 与 Claude 形状一致，调用器以 `cursor_stream_json` 复用同一套 result 提取。
+- `--force --trust --sandbox disabled`：reviewer 需能自主运行只读命令并把结论写到 **repo 外的 `run_dir`**；Cursor 没有 Codex `--add-dir` 那样的细粒度可写目录授权、沙箱又是粗粒度开关，故 disabled。该自治姿态与现有 codex（`--ask-for-approval never`）/claude（bypass）等价，并非新增风险。`--mode plan/ask` 是只读模式，不可用于需要写回的 reviewer。
+- 不 pin `--model`（用账户默认）；如需固定模型可在 command 里加 `--model <name>`。
+
 ## 用户没有已知 agent 时
 
 1. 运行 `scripts/discover_santa_alternative_agents.sh` 或手动做等价检查，列出当前环境中看起来像 coding agent 的候选。

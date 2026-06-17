@@ -10,7 +10,7 @@ as-built 兼容性矩阵、(M+N) vs (P+R) 区别、core ↔ adapter 边界与 pl
 
 - **Claude Code** = Adapter-backed（trigger-only, bridged to Codex core）：`Stop` + `UserPromptSubmit` 两个 hook 入口为薄 shim，转发到 Codex core 脚本（路径 C），不重写 review 逻辑。
 - **Codex CLI** = Native（hook 由 `install_to_codex.py --configure-stop-hook` 注册进 `~/.codex/hooks.json`）。
-- **OpenCode / Cursor / Hermes / OpenClaw** = Reference-only（仅 `agentskills.io` skill 文档，不接线 hook/subagent）。
+- **OpenCode / Cursor / Hermes / OpenClaw** = 作为 **host adapter** 仍 Reference-only（仅 `agentskills.io` skill 文档，不接线 hook/subagent）。注意：这只针对「RVF 寄居其中的 harness」这一 host-adapter 角色；另有一条独立的 **alternative reviewer**（santa-method 外部评审员）线——`cursor-agent` 已作为可选 alternative reviewer 受支持（仓库自带 `config/alternative-reviewer.cursor.json` 模板，`--config` 即可激活），与其 host-adapter 的 Reference-only 状态互不影响。
 
 分析/归因层已 host-agnostic：transcript 解析（`core/transcript/` + `adapters/{codex,claude_code}/transcript.py`）、write-op 计数、子代理捕获与调用向量（`core/subagents/` + 各 adapter）均不消费 host 工具名或硬编码 host 布局。三份 manifest 的 `name`/`version`/`source` 一致性由 `scripts/sync-manifest.sh` fail-fast 守护。
 

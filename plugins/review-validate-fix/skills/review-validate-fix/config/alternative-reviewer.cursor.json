@@ -1,0 +1,31 @@
+{
+  "enabled": true,
+  "label": "alternative-reviewer:cursor-cli",
+  "command": [
+    "cursor-agent",
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--force",
+    "--trust",
+    "--sandbox",
+    "disabled"
+  ],
+  "allow_repo_cwd": true,
+  "idle_timeout_seconds": 300,
+  "activity_check_interval_seconds": 5,
+  "activity_probe_command": null,
+  "activity_probe_timeout_seconds": 10,
+  "activity_probe_failure_threshold": 3,
+  "max_runtime_seconds": null,
+  "health_timeout_seconds": 30,
+  "pre_run_health": true,
+  "output_format": "cursor_stream_json",
+  "env_unset": [
+    "ANTHROPIC_API_KEY"
+  ],
+  "health_command": [
+    "cursor-agent",
+    "status"
+  ]
+}
