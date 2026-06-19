@@ -894,6 +894,7 @@ def build_manifest(
     tracker_run_id: str | None = None,
     tracker_log_root: Path | None = None,
     include_all_transcript_ownership: bool = False,
+    committed_baseline: str | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
     records = parse_jsonl(transcript)
@@ -928,6 +929,48 @@ def build_manifest(
     claude_write_events: list[dict[str, Any]] = []
     dirty = dirty_paths(root)
     dirty_set = set(dirty)
+    # Committed-round attribution (the single relaxation of pillar ④): when a
+    # round baseline is supplied, the net first-parent committed diff
+    # `baseline..HEAD` is a second source of in-round change for work the agent
+    # committed mid-turn. It is intersected with transcript attribution below
+    # (only agent-tool-touched committed paths enter scope — pillar ③), and is
+    # empty/inert whenever committed_baseline is None, so the no-commit path is
+    # byte-identical to prior behaviour.
+    committed_round_set: set[str] = set()
+    if committed_baseline:
+        try:
+            committed_round_set = set(
+                diff_tracker._list_committed_round_changed_paths(root, committed_baseline)
+            )
+        except Exception:
+            committed_round_set = set()
+    # Committed-round attribution window. The standard ownership cutoff
+    # (`should_include_tool_record` → head_committed_at / last-git-commit) is the
+    # very pillar-④ mechanism that hides committed work: it ignores the tool
+    # records that PRODUCED now-committed changes (their timestamp/line precedes
+    # the commit). So committed-path attribution uses a SEPARATE, wider window —
+    # back to this round's last user prompt — while still being floored by the
+    # git `committed_round_set` (baseline..HEAD, first-parent) above. These hold
+    # paths the agent touched via a tool within that round window:
+    round_window_apply_patch_paths: set[str] = set()
+    round_window_claude_write_paths: set[str] = set()
+    round_window_exec_paths: set[str] = set()
+    round_window_cutoff_line: int | None = None
+    if committed_baseline:
+        for _scan_record in records:
+            if user_message_from_record(_scan_record) is not None:
+                _scan_line = _scan_record.get("_line_number")
+                if isinstance(_scan_line, int):
+                    round_window_cutoff_line = _scan_line
+
+    def _in_round_window(record: dict[str, Any]) -> bool:
+        if not committed_baseline:
+            return False
+        if round_window_cutoff_line is None:
+            return True
+        line_number = record.get("_line_number")
+        return isinstance(line_number, int) and line_number > round_window_cutoff_line
+
     live_owned_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
     live_exec_paths: set[str] = set()
     included_tool_record_count = 0
@@ -962,6 +1005,8 @@ def build_manifest(
             )
             apply_patch_operations.extend(operations)
             owned_paths.update(paths)
+            if _in_round_window(record):
+                round_window_apply_patch_paths.update(paths)
             if should_include_tool_record(
                 record,
                 cutoff_line_number=cutoff_line_number,
@@ -997,6 +1042,8 @@ def build_manifest(
                 }
                 claude_write_events.append(event)
                 owned_paths.add(path)
+                if _in_round_window(record):
+                    round_window_claude_write_paths.add(path)
                 if should_include_tool_record(
                     record,
                     cutoff_line_number=cutoff_line_number,
@@ -1042,6 +1089,8 @@ def build_manifest(
                 for item in candidates
             )
             owned_paths.update(str(item["path"]) for item in candidates)
+            if _in_round_window(record):
+                round_window_exec_paths.update(str(item["path"]) for item in candidates)
             if should_include_tool_record(
                 record,
                 cutoff_line_number=cutoff_line_number,
@@ -1078,7 +1127,38 @@ def build_manifest(
         seen_live_units.add(key)
         deduped_live_units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "exec_command"))
 
+    # Committed-round owned paths: agent-attributed paths whose round work lives
+    # in this round's commits (clean at HEAD, hence absent from dirty_set).
+    # Registered as path-level OwnedUnits — register_claims expands them per-hunk
+    # against the committed baseline. A committed path with no in-window tool
+    # attribution is skipped (pillar ③: never scope unattributed committed work,
+    # e.g. base-branch-sync content the agent never touched via a tool).
+    committed_round_owned: list[str] = []
+    for path in sorted(committed_round_set):
+        if path in dirty_set:
+            continue
+        if path in round_window_apply_patch_paths:
+            evidence = "apply_patch"
+        elif path in round_window_claude_write_paths:
+            evidence = "claude_write"
+        elif path in round_window_exec_paths:
+            evidence = "exec_command"
+        else:
+            continue
+        key = (path, "path", "")
+        if key in seen_live_units:
+            continue
+        seen_live_units.add(key)
+        deduped_live_units.append(
+            (diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), evidence)
+        )
+        committed_round_owned.append(path)
+    committed_round_owned_set = set(committed_round_owned)
+
     owned_dirty = sorted({owned_unit.path for owned_unit, _evidence in deduped_live_units if owned_unit.path in dirty_set})
+    # Scope handed to the tracker = dirty-owned ∪ committed-round-owned. Equal to
+    # owned_dirty whenever there is no committed-round work.
+    owned_scope = sorted(set(owned_dirty) | committed_round_owned_set)
     unattributed_dirty = sorted(path for path in dirty if path not in set(owned_dirty))
     baseline["included_tool_record_count"] = included_tool_record_count
     baseline["ignored_tool_record_count"] = ignored_tool_record_count
@@ -1086,8 +1166,9 @@ def build_manifest(
 
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
-    if tracker_enabled and owned_dirty:
+    if tracker_enabled and owned_scope:
         owned_dirty_set = set(owned_dirty)
+        owned_scope_set = set(owned_scope)
         tracker_apply_patch_paths = {
             owned_unit.path
             for owned_unit, evidence in deduped_live_units
@@ -1099,6 +1180,10 @@ def build_manifest(
             if evidence in {"exec_command", "claude_write"} and owned_unit.path in owned_dirty_set
         }
         register_session_id = session_id or (tracker_run_id or f"transcript-{transcript.name}")
+        # tracker_units stays dirty-only: it feeds the diagnostic payload and
+        # `build_edit_claims` (the pending-edit-claim ownership source for
+        # apply_patch hunks). Committed-round paths rely solely on session_units
+        # ownership written by register_claims below, so they need no edit_claim.
         tracker_units = [
             {
                 "path": owned_unit.path,
@@ -1116,15 +1201,17 @@ def build_manifest(
             run_id=tracker_run_id,
             worktree=root,
             branch=None,
-            owned_paths=owned_dirty,
+            owned_paths=owned_scope,
             apply_patch_paths=tracker_apply_patch_paths,
             exec_only_paths=tracker_exec_only_paths,
             owned_units_override=[
                 (owned_unit, evidence)
                 for owned_unit, evidence in deduped_live_units
-                if owned_unit.path in owned_dirty_set
+                if owned_unit.path in owned_scope_set
             ],
             log_root_override=tracker_log_root,
+            committed_paths=committed_round_owned_set,
+            committed_baseline=committed_baseline,
         )
         tracker_payload = result.to_dict()
         tracker_payload["session_id"] = register_session_id
@@ -1176,6 +1263,8 @@ def build_manifest(
         "ownership_baseline": baseline,
         "owned_paths": sorted(owned_paths),
         "owned_dirty_paths": owned_dirty,
+        "owned_committed_round_paths": committed_round_owned,
+        "committed_round_baseline": committed_baseline,
         "unattributed_dirty_paths": unattributed_dirty,
         "apply_patch_operations": apply_patch_operations,
         "command_path_candidates": command_candidates,

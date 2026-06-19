@@ -298,6 +298,69 @@ def _git_resolved_repo(cwd: str) -> str | None:
     return None
 
 
+def _git_head_oid(repo: str) -> str | None:
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            head = result.stdout.strip()
+            if head:
+                return head
+    except (FileNotFoundError, OSError):
+        return None
+    return None
+
+
+def _capture_round_baseline(event: dict[str, Any], prompt: str | None) -> dict[str, Any] | None:
+    """Record HEAD at this genuine user prompt as the lower bound for the next
+    RVF round's committed-change detection (see ``round_baseline_marker``).
+
+    Best-effort and strictly non-blocking: any failure (no cwd, not a git repo,
+    detached/empty HEAD, IO error) returns None and the next Stop simply falls
+    back to dirty-only behaviour. Keyed task_id-first / session_id-fallback to
+    mirror how the Stop hook reads it. Only called for genuine user prompts —
+    RVF's own injected dispatch-token / origin-marker prompts are not round
+    boundaries and must not move the baseline.
+    """
+    try:
+        import round_baseline_marker  # noqa: PLC0415 - lazy, off the hot import path
+
+        cwd = event.get("cwd")
+        if not isinstance(cwd, str) or not cwd.strip():
+            return None
+        repo = _git_resolved_repo(cwd) or cwd
+        head = _git_head_oid(repo)
+        if not head:
+            return None
+        try:
+            from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+            task_id = current_kanban_task_id(event)
+        except Exception:
+            task_id = None
+        raw_session = event.get("session_id")
+        session_id = raw_session.strip() if isinstance(raw_session, str) and raw_session.strip() else None
+        marker_path = round_baseline_marker.write_round_baseline_marker(
+            task_id=task_id,
+            session_id=session_id,
+            baseline_head=head,
+            repo=repo,
+            prompt_excerpt=prompt or "",
+        )
+        if marker_path is None:
+            return None
+        return {"baseline_head": head, "marker_path": str(marker_path)}
+    except Exception:
+        return None
+
+
 def _create_manual_prep_file(
     *,
     event: dict[str, Any],
@@ -785,6 +848,14 @@ def inspect_user_prompt_submit(
     # manual 路径解析出的内联 scope（primary 文件），喂给 shared workflow；
     # 其它 dispatch 路径保持空（scope 由 Stop hook / prep payload 决定）。
     manual_extra_primary_files: list[str] = []
+
+    # 仅对「真正的用户 prompt」记录本轮 baseline（dispatch token / origin marker 是
+    # RVF 自注入的机器 prompt，不是用户轮边界，不得前移 baseline）。纯副作用 +
+    # best-effort：失败即降级为今日 dirty-only 行为。
+    if token is None and origin_marker is None:
+        round_baseline_debug = _capture_round_baseline(event, prompt)
+        if round_baseline_debug:
+            payload["round_baseline"] = round_baseline_debug
 
     if token is not None:
         lookup_now = rvf_prep_file.parse_timestamp(now) if now else None

@@ -8634,8 +8634,372 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
     assert metadata["tracker_scope_present"] is True
 
 
+# ---------------------------------------------------------------------------
+# Committed-round detection (RVF Stop hook auto-includes work the agent
+# committed mid-round). Exercises diff_tracker committed observation/dedup,
+# session_manifest committed attribution, and the round-baseline marker.
+# ---------------------------------------------------------------------------
+
+def _round_baseline_committed_modules():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import diff_tracker as _dt  # noqa: PLC0415
+    import session_manifest as _sm  # noqa: PLC0415
+    import round_baseline_marker as _rbm  # noqa: PLC0415
+
+    return _dt, _sm, _rbm
+
+
+def _committed_round_repo(tmp: Path) -> tuple[Path, str]:
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    baseline = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    return repo, baseline
+
+
+def _committed_round_transcript(tmp: Path, repo: Path, *, session_id: str, path: str, old: str, new: str) -> Path:
+    transcript = tmp / "session.jsonl"
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: {path}\n"
+        "@@\n"
+        f"-{old}\n"
+        f"+{new}\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {"timestamp": "2026-04-27T00:00:00.000Z", "type": "session_meta", "payload": {"id": session_id, "cwd": str(repo)}},
+        {
+            "timestamp": "2026-04-27T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "c1"},
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    return transcript
+
+
+def _units_observed_state_by_path(tracker_dir: str, path: str) -> dict[str, str]:
+    import sqlite3 as _sqlite  # noqa: PLC0415
+
+    conn = _sqlite.connect(str(Path(tracker_dir) / "tracker.sqlite3"))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state FROM units WHERE path=?", (path,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row[0]: row[1] for row in rows}
+
+
+def _units_full_by_path(tracker_dir: str, path: str) -> dict[str, tuple[str, str]]:
+    import sqlite3 as _sqlite  # noqa: PLC0415
+
+    conn = _sqlite.connect(str(Path(tracker_dir) / "tracker.sqlite3"))
+    try:
+        rows = conn.execute(
+            "SELECT unit_id, observed_state, review_state FROM units WHERE path=?", (path,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def test_diff_tracker_observes_committed_round_units(tmp: Path) -> None:
+    """A committed hunk yields the SAME unit_id as the equivalent dirty
+    observation — the content-identity invariant that makes dedup free (§2/§4)."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    # Observe the change while dirty.
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    dirty_obs = dt._classify_path(repo, "f.txt")
+    dirty_ids = sorted(s.unit_id for s in dt._specs_from_observation(dirty_obs, "f.txt"))
+    # Commit it; worktree is now clean.
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "work"], cwd=repo)
+    assert run(["git", "status", "--porcelain"], cwd=repo).stdout.strip() == ""
+    committed_obs = dt._classify_committed_path(repo, "f.txt", baseline)
+    assert committed_obs is not None and committed_obs.kind == "tracked_hunk"
+    committed_ids = sorted(s.unit_id for s in dt._specs_from_observation(committed_obs, "f.txt"))
+    assert committed_ids == dirty_ids, (committed_ids, dirty_ids)
+    assert dt._list_committed_round_changed_paths(repo, baseline) == ["f.txt"]
+
+
+def test_committed_unit_dedup_reviewed_not_resurrected(tmp: Path) -> None:
+    """A reviewed dirty unit, once committed, must NOT re-enter the candidate
+    pool: same unit_id, review_state stays 'reviewed' (§4)."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    owned = dt.OwnedUnit(path="f.txt", unit="path", hunk_anchor=None)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r1", worktree=repo, branch=None,
+        owned_paths=["f.txt"], apply_patch_paths={"f.txt"}, exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+    )
+    first = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False,
+    )
+    assert first["status"] == "allocated", first
+    assert first["candidate_unit_count"] >= 1, first
+    dt.complete_review_scope(
+        repo=repo, lease_id=first["lease_id"], scope_hash=first["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    reviewed_before = _units_full_by_path(first["tracker_dir"], "f.txt")
+    reviewed_ids = [uid for uid, (_obs, rev) in reviewed_before.items() if rev == "reviewed"]
+    assert reviewed_ids, reviewed_before
+    # Commit the reviewed work; re-register + re-allocate with the baseline.
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit reviewed"], cwd=repo)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r2", worktree=repo, branch=None,
+        owned_paths=["f.txt"], apply_patch_paths=set(), exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+        committed_paths={"f.txt"}, committed_baseline=baseline,
+    )
+    second = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r2", reviewer_id="rev2",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    assert second["status"] == "empty", second
+    # The reviewed units are now observed 'committed' yet stay 'reviewed'.
+    after = _units_full_by_path(first["tracker_dir"], "f.txt")
+    for uid in reviewed_ids:
+        assert after[uid][0] == "committed", (uid, after[uid])
+        assert after[uid][1] == "reviewed", (uid, after[uid])
+
+
+def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> None:
+    """Files brought in only via a base-branch-sync merge (second parent) are
+    excluded from committed-round paths; first-parent agent work is kept (§3)."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    run(["git", "checkout", "-q", "-b", "feature"], cwd=repo)
+    # main advances with a base-only file.
+    run(["git", "checkout", "-q", "main"], cwd=repo)
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base advance"], cwd=repo)
+    # feature: agent's own first-parent commit, then merge main in.
+    run(["git", "checkout", "-q", "feature"], cwd=repo)
+    (repo / "feature.txt").write_text("agent work\n", encoding="utf-8")
+    run(["git", "add", "feature.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "feature work"], cwd=repo)
+    run(["git", "merge", "-q", "--no-edit", "main"], cwd=repo)
+    paths = dt._list_committed_round_changed_paths(repo, baseline)
+    assert "feature.txt" in paths, paths
+    assert "base_only.txt" not in paths, paths
+
+
+def test_build_manifest_includes_committed_round_owned_paths(tmp: Path) -> None:
+    """An apply_patch-attributed file committed clean within the round still
+    lands in owned_committed_round_paths and registers tracker ownership (§5)."""
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    transcript = _committed_round_transcript(tmp, repo, session_id="s1", path="f.txt", old="base", new="changed")
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "agent commit"], cwd=repo)
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=baseline)
+    assert manifest["owned_committed_round_paths"] == ["f.txt"], manifest["owned_committed_round_paths"]
+    assert manifest["owned_dirty_paths"] == []
+    assert manifest["tracker"]["status"] == "ok"
+    # Zero-diff guarantee: no baseline => no committed scope.
+    manifest_none = sm.build_manifest(repo, transcript, tracker_run_id="r2", tracker_log_root=tmp / "logs2", committed_baseline=None)
+    assert manifest_none["owned_committed_round_paths"] == []
+
+
+def test_committed_then_dirty_same_path_resolves_to_dirty(tmp: Path) -> None:
+    """A path both committed in-round and further dirtied: the live worktree
+    change is observed 'dirty' (committed walk runs first, dirty walk wins; §5)."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("base\nX\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "committed X"], cwd=repo)
+    (repo / "f.txt").write_text("base\nX\nY\n", encoding="utf-8")  # further dirty edit
+    owned = dt.OwnedUnit(path="f.txt", unit="path", hunk_anchor=None)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r1", worktree=repo, branch=None,
+        owned_paths=["f.txt"], apply_patch_paths={"f.txt"}, exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+    )
+    result = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    states = set(_units_observed_state_by_path(result["tracker_dir"], "f.txt").values())
+    assert "dirty" in states, states  # the live worktree edit is captured
+
+
+def test_committed_unit_gone_after_reset_is_superseded(tmp: Path) -> None:
+    """A committed unit that drops out of baseline..HEAD (commit reset away) is
+    swept to 'superseded' by the unified supersession chokepoint."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "work"], cwd=repo)
+    dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    tracker_dir = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1b", reviewer_id="rev1b",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+        dry_run=True,
+    )["tracker_dir"]
+    states_before = _units_observed_state_by_path(tracker_dir, "f.txt")
+    committed_ids = [uid for uid, st in states_before.items() if st == "committed"]
+    assert committed_ids, states_before
+    # Drop the commit; the committed unit leaves baseline..HEAD.
+    run(["git", "reset", "-q", "--hard", baseline], cwd=repo)
+    dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r2", reviewer_id="rev2",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    states_after = _units_observed_state_by_path(tracker_dir, "f.txt")
+    assert all(states_after.get(uid) == "superseded" for uid in committed_ids), states_after
+
+
+def test_round_baseline_marker_round_trip(tmp: Path) -> None:
+    """write/read/dual-key/overwrite/status for the round-baseline marker."""
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    root = tmp / "state"
+    head_a = "a" * 40
+    head_b = "b" * 40
+    # task-keyed write, then overwrite (multi-prompt semantics: last wins).
+    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_a, repo="/r", root=root)
+    assert rbm.read_round_baseline_marker(task_id="t1", session_id=None, root=root)["baseline_head"] == head_a
+    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_b, repo="/r", root=root)
+    marker = rbm.read_round_baseline_marker(task_id="t1", session_id=None, root=root)
+    assert marker["baseline_head"] == head_b
+    # session fallback when no task id.
+    rbm.write_round_baseline_marker(task_id=None, session_id="s9", baseline_head=head_a, repo="/r", root=root)
+    assert rbm.read_round_baseline_marker(task_id=None, session_id="s9", root=root)["baseline_head"] == head_a
+    # status + resolve helper.
+    assert rbm.round_baseline_status(marker) == rbm.STATUS_ACTIVE
+    assert rbm.resolve_round_baseline_head(task_id="t1", session_id=None, root=root) == head_b
+    assert rbm.round_baseline_status(marker, now_ts=4102444800.0) == rbm.STATUS_STALE  # year 2100
+    assert rbm.round_baseline_status({"baseline_head": ""}) == rbm.STATUS_INVALID
+    assert rbm.round_baseline_status(None) == rbm.STATUS_INVALID
+    # No keys / empty head => no write.
+    assert rbm.write_round_baseline_marker(task_id=None, session_id=None, baseline_head=head_a, repo=None, root=root) is None
+    assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head="", repo=None, root=root) is None
+
+
+def test_rvf_user_prompt_submit_captures_round_baseline(tmp: Path) -> None:
+    """A genuine user prompt records HEAD as the next round's baseline marker;
+    the captured value matches the repo HEAD."""
+    submit = load_rvf_user_prompt_submit_module()
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    # advance HEAD so the captured baseline is the post-advance HEAD.
+    (repo / "f.txt").write_text("base\nmore\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "advance"], cwd=repo)
+    head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    state_root = tmp / "state"
+    # Isolate from any ambient Kanban task id in the runner env so the marker is
+    # deterministically session-keyed (task_id takes precedence when present).
+    kanban_env_keys = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
+    saved_env = {k: os.environ.get(k) for k in (*kanban_env_keys, "CODEX_RVF_LOG_ROOT")}
+    for k in kanban_env_keys:
+        os.environ.pop(k, None)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(state_root)
+    try:
+        event = {
+            "session_id": "sess-capture",
+            "cwd": str(repo),
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "please refactor the parser",
+        }
+        submit.inspect_user_prompt_submit(event, prep_root=tmp / "prep")
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    marker = rbm.read_round_baseline_marker(task_id=None, session_id="sess-capture", root=state_root)
+    assert marker is not None, "expected a round-baseline marker to be written"
+    assert marker["baseline_head"] == head, (marker.get("baseline_head"), head)
+
+
+def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
+    """End-to-end: round-baseline marker present + in-round commit ⇒ the
+    committed unit reaches allocator scope through resolve→build_manifest→allocate."""
+    dt, sm, rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    state_root = tmp / "state"
+    transcript = _committed_round_transcript(tmp, repo, session_id="s1", path="f.txt", old="base", new="changed")
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "agent commit"], cwd=repo)
+    # Marker written at the prior prompt (baseline = pre-commit HEAD).
+    rbm.write_round_baseline_marker(task_id=None, session_id="s1", baseline_head=baseline, repo=str(repo), root=state_root)
+    resolved = rbm.resolve_round_baseline_head(task_id=None, session_id="s1", root=state_root)
+    assert resolved == baseline
+    sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=resolved)
+    result = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=resolved,
+    )
+    assert result["status"] == "allocated", result
+    assert result["candidate_unit_count"] >= 1, result
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
+        (
+            "diff_tracker_observes_committed_round_units",
+            lambda: test_diff_tracker_observes_committed_round_units(root / "committed-observe"),
+        ),
+        (
+            "committed_unit_dedup_reviewed_not_resurrected",
+            lambda: test_committed_unit_dedup_reviewed_not_resurrected(root / "committed-dedup"),
+        ),
+        (
+            "committed_observation_excludes_base_branch_sync_merge",
+            lambda: test_committed_observation_excludes_base_branch_sync_merge(root / "committed-merge"),
+        ),
+        (
+            "build_manifest_includes_committed_round_owned_paths",
+            lambda: test_build_manifest_includes_committed_round_owned_paths(root / "committed-manifest"),
+        ),
+        (
+            "committed_then_dirty_same_path_resolves_to_dirty",
+            lambda: test_committed_then_dirty_same_path_resolves_to_dirty(root / "committed-then-dirty"),
+        ),
+        (
+            "committed_unit_gone_after_reset_is_superseded",
+            lambda: test_committed_unit_gone_after_reset_is_superseded(root / "committed-superseded"),
+        ),
+        (
+            "round_baseline_marker_round_trip",
+            lambda: test_round_baseline_marker_round_trip(root / "round-baseline-marker"),
+        ),
+        (
+            "rvf_user_prompt_submit_captures_round_baseline",
+            lambda: test_rvf_user_prompt_submit_captures_round_baseline(root / "round-baseline-capture"),
+        ),
+        (
+            "allocate_review_scope_includes_committed_round",
+            lambda: test_allocate_review_scope_includes_committed_round(root / "committed-allocate-e2e"),
+        ),
         (
             "rvf_handoff_cli_notify",
             lambda: test_rvf_handoff_cli_notify(root / "handoff-notify"),

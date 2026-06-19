@@ -70,6 +70,7 @@ from review_reopen_marker import (
     read_review_reopen_marker,
     review_reopen_status,
 )
+from round_baseline_marker import resolve_round_baseline_head
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
@@ -6059,8 +6060,26 @@ def refresh_global_diff_tracker(
         # 没 transcript / 没 repo：合法的"无 seeding"分支，不算失败。调用方
         # 会继续走 allocator 的 auto-claim fallback 或返回 None。
         return {"observed": False, "manifest": None}
+    # 本轮 committed-change 下界：UserPromptSubmit 写的 round-baseline marker。
+    # active 才用；stale/invalid/缺失 → None ⇒ committed 观测整支静默关闭、行为与
+    # 今日 dirty-only 完全一致。best-effort，绝不阻断 refresh。
+    committed_baseline: str | None = None
     try:
-        manifest = build_manifest(Path(repo).expanduser().resolve(), transcript)
+        event = context.get("event")
+        if isinstance(event, dict):
+            committed_baseline = resolve_round_baseline_head(
+                task_id=current_kanban_task_id(event),
+                session_id=session_hook_id_from_event(event),
+            )
+    except Exception:
+        committed_baseline = None
+    context["committed_baseline"] = committed_baseline
+    try:
+        manifest = build_manifest(
+            Path(repo).expanduser().resolve(),
+            transcript,
+            committed_baseline=committed_baseline,
+        )
     except Exception as exc:
         # build_manifest 失败时 emit `tracker_refresh_failed`（保持原 ledger
         # event，不双重 log），并把错误信息回传给调用方，让 orchestrator /
@@ -6454,6 +6473,7 @@ def allocate_auto_review_scope(
                 auto_claim_observed=False,
                 lease_ttl_seconds=lease_ttl_seconds,
                 transcript_max_line_number=transcript_max_line_number,
+                committed_baseline=context.get("committed_baseline"),
             )
             incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
             if incomplete is not None:
@@ -6493,6 +6513,7 @@ def allocate_auto_review_scope(
             # `register_claims`; auto-claim here would broaden scope past
             # transcript intent.
             auto_claim_observed=False,
+            committed_baseline=context.get("committed_baseline"),
         )
     except Exception as exc:
         ledger.event(

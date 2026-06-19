@@ -275,12 +275,17 @@ def _normalize_header(line: str) -> str:
     return line.rstrip()
 
 
-def derive_hunk_anchors(repo: Path, path: str) -> list[HunkAnchor]:
+def derive_hunk_anchors(repo: Path, path: str, base_ref: str = "HEAD") -> list[HunkAnchor]:
     """Phase 1 anchor derivation, kept verbatim so manifest payloads (which
     serialize HunkAnchor) remain stable across versions. Used to map an OwnedUnit
-    back onto a freshly observed hunk under Phase 2."""
+    back onto a freshly observed hunk under Phase 2.
+
+    `base_ref` is the git diff spec to compare against. It defaults to ``HEAD``
+    (worktree-vs-HEAD, the original behaviour). Callers observing committed
+    round work pass a two-dot range spec like ``"<baseline>..HEAD"`` so anchors
+    are derived from the net committed diff instead of the dirty worktree."""
     try:
-        diff = _run_git(repo, ["diff", "-U3", "--no-color", "HEAD", "--", path])
+        diff = _run_git(repo, ["diff", "-U3", "--no-color", base_ref, "--", path])
     except RuntimeError:
         return []
     anchors: list[HunkAnchor] = []
@@ -463,12 +468,32 @@ class _PathObservation:
     hunks: tuple[_ObservedHunk, ...] = ()     # only for tracked_hunk
 
 
-def _resolve_blob_at_head(repo: Path, path: str) -> str | None:
+def _resolve_blob_at_ref(repo: Path, ref: str, path: str) -> str | None:
+    """Return the git blob oid for `path` at `ref` (e.g. ``HEAD`` or a commit
+    sha), or None when the path does not exist there. Used for preimage/postimage
+    identity on both the dirty side (ref=HEAD) and the committed-round side
+    (ref=baseline for preimage, ref=HEAD for postimage)."""
     try:
-        sha = _run_git(repo, ["rev-parse", f"HEAD:{path}"]).strip()
+        sha = _run_git(repo, ["rev-parse", f"{ref}:{path}"]).strip()
     except RuntimeError:
         return None
     return sha or None
+
+
+def _resolve_blob_at_head(repo: Path, path: str) -> str | None:
+    return _resolve_blob_at_ref(repo, "HEAD", path)
+
+
+def _blob_content_sha_at_ref(repo: Path, ref: str, path: str) -> str | None:
+    """sha256 of the bytes of `path` at `ref`, matching `_file_content_sha`'s
+    digest so a binary/postimage observed first on the dirty side (worktree
+    bytes) and later on the committed side (HEAD blob bytes) hash identically
+    and dedup by unit_id. Returns None when the path is absent at `ref`."""
+    try:
+        out = _run_git_bytes(repo, ["cat-file", "-p", f"{ref}:{path}"])
+    except RuntimeError:
+        return None
+    return hashlib.sha256(out).hexdigest()
 
 
 def _file_content_sha(file_path: Path) -> str | None:
@@ -494,11 +519,18 @@ def _is_binary_blob(repo: Path, sha: str) -> bool:
     return b"\0" in out[:8192]
 
 
-def _parse_tracked_hunks(repo: Path, path: str) -> list[_ObservedHunk]:
-    """Parse `git diff -U3 HEAD -- path` into per-hunk observations whose
-    canonical_hash is line-shift-stable."""
+def _parse_tracked_hunks(repo: Path, path: str, base_ref: str = "HEAD") -> list[_ObservedHunk]:
+    """Parse `git diff -U3 <base_ref> -- path` into per-hunk observations whose
+    canonical_hash is line-shift-stable.
+
+    `base_ref` defaults to ``HEAD`` (worktree-vs-HEAD dirty diff). The committed
+    classifier passes a two-dot range spec (``"<baseline>..HEAD"``) so the net
+    committed-round hunk bodies are parsed; because the canonical hash hashes
+    only `(path, change_type, hunk body)` — never the @@ header or the ref — a
+    hunk observed dirty and the same hunk observed committed produce the same
+    unit_id, which is what makes reviewed-then-committed dedup free."""
     try:
-        diff = _run_git(repo, ["diff", "-U3", "--no-color", "HEAD", "--", path])
+        diff = _run_git(repo, ["diff", "-U3", "--no-color", base_ref, "--", path])
     except RuntimeError:
         return []
     if not diff:
@@ -652,10 +684,230 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
     return None
 
 
+def _specs_from_observation(observation: _PathObservation | None, path: str) -> list[_UnitSpec]:
+    """Turn a `_PathObservation` into the `_UnitSpec` rows the observation walk
+    upserts. Shared by the dirty walk and the committed-round walk so both
+    derive identical unit_ids for identical change content. A None observation
+    (no observable change) falls back to a single `path_only` spec, matching the
+    dirty walk's historical behaviour for exec-only evidence."""
+    if observation is None:
+        return [
+            _UnitSpec(
+                unit_id=_canonical_hash_path_only(path),
+                path=path,
+                old_path=None,
+                kind="path_only",
+                change_type="modify",
+                preimage_blob=None,
+                postimage_hash=None,
+                hunk_header=None,
+            )
+        ]
+    if observation.kind == "tracked_hunk":
+        return [
+            _UnitSpec(
+                unit_id=hunk.canonical_hash,
+                path=path,
+                old_path=None,
+                kind="tracked_hunk",
+                change_type=observation.change_type,
+                preimage_blob=observation.preimage_blob,
+                postimage_hash=observation.postimage_hash,
+                hunk_header=hunk.anchor.header,
+            )
+            for hunk in observation.hunks
+        ]
+    if observation.kind == "untracked_file":
+        return [
+            _UnitSpec(
+                unit_id=_canonical_hash_untracked(path, observation.postimage_hash or ""),
+                path=path,
+                old_path=None,
+                kind="untracked_file",
+                change_type="add",
+                preimage_blob=None,
+                postimage_hash=observation.postimage_hash,
+                hunk_header=None,
+            )
+        ]
+    if observation.kind == "deleted_file":
+        return [
+            _UnitSpec(
+                unit_id=_canonical_hash_deleted(path, observation.preimage_blob or ""),
+                path=path,
+                old_path=None,
+                kind="deleted_file",
+                change_type="delete",
+                preimage_blob=observation.preimage_blob,
+                postimage_hash=None,
+                hunk_header=None,
+            )
+        ]
+    if observation.kind == "binary_file":
+        return [
+            _UnitSpec(
+                unit_id=_canonical_hash_binary(
+                    path,
+                    observation.preimage_blob or "",
+                    observation.postimage_hash or "",
+                ),
+                path=path,
+                old_path=None,
+                kind="binary_file",
+                change_type=observation.change_type,
+                preimage_blob=observation.preimage_blob,
+                postimage_hash=observation.postimage_hash,
+                hunk_header=None,
+            )
+        ]
+    return [
+        _UnitSpec(
+            unit_id=_canonical_hash_path_only(path),
+            path=path,
+            old_path=None,
+            kind="path_only",
+            change_type="modify",
+            preimage_blob=None,
+            postimage_hash=None,
+            hunk_header=None,
+        )
+    ]
+
+
+def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObservation | None:
+    """Committed-round sibling of `_classify_path`. Where `_classify_path`
+    reads worktree state (`git status`, the on-disk file) to classify a *dirty*
+    change, this classifies the *net committed* change for `path` across the
+    range ``baseline..HEAD``. State therefore comes from the two-tree diff, not
+    the worktree:
+
+    * change_type/kind from `git diff --name-status`/`--numstat baseline..HEAD`,
+    * preimage from the blob at `baseline`, postimage from the blob at `HEAD`,
+    * hunks from `_parse_tracked_hunks(base_ref="baseline..HEAD")`.
+
+    Returns None when there is no net committed change for the path (e.g. it was
+    committed and then reverted within the round, leaving the trees equal)."""
+    spec_diff = f"{baseline}..HEAD"
+    try:
+        name_status = _run_git(
+            repo, ["diff", "--no-renames", "--name-status", "-z", spec_diff, "--", path]
+        )
+    except RuntimeError:
+        return None
+    records = [item for item in name_status.split("\0") if item]
+    status_code = records[0][0] if records and records[0] else ""
+
+    preimage_blob = _resolve_blob_at_ref(repo, baseline, path)
+
+    if status_code == "D":
+        if preimage_blob is None:
+            return None
+        return _PathObservation(
+            path=path,
+            kind="deleted_file",
+            change_type="delete",
+            preimage_blob=preimage_blob,
+            postimage_hash=None,
+            old_path=None,
+        )
+
+    # Binary modification: `git diff --numstat` reports `-` `-` for both columns.
+    try:
+        numstat = _run_git(repo, ["diff", "--numstat", spec_diff, "--", path]).strip()
+    except RuntimeError:
+        numstat = ""
+    if numstat:
+        cols = numstat.split("\t", 2)
+        if len(cols) >= 2 and cols[0] == "-" and cols[1] == "-":
+            postimage_sha = _blob_content_sha_at_ref(repo, "HEAD", path) or ""
+            if preimage_blob is None and postimage_sha == "":
+                return None
+            return _PathObservation(
+                path=path,
+                kind="binary_file",
+                change_type="modify" if preimage_blob else "add",
+                preimage_blob=preimage_blob,
+                postimage_hash=postimage_sha or None,
+                old_path=None,
+            )
+
+    hunks = _parse_tracked_hunks(repo, path, base_ref=spec_diff)
+    if hunks:
+        return _PathObservation(
+            path=path,
+            kind="tracked_hunk",
+            # A committed add (absent at baseline) is still a tracked file at
+            # HEAD, so it surfaces as tracked_hunk/change_type='add' rather than
+            # an untracked_file — git diff renders it as one all-`+` hunk.
+            change_type="modify" if preimage_blob else "add",
+            preimage_blob=preimage_blob,
+            postimage_hash=_blob_content_sha_at_ref(repo, "HEAD", path),
+            old_path=None,
+            hunks=tuple(hunks),
+        )
+
+    return None
+
+
+def _list_committed_round_changed_paths(repo: Path, baseline: str) -> list[str]:
+    """Paths whose content differs between the `baseline` tree and `HEAD`,
+    restricted to the work introduced by *this round's own* first-parent,
+    non-merge commits.
+
+    Pillar ③ (exclude background WIP / base-branch sync): the ``baseline..HEAD``
+    range already floors at this round's start, and when the round contains a
+    merge (e.g. the agent ran `git merge main` / `git pull`) the first-parent +
+    no-merges commit walk drops the merge commit and the base commits it imports
+    via its second parent. The authoritative gate remains transcript attribution
+    in `build_manifest` (`owned_paths ∩` this set); this function is the cheap
+    structural pre-filter, not the scope decision itself."""
+    try:
+        net = _run_git(repo, ["diff", "--no-renames", "--name-only", "-z", f"{baseline}..HEAD"])
+    except RuntimeError:
+        return []
+    net_paths = sorted({item for item in net.split("\0") if item})
+    if not net_paths:
+        return []
+    # Fast path: when the round contains no merges, the net diff already
+    # reflects only first-parent work — no allowlist filtering needed.
+    try:
+        total = _run_git(repo, ["rev-list", "--count", f"{baseline}..HEAD"]).strip()
+        first_parent = _run_git(
+            repo, ["rev-list", "--count", "--first-parent", "--no-merges", f"{baseline}..HEAD"]
+        ).strip()
+    except RuntimeError:
+        return net_paths
+    if total == first_parent:
+        return net_paths
+    # Merges present: keep only paths touched by first-parent non-merge commits.
+    try:
+        log_out = _run_git(
+            repo,
+            ["log", "--first-parent", "--no-merges", "--no-renames", "--name-only", "--format=", f"{baseline}..HEAD"],
+        )
+    except RuntimeError:
+        return net_paths
+    allowed = {line.strip() for line in log_out.splitlines() if line.strip()}
+    return [path for path in net_paths if path in allowed]
+
+
 def _unit_specs_for_owned(
     repo: Path,
     owned_unit: OwnedUnit,
+    committed_baseline: str | None = None,
 ) -> list[_UnitSpec]:
+    if committed_baseline:
+        # Committed-round ownership: classify against the net committed diff so
+        # the owned unit_ids match what the committed observation walk records.
+        # The file is clean at HEAD, so the dirty classifier below would
+        # degrade to path_only and mint a non-matching unit_id; instead we emit
+        # one spec per committed hunk via the shared `_specs_from_observation`
+        # (committed owned hints are always path-level, so hunk anchors are
+        # moot here).
+        return _specs_from_observation(
+            _classify_committed_path(repo, owned_unit.path, committed_baseline),
+            owned_unit.path,
+        )
     observation = _classify_path(repo, owned_unit.path)
     if observation is None:
         return [
@@ -1552,7 +1804,19 @@ def _upsert_unit(
     branch_key: str | None,
     worktree_key: str,
     now: str,
+    observed_state: str = "dirty",
 ) -> None:
+    """Upsert a unit row. `observed_state` defaults to ``'dirty'`` (the original
+    behaviour); the committed-round observation source passes ``'committed'``.
+
+    The conflict clause sets ``observed_state=excluded.observed_state`` (the
+    value we tried to insert) rather than a hardcoded ``'dirty'``: this lets the
+    committed walk record ``'committed'`` while the dirty walk — which runs last
+    in `_observe_and_upsert_units_in_txn` — still wins for a path that is both
+    committed and re-dirtied. Crucially `review_state` is NEVER written here, so
+    a unit that was already ``reviewed`` stays reviewed when re-observed as
+    committed: that is what keeps reviewed-then-committed work out of the
+    candidate pool without any extra dedup logic."""
     conn.execute(
         """
         INSERT INTO units(
@@ -1560,7 +1824,7 @@ def _upsert_unit(
             preimage_blob, postimage_hash, hunk_header, canonical_patch_hash,
             first_observed_at, last_observed_at, observed_state, review_state
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'dirty', 'available')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available')
         ON CONFLICT(unit_id) DO UPDATE SET
             branch_key=COALESCE(excluded.branch_key, units.branch_key),
             worktree_key=excluded.worktree_key,
@@ -1572,7 +1836,7 @@ def _upsert_unit(
             postimage_hash=COALESCE(excluded.postimage_hash, units.postimage_hash),
             hunk_header=COALESCE(excluded.hunk_header, units.hunk_header),
             last_observed_at=excluded.last_observed_at,
-            observed_state='dirty',
+            observed_state=excluded.observed_state,
             is_tombstoned=0,
             tombstoned_at=NULL,
             tombstone_reason=NULL
@@ -1591,6 +1855,7 @@ def _upsert_unit(
             spec.unit_id,
             now,
             now,
+            observed_state,
         ),
     )
 
@@ -2094,7 +2359,15 @@ def register_claims(
     exec_only_paths: set[str],
     owned_units_override: list[tuple[OwnedUnit, str]] | None = None,
     log_root_override: Path | None = None,
+    committed_paths: set[str] | None = None,
+    committed_baseline: str | None = None,
 ) -> RegisterResult:
+    # `committed_paths` are owned paths whose round work lives in committed
+    # history (clean at HEAD); for them ownership is classified against
+    # `committed_baseline` (range `<baseline>..HEAD`) instead of the worktree,
+    # and the unit row is recorded as observed_state='committed' so it matches
+    # the committed observation walk. Empty/None => identical to prior behaviour.
+    committed_path_set = {p for p in (committed_paths or set()) if isinstance(p, str)}
     repo_resolved = repo.resolve()
 
     if _disabled():
@@ -2170,9 +2443,17 @@ def register_claims(
             current_unit_ids: set[str] = set()
 
             for owned_unit, evidence in units:
-                specs = _unit_specs_for_owned(repo_resolved, owned_unit)
+                is_committed = bool(committed_baseline) and owned_unit.path in committed_path_set
+                specs = _unit_specs_for_owned(
+                    repo_resolved,
+                    owned_unit,
+                    committed_baseline=committed_baseline if is_committed else None,
+                )
+                spec_observed_state = "committed" if is_committed else "dirty"
                 for spec in specs:
-                    _upsert_unit(conn, spec, branch_key, worktree_key, now)
+                    _upsert_unit(
+                        conn, spec, branch_key, worktree_key, now, observed_state=spec_observed_state
+                    )
                     is_new = _upsert_session_unit(
                         conn,
                         session_id,
@@ -4221,6 +4502,50 @@ def _prune_stale_leases_in_txn(conn: sqlite3.Connection, now_iso: str) -> int:
     return len(stale_lease_ids)
 
 
+def _supersede_absent_units_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    worktree_key: str,
+    live_unit_ids: set[str],
+    now_iso: str,
+) -> None:
+    """Single supersession chokepoint shared by the dirty walk and the
+    committed-round walk. A unit is superseded only when it is observed in
+    NEITHER the dirty set NOR the committed-round set this pass, and is not
+    already `reviewed`.
+
+    The `review_state IN ('available','assigned')` filter is the load-bearing
+    invariant: a `reviewed` unit is never touched here, so reviewed-then-
+    committed work neither gets superseded nor resurrected — reopening reviewed
+    work stays the exclusive job of the explicit `rvf-reopen` marker
+    (`invalidate_reviewed_units_for_run`), keeping the two paths orthogonal.
+
+    Selecting both observed_states (not just 'dirty') means a committed unit
+    that has dropped out of `baseline..HEAD` (rebased/reverted away) is also
+    swept. When `live_unit_ids` carries only dirty ids — i.e. no committed
+    baseline this pass — there are no committed rows to consider, so behaviour
+    is identical to the historical dirty-only sweep."""
+    rows = conn.execute(
+        """
+        SELECT unit_id
+          FROM units
+         WHERE worktree_key=?
+           AND observed_state IN ('dirty','committed')
+           AND review_state IN ('available','assigned')
+           AND is_tombstoned=0
+        """,
+        (worktree_key,),
+    ).fetchall()
+    for row in rows:
+        unit_id = row["unit_id"]
+        if unit_id in live_unit_ids:
+            continue
+        conn.execute(
+            "UPDATE units SET observed_state='superseded', last_observed_at=? WHERE unit_id=?",
+            (now_iso, unit_id),
+        )
+
+
 def _observe_and_upsert_units_in_txn(
     conn: sqlite3.Connection,
     *,
@@ -4228,132 +4553,57 @@ def _observe_and_upsert_units_in_txn(
     branch_value: str | None,
     worktree_value: str,
     now_iso: str,
+    committed_baseline: str | None = None,
 ) -> dict[str, Any]:
-    """Walk the worktree, upsert units for every dirty path, and mark units
-    that no longer have an observable change as `superseded`. Returns a dict
-    with `branch_key`, `worktree_key`, and the set of currently-observed
-    `unit_ids`."""
+    """Walk the worktree (and, when `committed_baseline` is set, the net
+    committed-round diff), upsert units for every observed change, and mark
+    units that no longer have an observable change as `superseded`. Returns a
+    dict with `branch_key`, `worktree_key`, the set of currently-observed dirty
+    `observed_unit_ids`, and `committed_observed_unit_ids`.
+
+    Ordering: the committed walk runs FIRST and the dirty walk SECOND, so a path
+    that was committed and then re-dirtied within the round ends in the `dirty`
+    observed_state (live state wins) via `_upsert_unit`'s
+    `observed_state=excluded.observed_state` conflict clause. When
+    `committed_baseline` is None the committed walk is skipped entirely and the
+    function reduces to its historical dirty-only behaviour."""
     branch_key = _upsert_branch(conn, branch_value, now_iso) if branch_value else None
     worktree_key = _upsert_worktree(conn, worktree_value, branch_key, None, now_iso)
 
+    committed_observed_unit_ids: set[str] = set()
+    if committed_baseline:
+        for path in _list_committed_round_changed_paths(repo, committed_baseline):
+            observation = _classify_committed_path(repo, path, committed_baseline)
+            if observation is None:
+                continue
+            for spec in _specs_from_observation(observation, path):
+                _upsert_unit(
+                    conn, spec, branch_key, worktree_key, now_iso, observed_state="committed"
+                )
+                committed_observed_unit_ids.add(spec.unit_id)
+
     dirty_paths = _list_dirty_paths(repo)
     observed_unit_ids: set[str] = set()
-    observed_paths: set[str] = set()
     for path in dirty_paths:
-        observation = _classify_path(repo, path)
-        if observation is None:
-            # No observable change on this path — fall back to path_only so
-            # the row still anchors session ownership for paths whose only
-            # evidence was an exec_command (e.g. `chmod +x`).
-            spec = _UnitSpec(
-                unit_id=_canonical_hash_path_only(path),
-                path=path,
-                old_path=None,
-                kind="path_only",
-                change_type="modify",
-                preimage_blob=None,
-                postimage_hash=None,
-                hunk_header=None,
-            )
+        for spec in _specs_from_observation(_classify_path(repo, path), path):
             _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
             observed_unit_ids.add(spec.unit_id)
-            observed_paths.add(path)
-            continue
-        if observation.kind == "tracked_hunk":
-            for hunk in observation.hunks:
-                spec = _UnitSpec(
-                    unit_id=hunk.canonical_hash,
-                    path=path,
-                    old_path=None,
-                    kind="tracked_hunk",
-                    change_type=observation.change_type,
-                    preimage_blob=observation.preimage_blob,
-                    postimage_hash=observation.postimage_hash,
-                    hunk_header=hunk.anchor.header,
-                )
-                _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
-                observed_unit_ids.add(spec.unit_id)
-            observed_paths.add(path)
-            continue
-        if observation.kind == "untracked_file":
-            spec = _UnitSpec(
-                unit_id=_canonical_hash_untracked(path, observation.postimage_hash or ""),
-                path=path,
-                old_path=None,
-                kind="untracked_file",
-                change_type="add",
-                preimage_blob=None,
-                postimage_hash=observation.postimage_hash,
-                hunk_header=None,
-            )
-        elif observation.kind == "deleted_file":
-            spec = _UnitSpec(
-                unit_id=_canonical_hash_deleted(path, observation.preimage_blob or ""),
-                path=path,
-                old_path=None,
-                kind="deleted_file",
-                change_type="delete",
-                preimage_blob=observation.preimage_blob,
-                postimage_hash=None,
-                hunk_header=None,
-            )
-        elif observation.kind == "binary_file":
-            spec = _UnitSpec(
-                unit_id=_canonical_hash_binary(
-                    path,
-                    observation.preimage_blob or "",
-                    observation.postimage_hash or "",
-                ),
-                path=path,
-                old_path=None,
-                kind="binary_file",
-                change_type=observation.change_type,
-                preimage_blob=observation.preimage_blob,
-                postimage_hash=observation.postimage_hash,
-                hunk_header=None,
-            )
-        else:
-            spec = _UnitSpec(
-                unit_id=_canonical_hash_path_only(path),
-                path=path,
-                old_path=None,
-                kind="path_only",
-                change_type="modify",
-                preimage_blob=None,
-                postimage_hash=None,
-                hunk_header=None,
-            )
-        _upsert_unit(conn, spec, branch_key, worktree_key, now_iso)
-        observed_unit_ids.add(spec.unit_id)
-        observed_paths.add(path)
 
-    # Mark units whose paths disappeared from the worktree (file got committed
-    # / reverted) as `superseded` so they don't show up as candidates.
-    if observed_paths is not None:
-        rows = conn.execute(
-            """
-            SELECT unit_id, path
-              FROM units
-             WHERE worktree_key=?
-               AND observed_state='dirty'
-               AND review_state IN ('available','assigned')
-               AND is_tombstoned=0
-            """,
-            (worktree_key,),
-        ).fetchall()
-        for row in rows:
-            unit_id = row["unit_id"]
-            if unit_id in observed_unit_ids:
-                continue
-            conn.execute(
-                "UPDATE units SET observed_state='superseded', last_observed_at=? WHERE unit_id=?",
-                (now_iso, unit_id),
-            )
+    # Mark units whose change no longer appears in either observed set (file got
+    # committed past the baseline / reverted) as `superseded` so they don't show
+    # up as candidates. Reviewed units are left untouched by the helper.
+    _supersede_absent_units_in_txn(
+        conn,
+        worktree_key=worktree_key,
+        live_unit_ids=observed_unit_ids | committed_observed_unit_ids,
+        now_iso=now_iso,
+    )
 
     return {
         "branch_key": branch_key,
         "worktree_key": worktree_key,
         "observed_unit_ids": observed_unit_ids,
+        "committed_observed_unit_ids": committed_observed_unit_ids,
     }
 
 
@@ -4663,6 +4913,7 @@ def allocate_review_scope(
     now: str | None = None,
     auto_claim_observed: bool = True,
     transcript_max_line_number: int | None = None,
+    committed_baseline: str | None = None,
 ) -> dict[str, Any]:
     """Producer half of the global reviewed-diff tracker.
 
@@ -4742,13 +4993,15 @@ def allocate_review_scope(
             # Step 1: prune stale leases.
             stale_freed = _prune_stale_leases_in_txn(conn, now_iso)
 
-            # Step 2: observe worktree → upsert units.
+            # Step 2: observe worktree (and committed round, when a baseline is
+            # supplied) → upsert units.
             observation = _observe_and_upsert_units_in_txn(
                 conn,
                 repo=repo_resolved,
                 branch_value=branch_value,
                 worktree_value=worktree_value,
                 now_iso=now_iso,
+                committed_baseline=committed_baseline,
             )
             worktree_key = observation["worktree_key"]
 
