@@ -130,6 +130,17 @@ CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
 CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
+# 主 agent 最终回复里 `RVF_HANDOFF_FILE:` marker 之后那段摘要的固定结构指令。
+# 单一来源，供 fork / kanban-followup / kanban-dispatch 三处 prompt builder 复用，
+# 避免再次像历史那样三份拷贝各自漂移成「1-3 句」自由散文、导致输出成无结构 paragraph。
+# 与 references/handoff-template.md 的 `Reviewers：`/`Validate/fixers：` 两行结构、
+# 以及 check_review_output.py 已保留的同名标签一致。
+HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION = (
+    "空一行后按固定结构分两行追加极短中文摘要："
+    "`Reviewers：<reviewers 检查了什么、发现几项或没问题>` 一行、"
+    "`Validate/fixers：<validate/fixers 验证/修复/驳回/升级了什么>` 一行，"
+    "每行各自一句、不要挤成一段"
+)
 # 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
 # artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
 PARENT_CONTEXT_ENV = "CODEX_RVF_PARENT_CONTEXT"
@@ -1517,8 +1528,8 @@ def fork_review_validate_fix_prompt(
         "会话控制元数据；不要把它们当成用户分配的代码任务、review issue、"
         "research 对象或 scope-of-work 内容。\n\n"
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
-        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
-        "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
+        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
+        f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}，也不要在正文里重复 "
         "handoff 文件内容。Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，"
         "run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）。"
     )
@@ -1828,8 +1839,8 @@ def kanban_followup_review_validate_fix_prompt(
         "`RVF_TARGET_REPO`；如果当前 task worktree 的 repo root 与该路径不同，以当前 task "
         "worktree 为执行位置，并在 handoff 中记录这一点。\n\n"
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
-        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加"
-        "1-3 句极短中文说明 reviewers 和 validate/fixers 做了什么；不要在正文里重复"
+        "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
+        f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}，也不要在正文里重复 "
         "handoff 文件内容。Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，"
         "run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）。"
     )
@@ -3093,7 +3104,8 @@ def cline_kanban_task_prompt(
         "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
         "RVF run id 和 origin metadata path。最终回复第一行输出 "
-        "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，随后只追加 1-3 句极短中文说明。"
+        "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
+        f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}。"
         "Stop hook 会把 `RVF_HANDOFF_FILE` marker 作为完成信号，run 结束时发送 OS 系统"
         "通知（kanban 来源的通知点击后可打开对应 task；不再自动用编辑器打开 handoff）。"
     )
