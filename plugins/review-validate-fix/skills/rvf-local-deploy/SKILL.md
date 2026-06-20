@@ -84,6 +84,46 @@ rg -n "SCHEMA_VERSION|ANALYSIS_SCHEMA_VERSION" \
   /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/analysis_artifacts.py
 ```
 
+## 实际部署后：汇总本次新投入使用的 commit
+
+仅在**确实执行了安装**（installer 跑成功、向 deploy log 追加了新条目）后做；在 Failure Gate 处中止、根本没安装时跳过本节。
+
+目的：最终回复不仅要说「部署到了哪个 HEAD」，还要明确「这次部署相对**上一次部署**，新投入使用了哪些 commit」——这是用户每次实际部署都想在收尾看到的 delta。
+
+数据源是 deploy log `deployments.jsonl`：installer 每次安装都向它 append 一条含 `source.head` 的记录。本次安装写入的是**最后一行**，上一次部署是**倒数第二行**；两者的 `source.head` 做 `git log` 区间即得本次新增 commit：
+
+```bash
+JSONL=/Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/deployments.jsonl
+python3 - "$JSONL" <<'PY'
+import json, sys, subprocess, pathlib
+lines = [l for l in pathlib.Path(sys.argv[1]).read_text().splitlines() if l.strip()]
+heads = [json.loads(l).get("source", {}).get("head") for l in lines]
+new = heads[-1]
+prev = heads[-2] if len(heads) >= 2 else None
+print("本次部署 HEAD:", (new or "?")[:12])
+if not prev:
+    print("（首次记录的部署，无前序部署可对比）"); raise SystemExit
+print("上次部署 HEAD:", prev[:12])
+fwd = subprocess.run(["git", "log", "--oneline", "--no-decorate", f"{prev}..{new}"], capture_output=True, text=True)
+back = subprocess.run(["git", "log", "--oneline", "--no-decorate", f"{new}..{prev}"], capture_output=True, text=True)
+if fwd.returncode or back.returncode:
+    print("（区间计算失败：前序 HEAD 可能已不在当前 repo——按 describe/head 直述，不做区间）"); raise SystemExit
+fwd_lines = [x for x in fwd.stdout.splitlines() if x.strip()]
+back_lines = [x for x in back.stdout.splitlines() if x.strip()]
+if not fwd_lines and not back_lines:
+    print("本次与上一次部署为同一 HEAD，无新增 commit。")
+else:
+    if fwd_lines:
+        print(f"新投入使用 {len(fwd_lines)} 个 commit（上次 → 本次）：")
+        for x in fwd_lines: print("  +", x)
+    if back_lines:
+        print(f"⚠️ 另有 {len(back_lines)} 个 commit 不在本次 HEAD 上（回滚/分叉，本次相对上次回退了它们）：")
+        for x in back_lines: print("  -", x)
+PY
+```
+
+把这段输出里「新投入使用的 commit 列表」（及回滚/分叉警告，如有）原样纳入最终回复。三种边界都要如实呈现：首次部署无基线、与上次同一 HEAD 无新增、以及回滚/分叉时哪些 commit 被回退。
+
 ## 重启 Kanban listener（如适用）
 
 本 skill 只部署 plugin 文件，不重启任何运行进程。但若某次部署后确实需要重启 RVF 所拥有/复用的 Kanban listener（tmux 会话 `cline-kanban` / `cline-kanban-<port>`），**不要按进程名杀**（`pkill -f kanban` / `killall node` 会误杀同机并存的其它 kanban/mkanban/node listener），**也不要盲目重建 tmux 会话**（会丢失富交互 PATH）。正确做法：按端口反查唯一 PID，用 `kill -9 <pid>` 让 `while true` 监督脚本（`run-cline-kanban-<port>-service.sh`）原地重拉，PATH/cwd 经存活的监督进程继承。
@@ -101,4 +141,4 @@ rg -n "SCHEMA_VERSION|ANALYSIS_SCHEMA_VERSION" \
 - 部署会复制无关的未提交 plugin/runtime 改动。
 - 用户要求 stable deployment，但 checkout 不在预期 branch/tag/commit。
 
-最终回复中说明 installer 输出摘要、post-deploy checks、deploy log 路径，以及哪些 dirty paths 被有意保留未动。
+最终回复中说明 installer 输出摘要、post-deploy checks、deploy log 路径、**本次相对上一次部署新投入使用的 commit 列表**（见「实际部署后：汇总本次新投入使用的 commit」一节；仅实际安装后给出），以及哪些 dirty paths 被有意保留未动。
