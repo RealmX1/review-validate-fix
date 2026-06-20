@@ -962,6 +962,15 @@ def parent_conversation_origin(
         session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
     )
     transcript_path = str(parent_thread_path) if parent_thread_path is not None else None
+    # host_kind 复用 executor 选择的同一探测（detect_transcript_format）：同输入→同结果、
+    # 不与 resolve_cline_kanban_agent_id 漂移。它决定 session_ref_fallback 前缀与 codex_url
+    # 是否成立——避免把 Claude Code 会话硬贴成 "Codex" 标签 / `codex://` URL。
+    host_kind: str | None = None
+    if parent_thread_path is not None:
+        try:
+            host_kind = detect_transcript_format(parent_thread_path)
+        except Exception:
+            host_kind = None
     name_source = "app_server_name"
     label = parent_thread_name.strip() if isinstance(parent_thread_name, str) else ""
     if not label:
@@ -971,7 +980,11 @@ def parent_conversation_origin(
         label = quoted_prompt_session_name(parent_thread_path) or ""
         name_source = "first_user_prompt_fallback" if label else "session_ref_fallback"
     if not label:
-        label = f"Codex {transcript_origin_label(parent_thread_path, session_id) or short_identifier(session_id)}"
+        # 前三级 lookup 全是 Codex-only schema（session_index / Codex 记录的首条 user
+        # message），在 Claude 会话上必然落空。这里按 host_kind 给出正确前缀；host 未知
+        # （transcript 缺失/不可识别）时仍兜底 "Codex"，与既有 Codex-only 用例零回归。
+        host_prefix = "Claude" if host_kind == HOST_CLAUDE else "Codex"
+        label = f"{host_prefix} {transcript_origin_label(parent_thread_path, session_id) or short_identifier(session_id)}"
         name_source = "session_ref_fallback"
     run_ref = short_run_ref(run_id)
     return {
@@ -981,12 +994,27 @@ def parent_conversation_origin(
         "name_lookup": name_lookup,
         "session_id": session_id,
         "session_short_id": short_identifier(session_id),
-        "codex_url": f"codex://local/{session_id}" if session_id else None,
+        "host_kind": host_kind,
+        # codex:// 只对 Codex（含 host 未知兜底）成立；Claude Code 会话无该 scheme，
+        # 置 None（prompt block 经 value_or_unavailable 渲染为 <unavailable>），
+        # 其「打开」入口由已输出的 RVF_PARENT_TRANSCRIPT_PATH 承担。
+        "codex_url": (
+            f"codex://local/{session_id}" if session_id and host_kind != HOST_CLAUDE else None
+        ),
         "transcript_path": transcript_path,
         "transcript_file": parent_thread_path.name if parent_thread_path is not None else None,
         "run_id": run_id,
         "run_ref": run_ref,
     }
+
+
+def parent_conversation_host_label(host_kind: str | None) -> str:
+    """父会话 harness 的人类可读名，用于 prompt-block 文案标题。
+
+    Claude transcript → ``Claude Code``；其余（Codex / host 未知 / parent_origin 缺
+    ``host_kind`` 键）→ ``Codex``，与 ``parent_conversation_origin`` 的兜底口径一致。
+    """
+    return "Claude Code" if host_kind == HOST_CLAUDE else "Codex"
 
 
 def source_origin_for_kanban_task(
@@ -1044,8 +1072,9 @@ def parent_origin_prompt_block(
     parent_transcript_path = value_or_unavailable(parent_origin.get("transcript_path"))
     parent_transcript_file = value_or_unavailable(parent_origin.get("transcript_file"))
     parent_origin_path = value_or_unavailable(origin_path)
+    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
     lines = [
-        "Original Codex conversation metadata:\n"
+        f"Original {host_label} conversation metadata:\n"
         f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
         f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
         f"RVF_PARENT_CONVERSATION_NAME_SOURCE: {parent_conversation_source}\n"
@@ -1070,7 +1099,7 @@ def parent_origin_prompt_block(
     lines.append(
         "\n"
         "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
-        "Codex conversation name/ref、name source、codex URL、transcript path "
+        f"{host_label} conversation name/ref、name source、codex URL、transcript path "
         "和 origin metadata path；如果存在 `RVF_PARENT_KANBAN_TASK_ID`，还必须写入 "
         "`source Kanban task id` 和 `source Kanban attempt id`，以便任务改名后仍可反查"
         "当前 task title；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
@@ -3010,7 +3039,10 @@ def cline_kanban_task_prompt(
     worktree_mode: str,
 ) -> str:
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
-    parent_conversation_ref = str(parent_origin.get("label") or "<unknown Codex conversation>")
+    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
+    parent_conversation_ref = str(
+        parent_origin.get("label") or f"<unknown {host_label} conversation>"
+    )
     parent_conversation_source = str(parent_origin.get("name_source") or "<unknown>")
     parent_codex_url = str(parent_origin.get("codex_url") or "<unavailable>")
     parent_transcript_file = str(parent_origin.get("transcript_file") or "<unknown>")
@@ -3087,7 +3119,7 @@ def cline_kanban_task_prompt(
         "RVF_ORIGINAL_FORK_PROMPT: $RVF_ARTIFACTS_DIR/fork.prompt.txt\n"
         f"RVF_DISPATCH=token={dispatch_prep.token}\n"
         f"RVF_PREP_FILE: {dispatch_prep.path}\n\n"
-        "Original Codex conversation trace:\n"
+        f"Original {host_label} conversation trace:\n"
         f"- name/ref: `{parent_conversation_ref}`\n"
         f"- name source: `{parent_conversation_source}`\n"
         f"- open: `{parent_codex_url}`\n"

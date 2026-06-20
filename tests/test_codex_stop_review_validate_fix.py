@@ -907,6 +907,82 @@ def test_parent_conversation_origin_uses_stable_ref_when_prompt_fallback_unavail
     assert origin["label"] == "Codex 2026-05-01T11-25-17 019de191"
     assert origin["name_source"] == "session_ref_fallback"
     assert '"' not in origin["task_title"]
+    # host=Codex 兜底无回归：host_kind 标 Codex、codex:// URL 仍铸造。
+    assert origin["host_kind"] == module.HOST_CODEX
+    assert origin["codex_url"] == "codex://local/019de191-ba6c-7b13-9874-65eeabb6a6a7"
+
+
+def test_parent_conversation_origin_labels_claude_host_when_codex_lookups_miss(
+    tmp_path: Path,
+) -> None:
+    """Claude Code 会话：前置 Codex-only lookup 全落空时，前缀应为 Claude 而非 Codex，
+    且不再铸造 codex:// URL（复现并锁死 board.json 里 ``RVF from Codex … / agentId=claude``
+    的矛盾根因）。"""
+    module = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    session_id = "57f1d2ff-8470-48e5-a259-0b51e2002603"
+    # Claude transcript：文件名是裸 UUID（非 rollout-…），记录用 Claude schema
+    # （type=user/assistant），Codex 侧 first_user_message 解析不到 → 落到 host-aware 兜底。
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "codex 解析器读不到"}})
+        + "\n"
+        + json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "ok"}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    original_session_index = isolate_codex_session_index(tmp_path)
+    try:
+        origin = module.parent_conversation_origin(
+            parent_session_id=session_id,
+            parent_thread_path=transcript,
+            run_id="rvf-20260620T153456Z-stop-hook-134fa44d",
+            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
+        )
+    finally:
+        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
+
+    assert origin["host_kind"] == module.HOST_CLAUDE
+    assert origin["name_source"] == "session_ref_fallback"
+    assert origin["label"] == "Claude 57f1d2ff"
+    assert origin["task_title"] == "RVF from Claude 57f1d2ff run 134fa44d"
+    assert "Codex" not in origin["task_title"]
+    assert origin["codex_url"] is None
+
+
+def test_parent_origin_prompt_block_uses_claude_heading_for_claude_host(tmp_path: Path) -> None:
+    """prompt-block 人类可读文案随 host_kind 走：Claude 会话不应再写 'Original Codex …'
+    标题，codex_url 缺失时渲染 <unavailable>。"""
+    module = load_hook_module()
+    block = module.parent_origin_prompt_block(
+        parent_origin={
+            "label": "Claude 57f1d2ff",
+            "name_source": "session_ref_fallback",
+            "host_kind": module.HOST_CLAUDE,
+            "codex_url": None,
+            "session_id": "57f1d2ff-8470-48e5-a259-0b51e2002603",
+            "transcript_path": "/Users/x/.claude/projects/p/57f1d2ff.jsonl",
+            "transcript_file": "57f1d2ff.jsonl",
+        },
+        origin_path="/tmp/origin.json",
+    )
+    assert "Original Claude Code conversation metadata:" in block
+    assert "Original Codex conversation metadata:" not in block
+    assert "original Claude Code conversation name/ref" in block
+    assert "RVF_PARENT_CODEX_URL: <unavailable>" in block
+    # Codex host 仍写 'Original Codex …'（兜底口径，无回归）。
+    codex_block = module.parent_origin_prompt_block(
+        parent_origin={
+            "label": "Codex 019de191",
+            "name_source": "session_ref_fallback",
+            "host_kind": module.HOST_CODEX,
+            "codex_url": "codex://local/019de191",
+        },
+        origin_path="/tmp/origin.json",
+    )
+    assert "Original Codex conversation metadata:" in codex_block
+    assert "RVF_PARENT_CODEX_URL: codex://local/019de191" in codex_block
 
 
 def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp_path: Path) -> None:
@@ -7070,6 +7146,8 @@ def main() -> int:
         test_parent_conversation_origin_uses_session_index_when_chat_lookup_fails,
         test_parent_conversation_origin_quotes_first_user_prompt_when_chat_lookup_fails,
         test_parent_conversation_origin_uses_stable_ref_when_prompt_fallback_unavailable,
+        test_parent_conversation_origin_labels_claude_host_when_codex_lookups_miss,
+        test_parent_origin_prompt_block_uses_claude_heading_for_claude_host,
         test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
