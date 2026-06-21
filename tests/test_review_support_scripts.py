@@ -8962,8 +8962,347 @@ def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
     assert result["candidate_unit_count"] >= 1, result
 
 
+def load_dispatch_reviewers_module():
+    # dispatch_reviewers imports rvf_logging / run_alternative_reviewer / trajectory_distill
+    # from SCRIPT_DIR, so SCRIPT_DIR must be importable.
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "dispatch_reviewers", SCRIPT_DIR / "dispatch_reviewers.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load dispatch_reviewers module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _dispatch_registry() -> dict:
+    """In-memory registry mirroring config/reviewer-registry.json (real harness ids)."""
+    return {
+        "schema_version": 1,
+        "harnesses": {
+            "cursor": {
+                "harness_id": "cursor",
+                "label_prefix": "alternative-reviewer:cursor-cli",
+                "config_path": "config/alternative-reviewer.cursor.json",
+                "dispatch_mode": "external_cli",
+                "enabled": True,
+                "priority_default": 100,
+            },
+            "claude_code": {
+                "harness_id": "claude_code",
+                "label_prefix": "alternative-reviewer:claude-code",
+                "config_path": "config/alternative-reviewer.claude.json",
+                "dispatch_mode": "external_cli",
+                "enabled": True,
+                "priority_default": 50,
+            },
+            "codex": {
+                "harness_id": "codex",
+                "label_prefix": "alternative-reviewer:codex-cli",
+                "config_path": "config/alternative-reviewer.codex.json",
+                "dispatch_mode": "external_cli",
+                "enabled": True,
+                "priority_default": 50,
+            },
+        },
+    }
+
+
+def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
+    """路由矩阵 R0–R4：测试用例名 ↔ 规则 id。
+
+    | 场景 | M | A | rule | slots |
+    |------|---|---|------|-------|
+    | R0 main=claude | claude_code | cursor,claude_code,codex | R0 | cursor,codex |
+    | R0 main=codex  | codex       | cursor,claude_code,codex | R0 | cursor,claude_code |
+    | R0 main=cursor(override) | cursor | cursor,claude_code,codex | R0 | claude_code,codex |
+    | R1 cursor+codex | claude_code | cursor,codex | R1 | cursor,codex |
+    | R1 no-cursor (R4) | claude_code | claude_code,codex | R1 | claude_code,codex + cursor_unavailable |
+    | R2 only==M | codex | codex | R2 | codex-cli-a,codex-cli-b |
+    | R2 only!=M | claude_code | codex | R2 | codex-cli-a,codex-cli-b + mismatch |
+    | R3 zero | claude_code | (none) | R3 | needs_last_resort_fallback |
+    """
+    d = load_dispatch_reviewers_module()
+    reg = _dispatch_registry()
+
+    def harnesses(plan):
+        return [r["harness_id"] for r in plan["reviewers"]]
+
+    def warns(plan):
+        return {w["code"] for w in plan["warnings"]}
+
+    # R0 — 默认两路非主，cursor 必选一腿
+    p = d.route("claude_code", ["cursor", "claude_code", "codex"], reg)
+    assert p["routing_rule"] == "R0", p
+    assert harnesses(p) == ["cursor", "codex"], p
+    assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
+    assert p["status"] == "planned" and p["needs_last_resort_fallback"] is False
+
+    p = d.route("codex", ["cursor", "claude_code", "codex"], reg)
+    assert p["routing_rule"] == "R0" and harnesses(p) == ["cursor", "claude_code"], p
+
+    # R0 主=cursor（仅显式覆盖可达）→ 两路非主，cursor 不占 slot
+    p = d.route("cursor", ["cursor", "claude_code", "codex"], reg)
+    assert p["routing_rule"] == "R0" and set(harnesses(p)) == {"claude_code", "codex"}, p
+
+    # R1 — 恰两路 external（含 cursor）
+    p = d.route("claude_code", ["cursor", "codex"], reg)
+    assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"cursor", "codex"}, p
+
+    # R1 + R4 — cursor 不可用：仍两路 external（主以 external 跑），记 cursor_unavailable
+    p = d.route("claude_code", ["claude_code", "codex"], reg)
+    assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"claude_code", "codex"}, p
+    assert "cursor_unavailable" in warns(p), p
+    assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
+
+    # R2 — 同 harness 双 external，only==M（info）
+    p = d.route("codex", ["codex"], reg)
+    assert p["routing_rule"] == "R2", p
+    assert [r["reviewer_id"] for r in p["reviewers"]] == ["codex-cli-a", "codex-cli-b"], p
+    assert "only_main_harness_available" in warns(p), p
+    assert "cursor_unavailable" not in warns(p), p  # R2 不叠加 R4
+
+    # R2 — only!=M：必须 mismatch warning
+    p = d.route("claude_code", ["codex"], reg)
+    assert p["routing_rule"] == "R2" and "available_reviewer_harness_mismatch" in warns(p), p
+
+    # R3 — 零可用：默认 needs_last_resort_fallback，不 fail
+    p = d.route("claude_code", [], reg)
+    assert p["routing_rule"] == "R3" and p["needs_last_resort_fallback"] is True, p
+    assert p["status"] == "planned" and p["reviewers"] == [], p
+
+    # R3 — require_external：fail-close
+    p = d.route("claude_code", [], reg, require_external_only=True)
+    assert p["status"] == "failed" and p.get("reason") == "no_reviewer_harness_available", p
+
+
+def test_dispatch_reviewers_same_harness_double_instance_distinct_ids(root: Path) -> None:
+    d = load_dispatch_reviewers_module()
+    reg = _dispatch_registry()
+    p = d.route("cursor", ["cursor"], reg)
+    ids = [r["reviewer_id"] for r in p["reviewers"]]
+    labels = [r["label"] for r in p["reviewers"]]
+    assert len(set(ids)) == 2, ids
+    assert ids == ["cursor-cli-a", "cursor-cli-b"], ids
+    assert labels == [
+        "alternative-reviewer:cursor-cli#a",
+        "alternative-reviewer:cursor-cli#b",
+    ], labels
+
+
+def test_dispatch_reviewers_plan_artifact_schema(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    reg_path = root / "registry.json"
+    reg_path.write_text(json.dumps(_dispatch_registry()), encoding="utf-8")
+    run_dir = root / "run"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "dispatch_reviewers.py"),
+            "--registry",
+            str(reg_path),
+            "--assume-available",
+            "cursor,codex",
+            "--main-harness",
+            "codex",
+            "--rvf-run-dir",
+            str(run_dir),
+            "--plan-only",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    plan_path = run_dir / "artifacts" / "reviewers" / "reviewer-plan.json"
+    assert plan_path.exists(), completed.stdout
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    for key in (
+        "schema_version",
+        "main_harness",
+        "available_harnesses",
+        "routing_rule",
+        "reviewers",
+        "warnings",
+        "needs_last_resort_fallback",
+        "status",
+    ):
+        assert key in plan, (key, plan)
+    assert plan["status"] == "planned" and plan["main_harness"] == "codex"
+    assert plan["routing_rule"] == "R1" and len(plan["reviewers"]) == 2
+    for r in plan["reviewers"]:
+        for key in ("slot", "harness_id", "dispatch_mode", "label", "config_path", "reviewer_id"):
+            assert key in r, (key, r)
+        assert r["dispatch_mode"] == "external_cli", r
+
+
+def test_dispatch_reviewers_executes_two_external(root: Path) -> None:
+    """fake CLI shim 并行双 external：两路 review-result.json 路径存在、reviewer_id 唯一不撞目录。"""
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_cmd = [
+        "bash",
+        "-c",
+        'cat >/dev/null; python3 "$RVF_WRITE_REVIEW_RESULT" no-issues '
+        '--out "$RVF_REVIEW_RESULT" --audit-summary "fake $RVF_REVIEWER_ID reviewed scope"',
+    ]
+    reg = {"schema_version": 1, "harnesses": {}}
+    for hid in ("alpha", "beta"):
+        config_path = root / f"alt-{hid}.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "label": f"alternative-reviewer:{hid}-cli",
+                    "command": fake_cmd,
+                    "allow_repo_cwd": True,
+                    "pre_run_health": False,
+                    "output_format": "text",
+                }
+            ),
+            encoding="utf-8",
+        )
+        reg["harnesses"][hid] = {
+            "harness_id": hid,
+            "label_prefix": f"alternative-reviewer:{hid}-cli",
+            "config_path": str(config_path),
+            "dispatch_mode": "external_cli",
+            "enabled": True,
+            "priority_default": 100 if hid == "alpha" else 50,
+        }
+    plan = d.route("codex", ["alpha", "beta"], reg)
+    assert plan["routing_rule"] == "R1" and len(plan["reviewers"]) == 2
+    run_dir = root / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = root / "packet.md"
+    packet.write_text("## Review Packet\n\nintegration test\n", encoding="utf-8")
+    plan = d.execute_plan(
+        plan,
+        repo=None,
+        review_packet=str(packet),
+        session_context=None,
+        scope_contract=None,
+        run_id="dispatch-exec-test",
+        run_dir=str(run_dir),
+        artifacts_dir=artifacts_dir,
+    )
+    assert plan["status"] == "completed", plan
+    reviewer_dirs = sorted(p.name for p in (artifacts_dir / "reviewers").iterdir() if p.is_dir())
+    assert reviewer_dirs == ["alpha-cli", "beta-cli"], reviewer_dirs
+    seen_paths = set()
+    for r in plan["reviewers"]:
+        assert r["returncode"] == 0, r
+        result_path = Path(r["review_result_path"])
+        assert result_path.exists(), r
+        seen_paths.add(str(result_path))
+    assert len(seen_paths) == 2, seen_paths
+
+
+def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
+    """回归（RVF-001）：`source review-env.sh; dispatch_reviewers.py --execute` 不带显式
+    --repo/--review-packet/--session-context 时，应从 review-env.sh 导出的
+    RVF_REPO / RVF_REVIEW_PACKET / RVF_SCOPE_OF_WORK 回填，否则子进程 reviewer 因缺参失败。"""
+    root.mkdir(parents=True, exist_ok=True)
+    fake_cmd = [
+        "bash",
+        "-c",
+        'cat >/dev/null; python3 "$RVF_WRITE_REVIEW_RESULT" no-issues '
+        '--out "$RVF_REVIEW_RESULT" --audit-summary "env-backfill ok"',
+    ]
+    reg = {"schema_version": 1, "harnesses": {}}
+    for hid in ("alpha", "beta"):
+        config_path = root / f"alt-{hid}.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "label": f"alternative-reviewer:{hid}-cli",
+                    "command": fake_cmd,
+                    "allow_repo_cwd": True,
+                    "pre_run_health": False,
+                    "output_format": "text",
+                }
+            ),
+            encoding="utf-8",
+        )
+        reg["harnesses"][hid] = {
+            "harness_id": hid,
+            "label_prefix": f"alternative-reviewer:{hid}-cli",
+            "config_path": str(config_path),
+            "dispatch_mode": "external_cli",
+            "enabled": True,
+            "priority_default": 100 if hid == "alpha" else 50,
+        }
+    reg_path = root / "registry.json"
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    packet = root / "packet.md"
+    packet.write_text("## Review Packet\n\nenv backfill\n", encoding="utf-8")
+    sow = root / "scope-of-work.md"
+    sow.write_text("## scope\n", encoding="utf-8")
+    run_dir = root / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CODEX_RVF_")}
+    # emulate `source review-env.sh`: packet/scope only via env, NOT CLI args.
+    # (RVF_REPO omitted — review-packet alone is sufficient for the reviewer kernel;
+    # setting it to a non-git tmp dir would trip check_repo. The env-backfill code path
+    # is identical for repo/packet/scope.)
+    env["RVF_REVIEW_PACKET"] = str(packet)
+    env["RVF_SCOPE_OF_WORK"] = str(sow)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "dispatch_reviewers.py"),
+            "--registry",
+            str(reg_path),
+            "--main-harness",
+            "codex",
+            "--assume-available",
+            "alpha,beta",
+            "--rvf-run-id",
+            "env-backfill",
+            "--rvf-run-dir",
+            str(run_dir),
+            "--execute",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert completed.returncode == 0, completed.stderr
+    plan = json.loads(
+        (run_dir / "artifacts" / "reviewers" / "reviewer-plan.json").read_text(encoding="utf-8")
+    )
+    assert plan["status"] == "completed", plan
+    for r in plan["reviewers"]:
+        assert r["returncode"] == 0, r
+        assert Path(r["review_result_path"]).exists(), r
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
+        (
+            "dispatch_reviewers_routing_matrix",
+            lambda: test_dispatch_reviewers_routing_matrix(root / "dispatch-routing"),
+        ),
+        (
+            "dispatch_reviewers_same_harness_double_instance_distinct_ids",
+            lambda: test_dispatch_reviewers_same_harness_double_instance_distinct_ids(
+                root / "dispatch-double-instance"
+            ),
+        ),
+        (
+            "dispatch_reviewers_plan_artifact_schema",
+            lambda: test_dispatch_reviewers_plan_artifact_schema(root / "dispatch-plan-schema"),
+        ),
+        (
+            "dispatch_reviewers_executes_two_external",
+            lambda: test_dispatch_reviewers_executes_two_external(root / "dispatch-execute"),
+        ),
+        (
+            "dispatch_reviewers_execute_backfills_review_env",
+            lambda: test_dispatch_reviewers_execute_backfills_review_env(root / "dispatch-env-backfill"),
+        ),
         (
             "diff_tracker_observes_committed_round_units",
             lambda: test_diff_tracker_observes_committed_round_units(root / "committed-observe"),

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "description": "RVF santa-method 双 review 的 external reviewer harness 注册表。dispatch_reviewers.py 据此 probe 可用 harness 并路由出恰好两路 external_cli reviewer。config_path 相对 skill 根目录解析。",
+  "harnesses": {
+    "cursor": {
+      "harness_id": "cursor",
+      "label_prefix": "alternative-reviewer:cursor-cli",
+      "config_path": "config/alternative-reviewer.cursor.json",
+      "dispatch_mode": "external_cli",
+      "enabled": true,
+      "priority_default": 100
+    },
+    "claude_code": {
+      "harness_id": "claude_code",
+      "label_prefix": "alternative-reviewer:claude-code",
+      "config_path": "config/alternative-reviewer.claude.json",
+      "dispatch_mode": "external_cli",
+      "enabled": true,
+      "priority_default": 50
+    },
+    "codex": {
+      "harness_id": "codex",
+      "label_prefix": "alternative-reviewer:codex-cli",
+      "config_path": "config/alternative-reviewer.codex.json",
+      "dispatch_mode": "external_cli",
+      "enabled": true,
+      "priority_default": 50
+    }
+  }
+}

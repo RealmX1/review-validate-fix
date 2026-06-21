@@ -1,15 +1,16 @@
 {
   "enabled": true,
-  "label": "alternative-reviewer:cursor-cli",
+  "label": "alternative-reviewer:claude-code",
   "command": [
-    "cursor-agent",
+    "claude",
     "-p",
     "--output-format",
     "stream-json",
-    "--force",
-    "--trust",
-    "--sandbox",
-    "disabled"
+    "--include-hook-events",
+    "--include-partial-messages",
+    "--no-session-persistence",
+    "--tools",
+    "Bash,Read"
   ],
   "allow_repo_cwd": true,
   "idle_timeout_seconds": 300,
@@ -20,12 +21,13 @@
   "max_runtime_seconds": null,
   "health_timeout_seconds": 30,
   "pre_run_health": true,
-  "output_format": "cursor_stream_json",
+  "output_format": "claude_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],
   "health_command": [
-    "cursor-agent",
+    "claude",
+    "auth",
     "status"
   ]
 }

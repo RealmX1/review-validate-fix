@@ -20,7 +20,7 @@ from rvf_logging import start_run
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = SKILL_DIR / "config" / "alternative-reviewer.json"
+DEFAULT_CONFIG = SKILL_DIR / "config" / "alternative-reviewer.cursor.json"
 DEFAULT_PROMPT = SKILL_DIR / "prompts" / "reviewer.md"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
@@ -1380,6 +1380,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Print command and prompt length without invoking reviewer.")
     parser.add_argument("--rvf-run-id", help="Use an existing RVF run id instead of creating a new one.")
     parser.add_argument("--rvf-run-dir", help="Use this RVF run directory instead of resolving state/runs/<run_id>.")
+    parser.add_argument("--reviewer-id", help="Override the reviewer artifact id (defaults to the config label). Used by dispatch_reviewers.py to run two same-harness instances without colliding on artifacts/reviewers/<id>/.")
     args = parser.parse_args()
     ledger = start_run(
         "reviewer",
@@ -1641,7 +1642,7 @@ def main() -> int:
     session_context = Path(args.session_context).expanduser().resolve() if args.session_context else None
     review_packet = Path(args.review_packet).expanduser().resolve() if args.review_packet else None
     scope_contract = Path(args.scope_contract).expanduser().resolve() if args.scope_contract else None
-    reviewer_id = reviewer_id_from_label(label)
+    reviewer_id = safe_artifact_token(args.reviewer_id) if args.reviewer_id else reviewer_id_from_label(label)
     reviewer_dir = ledger.artifacts_dir / "reviewers" / reviewer_id
     review_result_path = reviewer_dir / "review-result.json"
 

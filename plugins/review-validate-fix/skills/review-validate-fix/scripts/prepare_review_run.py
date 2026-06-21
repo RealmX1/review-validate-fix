@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -19,7 +20,12 @@ import diff_tracker
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
+from trajectory_distill import HOST_CODEX, detect_transcript_format
 
+
+# 合法的主 dispatch harness（与 dispatch_reviewers / reviewer-registry 对齐）。
+# cursor 仅经显式 RVF_MAIN_HARNESS=cursor 覆盖可达，transcript 探测永不返回 cursor。
+VALID_MAIN_HARNESSES = {"cursor", "claude_code", "codex"}
 
 SHARED_WORKFLOW_DEFAULT_TIMEOUT_SECONDS = 60.0
 TARGET_FLOW_BACKEND = {
@@ -92,6 +98,7 @@ def review_env_exports(
     tracker_scope_path: Path | None = None,
     rvf_backend: str | None = None,
     parent_context_path: Path | None = None,
+    main_harness: str | None = None,
 ) -> tuple[dict[str, str], str]:
     env: dict[str, str] = {
         "RVF_REPO": str(repo),
@@ -111,6 +118,8 @@ def review_env_exports(
         "CODEX_RVF_RUN_ID": run_id,
         "CODEX_RVF_RUN_DIR": str(run_dir),
     }
+    if main_harness:
+        env["RVF_MAIN_HARNESS"] = main_harness
     canonical_backend = normalize_rvf_backend(rvf_backend)
     if canonical_backend is not None:
         env["RVF_BACKEND"] = canonical_backend
@@ -158,6 +167,8 @@ def review_env_exports(
         lines.append('export RVF_SESSION_CONTEXT="$RVF_SCOPE_OF_WORK"')
     if session_manifest_path is not None:
         lines.append('export RVF_SESSION_MANIFEST="$RVF_ARTIFACTS_DIR/session-manifest.json"')
+    if main_harness:
+        lines.append(f"export RVF_MAIN_HARNESS={shlex.quote(main_harness)}")
     if canonical_backend is not None:
         lines.append(f"export RVF_BACKEND={shlex.quote(canonical_backend)}")
     lines.extend(
@@ -866,6 +877,35 @@ def prepare_run(
                         )
                     except Exception:
                         pass
+    # 主 dispatch harness 解析（供 dispatch_reviewers.py 只读）。cursor 永远不会被
+    # transcript 探测命中——只能经显式 RVF_MAIN_HARNESS 覆盖到达（Q3）。优先级与
+    # dispatch_reviewers.resolve_main_harness 对齐：显式 env 覆盖 > transcript 探测 > 默认 codex。
+    # 必须在这里 honor 显式 env，否则下面导出的 review-env.sh 会把用户设的
+    # RVF_MAIN_HARNESS=cursor 覆盖回 codex，令 env 覆盖路径在端到端失效。
+    override_main_harness = os.environ.get("RVF_MAIN_HARNESS")
+    if override_main_harness not in VALID_MAIN_HARNESSES:
+        override_main_harness = None
+    detected_main_harness = detect_transcript_format(transcript) if transcript is not None else None
+    main_harness = override_main_harness or detected_main_harness or HOST_CODEX
+    main_harness_source = (
+        "env-override" if override_main_harness else ("transcript" if detected_main_harness else "default")
+    )
+    main_harness_path = inputs_dir / "main-harness.json"
+    main_harness_path.write_text(
+        json.dumps(
+            {
+                "main_harness": main_harness,
+                "detected": detected_main_harness,
+                "override": override_main_harness,
+                "source": main_harness_source,
+                "transcript": str(transcript) if transcript is not None else None,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     review_env, review_env_text = review_env_exports(
         repo=root,
         run_id=ledger.run_id,
@@ -885,6 +925,7 @@ def prepare_run(
         tracker_scope_path=resolved_input_tracker_scope_path,
         rvf_backend=canonical_backend,
         parent_context_path=artifact_dir / "parent-conversation-context.md",
+        main_harness=main_harness,
     )
     review_env_path.write_text(review_env_text, encoding="utf-8")
     review_agent_context = review_agent_context_text(
@@ -903,6 +944,8 @@ def prepare_run(
         "summary_path": str(ledger.summary_path),
         "artifacts_dir": str(artifact_dir),
         "inputs_dir": str(inputs_dir),
+        "main_harness": main_harness,
+        "main_harness_file": str(main_harness_path),
         "scope_contract": str(scope_contract_path),
         "scope_contract_payload": scope_contract,
         "review_packet": str(packet_path),

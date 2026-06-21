@@ -45,6 +45,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 ## Review
 
 - 默认执行两个独立 review pass，除非用户显式跳过 review。
+- 派发由脚本完成：`source review-env.sh` 后运行 `scripts/dispatch_reviewers.py --execute`，它解析主 dispatch harness、probe `reviewer-registry.json` 中的 harness、按路由规则选出**恰好两路 external reviewer** 并并行派发。主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿；只在 `dispatch_reviewers.py` 报告 0 个 external 可用时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
 - `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。
 - 每个 reviewer artifact 必须通过 `scripts/check_review_result.py` 校验；artifact 缺失、schema invalid、excluded path、clean/issues/request 混写都不能当作合格结果。

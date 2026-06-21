@@ -535,7 +535,7 @@ def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     dst = tmp_path / "dst"
     source_config = src / "skills" / "review-validate-fix" / "config"
     source_config.mkdir(parents=True)
-    (source_config / "alternative-reviewer.json").write_text("repo\n", encoding="utf-8")
+    (source_config / "reviewer-registry.json").write_text("repo\n", encoding="utf-8")
     (src / "skills" / "review-validate-fix" / "SKILL.md").write_text("repo skill\n", encoding="utf-8")
     (src / ".codex-plugin").mkdir()
     (src / ".codex-plugin" / "plugin.json").write_text("{}\n", encoding="utf-8")
@@ -544,13 +544,13 @@ def test_copy_tree_preserves_nested_plugin_setup(tmp_path: Path) -> None:
     local_state = dst / "skills" / "review-validate-fix" / "state"
     local_config.mkdir(parents=True)
     local_state.mkdir(parents=True)
-    (local_config / "alternative-reviewer.json").write_text("local\n", encoding="utf-8")
+    (local_config / "reviewer-registry.json").write_text("local\n", encoding="utf-8")
     (local_state / "session.json").write_text("state\n", encoding="utf-8")
     (dst / "old.txt").write_text("remove\n", encoding="utf-8")
 
     module.copy_tree(src, dst, module.PRESERVE_IN_PLUGIN, True)
 
-    assert (local_config / "alternative-reviewer.json").read_text(encoding="utf-8") == "local\n"
+    assert (local_config / "reviewer-registry.json").read_text(encoding="utf-8") == "local\n"
     assert (local_state / "session.json").read_text(encoding="utf-8") == "state\n"
     assert (dst / "skills" / "review-validate-fix" / "SKILL.md").read_text(encoding="utf-8") == "repo skill\n"
     assert not (dst / "old.txt").exists()
@@ -688,7 +688,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     cache_config.mkdir(parents=True)
     cache_state.mkdir(parents=True)
     (cache_skill / "SKILL.md").write_text("stale cached skill\n", encoding="utf-8")
-    (cache_config / "alternative-reviewer.json").write_text("local cache config\n", encoding="utf-8")
+    (cache_config / "reviewer-registry.json").write_text("local cache config\n", encoding="utf-8")
     (cache_state / "run.json").write_text("local cache state\n", encoding="utf-8")
 
     def run_main() -> None:
@@ -729,7 +729,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
         module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert (cache_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
-    assert (cache_config / "alternative-reviewer.json").read_text(encoding="utf-8") == "local cache config\n"
+    assert (cache_config / "reviewer-registry.json").read_text(encoding="utf-8") == "local cache config\n"
     assert (cache_state / "run.json").read_text(encoding="utf-8") == "local cache state\n"
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)

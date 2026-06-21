@@ -1,6 +1,6 @@
 # Review Validate Fix MCP Setup Startup
 
-把本 markdown 作为一个新的 coding agent session 的启动提示，用来协助设置 `$review-validate-fix` 的 MCP / agent 集成。目标只限于配置 santa-method 的 alternative reviewer；不要顺手重写 review loop、Stop hook 或 legacy Claude 逻辑。setup 未完成不能阻塞 `$review-validate-fix` 正常运行；运行期会默认使用 Codex-only fallback。
+把本 markdown 作为一个新的 coding agent session 的启动提示，用来协助设置 `$review-validate-fix` 的 santa-method external reviewer harness 注册表（`config/reviewer-registry.json`）。目标只限于让 `scripts/dispatch_reviewers.py` 能 probe 到至少两路 external reviewer harness；不要顺手重写 review loop、Stop hook 或 legacy 逻辑。setup 未完成不能阻塞 `$review-validate-fix` 正常运行；运行期当 `dispatch_reviewers.py` 报告 0 个 external 可用时会按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走 in-harness 最后兜底。
 
 ## 启动时先问用户
 
@@ -30,11 +30,12 @@
 
 ## 仓库已自带的 alternative reviewer 模板
 
-无需从零写 config 的几个常见 agent，仓库已带模板，激活方式是把它传给 `run_alternative_reviewer.py --config <path>`（或经 setup 拷成 active 的 `config/alternative-reviewer.json`）：
+仓库已带三份 per-harness 模板，并由 `config/reviewer-registry.json` 统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
 
-- `config/alternative-reviewer.json` — Claude Code，active 默认。
+- `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，默认路由的首选一腿；`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。`run_alternative_reviewer.py` 无 `--config` 时的默认即指向它。
+- `config/alternative-reviewer.claude.json` — Claude Code CLI 模板。
 - `config/alternative-reviewer.codex.json` — Codex CLI 模板。
-- `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。
+- `config/reviewer-registry.json` — 上述三者的注册表，是「本机启用哪些 external reviewer」的唯一事实源；`install_to_codex.py` 重装时保留本机这份 registry，不被仓库版本覆盖。
 
 Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force --trust --sandbox disabled`，几个 flag 的理由：
 
@@ -49,24 +50,17 @@ Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force -
 3. 如果发现多个候选，不要自行替用户决定；说明每个候选的可验证入口，例如命令路径或配置文件。
 4. 如果没有发现候选，问用户是否还有未被发现的 coding agent 可以提供。
 
-## 没有 alternative agent 时的 fallback
+## 没有可用 external reviewer 时的最后兜底
 
-如果没有可用 alternative reviewer，或用户没有完成这一部分 setup，默认使用 Codex-only fallback。无需用户额外声明没有其他 coding agent。
+如果 registry 中没有任何 enabled 且 probe 通过的 external reviewer harness，或用户没有完成这一部分 setup，运行期由 `dispatch_reviewers.py` 自动判定（plan `routing_rule: R3`、`needs_last_resort_fallback: true`），退到 in-harness mimic 最后兜底。无需用户额外声明没有其他 coding agent。
 
-fallback 行为：
-
-- 不降级为单 reviewer。
-- 并行启动两个 Codex-native 子代理来模拟 santa-method double review。
-- 两个子代理使用同一份 `prompts/reviewer.md` 和同一份 session context，彼此不看对方输出。
-- 来源标签使用两个独立来源，例如 `codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
-- validate/fix 子代理仍然只接收 source-agnostic issue context。
-- 如果用户之后配置了真实 alternative reviewer，运行期可切回 `codex-reviewer` + `alternative-reviewer:<agent-name>`；不需要改动 review/validate/fix 的问题契约。
+最后兜底的完整 setup（两路 `codex-mimic-reviewer-a` / `codex-mimic-reviewer-b`、clean context、同 packet、同 `prompts/reviewer.md`、写 `review-result.json`、互不可见、source-agnostic 传递）见 `references/zero-external-reviewer-last-resort-in-harness-fallback.md`，仅当所有 external 路径都失败时才读。setup 阶段无需为该兜底做额外配置——它是零 external 时的运行期自动行为。用户之后让任一 harness 在 registry 中 enabled 且 probe 通过后，下一轮自动回到两路 external，不改动 review/validate/fix 的问题契约。
 
 ## 交付要求
 
 完成 setup 后，用中文总结：
 
-- 选择或配置了哪个 alternative reviewer，或是否启用了 Codex-only fallback。
+- registry 中启用并 probe 通过了哪些 external reviewer harness，或是否将退到 in-harness 最后兜底。
 - 具体改了哪些文件。
 - 如何手动验证该 setup。
 - 尚未解决的风险或需要用户补充的凭据 / 命令。

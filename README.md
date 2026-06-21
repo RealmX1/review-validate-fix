@@ -77,7 +77,7 @@ python3 scripts/check_plugin_contracts.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-`scripts/check_skill_contracts.sh` 是最完整的本地验证入口，会执行 shell 语法检查、Python 编译检查和仓库级测试。`scripts/check_plugin_contracts.py` 保留为 plugin 契约入口，当前会委托同一套仓库级检查。安装脚本默认保留本机 `alternative-reviewer.json` 和 `state/`，因此不会覆盖机器相关 setup。
+`scripts/check_skill_contracts.sh` 是最完整的本地验证入口，会执行 shell 语法检查、Python 编译检查和仓库级测试。`scripts/check_plugin_contracts.py` 保留为 plugin 契约入口，当前会委托同一套仓库级检查。安装脚本默认保留本机 `reviewer-registry.json` 和 `state/`，因此不会覆盖机器相关 setup。
 
 验证入口默认只输出简短成功信息；排查失败或需要查看每个测试脚本输出时，加 `--verbose`。
 
@@ -316,18 +316,28 @@ RVF_STOP_HOOK_CHANNEL: status
 
 这些 `RVF_STOP_HOOK:*` 与 `RVF_STOP_HOOK_CHANNEL:*` 行是 Stop hook 的会话控制元数据，不是交给主 agent 的代码任务、review issue、research 对象或 scope-of-work 内容。自动 fork prompt 会显式提醒 fork 会话忽略这类控制行，避免把临时开关误纳入 review 工作。
 
+## Multi-harness double review
+
+RVF 的 santa-method 双 review 默认派发**恰好两路 external CLI reviewer**，由单一入口 `plugins/review-validate-fix/skills/review-validate-fix/scripts/dispatch_reviewers.py` 完成路由、probe 和派发；主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
+
+- **注册表**：`config/reviewer-registry.json` 注册三个 external harness（`cursor` / `claude_code` / `codex`），各自指向一份 per-harness 模板（`config/alternative-reviewer.{cursor,claude,codex}.json`），记 `enabled` 与 `priority_default`。
+- **主 harness 解析**：`prepare_review_run.py` 把本轮主 dispatch harness 写入 `artifacts/inputs/main-harness.json` 并在 `review-env.sh` 导出 `RVF_MAIN_HARNESS`（transcript 探测仅返回 codex/claude_code；cursor 只能经显式 `--main-harness cursor` / `RVF_MAIN_HARNESS=cursor` 覆盖）。
+- **路由规则**：默认 = cursor + 非主 dispatch harness（主=Claude → cursor+codex；主=Codex → cursor+claude）。`|A|`=可用 harness 数：≥3→R0、==2→R1、==1→R2（同 harness 双实例，reviewer_id 后缀 `-a`/`-b`）、==0→R3（最后兜底）；cursor 不可用时记 `cursor_unavailable` 降级（R4）。
+- **产物**：`dispatch_reviewers.py --plan-only` 写 `artifacts/reviewers/reviewer-plan.json`；`--execute` 并行复用 `run_alternative_reviewer.py` 派发，每路落 `artifacts/reviewers/<reviewer-id>/review-result.json`。
+- **最后兜底**：仅当 0 个 external 可用（plan `routing_rule: R3`）时，按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 退到 in-harness mimic 双 review；`--require-external` 则改为 fail-close。
+
 ## Setup 相关配置
 
 有些变化不能简单从仓库覆盖到本机，因为它们绑定机器、凭据或用户选择。当前最典型的是：
 
-- `config/alternative-reviewer.json`
+- `config/reviewer-registry.json`
 - `state/`
 - `~/.codex/hooks.json` 中的 Stop hook / fork hook 绑定
 - `~/.codex/hooks.json` 中 `CODEX_RVF_DEV_REPO` 指向的本机源仓库路径
 - `~/.codex/app-server-control/rvf-app-server.sock` 和 `~/.codex/app-server-control/rvf-app-server.log` 这类本机 app-server bridge 文件
 - 外部 reviewer 的 CLI/MCP/IDE wrapper 认证状态和环境变量
 
-`scripts/install_to_codex.py` 默认会保留本机 plugin 中已有的 `skills/review-validate-fix/config/alternative-reviewer.json` 和 `skills/review-validate-fix/state/`，避免仓库更新覆盖掉已完成的 external reviewer setup。确实要用仓库版本覆盖 setup 配置时，显式加：
+`scripts/install_to_codex.py` 默认会保留本机 plugin 中已有的 `skills/review-validate-fix/config/reviewer-registry.json` 和 `skills/review-validate-fix/state/`，避免仓库更新覆盖掉已完成的 external reviewer setup（三份 per-harness 模板 `alternative-reviewer.{cursor,claude,codex}.json` 是仓库版唯一事实源、随仓库同步，不在保留之列）。确实要用仓库版本覆盖 setup 配置时，显式加：
 
 ```bash
 python3 scripts/install_to_codex.py --replace-setup-config

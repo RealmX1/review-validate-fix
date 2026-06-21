@@ -46,7 +46,7 @@ LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
 CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
 
 PRESERVE_IN_PLUGIN = {
-    PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+    PLUGIN_SKILL_REL / "config" / "reviewer-registry.json",
     PLUGIN_SKILL_REL / "state",
 }
 IGNORE_NAMES = {".DS_Store", "__pycache__", ".pytest_cache", ".mypy_cache", "state"}
@@ -233,7 +233,7 @@ def deployment_file_digest(root: Path) -> dict[str, Any]:
         "file_count": file_count,
         "byte_count": byte_count,
         "root": str(root),
-        "excluded": ["state/", "config/alternative-reviewer.json", "dev-only paths", "*.pyc"],
+        "excluded": ["state/", "config/reviewer-registry.json", "dev-only paths", "*.pyc"],
     }
 
 
@@ -498,7 +498,7 @@ def copy_missing_tree(src: Path, dst: Path) -> None:
 def copy_legacy_config_if_safe(src: Path, dst: Path) -> None:
     if not src.exists():
         return
-    repo_default = PLUGIN_SRC / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json"
+    repo_default = PLUGIN_SRC / PLUGIN_SKILL_REL / "config" / "reviewer-registry.json"
     should_copy = not dst.exists()
     if not should_copy and repo_default.exists():
         try:
@@ -770,8 +770,8 @@ def sync_codex_plugin_cache(plugin_src: Path, preserve_local_config: bool) -> Pa
     copy_tree(plugin_src, cache_dir, PRESERVE_IN_PLUGIN, preserve_local_config)
     if preserve_local_config:
         copy_legacy_config_if_safe(
-            plugin_src / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
-            cache_dir / PLUGIN_SKILL_REL / "config" / "alternative-reviewer.json",
+            plugin_src / PLUGIN_SKILL_REL / "config" / "reviewer-registry.json",
+            cache_dir / PLUGIN_SKILL_REL / "config" / "reviewer-registry.json",
         )
         copy_missing_tree(
             plugin_src / PLUGIN_SKILL_REL / "state",
@@ -961,7 +961,7 @@ def main() -> int:
     parser.add_argument(
         "--replace-setup-config",
         action="store_true",
-        help="覆盖本机 setup 相关配置；默认会保留 alternative-reviewer.json 和 state/。",
+        help="覆盖本机 setup 相关配置；默认会保留 reviewer-registry.json 和 state/。",
     )
     parser.add_argument(
         "--configure-stop-hook",
@@ -1143,7 +1143,7 @@ def main() -> int:
     for item in installed:
         print(f"已安装 {item}")
     if preserve:
-        print("已默认保留本机 setup 配置: alternative-reviewer.json 与 state/。")
+        print("已默认保留本机 setup 配置: reviewer-registry.json 与 state/。")
     return 0
 
 
