@@ -798,13 +798,6 @@ def test_main_syncs_existing_claude_plugin_install(tmp_path: Path) -> None:
         assert (root / "hooks" / "hooks.json").exists()
         assert (root / "hooks" / "stop.py").exists()
         assert (root / "commands" / "rvf-handoff-commit.md").exists()
-        assert (
-            root
-            / "skills"
-            / "review-validate-fix"
-            / "scripts"
-            / "post_analyze_quiet.py"
-        ).exists()
 
     settings = json.loads(settings_path.read_text(encoding="utf-8"))
     assert settings["enabledPlugins"]["review-validate-fix@review-validate-fix-local"] is True

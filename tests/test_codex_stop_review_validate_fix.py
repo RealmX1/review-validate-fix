@@ -4888,150 +4888,31 @@ def test_rvf_analyze_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> N
     assert latest["reason_code"] == "rvf_analyze_followup_trigger_turn"
 
 
-def _seed_post_analyze_quiet_marker(
-    *,
-    state: Path,
-    task_id: str,
-    armed_at: str,
-    analyze_run_dir: Path,
-    seed_artifacts: bool,
-) -> Path:
-    """直接写一份 post-analyze quiet marker 文件，模拟上一次 stop hook 注入完成。
+def test_rvf_analyze_manual_invocation_skips_one_turn(tmp_path: Path) -> None:
+    """用户本 turn 显式 ``$rvf-analyze``（只读复盘 skill）→ 这一次 Stop 一次性跳过
+    自动 RVF dispatch，reason=``rvf_analyze_manual_turn``。
 
-    用 safe_token 等价规则 (`safe_token` strip 非法字符后保留下来) 算文件名，
-    与 post_analyze_quiet._task_path 保持一致。
-    """
-    quiet_dir = state / "post-analyze-quiet"
-    quiet_dir.mkdir(parents=True, exist_ok=True)
-    # task_id 已是简单 ascii，safe_token 不会改写它，可以直接用。
-    marker = quiet_dir / f"task-{task_id}.json"
-    summary_md = analyze_run_dir / "artifacts" / "analysis" / "summary.md"
-    causality_json = analyze_run_dir / "artifacts" / "analysis" / "causality.json"
-    if seed_artifacts:
-        summary_md.parent.mkdir(parents=True, exist_ok=True)
-        summary_md.write_text("# seeded\n", encoding="utf-8")
-        causality_json.write_text("{}\n", encoding="utf-8")
-        # 把 mtime 推到 armed_at 之后 5 秒，确保 freshness 检查通过。
-        ts = time.time()
-        os.utime(summary_md, (ts, ts))
-        os.utime(causality_json, (ts, ts))
-    marker.write_text(
-        json.dumps(
-            {
-                "marker_version": 1,
-                "armed_at": armed_at,
-                "armed_run_id": "rvf-prev-run",
-                "armed_handoff_path": str(analyze_run_dir / "artifacts" / "handoff.md"),
-                "analyze_run_dir": str(analyze_run_dir),
-                "analyze_summary_md": str(summary_md),
-                "analyze_causality_json": str(causality_json),
-                "kanban_task_id": task_id,
-                "kanban_attempt_id": "attempt-prev",
-                "parent_session_id": None,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return marker
-
-
-def test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready(tmp_path: Path) -> None:
+    turn-scoped 替代已退役的 task-keyed + 6h ``post_analyze_quiet`` marker：不写任何
+    持久 marker，故仅作用于「显式调用 analyze 的这一 turn」，下一轮真实改动的 Stop
+    会照常触发 RVF（不再有 6h 跨 turn 误抑制）。注意 last_user_message 不含
+    ``RVF_KANBAN_ANALYZE_TRIGGER``，以确保命中的是本守卫而非上游 follow-up 守卫。"""
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     state = tmp_path / "state"
-    analyze_run_dir = tmp_path / "prev-run"
-    armed_at = "2026-05-12T00:00:00Z"  # 1 年前 timestamp，artifact mtime 现在写一定更新
-
-    marker_path = _seed_post_analyze_quiet_marker(
-        state=state,
-        task_id="task-T1",
-        armed_at=armed_at,
-        analyze_run_dir=analyze_run_dir,
-        seed_artifacts=True,
-    )
-    assert marker_path.exists()
 
     stdout, _ = invoke(
         {
             "cwd": str(dirty),
             "stop_hook_active": False,
-            "session_id": "session-T1",
-            "last_user_message": "ok thanks, looks fine to me",
+            "last_user_message": "$rvf-analyze rvf-20260101T000000Z-abc",
         },
-        extra_env={"KANBAN_TASK_ID": "task-T1"},
         state_dir=state,
     )
+
     payload = parse_json(stdout)
-    assert "reason=post_analyze_workflow_complete" in payload["systemMessage"]
+    assert "reason=rvf_analyze_manual_turn" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "post_analyze_workflow_complete"
-    # marker 必须在 consume 后被删除（一次性语义）。
-    assert not marker_path.exists()
-
-
-def test_post_analyze_quiet_marker_pending_when_artifacts_missing(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    analyze_run_dir = tmp_path / "prev-run-missing"
-    armed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    marker_path = _seed_post_analyze_quiet_marker(
-        state=state,
-        task_id="task-T2",
-        armed_at=armed_at,
-        analyze_run_dir=analyze_run_dir,
-        seed_artifacts=False,  # 没生成 analysis artifacts，模拟用户岔开了 analyze
-    )
-    assert marker_path.exists()
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "session_id": "session-T2",
-            "last_user_message": "ok thanks, looks fine to me",
-        },
-        extra_env={"KANBAN_TASK_ID": "task-T2"},
-        state_dir=state,
-    )
-    payload = parse_json(stdout)
-    latest = latest_summary(state)
-    assert "reason=post_analyze_workflow_pending" in payload.get("systemMessage", "")
-    assert latest["reason_code"] == "post_analyze_workflow_pending"
-    assert marker_path.exists()
-
-
-def test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    analyze_run_dir = tmp_path / "prev-run-stale"
-    marker_path = _seed_post_analyze_quiet_marker(
-        state=state,
-        task_id="task-T3",
-        armed_at="2026-05-12T00:00:00Z",
-        analyze_run_dir=analyze_run_dir,
-        seed_artifacts=False,
-    )
-    assert marker_path.exists()
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "session_id": "session-T3",
-            "last_user_message": "ok thanks, looks fine to me",
-        },
-        extra_env={"KANBAN_TASK_ID": "task-T3"},
-        state_dir=state,
-    )
-    payload = parse_json(stdout)
-    latest = latest_summary(state)
-    assert "reason=post_analyze_workflow_pending" not in payload.get("systemMessage", "")
-    assert latest["reason_code"] != "post_analyze_workflow_pending"
-    assert not marker_path.exists()
+    assert latest["reason_code"] == "rvf_analyze_manual_turn"
 
 
 def _dirty_repo_with_units_for_reopen(path: Path) -> Path:
@@ -6851,10 +6732,6 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
     assert status["host"] == "codex"
     assert isinstance(status["command"], list) and "exec" in status["command"]
 
-    # PENDING quiet marker 照常 arm，供下一次 Stop 自动判 COMPLETE。
-    assert summary.get("post_analyze_quiet_marker_status") == "armed"
-    assert Path(summary["post_analyze_quiet_marker_path"]).exists()
-
     events = latest_events(state)
     assert any(event["event"] == "rvf_analyze_thread_launched" for event in events)
 
@@ -7003,8 +6880,6 @@ def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) ->
     assert summary["rvf_analyze_status"] == "thread-launch-failed"
     assert summary["rvf_analyze_thread_launch_status"] == "launch_failed"
     assert summary.get("rvf_analyze_error")
-    # PENDING marker 仍 armed（用户可手动 $rvf-analyze 收尾）。
-    assert summary.get("post_analyze_quiet_marker_status") == "armed"
     events = latest_events(state)
     assert any(event["event"] == "rvf_analyze_thread_launch_failed" for event in events)
 
@@ -7528,9 +7403,7 @@ def main() -> int:
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
-        test_post_analyze_quiet_marker_skips_one_turn_when_artifacts_ready,
-        test_post_analyze_quiet_marker_pending_when_artifacts_missing,
-        test_post_analyze_quiet_marker_stale_when_artifacts_missing_continues,
+        test_rvf_analyze_manual_invocation_skips_one_turn,
         test_review_reopen_marker_reopens_run_scope_before_dispatch,
         test_review_reopen_marker_stale_is_discarded_without_reopen,
         test_review_reopen_reconciles_abandoned_followup_lock,

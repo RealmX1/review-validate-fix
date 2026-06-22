@@ -2,10 +2,14 @@
 """RVF finalize 后的 ``$rvf-analyze`` 后台线程派发。
 
 这个模块只处理 finalize 已经生成 deterministic analysis scaffold 之后的收尾：
-arm 一次性 ``post_analyze_quiet`` PENDING marker，并把 analyze 的 LLM 补全步骤
-通过 ``rvf_analyze_thread.launch_detached_analyze_thread`` 派进一个 detached
+把 analyze 的 LLM 补全步骤通过
+``rvf_analyze_thread.launch_detached_analyze_thread`` 派进一个 detached
 tmux 线程后台运行。它不直接运行 ``rvf_analyze.py``，也不在当前会话内同步触发
 LLM skill —— 原会话/task finalize 完即可 idle，无需等待 analyze 完成。
+
+detached analyze 线程靠注入的 ``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
+``CODEX_RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 时自抑制，无需再 arm 任何
+task 级 quiet marker 来挡父会话——父会话下一轮真实改动的 Stop 应正常触发 RVF。
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ from typing import Any
 
 RVF_ANALYZE_FOLLOWUP_MARKER = "RVF_KANBAN_ANALYZE_TRIGGER"
 
-from post_analyze_quiet import write_post_analyze_quiet_marker
 from rvf_analyze_thread import launch_detached_analyze_thread
 
 
@@ -114,47 +117,6 @@ def parent_session_id_from_event(event: dict[str, Any]) -> str | None:
         if session_id:
             return session_id
     return None
-
-
-def _arm_post_analyze_quiet_marker_safe(
-    *,
-    event: dict[str, Any],
-    ledger: Any,
-    finalize_record: dict[str, Any] | None,
-    analysis: dict[str, str],
-    task_id: str | None,
-    attempt_id: str | None,
-) -> dict[str, Any]:
-    """写一次性 quiet marker。返回 ledger event 用 metadata；失败也不抛。"""
-    session_id = parent_session_id_from_event(event)
-    armed_run_id = getattr(ledger, "run_id", None) or "unknown"
-    handoff_path = None
-    if isinstance(finalize_record, dict):
-        candidate = finalize_record.get("handoff_path") or finalize_record.get("handoff")
-        if isinstance(candidate, str) and candidate:
-            handoff_path = candidate
-    try:
-        marker_path = write_post_analyze_quiet_marker(
-            task_id=task_id,
-            session_id=session_id,
-            armed_run_id=armed_run_id,
-            armed_handoff_path=handoff_path,
-            analyze_run_dir=analysis["run_dir"],
-            analyze_summary_md=analysis["summary_md_path"],
-            analyze_causality_json=analysis["causality_json_path"],
-            kanban_attempt_id=attempt_id,
-        )
-    except Exception as exc:  # noqa: BLE001 — marker 失败绝不阻断 advisory 主路径。
-        return {
-            "post_analyze_quiet_marker_status": "write-failed",
-            "post_analyze_quiet_marker_error": f"{type(exc).__name__}: {exc}",
-        }
-    if marker_path is None:
-        return {"post_analyze_quiet_marker_status": "no-key-available"}
-    return {
-        "post_analyze_quiet_marker_status": "armed",
-        "post_analyze_quiet_marker_path": str(marker_path),
-    }
 
 
 def _event_or_env_text(
@@ -267,15 +229,16 @@ def surface_rvf_analyze_advisory(
 ) -> dict[str, Any] | None:
     """finalize handoff 完成后，把 ``$rvf-analyze`` 派进 detached tmux 后台线程。
 
-    不再向当前会话/Kanban task 注入 follow-up 用户消息：arm 一次性 PENDING
-    quiet marker 后，调 ``launch_detached_analyze_thread`` 在
-    ``rvf-analyze-<run_name>`` tmux session 里 detached 跑 analyze agent，原会话
-    finalize 完即可 idle。手动 ``$rvf-analyze`` 路径不受影响。
+    不再向当前会话/Kanban task 注入 follow-up 用户消息：直接调
+    ``launch_detached_analyze_thread`` 在 ``rvf-analyze-<run_name>`` tmux session
+    里 detached 跑 analyze agent，原会话 finalize 完即可 idle。手动 ``$rvf-analyze``
+    路径不受影响。
 
-    PENDING marker 照常 arm（keyed task_id / session_id）：analyze 线程补全
-    artifacts 后，由父会话下一次 Stop 依据 artifacts mtime 自动判定 COMPLETE。
-    launch 失败按 fail-open 处理（``thread-launch-failed``），不阻断 handoff，
-    用户可手动 ``$rvf-analyze`` 收尾。
+    detached 线程靠注入的 ``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
+    ``CODEX_RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 自抑制，不再 arm 任何
+    task 级 quiet marker——父会话下一轮真实改动会正常触发 RVF。launch 失败按
+    fail-open 处理（``thread-launch-failed``），不阻断 handoff，用户可手动
+    ``$rvf-analyze`` 收尾。
     """
     analysis = _analysis_payload(finalize_record)
     if analysis is None:
@@ -290,15 +253,6 @@ def surface_rvf_analyze_advisory(
     }
     task_id = current_kanban_task_id(event)
     attempt_id = current_kanban_attempt_id(event)
-
-    marker_info = _arm_post_analyze_quiet_marker_safe(
-        event=event,
-        ledger=ledger,
-        finalize_record=finalize_record,
-        analysis=analysis,
-        task_id=task_id,
-        attempt_id=attempt_id,
-    )
 
     try:
         thread_info = launch_detached_analyze_thread(
@@ -336,7 +290,6 @@ def surface_rvf_analyze_advisory(
             **base_fields,
             "rvf_analyze_status": "thread-launched",
             **thread_fields,
-            **marker_info,
         }
         ledger.event(
             phase="analysis",
@@ -355,7 +308,6 @@ def surface_rvf_analyze_advisory(
         "rvf_analyze_status": "thread-launch-failed",
         "rvf_analyze_error": error,
         **thread_fields,
-        **marker_info,
     }
     ledger.event(
         phase="analysis",

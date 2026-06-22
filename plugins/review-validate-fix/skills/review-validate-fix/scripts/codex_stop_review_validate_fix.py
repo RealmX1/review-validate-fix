@@ -38,13 +38,16 @@ from rvf_analyze_advisory import (
     current_kanban_task_id,
     surface_rvf_analyze_advisory,
 )
-from post_analyze_quiet import (
-    WORKFLOW_COMPLETE,
-    WORKFLOW_PENDING,
-    clear_post_analyze_quiet_marker,
-    post_analyze_workflow_status,
-    read_post_analyze_quiet_marker,
-)
+
+try:
+    # Vendored single-file reader (same copy rvf_user_prompt_submit uses): a
+    # structured "which skill did the user explicitly invoke this turn" read from
+    # the Codex rollout, plus an anchored text fallback. Used by the turn-scoped
+    # `$rvf-analyze` re-entrancy guard below. Optional: stay resilient on Claude /
+    # missing transcript / vendor absent.
+    import codex_invoked_skill
+except Exception:  # pragma: no cover - structured read is best-effort
+    codex_invoked_skill = None
 from kanban_followup_lock import (
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
     STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
@@ -7552,6 +7555,42 @@ def report_only_decision(repo: str, ledger: RunLedger) -> StopDecision:
     )
 
 
+RVF_ANALYZE_MANUAL_SKILL = "rvf-analyze"
+
+
+def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None) -> bool:
+    """本 turn 用户是否**显式调用了** ``$rvf-analyze``（只读复盘 skill）？
+
+    turn-scoped：只看本 turn 的 invoked-skill / 最新用户消息——下一个真实改动的
+    user turn 天然不命中，故只抑制 analyze 自身那一次 Stop，绝不波及后续轮。这取代
+    了已退役的 task-keyed + 6h ``post_analyze_quiet`` marker（旧 marker 会顺带把父
+    会话后续真实改动也误抑制）。自动 / detached analyze 线程的再入由其注入的
+    ``CODEX_RVF_ANALYZE_THREAD`` env 守卫（本函数上方早退）覆盖，不依赖本检测。
+
+    两路检测（任一命中即真），均复用 vendored ``codex_invoked_skill``，避免再造第三套
+    anchored-regex：
+    1. 结构化（Codex）：``was_skill_invoked`` 读 rollout 的显式 ``$skill`` 调用，
+       命中含命名空间的 ``$rvf:rvf-analyze``——authoritative，无 handoff 正文误判。
+    2. 文本兜底（Claude / 无结构化读）：``match_invocation_in_text`` 对最新用户消息做
+       行首/空白锚定的 ``$``/``/``/``:`` + skill 名匹配（带词边界，避免误吞 prose /
+       packet 里的字面量）。即便偶发误判，后果也仅是本 turn 跳过一次自动 RVF，下一轮
+       自愈。
+    best-effort：结构化 / 文本读取异常绝不阻断，按未命中处理。
+    """
+    if codex_invoked_skill is None:
+        return False
+    try:
+        if codex_invoked_skill.was_skill_invoked(event, RVF_ANALYZE_MANUAL_SKILL):
+            return True
+        if latest_user and codex_invoked_skill.match_invocation_in_text(
+            latest_user, (RVF_ANALYZE_MANUAL_SKILL,)
+        ):
+            return True
+    except Exception:  # pragma: no cover - 结构化/文本读取永不阻断
+        return False
+    return False
+
+
 def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecision:
     latest_user = latest_user_message_from_event(event)
     cwd_value = event.get("cwd")
@@ -7626,60 +7665,22 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     if in_progress_decision is not None:
         return in_progress_decision
 
-    quiet_task_id = current_kanban_task_id(event)
-    quiet_session_id = session_hook_id_from_event(event)
-    quiet_marker = read_post_analyze_quiet_marker(
-        task_id=quiet_task_id,
-        session_id=quiet_session_id,
-    )
-    if quiet_marker is not None:
-        quiet_status = post_analyze_workflow_status(quiet_marker)
-        if quiet_status == WORKFLOW_COMPLETE:
-            removed_paths = clear_post_analyze_quiet_marker(
-                task_id=quiet_task_id,
-                session_id=quiet_session_id,
-            )
-            return skip_decision(
-                "上一轮 RVF + $rvf-analyze 工作流已完整结束（analysis artifacts 已就绪）；"
-                "本次 Stop 一次性跳过自动 RVF dispatch，等待显式触发再开新一轮。",
-                ledger,
-                "post_analyze_workflow_complete",
-                cwd=cwd,
-                backend="kanban-followup" if quiet_task_id else "manual",
-                consumed_post_analyze_quiet_marker=quiet_marker,
-                consumed_post_analyze_quiet_marker_paths=removed_paths,
-            )
-        if quiet_status == WORKFLOW_PENDING:
-            return skip_decision(
-                "上一轮 RVF 的 $rvf-analyze 仍在进行（analysis artifacts 尚未完成）；"
-                "本次 Stop 跳过自动 RVF dispatch，并保留 pending marker。",
-                ledger,
-                "post_analyze_workflow_pending",
-                cwd=cwd,
-                backend="kanban-followup" if quiet_task_id else "manual",
-                post_analyze_quiet_marker=quiet_marker,
-            )
-        removed_paths = clear_post_analyze_quiet_marker(
-            task_id=quiet_task_id,
-            session_id=quiet_session_id,
-        )
-        ledger.event(
-            phase="dev-sync",
-            event="post_analyze_quiet_marker_consumed_incomplete",
-            status="skipped",
-            reason_code=f"post_analyze_workflow_{quiet_status}",
-            message="post-analyze quiet marker 已过期或无效，消费 marker 后继续既有 RVF 逻辑。",
-            consumed_post_analyze_quiet_marker=quiet_marker,
-            consumed_post_analyze_quiet_marker_paths=removed_paths,
-            post_analyze_workflow_status=quiet_status,
-        )
-
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
         return skip_decision(
             "当前最新用户消息是 Cline Kanban 注入的 RVF analyze follow-up trigger；"
             "本次 Stop 跳过自动 RVF，避免复盘消息结束后递归触发主 review loop。",
             ledger,
             "rvf_analyze_followup_trigger_turn",
+            cwd=cwd,
+        )
+
+    if _rvf_analyze_manually_invoked(event, latest_user):
+        return skip_decision(
+            "本轮用户显式调用了 $rvf-analyze（只读复盘 skill）；本次 Stop 一次性跳过自动 "
+            "RVF dispatch，避免把复盘那一轮误当成新改动触发 review。仅作用于本 turn——"
+            "下一轮真实改动的 Stop 会正常触发 RVF。",
+            ledger,
+            "rvf_analyze_manual_turn",
             cwd=cwd,
         )
 
