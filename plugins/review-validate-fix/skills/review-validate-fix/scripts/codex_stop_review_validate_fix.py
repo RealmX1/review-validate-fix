@@ -22,10 +22,16 @@ from rvf_logging import (
     log_root,
     normalize_rvf_backend,
     rvf_state_fields,
+    safe_token,
     skill_deploy_metadata,
     start_run,
 )
-from rvf_handoff import handoff_completion_payload, handoff_path_from_event
+from rvf_handoff import (
+    handoff_completion_payload,
+    handoff_path_from_event,
+    notify_kanban_followup_stranded,
+    resolve_kanban_task_url,
+)
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
@@ -41,12 +47,15 @@ from post_analyze_quiet import (
 )
 from kanban_followup_lock import (
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
+    STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
     clear_marker as clear_kanban_followup_lock,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
     clear_pending_marker as clear_kanban_followup_pending,
+    iter_pending_markers as iter_kanban_followup_pending,
     pending_status as kanban_followup_pending_status,
     read_pending_marker as read_kanban_followup_pending,
+    stamp_pending_notified as stamp_kanban_followup_pending_notified,
     write_pending_marker as write_kanban_followup_pending,
 )
 from session_manifest import build_manifest
@@ -2438,6 +2447,310 @@ def _kanban_followup_pending_decision(
     return None
 
 
+# ---------------------------------------------------------------------------
+# S1b：跨 task stranded-pending 扫荡 + 升级（治本主体）
+#
+# flow-1-self-rising 的死结：被卡住的 task 自己不会再 Stop，而唯一的同 task 对账
+# （``_kanban_followup_pending_decision``）只在该 task 下次 Stop 触发——于是
+# dispatched-unconfirmed 的 review 会静默永久 parked。本扫荡让**任意会话、任意 repo 的 Stop**
+# 都能发现并持续把别的 task 遗留的 stale pending 浮现给用户，直至目标 session 的
+# UserPromptSubmit hook 在真实投递落地时按 token 清掉 marker。「stale marker 仍在」即 stranded
+# 的权威信号（marker 的清除只发生在：真实投递 UPS arm 清 / 同 task stale 自愈清 / handoff 清锁）。
+# ---------------------------------------------------------------------------
+
+DEFAULT_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS = 3600
+DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX = 8
+KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
+KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
+KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
+KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
+DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
+# verify-consumed 精修读 transcript 的体积上限（超过则跳过精修、按 stranded 处理），
+# 防在 30s Codex 链路预算内读超大 JSONL transcript 卡顿。
+KANBAN_FOLLOWUP_CONSUMED_SCAN_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _kanban_followup_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(default)
+
+
+def _kanban_followup_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return int(default)
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return int(default)
+
+
+def _parse_marker_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _strip_dispatch_prep_block(prompt: str) -> str:
+    """剥掉 prompt 末尾由 ``add_dispatch_prep_to_prompt`` 追加的 dispatch-prep 注入块。
+
+    注入块以 ``"RVF dispatch prep file:"`` 起头、追加在 prompt 末尾，故从该标记处截断即可
+    干净移除；S2 重投据此用新 token 重新注入。无注入块时原样返回（已 rstrip）。
+    """
+    marker = "RVF dispatch prep file:"
+    idx = prompt.find(marker)
+    if idx == -1:
+        return prompt.rstrip()
+    return prompt[:idx].rstrip()
+
+
+def _kanban_followup_marker_consumed(marker: dict[str, Any]) -> bool:
+    """（可选 best-effort 精修）据 ``origin_transcript_path`` 判 stranded review 是否已迟到消费。
+
+    命中 ``RVF_DISPATCH=token={token}`` = 注入的 follow-up 已落进派发方 transcript（同会话
+    消费）→ 视为 consumed。解析不出 / 文件缺失 / 过大 → 返回 False（**不据此判 consumed**，
+    仍按 stranded 升级）。这是对「UPS arm 异常没清掉」假 stranded 的兜底；权威信号仍是
+    marker 是否仍在，故本精修永远只会「多清」不会「漏报 stranded」。
+    """
+    token = marker.get("token")
+    if not (isinstance(token, str) and token.strip()):
+        return False
+    transcript_raw = marker.get("origin_transcript_path")
+    if not (isinstance(transcript_raw, str) and transcript_raw.strip()):
+        return False
+    try:
+        path = Path(transcript_raw).expanduser()
+        if not path.is_file():
+            return False
+        if path.stat().st_size > KANBAN_FOLLOWUP_CONSUMED_SCAN_MAX_BYTES:
+            return False
+        needle = f"RVF_DISPATCH=token={token}"
+        return needle in path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def _maybe_redispatch_stranded_kanban_followup(
+    marker: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    token: str | None,
+) -> dict[str, Any]:
+    """S2（可选，``CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1`` 开启）：app-server 此刻可达时
+    对 stranded marker 机会式重投一次。
+
+    诚实边界：即便 app-server 活着，已停 session 也未必消费 → best-effort，绝不谎报已跑。
+    契约（按审查修正）：铸**新** dispatch-prep + 新 token（旧 token 的 prep 可能已被
+    ``rvf_prep_file.sweep_stale`` 清，复用会让目标 UPS 判 ``dispatch_no_prep`` 不清 pending）；
+    用**稳定** idempotency key ``rvf-redispatch-<task>-<token>``（不可用每 Stop 变的 run_id，
+    否则 Kanban 侧不幂等）；子进程带 timeout；重投后据投递通道改写/清除 pending，避免与该
+    task 自己的下次 Stop 撞成双投。
+    """
+    if not is_truthy(os.environ.get(KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV)):
+        return {"redispatched": False, "reason": "disabled"}
+    task_id = marker.get("kanban_task_id")
+    project_path = marker.get("kanban_project_path")
+    prompt_path = marker.get("prompt_path")
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return {"redispatched": False, "reason": "missing-task-id"}
+    if not (isinstance(project_path, str) and project_path.strip()):
+        return {"redispatched": False, "reason": "missing-project-path"}
+    if not (isinstance(prompt_path, str) and prompt_path.strip()):
+        return {"redispatched": False, "reason": "missing-prompt-path"}
+    # app-server 可达性闸门：不可达即放弃（marker 仍在 + 已发通知，留待 human-in-the-loop）。
+    try:
+        socket_path, _socket_source, _socket_meta = select_existing_app_server_socket_for_metadata()
+    except Exception:
+        return {"redispatched": False, "reason": "app-server-unreachable"}
+    if not can_connect_app_server_socket(socket_path):
+        return {"redispatched": False, "reason": "app-server-unreachable"}
+    try:
+        old_prompt = Path(prompt_path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return {"redispatched": False, "reason": "prompt-unreadable"}
+    base_prompt = _strip_dispatch_prep_block(old_prompt)
+    run_dir = marker.get("run_dir")
+    origin_metadata_path = (
+        str(Path(run_dir).expanduser() / "artifacts" / "origin.json")
+        if isinstance(run_dir, str) and run_dir.strip()
+        else None
+    )
+    try:
+        fresh_prep = write_dispatch_prep_file(
+            ledger=ledger,
+            origin_session_id=marker.get("session_id"),
+            origin_repo=marker.get("repo"),
+            origin_cwd=marker.get("cwd"),
+            target_flow="flow-1-self-rising",
+            target_worktree=marker.get("cwd"),
+            target_kanban_task_id=task_id,
+            origin_metadata_path=origin_metadata_path,
+        )
+    except Exception as exc:
+        return {"redispatched": False, "reason": "prep-failed", "error": f"{type(exc).__name__}: {exc}"}
+    new_prompt = add_dispatch_prep_to_prompt(base_prompt, fresh_prep)
+    # 幂等键必须绑定**稳定**的 stranded token（marker 当前 token），不能用每次扫荡新铸的
+    # fresh_prep.token——否则同一 stranded marker 在 renotify 窗口内被多个会话的 Stop 并发扫荡时
+    # 各生成不同 key，Kanban 无法去重 → 重复派发。token 缺失（退化 marker）才回退占位。
+    idem = f"rvf-redispatch-{safe_token(task_id)}-{token or 'no-token'}"
+    redispatch_timeout = _kanban_followup_env_float(
+        KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS,
+    )
+    try:
+        message_payload = start_cline_kanban_followup_message(
+            project_path=project_path,
+            task_id=task_id,
+            attempt_id=marker.get("kanban_attempt_id"),
+            prompt=new_prompt,
+            ledger=ledger,
+            idempotency_key=idem,
+            timeout=redispatch_timeout if redispatch_timeout > 0 else None,
+        )
+    except subprocess.TimeoutExpired:
+        return {"redispatched": False, "reason": "redispatch-timeout", "token": fresh_prep.token}
+    except Exception as exc:
+        return {"redispatched": False, "reason": "redispatch-failed", "error": f"{type(exc).__name__}: {exc}"}
+    new_message_id = message_payload.get("message_id")
+    new_channel = _kanban_followup_delivery_channel(new_message_id)
+    if new_channel == "app-server":
+        # 这次直接确认到 app-server → 清掉 pending（用旧 token 过 clear 的防误清 guard）。
+        clear_kanban_followup_pending(task_id=task_id, token=token)
+    else:
+        # 仍未确认 → 把 pending 改写到新 token、重置在途窗口，落地时 UPS arm 按新 token 清。
+        # 必须带上**本次重投新派发**的 prompt_path/turn_id：否则改写后的 marker 丢失 prompt_path，
+        # 下一次扫荡的 S2 重投会因 missing-prompt-path 永久无法再重投。last_notified_at 有意不保留——
+        # 改写后 marker 变 active（新 expires_at），sweep 会跳过它直到再次 stale；届时重新通知才正确。
+        try:
+            write_kanban_followup_pending(
+                task_id=task_id,
+                session_id=marker.get("session_id"),
+                run_id=str(ledger.run_id),
+                run_dir=str(ledger.run_dir),
+                repo=marker.get("repo"),
+                cwd=marker.get("cwd"),
+                token=fresh_prep.token,
+                delivery_channel=new_channel,
+                attempt_id=marker.get("kanban_attempt_id"),
+                message_id=new_message_id if isinstance(new_message_id, str) else None,
+                turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+                prompt_path=message_payload.get("prompt_path"),
+                kanban_project_path=project_path,
+                kanban_task_title=marker.get("kanban_task_title"),
+                kanban_task_title_source=marker.get("kanban_task_title_source"),
+                origin_transcript_path=marker.get("origin_transcript_path"),
+            )
+        except Exception:
+            pass
+    return {
+        "redispatched": True,
+        "reason": "redispatched",
+        "delivery_channel": new_channel,
+        "token": fresh_prep.token,
+        "idempotency_key": idem,
+    }
+
+
+def sweep_stranded_kanban_followup_pending(
+    event: dict[str, Any],
+    ledger: RunLedger,
+) -> None:
+    """跨 task 扫荡 stale dispatched-unconfirmed pending 并升级（S1b）。整函数 try/except 永不抛。
+
+    任意会话、任意 repo 的 Stop 入口调用：打破 flow-1-self-rising 的自升循环。受 30s Codex 链路
+    预算约束——单次最多处理 ``SWEEP_MAX`` 条、通知 timeout=10、可选精修读 transcript 有体积上限。
+    """
+    try:
+        current_task_id = current_kanban_task_id(event)
+        renotify_seconds = _kanban_followup_env_float(
+            KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS,
+        )
+        sweep_max = _kanban_followup_env_int(
+            KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX,
+        )
+        if sweep_max <= 0:
+            return
+        markers = iter_kanban_followup_pending()
+        now_ts = datetime.now(timezone.utc).timestamp()
+        processed = 0
+        for marker in markers:
+            if processed >= sweep_max:
+                break
+            if not isinstance(marker, dict):
+                continue
+            marker_task_id = marker.get("kanban_task_id")
+            if not (isinstance(marker_task_id, str) and marker_task_id.strip()):
+                continue
+            # 当前 Stop 的 task 交既有同 task 对账（_kanban_followup_pending_decision）清+重投，
+            # 避免两条路径语义打架。
+            if current_task_id and marker_task_id == current_task_id:
+                continue
+            if kanban_followup_pending_status(marker, now_ts=now_ts) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+                continue
+            token = marker.get("token") if isinstance(marker.get("token"), str) else None
+            # 可选 best-effort 精修：迟到消费 → 清 marker、不通知。
+            if _kanban_followup_marker_consumed(marker):
+                removed = clear_kanban_followup_pending(task_id=marker_task_id, token=token)
+                ledger.event(
+                    phase="gate",
+                    event="kanban_followup_pending_reconciled_consumed",
+                    status="completed",
+                    reason_code="kanban_followup_pending_reconciled_consumed",
+                    cline_kanban_task_id=marker_task_id,
+                    kanban_followup_pending_marker_path=marker.get("_marker_path"),
+                    removed_kanban_followup_pending_marker_paths=removed,
+                )
+                processed += 1
+                continue
+            # 防刷屏：距上次通知不足 renotify_seconds 则跳过通知（保留 marker，持续浮现）。
+            last_notified_ts = _parse_marker_epoch(marker.get("last_notified_at"))
+            if last_notified_ts is not None and (now_ts - last_notified_ts) < renotify_seconds:
+                continue
+            task_url = resolve_kanban_task_url(marker.get("kanban_project_path"), marker_task_id)
+            notify_result = notify_kanban_followup_stranded(
+                task_id=marker_task_id,
+                task_title=marker.get("kanban_task_title"),
+                task_url=task_url,
+                reason="stranded-escalated",
+            )
+            stamp_kanban_followup_pending_notified(task_id=marker_task_id, token=token)
+            redispatch = _maybe_redispatch_stranded_kanban_followup(marker, ledger, token=token)
+            ledger.event(
+                phase="gate",
+                event="kanban_followup_pending_stranded_escalated",
+                status="completed",
+                reason_code="kanban_followup_pending_stranded_escalated",
+                cline_kanban_task_id=marker_task_id,
+                cline_kanban_task_title=marker.get("kanban_task_title"),
+                kanban_followup_pending_marker_path=marker.get("_marker_path"),
+                kanban_followup_task_url=task_url,
+                kanban_followup_stranded_notified=bool(notify_result.get("notified")),
+                kanban_followup_stranded_notify_reason=notify_result.get("reason"),
+                kanban_followup_stranded_dispatched_at=marker.get("dispatched_at"),
+                kanban_followup_stranded_redispatch=redispatch,
+            )
+            processed += 1
+    except Exception:
+        # 对齐既有 best-effort：扫荡的任何异常都不得影响本次 Stop 的主流程。
+        pass
+
+
 def kanban_followup_in_progress_decision(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -3594,6 +3907,8 @@ def start_cline_kanban_followup_message(
     attempt_id: str | None,
     prompt: str,
     ledger: RunLedger,
+    idempotency_key: str | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
     task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
@@ -3601,6 +3916,8 @@ def start_cline_kanban_followup_message(
     if not prompt_path:
         raise RuntimeError("failed to write Cline Kanban follow-up prompt artifact")
 
+    # 默认沿用每次 Stop 唯一的 ledger.run_id 作幂等键（主派发路径）；S2 重投显式传入
+    # 稳定键（rvf-redispatch-<task>-<token>），使 Kanban 侧对「同一条 stranded 重投」幂等。
     command = [
         sys.executable,
         str(client),
@@ -3616,17 +3933,20 @@ def start_cline_kanban_followup_message(
         "--source",
         "review-validate-fix",
         "--idempotency-key",
-        ledger.run_id,
+        idempotency_key or ledger.run_id,
     ]
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
 
+    # timeout 默认 None=主路径行为不变（无内层超时，由 Codex 链路 30s 总预算兜底）；
+    # S2 重投显式传入有界 timeout，避免在 best-effort 路径上无界阻塞吃光预算。
     completed = subprocess.run(
         command,
         capture_output=True,
         text=True,
         env={**os.environ, **ledger.env()},
         check=False,
+        timeout=timeout,
     )
     command_path = ledger.artifact(
         "kanban-followup-message.json",
@@ -5822,9 +6142,10 @@ def launch_backend(
         # 静默丢投并放行重投，同时 active 期间为 dispatch→delivery 在途窗口提供去重保护。
         pending_marker_path: str | None = None
         if not delivery_confirmed:
+            pending_task_id = message_payload.get("task_id") or task_id
             try:
                 pending_path = write_kanban_followup_pending(
-                    task_id=message_payload.get("task_id") or task_id,
+                    task_id=pending_task_id,
                     session_id=source_session_id,
                     run_id=str(ledger.run_id),
                     run_dir=str(ledger.run_dir),
@@ -5836,10 +6157,48 @@ def launch_backend(
                     message_id=message_id if isinstance(message_id, str) else None,
                     turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
                     prompt_path=message_payload.get("prompt_path"),
+                    # S0：快照 deep-link 与可选 verify-consumed 所需字段，供 S1a/S1b 复用。
+                    kanban_project_path=project_path,
+                    kanban_task_title=source_origin.get("kanban_task_title"),
+                    kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+                    origin_transcript_path=source_origin.get("transcript_path"),
                 )
                 pending_marker_path = str(pending_path) if pending_path else None
             except Exception:  # best-effort：写 pending 失败不阻断 dispatch 上报
                 pending_marker_path = None
+            # S1a：首次未确认派发即发一条强可见 OS 通知（hook systemMessage 易被忽略），
+            # 并盖 last_notified_at 防随后任意会话 Stop 的 stranded-sweep 立刻重复通知。
+            # 整段 best-effort，永不抛——通知失败不影响 dispatch 上报。
+            if pending_marker_path:
+                try:
+                    stranded_task_url = resolve_kanban_task_url(project_path, pending_task_id)
+                    stranded_notify = notify_kanban_followup_stranded(
+                        task_id=pending_task_id,
+                        task_title=source_origin.get("kanban_task_title"),
+                        task_url=stranded_task_url,
+                        reason="dispatched-unconfirmed",
+                    )
+                    stamp_kanban_followup_pending_notified(
+                        task_id=pending_task_id,
+                        token=dispatch_prep.token,
+                    )
+                    ledger.event(
+                        phase="fork",
+                        event="kanban_followup_stranded_notified",
+                        status=status,
+                        reason_code="kanban_followup_dispatched_unconfirmed_notified",
+                        repo=decision.repo,
+                        cwd=cwd,
+                        mode="kanban-followup",
+                        cline_kanban_task_id=pending_task_id,
+                        cline_kanban_task_title=source_origin.get("kanban_task_title"),
+                        kanban_followup_pending_marker_path=pending_marker_path,
+                        kanban_followup_task_url=stranded_task_url,
+                        kanban_followup_stranded_notified=bool(stranded_notify.get("notified")),
+                        kanban_followup_stranded_notify_reason=stranded_notify.get("reason"),
+                    )
+                except Exception:
+                    pass
         paths = {
             key: value
             for key, value in {
@@ -7611,6 +7970,10 @@ def main() -> int:
 
     latest_user = latest_user_message_from_event(event)
     ledger = start_stop_hook_ledger(event)
+    # S1b：与 backend 无关的跨 task stranded-pending 扫荡，必须早于 suppress/launch 分支——
+    # 即便本次 Stop 自身被 suppress 或不 launch，也要让它把**别的** task 遗留的 stale pending
+    # 浮现给用户（打破 flow-1-self-rising 自升循环）。整段 best-effort，永不抛、不改主流程结果。
+    sweep_stranded_kanban_followup_pending(event, ledger)
     # 整体 suppress 必须早于 handoff、dirty gate 和 backend launch，避免子会话停止时继续生成 review/fork artifact。
     if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
         decision = suppressed_decision(event, ledger)

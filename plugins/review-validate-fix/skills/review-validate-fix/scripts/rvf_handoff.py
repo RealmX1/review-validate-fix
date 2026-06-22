@@ -376,6 +376,75 @@ def notify_handoff_ready(
     }
 
 
+def notify_kanban_followup_stranded(
+    *,
+    task_id: str | None,
+    task_title: str | None,
+    task_url: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    """RVF self-rising follow-up review 未确认/滞留时的 OS 系统通知。
+
+    用于两处：S1a（首次 ``dispatched-unconfirmed`` 立即提醒）与 S1b（任意会话 Stop 的
+    跨 task stranded-sweep 升级提醒）。复用 ``notify_handoff_ready`` 的
+    subprocess + ``-open <taskUrl>`` + ``timeout=10`` 形状；故意**不**改 notify_handoff_ready
+    （其 blast radius 高），以零回归方式并存。terminal-notifier 缺失 / 非 darwin 时返回
+    显式 reason，由上层透出而非静默假装已通知。``-group`` 按 task 合并，避免同一 task 的
+    多次升级在通知中心堆叠刷屏。
+    """
+    override = os.environ.get(TERMINAL_NOTIFIER_BIN_ENV)
+    if sys.platform != "darwin" and not (override and override.strip()):
+        return {"notified": False, "reason": "unsupported-platform", "platform": sys.platform}
+    notifier = _terminal_notifier_bin()
+    if not notifier:
+        return {"notified": False, "reason": "terminal-notifier-missing"}
+    title_text = task_title.strip() if isinstance(task_title, str) else ""
+    label = f"task {task_id} «{title_text}»" if title_text else f"task {task_id}"
+    message = (
+        f"RVF review 已排队但未确认运行（{reason}）：{label}。"
+        "打开该 task，让排队中的 $review-validate-fix 被消费。"
+    )
+    command = [notifier, "-title", NOTIFY_TITLE, "-message", message]
+    if task_id:
+        command += ["-group", f"rvf-followup-{safe_token(str(task_id))}"]
+    if task_url:
+        command += ["-open", task_url]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "notified": False,
+            "reason": "timeout",
+            "command": command,
+            "task_url": task_url,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+        }
+    except OSError as exc:
+        return {
+            "notified": False,
+            "reason": "exec_failed",
+            "command": command,
+            "task_url": task_url,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "notified": completed.returncode == 0,
+        "reason": "notified" if completed.returncode == 0 else "command_failed",
+        "command": command,
+        "returncode": completed.returncode,
+        "task_url": task_url,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
 def maybe_trigger_kanban_notification(
     *,
     task_url: str | None,

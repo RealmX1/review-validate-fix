@@ -381,6 +381,10 @@ def pending_marker_payload(
     message_id: str | None = None,
     turn_id: str | None = None,
     prompt_path: str | None = None,
+    kanban_project_path: str | None = None,
+    kanban_task_title: str | None = None,
+    kanban_task_title_source: str | None = None,
+    origin_transcript_path: str | None = None,
 ) -> dict[str, Any]:
     ttl = pending_ttl_seconds()
     return {
@@ -401,6 +405,12 @@ def pending_marker_payload(
         "message_id": message_id,
         "turn_id": turn_id,
         "prompt_path": prompt_path,
+        # 跨 task stranded-sweep（S1b）与 OS 通知 deep-link（S1a）所需的快照字段：
+        # 任意会话的 Stop 都能据此对别的 task 的 stale pending 推出 taskUrl 并通知用户。
+        "kanban_project_path": kanban_project_path,
+        "kanban_task_title": kanban_task_title,
+        "kanban_task_title_source": kanban_task_title_source,
+        "origin_transcript_path": origin_transcript_path,
     }
 
 
@@ -418,6 +428,10 @@ def write_pending_marker(
     message_id: str | None = None,
     turn_id: str | None = None,
     prompt_path: str | None = None,
+    kanban_project_path: str | None = None,
+    kanban_task_title: str | None = None,
+    kanban_task_title_source: str | None = None,
+    origin_transcript_path: str | None = None,
     root: Path | None = None,
 ) -> Path | None:
     if not (isinstance(task_id, str) and task_id.strip()):
@@ -435,6 +449,10 @@ def write_pending_marker(
         message_id=message_id,
         turn_id=turn_id,
         prompt_path=prompt_path,
+        kanban_project_path=kanban_project_path,
+        kanban_task_title=kanban_task_title,
+        kanban_task_title_source=kanban_task_title_source,
+        origin_transcript_path=origin_transcript_path,
     )
     target = _pending_task_path(task_id, root)
     _atomic_write(target, payload)
@@ -490,3 +508,78 @@ def pending_status(
 ) -> str:
     # pending payload 始终带 ``expires_at``，故可直接复用 ``marker_status`` 的过期判定。
     return marker_status(marker, now_ts=now_ts)
+
+
+def iter_pending_markers(
+    *,
+    root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """枚举 pending 目录下所有 ``task-*.json`` 的 payload（跨 task）。
+
+    供 S1b 跨 task stranded-sweep 使用：任意会话的 Stop 都能据此发现**别的** task
+    遗留的 stale pending。形状仿 ``rvf_prep_file.sweep_stale``——glob 整目录、逐文件
+    吞 OSError/JSON 错误，绝不因单个坏文件中断整轮扫荡。每个 payload 注入 ``_marker_path``
+    以便调用方定位文件（与 ``read_pending_marker`` 一致）。
+    """
+    base = _pending_root(root)
+    if not base.is_dir():
+        return []
+    markers: list[dict[str, Any]] = []
+    try:
+        paths = sorted(base.glob("task-*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("_marker_path", str(path))
+            markers.append(payload)
+    return markers
+
+
+def stamp_pending_notified(
+    *,
+    task_id: str | None,
+    token: str | None = None,
+    root: Path | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """给某条 pending marker 盖 ``last_notified_at`` 戳（防 stranded-sweep 刷屏）。
+
+    **read-merge-write，且 ``token`` 必须原样保留**——否则会破坏
+    ``clear_pending_marker`` 的 token 防误清 guard（一条迟到的旧投递确认会因 token
+    不再匹配而无法清掉，导致 marker 永久误锁）。这里直接读原始文件（不经
+    ``read_pending_marker`` 的 ``_marker_path`` 注入），合并戳记后整体写回，
+    payload 里既有的 ``token`` 字段保持不动。
+
+    ``token`` 传入时作为「确认在盖正确的 marker」的 guard：若磁盘上 marker 的 token
+    与传入不一致（已被更新的 dispatch 覆盖），返回 False、不盖戳。
+    """
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return False
+    path = _pending_task_path(task_id, root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if token is not None:
+        stored = payload.get("token")
+        if isinstance(stored, str) and stored and stored != token:
+            return False
+    payload.pop("_marker_path", None)
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    payload["last_notified_at"] = stamp.isoformat().replace("+00:00", "Z")
+    try:
+        payload["notify_count"] = int(payload.get("notify_count") or 0) + 1
+    except (TypeError, ValueError):
+        payload["notify_count"] = 1
+    try:
+        _atomic_write(path, payload)
+    except OSError:
+        return False
+    return True
