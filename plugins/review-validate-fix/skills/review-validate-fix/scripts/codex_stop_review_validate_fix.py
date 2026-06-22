@@ -57,6 +57,7 @@ from diff_tracker import (
     REASON_MANUAL_SCOPE_ALREADY_COMPLETED,
     REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
     _disabled as _tracker_disabled,
+    _list_committed_round_changed_paths,
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
@@ -7193,6 +7194,225 @@ def report_only_decision(repo: str, ledger: RunLedger) -> StopDecision:
     )
 
 
+def route_reviewable_scope(
+    event: dict[str, Any],
+    repo: str,
+    candidate_paths: list[str],
+    ledger: RunLedger,
+    cwd: str | None,
+    *,
+    source: str,
+    gate_status: str,
+) -> StopDecision:
+    """gate 通过后的共享路由：session precheck → reopen marker → plan/doc 路由
+    → allocate → backend 选择 → launch。
+
+    被两个上游复用，唯一区别是 ``candidate_paths`` 的来源：
+      * dirty 工作区（``source="dirty_working_tree"``，paths 来自 gate stdout 的
+        ``git status`` 摘要）；
+      * 本轮已提交但未审改动（``source="committed_round"``，paths 来自
+        ``baseline..HEAD`` first-parent 净 diff）。
+    两条路径共用同一 precheck/allocate 管线：``precheck_session_scope_for_dirty_route``
+    与回退的 ``session_scope_gate_payload`` 都会调 ``refresh_global_diff_tracker``，
+    后者自解析 round-baseline marker 把 committed 单元喂进 manifest，因此 committed
+    改动与 dirty 改动的归属 / 分配 / 去重完全一致。
+    """
+    all_changed_paths = candidate_paths
+    session_precheck = precheck_session_scope_for_dirty_route(
+        event,
+        repo,
+        ledger,
+    )
+    if session_precheck.skip_payload is not None:
+        return payload_decision(
+            session_precheck.skip_payload,
+            reason_code="session_scope_skipped",
+            repo=repo,
+            cwd=cwd,
+        )
+
+    # 失败再入：若上游 agent 经 $rvf-reopen 武装了 rescope marker，在 allocate /
+    # kanban-followup launch 之前按 target_run_id 把那次实现仍存在的 reviewed
+    # units 翻回 available（run-scoped），使本轮 RVF 全量重审「实现 ∪ fix」。
+    # precheck 已做 tracker refresh；此处翻转的 DB 状态会被紧接着的本进程
+    # allocate 或 kanban-followup 后台 run 的 refresh+allocate 一并 reconcile。
+    consume_review_reopen_marker(event, repo, ledger, cwd=cwd)
+
+    route_candidate_paths = (
+        session_precheck.route_paths
+        if session_precheck.route_paths is not None
+        else all_changed_paths
+    )
+    doc_review = plan_doc_review_classification(route_candidate_paths)
+    if doc_review["should_route"]:
+        ledger.event(
+            phase="gate",
+            event="plan_doc_review_routed",
+            status="skipped",
+            reason_code="plan_document_only",
+            repo=repo,
+            cwd=cwd,
+            changed_paths=doc_review["changed_paths"],
+            plan_like_paths=doc_review["plan_like_paths"],
+            route="plan-doc-maintainer-review",
+        )
+        return skip_decision(
+            "plan/document-only dirty scope should route to Plan/Doc Maintainer Review, "
+            "not full review-validate-fix.",
+            ledger,
+            "plan_document_only",
+            repo=repo,
+            cwd=cwd,
+            route="plan-doc-maintainer-review",
+            changed_paths=doc_review["changed_paths"],
+            doc_paths=doc_review["doc_paths"],
+            plan_like_paths=doc_review["plan_like_paths"],
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="plan-doc-review",
+                backend_raw="plan-doc-review",
+                completion_gate="plan_document_only",
+            ),
+        )
+    if session_precheck.context is not None:
+        session_scope_payload = allocate_auto_review_scope(
+            session_precheck.context,
+            ledger,
+            dry_run=False,
+        )
+    elif session_precheck.checked:
+        session_scope_payload = None
+    else:
+        session_scope_payload = session_scope_gate_payload(event, repo, ledger)
+    if session_scope_payload is not None:
+        return payload_decision(
+            session_scope_payload,
+            reason_code="session_scope_skipped",
+            repo=repo,
+            cwd=cwd,
+        )
+
+    backend = normalize_backend_from_env(event)
+    backend_selection_mode = fork_mode_selection_from_env()
+    if backend == "off":
+        return skip_decision(
+            "CODEX_RVF_MODE=off",
+            ledger,
+            "mode_off",
+            repo=repo,
+            cwd=cwd,
+            backend=backend,
+        )
+    if backend == "report-only":
+        return report_only_decision(repo, ledger)
+
+    parent_thread_id = parent_thread_id_from_event(event)
+    parent_thread_path = parent_thread_path_from_event(event)
+    if backend != "kanban-followup" and not parent_thread_id:
+        return skip_decision(
+            "Stop event did not expose a parent thread id.",
+            ledger,
+            "missing_parent_thread_id",
+            repo=repo,
+            cwd=cwd,
+            backend=backend,
+            log_prefix="review-validate-fix-fork",
+        )
+    if backend == "kanban":
+        parent_thread_path = first_readable_session_path(event)
+        if parent_thread_path is None and backend_selection_mode != "auto":
+            return skip_decision(
+                "Cline Kanban backend requires a readable parent transcript/session "
+                "scope anchor; skipped to avoid starting with an empty session-owned "
+                "worktree bootstrap.",
+                ledger,
+                "cline_kanban_missing_scope_anchor",
+                repo=repo,
+                cwd=cwd,
+                backend=backend,
+            )
+
+    return StopDecision(
+        action="launch",
+        reason_code="backend_selected",
+        repo=repo,
+        cwd=fork_cwd_for_event(event, repo),
+        parent_thread_id=parent_thread_id,
+        parent_thread_path=parent_thread_path,
+        backend=backend,
+        message="RVF backend selected.",
+        summary_fields={
+            "gate_status": gate_status,
+            "review_scope_source": source,
+            "backend_selection_mode": backend_selection_mode,
+            "legacy_gui_fallback_role": "backup-of-backup"
+            if backend_selection_mode == "auto"
+            else None,
+            **stop_hook_rvf_state_fields(
+                phase="prepare",
+                backend=backend,
+                backend_raw=backend,
+            ),
+        },
+        status="started",
+    )
+
+
+def maybe_route_committed_round_scope(
+    event: dict[str, Any],
+    repo: str | None,
+    ledger: RunLedger,
+    cwd: str | None,
+) -> StopDecision | None:
+    """工作区 clean 时，把「本轮已提交但未审」的改动接回 review 管线。
+
+    这是 commit ``9127824`` 缺失的前置 gate：committed 检测的全部下游
+    （``refresh_global_diff_tracker`` / ``build_manifest`` / ``allocate_auto_review_scope``）
+    本就 committed-aware，却被 dirty-only gate 挡在 ``if status == "DIRTY"`` 之外，
+    导致「agent commit 掉本轮工作 → 工作区变 clean」这一主目标场景永远走不到。
+
+    行为零回归：缺 round-baseline marker（None）/ baseline..HEAD 无本轮提交（空）
+    → 返回 None，调用方维持今日的 ``clean_repo`` skip。仅当确有本轮 committed 改动时
+    才经 ``route_reviewable_scope`` 进入与 dirty 完全一致的 precheck/allocate/launch。
+    """
+    if not repo:
+        return None
+    baseline = resolve_round_baseline_head(
+        task_id=current_kanban_task_id(event),
+        session_id=session_hook_id_from_event(event),
+    )
+    if not baseline:
+        return None
+    try:
+        committed_paths = _list_committed_round_changed_paths(
+            Path(repo).expanduser().resolve(),
+            baseline,
+        )
+    except Exception:
+        committed_paths = []
+    if not committed_paths:
+        return None
+    ledger.event(
+        phase="gate",
+        event="committed_round_route_selected",
+        status="committed",
+        reason_code="committed_round_changes",
+        repo=repo,
+        cwd=cwd,
+        committed_baseline=baseline,
+        committed_path_count=len(committed_paths),
+    )
+    return route_reviewable_scope(
+        event,
+        repo,
+        committed_paths,
+        ledger,
+        cwd,
+        source="committed_round",
+        gate_status="CLEAN",
+    )
+
+
 def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecision:
     latest_user = latest_user_message_from_event(event)
     cwd_value = event.get("cwd")
@@ -7397,145 +7617,27 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
-            all_changed_paths = changed_paths_from_gate_output(cwd_result.output)
-            session_precheck = precheck_session_scope_for_dirty_route(
+            return route_reviewable_scope(
                 event,
                 cwd_result.repo,
+                changed_paths_from_gate_output(cwd_result.output),
                 ledger,
-            )
-            if session_precheck.skip_payload is not None:
-                return payload_decision(
-                    session_precheck.skip_payload,
-                    reason_code="session_scope_skipped",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                )
-
-            # 失败再入：若上游 agent 经 $rvf-reopen 武装了 rescope marker，在 allocate /
-            # kanban-followup launch 之前按 target_run_id 把那次实现仍存在的 reviewed
-            # units 翻回 available（run-scoped），使本轮 RVF 全量重审「实现 ∪ fix」。
-            # precheck 已做 tracker refresh；此处翻转的 DB 状态会被紧接着的本进程
-            # allocate 或 kanban-followup 后台 run 的 refresh+allocate 一并 reconcile。
-            consume_review_reopen_marker(event, cwd_result.repo, ledger, cwd=cwd)
-
-            route_candidate_paths = (
-                session_precheck.route_paths
-                if session_precheck.route_paths is not None
-                else all_changed_paths
-            )
-            doc_review = plan_doc_review_classification(route_candidate_paths)
-            if doc_review["should_route"]:
-                ledger.event(
-                    phase="gate",
-                    event="plan_doc_review_routed",
-                    status="skipped",
-                    reason_code="plan_document_only",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                    changed_paths=doc_review["changed_paths"],
-                    plan_like_paths=doc_review["plan_like_paths"],
-                    route="plan-doc-maintainer-review",
-                )
-                return skip_decision(
-                    "plan/document-only dirty scope should route to Plan/Doc Maintainer Review, "
-                    "not full review-validate-fix.",
-                    ledger,
-                    "plan_document_only",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                    route="plan-doc-maintainer-review",
-                    changed_paths=doc_review["changed_paths"],
-                    doc_paths=doc_review["doc_paths"],
-                    plan_like_paths=doc_review["plan_like_paths"],
-                    **stop_hook_rvf_state_fields(
-                        phase="complete",
-                        backend="plan-doc-review",
-                        backend_raw="plan-doc-review",
-                        completion_gate="plan_document_only",
-                    ),
-                )
-            if session_precheck.context is not None:
-                session_scope_payload = allocate_auto_review_scope(
-                    session_precheck.context,
-                    ledger,
-                    dry_run=False,
-                )
-            elif session_precheck.checked:
-                session_scope_payload = None
-            else:
-                session_scope_payload = session_scope_gate_payload(event, cwd_result.repo, ledger)
-            if session_scope_payload is not None:
-                return payload_decision(
-                    session_scope_payload,
-                    reason_code="session_scope_skipped",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                )
-
-            backend = normalize_backend_from_env(event)
-            backend_selection_mode = fork_mode_selection_from_env()
-            if backend == "off":
-                return skip_decision(
-                    "CODEX_RVF_MODE=off",
-                    ledger,
-                    "mode_off",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                    backend=backend,
-                )
-            if backend == "report-only":
-                return report_only_decision(cwd_result.repo, ledger)
-
-            parent_thread_id = parent_thread_id_from_event(event)
-            parent_thread_path = parent_thread_path_from_event(event)
-            if backend != "kanban-followup" and not parent_thread_id:
-                return skip_decision(
-                    "Stop event did not expose a parent thread id.",
-                    ledger,
-                    "missing_parent_thread_id",
-                    repo=cwd_result.repo,
-                    cwd=cwd,
-                    backend=backend,
-                    log_prefix="review-validate-fix-fork",
-                )
-            if backend == "kanban":
-                parent_thread_path = first_readable_session_path(event)
-                if parent_thread_path is None and backend_selection_mode != "auto":
-                    return skip_decision(
-                        "Cline Kanban backend requires a readable parent transcript/session "
-                        "scope anchor; skipped to avoid starting with an empty session-owned "
-                        "worktree bootstrap.",
-                        ledger,
-                        "cline_kanban_missing_scope_anchor",
-                        repo=cwd_result.repo,
-                        cwd=cwd,
-                        backend=backend,
-                    )
-
-            return StopDecision(
-                action="launch",
-                reason_code="backend_selected",
-                repo=cwd_result.repo,
-                cwd=fork_cwd_for_event(event, cwd_result.repo),
-                parent_thread_id=parent_thread_id,
-                parent_thread_path=parent_thread_path,
-                backend=backend,
-                message="RVF backend selected.",
-                summary_fields={
-                    "gate_status": cwd_result.status,
-                    "backend_selection_mode": backend_selection_mode,
-                    "legacy_gui_fallback_role": "backup-of-backup"
-                    if backend_selection_mode == "auto"
-                    else None,
-                    **stop_hook_rvf_state_fields(
-                        phase="prepare",
-                        backend=backend,
-                        backend_raw=backend,
-                    ),
-                },
-                status="started",
+                cwd,
+                source="dirty_working_tree",
+                gate_status=cwd_result.status,
             )
         if cwd_result.status == "CLEAN":
+            # gate 只看 dirty 工作区；工作区 clean 时再看本轮有没有「已提交但未审」
+            # 的改动（commit 9127824 的下游 committed 检测就是为这一幕而做，却一直被
+            # 这个 dirty-only gate 挡在外面）。有则照常进 review，没有才 clean skip。
+            committed_decision = maybe_route_committed_round_scope(
+                event,
+                cwd_result.repo or cwd,
+                ledger,
+                cwd,
+            )
+            if committed_decision is not None:
+                return committed_decision
             return skip_decision(
                 f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
                 ledger,

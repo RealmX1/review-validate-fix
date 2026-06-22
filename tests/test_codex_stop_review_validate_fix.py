@@ -5953,6 +5953,157 @@ def test_clean_repo_skips(tmp_path: Path) -> None:
     assert_skip_reason(stdout, "clean")
 
 
+UPS_SCRIPT = SCRIPT.with_name("rvf_user_prompt_submit.py")
+
+
+def invoke_ups(event: dict[str, object], *, state_dir: Path) -> None:
+    """Run the REAL UserPromptSubmit hook so its round-baseline marker side
+    effect lands under the same state root the Stop hook reads. Driving the
+    actual marker writer (instead of planting a file) guards against key/root
+    drift that would silently turn a committed-round test into a no-op."""
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+            env.pop(name, None)
+    env.pop("CODEX_THREAD_ID", None)
+    env["CODEX_RVF_STATE_DIR"] = str(state_dir)
+    subprocess.run(
+        [sys.executable, str(UPS_SCRIPT)],
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+
+
+def _init_committed_round_repo(path: Path) -> Path:
+    repo = path / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], repo)
+    run(["git", "config", "user.email", "rvf@example.test"], repo)
+    run(["git", "config", "user.name", "RVF Test"], repo)
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base"], repo)
+    return repo
+
+
+def _commit_round_work(repo: Path) -> None:
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], repo)
+    run(["git", "commit", "-q", "-m", "round work"], repo)
+
+
+def _porcelain(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _committed_round_session(path: Path, repo: Path, session_id: str) -> Path:
+    transcript = path / "session.jsonl"
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: f.txt\n"
+        "@@\n"
+        " base\n"
+        "+added\n"
+        "*** End Patch\n"
+    )
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": str(repo)}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "apply_patch",
+                "input": patch,
+                "call_id": "call_committed",
+            },
+        },
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+    return transcript
+
+
+def test_committed_round_clean_repo_routes_to_review(tmp_path: Path) -> None:
+    """Regression for the commit-9127824 gate gap: once the agent commits this
+    round's work the tree is clean, yet the committed-but-unreviewed change must
+    still be routed to review instead of short-circuiting at the dirty-only gate.
+
+    Exercises the REAL Stop path end-to-end (the e2e missing when 9127824
+    landed): UserPromptSubmit records baseline = HEAD@prompt, the work is
+    committed, then the Stop hook must take the new
+    `committed_round_route_selected` branch, reach the committed-aware downstream
+    (`tracker_refresh_started`), allocate the committed unit
+    (`tracker_scope_allocated`), and decide `dry_run` — NOT `clean_repo`."""
+    repo = _init_committed_round_repo(tmp_path)
+    state = tmp_path / "state"
+    session_id = "11111111-2222-3333-4444-555555555555"
+    transcript = _committed_round_session(tmp_path, repo, session_id)
+
+    # Prompt-time UserPromptSubmit: records baseline = HEAD (pre-work commit).
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "请加一行并提交",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    marker_dir = state / "round-baseline-pending"
+    assert marker_dir.is_dir() and any(marker_dir.iterdir()), "UPS 应写入 round-baseline marker"
+
+    # Agent commits the round's work -> working tree is clean.
+    _commit_round_work(repo)
+    assert _porcelain(repo) == ""
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "decision" not in payload
+    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
+    summary = latest_summary(state)
+    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_route_selected" in events, events
+    assert "tracker_refresh_started" in events, events
+    assert "tracker_scope_allocated" in events, events
+
+
+def test_clean_repo_with_committed_work_but_no_marker_skips(tmp_path: Path) -> None:
+    """Zero-regression guard: a clean tree with committed work but NO
+    round-baseline marker (UserPromptSubmit never ran / marker expired) must
+    still take the historical `clean_repo` skip. Without an active baseline the
+    committed detection stays fully off — byte-identical to pre-fix behavior."""
+    repo = _init_committed_round_repo(tmp_path)
+    _commit_round_work(repo)
+    assert _porcelain(repo) == ""
+    state = tmp_path / "state"
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": "deadbeef-0000-0000-0000-000000000000",
+            "stop_hook_active": False,
+        },
+        state_dir=state,
+    )
+    assert_skip_reason(stdout, "clean")
+
+
 def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "doc-plan", dirty=False)
     state = tmp_path / "state"
@@ -7246,6 +7397,8 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
+        test_committed_round_clean_repo_routes_to_review,
+        test_clean_repo_with_committed_work_but_no_marker_skips,
         test_plan_document_only_routes_out_of_full_rvf,
         test_read_only_session_with_background_plan_docs_does_not_plan_route,
         test_plan_document_route_does_not_hide_source_rename,
