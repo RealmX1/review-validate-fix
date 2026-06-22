@@ -797,6 +797,107 @@ def test_kanban_followup_pending_marker_round_trip(tmp_path: Path) -> None:
             os.environ[k.PENDING_TTL_ENV] = prev_ttl
 
 
+def test_kanban_followup_iter_pending_and_stamp_notified(tmp_path: Path) -> None:
+    """S0/S0b：pending 新快照字段 + iter_pending_markers 跨 task 枚举 + stamp_pending_notified 保 token。
+
+    stamp 必须 read-merge-write 且**原样保留 token**，否则会破坏 clear_pending_marker 的 token
+    防误清 guard（一条迟到的旧投递确认会因 token 不再匹配而无法清掉 marker → 永久误锁）。
+    """
+    k = load_kanban_followup_lock_module()
+    root = tmp_path / "lock-root"
+    pa = k.write_pending_marker(
+        task_id="taskA", session_id="sA", run_id="rA", run_dir=str(tmp_path / "rA"),
+        repo="/repo", cwd="/repo", token="aaaaaaaaaaaaaaaa", delivery_channel="terminal",
+        kanban_project_path="/repo", kanban_task_title="标题A",
+        kanban_task_title_source="cline_kanban_task_env",
+        origin_transcript_path=str(tmp_path / "tA.jsonl"), root=root,
+    )
+    pb = k.write_pending_marker(
+        task_id="taskB", session_id="sB", run_id="rB", run_dir=str(tmp_path / "rB"),
+        repo="/repo2", cwd="/repo2", token="bbbbbbbbbbbbbbbb", delivery_channel="terminal",
+        kanban_project_path="/repo2", kanban_task_title="标题B",
+        origin_transcript_path=None, root=root,
+    )
+    assert pa and pb
+    # S0 快照字段持久化。
+    ma = k.read_pending_marker(task_id="taskA", root=root)
+    assert ma["kanban_project_path"] == "/repo"
+    assert ma["kanban_task_title"] == "标题A"
+    assert ma["kanban_task_title_source"] == "cline_kanban_task_env"
+    assert ma["origin_transcript_path"] == str(tmp_path / "tA.jsonl")
+    # iter 枚举两个 task（顺序无关），每个 payload 注入 _marker_path。
+    markers = k.iter_pending_markers(root=root)
+    assert {m.get("kanban_task_id") for m in markers} == {"taskA", "taskB"}
+    assert all(m.get("_marker_path") for m in markers)
+    # stamp 盖 last_notified_at 且保留 token。
+    assert k.stamp_pending_notified(task_id="taskA", token="aaaaaaaaaaaaaaaa", root=root) is True
+    after = k.read_pending_marker(task_id="taskA", root=root)
+    assert after.get("last_notified_at")
+    assert after.get("token") == "aaaaaaaaaaaaaaaa"
+    assert int(after.get("notify_count")) == 1
+    # 错误 token 不盖戳（notify_count 不变）。
+    assert k.stamp_pending_notified(task_id="taskA", token="ffffffffffffffff", root=root) is False
+    assert int(k.read_pending_marker(task_id="taskA", root=root).get("notify_count")) == 1
+    # 关键回归：stamp 之后用原 token 仍能清掉（token guard 未被破坏）。
+    removed = k.clear_pending_marker(task_id="taskA", token="aaaaaaaaaaaaaaaa", root=root)
+    assert removed == [str(pa)]
+    assert k.read_pending_marker(task_id="taskA", root=root) is None
+    # 缺失 marker → stamp 返回 False、不抛。
+    assert k.stamp_pending_notified(task_id="taskA", token="aaaaaaaaaaaaaaaa", root=root) is False
+    # iter 在空/不存在目录上返回 []（不抛）。
+    assert k.iter_pending_markers(root=tmp_path / "nonexistent") == []
+
+
+def test_notify_kanban_followup_stranded(tmp_path: Path) -> None:
+    """S1a/S1b 共用 OS 通知：命令含 -open <taskUrl> + task 标题 + 按 task 合并 group；
+    缺 notifier / 非 darwin 返回显式 reason 且不抛。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mod = _load_rvf_handoff_module()
+    notifier_log = tmp_path / "notify.log"
+    notifier = _write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
+    saved_bin = os.environ.get(mod.TERMINAL_NOTIFIER_BIN_ENV)
+    os.environ[mod.TERMINAL_NOTIFIER_BIN_ENV] = str(notifier)
+    try:
+        result = mod.notify_kanban_followup_stranded(
+            task_id="4fc83",
+            task_title="修复登录",
+            task_url="http://127.0.0.1:3484/repo?task=4fc83",
+            reason="stranded-escalated",
+        )
+        assert result["notified"] is True
+        calls = [
+            json.loads(line)
+            for line in notifier_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(calls) == 1
+        argv = calls[0]
+        assert argv[argv.index("-open") + 1] == "http://127.0.0.1:3484/repo?task=4fc83"
+        msg = argv[argv.index("-message") + 1]
+        assert "4fc83" in msg and "修复登录" in msg
+        group = argv[argv.index("-group") + 1]
+        assert group.startswith("rvf-followup-")
+    finally:
+        if saved_bin is None:
+            os.environ.pop(mod.TERMINAL_NOTIFIER_BIN_ENV, None)
+        else:
+            os.environ[mod.TERMINAL_NOTIFIER_BIN_ENV] = saved_bin
+    # 缺 notifier：非 darwin → unsupported-platform；darwin → terminal-notifier-missing；均不抛。
+    saved_which = mod.shutil.which
+    saved_bin2 = os.environ.pop(mod.TERMINAL_NOTIFIER_BIN_ENV, None)
+    try:
+        mod.shutil.which = lambda name: None
+        r2 = mod.notify_kanban_followup_stranded(
+            task_id="t", task_title=None, task_url=None, reason="dispatched-unconfirmed"
+        )
+        assert r2["notified"] is False
+        assert r2["reason"] in {"terminal-notifier-missing", "unsupported-platform"}
+    finally:
+        mod.shutil.which = saved_which
+        if saved_bin2 is not None:
+            os.environ[mod.TERMINAL_NOTIFIER_BIN_ENV] = saved_bin2
+
+
 def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> None:
     """投递落地：UPS arm in-progress 锁的同时，按 token 清掉 Stop 写的 pending(dispatched-unconfirmed)。
 
@@ -9379,6 +9480,16 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_kanban_followup_pending_marker_round_trip(
                 root / "kanban-followup-pending"
             ),
+        ),
+        (
+            "kanban_followup_iter_pending_and_stamp_notified",
+            lambda: test_kanban_followup_iter_pending_and_stamp_notified(
+                root / "kanban-followup-iter-stamp"
+            ),
+        ),
+        (
+            "notify_kanban_followup_stranded",
+            lambda: test_notify_kanban_followup_stranded(root / "kanban-followup-notify"),
         ),
         (
             "rvf_user_prompt_submit_clears_pending_on_delivery",
