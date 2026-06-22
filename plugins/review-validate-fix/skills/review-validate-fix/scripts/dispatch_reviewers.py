@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -41,8 +42,14 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness_limit_cooldown
 from rvf_logging import start_run
-from run_alternative_reviewer import reviewer_id_from_label, safe_artifact_token
+from run_alternative_reviewer import (
+    EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE,
+    EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG,
+    reviewer_id_from_label,
+    safe_artifact_token,
+)
 from trajectory_distill import HOST_CODEX, detect_transcript_format
 
 
@@ -167,6 +174,9 @@ def route(
         "warnings": warnings,
         "needs_last_resort_fallback": False,
         "sequential_execution": False,
+        # 额度耗尽轮内 reroute 记录：每项 {slot, from, from_reviewer_id, to, to_reviewer_id, round}。
+        # additive 字段，schema_version 仍为 1（既有消费者忽略未知 key）。
+        "fallbacks": [],
         "status": "planned",
     }
 
@@ -269,17 +279,25 @@ def probe_available(
     probe_mode: str = "preflight",
     timeout: float = 60.0,
     assume_available: list[str] | None = None,
+    cooldown_active: set[str] | None = None,
 ) -> list[str]:
     """对每个 enabled harness 跑 ``run_alternative_reviewer.py --config <path> --<probe_mode>``。
 
     ``assume_available`` 给定时跳过真实 probe（用于 --plan-only 测试 / 确定性路由），
-    只取其与 enabled 的交集。
+    只取其与 enabled 的交集；此路径**不**应用 cooldown（D-O4：assume 仅测试用，须走真实 probe
+    才会被额度冷却排除）。
+
+    ``cooldown_active`` 给定时，处于额度耗尽冷却期的 harness **连 probe 都跳过**（额度耗尽时
+    ``codex login status`` 之类 auth probe 仍返回 0，单看 auth 发现不了，故需独立额度信号）。
     """
     enabled = _enabled_harnesses(registry)
     if assume_available is not None:
         return [h for h in assume_available if h in enabled]
+    cooled = cooldown_active or set()
     available: list[str] = []
     for harness_id in enabled:
+        if harness_id in cooled:
+            continue
         spec = registry["harnesses"][harness_id]
         config_path = SKILL_DIR / spec["config_path"]
         cmd = [
@@ -336,6 +354,93 @@ def _build_reviewer_command(
     return cmd
 
 
+def _newest_artifact(reviewer_dir: Path, pattern: str) -> Path | None:
+    try:
+        candidates = [p for p in reviewer_dir.glob(pattern) if p.is_file()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _read_reviewer_summary(reviewer_dir: Path) -> dict[str, Any] | None:
+    """读子 reviewer 的 ``reviewer.summary*.json``（unique 命名，取 mtime 最新一份）。"""
+    path = _newest_artifact(reviewer_dir, "reviewer.summary*.json")
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _read_reviewer_stderr(reviewer_dir: Path) -> str | None:
+    path = _newest_artifact(reviewer_dir, "reviewer.stderr*.txt")
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _leg_usage_limit(reviewer: dict[str, Any], artifacts_dir: Path) -> tuple[bool, str | None]:
+    """D3 双条件：returncode==125 且（summary.output_error_reason==usage_limit_exhausted
+    或 stderr 含 flag）。返回 (是否额度耗尽, 错误文案 snippet 供解析 reset hint)。
+
+    只看裸 125 会误判（exit code 可能来自非本脚本的命令）；故要求 artifact 佐证，
+    对齐 timeout 的「124 AND flag」先例。
+    """
+    if reviewer.get("returncode") != EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE:
+        return False, None
+    reviewer_dir = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+    summary = _read_reviewer_summary(reviewer_dir)
+    if isinstance(summary, dict) and summary.get("output_error_reason") == "usage_limit_exhausted":
+        return True, summary.get("output_error_message")
+    stderr_text = _read_reviewer_stderr(reviewer_dir)
+    if stderr_text and EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG in stderr_text:
+        return True, stderr_text
+    return False, None
+
+
+def _dedupe_reviewer_id(reviewer_id: str, used_ids: set[str]) -> str:
+    """bounded 去重：替换 leg id 与已占用 id 碰撞时追加序号（多轮 reroute 也不撞）。"""
+    if reviewer_id not in used_ids:
+        return reviewer_id
+    for index in range(2, 100):
+        candidate = f"{reviewer_id}-{index}"
+        if candidate not in used_ids:
+            return candidate
+    return f"{reviewer_id}-{secrets.token_hex(2)}"
+
+
+def _reroute_candidates(
+    main_harness: str | None,
+    available: list[str],
+    cooled: set[str],
+    registry: dict[str, Any],
+) -> list[str]:
+    """对 ``A' = available − cooled`` 重调 ``route()`` 取替换候选 harness 顺序（R-c 单源）。
+
+    候选 = route 在 A' 上的两腿选择（已含 R0–R4 的 cursor 优先 / main-as-external / R2 双实例
+    偏好），再按 priority 补齐 A' 其余，保证「需补两腿但 route 只给两腿」时仍有后备。
+    """
+    a_prime = [h for h in available if h not in cooled]
+    candidates: list[str] = []
+    if main_harness is not None and a_prime:
+        sub_plan = route(main_harness, a_prime, registry)
+        for reviewer in sub_plan.get("reviewers", []):
+            hid = reviewer.get("harness_id")
+            if hid and hid not in candidates:
+                candidates.append(hid)
+    for hid in _order_by_priority(registry, a_prime):
+        if hid not in candidates:
+            candidates.append(hid)
+    return candidates
+
+
 def execute_plan(
     plan: dict[str, Any],
     *,
@@ -346,50 +451,157 @@ def execute_plan(
     run_id: str,
     run_dir: str,
     artifacts_dir: Path,
+    registry: dict[str, Any] | None = None,
+    main_harness: str | None = None,
+    available: list[str] | None = None,
+    max_fallback_rounds: int = 2,
 ) -> dict[str, Any]:
-    """并行（或顺序）派发 plan 中的两路 external reviewer，回填 returncode / result path / status。"""
+    """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
+
+    撞额度耗尽（returncode 125 + 佐证）时，做**轮内 reroute**：记 cooldown → 对
+    ``A' = available − cooled`` 重调 ``route()`` 取替换 → in-place 替换失败 slot（保持恰好两腿、
+    保留成功 leg 的 artifact）→ 派发替换 leg；替换也 125 则 bounded 再来一轮。补不上则
+    fail-close（F1/F2/R-e）。``registry``/``main_harness``/``available`` 缺省（None）时退化为
+    「无 reroute」，仅按 returncode 计 status（兼容旧调用方）。
+    """
     reviewers = plan.get("reviewers", [])
-    results: dict[int, int] = {}
+    cooled: set[str] = set()
+    cooldown_recorded: list[str] = []
+    used_ids: set[str] = {r["reviewer_id"] for r in reviewers}
+    available = available or []
 
-    def _run(index: int, reviewer: dict[str, Any]) -> None:
-        cmd = _build_reviewer_command(
-            reviewer,
-            repo=repo,
-            review_packet=review_packet,
-            session_context=session_context,
-            scope_contract=scope_contract,
-            run_id=run_id,
-            run_dir=run_dir,
-        )
-        try:
-            completed = subprocess.run(cmd)
-            results[index] = completed.returncode
-        except OSError as exc:  # pragma: no cover - 启动失败
-            results[index] = 1
-            reviewer["error"] = f"{type(exc).__name__}: {exc}"
+    def _dispatch_indices(indices: list[int]) -> None:
+        """派发给定下标的 reviewer（尊重 sequential_execution），回填 returncode/result path。"""
+        local_results: dict[int, int] = {}
 
-    if plan.get("sequential_execution"):
+        def _run(index: int) -> None:
+            reviewer = reviewers[index]
+            cmd = _build_reviewer_command(
+                reviewer,
+                repo=repo,
+                review_packet=review_packet,
+                session_context=session_context,
+                scope_contract=scope_contract,
+                run_id=run_id,
+                run_dir=run_dir,
+            )
+            try:
+                completed = subprocess.run(cmd)
+                local_results[index] = completed.returncode
+            except OSError as exc:  # pragma: no cover - 启动失败
+                local_results[index] = 1
+                reviewer["error"] = f"{type(exc).__name__}: {exc}"
+
+        if plan.get("sequential_execution"):
+            for index in indices:
+                _run(index)
+        else:
+            threads = [threading.Thread(target=_run, args=(index,)) for index in indices]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        for index in indices:
+            reviewer = reviewers[index]
+            reviewer["returncode"] = local_results.get(index, 1)
+            reviewer["review_result_path"] = str(
+                artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
+            )
+
+    # 初派全部两腿。
+    _dispatch_indices(list(range(len(reviewers))))
+
+    # 反应式 reroute：bounded 轮次，每轮替换本轮新撞额度的 slot。
+    can_reroute = registry is not None and main_harness is not None
+    for _round in range(max_fallback_rounds):
+        failed_slots: list[tuple[int, str | None]] = []
         for index, reviewer in enumerate(reviewers):
-            _run(index, reviewer)
-    else:
-        threads = [
-            threading.Thread(target=_run, args=(index, reviewer))
-            for index, reviewer in enumerate(reviewers)
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+            hit, err = _leg_usage_limit(reviewer, artifacts_dir)
+            if hit:
+                failed_slots.append((index, err))
+        if not failed_slots:
+            break
 
-    ok = 0
-    for index, reviewer in enumerate(reviewers):
-        returncode = results.get(index, 1)
-        reviewer["returncode"] = returncode
-        reviewer["review_result_path"] = str(
-            artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
-        )
-        if returncode == 0:
-            ok += 1
+        # 记 cooldown（无论能否 reroute 都记——跨轮 cooldown 是第二层防线）。
+        for index, err in failed_slots:
+            harness_id = reviewers[index]["harness_id"]
+            if harness_id not in cooled:
+                reset_hint = harness_limit_cooldown.parse_reset_hint(err)
+                harness_limit_cooldown.record(
+                    harness_id,
+                    reset_hint=reset_hint,
+                    reason="usage_limit_exhausted",
+                    error_message=err,
+                )
+                cooled.add(harness_id)
+                cooldown_recorded.append(harness_id)
+
+        if not can_reroute:
+            break
+
+        candidates = _reroute_candidates(main_harness, available, cooled, registry)
+        surviving = {
+            reviewers[i]["harness_id"]
+            for i in range(len(reviewers))
+            if i not in {idx for idx, _ in failed_slots}
+        }
+        used_replacement: set[str] = set()
+        new_indices: list[int] = []
+        any_assigned = False
+        for index, _err in failed_slots:
+            pick = None
+            # 第一遍：偏好与 surviving + 本轮已用替换都不同的 harness（两腿尽量异构）。
+            for hid in candidates:
+                if hid in surviving or hid in used_replacement:
+                    continue
+                pick = hid
+                break
+            # 第二遍：放宽到「不在 surviving」（仅剩一个 eligible 时允许同 harness 双实例，R-e/R-b）。
+            if pick is None:
+                for hid in candidates:
+                    if hid in surviving:
+                        continue
+                    pick = hid
+                    break
+            if pick is None:
+                continue  # 该 slot 补不上（A' 耗尽）→ 留待 fail-close 判定。
+            slot_no = reviewers[index]["slot"]
+            spec = _reviewer_spec(
+                registry,
+                pick,
+                slot=slot_no,
+                reviewer_id_suffix=f"fb{slot_no}",
+            )
+            spec["reviewer_id"] = _dedupe_reviewer_id(spec["reviewer_id"], used_ids)
+            plan["fallbacks"].append(
+                {
+                    "slot": slot_no,
+                    "from": reviewers[index]["harness_id"],
+                    "from_reviewer_id": reviewers[index]["reviewer_id"],
+                    "to": pick,
+                    "to_reviewer_id": spec["reviewer_id"],
+                    "round": _round + 1,
+                }
+            )
+            reviewers[index] = spec
+            used_ids.add(spec["reviewer_id"])
+            used_replacement.add(pick)
+            new_indices.append(index)
+            any_assigned = True
+
+        if not any_assigned:
+            break  # 没有任何可补的替换 → 停止 reroute，进入 fail-close 判定。
+        _dispatch_indices(new_indices)
+
+    # 统计 + status + fail-close（F1/F2/R-e）。
+    ok = sum(1 for reviewer in reviewers if reviewer.get("returncode") == 0)
+    unfilled_usage = [
+        index
+        for index, reviewer in enumerate(reviewers)
+        if _leg_usage_limit(reviewer, artifacts_dir)[0]
+    ]
+    plan["cooldown_recorded"] = cooldown_recorded
 
     if ok == len(reviewers) and reviewers:
         plan["status"] = "completed"
@@ -397,6 +609,24 @@ def execute_plan(
         plan["status"] = "failed"
     else:
         plan["status"] = "partial"
+
+    if unfilled_usage:
+        # external 补不上：缺一条合法 leg 即非法 double-review（merge policy 要求恰好两腿），
+        # 整体 fail-close 判 failed + 响亮信号，绝不静默置伪 R3 last-resort。
+        plan["status"] = "failed"
+        main_exhausted = bool(main_harness) and main_harness in cooled
+        if ok == 0:
+            reason = "all_reviewers_usage_limit_exhausted"
+            message = "全部 reviewer 腿均因额度/配额耗尽失败，且无可用 harness 可回退；本轮 external double-review 无法完成。"
+        elif main_exhausted:
+            reason = "main_harness_usage_limit_exhausted"
+            message = f"主/兜底 harness {main_harness} 额度耗尽且 external 补位不足；不退回 in-harness mimic，请改用其它 harness 或稍后重跑。"
+        else:
+            reason = "reviewer_usage_limit_unfilled"
+            message = "部分 reviewer 腿因额度耗尽失败且无可用 harness 回退补位。"
+        plan["reason"] = reason
+        plan["warnings"].append(_warn(reason, "error", message))
+
     return plan
 
 
@@ -494,11 +724,17 @@ def main() -> int:
         if args.assume_available is not None
         else None
     )
+    # 跨轮 cooldown：真实 probe 才应用（assume-available 仅测试用、不受额度冷却影响，D-O4）。
+    # 额度耗尽时 auth probe 仍返回 0，故须以独立 cooldown 标记把冷却中的 harness 排除在 probe 外。
+    cooled_markers = (
+        {} if assume_available is not None else harness_limit_cooldown.active_harnesses()
+    )
     available = probe_available(
         registry,
         probe_mode=args.probe_mode,
         timeout=args.probe_timeout,
         assume_available=assume_available,
+        cooldown_active=set(cooled_markers),
     )
 
     plan = route(
@@ -507,6 +743,32 @@ def main() -> int:
         registry,
         require_external_only=args.require_external,
     )
+
+    # 被 cooldown 排除的 enabled harness：逐一发可观测 warning（O2 契约 code）。
+    enabled_ids = set(_enabled_harnesses(registry))
+    cooled_enabled = [hid for hid in cooled_markers if hid in enabled_ids]
+    for hid in cooled_enabled:
+        marker = cooled_markers.get(hid) or {}
+        plan["warnings"].append(
+            _warn(
+                "harness_limit_cooldown_active",
+                "warning",
+                f"{hid} 仍处额度耗尽冷却期（到 {marker.get('expires_at')}），本轮 probe 跳过；已在其余 harness 中路由。",
+            )
+        )
+    # F2：A 被 cooldown 清空（而非 probe 全失败）→ 响亮 error fail-close，绝不静默置伪 R3 last-resort。
+    if not available and cooled_enabled:
+        plan["status"] = "failed"
+        plan["reason"] = "all_harnesses_usage_limited"
+        plan["needs_last_resort_fallback"] = False
+        plan["warnings"].append(
+            _warn(
+                "all_harnesses_usage_limited",
+                "error",
+                "所有 enabled reviewer harness 均处额度耗尽冷却期；本轮无可用 external reviewer，"
+                "不退回 in-harness mimic。请稍后重跑或更换可用 harness。",
+            )
+        )
 
     ledger.event(
         phase="review",
@@ -529,6 +791,7 @@ def main() -> int:
         return 0 if plan["status"] != "failed" else 1
 
     if args.execute and plan["status"] != "failed" and plan["reviewers"]:
+        pre_execute_warning_count = len(plan["warnings"])
         plan = execute_plan(
             plan,
             repo=repo,
@@ -538,7 +801,16 @@ def main() -> int:
             run_id=ledger.run_id,
             run_dir=str(ledger.run_dir),
             artifacts_dir=artifacts_dir,
+            registry=registry,
+            main_harness=main_harness,
+            available=available,
         )
+        # reroute / fail-close 在 execute_plan 内可能追加 warning，只打印增量部分（避免重复已打印的）。
+        for warning in plan["warnings"][pre_execute_warning_count:]:
+            print(
+                f"[dispatch_reviewers] {warning['severity']}: {warning['code']}: {warning['message']}",
+                file=sys.stderr,
+            )
         ledger.event(
             phase="review",
             event="dispatch_executed",
@@ -548,6 +820,8 @@ def main() -> int:
                 {"reviewer_id": r["reviewer_id"], "returncode": r.get("returncode")}
                 for r in plan["reviewers"]
             ],
+            fallbacks=plan.get("fallbacks", []),
+            cooldown_recorded=plan.get("cooldown_recorded", []),
         )
 
     reviewers_dir.mkdir(parents=True, exist_ok=True)

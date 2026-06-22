@@ -34,7 +34,30 @@ DEFAULT_LEASE_HEARTBEAT_SECONDS = 60.0
 LEASE_HEARTBEAT_ENV = "CODEX_RVF_LEASE_HEARTBEAT_SECONDS"
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
+# reviewer 背后的 agentic/coding 订阅额度耗尽（usage limit / quota exhausted）专用退出码 + flag。
+# 对齐 timeout 的 124+flag 双条件先例：dispatch_reviewers 以「125 AND (flag in stderr OR
+# summary.output_error_reason==usage_limit_exhausted)」双条件识别，避免裸退出码误判。
+EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE = 125
+EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG = "RVF_EXTERNAL_REVIEWER_USAGE_LIMIT"
 CODEX_BACKEND_CHALLENGE_FLAG = "RVF_CODEX_BACKEND_CHALLENGE"
+# 额度/配额耗尽签名（D4 收紧）：在「无合法 review-result 的失败输出」上做大小写无关子串匹配。
+# 裸 ``429`` 不计（commit hash / 字节数会误命中），需 http/status 前缀或与 too many requests 共现。
+USAGE_LIMIT_SIGNATURES: tuple[str, ...] = (
+    "usage limit",
+    "rate limit",
+    "quota exceeded",
+    "insufficient_quota",
+    "out of credits",
+    "plan limit",
+    "too many requests",
+    "resource_exhausted",
+    "rate_limit_exceeded",
+)
+USAGE_LIMIT_429_SIGNATURES: tuple[str, ...] = (
+    "http 429",
+    "status 429",
+    "429 too many requests",
+)
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
@@ -1299,6 +1322,59 @@ def looks_like_codex_backend_challenge(output: str) -> bool:
     return any(marker in text for marker in challenge_markers)
 
 
+def looks_like_usage_limit(text: str, *, signatures: tuple[str, ...] | None = None) -> str | None:
+    """识别 reviewer 失败输出里的「额度/配额耗尽」签名，命中返回该短语、否则 None。
+
+    只应对**无合法 review-result 的失败输出**调用（绑 raw stderr/stdout，绝不绑 normalize 后的
+    模型评审正文）；调用点见 main() 的 D2 守卫与 ``extract_codex_json_result`` 的 typed error
+    事件分支。``signatures`` 可由 config 覆盖/扩充内置集。
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    sigs = signatures if signatures is not None else USAGE_LIMIT_SIGNATURES
+    for sig in sigs:
+        if sig in lowered:
+            return sig
+    for sig in USAGE_LIMIT_429_SIGNATURES:
+        if sig in lowered:
+            return sig
+    if "429" in lowered and "too many requests" in lowered:
+        return "429 too many requests"
+    return None
+
+
+def _codex_error_text(record: dict[str, Any]) -> str | None:
+    """从 codex JSONL ``error`` / ``turn.failed`` / ``thread.error`` 事件里抽出人类可读错误文本。
+
+    兼容多种嵌套形态（顶层 ``message`` / ``error`` 字符串、``error.message``、``turn.error`` …）；
+    全部抽不到时兜底序列化整条记录（bounded），保证签名扫描总有输入。
+    """
+    candidates: list[Any] = [record.get(key) for key in ("message", "reason", "detail")]
+    err = record.get("error")
+    if isinstance(err, str):
+        candidates.append(err)
+    elif isinstance(err, dict):
+        candidates.extend(err.get(key) for key in ("message", "reason", "detail", "type", "code"))
+    turn = record.get("turn")
+    if isinstance(turn, dict):
+        terr = turn.get("error")
+        if isinstance(terr, str):
+            candidates.append(terr)
+        elif isinstance(terr, dict):
+            candidates.extend(terr.get(key) for key in ("message", "reason", "detail"))
+    parts = [c for c in candidates if isinstance(c, str) and c.strip()]
+    if parts:
+        return " ".join(parts)
+    via_payload = message_text_from_payload(record)
+    if via_payload:
+        return via_payload
+    try:
+        return json.dumps(record, ensure_ascii=False)[:2000]
+    except (TypeError, ValueError):
+        return None
+
+
 def extract_codex_json_result(output: str) -> str:
     """从 `codex exec --json` JSONL stdout 中提取最后一条 assistant 文本。"""
 
@@ -1316,6 +1392,34 @@ def extract_codex_json_result(output: str) -> str:
 
         record_type = record.get("type")
         payload = record.get("payload")
+
+        # D1：codex 真实额度错误走 error / turn.failed / thread.error 事件（顶层或 event_msg /
+        # item.completed 嵌套），而非 assistant 文本。命中额度签名**立即 raise**，优先于任何已累积的
+        # assistant 文本——失败的 turn 不构成合法评审；非额度类错误不在此 raise，沿用既有收尾逻辑。
+        error_record: dict[str, Any] | None = None
+        if record_type in {"error", "turn.failed", "thread.error"}:
+            error_record = record
+        elif (
+            record_type == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") in {"error", "turn.failed", "thread.error"}
+        ):
+            error_record = payload
+        elif (
+            record_type == "item.completed"
+            and isinstance(record.get("item"), dict)
+            and record["item"].get("type") in {"error", "turn.failed", "thread.error"}
+        ):
+            error_record = record["item"]
+        if error_record is not None:
+            error_text = _codex_error_text(error_record)
+            if error_text and looks_like_usage_limit(error_text):
+                raise CodexJsonOutputError(
+                    "usage_limit_exhausted",
+                    f"{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG} {error_text.strip()[:2000]}",
+                )
+            continue
+
         if record_type in {"agent_message", "assistant_message"}:
             text = message_text_from_payload(record)
             if text:
@@ -1809,6 +1913,10 @@ def main() -> int:
     raw_stderr = completed.stderr or ""
     stdout = raw_stdout.strip()
     output_error_reason: str | None = None
+    output_error_message: str | None = None
+    # 子进程真实退出码（D2 守卫）：先于任何翻码记录。文本兜底额度扫描只在它非零时触发，
+    # 由此排除「returncode 0 → review-result 校验失败被翻成 1」这条会让模型评审正文进入扫描的路径。
+    subprocess_returncode = completed.returncode
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
         stdout = extract_claude_stream_result(stdout)
     elif output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON:
@@ -1818,6 +1926,7 @@ def main() -> int:
             stdout = extract_codex_json_result(stdout)
         except CodexJsonOutputError as exc:
             output_error_reason = exc.reason_code
+            output_error_message = str(exc)
             stdout = str(exc)
             if completed.returncode == 0:
                 completed.returncode = 1
@@ -1830,6 +1939,30 @@ def main() -> int:
     )
     if timed_out:
         stdout = EXTERNAL_REVIEWER_TIMEOUT_FLAG
+
+    # D2/D3/D4：文本兜底额度检测。仅在「子进程真实非零退出、尚未识别错误原因、非 timeout」时，
+    # 从 raw stderr（优先）/ raw stdout 扫额度签名——绝不扫 normalize 后的模型评审正文。
+    # codex_json 的 typed error 事件已在 extract_codex_json_result 中先行命中（output_error_reason
+    # 已置位则跳过此处），此兜底主要覆盖 text/claude/cursor 等格式 CLI 自身崩溃时 stderr 带额度文案的情形。
+    if output_error_reason is None and not timed_out and subprocess_returncode != 0:
+        hit = looks_like_usage_limit(raw_stderr)
+        scanned = raw_stderr
+        if hit is None:
+            hit = looks_like_usage_limit(raw_stdout)
+            scanned = raw_stdout
+        if hit is not None:
+            output_error_reason = "usage_limit_exhausted"
+            output_error_message = scanned.strip()[:2000]
+
+    # 命中额度耗尽：统一规整为专用退出码 125 + flag（对齐 timeout 124+flag 双条件先例），
+    # 供 dispatch_reviewers 以「125 AND (flag in stderr OR summary.output_error_reason)」识别并回退。
+    if output_error_reason == "usage_limit_exhausted":
+        completed.returncode = EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE
+        if EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG not in raw_stderr:
+            raw_stderr = f"{raw_stderr.rstrip()}\n{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG}".strip()
+        stderr = raw_stderr.strip()
+        if output_error_message is None:
+            output_error_message = stderr[:2000]
     normalized_path = write_child_artifact(reviewer_dir, "reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
     stdout_path = write_child_artifact(reviewer_dir, "reviewer.stdout.txt", raw_stdout, unique=True)
     stderr_path = write_child_artifact(reviewer_dir, "reviewer.stderr.txt", raw_stderr, unique=True)
@@ -1887,6 +2020,7 @@ def main() -> int:
             "review_result_complete": review_result_complete,
             "review_request_pending": review_request_pending,
             "output_error_reason": output_error_reason,
+            "output_error_message": output_error_message,
         },
         unique=True,
     )
@@ -1927,6 +2061,10 @@ def main() -> int:
         reason_code = "reviewer_request_pending"
         event_name = "request_pending"
         message = "alternative reviewer recorded a request"
+    elif output_error_reason == "usage_limit_exhausted":
+        reason_code = "reviewer_usage_limit_exhausted"
+        event_name = "failed"
+        message = "alternative reviewer failed: provider usage/quota limit exhausted"
     elif output_error_reason == "codex_backend_challenge":
         reason_code = "reviewer_codex_backend_challenge"
         event_name = "failed"
@@ -1957,6 +2095,7 @@ def main() -> int:
         review_request_pending=review_request_pending,
         review_result_check_stderr=review_result_check_stderr,
         output_error_reason=output_error_reason,
+        output_error_message=output_error_message,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_failure_threshold=activity_probe_failure_threshold,
         activity_probe_history=completed.probe_history,
@@ -1985,6 +2124,7 @@ def main() -> int:
         review_result_summary=review_result_summary,
         review_result_check_stderr=review_result_check_stderr,
         output_error_reason=output_error_reason,
+        output_error_message=output_error_message,
         activity_probe_configured=activity_probe_command is not None,
         activity_probe_command=activity_probe_command,
         activity_probe_timeout_seconds=activity_probe_timeout,

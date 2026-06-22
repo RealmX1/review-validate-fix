@@ -8978,6 +8978,59 @@ def load_dispatch_reviewers_module():
     return module
 
 
+def load_harness_limit_cooldown_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "harness_limit_cooldown", SCRIPT_DIR / "harness_limit_cooldown.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load harness_limit_cooldown module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
+    """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
+    return write_alternative_reviewer_config(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import sys; sys.stdin.read(); "
+                f"sys.stderr.write({stderr_text!r}); sys.stderr.flush(); sys.exit(1)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+
+
+def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
+    """文本格式 reviewer 配置：shim 写合法 no-issues review-result 并 rc0（reroute 备援腿用）。"""
+    cfg = write_alternative_reviewer_config(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            clean_review_result_python(stdout="ok"),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["label"] = label
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return cfg
+
+
 def _dispatch_registry() -> dict:
     """In-memory registry mirroring config/reviewer-registry.json (real harness ids)."""
     return {
@@ -9127,9 +9180,11 @@ def test_dispatch_reviewers_plan_artifact_schema(root: Path) -> None:
         "reviewers",
         "warnings",
         "needs_last_resort_fallback",
+        "fallbacks",
         "status",
     ):
         assert key in plan, (key, plan)
+    assert plan["fallbacks"] == [], plan
     assert plan["status"] == "planned" and plan["main_harness"] == "codex"
     assert plan["routing_rule"] == "R1" and len(plan["reviewers"]) == 2
     for r in plan["reviewers"]:
@@ -9279,6 +9334,431 @@ def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
         assert Path(r["review_result_path"]).exists(), r
 
 
+def _run_alternative_reviewer_summary(run_dir: Path, reviewer_id: str = "test") -> dict:
+    reviewer_dir = run_dir / "artifacts" / "reviewers" / reviewer_id
+    return json.loads(
+        next(reviewer_dir.glob("reviewer.summary*.json")).read_text(encoding="utf-8")
+    )
+
+
+def test_run_alternative_reviewer_usage_limit_codex_json_error(tmp_path: Path) -> None:
+    """codex_json 吐 turn.failed + 真实额度文案 → 退出码 125 + summary usage_limit_exhausted。"""
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import json, sys; sys.stdin.read(); "
+                "print(json.dumps({'type':'turn.failed','error':{'message':"
+                "'You have hit your usage limit. Please try again in 4h.'}}), flush=True)"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="codex_json",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 125, (completed.returncode, completed.stderr)
+    assert "RVF_EXTERNAL_REVIEWER_USAGE_LIMIT" in completed.stderr, completed.stderr
+    summary = _run_alternative_reviewer_summary(run_dir)
+    assert summary["output_error_reason"] == "usage_limit_exhausted", summary
+    assert "usage limit" in (summary.get("output_error_message") or "").lower(), summary
+
+
+def test_run_alternative_reviewer_usage_limit_stderr_text(tmp_path: Path) -> None:
+    """text reviewer：stderr 吐额度签名 + 非零退出 + 无 review-result → 退出码 125。"""
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    config = _usage_limit_text_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        stderr_text="Error: rate limit exceeded — HTTP 429 Too Many Requests\n",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 125, (completed.returncode, completed.stderr)
+    assert "RVF_EXTERNAL_REVIEWER_USAGE_LIMIT" in completed.stderr, completed.stderr
+    summary = _run_alternative_reviewer_summary(run_dir)
+    assert summary["output_error_reason"] == "usage_limit_exhausted", summary
+
+
+def test_run_alternative_reviewer_usage_limit_no_false_positive_success(tmp_path: Path) -> None:
+    """成功评审正文含 'rate limit' → 退出码 0、非额度（rc0 路径不扫正文）。"""
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            clean_review_result_python(
+                stdout="review complete: consider adding rate limit handling for HTTP 429"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "RVF_EXTERNAL_REVIEWER_USAGE_LIMIT" not in (completed.stderr or ""), completed.stderr
+    summary = _run_alternative_reviewer_summary(run_dir)
+    assert summary.get("output_error_reason") is None, summary
+
+
+def test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(tmp_path: Path) -> None:
+    """rc0 子进程 + 无合法 review-result + 正文含 429/rate limit → reviewer_result_invalid，非 usage_limit、非 125（D2 回归）。"""
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, sys; sys.stdin.read(); "
+                "open(os.environ['RVF_REVIEW_RESULT'], 'w', encoding='utf-8')"
+                ".write('not-valid-json — discussing http 429 rate limit'); "
+                "print('model body mentions rate limit and 429')"
+            ),
+        ],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 1, (completed.returncode, completed.stderr)
+    assert completed.returncode != 125
+    assert "RVF_EXTERNAL_REVIEWER_USAGE_LIMIT" not in (completed.stderr or ""), completed.stderr
+    summary = _run_alternative_reviewer_summary(run_dir)
+    assert summary.get("output_error_reason") is None, summary
+
+
+def test_harness_limit_cooldown_record_active_sweep(tmp_path: Path) -> None:
+    """record→active True；过期→lazy sweep 后 False；默认 TTL 3600；parse_reset_hint '4h'→14400。"""
+    from datetime import datetime, timedelta, timezone
+
+    cd = load_harness_limit_cooldown_module()
+    root = tmp_path / "cooldown"
+    assert cd.default_ttl_seconds() == 3600.0
+    assert cd.parse_reset_hint("please try again in 4h") == 14400.0
+    assert cd.parse_reset_hint("retry in 30 minutes") == 1800.0
+    assert cd.parse_reset_hint("Retry-After: 120") == 120.0
+    assert cd.parse_reset_hint("no reset hint here") is None
+
+    cd.record("codex", reason="usage_limit_exhausted", error_message="hit usage limit", root=root)
+    assert cd.active("codex", root=root) is True
+    assert cd.active("claude_code", root=root) is False
+    assert set(cd.active_harnesses(root=root)) == {"codex"}
+
+    # 写一条过期 marker → active() 的 lazy sweep 应清掉它。
+    past = (
+        (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    )
+    marker_path = cd._marker_path("codex", root)
+    marker_path.write_text(
+        json.dumps(
+            {"marker_version": 1, "harness_id": "codex", "recorded_at": past, "expires_at": past}
+        ),
+        encoding="utf-8",
+    )
+    assert cd.active("codex", root=root) is False
+    assert not marker_path.exists()
+
+
+def _make_usage_or_clean_registry(tmp_path: Path, specs: dict[str, tuple[str, int]]) -> dict:
+    """specs: {harness_id: (kind, priority)}，kind ∈ {'usage','clean'}。返回内存 registry。"""
+    reg: dict = {"schema_version": 1, "harnesses": {}}
+    for hid, (kind, prio) in specs.items():
+        cfg_path = tmp_path / f"alt-{hid}.json"
+        if kind == "usage":
+            _usage_limit_text_reviewer_config(
+                cfg_path, stderr_text=f"fatal: usage limit reached for {hid} plan\n"
+            )
+        else:
+            _clean_text_reviewer_config(cfg_path, label=f"alternative-reviewer:{hid}-cli")
+        reg["harnesses"][hid] = {
+            "harness_id": hid,
+            "label_prefix": f"alternative-reviewer:{hid}-cli",
+            "config_path": str(cfg_path),
+            "dispatch_mode": "external_cli",
+            "enabled": True,
+            "priority_default": prio,
+        }
+    return reg
+
+
+def _with_cooldown_env(cooldown_root: Path):
+    """上下文：把 RVF_HARNESS_LIMIT_COOLDOWN_ROOT 指到 tmp，退出时还原（防污染真实 ~/.rvf）。"""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _ctx():
+        key = "RVF_HARNESS_LIMIT_COOLDOWN_ROOT"
+        prev = os.environ.get(key)
+        os.environ[key] = str(cooldown_root)
+        try:
+            yield
+        finally:
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+    return _ctx()
+
+
+def test_dispatch_reviewers_reroutes_on_usage_limit(tmp_path: Path) -> None:
+    """alpha 撞额度(125) → 轮内 reroute 到 gamma：status completed、fallbacks 记录、cooldown 落盘。"""
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("usage", 100), "beta": ("clean", 90), "gamma": ("clean", 80)}
+    )
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
+    assert plan["routing_rule"] == "R0", plan
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="reroute-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta", "gamma"],
+        )
+    assert plan["status"] == "completed", plan
+    assert "alpha" in plan["cooldown_recorded"], plan
+    assert (cooldown_root / "harness-alpha.json").exists(), list(cooldown_root.glob("*"))
+    assert len(plan["fallbacks"]) == 1, plan["fallbacks"]
+    fb = plan["fallbacks"][0]
+    assert fb["from"] == "alpha" and fb["to"] == "gamma", fb
+    assert len(plan["reviewers"]) == 2
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"beta", "gamma"}
+    for r in plan["reviewers"]:
+        assert r["returncode"] == 0, r
+        assert Path(r["review_result_path"]).exists(), r
+
+
+def test_dispatch_reviewers_reroute_id_collision(tmp_path: Path) -> None:
+    """两腿均撞额度、只剩一个 eligible harness → 两替换 leg id 不碰撞(-fb1/-fb2)、两份 artifact 都在。"""
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("usage", 100), "beta": ("usage", 90), "gamma": ("clean", 80)}
+    )
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
+    assert plan["routing_rule"] == "R0"
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="collision-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta", "gamma"],
+        )
+    assert plan["status"] == "completed", plan
+    assert {"alpha", "beta"} <= set(plan["cooldown_recorded"]), plan
+    assert len(plan["fallbacks"]) == 2, plan["fallbacks"]
+    ids = sorted(r["reviewer_id"] for r in plan["reviewers"])
+    assert ids == ["gamma-cli-fb1", "gamma-cli-fb2"], ids
+    seen = set()
+    for r in plan["reviewers"]:
+        assert r["returncode"] == 0, r
+        assert Path(r["review_result_path"]).exists(), r
+        seen.add(r["review_result_path"])
+    assert len(seen) == 2, seen
+
+
+def test_dispatch_reviewers_probe_excludes_cooldown(tmp_path: Path) -> None:
+    """tmp root 预置 alpha 冷却 → 真实 probe 排除 alpha → route 落他者 + harness_limit_cooldown_active 警告。"""
+    cd = load_harness_limit_cooldown_module()
+    load_dispatch_reviewers_module()  # 确保 SCRIPT_DIR 在 sys.path
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg_path = tmp_path / "registry.json"
+    reg = {"schema_version": 1, "harnesses": {}}
+    for hid, prio in (("alpha", 100), ("beta", 50)):
+        cfg = tmp_path / f"alt-{hid}.json"
+        write_alternative_reviewer_config(
+            cfg,
+            [sys.executable, "-c", "pass"],
+            idle_timeout_seconds=5.0,
+            activity_check_interval_seconds=0.05,
+            output_format="text",
+            health_command=[sys.executable, "-c", ""],
+            pre_run_health=True,
+        )
+        reg["harnesses"][hid] = {
+            "harness_id": hid,
+            "label_prefix": f"alternative-reviewer:{hid}-cli",
+            "config_path": str(cfg),
+            "dispatch_mode": "external_cli",
+            "enabled": True,
+            "priority_default": prio,
+        }
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    with _with_cooldown_env(cooldown_root):
+        # env 已指向 cooldown_root（无 SUBDIR）；用 env 路径 record，确保子进程读同一处。
+        cd.record("alpha", reason="usage_limit_exhausted")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "dispatch_reviewers.py"),
+                "--registry",
+                str(reg_path),
+                "--main-harness",
+                "codex",
+                "--probe-mode",
+                "preflight",
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+            check=False,
+        )
+    assert "harness_limit_cooldown_active" in completed.stderr, completed.stderr
+    plan = json.loads(completed.stdout)
+    assert "alpha" not in plan["available_harnesses"], plan
+    assert "beta" in plan["available_harnesses"], plan
+
+
+def test_dispatch_reviewers_failclose_when_main_exhausted(tmp_path: Path) -> None:
+    """external 补不上 + 主 harness 耗尽 → status=failed + main_harness_usage_limit_exhausted，不置伪 R3。"""
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("usage", 100), "beta": ("clean", 90)}
+    )
+    plan = d.route("alpha", ["alpha", "beta"], reg)
+    assert plan["routing_rule"] == "R1", plan
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="failclose-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="alpha",
+            available=["alpha", "beta"],
+        )
+    assert plan["status"] == "failed", plan
+    assert plan.get("reason") == "main_harness_usage_limit_exhausted", plan
+    assert plan["needs_last_resort_fallback"] is False, plan
+    assert any(w["code"] == "main_harness_usage_limit_exhausted" for w in plan["warnings"]), plan["warnings"]
+    assert "alpha" in plan["cooldown_recorded"], plan
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -9302,6 +9782,52 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "dispatch_reviewers_execute_backfills_review_env",
             lambda: test_dispatch_reviewers_execute_backfills_review_env(root / "dispatch-env-backfill"),
+        ),
+        (
+            "run_alternative_reviewer_usage_limit_codex_json_error",
+            lambda: test_run_alternative_reviewer_usage_limit_codex_json_error(
+                root / "usage-limit-codex-json"
+            ),
+        ),
+        (
+            "run_alternative_reviewer_usage_limit_stderr_text",
+            lambda: test_run_alternative_reviewer_usage_limit_stderr_text(
+                root / "usage-limit-stderr-text"
+            ),
+        ),
+        (
+            "run_alternative_reviewer_usage_limit_no_false_positive_success",
+            lambda: test_run_alternative_reviewer_usage_limit_no_false_positive_success(
+                root / "usage-limit-fp-success"
+            ),
+        ),
+        (
+            "run_alternative_reviewer_usage_limit_no_false_positive_invalid_result",
+            lambda: test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(
+                root / "usage-limit-fp-invalid"
+            ),
+        ),
+        (
+            "harness_limit_cooldown_record_active_sweep",
+            lambda: test_harness_limit_cooldown_record_active_sweep(root / "cooldown-unit"),
+        ),
+        (
+            "dispatch_reviewers_reroutes_on_usage_limit",
+            lambda: test_dispatch_reviewers_reroutes_on_usage_limit(root / "dispatch-reroute"),
+        ),
+        (
+            "dispatch_reviewers_reroute_id_collision",
+            lambda: test_dispatch_reviewers_reroute_id_collision(root / "dispatch-reroute-collision"),
+        ),
+        (
+            "dispatch_reviewers_probe_excludes_cooldown",
+            lambda: test_dispatch_reviewers_probe_excludes_cooldown(root / "dispatch-probe-cooldown"),
+        ),
+        (
+            "dispatch_reviewers_failclose_when_main_exhausted",
+            lambda: test_dispatch_reviewers_failclose_when_main_exhausted(
+                root / "dispatch-failclose-main"
+            ),
         ),
         (
             "diff_tracker_observes_committed_round_units",
