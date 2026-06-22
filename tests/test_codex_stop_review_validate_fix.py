@@ -3944,6 +3944,312 @@ def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) 
     assert refreshed["token"] == dispatch_prep_payload(latest)["token"]
 
 
+def _write_stranded_pending(
+    pending_dir: Path,
+    *,
+    task_id: str,
+    token: str,
+    project_path: str,
+    title: str | None = None,
+    origin_transcript_path: str | None = None,
+    prompt_path: str | None = None,
+    expires_at: str = "2000-01-01T00:15:00Z",
+    last_notified_at: str | None = None,
+) -> Path:
+    """预置一条 dispatched-unconfirmed pending marker（默认 STALE，含 S0 快照字段）。"""
+    payload = {
+        "marker_version": 1,
+        "state": "dispatched_unconfirmed",
+        "dispatched_at": "2000-01-01T00:00:00Z",
+        "expires_at": expires_at,
+        "ttl_seconds": 900,
+        "kanban_task_id": task_id,
+        "session_id": "sess-" + task_id,
+        "run_id": "run-" + task_id,
+        "run_dir": str(pending_dir.parent / ("run-" + task_id)),
+        "repo": project_path,
+        "cwd": project_path,
+        "token": token,
+        "delivery_channel": "terminal",
+        "kanban_project_path": project_path,
+        "kanban_task_title": title,
+        "origin_transcript_path": origin_transcript_path,
+        "prompt_path": prompt_path,
+    }
+    if last_notified_at is not None:
+        payload["last_notified_at"] = last_notified_at
+    path = pending_dir / f"task-{task_id}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _logging_notifier(path: Path, log: Path) -> Path:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['NOTIFY_LOG'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:], ensure_ascii=False) + '\\n')\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: Path) -> None:
+    """S1b：任意会话的 Stop 在入口扫荡——升级**别的** task 的 stale pending（OS 通知 + 盖戳 + 保留
+    marker），但**跳过当前 Stop 的 task**（交既有同 task 对账）；二次立即 Stop 被 RENOTIFY 抑制。"""
+    repo = init_repo(tmp_path / "clean", dirty=False)  # 干净 repo → 主流程 skip，但 sweep 仍在入口跑
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    other = _write_stranded_pending(
+        pending_dir, task_id="taskOTHER", token="aaaaaaaaaaaaaaaa",
+        project_path=str(repo), title="修复登录",
+    )
+    current = _write_stranded_pending(
+        pending_dir, task_id="taskCURRENT", token="cccccccccccccccc",
+        project_path=str(repo), title="当前任务",
+    )
+    notify_log = tmp_path / "notify.log"
+    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
+    extra = {
+        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "NOTIFY_LOG": str(notify_log),
+        # 让 sweep 把 taskCURRENT 视为当前 task（current_kanban_task_id 读 env）。
+        "KANBAN_TASK_ID": "taskCURRENT",
+    }
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+
+    events = latest_events(state)
+    escalated = [
+        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
+    ]
+    # 只升级 taskOTHER，绝不升级当前 task。
+    assert [e.get("cline_kanban_task_id") for e in escalated] == ["taskOTHER"]
+    # S2 默认关：升级事件里 redispatch 为 disabled（已接线、但不开则纯通知，不重投）。
+    assert escalated[0].get("kanban_followup_stranded_redispatch", {}).get("reason") == "disabled"
+    # OS 通知发了一次、带 -open。
+    calls = [
+        json.loads(line)
+        for line in notify_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1 and "-open" in calls[0]
+    # taskOTHER marker 保留 + 盖 last_notified_at + token 原样保留。
+    assert other.exists()
+    other_after = json.loads(other.read_text(encoding="utf-8"))
+    assert other_after.get("last_notified_at")
+    assert other_after.get("token") == "aaaaaaaaaaaaaaaa"
+    # 当前 task 未被 sweep 升级/通知（escalated 列表里没有它；通知只发了 taskOTHER 一次）。
+    # 注：当前 task 的 stale marker 交既有同 task 对账（_kanban_followup_pending_decision）
+    # 处理，可能被它清除——这正是 sweep 跳过当前 task 的目的，故此处不对该 marker 存留做断言。
+    assert "taskCURRENT" not in [e.get("cline_kanban_task_id") for e in escalated]
+    assert all("taskCURRENT" not in str(arg) for call in calls for arg in call)
+
+    # 二次立即 Stop → RENOTIFY 抑制，不再新发通知。
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+    calls2 = [
+        json.loads(line)
+        for line in notify_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls2) == 1
+
+
+def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_path: Path) -> None:
+    """S1b 可选精修：marker 的 origin_transcript_path 命中 RVF_DISPATCH=token=<token> → 判迟到消费，
+    清 marker、不通知；transcript 无该 token → 不据此判 consumed，仍按 stranded 升级。"""
+    repo = init_repo(tmp_path / "clean", dirty=False)
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    # consumed：transcript 含该 token。
+    consumed_tx = tmp_path / "consumed.jsonl"
+    consumed_tx.write_text(
+        '{"role":"user","content":"... RVF_DISPATCH=token=dddddddddddddddd ..."}\n',
+        encoding="utf-8",
+    )
+    consumed = _write_stranded_pending(
+        pending_dir, task_id="taskConsumed", token="dddddddddddddddd",
+        project_path=str(repo), origin_transcript_path=str(consumed_tx),
+    )
+    # not-consumed：transcript 不含该 token。
+    miss_tx = tmp_path / "miss.jsonl"
+    miss_tx.write_text('{"role":"user","content":"no dispatch token here"}\n', encoding="utf-8")
+    stranded = _write_stranded_pending(
+        pending_dir, task_id="taskStranded", token="eeeeeeeeeeeeeeee",
+        project_path=str(repo), origin_transcript_path=str(miss_tx),
+    )
+    notify_log = tmp_path / "notify.log"
+    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
+    extra = {
+        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "NOTIFY_LOG": str(notify_log),
+    }
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+
+    events = latest_events(state)
+    # consumed marker 被清、记 reconciled_consumed、不通知。
+    assert not consumed.exists()
+    assert any(
+        e.get("event") == "kanban_followup_pending_reconciled_consumed"
+        and e.get("cline_kanban_task_id") == "taskConsumed"
+        for e in events
+    )
+    # 未命中 token 的 marker → 仍按 stranded 升级、保留。
+    assert stranded.exists()
+    assert any(
+        e.get("event") == "kanban_followup_pending_stranded_escalated"
+        and e.get("cline_kanban_task_id") == "taskStranded"
+        for e in events
+    )
+    # 只为 stranded（taskStranded）发了一次通知，consumed 不通知。
+    calls = [
+        json.loads(line)
+        for line in notify_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(calls) == 1
+
+
+def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_path: Path) -> None:
+    """S2（CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
+    仍发通知 + 保留 marker，绝不谎报已自动跑。"""
+    repo = init_repo(tmp_path / "clean", dirty=False)
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    # 真实 stranded marker 总带已渲染的 prompt（含旧 dispatch 注入块），让 S2 走到 app-server 闸门。
+    old_prompt = tmp_path / "old-prompt.md"
+    old_prompt.write_text(
+        "$review-validate-fix\n\nRVF dispatch prep file:\nRVF_DISPATCH=token=abcabcabcabcabca\n",
+        encoding="utf-8",
+    )
+    marker = _write_stranded_pending(
+        pending_dir, task_id="taskS2", token="abcabcabcabcabca",
+        project_path=str(repo), title="S2 重投", prompt_path=str(old_prompt),
+    )
+    notify_log = tmp_path / "notify.log"
+    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
+    extra = {
+        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "NOTIFY_LOG": str(notify_log),
+        "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
+        # 显式指向不存在的 app-server socket，确定性不可达（避免误连真机 app-server）。
+        "CODEX_RVF_APP_SERVER_SOCKET": str(tmp_path / "no-such.sock"),
+    }
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+
+    events = latest_events(state)
+    escalated = [
+        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
+    ]
+    assert len(escalated) == 1
+    redispatch = escalated[0].get("kanban_followup_stranded_redispatch", {})
+    assert redispatch.get("redispatched") is False
+    assert redispatch.get("reason") == "app-server-unreachable"
+    # marker 保留（未重投、未确认）；通知仍发了一次。
+    assert marker.exists()
+    calls = [
+        line for line in notify_log.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert len(calls) == 1
+
+
+def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp_path: Path) -> None:
+    """S2 重投可达路径回归（RVF-001 / RVF-002）：in-process 调用 _maybe_redispatch_*，monkeypatch
+    app-server 可达 + 假派发，断言——
+      RVF-001：idempotency_key 必须绑定**稳定** stranded token（传入的 token），不含每次新铸的
+        fresh prep token；
+      RVF-002：terminal 未确认重投改写 pending 必须带上新派发的 prompt_path/turn_id（否则下次
+        重投 missing-prompt-path）。
+    e2e 路径需 websocket-协议假 socket（过重），故此处走 in-process 单测直接锁住两个修复。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cs_s2_under_test", SCRIPT)
+    cs = importlib.util.module_from_spec(spec)
+    sys.modules["cs_s2_under_test"] = cs
+    spec.loader.exec_module(cs)
+
+    old_prompt = tmp_path / "old-prompt.md"
+    old_prompt.write_text(
+        "$review-validate-fix\n\nRVF dispatch prep file:\nRVF_DISPATCH=token=oldoldoldoldoldo\n",
+        encoding="utf-8",
+    )
+
+    class _FakePrep:
+        token = "freshtoken000000"
+        path = tmp_path / "fresh-prep.json"
+
+    class _FakeLedger:
+        run_id = "run-redispatch"
+        run_dir = str(tmp_path / "rd")
+
+    recorded: dict[str, dict] = {}
+    cs.select_existing_app_server_socket_for_metadata = lambda: (tmp_path / "sock", "explicit", {})
+    cs.can_connect_app_server_socket = lambda p: True
+    cs.write_dispatch_prep_file = lambda **kw: _FakePrep()
+
+    def _fake_start(**kw):
+        recorded["start"] = kw
+        return {
+            "message_id": "terminal:taskX:redispatch",
+            "prompt_path": "/new/redispatch-prompt.md",
+            "turn_id": "7",
+        }
+
+    cs.start_cline_kanban_followup_message = _fake_start
+
+    def _fake_write_pending(**kw):
+        recorded["pending"] = kw
+        return tmp_path / "pending.json"
+
+    cs.write_kanban_followup_pending = _fake_write_pending
+    cs.clear_kanban_followup_pending = lambda **kw: []
+
+    marker = {
+        "kanban_task_id": "taskX",
+        "kanban_project_path": "/repo",
+        "prompt_path": str(old_prompt),
+        "session_id": "sX",
+        "repo": "/repo",
+        "cwd": "/repo",
+        "run_dir": str(tmp_path / "origin-run"),
+        "kanban_attempt_id": "att",
+        "kanban_task_title": "标题",
+        "kanban_task_title_source": "src",
+        "origin_transcript_path": str(tmp_path / "tx.jsonl"),
+    }
+    saved = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
+    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
+    try:
+        result = cs._maybe_redispatch_stranded_kanban_followup(
+            marker, _FakeLedger(), token="stabletoken00000"
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
+        else:
+            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
+
+    assert result.get("redispatched") is True
+    # RVF-001：idem 绑定稳定 token，绝不含 fresh prep token。
+    idem = recorded["start"]["idempotency_key"]
+    assert idem == f"rvf-redispatch-{cs.safe_token('taskX')}-stabletoken00000"
+    assert "freshtoken000000" not in idem
+    # 重投子进程带 timeout（有界）。
+    assert recorded["start"].get("timeout")
+    # RVF-002：terminal 未确认重投改写 pending 带新 prompt_path/turn_id + 新 token。
+    pending = recorded["pending"]
+    assert pending["prompt_path"] == "/new/redispatch-prompt.md"
+    assert pending["turn_id"] == "7"
+    assert pending["token"] == "freshtoken000000"
+
+
 def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -> None:
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
@@ -7358,6 +7664,10 @@ def main() -> int:
         test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pending,
         test_kanban_followup_active_pending_skips_redispatch,
         test_kanban_followup_stale_pending_redispatches_and_reports,
+        test_kanban_followup_stranded_sweep_escalates_other_skips_current,
+        test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker,
+        test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable,
+        test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path,
         test_kanban_followup_title_falls_back_to_local_board_state,
         test_kanban_followup_title_ignores_unrelated_board_with_same_task_id,
         test_kanban_followup_title_uses_session_matched_board_state,
