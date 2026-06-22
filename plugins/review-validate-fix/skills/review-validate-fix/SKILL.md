@@ -45,7 +45,9 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 ## Review
 
 - 默认执行两个独立 review pass，除非用户显式跳过 review。
-- 派发由脚本完成：`source review-env.sh` 后运行 `scripts/dispatch_reviewers.py --execute`，它解析主 dispatch harness、probe `reviewer-registry.json` 中的 harness、按路由规则选出**恰好两路 external reviewer** 并并行派发。主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿；只在 `dispatch_reviewers.py` 报告 0 个 external 可用时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
+- 派发由脚本完成，且**与前台 Bash 的 600s 上限解耦**（一次彻底 review 可能 > 10 分钟）：`source review-env.sh` 后运行 `scripts/dispatch_reviewers.py --execute --detached`。它把整轮派发（解析主 dispatch harness、probe `reviewer-registry.json` 中的 harness、按路由规则选出**恰好两路 external reviewer**、并行派发、额度 reroute/cooldown）self-fork 进一个 detached tmux 线程并**立即返回**，stdout 打印 `RVF_DISPATCH_STATUS=<status.json 路径>` 与 `RVF_DISPATCH_LAUNCH=<launched|already_running|launch_failed>`。这是 host-agnostic 的（不用 Claude 专属 `run_in_background`），Codex / Claude 驱动的 Kanban task 行为一致。
+- 随后**循环有界轮询**直到终态：`scripts/dispatch_reviewers.py --wait-status --status-path <上面打印的 status.json> --max-wait 480`，每次最多阻塞 480s（< 600s 上限，永不被砍断）。打印 `RVF_DISPATCH_STATE=running launch_status=<...>` 就再调一次继续等；打印 `RVF_DISPATCH_STATE=done launch_status=<...> returncode=<n>` 即派发结束——`returncode=0` 表示派发成功，非 0 读 status.json 的 `error` 与同目录 `.dispatch-thread.log` 排障。选路 / reroute / cooldown 全在 detached 的 `--execute` 本体内完成，主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
+- 轮询到 `done` 后，照常读取 `artifacts/reviewers/reviewer-plan.json` 与各路 reviewer artifact；只在该 plan 报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
 - `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。
 - 每个 reviewer artifact 必须通过 `scripts/check_review_result.py` 校验；artifact 缺失、schema invalid、excluded path、clean/issues/request 混写都不能当作合格结果。

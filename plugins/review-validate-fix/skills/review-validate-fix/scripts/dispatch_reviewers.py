@@ -43,7 +43,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness_limit_cooldown
-from rvf_logging import start_run
+from rvf_logging import safe_token, start_run
+from rvf_detached_thread import (
+    LAUNCH_FAILED,
+    LAUNCH_LAUNCHED,
+    _iso_now,
+    launch_detached,
+)
 from run_alternative_reviewer import (
     EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE,
     EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG,
@@ -57,6 +63,19 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = SKILL_DIR / "config" / "reviewer-registry.json"
 RUN_ALTERNATIVE_REVIEWER = Path(__file__).resolve().parent / "run_alternative_reviewer.py"
 PLAN_SCHEMA_VERSION = 1
+
+# Detached 派发线程（--detached / --wait-status）：把「agent 前台 Bash 调用 ↔ 整轮
+# 派发 wall-clock」解耦，突破 Bash 工具 600s 硬上限。status/log/lock 落在
+# <artifacts>/reviewers/ 下，与 reviewer-plan.json / 各 reviewer artifact 同处。
+DISPATCH_STATUS_SCHEMA_VERSION = 1
+DISPATCH_STATUS_FILENAME = ".dispatch-thread.status.json"
+DISPATCH_LOG_FILENAME = ".dispatch-thread.log"
+DISPATCH_LOCK_FILENAME = ".dispatch-thread.lock"
+# 单次 waiter 阻塞上限：480 < 600s Bash 上限，留余量；agent 循环调用直到 done。
+DEFAULT_DISPATCH_MAX_WAIT_SECONDS = 480.0
+# 总超时 backstop：比任何单 reviewer 都宽（单 reviewer idle-timeout 300s、无总上限），
+# 保证 detached 派发 status.json 终会落终态，又不误杀正当长 review。
+DEFAULT_DISPATCH_TOTAL_TIMEOUT_SECONDS = 2700.0
 
 CURSOR_HARNESS = "cursor"
 DEFAULT_MAIN_HARNESS = HOST_CODEX  # 与现有 Kanban 兜底一致
@@ -630,6 +649,193 @@ def execute_plan(
     return plan
 
 
+def _read_dispatch_status(status_path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _dispatch_status_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "launch_status": payload.get("launch_status"),
+        "returncode": payload.get("returncode"),
+        "finished_at": payload.get("finished_at"),
+        "error": payload.get("error"),
+    }
+
+
+def _dispatch_status_is_terminal(payload: dict[str, Any]) -> bool:
+    """终态：被包命令已退出（``finished_at`` 落值）或 launch 从未成功（``launch_failed``）。"""
+    if payload.get("finished_at"):
+        return True
+    return payload.get("launch_status") == LAUNCH_FAILED
+
+
+def wait_for_dispatch_status(
+    status_path: Path,
+    *,
+    max_wait: float,
+    poll_interval: float = 2.0,
+) -> dict[str, Any]:
+    """有界轮询 detached 派发的 ``status.json``，直到终态或 ``max_wait`` 耗尽。
+
+    返回 ``{"state": "done"|"running", "launch_status", "returncode", "finished_at",
+    "error"}``。单次调用 ≤ ``max_wait`` 秒（默认 480 < Bash 工具 600s 上限），agent
+    循环调用直到 ``state == "done"``——每次都在上限内、永不被砍断。
+    """
+    import time
+
+    deadline = time.monotonic() + max(0.0, max_wait)
+    latest: dict[str, Any] = {}
+    while True:
+        payload = _read_dispatch_status(status_path)
+        if payload is not None:
+            latest = payload
+            if _dispatch_status_is_terminal(payload):
+                return {"state": "done", **_dispatch_status_summary(payload)}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"state": "running", **_dispatch_status_summary(latest)}
+        time.sleep(min(poll_interval, remaining))
+
+
+def _build_detached_child_argv(
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    run_dir: str,
+    repo: str | None,
+    review_packet: str | None,
+    session_context: str | None,
+    scope_contract: str | None,
+) -> list[str]:
+    """拼 detached 子进程命令：``dispatch_reviewers.py --execute`` 复用同一 run。
+
+    刻意**不带** ``--detached``——子进程跑真正的 probe/route/execute/reroute 本体；
+    run_id/run_dir 显式透传以复用父进程已解析的 run；repo / packet 等输入按解析后的值
+    透传，缺省时让 child 经 ``launch_env`` 里的 ``RVF_*`` env 回填。
+    """
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--execute",
+        "--rvf-run-id",
+        run_id,
+        "--rvf-run-dir",
+        run_dir,
+        "--registry",
+        args.registry,
+        "--probe-mode",
+        args.probe_mode,
+        "--probe-timeout",
+        str(args.probe_timeout),
+        "--main-harness",
+        args.main_harness,
+    ]
+    for flag, value in (
+        ("--repo", repo),
+        ("--review-packet", review_packet),
+        ("--session-context", session_context),
+        ("--scope-contract", scope_contract),
+        ("--transcript", args.transcript),
+        ("--main-harness-file", args.main_harness_file),
+        ("--assume-available", args.assume_available),
+    ):
+        if value:
+            argv += [flag, value]
+    if args.require_external:
+        argv.append("--require-external")
+    return argv
+
+
+def launch_detached_dispatch(
+    args: argparse.Namespace,
+    ledger: Any,
+    reviewers_dir: Path,
+    *,
+    repo: str | None,
+    review_packet: str | None,
+    session_context: str | None,
+    scope_contract: str | None,
+) -> int:
+    """把 ``dispatch_reviewers.py --execute`` 派进 detached tmux session，立即返回。
+
+    解除「agent 前台 Bash 调用 ↔ 整轮派发 wall-clock」的耦合：派发本体（probe/route/
+    execute/reroute）跑在 detached 子进程里、不受 Bash 工具 600s 上限约束；agent 改用
+    ``--wait-status`` 有界轮询 ``status.json`` 直到终态。施加一个比任何单 reviewer 都宽
+    的总 backstop（``--total-timeout``，默认 2700s）保证 ``status.json`` 终会落终态。
+    幂等：同一 run 重复 ``--execute --detached`` 命中 O_EXCL 锁 → ``already_running``。
+    """
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+    status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
+    log_path = reviewers_dir / DISPATCH_LOG_FILENAME
+    lock_path = reviewers_dir / DISPATCH_LOCK_FILENAME
+    run_name = ledger.run_dir.name
+    session_name = f"rvf-dispatch-{safe_token(run_name)}"
+
+    child_argv = _build_detached_child_argv(
+        args,
+        run_id=ledger.run_id,
+        run_dir=str(ledger.run_dir),
+        repo=repo,
+        review_packet=review_packet,
+        session_context=session_context,
+        scope_contract=scope_contract,
+    )
+    status_payload = {
+        "schema_version": DISPATCH_STATUS_SCHEMA_VERSION,
+        "kind": "dispatch",
+        "run_id": ledger.run_id,
+        "run_dir": str(ledger.run_dir),
+        "run_name": run_name,
+        "tmux_session": session_name,
+        "command": child_argv,
+        "total_timeout_seconds": args.total_timeout,
+        "pid": None,
+        "started_at": _iso_now(),
+        "returncode": None,
+        "finished_at": None,
+        "launch_status": LAUNCH_LAUNCHED,
+        "error": None,
+    }
+
+    result = launch_detached(
+        session_name=session_name,
+        argv=child_argv,
+        log_path=log_path,
+        status_path=status_path,
+        lock_path=lock_path,
+        status_payload=status_payload,
+        launch_env={**os.environ, **ledger.env()},
+        idempotency_key=f"rvf-dispatch:{run_name}",
+        total_timeout_seconds=args.total_timeout,
+    )
+
+    ledger.event(
+        phase="review",
+        event="dispatch_detached_launched",
+        status=(
+            "completed"
+            if result["launch_status"] in (LAUNCH_LAUNCHED, "already_running")
+            else "failed"
+        ),
+        reason_code=f"dispatch_detached_{result['launch_status']}",
+        tmux_session=session_name,
+        status_path=str(status_path),
+        launch_status=result["launch_status"],
+    )
+
+    # agent 解析这两行：status.json 落点 + 本次 launch 结果，随后用 --wait-status 轮询。
+    print(f"RVF_DISPATCH_STATUS={status_path}")
+    print(f"RVF_DISPATCH_LAUNCH={result['launch_status']}")
+    if result["launch_status"] == LAUNCH_FAILED:
+        print(result.get("error") or "dispatch detached launch failed", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Route + dispatch RVF santa-method double-review reviewers."
@@ -675,7 +881,60 @@ def main() -> int:
     parser.add_argument("--plan-only", action="store_true", help="Plan + write reviewer-plan.json; do not execute.")
     parser.add_argument("--execute", action="store_true", help="Plan then execute reviewers in parallel.")
     parser.add_argument("--dry-run", action="store_true", help="Print plan JSON to stdout; do not write or execute.")
+    parser.add_argument(
+        "--detached",
+        action="store_true",
+        help="With --execute: self-fork the whole dispatch into a detached tmux "
+        "thread and return the status.json path immediately (breaks the Bash-tool "
+        "600s cap). Host-agnostic; does not use Claude-only run_in_background.",
+    )
+    parser.add_argument(
+        "--wait-status",
+        action="store_true",
+        help="Bounded-poll a detached dispatch status.json until terminal; use with "
+        "--status-path / --max-wait. Prints RVF_DISPATCH_STATE=done|running, exit 0.",
+    )
+    parser.add_argument("--status-path", help="Detached dispatch status.json path (required with --wait-status).")
+    parser.add_argument(
+        "--max-wait",
+        type=float,
+        default=DEFAULT_DISPATCH_MAX_WAIT_SECONDS,
+        help=f"--wait-status max blocking seconds per call (default {DEFAULT_DISPATCH_MAX_WAIT_SECONDS:g} < 600s cap).",
+    )
+    parser.add_argument(
+        "--total-timeout",
+        type=float,
+        default=DEFAULT_DISPATCH_TOTAL_TIMEOUT_SECONDS,
+        help=f"--detached total backstop seconds, wider than any single reviewer "
+        f"(default {DEFAULT_DISPATCH_TOTAL_TIMEOUT_SECONDS:g}); guarantees status.json reaches a terminal state.",
+    )
     args = parser.parse_args()
+
+    # --wait-status：纯读 status.json 的有界轮询，不需要 registry / run；最先短路。
+    if args.wait_status:
+        if not args.status_path:
+            print("--wait-status requires --status-path", file=sys.stderr)
+            return 2
+        result = wait_for_dispatch_status(
+            Path(args.status_path).expanduser(),
+            max_wait=args.max_wait,
+        )
+        if result["state"] == "done":
+            print(
+                f"RVF_DISPATCH_STATE=done "
+                f"launch_status={result.get('launch_status')} "
+                f"returncode={result.get('returncode')}"
+            )
+        else:
+            print(
+                f"RVF_DISPATCH_STATE=running "
+                f"launch_status={result.get('launch_status')}"
+            )
+        return 0
+
+    if args.detached and not args.execute:
+        print("--detached requires --execute", file=sys.stderr)
+        return 2
 
     # SKILL.md 契约：`source review-env.sh` 后只需运行 `dispatch_reviewers.py --execute`。
     # review-env.sh 导出 RVF_REPO / RVF_REVIEW_PACKET / RVF_SCOPE_OF_WORK(/RVF_SESSION_CONTEXT) /
@@ -705,6 +964,19 @@ def main() -> int:
     )
     artifacts_dir = ledger.artifacts_dir
     reviewers_dir = artifacts_dir / "reviewers"
+
+    # --detached：把整轮派发本体（下方 probe/route/execute）self-fork 进 detached tmux
+    # 线程并立即返回。run 已解析（上方 start_run），child 复用同一 run_id/run_dir。
+    if args.detached:
+        return launch_detached_dispatch(
+            args,
+            ledger,
+            reviewers_dir,
+            repo=repo,
+            review_packet=review_packet,
+            session_context=session_context,
+            scope_contract=scope_contract,
+        )
 
     env_main_harness = os.environ.get("RVF_MAIN_HARNESS")
     main_harness_file = (

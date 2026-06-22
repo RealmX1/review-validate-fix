@@ -9165,6 +9165,336 @@ def _dispatch_registry() -> dict:
     }
 
 
+def load_rvf_detached_thread_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_detached_thread", SCRIPT_DIR / "rvf_detached_thread.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_detached_thread module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_realexec_tmux_script(path: Path) -> Path:
+    """fake tmux：同步执行 wrapper shell（区别于 write_fake_tmux_script 只记录调用）。
+
+    真实 ``tmux new-session -d`` detach 所有 fd 后台运行；测试为确定性改为同步跑完
+    wrapper（被包命令 + ``--finalize-status`` 回调），故 launch_detached 返回时
+    status.json 已落终态，便于断言两阶段写入。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys\n"
+        "shell = sys.argv[-1]\n"  # tmux new-session -d -s <name> <shell>
+        "raise SystemExit(subprocess.run(['/bin/sh', '-c', shell]).returncode)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _detached_status_payload() -> dict:
+    return {
+        "schema_version": 1,
+        "started_at": "t0",
+        "returncode": None,
+        "finished_at": None,
+        "launch_status": "launched",
+        "error": None,
+    }
+
+
+def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
+    """real-exec tmux：launch 写 launched，wrapper 退出后 --finalize-status 回写 returncode/finished_at。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_realexec_tmux_script(root / "tmux.py")
+    saved = os.environ.get("CODEX_RVF_TMUX_BIN")
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    try:
+        status_path = root / "s.status.json"
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=[sys.executable, "-c", "import sys; sys.exit(5)"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=root / "s.lock",
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("CODEX_RVF_TMUX_BIN", None)
+        else:
+            os.environ["CODEX_RVF_TMUX_BIN"] = saved
+    assert result["launch_status"] == "launched", result
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["launch_status"] == "launched"  # 启动期字段保留
+    assert status["returncode"] == 5  # 退出码经 finalize 回写
+    assert status["finished_at"]
+    assert (root / "s.lock").exists()
+    assert (root / "s.log").exists()
+
+
+def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
+    """每-run O_EXCL 锁：第二次 launch 命中 already_running，不再起 tmux。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    try:
+        kw = dict(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=root / "s.status.json",
+            lock_path=root / "s.lock",
+        )
+        first = module.launch_detached(status_payload=_detached_status_payload(), **kw)
+        second = module.launch_detached(status_payload=_detached_status_payload(), **kw)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert first["launch_status"] == "launched", first
+    assert second["launch_status"] == "already_running", second
+    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
+    """tmux 非零退出 → launch_failed：status 记 error、锁被释放（便于重试）。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "CODEX_RVF_TMUX_BIN",
+            "FAKE_TMUX_CALLS",
+            "FAKE_TMUX_RETURNCODE",
+            "FAKE_TMUX_STDERR",
+        )
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(root / "calls.jsonl")
+    os.environ["FAKE_TMUX_RETURNCODE"] = "1"
+    os.environ["FAKE_TMUX_STDERR"] = "boom: cannot create session"
+    lock_path = root / "s.lock"
+    status_path = root / "s.status.json"
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert result["launch_status"] == "launch_failed", result
+    assert "boom" in (result["error"] or "")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["launch_status"] == "launch_failed"
+    assert "boom" in (status["error"] or "")
+    assert not lock_path.exists()  # 锁释放，可重试
+
+
+def test_rvf_detached_thread_run_with_timeout(_root: Path | None = None) -> None:
+    """--run-with-timeout：正常退出码透传；超时 killpg 整组并返回 124。"""
+    helper = SCRIPT_DIR / "rvf_detached_thread.py"
+    passthrough = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--run-with-timeout",
+            "30",
+            "--",
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(3)",
+        ]
+    ).returncode
+    assert passthrough == 3
+    timed_out = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--run-with-timeout",
+            "1",
+            "--",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(10)",
+        ]
+    ).returncode
+    assert timed_out == 124
+
+
+def test_rvf_detached_thread_finalize_status_cli(root: Path) -> None:
+    """--finalize-status：merge returncode/finished_at，保留 launch 期字段。"""
+    root.mkdir(parents=True, exist_ok=True)
+    helper = SCRIPT_DIR / "rvf_detached_thread.py"
+    status_path = root / "s.status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "launch_status": "launched",
+                "started_at": "t0",
+                "returncode": None,
+                "finished_at": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rc = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--finalize-status",
+            "--status-path",
+            str(status_path),
+            "--returncode",
+            "7",
+        ]
+    ).returncode
+    assert rc == 0
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["returncode"] == 7 and payload["finished_at"]
+    assert payload["launch_status"] == "launched" and payload["started_at"] == "t0"
+
+
+def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
+    """--execute --detached：self-fork dispatch_reviewers.py --execute 进 tmux，立即返回 status 路径。"""
+    import contextlib
+    import io
+
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    run_dir = root / "runs" / "rvf-disp-unit"
+    reviewers_dir = run_dir / "artifacts" / "reviewers"
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+
+    class _Ledger:
+        run_id = "rvf-disp-unit"
+
+        def __init__(self, rd: Path) -> None:
+            self.run_dir = rd
+
+        def env(self) -> dict:
+            return {"CODEX_RVF_RUN_ID": self.run_id}
+
+        def event(self, **_kw) -> None:
+            pass
+
+    args = argparse.Namespace(
+        registry="reg.json",
+        probe_mode="preflight",
+        probe_timeout=60.0,
+        main_harness="auto",
+        transcript=None,
+        main_harness_file=None,
+        assume_available=None,
+        require_external=False,
+        total_timeout=2700.0,
+    )
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = d.launch_detached_dispatch(
+                args,
+                _Ledger(run_dir),
+                reviewers_dir,
+                repo="/repo",
+                review_packet="/pkt",
+                session_context="/sow",
+                scope_contract="/sc",
+            )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    out = buf.getvalue()
+    assert rc == 0, out
+    assert "RVF_DISPATCH_STATUS=" in out and "RVF_DISPATCH_LAUNCH=launched" in out
+    status = json.loads(
+        (reviewers_dir / ".dispatch-thread.status.json").read_text(encoding="utf-8")
+    )
+    assert status["launch_status"] == "launched"
+    assert status["tmux_session"] == "rvf-dispatch-rvf-disp-unit"
+    child = status["command"]
+    assert "--execute" in child and "--detached" not in child
+    assert "--rvf-run-id" in child and "rvf-disp-unit" in child
+    assert "--rvf-run-dir" in child and "--repo" in child and "/repo" in child
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len(recorded) == 1
+    assert recorded[0]["argv"][:4] == [
+        "new-session",
+        "-d",
+        "-s",
+        "rvf-dispatch-rvf-disp-unit",
+    ]
+
+
+def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:
+    """waiter 终态判定：running / done(finished_at) / done(launch_failed) / 缺文件→running。"""
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    status_path = root / "s.json"
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launched", "finished_at": None, "returncode": None}),
+        encoding="utf-8",
+    )
+    running = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert running["state"] == "running", running
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launched", "finished_at": "t1", "returncode": 0}),
+        encoding="utf-8",
+    )
+    done = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert done["state"] == "done" and done["returncode"] == 0, done
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launch_failed", "finished_at": None, "error": "boom"}),
+        encoding="utf-8",
+    )
+    failed = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert failed["state"] == "done" and failed["launch_status"] == "launch_failed", failed
+
+    missing = d.wait_for_dispatch_status(root / "missing.json", max_wait=0.0)
+    assert missing["state"] == "running", missing
+
+
 def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     """路由矩阵 R0–R4：测试用例名 ↔ 规则 id。
 
@@ -10956,6 +11286,34 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_analyze_thread_lock_blocks_second_launch",
             lambda: test_rvf_analyze_thread_lock_blocks_second_launch(root / "analyze-thread-lock"),
+        ),
+        (
+            "rvf_detached_thread_status_two_phase",
+            lambda: test_rvf_detached_thread_status_two_phase(root / "detached-two-phase"),
+        ),
+        (
+            "rvf_detached_thread_lock_idempotent",
+            lambda: test_rvf_detached_thread_lock_idempotent(root / "detached-lock"),
+        ),
+        (
+            "rvf_detached_thread_launch_failed_releases_lock",
+            lambda: test_rvf_detached_thread_launch_failed_releases_lock(root / "detached-failed"),
+        ),
+        (
+            "rvf_detached_thread_run_with_timeout",
+            lambda: test_rvf_detached_thread_run_with_timeout(),
+        ),
+        (
+            "rvf_detached_thread_finalize_status_cli",
+            lambda: test_rvf_detached_thread_finalize_status_cli(root / "detached-finalize"),
+        ),
+        (
+            "dispatch_reviewers_detached_launch_wiring",
+            lambda: test_dispatch_reviewers_detached_launch_wiring(root / "dispatch-detached"),
+        ),
+        (
+            "dispatch_reviewers_wait_status_branches",
+            lambda: test_dispatch_reviewers_wait_status_branches(root / "dispatch-wait"),
         ),
     ]
 
