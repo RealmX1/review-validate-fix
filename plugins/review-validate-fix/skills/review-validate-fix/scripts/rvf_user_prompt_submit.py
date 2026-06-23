@@ -50,8 +50,14 @@ RVF_MANUAL_TRIGGERS = ("$review-validate-fix", "/review-validate-fix", ":review-
 # triggering on quoted/embedded literals that appear inside review packets,
 # transcript excerpts, error stacks, or normal prose like
 # "please document the /review-validate-fix tool".
+# 负向先行断言 `(?!:rvf-)`：在检测层就区分主 skill 与 `rvf-*` 姊妹子 skill。所有
+# 姊妹 skill 的命名空间形态都是 `…:rvf-<name>`（如 `/review-validate-fix:rvf-land`、
+# `/review-validate-fix:rvf-local-deploy`），调用它们不应启动新 review；而主 skill
+# 的裸形态 `/review-validate-fix` 与命名空间形态
+# `/review-validate-fix:review-validate-fix`（后缀是 `:review-` 而非 `:rvf-`）仍命中。
+# 本断言位置无关，根因级修复「子 skill 出现在 prompt 句中时误触发 manual review」。
 RVF_MANUAL_TRIGGER_RE = re.compile(
-    r"(?:^|\s)[\$/:]review-validate-fix\b",
+    r"(?:^|\s)[\$/:]review-validate-fix(?!:rvf-)\b",
     re.MULTILINE,
 )
 # 前导姊妹命令抑制（位置锚定 prompt 开头，容忍前导空白）。`rvf-land` /

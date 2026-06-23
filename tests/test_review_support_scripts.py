@@ -1279,6 +1279,73 @@ def test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(tmp_pat
     assert submit._looks_like_handoff_body(f"提一句 {run_id} 没别的") is False
 
 
+def test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger(tmp_path: Path) -> None:
+    """调用 `rvf-*` 姊妹子 skill 的命名空间形态不得误触发 manual review。
+
+    复现的 bug：在 Claude Code 里调用任意 RVF 子 skill（如
+    `/review-validate-fix:rvf-local-deploy`、`/review-validate-fix:rvf-land`）时，UPS hook
+    的检测正则只看到前缀 `/review-validate-fix`（`\\b` 在冒号处即成立），把它误判为「用户手动
+    触发主 RVF workflow」，于是 bootstrap manual prep 并派发。尤其当子 skill 出现在 prompt
+    **句中**时，连历史的开头锚定姊妹抑制（`_leading_sibling_command` 用 `.match`）都够不着。
+
+    修复后检测正则带负向先行断言 `(?!:rvf-)`：主 skill（裸 `/review-validate-fix` 或命名空间
+    `/review-validate-fix:review-validate-fix`）仍命中；`…:rvf-<name>` 子 skill 一律不命中、
+    走静默 `none`（不抑制、不发 systemMessage、不建 prep），且判定**位置无关**。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # (a) 报告中的原始复现样本（子 skill 出现在句中）→ 静默 none，不视为 manual。
+    example = (
+        "Can I now try to do /review-validate-fix:rvf-local-deploy ? "
+        "or Are there any additional work to be done?"
+    )
+    assert submit._classify_manual_trigger({}, example) == "none", example
+    assert submit.detect_manual_trigger(example) is False, example
+
+    # (b) 全部 6 个 `rvf-*` 子 skill 的命名空间形态，开头与句中各一 → 均静默 none。
+    subskills = (
+        "rvf-land",
+        "rvf-local-deploy",
+        "rvf-analyze",
+        "rvf-handoff-intake",
+        "rvf-handoff-commit",
+        "rvf-reopen",
+    )
+    for name in subskills:
+        leading = f"/review-validate-fix:{name}"
+        mid_sentence = f"please now run /review-validate-fix:{name} for this branch"
+        for prompt in (leading, mid_sentence):
+            assert submit._classify_manual_trigger({}, prompt) == "none", prompt
+            assert submit.detect_manual_trigger(prompt) is False, prompt
+
+    # (c) 假阴守卫：主 skill 的裸形态与命名空间形态（后缀 `:review-` 而非 `:rvf-`）仍是 manual。
+    assert submit._classify_manual_trigger({}, "/review-validate-fix") == "manual"
+    assert (
+        submit._classify_manual_trigger({}, "/review-validate-fix:review-validate-fix")
+        == "manual"
+    )
+    # 主 skill 句中出现同样应触发（检测位置无关）。
+    assert (
+        submit._classify_manual_trigger({}, "hey please /review-validate-fix this branch")
+        == "manual"
+    )
+
+    # (d) 端到端：对原始复现样本跑 inspect_user_prompt_submit → 不启动 workflow、不建 prep。
+    payload = submit.inspect_user_prompt_submit(
+        {"prompt": example, "cwd": str(repo), "hook_event_name": "UserPromptSubmit"},
+        prep_root=root,
+    )
+    assert payload["status"] == "no_token", payload
+    assert payload.get("workflow_started") is False, payload
+    assert "hookSpecificOutput" not in payload, payload
+    # 不应留下任何 manual prep 痕迹（子 skill 调用是静默 none，不是 suppressed）。
+    assert not root.exists() or not any(root.iterdir()), list(root.iterdir()) if root.exists() else []
+
+
 def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -10381,6 +10448,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger",
             lambda: test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(
                 root / "prompt-submit-handoff-literal"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger",
+            lambda: test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger(
+                root / "prompt-submit-namespaced-subskill"
             ),
         ),
         (
