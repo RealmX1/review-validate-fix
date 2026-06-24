@@ -24,13 +24,8 @@ review-validate-fix 的会话立即 idle，用户无需等待 analyze 完成。
 
 from __future__ import annotations
 
-import json
 import os
-import secrets
-import shlex
-import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +38,17 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 adap
 
 from rvf_logging import safe_token  # noqa: E402
 from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
+
+# detached-launch 通用机制（O_EXCL 幂等锁 + 两阶段原子 status + catch-all）抽到共享
+# helper，analyze 线程与 reviewer dispatch 两路复用；analyze 专属决策（host 选择 /
+# prompt 冻结 / 自抑制 env）仍留在本模块。
+from rvf_detached_thread import (  # noqa: E402
+    LAUNCH_FAILED,
+    LAUNCH_LAUNCHED,
+    _atomic_write_json,
+    _iso_now,
+    launch_detached,
+)
 
 from adapters.codex.subagent import (  # noqa: E402
     build_analyze_command as _codex_build_analyze_command,
@@ -60,10 +66,6 @@ PROMPT_FILENAME = ".analyze-thread.prompt.md"
 LOG_FILENAME = ".analyze-thread.log"
 STATUS_FILENAME = ".analyze-thread.status.json"
 LOCK_FILENAME = ".analyze-thread.lock"
-
-LAUNCH_LAUNCHED = "launched"
-LAUNCH_ALREADY_RUNNING = "already_running"
-LAUNCH_FAILED = "launch_failed"
 
 # 与 rvf_analyze_advisory._SESSION_PATH_KEYS 对齐：inline 一份避免循环 import
 # （advisory 在 top-level import 本模块）。
@@ -83,14 +85,6 @@ def claude_bin() -> str:
 def codex_bin() -> str:
     # 与 codex_stop_review_validate_fix.codex_bin 等价；inline 避免循环 import。
     return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
-
-
-def tmux_bin() -> str:
-    return os.environ.get("CODEX_RVF_TMUX_BIN", "tmux")
-
-
-def _iso_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parent_transcript_path(event: dict[str, Any]) -> Path | None:
@@ -154,56 +148,6 @@ def build_analyze_command(host: str) -> tuple[list[str], bool]:
     return command.argv, command.uses_stdin
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    tmp.replace(path)
-
-
-def _build_wrapper_shell(
-    *,
-    agent_argv: list[str],
-    uses_stdin: bool,
-    prompt_path: Path,
-    log_path: Path,
-    status_path: Path,
-    exports: dict[str, str],
-) -> str:
-    """拼 tmux 内执行的 shell：导出自抑制 env → 跑 agent（log 落盘）→ 回写 status。
-
-    退出码经由独立的 ``--finalize-status`` 回调写入 status.json，避免从 shell
-    手工拼 JSON 丢字段。``$?`` 取最后一条命令（管道里是 agent）的退出码。
-    """
-    export_lines = "".join(
-        f"export {name}={shlex.quote(value)}; " for name, value in exports.items()
-    )
-    agent_cmd = " ".join(shlex.quote(token) for token in agent_argv)
-    log_q = shlex.quote(str(log_path))
-    if uses_stdin:
-        run_line = f"cat {shlex.quote(str(prompt_path))} | {agent_cmd} >> {log_q} 2>&1"
-    else:
-        run_line = f"{agent_cmd} >> {log_q} 2>&1"
-    finalize_cmd = " ".join(
-        shlex.quote(token)
-        for token in [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            "--finalize-status",
-            "--status-path",
-            str(status_path),
-        ]
-    )
-    return (
-        f"{export_lines}"
-        f"{run_line}; rc=$?; "
-        f"{finalize_cmd} --returncode \"$rc\" >> {log_q} 2>&1"
-    )
-
-
 def launch_detached_analyze_thread(
     *,
     event: dict[str, Any],
@@ -213,9 +157,12 @@ def launch_detached_analyze_thread(
 ) -> dict[str, Any]:
     """把 analyze agent 派进 ``rvf-analyze-<run_name>`` tmux session（detached）。
 
-    整体 catch-all：任何异常都收敛成 ``launch_failed`` 返回，**绝不**让 analyze
-    线程启动失败打断 finalize/handoff 主路径。返回字段供 advisory 写入 ledger /
-    summary / systemMessage。
+    detached-launch 通用机制（O_EXCL 幂等锁 / 两阶段原子 status / catch-all）由
+    ``rvf_detached_thread.launch_detached`` 提供；本函数只负责 analyze 专属决策——
+    host 选择、prompt 冻结、自抑制 env（``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
+    ``CODEX_RVF_ANALYZE_THREAD``）与返回字段拼装（供 advisory 写入 ledger / summary /
+    systemMessage）。整体 catch-all：任何异常收敛成 ``launch_failed``，**绝不**让线程
+    启动失败打断 finalize/handoff 主路径。
     """
     del finalize_record  # 目前不需要，保留签名以备未来透传。
     run_dir = analysis["run_dir"]
@@ -248,23 +195,6 @@ def launch_detached_analyze_thread(
 
         prompt_text = rvf_analyze_followup_prompt(analysis)
         prompt_path.write_text(prompt_text, encoding="utf-8")
-        log_path.touch(exist_ok=True)
-
-        # 每 run O_EXCL 锁：第二次 launch 命中 FileExistsError → already_running。
-        idempotency_key = f"rvf-analyze:{run_name}"
-        try:
-            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return {
-                **base,
-                "host": host,
-                "agent_command": agent_argv,
-                "launch_status": LAUNCH_ALREADY_RUNNING,
-                "returncode": None,
-                "error": None,
-            }
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(f"{idempotency_key}\n{_iso_now()}\n")
 
         exports = {
             SUPPRESS_STOP_HOOK_ENV: "1",
@@ -286,68 +216,29 @@ def launch_detached_analyze_thread(
             "launch_status": LAUNCH_LAUNCHED,
             "error": None,
         }
-        _atomic_write_json(status_path, status_payload)
 
-        shell_command = _build_wrapper_shell(
-            agent_argv=agent_argv,
-            uses_stdin=uses_stdin,
-            prompt_path=prompt_path,
+        # analyze prompt 一律走 stdin（``cat <prompt> | <agent>``）；不施加总超时
+        # backstop（analyze 补全自有边界，保持既有行为不变）。
+        result = launch_detached(
+            session_name=tmux_session,
+            argv=agent_argv,
+            stdin_path=prompt_path if uses_stdin else None,
             log_path=log_path,
             status_path=status_path,
+            lock_path=lock_path,
+            status_payload=status_payload,
             exports=exports,
+            launch_env={**os.environ, **ledger.env(), **exports},
+            idempotency_key=f"rvf-analyze:{run_name}",
         )
-        tmux_command = [tmux_bin(), "new-session", "-d", "-s", tmux_session, shell_command]
-        launch_env = {**os.environ, **ledger.env(), **exports}
-        completed = subprocess.run(
-            tmux_command,
-            capture_output=True,
-            text=True,
-            check=False,
-            env=launch_env,
-            timeout=30,
-        )
-
-        if completed.returncode != 0:
-            combined = (completed.stderr + completed.stdout).lower()
-            if "duplicate session" in combined:
-                status_payload["launch_status"] = LAUNCH_ALREADY_RUNNING
-                _atomic_write_json(status_path, status_payload)
-                return {
-                    **base,
-                    "host": host,
-                    "agent_command": agent_argv,
-                    "command": tmux_command,
-                    "launch_status": LAUNCH_ALREADY_RUNNING,
-                    "returncode": completed.returncode,
-                    "error": None,
-                }
-            error = completed.stderr.strip() or completed.stdout.strip() or "tmux new-session failed"
-            status_payload["launch_status"] = LAUNCH_FAILED
-            status_payload["error"] = error
-            _atomic_write_json(status_path, status_payload)
-            # launch 失败时释放锁，便于后续重新 launch / 手动 $rvf-analyze。
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
-            return {
-                **base,
-                "host": host,
-                "agent_command": agent_argv,
-                "command": tmux_command,
-                "launch_status": LAUNCH_FAILED,
-                "returncode": completed.returncode,
-                "error": error,
-            }
-
         return {
             **base,
             "host": host,
             "agent_command": agent_argv,
-            "command": tmux_command,
-            "launch_status": LAUNCH_LAUNCHED,
-            "returncode": completed.returncode,
-            "error": None,
+            "command": result.get("tmux_command"),
+            "launch_status": result["launch_status"],
+            "returncode": result["returncode"],
+            "error": result["error"],
         }
     except Exception as exc:  # noqa: BLE001 - 启动失败绝不阻断 finalize/handoff。
         error = f"{type(exc).__name__}: {exc}"
@@ -380,35 +271,17 @@ def launch_detached_analyze_thread(
         }
 
 
-def _finalize_status(status_path: Path, returncode: int) -> int:
-    """tmux 内 shell 完成时回写 returncode / finished_at；保留 launch 期字段。"""
-    try:
-        payload = json.loads(status_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            payload = {}
-    except (OSError, json.JSONDecodeError):
-        payload = {}
-    payload["returncode"] = returncode
-    payload["finished_at"] = _iso_now()
-    try:
-        _atomic_write_json(status_path, payload)
-    except OSError:
-        return 1
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--finalize-status", action="store_true")
-    parser.add_argument("--status-path")
-    parser.add_argument("--returncode", type=int)
-    args = parser.parse_args(argv)
-    if args.finalize_status:
-        if not args.status_path or args.returncode is None:
-            return 2
-        return _finalize_status(Path(args.status_path), args.returncode)
+    parser = argparse.ArgumentParser(
+        description=(
+            "rvf_analyze_thread is import-only. The detached-launch mechanism "
+            "(including the --finalize-status status callback) now lives in "
+            "rvf_detached_thread.py."
+        )
+    )
+    parser.parse_args(argv)
     parser.print_help()
     return 0
 

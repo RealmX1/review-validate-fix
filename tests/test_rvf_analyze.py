@@ -129,37 +129,6 @@ def test_analyze_finalized_run_scaffolds(tmp_path, monkeypatch):
     assert causality["schema_version"] == 2
 
 
-def test_analyze_finalized_run_arms_manual_quiet_marker(tmp_path, monkeypatch):
-    rvf_analyze = _load("rvf_analyze")
-    post_analyze_quiet = _load("post_analyze_quiet")
-    log_root = tmp_path / "rvf-log"
-    run_dir = _bootstrap_run(
-        log_root,
-        run_id="rvf-finalized-quiet",
-        finalize_lock=True,
-    )
-    monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
-    monkeypatch.setenv("KANBAN_TASK_ID", "task-manual-analyze")
-    monkeypatch.setenv("CODEX_SESSION_ID", "session-manual-analyze")
-
-    code, payload = rvf_analyze.analyze(_make_args(run_id="rvf-finalized-quiet"))
-
-    assert code == rvf_analyze.EXIT_OK
-    assert payload["post_analyze_quiet_marker_status"] == "armed"
-    marker = post_analyze_quiet.read_post_analyze_quiet_marker(
-        task_id="task-manual-analyze",
-        session_id="session-manual-analyze",
-        root=log_root,
-    )
-    assert marker is not None
-    assert marker["armed_run_id"] == "rvf-analyze:rvf-finalized-quiet"
-    assert marker["analyze_run_dir"] == str(run_dir)
-    assert marker["analyze_summary_md"] == payload["summary_md_path"]
-    assert marker["analyze_causality_json"] == payload["causality_json_path"]
-    assert marker["armed_at"] == payload["post_analyze_quiet_marker_armed_at"]
-    assert payload["post_analyze_quiet_marker_path"] == marker["_marker_path"]
-
-
 def test_analyze_orphan_without_decision_returns_needs_decision(tmp_path, monkeypatch):
     rvf_analyze = _load("rvf_analyze")
     log_root = tmp_path / "rvf-log"

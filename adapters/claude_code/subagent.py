@@ -46,9 +46,8 @@ def build_analyze_command(*, claude_bin: str) -> InvokeCommand:
     干净退 0 但零产出（``returncode=0`` 误判 success）。证据：线上 run
     ``rvf-20260530T185312Z-...-30a814b9`` 的 ``.analyze-thread.log`` 末尾
     ``result.permission_denials`` 列了 2× Read + 3× Bash 全部被拒，agent 输出
-    "请批准这两个权限" 后 end_turn，summary.md 与 causality.json 零编辑、
-    post_analyze_quiet marker 卡 PENDING 6h。Codex 侧 ``--ask-for-approval never``
-    已是同效力。
+    "请批准这两个权限" 后 end_turn，summary.md 与 causality.json 零编辑（analyze
+    线程干净退 0 却零产出）。Codex 侧 ``--ask-for-approval never`` 已是同效力。
     """
     return InvokeCommand(
         argv=[

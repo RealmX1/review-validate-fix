@@ -178,6 +178,33 @@ def write_fake_tmux_script(path: Path) -> Path:
     return path
 
 
+def write_subcommand_aware_tmux_script(path: Path) -> Path:
+    """fake tmux：记录调用，并按子命令分别返回退出码——
+
+    - ``has-session`` → ``FAKE_TMUX_HAS_SESSION_RETURNCODE``（默认 0，即「存活」）
+    - 其余（``new-session`` 等）→ ``FAKE_TMUX_RETURNCODE``（默认 0）
+
+    供 FU-2 staleness 测试构造「has-session 报死 + new-session 成功」等组合
+    （uniform 的 write_fake_tmux_script 无法区分子命令）。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "calls = os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'argv': argv}) + '\\n')\n"
+        "sub = argv[0] if argv else ''\n"
+        "if sub == 'has-session':\n"
+        "    raise SystemExit(int(os.environ.get('FAKE_TMUX_HAS_SESSION_RETURNCODE', '0')))\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 class _AnalyzeLedgerStub:
     run_id = "rvf-unit"
 
@@ -324,8 +351,10 @@ def test_rvf_analyze_thread_lock_blocks_second_launch(root: Path) -> None:
 
     assert first["launch_status"] == "launched"
     # 每 run O_EXCL 锁：第二次命中 already_running，不再启动 tmux。
+    # 第二次会先 has-session 探活（session 存活 → already_running），故按 new-session 计数。
+    recorded = [json.loads(line)["argv"] for line in tmux_calls.read_text(encoding="utf-8").splitlines()]
     assert second["launch_status"] == "already_running"
-    assert len(tmux_calls.read_text(encoding="utf-8").splitlines()) == 1
+    assert len([a for a in recorded if a[:1] == ["new-session"]]) == 1, recorded
 
 
 def load_check_review_output_module():
@@ -496,6 +525,49 @@ def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
     assert not written.path.exists()
 
 
+def test_rvf_prep_file_revive_expired_restamps_ttl(tmp_path: Path) -> None:
+    """FU-1：写 prep → now 越过 expiry（read 为 expired 但带回 payload）→ revive 续期 →
+    再 read 为 valid，且非时间戳字段原样保留；缺 payload 的 lookup 不可 revive。"""
+    prep = load_rvf_prep_file_module()
+    root = tmp_path / "prep-root"
+    t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+    written = prep.write_prep_file(
+        {
+            "origin_session_id": "session-revive",
+            "rvf_run": {"run_id": "rvf-revive", "run_dir": str(tmp_path / "run")},
+        },
+        root=root,
+        token="0123456789abcdef",
+        now=t0,
+        ttl_seconds=300,
+    )
+    after = prep.parse_timestamp("2026-05-07T00:10:00Z")  # 越过 00:05:00 expiry
+    expired = prep.read_prep_file(written.token, root=root, now=after)
+    assert expired.status == "expired"
+    assert expired.payload is not None  # read 对 expired 仍带回 payload
+
+    revived = prep.revive_prep_file(expired, root=root, now=after, ttl_seconds=300)
+    assert revived.path == written.path  # 就地重写同一 token 文件
+    assert revived.payload["created_at"] == "2026-05-07T00:10:00Z"
+    assert revived.payload["expires_at"] == "2026-05-07T00:15:00Z"
+    assert revived.payload["origin_session_id"] == "session-revive"  # 非时间戳字段保留
+    assert revived.payload["rvf_run"]["run_id"] == "rvf-revive"
+
+    again = prep.read_prep_file(
+        written.token, root=root, now=prep.parse_timestamp("2026-05-07T00:12:00Z")
+    )
+    assert again.status == "valid", again  # 续期后回到 valid
+
+    missing = prep.read_prep_file("aaaaaaaaaaaaaaaa", root=root, now=after)
+    assert missing.status == "missing" and missing.payload is None
+    try:
+        prep.revive_prep_file(missing, root=root, now=after)
+    except prep.PrepFileError:
+        pass
+    else:
+        raise AssertionError("expected revive of payload-less lookup to fail")
+
+
 def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -607,6 +679,151 @@ def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> No
             )
         finally:
             prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
+    tmp_path: Path,
+) -> None:
+    """FU-1：dispatch token 在场、prep 已过 TTL，但 run_dir 仍在 → 就地续期、走 valid 派发
+    路径（workflow 启动），而非静默丢整轮 followup。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)  # run artifacts 仍在
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-revive",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-revive", "run_dir": str(run_dir)},
+            },
+            root=root,
+            token="aaaaaaaaaaaaaaaa",
+            now=t0,
+            ttl_seconds=300,
+        )
+        prepare_calls: list[str] = []
+
+        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            prepare_calls.append(record_arg.token)
+            state = {
+                "started_at": "2026-05-07T00:10:01Z",
+                "completed_at": "2026-05-07T00:10:02Z",
+                "status": "completed",
+                "target_flow": record_arg.payload.get("target_flow"),
+                "artifacts": {"review_env": "/tmp/review-env.sh"},
+            }
+            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            # now 越过 expiry（00:05:00）：read 判 expired，但 run_dir 在 → 续期 → valid 派发。
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+                now="2026-05-07T00:10:00Z",
+            )
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+        assert payload["status"] == "valid", payload  # 续期后走 valid 路径
+        assert payload.get("prep_revived") is True
+        assert payload["workflow_started"] is True
+        assert prepare_calls == ["aaaaaaaaaaaaaaaa"]  # 确实派发，而非静默丢
+        # 非 dispatch_no_prep：systemMessage 含 run_id（valid 行），不是「未跑」诊断。
+        assert "rvf-revive" in (payload.get("systemMessage") or "")
+        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
+        assert any(
+            d.get("event") == "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
+        ), diagnostics
+        # prep 文件已就地续期：在 00:12:00 仍 valid（原 300s TTL 早已过）。
+        again = prep.read_prep_file(
+            "aaaaaaaaaaaaaaaa", root=root, now=prep.parse_timestamp("2026-05-07T00:12:00Z")
+        )
+        assert again.status == "valid", again
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing(
+    tmp_path: Path,
+) -> None:
+    """FU-1 负例：prep 已过 TTL 且 run_dir 不在（run 已清理 / 真过期）→ 不复活，仍走原
+    dispatch_no_prep 早返回（不复活已消失的 run）。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    missing_run_dir = tmp_path / "run-gone"  # 故意不创建
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-gone",
+                "origin_repo": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-gone", "run_dir": str(missing_run_dir)},
+            },
+            root=root,
+            token="aaaaaaaaaaaaaaaa",
+            now=t0,
+            ttl_seconds=300,
+        )
+        prepare_calls: list[str] = []
+
+        def fake_prepare(record_arg, **_):
+            prepare_calls.append(record_arg.token)
+            return {"status": "completed"}
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                },
+                prep_root=root,
+                now="2026-05-07T00:10:00Z",
+            )
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+        assert payload["status"] == "expired", payload  # 未复活
+        assert "prep_revived" not in payload
+        assert payload["workflow_started"] is False
+        assert prepare_calls == []  # 未派发
+        assert (
+            isinstance(payload.get("systemMessage"), str)
+            and "aaaaaaaaaaaaaaaa" in payload["systemMessage"]
+        )
+        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
+        assert all(
+            d.get("event") != "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
+        ), diagnostics
     finally:
         os.environ.pop("CODEX_RVF_PREP_ROOT", None)
 
@@ -1277,6 +1494,73 @@ def test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(tmp_pat
     assert submit._leading_sibling_command("/review-validate-fix") is False
     assert submit._looks_like_handoff_body(handoff_body) is True
     assert submit._looks_like_handoff_body(f"提一句 {run_id} 没别的") is False
+
+
+def test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger(tmp_path: Path) -> None:
+    """调用 `rvf-*` 姊妹子 skill 的命名空间形态不得误触发 manual review。
+
+    复现的 bug：在 Claude Code 里调用任意 RVF 子 skill（如
+    `/review-validate-fix:rvf-local-deploy`、`/review-validate-fix:rvf-land`）时，UPS hook
+    的检测正则只看到前缀 `/review-validate-fix`（`\\b` 在冒号处即成立），把它误判为「用户手动
+    触发主 RVF workflow」，于是 bootstrap manual prep 并派发。尤其当子 skill 出现在 prompt
+    **句中**时，连历史的开头锚定姊妹抑制（`_leading_sibling_command` 用 `.match`）都够不着。
+
+    修复后检测正则带负向先行断言 `(?!:rvf-)`：主 skill（裸 `/review-validate-fix` 或命名空间
+    `/review-validate-fix:review-validate-fix`）仍命中；`…:rvf-<name>` 子 skill 一律不命中、
+    走静默 `none`（不抑制、不发 systemMessage、不建 prep），且判定**位置无关**。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "prep-root"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # (a) 报告中的原始复现样本（子 skill 出现在句中）→ 静默 none，不视为 manual。
+    example = (
+        "Can I now try to do /review-validate-fix:rvf-local-deploy ? "
+        "or Are there any additional work to be done?"
+    )
+    assert submit._classify_manual_trigger({}, example) == "none", example
+    assert submit.detect_manual_trigger(example) is False, example
+
+    # (b) 全部 6 个 `rvf-*` 子 skill 的命名空间形态，开头与句中各一 → 均静默 none。
+    subskills = (
+        "rvf-land",
+        "rvf-local-deploy",
+        "rvf-analyze",
+        "rvf-handoff-intake",
+        "rvf-handoff-commit",
+        "rvf-reopen",
+    )
+    for name in subskills:
+        leading = f"/review-validate-fix:{name}"
+        mid_sentence = f"please now run /review-validate-fix:{name} for this branch"
+        for prompt in (leading, mid_sentence):
+            assert submit._classify_manual_trigger({}, prompt) == "none", prompt
+            assert submit.detect_manual_trigger(prompt) is False, prompt
+
+    # (c) 假阴守卫：主 skill 的裸形态与命名空间形态（后缀 `:review-` 而非 `:rvf-`）仍是 manual。
+    assert submit._classify_manual_trigger({}, "/review-validate-fix") == "manual"
+    assert (
+        submit._classify_manual_trigger({}, "/review-validate-fix:review-validate-fix")
+        == "manual"
+    )
+    # 主 skill 句中出现同样应触发（检测位置无关）。
+    assert (
+        submit._classify_manual_trigger({}, "hey please /review-validate-fix this branch")
+        == "manual"
+    )
+
+    # (d) 端到端：对原始复现样本跑 inspect_user_prompt_submit → 不启动 workflow、不建 prep。
+    payload = submit.inspect_user_prompt_submit(
+        {"prompt": example, "cwd": str(repo), "hook_event_name": "UserPromptSubmit"},
+        prep_root=root,
+    )
+    assert payload["status"] == "no_token", payload
+    assert payload.get("workflow_started") is False, payload
+    assert "hookSpecificOutput" not in payload, payload
+    # 不应留下任何 manual prep 痕迹（子 skill 调用是静默 none，不是 suppressed）。
+    assert not root.exists() or not any(root.iterdir()), list(root.iterdir()) if root.exists() else []
 
 
 def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tmp_path: Path) -> None:
@@ -9239,6 +9523,564 @@ def _dispatch_registry() -> dict:
     }
 
 
+def load_rvf_detached_thread_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_detached_thread", SCRIPT_DIR / "rvf_detached_thread.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_detached_thread module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_realexec_tmux_script(path: Path) -> Path:
+    """fake tmux：同步执行 wrapper shell（区别于 write_fake_tmux_script 只记录调用）。
+
+    真实 ``tmux new-session -d`` detach 所有 fd 后台运行；测试为确定性改为同步跑完
+    wrapper（被包命令 + ``--finalize-status`` 回调），故 launch_detached 返回时
+    status.json 已落终态，便于断言两阶段写入。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess, sys\n"
+        "shell = sys.argv[-1]\n"  # tmux new-session -d -s <name> <shell>
+        "raise SystemExit(subprocess.run(['/bin/sh', '-c', shell]).returncode)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _detached_status_payload() -> dict:
+    return {
+        "schema_version": 1,
+        "started_at": "t0",
+        "returncode": None,
+        "finished_at": None,
+        "launch_status": "launched",
+        "error": None,
+    }
+
+
+def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
+    """real-exec tmux：launch 写 launched，wrapper 退出后 --finalize-status 回写 returncode/finished_at。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_realexec_tmux_script(root / "tmux.py")
+    saved = os.environ.get("CODEX_RVF_TMUX_BIN")
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    try:
+        status_path = root / "s.status.json"
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=[sys.executable, "-c", "import sys; sys.exit(5)"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=root / "s.lock",
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("CODEX_RVF_TMUX_BIN", None)
+        else:
+            os.environ["CODEX_RVF_TMUX_BIN"] = saved
+    assert result["launch_status"] == "launched", result
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["launch_status"] == "launched"  # 启动期字段保留
+    assert status["returncode"] == 5  # 退出码经 finalize 回写
+    assert status["finished_at"]
+    assert (root / "s.lock").exists()
+    assert (root / "s.log").exists()
+
+
+def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
+    """每-run O_EXCL 锁：第二次 launch 命中 already_running，不再起 tmux。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    try:
+        kw = dict(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=root / "s.status.json",
+            lock_path=root / "s.lock",
+        )
+        first = module.launch_detached(status_payload=_detached_status_payload(), **kw)
+        second = module.launch_detached(status_payload=_detached_status_payload(), **kw)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert first["launch_status"] == "launched", first
+    assert second["launch_status"] == "already_running", second
+    # 第二次 launch 现在会先 has-session 探活（session 存活 → already_running），
+    # 故按 new-session 子命令计数：全程只起过一次 tmux。
+    recorded = [json.loads(line)["argv"] for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len([a for a in recorded if a[:1] == ["new-session"]]) == 1, recorded
+
+
+def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
+    """tmux 非零退出 → launch_failed：status 记 error、锁被释放（便于重试）。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "CODEX_RVF_TMUX_BIN",
+            "FAKE_TMUX_CALLS",
+            "FAKE_TMUX_RETURNCODE",
+            "FAKE_TMUX_STDERR",
+        )
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(root / "calls.jsonl")
+    os.environ["FAKE_TMUX_RETURNCODE"] = "1"
+    os.environ["FAKE_TMUX_STDERR"] = "boom: cannot create session"
+    lock_path = root / "s.lock"
+    status_path = root / "s.status.json"
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert result["launch_status"] == "launch_failed", result
+    assert "boom" in (result["error"] or "")
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["launch_status"] == "launch_failed"
+    assert "boom" in (status["error"] or "")
+    assert not lock_path.exists()  # 锁释放，可重试
+
+
+def _seed_detached_stale_lock(root: Path, *, returncode: object) -> tuple[Path, Path]:
+    """预置一个「持锁线程已退出」的现场：写锁文件 + 带指定 returncode 的 status.json。
+
+    ``returncode=None`` 表示未干净完成（launched 后没回写）；``returncode=0`` 表示干净完成。
+    """
+    lock_path = root / "s.lock"
+    status_path = root / "s.status.json"
+    lock_path.write_text("rvf-detached-unit\nt0\n", encoding="utf-8")
+    payload: dict[str, object] = {"launch_status": "launched", "finished_at": None}
+    if returncode is not None:
+        payload["returncode"] = returncode
+        payload["finished_at"] = "t1"
+    else:
+        payload["returncode"] = None
+    status_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return lock_path, status_path
+
+
+def _launch_detached_with_staleness_env(
+    module,
+    root: Path,
+    *,
+    lock_path: Path,
+    status_path: Path,
+    has_session_rc: str,
+    new_session_rc: str = "0",
+) -> tuple[dict, list[list]]:
+    """用 subcommand-aware fake tmux 跑一次 launch_detached，返回 (result, 记录的 tmux argv)。"""
+    fake_tmux = write_subcommand_aware_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "CODEX_RVF_TMUX_BIN",
+            "FAKE_TMUX_CALLS",
+            "FAKE_TMUX_RETURNCODE",
+            "FAKE_TMUX_HAS_SESSION_RETURNCODE",
+        )
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = new_session_rc
+    os.environ["FAKE_TMUX_HAS_SESSION_RETURNCODE"] = has_session_rc
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    recorded = (
+        [json.loads(line)["argv"] for line in calls.read_text(encoding="utf-8").splitlines()]
+        if calls.exists()
+        else []
+    )
+    return result, recorded
+
+
+def test_rvf_detached_thread_reclaims_stale_lock_when_session_dead(root: Path) -> None:
+    """FU-2：持锁 detached 线程已死（has-session≠0）且 run 未干净完成 → 重夺锁、重新 launch。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
+    )
+    assert result["launch_status"] == "launched", result  # 重夺并重派
+    assert ["has-session", "-t", "rvf-detached-unit"] in recorded  # 确实先探活
+    assert any(a[:1] == ["new-session"] for a in recorded), recorded  # 确实重新起 tmux
+    assert lock_path.exists()  # 重夺后锁仍由本次持有
+
+
+def test_rvf_detached_thread_keeps_lock_when_session_alive(root: Path) -> None:
+    """FU-2：持锁 session 仍存活（has-session==0）→ already_running，绝不重派。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="0"
+    )
+    assert result["launch_status"] == "already_running", result
+    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 未起新 tmux
+    assert lock_path.exists()  # 活锁保留
+
+
+def test_rvf_detached_thread_keeps_lock_on_clean_finish(root: Path) -> None:
+    """FU-2：session 已死但 run 已干净完成（returncode==0）→ already_running，幂等不重跑。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=0)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
+    )
+    assert result["launch_status"] == "already_running", result
+    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 不重跑已完成的 run
+    assert lock_path.exists()
+
+
+def test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(root: Path) -> None:
+    """FU-2 安全不变量（RVF cursor review 发现）：tmux 探活本身失败（binary 不可用 / 超时
+    / 异常）时无法确认 session 已死 → 保守保持 already_running、绝不删可能仍活的锁。
+
+    回归：旧实现 `_tmux_session_alive` 异常→False，会被调用方当成「session 已死」误入重夺，
+    在 tmux 临时不可用时删掉仍在跑的 detached session 的锁（破坏「绝不误删活锁」不变量）。
+    """
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)  # 未干净完成
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    # 指向不存在的 tmux 二进制 → subprocess.run 抛 FileNotFoundError（模拟 tmux 临时不可用）。
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
+    os.environ.pop("FAKE_TMUX_CALLS", None)
+    os.environ.pop("FAKE_TMUX_RETURNCODE", None)
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    # 无法确认死亡 → 保守 already_running，锁保留（不重夺、不 launch）。
+    assert result["launch_status"] == "already_running", result
+    assert lock_path.exists()
+
+
+def test_rvf_detached_thread_run_with_timeout(_root: Path | None = None) -> None:
+    """--run-with-timeout：正常退出码透传；超时 killpg 整组并返回 124。"""
+    helper = SCRIPT_DIR / "rvf_detached_thread.py"
+    passthrough = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--run-with-timeout",
+            "30",
+            "--",
+            sys.executable,
+            "-c",
+            "import sys; sys.exit(3)",
+        ]
+    ).returncode
+    assert passthrough == 3
+    timed_out = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--run-with-timeout",
+            "1",
+            "--",
+            sys.executable,
+            "-c",
+            "import time; time.sleep(10)",
+        ]
+    ).returncode
+    assert timed_out == 124
+
+
+def test_rvf_detached_thread_finalize_status_cli(root: Path) -> None:
+    """--finalize-status：merge returncode/finished_at，保留 launch 期字段。"""
+    root.mkdir(parents=True, exist_ok=True)
+    helper = SCRIPT_DIR / "rvf_detached_thread.py"
+    status_path = root / "s.status.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "launch_status": "launched",
+                "started_at": "t0",
+                "returncode": None,
+                "finished_at": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rc = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            "--finalize-status",
+            "--status-path",
+            str(status_path),
+            "--returncode",
+            "7",
+        ]
+    ).returncode
+    assert rc == 0
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["returncode"] == 7 and payload["finished_at"]
+    assert payload["launch_status"] == "launched" and payload["started_at"] == "t0"
+
+
+def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
+    """--execute --detached：self-fork dispatch_reviewers.py --execute 进 tmux，立即返回 status 路径。"""
+    import contextlib
+    import io
+
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    run_dir = root / "runs" / "rvf-disp-unit"
+    reviewers_dir = run_dir / "artifacts" / "reviewers"
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+
+    class _Ledger:
+        run_id = "rvf-disp-unit"
+
+        def __init__(self, rd: Path) -> None:
+            self.run_dir = rd
+
+        def env(self) -> dict:
+            return {"CODEX_RVF_RUN_ID": self.run_id}
+
+        def event(self, **_kw) -> None:
+            pass
+
+    args = argparse.Namespace(
+        registry="reg.json",
+        probe_mode="preflight",
+        probe_timeout=60.0,
+        main_harness="auto",
+        transcript=None,
+        main_harness_file=None,
+        assume_available=None,
+        require_external=False,
+        total_timeout=2700.0,
+    )
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = d.launch_detached_dispatch(
+                args,
+                _Ledger(run_dir),
+                reviewers_dir,
+                repo="/repo",
+                review_packet="/pkt",
+                session_context="/sow",
+                scope_contract="/sc",
+            )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    out = buf.getvalue()
+    assert rc == 0, out
+    assert "RVF_DISPATCH_STATUS=" in out and "RVF_DISPATCH_LAUNCH=launched" in out
+    status = json.loads(
+        (reviewers_dir / ".dispatch-thread.status.json").read_text(encoding="utf-8")
+    )
+    assert status["launch_status"] == "launched"
+    assert status["tmux_session"] == "rvf-dispatch-rvf-disp-unit"
+    child = status["command"]
+    assert "--execute" in child and "--detached" not in child
+    assert "--rvf-run-id" in child and "rvf-disp-unit" in child
+    assert "--rvf-run-dir" in child and "--repo" in child and "/repo" in child
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len(recorded) == 1
+    assert recorded[0]["argv"][:4] == [
+        "new-session",
+        "-d",
+        "-s",
+        "rvf-dispatch-rvf-disp-unit",
+    ]
+
+
+def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> None:
+    """FU-3：detached 派发把 ``ledger.env()``（含 CODEX_RVF_LOG_ROOT）显式写进 tmux 内层
+    wrapper shell 的 ``export X=Y;`` 行——reviewer 子进程不再依赖 tmux server 的 env 继承，
+    其 diff-tracker DB 与 prepare 写 lease 的库一致，消除 lease_not_found。"""
+    import contextlib
+    import io
+
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    run_dir = root / "runs" / "rvf-disp-unit"
+    reviewers_dir = run_dir / "artifacts" / "reviewers"
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+    log_root = root / "rvf-log-root"
+
+    class _Ledger:
+        run_id = "rvf-disp-unit"
+
+        def __init__(self, rd: Path) -> None:
+            self.run_dir = rd
+
+        def env(self) -> dict:
+            # 模拟 RunLedger.env()：含决定 diff-tracker DB 落点的 CODEX_RVF_LOG_ROOT。
+            return {
+                "CODEX_RVF_RUN_ID": self.run_id,
+                "CODEX_RVF_LOG_ROOT": str(log_root),
+                "CODEX_RVF_RUN_DIR": str(self.run_dir),
+            }
+
+        def event(self, **_kw) -> None:
+            pass
+
+    args = argparse.Namespace(
+        registry="reg.json",
+        probe_mode="preflight",
+        probe_timeout=60.0,
+        main_harness="auto",
+        transcript=None,
+        main_harness_file=None,
+        assume_available=None,
+        require_external=False,
+        total_timeout=2700.0,
+    )
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = d.launch_detached_dispatch(
+                args,
+                _Ledger(run_dir),
+                reviewers_dir,
+                repo="/repo",
+                review_packet="/pkt",
+                session_context="/sow",
+                scope_contract="/sc",
+            )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert rc == 0, buf.getvalue()
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len(recorded) == 1
+    # tmux new-session -d -s <name> <shell>：内层 wrapper shell 是最后一个参数。
+    shell_command = recorded[0]["argv"][-1]
+    # 关键断言：CODEX_RVF_LOG_ROOT 必须以正确的值显式 export 进内层 shell。
+    assert (
+        f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
+    ), shell_command
+    assert f"export CODEX_RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
+
+
+def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:
+    """waiter 终态判定：running / done(finished_at) / done(launch_failed) / 缺文件→running。"""
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    status_path = root / "s.json"
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launched", "finished_at": None, "returncode": None}),
+        encoding="utf-8",
+    )
+    running = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert running["state"] == "running", running
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launched", "finished_at": "t1", "returncode": 0}),
+        encoding="utf-8",
+    )
+    done = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert done["state"] == "done" and done["returncode"] == 0, done
+
+    status_path.write_text(
+        json.dumps({"launch_status": "launch_failed", "finished_at": None, "error": "boom"}),
+        encoding="utf-8",
+    )
+    failed = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert failed["state"] == "done" and failed["launch_status"] == "launch_failed", failed
+
+    missing = d.wait_for_dispatch_status(root / "missing.json", max_wait=0.0)
+    assert missing["state"] == "running", missing
+
+
 def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     """路由矩阵 R0–R4：测试用例名 ↔ 规则 id。
 
@@ -10074,8 +10916,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
         (
+            "rvf_prep_file_revive_expired_restamps_ttl",
+            lambda: test_rvf_prep_file_revive_expired_restamps_ttl(root / "prep-file-revive"),
+        ),
+        (
             "rvf_user_prompt_submit_dispatches_shared_workflow",
             lambda: test_rvf_user_prompt_submit_dispatches_shared_workflow(root / "prompt-submit-token"),
+        ),
+        (
+            "rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist",
+            lambda: test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
+                root / "prompt-submit-revive"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing",
+            lambda: test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing(
+                root / "prompt-submit-revive-missing"
+            ),
         ),
         (
             "rvf_user_prompt_submit_marker_without_token",
@@ -10137,6 +10995,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger",
             lambda: test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(
                 root / "prompt-submit-handoff-literal"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger",
+            lambda: test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger(
+                root / "prompt-submit-namespaced-subskill"
             ),
         ),
         (
@@ -11042,6 +11906,64 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_analyze_thread_lock_blocks_second_launch",
             lambda: test_rvf_analyze_thread_lock_blocks_second_launch(root / "analyze-thread-lock"),
+        ),
+        (
+            "rvf_detached_thread_status_two_phase",
+            lambda: test_rvf_detached_thread_status_two_phase(root / "detached-two-phase"),
+        ),
+        (
+            "rvf_detached_thread_lock_idempotent",
+            lambda: test_rvf_detached_thread_lock_idempotent(root / "detached-lock"),
+        ),
+        (
+            "rvf_detached_thread_launch_failed_releases_lock",
+            lambda: test_rvf_detached_thread_launch_failed_releases_lock(root / "detached-failed"),
+        ),
+        (
+            "rvf_detached_thread_reclaims_stale_lock_when_session_dead",
+            lambda: test_rvf_detached_thread_reclaims_stale_lock_when_session_dead(
+                root / "detached-stale-reclaim"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_when_session_alive",
+            lambda: test_rvf_detached_thread_keeps_lock_when_session_alive(
+                root / "detached-stale-alive"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_on_clean_finish",
+            lambda: test_rvf_detached_thread_keeps_lock_on_clean_finish(
+                root / "detached-stale-clean"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_when_tmux_probe_fails",
+            lambda: test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(
+                root / "detached-stale-probe-fail"
+            ),
+        ),
+        (
+            "rvf_detached_thread_run_with_timeout",
+            lambda: test_rvf_detached_thread_run_with_timeout(),
+        ),
+        (
+            "rvf_detached_thread_finalize_status_cli",
+            lambda: test_rvf_detached_thread_finalize_status_cli(root / "detached-finalize"),
+        ),
+        (
+            "dispatch_reviewers_detached_launch_wiring",
+            lambda: test_dispatch_reviewers_detached_launch_wiring(root / "dispatch-detached"),
+        ),
+        (
+            "dispatch_reviewers_detached_exports_codex_rvf_log_root",
+            lambda: test_dispatch_reviewers_detached_exports_codex_rvf_log_root(
+                root / "dispatch-detached-exports"
+            ),
+        ),
+        (
+            "dispatch_reviewers_wait_status_branches",
+            lambda: test_dispatch_reviewers_wait_status_branches(root / "dispatch-wait"),
         ),
     ]
 

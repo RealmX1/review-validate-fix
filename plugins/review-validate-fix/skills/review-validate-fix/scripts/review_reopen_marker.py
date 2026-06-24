@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """失败再入「重开评审范围」一次性标记（agent 写、Stop 消费）。
 
-约束 / 生命周期（镜像 ``post_analyze_quiet`` 的存储与原子写，状态语义借
+约束 / 生命周期（存储与原子写镜像 ``round_baseline_marker``，状态语义借
 ``kanban_followup_lock`` 的 active/stale/invalid）：
 
 - 由主 agent 在「用户带『实现未达标 / 有问题』信号回到实现终点、准备开修」时，

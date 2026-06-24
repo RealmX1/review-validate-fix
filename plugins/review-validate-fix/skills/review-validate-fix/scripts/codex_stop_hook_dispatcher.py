@@ -17,16 +17,7 @@ from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
-    current_kanban_task_id,
-    parent_session_id_from_event,
     surface_rvf_analyze_advisory,
-)
-from post_analyze_quiet import (
-    WORKFLOW_COMPLETE,
-    WORKFLOW_PENDING,
-    clear_post_analyze_quiet_marker,
-    post_analyze_workflow_status,
-    read_post_analyze_quiet_marker,
 )
 from session_manifest import build_manifest
 
@@ -1317,66 +1308,6 @@ def main() -> int:
             emit(payload)
             return 0
     latest_user = latest_user_message_from_event(event)
-    quiet_task_id = current_kanban_task_id(event)
-    quiet_session_id = parent_session_id_from_event(event)
-    quiet_marker = read_post_analyze_quiet_marker(
-        task_id=quiet_task_id,
-        session_id=quiet_session_id,
-    )
-    if quiet_marker is not None:
-        quiet_status = post_analyze_workflow_status(quiet_marker)
-        if quiet_status == WORKFLOW_COMPLETE:
-            consumed_paths = clear_post_analyze_quiet_marker(
-                task_id=quiet_task_id,
-                session_id=quiet_session_id,
-            )
-            ledger.event(
-                phase="dev-sync",
-                event="post_analyze_quiet_marker_consumed",
-                status="skipped",
-                reason_code="post_analyze_workflow_complete",
-                message="post-analyze quiet marker consumed by dispatcher; one-shot 已生效。",
-                post_analyze_quiet_marker=quiet_marker,
-                consumed_post_analyze_quiet_marker_paths=consumed_paths,
-            )
-            return emit_terminal_payload(
-                ledger,
-                status="skipped",
-                reason_code="post_analyze_workflow_complete",
-                message="post-analyze quiet marker consumed; dispatcher skipped sync and installed hook",
-                detail="检测到 post-analyze quiet marker，已就地消费并跳过 dispatcher dev sync 与 installed stop hook。",
-                consumed_post_analyze_quiet_marker_paths=consumed_paths,
-            )
-        if quiet_status == WORKFLOW_PENDING:
-            ledger.event(
-                phase="dev-sync",
-                event="post_analyze_quiet_marker_pending",
-                status="skipped",
-                reason_code="post_analyze_workflow_pending",
-                message="post-analyze quiet marker 仍在等待 analyze artifacts 完成；dispatcher 跳过自动 RVF 并保留 marker。",
-                post_analyze_quiet_marker=quiet_marker,
-            )
-            return emit_terminal_payload(
-                ledger,
-                status="skipped",
-                reason_code="post_analyze_workflow_pending",
-                message="post-analyze workflow is still pending; dispatcher skipped sync and installed hook",
-                detail="检测到 $rvf-analyze 尚未完成，已跳过本次自动 RVF，并保留 pending marker。",
-            )
-        consumed_paths = clear_post_analyze_quiet_marker(
-            task_id=quiet_task_id,
-            session_id=quiet_session_id,
-        )
-        ledger.event(
-            phase="dev-sync",
-            event="post_analyze_quiet_marker_consumed_incomplete",
-            status="skipped",
-            reason_code=f"post_analyze_workflow_{quiet_status}",
-            message="post-analyze quiet marker 已过期或无效，dispatcher 消费 marker 后继续既有流程。",
-            consumed_post_analyze_quiet_marker=quiet_marker,
-            consumed_post_analyze_quiet_marker_paths=consumed_paths,
-            post_analyze_workflow_status=quiet_status,
-        )
     if latest_user and RVF_ANALYZE_FOLLOWUP_MARKER in latest_user:
         ledger.event(
             phase="dev-sync",
