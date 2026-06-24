@@ -1127,12 +1127,20 @@ def build_manifest(
         seen_live_units.add(key)
         deduped_live_units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "exec_command"))
 
-    # Committed-round owned paths: agent-attributed paths whose round work lives
-    # in this round's commits (clean at HEAD, hence absent from dirty_set).
-    # Registered as path-level OwnedUnits — register_claims expands them per-hunk
-    # against the committed baseline. A committed path with no in-window tool
-    # attribution is skipped (pillar ③: never scope unattributed committed work,
-    # e.g. base-branch-sync content the agent never touched via a tool).
+    # Committed-round owned paths: paths whose round work lives in this round's
+    # commits (clean at HEAD, hence absent from dirty_set). Registered as
+    # path-level OwnedUnits — register_claims expands them per-hunk against the
+    # committed baseline. Attribution is default-on: a committed-round path is
+    # scoped even without parent-session transcript evidence, because the
+    # committed_round_set is already floored to this round's own first-parent,
+    # non-merge commits (base-branch-sync / merge imports are excluded upstream by
+    # `_list_committed_round_changed_paths`, and per-commit opt-out is available
+    # via the `RVF-Skip-Review` trailer). In-window tool evidence still labels the
+    # path precisely (apply_patch / claude_write / exec_command); paths with none
+    # — e.g. work committed by a sub-agent / headless runner / Kanban task that
+    # never appears in this transcript — fall back to `committed_round_git` so
+    # they are still attributed instead of silently dropped (the second-gate
+    # `no_session_owned_dirty` leak this closes).
     committed_round_owned: list[str] = []
     for path in sorted(committed_round_set):
         if path in dirty_set:
@@ -1144,7 +1152,7 @@ def build_manifest(
         elif path in round_window_exec_paths:
             evidence = "exec_command"
         else:
-            continue
+            evidence = "committed_round_git"
         key = (path, "path", "")
         if key in seen_live_units:
             continue

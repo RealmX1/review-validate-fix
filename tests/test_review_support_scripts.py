@@ -8812,6 +8812,21 @@ def _units_full_by_path(tracker_dir: str, path: str) -> dict[str, tuple[str, str
     return {row[0]: (row[1], row[2]) for row in rows}
 
 
+def _session_units_evidence_by_path(tracker_dir: str, path: str) -> set[str]:
+    import sqlite3 as _sqlite  # noqa: PLC0415
+
+    conn = _sqlite.connect(str(Path(tracker_dir) / "tracker.sqlite3"))
+    try:
+        rows = conn.execute(
+            "SELECT su.evidence FROM session_units su "
+            "JOIN units u ON u.unit_id = su.unit_id WHERE u.path = ?",
+            (path,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {row[0] for row in rows}
+
+
 def test_diff_tracker_observes_committed_round_units(tmp: Path) -> None:
     """A committed hunk yields the SAME unit_id as the equivalent dirty
     observation — the content-identity invariant that makes dedup free (§2/§4)."""
@@ -8918,6 +8933,65 @@ def test_build_manifest_includes_committed_round_owned_paths(tmp: Path) -> None:
     # Zero-diff guarantee: no baseline => no committed scope.
     manifest_none = sm.build_manifest(repo, transcript, tracker_run_id="r2", tracker_log_root=tmp / "logs2", committed_baseline=None)
     assert manifest_none["owned_committed_round_paths"] == []
+
+
+def test_build_manifest_attributes_committed_round_without_transcript_evidence(tmp: Path) -> None:
+    """Second-gate fix: a path committed in-round with NO parent-session
+    transcript tool evidence (sub-agent / headless runner / Kanban commit) is
+    still attributed (evidence='committed_round_git') and registers session_units,
+    so `_collect_candidate_unit_ids_in_txn` (EXISTS session_units) can see it.
+    Reproduces the `no_session_owned_dirty` leak that survived 218c5ed."""
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    # Transcript with session_meta only — no apply_patch / write / exec record,
+    # i.e. the parent session never touched f.txt via a tool.
+    transcript = tmp / "session.jsonl"
+    records = [
+        {"timestamp": "2026-06-24T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+    ]
+    transcript.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    # A "sub-agent" commits work to f.txt directly; HEAD is clean.
+    (repo / "f.txt").write_text("base\nsubagent\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "subagent work"], cwd=repo)
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=baseline)
+    assert manifest["owned_committed_round_paths"] == ["f.txt"], manifest["owned_committed_round_paths"]
+    assert manifest["owned_dirty_paths"] == []
+    assert manifest["tracker"]["status"] == "ok", manifest["tracker"]
+    evidence = _session_units_evidence_by_path(manifest["tracker"]["tracker_dir"], "f.txt")
+    assert evidence == {"committed_round_git"}, evidence
+
+
+def test_committed_round_changed_paths_excludes_skip_review_trailer(tmp: Path) -> None:
+    """Per-commit opt-out: a round commit carrying the `RVF-Skip-Review` trailer
+    drops its EXCLUSIVE paths from the committed-round set, while a path also
+    touched by a normal round commit stays (it remains in that commit's
+    name-only block), and normal-commit paths are kept."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    # Normal round commit: normal.txt (exclusive) + shared.txt.
+    (repo / "normal.txt").write_text("normal\n", encoding="utf-8")
+    (repo / "shared.txt").write_text("v1\n", encoding="utf-8")
+    run(["git", "add", "normal.txt", "shared.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "normal round work"], cwd=repo)
+    # Opt-out round commit: skip_only.txt (exclusive) + shared.txt again.
+    (repo / "skip_only.txt").write_text("skip\n", encoding="utf-8")
+    (repo / "shared.txt").write_text("v2\n", encoding="utf-8")
+    run(["git", "add", "skip_only.txt", "shared.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "headless cleanup", "-m", "RVF-Skip-Review: noise commit"], cwd=repo)
+    skip_shas = dt._list_round_skip_review_commit_shas(repo, baseline)
+    assert len(skip_shas) == 1, skip_shas
+    paths = dt._list_committed_round_changed_paths(repo, baseline)
+    assert "normal.txt" in paths, paths
+    assert "shared.txt" in paths, paths  # kept: also in the non-skip commit's block
+    assert "skip_only.txt" not in paths, paths  # excluded: only the skip commit touched it
+    # Bare-token form (no colon / value) also opts a commit out.
+    (repo / "bare_skip.txt").write_text("bare\n", encoding="utf-8")
+    run(["git", "add", "bare_skip.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "bare opt out", "-m", "RVF-Skip-Review"], cwd=repo)
+    assert len(dt._list_round_skip_review_commit_shas(repo, baseline)) == 2
+    assert "bare_skip.txt" not in dt._list_committed_round_changed_paths(repo, baseline)
 
 
 def test_committed_then_dirty_same_path_resolves_to_dirty(tmp: Path) -> None:
@@ -9945,6 +10019,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "build_manifest_includes_committed_round_owned_paths",
             lambda: test_build_manifest_includes_committed_round_owned_paths(root / "committed-manifest"),
+        ),
+        (
+            "build_manifest_attributes_committed_round_without_transcript_evidence",
+            lambda: test_build_manifest_attributes_committed_round_without_transcript_evidence(
+                root / "committed-no-evidence"
+            ),
+        ),
+        (
+            "committed_round_changed_paths_excludes_skip_review_trailer",
+            lambda: test_committed_round_changed_paths_excludes_skip_review_trailer(
+                root / "committed-skip-trailer"
+            ),
         ),
         (
             "committed_then_dirty_same_path_resolves_to_dirty",
