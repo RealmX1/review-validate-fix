@@ -525,6 +525,49 @@ def test_rvf_prep_file_round_trip_and_sweep(tmp_path: Path) -> None:
     assert not written.path.exists()
 
 
+def test_rvf_prep_file_revive_expired_restamps_ttl(tmp_path: Path) -> None:
+    """FU-1：写 prep → now 越过 expiry（read 为 expired 但带回 payload）→ revive 续期 →
+    再 read 为 valid，且非时间戳字段原样保留；缺 payload 的 lookup 不可 revive。"""
+    prep = load_rvf_prep_file_module()
+    root = tmp_path / "prep-root"
+    t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+    written = prep.write_prep_file(
+        {
+            "origin_session_id": "session-revive",
+            "rvf_run": {"run_id": "rvf-revive", "run_dir": str(tmp_path / "run")},
+        },
+        root=root,
+        token="0123456789abcdef",
+        now=t0,
+        ttl_seconds=300,
+    )
+    after = prep.parse_timestamp("2026-05-07T00:10:00Z")  # 越过 00:05:00 expiry
+    expired = prep.read_prep_file(written.token, root=root, now=after)
+    assert expired.status == "expired"
+    assert expired.payload is not None  # read 对 expired 仍带回 payload
+
+    revived = prep.revive_prep_file(expired, root=root, now=after, ttl_seconds=300)
+    assert revived.path == written.path  # 就地重写同一 token 文件
+    assert revived.payload["created_at"] == "2026-05-07T00:10:00Z"
+    assert revived.payload["expires_at"] == "2026-05-07T00:15:00Z"
+    assert revived.payload["origin_session_id"] == "session-revive"  # 非时间戳字段保留
+    assert revived.payload["rvf_run"]["run_id"] == "rvf-revive"
+
+    again = prep.read_prep_file(
+        written.token, root=root, now=prep.parse_timestamp("2026-05-07T00:12:00Z")
+    )
+    assert again.status == "valid", again  # 续期后回到 valid
+
+    missing = prep.read_prep_file("aaaaaaaaaaaaaaaa", root=root, now=after)
+    assert missing.status == "missing" and missing.payload is None
+    try:
+        prep.revive_prep_file(missing, root=root, now=after)
+    except prep.PrepFileError:
+        pass
+    else:
+        raise AssertionError("expected revive of payload-less lookup to fail")
+
+
 def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> None:
     prep = load_rvf_prep_file_module()
     submit = load_rvf_user_prompt_submit_module()
@@ -636,6 +679,151 @@ def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> No
             )
         finally:
             prepare_module.prepare_run_from_prep_file = original_prepare
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
+    tmp_path: Path,
+) -> None:
+    """FU-1：dispatch token 在场、prep 已过 TTL，但 run_dir 仍在 → 就地续期、走 valid 派发
+    路径（workflow 启动），而非静默丢整轮 followup。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)  # run artifacts 仍在
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-revive",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-revive", "run_dir": str(run_dir)},
+            },
+            root=root,
+            token="aaaaaaaaaaaaaaaa",
+            now=t0,
+            ttl_seconds=300,
+        )
+        prepare_calls: list[str] = []
+
+        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
+            prepare_calls.append(record_arg.token)
+            state = {
+                "started_at": "2026-05-07T00:10:01Z",
+                "completed_at": "2026-05-07T00:10:02Z",
+                "status": "completed",
+                "target_flow": record_arg.payload.get("target_flow"),
+                "artifacts": {"review_env": "/tmp/review-env.sh"},
+            }
+            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
+            new_rvf_run["shared_workflow_state"] = state
+            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
+            return state
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            # now 越过 expiry（00:05:00）：read 判 expired，但 run_dir 在 → 续期 → valid 派发。
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=root,
+                now="2026-05-07T00:10:00Z",
+            )
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+        assert payload["status"] == "valid", payload  # 续期后走 valid 路径
+        assert payload.get("prep_revived") is True
+        assert payload["workflow_started"] is True
+        assert prepare_calls == ["aaaaaaaaaaaaaaaa"]  # 确实派发，而非静默丢
+        # 非 dispatch_no_prep：systemMessage 含 run_id（valid 行），不是「未跑」诊断。
+        assert "rvf-revive" in (payload.get("systemMessage") or "")
+        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
+        assert any(
+            d.get("event") == "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
+        ), diagnostics
+        # prep 文件已就地续期：在 00:12:00 仍 valid（原 300s TTL 早已过）。
+        again = prep.read_prep_file(
+            "aaaaaaaaaaaaaaaa", root=root, now=prep.parse_timestamp("2026-05-07T00:12:00Z")
+        )
+        assert again.status == "valid", again
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing(
+    tmp_path: Path,
+) -> None:
+    """FU-1 负例：prep 已过 TTL 且 run_dir 不在（run 已清理 / 真过期）→ 不复活，仍走原
+    dispatch_no_prep 早返回（不复活已消失的 run）。"""
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    missing_run_dir = tmp_path / "run-gone"  # 故意不创建
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-gone",
+                "origin_repo": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-gone", "run_dir": str(missing_run_dir)},
+            },
+            root=root,
+            token="aaaaaaaaaaaaaaaa",
+            now=t0,
+            ttl_seconds=300,
+        )
+        prepare_calls: list[str] = []
+
+        def fake_prepare(record_arg, **_):
+            prepare_calls.append(record_arg.token)
+            return {"status": "completed"}
+
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        import importlib
+
+        prepare_module = importlib.import_module("prepare_review_run")
+        original_prepare = prepare_module.prepare_run_from_prep_file
+        prepare_module.prepare_run_from_prep_file = fake_prepare
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
+                    "cwd": str(tmp_path),
+                },
+                prep_root=root,
+                now="2026-05-07T00:10:00Z",
+            )
+        finally:
+            prepare_module.prepare_run_from_prep_file = original_prepare
+        assert payload["status"] == "expired", payload  # 未复活
+        assert "prep_revived" not in payload
+        assert payload["workflow_started"] is False
+        assert prepare_calls == []  # 未派发
+        assert (
+            isinstance(payload.get("systemMessage"), str)
+            and "aaaaaaaaaaaaaaaa" in payload["systemMessage"]
+        )
+        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
+        assert all(
+            d.get("event") != "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
+        ), diagnostics
     finally:
         os.environ.pop("CODEX_RVF_PREP_ROOT", None)
 
@@ -10604,8 +10792,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         ),
         ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
         (
+            "rvf_prep_file_revive_expired_restamps_ttl",
+            lambda: test_rvf_prep_file_revive_expired_restamps_ttl(root / "prep-file-revive"),
+        ),
+        (
             "rvf_user_prompt_submit_dispatches_shared_workflow",
             lambda: test_rvf_user_prompt_submit_dispatches_shared_workflow(root / "prompt-submit-token"),
+        ),
+        (
+            "rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist",
+            lambda: test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
+                root / "prompt-submit-revive"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing",
+            lambda: test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing(
+                root / "prompt-submit-revive-missing"
+            ),
         ),
         (
             "rvf_user_prompt_submit_marker_without_token",
