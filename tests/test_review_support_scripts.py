@@ -178,6 +178,33 @@ def write_fake_tmux_script(path: Path) -> Path:
     return path
 
 
+def write_subcommand_aware_tmux_script(path: Path) -> Path:
+    """fake tmux：记录调用，并按子命令分别返回退出码——
+
+    - ``has-session`` → ``FAKE_TMUX_HAS_SESSION_RETURNCODE``（默认 0，即「存活」）
+    - 其余（``new-session`` 等）→ ``FAKE_TMUX_RETURNCODE``（默认 0）
+
+    供 FU-2 staleness 测试构造「has-session 报死 + new-session 成功」等组合
+    （uniform 的 write_fake_tmux_script 无法区分子命令）。
+    """
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        "calls = os.environ.get('FAKE_TMUX_CALLS')\n"
+        "if calls:\n"
+        "    with open(calls, 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'argv': argv}) + '\\n')\n"
+        "sub = argv[0] if argv else ''\n"
+        "if sub == 'has-session':\n"
+        "    raise SystemExit(int(os.environ.get('FAKE_TMUX_HAS_SESSION_RETURNCODE', '0')))\n"
+        "raise SystemExit(int(os.environ.get('FAKE_TMUX_RETURNCODE', '0')))\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
 class _AnalyzeLedgerStub:
     run_id = "rvf-unit"
 
@@ -324,8 +351,10 @@ def test_rvf_analyze_thread_lock_blocks_second_launch(root: Path) -> None:
 
     assert first["launch_status"] == "launched"
     # 每 run O_EXCL 锁：第二次命中 already_running，不再启动 tmux。
+    # 第二次会先 has-session 探活（session 存活 → already_running），故按 new-session 计数。
+    recorded = [json.loads(line)["argv"] for line in tmux_calls.read_text(encoding="utf-8").splitlines()]
     assert second["launch_status"] == "already_running"
-    assert len(tmux_calls.read_text(encoding="utf-8").splitlines()) == 1
+    assert len([a for a in recorded if a[:1] == ["new-session"]]) == 1, recorded
 
 
 def load_check_review_output_module():
@@ -9337,7 +9366,10 @@ def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
                 os.environ[key] = value
     assert first["launch_status"] == "launched", first
     assert second["launch_status"] == "already_running", second
-    assert len(calls.read_text(encoding="utf-8").splitlines()) == 1
+    # 第二次 launch 现在会先 has-session 探活（session 存活 → already_running），
+    # 故按 new-session 子命令计数：全程只起过一次 tmux。
+    recorded = [json.loads(line)["argv"] for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len([a for a in recorded if a[:1] == ["new-session"]]) == 1, recorded
 
 
 def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
@@ -9381,6 +9413,112 @@ def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
     assert status["launch_status"] == "launch_failed"
     assert "boom" in (status["error"] or "")
     assert not lock_path.exists()  # 锁释放，可重试
+
+
+def _seed_detached_stale_lock(root: Path, *, returncode: object) -> tuple[Path, Path]:
+    """预置一个「持锁线程已退出」的现场：写锁文件 + 带指定 returncode 的 status.json。
+
+    ``returncode=None`` 表示未干净完成（launched 后没回写）；``returncode=0`` 表示干净完成。
+    """
+    lock_path = root / "s.lock"
+    status_path = root / "s.status.json"
+    lock_path.write_text("rvf-detached-unit\nt0\n", encoding="utf-8")
+    payload: dict[str, object] = {"launch_status": "launched", "finished_at": None}
+    if returncode is not None:
+        payload["returncode"] = returncode
+        payload["finished_at"] = "t1"
+    else:
+        payload["returncode"] = None
+    status_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    return lock_path, status_path
+
+
+def _launch_detached_with_staleness_env(
+    module,
+    root: Path,
+    *,
+    lock_path: Path,
+    status_path: Path,
+    has_session_rc: str,
+    new_session_rc: str = "0",
+) -> tuple[dict, list[list]]:
+    """用 subcommand-aware fake tmux 跑一次 launch_detached，返回 (result, 记录的 tmux argv)。"""
+    fake_tmux = write_subcommand_aware_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    saved = {
+        k: os.environ.get(k)
+        for k in (
+            "CODEX_RVF_TMUX_BIN",
+            "FAKE_TMUX_CALLS",
+            "FAKE_TMUX_RETURNCODE",
+            "FAKE_TMUX_HAS_SESSION_RETURNCODE",
+        )
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = new_session_rc
+    os.environ["FAKE_TMUX_HAS_SESSION_RETURNCODE"] = has_session_rc
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    recorded = (
+        [json.loads(line)["argv"] for line in calls.read_text(encoding="utf-8").splitlines()]
+        if calls.exists()
+        else []
+    )
+    return result, recorded
+
+
+def test_rvf_detached_thread_reclaims_stale_lock_when_session_dead(root: Path) -> None:
+    """FU-2：持锁 detached 线程已死（has-session≠0）且 run 未干净完成 → 重夺锁、重新 launch。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
+    )
+    assert result["launch_status"] == "launched", result  # 重夺并重派
+    assert ["has-session", "-t", "rvf-detached-unit"] in recorded  # 确实先探活
+    assert any(a[:1] == ["new-session"] for a in recorded), recorded  # 确实重新起 tmux
+    assert lock_path.exists()  # 重夺后锁仍由本次持有
+
+
+def test_rvf_detached_thread_keeps_lock_when_session_alive(root: Path) -> None:
+    """FU-2：持锁 session 仍存活（has-session==0）→ already_running，绝不重派。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="0"
+    )
+    assert result["launch_status"] == "already_running", result
+    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 未起新 tmux
+    assert lock_path.exists()  # 活锁保留
+
+
+def test_rvf_detached_thread_keeps_lock_on_clean_finish(root: Path) -> None:
+    """FU-2：session 已死但 run 已干净完成（returncode==0）→ already_running，幂等不重跑。"""
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=0)
+    result, recorded = _launch_detached_with_staleness_env(
+        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
+    )
+    assert result["launch_status"] == "already_running", result
+    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 不重跑已完成的 run
+    assert lock_path.exists()
 
 
 def test_rvf_detached_thread_run_with_timeout(_root: Path | None = None) -> None:
@@ -11452,6 +11590,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_detached_thread_launch_failed_releases_lock",
             lambda: test_rvf_detached_thread_launch_failed_releases_lock(root / "detached-failed"),
+        ),
+        (
+            "rvf_detached_thread_reclaims_stale_lock_when_session_dead",
+            lambda: test_rvf_detached_thread_reclaims_stale_lock_when_session_dead(
+                root / "detached-stale-reclaim"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_when_session_alive",
+            lambda: test_rvf_detached_thread_keeps_lock_when_session_alive(
+                root / "detached-stale-alive"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_on_clean_finish",
+            lambda: test_rvf_detached_thread_keeps_lock_on_clean_finish(
+                root / "detached-stale-clean"
+            ),
         ),
         (
             "rvf_detached_thread_run_with_timeout",
