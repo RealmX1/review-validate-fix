@@ -9531,6 +9531,87 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
     ]
 
 
+def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> None:
+    """FU-3：detached 派发把 ``ledger.env()``（含 CODEX_RVF_LOG_ROOT）显式写进 tmux 内层
+    wrapper shell 的 ``export X=Y;`` 行——reviewer 子进程不再依赖 tmux server 的 env 继承，
+    其 diff-tracker DB 与 prepare 写 lease 的库一致，消除 lease_not_found。"""
+    import contextlib
+    import io
+
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    fake_tmux = write_fake_tmux_script(root / "tmux.py")
+    calls = root / "calls.jsonl"
+    run_dir = root / "runs" / "rvf-disp-unit"
+    reviewers_dir = run_dir / "artifacts" / "reviewers"
+    reviewers_dir.mkdir(parents=True, exist_ok=True)
+    log_root = root / "rvf-log-root"
+
+    class _Ledger:
+        run_id = "rvf-disp-unit"
+
+        def __init__(self, rd: Path) -> None:
+            self.run_dir = rd
+
+        def env(self) -> dict:
+            # 模拟 RunLedger.env()：含决定 diff-tracker DB 落点的 CODEX_RVF_LOG_ROOT。
+            return {
+                "CODEX_RVF_RUN_ID": self.run_id,
+                "CODEX_RVF_LOG_ROOT": str(log_root),
+                "CODEX_RVF_RUN_DIR": str(self.run_dir),
+            }
+
+        def event(self, **_kw) -> None:
+            pass
+
+    args = argparse.Namespace(
+        registry="reg.json",
+        probe_mode="preflight",
+        probe_timeout=60.0,
+        main_harness="auto",
+        transcript=None,
+        main_harness_file=None,
+        assume_available=None,
+        require_external=False,
+        total_timeout=2700.0,
+    )
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = d.launch_detached_dispatch(
+                args,
+                _Ledger(run_dir),
+                reviewers_dir,
+                repo="/repo",
+                review_packet="/pkt",
+                session_context="/sow",
+                scope_contract="/sc",
+            )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert rc == 0, buf.getvalue()
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert len(recorded) == 1
+    # tmux new-session -d -s <name> <shell>：内层 wrapper shell 是最后一个参数。
+    shell_command = recorded[0]["argv"][-1]
+    # 关键断言：CODEX_RVF_LOG_ROOT 必须以正确的值显式 export 进内层 shell。
+    assert (
+        f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
+    ), shell_command
+    assert f"export CODEX_RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
+
+
 def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:
     """waiter 终态判定：running / done(finished_at) / done(launch_failed) / 缺文件→running。"""
     d = load_dispatch_reviewers_module()
@@ -11383,6 +11464,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "dispatch_reviewers_detached_launch_wiring",
             lambda: test_dispatch_reviewers_detached_launch_wiring(root / "dispatch-detached"),
+        ),
+        (
+            "dispatch_reviewers_detached_exports_codex_rvf_log_root",
+            lambda: test_dispatch_reviewers_detached_exports_codex_rvf_log_root(
+                root / "dispatch-detached-exports"
+            ),
         ),
         (
             "dispatch_reviewers_wait_status_branches",

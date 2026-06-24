@@ -808,6 +808,12 @@ def launch_detached_dispatch(
         status_path=status_path,
         lock_path=lock_path,
         status_payload=status_payload,
+        # 把 RVF env 显式写进 tmux 内层 shell 的 `export X=Y;` 行，让 detached
+        # reviewer 子进程稳定读到 CODEX_RVF_LOG_ROOT 等——不再依赖 tmux server 是否
+        # 预存在的 env 继承（既有 tmux server 会让 new-session 继承 server 的 env，
+        # 丢掉这里 launch_env 传入的值）。否则 reviewer 的 diff-tracker DB 落到默认
+        # state 目录、与 prepare 写 lease 的库分叉 → lease_not_found。
+        exports=ledger.env(),
         launch_env={**os.environ, **ledger.env()},
         idempotency_key=f"rvf-dispatch:{run_name}",
         total_timeout_seconds=args.total_timeout,
