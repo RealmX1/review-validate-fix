@@ -130,10 +130,15 @@ def _build_wrapper_shell(
 
 
 def _tmux_session_alive(session_name: str) -> bool:
-    """``tmux has-session``：returncode 0 → session 存活。
+    """``tmux has-session`` 探活：仅当能**确定性**断定 session 不存在时才回 False。
 
-    任何异常 / 超时一律视为「无法确认存活」→ False（保守：宁可后续按 stale 重夺，也不
-    因探活失败而让死 tmux 的锁永久挡住重派）。
+    - has-session 跑完、returncode 0 → session 存活 → True。
+    - has-session 跑完、returncode≠0（含「无此 session」「无 server」）→ 确定不存在 → False。
+    - 探活本身失败（tmux 二进制不可用 / PATH 问题 / 超时 / 任何异常）→ **无法确认** →
+      **保守回 True（当作可能存活）**。这是「绝不误删活锁」不变量的关键：tmux 临时不可用
+      时，决不能把仍在跑的 detached session 误判为死、进而删它的锁。代价是 tmux 持续不可用
+      下真陈旧锁暂不被回收——这是更安全的失败方向（且回到 FU-2 之前的「不回收」行为，可由
+      后续 tmux 恢复后的下一次派发兜底）。
     """
     try:
         completed = subprocess.run(
@@ -144,7 +149,7 @@ def _tmux_session_alive(session_name: str) -> bool:
             timeout=10.0,
         )
     except Exception:  # noqa: BLE001
-        return False
+        return True
     return completed.returncode == 0
 
 
@@ -168,13 +173,14 @@ def _reclaim_stale_detached_lock(
 ) -> int | None:
     """detached 幂等锁的 staleness 判定 + 单次重夺。
 
-    仅当**持锁的 detached 线程确已死**（``tmux has-session`` 失败）**且其 run 未干净
-    完成**（status.json ``returncode`` 非 0）时，判定锁陈旧：删旧锁并以 ``O_EXCL`` 单次
-    重夺，成功则返回新 fd（调用方据此继续 launch，后续用新 payload 覆盖旧 status.json）。
+    仅当 ``tmux has-session`` **确定性报 session 不存在**（探活成功且 returncode≠0）**且其
+    run 未干净完成**（status.json ``returncode`` 非 0）时，判定锁陈旧：删旧锁并以 ``O_EXCL``
+    单次重夺，成功则返回新 fd（调用方据此继续 launch，后续用新 payload 覆盖旧 status.json）。
 
-    返回 None 的三种情形，调用方一律回退到 ``already_running``：
+    返回 None 的四种情形，调用方一律回退到 ``already_running``：
 
     - session 仍存活 → 真 already_running（不可重派）；
+    - 探活无法确认存活/死亡（tmux 临时不可用 → ``_tmux_session_alive`` 保守回 True）→ 不动锁；
     - session 已死但 run 已干净完成 → 幂等、不重跑已完成的 run；
     - 重夺时与并发者竞态再撞 ``FileExistsError`` → 让对方持有。
 

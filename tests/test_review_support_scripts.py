@@ -9709,6 +9709,44 @@ def test_rvf_detached_thread_keeps_lock_on_clean_finish(root: Path) -> None:
     assert lock_path.exists()
 
 
+def test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(root: Path) -> None:
+    """FU-2 安全不变量（RVF cursor review 发现）：tmux 探活本身失败（binary 不可用 / 超时
+    / 异常）时无法确认 session 已死 → 保守保持 already_running、绝不删可能仍活的锁。
+
+    回归：旧实现 `_tmux_session_alive` 异常→False，会被调用方当成「session 已死」误入重夺，
+    在 tmux 临时不可用时删掉仍在跑的 detached session 的锁（破坏「绝不误删活锁」不变量）。
+    """
+    module = load_rvf_detached_thread_module()
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)  # 未干净完成
+    saved = {
+        k: os.environ.get(k)
+        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    # 指向不存在的 tmux 二进制 → subprocess.run 抛 FileNotFoundError（模拟 tmux 临时不可用）。
+    os.environ["CODEX_RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
+    os.environ.pop("FAKE_TMUX_CALLS", None)
+    os.environ.pop("FAKE_TMUX_RETURNCODE", None)
+    try:
+        result = module.launch_detached(
+            session_name="rvf-detached-unit",
+            argv=["echo", "hi"],
+            log_path=root / "s.log",
+            status_path=status_path,
+            lock_path=lock_path,
+            status_payload=_detached_status_payload(),
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    # 无法确认死亡 → 保守 already_running，锁保留（不重夺、不 launch）。
+    assert result["launch_status"] == "already_running", result
+    assert lock_path.exists()
+
+
 def test_rvf_detached_thread_run_with_timeout(_root: Path | None = None) -> None:
     """--run-with-timeout：正常退出码透传；超时 killpg 整组并返回 124。"""
     helper = SCRIPT_DIR / "rvf_detached_thread.py"
@@ -11811,6 +11849,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_detached_thread_keeps_lock_on_clean_finish",
             lambda: test_rvf_detached_thread_keeps_lock_on_clean_finish(
                 root / "detached-stale-clean"
+            ),
+        ),
+        (
+            "rvf_detached_thread_keeps_lock_when_tmux_probe_fails",
+            lambda: test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(
+                root / "detached-stale-probe-fail"
             ),
         ),
         (
