@@ -46,6 +46,14 @@ RANGE_TOLERANCE = 5
 
 DISABLE_ENV = "CODEX_RVF_TRACKER_DISABLE"
 
+# Per-commit opt-out trailer (pillar ③ compatible). A round commit whose message
+# carries this git trailer (`RVF-Skip-Review:` with an optional reason value, or a
+# bare `RVF-Skip-Review` line) is excluded from the committed-round path set, so
+# its changes are never auto-routed to review. This is the explicit "don't review
+# this commit" escape hatch that complements the default-on attribution of
+# `_list_committed_round_changed_paths`.
+RVF_SKIP_REVIEW_COMMIT_TRAILER = "RVF-Skip-Review"
+
 # Slice 3 reason-code rename (with one-release alias). The new names belong to
 # the `allocate_review_scope` path; the legacy names stay live in the
 # `CODEX_RVF_TRACKER_DISABLE=1` fallback so disable-mode users see no behavior
@@ -849,18 +857,69 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
     return None
 
 
+def _commit_message_has_skip_review_trailer(message: str) -> bool:
+    """True when a commit message opts out via the ``RVF-Skip-Review`` trailer.
+
+    Accepts both the canonical git-trailer form (``RVF-Skip-Review: <reason>``,
+    value optional) and a bare standalone ``RVF-Skip-Review`` line. Matching is
+    case-insensitive on the trailer key and lenient about placement (any line
+    in the message), so an agent need not perfectly format a trailer block to
+    opt a commit out of review."""
+    token = RVF_SKIP_REVIEW_COMMIT_TRAILER.lower()
+    for raw_line in message.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower() == token:
+            return True
+        key = line.split(":", 1)[0].strip().lower()
+        if key == token:
+            return True
+    return False
+
+
+def _list_round_skip_review_commit_shas(repo: Path, baseline: str) -> set[str]:
+    """SHAs of this round's first-parent, non-merge commits that carry the
+    ``RVF-Skip-Review`` opt-out trailer (see ``RVF_SKIP_REVIEW_COMMIT_TRAILER``).
+
+    Walks the same first-parent/no-merges window the path collector uses, so an
+    excluded commit's changes drop out of every committed-round consumer at
+    once."""
+    try:
+        # %H<US>%B<RS> — unit-sep between sha and body, record-sep between commits.
+        out = _run_git(
+            repo,
+            ["log", "--first-parent", "--no-merges", "--format=%H%x1f%B%x1e", f"{baseline}..HEAD"],
+        )
+    except RuntimeError:
+        return set()
+    skip: set[str] = set()
+    for record in out.split("\x1e"):
+        record = record.strip("\n")
+        if not record or "\x1f" not in record:
+            continue
+        sha, _sep, body = record.partition("\x1f")
+        sha = sha.strip()
+        if sha and _commit_message_has_skip_review_trailer(body):
+            skip.add(sha)
+    return skip
+
+
 def _list_committed_round_changed_paths(repo: Path, baseline: str) -> list[str]:
     """Paths whose content differs between the `baseline` tree and `HEAD`,
     restricted to the work introduced by *this round's own* first-parent,
-    non-merge commits.
+    non-merge commits, minus any commit that opted out via the
+    ``RVF-Skip-Review`` trailer.
 
     Pillar ③ (exclude background WIP / base-branch sync): the ``baseline..HEAD``
     range already floors at this round's start, and when the round contains a
     merge (e.g. the agent ran `git merge main` / `git pull`) the first-parent +
     no-merges commit walk drops the merge commit and the base commits it imports
-    via its second parent. The authoritative gate remains transcript attribution
-    in `build_manifest` (`owned_paths ∩` this set); this function is the cheap
-    structural pre-filter, not the scope decision itself."""
+    via its second parent. A first-parent commit may additionally opt out of
+    review via the ``RVF-Skip-Review`` trailer; such commits' exclusive changes
+    are removed here (a path also touched by a non-skip round commit stays, since
+    it remains in that commit's name-only block). This function is the cheap
+    structural pre-filter; `build_manifest` then attributes the survivors."""
     try:
         net = _run_git(repo, ["diff", "--no-renames", "--name-only", "-z", f"{baseline}..HEAD"])
     except RuntimeError:
@@ -868,26 +927,46 @@ def _list_committed_round_changed_paths(repo: Path, baseline: str) -> list[str]:
     net_paths = sorted({item for item in net.split("\0") if item})
     if not net_paths:
         return []
-    # Fast path: when the round contains no merges, the net diff already
-    # reflects only first-parent work — no allowlist filtering needed.
+    skip_shas = _list_round_skip_review_commit_shas(repo, baseline)
+    # Fast path: when the round contains no merges AND no opt-out commits, the net
+    # diff already reflects only reviewable first-parent work — no allowlist pass.
     try:
         total = _run_git(repo, ["rev-list", "--count", f"{baseline}..HEAD"]).strip()
         first_parent = _run_git(
             repo, ["rev-list", "--count", "--first-parent", "--no-merges", f"{baseline}..HEAD"]
         ).strip()
+        no_merges = total == first_parent
     except RuntimeError:
+        # Counts unavailable: only safe to fast-return when nothing must be
+        # filtered out; otherwise fall through to the per-commit allowlist.
+        if not skip_shas:
+            return net_paths
+        no_merges = False
+    if no_merges and not skip_shas:
         return net_paths
-    if total == first_parent:
-        return net_paths
-    # Merges present: keep only paths touched by first-parent non-merge commits.
+    # Merges and/or opt-out commits present: keep only paths touched by a
+    # first-parent, non-merge, non-skip commit. The `%x1e%H` record marker lets
+    # us attribute each name-only block to its commit so skip commits drop out.
     try:
         log_out = _run_git(
             repo,
-            ["log", "--first-parent", "--no-merges", "--no-renames", "--name-only", "--format=", f"{baseline}..HEAD"],
+            ["log", "--first-parent", "--no-merges", "--no-renames", "--name-only", "--format=%x1e%H", f"{baseline}..HEAD"],
         )
     except RuntimeError:
         return net_paths
-    allowed = {line.strip() for line in log_out.splitlines() if line.strip()}
+    allowed: set[str] = set()
+    for block in log_out.split("\x1e"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        lines = block.split("\n")
+        sha = lines[0].strip()
+        if sha in skip_shas:
+            continue
+        for line in lines[1:]:
+            path = line.strip()
+            if path:
+                allowed.add(path)
     return [path for path in net_paths if path in allowed]
 
 

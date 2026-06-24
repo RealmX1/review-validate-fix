@@ -129,6 +129,77 @@ def _build_wrapper_shell(
     )
 
 
+def _tmux_session_alive(session_name: str) -> bool:
+    """``tmux has-session`` 探活：仅当能**确定性**断定 session 不存在时才回 False。
+
+    - has-session 跑完、returncode 0 → session 存活 → True。
+    - has-session 跑完、returncode≠0（含「无此 session」「无 server」）→ 确定不存在 → False。
+    - 探活本身失败（tmux 二进制不可用 / PATH 问题 / 超时 / 任何异常）→ **无法确认** →
+      **保守回 True（当作可能存活）**。这是「绝不误删活锁」不变量的关键：tmux 临时不可用
+      时，决不能把仍在跑的 detached session 误判为死、进而删它的锁。代价是 tmux 持续不可用
+      下真陈旧锁暂不被回收——这是更安全的失败方向（且回到 FU-2 之前的「不回收」行为，可由
+      后续 tmux 恢复后的下一次派发兜底）。
+    """
+    try:
+        completed = subprocess.run(
+            [tmux_bin(), "has-session", "-t", session_name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10.0,
+        )
+    except Exception:  # noqa: BLE001
+        return True
+    return completed.returncode == 0
+
+
+def _detached_run_finished_clean(status_path: Path) -> bool:
+    """读 status.json，仅当 ``returncode == 0``（被包命令干净完成）才返回 True。
+
+    缺文件 / 非法 JSON / 非 dict / 无 returncode / returncode≠0 一律 False（视作未干净
+    完成，可被重派）。
+    """
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("returncode") == 0
+
+
+def _reclaim_stale_detached_lock(
+    *, lock_path: Path, session_name: str, status_path: Path
+) -> int | None:
+    """detached 幂等锁的 staleness 判定 + 单次重夺。
+
+    仅当 ``tmux has-session`` **确定性报 session 不存在**（探活成功且 returncode≠0）**且其
+    run 未干净完成**（status.json ``returncode`` 非 0）时，判定锁陈旧：删旧锁并以 ``O_EXCL``
+    单次重夺，成功则返回新 fd（调用方据此继续 launch，后续用新 payload 覆盖旧 status.json）。
+
+    返回 None 的四种情形，调用方一律回退到 ``already_running``：
+
+    - session 仍存活 → 真 already_running（不可重派）；
+    - 探活无法确认存活/死亡（tmux 临时不可用 → ``_tmux_session_alive`` 保守回 True）→ 不动锁；
+    - session 已死但 run 已干净完成 → 幂等、不重跑已完成的 run；
+    - 重夺时与并发者竞态再撞 ``FileExistsError`` → 让对方持有。
+
+    全程兜底：任何异常 → None（保守保留 already_running，绝不误删活锁）。
+    """
+    try:
+        if _tmux_session_alive(session_name):
+            return None
+        if _detached_run_finished_clean(status_path):
+            return None
+        _unlink_quiet(lock_path)
+        try:
+            return os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def launch_detached(
     *,
     session_name: str,
@@ -164,17 +235,27 @@ def launch_detached(
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.touch(exist_ok=True)
 
-        # 每-run O_EXCL 锁：第二次 launch 命中 FileExistsError → already_running
+        # 每-run O_EXCL 锁：第二次 launch 命中 FileExistsError → 默认 already_running
         # （不重写 status：首个 launch 已写过，保留其 started_at 等启动期字段）。
+        # 例外——staleness 重夺：若持锁的 detached 线程确已死（tmux session 不在）且其
+        # run 未干净完成，则该锁是陈旧锁（死 tmux 后内层命令失败/被杀，finalize 只回写
+        # returncode、从不删锁），删后单次重夺以放行重派；其余情形仍幂等地保持
+        # already_running。
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            return {
-                "launch_status": LAUNCH_ALREADY_RUNNING,
-                "returncode": None,
-                "error": None,
-                "tmux_command": None,
-            }
+            fd = _reclaim_stale_detached_lock(
+                lock_path=lock_path,
+                session_name=session_name,
+                status_path=status_path,
+            )
+            if fd is None:
+                return {
+                    "launch_status": LAUNCH_ALREADY_RUNNING,
+                    "returncode": None,
+                    "error": None,
+                    "tmux_command": None,
+                }
         lock_acquired = True
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(f"{idempotency_key or session_name}\n{_iso_now()}\n")

@@ -6216,6 +6216,22 @@ def _committed_round_session(path: Path, repo: Path, session_id: str) -> Path:
     return transcript
 
 
+def _committed_round_session_without_tool_evidence(path: Path, repo: Path, session_id: str) -> Path:
+    """Transcript with session_meta only — no apply_patch / write / exec record.
+    Models round work committed by a sub-agent / headless runner / Kanban task
+    that never appears as a tool call in the parent session (the second-gate
+    `no_session_owned_dirty` leak). session_meta.id == the Stop event session_id
+    so register_claims and candidate collection key the same session."""
+    transcript = path / "session.jsonl"
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": str(repo)}},
+    ]
+    transcript.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+    return transcript
+
+
 def test_committed_round_clean_repo_routes_to_review(tmp_path: Path) -> None:
     """Regression for the commit-9127824 gate gap: once the agent commits this
     round's work the tree is clean, yet the committed-but-unreviewed change must
@@ -6289,6 +6305,96 @@ def test_clean_repo_with_committed_work_but_no_marker_skips(tmp_path: Path) -> N
         state_dir=state,
     )
     assert_skip_reason(stdout, "clean")
+
+
+def test_committed_round_without_transcript_evidence_routes_to_review(tmp_path: Path) -> None:
+    """Second-gate regression — reproduces rvf-20260624T054404Z. The round's work
+    is committed by a sub-agent / headless runner, so the parent transcript carries
+    NO apply_patch/write/exec record. 218c5ed's first gate routes it, but pillar ③
+    previously dropped it for lack of transcript evidence → the downstream
+    `no_session_owned_dirty` (session_scope_clean) skip fired and the user had to
+    trigger RVF by hand. After the fix the path must be attributed
+    (evidence='committed_round_git'), reach `tracker_scope_allocated`, and decide
+    `dry_run` — NOT skip."""
+    repo = _init_committed_round_repo(tmp_path)
+    state = tmp_path / "state"
+    session_id = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+    transcript = _committed_round_session_without_tool_evidence(tmp_path, repo, session_id)
+
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "请让子 agent 改一行并提交",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    # Sub-agent commits the round's work -> working tree is clean, no tool record.
+    _commit_round_work(repo)
+    assert _porcelain(repo) == ""
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "decision" not in payload
+    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
+    summary = latest_summary(state)
+    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_route_selected" in events, events
+    assert "tracker_scope_allocated" in events, events
+
+
+def test_committed_round_skip_review_trailer_excludes_and_audits(tmp_path: Path) -> None:
+    """Per-commit opt-out e2e: a round whose only commit carries the
+    `RVF-Skip-Review` trailer must NOT route to review (historical clean_repo
+    skip), yet must leave a `committed_round_skip_excluded` audit event so the
+    exclusion is never silent and `committed_round_route_selected` never fires."""
+    repo = _init_committed_round_repo(tmp_path)
+    state = tmp_path / "state"
+    session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+    transcript = _committed_round_session(tmp_path, repo, session_id)
+
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "提交但请勿自动审",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    # Commit the round's work WITH the opt-out trailer.
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], repo)
+    run(["git", "commit", "-q", "-m", "round work", "-m", "RVF-Skip-Review: opt out"], repo)
+    assert _porcelain(repo) == ""
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    assert_skip_reason(stdout, "clean")
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_skip_excluded" in events, events
+    assert "committed_round_route_selected" not in events, events
 
 
 def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
@@ -7581,6 +7687,8 @@ def main() -> int:
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
         test_committed_round_clean_repo_routes_to_review,
+        test_committed_round_without_transcript_evidence_routes_to_review,
+        test_committed_round_skip_review_trailer_excludes_and_audits,
         test_clean_repo_with_committed_work_but_no_marker_skips,
         test_plan_document_only_routes_out_of_full_rvf,
         test_read_only_session_with_background_plan_docs_does_not_plan_route,

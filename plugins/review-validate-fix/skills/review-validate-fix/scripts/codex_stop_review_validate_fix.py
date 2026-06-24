@@ -70,6 +70,7 @@ from diff_tracker import (
     REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
     _disabled as _tracker_disabled,
     _list_committed_round_changed_paths,
+    _list_round_skip_review_commit_shas,
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
@@ -7745,9 +7746,30 @@ def maybe_route_committed_round_scope(
     )
     if not baseline:
         return None
+    repo_path = Path(repo).expanduser().resolve()
+    # Per-commit opt-out audit: surface which round commits the `RVF-Skip-Review`
+    # trailer excluded BEFORE the empty-set early return, so even a round whose
+    # commits are all opted-out (committed_paths == []) leaves an audit trace
+    # instead of looking indistinguishable from "no committed work".
+    try:
+        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline))
+    except Exception:
+        skip_review_shas = []
+    if skip_review_shas:
+        ledger.event(
+            phase="gate",
+            event="committed_round_skip_excluded",
+            status="committed",
+            reason_code="rvf_skip_review_trailer",
+            repo=repo,
+            cwd=cwd,
+            committed_baseline=baseline,
+            skipped_commit_shas=skip_review_shas,
+            skipped_commit_count=len(skip_review_shas),
+        )
     try:
         committed_paths = _list_committed_round_changed_paths(
-            Path(repo).expanduser().resolve(),
+            repo_path,
             baseline,
         )
     except Exception:

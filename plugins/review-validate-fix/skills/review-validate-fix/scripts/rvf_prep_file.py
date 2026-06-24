@@ -212,6 +212,46 @@ def update_prep_file(
     return PrepFileRecord(token=record.token, path=record.path, payload=payload)
 
 
+def revive_prep_file(
+    lookup: PrepFileLookup,
+    *,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> PrepFileRecord:
+    """把一个**已过期、但 payload 仍在**的 prep 文件就地续期为可派发（valid）。
+
+    用途（FU-1，方案 B）：dispatch token 在场、prep 已过 TTL，但其 run artifacts 仍存在
+    ——与其静默丢弃整轮 followup，不如以新的 ``created_at`` / ``expires_at`` 重写**同一个
+    token 文件**，让既有 valid 派发路径继续。仅覆盖时间戳（受保护字段），其余 payload
+    字段原样保留。
+
+    ``read_prep_file`` 对 ``expired`` 状态仍带回 payload，故 ``lookup.payload`` 在过期场景
+    可用；缺 payload（``missing`` / ``invalid_json`` 等）则抛 ``PrepFileError``。经
+    ``_atomic_write_json`` **覆盖**既存过期文件（区别于 ``_atomic_create_json`` 的 O_EXCL
+    创建语义——目标文件本就存在）。
+    """
+    if ttl_seconds <= 0:
+        raise PrepFileError("prep file ttl_seconds must be positive")
+    if lookup.payload is None:
+        raise PrepFileError("cannot revive prep file without payload")
+    normalized_token = validate_token(lookup.token)
+    created_at = (now or utc_now()).astimezone(timezone.utc)
+    expires_at = created_at + timedelta(seconds=ttl_seconds)
+    payload = dict(lookup.payload)
+    payload.update(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "token": normalized_token,
+            "created_at": format_timestamp(created_at),
+            "expires_at": format_timestamp(expires_at),
+        }
+    )
+    path = prep_file_path(normalized_token, root)
+    _atomic_write_json(path, payload)
+    return PrepFileRecord(token=normalized_token, path=path, payload=payload)
+
+
 def _invalid(token: str, path: Path, status: str, error: str | None = None) -> PrepFileLookup:
     return PrepFileLookup(status=status, token=token, path=path, error=error)
 

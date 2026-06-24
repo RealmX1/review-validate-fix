@@ -816,6 +816,26 @@ def arm_kanban_followup_lock_on_delivery(
     return marker_str
 
 
+def _run_artifacts_present(payload: dict[str, Any]) -> bool:
+    """best-effort：prep payload 指向的 run artifacts（``rvf_run.run_dir``）是否仍在磁盘。
+
+    FU-1 过期再生成的守卫——只复活 run_dir 仍存在的过期 prep，不复活已被清理 / 真过期的
+    run。任何结构异常或 OSError → False（保守不复活）。
+    """
+    if not isinstance(payload, dict):
+        return False
+    rvf_run = payload.get("rvf_run")
+    if not isinstance(rvf_run, dict):
+        return False
+    run_dir = rvf_run.get("run_dir")
+    if not isinstance(run_dir, str) or not run_dir:
+        return False
+    try:
+        return Path(run_dir).is_dir()
+    except OSError:
+        return False
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
@@ -892,8 +912,43 @@ def inspect_user_prompt_submit(
             payload["diagnostic_path"] = str(diag_path)
         except (OSError, rvf_prep_file.PrepFileError) as exc:
             payload["diagnostic_error"] = str(exc)
+        if (
+            lookup.status == "expired"
+            and lookup.payload is not None
+            and _run_artifacts_present(lookup.payload)
+        ):
+            # FU-1（方案 B）：prep 已过 TTL，但其 run artifacts 仍在 → 就地续期、记一条
+            # revived 诊断、沿用既有 valid 派发路径，而非静默丢整轮 followup。run_dir 不在
+            # （run 已清理 / 真过期）则不复活，继续走下面的 dispatch_no_prep 早返回。
+            try:
+                revived = rvf_prep_file.revive_prep_file(lookup, root=prep_root, now=lookup_now)
+            except (OSError, rvf_prep_file.PrepFileError):
+                revived = None
+            if revived is not None:
+                lookup = rvf_prep_file.PrepFileLookup(
+                    status="valid",
+                    token=revived.token,
+                    path=revived.path,
+                    payload=revived.payload,
+                )
+                payload["status"] = "valid"
+                payload["prep_revived"] = True
+                try:
+                    rvf_prep_file.append_diagnostic(
+                        root=prep_root,
+                        token=token,
+                        record={
+                            "event": "user_prompt_submit_dispatch_prep_revived",
+                            "status": "revived",
+                            "workflow_started": False,
+                            "prep_file_path": str(revived.path),
+                            "prompt_source": prompt_source,
+                        },
+                    )
+                except (OSError, rvf_prep_file.PrepFileError):
+                    pass
         if lookup.status != "valid" or lookup.payload is None:
-            # dispatch token 在场但 prep 缺失 / 过期 / 不可读：给用户一条可见诊断行
+            # dispatch token 在场但 prep 缺失 / 过期不可再生 / 不可读：给用户一条可见诊断行
             # （user-facing systemMessage，不进模型上下文），磁盘 diagnostics 已另记。
             payload["systemMessage"] = _trigger_system_message(
                 kind="dispatch_no_prep", token=token, status=lookup.status
