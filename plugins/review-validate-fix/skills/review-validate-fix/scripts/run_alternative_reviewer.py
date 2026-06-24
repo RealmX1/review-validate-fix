@@ -16,6 +16,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import diff_tracker
+from cursor_stream_tool_layer_health import classify_cursor_tool_call_outcome
 from rvf_logging import start_run
 
 
@@ -29,6 +30,12 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_ACTIVITY_CHECK_INTERVAL_SECONDS = 300.0
 DEFAULT_ACTIVITY_PROBE_TIMEOUT_SECONDS = 10.0
 DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD = 3
+# cursor-agent stream-json 工具层失败「快速失败」阈值：在 cursor 自身 tool-runtime
+# 连续报 spawnError / Aborted（工具执行器坏了，而非命令本身退出非零）累计达到该次数、
+# 且尚无任何一次成功工具调用时，判定工具层不可用并提前 fail-over，不再白烧 idle_timeout。
+# 详见 CursorStreamActivityMonitor。背景：2026-06-24 一次 cursor 自更新后的首次运行
+# transient 把整条工具层打断（10/10 工具调用失败），旧逻辑直到 ~83s 才放弃。
+DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
 DEFAULT_LEASE_HEARTBEAT_SECONDS = 60.0
 LEASE_HEARTBEAT_ENV = "CODEX_RVF_LEASE_HEARTBEAT_SECONDS"
@@ -837,6 +844,63 @@ class ClaudeStreamActivityMonitor:
                     self.active_anonymous_bash_tools -= 1
 
 
+class CursorStreamActivityMonitor:
+    """监控 cursor-agent stream-json，在工具执行层整体坏掉时支持「快速失败」。
+
+    与 :class:`ClaudeStreamActivityMonitor` 不同，本 monitor **不**抑制 idle 超时
+    （``waiting_on_long_command`` 恒为 ``False``，保留既有 idle-timeout 安全网完整不变），
+    只做一件事：累计 cursor 自身 tool-runtime 失败次数，并在「失败达阈值且从未有过一次
+    成功工具调用」时把 :attr:`tool_layer_unavailable` 置真，让调度循环提前 fail-over。
+    """
+
+    def __init__(self, *, tool_failure_threshold: int) -> None:
+        self._pending_line = ""
+        self._tool_failure_threshold = max(1, int(tool_failure_threshold))
+        self.tool_runtime_failures = 0
+        self.tool_successes = 0
+
+    @property
+    def waiting_on_long_command(self) -> bool:
+        # 刻意不抑制 idle 超时：cursor 一直靠 stdout 增长刷新 liveness，且「started 但永不
+        # completed」的悬挂工具调用若抑制 idle 反而会让既有兜底失效（cursor 无 max_runtime）。
+        return False
+
+    @property
+    def tool_layer_unavailable(self) -> bool:
+        return (
+            self.tool_runtime_failures >= self._tool_failure_threshold
+            and self.tool_successes == 0
+        )
+
+    def ingest(self, output: str) -> None:
+        self._pending_line += output
+        lines = self._pending_line.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_line = lines.pop()
+        else:
+            self._pending_line = ""
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            self._ingest_line(line)
+
+    def _ingest_line(self, line: str) -> None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") != "tool_call" or payload.get("subtype") != "completed":
+            return
+        outcome = classify_cursor_tool_call_outcome(payload.get("tool_call"))
+        if outcome == "runtime_failure":
+            self.tool_runtime_failures += 1
+        elif outcome == "ok":
+            self.tool_successes += 1
+
+
 class ReviewerRunResult:
     def __init__(
         self,
@@ -1006,6 +1070,7 @@ def run_with_activity_timeout(
     activity_probe_failure_threshold: int,
     max_runtime_seconds: float | None,
     output_format: str,
+    tool_failure_threshold: int = DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD,
 ) -> ReviewerRunResult:
     """运行外部 reviewer，并按 stdout/stderr 可观测活动刷新空闲超时。
 
@@ -1032,15 +1097,21 @@ def run_with_activity_timeout(
     consecutive_probe_failures = 0
     probe_history: list[dict[str, Any]] = []
     pending_input: str | None = input_text
-    # 已知限制：activity monitor 只解析 Claude 的 tool_use 块以在"长静默命令"期间抑制 idle 超时。
-    # cursor-agent stream-json 发的是 schema 不同的 tool_call 事件，故 cursor_stream_json
-    # 不挂 monitor——常规评审靠 stdout 增长刷新 idle-timeout 已足够，边角可调 idle_timeout_seconds /
-    # activity_probe 兜底。后续如需更精细可扩展 monitor 识别 cursor tool_call。
-    stream_monitor = (
-        ClaudeStreamActivityMonitor()
-        if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON
-        else None
-    )
+    # 两种 stream monitor 各司其职：
+    #  - Claude：解析 tool_use 块，在「长静默命令」期间抑制 idle 超时（waiting_on_long_command）。
+    #  - cursor：解析 tool_call(completed) 事件，统计 cursor 自身工具执行层失败；不抑制 idle，
+    #    只在工具层整体坏掉时（tool_layer_unavailable）让下方循环提前 fail-over。
+    #    背景见 CursorStreamActivityMonitor 与 DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD。
+    if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
+        stream_monitor: ClaudeStreamActivityMonitor | CursorStreamActivityMonitor | None = (
+            ClaudeStreamActivityMonitor()
+        )
+    elif output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON:
+        stream_monitor = CursorStreamActivityMonitor(
+            tool_failure_threshold=tool_failure_threshold
+        )
+    else:
+        stream_monitor = None
 
     try:
         while True:
@@ -1120,6 +1191,24 @@ def run_with_activity_timeout(
                     last_stdout_len = stdout_len
                     last_stderr_len = stderr_len
                     consecutive_probe_failures = 0
+                    # 快速失败：cursor 工具执行层整体坏掉（连续 spawnError/Aborted 且零成功）时
+                    # 立即终止并 fail-over，不再等 idle_timeout 白烧（实测可省 ~83s）。
+                    if (
+                        isinstance(stream_monitor, CursorStreamActivityMonitor)
+                        and stream_monitor.tool_layer_unavailable
+                    ):
+                        return timeout_completed(
+                            process,
+                            command,
+                            idle_timeout_seconds=idle_timeout_seconds,
+                            activity_check_interval_seconds=activity_check_interval_seconds,
+                            activity_probe_command=activity_probe_command,
+                            activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+                            activity_probe_failure_threshold=activity_probe_failure_threshold,
+                            max_runtime_seconds=max_runtime_seconds,
+                            reason="cursor_tool_layer_unavailable",
+                            probe_history=probe_history,
+                        )
                     continue
 
                 if now - last_liveness_at < idle_timeout_seconds:
@@ -1569,6 +1658,11 @@ def main() -> int:
             "activity_probe_failure_threshold",
             DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD,
         )
+        tool_failure_threshold = positive_int(
+            config,
+            "tool_failure_threshold",
+            DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD,
+        )
         max_runtime = optional_positive_float(
             config,
             "max_runtime_seconds",
@@ -1887,6 +1981,7 @@ def main() -> int:
                 activity_probe_failure_threshold=activity_probe_failure_threshold,
                 max_runtime_seconds=max_runtime,
                 output_format=output_format,
+                tool_failure_threshold=tool_failure_threshold,
             )
         except Exception as exc:
             completed = ReviewerRunResult(

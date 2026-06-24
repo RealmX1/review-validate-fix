@@ -1,4 +1,27 @@
 {
+  "_comment_cursor_tool_layer": [
+    "运维须知（cursor-agent 工具执行层）：",
+    "cursor-agent 的 `status`/`--version` 只验 auth 与版本号，不验工具执行层。2026-06-24 一次自更新",
+    "后的『首次运行 transient』曾让 model/auth 全正常、却 10/10 工具调用 spawnError/Aborted（坏 build",
+    "骗过了健康检查），RVF 直到 ~83s idle 才放弃。该次故障经多次 repro 证实为一次性 transient、已自愈，",
+    "故此处【不】主动 pin 版本（主动冻结会为已消失的问题永久挡住 cursor 更新，不划算）。",
+    "",
+    "现有防护：评审过程中 CursorStreamActivityMonitor 会实时检测连续 spawnError/Aborted（见",
+    "run_alternative_reviewer.py 与 tool_failure_threshold，默认 3）并提前 fail-over，不再白烧 83s。",
+    "",
+    "若未来某 cursor build 【持续性】破坏工具层（gate 复测仍坏），RVF-local 应急冻结办法：把下方",
+    "`command` 数组的首元素从 \"cursor-agent\" 改成某个 known-good 版本的【绝对路径】，例如",
+    "  \"/Users/<you>/.local/share/cursor-agent/versions/<known-good>/cursor-agent\"",
+    "（仅冻结 RVF 用的 cursor，不动你交互式 cursor）。注意两点：① 必须用绝对路径——subprocess 不展开 `~`；",
+    "② 本机 cursor-agent 是按版本目录的 wrapper，环境变量 `CURSOR_AGENT_BIN` 在此 install 下【不生效】",
+    "（实测设了仍跑 PATH 上的 build），论坛上的 CURSOR_AGENT_BIN 招法只适用于另一种 launcher 式安装。",
+    "known-good 版本见 ~/.local/share/cursor-agent/versions/ 里前一个日期的 build。",
+    "",
+    "【升级 / 改 pin / 解冻前必须先跑】工具层冒烟 gate，过了才信任新 build：",
+    "  python3 ../scripts/verify_cursor_tool_layer.py            # 验证 PATH 上当前 cursor-agent",
+    "  python3 ../scripts/verify_cursor_tool_layer.py --cursor-bin <候选 build 的 cursor-agent>",
+    "退出码 0=工具层健康可信任，1=工具层坏掉勿用，2=harness 错误需人工排查。"
+  ],
   "enabled": true,
   "label": "alternative-reviewer:cursor-cli",
   "command": [
