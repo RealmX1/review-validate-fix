@@ -16,6 +16,15 @@ import time
 from pathlib import Path
 
 from _rvf_test_support.repo import templated_repo
+from _rvf_test_support.registry_completeness_guard import (
+    assert_every_defined_test_is_registered,
+    registered_names_from_callables,
+)
+
+
+# 注册表完整性守卫的豁免名单（唯一合法出口）：仅放确属暂时隔离、暂时跑不过的测试，
+# 每项须附 `# quarantined: <原因+issue>`。当前为空 = 严格模式：任何 def test_* 漏登记即红。
+INTENTIONALLY_UNREGISTERED: frozenset[str] = frozenset()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -7476,6 +7485,7 @@ def test_log_unavailable_does_not_break_hook_payload(tmp_path: Path) -> None:
 
 def test_parent_thread_path_for_origin_returns_codex_validated_path(tmp_path: Path) -> None:
     module = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
     rollout = tmp_path / "rollout.jsonl"
     rollout.write_text(
         json.dumps({"type": "session_meta", "payload": {"id": "codex-sess"}}) + "\n",
@@ -7504,6 +7514,7 @@ def _read_ledger_events(ledger) -> list[dict]:
 def test_parent_thread_path_for_origin_falls_back_to_existing_file(tmp_path: Path) -> None:
     """Claude transcript：file 存在但 session_meta 校验失败 → 走 fallback。"""
     module = load_hook_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
     transcript = tmp_path / "claude.jsonl"
     transcript.write_text(
         json.dumps({"type": "permission-mode", "permissionMode": "plan", "sessionId": "claude"})
@@ -7723,7 +7734,16 @@ def main() -> int:
         test_missing_cwd_skips_and_requests_target_repo,
         test_log_unavailable_does_not_break_hook_payload,
         test_resolve_cline_kanban_agent_id_mirrors_parent_harness,
+        test_parent_thread_path_for_origin_returns_codex_validated_path,
+        test_parent_thread_path_for_origin_falls_back_to_existing_file,
+        test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty,
     ]
+    assert_every_defined_test_is_registered(
+        globals(),
+        registered_names_from_callables(tests),
+        source_path=__file__,
+        intentionally_unregistered=INTENTIONALLY_UNREGISTERED,
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         selected = [

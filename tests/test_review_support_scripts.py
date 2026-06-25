@@ -18,6 +18,16 @@ import time
 import traceback
 from pathlib import Path
 
+from _rvf_test_support.registry_completeness_guard import (
+    assert_every_defined_test_is_registered,
+    registered_names_from_case_tuples,
+)
+
+
+# 注册表完整性守卫的豁免名单（唯一合法出口）：仅放确属暂时隔离、暂时跑不过的测试，
+# 每项须附 `# quarantined: <原因+issue>`。当前为空 = 严格模式：任何 def test_* 漏登记即红。
+INTENTIONALLY_UNREGISTERED: frozenset[str] = frozenset()
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SKILL_CONTRACTS = ROOT / "scripts" / "check_skill_contracts.sh"
@@ -11672,6 +11682,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap"),
         ),
         (
+            "prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore",
+            lambda: test_prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore(
+                root / "worktree-bootstrap-ignore"
+            ),
+        ),
+        (
             "prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide",
             lambda: test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
                 root / "worktree-bootstrap-name-collision"
@@ -12211,6 +12227,15 @@ def main() -> int:
                 f"reviewer tests may flake. Recommended: --jobs <= {_cpu // 2}.",
                 file=sys.stderr,
             )
+
+    # 分片之前无条件跑一次完整性守卫：注册表 = 唯一索引，任何 def test_* 漏登记即红。
+    # 用任意 root 构造未分片的全量注册表即可（lambda 不被调用，root 值无关）。
+    assert_every_defined_test_is_registered(
+        globals(),
+        registered_names_from_case_tuples(review_support_test_cases(Path("/"))),
+        source_path=__file__,
+        intentionally_unregistered=INTENTIONALLY_UNREGISTERED,
+    )
 
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
