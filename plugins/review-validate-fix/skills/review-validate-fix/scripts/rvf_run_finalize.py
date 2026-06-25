@@ -240,7 +240,16 @@ def _release_tracker_lease(
     log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
     log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
     release_reason = "failed" if decision_kind in {"cancelled", "cancel", "interrupted"} else "completed"
+    did_review: bool | None = None
     if release_reason == "completed":
+        # A genuine review leaves at least one reviewer artifact on disk; a no-op
+        # follow-up (clean tree → 0 reviewers dispatched) leaves none. Only flip
+        # leased units to `reviewed` when a reviewer actually ran, so a no-op
+        # completion releases the lease without silently marking unreviewed work
+        # reviewed (which would convert an over-dispatch into a missed-review).
+        did_review = any(
+            (run_dir / "artifacts" / "reviewers").glob("*/review-result.json")
+        )
         result = diff_tracker.complete_review_scope(
             repo=repo,
             lease_id=lease_id,
@@ -248,6 +257,7 @@ def _release_tracker_lease(
             scope_hash=scope_hash,
             run_id=run_id,
             reason=release_reason,
+            mark_reviewed=did_review,
             log_root_override=log_root_override,
         )
     else:
@@ -262,6 +272,7 @@ def _release_tracker_lease(
         "lease_id": lease_id,
         "release_reason": release_reason,
         "primary_unit_count": len(primary_units),
+        "did_review": did_review,
         **result,
     }
 

@@ -9178,6 +9178,249 @@ def test_committed_unit_dedup_reviewed_not_resurrected(tmp: Path) -> None:
         assert after[uid][1] == "reviewed", (uid, after[uid])
 
 
+def test_added_file_unit_identity_stable_dirty_staged_committed(tmp: Path) -> None:
+    """A NEW file must mint ONE content-keyed unit_id across all three observed
+    forms — untracked (dirty), staged, and committed — so a new file reviewed
+    while dirty stays deduped once it becomes tracked. Before the add-identity
+    unification the tracked (staged/committed) forms minted a fresh hunk-body
+    unit_id and diverged from the untracked id, which is what re-dispatched
+    reviewed-then-committed new files (the rename add-half over-dispatch)."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    (repo / "newfile.txt").write_text("hello\nworld\n", encoding="utf-8")
+
+    dirty_obs = dt._classify_path(repo, "newfile.txt")
+    assert dirty_obs is not None and dirty_obs.kind == "untracked_file", dirty_obs
+    dirty_ids = sorted(s.unit_id for s in dt._specs_from_observation(dirty_obs, "newfile.txt"))
+    assert len(dirty_ids) == 1, dirty_ids
+
+    run(["git", "add", "newfile.txt"], cwd=repo)
+    staged_obs = dt._classify_path(repo, "newfile.txt")
+    assert staged_obs is not None and staged_obs.kind == "tracked_hunk", staged_obs
+    assert staged_obs.change_type == "add", staged_obs
+    staged_ids = sorted(s.unit_id for s in dt._specs_from_observation(staged_obs, "newfile.txt"))
+
+    run(["git", "commit", "-q", "-m", "add newfile"], cwd=repo)
+    assert run(["git", "status", "--porcelain"], cwd=repo).stdout.strip() == ""
+    committed_obs = dt._classify_committed_path(repo, "newfile.txt", baseline)
+    assert committed_obs is not None and committed_obs.change_type == "add", committed_obs
+    committed_ids = sorted(s.unit_id for s in dt._specs_from_observation(committed_obs, "newfile.txt"))
+
+    assert dirty_ids == staged_ids == committed_ids, (dirty_ids, staged_ids, committed_ids)
+
+
+def test_committed_added_file_dedup_reviewed_not_redispatched(tmp: Path) -> None:
+    """The reported over-dispatch dual, at the allocate level: a NEW file (models
+    a rename's add half / a new file authored + reviewed while dirty) is reviewed
+    clean, then committed; the follow-up allocate with the round baseline must
+    find NO candidate (status 'empty') — not re-dispatch it. Pre-fix the committed
+    add minted a fresh unit_id, so it re-entered the candidate pool as available
+    and the follow-up over-dispatched a no-op review round."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "newfile.txt").write_text("brand new content\n", encoding="utf-8")
+    owned = dt.OwnedUnit(path="newfile.txt", unit="path", hunk_anchor=None)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r1", worktree=repo, branch=None,
+        owned_paths=["newfile.txt"], apply_patch_paths={"newfile.txt"}, exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+    )
+    first = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False,
+    )
+    assert first["status"] == "allocated", first
+    assert first["candidate_unit_count"] >= 1, first
+    dt.complete_review_scope(
+        repo=repo, lease_id=first["lease_id"], scope_hash=first["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    reviewed_before = _units_full_by_path(first["tracker_dir"], "newfile.txt")
+    reviewed_ids = [uid for uid, (_obs, rev) in reviewed_before.items() if rev == "reviewed"]
+    assert reviewed_ids, reviewed_before
+
+    run(["git", "add", "newfile.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "commit reviewed new file"], cwd=repo)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r2", worktree=repo, branch=None,
+        owned_paths=["newfile.txt"], apply_patch_paths=set(), exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+        committed_paths={"newfile.txt"}, committed_baseline=baseline,
+    )
+    second = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r2", reviewer_id="rev2",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    assert second["status"] == "empty", second
+    after = _units_full_by_path(first["tracker_dir"], "newfile.txt")
+    for uid in reviewed_ids:
+        assert after[uid][0] == "committed", (uid, after[uid])
+        assert after[uid][1] == "reviewed", (uid, after[uid])
+
+
+def test_complete_review_scope_mark_reviewed_gate(tmp: Path) -> None:
+    """`complete_review_scope(mark_reviewed=False)` must release the lease but NOT
+    flip any unit to 'reviewed' (the no-op-completion guard); the default
+    (mark_reviewed=True) still flips. Without the gate, a no-op completion
+    silently marks unreviewed work reviewed → reverse missed-review."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    owned = dt.OwnedUnit(path="f.txt", unit="path", hunk_anchor=None)
+    dt.register_claims(
+        repo=repo, session_id="s1", run_id="r1", worktree=repo, branch=None,
+        owned_paths=["f.txt"], apply_patch_paths={"f.txt"}, exec_only_paths=set(),
+        owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+    )
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False,
+    )
+    assert alloc["status"] == "allocated", alloc
+    released = dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        mark_reviewed=False, log_root_override=logs,
+    )
+    assert released["released"] is True, released
+    assert released["released_unit_count"] == 0, released
+    after_noop = _units_full_by_path(alloc["tracker_dir"], "f.txt")
+    assert after_noop, after_noop
+    # No-op completion reverts assigned units to 'available' (re-reviewable), not 'reviewed'.
+    assert all(rev == "available" for (_obs, rev) in after_noop.values()), after_noop
+
+    # Nothing was marked reviewed, so the same work is still allocatable.
+    re_alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1b", reviewer_id="rev2",
+        log_root_override=logs, auto_claim_observed=False,
+    )
+    assert re_alloc["status"] == "allocated", re_alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=re_alloc["lease_id"], scope_hash=re_alloc["scope_hash"], run_id="r1b",
+        log_root_override=logs,
+    )
+    after_real = _units_full_by_path(alloc["tracker_dir"], "f.txt")
+    assert any(rev == "reviewed" for (_obs, rev) in after_real.values()), after_real
+
+
+def test_release_tracker_lease_noop_completion_does_not_mark_reviewed(tmp: Path) -> None:
+    """finalize-level wiring of the no-op guard: `_release_tracker_lease` derives
+    `mark_reviewed` from reviewer-artifact presence. A run_dir with NO
+    reviewers/*/review-result.json (a no-op follow-up) must release the lease with
+    did_review=False and leave units unreviewed; a run_dir WITH a reviewer
+    artifact marks them reviewed."""
+    import importlib  # noqa: PLC0415
+
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    if "rvf_run_finalize" in sys.modules:
+        fin = sys.modules["rvf_run_finalize"]
+    else:
+        fin = importlib.import_module("rvf_run_finalize")
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+    owned = dt.OwnedUnit(path="f.txt", unit="path", hunk_anchor=None)
+
+    def _write_contract(run_dir: Path, lease_id: str, scope_hash: str, run_id: str, units: list[str]) -> None:
+        inputs = run_dir / "artifacts" / "inputs"
+        inputs.mkdir(parents=True, exist_ok=True)
+        (inputs / "scope.contract.json").write_text(
+            json.dumps({
+                "tracker_lease_id": lease_id,
+                "tracker_scope_hash": scope_hash,
+                "run_id": run_id,
+                "primary_units": units,
+            }),
+            encoding="utf-8",
+        )
+
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    try:
+        dt.register_claims(
+            repo=repo, session_id="s1", run_id="r1", worktree=repo, branch=None,
+            owned_paths=["f.txt"], apply_patch_paths={"f.txt"}, exec_only_paths=set(),
+            owned_units_override=[(owned, "apply_patch")], log_root_override=logs,
+        )
+        alloc1 = dt.allocate_review_scope(
+            repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+            log_root_override=logs, auto_claim_observed=False,
+        )
+        assert alloc1["status"] == "allocated", alloc1
+        unit_ids = list(_units_full_by_path(alloc1["tracker_dir"], "f.txt").keys())
+
+        # No-op follow-up: run_dir without any reviewer artifact.
+        noop_run = tmp / "run-noop"
+        _write_contract(noop_run, alloc1["lease_id"], alloc1["scope_hash"], "r1", unit_ids)
+        noop_result = fin._release_tracker_lease(noop_run, repo, decision_kind="handoff")
+        assert noop_result is not None, "expected a release result"
+        assert noop_result["did_review"] is False, noop_result
+        assert noop_result["released"] is True, noop_result
+        after_noop = _units_full_by_path(alloc1["tracker_dir"], "f.txt")
+        # No-op finalize reverts assigned units to 'available', never 'reviewed'.
+        assert all(rev == "available" for (_obs, rev) in after_noop.values()), after_noop
+
+        # Genuine review: run_dir with a reviewer artifact present.
+        alloc2 = dt.allocate_review_scope(
+            repo=repo, session_id="s1", run_id="r2", reviewer_id="rev2",
+            log_root_override=logs, auto_claim_observed=False,
+        )
+        assert alloc2["status"] == "allocated", alloc2
+        real_run = tmp / "run-real"
+        reviewer_dir = real_run / "artifacts" / "reviewers" / "rev2"
+        reviewer_dir.mkdir(parents=True, exist_ok=True)
+        (reviewer_dir / "review-result.json").write_text("{}", encoding="utf-8")
+        _write_contract(real_run, alloc2["lease_id"], alloc2["scope_hash"], "r2", unit_ids)
+        real_result = fin._release_tracker_lease(real_run, repo, decision_kind="handoff")
+        assert real_result is not None and real_result["did_review"] is True, real_result
+        after_real = _units_full_by_path(alloc1["tracker_dir"], "f.txt")
+        assert any(rev == "reviewed" for (_obs, rev) in after_real.values()), after_real
+    finally:
+        if original_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original_log_root
+
+
+def test_seal_round_baseline_to_head_advances_marker(tmp: Path) -> None:
+    """rvf-land 封窗: `seal_round_baseline_to_head` advances the round-baseline
+    marker from an older baseline to the current HEAD, so the next Stop's
+    committed-round window (baseline..HEAD) is empty for the just-landed commit."""
+    dt, _sm, rbm = _round_baseline_committed_modules()
+    import seal_round_baseline_to_head as seal  # noqa: PLC0415
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_task = os.environ.get("KANBAN_TASK_ID")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    os.environ["KANBAN_TASK_ID"] = "seal-task-1"
+    try:
+        # Marker initially pinned at the pre-work baseline.
+        rbm.write_round_baseline_marker(
+            task_id="seal-task-1", session_id=None, baseline_head=baseline, repo=str(repo),
+        )
+        (repo / "f.txt").write_text("base\nlanded\n", encoding="utf-8")
+        run(["git", "add", "f.txt"], cwd=repo)
+        run(["git", "commit", "-q", "-m", "land reviewed work"], cwd=repo)
+        new_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        assert new_head != baseline
+
+        result = seal.seal_round_baseline_to_head(str(repo))
+        assert result["sealed"] is True, result
+        assert result["baseline_head"] == new_head, result
+        sealed_head = rbm.resolve_round_baseline_head(task_id="seal-task-1", session_id=None)
+        assert sealed_head == new_head, (sealed_head, new_head)
+        # Window is now empty for the landed commit.
+        assert dt._list_committed_round_changed_paths(repo, sealed_head) == []
+    finally:
+        for name, val in (("CODEX_RVF_LOG_ROOT", original_log_root), ("KANBAN_TASK_ID", original_task)):
+            if val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = val
+
+
 def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> None:
     """Files brought in only via a base-branch-sync merge (second parent) are
     excluded from committed-round paths; first-parent agent work is kept (§3)."""
@@ -10853,6 +11096,26 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "committed_unit_dedup_reviewed_not_resurrected",
             lambda: test_committed_unit_dedup_reviewed_not_resurrected(root / "committed-dedup"),
+        ),
+        (
+            "added_file_unit_identity_stable_dirty_staged_committed",
+            lambda: test_added_file_unit_identity_stable_dirty_staged_committed(root / "added-identity"),
+        ),
+        (
+            "committed_added_file_dedup_reviewed_not_redispatched",
+            lambda: test_committed_added_file_dedup_reviewed_not_redispatched(root / "added-dedup"),
+        ),
+        (
+            "complete_review_scope_mark_reviewed_gate",
+            lambda: test_complete_review_scope_mark_reviewed_gate(root / "mark-reviewed-gate"),
+        ),
+        (
+            "release_tracker_lease_noop_completion_does_not_mark_reviewed",
+            lambda: test_release_tracker_lease_noop_completion_does_not_mark_reviewed(root / "noop-finalize"),
+        ),
+        (
+            "seal_round_baseline_to_head_advances_marker",
+            lambda: test_seal_round_baseline_to_head_advances_marker(root / "seal-marker"),
         ),
         (
             "committed_observation_excludes_base_branch_sync_merge",

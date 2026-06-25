@@ -418,7 +418,17 @@ def _canonical_hash_tracked_hunk(path: str, change_type: str, hunk_lines: list[s
     return _sha256_hex(b"\0".join(parts))
 
 
-def _canonical_hash_untracked(path: str, content_sha: str) -> str:
+def _canonical_hash_added(path: str, content_sha: str) -> str:
+    """Whole-file identity for a newly added file, keyed by (path, content_sha).
+
+    The hash bytes deliberately keep the legacy ``b"untracked\0..."`` domain
+    separator so an *untracked* observation and a *tracked* add (staged or
+    committed) of the same new file converge on one unit_id. Keeping the bytes
+    unchanged also means existing untracked unit_ids do not churn; only the
+    tracked-add side now folds onto this identity. That convergence is what
+    makes a new file reviewed-while-dirty dedup (stay ``reviewed``) once it is
+    staged/committed, instead of re-dispatching as a fresh ``available`` unit.
+    """
     return _sha256_hex(b"\0".join([b"untracked", path.encode("utf-8"), content_sha.encode("utf-8")]))
 
 
@@ -692,6 +702,30 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
     return None
 
 
+def _added_file_unit_spec(path: str, postimage_hash: str | None) -> _UnitSpec:
+    """Single whole-file spec for an added file observed as a *tracked* hunk
+    (staged or committed add). Keyed by content via `_canonical_hash_added` so it
+    shares the unit_id of the same file's untracked observation — without this, a
+    new file picks up a fresh ``hunk``-body unit_id the moment it becomes tracked
+    and a reviewed-while-dirty new file gets re-dispatched after commit/stage.
+
+    ``kind='tracked_hunk'`` is accurate for this observation (the file *is*
+    tracked at this point) and stays within the units.kind CHECK enum; the
+    untracked observation keeps ``kind='untracked_file'``. The two share a
+    unit_id and `_upsert_unit` merges them by primary key, so the differing kind
+    is cosmetic while review_state (never rewritten on conflict) is preserved."""
+    return _UnitSpec(
+        unit_id=_canonical_hash_added(path, postimage_hash or ""),
+        path=path,
+        old_path=None,
+        kind="tracked_hunk",
+        change_type="add",
+        preimage_blob=None,
+        postimage_hash=postimage_hash,
+        hunk_header=None,
+    )
+
+
 def _specs_from_observation(observation: _PathObservation | None, path: str) -> list[_UnitSpec]:
     """Turn a `_PathObservation` into the `_UnitSpec` rows the observation walk
     upserts. Shared by the dirty walk and the committed-round walk so both
@@ -712,6 +746,11 @@ def _specs_from_observation(observation: _PathObservation | None, path: str) -> 
             )
         ]
     if observation.kind == "tracked_hunk":
+        if observation.change_type == "add":
+            # A tracked add (staged/committed new file) is whole-file identity,
+            # not per-hunk: fold it onto the same content-keyed unit_id as the
+            # untracked observation so a reviewed-while-dirty new file dedups.
+            return [_added_file_unit_spec(path, observation.postimage_hash)]
         return [
             _UnitSpec(
                 unit_id=hunk.canonical_hash,
@@ -728,7 +767,7 @@ def _specs_from_observation(observation: _PathObservation | None, path: str) -> 
     if observation.kind == "untracked_file":
         return [
             _UnitSpec(
-                unit_id=_canonical_hash_untracked(path, observation.postimage_hash or ""),
+                unit_id=_canonical_hash_added(path, observation.postimage_hash or ""),
                 path=path,
                 old_path=None,
                 kind="untracked_file",
@@ -1002,6 +1041,13 @@ def _unit_specs_for_owned(
             )
         ]
     if observation.kind == "tracked_hunk":
+        if observation.change_type == "add":
+            # Mirror `_specs_from_observation`: a tracked add is whole-file
+            # identity. register_claims keys session_units ownership on this
+            # unit_id, so it MUST equal the observation walk's id for the same
+            # staged add — otherwise the owned (hunk-body) unit and the observed
+            # (content-keyed) unit diverge and the dirty review mis-binds.
+            return [_added_file_unit_spec(owned_unit.path, observation.postimage_hash)]
         if owned_unit.unit == "hunk" and owned_unit.hunk_anchor is not None:
             for hunk in observation.hunks:
                 if _hunk_anchors_match(owned_unit.hunk_anchor, hunk.anchor):
@@ -1051,7 +1097,7 @@ def _unit_specs_for_owned(
     if observation.kind == "untracked_file":
         return [
             _UnitSpec(
-                unit_id=_canonical_hash_untracked(observation.path, observation.postimage_hash or ""),
+                unit_id=_canonical_hash_added(observation.path, observation.postimage_hash or ""),
                 path=observation.path,
                 old_path=None,
                 kind="untracked_file",
@@ -3823,6 +3869,7 @@ def complete_review_scope(
     scope_hash: str | None = None,
     run_id: str | None = None,
     reason: str = "completed",
+    mark_reviewed: bool = True,
     log_root_override: Path | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
@@ -3831,6 +3878,14 @@ def complete_review_scope(
     This is intentionally stronger than generic lease release: completed RVF
     scopes must leave durable `reviewed` unit state, even when a long-running
     reviewer let its lease expire and stale-sweep already removed `lease_units`.
+
+    ``mark_reviewed`` (default True) gates the unit ``review_state='reviewed'``
+    flip. A no-op completion — a run that released its lease without actually
+    dispatching any reviewer (no review artifacts on disk) — must pass
+    ``mark_reviewed=False`` so it still releases the lease/participants but does
+    NOT silently mark unreviewed units reviewed. Flipping on a no-op completion
+    would turn an over-dispatch into a fresh missed-review (see
+    `rvf_run_finalize._release_tracker_lease`).
     """
     repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
         repo,
@@ -3944,18 +3999,38 @@ def complete_review_scope(
                             (now_iso, now_iso, *emptied_lease_ids),
                         )
                 reviewable_unit_ids = [unit_id for unit_id in existing_unit_ids if unit_id not in blocked_unit_ids]
-                reviewable_placeholders = ",".join("?" for _ in reviewable_unit_ids)
                 if reviewable_unit_ids:
-                    conn.execute(
-                        f"""
-                        UPDATE units
-                           SET review_state='reviewed'
-                         WHERE review_state IN ('available','assigned','reviewed')
-                           AND is_tombstoned=0
-                           AND unit_id IN ({reviewable_placeholders})
-                        """,
-                        tuple(reviewable_unit_ids),
-                    )
+                    reviewable_placeholders = ",".join("?" for _ in reviewable_unit_ids)
+                    if mark_reviewed:
+                        conn.execute(
+                            f"""
+                            UPDATE units
+                               SET review_state='reviewed'
+                             WHERE review_state IN ('available','assigned','reviewed')
+                               AND is_tombstoned=0
+                               AND unit_id IN ({reviewable_placeholders})
+                            """,
+                            tuple(reviewable_unit_ids),
+                        )
+                    else:
+                        # No-op completion: this run released its lease without
+                        # actually reviewing. Revert any units it had assigned
+                        # back to 'available' (mirror lease_release's failed path)
+                        # so genuinely-unreviewed work stays reviewable instead of
+                        # being stranded 'assigned' or silently marked 'reviewed'.
+                        # Emptying reviewable_unit_ids below keeps the downstream
+                        # edit_claims update and the returned counts honest.
+                        conn.execute(
+                            f"""
+                            UPDATE units
+                               SET review_state='available'
+                             WHERE review_state='assigned'
+                               AND is_tombstoned=0
+                               AND unit_id IN ({reviewable_placeholders})
+                            """,
+                            tuple(reviewable_unit_ids),
+                        )
+                        reviewable_unit_ids = []
                 else:
                     reviewable_unit_ids = []
             else:

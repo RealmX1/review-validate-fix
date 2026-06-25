@@ -73,7 +73,17 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
    - commit message 使用 conventional commit 风格（如 `fix(rvf): ...`、`feat(rvf): ...`、`docs(rvf): ...`）。
    - commit body 用中文简要记录 RVF run id、sanity-check 结论、是否采纳/未采纳 suggestion 及原因、运行过的验证命令。
 
-本命令到提交为止结束，不自动运行 base-branch-sync。
+6. **封窗：把 round-baseline 标记推进到新 HEAD。** commit 成功后立即运行：
+
+   ```bash
+   python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/seal_round_baseline_to_head.py --repo .
+   ```
+
+   - 这会把本轮 committed-round 检测的窗口下界推进到刚 land 的 commit，等价于「到此 HEAD 为止的工作都已审」，避免紧随的 Stop hook 把刚提交的已审工作重新当作「未审已提交改动」多派一轮 review。
+   - 脚本严格 best-effort：打印 `RVF_ROUND_BASELINE_SEALED ...` 即封窗成功；打印 `RVF_ROUND_BASELINE_SEAL_SKIPPED reason=...` 表示本环境无法封窗（非 kanban 会话等），可忽略，不影响提交。
+   - 在最终输出里记一行封窗结果（已封窗到 `<HEAD>` 或已跳过及原因）。
+
+本命令到封窗为止结束，不自动运行 base-branch-sync。
 
 ## Failure Gates
 
