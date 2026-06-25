@@ -699,6 +699,23 @@ def _classify_path(repo: Path, path: str) -> _PathObservation | None:
             hunks=tuple(hunks),
         )
 
+    if preimage_blob is None and abs_file.exists():
+        # Empty (hunkless) staged add: an empty new file produces no diff hunk,
+        # so without this it would fall through to path_only and mint a unit_id
+        # that does NOT match the untracked observation of the same empty file.
+        # Emit a content-keyed add (empty hunks) so `_specs_from_observation`'s
+        # add branch folds it onto `_canonical_hash_added` and empty new files
+        # dedup across dirty(untracked)↔staged↔committed like any other add.
+        return _PathObservation(
+            path=path,
+            kind="tracked_hunk",
+            change_type="add",
+            preimage_blob=None,
+            postimage_hash=_file_content_sha(abs_file),
+            old_path=None,
+            hunks=(),
+        )
+
     return None
 
 
@@ -891,6 +908,22 @@ def _classify_committed_path(repo: Path, path: str, baseline: str) -> _PathObser
             postimage_hash=_blob_content_sha_at_ref(repo, "HEAD", path),
             old_path=None,
             hunks=tuple(hunks),
+        )
+
+    if status_code == "A" and preimage_blob is None:
+        # Empty (hunkless) committed add — mirror `_classify_path`: an empty new
+        # file committed within the round has no diff hunk, so emit a
+        # content-keyed add (empty hunks) instead of falling through to None /
+        # path_only. This keeps its unit_id equal to the dirty/untracked
+        # observation so a reviewed empty new file stays deduped after commit.
+        return _PathObservation(
+            path=path,
+            kind="tracked_hunk",
+            change_type="add",
+            preimage_blob=None,
+            postimage_hash=_blob_content_sha_at_ref(repo, "HEAD", path),
+            old_path=None,
+            hunks=(),
         )
 
     return None

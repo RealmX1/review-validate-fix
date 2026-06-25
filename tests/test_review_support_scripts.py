@@ -9209,6 +9209,34 @@ def test_added_file_unit_identity_stable_dirty_staged_committed(tmp: Path) -> No
     assert dirty_ids == staged_ids == committed_ids, (dirty_ids, staged_ids, committed_ids)
 
 
+def test_empty_added_file_unit_identity_stable(tmp: Path) -> None:
+    """Edge of the add-identity unification (RVF reviewer cursor-cli finding):
+    an EMPTY new file produces no diff hunk, so without the hunkless-add handling
+    the committed/staged observation falls back to path_only and mints a unit_id
+    that diverges from the untracked observation — re-dispatching a reviewed
+    empty new file after commit. Assert all three forms share one unit_id."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    (repo / "empty.txt").write_text("", encoding="utf-8")
+
+    dirty_obs = dt._classify_path(repo, "empty.txt")
+    assert dirty_obs is not None and dirty_obs.kind == "untracked_file", dirty_obs
+    dirty_ids = sorted(s.unit_id for s in dt._specs_from_observation(dirty_obs, "empty.txt"))
+
+    run(["git", "add", "empty.txt"], cwd=repo)
+    staged_obs = dt._classify_path(repo, "empty.txt")
+    assert staged_obs is not None and staged_obs.change_type == "add", staged_obs
+    staged_ids = sorted(s.unit_id for s in dt._specs_from_observation(staged_obs, "empty.txt"))
+
+    run(["git", "commit", "-q", "-m", "add empty file"], cwd=repo)
+    committed_obs = dt._classify_committed_path(repo, "empty.txt", baseline)
+    assert committed_obs is not None and committed_obs.change_type == "add", committed_obs
+    committed_ids = sorted(s.unit_id for s in dt._specs_from_observation(committed_obs, "empty.txt"))
+
+    assert dirty_ids == staged_ids == committed_ids, (dirty_ids, staged_ids, committed_ids)
+    assert len(dirty_ids) == 1, dirty_ids
+
+
 def test_committed_added_file_dedup_reviewed_not_redispatched(tmp: Path) -> None:
     """The reported over-dispatch dual, at the allocate level: a NEW file (models
     a rename's add half / a new file authored + reviewed while dirty) is reviewed
@@ -11100,6 +11128,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "added_file_unit_identity_stable_dirty_staged_committed",
             lambda: test_added_file_unit_identity_stable_dirty_staged_committed(root / "added-identity"),
+        ),
+        (
+            "empty_added_file_unit_identity_stable",
+            lambda: test_empty_added_file_unit_identity_stable(root / "empty-added-identity"),
         ),
         (
             "committed_added_file_dedup_reviewed_not_redispatched",
