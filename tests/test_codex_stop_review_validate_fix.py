@@ -3819,140 +3819,6 @@ def test_plan_document_route_does_not_hide_source_rename(tmp_path: Path) -> None
     assert summary["status"] == "dry-run"
 
 
-def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000002",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "dry-run"
-    assert latest["mode"] == "dry-run"
-    requests = app_server_requests(latest)
-    prompt = prompt_text(latest)
-    assert requests[0]["method"] == "thread/fork"
-    assert requests[1]["method"] == "turn/start"
-    assert "$review-validate-fix" in prompt
-    assert str(dirty) in prompt
-
-
-def test_dirty_repo_manual_mode_only_prepares_prompt(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000022",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "manual",
-            },
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: manual-prepared; reason=manual_prepared;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "manual-prepared"
-    assert latest["rvf_backend"] == "manual"
-    assert latest["rvf_state_phase"] == "prepare"
-    assert Path(latest["prompt_path"]).exists()
-
-
-def test_dirty_repo_fork_dry_run(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000003",
-                "model": "gpt-test",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "dry-run",
-                "CODEX_RVF_FORK_REASONING_EFFORT": "high",
-            },
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    prompt = prompt_text(latest)
-    prep = dispatch_prep_payload(latest)
-    prep_token = prep["token"]
-    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
-    assert "$review-validate-fix" in prompt
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
-    assert f"RVF_DISPATCH=token={prep_token}" in prompt
-    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt
-    assert prep["origin_session_id"] == "00000000-0000-0000-0000-000000000003"
-    assert prep["origin_repo"] == str(dirty.resolve())
-    assert prep["target_flow"] == "flow-3-inplace"
-    assert prep["rvf_run"]["run_id"] == latest["run_id"]
-    assert str(dirty) in prompt
-    assert "RVF_STOP_HOOK: off" in prompt
-    assert "会话控制元数据" in prompt
-    assert "不要把它们当成用户分配的代码任务" in prompt
-    assert latest["suppress_child_stop_hook"] is False
-    assert latest["model"] == "gpt-test"
-    assert latest["reasoning_effort"] == "high"
-    requests = app_server_requests(latest)
-    assert requests[0]["method"] == "thread/fork"
-    assert requests[0]["params"]["model"] == "gpt-test"
-    assert requests[1]["method"] == "turn/start"
-    assert requests[1]["params"]["model"] == "gpt-test"
-    assert requests[1]["params"]["effort"] == "high"
-
-
-def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    subdir = dirty / "nested"
-    subdir.mkdir()
-    state = tmp_path / "state"
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(subdir),
-                "session_id": "00000000-0000-0000-0000-000000000103",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "dry-run",
-            },
-            state_dir=state,
-        )[0]
-    )
-
-    assert "decision" not in payload
-    latest = latest_summary(state)
-    requests = app_server_requests(latest)
-    prompt = prompt_text(latest)
-    assert latest["cwd"] == str(subdir.resolve())
-    assert requests[0]["params"]["cwd"] == str(subdir.resolve())
-    assert requests[1]["params"]["cwd"] == str(subdir.resolve())
-    assert f"RVF_PARENT_CWD: {subdir.resolve()}" in prompt
-    assert f"RVF_TARGET_REPO: {dirty.resolve()}" in prompt
-
-
 def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir(parents=True)
@@ -4044,27 +3910,6 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) ->
     assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000100"
     assert latest["parent_thread_path"] is None
     assert "path" not in app_server_requests(latest)[0]["params"]
-
-
-def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000004",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_MODE": "continuation"},
-        )[0]
-    )
-    assert "decision" not in payload
-    assert payload["continue"] is True
-    assert "reason=continuation_disabled" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert "$review-validate-fix" in str(summary["message"])
-    assert str(dirty) in str(summary["message"])
-    assert "Stop continuation prompt 已禁用" in str(summary["message"])
 
 
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
@@ -4758,6 +4603,22 @@ _f2forked.inject(
     write_user_session_messages=write_user_session_messages,
 )
 globals().update({_n: getattr(_f2forked, _n) for _n in _f2forked.__all__})
+
+
+# 有界拆分：dirty repo 闸 测试簇（5 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import dirty_repo_gate as _f2dirty
+_f2dirty.inject(
+    app_server_requests=app_server_requests,
+    dispatch_prep_payload=dispatch_prep_payload,
+    init_repo=init_repo,
+    invoke=invoke,
+    latest_summary=latest_summary,
+    parse_json=parse_json,
+    prompt_text=prompt_text,
+    summary_from_payload=summary_from_payload,
+)
+globals().update({_n: getattr(_f2dirty, _n) for _n in _f2dirty.__all__})
 
 
 def main() -> int:
