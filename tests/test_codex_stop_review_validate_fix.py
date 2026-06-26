@@ -4067,72 +4067,6 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -
     assert "Stop continuation prompt 已禁用" in str(summary["message"])
 
 
-def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
-    handoff.parent.mkdir(parents=True, exist_ok=True)
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    notifier_log = tmp_path / "notify.log"
-    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    event = {
-        "cwd": str(tmp_path),
-        "session_id": "child-session",
-        "stop_hook_active": False,
-        "last_user_message": fork_prompt,
-        "last_assistant_message": f"完成。\nRVF_HANDOFF_FILE: {handoff}",
-    }
-    payload = parse_json(
-        invoke(
-            event,
-            state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "reason=handoff_file_ready" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["handoff_path"] == str(handoff.resolve())
-    assert summary["rvf_state_phase"] == "complete"
-    assert summary["rvf_completion_gate"] == "handoff_file_ready"
-    assert summary["rvf_handoff_path"] == str(handoff.resolve())
-    assert summary["handoff_notify_result"]["notified"] is True
-    calls = [
-        json.loads(line)
-        for line in notifier_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1
-    assert "-title" in calls[0] and "RVF" in calls[0]
-    # 非 kanban 来源 → 信息-only，不带 -open。
-    assert "-open" not in calls[0]
-    assert summary["handoff_task_url"] is None
-
-    stdout, _ = invoke(
-        event,
-        state_dir=state,
-        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
-    )
-    payload = parse_json(stdout)
-    summary = summary_from_payload(payload)
-    assert summary["already_notified"] is True
-    assert summary["handoff_notify_result"]["reason"] == "already_notified"
-    # 去重：第二次 Stop 不应再调用 notifier。
-    calls = [
-        json.loads(line)
-        for line in notifier_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1
-
-
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
@@ -4601,53 +4535,6 @@ def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -
     assert "app_server_requests_path" not in summary
 
 
-def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(tmp_path),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "last_user_message": fork_prompt,
-            "last_assistant_message": "我还需要继续检查，尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-notified").exists()
-
-
-def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(tmp_path),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "last_user_message": fork_prompt,
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-notified").exists()
-
-
 def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
@@ -4662,75 +4549,6 @@ def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
         state_dir=state,
     )
     assert_skip_reason(stdout, "当前 cwd 不在 git repo/worktree 内")
-
-
-def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "repo", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {dirty}\n"
-    )
-    write_user_session_messages(
-        transcript,
-        "child-session",
-        [
-            fork_prompt,
-            "后续用户消息遮住了最初的 fork marker。",
-        ],
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-            "last_assistant_message": "尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
-
-
-def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "repo", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {dirty}\n"
-    )
-    write_user_session_messages(
-        transcript,
-        "child-session",
-        [
-            "早先普通讨论里提到了 RVF_FORKED_REVIEW_VALIDATE_FIX，但没有完整 metadata。",
-            fork_prompt,
-            "后续用户消息遮住了最初的 fork marker。",
-        ],
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-            "last_assistant_message": "尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp_path: Path) -> None:
@@ -4924,6 +4742,22 @@ _f2shook.inject(
     write_user_session=write_user_session,
 )
 globals().update({_n: getattr(_f2shook, _n) for _n in _f2shook.__all__})
+
+
+# 有界拆分：forked RVF 实验模式 测试簇（5 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import forked_rvf_experiment_mode as _f2forked
+_f2forked.inject(
+    assert_skip_reason=assert_skip_reason,
+    init_repo=init_repo,
+    invoke=invoke,
+    latest_pointer=latest_pointer,
+    parse_json=parse_json,
+    summary_from_payload=summary_from_payload,
+    write_fake_notifier=write_fake_notifier,
+    write_user_session_messages=write_user_session_messages,
+)
+globals().update({_n: getattr(_f2forked, _n) for _n in _f2forked.__all__})
 
 
 def main() -> int:
