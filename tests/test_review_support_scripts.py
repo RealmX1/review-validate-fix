@@ -37,6 +37,8 @@ CHECK_REVIEW_RESULT = SCRIPT_DIR / "check_review_result.py"
 COMMAND_LOCK = SCRIPT_DIR / "command_lock.py"
 PREPARE_REVIEW_RUN = SCRIPT_DIR / "prepare_review_run.py"
 RUN_ALTERNATIVE_REVIEWER = SCRIPT_DIR / "run_alternative_reviewer.py"
+CURSOR_STREAM_TOOL_LAYER_HEALTH = SCRIPT_DIR / "cursor_stream_tool_layer_health.py"
+VERIFY_CURSOR_TOOL_LAYER = SCRIPT_DIR / "verify_cursor_tool_layer.py"
 CANCEL_RVF_RUN = SCRIPT_DIR / "cancel_rvf_run.py"
 CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
@@ -57,6 +59,17 @@ def load_alternative_reviewer_module():
     spec = importlib.util.spec_from_file_location("rvf_run_alternative_reviewer", RUN_ALTERNATIVE_REVIEWER)
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load run_alternative_reviewer module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_cursor_tool_layer_health_module():
+    spec = importlib.util.spec_from_file_location(
+        "rvf_cursor_stream_tool_layer_health", CURSOR_STREAM_TOOL_LAYER_HEALTH
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load cursor_stream_tool_layer_health module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -2442,6 +2455,7 @@ def write_alternative_reviewer_config(
     activity_probe_command: list[str] | None = None,
     activity_probe_timeout_seconds: float | None = None,
     activity_probe_failure_threshold: int | None = None,
+    tool_failure_threshold: int | None = None,
     max_runtime_seconds: float | None = None,
     output_format: str | None = "text",
     health_command: list[str] | None = None,
@@ -2462,6 +2476,8 @@ def write_alternative_reviewer_config(
         payload["activity_probe_timeout_seconds"] = activity_probe_timeout_seconds
     if activity_probe_failure_threshold is not None:
         payload["activity_probe_failure_threshold"] = activity_probe_failure_threshold
+    if tool_failure_threshold is not None:
+        payload["tool_failure_threshold"] = tool_failure_threshold
     if max_runtime_seconds is not None:
         payload["max_runtime_seconds"] = max_runtime_seconds
     if output_format is not None:
@@ -6455,6 +6471,150 @@ def test_alternative_reviewer_cursor_stream_json_extracts_result(tmp_path: Path)
     )
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
+
+
+def _cursor_tool_call_line(tool_key: str, result: dict) -> str:
+    return json.dumps(
+        {
+            "type": "tool_call",
+            "subtype": "completed",
+            "tool_call": {tool_key: {"result": result}},
+        }
+    )
+
+
+def test_cursor_stream_tool_layer_health_classifier_and_summary() -> None:
+    health = load_cursor_tool_layer_health_module()
+    classify = health.classify_cursor_tool_call_outcome
+
+    # spawnError（shell 执行器坏了）=> runtime_failure
+    assert (
+        classify({"shellToolCall": {"result": {"spawnError": {"error": "returned no exit status"}}}})
+        == "runtime_failure"
+    )
+    # read/glob 的 Aborted（两种 error 嵌套形态）=> runtime_failure
+    assert classify({"readToolCall": {"result": {"error": {"errorMessage": "Aborted"}}}}) == "runtime_failure"
+    assert classify({"globToolCall": {"result": {"error": {"error": "Aborted"}}}}) == "runtime_failure"
+    # 关键反例：普通工具错误（文件不存在）证明工具层在工作 => ok，绝不能误判成 runtime_failure
+    assert (
+        classify({"readToolCall": {"result": {"error": {"errorMessage": "ENOENT: no such file"}}}})
+        == "ok"
+    )
+    # 成功 => ok；非工具结果 => None
+    assert classify({"shellToolCall": {"result": {"success": "out", "isBackground": False}}}) == "ok"
+    assert classify({"toolCallId": "x"}) is None
+    assert classify("not-a-dict") is None
+
+    broken_stream = "\n".join(
+        _cursor_tool_call_line("shellToolCall", {"spawnError": {"error": "returned no exit status"}})
+        for _ in range(4)
+    )
+    broken = health.summarize_cursor_stream_tool_layer(broken_stream)
+    assert broken == {
+        "tool_runtime_failures": 4,
+        "tool_successes": 0,
+        "completed_tool_calls": 4,
+        "healthy": False,
+    }
+
+    healthy_stream = "\n".join(
+        [
+            _cursor_tool_call_line("shellToolCall", {"success": "ok", "isBackground": False}),
+            _cursor_tool_call_line("readToolCall", {"success": {"content": "x"}}),
+        ]
+    )
+    assert health.summarize_cursor_stream_tool_layer(healthy_stream)["healthy"] is True
+
+
+def test_alternative_reviewer_cursor_stream_monitor_detects_tool_layer_failure() -> None:
+    module = load_alternative_reviewer_module()
+    spawn_error = _cursor_tool_call_line(
+        "shellToolCall", {"spawnError": {"command": "", "workingDirectory": "", "error": "returned no exit status"}}
+    )
+
+    # 阈值前不触发；达到阈值（且零成功）触发；split 字节边界仍能识别
+    monitor = module.CursorStreamActivityMonitor(tool_failure_threshold=3)
+    monitor.ingest(spawn_error + "\n")
+    monitor.ingest(spawn_error + "\n")
+    assert monitor.tool_layer_unavailable is False
+    half = len(spawn_error) // 2
+    monitor.ingest(spawn_error[:half])
+    assert monitor.tool_layer_unavailable is False
+    monitor.ingest(spawn_error[half:] + "\n")
+    assert monitor.tool_layer_unavailable is True
+    # cursor monitor 刻意不抑制 idle 超时
+    assert monitor.waiting_on_long_command is False
+
+    # 出现过一次成功 => 工具层是好的，后续失败也不判不可用
+    mixed = module.CursorStreamActivityMonitor(tool_failure_threshold=2)
+    mixed.ingest(_cursor_tool_call_line("readToolCall", {"success": {"content": "x"}}) + "\n")
+    for _ in range(5):
+        mixed.ingest(spawn_error + "\n")
+    assert mixed.tool_successes == 1
+    assert mixed.tool_runtime_failures == 5
+    assert mixed.tool_layer_unavailable is False
+
+
+def test_alternative_reviewer_cursor_tool_layer_failure_fast_aborts(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    spawn_error_event = {
+        "type": "tool_call",
+        "subtype": "completed",
+        "tool_call": {
+            "shellToolCall": {"result": {"spawnError": {"command": "", "workingDirectory": "", "error": "returned no exit status"}}}
+        },
+    }
+    # 假 reviewer：发 init/叙述，再连发 3 条 spawnError（工具层坏），然后长睡。
+    # idle_timeout 设很大（30s）：若 fast-abort 失效，测试会因等到 idle 而超慢/原因不符而失败。
+    fake = (
+        "import sys, time, json; sys.stdin.read(); "
+        "print(json.dumps({'type':'system','subtype':'init','model':'Composer 2.5'}), flush=True); "
+        "print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'probing tools'}]}}), flush=True); "
+        f"ev = {json.dumps(spawn_error_event)}; "
+        "[ (print(json.dumps(ev), flush=True), time.sleep(0.05)) for _ in range(3) ]; "
+        "time.sleep(30)"
+    )
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.json",
+        [sys.executable, "-u", "-c", fake],
+        idle_timeout_seconds=30.0,
+        activity_check_interval_seconds=0.05,
+        tool_failure_threshold=3,
+        output_format="cursor_stream_json",
+    )
+
+    started = time.monotonic()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "cursor-tool-layer-fast-abort",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode == 124, completed.stderr
+    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
+    # 关键：远早于 idle_timeout(30s) 就因工具层判定而终止
+    assert elapsed < 15.0, f"fast-abort 应远早于 idle_timeout，实际 {elapsed:.1f}s"
+    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["timeout_reason"] == "cursor_tool_layer_unavailable", summary
+    assert summary["terminated_signal"] == "SIGKILL"
 
 
 def test_alternative_reviewer_cursor_command_not_claude_patched(tmp_path: Path) -> None:
@@ -11813,6 +11973,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_cursor_stream_json_extracts_result",
             lambda: test_alternative_reviewer_cursor_stream_json_extracts_result(root / "alternative-cursor-stream-json"),
+        ),
+        (
+            "cursor_stream_tool_layer_health_classifier_and_summary",
+            lambda: test_cursor_stream_tool_layer_health_classifier_and_summary(),
+        ),
+        (
+            "alternative_reviewer_cursor_stream_monitor_detects_tool_layer_failure",
+            lambda: test_alternative_reviewer_cursor_stream_monitor_detects_tool_layer_failure(),
+        ),
+        (
+            "alternative_reviewer_cursor_tool_layer_failure_fast_aborts",
+            lambda: test_alternative_reviewer_cursor_tool_layer_failure_fast_aborts(root / "cursor-tool-layer-fast-abort"),
         ),
         (
             "alternative_reviewer_cursor_command_not_claude_patched",
