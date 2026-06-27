@@ -85,6 +85,7 @@ from review_reopen_marker import (
     review_reopen_status,
 )
 from round_baseline_marker import resolve_round_baseline_head
+import review_highwater_marker
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
@@ -6468,16 +6469,21 @@ def refresh_global_diff_tracker(
         # 没 transcript / 没 repo：合法的"无 seeding"分支，不算失败。调用方
         # 会继续走 allocator 的 auto-claim fallback 或返回 None。
         return {"observed": False, "manifest": None}
-    # 本轮 committed-change 下界：UserPromptSubmit 写的 round-baseline marker。
-    # active 才用；stale/invalid/缺失 → None ⇒ committed 观测整支静默关闭、行为与
-    # 今日 dirty-only 完全一致。best-effort，绝不阻断 refresh。
+    # 本轮 committed-change 下界：优先「最近一次完成 review 的高水位」（review_highwater_marker，
+    # 仅当为 HEAD 祖先时），无高水位才回退 UserPromptSubmit 写的 round-baseline marker——与
+    # detection 端 `maybe_route_committed_round_scope` 走 **同一个** `_resolve_committed_round_baseline`，
+    # 否则 detection 用高水位 C1 选中孤儿、而这里 refresh 仍用被 prompt 顶到 HEAD 的 round-baseline
+    # C2 → 窗口空 → 无 committed 观测 → 误判 no_session_owned_dirty（detection 与 allocation 必须
+    # 用同一下界）。无任一可用下界 → None ⇒ committed 观测整支静默关闭、与今日 dirty-only 一致。
+    # best-effort，绝不阻断 refresh。
     committed_baseline: str | None = None
     try:
         event = context.get("event")
         if isinstance(event, dict):
-            committed_baseline = resolve_round_baseline_head(
-                task_id=current_kanban_task_id(event),
-                session_id=session_hook_id_from_event(event),
+            committed_baseline = _resolve_committed_round_baseline(
+                Path(repo).expanduser().resolve(),
+                current_kanban_task_id(event),
+                session_hook_id_from_event(event),
             )
     except Exception:
         committed_baseline = None
@@ -7721,6 +7727,54 @@ def route_reviewable_scope(
     )
 
 
+def _commit_is_ancestor_of_head(repo_path: Path, commit: str) -> bool:
+    """``commit`` 是否为当前 HEAD 的祖先（含等于 HEAD）。best-effort：任何失败返回 False。
+
+    high-water 仅在通过本判定时才被 committed-round 采纳为窗口下界——分支被 reset/rebase
+    到 high-water 之前时，旧 high-water 不再是 HEAD 祖先，``baseline..HEAD`` 会退化，故视为
+    失效、回退 round-baseline。
+    """
+    if not commit:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _resolve_committed_round_baseline(
+    repo_path: Path,
+    task_id: str | None,
+    session_id: str | None,
+) -> str | None:
+    """committed-round 窗口下界：优先「最近一次完成 review 覆盖到的 HEAD」高水位
+    （``review_highwater_marker``，仅当其为当前 HEAD 祖先时采用），仅当某 task/session
+    从未完成过 review（无高水位）时才回退 round-baseline（上一条 prompt 的 HEAD）作 bootstrap。
+
+    这样『在某轮提交、却没在该轮自己的 Stop 里被审』的孤儿提交不会因后续任意 prompt 推进
+    round-baseline 而落出窗口——它们留在 ``high-water..HEAD`` 内直到真被审，修掉
+    "since last user prompt" 语义下的第三面漏审盲区（见 ``review_highwater_marker`` 模块头）。
+    best-effort：高水位读取异常时静默回退 round-baseline。
+    """
+    try:
+        highwater = review_highwater_marker.resolve_review_highwater_head(
+            task_id=task_id,
+            session_id=session_id,
+        )
+    except Exception:  # pragma: no cover - 高水位读取永不阻断
+        highwater = None
+    if highwater and _commit_is_ancestor_of_head(repo_path, highwater):
+        return highwater
+    return resolve_round_baseline_head(task_id=task_id, session_id=session_id)
+
+
 def maybe_route_committed_round_scope(
     event: dict[str, Any],
     repo: str | None,
@@ -7740,13 +7794,14 @@ def maybe_route_committed_round_scope(
     """
     if not repo:
         return None
-    baseline = resolve_round_baseline_head(
-        task_id=current_kanban_task_id(event),
-        session_id=session_hook_id_from_event(event),
+    repo_path = Path(repo).expanduser().resolve()
+    baseline = _resolve_committed_round_baseline(
+        repo_path,
+        current_kanban_task_id(event),
+        session_hook_id_from_event(event),
     )
     if not baseline:
         return None
-    repo_path = Path(repo).expanduser().resolve()
     # Per-commit opt-out audit: surface which round commits the `RVF-Skip-Review`
     # trailer excluded BEFORE the empty-set early return, so even a round whose
     # commits are all opted-out (committed_paths == []) leaves an audit trace

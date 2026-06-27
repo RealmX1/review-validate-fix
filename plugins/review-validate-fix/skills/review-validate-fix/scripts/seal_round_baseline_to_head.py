@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import round_baseline_marker
+import review_highwater_marker
 
 SEAL_PROMPT_EXCERPT = "rvf-land seal (round baseline advanced to landed HEAD)"
 
@@ -121,11 +122,29 @@ def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:
         return {"sealed": False, "reason": f"write_failed:{exc}", "repo": repo}
     if marker_path is None:
         return {"sealed": False, "reason": "write_returned_none", "repo": repo}
+    # 同时把 last-reviewed 高水位推进到 landed HEAD。committed-round 优先用高水位作窗口
+    # 下界（review_highwater_marker）；rvf-land 断言「到此 HEAD 为止都已审/已 land」，若只
+    # 推进 round-baseline 而不推进高水位，下一次 Stop 会因高水位仍停在上一次 review 的旧
+    # HEAD 而把刚 land 的 commit 重新纳入窗口（多派）。故二者必须一并推进。best-effort：
+    # 高水位写失败不影响封窗成功（dedup 仍兜底）。
+    highwater_marker_path: str | None = None
+    try:
+        hw_path = review_highwater_marker.write_review_highwater(
+            task_id=task_id,
+            session_id=session_id,
+            reviewed_head=head,
+            repo=repo,
+            source="rvf_land_seal",
+        )
+        highwater_marker_path = str(hw_path) if hw_path is not None else None
+    except Exception:  # noqa: BLE001 - best-effort, never break rvf-land
+        highwater_marker_path = None
     return {
         "sealed": True,
         "repo": repo,
         "baseline_head": head,
         "marker_path": str(marker_path),
+        "highwater_marker_path": highwater_marker_path,
         "task_id": task_id,
         "session_id": session_id,
     }
@@ -145,7 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     if result.get("sealed"):
         print(
             f"RVF_ROUND_BASELINE_SEALED head={result.get('baseline_head')} "
-            f"marker={result.get('marker_path')}"
+            f"marker={result.get('marker_path')} "
+            f"highwater={result.get('highwater_marker_path')}"
         )
     else:
         print(f"RVF_ROUND_BASELINE_SEAL_SKIPPED reason={result.get('reason')}")

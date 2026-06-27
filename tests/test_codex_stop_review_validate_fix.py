@@ -6372,6 +6372,90 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
     assert "committed_round_route_selected" not in events, events
 
 
+def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_path: Path) -> None:
+    """漏审第三面盲区 e2e — reported run rvf-20260626T133034Z (task 498db). Work
+    committed in an earlier turn (C1) was reviewed → last-reviewed high-water = C1.
+    MORE work was then committed in a later turn (C2, the orphan refactor chain), and
+    a subsequent prompt — here the user's own『now stop and let stophook take over』—
+    drove UserPromptSubmit to advance the round-baseline marker to C2 (= HEAD).
+
+    With round-baseline as the SOLE window lower bound, C2..C2 is empty → the Stop
+    hook skips `clean_repo` and the C2 orphan is never reviewed (the reported bug).
+    The high-water fix makes committed-round prefer the last-reviewed high-water (C1,
+    still a HEAD ancestor) over the prompt-advanced round-baseline, so the Stop hook
+    routes the orphaned C1..C2 commit (`committed_round_route_selected` → allocate →
+    dry_run) instead of skipping clean."""
+    import importlib  # noqa: PLC0415
+
+    repo = _init_committed_round_repo(tmp_path)
+    state = tmp_path / "state"
+    session_id = "0ec54540-aaaa-bbbb-cccc-000000000001"
+
+    if str(SCRIPT.parent) not in sys.path:
+        sys.path.insert(0, str(SCRIPT.parent))
+    hwm = importlib.import_module("review_highwater_marker")
+    rbm = importlib.import_module("round_baseline_marker")
+
+    # First round: agent commits work1 (C1); a review completed → high-water = C1.
+    # (Plant the high-water exactly as finalize would, keyed/rooted like the Stop
+    # hook reads it: no kanban task → session-keyed under CODEX_RVF_STATE_DIR=state.)
+    _commit_round_work(repo)
+    c1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    hwm.write_review_highwater(
+        task_id=None, session_id=session_id, reviewed_head=c1, repo=str(repo),
+        source="stop_finalize", root=state,
+    )
+
+    # Later turn: agent commits MORE work (C2) — the orphan, never reviewed.
+    (repo / "g.txt").write_text("orphan work from a later turn\n", encoding="utf-8")
+    run(["git", "add", "g.txt"], repo)
+    run(["git", "commit", "-q", "-m", "orphan round work (later turn)"], repo)
+    c2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout.strip()
+    assert c2 != c1
+    assert _porcelain(repo) == ""
+
+    transcript = _committed_round_session_without_tool_evidence(tmp_path, repo, session_id)
+
+    # The『now stop and let stophook take over』prompt advances round-baseline to C2.
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "now stop and let stophook take over and launch rvf of your work.",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    # Precondition that reproduced the bug: round-baseline alone == HEAD → empty window.
+    assert rbm.resolve_round_baseline_head(
+        task_id=None, session_id=session_id, root=state
+    ) == c2
+
+    # Stop hook must prefer high-water (C1) and route the orphan C1..C2 — not skip clean.
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+    payload = parse_json(stdout)
+    assert "decision" not in payload
+    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
+    summary = latest_summary(state)
+    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_route_selected" in events, events
+    assert "tracker_scope_allocated" in events, events
+
+
 def test_committed_round_without_transcript_evidence_routes_to_review(tmp_path: Path) -> None:
     """Second-gate regression — reproduces rvf-20260624T054404Z. The round's work
     is committed by a sub-agent / headless runner, so the parent transcript carries
@@ -7753,6 +7837,7 @@ def main() -> int:
         test_clean_repo_skips,
         test_committed_round_clean_repo_routes_to_review,
         test_committed_round_seal_after_land_suppresses_redispatch,
+        test_committed_round_highwater_routes_orphan_below_advanced_baseline,
         test_committed_round_without_transcript_evidence_routes_to_review,
         test_committed_round_skip_review_trailer_excludes_and_audits,
         test_clean_repo_with_committed_work_but_no_marker_skips,

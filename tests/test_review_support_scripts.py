@@ -9449,6 +9449,111 @@ def test_seal_round_baseline_to_head_advances_marker(tmp: Path) -> None:
                 os.environ[name] = val
 
 
+def test_review_highwater_marker_round_trip(tmp: Path) -> None:
+    """review_highwater_marker: task-first/session-fallback keying, overwrite
+    advances, missing/empty/no-key → None, clear removes. Mirrors
+    round_baseline_marker's IO contract so finalize/seal writes land exactly where
+    committed-round reads (same (task,session) under the same log_root())."""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import review_highwater_marker as hwm  # noqa: PLC0415
+    root = tmp / "state"
+    head_a = "a" * 40
+    head_b = "b" * 40
+    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_a, repo="/r", root=root)
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) == head_a
+    # Overwrite advances (high-water only moves forward by caller contract).
+    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_b, repo="/r", root=root)
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) == head_b
+    # Session-only keying when no task_id.
+    hwm.write_review_highwater(task_id=None, session_id="s9", reviewed_head=head_a, repo="/r", root=root)
+    assert hwm.resolve_review_highwater_head(task_id=None, session_id="s9", root=root) == head_a
+    # Missing / empty head / no key → None (no write).
+    assert hwm.resolve_review_highwater_head(task_id="nope", session_id=None, root=root) is None
+    assert hwm.write_review_highwater(task_id=None, session_id=None, reviewed_head=head_a, repo=None, root=root) is None
+    assert hwm.write_review_highwater(task_id="t2", session_id=None, reviewed_head="  ", repo=None, root=root) is None
+    removed = hwm.clear_review_highwater(task_id="t1", session_id="s1", root=root)
+    assert removed, removed
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) is None
+
+
+def test_seal_advances_review_highwater(tmp: Path) -> None:
+    """rvf-land 封窗 must advance BOTH round-baseline AND the last-reviewed high-water
+    to HEAD. committed-round prefers the high-water; if seal advanced only
+    round-baseline, the next Stop would re-window the just-landed commit
+    (over-dispatch) because the high-water still pointed at the prior review's HEAD."""
+    _dt, _sm, _rbm = _round_baseline_committed_modules()
+    import seal_round_baseline_to_head as seal  # noqa: PLC0415
+    import review_highwater_marker as hwm  # noqa: PLC0415
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_task = os.environ.get("KANBAN_TASK_ID")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    os.environ["KANBAN_TASK_ID"] = "seal-hw-task"
+    try:
+        (repo / "f.txt").write_text("base\nlanded\n", encoding="utf-8")
+        run(["git", "add", "f.txt"], cwd=repo)
+        run(["git", "commit", "-q", "-m", "land reviewed work"], cwd=repo)
+        new_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        result = seal.seal_round_baseline_to_head(str(repo))
+        assert result["sealed"] is True, result
+        assert result.get("highwater_marker_path"), result
+        assert hwm.resolve_review_highwater_head(task_id="seal-hw-task", session_id=None) == new_head
+    finally:
+        for name, val in (("CODEX_RVF_LOG_ROOT", original_log_root), ("KANBAN_TASK_ID", original_task)):
+            if val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = val
+
+
+def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
+    """finalize 推进高水位的语义：``did_review=True`` → 写高水位到被审 HEAD；
+    ``did_review=False``（纯 no-op 完成）→ 不写。偏向「重审」安全方向，杜绝把未审已提交
+    工作静默标已审。键走 task（cline-kanban 主路径）。"""
+    import importlib  # noqa: PLC0415
+
+    if "rvf_run_finalize" in sys.modules:
+        fin = sys.modules["rvf_run_finalize"]
+    else:
+        fin = importlib.import_module("rvf_run_finalize")
+    import review_highwater_marker as hwm  # noqa: PLC0415
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    original_task = os.environ.get("KANBAN_TASK_ID")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    os.environ["KANBAN_TASK_ID"] = "hw-fin-task"
+    try:
+        run_dir = tmp / "run"
+        # No-op completion (no reviewer artifacts) → high-water NOT advanced.
+        rec_noop = {
+            "tracker_lease_release": {"did_review": False},
+            "workspace_diff": {"head_after": head},
+        }
+        out_noop = fin._advance_review_highwater(run_dir, repo, {}, {}, rec_noop)
+        assert out_noop["status"] == "skipped", out_noop
+        assert hwm.resolve_review_highwater_head(task_id="hw-fin-task", session_id=None) is None
+
+        # Genuine review completion → high-water advanced to reviewed HEAD.
+        rec_real = {
+            "tracker_lease_release": {"did_review": True},
+            "workspace_diff": {"head_after": head},
+        }
+        out_real = fin._advance_review_highwater(run_dir, repo, {}, {}, rec_real)
+        assert out_real["status"] == "advanced", out_real
+        assert out_real["reviewed_head"] == head, out_real
+        assert hwm.resolve_review_highwater_head(task_id="hw-fin-task", session_id=None) == head
+    finally:
+        for name, val in (("CODEX_RVF_LOG_ROOT", original_log_root), ("KANBAN_TASK_ID", original_task)):
+            if val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = val
+
+
 def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> None:
     """Files brought in only via a base-branch-sync merge (second parent) are
     excluded from committed-round paths; first-parent agent work is kept (§3)."""
@@ -11148,6 +11253,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "seal_round_baseline_to_head_advances_marker",
             lambda: test_seal_round_baseline_to_head_advances_marker(root / "seal-marker"),
+        ),
+        (
+            "review_highwater_marker_round_trip",
+            lambda: test_review_highwater_marker_round_trip(root / "highwater-marker"),
+        ),
+        (
+            "seal_advances_review_highwater",
+            lambda: test_seal_advances_review_highwater(root / "seal-highwater"),
+        ),
+        (
+            "advance_review_highwater_only_on_did_review",
+            lambda: test_advance_review_highwater_only_on_did_review(root / "finalize-highwater"),
         ),
         (
             "committed_observation_excludes_base_branch_sync_merge",
