@@ -5,7 +5,7 @@
 ``thinking`` / ``tool_use`` / ``tool_result`` block)，归一成
 ``core.transcript.models``。Claude ``Edit`` / ``Write`` / ``NotebookEdit`` 没有
 行号信息，``artifact_refs.lines`` 写 None；``Bash`` 工具中检测 ``apply_patch``
-heredoc 后复用 Codex adapter 的 patch 解析 helper。
+heredoc 后复用 ``core.transcript.patch_parsing`` 的 host-中性解析 helper。
 """
 
 from __future__ import annotations
@@ -23,11 +23,11 @@ from core.transcript.io import (  # noqa: E402
     _truncate,
 )
 from core.transcript.models import TranscriptRecord  # noqa: E402
-from adapters.codex.transcript import (  # noqa: E402
-    _codex_parse_apply_patch_fallback,
-    _extract_apply_patch_from_bash,
-    _patch_lines_for_op,
-    _patch_op_name,
+from core.transcript.patch_parsing import (  # noqa: E402
+    apply_patch_hunk_line_range_for_path,
+    apply_patch_operation_to_artifact_verb,
+    extract_apply_patch_text_from_bash_command,
+    parse_apply_patch_operations_without_repo,
 )
 from session_manifest import parse_apply_patch  # noqa: E402
 
@@ -63,18 +63,18 @@ def _claude_tool_call_artifact_refs(
     elif tool_name == "Bash":
         command = tool_input.get("command")
         if isinstance(command, str):
-            patch_text = _extract_apply_patch_from_bash(command)
+            patch_text = extract_apply_patch_text_from_bash_command(command)
             if patch_text:
                 if repo is not None:
                     ops, _ = parse_apply_patch(repo, patch_text, line_number)
                 else:
-                    ops, _ = _codex_parse_apply_patch_fallback(patch_text, line_number)
+                    ops, _ = parse_apply_patch_operations_without_repo(patch_text, line_number)
                 for op in ops:
                     refs.append(
                         {
                             "path": op.get("path"),
-                            "lines": _patch_lines_for_op(patch_text, op.get("path")),
-                            "op": _patch_op_name(op.get("operation")),
+                            "lines": apply_patch_hunk_line_range_for_path(patch_text, op.get("path")),
+                            "op": apply_patch_operation_to_artifact_verb(op.get("operation")),
                         }
                     )
     return refs

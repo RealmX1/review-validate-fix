@@ -7,15 +7,13 @@ Codex 把 ``apply_patch`` 调用走 ``custom_tool_call`` (``payload.input``)；
 ``exec_command`` 等仍走 ``function_call`` (``payload.arguments``)；两条路径都识别。
 output 既可能是 ``function_call_output`` 也可能是 ``custom_tool_call_output``。
 
-``apply_patch`` patch-text 解析 helper（``_codex_parse_apply_patch_fallback`` /
-``_patch_lines_for_op`` / ``_patch_op_name`` / ``_extract_apply_patch_from_bash``）
-是 Codex 原生格式，Claude adapter 的 Bash ``apply_patch`` 检测复用它们。
+``apply_patch`` custom-format patch-text 的纯文本解析 helper 已上提到
+``core.transcript.patch_parsing``（host-中性：Codex rollout 与 Claude Bash 共用）。
 """
 
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +28,11 @@ from core.transcript.io import (  # noqa: E402
     _truncate,
 )
 from core.transcript.models import TranscriptRecord  # noqa: E402
+from core.transcript.patch_parsing import (  # noqa: E402
+    apply_patch_hunk_line_range_for_path,
+    apply_patch_operation_to_artifact_verb,
+    parse_apply_patch_operations_without_repo,
+)
 from session_manifest import parse_apply_patch  # noqa: E402
 
 
@@ -65,93 +68,6 @@ def read_codex_originator(rollout_path: Path) -> str | None:
                 return None
     except OSError:
         return None
-    return None
-
-
-def _codex_parse_apply_patch_fallback(patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
-    """Repo-less Codex apply_patch parser; mirrors session_manifest.parse_apply_patch
-    shape but skips path normalization. Codex-specific patch text format
-    (``*** Add File: ...`` / ``*** Update File: ...``).
-    """
-    operations: list[dict[str, Any]] = []
-    paths: set[str] = set()
-    for raw_line in patch_text.splitlines():
-        for prefix, op in (
-            ("*** Add File: ", "add"),
-            ("*** Delete File: ", "delete"),
-            ("*** Update File: ", "update"),
-        ):
-            if raw_line.startswith(prefix):
-                rel = raw_line.removeprefix(prefix).strip()
-                if rel:
-                    operations.append({"operation": op, "path": rel, "line_number": line_number})
-                    paths.add(rel)
-                break
-    return operations, paths
-
-
-def _patch_lines_for_op(patch_text: str, path: str | None) -> list[int]:
-    """从 apply_patch 文本中提取该 path 下首段 hunk 的 @@ -X,Y +A,B @@ 中的 A 与 A+B-1。"""
-    if not path:
-        return []
-    in_path = False
-    for raw_line in patch_text.splitlines():
-        if raw_line.startswith("*** ") and "File:" in raw_line:
-            in_path = raw_line.endswith(": " + path) or raw_line.endswith(":" + path) or raw_line.endswith(path)
-            continue
-        if not in_path:
-            continue
-        if raw_line.startswith("@@"):
-            try:
-                # @@ -a,b +c,d @@
-                parts = raw_line.split(" ")
-                plus = next(p for p in parts if p.startswith("+"))
-                plus = plus.lstrip("+")
-                if "," in plus:
-                    start_str, length_str = plus.split(",", 1)
-                    start = int(start_str)
-                    length = int(length_str)
-                    return [start, start + max(length, 1) - 1]
-                return [int(plus), int(plus)]
-            except (StopIteration, ValueError):
-                continue
-    return []
-
-
-def _patch_op_name(operation: str | None) -> str:
-    if operation == "add":
-        return "create"
-    if operation == "delete":
-        return "delete"
-    return "edit"
-
-
-_HEREDOC_RE = re.compile(
-    r"<<\s*['\"]?(?P<token>[A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\n(?P<body>.*?)\n(?P=token)\s*$",
-    re.DOTALL | re.MULTILINE,
-)
-
-
-def _extract_apply_patch_from_bash(command: str) -> str | None:
-    """从 Bash ``apply_patch`` 调用中抽出 patch 文本。
-
-    支持两种形式：
-    - heredoc: ``apply_patch <<'EOF'\n*** Begin Patch...\nEOF``
-    - 内联 stdin: ``apply_patch '*** Begin Patch...\n*** End Patch'``
-    无 ``apply_patch`` 关键字 → 返回 None。
-    """
-    if "apply_patch" not in command:
-        return None
-    match = _HEREDOC_RE.search(command)
-    if match:
-        body = match.group("body")
-        if "*** Begin Patch" in body or "*** Add File:" in body or "*** Update File:" in body or "*** Delete File:" in body:
-            return body
-    if "*** Begin Patch" in command:
-        start = command.find("*** Begin Patch")
-        end = command.rfind("*** End Patch")
-        if end > start:
-            return command[start:end + len("*** End Patch")]
     return None
 
 
@@ -264,13 +180,13 @@ def _distill_codex_record(
                     if repo is not None:
                         ops, _ = parse_apply_patch(repo, patch_text, line_number)
                     else:
-                        ops, _ = _codex_parse_apply_patch_fallback(patch_text, line_number)
+                        ops, _ = parse_apply_patch_operations_without_repo(patch_text, line_number)
                     for op in ops:
                         artifact_refs.append(
                             {
                                 "path": op.get("path"),
-                                "lines": _patch_lines_for_op(patch_text, op.get("path")),
-                                "op": _patch_op_name(op.get("operation")),
+                                "lines": apply_patch_hunk_line_range_for_path(patch_text, op.get("path")),
+                                "op": apply_patch_operation_to_artifact_verb(op.get("operation")),
                             }
                         )
                     summary_parts.append(
