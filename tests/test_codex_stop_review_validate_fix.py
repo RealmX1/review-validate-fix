@@ -28,7 +28,7 @@ SCRIPT = (
     / "scripts"
     / "codex_stop_review_validate_fix.py"
 )
-DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_codex_fork.py")
+DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_fork.py")
 RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")
 
 for _name in tuple(os.environ):
@@ -1173,7 +1173,7 @@ def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp_path: Path
     assert "app_server_requests_path" not in latest
 
 
-def test_diagnose_codex_fork_dry_run_writes_requests(tmp_path: Path) -> None:
+def test_diagnose_fork_dry_run_writes_requests(tmp_path: Path) -> None:
     state = tmp_path / "state"
     message = "RVF_FORK_EXPERIMENT: custom diagnostic message"
     env = os.environ.copy()
@@ -7738,7 +7738,7 @@ def main() -> int:
         test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
-        test_diagnose_codex_fork_dry_run_writes_requests,
+        test_diagnose_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
         test_codex_goal_mode_skips_direct_stop_hook,
         test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook,

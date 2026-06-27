@@ -279,7 +279,7 @@ flowchart TD
 
 这张图里的关键边界是：router 只负责 stable/dev channel 选择，默认 stable；dispatcher 只负责 dev-only sync 与 installed hook 转交；installed hook 内部先用 `evaluate_stop_event()` 统一决定是否启动 RVF，再由 `launch_backend()` 执行 Cline Kanban task、Cline Kanban follow-up、legacy GUI fallback、manual 或 dry-run。`CODEX_RVF_MODE` / `CODEX_RVF_FORK_MODE` 仍是公开配置入口，但主程序内部只使用归一后的 backend。默认 `auto` 成功路径会在普通 Codex GUI session 中创建新的 Cline Kanban task，在 Kanban task session 中注入 follow-up user message；只有自动模式下 Kanban task 启动失败且不是 stale listener / wrong repo 这类可诊断 Kanban 管理面错误时才进入 legacy GUI fallback。失败路径只报告原因，不把 `$review-validate-fix` 作为当前 Stop continuation 注入父会话。
 
-fork 诊断不再通过 Stop hook 主路径里的 `RVF_FORK_EXPERIMENT` 自动触发；需要排查 app-server fork 行为时，手动运行 plugin runtime 的 `scripts/diagnose_codex_fork.py --mode dry-run|gui|manual`，并把 Stop event JSON 通过 stdin 传入。
+fork 诊断不再通过 Stop hook 主路径里的 `RVF_FORK_EXPERIMENT` 自动触发；需要排查 app-server fork 行为时，手动运行 plugin runtime 的 `scripts/diagnose_fork.py --mode dry-run|gui|manual`，并把 Stop event JSON 通过 stdin 传入。
 
 ### 当前 session 开关
 
