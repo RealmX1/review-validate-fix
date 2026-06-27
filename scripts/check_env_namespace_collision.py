@@ -76,9 +76,15 @@ def scan_repo(repo_root: Path) -> dict[str, tuple[set[str], set[str]]]:
         text=True,
         check=True,
     ).stdout.splitlines()
+    # 跳过 gate 自身：它的 _self_test() 含 env-访问形态的样本字面量（CODEX_RVF_FOO /
+    # RVF_FOO / export RVF_STATE_DIR 等），是检测器的测试夹具而非真实 env 访问；自扫会
+    # 把这些样本误判成跨命名空间碰撞（gate 提交、被 git 跟踪后才发生）。
+    self_path = Path(__file__).resolve()
     per_base: dict[str, tuple[set[str], set[str]]] = {}
     for rel in tracked:
         path = repo_root / rel
+        if path.resolve() == self_path:
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
