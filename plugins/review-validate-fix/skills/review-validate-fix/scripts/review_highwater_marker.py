@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,35 @@ from rvf_logging import log_root, safe_token
 
 SUBDIR_NAME = "review-highwater"
 MARKER_VERSION = 1
+
+
+def _reviewed_head_would_regress(repo: str | None, old_head: str, new_head: str) -> bool:
+    """``new_head`` 是否为 ``old_head`` 的**严格祖先**（同一线性史上的回退）。
+
+    用于把模块头声明的「高水位只前移、不回退」从注释承诺变为**实际强制**：committed-round
+    优先用高水位作窗口下界，且消费端只判「高水位是否当前 HEAD 祖先」、并不判「是否 ≥ 旧高
+    水位」。若不在写入处强制单调，task-keyed 跨 worktree/attempt 共享时，一个『落后』上下文
+    （HEAD=B3，B3 是另一上下文 HEAD A5 的祖先）后完成 review，会把高水位从 A5 盲覆盖回 B3；
+    回到 A5 上下文下次 Stop，ancestry 守卫仍通过（B3 是 A5 祖先）→ 采 B3 作下界 → 窗口
+    B3..A5 偏宽 → 对边界两侧均改动的文件 canonical-hash 去重 miss → 重派已审工作。
+
+    仅当 ``new_head`` 严格落后于 ``old_head`` 时返回 True（拒绝覆盖、保留更高水位）；前移 /
+    分叉 / 相等一律 False（照常写入）。best-effort：repo 不可用或 git 失败一律 False（退化为
+    盲写，保持旧行为、绝不阻断 finalize/seal）。
+    """
+    if not repo or not old_head or old_head == new_head:
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", new_head, old_head],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return result.returncode == 0
 
 
 def _highwater_root(root: Path | None = None) -> Path:
@@ -128,25 +158,36 @@ def write_review_highwater(
 ) -> Path | None:
     """写入 / 推进高水位。优先 task_id；无 task_id 时退回 session_id；都无返回 None。
 
-    幂等覆盖（``_atomic_write``）。**只前移不应回退**的不变量由调用方保证：finalize 仅在
-    真正完成 review 时调用、seal 仅在 rvf-land HEAD 调用——二者都是单调向前的 HEAD。本函数
-    刻意不做 ancestry 比较（拿不到 repo 上下文且应保持 IO-only，与 ``round_baseline_marker``
-    一致）；非单调的极端情形由消费端的 ancestry 守卫兜底。
+    **只前移不回退**：传入 ``repo`` 时，若已有高水位且新值是其严格祖先（同线性史回退），
+    跳过覆盖、保留更高水位并返回现有 marker 路径（见 ``_reviewed_head_would_regress`` 对
+    task-keyed 跨 worktree 共享回退的论证）。``repo=None`` / git 不可用 / 前移 / 分叉 / 相等
+    → 照常幂等覆盖（``_atomic_write``）。finalize 与 seal 都已持有 repo 并传入，故该不变量在
+    实际写入路径上被强制，而非仅靠注释 + 消费端 ancestry 守卫（后者只判「高水位是否当前 HEAD
+    祖先」，并不判「是否 ≥ 旧高水位」，故单靠它兜不住回退）。
     """
     if not isinstance(reviewed_head, str) or not reviewed_head.strip():
         return None
+    new_head = reviewed_head.strip()
     paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
     if not paths:
         return None
+    target = paths[0]
+    existing = _read_json(target)
+    if isinstance(existing, dict):
+        old_head = existing.get("reviewed_head")
+        if isinstance(old_head, str) and _reviewed_head_would_regress(
+            repo, old_head.strip(), new_head
+        ):
+            # 拒绝把高水位回退到更早的 commit，保留现有（更高）水位。
+            return target
     payload = marker_payload(
         task_id=task_id,
         session_id=session_id,
-        reviewed_head=reviewed_head.strip(),
+        reviewed_head=new_head,
         repo=repo,
         source=source,
         captured_at=captured_at,
     )
-    target = paths[0]
     _atomic_write(target, payload)
     return target
 

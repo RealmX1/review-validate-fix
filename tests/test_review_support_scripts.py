@@ -9554,6 +9554,40 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
                 os.environ[name] = val
 
 
+def test_review_highwater_write_is_monotonic_with_repo(tmp: Path) -> None:
+    """高水位只前移不回退（实际强制，非仅注释）：传入 repo 时，把高水位写成现值的严格祖先
+    会被拒绝（保留更高水位）；前移正常推进；repo=None 退化盲写。修 task-keyed 跨 worktree
+    落后上下文后完成 review 盲覆盖回退高水位 → committed-round 窗口偏宽重派已审工作 的缝
+    （对抗式 review 发现，over-dispatch-regression lens）。"""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import review_highwater_marker as hwm  # noqa: PLC0415
+    repo, _baseline = _committed_round_repo(tmp)
+    root = tmp / "state"
+    (repo / "f.txt").write_text("base\nc1\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo); run(["git", "commit", "-q", "-m", "c1"], cwd=repo)
+    c1 = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    (repo / "f.txt").write_text("base\nc1\nc2\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo); run(["git", "commit", "-q", "-m", "c2"], cwd=repo)
+    c2 = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    # Advance to c2 (ahead).
+    hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c2, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c2
+    # Regress to c1 (strict ancestor of c2) WITH repo → refused, stays c2.
+    hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c1, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c2, "regress must be refused"
+    # Forward to c3 (descendant) → advances.
+    (repo / "f.txt").write_text("base\nc1\nc2\nc3\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo); run(["git", "commit", "-q", "-m", "c3"], cwd=repo)
+    c3 = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c3, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c3
+    # repo=None → degrade to blind write (best-effort), regress allowed.
+    hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c1, repo=None, root=root)
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c1
+
+
 def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> None:
     """Files brought in only via a base-branch-sync merge (second parent) are
     excluded from committed-round paths; first-parent agent work is kept (§3)."""
@@ -11265,6 +11299,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "advance_review_highwater_only_on_did_review",
             lambda: test_advance_review_highwater_only_on_did_review(root / "finalize-highwater"),
+        ),
+        (
+            "review_highwater_write_is_monotonic_with_repo",
+            lambda: test_review_highwater_write_is_monotonic_with_repo(root / "highwater-monotonic"),
         ),
         (
             "committed_observation_excludes_base_branch_sync_merge",
