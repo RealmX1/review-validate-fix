@@ -240,7 +240,16 @@ def _release_tracker_lease(
     log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
     log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
     release_reason = "failed" if decision_kind in {"cancelled", "cancel", "interrupted"} else "completed"
+    did_review: bool | None = None
     if release_reason == "completed":
+        # A genuine review leaves at least one reviewer artifact on disk; a no-op
+        # follow-up (clean tree → 0 reviewers dispatched) leaves none. Only flip
+        # leased units to `reviewed` when a reviewer actually ran, so a no-op
+        # completion releases the lease without silently marking unreviewed work
+        # reviewed (which would convert an over-dispatch into a missed-review).
+        did_review = any(
+            (run_dir / "artifacts" / "reviewers").glob("*/review-result.json")
+        )
         result = diff_tracker.complete_review_scope(
             repo=repo,
             lease_id=lease_id,
@@ -248,6 +257,7 @@ def _release_tracker_lease(
             scope_hash=scope_hash,
             run_id=run_id,
             reason=release_reason,
+            mark_reviewed=did_review,
             log_root_override=log_root_override,
         )
     else:
@@ -262,7 +272,102 @@ def _release_tracker_lease(
         "lease_id": lease_id,
         "release_reason": release_reason,
         "primary_unit_count": len(primary_units),
+        "did_review": did_review,
         **result,
+    }
+
+
+def _head_oid(repo: Path) -> str | None:
+    import subprocess  # noqa: PLC0415 - off the hot path, only on finalize fallback
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    head = result.stdout.strip()
+    # A fresh repo with no commits prints nothing / the literal "HEAD".
+    return head if head and head != "HEAD" else None
+
+
+def _advance_review_highwater(
+    run_dir: Path,
+    repo: Path | None,
+    event: dict[str, Any] | None,
+    summary: dict[str, Any],
+    finalize_record: dict[str, Any],
+) -> dict[str, Any]:
+    """review 真正完成时，把 last-reviewed 高水位推进到本次被审到的 HEAD。
+
+    committed-round 漏审检测以该高水位（``review_highwater_marker``）而非 round-baseline
+    作窗口下界：round-baseline 被 UserPromptSubmit **每条 prompt** 顶到当前 HEAD，会让
+    「在某轮提交、却没在该轮自己的 Stop 里被审」的工作，一旦后续任意 prompt 推进 baseline
+    就永久落出窗口（漏审）。高水位只在此处（``did_review`` 真完成）与 rvf-land 封窗推进，于是
+    孤儿提交留在 ``high-water..HEAD`` 内直到真被审。纯 no-op / 失败完成不推进，偏向「重审」
+    安全方向。键（task 优先、session 回退）与 committed-round 读取对齐，同 ``log_root()``。
+    best-effort：任何失败折叠为 skip，绝不影响 finalize。见 ``review_highwater_marker`` 模块头。
+    """
+    if repo is None:
+        return {"status": "skipped", "reason": "missing_repo"}
+    lease_rel = finalize_record.get("tracker_lease_release")
+    did_review = bool(lease_rel.get("did_review")) if isinstance(lease_rel, dict) else False
+    if not did_review:
+        return {"status": "skipped", "reason": "no_review_artifacts"}
+    # 被审到的 HEAD = finalize 时的 HEAD：committed-round 审已提交工作时 HEAD 未动；dirty
+    # review 时 dirty 工作尚未提交、HEAD 同样未动。复用 workspace_diff 已算的 head_after，
+    # 缺失时现算 git rev-parse HEAD 兜底。
+    reviewed_head: str | None = None
+    workspace_diff = finalize_record.get("workspace_diff")
+    if isinstance(workspace_diff, dict):
+        candidate = workspace_diff.get("head_after")
+        if isinstance(candidate, str) and candidate.strip():
+            reviewed_head = candidate.strip()
+    if not reviewed_head:
+        reviewed_head = _head_oid(repo)
+    if not reviewed_head:
+        return {"status": "skipped", "reason": "no_head"}
+
+    import review_highwater_marker  # noqa: PLC0415 - lazy, off the hot import path
+
+    event_ctx = event or {}
+    try:
+        from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+        task_id = current_kanban_task_id(event_ctx)
+    except Exception:
+        task_id = None
+    session_id: str | None = None
+    raw_session = event_ctx.get("session_id")
+    if isinstance(raw_session, str) and raw_session.strip():
+        session_id = raw_session.strip()
+    elif isinstance(summary, dict):
+        summary_session = summary.get("session_id")
+        if isinstance(summary_session, str) and summary_session.strip():
+            session_id = summary_session.strip()
+    marker_path = review_highwater_marker.write_review_highwater(
+        task_id=task_id,
+        session_id=session_id,
+        reviewed_head=reviewed_head,
+        repo=str(repo),
+        source="stop_finalize",
+    )
+    if marker_path is None:
+        return {
+            "status": "skipped",
+            "reason": "no_marker_key",
+            "reviewed_head": reviewed_head,
+        }
+    return {
+        "status": "advanced",
+        "reviewed_head": reviewed_head,
+        "marker_path": str(marker_path),
     }
 
 
@@ -300,6 +405,7 @@ def finalize_run(
         "usage": None,
         "workspace_diff": None,
         "tracker_lease_release": None,
+        "review_highwater": None,
         "analysis": None,
         "errors": [],
     }
@@ -379,6 +485,19 @@ def finalize_run(
         finalize_record["errors"].append(
             {
                 "stage": "tracker_lease_release",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
+
+    try:
+        finalize_record["review_highwater"] = _advance_review_highwater(
+            run_dir, repo, event, summary, finalize_record
+        )
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "review_highwater",
                 "error": f"{type(exc).__name__}: {exc}",
                 "trace": traceback.format_exc(),
             }
