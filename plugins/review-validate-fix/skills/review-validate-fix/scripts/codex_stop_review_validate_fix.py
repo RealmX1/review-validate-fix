@@ -1057,8 +1057,8 @@ def source_origin_for_kanban_task(
             "kanban_attempt_id": attempt_id,
             "kanban_task_title": title or None,
             "kanban_task_title_source": task_title_source,
-            "codex_session_label": fallback_origin.get("label"),
-            "codex_session_name_source": fallback_origin.get("name_source"),
+            "source_session_label": fallback_origin.get("label"),
+            "source_session_name_source": fallback_origin.get("name_source"),
         }
     )
     return origin
@@ -1106,10 +1106,10 @@ def parent_origin_prompt_block(
             f"RVF_PARENT_KANBAN_TASK_TITLE: {value_or_unavailable(parent_origin.get('kanban_task_title'))}\n"
             "RVF_PARENT_KANBAN_TASK_TITLE_SOURCE: "
             f"{value_or_unavailable(parent_origin.get('kanban_task_title_source'))}\n"
-            "RVF_PARENT_CODEX_SESSION_REF: "
-            f"{value_or_unavailable(parent_origin.get('codex_session_label'))}\n"
-            "RVF_PARENT_CODEX_SESSION_NAME_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('codex_session_name_source'))}\n"
+            "RVF_PARENT_SOURCE_SESSION_REF: "
+            f"{value_or_unavailable(parent_origin.get('source_session_label'))}\n"
+            "RVF_PARENT_SOURCE_SESSION_NAME_SOURCE: "
+            f"{value_or_unavailable(parent_origin.get('source_session_name_source'))}\n"
         )
     lines.append(
         "\n"
@@ -1145,8 +1145,8 @@ def parent_origin_summary_fields(
         "parent_kanban_attempt_id": parent_origin.get("kanban_attempt_id"),
         "parent_kanban_task_title": parent_origin.get("kanban_task_title"),
         "parent_kanban_task_title_source": parent_origin.get("kanban_task_title_source"),
-        "parent_codex_session_ref": parent_origin.get("codex_session_label"),
-        "parent_codex_session_name_source": parent_origin.get("codex_session_name_source"),
+        "parent_source_session_ref": parent_origin.get("source_session_label"),
+        "parent_source_session_name_source": parent_origin.get("source_session_name_source"),
     }
 
 

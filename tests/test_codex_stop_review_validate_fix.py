@@ -3679,8 +3679,8 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert latest["parent_conversation_ref"] == "Fix RVF follow-up source metadata"
     assert latest["parent_conversation_name"] == latest["parent_conversation_ref"]
     assert latest["parent_conversation_name_source"] == "cline_kanban_task_lookup"
-    assert latest["parent_codex_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
-    assert latest["parent_codex_session_name_source"] == "session_ref_fallback"
+    assert latest["parent_source_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
+    assert latest["parent_source_session_name_source"] == "session_ref_fallback"
     assert latest["parent_codex_url"] == f"codex://local/{session_id}"
     assert Path(str(latest["parent_origin_path"])).exists()
     calls = [
@@ -3711,7 +3711,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert "`source Kanban task id`" in prompt_text
     assert "`source Kanban attempt id`" in prompt_text
     assert "`source Kanban task title at trigger`" in prompt_text
-    assert "RVF_PARENT_CODEX_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
+    assert "RVF_PARENT_SOURCE_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
     assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
     assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
     prep = dispatch_prep_payload(latest)
