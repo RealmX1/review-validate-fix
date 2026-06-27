@@ -1021,6 +1021,11 @@ require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md"
 # 反模式 ② 已脱离：04 不得再宣称本仓库"当前正是该反模式的样本"。
 forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '本仓库当前正是该反模式的样本'
 
+# S8.0（去-codex 重构）：env-namespace 碰撞 gate。防 CODEX_RVF_* → RVF_* 改名半完成
+# ——同一 base 在 CODEX_RVF_ 与裸 RVF_ 两命名空间都被 env 访问 = 运行时变量分裂、
+# 静默损坏（无语法/import 错，未覆盖路径假绿）。ALLOWLIST 在脚本内随坍缩切片收窄。
+python3 "$repo_root/scripts/check_env_namespace_collision.py"
+
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'
   printf 'hashes:\n'
