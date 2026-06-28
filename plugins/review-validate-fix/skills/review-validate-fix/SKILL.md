@@ -65,6 +65,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 - Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新。
 - 最终回复第一行输出 `RVF_HANDOFF_FILE: <绝对路径>`，空一行后按 `references/handoff-template.md` 规定的固定分行标签结构追加极短中文摘要（不要挤成一段）；该模板是摘要结构的唯一详述处。Stop hook 会把该 marker 当作完成信号，run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）；不要再手动调用任何「打开 handoff」脚本。
+- **存在任何 `[elevated]` 时，最终回复必须当场把每条升级直接摆给用户（简述卡点 + 候选方向），绝不只塞进 handoff 正文靠两行标签摘要带过——升级即「需用户决策」。** 当某条升级是只有用户能拍板的方案选择（trade-off）时，用 `AskUserQuestion` 把选项摆出来让其当场选，而不是留在回复里等下一轮。
 - Handoff 只写确认过的事实，不把背景 WIP 或其他 session 的改动混成本轮工作。
 
 ## 拿 handoff 回到实现起点后的两条再入分支

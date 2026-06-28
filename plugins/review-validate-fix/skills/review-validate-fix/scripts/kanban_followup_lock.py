@@ -18,7 +18,11 @@ from rvf_logging import safe_token
 
 SUBDIR_NAME = "kanban-followup-in-progress"
 MARKER_VERSION = 1
-DEFAULT_TTL_SECONDS = 6 * 60 * 60
+# 锁的合法寿命 = agent 处理「一轮 follow-up review」的时间（分钟级，实测最长约 47min）。
+# 历史默认 6h 是「兜底」，但它同时也是「一把因故未 handoff 的锁把 agent Stop 静默挡住」的
+# 最坏冻结时长。砍到 1h：既覆盖正常长 follow-up，又把卡死锁最坏自释放窗口从 6h 压到 ≤1h
+# （锁过期→STALE→读侧惰性清）。需要更长可经 TTL_ENV 覆盖。
+DEFAULT_TTL_SECONDS = 60 * 60
 TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_TTL_SECONDS"
 LOCK_ROOT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"
 STATUS_ACTIVE = "active"
@@ -201,6 +205,18 @@ def write_marker(
         prompt_path=prompt_path,
     )
     target = paths[0]
+    # Option A（兑现 nudge 预算的 loop-break 契约）：本函数是 in-progress 锁唯一的 arm 入口
+    # （arm_kanban_followup_lock_on_delivery 投递确认时调用），整份覆盖 marker。重派发的
+    # delivery re-arm 若不保留既有 reengage_nudge_count，会把『预算用尽再退回静默 skip 防
+    # review↔fix 死循环』的计数每轮清回 0（见 codex_stop_review_validate_fix.py 的 nudge 分支）。
+    # 故在覆盖前读出同 task 既有 marker 的计数并带入新 payload：首次 arm（无既有 marker）自然从
+    # 0 起，re-arm 则让计数跨投递存活。best-effort：read_marker 吞读错、reengage_nudge_count
+    # 坏值按 0（保守：宁可多给一次 nudge，也不因坏值误判预算耗尽而静默挡停）。
+    carried_nudge_count = reengage_nudge_count(
+        read_marker(task_id=task_id, session_id=session_id, root=root)
+    )
+    if carried_nudge_count:
+        payload["reengage_nudge_count"] = carried_nudge_count
     _atomic_write(target, payload)
     return target
 
@@ -322,6 +338,41 @@ def marker_status(
     if armed_ts is None:
         return STATUS_INVALID
     return STATUS_ACTIVE if current_ts - armed_ts <= ttl_seconds() else STATUS_STALE
+
+
+def reengage_nudge_count(marker: dict[str, Any] | None) -> int:
+    """读出 in-progress 锁 marker 上已累计的 re-engage nudge 次数（缺省 0）。
+
+    Stop 读侧据此判断「这把 active 锁还剩多少次 re-engage 预算」：在预算内时不再静默放行
+    agent 干停，而是放回常规 RVF gate 重新唤起；预算用尽再退回静默 skip（防 review↔fix 死循环）。
+    任何结构异常一律按 0 处理（保守：宁可多给一次 nudge，也不因坏值误判为预算耗尽而静默挡停）。
+    """
+    if not isinstance(marker, dict):
+        return 0
+    try:
+        return max(0, int(marker.get("reengage_nudge_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_reengage_nudge_count(marker: dict[str, Any]) -> int:
+    """读-改-写：把 in-progress 锁 marker 的 ``reengage_nudge_count`` +1，原子写回其原文件。
+
+    直接在 ``marker['_marker_path']``（``read_marker`` 注入的实际命中文件，task-path 或
+    session-path）上原地自增，避免重新解析 marker_paths 写到另一条路径上。返回新计数。
+    best-effort：无 ``_marker_path`` 或写失败时返回当前计数、绝不抛——nudge 记账永不阻断 Stop。
+    """
+    current = reengage_nudge_count(marker)
+    raw_path = marker.get("_marker_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return current
+    payload = {key: value for key, value in marker.items() if key != "_marker_path"}
+    payload["reengage_nudge_count"] = current + 1
+    try:
+        _atomic_write(Path(raw_path), payload)
+    except OSError:
+        return current
+    return current + 1
 
 
 # ---------------------------------------------------------------------------

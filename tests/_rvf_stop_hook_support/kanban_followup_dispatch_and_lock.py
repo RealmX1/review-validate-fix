@@ -35,6 +35,9 @@ __all__ = [
     'test_kanban_followup_mode_without_task_id_reports_without_fallback',
     'test_kanban_followup_trigger_marker_skips_one_turn',
     'test_kanban_followup_in_progress_marker_skips_new_followup',
+    'test_kanban_followup_in_progress_lock_reengage_nudges_within_budget',
+    'test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted',
+    'test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rearm',
     'test_kanban_followup_stale_takeover_rechecks_marker_before_unlink',
     'test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots',
 ]
@@ -1196,6 +1199,11 @@ def test_kanban_followup_in_progress_marker_skips_new_followup(tmp_path: Path) -
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "KANBAN_TASK_ID": "task-active",
             "FAKE_CLIENT_CALLS": str(client_calls),
+            # nudge 预算=0 → 关掉 re-engage，锁 active 即静默 skip（历史行为 / loop-break 守卫）。
+            # 默认预算>0 时的「先 re-engage 再 skip」由
+            # test_kanban_followup_in_progress_lock_reengage_nudges_within_budget 与
+            # test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted 覆盖。
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "0",
         },
         state_dir=state,
     )
@@ -1209,6 +1217,177 @@ def test_kanban_followup_in_progress_marker_skips_new_followup(tmp_path: Path) -
     assert latest["kanban_followup_in_progress_marker_path"] == str(marker_path)
     assert marker_path.exists()
     assert not client_calls.exists()
+
+
+def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
+    tmp_path: Path,
+) -> None:
+    """锁 active + nudge 预算未尽：不静默 skip，而是 re-engage（return None → 让回常规 gate）。
+
+    用 clean repo 让「让回常规 gate」后落到轻量的 dirty-gate clean skip（不触发重派发的重活），
+    只断言**这把锁没有把本次 Stop 静默挡停**：systemMessage 不含 kanban_followup_in_progress、
+    并记了一条 kanban_followup_in_progress_nudged、且 marker 的 reengage_nudge_count 自增到 1。
+    """
+    clean = init_repo(tmp_path / "clean", dirty=False)
+    state = tmp_path / "state"
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True)
+    marker_path = marker_dir / "task-task-active.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-active",
+                "session_id": "session-active",
+                "run_id": "rvf-existing",
+                "run_dir": str(tmp_path / "existing-run"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(clean),
+            "session_id": "session-active",
+            "stop_hook_active": False,
+            "last_user_message": "测试再次后台跑。等完成后 finalize handoff.md。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-active",
+            # 默认预算=2，这里显式钉死以免环境带入覆盖。
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    parse_json(stdout)  # 仍是合法 hook 输出
+    # nudge 让回常规 gate → clean repo 落到 dirty-gate clean skip，而非被锁静默挡停。
+    # （注意：不能用 systemMessage 子串判定——tmp_path 含测试名 "kanban_followup_in_progress"
+    #  会假阳性；改用精确 reason_code。）
+    latest = latest_summary(state)
+    assert latest["reason_code"] == "clean_repo"
+    assert latest["reason_code"] != "kanban_followup_in_progress"
+    events = latest_events(state)
+    nudged = [
+        event
+        for event in events
+        if event.get("event") == "kanban_followup_in_progress_nudged"
+    ]
+    assert len(nudged) == 1, events
+    assert nudged[0].get("reason_code") == "kanban_followup_in_progress_reengage_nudge"
+    assert nudged[0].get("kanban_followup_in_progress_nudge_count") == 1
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted.get("reengage_nudge_count") == 1
+    assert marker_path.exists()
+
+
+def test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted(
+    tmp_path: Path,
+) -> None:
+    """nudge 预算用尽（reengage_nudge_count >= 预算）：退回静默 skip，保住 review↔fix loop-break。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True)
+    marker_path = marker_dir / "task-task-active.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-active",
+                "session_id": "session-active",
+                "run_id": "rvf-existing",
+                "run_dir": str(tmp_path / "existing-run"),
+                "reengage_nudge_count": 2,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "stop_hook_active": False,
+            "last_user_message": "测试再次后台跑。等完成后 finalize handoff.md。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-active",
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "reason=kanban_followup_in_progress" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "kanban_followup_in_progress"
+    # 预算用尽不再自增（marker 计数维持 2，不被 bump 到 3）。
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted.get("reengage_nudge_count") == 2
+
+
+def test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rearm(
+    tmp_path: Path,
+) -> None:
+    """Option A：重派发的 delivery re-arm（write_marker 整份覆盖 marker）必须保留既有
+    reengage_nudge_count——否则 nudge 预算每轮被清回 0，『预算用尽再退回静默 skip』的 loop-break
+    在 kanban『dirty 停→re-engage→重派发→re-arm』循环里永不触发。本测试钉死：首次 arm（无既有
+    marker）从 0 起；bump 累积后的 re-arm 既是真·整份覆盖（run_id 换新），又把计数带回（计数跨
+    投递存活）。
+    """
+    module = load_kanban_followup_lock_module()
+    root = tmp_path / "locks"
+    arm_kwargs = dict(
+        task_id="task-rearm",
+        session_id="session-rearm",
+        repo=None,
+        cwd=None,
+        root=root,
+    )
+
+    # 首次 arm：无既有 marker → 计数缺省 0（不应被 carry 逻辑误置）。
+    first = module.write_marker(run_id="rvf-1", run_dir=str(tmp_path / "run-1"), **arm_kwargs)
+    assert first is not None
+    marker_after_first = module.read_marker(
+        task_id="task-rearm", session_id="session-rearm", root=root
+    )
+    assert module.reengage_nudge_count(marker_after_first) == 0
+
+    # 模拟 Stop 读侧的 nudge 记账：bump 两次 → 计数 2，写在实际命中文件上。
+    assert module.bump_reengage_nudge_count(marker_after_first) == 1
+    assert (
+        module.bump_reengage_nudge_count(
+            module.read_marker(task_id="task-rearm", session_id="session-rearm", root=root)
+        )
+        == 2
+    )
+
+    # re-arm（新 run，整份覆盖）：run_id 必须换成 rvf-2（证明是真覆盖而非 no-op），
+    # 且 reengage_nudge_count 必须保留为 2（Option A 的核心：计数跨 re-arm 存活）。
+    second = module.write_marker(run_id="rvf-2", run_dir=str(tmp_path / "run-2"), **arm_kwargs)
+    assert second is not None
+    marker_after_rearm = module.read_marker(
+        task_id="task-rearm", session_id="session-rearm", root=root
+    )
+    assert marker_after_rearm.get("run_id") == "rvf-2"
+    assert module.reengage_nudge_count(marker_after_rearm) == 2
 
 
 def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: Path) -> None:
@@ -1332,6 +1511,9 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
             "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
             "KANBAN_TASK_ID": "task-shared",
             "FAKE_CLIENT_CALLS": str(client_calls),
+            # 本测试只验「跨 state-root 共享锁挡住第二次 dispatch」的 skip 短路语义，与
+            # re-engage nudge 正交：预算=0 关掉 nudge，钉死走静默 skip 分支。
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "0",
         },
         state_dir=state_b,
     )
