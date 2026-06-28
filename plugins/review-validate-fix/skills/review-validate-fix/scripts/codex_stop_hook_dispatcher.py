@@ -143,7 +143,16 @@ def coerce_text(value: object) -> str:
 
 
 def sync_child_env() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if not key.startswith("CODEX_RVF_")}
+    # dev-sync 子进程（contract-check / installer / 重入 hook）必须拿到不含父会话 RVF
+    # run 状态的干净 env，否则子进程会误继承父 RVF run 的 run_dir / suppress marker /
+    # tracker 开关。RVF env 命名空间横跨两个前缀：``CODEX_RVF_``（部署 + codex-specific）
+    # 与裸 ``RVF_``（去-codex 后的中性运行时变量，如 RVF_RUN_DIR / RVF_SUPPRESS_STOP_HOOK /
+    # RVF_TRACKER_*），两者都要剥离。
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not (key.startswith("CODEX_RVF_") or key.startswith("RVF_"))
+    }
 
 
 def git_root(path: Path) -> Path | None:

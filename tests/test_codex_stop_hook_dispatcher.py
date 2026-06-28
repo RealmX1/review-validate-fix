@@ -103,7 +103,13 @@ def write_env_check_dev_scripts(repo: Path, marker: Path) -> None:
     body = (
         "#!/usr/bin/env python3\n"
         "import os, pathlib, sys\n"
-        "if any(key.startswith('CODEX_RVF_') for key in os.environ):\n"
+        # RVF env 命名空间横跨 CODEX_RVF_ 与去-codex 后的裸 RVF_。继承自父会话的任一前缀
+        # 变量都判脏；但 dispatcher 显式注入给 dev-sync 子进程的 RVF_ 变量是合法的
+        # （如 contract-check 步骤的 RVF_CONTRACT_TIMING_REPORT），不算泄漏。
+        "allowed = {'RVF_CONTRACT_TIMING_REPORT'}\n"
+        "leaked = [k for k in os.environ if (k.startswith('CODEX_RVF_') or k.startswith('RVF_')) and k not in allowed]\n"
+        "if leaked:\n"
+        "    sys.stderr.write('leaked RVF env into dev-sync child: ' + ','.join(sorted(leaked)) + chr(10))\n"
         "    sys.exit(9)\n"
         f"pathlib.Path({str(marker)!r}).write_text('clean\\n', encoding='utf-8')\n"
     )
@@ -1992,7 +1998,16 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_FORK_MODE": "dry-run", "CODEX_RVF_STATE_DIR": "/tmp/rvf-test"},
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "dry-run",
+            "CODEX_RVF_STATE_DIR": "/tmp/rvf-test",
+            # 去-codex S8 把中性运行时 env 改名为裸 RVF_；这些继承自父会话的值必须同样被
+            # sync_child_env 剥离。用 inert path-config 变量当探针：dispatcher 不消费它们
+            # （无 RunLedger/suppress 等控制语义）、run_step 也不会把它们当合法注入重新加入，
+            # 故能干净地探测「裸 RVF_ 是否泄漏进 dev-sync 子进程」。
+            "RVF_TMUX_BIN": "/tmp/probe-tmux",
+            "RVF_TERMINAL_NOTIFIER_BIN": "/tmp/probe-notifier",
+        },
     )
 
     payload = json.loads(stdout)
