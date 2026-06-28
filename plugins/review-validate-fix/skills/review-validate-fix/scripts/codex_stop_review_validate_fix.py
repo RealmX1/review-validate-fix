@@ -26,6 +26,12 @@ from adapters.codex.codex_gui_fork_app_server_bridge import (  # noqa: E402 — 
     run_app_server_fork,
     select_existing_app_server_socket_for_metadata,
 )
+from adapters.codex.transcript import (  # noqa: E402 — codex rollout / goal-mode 解析缝（S9b 抽出）
+    codex_goal_mode_context_from_event,
+    latest_user_message,
+    session_id_from_path,
+    user_messages_containing,
+)
 from rvf_logging import (
     RunLedger,
     log_root,
@@ -191,14 +197,6 @@ SUPPRESS_ENV_NAMES = (
 # 这是「这是 analyze 线程自己的 Stop event」的显式信号，用于 evaluate_stop_event
 # 早退守卫，短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF。
 RVF_ANALYZE_THREAD = "RVF_ANALYZE_THREAD"
-CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
-CODEX_GOAL_INCOMPLETE_STATUSES = {
-    "active",
-    "paused",
-    "budgetlimited",
-    "budget_limited",
-    "budget-limited",
-}
 SESSION_PATH_KEYS = (
     "transcript_path",
     "session_path",
@@ -535,65 +533,6 @@ def first_readable_session_path(event: dict[str, Any]) -> Path | None:
     return None
 
 
-def latest_user_message(path: Path) -> str | None:
-    latest: str | None = None
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    if isinstance(message, str):
-                        latest = message
-                    continue
-
-                if record.get("type") == "response_item":
-                    if payload.get("type") == "message" and payload.get("role") == "user":
-                        text = text_from_message_payload(payload)
-                        if text:
-                            latest = text
-    except OSError:
-        return None
-    return latest
-
-
-def user_messages_containing(path: Path, marker: str) -> list[str]:
-    messages: list[str] = []
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                text = ""
-                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    text = message if isinstance(message, str) else ""
-                elif record.get("type") == "response_item":
-                    if payload.get("type") == "message" and payload.get("role") == "user":
-                        text = text_from_message_payload(payload)
-
-                if marker in text:
-                    messages.append(text)
-    except OSError:
-        return []
-    return messages
-
-
 def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
     direct = event.get("last_user_message")
     if isinstance(direct, str) and direct:
@@ -603,172 +542,6 @@ def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
         message = latest_user_message(path)
         if message:
             return message
-    return None
-
-
-def session_id_from_path(path: Path) -> str | None:
-    meta = session_meta_from_path(path)
-    value = meta.get("id")
-    return value if isinstance(value, str) and value else None
-
-
-def session_meta_from_path(path: Path) -> dict[str, Any]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for _ in range(20):
-                line = handle.readline()
-                if not line:
-                    return {}
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                return payload if isinstance(payload, dict) else {}
-    except (OSError, UnicodeDecodeError):
-        return {}
-    return {}
-
-
-def _normalized_goal_status(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value.strip().replace(" ", "").replace("-", "").replace("_", "").lower()
-
-
-def _goal_status_from_mapping(value: Any) -> str | None:
-    if not isinstance(value, dict):
-        return None
-    goal = value.get("goal")
-    if isinstance(goal, dict):
-        status = _normalized_goal_status(goal.get("status"))
-        if status is not None:
-            return status
-    return _normalized_goal_status(
-        value.get("goal_status")
-        or value.get("goalStatus")
-        or value.get("thread_goal_status")
-        or value.get("threadGoalStatus")
-    )
-
-
-def _goal_status_from_text(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return None
-    return _goal_status_from_mapping(parsed)
-
-
-def _record_goal_status(payload: Any) -> str | None:
-    status = _goal_status_from_mapping(payload)
-    if status is not None:
-        return status
-    if not isinstance(payload, dict):
-        return None
-    return _goal_status_from_text(payload.get("output"))
-
-
-def _record_text_contains_goal_continuation(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("role") != "developer":
-        return False
-    for key in ("content", "message", "text"):
-        value = payload.get(key)
-        if isinstance(value, str) and CODEX_GOAL_CONTINUATION_MARKER in value:
-            return True
-        if isinstance(value, list):
-            for item in value:
-                if (
-                    isinstance(item, dict)
-                    and isinstance(item.get("text"), str)
-                    and CODEX_GOAL_CONTINUATION_MARKER in item["text"]
-                ):
-                    return True
-    return False
-
-
-def _codex_session_meta_details(path: Path) -> dict[str, Any]:
-    meta = session_meta_from_path(path)
-    source = meta.get("source")
-    originator = meta.get("originator")
-    cli_version = meta.get("cli_version")
-    codex_originator = isinstance(originator, str) and "codex" in originator.lower()
-    return {
-        "is_codex": codex_originator or isinstance(cli_version, str),
-        "is_subagent": source_marks_subagent(source),
-        "originator": originator if isinstance(originator, str) else None,
-        "cli_version": cli_version if isinstance(cli_version, str) else None,
-    }
-
-
-def _scan_codex_goal_transcript(path: Path) -> dict[str, Any]:
-    latest_status: str | None = None
-    has_goal_continuation = False
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = record.get("payload")
-                status = _record_goal_status(payload)
-                if status is not None:
-                    latest_status = status
-                if _record_text_contains_goal_continuation(payload):
-                    has_goal_continuation = True
-    except (OSError, UnicodeDecodeError):
-        return {
-            "readable": False,
-            "latest_goal_status": None,
-            "has_goal_continuation": False,
-        }
-    return {
-        "readable": True,
-        "latest_goal_status": latest_status,
-        "has_goal_continuation": has_goal_continuation,
-    }
-
-
-def codex_goal_mode_context_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Temporary stop-hook guard: skip RVF while a Codex main session is in /goal."""
-    if source_marks_subagent(event.get("source")):
-        return None
-
-    for path in event_session_paths(event):
-        try:
-            resolved = path.expanduser().resolve()
-        except OSError:
-            continue
-        if not resolved.is_file():
-            continue
-
-        meta_details = _codex_session_meta_details(resolved)
-        if not meta_details["is_codex"] or meta_details["is_subagent"]:
-            continue
-
-        goal_scan = _scan_codex_goal_transcript(resolved)
-        latest_status = goal_scan.get("latest_goal_status")
-        if isinstance(latest_status, str):
-            if latest_status not in CODEX_GOAL_INCOMPLETE_STATUSES:
-                continue
-        elif not goal_scan.get("has_goal_continuation"):
-            continue
-
-        return {
-            "transcript_path": str(resolved),
-            "goal_status": latest_status,
-            "goal_continuation_marker": bool(goal_scan.get("has_goal_continuation")),
-            "codex_originator": meta_details.get("originator"),
-            "codex_cli_version": meta_details.get("cli_version"),
-            "temporary_fix": True,
-        }
     return None
 
 

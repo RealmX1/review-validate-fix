@@ -33,6 +33,7 @@ from core.transcript.patch_parsing import (  # noqa: E402
     apply_patch_operation_to_artifact_verb,
     parse_apply_patch_operations_without_repo,
 )
+from session_label import text_from_message_payload  # noqa: E402 — S9b：Codex rollout user-message 文本抽取（leaf, stdlib-only，无环）
 from session_manifest import parse_apply_patch  # noqa: E402
 
 
@@ -274,3 +275,279 @@ def distill_codex_jsonl(
         "kind_counts": counts,
     }
     return distilled, index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S9b：Codex rollout / goal-mode 解析缝（从共享审查引擎抽出）
+#
+# Codex rollout JSONL 的逐行解析（latest_user_message / user_messages_containing）、
+# session_meta 读取（session_meta_from_path / session_id_from_path）、以及 /goal
+# mode 扫描（codex_goal_mode_context_from_event 及其私有 helper）属 Codex-specific，
+# 落在此 Codex transcript adapter。共享审查引擎经
+# ``from adapters.codex.transcript import (...)`` re-import 下列入口委派执行。
+#
+# 本 adapter 只 import stdlib + ``session_label``（leaf, stdlib-only）；绝不 import
+# 引擎，杜绝 ``adapters → engine`` 循环。下面三个 host-中性符号
+# （``SESSION_PATH_KEYS`` / ``event_session_paths`` / ``source_marks_subagent``）
+# 本应住 core/；S9b 阶段引擎尚未进 core/，故按本仓既有惯例（router / dispatcher /
+# rvf_handoff / rvf_analyze_advisory / rvf_analyze_thread 各自 inline 一份
+# SESSION_PATH_KEYS 以避免循环 import）在此自带副本，与
+# ``codex_stop_review_validate_fix.SESSION_PATH_KEYS`` 保持一致；待 S10 中性体迁
+# core/ 后统一上提共享。
+# ─────────────────────────────────────────────────────────────────────────────
+
+SESSION_PATH_KEYS = (
+    "transcript_path",
+    "session_path",
+    "conversation_path",
+    "log_path",
+    "session_file",
+)
+
+
+def event_session_paths(event: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for key in SESSION_PATH_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            paths.append(Path(value))
+    return paths
+
+
+def source_marks_subagent(source: Any) -> bool:
+    return isinstance(source, dict) and isinstance(source.get("subagent"), dict)
+
+
+CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
+CODEX_GOAL_INCOMPLETE_STATUSES = {
+    "active",
+    "paused",
+    "budgetlimited",
+    "budget_limited",
+    "budget-limited",
+}
+
+
+def latest_user_message(path: Path) -> str | None:
+    latest: str | None = None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        latest = message
+                    continue
+
+                if record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+                        if text:
+                            latest = text
+    except OSError:
+        return None
+    return latest
+
+
+def user_messages_containing(path: Path, marker: str) -> list[str]:
+    messages: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                text = ""
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    text = message if isinstance(message, str) else ""
+                elif record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+
+                if marker in text:
+                    messages.append(text)
+    except OSError:
+        return []
+    return messages
+
+
+def session_id_from_path(path: Path) -> str | None:
+    meta = session_meta_from_path(path)
+    value = meta.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def session_meta_from_path(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for _ in range(20):
+                line = handle.readline()
+                if not line:
+                    return {}
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                return payload if isinstance(payload, dict) else {}
+    except (OSError, UnicodeDecodeError):
+        return {}
+    return {}
+
+
+def _normalized_goal_status(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().replace(" ", "").replace("-", "").replace("_", "").lower()
+
+
+def _goal_status_from_mapping(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    goal = value.get("goal")
+    if isinstance(goal, dict):
+        status = _normalized_goal_status(goal.get("status"))
+        if status is not None:
+            return status
+    return _normalized_goal_status(
+        value.get("goal_status")
+        or value.get("goalStatus")
+        or value.get("thread_goal_status")
+        or value.get("threadGoalStatus")
+    )
+
+
+def _goal_status_from_text(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return _goal_status_from_mapping(parsed)
+
+
+def _record_goal_status(payload: Any) -> str | None:
+    status = _goal_status_from_mapping(payload)
+    if status is not None:
+        return status
+    if not isinstance(payload, dict):
+        return None
+    return _goal_status_from_text(payload.get("output"))
+
+
+def _record_text_contains_goal_continuation(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("role") != "developer":
+        return False
+    for key in ("content", "message", "text"):
+        value = payload.get(key)
+        if isinstance(value, str) and CODEX_GOAL_CONTINUATION_MARKER in value:
+            return True
+        if isinstance(value, list):
+            for item in value:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("text"), str)
+                    and CODEX_GOAL_CONTINUATION_MARKER in item["text"]
+                ):
+                    return True
+    return False
+
+
+def _codex_session_meta_details(path: Path) -> dict[str, Any]:
+    meta = session_meta_from_path(path)
+    source = meta.get("source")
+    originator = meta.get("originator")
+    cli_version = meta.get("cli_version")
+    codex_originator = isinstance(originator, str) and "codex" in originator.lower()
+    return {
+        "is_codex": codex_originator or isinstance(cli_version, str),
+        "is_subagent": source_marks_subagent(source),
+        "originator": originator if isinstance(originator, str) else None,
+        "cli_version": cli_version if isinstance(cli_version, str) else None,
+    }
+
+
+def _scan_codex_goal_transcript(path: Path) -> dict[str, Any]:
+    latest_status: str | None = None
+    has_goal_continuation = False
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload")
+                status = _record_goal_status(payload)
+                if status is not None:
+                    latest_status = status
+                if _record_text_contains_goal_continuation(payload):
+                    has_goal_continuation = True
+    except (OSError, UnicodeDecodeError):
+        return {
+            "readable": False,
+            "latest_goal_status": None,
+            "has_goal_continuation": False,
+        }
+    return {
+        "readable": True,
+        "latest_goal_status": latest_status,
+        "has_goal_continuation": has_goal_continuation,
+    }
+
+
+def codex_goal_mode_context_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Temporary stop-hook guard: skip RVF while a Codex main session is in /goal."""
+    if source_marks_subagent(event.get("source")):
+        return None
+
+    for path in event_session_paths(event):
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+
+        meta_details = _codex_session_meta_details(resolved)
+        if not meta_details["is_codex"] or meta_details["is_subagent"]:
+            continue
+
+        goal_scan = _scan_codex_goal_transcript(resolved)
+        latest_status = goal_scan.get("latest_goal_status")
+        if isinstance(latest_status, str):
+            if latest_status not in CODEX_GOAL_INCOMPLETE_STATUSES:
+                continue
+        elif not goal_scan.get("has_goal_continuation"):
+            continue
+
+        return {
+            "transcript_path": str(resolved),
+            "goal_status": latest_status,
+            "goal_continuation_marker": bool(goal_scan.get("has_goal_continuation")),
+            "codex_originator": meta_details.get("originator"),
+            "codex_cli_version": meta_details.get("cli_version"),
+            "temporary_fix": True,
+        }
+    return None
