@@ -6477,22 +6477,31 @@ def refresh_global_diff_tracker(
     # 用同一下界）。无任一可用下界 → None ⇒ committed 观测整支静默关闭、与今日 dirty-only 一致。
     # best-effort，绝不阻断 refresh。
     committed_baseline: str | None = None
+    committed_base_ref: str | None = None
     try:
         event = context.get("event")
         if isinstance(event, dict):
+            repo_resolved = Path(repo).expanduser().resolve()
             committed_baseline = _resolve_committed_round_baseline(
-                Path(repo).expanduser().resolve(),
+                repo_resolved,
                 current_kanban_task_id(event),
                 session_hook_id_from_event(event),
             )
+            # base 分支 ref：排除 rebase/cherry 压平到第一父链的 base 工作。与 detection 端
+            # `maybe_route_committed_round_scope` 走同一个 `_resolve_committed_round_base_ref`
+            # （入参仅 repo），detection 与 allocation 同源——见 ac042be 的下界同源教训。
+            committed_base_ref = _resolve_committed_round_base_ref(repo_resolved)
     except Exception:
         committed_baseline = None
+        committed_base_ref = None
     context["committed_baseline"] = committed_baseline
+    context["committed_base_ref"] = committed_base_ref
     try:
         manifest = build_manifest(
             Path(repo).expanduser().resolve(),
             transcript,
             committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
         )
     except Exception as exc:
         # build_manifest 失败时 emit `tracker_refresh_failed`（保持原 ledger
@@ -6888,6 +6897,7 @@ def allocate_auto_review_scope(
                 lease_ttl_seconds=lease_ttl_seconds,
                 transcript_max_line_number=transcript_max_line_number,
                 committed_baseline=context.get("committed_baseline"),
+                committed_base_ref=context.get("committed_base_ref"),
             )
             incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
             if incomplete is not None:
@@ -6928,6 +6938,7 @@ def allocate_auto_review_scope(
             # transcript intent.
             auto_claim_observed=False,
             committed_baseline=context.get("committed_baseline"),
+            committed_base_ref=context.get("committed_base_ref"),
         )
     except Exception as exc:
         ledger.event(
@@ -7749,6 +7760,47 @@ def _commit_is_ancestor_of_head(repo_path: Path, commit: str) -> bool:
     return result.returncode == 0
 
 
+COMMITTED_ROUND_BASE_REF_ENV = "CODEX_RVF_COMMITTED_ROUND_BASE_REF"
+
+
+def _local_branch_exists(repo_path: Path, branch: str) -> bool:
+    """``refs/heads/<branch>`` 是否存在（best-effort，任何失败返回 False）。"""
+    try:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _resolve_committed_round_base_ref(repo_path: Path) -> str | None:
+    """committed-round 的 base 分支 ref——把「被 rebase / cherry-pick 压平到本轮第一父链
+    的 base 工作」排除出可审窗口（见 ``diff_tracker._base_ref_exclude_revs`` /
+    ``_list_committed_round_changed_paths``）。
+
+    返回的是**活的 base 分支引用**（如 ``main``），不是 bootstrap 冻结的 base SHA：
+    ``base-branch-sync`` 把 main 顶到 worktree 创建之后才追加的 base 提交（如 monthly-deck）
+    重放进第一父链，只有活引用才能覆盖到它们——冻结 SHA 是这些提交的祖先，``^SHA`` 排不掉。
+
+    优先级：① 环境变量 ``CODEX_RVF_COMMITTED_ROUND_BASE_REF`` 显式覆盖（逃生口 / 测试注入）；
+    ② 本地 ``main`` 分支（base-branch-sync 默认 base，两起实测过触发用的都是它）；③ None。
+    HEAD 在 base 上/之下时绝不排除（否则会减掉会话自己的提交）的发散守卫，统一兜底在
+    diff_tracker 侧，故这里只做纯引用选择。base 是非-main 的特性分支栈式 task 是已记录的残留
+    （main-only 仍严格优于今天的「rebase 路径完全不排除」）。同一 hook 调用内 detection 与
+    allocation 都调本函数、入参只有 repo_path，天然同源（无 ac042be 式不同源风险）。"""
+    override = os.environ.get(COMMITTED_ROUND_BASE_REF_ENV, "").strip()
+    if override:
+        return override
+    if _local_branch_exists(repo_path, "main"):
+        return "main"
+    return None
+
+
 def _resolve_committed_round_baseline(
     repo_path: Path,
     task_id: str | None,
@@ -7802,12 +7854,17 @@ def maybe_route_committed_round_scope(
     )
     if not baseline:
         return None
+    # base 分支 ref：把 rebase/cherry 压平到第一父链的 base 工作排除出可审窗口。
+    # 与 allocation 端 `refresh_global_diff_tracker` 调**同一个**
+    # `_resolve_committed_round_base_ref`（入参仅 repo_path，天然同源），否则 detection
+    # 选中的窗口与 allocation 重建的窗口不一致 → no_session_owned_dirty 误判（ac042be 教训）。
+    base_ref = _resolve_committed_round_base_ref(repo_path)
     # Per-commit opt-out audit: surface which round commits the `RVF-Skip-Review`
     # trailer excluded BEFORE the empty-set early return, so even a round whose
     # commits are all opted-out (committed_paths == []) leaves an audit trace
     # instead of looking indistinguishable from "no committed work".
     try:
-        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline))
+        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline, base_ref))
     except Exception:
         skip_review_shas = []
     if skip_review_shas:
@@ -7826,6 +7883,7 @@ def maybe_route_committed_round_scope(
         committed_paths = _list_committed_round_changed_paths(
             repo_path,
             baseline,
+            base_ref,
         )
     except Exception:
         committed_paths = []

@@ -3728,6 +3728,60 @@ def test_committed_round_skip_review_trailer_excludes_and_audits(tmp_path: Path)
     assert "committed_round_route_selected" not in events, events
 
 
+def test_committed_round_excludes_rebased_base_branch_commits(tmp_path: Path) -> None:
+    """e2e dual of the merge-exclusion path for a REBASE: base work absorbed by
+    `git rebase` (base-branch-sync diverged handback / `pull --rebase`) lands on the
+    round's first-parent line, which `--first-parent --no-merges` alone keeps. With
+    the live base ref (`main`) auto-resolved, committed-round subtracts the
+    base-reachable commits, the reviewable window is empty, and
+    `committed_round_route_selected` never fires — the reported over-trigger (a batch
+    of base 'monthly-deck' files spuriously routed as committed-but-unreviewed) no
+    longer dispatches a redundant review."""
+    repo = _init_committed_round_repo(tmp_path)  # on `main`, f.txt committed
+    state = tmp_path / "state"
+    session_id = "abababab-cdcd-efef-0101-232345456767"
+    # This round's own work on a diverged feature branch; the round baseline is
+    # pinned at its tip (mirrors the marker UserPromptSubmit writes at task HEAD).
+    run(["git", "checkout", "-q", "-b", "feature"], repo)
+    (repo / "feature.txt").write_text("agent work\n", encoding="utf-8")
+    run(["git", "add", "feature.txt"], repo)
+    run(["git", "commit", "-q", "-m", "feature work"], repo)
+    transcript = _committed_round_session(tmp_path, repo, session_id)
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "继续推进",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    # main advances with a base-only file; the feature branch absorbs it via REBASE
+    # (the base commit is replayed onto the first-parent line as a non-merge commit).
+    run(["git", "checkout", "-q", "main"], repo)
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base advance"], repo)
+    run(["git", "checkout", "-q", "feature"], repo)
+    run(["git", "rebase", "-q", "main"], repo)
+    assert _porcelain(repo) == ""
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    assert_skip_reason(stdout, "clean")
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_route_selected" not in events, events
+
+
 def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "doc-plan", dirty=False)
     state = tmp_path / "state"
@@ -4760,6 +4814,7 @@ def main() -> int:
         test_committed_round_highwater_routes_orphan_below_advanced_baseline,
         test_committed_round_without_transcript_evidence_routes_to_review,
         test_committed_round_skip_review_trailer_excludes_and_audits,
+        test_committed_round_excludes_rebased_base_branch_commits,
         test_clean_repo_with_committed_work_but_no_marker_skips,
         test_plan_document_only_routes_out_of_full_rvf,
         test_read_only_session_with_background_plan_docs_does_not_plan_route,

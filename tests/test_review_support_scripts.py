@@ -4247,6 +4247,106 @@ def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> Non
     assert "base_only.txt" not in paths, paths
 
 
+def test_committed_round_changed_paths_excludes_rebased_base_commits(tmp: Path) -> None:
+    """The dual of the merge test for the path a *rebase* takes: when base work is
+    REPLAYED onto the round's first-parent line (`git rebase` / `pull --rebase` /
+    base-branch-sync diverged handback), `--first-parent --no-merges` no longer
+    drops it (only merge SECOND parents are dropped). Supplying the live base ref
+    (`main`) subtracts the base-reachable commits; own first-parent work stays.
+
+    Reproduces the reported committed-round over-trigger: 34 base 'monthly-deck'
+    files surfaced as this session's committed-but-unreviewed work after a rebase.
+    `base_ref=None` keeps today's (buggy) behaviour — proving the fallback is safe
+    and that the exclusion is the load-bearing change."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _c0 = _committed_round_repo(tmp)
+    run(["git", "checkout", "-q", "-b", "feature"], cwd=repo)
+    # Own work done THIS round, then the round baseline is pinned at its tip
+    # (mirrors the marker UserPromptSubmit writes at the task's HEAD).
+    (repo / "feature.txt").write_text("agent work\n", encoding="utf-8")
+    run(["git", "add", "feature.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "feature work"], cwd=repo)
+    baseline = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    # main advances with a base-only file (the 'monthly-deck' analogue)...
+    run(["git", "checkout", "-q", "main"], cwd=repo)
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base advance"], cwd=repo)
+    # ...and the diverged feature branch absorbs it via REBASE (base commit lands
+    # on the first-parent line as an ordinary non-merge commit).
+    run(["git", "checkout", "-q", "feature"], cwd=repo)
+    run(["git", "rebase", "-q", "main"], cwd=repo)
+    # New own work committed after the rebase, so we can prove own work is kept.
+    (repo / "own2.txt").write_text("more agent work\n", encoding="utf-8")
+    run(["git", "add", "own2.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "more feature work"], cwd=repo)
+
+    excluded = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert excluded == ["own2.txt"], excluded  # base_only.txt subtracted, own kept
+
+    # Safe fallback: without a base ref the base file leaks back in (today's bug).
+    leaked = dt._list_committed_round_changed_paths(repo, baseline, base_ref=None)
+    assert "base_only.txt" in leaked and "own2.txt" in leaked, leaked
+    # An unresolvable base ref degrades to the same no-exclusion behaviour.
+    assert dt._base_ref_exclude_revs(repo, "no/such/ref") == []
+
+
+def test_committed_round_base_ref_self_disables_when_head_on_base(tmp: Path) -> None:
+    """Regression guard for the plain-repo flow: when the agent commits directly
+    ON the base branch (HEAD == `main`), `^main` would subtract the session's OWN
+    commits and silently disable committed-round entirely. `_base_ref_exclude_revs`
+    must self-disable (return []) whenever HEAD is an ancestor-or-equal of base, so
+    own committed work is still observed."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)  # HEAD is on `main`
+    (repo / "own.txt").write_text("on-main work\n", encoding="utf-8")
+    run(["git", "add", "own.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "work on main"], cwd=repo)
+    # HEAD == main tip → no safe base to subtract → exclusion disabled.
+    assert dt._base_ref_exclude_revs(repo, "main") == []
+    kept = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert kept == ["own.txt"], kept  # NOT empty — own work survives
+
+
+def test_committed_round_base_ref_excludes_ff_to_base(tmp: Path) -> None:
+    """The sibling of the rebase test, for the path a *fast-forward* takes: when a
+    task worktree (detached HEAD, or a non-base feature branch with no own commits)
+    is quick-forwarded onto the base tip (``git merge --ff-only main`` /
+    base-branch-sync non-divergent handback), ``HEAD == base tip`` but the checkout
+    is NOT on the base branch ref. The previous ``merge-base --is-ancestor HEAD
+    base`` guard saw ``HEAD == base tip`` and self-disabled → ``^base`` never fired →
+    the base commits in ``baseline..HEAD`` leaked back as this session's committed-
+    but-unreviewed work (the reported committed-round over-trigger).
+
+    ``_base_ref_exclude_revs`` must NOT self-disable here (ff implies the branch has
+    no own commits, so ``baseline..HEAD`` is pure base work): it returns ``^<tip>``
+    and the committed-round window holds no base file. The on-base self-disable
+    regression (committing directly on ``main``) is covered by the sibling test."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)  # HEAD on `main`, baseline at base
+    # main advances with a base-only file the session does NOT own.
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base advance"], cwd=repo)
+    base_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    # Detached HEAD fast-forwarded to the base tip (worktree quick-forward).
+    run(["git", "checkout", "-q", "--detach", base_tip], cwd=repo)
+    assert dt._base_ref_exclude_revs(repo, "main") == [f"^{base_tip}"]
+    detached_paths = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert "base_only.txt" not in detached_paths, detached_paths  # base work subtracted
+    assert detached_paths == [], detached_paths  # pure base ff → empty window
+
+    # Same for a NON-base feature branch fast-forwarded onto the base tip: ff only
+    # succeeds because `feat` has no own commits, so the window is still pure base.
+    run(["git", "checkout", "-q", "-b", "feat", baseline], cwd=repo)
+    run(["git", "merge", "-q", "--ff-only", "main"], cwd=repo)
+    assert dt._base_ref_exclude_revs(repo, "main") == [f"^{base_tip}"]
+    feat_paths = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert "base_only.txt" not in feat_paths, feat_paths
+    assert feat_paths == [], feat_paths
+
+
 def test_build_manifest_includes_committed_round_owned_paths(tmp: Path) -> None:
     """An apply_patch-attributed file committed clean within the round still
     lands in owned_committed_round_paths and registers tracker ownership (§5)."""
@@ -5012,6 +5112,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "committed_observation_excludes_base_branch_sync_merge",
             lambda: test_committed_observation_excludes_base_branch_sync_merge(root / "committed-merge"),
+        ),
+        (
+            "committed_round_changed_paths_excludes_rebased_base_commits",
+            lambda: test_committed_round_changed_paths_excludes_rebased_base_commits(
+                root / "committed-rebase"
+            ),
+        ),
+        (
+            "committed_round_base_ref_self_disables_when_head_on_base",
+            lambda: test_committed_round_base_ref_self_disables_when_head_on_base(
+                root / "committed-base-self-disable"
+            ),
+        ),
+        (
+            "committed_round_base_ref_excludes_ff_to_base",
+            lambda: test_committed_round_base_ref_excludes_ff_to_base(
+                root / "committed-base-ff-to-base"
+            ),
         ),
         (
             "build_manifest_includes_committed_round_owned_paths",
