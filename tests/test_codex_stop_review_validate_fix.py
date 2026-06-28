@@ -4783,6 +4783,7 @@ def main() -> int:
         test_kanban_followup_in_progress_lock_reengage_nudges_within_budget,
         test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted,
         test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rearm,
+        test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn,
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,

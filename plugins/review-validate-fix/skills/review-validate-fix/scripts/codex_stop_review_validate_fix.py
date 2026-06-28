@@ -2824,6 +2824,23 @@ def kanban_followup_in_progress_decision(
         # trigger 且仍有未审改动，常规 gate 会重新派发 review / 重新唤起 agent（把「让 agent 停」
         # 与「不派重复 review」解耦）。预算（marker.reengage_nudge_count vs 默认 2）用尽再退回
         # 静默 skip，防 review↔fix 死循环；配合 1h 锁 TTL，一把卡死锁最坏只冻「预算次 + ≤1h」。
+        #
+        # 仅在本回合「不会被随后的 followup/analyze trigger-skip 无条件挡停」时才消耗预算 nudge：
+        # evaluate_stop_event 在调用本函数之后还排了三道 trigger-skip（RVF_ANALYZE_FOLLOWUP /
+        # 显式 $rvf-analyze / KANBAN_FOLLOWUP），若本 Stop 的 latest_user 命中其一，本函数 return
+        # None 也换不来 re-engage（trigger-skip 会接管挡停本回合），只会空耗预算、把真正能 re-engage
+        # 的 non-trigger turn 的预算削掉。故这种 trigger turn 直接 return None 不 bump，预算留到后面
+        # 能真正生效的 non-trigger turn。（committed-round RVF review elevated 修复：原实现在 trigger
+        # turn 上先 bump 再被 trigger-skip 挡停，stall-on-trigger-turn 场景下预算白花、re-engage 失效。）
+        latest_user_for_nudge = latest_user_message_from_event(event)
+        if (
+            latest_user_for_nudge
+            and (
+                RVF_ANALYZE_FOLLOWUP_MARKER in latest_user_for_nudge
+                or KANBAN_FOLLOWUP_MARKER in latest_user_for_nudge
+            )
+        ) or _rvf_analyze_manually_invoked(event, latest_user_for_nudge):
+            return None
         nudge_budget = _kanban_followup_env_int(
             KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV,
             DEFAULT_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET,

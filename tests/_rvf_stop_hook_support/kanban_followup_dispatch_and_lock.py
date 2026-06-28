@@ -38,6 +38,7 @@ __all__ = [
     'test_kanban_followup_in_progress_lock_reengage_nudges_within_budget',
     'test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted',
     'test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rearm',
+    'test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn',
     'test_kanban_followup_stale_takeover_rechecks_marker_before_unlink',
     'test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots',
 ]
@@ -1388,6 +1389,74 @@ def test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rea
     )
     assert marker_after_rearm.get("run_id") == "rvf-2"
     assert module.reengage_nudge_count(marker_after_rearm) == 2
+
+
+def test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn(
+    tmp_path: Path,
+) -> None:
+    """trigger turn（latest_user 是注入的 RVF_KANBAN_FOLLOWUP_TRIGGER）+ 锁 active：nudge 分支
+    不得消耗预算——本回合必被随后的 KANBAN_FOLLOWUP trigger-skip 无条件挡停，若先 bump 则预算白花、
+    削掉真正能 re-engage 的 non-trigger turn 预算（committed-round RVF review elevated 修复的回归守卫）。
+
+    断言：落到 kanban_followup_trigger_turn skip（用精确 reason_code，避免 tmp_path 含测试名
+    子串假阳性）、没有 kanban_followup_in_progress_nudged 事件、marker 的 reengage_nudge_count 仍为 0。
+    """
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True)
+    marker_path = marker_dir / "task-task-active.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-active",
+                "session_id": "session-active",
+                "run_id": "rvf-existing",
+                "run_dir": str(tmp_path / "existing-run"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "stop_hook_active": False,
+            "last_user_message": "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-active",
+            # 默认预算=2，显式钉死以免环境带入覆盖。
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    parse_json(stdout)  # 仍是合法 hook 输出
+    # trigger turn 应落到 kanban_followup_trigger_turn skip（in_progress_decision 的新 guard 在
+    # trigger marker 命中时不 bump、return None，让 trigger-skip 接管）。
+    latest = latest_summary(state)
+    assert latest["reason_code"] == "kanban_followup_trigger_turn"
+    # 关键：本回合没有消耗 nudge 预算。
+    events = latest_events(state)
+    nudged = [
+        event
+        for event in events
+        if event.get("event") == "kanban_followup_in_progress_nudged"
+    ]
+    assert nudged == [], events
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted.get("reengage_nudge_count", 0) == 0
+    assert marker_path.exists()
 
 
 def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: Path) -> None:
