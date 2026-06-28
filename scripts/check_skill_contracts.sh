@@ -870,8 +870,9 @@ require_literal "scripts/codex_stop_review_validate_fix.py" '不是关闭全局 
 require_literal "scripts/codex_stop_review_validate_fix.py" 'dispatcher 仍会运行'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'manual-prepared'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'no Terminal was launched'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'thread/fork'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'turn/start'
+# S9a：app-server fork-request 构造（thread/fork、turn/start）已抽到 adapters/codex
+require_repo_literal "adapters/codex/codex_gui_fork_app_server_bridge.py" 'thread/fork'
+require_repo_literal "adapters/codex/codex_gui_fork_app_server_bridge.py" 'turn/start'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'Terminal/CLI fork launch is intentionally disabled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_REASONING_EFFORT'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'review-validate-fix-fork'
