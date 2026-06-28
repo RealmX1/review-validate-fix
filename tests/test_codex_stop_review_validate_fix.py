@@ -32,7 +32,7 @@ DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_fork.py")
 RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")
 
 for _name in tuple(os.environ):
-    if _name.startswith("CODEX_RVF_"):
+    if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
 
@@ -210,7 +210,7 @@ def invoke(
 ) -> tuple[str, str]:
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             env.pop(name, None)
     env.pop("CODEX_THREAD_ID", None)
     if config is not None:
@@ -1178,7 +1178,7 @@ def test_diagnose_fork_dry_run_writes_requests(tmp_path: Path) -> None:
     message = "RVF_FORK_EXPERIMENT: custom diagnostic message"
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_"):
             env.pop(name, None)
     env["CODEX_RVF_STATE_DIR"] = str(state)
     completed = subprocess.run(
@@ -5291,7 +5291,7 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
     home.mkdir(parents=True)
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_"):
             env.pop(name, None)
     env["HOME"] = str(home)
     env["CODEX_RVF_STATE_DIR"] = str(state)
@@ -6151,7 +6151,7 @@ def invoke_ups(event: dict[str, object], *, state_dir: Path) -> None:
     drift that would silently turn a committed-round test into a no-op."""
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             env.pop(name, None)
     env.pop("CODEX_THREAD_ID", None)
     env["CODEX_RVF_STATE_DIR"] = str(state_dir)
@@ -6346,7 +6346,7 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
     seal_script = SCRIPT.with_name("seal_round_baseline_to_head.py")
     seal_env = os.environ.copy()
     for name in tuple(seal_env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             seal_env.pop(name, None)
     seal_env["CODEX_RVF_STATE_DIR"] = str(state)
     seal_env["RVF_SESSION_ID"] = session_id
@@ -7884,18 +7884,18 @@ def main() -> int:
             if args.shard_count <= 1 or index % args.shard_count == args.shard_index
         ]
         for test in selected:
-            codex_rvf_env = {
+            rvf_env_snapshot = {
                 key: value
                 for key, value in os.environ.items()
-                if key.startswith("CODEX_RVF_")
+                if key.startswith("CODEX_RVF_") or key.startswith("RVF_")
             }
             try:
                 test(root / test.__name__)
             finally:
                 for key in tuple(os.environ):
-                    if key.startswith("CODEX_RVF_"):
+                    if key.startswith("CODEX_RVF_") or key.startswith("RVF_"):
                         os.environ.pop(key, None)
-                os.environ.update(codex_rvf_env)
+                os.environ.update(rvf_env_snapshot)
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
         if args.shard_count > 1

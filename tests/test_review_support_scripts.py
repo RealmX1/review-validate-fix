@@ -51,7 +51,7 @@ RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
 
 for _name in tuple(os.environ):
-    if _name.startswith("CODEX_RVF_"):
+    if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
 
@@ -10885,7 +10885,7 @@ def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
     sow = root / "scope-of-work.md"
     sow.write_text("## scope\n", encoding="utf-8")
     run_dir = root / "run"
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CODEX_RVF_")}
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("CODEX_RVF_") or k.startswith("RVF_"))}
     # emulate `source review-env.sh`: packet/scope only via env, NOT CLI args.
     # (RVF_REPO omitted — review-packet alone is sufficient for the reviewer kernel;
     # setting it to a non-git tmp dir would trip check_repo. The env-backfill code path

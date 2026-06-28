@@ -440,7 +440,7 @@ def invoke_result(
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for key in tuple(env):
-        if key.startswith("CODEX_RVF_") or key.startswith("KANBAN_") or key.startswith("CLINE_KANBAN_"):
+        if key.startswith("CODEX_RVF_") or key.startswith("RVF_") or key.startswith("KANBAN_") or key.startswith("CLINE_KANBAN_"):
             env.pop(key, None)
     if dev_repo is not None:
         env["CODEX_RVF_DEV_REPO"] = str(dev_repo)
