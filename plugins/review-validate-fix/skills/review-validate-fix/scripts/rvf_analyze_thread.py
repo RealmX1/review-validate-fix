@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 adapters.* import
 
 from rvf_logging import safe_token  # noqa: E402
-from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
+from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
 
 # detached-launch 通用机制（O_EXCL 幂等锁 + 两阶段原子 status + catch-all）抽到共享
 # helper，analyze 线程与 reviewer dispatch 两路复用；analyze 专属决策（host 选择 /

@@ -118,7 +118,7 @@ from session_label import (
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
-from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
 import rvf_parent_context
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
@@ -1727,7 +1727,7 @@ def is_codex_agent_id(agent_id: str | None) -> bool:
 def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
     """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
 
-    复用 ``trajectory_distill.detect_transcript_format`` 做 host 识别：
+    复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 做 host 识别：
     Claude Code transcript → ``claude``；Codex rollout → ``codex``；
     无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
     保证既有 Codex-only 用例零回归。

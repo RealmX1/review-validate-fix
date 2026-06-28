@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Claude Code transcript distiller 单元测试。
 
-测试 ``trajectory_distill`` 中新增的：
-- ``detect_transcript_format``
+测试：
+- ``detect_transcript_format``（S9c 起住 ``core/host_adapter/host_transcript_format_detection.py``）
 - ``_claude_user_message_text``（在 trajectory_capture 模块）
 - ``find_rvf_start_in_claude_jsonl``（在 trajectory_capture 模块）
 - ``_distill_claude_record`` / ``distill_claude_jsonl``
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 
@@ -23,6 +24,12 @@ SCRIPT_DIR = (
     / "scripts"
 )
 
+sys.path.insert(0, str(ROOT))  # repo 根（持有 core/ + adapters/），供 host 探测原语 import
+from core.host_adapter.host_transcript_format_detection import (
+    HOST_CLAUDE,
+    HOST_CODEX,
+    detect_transcript_format,
+)
 
 from _rvf_test_support.loader import load_script_module as _load
 
@@ -75,7 +82,6 @@ def _claude_user_tool_result(tool_use_id, content, ts="2026-05-09T10:00:02Z", uu
 
 
 def test_detect_transcript_format_codex(tmp_path: Path) -> None:
-    distill = _load("trajectory_distill")
     rollout = tmp_path / "codex.jsonl"
     _write_jsonl(
         rollout,
@@ -84,11 +90,10 @@ def test_detect_transcript_format_codex(tmp_path: Path) -> None:
             {"type": "event_msg", "payload": {"type": "user_message", "message": "hi"}},
         ],
     )
-    assert distill.detect_transcript_format(rollout) == distill.HOST_CODEX
+    assert detect_transcript_format(rollout) == HOST_CODEX
 
 
 def test_detect_transcript_format_claude(tmp_path: Path) -> None:
-    distill = _load("trajectory_distill")
     transcript = tmp_path / "claude.jsonl"
     _write_jsonl(
         transcript,
@@ -98,23 +103,21 @@ def test_detect_transcript_format_claude(tmp_path: Path) -> None:
             _claude_user("hello"),
         ],
     )
-    assert distill.detect_transcript_format(transcript) == distill.HOST_CLAUDE
+    assert detect_transcript_format(transcript) == HOST_CLAUDE
 
 
 def test_detect_transcript_format_returns_none_for_garbage(tmp_path: Path) -> None:
-    distill = _load("trajectory_distill")
     transcript = tmp_path / "garbage.jsonl"
     transcript.write_text(
         "\n".join(["", "not json", json.dumps({"type": "permission-mode"})] * 5),
         encoding="utf-8",
     )
     # permission-mode 不在 detector 的两个集合中，且只有它有效 → None（保险 fallback 由调用方决定）
-    assert distill.detect_transcript_format(transcript) is None
+    assert detect_transcript_format(transcript) is None
 
 
 def test_detect_transcript_format_missing_file_returns_none(tmp_path: Path) -> None:
-    distill = _load("trajectory_distill")
-    assert distill.detect_transcript_format(tmp_path / "nope.jsonl") is None
+    assert detect_transcript_format(tmp_path / "nope.jsonl") is None
 
 
 def test_claude_user_message_text_string_content() -> None:

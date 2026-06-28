@@ -954,6 +954,16 @@ require_literal "scripts/trajectory_distill.py" 'from core.transcript'
 require_literal "scripts/trajectory_distill.py" 'from adapters.codex.transcript import'
 require_literal "scripts/trajectory_distill.py" 'from adapters.claude_code.transcript import'
 
+# S9c: host 探测组合根（HOST_CODEX/HOST_CLAUDE/detect_transcript_format）从 trajectory_distill
+# facade 上提到 core/host_adapter/——host 身份真相源住 core 注入契约包，不再住名为 "distill" 的脚本。
+require_repo_file "core/host_adapter/host_transcript_format_detection.py"
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'def detect_transcript_format'
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'HOST_CODEX = "codex"'
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'HOST_CLAUDE = "claude_code"'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.host_adapter.host_transcript_format_detection import'
+# 真相源已迁走：trajectory_distill facade 不得再定义 host 探测原语（防回灌到旧位置）。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_distill.py" 'def detect_transcript_format'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'

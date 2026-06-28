@@ -36,7 +36,7 @@ review 前能读到父会话背景。
 
 Host-aware
 ----------
-复用 ``trajectory_distill.detect_transcript_format`` 判定父 transcript 格式：
+复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 判定父 transcript 格式：
 ``HOST_CODEX`` 走 Codex rollout schema，``HOST_CLAUDE`` 走 Claude transcript
 schema；探测失败（空文件/异常 schema）fallback 到 Codex 解析，与既有
 Codex-only 用例保持一致。
@@ -51,7 +51,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trajectory_distill import (  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+
+from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
     detect_transcript_format,

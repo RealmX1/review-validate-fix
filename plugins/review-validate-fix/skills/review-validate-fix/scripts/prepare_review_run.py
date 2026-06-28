@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import concurrent.futures
 import diff_tracker
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
-from trajectory_distill import HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 
 
 # 合法的主 dispatch harness（与 dispatch_reviewers / reviewer-registry 对齐）。

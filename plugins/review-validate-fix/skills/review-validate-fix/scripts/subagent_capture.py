@@ -43,9 +43,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* / adapters.* import
 
-from trajectory_distill import (  # noqa: E402
+from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
+)
+from trajectory_distill import (  # noqa: E402
     distill_claude_jsonl,
     distill_codex_jsonl,
     read_codex_originator,
