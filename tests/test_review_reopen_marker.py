@@ -26,7 +26,7 @@ def _isolate_state(tmp_path: Path) -> None:
     os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "state")
     os.environ.pop("CODEX_RVF_STATE_DIR", None)
     os.environ.pop("CODEX_RVF_INSTALLED_SKILL_DIR", None)
-    os.environ.pop("CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS", None)
+    os.environ.pop("RVF_REVIEW_REOPEN_TTL_SECONDS", None)
 
 
 def test_marker_paths_prefers_task_then_session(tmp_path: Path) -> None:
@@ -157,17 +157,17 @@ def test_ttl_env_override(tmp_path: Path) -> None:
     import review_reopen_marker as rrm
 
     assert rrm.ttl_seconds() == float(rrm.DEFAULT_TTL_SECONDS)
-    os.environ["CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS"] = "10"
+    os.environ["RVF_REVIEW_REOPEN_TTL_SECONDS"] = "10"
     try:
         assert rrm.ttl_seconds() == 10.0
     finally:
-        os.environ.pop("CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS", None)
+        os.environ.pop("RVF_REVIEW_REOPEN_TTL_SECONDS", None)
     # malformed → default
-    os.environ["CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS"] = "not-a-number"
+    os.environ["RVF_REVIEW_REOPEN_TTL_SECONDS"] = "not-a-number"
     try:
         assert rrm.ttl_seconds() == float(rrm.DEFAULT_TTL_SECONDS)
     finally:
-        os.environ.pop("CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS", None)
+        os.environ.pop("RVF_REVIEW_REOPEN_TTL_SECONDS", None)
 
 
 def main() -> int:

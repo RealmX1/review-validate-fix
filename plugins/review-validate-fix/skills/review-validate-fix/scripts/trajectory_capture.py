@@ -71,7 +71,6 @@ from subagent_capture import capture_all_subagents  # noqa: E402
 from trajectory_distill import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIND,
     detect_transcript_format,
     distill_claude_jsonl,
     distill_codex_jsonl,

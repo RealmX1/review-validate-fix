@@ -39,12 +39,12 @@ EVENTS_SCHEMA = "diff-tracker.v2"
 LEGACY_TRACKER_SUBDIR = "tracker"
 
 DEFAULT_BUSY_TIMEOUT_MS = 5000
-BUSY_TIMEOUT_ENV = "CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS"
+BUSY_TIMEOUT_ENV = "RVF_TRACKER_BUSY_TIMEOUT_MS"
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 RANGE_TOLERANCE = 5
 
-DISABLE_ENV = "CODEX_RVF_TRACKER_DISABLE"
+DISABLE_ENV = "RVF_TRACKER_DISABLE"
 
 # Per-commit opt-out trailer (pillar ③ compatible). A round commit whose message
 # carries this git trailer (`RVF-Skip-Review:` with an optional reason value, or a
@@ -56,7 +56,7 @@ RVF_SKIP_REVIEW_COMMIT_TRAILER = "RVF-Skip-Review"
 
 # Slice 3 reason-code rename (with one-release alias). The new names belong to
 # the `allocate_review_scope` path; the legacy names stay live in the
-# `CODEX_RVF_TRACKER_DISABLE=1` fallback so disable-mode users see no behavior
+# `RVF_TRACKER_DISABLE=1` fallback so disable-mode users see no behavior
 # change.
 REASON_NO_UNASSIGNED_REVIEW_SCOPE = "no_unassigned_review_scope"
 REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE = "unassigned_review_scope_available"
@@ -64,8 +64,8 @@ LEGACY_REASON_NO_SESSION_OWNED_DIRTY = "no_session_owned_dirty"
 LEGACY_REASON_SESSION_OWNED_DIRTY = "session_owned_dirty"
 
 DEFAULT_LEASE_TTL_SECONDS = 600
-LEASE_TTL_ENV = "CODEX_RVF_TRACKER_LEASE_TTL_SECONDS"
-MANUAL_RUN_TTL_ENV = "CODEX_RVF_MANUAL_RUN_TTL_SECONDS"
+LEASE_TTL_ENV = "RVF_TRACKER_LEASE_TTL_SECONDS"
+MANUAL_RUN_TTL_ENV = "RVF_MANUAL_RUN_TTL_SECONDS"
 REASON_MANUAL_SCOPE_ALREADY_COMPLETED = "manual_scope_already_completed"
 REASON_MANUAL_TAKEOVER_COMPLETED = "manual_takeover_completed"
 

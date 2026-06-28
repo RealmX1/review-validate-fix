@@ -34,7 +34,7 @@ from rvf_logging import log_root, safe_token
 SUBDIR_NAME = "review-reopen-pending"
 MARKER_VERSION = 1
 DEFAULT_TTL_SECONDS = 6 * 60 * 60
-TTL_ENV = "CODEX_RVF_REVIEW_REOPEN_TTL_SECONDS"
+TTL_ENV = "RVF_REVIEW_REOPEN_TTL_SECONDS"
 STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"
 STATUS_INVALID = "invalid"

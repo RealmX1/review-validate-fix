@@ -751,7 +751,7 @@ def arm_kanban_followup_lock_on_delivery(
     锁主键是 task_id（task-path），故 ``target_kanban_task_id`` 的一致性是关键——它取自 prep
     payload（权威，与 Stop hook 旧 arm 用的同一来源）。run/repo/cwd 同样取自 prep。
     best-effort：缺 task_id 则不 arm；任何异常都不阻断本次 prompt（只记 diagnostic）。
-    锁根路径走 ``kanban_followup_lock`` 的默认解析（``CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
+    锁根路径走 ``kanban_followup_lock`` 的默认解析（``RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
     env 或 ``~/.rvf``），与 Stop hook 读/清侧一致。
     """
     payload = record.payload

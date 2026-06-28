@@ -65,7 +65,7 @@ from trajectory_distill import (  # noqa: E402
 TOOL_ARGS_LIMIT_BYTES = 800
 #: tool_result / exec 输出渲染上限（字节，UTF-8）。超出截断并标注。
 TOOL_RESULT_LIMIT_BYTES = 400
-#: 默认总字节预算（与 codex_stop hook 的 CODEX_RVF_PARENT_CONTEXT_MAX_BYTES 默认对齐）。
+#: 默认总字节预算（与 codex_stop hook 的 RVF_PARENT_CONTEXT_MAX_BYTES 默认对齐）。
 DEFAULT_MAX_BYTES = 64 * 1024
 
 #: Codex ``event_msg`` 中视为纯噪声、整条丢弃的 subtype。

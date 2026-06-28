@@ -11,11 +11,14 @@
 量），按 base 名归一，若同一 base 同时出现在 ``CODEX_RVF_`` 与裸 ``RVF_`` 两个
 命名空间 → 判为碰撞并失败。
 
-ALLOWLIST 收录「正在原子坍缩、过渡期允许双名共存」的 base（当前仅 RUN_DIR /
-RUN_ID / CORRELATION_ID —— RunLedger 的裸名镜像，S8 坍缩后从本表删除）。
+ALLOWLIST 收录「正在原子坍缩、过渡期允许双名共存」的 base。S8 已把 RUN_DIR /
+RUN_ID / CORRELATION_ID 坍缩为单一裸 ``RVF_`` 命名空间并清空本表；后续若再引入过渡期
+坍缩，临时加入、收尾切片删除。
 
-只扫描代码/配置（py/sh/json），不扫 markdown：env 在代码里访问，文档里只是叙述，
-扫 md 会把 ``RVF_PARENT_CONVERSATION_REF`` 这类 prompt 字段误判为 env。
+只扫描代码/配置（py/sh/json），且跳过整个 ``docs/`` 子树：env 在代码里访问，文档里
+（含 markdown 与 ``docs/`` 下的数据 json）只是叙述。扫文档会把 ``RVF_PARENT_CONVERSATION_REF``
+这类 prompt 字段、或 anti-patterns ``_history_raw.json`` 里引用历史 commit 的 ``CODEX_RVF_``
+字面量误判为 env 访问。真实 env 访问（installer / hooks.json 烘焙、契约字面量）都在 ``docs/`` 之外。
 """
 
 from __future__ import annotations
@@ -25,8 +28,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# 过渡期允许 CODEX_RVF_<base> 与 RVF_<base> 双名共存的 base（S8 坍缩后清空）。
-ALLOWLIST: set[str] = {"RUN_DIR", "RUN_ID", "CORRELATION_ID"}
+# 过渡期允许 CODEX_RVF_<base> 与 RVF_<base> 双名共存的 base。S8 已把
+# RUN_DIR / RUN_ID / CORRELATION_ID 从 CODEX_RVF_ 坍缩为单一裸 RVF_ 命名空间，
+# 故本表清空；后续切片若再引入过渡期坍缩，临时把对应 base 加回、收尾切片删除。
+ALLOWLIST: set[str] = set()
 
 # env-var token：CODEX_RVF_<X> 或裸 RVF_<X>。捕获是否带 CODEX_ 前缀 + base 名。
 _TOKEN_RE = re.compile(r"\b(CODEX_)?(RVF_[A-Z0-9_]+)\b")
@@ -84,6 +89,12 @@ def scan_repo(repo_root: Path) -> dict[str, tuple[set[str], set[str]]]:
     for rel in tracked:
         path = repo_root / rel
         if path.resolve() == self_path:
+            continue
+        # docs/ 子树是叙述层：md 与数据 json（如 anti-patterns 的 _history_raw.json）
+        # 在 rationale / 设计说明里引用历史 commit 注入的 CODEX_RVF_ 字面量，是「叙述 env
+        # 名」而非「访问 env」。与本 gate 顶部「只扫代码/配置、不扫 markdown」同一 doctrine：
+        # 真实 env 访问（installer/hooks.json 烘焙、契约字面量）都在 docs/ 之外。
+        if rel.startswith("docs/"):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")

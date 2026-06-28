@@ -444,8 +444,8 @@ def invoke_result(
     if extra_env:
         env.update(extra_env)
     # 默认假 tmux：避免触发 handoff→advisory 的测试在后台真的拉起 analyze agent。
-    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
-    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    env.setdefault("RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     return subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -501,8 +501,8 @@ def invoke_router(
     env["CODEX_RVF_LOG_ROOT"] = str(state)
     if extra_env:
         env.update(extra_env)
-    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
-    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    env.setdefault("RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     return subprocess.run(
         [sys.executable, str(ROUTER_SCRIPT)],
         input=json.dumps(event),
@@ -780,7 +780,7 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+        extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
     )
 
     payload = json.loads(stdout)
@@ -921,7 +921,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
         hook=hook,
         state=state,
         extra_env={
-            "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+            "RVF_TMUX_BIN": str(fake_tmux),
             "FAKE_TMUX_CALLS": str(tmux_calls),
         },
     )
@@ -1467,7 +1467,7 @@ def test_suppress_env_skips_before_sync_and_installed_hook(tmp_path: Path) -> No
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+        extra_env={"RVF_SUPPRESS_STOP_HOOK": "1"},
     )
 
     assert completed.returncode == 0
@@ -1507,8 +1507,8 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
         hook=hook,
         state=tmp_path / "state",
         extra_env={
-            "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-            "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+            "RVF_SUPPRESS_STOP_HOOK": "1",
+            "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         },
     )
 
@@ -1678,7 +1678,7 @@ def test_dev_repo_without_session_owned_dirty_skips_sync_and_hook(tmp_path: Path
 
 
 def test_dispatcher_falls_back_to_legacy_when_tracker_disabled(tmp_path: Path) -> None:
-    """`CODEX_RVF_TRACKER_DISABLE=1` keeps Phase-0 reason codes
+    """`RVF_TRACKER_DISABLE=1` keeps Phase-0 reason codes
     (`no_session_owned_dirty`) flowing through the dispatcher gate so
     disable-mode users see no behavior change."""
     repo = init_repo(tmp_path / "rvf")
@@ -1699,7 +1699,7 @@ def test_dispatcher_falls_back_to_legacy_when_tracker_disabled(tmp_path: Path) -
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+        extra_env={"RVF_TRACKER_DISABLE": "1"},
     )
 
     assert completed.returncode == 0
@@ -1898,7 +1898,7 @@ def test_committed_session_edit_with_later_same_path_dirty_skips_legacy_gate(tmp
         dev_repo=repo,
         hook=hook,
         state=tmp_path / "state",
-        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+        extra_env={"RVF_TRACKER_DISABLE": "1"},
     )
 
     assert completed.returncode == 0
@@ -1942,7 +1942,7 @@ def test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fa
     state.mkdir(parents=True, exist_ok=True)
     old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
     os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
-    old_disable = os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+    old_disable = os.environ.pop("RVF_TRACKER_DISABLE", None)
     try:
         hook_module.build_manifest = _raise  # type: ignore[assignment]
         ledger = hook_module.start_run(
@@ -1959,7 +1959,7 @@ def test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fa
         else:
             os.environ["CODEX_RVF_LOG_ROOT"] = old_log
         if old_disable is not None:
-            os.environ["CODEX_RVF_TRACKER_DISABLE"] = old_disable
+            os.environ["RVF_TRACKER_DISABLE"] = old_disable
 
     assert synced is False
     assert reason_code == "session_manifest_failed"

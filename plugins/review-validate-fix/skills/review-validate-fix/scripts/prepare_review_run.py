@@ -115,8 +115,6 @@ def review_env_exports(
         "RVF_CHECK_REVIEW_RESULT": str(CHECK_REVIEW_RESULT),
         "RVF_REVIEW_RESULT": str(artifacts_dir / "reviewers" / "reviewer" / "review-result.json"),
         "CODEX_RVF_LOG_ROOT": str(log_root),
-        "CODEX_RVF_RUN_ID": run_id,
-        "CODEX_RVF_RUN_DIR": str(run_dir),
     }
     if main_harness:
         env["RVF_MAIN_HARNESS"] = main_harness
@@ -147,8 +145,6 @@ def review_env_exports(
         f"export RVF_RUN_ID={shlex.quote(env['RVF_RUN_ID'])}",
         f"export RVF_RUN_DIR={shlex.quote(env['RVF_RUN_DIR'])}",
         f"export CODEX_RVF_LOG_ROOT={shlex.quote(env['CODEX_RVF_LOG_ROOT'])}",
-        'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"',
-        'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"',
     ]
     if artifacts_dir == run_dir / "artifacts":
         lines.append('export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"')

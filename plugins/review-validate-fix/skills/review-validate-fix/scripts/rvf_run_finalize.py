@@ -40,10 +40,10 @@ def resolve_run_dir(*, handoff_path: Path | None, event: dict[str, Any] | None) 
 
     optimistic 顺序:
       1. handoff_path 的 ../.. (即 <run_dir>/artifacts/handoff.md → <run_dir>)
-      2. event['rvf_run_dir'] / event['CODEX_RVF_RUN_DIR'] (若 caller 显式传入)
+      2. event['rvf_run_dir'] / event['RVF_RUN_DIR'] (若 caller 显式传入)
     返回 None 表示无法定位。
 
-    历史上这里还有一个 ``os.environ.get('CODEX_RVF_RUN_DIR')`` fallback，但
+    历史上这里还有一个 ``os.environ.get('RVF_RUN_DIR')`` fallback，但
     reviewer 子进程及任何继承父 RVF run 环境的 process 都会带着这条 env，
     一旦它指向某个旧 run_dir，finalize 会把 trajectory / lock / workspace-diff
     写到错误的 run。Caller 若真的想用 env 驱动 targeting，应在调用前把值塞进
@@ -54,7 +54,7 @@ def resolve_run_dir(*, handoff_path: Path | None, event: dict[str, Any] | None) 
         if _is_run_dir(candidate):
             return candidate
     if event:
-        for key in ("rvf_run_dir", "CODEX_RVF_RUN_DIR"):
+        for key in ("rvf_run_dir", "RVF_RUN_DIR"):
             value = event.get(key)
             if isinstance(value, str) and value:
                 candidate = Path(value).expanduser().resolve()

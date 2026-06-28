@@ -332,11 +332,11 @@ def test_finalize_run_marks_stale_tracker_scope_reviewed_from_contract_units(
 def test_finalize_for_handoff_returns_none_when_run_dir_missing(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Stale CODEX_RVF_RUN_DIR inherited from a previous RVF run (or from a
+    # Stale RVF_RUN_DIR inherited from a previous RVF run (or from a
     # reviewer subprocess) used to leak into resolve_run_dir; ensure a missing
     # handoff/event truly resolves to None even if the env points at some other
     # run_dir.
-    monkeypatch.delenv("CODEX_RVF_RUN_DIR", raising=False)
+    monkeypatch.delenv("RVF_RUN_DIR", raising=False)
     finalize = _load("rvf_run_finalize")
     handoff = tmp_path / "stray.md"
     handoff.write_text("hi", encoding="utf-8")

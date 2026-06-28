@@ -35,9 +35,9 @@ MARKDOWN_SUFFIXES = {".md", ".markdown"}
 NOTIFY_TITLE = "RVF"
 # terminal-notifier 是 OS 通知的硬依赖；可用此环境变量覆盖二进制路径，
 # 测试用它注入假 notifier，同时绕过 darwin 平台门控以便跨平台 CI 也能验证命令构建。
-TERMINAL_NOTIFIER_BIN_ENV = "CODEX_RVF_TERMINAL_NOTIFIER_BIN"
+TERMINAL_NOTIFIER_BIN_ENV = "RVF_TERMINAL_NOTIFIER_BIN"
 # Phase B（cline-kanban 内带按钮通知）外部触发命令；未配置时该路径恒为 no-op。
-KANBAN_NOTIFY_CMD_ENV = "CODEX_RVF_KANBAN_NOTIFY_CMD"
+KANBAN_NOTIFY_CMD_ENV = "RVF_KANBAN_NOTIFY_CMD"
 # cline-kanban runtime 默认端口（与 cline_kanban_client.DEFAULT_RUNTIME_PORT 对齐的兜底）。
 DEFAULT_KANBAN_PORT = 3484
 
@@ -326,7 +326,7 @@ def notify_handoff_ready(
     """发一条 OS 系统通知（terminal-notifier）；kanban 来源带 ``-open <taskUrl>``。
 
     terminal-notifier 是硬依赖：缺失时返回显式 reason，由上层透出而非静默。
-    显式 ``CODEX_RVF_TERMINAL_NOTIFIER_BIN`` 覆盖会绕过 darwin 门控（测试/自定义）。
+    显式 ``RVF_TERMINAL_NOTIFIER_BIN`` 覆盖会绕过 darwin 门控（测试/自定义）。
     """
     override = os.environ.get(TERMINAL_NOTIFIER_BIN_ENV)
     if sys.platform != "darwin" and not (override and override.strip()):
@@ -454,7 +454,7 @@ def maybe_trigger_kanban_notification(
 ) -> dict[str, Any]:
     """Phase B 触发桩：把一条带按钮的通知推进 cline-kanban UI。
 
-    ``CODEX_RVF_KANBAN_NOTIFY_CMD`` 未配置时恒为 no-op（不报错）；配置后把 task
+    ``RVF_KANBAN_NOTIFY_CMD`` 未配置时恒为 no-op（不报错）；配置后把 task
     上下文经 env + stdin(JSON) 交给该命令（Phase B 的 ``kanban task notify`` CLI）。
     与 cline-kanban 具体 flag 解耦，避免在尚未落地的 Phase B 上硬编码契约。
     """

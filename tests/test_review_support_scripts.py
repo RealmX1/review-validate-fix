@@ -288,8 +288,8 @@ def test_rvf_analyze_thread_status_file_schema(root: Path) -> None:
     fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
     tmux_calls = root / "tmux-calls.jsonl"
 
-    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = {k: os.environ.get(k) for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -344,8 +344,8 @@ def test_rvf_analyze_thread_lock_blocks_second_launch(root: Path) -> None:
     fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
     tmux_calls = root / "tmux-calls.jsonl"
 
-    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = {k: os.environ.get(k) for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -872,9 +872,9 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
     try:
         now = prep.parse_timestamp("2026-06-04T00:00:00Z")
         # kanban-followup 风格 prep：target_kanban_task_id + flow-1-self-rising + run 信息。
@@ -962,9 +962,9 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
         else:
             os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
         if prev_lock is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
 
 
 def test_kanban_followup_pending_marker_round_trip(tmp_path: Path) -> None:
@@ -1139,9 +1139,9 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
     try:
         now = prep.parse_timestamp("2026-06-07T00:00:00Z")
         prep.write_prep_file(
@@ -1204,9 +1204,9 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
         else:
             os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
         if prev_lock is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
 
 
 def test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(tmp_path: Path) -> None:
@@ -2272,7 +2272,7 @@ def test_rvf_handoff_cli_notify(tmp_path: Path) -> None:
     handoff.write_text("# handoff\n", encoding="utf-8")
     notifier_log = tmp_path / "notify.log"
     notifier = _write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
-    env = {**os.environ, "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)}
+    env = {**os.environ, "RVF_TERMINAL_NOTIFIER_BIN": str(notifier)}
 
     completed = run(
         [
@@ -4791,8 +4791,8 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert payload["review_env"]["RVF_REVIEW_RESULT"].endswith("artifacts/reviewers/reviewer/review-result.json")
     assert "${" not in payload["review_env"]["RVF_REVIEW_RESULT"]
     assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
-    assert payload["review_env"]["CODEX_RVF_RUN_ID"] == payload["run_id"]
-    assert payload["review_env"]["CODEX_RVF_RUN_DIR"] == payload["run_dir"]
+    assert payload["review_env"]["RVF_RUN_ID"] == payload["run_id"]
+    assert payload["review_env"]["RVF_RUN_DIR"] == payload["run_dir"]
     assert payload["review_env"]["RVF_BACKEND"] == "manual"
     assert payload["rvf_backend"] == "manual"
     assert payload["rvf_state_phase"] == "prepare"
@@ -4801,8 +4801,9 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
-    assert 'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"' in review_env_text
-    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in review_env_text
+    assert "export RVF_RUN_ID=" in review_env_text
+    assert "CODEX_RVF_RUN_ID" not in review_env_text
+    assert "CODEX_RVF_RUN_DIR" not in review_env_text
     assert "export RVF_BACKEND=manual" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
@@ -5131,8 +5132,8 @@ def test_command_lock_writes_lifecycle_events(tmp_path: Path) -> None:
     run_id = "test-command-lock-lifecycle"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
-    env["CODEX_RVF_RUN_ID"] = run_id
-    env.pop("CODEX_RVF_RUN_DIR", None)
+    env["RVF_RUN_ID"] = run_id
+    env.pop("RVF_RUN_DIR", None)
 
     locked = run(
         [
@@ -5171,8 +5172,8 @@ def test_command_lock_respects_env_run_dir(tmp_path: Path) -> None:
     run_dir = tmp_path / "custom-run-dir"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
-    env["CODEX_RVF_RUN_ID"] = "test-command-lock-custom-dir"
-    env["CODEX_RVF_RUN_DIR"] = str(run_dir)
+    env["RVF_RUN_ID"] = "test-command-lock-custom-dir"
+    env["RVF_RUN_DIR"] = str(run_dir)
 
     run(
         [
@@ -5202,12 +5203,12 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
     lock_dir = tmp_path / "locks"
     holder_env = os.environ.copy()
     holder_env["CODEX_RVF_LOG_ROOT"] = str(state)
-    holder_env["CODEX_RVF_RUN_ID"] = "test-command-lock-holder"
-    holder_env.pop("CODEX_RVF_RUN_DIR", None)
+    holder_env["RVF_RUN_ID"] = "test-command-lock-holder"
+    holder_env.pop("RVF_RUN_DIR", None)
     contender_env = os.environ.copy()
     contender_env["CODEX_RVF_LOG_ROOT"] = str(state)
-    contender_env["CODEX_RVF_RUN_ID"] = "test-command-lock-contender"
-    contender_env.pop("CODEX_RVF_RUN_DIR", None)
+    contender_env["RVF_RUN_ID"] = "test-command-lock-contender"
+    contender_env.pop("RVF_RUN_DIR", None)
 
     lock_path_result = run(
         [
@@ -6220,7 +6221,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
                 f"#!{sys.executable}",
                 "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps({"
-                "'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'), "
+                "'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK'), "
                 "'thread': os.environ.get('CODEX_THREAD_ID')"
                 "}))" % str(sink),
                 "sys.stdin.read()",
@@ -6244,7 +6245,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path}:{env.get('PATH', '')}"
     env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
-    env.pop("CODEX_RVF_SUPPRESS_STOP_HOOK", None)
+    env.pop("RVF_SUPPRESS_STOP_HOOK", None)
     completed = subprocess.run(
         [
             sys.executable,
@@ -7826,7 +7827,7 @@ def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
         # Bump busy_timeout high enough that the second writer can wait out
         # the first's lock even under load (4-shard contract checks run several
         # tests in parallel, slowing each register_claims's git calls).
-        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
         "import diff_tracker as dt\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"repo = Path({str(repo)!r})\n"
@@ -8668,13 +8669,13 @@ def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
     module = load_diff_tracker_module()
     repo = init_repo(tmp / "repo")
     log_root = tmp / "logs"
-    previous = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
+    previous = os.environ.get("RVF_TRACKER_DISABLE")
 
     def _run_with_disable_value(value: str | None) -> object:
         if value is None:
-            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+            os.environ.pop("RVF_TRACKER_DISABLE", None)
         else:
-            os.environ["CODEX_RVF_TRACKER_DISABLE"] = value
+            os.environ["RVF_TRACKER_DISABLE"] = value
         return module.register_claims(
             repo=repo,
             session_id="session-1",
@@ -8699,9 +8700,9 @@ def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
             assert res.status == "ok", f"value={falsy!r} unexpectedly disabled tracker"
     finally:
         if previous is None:
-            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+            os.environ.pop("RVF_TRACKER_DISABLE", None)
         else:
-            os.environ["CODEX_RVF_TRACKER_DISABLE"] = previous
+            os.environ["RVF_TRACKER_DISABLE"] = previous
 
 
 def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
@@ -8743,7 +8744,7 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
         line = blocker.stdout.readline()
         assert line.strip() == "LOCKED", f"blocker did not acquire lock; got: {line!r}"
         # Shrink busy_timeout so the test stays fast.
-        os.environ["CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS"] = "300"
+        os.environ["RVF_TRACKER_BUSY_TIMEOUT_MS"] = "300"
         try:
             result = module.register_claims(
                 repo=repo,
@@ -8757,7 +8758,7 @@ def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
                 log_root_override=log_root,
             )
         finally:
-            os.environ.pop("CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS", None)
+            os.environ.pop("RVF_TRACKER_BUSY_TIMEOUT_MS", None)
     finally:
         blocker.terminate()
         blocker.wait(timeout=5)
@@ -10141,8 +10142,8 @@ def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
     module = load_rvf_detached_thread_module()
     root.mkdir(parents=True, exist_ok=True)
     fake_tmux = write_realexec_tmux_script(root / "tmux.py")
-    saved = os.environ.get("CODEX_RVF_TMUX_BIN")
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = os.environ.get("RVF_TMUX_BIN")
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     try:
         status_path = root / "s.status.json"
         result = module.launch_detached(
@@ -10155,9 +10156,9 @@ def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
         )
     finally:
         if saved is None:
-            os.environ.pop("CODEX_RVF_TMUX_BIN", None)
+            os.environ.pop("RVF_TMUX_BIN", None)
         else:
-            os.environ["CODEX_RVF_TMUX_BIN"] = saved
+            os.environ["RVF_TMUX_BIN"] = saved
     assert result["launch_status"] == "launched", result
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["launch_status"] == "launched"  # 启动期字段保留
@@ -10175,9 +10176,9 @@ def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
     calls = root / "calls.jsonl"
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -10212,13 +10213,13 @@ def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
     saved = {
         k: os.environ.get(k)
         for k in (
-            "CODEX_RVF_TMUX_BIN",
+            "RVF_TMUX_BIN",
             "FAKE_TMUX_CALLS",
             "FAKE_TMUX_RETURNCODE",
             "FAKE_TMUX_STDERR",
         )
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(root / "calls.jsonl")
     os.environ["FAKE_TMUX_RETURNCODE"] = "1"
     os.environ["FAKE_TMUX_STDERR"] = "boom: cannot create session"
@@ -10280,13 +10281,13 @@ def _launch_detached_with_staleness_env(
     saved = {
         k: os.environ.get(k)
         for k in (
-            "CODEX_RVF_TMUX_BIN",
+            "RVF_TMUX_BIN",
             "FAKE_TMUX_CALLS",
             "FAKE_TMUX_RETURNCODE",
             "FAKE_TMUX_HAS_SESSION_RETURNCODE",
         )
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = new_session_rc
     os.environ["FAKE_TMUX_HAS_SESSION_RETURNCODE"] = has_session_rc
@@ -10365,10 +10366,10 @@ def test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(root: Path) -> Non
     lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)  # 未干净完成
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
     # 指向不存在的 tmux 二进制 → subprocess.run 抛 FileNotFoundError（模拟 tmux 临时不可用）。
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
+    os.environ["RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
     os.environ.pop("FAKE_TMUX_CALLS", None)
     os.environ.pop("FAKE_TMUX_RETURNCODE", None)
     try:
@@ -10476,7 +10477,7 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
             self.run_dir = rd
 
         def env(self) -> dict:
-            return {"CODEX_RVF_RUN_ID": self.run_id}
+            return {"RVF_RUN_ID": self.run_id}
 
         def event(self, **_kw) -> None:
             pass
@@ -10494,9 +10495,9 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
     )
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     buf = io.StringIO()
@@ -10564,9 +10565,9 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
         def env(self) -> dict:
             # 模拟 RunLedger.env()：含决定 diff-tracker DB 落点的 CODEX_RVF_LOG_ROOT。
             return {
-                "CODEX_RVF_RUN_ID": self.run_id,
+                "RVF_RUN_ID": self.run_id,
                 "CODEX_RVF_LOG_ROOT": str(log_root),
-                "CODEX_RVF_RUN_DIR": str(self.run_dir),
+                "RVF_RUN_DIR": str(self.run_dir),
             }
 
         def event(self, **_kw) -> None:
@@ -10585,9 +10586,9 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
     )
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     buf = io.StringIO()
@@ -10617,7 +10618,7 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
     assert (
         f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
     ), shell_command
-    assert f"export CODEX_RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
+    assert f"export RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
 
 
 def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:

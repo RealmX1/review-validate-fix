@@ -158,18 +158,18 @@ HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION = (
 )
 # 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
 # artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
-PARENT_CONTEXT_ENV = "CODEX_RVF_PARENT_CONTEXT"
+PARENT_CONTEXT_ENV = "RVF_PARENT_CONTEXT"
 """开关：默认开启；设 ``0`` / ``false`` / ``no`` / ``off`` 关闭父对话 context 生成。"""
-PARENT_CONTEXT_MAX_BYTES_ENV = "CODEX_RVF_PARENT_CONTEXT_MAX_BYTES"
+PARENT_CONTEXT_MAX_BYTES_ENV = "RVF_PARENT_CONTEXT_MAX_BYTES"
 """总字节上限覆盖；缺省用 rvf_parent_context.DEFAULT_MAX_BYTES (64KB)，超限保留最近内容。"""
 PARENT_CONTEXT_ARTIFACT_NAME = "parent-conversation-context.md"
 """run artifacts 中父对话 context 的文件名，与 task prompt / review-env 引用一致。"""
 PARENT_CONTEXT_PROMPT_KEY = "RVF_PARENT_CONVERSATION_CONTEXT"
 """task prompt / review-env 中标记父对话 context 路径的键名。"""
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
-KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
+KANBAN_FOLLOWUP_LEASE_TTL_ENV = "RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
-SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
+SUPPRESS_STOP_HOOK_MARKER = "RVF_SUPPRESS_STOP_HOOK=1"
 MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
 MANUAL_RVF_RUN_ID_KEY = "manual_rvf_run_id"
 MANUAL_RVF_MARKER_KEYS = (
@@ -190,13 +190,13 @@ APP_SERVER_CLIENT_INFO = {
     "version": "0.1.0",
 }
 SUPPRESS_ENV_NAMES = (
-    "CODEX_RVF_SUPPRESS",
-    "CODEX_RVF_SUPPRESS_STOP_HOOK",
+    "RVF_SUPPRESS",
+    "RVF_SUPPRESS_STOP_HOOK",
 )
 # detached $rvf-analyze 线程注入的标记 env。语义上与 SUPPRESS_ENV_NAMES 区分开：
 # 这是「这是 analyze 线程自己的 Stop event」的显式信号，用于 evaluate_stop_event
 # 早退守卫，短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF。
-CODEX_RVF_ANALYZE_THREAD = "CODEX_RVF_ANALYZE_THREAD"
+RVF_ANALYZE_THREAD = "RVF_ANALYZE_THREAD"
 CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
 CODEX_GOAL_INCOMPLETE_STATUSES = {
     "active",
@@ -396,11 +396,11 @@ def is_falsey(value: str | None) -> bool:
 
 
 def provider_health_check_enabled() -> bool:
-    return not is_falsey(os.environ.get("CODEX_RVF_PROVIDER_HEALTH_CHECK"))
+    return not is_falsey(os.environ.get("RVF_PROVIDER_HEALTH_CHECK"))
 
 
 def provider_health_timeout_seconds() -> float:
-    raw = os.environ.get("CODEX_RVF_PROVIDER_HEALTH_TIMEOUT_SECONDS")
+    raw = os.environ.get("RVF_PROVIDER_HEALTH_TIMEOUT_SECONDS")
     if raw is None or not raw.strip():
         return 12.0
     try:
@@ -414,7 +414,7 @@ def codex_bin() -> str:
 
 
 def parent_context_enabled() -> bool:
-    """父会话对话 context 注入是否开启（默认开启，``CODEX_RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
+    """父会话对话 context 注入是否开启（默认开启，``RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
     return not is_falsey(os.environ.get(PARENT_CONTEXT_ENV))
 
 
@@ -2466,10 +2466,10 @@ def _kanban_followup_pending_decision(
 
 DEFAULT_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS = 3600
 DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX = 8
-KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
-KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
-KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
-KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
+KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
+KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
+KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
+KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
 # verify-consumed 精修读 transcript 的体积上限（超过则跳过精修、按 stranded 处理），
 # 防在 30s Codex 链路预算内读超大 JSONL transcript 卡顿。
@@ -2556,7 +2556,7 @@ def _maybe_redispatch_stranded_kanban_followup(
     *,
     token: str | None,
 ) -> dict[str, Any]:
-    """S2（可选，``CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1`` 开启）：app-server 此刻可达时
+    """S2（可选，``RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1`` 开启）：app-server 此刻可达时
     对 stranded marker 机会式重投一次。
 
     诚实边界：即便 app-server 活着，已停 session 也未必消费 → best-effort，绝不谎报已跑。
@@ -3389,8 +3389,7 @@ def cline_kanban_task_prompt(
             "```sh\n"
             f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
             f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
-            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
-            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            f"export RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
             'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
             '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
             "```\n\n"
@@ -3405,8 +3404,7 @@ def cline_kanban_task_prompt(
             'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
             f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
             f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
-            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
-            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            f"export RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
             'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
             '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
             'export RVF_REPO="$RVF_TASK_REPO"\n'
@@ -3450,7 +3448,7 @@ def cline_kanban_task_prompt(
         "开始任何 review/validate/fix 前，先 `cat $RVF_PREP_FILE` 确认 `rvf_run.shared_workflow_state.status == \"completed\"` 且 "
         "`artifacts` 字段齐全；齐全则跳过手动跑 `prepare_review_run.py`，直接 source `$RVF_REVIEW_ENV` 继续既有模式。"
         "若 `shared_workflow_state.status` 是 `failed` / `timeout` / `pending`，再按 SKILL.md fallback 手动跑 prepare。"
-        "本 task 已经复用 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、summary 和 events 都必须继续写入该 installed plugin state run。"
+        "本 task 已经复用 `RVF_RUN_DIR`，所有 handoff、reviewer 输出、summary 和 events 都必须继续写入该 installed plugin state run。"
         "Handoff 默认开启时，必须持续维护 "
         "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
@@ -7095,7 +7093,7 @@ def legacy_session_scope_gate_payload(
     repo: str,
     ledger: RunLedger,
 ) -> dict[str, Any] | None:
-    """Phase-0/1 gate body, kept verbatim so `CODEX_RVF_TRACKER_DISABLE=1`
+    """Phase-0/1 gate body, kept verbatim so `RVF_TRACKER_DISABLE=1`
     users see no behavior change. Reason-code literals stay
     `no_session_owned_dirty` / `session_owned_dirty` here on purpose."""
     session_paths = event_session_scope_paths(event)
@@ -7278,7 +7276,7 @@ def manual_rvf_session_marker_payload(
     return skip_payload(
         "当前 chat session 已完成手动 $review-validate-fix；"
         "installed Stop hook 跳过自动 RVF fork/review，"
-        "但这不是 CODEX_RVF_SUPPRESS_STOP_HOOK 全 hook suppress。"
+        "但这不是 RVF_SUPPRESS_STOP_HOOK 全 hook suppress。"
         f"session_id={session_id}; manual_rvf_run_id={run_id}; "
         f"manual_rvf_completed_at={completed_at}",
         ledger,
@@ -7862,7 +7860,7 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
     user turn 天然不命中，故只抑制 analyze 自身那一次 Stop，绝不波及后续轮。这取代
     了已退役的 task-keyed + 6h ``post_analyze_quiet`` marker（旧 marker 会顺带把父
     会话后续真实改动也误抑制）。自动 / detached analyze 线程的再入由其注入的
-    ``CODEX_RVF_ANALYZE_THREAD`` env 守卫（本函数上方早退）覆盖，不依赖本检测。
+    ``RVF_ANALYZE_THREAD`` env 守卫（本函数上方早退）覆盖，不依赖本检测。
 
     两路检测（任一命中即真），均复用 vendored ``codex_invoked_skill``，避免再造第三套
     anchored-regex：
@@ -7902,9 +7900,9 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
         )
 
-    if is_truthy(os.environ.get(CODEX_RVF_ANALYZE_THREAD)):
+    if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
-            "检测到 CODEX_RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
+            "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
             "$rvf-analyze 后台线程自身，短路所有 gate 跳过，避免后台 analyze "
             "递归触发新一轮 RVF。",
             ledger,

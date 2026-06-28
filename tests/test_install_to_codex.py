@@ -952,8 +952,8 @@ def test_main_records_deploy_log_with_rvf_context(tmp_path: Path) -> None:
         home,
         lambda: with_env(
             {
-                "CODEX_RVF_RUN_ID": "rvf-run-1",
-                "CODEX_RVF_RUN_DIR": str(run_dir),
+                "RVF_RUN_ID": "rvf-run-1",
+                "RVF_RUN_DIR": str(run_dir),
                 "CODEX_SESSION_ID": "session-1",
             },
             run_main,

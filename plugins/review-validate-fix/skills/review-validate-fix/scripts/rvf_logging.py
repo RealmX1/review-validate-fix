@@ -262,7 +262,7 @@ def log_root() -> Path:
 
 
 def max_inline_bytes(default: int = DEFAULT_INLINE_BYTES) -> int:
-    value = os.environ.get("CODEX_RVF_LOG_MAX_INLINE_BYTES")
+    value = os.environ.get("RVF_LOG_MAX_INLINE_BYTES")
     if not value or not value.strip():
         return default
     try:
@@ -272,7 +272,7 @@ def max_inline_bytes(default: int = DEFAULT_INLINE_BYTES) -> int:
 
 
 def log_level() -> str:
-    value = os.environ.get("CODEX_RVF_LOG_LEVEL", "info").strip().lower()
+    value = os.environ.get("RVF_LOG_LEVEL", "info").strip().lower()
     return value if value in {"debug", "info", "warn", "error"} else "info"
 
 
@@ -313,16 +313,16 @@ class RunLedger:
         self.cwd = str(cwd) if cwd is not None else None
         self.run_id = (
             run_id
-            or os.environ.get("CODEX_RVF_RUN_ID")
+            or os.environ.get("RVF_RUN_ID")
             or new_run_id(component)
         )
         self.correlation_id = (
             correlation_id
-            or os.environ.get("CODEX_RVF_CORRELATION_ID")
+            or os.environ.get("RVF_CORRELATION_ID")
             or self.run_id
         )
         self.root = log_root()
-        env_run_dir = os.environ.get("CODEX_RVF_RUN_DIR")
+        env_run_dir = os.environ.get("RVF_RUN_DIR")
         self.run_dir = (
             Path(run_dir).expanduser()
             if run_dir
@@ -357,10 +357,10 @@ class RunLedger:
 
     def env(self) -> dict[str, str]:
         return {
-            "CODEX_RVF_RUN_ID": self.run_id,
-            "CODEX_RVF_CORRELATION_ID": self.correlation_id,
+            "RVF_RUN_ID": self.run_id,
+            "RVF_CORRELATION_ID": self.correlation_id,
             "CODEX_RVF_LOG_ROOT": str(self.root),
-            "CODEX_RVF_RUN_DIR": str(self.run_dir),
+            "RVF_RUN_DIR": str(self.run_dir),
         }
 
     def artifact_path(self, name: str) -> Path:

@@ -100,7 +100,7 @@ def single_line_excerpt(text: str, max_chars: int) -> str:
 
 
 def parent_conversation_fallback_chars() -> int:
-    raw = os.environ.get("CODEX_RVF_PARENT_CONVERSATION_FALLBACK_CHARS")
+    raw = os.environ.get("RVF_PARENT_CONVERSATION_FALLBACK_CHARS")
     if raw is None or not raw.strip():
         return DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS
     try:

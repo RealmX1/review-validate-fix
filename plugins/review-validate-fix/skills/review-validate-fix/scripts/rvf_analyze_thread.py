@@ -17,8 +17,8 @@ review-validate-fix 的会话立即 idle，用户无需等待 analyze 完成。
 > 刻意保持「不直接可见、仅磁盘可观测」的形态，不做额外 UI 建模。
 
 自抑制 lynchpin：detached agent 自己结束 turn 会触发它**自己的** Stop hook。
-线程 env 注入 ``CODEX_RVF_SUPPRESS_STOP_HOOK=1``（主防线，命中
-``should_suppress``）与 ``CODEX_RVF_ANALYZE_THREAD=1``（副防线，
+线程 env 注入 ``RVF_SUPPRESS_STOP_HOOK=1``（主防线，命中
+``should_suppress``）与 ``RVF_ANALYZE_THREAD=1``（副防线，
 ``evaluate_stop_event`` 早退守卫），避免后台 analyze 递归触发新一轮 RVF。
 """
 
@@ -59,8 +59,8 @@ from adapters.claude_code.subagent import (  # noqa: E402
 
 
 STATUS_SCHEMA_VERSION = 1
-SUPPRESS_STOP_HOOK_ENV = "CODEX_RVF_SUPPRESS_STOP_HOOK"
-ANALYZE_THREAD_ENV = "CODEX_RVF_ANALYZE_THREAD"
+SUPPRESS_STOP_HOOK_ENV = "RVF_SUPPRESS_STOP_HOOK"
+ANALYZE_THREAD_ENV = "RVF_ANALYZE_THREAD"
 
 PROMPT_FILENAME = ".analyze-thread.prompt.md"
 LOG_FILENAME = ".analyze-thread.log"
@@ -159,8 +159,8 @@ def launch_detached_analyze_thread(
 
     detached-launch 通用机制（O_EXCL 幂等锁 / 两阶段原子 status / catch-all）由
     ``rvf_detached_thread.launch_detached`` 提供；本函数只负责 analyze 专属决策——
-    host 选择、prompt 冻结、自抑制 env（``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
-    ``CODEX_RVF_ANALYZE_THREAD``）与返回字段拼装（供 advisory 写入 ledger / summary /
+    host 选择、prompt 冻结、自抑制 env（``RVF_SUPPRESS_STOP_HOOK`` /
+    ``RVF_ANALYZE_THREAD``）与返回字段拼装（供 advisory 写入 ledger / summary /
     systemMessage）。整体 catch-all：任何异常收敛成 ``launch_failed``，**绝不**让线程
     启动失败打断 finalize/handoff 主路径。
     """

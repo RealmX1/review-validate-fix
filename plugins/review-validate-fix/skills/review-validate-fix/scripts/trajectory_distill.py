@@ -68,11 +68,6 @@ HOST_CLAUDE = "claude_code"
 """Claude Code transcript NDJSON schema (``user`` / ``assistant`` / ``summary``
 record types，无 ``payload`` 包裹)。由 ``adapters.claude_code.transcript`` 解析。"""
 
-HOST_KIND = HOST_CODEX
-"""向后兼容别名。新代码请直接使用 ``HOST_CODEX`` / ``HOST_CLAUDE`` 二者之一。
-本常量保留是为了让早期写死 ``HOST_KIND="codex"`` 字面量的历史 import 点继续工作；
-所有新增 manifest / summary 写入路径都应当从 ``detect_transcript_format`` 结果决定。"""
-
 _FORMAT_DETECT_MAX_LINES = 32
 _CODEX_RECORD_TYPES = frozenset(
     {"session_meta", "turn_context", "event_msg", "response_item"}

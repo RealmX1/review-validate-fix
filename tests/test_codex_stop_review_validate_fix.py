@@ -217,18 +217,18 @@ def invoke(
         env["CODEX_RVF_CONFIG"] = str(config)
     if state_dir is not None:
         env["CODEX_RVF_STATE_DIR"] = str(state_dir)
-        env["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
+        env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
             state_dir / "kanban-followup-in-progress"
         )
     if extra_env is not None:
         env.update(extra_env)
     # 默认把 detached analyze 线程的 tmux 指向假 tmux，避免任意触发 handoff→
     # advisory 路径的测试在后台真的拉起 analyze agent；需要断言 tmux 行为的
-    # 测试自行传入 CODEX_RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
-    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    # 测试自行传入 RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
+    env.setdefault("RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
     # 默认把 terminal-notifier 指向无副作用的假 notifier，确保没有测试会在真机弹出
-    # 真实 OS 通知；需要断言通知行为的测试自行传入 CODEX_RVF_TERMINAL_NOTIFIER_BIN。
-    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    # 真实 OS 通知；需要断言通知行为的测试自行传入 RVF_TERMINAL_NOTIFIER_BIN。
+    env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -483,8 +483,8 @@ def write_fake_tmux(path: Path) -> Path:
         "    with open(calls, 'a', encoding='utf-8') as fh:\n"
         "        fh.write(json.dumps({\n"
         "            'argv': sys.argv[1:],\n"
-        "            'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'),\n"
-        "            'analyze_thread': os.environ.get('CODEX_RVF_ANALYZE_THREAD'),\n"
+        "            'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK'),\n"
+        "            'analyze_thread': os.environ.get('RVF_ANALYZE_THREAD'),\n"
         "        }) + '\\n')\n"
         "stderr = os.environ.get('FAKE_TMUX_STDERR')\n"
         "if stderr:\n"
@@ -1285,9 +1285,9 @@ def test_env_suppression_skips(tmp_path: Path) -> None:
     stdout, _ = invoke(
         {"cwd": str(dirty), "stop_hook_active": False},
         extra_env={
-            "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-            "CODEX_RVF_RUN_ID": "rvf-child",
-            "CODEX_RVF_RUN_DIR": str(run_dir),
+            "RVF_SUPPRESS_STOP_HOOK": "1",
+            "RVF_RUN_ID": "rvf-child",
+            "RVF_RUN_DIR": str(run_dir),
         },
     )
     payload = parse_json(stdout)
@@ -1307,7 +1307,7 @@ def test_prompt_suppression_marker_skips(tmp_path: Path) -> None:
     write_user_session(
         transcript,
         "00000000-0000-0000-0000-000000000201",
-        "diagnostic fork\n\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+        "diagnostic fork\n\nRVF_SUPPRESS_STOP_HOOK=1",
     )
     stdout, _ = invoke(
         {
@@ -1333,7 +1333,7 @@ def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp_path:
         transcript,
         "00000000-0000-0000-0000-000000000202",
         [
-            "$review-validate-fix\n\nRVF_CLINE_KANBAN_TASK\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+            "$review-validate-fix\n\nRVF_CLINE_KANBAN_TASK\nRVF_SUPPRESS_STOP_HOOK=1",
             "later Kanban user turn without the suppress marker",
         ],
     )
@@ -1420,7 +1420,7 @@ def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
 
 
 def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -> None:
-    """`CODEX_RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
+    """`RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
     for-byte so disable-mode users see no churn during the Slice 3 rename."""
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
@@ -1439,7 +1439,7 @@ def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "dry-run",
-            "CODEX_RVF_TRACKER_DISABLE": "1",
+            "RVF_TRACKER_DISABLE": "1",
         },
         state_dir=state,
     )
@@ -1527,7 +1527,7 @@ def test_evaluate_session_gate_suppresses_on_manual_marker(tmp: Path) -> None:
 
 
 def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path) -> None:
-    """With `CODEX_RVF_TRACKER_DISABLE=1`, the orchestrator must delegate to
+    """With `RVF_TRACKER_DISABLE=1`, the orchestrator must delegate to
     the verbatim Phase-0 body so legacy `session_owned_dirty` reason codes
     flow through unchanged."""
     module = load_hook_module()
@@ -1564,8 +1564,8 @@ def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path)
     )
     state = tmp / "state"
     old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
-    old_disable = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
-    os.environ["CODEX_RVF_TRACKER_DISABLE"] = "1"
+    old_disable = os.environ.get("RVF_TRACKER_DISABLE")
+    os.environ["RVF_TRACKER_DISABLE"] = "1"
     try:
         ledger = _make_test_ledger(module, state)
         event = {
@@ -1579,9 +1579,9 @@ def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path)
         else:
             os.environ["CODEX_RVF_LOG_ROOT"] = old_log
         if old_disable is None:
-            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+            os.environ.pop("RVF_TRACKER_DISABLE", None)
         else:
-            os.environ["CODEX_RVF_TRACKER_DISABLE"] = old_disable
+            os.environ["RVF_TRACKER_DISABLE"] = old_disable
     assert result is None  # session-owned dirty → legacy path returns None to continue
     # Verify the legacy reason code went through the events log.
     events_path = ledger.events_path
@@ -2792,7 +2792,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "action = sys.argv[1]\n"
         "if action == 'ensure':\n"
         "    print(json.dumps({'ok': True, 'started': False}))\n"
@@ -2813,7 +2813,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
             "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
             "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
-            "CODEX_RVF_SUPPRESS_STOP_HOOK",
+            "RVF_SUPPRESS_STOP_HOOK",
             "CODEX_RVF_PREP_ROOT",
             "FAKE_CLIENT_CALLS",
         )
@@ -2831,7 +2831,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
-        os.environ["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
+        os.environ["RVF_SUPPRESS_STOP_HOOK"] = "1"
         os.environ["CODEX_RVF_PREP_ROOT"] = str(prep_root)
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
@@ -2894,7 +2894,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
     assert "RVF_CLINE_KANBAN_TASK" in prompt_text
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
+    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert "RVF_TARGET_REPO: ." in prompt_text
     assert f"RVF_PARENT_REPO: {repo}" in prompt_text
     assert f"RVF_PARENT_CWD: {repo}" in prompt_text
@@ -2902,8 +2902,9 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts" in prompt_text
     assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
     assert "export CODEX_RVF_LOG_ROOT=" in prompt_text
-    assert "export CODEX_RVF_RUN_ID=" in prompt_text
-    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in prompt_text
+    assert "export RVF_RUN_ID=" in prompt_text
+    assert "export RVF_RUN_DIR=" in prompt_text
+    assert "CODEX_RVF_RUN_DIR" not in prompt_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in prompt_text
     assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
     assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text
@@ -3261,7 +3262,7 @@ def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
                 "transcript_path": str(transcript),
             },
             extra_env={
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "FAKE_CLIENT_CALLS": str(client_calls),
@@ -3626,7 +3627,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "if sys.argv[1] == 'list':\n"
         f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
         "elif sys.argv[1] == 'message':\n"
@@ -3645,7 +3646,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -3726,7 +3727,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task" in prompt_text
     assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
+    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert calls[0]["suppress"] is None
     assert calls[1]["suppress"] is None
 
@@ -3768,7 +3769,7 @@ def test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pendin
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -3914,7 +3915,7 @@ def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) 
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -4013,8 +4014,8 @@ def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: 
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
         # 让 sweep 把 taskCURRENT 视为当前 task（current_kanban_task_id 读 env）。
         "KANBAN_TASK_ID": "taskCURRENT",
@@ -4084,8 +4085,8 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
     }
     invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
@@ -4115,7 +4116,7 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
 
 
 def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_path: Path) -> None:
-    """S2（CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
+    """S2（RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
     仍发通知 + 保留 marker，绝不谎报已自动跑。"""
     repo = init_repo(tmp_path / "clean", dirty=False)
     state = tmp_path / "state"
@@ -4134,10 +4135,10 @@ def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_p
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
-        "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
+        "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
         # 显式指向不存在的 app-server socket，确定性不可达（避免误连真机 app-server）。
         "CODEX_RVF_APP_SERVER_SOCKET": str(tmp_path / "no-such.sock"),
     }
@@ -4224,17 +4225,17 @@ def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp
         "kanban_task_title_source": "src",
         "origin_transcript_path": str(tmp_path / "tx.jsonl"),
     }
-    saved = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
+    saved = os.environ.get("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
+    os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
     try:
         result = cs._maybe_redispatch_stranded_kanban_followup(
             marker, _FakeLedger(), token="stabletoken00000"
         )
     finally:
         if saved is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
+            os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
 
     assert result.get("redispatched") is True
     # RVF-001：idem 绑定稳定 token，绝不含 fresh prep token。
@@ -4301,7 +4302,7 @@ def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -4381,7 +4382,7 @@ def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_pat
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -4474,7 +4475,7 @@ def test_kanban_followup_title_uses_session_matched_board_state(tmp_path: Path) 
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -4529,7 +4530,7 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
             },
             extra_env={
                 "CODEX_RVF_FORK_MODE": "kanban-followup",
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "KANBAN_TASK_ID": "task-77",
@@ -4808,7 +4809,7 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
     shared_lock_root = tmp_path / "shared-followup-lock"
     shared_lock_root.mkdir(parents=True)
     # 直接写一份 marker，等价于 UPS 在投递确认时 arm 的结果（env 模式：marker 直接落在
-    # CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
+    # RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
     marker_path = shared_lock_root / "task-task-shared.json"
     marker_path.write_text(
         json.dumps(
@@ -4849,7 +4850,7 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
             "KANBAN_TASK_ID": "task-shared",
             "FAKE_CLIENT_CALLS": str(client_calls),
         },
@@ -5892,7 +5893,7 @@ def test_session_hook_control_status_works_when_env_suppressed(tmp_path: Path) -
                 "stop_hook_active": False,
                 "transcript_path": str(transcript),
             },
-            extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+            extra_env={"RVF_SUPPRESS_STOP_HOOK": "1"},
             state_dir=state,
         )[0]
     )
@@ -5996,7 +5997,7 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
             },
             extra_env={
                 "CODEX_RVF_FORK_MODE": "cline-kanban",
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "FAKE_CLIENT_CALLS": str(client_calls),
@@ -6908,7 +6909,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
         invoke(
             event,
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert "decision" not in payload
@@ -6933,7 +6934,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     stdout, _ = invoke(
         event,
         state_dir=state,
-        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+        extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
     )
     payload = parse_json(stdout)
     summary = summary_from_payload(payload)
@@ -7025,7 +7026,7 @@ def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     summary = summary_from_payload(payload)
@@ -7108,7 +7109,7 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
         )[0]
@@ -7164,7 +7165,7 @@ def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
         )[0]
@@ -7176,8 +7177,8 @@ def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
     assert call["analyze_thread"] == "1"
     # 同样把 export 烘进 tmux 内 shell，保证不依赖 tmux server env。
     shell_command = call["argv"][4]
-    assert "export CODEX_RVF_SUPPRESS_STOP_HOOK=1" in shell_command
-    assert "export CODEX_RVF_ANALYZE_THREAD=1" in shell_command
+    assert "export RVF_SUPPRESS_STOP_HOOK=1" in shell_command
+    assert "export RVF_ANALYZE_THREAD=1" in shell_command
 
 
 def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
@@ -7194,8 +7195,8 @@ def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
         },
         state_dir=state,
         extra_env={
-            "CODEX_RVF_ANALYZE_THREAD": "1",
-            "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+            "RVF_ANALYZE_THREAD": "1",
+            "RVF_TMUX_BIN": str(fake_tmux),
             "FAKE_TMUX_CALLS": str(tmux_calls),
         },
     )
@@ -7231,7 +7232,7 @@ def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "1",
                 "FAKE_TMUX_STDERR": "duplicate session: rvf-analyze-rvf-child",
@@ -7271,7 +7272,7 @@ def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) ->
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "3",
                 "FAKE_TMUX_STDERR": "tmux: command failed for unknown reason",
@@ -7307,7 +7308,7 @@ def test_handoff_advisory_records_notify_failure(tmp_path: Path) -> None:
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     # 通知失败不阻断 run；handoff 仍被认定 ready（continue=True），但记为 warning。
@@ -7349,8 +7350,8 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-                "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+                "RVF_SUPPRESS_STOP_HOOK": "1",
+                "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
             },
         )[0]
     )
@@ -7381,7 +7382,7 @@ def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert payload["continue"] is True

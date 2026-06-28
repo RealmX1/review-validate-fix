@@ -132,7 +132,7 @@ def _capture_post_bootstrap_snapshot(root: Path, metadata: dict[str, Any]) -> di
             target_value = value
             break
     if target_value is None:
-        run_dir_value = metadata.get("rvf_run_dir") or os.environ.get("CODEX_RVF_RUN_DIR")
+        run_dir_value = metadata.get("rvf_run_dir") or os.environ.get("RVF_RUN_DIR")
         if isinstance(run_dir_value, str) and run_dir_value:
             target_value = str(
                 Path(run_dir_value).expanduser() / "artifacts" / "before-workspace-snapshot.json"

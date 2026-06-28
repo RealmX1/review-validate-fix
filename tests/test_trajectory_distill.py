@@ -194,11 +194,6 @@ def test_distill_reasoning_redacts_encrypted_blob(tmp_path: Path) -> None:
     assert "encrypted" in distilled[0]["summary"]
 
 
-def test_host_kind_constant_is_codex() -> None:
-    distill = _load("trajectory_distill")
-    assert distill.HOST_KIND == "codex"
-
-
 def test_read_codex_originator_returns_value_from_session_meta(tmp_path: Path) -> None:
     distill = _load("trajectory_distill")
     rollout = tmp_path / "rollout.jsonl"
