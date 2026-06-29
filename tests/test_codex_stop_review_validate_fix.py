@@ -4686,6 +4686,137 @@ _f2manual.inject(
 globals().update({_n: getattr(_f2manual, _n) for _n in _f2manual.__all__})
 
 
+def _write_fake_kanban_recorder(tmp_path: Path) -> tuple[str, Path]:
+    """写一个假 `kanban` 脚本：记录 argv 到 calls.jsonl、对任意 action 回 {ok:true}。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake = tmp_path / "fake_kanban.py"
+    calls = tmp_path / "calls.jsonl"
+    fake.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'ok': True, 'taskId': sys.argv[sys.argv.index('--task-id')+1], 'parked': sys.argv[0]=='park'}))\n",
+        encoding="utf-8",
+    )
+    os.environ["KANBAN_CALLS"] = str(calls)
+    return f"{sys.executable} {fake}", calls
+
+
+def test_launch_keep_park_signal_uses_real_hook_payload_shape(tmp_path: Path) -> None:
+    """回归 REAL/high（reviewer claude-code 发现）：``ledger.hook_payload`` 顶层只有
+    ``continue`` / ``systemMessage``、**没有 status 键**，故保留-park 信号必须走显式内部键，
+    绝不能靠 ``result['status']``（旧实现因此对成功派发也 unpark、100% 破坏 park）。"""
+    module = load_hook_module()
+    ledger = module.start_run(component="stop-hook", run_dir=tmp_path / "run")
+    payload = ledger.hook_payload(
+        status="kanban-followup-started", reason_code="kanban_followup_started"
+    )
+    # 这正是当初的坑：成功派发的 hook_payload 顶层没有 status 键。
+    assert payload.get("status") is None
+    assert set(payload.keys()) == {"continue", "systemMessage"}
+    # 缺信号（= 旧的「靠 status」实现路径）→ 不保留 park（会 unpark）。
+    assert module._launch_result_keeps_self_park(payload) is False
+    # dispatch 成功路径显式置位后 → 保留 park。
+    payload[module._RVF_KEEP_SELF_PARK_FLAG] = True
+    assert module._launch_result_keeps_self_park(payload) is True
+    # 非 dict / None 安全。
+    assert module._launch_result_keeps_self_park(None) is False
+
+
+def test_skip_decision_should_unpark_keeps_park_for_resume_pending(tmp_path: Path) -> None:
+    """回归 REAL/medium（reviewer cursor-cli 发现）：dispatch-in-flight / in-progress 的 skip
+    表示 resume 在路上，main 的 skip 分支必须保留 park（这些 reason 上不 unpark）。"""
+    module = load_hook_module()
+    SD = module.StopDecision
+    # resume 在路上的 skip → 不 unpark。
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="kanban_followup_dispatch_in_flight")
+    ) is False
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="kanban_followup_in_progress")
+    ) is False
+    # 无 resume 的普通 skip（handoff 完成、无 owned dirty 等）→ 照常 unpark。
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="handoff_file_ready")
+    ) is True
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="session_scope_clean")
+    ) is True
+
+
+def test_stop_unparks_on_dispatch_failure_and_no_dispatch(tmp_path: Path) -> None:
+    """安全阀：本会话 self-park 过但本次 Stop 无 resume → 幂等 unpark + 清 self-park 标记。"""
+    module = load_hook_module()
+    park = module.rvf_post_tool_use
+    state_root = tmp_path / "park-state"
+    os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(state_root)
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    session_id = "sess-abc"
+    # 模拟 PostToolUse 已写下的 self-park 标记。
+    park._atomic_write(
+        park._parked_path(session_id),
+        {"nonce": "n1", "task_id": "task-7", "project_path": str(repo), "parked_at": "now"},
+    )
+    assert park.read_self_park_state(session_id) is not None
+
+    class _FakeLedger:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def event(self, **kw: object) -> dict:
+            self.events.append(kw)
+            return kw
+
+    ledger = _FakeLedger()
+    module.unpark_self_parked_card(
+        {"session_id": session_id, "cwd": str(repo)}, ledger, reason="no_followup_dispatch"
+    )
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded, "expected an unpark call to the kanban client"
+    assert recorded[0][0] == "unpark"
+    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-7"
+    # self-park 标记已清（避免下一次 Stop 重复 unpark）。
+    assert park.read_self_park_state(session_id) is None
+    assert any(e.get("event") == "kanban_followup_self_park_unparked" for e in ledger.events)
+
+
+def test_stop_safety_valve_noop_when_not_self_parked(tmp_path: Path) -> None:
+    """未 self-park 的会话：安全阀是廉价 noop（不触 kanban、不报错）。"""
+    module = load_hook_module()
+    os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(tmp_path / "empty-state")
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    class _FakeLedger:
+        def event(self, **kw: object) -> dict:
+            return kw
+
+    module.unpark_self_parked_card(
+        {"session_id": "never-parked", "cwd": str(tmp_path)}, _FakeLedger(), reason="stop_no_launch"
+    )
+    assert not calls.exists() or calls.read_text(encoding="utf-8").strip() == ""
+
+
+def test_stranded_sweep_unparks_on_giveup(tmp_path: Path) -> None:
+    """stranded-sweep 兜底：按 marker 的 task_id/project_path 幂等 unpark 泄漏的 park。"""
+    module = load_hook_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    assert module._unpark_stranded_task(str(repo), "task-9") is True
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0][0] == "unpark"
+    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-9"
+    # 缺 project_path → 直接 False、不调 kanban。
+    assert module._unpark_stranded_task(None, "task-9") is False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
@@ -4856,6 +4987,11 @@ def main() -> int:
         test_parent_thread_path_for_origin_returns_codex_validated_path,
         test_parent_thread_path_for_origin_falls_back_to_existing_file,
         test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty,
+        test_launch_keep_park_signal_uses_real_hook_payload_shape,
+        test_skip_decision_should_unpark_keeps_park_for_resume_pending,
+        test_stop_unparks_on_dispatch_failure_and_no_dispatch,
+        test_stop_safety_valve_noop_when_not_self_parked,
+        test_stranded_sweep_unparks_on_giveup,
     ]
     assert_every_defined_test_is_registered(
         globals(),

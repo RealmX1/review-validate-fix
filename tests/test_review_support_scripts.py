@@ -59,6 +59,10 @@ RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
+RVF_POST_TOOL_USE = SCRIPT_DIR / "rvf_post_tool_use.py"
+HOOKS_JSON = (
+    ROOT / "plugins" / "review-validate-fix" / "hooks" / "hooks.json"
+)
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_"):
@@ -161,6 +165,16 @@ def load_cline_kanban_client_module():
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load cline_kanban_client module")
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_post_tool_use_module():
+    spec = importlib.util.spec_from_file_location("rvf_post_tool_use", RVF_POST_TOOL_USE)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_post_tool_use module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -813,6 +827,241 @@ def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
         shim = hooks_dir / name
         assert shim.is_file(), f"hooks/{name} missing"
         py_compile.compile(str(shim), doraise=True)
+
+
+def test_claude_plugin_hooks_declare_post_tool_use_with_write_matcher() -> None:
+    """park 的 race-free 落点：hooks.json 必须声明一个带写型工具 matcher 的 PostToolUse
+    条目，wired 到 post_tool_use.py shim；且 shim + 核心脚本存在可编译。"""
+    import py_compile
+
+    data = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
+    groups = data["hooks"].get("PostToolUse")
+    assert isinstance(groups, list) and groups, "PostToolUse not declared"
+    matched = [
+        group
+        for group in groups
+        if group.get("matcher") == "Edit|Write|MultiEdit|NotebookEdit"
+        and any(
+            isinstance(entry.get("command"), str)
+            and "${CLAUDE_PLUGIN_ROOT}" in entry["command"]
+            and "hooks/post_tool_use.py" in entry["command"]
+            for entry in group.get("hooks", [])
+        )
+    ]
+    assert matched, f"PostToolUse not wired with write-tool matcher: {groups}"
+
+    hooks_dir = ROOT / "plugins" / "review-validate-fix" / "hooks"
+    shim = hooks_dir / "post_tool_use.py"
+    assert shim.is_file(), "hooks/post_tool_use.py missing"
+    py_compile.compile(str(shim), doraise=True)
+    py_compile.compile(str(RVF_POST_TOOL_USE), doraise=True)
+
+
+def _write_fake_park_client(tmp_path: Path) -> tuple[Path, Path]:
+    """假 cline_kanban_client：记录 argv 到 calls.jsonl、对任意 action 回 {ok:true}。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake = tmp_path / "fake_client.py"
+    calls = tmp_path / "client_calls.jsonl"
+    fake.write_text(
+        "import json, sys\n"
+        f"calls = {json.dumps(str(calls))}\n"
+        "with open(calls, 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'ok': True, 'parked': True}))\n",
+        encoding="utf-8",
+    )
+    return fake, calls
+
+
+_PARK_ENV_KEYS = (
+    "KANBAN_TASK_ID",
+    "CLINE_KANBAN_TASK_ID",
+    "KANBAN_HOOK_TASK_ID",
+    "KANBAN_PROJECT_PATH",
+    "CLINE_KANBAN_PROJECT_PATH",
+    "CODEX_RVF_CLINE_KANBAN_CLIENT",
+    "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+    "CODEX_RVF_KANBAN_PARK_STATE_ROOT",
+)
+
+
+def _save_park_env() -> dict[str, str | None]:
+    return {k: os.environ.pop(k, None) for k in _PARK_ENV_KEYS}
+
+
+def _restore_park_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_cline_kanban_client_park_unpark_is_parked(tmp_path: Path) -> None:
+    """client 新增三 verb：park（带 --label）/ unpark / is-parked，argv 路由正确 + JSON 透传。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp_path / "fake_kanban_task.py"
+    calls = tmp_path / "calls.jsonl"
+    fake_task.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "tid = sys.argv[sys.argv.index('--task-id') + 1]\n"
+        "out = {'ok': True, 'taskId': tid}\n"
+        "out['parked'] = action != 'unpark'\n"
+        "print(json.dumps(out))\n",
+        encoding="utf-8",
+    )
+    repo = init_repo(tmp_path / "repo")
+    env = os.environ.copy()
+    env["KANBAN_CALLS"] = str(calls)
+    task_cmd = f"{sys.executable} {fake_task}"
+
+    def _client(action: str, *extra: str) -> dict:
+        completed = run(
+            [
+                sys.executable,
+                str(CLINE_KANBAN_CLIENT),
+                action,
+                "--repo",
+                str(repo),
+                "--task-cmd",
+                task_cmd,
+                "--task-id",
+                "task-1",
+                *extra,
+            ],
+            env=env,
+        )
+        return json.loads(completed.stdout)
+
+    park_payload = _client("park", "--label", "self-rising")
+    assert park_payload["task_id"] == "task-1"
+    assert park_payload["parked"] is True
+    unpark_payload = _client("unpark")
+    assert unpark_payload["parked"] is False
+    is_parked_payload = _client("is-parked")
+    assert is_parked_payload["task_id"] == "task-1"
+
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0][0] == "park"
+    assert "--label" in recorded[0] and recorded[0][recorded[0].index("--label") + 1] == "self-rising"
+    assert recorded[1][0] == "unpark"
+    assert recorded[2][0] == "is-parked"
+    for call in recorded:
+        assert call[call.index("--task-id") + 1] == "task-1"
+        # client 对 --repo 做 .resolve()（macOS /var→/private/var），故比较解析后路径。
+        assert call[call.index("--project-path") + 1] == str(Path(repo).resolve())
+
+
+def test_post_tool_use_parks_eligible_edit_turn(tmp_path: Path) -> None:
+    """eligible 回合 + 写型工具 → park 一次；同 nonce 第二次编辑 → 不重复 park。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+
+        nonce = park.mark_park_eligibility("sess-1", eligible=True, root=root)
+        assert nonce
+        event = {
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "task_id": "task-1",
+            "project_path": str(tmp_path),
+            "cwd": str(tmp_path),
+        }
+        first = park.inspect_post_tool_use(event, root=root)
+        assert first["status"] == "parked"
+        assert park.read_self_park_state("sess-1", root=root)["nonce"] == nonce
+        # 同 nonce 第二次编辑：不重复 park。
+        second = park.inspect_post_tool_use(event, root=root)
+        assert second["status"] == "noop"
+        recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        assert len(recorded) == 1
+        assert recorded[0][0] == "park"
+        assert recorded[0][recorded[0].index("--task-id") + 1] == "task-1"
+    finally:
+        _restore_park_env(saved)
+
+
+def test_post_tool_use_skips_token_turn(tmp_path: Path) -> None:
+    """eligible=false（Turn 2 token 回合 / 终态待审）→ 绝不 park。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+        park.mark_park_eligibility("sess-1", eligible=False, root=root)
+        event = {"session_id": "sess-1", "tool_name": "Write", "task_id": "task-1", "cwd": str(tmp_path)}
+        result = park.inspect_post_tool_use(event, root=root)
+        assert result["status"] == "skipped" and result["reason"] == "not_eligible"
+        assert not calls.exists()
+        assert park.read_self_park_state("sess-1", root=root) is None
+    finally:
+        _restore_park_env(saved)
+
+
+def test_post_tool_use_skips_non_edit_or_non_kanban(tmp_path: Path) -> None:
+    """非写型工具 / 不在 kanban task → noop（保热路径开销 + 不误 park）。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+        park.mark_park_eligibility("sess-1", eligible=True, root=root)
+        # 非 kanban task（无 task id，env 已清）→ 早退。
+        non_kanban = park.inspect_post_tool_use(
+            {"session_id": "sess-1", "tool_name": "Edit", "cwd": str(tmp_path)}, root=root
+        )
+        assert non_kanban["reason"] == "not_kanban_task"
+        # 非写型工具 → 早退。
+        non_edit = park.inspect_post_tool_use(
+            {"session_id": "sess-1", "tool_name": "Read", "task_id": "task-1", "cwd": str(tmp_path)},
+            root=root,
+        )
+        assert non_edit["reason"] == "not_write_tool"
+        assert not calls.exists()
+    finally:
+        _restore_park_env(saved)
+
+
+def test_user_prompt_submit_marks_park_eligibility(tmp_path: Path) -> None:
+    """UPS 在回合开头标 park 资格：人类 kanban 回合 eligible=true；token 回合 eligible=false。"""
+    saved = _save_park_env()
+    try:
+        submit = load_rvf_user_prompt_submit_module()
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(root)
+        prep_root = tmp_path / "prep"
+
+        # 人类 kanban 实现回合（无 token/marker/manual，且在 kanban task）→ eligible=true。
+        submit.inspect_user_prompt_submit(
+            {"session_id": "sess-human", "task_id": "task-1", "cwd": str(tmp_path), "prompt": "fix the bug"},
+            prep_root=prep_root,
+        )
+        human = park.read_park_eligibility("sess-human")
+        assert human is not None and human["eligible"] is True
+
+        # token 回合（被注入 followup 唤回，终态待审）→ eligible=false。
+        submit.inspect_user_prompt_submit(
+            {
+                "session_id": "sess-token",
+                "task_id": "task-1",
+                "cwd": str(tmp_path),
+                "prompt": "RVF_DISPATCH=token=deadbeefdeadbeef resume",
+            },
+            prep_root=prep_root,
+        )
+        token_turn = park.read_park_eligibility("sess-token")
+        assert token_turn is not None and token_turn["eligible"] is False
+    finally:
+        _restore_park_env(saved)
 
 
 def _load_claude_hook_entry_module():
@@ -5283,6 +5532,34 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "claude_plugin_hooks_declare_user_prompt_submit",
             lambda: test_claude_plugin_hooks_declare_user_prompt_submit(),
+        ),
+        (
+            "claude_plugin_hooks_declare_post_tool_use_with_write_matcher",
+            lambda: test_claude_plugin_hooks_declare_post_tool_use_with_write_matcher(),
+        ),
+        (
+            "cline_kanban_client_park_unpark_is_parked",
+            lambda: test_cline_kanban_client_park_unpark_is_parked(root / "cline-kanban-park"),
+        ),
+        (
+            "post_tool_use_parks_eligible_edit_turn",
+            lambda: test_post_tool_use_parks_eligible_edit_turn(root / "post-tool-use-park"),
+        ),
+        (
+            "post_tool_use_skips_token_turn",
+            lambda: test_post_tool_use_skips_token_turn(root / "post-tool-use-skip-token"),
+        ),
+        (
+            "post_tool_use_skips_non_edit_or_non_kanban",
+            lambda: test_post_tool_use_skips_non_edit_or_non_kanban(
+                root / "post-tool-use-skip-nonedit"
+            ),
+        ),
+        (
+            "user_prompt_submit_marks_park_eligibility",
+            lambda: test_user_prompt_submit_marks_park_eligibility(
+                root / "ups-park-eligibility"
+            ),
         ),
         (
             "claude_hook_entry_detects_foreign_invocation",
