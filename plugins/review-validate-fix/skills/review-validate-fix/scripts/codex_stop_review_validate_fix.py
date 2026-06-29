@@ -63,6 +63,9 @@ from kanban_followup_lock import (
     stamp_pending_notified as stamp_kanban_followup_pending_notified,
     write_pending_marker as write_kanban_followup_pending,
 )
+from rvf_awaiting_dispatched_agent_marker import (
+    iter_active_awaiting_for_session as iter_active_awaiting_dispatched_agent_for_session,
+)
 from session_manifest import build_manifest
 from diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
@@ -2979,6 +2982,54 @@ def sweep_stranded_kanban_followup_pending(
     except Exception:
         # 对齐既有 best-effort：扫荡的任何异常都不得影响本次 Stop 的主流程。
         pass
+
+
+def awaiting_dispatched_agent_decision(
+    event: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    cwd: str | None,
+) -> StopDecision | None:
+    """RVF 内外统一 shield：主 agent 本轮 Stop 的原因是「正在等待某个已派发的后台/外部 agent」时，
+    不触发新 RVF。
+
+    与 in-progress 锁（``kanban_followup_in_progress_decision``，管 RVF **内**等已派发 reviewer）
+    互补：本闸管 RVF **外 / 实现期**那条——主 agent 还没进 RVF、实现到一半派了个后台 agent（典型 =
+    delegate-to-cursor WRITE 模式留脏树）后纯文本停下等它。没有本闸，``evaluate_stop_event`` 会因
+    无 in-progress 锁 / 无 pending 落到 dirty gate，对半成品工作树 mint 一个不该有的新 RVF + 自注入。
+
+    signal 是 dispatch 层写的 wait-on marker（见 rvf_awaiting_dispatched_agent_marker），不是 agent
+    文本 sentinel（Stop hook 在 Claude 下读不到主 agent 自己最后一轮文本）。只对 ACTIVE marker 跳过，
+    STALE 由 reader 惰性清后放行 → masking 上界 = marker TTL。
+
+    放在 in-progress 闸**之上**：合法 parked 的主 agent 应先被认出「还在等」，再轮到 in-progress 的
+    reengage/nudge。静默 ``{"continue": true}`` skip——不打断 agent 续等、不 nudge、不 force-continue
+    （harness 会在后台 agent 完成时重新唤起主 agent）。
+    """
+    session_id = session_hook_id_from_event(event)
+    if not session_id:
+        return None
+    active = iter_active_awaiting_dispatched_agent_for_session(session_id)
+    if not active:
+        return None
+    dispatched_ids = [marker.get("dispatched_agent_id") or "<unknown>" for marker in active]
+    dispatchers = sorted(
+        {marker.get("dispatcher") for marker in active if marker.get("dispatcher")}
+    )
+    return skip_decision(
+        "主 Agent 本轮 Stop 的原因是正在等待已派发的后台/外部 agent"
+        f"（dispatched_agent_id={', '.join(dispatched_ids)}；"
+        f"dispatcher={', '.join(dispatchers) or '<unknown>'}）；"
+        "本次 Stop 不触发 RVF——agent 只是 park 等待异步派发结果、并未完成可审单元。"
+        "派发方消费完结果后会 clear 该 awaiting marker（或 TTL 到期自动失效），届时正常 Stop 照常触发 RVF。",
+        ledger,
+        "awaiting_dispatched_agent",
+        cwd=cwd,
+        session_id=session_id,
+        awaiting_dispatched_agent_ids=dispatched_ids,
+        awaiting_dispatched_agent_dispatchers=dispatchers,
+        awaiting_dispatched_agent_markers=active,
+    )
 
 
 def kanban_followup_in_progress_decision(
@@ -8365,6 +8416,10 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 handoff_path=str(handoff_path_value),
             )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    awaiting_decision = awaiting_dispatched_agent_decision(event, ledger, cwd=cwd)
+    if awaiting_decision is not None:
+        return awaiting_decision
 
     in_progress_decision = kanban_followup_in_progress_decision(event, ledger, cwd=cwd)
     if in_progress_decision is not None:

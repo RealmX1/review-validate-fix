@@ -41,6 +41,7 @@ __all__ = [
     'test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn',
     'test_kanban_followup_stale_takeover_rechecks_marker_before_unlink',
     'test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots',
+    'test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch',
 ]
 
 
@@ -1633,5 +1634,72 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
     assert latest_b["active_rvf_run_id"] == "rvf-delivered"
     assert latest_b["kanban_followup_in_progress_marker_path"] == str(marker_path)
     # 读侧短路发生在任何 kanban client 调用之前：不会有 list / message。
+    assert not client_calls.exists()
+
+
+def test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch(
+    tmp_path: Path,
+) -> None:
+    """RVF 内外统一 shield 的集成验证：主 agent 本轮 Stop 只是 park 等一个已派发的后台/外部
+    agent（典型 = 实现期 delegate-to-cursor WRITE 留脏树）→ 即使工作树 DIRTY，``evaluate_stop_event``
+    也走 ``awaiting_dispatched_agent`` 静默 skip，**不**落到 dirty gate / 不 mint 新 RVF。
+
+    没有本闸时，dirty 工作树会被 route_reviewable_scope 当成「有未审改动」开审、打断 agent 的等待。
+    marker 由 dispatch 层（writer）经 arm_awaiting_dispatched_agent 写入；Stop hook 只是 reader。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)
+    session_id = "session-awaiting"
+    awaiting_root = tmp_path / "awaiting-root"
+    awaiting_root.mkdir(parents=True)
+
+    # writer = dispatch 层：加载 marker 模块并 arm 一条 wait-on marker（root 指向 subprocess
+    # 将经 CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT 读到的同一基目录）。
+    load_kanban_followup_lock_module()  # 副作用：加载 stop hook，连带 import 同目录 marker 模块
+    awaiting = sys.modules["rvf_awaiting_dispatched_agent_marker"]
+    marker_path = awaiting.arm_awaiting_dispatched_agent(
+        main_session_id=session_id,
+        dispatched_agent_id="bg-impl-1",
+        dispatcher="delegate-to-cursor",
+        description="后台实现 agent，留脏树等收编",
+        root=awaiting_root,
+    )
+    assert marker_path is not None and Path(marker_path).exists()
+
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    client_calls = tmp_path / "client-calls.jsonl"
+    fake_client.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+        "print(json.dumps({'task_id': 'task-await', 'message_id': 'should-not-enqueue'}))\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "session_id": session_id,
+            "last_user_message": "派了个后台 agent 去实现，等它完成后我再收编。",
+        },
+        extra_env={
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+            "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(awaiting_root),
+            "FAKE_CLIENT_CALLS": str(client_calls),
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert payload.get("continue") is True  # 静默 skip，不打断 agent 续等（非 decision:block）
+    assert "reason=awaiting_dispatched_agent" in payload["systemMessage"]
+    latest = latest_summary(state)
+    assert latest["status"] == "skipped"
+    assert latest["reason_code"] == "awaiting_dispatched_agent"
+    assert latest["awaiting_dispatched_agent_ids"] == ["bg-impl-1"]
+    assert latest["awaiting_dispatched_agent_dispatchers"] == ["delegate-to-cursor"]
+    # 闸是 read-only：active marker 不被清；且短路发生在 dirty gate / 任何 dispatch 之前。
+    assert Path(marker_path).exists()
     assert not client_calls.exists()
 
