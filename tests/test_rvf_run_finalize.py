@@ -190,7 +190,7 @@ def test_finalize_for_handoff_resolves_run_dir_from_handoff_path(tmp_path: Path)
 
 def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path, monkeypatch) -> None:
     finalize = _load("rvf_run_finalize")
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"
@@ -259,7 +259,7 @@ def test_finalize_run_marks_stale_tracker_scope_reviewed_from_contract_units(
     monkeypatch,
 ) -> None:
     finalize = _load("rvf_run_finalize")
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     capture = _load("trajectory_capture")
     repo = _init_repo(tmp_path / "repo")
     transcript = tmp_path / "rollout.jsonl"

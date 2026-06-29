@@ -12,7 +12,7 @@ fix delta」全量重审。
   1. 显式 ``--target-run-id``（agent / 用户覆盖）；
   2. 粘贴的 handoff（``--handoff`` / ``--handoff-text-file`` / ``--stdin``）里的 run_id；
   3. tracker：本 worktree 最近一次「仍有 reviewed units」的 RVF run
-     （``diff_tracker.latest_reviewed_run_for_worktree``）；
+     （``reviewable_unit_diff_tracker.latest_reviewed_run_for_worktree``）；
   4. ``log_root()/latest.json`` 的 run_id（log-root 级全局指针，不分 worktree，仅兜底）。
 
 marker 维度与消费侧（Stop hook）保持一致：优先 task_id（kanban），无则 session_id。
@@ -29,12 +29,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import diff_tracker
 import review_reopen_marker
 from rvf_handoff_intake import RVF_RUN_RE
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import log_root  # noqa: E402
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 KANBAN_TASK_ID_ENV_KEYS = (
@@ -105,7 +105,7 @@ def resolve_target_run_id(
         return from_handoff, "handoff"
 
     try:
-        tracker_result = diff_tracker.latest_reviewed_run_for_worktree(
+        tracker_result = reviewable_unit_diff_tracker.latest_reviewed_run_for_worktree(
             repo=repo, log_root_override=log_root_override
         )
     except Exception:

@@ -312,10 +312,10 @@ def test_allocate_review_scope_concurrent_writers_serialize(tmp: Path) -> None:
     log_root = tmp / "logs"
     snippet = (
         "import os, sys, time, json\n"
-        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from pathlib import Path\n"
         "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import diff_tracker as dt\n"
+        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"repo = Path({str(repo)!r})\n"
         "session = sys.argv[1]\n"
@@ -2051,10 +2051,10 @@ def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:
     _module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
     snippet = (
         "import json, os, sys, time\n"
-        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from pathlib import Path\n"
         "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import diff_tracker as dt\n"
+        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
         f"repo = Path({str(repo)!r})\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"unit_id = {unit_ids[0]!r}\n"

@@ -18,8 +18,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+# 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.reviewable_unit_diff_tracker``
+# import、也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里
+# 含 ``core/`` 的 PYROOT 尚不在 ``sys.path``，且 ``_rvf_pyroot.py`` 不在本目录（它在
+# ``scripts/``），无法沿用 scripts 侧「同目录 ``import _rvf_pyroot``」自举。故内联哨兵自举：
+# 自底向上找同时含 ``.rvf-pyroot`` 哨兵与 ``core/`` 的最近祖先（与 ``_rvf_pyroot`` 同口径、
+# depth-robust），把它插入 ``sys.path``，使下面的 ``core.*`` import 在 repo / 部署 payload /
+# worktree / 测试四种上下文走同一条码路。被当作 ``core.*`` import 时 PYROOT 已在 path，幂等无副作用。
+_pyroot_search_start = Path(__file__).resolve()
+for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
+    if (_pyroot_candidate / ".rvf-pyroot").is_file() and (_pyroot_candidate / "core").is_dir():
+        if str(_pyroot_candidate) not in sys.path:
+            sys.path.insert(0, str(_pyroot_candidate))
+        break
 from core.run_ledger.run_ledger import (  # noqa: E402
     _append_jsonl,
     _atomic_write_text,

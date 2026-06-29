@@ -235,7 +235,8 @@ def _release_tracker_lease(
     if not isinstance(run_id, str) or not run_id:
         run_id = None
 
-    import diff_tracker  # noqa: WPS433
+    import _rvf_pyroot  # noqa: WPS433,F401 — pyroot 上 sys.path，供 core.* import
+    from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: WPS433
 
     log_root_raw = os.environ.get("CODEX_RVF_LOG_ROOT", "").strip()
     log_root_override = Path(log_root_raw).expanduser().resolve() if log_root_raw else None
@@ -250,7 +251,7 @@ def _release_tracker_lease(
         did_review = any(
             (run_dir / "artifacts" / "reviewers").glob("*/review-result.json")
         )
-        result = diff_tracker.complete_review_scope(
+        result = reviewable_unit_diff_tracker.complete_review_scope(
             repo=repo,
             lease_id=lease_id,
             unit_ids=primary_units,
@@ -261,7 +262,7 @@ def _release_tracker_lease(
             log_root_override=log_root_override,
         )
     else:
-        result = diff_tracker.lease_release(
+        result = reviewable_unit_diff_tracker.lease_release(
             repo=repo,
             lease_id=lease_id,
             reason=release_reason,

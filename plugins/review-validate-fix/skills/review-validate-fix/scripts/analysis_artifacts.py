@@ -915,9 +915,10 @@ def scaffold_causality_json(
     if repo is not None and stats.run_id:
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
-            import diff_tracker  # noqa: WPS433
+            import _rvf_pyroot  # noqa: WPS433,F401 — pyroot 上 sys.path，供 core.* import
+            from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: WPS433
 
-            ledger = diff_tracker.rvf_causality_for_run(repo=repo, run_id=stats.run_id)
+            ledger = reviewable_unit_diff_tracker.rvf_causality_for_run(repo=repo, run_id=stats.run_id)
         except Exception as exc:  # noqa: BLE001 - scaffold must not fail analysis.
             diagnostics.append(f"causality_ledger_read_failed: {type(exc).__name__}: {exc}")
             ledger = None

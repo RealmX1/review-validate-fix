@@ -454,7 +454,7 @@ def _run_shared_workflow(
     timeout_seconds: float,
     extra_primary_files: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Import prepare_review_run lazily to avoid pulling diff_tracker on early-exit paths."""
+    """Import prepare_review_run lazily to avoid pulling reviewable_unit_diff_tracker on early-exit paths."""
     import prepare_review_run  # noqa: PLC0415 - intentional lazy import
 
     return prepare_review_run.prepare_run_from_prep_file(

@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import diff_tracker
 from cursor_stream_tool_layer_health import classify_cursor_tool_call_outcome
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import start_run  # noqa: E402
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -510,7 +510,7 @@ class TrackerLeaseRuntime:
         existing = self.scope_contract.get("tracker_lease_id")
         if isinstance(existing, str) and existing:
             self.lease_id = existing
-            result = diff_tracker.lease_participant_join(
+            result = reviewable_unit_diff_tracker.lease_participant_join(
                 repo=self.repo,
                 lease_id=existing,
                 reviewer_id=self.reviewer_id,
@@ -528,7 +528,7 @@ class TrackerLeaseRuntime:
         session_id = tracker_scope.get("source_session_id")
         if not isinstance(session_id, str) or not session_id:
             session_id = os.environ.get("CODEX_SESSION_ID") or "alternative-reviewer"
-        result = diff_tracker.lease_acquire(
+        result = reviewable_unit_diff_tracker.lease_acquire(
             repo=self.repo,
             session_id=session_id,
             run_id=str(self.scope_contract.get("run_id") or self.run_id),
@@ -545,7 +545,7 @@ class TrackerLeaseRuntime:
             raise RuntimeError("tracker lease acquire returned no lease_id")
         self.lease_id = lease_id
         self._owns_lease = True
-        joined = diff_tracker.lease_participant_join(
+        joined = reviewable_unit_diff_tracker.lease_participant_join(
             repo=self.repo,
             lease_id=lease_id,
             reviewer_id=self.reviewer_id,
@@ -583,7 +583,7 @@ class TrackerLeaseRuntime:
         )
         active_participant_count = 0
         if self._participant_joined:
-            result = diff_tracker.lease_participant_finish(
+            result = reviewable_unit_diff_tracker.lease_participant_finish(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reviewer_id=self.reviewer_id,
@@ -596,7 +596,7 @@ class TrackerLeaseRuntime:
         else:
             owning_participant_count = 1 if self._owns_lease else 0
         if self._owns_lease and owning_participant_count > 0 and active_participant_count == 0:
-            diff_tracker.lease_release(
+            reviewable_unit_diff_tracker.lease_release(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reason=reason,
@@ -611,7 +611,7 @@ class TrackerLeaseRuntime:
         assert self.lease_id is not None
         interval = lease_heartbeat_seconds()
         while not self._stop.wait(interval):
-            diff_tracker.lease_participant_refresh(
+            reviewable_unit_diff_tracker.lease_participant_refresh(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reviewer_id=self.reviewer_id,

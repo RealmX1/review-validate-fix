@@ -10,7 +10,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import diff_tracker  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -59,7 +60,7 @@ def _source_refs(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _write_mirror(run_dir: Path, issue_id: str, payload: dict[str, Any]) -> Path:
-    path = run_dir / "artifacts" / "fix-issues" / f"{diff_tracker.safe_token(issue_id)}.json"
+    path = run_dir / "artifacts" / "fix-issues" / f"{reviewable_unit_diff_tracker.safe_token(issue_id)}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
@@ -80,7 +81,7 @@ def command_upsert(args: argparse.Namespace) -> int:
     run_id = _run_id(payload, args.run_id, run_dir)
     payload = {**payload, "issue_id": issue_id, "run_id": run_id}
     mirror_path = _write_mirror(run_dir, issue_id, payload)
-    result = diff_tracker.rvf_issue_upsert(
+    result = reviewable_unit_diff_tracker.rvf_issue_upsert(
         repo=repo,
         run_id=run_id,
         issue_id=issue_id,

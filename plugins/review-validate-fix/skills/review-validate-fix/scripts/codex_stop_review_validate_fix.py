@@ -77,7 +77,7 @@ from kanban_followup_lock import (
     write_pending_marker as write_kanban_followup_pending,
 )
 from session_manifest import build_manifest
-from diff_tracker import (
+from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
     LEGACY_REASON_SESSION_OWNED_DIRTY,
     REASON_NO_UNASSIGNED_REVIEW_SCOPE,
@@ -5115,7 +5115,7 @@ def refresh_global_diff_tracker(
 ) -> dict[str, Any]:
     """Emit the Slice 3 shape-compliance ledger event and seed session-unit
     attribution from the transcript via `build_manifest`. The manifest helper
-    transitively calls `diff_tracker.register_claims`, which writes
+    transitively calls `reviewable_unit_diff_tracker.register_claims`, which writes
     `session_units` rows for transcript-attributed owned paths. The allocator
     then reads those rows directly without re-deriving them.
 

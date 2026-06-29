@@ -1792,7 +1792,7 @@ def test_kanban_followup_without_task_id_does_not_allocate_review_scope(tmp: Pat
     meta = getattr(ledger, "tracker_scope_meta", None)
     assert meta is None
 
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     _, _, tracker_dir, db_path, _, _ = diff_tracker._lease_repo_paths(
         repo,
         log_root_override=state / "global-diff-tracker",
@@ -1829,7 +1829,7 @@ def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp
         assert dry is not None and dry["would_proceed"] is True
         scope_hash = dry["result"]["scope_hash"]
 
-        diff_tracker = sys.modules["diff_tracker"]
+        diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
         diff_tracker.record_manual_rvf_run(
             repo=repo,
             session_id="manual-db-session",
@@ -1856,7 +1856,7 @@ def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp
 
 def test_manual_scope_suppression_sweeps_expired_lease_before_probe(tmp: Path) -> None:
     module = load_hook_module()
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     repo = init_repo_with_head(tmp / "dirty")
     transcript = tmp / "session.jsonl"
     write_apply_patch_transcript(transcript, repo, session_id="sess-manual-stale")
@@ -1914,7 +1914,7 @@ def test_manual_scope_suppression_sweeps_expired_lease_before_probe(tmp: Path) -
 
 def test_manual_scope_suppression_does_not_transfer_parent_takeover_units(tmp: Path) -> None:
     module = load_hook_module()
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     repo = init_repo_with_head(tmp / "dirty")
     state = tmp / "state"
     old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
@@ -4947,7 +4947,7 @@ def _dirty_repo_with_units_for_reopen(path: Path) -> Path:
 def _seed_reviewed_run_for_reopen(state: Path, repo: Path, run_id: str) -> str:
     """allocate + lease-release via the diff_tracker CLI so `run_id` leaves
     durable `reviewed` units under `state` log root. Returns repo_key."""
-    diff_tracker = SCRIPT.with_name("diff_tracker.py")
+    diff_tracker = ROOT / "core" / "session_scope_allocation" / "reviewable_unit_diff_tracker.py"
     alloc = subprocess.run(
         [
             sys.executable, str(diff_tracker), "allocate-review-scope",

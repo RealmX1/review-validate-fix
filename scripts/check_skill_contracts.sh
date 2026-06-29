@@ -435,7 +435,7 @@ repo_required_files=(
   "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
-  "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py"
+  "core/session_scope_allocation/reviewable_unit_diff_tracker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -518,7 +518,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
-  "$skill_dir/scripts/diff_tracker.py" \
+  "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
@@ -563,7 +563,7 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py" 'def resolve_target_run_id'
-require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py" 'def invalidate_reviewed_units_for_run'
+require_repo_literal "core/session_scope_allocation/reviewable_unit_diff_tracker.py" 'def invalidate_reviewed_units_for_run'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'review_scope_reopened_for_failed_impl'
 require_literal "SKILL.md" '本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用'
 require_literal "SKILL.md" 'policy.allow_implicit_invocation'

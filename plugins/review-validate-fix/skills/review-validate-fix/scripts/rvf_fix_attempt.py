@@ -13,7 +13,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import diff_tracker  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 def _run(
@@ -78,7 +79,7 @@ def _run_id(run_dir: Path, override: str | None) -> str:
 
 
 def _issue_path(run_dir: Path, issue_id: str) -> Path:
-    return run_dir / "artifacts" / "fix-issues" / f"{diff_tracker.safe_token(issue_id)}.json"
+    return run_dir / "artifacts" / "fix-issues" / f"{reviewable_unit_diff_tracker.safe_token(issue_id)}.json"
 
 
 def _issue_payload(run_dir: Path, issue_id: str) -> dict[str, Any]:
@@ -202,7 +203,7 @@ def _load_attempt(run_dir: Path, attempt_id: str) -> dict[str, Any]:
 
 
 def _attempt_id(run_id: str, issue_id: str) -> str:
-    return f"rvf-attempt-{diff_tracker.safe_token(run_id)[:24]}-{diff_tracker.safe_token(issue_id)}-{secrets.token_hex(4)}"
+    return f"rvf-attempt-{reviewable_unit_diff_tracker.safe_token(run_id)[:24]}-{reviewable_unit_diff_tracker.safe_token(issue_id)}-{secrets.token_hex(4)}"
 
 
 def _dirty_patch(repo: Path, paths: list[str], out_path: Path) -> bool:
@@ -296,7 +297,7 @@ def command_prepare(args: argparse.Namespace) -> int:
         "status": "prepared",
     }
     _write_json(attempt_dir / "attempt.json", attempt)
-    diff_tracker.rvf_attempt_upsert(
+    reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=run_id,
         issue_id=args.issue_id,
@@ -319,7 +320,7 @@ def command_start(args: argparse.Namespace) -> int:
     repo = _optional_repo(args.repo, attempt)
     attempt["status"] = "started"
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
-    result = diff_tracker.rvf_attempt_upsert(
+    result = reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
         issue_id=attempt["issue_id"],
@@ -450,7 +451,7 @@ def _sync_issue_state(
 ) -> None:
     issue_path = _issue_path(run_dir, issue_id)
     issue = _read_json(issue_path)
-    diff_tracker.rvf_issue_upsert(
+    reviewable_unit_diff_tracker.rvf_issue_upsert(
         repo=repo,
         run_id=str(issue.get("run_id") or _run_id(run_dir, None)),
         issue_id=issue_id,
@@ -523,7 +524,7 @@ def command_stop(args: argparse.Namespace) -> int:
     )
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
     log_root = Path(args.log_root).expanduser().resolve() if args.log_root else None
-    diff_tracker.rvf_attempt_upsert(
+    reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
         issue_id=attempt["issue_id"],
@@ -541,7 +542,7 @@ def command_stop(args: argparse.Namespace) -> int:
         state=status,
         log_root=log_root,
     )
-    diff_tracker.rvf_patch_events_replace(
+    reviewable_unit_diff_tracker.rvf_patch_events_replace(
         repo=repo,
         attempt_id=args.attempt_id,
         events=[
@@ -584,7 +585,7 @@ def command_apply(args: argparse.Namespace) -> int:
     attempt["status"] = status
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
     tracker_status = "merge_conflict" if status == "scope_expansion_conflict" else status
-    diff_tracker.rvf_attempt_upsert(
+    reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
         issue_id=attempt["issue_id"],
@@ -616,7 +617,7 @@ def command_status(args: argparse.Namespace) -> int:
         run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
         run_id = _run_id(run_dir, None)
     repo = _optional_repo(args.repo)
-    payload = diff_tracker.rvf_causality_for_run(
+    payload = reviewable_unit_diff_tracker.rvf_causality_for_run(
         repo=repo,
         run_id=run_id,
         log_root_override=Path(args.log_root).expanduser().resolve() if args.log_root else None,

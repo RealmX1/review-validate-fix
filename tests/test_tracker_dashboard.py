@@ -73,7 +73,7 @@ def test_collect_snapshot_empty_repo(tmp_path: Path) -> None:
 
 def test_collect_snapshot_after_allocate_release(tmp_path: Path) -> None:
     dashboard = _load("tracker_dashboard")
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     repo = _init_repo_with_dirty_file(tmp_path / "repo")
     log_root = tmp_path / "log_root"
     alloc = diff_tracker.allocate_review_scope(
@@ -165,7 +165,7 @@ def test_cli_from_snapshot_missing_file(tmp_path: Path) -> None:
 
 def test_server_live_serves_shell_and_api(tmp_path: Path) -> None:
     dashboard = _load("tracker_dashboard")
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     repo = _init_repo_with_dirty_file(tmp_path / "repo")
     log_root = tmp_path / "log_root"
     alloc = diff_tracker.allocate_review_scope(
@@ -216,7 +216,7 @@ def test_server_live_serves_shell_and_api(tmp_path: Path) -> None:
 
 def test_server_frozen_serves_snapshot_file(tmp_path: Path) -> None:
     dashboard = _load("tracker_dashboard")
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     repo = _init_repo_with_dirty_file(tmp_path / "repo")
     log_root = tmp_path / "log_root"
     alloc = diff_tracker.allocate_review_scope(

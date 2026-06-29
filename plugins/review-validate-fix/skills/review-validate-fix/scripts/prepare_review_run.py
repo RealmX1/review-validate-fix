@@ -17,10 +17,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import concurrent.futures
-import diff_tracker
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
+from core.session_scope_allocation import reviewable_unit_diff_tracker
 from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 
 
@@ -863,7 +863,7 @@ def prepare_run(
                 heartbeat_session = tracker_meta.get("session_id") or manifest_payload.get("session_id")
                 if isinstance(heartbeat_session, str) and heartbeat_session:
                     try:
-                        diff_tracker.heartbeat(
+                        reviewable_unit_diff_tracker.heartbeat(
                             root,
                             session_id=heartbeat_session,
                             run_id=ledger.run_id,

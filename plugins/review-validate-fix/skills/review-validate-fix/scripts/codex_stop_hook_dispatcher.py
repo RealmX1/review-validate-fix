@@ -287,7 +287,7 @@ def should_sync_session_scope(
         refresh_global_diff_tracker,
         allocate_auto_review_scope,
     )
-    from diff_tracker import (
+    from core.session_scope_allocation.reviewable_unit_diff_tracker import (
         LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
         LEGACY_REASON_SESSION_OWNED_DIRTY,
         REASON_NO_UNASSIGNED_REVIEW_SCOPE,
@@ -1355,8 +1355,7 @@ def main() -> int:
         # `no_session_owned_dirty` (emitted by tracker-disabled fallback) and
         # the new `no_unassigned_review_scope` (emitted by the allocator dry
         # run). The detail message branches on the same set.
-        sys.path.insert(0, str(SKILL_DIR / "scripts"))
-        from diff_tracker import REASON_NO_UNASSIGNED_REVIEW_SCOPE
+        from core.session_scope_allocation.reviewable_unit_diff_tracker import REASON_NO_UNASSIGNED_REVIEW_SCOPE
         clean_scope_codes = ("no_session_owned_dirty", REASON_NO_UNASSIGNED_REVIEW_SCOPE)
         if session_reason_code in clean_scope_codes and is_session_hook_control_event(event):
             ledger.event(

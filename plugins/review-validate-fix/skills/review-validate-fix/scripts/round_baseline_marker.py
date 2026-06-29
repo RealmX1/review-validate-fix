@@ -5,7 +5,7 @@
 判定「本轮 agent 已提交但未审改动」的下界 baseline。Stop hook 以
 ``baseline_head..HEAD`` 的 first-parent 净 diff 派生 committed 观测单元，与
 dirty 观测合流后再交集 transcript 归属，得到「本轮已提交、属于本会话、尚未审」
-的范围（见 ``diff_tracker._list_committed_round_changed_paths`` /
+的范围（见 ``reviewable_unit_diff_tracker._list_committed_round_changed_paths`` /
 ``session_manifest.build_manifest(committed_baseline=...)``）。
 
 存储与原子写镜像 ``review_reopen_marker``：env-root、

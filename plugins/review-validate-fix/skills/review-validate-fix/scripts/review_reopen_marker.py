@@ -8,7 +8,7 @@
   经 ``rvf_rescope.py arm`` 写入 marker，带 ``target_run_id``（最近一次刚经过
   RVF 的那次实现 run）；
 - 由后续 Stop hook 在 tracker refresh 之后、``allocate_review_scope`` 之前读取：
-  若 ``active`` → 调 ``diff_tracker.invalidate_reviewed_units_for_run`` 按
+  若 ``active`` → 调 ``reviewable_unit_diff_tracker.invalidate_reviewed_units_for_run`` 按
   ``target_run_id`` 把该 run 仍存在的 ``reviewed`` units 翻回 ``available``，
   使紧接着的 allocate 得到「该实现 units ∪ 本次 fix delta」全量 → 即时全量
   re-review dispatch；随后 **consume（删除）marker**；

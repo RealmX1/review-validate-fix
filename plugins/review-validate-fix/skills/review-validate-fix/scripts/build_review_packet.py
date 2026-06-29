@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import diff_tracker
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 IGNORE_FILE = ".review-validate-fix-ignore"
 
@@ -201,7 +202,7 @@ def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> s
             continue
         if line.startswith("@@"):
             in_any_hunk = True
-            normalized = diff_tracker._normalize_header(line)
+            normalized = reviewable_unit_diff_tracker._normalize_header(line)
             in_allowed_hunk = normalized in allowed_headers
             if in_allowed_hunk and not emitted_header:
                 output.extend(file_header)
@@ -231,7 +232,7 @@ def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_pr
             continue
         header = entry.get("hunk_header")
         if isinstance(header, str) and header:
-            hunk_headers_by_path.setdefault(path, set()).add(diff_tracker._normalize_header(header))
+            hunk_headers_by_path.setdefault(path, set()).add(reviewable_unit_diff_tracker._normalize_header(header))
         else:
             path_level_paths.add(path)
     chunks: list[str] = []
@@ -284,9 +285,9 @@ def build_packet(
             tracker_repo_key = tracker_meta.get("repo_key") if isinstance(tracker_meta.get("repo_key"), str) else None
             current_session = tracker_meta.get("session_id") or session_manifest.get("session_id") or ""
             if isinstance(current_session, str) and current_session:
-                owned_units = diff_tracker.owned_units_from_manifest(session_manifest)
+                owned_units = reviewable_unit_diff_tracker.owned_units_from_manifest(session_manifest)
                 if owned_units:
-                    conflicts = diff_tracker.list_conflicts(
+                    conflicts = reviewable_unit_diff_tracker.list_conflicts(
                         root,
                         current_session_id=current_session,
                         owned_units=owned_units,

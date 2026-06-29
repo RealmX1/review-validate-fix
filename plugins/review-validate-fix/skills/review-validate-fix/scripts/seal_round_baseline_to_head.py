@@ -3,7 +3,7 @@
 
 为什么需要它：committed-round 漏审检测以 ``round_baseline_marker`` 记录的
 「上一条 user prompt 提交时的 HEAD」为窗口下界（见 ``round_baseline_marker`` /
-``diff_tracker._list_committed_round_changed_paths``）。``$rvf-land`` 在同一个
+``reviewable_unit_diff_tracker._list_committed_round_changed_paths``）。``$rvf-land`` 在同一个
 prompt-turn 内提交了一段「刚被完整 RVF review 过、当时还是 dirty」的工作；但没有
 任何环节推进该 marker，于是紧随的 Stop hook 仍读旧 baseline（新 commit 的父），把
 刚 land 的 commit 重新纳入 ``baseline..HEAD`` 窗口 → 对已审工作多派一轮 review。

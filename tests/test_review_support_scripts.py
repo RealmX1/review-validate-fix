@@ -7703,7 +7703,7 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
 
 
-DIFF_TRACKER = SCRIPT_DIR / "diff_tracker.py"
+DIFF_TRACKER = ROOT / "core" / "session_scope_allocation" / "reviewable_unit_diff_tracker.py"
 
 
 def load_diff_tracker_module():
@@ -7822,13 +7822,13 @@ def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
     # confirm "two sequential writers don't drop each other's claims".
     snippet = (
         "import os, sys, time, json\n"
-        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from pathlib import Path\n"
         # Bump busy_timeout high enough that the second writer can wait out
         # the first's lock even under load (4-shard contract checks run several
         # tests in parallel, slowing each register_claims's git calls).
         "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import diff_tracker as dt\n"
+        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"repo = Path({str(repo)!r})\n"
         "session = sys.argv[1]\n"
@@ -9187,9 +9187,11 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
 # ---------------------------------------------------------------------------
 
 def _round_baseline_committed_modules():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import diff_tracker as _dt  # noqa: PLC0415
+    import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
     import session_manifest as _sm  # noqa: PLC0415
     import round_baseline_marker as _rbm  # noqa: PLC0415
 
@@ -12742,6 +12744,7 @@ _alt.inject(
     load_diff_tracker_module=load_diff_tracker_module,
     _slice_2b_repo_with_two_dirty=_slice_2b_repo_with_two_dirty,
     _slice_2b_prepare=_slice_2b_prepare,
+    ROOT=ROOT,
     SCRIPT_DIR=SCRIPT_DIR,
     DIFF_TRACKER=DIFF_TRACKER,
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
