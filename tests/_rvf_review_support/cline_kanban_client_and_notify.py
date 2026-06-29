@@ -99,7 +99,7 @@ def test_cline_kanban_client_reports_missing_stable_binary() -> None:
     else:
         raise AssertionError("expected missing kanban command to raise KanbanError")
     assert "Cline Kanban command not found" in message
-    assert "npm install -g kanban@0.1.67" in message
+    assert "npm install -g kanban@0.1.68" in message
     assert "does not use npx" in message
 
 

@@ -91,7 +91,9 @@ from cline_kanban_client import (
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
     DEFAULT_TASK_CMD as DEFAULT_CLINE_KANBAN_TASK_CMD,
     DEFAULT_TMUX_SESSION as DEFAULT_CLINE_KANBAN_TMUX_SESSION,
+    unpark_task as cline_kanban_unpark_task,
 )
+import rvf_post_tool_use
 from session_label import (
     DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS,
     first_user_message,
@@ -2358,6 +2360,114 @@ def _kanban_followup_delivery_channel(message_id: Any) -> str:
     return "app-server"
 
 
+# launch_backend 返回的是 ``ledger.hook_payload(...)`` = ``{"continue","systemMessage"}`` 两键，
+# **顶层没有 status 键**（status 只进 summary / systemMessage 文本）。故不能用 result["status"] 判断
+# 是否成功派发。改由「成功派发 self-rising followup」那一条返回路径显式置内部键
+# ``_rvf_keep_self_park=True`` 作为 main 的保留-park 信号（main 在 emit 前 pop 掉、不泄漏给 Claude）。
+# 命中 → resume 在路上 → 保留 park；缺失（派发失败 / kanban 早退 skip / 非 followup backend）→ unpark。
+_RVF_KEEP_SELF_PARK_FLAG = "_rvf_keep_self_park"
+
+
+def _launch_result_keeps_self_park(result: Any) -> bool:
+    return bool(isinstance(result, dict) and result.get(_RVF_KEEP_SELF_PARK_FLAG))
+
+
+# skip 分支中「followup 仍活跃 / resume 仍在途」的 reason_code：这些 skip 不代表无 resume，
+# 必须保留 park（绝不在 dispatch-in-flight / in-progress 期间提前 unpark，否则 followup 落地前
+# 卡片抑制就被误解除）。其余 skip（handoff 完成、无 owned dirty 等）= 无 resume → 照常 unpark。
+_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS = frozenset(
+    {
+        "kanban_followup_in_progress",
+        "kanban_followup_dispatch_in_flight",
+    }
+)
+
+
+def _skip_decision_should_unpark(decision: StopDecision) -> bool:
+    """skip / 不 launch 分支：是否应触发 self-park 安全阀。
+
+    resume 仍在途 / followup 仍活跃的 skip（见 ``_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS``）必须
+    保留 park、返回 False；其余 skip（handoff 完成、无 owned dirty 等）无 resume → True。
+    """
+    return decision.reason_code not in _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS
+
+
+def _unpark_stranded_task(project_path: Any, task_id: str) -> bool:
+    """跨 task 幂等 unpark（stranded-sweep 用）：直接按 marker 的 task_id/project_path unpark。
+
+    与 ``unpark_self_parked_card`` 不同——这里处理的是**别的** task 遗留的泄漏 park（派发成功但
+    resume 静默丢投），无本会话 self-park 标记可读，故直接按 marker 字段 unpark。best-effort、永不抛。
+    """
+    try:
+        if not (isinstance(task_id, str) and task_id.strip()):
+            return False
+        repo = (
+            Path(project_path).expanduser()
+            if isinstance(project_path, str) and project_path.strip()
+            else None
+        )
+        if repo is None:
+            return False
+        task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+        cline_kanban_unpark_task(task_cmd=task_cmd, repo=repo, task_id=task_id.strip())
+        return True
+    except Exception:
+        return False
+
+
+def unpark_self_parked_card(event: dict[str, Any], ledger: RunLedger, *, reason: str) -> None:
+    """park 泄漏安全阀（proposer §②）：若本会话本轮经 PostToolUse self-park、但本次 Stop 不会有
+    resume（派发失败 / 非 followup backend / skip / 不 launch），则幂等 unpark 父卡片并清 self-park
+    标记。Kanban park 无 TTL（Option A 把 TTL 所有权留给编排层），故必须由 RVF 显式清，否则
+    泄漏的 park 会把下一次**真实** Stop 的通知误抑制。
+
+    成功派发（resume 在路上）的路径**不**调本函数——交 Turn2 UPS 的 to_in_progress 自动 unpark /
+    stranded-sweep 兜底。整段 best-effort、永不抛、不改主流程结果；未 self-park 时是极廉价的一次
+    小文件读后即返回。
+    """
+    try:
+        session_id = event.get("session_id")
+        state = rvf_post_tool_use.read_self_park_state(
+            session_id if isinstance(session_id, str) else None
+        )
+        if not isinstance(state, dict):
+            return
+        task_id = state.get("task_id")
+        if not (isinstance(task_id, str) and task_id.strip()):
+            return
+        project_path = state.get("project_path")
+        repo = (
+            Path(project_path).expanduser()
+            if isinstance(project_path, str) and project_path.strip()
+            else Path(str(event.get("cwd") or ".")).expanduser()
+        )
+        task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+        ok = True
+        detail: str | None = None
+        try:
+            cline_kanban_unpark_task(task_cmd=task_cmd, repo=repo, task_id=task_id.strip())
+        except Exception as exc:  # best-effort：unpark 失败仅记日志，不抛
+            ok = False
+            detail = f"{type(exc).__name__}: {exc}"
+        # 无论 unpark 成败都清 self-park 标记：成功→已清；失败→避免每次 Stop 重复 unpark 刷屏，
+        # 残留 park 仍有 kanban onExit / 磁盘重载 / stranded-sweep 作 backstop。
+        rvf_post_tool_use.clear_self_park_state(session_id if isinstance(session_id, str) else None)
+        ledger.event(
+            phase="complete",
+            event="kanban_followup_self_park_unparked",
+            status="completed" if ok else "warning",
+            reason_code=f"self_park_unpark_{reason}",
+            level=None if ok else "warn",
+            cline_kanban_task_id=task_id.strip(),
+            cline_kanban_project_path=str(repo),
+            kanban_self_park_unpark_ok=ok,
+            kanban_self_park_unpark_error=detail,
+        )
+    except Exception:
+        # 安全阀本身绝不能影响主 Stop 流程。
+        pass
+
+
 def clear_kanban_followup_lock_for_event(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2737,6 +2847,12 @@ def sweep_stranded_kanban_followup_pending(
             )
             stamp_kanban_followup_pending_notified(task_id=marker_task_id, token=token)
             redispatch = _maybe_redispatch_stranded_kanban_followup(marker, ledger, token=token)
+            # park 泄漏兜底（proposer §②，量级对齐 pending 15min TTL）：stranded = 派发成功但 resume
+            # 静默丢投 → 该 task 的 PostToolUse self-park 已泄漏。幂等 unpark 清掉它，避免泄漏的 park
+            # 误抑制该 task 下一次真实 Stop 的通知（redispatch 若成功，其 followup 落地不依赖 park）。
+            stranded_unparked = _unpark_stranded_task(
+                marker.get("kanban_project_path"), marker_task_id
+            )
             ledger.event(
                 phase="gate",
                 event="kanban_followup_pending_stranded_escalated",
@@ -2750,6 +2866,7 @@ def sweep_stranded_kanban_followup_pending(
                 kanban_followup_stranded_notify_reason=notify_result.get("reason"),
                 kanban_followup_stranded_dispatched_at=marker.get("dispatched_at"),
                 kanban_followup_stranded_redispatch=redispatch,
+                kanban_followup_stranded_unparked=stranded_unparked,
             )
             processed += 1
     except Exception:
@@ -6243,7 +6360,7 @@ def launch_backend(
                 backend_raw=decision.backend,
             ),
         )
-        return ledger.hook_payload(
+        success_payload = ledger.hook_payload(
             status=status,
             reason_code=reason_code,
             message=(
@@ -6288,6 +6405,10 @@ def launch_backend(
                 if key != "rvf_state" and not key.startswith("rvf_")
             },
         )
+        # 仅本「成功派发 self-rising followup」路径置位：resume 在路上 → main 据此保留 park（不 unpark）。
+        # hook_payload 顶层无 status 键，故必须用这个显式内部信号；main 在 emit 前 pop 掉、不泄漏给 Claude。
+        success_payload[_RVF_KEEP_SELF_PARK_FLAG] = True
+        return success_payload
     if not decision.parent_thread_id:
         return skip_payload(
             "Stop event did not expose a parent thread id.",
@@ -8215,6 +8336,7 @@ def main() -> int:
     # 整体 suppress 必须早于 handoff、dirty gate 和 backend launch，避免子会话停止时继续生成 review/fork artifact。
     if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
         decision = suppressed_decision(event, ledger)
+        unpark_self_parked_card(event, ledger, reason="suppressed")
         if decision.payload is not None:
             emit(decision.payload)
         return 0
@@ -8223,6 +8345,7 @@ def main() -> int:
     if decision.action == "launch":
         provider_health_decision = provider_health_guard_decision(decision, event, ledger)
         if provider_health_decision is not None and provider_health_decision.payload is not None:
+            unpark_self_parked_card(event, ledger, reason="provider_health_block")
             emit(provider_health_decision.payload)
             return 0
         workspace_guard_payload = kanban_task_workspace_guard_payload(
@@ -8231,10 +8354,25 @@ def main() -> int:
             ledger=ledger,
         )
         if workspace_guard_payload is not None:
+            unpark_self_parked_card(event, ledger, reason="workspace_guard_block")
             emit(workspace_guard_payload)
             return 0
-        emit(launch_backend(decision, event, ledger))
+        result = launch_backend(decision, event, ledger)
+        # park 泄漏安全阀：仅当本次 Stop 成功派发了 self-rising followup（resume 在路上）才保留
+        # park。成功信号是 dispatch 成功路径置的内部键 `_rvf_keep_self_park`（hook_payload 顶层无
+        # status 键，不能用 result["status"] 判断）；其余结局（派发失败 / kanban 早退 skip / 非
+        # followup backend）= 无 resume → unpark。emit 前 pop 掉该内部键，不泄漏给 Claude。
+        keep_park = _launch_result_keeps_self_park(result)
+        if isinstance(result, dict):
+            result.pop(_RVF_KEEP_SELF_PARK_FLAG, None)
+        if not keep_park:
+            unpark_self_parked_card(event, ledger, reason="no_followup_dispatch")
+        emit(result)
         return 0
+    # skip / 不 launch（含 handoff 完成）= 一般无 resume → unpark；但 followup 仍活跃 / dispatch
+    # 仍在途的 skip（resume 在路上）必须保留 park，否则会在 followup 落地前误解除卡片抑制。
+    if _skip_decision_should_unpark(decision):
+        unpark_self_parked_card(event, ledger, reason="stop_no_launch")
     if decision.payload is not None:
         emit(decision.payload)
     return 0
