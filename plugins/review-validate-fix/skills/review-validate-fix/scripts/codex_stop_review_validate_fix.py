@@ -54,6 +54,8 @@ from kanban_followup_lock import (
     clear_marker as clear_kanban_followup_lock,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
+    reengage_nudge_count as kanban_followup_lock_nudge_count,
+    bump_reengage_nudge_count as bump_kanban_followup_lock_nudge_count,
     clear_pending_marker as clear_kanban_followup_pending,
     iter_pending_markers as iter_kanban_followup_pending,
     pending_status as kanban_followup_pending_status,
@@ -2581,6 +2583,12 @@ KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_SWE
 KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
 KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
+# in-progress 锁 active 时，「认锁前先 re-engage 几次再退回静默 skip」的预算上限。
+# 0 = 关掉 re-engage（永远静默放行，回到历史行为）。见 kanban_followup_in_progress_decision。
+KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV = (
+    "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET"
+)
+DEFAULT_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET = 2
 # verify-consumed 精修读 transcript 的体积上限（超过则跳过精修、按 stranded 处理），
 # 防在 30s Codex 链路预算内读超大 JSONL transcript 卡顿。
 KANBAN_FOLLOWUP_CONSUMED_SCAN_MAX_BYTES = 32 * 1024 * 1024
@@ -2924,6 +2932,53 @@ def kanban_followup_in_progress_decision(
                 reopen_target_run_id=reopen_target_run_id,
                 kanban_followup_in_progress_marker=marker,
                 removed_kanban_followup_in_progress_marker_paths=removed_lock,
+            )
+            return None
+        # B（re-engage nudge）：锁 active 但 agent 停在「未 handoff」处时，历史行为是无条件
+        # 返回 {"continue":true} 静默放行 → agent 当回合干停、RVF 不再 force-continue，于是它
+        # 被这把锁一路静默挡停直到 handoff/TTL（实测曾冻 47min）。这里改为：在 nudge 预算内
+        # 不静默放行，而是 return None 把判定让回常规 gate——若 latest turn 不是注入的 follow-up
+        # trigger 且仍有未审改动，常规 gate 会重新派发 review / 重新唤起 agent（把「让 agent 停」
+        # 与「不派重复 review」解耦）。预算（marker.reengage_nudge_count vs 默认 2）用尽再退回
+        # 静默 skip，防 review↔fix 死循环；配合 1h 锁 TTL，一把卡死锁最坏只冻「预算次 + ≤1h」。
+        #
+        # 仅在本回合「不会被随后的 followup/analyze trigger-skip 无条件挡停」时才消耗预算 nudge：
+        # evaluate_stop_event 在调用本函数之后还排了三道 trigger-skip（RVF_ANALYZE_FOLLOWUP /
+        # 显式 $rvf-analyze / KANBAN_FOLLOWUP），若本 Stop 的 latest_user 命中其一，本函数 return
+        # None 也换不来 re-engage（trigger-skip 会接管挡停本回合），只会空耗预算、把真正能 re-engage
+        # 的 non-trigger turn 的预算削掉。故这种 trigger turn 直接 return None 不 bump，预算留到后面
+        # 能真正生效的 non-trigger turn。（committed-round RVF review elevated 修复：原实现在 trigger
+        # turn 上先 bump 再被 trigger-skip 挡停，stall-on-trigger-turn 场景下预算白花、re-engage 失效。）
+        latest_user_for_nudge = latest_user_message_from_event(event)
+        if (
+            latest_user_for_nudge
+            and (
+                RVF_ANALYZE_FOLLOWUP_MARKER in latest_user_for_nudge
+                or KANBAN_FOLLOWUP_MARKER in latest_user_for_nudge
+            )
+        ) or _rvf_analyze_manually_invoked(event, latest_user_for_nudge):
+            return None
+        nudge_budget = _kanban_followup_env_int(
+            KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET,
+        )
+        nudge_count = kanban_followup_lock_nudge_count(marker)
+        if nudge_budget > 0 and nudge_count < nudge_budget:
+            bumped = bump_kanban_followup_lock_nudge_count(marker)
+            ledger.event(
+                phase="gate",
+                event="kanban_followup_in_progress_nudged",
+                status="completed",
+                reason_code="kanban_followup_in_progress_reengage_nudge",
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                kanban_followup_in_progress_nudge_count=bumped,
+                kanban_followup_in_progress_nudge_budget=nudge_budget,
+                active_rvf_run_id=blocking_run_id,
+                active_rvf_run_dir=marker.get("run_dir"),
             )
             return None
         return skip_decision(
