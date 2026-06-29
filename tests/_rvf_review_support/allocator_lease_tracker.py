@@ -77,7 +77,7 @@ def _alloc_invoke(
     completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=timeout)
     if completed.returncode != 0:
         raise AssertionError(
-            f"diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
+            f"reviewable_unit_diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
             f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
         )
     last_line = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "{}"

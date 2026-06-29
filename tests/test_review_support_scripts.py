@@ -18,6 +18,16 @@ import time
 import traceback
 from pathlib import Path
 
+from _rvf_test_support.registry_completeness_guard import (
+    assert_every_defined_test_is_registered,
+    registered_names_from_case_tuples,
+)
+
+
+# 注册表完整性守卫的豁免名单（唯一合法出口）：仅放确属暂时隔离、暂时跑不过的测试，
+# 每项须附 `# quarantined: <原因+issue>`。当前为空 = 严格模式：任何 def test_* 漏登记即红。
+INTENTIONALLY_UNREGISTERED: frozenset[str] = frozenset()
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SKILL_CONTRACTS = ROOT / "scripts" / "check_skill_contracts.sh"
@@ -49,6 +59,10 @@ RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
+RVF_POST_TOOL_USE = SCRIPT_DIR / "rvf_post_tool_use.py"
+HOOKS_JSON = (
+    ROOT / "plugins" / "review-validate-fix" / "hooks" / "hooks.json"
+)
 
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
@@ -151,6 +165,16 @@ def load_cline_kanban_client_module():
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load cline_kanban_client module")
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_post_tool_use_module():
+    spec = importlib.util.spec_from_file_location("rvf_post_tool_use", RVF_POST_TOOL_USE)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_post_tool_use module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -581,392 +605,6 @@ def test_rvf_prep_file_revive_expired_restamps_ttl(tmp_path: Path) -> None:
         raise AssertionError("expected revive of payload-less lookup to fail")
 
 
-def test_rvf_user_prompt_submit_dispatches_shared_workflow(tmp_path: Path) -> None:
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    try:
-        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
-        record = prep.write_prep_file(
-            {
-                "origin_session_id": "session-a",
-                "origin_repo": str(tmp_path),
-                "origin_cwd": str(tmp_path),
-                "target_flow": "flow-1-self-rising",
-                "target_worktree": str(tmp_path),
-                "rvf_run": {"run_id": "rvf-test", "run_dir": str(tmp_path / "run")},
-            },
-            root=root,
-            token="aaaaaaaaaaaaaaaa",
-            now=now,
-            ttl_seconds=300,
-        )
-
-        prepare_calls: list[dict[str, object]] = []
-
-        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            assert record_arg.token == record.token
-            prepare_calls.append(
-                {
-                    "token": record_arg.token,
-                    "timeout_seconds": timeout_seconds,
-                    "excerpt": user_prompt_excerpt,
-                }
-            )
-            state = {
-                "started_at": "2026-05-07T00:01:00Z",
-                "completed_at": "2026-05-07T00:01:01Z",
-                "status": "completed",
-                "target_flow": record_arg.payload.get("target_flow"),
-                "artifacts": {"review_env": "/tmp/review-env.sh"},
-            }
-            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
-            return state
-
-        # Replace the lazy-imported prepare_run_from_prep_file with a stub.
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            no_token_payload = submit.inspect_user_prompt_submit(
-                {"prompt": "ordinary prompt"}, prep_root=root
-            )
-            assert no_token_payload["status"] == "no_token"
-            assert no_token_payload["continue"] is True
-            assert prepare_calls == []
-            # 普通 prompt：既无 user-facing systemMessage，也无 model-facing additionalContext。
-            assert "systemMessage" not in no_token_payload
-            assert "hookSpecificOutput" not in no_token_payload
-
-            valid_payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                    "cwd": str(tmp_path),
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:00Z",
-            )
-            assert valid_payload["status"] == "valid"
-            assert valid_payload["workflow_started"] is True
-            assert valid_payload["shared_workflow_state"]["status"] == "completed"
-            assert valid_payload["prep_file_path"] == str(root / "aaaaaaaaaaaaaaaa.json")
-            assert len(prepare_calls) == 1
-            # token 派发成功：给用户可见行（含 run_id），但**不**给 agent additionalContext。
-            assert isinstance(valid_payload.get("systemMessage"), str)
-            assert "rvf-test" in valid_payload["systemMessage"]
-            assert "hookSpecificOutput" not in valid_payload
-
-            # Idempotent: state is now completed, second invocation should not re-run prepare.
-            second_payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                    "cwd": str(tmp_path),
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:30Z",
-            )
-            assert second_payload["status"] == "valid"
-            assert second_payload["workflow_started"] is False
-            assert second_payload["shared_workflow_state"]["status"] == "completed"
-            assert len(prepare_calls) == 1, "second call should be cached"
-            # already_completed 幂等路径同样给用户可见行、无 additionalContext。
-            assert isinstance(second_payload.get("systemMessage"), str)
-            assert "rvf-test" in second_payload["systemMessage"]
-            assert "hookSpecificOutput" not in second_payload
-
-            diagnostics_path = root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl"
-            diagnostics = read_jsonl(diagnostics_path)
-            statuses = [event["status"] for event in diagnostics]
-            assert "valid" in statuses
-            assert any(
-                event.get("event") == "user_prompt_submit_shared_workflow_skipped"
-                for event in diagnostics
-            )
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-
-
-def test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
-    tmp_path: Path,
-) -> None:
-    """FU-1：dispatch token 在场、prep 已过 TTL，但 run_dir 仍在 → 就地续期、走 valid 派发
-    路径（workflow 启动），而非静默丢整轮 followup。"""
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    run_dir = tmp_path / "run"
-    run_dir.mkdir(parents=True, exist_ok=True)  # run artifacts 仍在
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    try:
-        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-revive",
-                "origin_repo": str(tmp_path),
-                "origin_cwd": str(tmp_path),
-                "target_flow": "flow-1-self-rising",
-                "target_worktree": str(tmp_path),
-                "rvf_run": {"run_id": "rvf-revive", "run_dir": str(run_dir)},
-            },
-            root=root,
-            token="aaaaaaaaaaaaaaaa",
-            now=t0,
-            ttl_seconds=300,
-        )
-        prepare_calls: list[str] = []
-
-        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            prepare_calls.append(record_arg.token)
-            state = {
-                "started_at": "2026-05-07T00:10:01Z",
-                "completed_at": "2026-05-07T00:10:02Z",
-                "status": "completed",
-                "target_flow": record_arg.payload.get("target_flow"),
-                "artifacts": {"review_env": "/tmp/review-env.sh"},
-            }
-            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
-            return state
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            # now 越过 expiry（00:05:00）：read 判 expired，但 run_dir 在 → 续期 → valid 派发。
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                    "cwd": str(tmp_path),
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-                now="2026-05-07T00:10:00Z",
-            )
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-        assert payload["status"] == "valid", payload  # 续期后走 valid 路径
-        assert payload.get("prep_revived") is True
-        assert payload["workflow_started"] is True
-        assert prepare_calls == ["aaaaaaaaaaaaaaaa"]  # 确实派发，而非静默丢
-        # 非 dispatch_no_prep：systemMessage 含 run_id（valid 行），不是「未跑」诊断。
-        assert "rvf-revive" in (payload.get("systemMessage") or "")
-        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
-        assert any(
-            d.get("event") == "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
-        ), diagnostics
-        # prep 文件已就地续期：在 00:12:00 仍 valid（原 300s TTL 早已过）。
-        again = prep.read_prep_file(
-            "aaaaaaaaaaaaaaaa", root=root, now=prep.parse_timestamp("2026-05-07T00:12:00Z")
-        )
-        assert again.status == "valid", again
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-
-
-def test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing(
-    tmp_path: Path,
-) -> None:
-    """FU-1 负例：prep 已过 TTL 且 run_dir 不在（run 已清理 / 真过期）→ 不复活，仍走原
-    dispatch_no_prep 早返回（不复活已消失的 run）。"""
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    missing_run_dir = tmp_path / "run-gone"  # 故意不创建
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    try:
-        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-gone",
-                "origin_repo": str(tmp_path),
-                "rvf_run": {"run_id": "rvf-gone", "run_dir": str(missing_run_dir)},
-            },
-            root=root,
-            token="aaaaaaaaaaaaaaaa",
-            now=t0,
-            ttl_seconds=300,
-        )
-        prepare_calls: list[str] = []
-
-        def fake_prepare(record_arg, **_):
-            prepare_calls.append(record_arg.token)
-            return {"status": "completed"}
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "run RVF_DISPATCH=token=aaaaaaaaaaaaaaaa",
-                    "cwd": str(tmp_path),
-                },
-                prep_root=root,
-                now="2026-05-07T00:10:00Z",
-            )
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-        assert payload["status"] == "expired", payload  # 未复活
-        assert "prep_revived" not in payload
-        assert payload["workflow_started"] is False
-        assert prepare_calls == []  # 未派发
-        assert (
-            isinstance(payload.get("systemMessage"), str)
-            and "aaaaaaaaaaaaaaaa" in payload["systemMessage"]
-        )
-        diagnostics = read_jsonl(root / "diagnostics" / "aaaaaaaaaaaaaaaa.jsonl")
-        assert all(
-            d.get("event") != "user_prompt_submit_dispatch_prep_revived" for d in diagnostics
-        ), diagnostics
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-
-
-def test_rvf_user_prompt_submit_marker_without_token(tmp_path: Path) -> None:
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    payload = submit.inspect_user_prompt_submit(
-        {
-            "prompt": "Stop hook fork prompt body referencing RVF_FORKED_REVIEW_VALIDATE_FIX without token",
-            "cwd": str(tmp_path),
-            "hook_event_name": "UserPromptSubmit",
-        },
-        prep_root=root,
-    )
-    assert payload["status"] == "dispatch_marker_without_token"
-    assert payload["origin_marker"] == "fork"
-    assert payload["continue"] is True
-    # 自注入近失：给用户一条可见诊断行，但不给 agent additionalContext。
-    assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
-    assert "fork" in payload["systemMessage"]
-    assert "hookSpecificOutput" not in payload
-
-
-def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: Path) -> None:
-    """UPS hook 在 kanban-followup trigger 真正投递落地时 arm in-progress 锁；非 followup 不 arm。
-
-    这是把锁的 arm 从 Stop hook（dispatch 时乐观预 arm）移到 UserPromptSubmit 的核心回归：
-    只有注入的 follow-up trigger 真的成为一个 prompt（即本 hook fire）才上锁，治本 squat。
-    """
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    lock_root = tmp_path / "followup-lock"
-    prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
-    try:
-        now = prep.parse_timestamp("2026-06-04T00:00:00Z")
-        # kanban-followup 风格 prep：target_kanban_task_id + flow-1-self-rising + run 信息。
-        # 预置 shared_workflow_state=completed，使 inspect 在 arm 之后短路返回（无需 stub prepare）。
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-fu",
-                "origin_repo": str(tmp_path / "repo"),
-                "origin_cwd": str(tmp_path / "repo"),
-                "target_flow": "flow-1-self-rising",
-                "target_worktree": str(tmp_path / "repo"),
-                "target_kanban_task_id": "task-fu",
-                "rvf_run": {
-                    "run_id": "rvf-fu-delivered",
-                    "run_dir": str(tmp_path / "run"),
-                    "shared_workflow_state": {"status": "completed"},
-                },
-            },
-            root=root,
-            token="bbbbbbbbbbbbbbbb",
-            now=now,
-            ttl_seconds=300,
-        )
-        # 投递落地的 follow-up prompt：同时带 dispatch token 与 kanban-followup marker。
-        followup_prompt = (
-            "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER\n"
-            "RVF_DISPATCH=token=bbbbbbbbbbbbbbbb\n"
-        )
-        payload = submit.inspect_user_prompt_submit(
-            {
-                "prompt": followup_prompt,
-                "cwd": str(tmp_path / "repo"),
-                "session_id": "session-fu",
-                "hook_event_name": "UserPromptSubmit",
-            },
-            prep_root=root,
-            now="2026-06-04T00:01:00Z",
-        )
-        assert payload["status"] == "valid"
-        marker_path = lock_root / "task-task-fu.json"
-        assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
-        assert marker_path.exists()
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        assert marker["state"] == "in_progress"
-        assert marker["kanban_task_id"] == "task-fu"
-        assert marker["run_id"] == "rvf-fu-delivered"
-        assert marker["expires_at"] > marker["armed_at"]
-
-        # 负例：带 token 但**非** kanban-followup（无 RVF_KANBAN_FOLLOWUP_TRIGGER，这里是 fork）
-        # → 不 arm followup 锁。
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-fu",
-                "origin_repo": str(tmp_path / "repo"),
-                "origin_cwd": str(tmp_path / "repo"),
-                "target_flow": "flow-2-branch",
-                "target_kanban_task_id": "task-other",
-                "rvf_run": {
-                    "run_id": "rvf-other",
-                    "run_dir": str(tmp_path / "run2"),
-                    "shared_workflow_state": {"status": "completed"},
-                },
-            },
-            root=root,
-            token="cccccccccccccccc",
-            now=now,
-            ttl_seconds=300,
-        )
-        other_payload = submit.inspect_user_prompt_submit(
-            {
-                "prompt": "RVF_FORKED_REVIEW_VALIDATE_FIX\nRVF_DISPATCH=token=cccccccccccccccc",
-                "cwd": str(tmp_path / "repo"),
-                "session_id": "session-fu",
-                "hook_event_name": "UserPromptSubmit",
-            },
-            prep_root=root,
-            now="2026-06-04T00:01:00Z",
-        )
-        assert other_payload["status"] == "valid"
-        assert "kanban_followup_in_progress_marker_path" not in other_payload
-        assert not (lock_root / "task-task-other.json").exists()
-    finally:
-        if prev_prep is None:
-            os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        else:
-            os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
-        if prev_lock is None:
-            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
-        else:
-            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
-
-
 def test_kanban_followup_pending_marker_round_trip(tmp_path: Path) -> None:
     """dispatched-unconfirmed(pending) marker：write/read/clear(token 防误清)/stale/与 in-progress 物理隔离。
 
@@ -1128,217 +766,6 @@ def test_notify_kanban_followup_stranded(tmp_path: Path) -> None:
             os.environ[mod.TERMINAL_NOTIFIER_BIN_ENV] = saved_bin2
 
 
-def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> None:
-    """投递落地：UPS arm in-progress 锁的同时，按 token 清掉 Stop 写的 pending(dispatched-unconfirmed)。
-
-    这样投递真正落地后，下一次该 task 的 Stop 不会把那条 pending 误判为静默丢投而重投。
-    """
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    k = load_kanban_followup_lock_module()
-    root = tmp_path / "prep-root"
-    lock_root = tmp_path / "followup-lock"
-    prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
-    try:
-        now = prep.parse_timestamp("2026-06-07T00:00:00Z")
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-fu",
-                "origin_repo": str(tmp_path / "repo"),
-                "origin_cwd": str(tmp_path / "repo"),
-                "target_flow": "flow-1-self-rising",
-                "target_worktree": str(tmp_path / "repo"),
-                "target_kanban_task_id": "task-fu",
-                "rvf_run": {
-                    "run_id": "rvf-fu-delivered",
-                    "run_dir": str(tmp_path / "run"),
-                    "shared_workflow_state": {"status": "completed"},
-                },
-            },
-            root=root,
-            token="dddddddddddddddd",
-            now=now,
-            ttl_seconds=300,
-        )
-        # 预置 Stop 在「未确认投递」时写下的 pending（同 token、同 task）。
-        pending_path = k.write_pending_marker(
-            task_id="task-fu",
-            session_id="session-fu",
-            run_id="rvf-fu-delivered",
-            run_dir=str(tmp_path / "run"),
-            repo=str(tmp_path / "repo"),
-            cwd=str(tmp_path / "repo"),
-            token="dddddddddddddddd",
-            delivery_channel="terminal",
-            message_id="terminal:task-fu:rvf-fu-delivered",
-        )
-        assert pending_path is not None and pending_path.exists()
-        followup_prompt = (
-            "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER\n"
-            "RVF_DISPATCH=token=dddddddddddddddd\n"
-        )
-        payload = submit.inspect_user_prompt_submit(
-            {
-                "prompt": followup_prompt,
-                "cwd": str(tmp_path / "repo"),
-                "session_id": "session-fu",
-                "hook_event_name": "UserPromptSubmit",
-            },
-            prep_root=root,
-            now="2026-06-07T00:01:00Z",
-        )
-        assert payload["status"] == "valid"
-        # in-progress 锁已 arm（投递落地的权威信号）。
-        marker_path = lock_root / "task-task-fu.json"
-        assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
-        assert marker_path.exists()
-        # 同 token 的 pending 已被清。
-        assert not pending_path.exists()
-        assert k.read_pending_marker(task_id="task-fu") is None
-    finally:
-        if prev_prep is None:
-            os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        else:
-            os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
-        if prev_lock is None:
-            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
-        else:
-            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
-
-
-def test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(tmp_path: Path) -> None:
-    """RVF 采纳 vendored codex_invoked_skill：结构化检测命中正则漏掉的命名空间形态。
-
-    `$rvf:review-validate-fix` 的 `:review-validate-fix` 前缀非词边界，旧锚定正则 MISS；
-    经 rollout text_elements 的结构化读取能命中。回退正则对 Claude / 缺 transcript 仍有效。
-    """
-    submit = load_rvf_user_prompt_submit_module()
-    # 该 vendored 模块必须可被 RVF 加载（否则结构化路径静默退化）。
-    assert submit.codex_invoked_skill is not None
-
-    tmp_path.mkdir(parents=True, exist_ok=True)  # registry 传入的子目录可能尚未创建
-    rollout = tmp_path / "rollout.jsonl"
-    rollout.write_text(
-        json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {
-                    "type": "user_message",
-                    "message": "$rvf:review-validate-fix",
-                    "text_elements": [
-                        {"byte_range": {"start": 0, "end": 24}, "placeholder": "$rvf:review-validate-fix"}
-                    ],
-                },
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    namespaced = "$rvf:review-validate-fix"
-    # 旧正则确实漏掉命名空间形态：
-    assert submit.detect_manual_trigger(namespaced) is False
-    # 结构化路径（rollout text_elements）命中它：
-    event = {
-        "transcript_path": str(rollout),
-        "prompt": namespaced,
-        "hook_event_name": "UserPromptSubmit",
-    }
-    assert submit._review_validate_fix_manually_invoked(event, namespaced) is True
-    # 回退正则在无 rollout（Claude / 缺 transcript）时仍生效：
-    assert submit._review_validate_fix_manually_invoked(
-        {"prompt": "$review-validate-fix"}, "$review-validate-fix"
-    ) is True
-    # 散文里提到不构成触发（锚定 + 无 rollout 命中）：
-    assert submit._review_validate_fix_manually_invoked(
-        {}, "document the review-validate-fix tool"
-    ) is False
-
-
-def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
-    try:
-        captured: list[dict[str, object]] = []
-
-        def fake_prepare(record, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            captured.append(
-                {
-                    "token": record.token,
-                    "target_flow": record.payload.get("target_flow"),
-                    "dispatch_origin": record.payload.get("dispatch_origin"),
-                    "excerpt": user_prompt_excerpt,
-                }
-            )
-            state = {
-                "started_at": "2026-05-07T00:00:00Z",
-                "completed_at": "2026-05-07T00:00:01Z",
-                "status": "completed",
-                "target_flow": record.payload.get("target_flow"),
-                "artifacts": {},
-            }
-            new_rvf_run = dict(record.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
-            return state
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "/review-validate-fix please review my work",
-                    "cwd": str(repo),
-                    "session_id": "manual-session",
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-            )
-            assert payload["status"] == "manual_prep_created"
-            assert payload["dispatch_origin"] == "post_user_prompt_manual"
-            assert payload["workflow_started"] is True
-            assert payload["shared_workflow_state"]["status"] == "completed"
-            assert len(captured) == 1
-            assert captured[0]["target_flow"] == "flow-manual"
-            assert captured[0]["dispatch_origin"] == "post_user_prompt_manual"
-            # Prep file must exist on disk under the configured root.
-            prep_path = root / f"{payload['token']}.json"
-            assert prep_path.is_file()
-            # Manual same-session path must inject the prep file path back into
-            # the agent context via hookSpecificOutput.additionalContext.
-            assert "hookSpecificOutput" in payload
-            hook_specific = payload["hookSpecificOutput"]
-            assert hook_specific["hookEventName"] == "UserPromptSubmit"
-            additional_context = hook_specific["additionalContext"]
-            assert "RVF dispatch prep" in additional_context
-            assert str(prep_path) in additional_context
-            assert "shared_workflow_state.status: completed" in additional_context
-            # 成功触发须同时给用户一条可见 systemMessage（user-facing，不进模型
-            # 上下文），与上面 model-facing 的 additionalContext **共存**。
-            assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
-            assert "RVF UPS" in payload["systemMessage"]
-            assert "post_user_prompt_manual" in payload["systemMessage"]
-            assert "status=completed" in payload["systemMessage"]
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
-
-
 def test_parse_manual_scope_directive_variants() -> None:
     """`scope:` 指令解析：空白/逗号分隔、去引号、大小写不敏感、行内/跨行、无 scope。"""
     submit = load_rvf_user_prompt_submit_module()
@@ -1353,281 +780,6 @@ def test_parse_manual_scope_directive_variants() -> None:
     assert parse("just talking about telescope: lens here") == []
     assert parse("") == []
     assert parse(None) == []
-
-
-def test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(tmp_path: Path) -> None:
-    """manual 触发内联 `scope:` → 解析出的 primary 文件作为 extra_primary_files 传入 prepare。"""
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
-    try:
-        captured: list[dict[str, object]] = []
-
-        def fake_prepare(
-            record, *, timeout_seconds=60.0, user_prompt_excerpt=None, extra_primary_files=None, **_
-        ):
-            captured.append({"extra_primary_files": extra_primary_files})
-            state = {
-                "started_at": "2026-05-07T00:00:00Z",
-                "completed_at": "2026-05-07T00:00:01Z",
-                "status": "completed",
-                "artifacts": {},
-            }
-            new_rvf_run = dict(record.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
-            return state
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "/review-validate-fix please review scope: src/a.py, src/b.py",
-                    "cwd": str(repo),
-                    "session_id": "manual-scope-session",
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-            )
-            assert payload["status"] == "manual_prep_created"
-            assert payload["workflow_started"] is True
-            assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
-            assert len(captured) == 1
-            assert captured[0]["extra_primary_files"] == ["src/a.py", "src/b.py"]
-            additional_context = payload["hookSpecificOutput"]["additionalContext"]
-            assert "inline scope (primary): src/a.py, src/b.py" in additional_context
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
-
-
-def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_path: Path) -> None:
-    """Quoted/embedded references to the trigger literal must not create a manual prep."""
-
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-
-    # A normal-conversation reference to the trigger literal (preceded by a
-    # word character, not whitespace/start-of-line) must not fire. Without the
-    # word-boundary regex, plain substring matching would fire here.
-    embedded_payloads = [
-        "see RVF_DOC[/review-validate-fix] for details",
-        "FOO/review-validate-fix BAR",
-        "x:review-validate-fix",
-        "abc$review-validate-fixyz",
-    ]
-    for prompt in embedded_payloads:
-        payload = submit.inspect_user_prompt_submit(
-            {
-                "prompt": prompt,
-                "cwd": str(tmp_path),
-                "hook_event_name": "UserPromptSubmit",
-            },
-            prep_root=root,
-        )
-        assert payload["status"] == "no_token", (prompt, payload)
-        assert "hookSpecificOutput" not in payload
-
-    # detect_manual_trigger should also positively recognize the legitimate
-    # trigger forms (line-start or whitespace-prefixed).
-    assert submit.detect_manual_trigger("/review-validate-fix") is True
-    assert submit.detect_manual_trigger("$review-validate-fix") is True
-    assert submit.detect_manual_trigger(":review-validate-fix") is True
-    assert submit.detect_manual_trigger("please run /review-validate-fix now") is True
-    assert submit.detect_manual_trigger("first line\n/review-validate-fix") is True
-    # And reject quoted / embedded uses.
-    assert submit.detect_manual_trigger("see /review-validate-fixtool docs") is False
-    assert submit.detect_manual_trigger("FOO/review-validate-fix BAR") is False
-    assert submit.detect_manual_trigger("RVF_DOC[/review-validate-fix]") is False
-
-
-def test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger(tmp_path: Path) -> None:
-    """姊妹命令 / 粘贴的 handoff 正文里的 review-validate-fix 字面量不得启动新 review。
-
-    复现的 bug：`/rvf-land` + 粘贴 handoff 正文里出现 `/review-validate-fix` 字面量，
-    旧 `detect_manual_trigger`（对整段 prompt 任意位置匹配）误判为 manual，新建 manual
-    prep 并派发。修复后这类应被识别为 handoff 正文 / 姊妹命令参数而抑制，且抑制是
-    **位置无关**的；同时保留「输入框残留前缀把合法触发顶离行首」的假阴守卫。
-    """
-    submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
-
-    run_id = "rvf-20260609T124718Z-user-prompt-submit-manual-412bcf4a"
-    handoff_body = (
-        "# Review-validate-fix 交接上下文\n\n"
-        "## 状态\n"
-        f"- run id: {run_id}\n\n"
-        "## Validate/fix 分组\n"
-        "- RVF-G1: 见 /review-validate-fix 工具说明\n\n"
-        "## 验证\n"
-        "- python3 -m pytest: ok\n"
-    )
-
-    # (a) 四个姊妹 skill 前导 + 含字面量的 handoff 正文 → 抑制（manual_trigger_suppressed），
-    #     不新建 prep、不注入 additionalContext，但给一条 user-facing systemMessage。
-    for sibling in ("/rvf-land", "$rvf-handoff-intake", ":rvf-reopen", "/rvf-analyze"):
-        prompt = f"{sibling}\n\n{handoff_body}"
-        payload = submit.inspect_user_prompt_submit(
-            {"prompt": prompt, "cwd": str(tmp_path), "hook_event_name": "UserPromptSubmit"},
-            prep_root=root,
-        )
-        assert payload["status"] == "manual_trigger_suppressed", (sibling, payload)
-        assert "hookSpecificOutput" not in payload, sibling
-        assert isinstance(payload.get("systemMessage"), str) and "未启动 review" in payload["systemMessage"]
-        assert submit._classify_manual_trigger({}, prompt) == "suppressed", sibling
-
-    # (c) 无前导命令、仅靠 run-id + handoff 章节 + 字面量的纯 handoff 正文 → 抑制。
-    assert submit._classify_manual_trigger({}, handoff_body) == "suppressed"
-
-    # (d) 裸触发仍是 manual。
-    assert submit._classify_manual_trigger({}, "/review-validate-fix") == "manual"
-    # (e) 输入框残留前缀把合法触发顶离行首 → 仍 manual（假阴守卫，位置无关）。
-    assert submit._classify_manual_trigger({}, "todo: 买牛奶\n/review-validate-fix") == "manual"
-    # (f) 合法 review 请求里顺嘴提了 run id 但无 handoff 章节 → 仍 manual（防过度抑制）。
-    runid_only = f"/review-validate-fix 请复核 run {run_id}"
-    assert submit._classify_manual_trigger({}, runid_only) == "manual"
-
-    # 纯文本谓词单测（位置无关）。
-    assert submit._leading_sibling_command("/rvf-land paste...") is True
-    assert submit._leading_sibling_command("   $rvf-reopen") is True
-    assert submit._leading_sibling_command("/review-validate-fix") is False
-    assert submit._looks_like_handoff_body(handoff_body) is True
-    assert submit._looks_like_handoff_body(f"提一句 {run_id} 没别的") is False
-
-
-def test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger(tmp_path: Path) -> None:
-    """调用 `rvf-*` 姊妹子 skill 的命名空间形态不得误触发 manual review。
-
-    复现的 bug：在 Claude Code 里调用任意 RVF 子 skill（如
-    `/review-validate-fix:rvf-local-deploy`、`/review-validate-fix:rvf-land`）时，UPS hook
-    的检测正则只看到前缀 `/review-validate-fix`（`\\b` 在冒号处即成立），把它误判为「用户手动
-    触发主 RVF workflow」，于是 bootstrap manual prep 并派发。尤其当子 skill 出现在 prompt
-    **句中**时，连历史的开头锚定姊妹抑制（`_leading_sibling_command` 用 `.match`）都够不着。
-
-    修复后检测正则带负向先行断言 `(?!:rvf-)`：主 skill（裸 `/review-validate-fix` 或命名空间
-    `/review-validate-fix:review-validate-fix`）仍命中；`…:rvf-<name>` 子 skill 一律不命中、
-    走静默 `none`（不抑制、不发 systemMessage、不建 prep），且判定**位置无关**。
-    """
-    submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
-    repo = tmp_path / "repo"
-    repo.mkdir()
-
-    # (a) 报告中的原始复现样本（子 skill 出现在句中）→ 静默 none，不视为 manual。
-    example = (
-        "Can I now try to do /review-validate-fix:rvf-local-deploy ? "
-        "or Are there any additional work to be done?"
-    )
-    assert submit._classify_manual_trigger({}, example) == "none", example
-    assert submit.detect_manual_trigger(example) is False, example
-
-    # (b) 全部 6 个 `rvf-*` 子 skill 的命名空间形态，开头与句中各一 → 均静默 none。
-    subskills = (
-        "rvf-land",
-        "rvf-local-deploy",
-        "rvf-analyze",
-        "rvf-handoff-intake",
-        "rvf-handoff-commit",
-        "rvf-reopen",
-    )
-    for name in subskills:
-        leading = f"/review-validate-fix:{name}"
-        mid_sentence = f"please now run /review-validate-fix:{name} for this branch"
-        for prompt in (leading, mid_sentence):
-            assert submit._classify_manual_trigger({}, prompt) == "none", prompt
-            assert submit.detect_manual_trigger(prompt) is False, prompt
-
-    # (c) 假阴守卫：主 skill 的裸形态与命名空间形态（后缀 `:review-` 而非 `:rvf-`）仍是 manual。
-    assert submit._classify_manual_trigger({}, "/review-validate-fix") == "manual"
-    assert (
-        submit._classify_manual_trigger({}, "/review-validate-fix:review-validate-fix")
-        == "manual"
-    )
-    # 主 skill 句中出现同样应触发（检测位置无关）。
-    assert (
-        submit._classify_manual_trigger({}, "hey please /review-validate-fix this branch")
-        == "manual"
-    )
-
-    # (d) 端到端：对原始复现样本跑 inspect_user_prompt_submit → 不启动 workflow、不建 prep。
-    payload = submit.inspect_user_prompt_submit(
-        {"prompt": example, "cwd": str(repo), "hook_event_name": "UserPromptSubmit"},
-        prep_root=root,
-    )
-    assert payload["status"] == "no_token", payload
-    assert payload.get("workflow_started") is False, payload
-    assert "hookSpecificOutput" not in payload, payload
-    # 不应留下任何 manual prep 痕迹（子 skill 调用是静默 none，不是 suppressed）。
-    assert not root.exists() or not any(root.iterdir()), list(root.iterdir()) if root.exists() else []
-
-
-def test_rvf_user_prompt_submit_failed_prepare_records_state_without_blocking(tmp_path: Path) -> None:
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    try:
-        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
-        prep.write_prep_file(
-            {
-                "origin_session_id": "session-a",
-                "origin_repo": str(tmp_path),
-                "origin_cwd": str(tmp_path),
-                "target_flow": "flow-1-self-rising",
-                "target_worktree": str(tmp_path),
-                "rvf_run": {"run_id": "rvf-fail", "run_dir": str(tmp_path / "run")},
-            },
-            root=root,
-            token="cccccccccccccccc",
-            now=now,
-            ttl_seconds=300,
-        )
-
-        def boom(record, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            raise RuntimeError("prepare boom")
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = boom
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "go RVF_DISPATCH=token=cccccccccccccccc",
-                    "cwd": str(tmp_path),
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:00Z",
-            )
-            assert payload["continue"] is True
-            assert payload["workflow_started"] is False
-            assert payload["shared_workflow_state"]["status"] == "failed"
-            assert "prepare boom" in payload["shared_workflow_state"]["error"]
-            # The prep file on disk must reflect the failed state.
-            stored = json.loads((root / "cccccccccccccccc.json").read_text(encoding="utf-8"))
-            assert stored["rvf_run"]["shared_workflow_state"]["status"] == "failed"
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
 
 
 def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
@@ -1675,6 +827,267 @@ def test_claude_plugin_hooks_declare_user_prompt_submit() -> None:
         shim = hooks_dir / name
         assert shim.is_file(), f"hooks/{name} missing"
         py_compile.compile(str(shim), doraise=True)
+
+
+def test_claude_plugin_hooks_declare_post_tool_use_with_write_matcher() -> None:
+    """park 的 race-free 落点：hooks.json 必须声明一个带写型工具 matcher 的 PostToolUse
+    条目，wired 到 post_tool_use.py shim；且 shim + 核心脚本存在可编译。"""
+    import py_compile
+
+    data = json.loads(HOOKS_JSON.read_text(encoding="utf-8"))
+    groups = data["hooks"].get("PostToolUse")
+    assert isinstance(groups, list) and groups, "PostToolUse not declared"
+    matched = [
+        group
+        for group in groups
+        if group.get("matcher") == "Edit|Write|MultiEdit|NotebookEdit"
+        and any(
+            isinstance(entry.get("command"), str)
+            and "${CLAUDE_PLUGIN_ROOT}" in entry["command"]
+            and "hooks/post_tool_use.py" in entry["command"]
+            for entry in group.get("hooks", [])
+        )
+    ]
+    assert matched, f"PostToolUse not wired with write-tool matcher: {groups}"
+
+    hooks_dir = ROOT / "plugins" / "review-validate-fix" / "hooks"
+    shim = hooks_dir / "post_tool_use.py"
+    assert shim.is_file(), "hooks/post_tool_use.py missing"
+    py_compile.compile(str(shim), doraise=True)
+    py_compile.compile(str(RVF_POST_TOOL_USE), doraise=True)
+
+
+def _write_fake_park_client(tmp_path: Path) -> tuple[Path, Path]:
+    """假 cline_kanban_client：记录 argv 到 calls.jsonl、对任意 action 回 {ok:true}。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake = tmp_path / "fake_client.py"
+    calls = tmp_path / "client_calls.jsonl"
+    fake.write_text(
+        "import json, sys\n"
+        f"calls = {json.dumps(str(calls))}\n"
+        "with open(calls, 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'ok': True, 'parked': True}))\n",
+        encoding="utf-8",
+    )
+    return fake, calls
+
+
+_PARK_ENV_KEYS = (
+    "KANBAN_TASK_ID",
+    "CLINE_KANBAN_TASK_ID",
+    "KANBAN_HOOK_TASK_ID",
+    "KANBAN_PROJECT_PATH",
+    "CLINE_KANBAN_PROJECT_PATH",
+    "CODEX_RVF_CLINE_KANBAN_CLIENT",
+    "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
+    "CODEX_RVF_KANBAN_PARK_STATE_ROOT",
+)
+
+
+def _save_park_env() -> dict[str, str | None]:
+    return {k: os.environ.pop(k, None) for k in _PARK_ENV_KEYS}
+
+
+def _restore_park_env(saved: dict[str, str | None]) -> None:
+    for key, value in saved.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+
+def test_cline_kanban_client_session_field_readers() -> None:
+    """task_session_state / task_session_exit_code / task_payload_from_list：从 kanban task 的
+    session 子对象稳健取值（搁浅判定真相源；缺失/非法类型 → None，exitCode str 数字 → int）。"""
+    mod = load_cline_kanban_client_module()
+    # state：取字符串；空白 / 缺失 / 非 dict session → None。
+    assert mod.task_session_state({"session": {"state": "awaiting_review"}}) == "awaiting_review"
+    assert mod.task_session_state({"session": {"state": "  "}}) is None
+    assert mod.task_session_state({"session": {}}) is None
+    assert mod.task_session_state({"session": None}) is None
+    assert mod.task_session_state({}) is None
+    # exitCode：int 原样；str 数字 → int；bool / 非数字 / 缺失 → None（bool 不当作退出码）。
+    assert mod.task_session_exit_code({"session": {"exitCode": 0}}) == 0
+    assert mod.task_session_exit_code({"session": {"exitCode": 137}}) == 137
+    assert mod.task_session_exit_code({"session": {"exitCode": "137"}}) == 137
+    assert mod.task_session_exit_code({"session": {"exitCode": None}}) is None
+    assert mod.task_session_exit_code({"session": {"exitCode": True}}) is None
+    assert mod.task_session_exit_code({"session": {"exitCode": "oops"}}) is None
+    assert mod.task_session_exit_code({"session": {}}) is None
+    assert mod.task_session_exit_code({}) is None
+    # task_payload_from_list：按 id 命中；未命中 / tasks 非 list → None。
+    payload = {"tasks": [{"id": "x", "session": {"state": "running"}}]}
+    assert mod.task_payload_from_list(payload, "x")["id"] == "x"
+    assert mod.task_payload_from_list(payload, "y") is None
+    assert mod.task_payload_from_list({"tasks": "bad"}, "x") is None
+
+
+def test_cline_kanban_client_park_unpark_is_parked(tmp_path: Path) -> None:
+    """client 新增三 verb：park（带 --label）/ unpark / is-parked，argv 路由正确 + JSON 透传。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake_task = tmp_path / "fake_kanban_task.py"
+    calls = tmp_path / "calls.jsonl"
+    fake_task.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "action = sys.argv[1]\n"
+        "tid = sys.argv[sys.argv.index('--task-id') + 1]\n"
+        "out = {'ok': True, 'taskId': tid}\n"
+        "out['parked'] = action != 'unpark'\n"
+        "print(json.dumps(out))\n",
+        encoding="utf-8",
+    )
+    repo = init_repo(tmp_path / "repo")
+    env = os.environ.copy()
+    env["KANBAN_CALLS"] = str(calls)
+    task_cmd = f"{sys.executable} {fake_task}"
+
+    def _client(action: str, *extra: str) -> dict:
+        completed = run(
+            [
+                sys.executable,
+                str(CLINE_KANBAN_CLIENT),
+                action,
+                "--repo",
+                str(repo),
+                "--task-cmd",
+                task_cmd,
+                "--task-id",
+                "task-1",
+                *extra,
+            ],
+            env=env,
+        )
+        return json.loads(completed.stdout)
+
+    park_payload = _client("park", "--label", "self-rising")
+    assert park_payload["task_id"] == "task-1"
+    assert park_payload["parked"] is True
+    unpark_payload = _client("unpark")
+    assert unpark_payload["parked"] is False
+    is_parked_payload = _client("is-parked")
+    assert is_parked_payload["task_id"] == "task-1"
+
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0][0] == "park"
+    assert "--label" in recorded[0] and recorded[0][recorded[0].index("--label") + 1] == "self-rising"
+    assert recorded[1][0] == "unpark"
+    assert recorded[2][0] == "is-parked"
+    for call in recorded:
+        assert call[call.index("--task-id") + 1] == "task-1"
+        # client 对 --repo 做 .resolve()（macOS /var→/private/var），故比较解析后路径。
+        assert call[call.index("--project-path") + 1] == str(Path(repo).resolve())
+
+
+def test_post_tool_use_parks_eligible_edit_turn(tmp_path: Path) -> None:
+    """eligible 回合 + 写型工具 → park 一次；同 nonce 第二次编辑 → 不重复 park。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+
+        nonce = park.mark_park_eligibility("sess-1", eligible=True, root=root)
+        assert nonce
+        event = {
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "task_id": "task-1",
+            "project_path": str(tmp_path),
+            "cwd": str(tmp_path),
+        }
+        first = park.inspect_post_tool_use(event, root=root)
+        assert first["status"] == "parked"
+        assert park.read_self_park_state("sess-1", root=root)["nonce"] == nonce
+        # 同 nonce 第二次编辑：不重复 park。
+        second = park.inspect_post_tool_use(event, root=root)
+        assert second["status"] == "noop"
+        recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+        assert len(recorded) == 1
+        assert recorded[0][0] == "park"
+        assert recorded[0][recorded[0].index("--task-id") + 1] == "task-1"
+    finally:
+        _restore_park_env(saved)
+
+
+def test_post_tool_use_skips_token_turn(tmp_path: Path) -> None:
+    """eligible=false（Turn 2 token 回合 / 终态待审）→ 绝不 park。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+        park.mark_park_eligibility("sess-1", eligible=False, root=root)
+        event = {"session_id": "sess-1", "tool_name": "Write", "task_id": "task-1", "cwd": str(tmp_path)}
+        result = park.inspect_post_tool_use(event, root=root)
+        assert result["status"] == "skipped" and result["reason"] == "not_eligible"
+        assert not calls.exists()
+        assert park.read_self_park_state("sess-1", root=root) is None
+    finally:
+        _restore_park_env(saved)
+
+
+def test_post_tool_use_skips_non_edit_or_non_kanban(tmp_path: Path) -> None:
+    """非写型工具 / 不在 kanban task → noop（保热路径开销 + 不误 park）。"""
+    saved = _save_park_env()
+    try:
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        fake, calls = _write_fake_park_client(tmp_path / "fake")
+        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake)
+        park.mark_park_eligibility("sess-1", eligible=True, root=root)
+        # 非 kanban task（无 task id，env 已清）→ 早退。
+        non_kanban = park.inspect_post_tool_use(
+            {"session_id": "sess-1", "tool_name": "Edit", "cwd": str(tmp_path)}, root=root
+        )
+        assert non_kanban["reason"] == "not_kanban_task"
+        # 非写型工具 → 早退。
+        non_edit = park.inspect_post_tool_use(
+            {"session_id": "sess-1", "tool_name": "Read", "task_id": "task-1", "cwd": str(tmp_path)},
+            root=root,
+        )
+        assert non_edit["reason"] == "not_write_tool"
+        assert not calls.exists()
+    finally:
+        _restore_park_env(saved)
+
+
+def test_user_prompt_submit_marks_park_eligibility(tmp_path: Path) -> None:
+    """UPS 在回合开头标 park 资格：人类 kanban 回合 eligible=true；token 回合 eligible=false。"""
+    saved = _save_park_env()
+    try:
+        submit = load_rvf_user_prompt_submit_module()
+        park = load_rvf_post_tool_use_module()
+        root = tmp_path / "state"
+        os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(root)
+        prep_root = tmp_path / "prep"
+
+        # 人类 kanban 实现回合（无 token/marker/manual，且在 kanban task）→ eligible=true。
+        submit.inspect_user_prompt_submit(
+            {"session_id": "sess-human", "task_id": "task-1", "cwd": str(tmp_path), "prompt": "fix the bug"},
+            prep_root=prep_root,
+        )
+        human = park.read_park_eligibility("sess-human")
+        assert human is not None and human["eligible"] is True
+
+        # token 回合（被注入 followup 唤回，终态待审）→ eligible=false。
+        submit.inspect_user_prompt_submit(
+            {
+                "session_id": "sess-token",
+                "task_id": "task-1",
+                "cwd": str(tmp_path),
+                "prompt": "RVF_DISPATCH=token=deadbeefdeadbeef resume",
+            },
+            prep_root=prep_root,
+        )
+        token_turn = park.read_park_eligibility("sess-token")
+        assert token_turn is not None and token_turn["eligible"] is False
+    finally:
+        _restore_park_env(saved)
 
 
 def _load_claude_hook_entry_module():
@@ -1849,249 +1262,6 @@ def test_claude_plugin_stop_shim_codex_invocation_noop(tmp_path: Path) -> None:
     assert not any(log_root.iterdir()), "log root should be empty after Codex no-op"
 
 
-def test_rvf_user_prompt_submit_backfills_child_session(tmp_path: Path) -> None:
-    """Cline Kanban dispatch: the task agent's UserPromptSubmit hook must
-    self-backfill child_session_id / child_transcript_path into both the prep
-    payload and the persistent origin.json, and skip when same-session."""
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    root = tmp_path / "prep-root"
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    try:
-        now = prep.parse_timestamp("2026-05-07T00:00:00Z")
-
-        run_dir = tmp_path / "run"
-        (run_dir / "artifacts").mkdir(parents=True)
-        origin_json = run_dir / "artifacts" / "origin.json"
-        origin_json.write_text(
-            json.dumps(
-                {"session_id": "parent-codex", "transcript_path": "/parent/codex.jsonl"}
-            ),
-            encoding="utf-8",
-        )
-        child_transcript = tmp_path / "child_claude.jsonl"
-        child_transcript.write_text("{}\n", encoding="utf-8")
-
-        prep.write_prep_file(
-            {
-                "origin_session_id": "parent-codex",
-                "origin_repo": str(tmp_path),
-                "origin_cwd": str(tmp_path),
-                "origin_metadata_path": str(origin_json),
-                "target_flow": "flow-2-branch",
-                "target_worktree": str(tmp_path),
-                "rvf_run": {"run_id": "rvf-kanban", "run_dir": str(run_dir)},
-            },
-            root=root,
-            token="dddddddddddddddd",
-            now=now,
-            ttl_seconds=300,
-        )
-
-        def fake_prepare(record_arg, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            state = {
-                "started_at": "2026-05-07T00:01:00Z",
-                "completed_at": "2026-05-07T00:01:01Z",
-                "status": "completed",
-                "artifacts": {"review_env": "/tmp/review-env.sh"},
-            }
-            new_rvf_run = dict(record_arg.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record_arg, {"rvf_run": new_rvf_run})
-            return state
-
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
-
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "task: RVF_DISPATCH=token=dddddddddddddddd",
-                    "cwd": str(tmp_path),
-                    "session_id": "child-claude",
-                    "transcript_path": str(child_transcript),
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:00Z",
-            )
-            assert payload["status"] == "valid"
-            assert payload["child_session_id"] == "child-claude"
-            assert payload["child_transcript_path"] == str(child_transcript.resolve())
-
-            # Persistent channel: origin.json merged child fields, parent intact.
-            merged_origin = json.loads(origin_json.read_text(encoding="utf-8"))
-            assert merged_origin["session_id"] == "parent-codex"
-            assert merged_origin["transcript_path"] == "/parent/codex.jsonl"
-            assert merged_origin["child_session_id"] == "child-claude"
-            assert merged_origin["child_transcript_path"] == str(child_transcript.resolve())
-
-            # Prep payload also records the child fields.
-            stored = json.loads((root / "dddddddddddddddd.json").read_text(encoding="utf-8"))
-            assert stored["child_session_id"] == "child-claude"
-            assert stored["child_transcript_path"] == str(child_transcript.resolve())
-
-            diagnostics = read_jsonl(root / "diagnostics" / "dddddddddddddddd.jsonl")
-            assert any(
-                event.get("event") == "user_prompt_submit_child_session_backfill"
-                and event.get("status") == "ok"
-                for event in diagnostics
-            )
-
-            # Same-session guard: child == origin → no backfill.
-            same_origin = run_dir / "artifacts" / "origin-same.json"
-            same_origin.write_text(
-                json.dumps({"session_id": "same-sess"}), encoding="utf-8"
-            )
-            prep.write_prep_file(
-                {
-                    "origin_session_id": "same-sess",
-                    "origin_repo": str(tmp_path),
-                    "origin_cwd": str(tmp_path),
-                    "origin_metadata_path": str(same_origin),
-                    "target_flow": "flow-manual",
-                    "target_worktree": str(tmp_path),
-                    "rvf_run": {"run_id": "rvf-same", "run_dir": str(run_dir)},
-                },
-                root=root,
-                token="eeeeeeeeeeeeeeee",
-                now=now,
-                ttl_seconds=300,
-            )
-            same_payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "again RVF_DISPATCH=token=eeeeeeeeeeeeeeee",
-                    "cwd": str(tmp_path),
-                    "session_id": "same-sess",
-                    "transcript_path": str(child_transcript),
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:00Z",
-            )
-            assert same_payload["status"] == "valid"
-            assert "child_session_id" not in same_payload
-            same_origin_after = json.loads(same_origin.read_text(encoding="utf-8"))
-            assert "child_session_id" not in same_origin_after
-
-            # Layer 1 (declared, not-yet-flushed): no origin_metadata_path →
-            # derive origin.json from rvf_run.run_dir. The child's first
-            # UserPromptSubmit names the transcript before the host flushes it;
-            # the declared path is recorded (non-null) and flagged
-            # not-yet-existent rather than dropped — capture_run re-checks
-            # .is_file() at the child's Stop, by when it exists.
-            run_dir2 = tmp_path / "run2"
-            (run_dir2 / "artifacts").mkdir(parents=True)
-            (run_dir2 / "artifacts" / "origin.json").write_text(
-                json.dumps({"session_id": "parent2"}), encoding="utf-8"
-            )
-            prep.write_prep_file(
-                {
-                    "origin_session_id": "parent2",
-                    "origin_repo": str(tmp_path),
-                    "origin_cwd": str(tmp_path),
-                    "target_flow": "flow-2-inplace",
-                    "target_worktree": str(tmp_path),
-                    "rvf_run": {"run_id": "rvf-fb", "run_dir": str(run_dir2)},
-                },
-                root=root,
-                token="ffffffffffffffff",
-                now=now,
-                ttl_seconds=300,
-            )
-            declared_missing = tmp_path / "does_not_exist.jsonl"
-            fb_payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "fb RVF_DISPATCH=token=ffffffffffffffff",
-                    "cwd": str(tmp_path),
-                    "session_id": "child2",
-                    "transcript_path": str(declared_missing),
-                },
-                prep_root=root,
-                now="2026-05-07T00:01:00Z",
-            )
-            assert fb_payload["status"] == "valid"
-            assert fb_payload["child_session_id"] == "child2"
-            assert fb_payload["child_transcript_path"] == str(declared_missing.resolve())
-            fb_origin = json.loads(
-                (run_dir2 / "artifacts" / "origin.json").read_text(encoding="utf-8")
-            )
-            assert fb_origin["session_id"] == "parent2"
-            assert fb_origin["child_session_id"] == "child2"
-            assert fb_origin["child_transcript_path"] == str(declared_missing.resolve())
-            fb_stored = json.loads((root / "ffffffffffffffff.json").read_text(encoding="utf-8"))
-            assert fb_stored["child_session_id"] == "child2"
-            assert fb_stored["child_transcript_path"] == str(declared_missing.resolve())
-            fb_diags = read_jsonl(root / "diagnostics" / "ffffffffffffffff.jsonl")
-            assert any(
-                ev.get("event") == "user_prompt_submit_child_session_backfill"
-                and ev.get("transcript_source") == "declared"
-                and ev.get("child_transcript_exists") is False
-                for ev in fb_diags
-            )
-
-            # Layer 2 (derived from session_id): event carries NO transcript
-            # path at all; the child is Claude, so reconstruct
-            # <CLAUDE_CONFIG_DIR>/projects/<cwd-slug>/<sid>.jsonl — taken only
-            # because that project dir already exists (flush-independent signal).
-            claude_home = tmp_path / "claude-home"
-            run_dir3 = tmp_path / "run3"
-            (run_dir3 / "artifacts").mkdir(parents=True)
-            (run_dir3 / "artifacts" / "origin.json").write_text(
-                json.dumps({"session_id": "parent3"}), encoding="utf-8"
-            )
-            prep.write_prep_file(
-                {
-                    "origin_session_id": "parent3",
-                    "origin_repo": str(tmp_path),
-                    "origin_cwd": str(tmp_path),
-                    "target_flow": "flow-2-branch",
-                    "target_worktree": str(tmp_path),
-                    "rvf_run": {"run_id": "rvf-derive", "run_dir": str(run_dir3)},
-                },
-                root=root,
-                token="0000000000000000",
-                now=now,
-                ttl_seconds=300,
-            )
-            child3_cwd = str(tmp_path / "child-cwd")
-            project_dir = claude_home / "projects" / submit._claude_project_slug(child3_cwd)
-            project_dir.mkdir(parents=True)
-            expected_derived = (project_dir / "child3.jsonl").resolve()
-            os.environ["CLAUDE_CONFIG_DIR"] = str(claude_home)
-            try:
-                d_payload = submit.inspect_user_prompt_submit(
-                    {
-                        "prompt": "derive RVF_DISPATCH=token=0000000000000000",
-                        "cwd": child3_cwd,
-                        "session_id": "child3",
-                    },
-                    prep_root=root,
-                    now="2026-05-07T00:01:00Z",
-                )
-            finally:
-                os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            assert d_payload["status"] == "valid"
-            assert d_payload["child_session_id"] == "child3"
-            assert d_payload["child_transcript_path"] == str(expected_derived)
-            d_origin = json.loads(
-                (run_dir3 / "artifacts" / "origin.json").read_text(encoding="utf-8")
-            )
-            assert d_origin["child_transcript_path"] == str(expected_derived)
-            d_diags = read_jsonl(root / "diagnostics" / "0000000000000000.jsonl")
-            assert any(
-                ev.get("event") == "user_prompt_submit_child_session_backfill"
-                and ev.get("transcript_source") == "derived"
-                for ev in d_diags
-            )
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-
-
 def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) -> None:
     """Verify TimeoutError unblocks the hook even when the worker is still running.
 
@@ -2166,83 +1336,6 @@ def test_prepare_run_from_prep_file_timeout_returns_immediately(tmp_path: Path) 
     # Prep file on disk must reflect the timeout state.
     stored = json.loads((root / "dddddddddddddddd.json").read_text(encoding="utf-8"))
     assert stored["rvf_run"]["shared_workflow_state"]["status"] == "timeout"
-
-
-def test_rvf_user_prompt_submit_subprocess_stays_silent_in_hook_mode(tmp_path: Path) -> None:
-    prep = load_rvf_prep_file_module()
-    root = tmp_path / "prep-root"
-    now = prep.parse_timestamp("2026-05-07T00:00:00Z")
-    prep.write_prep_file(
-        {"origin_session_id": "session-a", "origin_repo": str(tmp_path), "target_flow": "flow-1-self-rising"},
-        root=root,
-        token="aaaaaaaaaaaaaaaa",
-        now=now,
-        ttl_seconds=300,
-    )
-    actual_hook = run(
-        [
-            sys.executable,
-            str(RVF_USER_PROMPT_SUBMIT),
-            "--prep-root",
-            str(root),
-            "--now",
-            "2026-05-07T00:01:00Z",
-        ],
-        input_text=json.dumps({"prompt": "ordinary prompt without trigger"}, ensure_ascii=False),
-    )
-    assert actual_hook.stdout == ""
-    assert actual_hook.stderr == ""
-
-
-def test_rvf_user_prompt_submit_dispatch_no_prep_emits_user_visible_systemMessage(tmp_path: Path) -> None:
-    # 端到端真子进程（非 --json）：prompt 带 dispatch token 但 prep 不可读（坏
-    # root）。选项 C 下此路径改为对**用户**可见（stdout 含 systemMessage），但
-    # **不**注入模型上下文（无 hookSpecificOutput）。证明 main() 的合并 emit 会
-    # 把 user-facing systemMessage 打到 stdout，而 token 路径不泄漏 additionalContext。
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    bad_root = tmp_path / "not-a-directory"
-    bad_root.write_text("not a directory\n", encoding="utf-8")
-
-    actual_hook = run(
-        [
-            sys.executable,
-            str(RVF_USER_PROMPT_SUBMIT),
-            "--prep-root",
-            str(bad_root),
-        ],
-        input_text=json.dumps({"prompt": "RVF_DISPATCH=token=bbbbbbbbbbbbbbbb"}, ensure_ascii=False),
-    )
-    assert actual_hook.stderr == ""
-    payload = json.loads(actual_hook.stdout)
-    assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
-    assert "bbbbbbbbbbbbbbbb" in payload["systemMessage"]
-    assert "hookSpecificOutput" not in payload
-    assert payload.get("continue") is True
-
-
-def test_rvf_user_prompt_submit_render_hook_payload_merges_channels(tmp_path: Path) -> None:
-    # 直接单测 main() 抽出的纯合并函数：systemMessage（user-facing）与
-    # hookSpecificOutput（model-facing）共存、各自单独、二者皆无 → 静默(None)。
-    # 确定性、不跑真 prepare —— 覆盖旧互斥 elif 会丢 manual additionalContext 的回归。
-    submit = load_rvf_user_prompt_submit_module()
-    render = submit._render_hook_payload
-
-    hook_block = {"hookEventName": "UserPromptSubmit", "additionalContext": "ctx"}
-    # 1) 两通道并存（manual 成功路径）：合并、不互相顶掉。
-    both = render({"systemMessage": "RVF UPS：派发已就绪", "hookSpecificOutput": hook_block, "continue": True})
-    assert both is not None
-    assert both["systemMessage"] == "RVF UPS：派发已就绪"
-    assert both["hookSpecificOutput"] == hook_block
-    assert both["continue"] is True
-    # 2) 仅 systemMessage（token 派发 / marker / invalid）：user-facing 行，无 hook 块。
-    sys_only = render({"systemMessage": "RVF UPS：自注入 marker 'fork' 无 token"})
-    assert sys_only == {"continue": True, "systemMessage": "RVF UPS：自注入 marker 'fork' 无 token"}
-    # 3) 仅 hookSpecificOutput：保留并补 continue。
-    hook_only = render({"hookSpecificOutput": hook_block})
-    assert hook_only == {"hookSpecificOutput": hook_block, "continue": True}
-    # 4) 普通 prompt：两者皆无 → None → 不打印 → 静默。
-    assert render({"status": "no_token", "continue": True}) is None
-    assert render({"systemMessage": ""}) is None
 
 
 def _load_rvf_handoff_module():
@@ -3404,474 +2497,6 @@ def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
         assert out["valid"] is False, f"[{case_id}] expected rejection, got {out}"
 
 
-def test_build_packet_metadata_and_scope(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
-        encoding="utf-8",
-    )
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-            "--primary-file",
-            "tracked.txt",
-            "--background-file",
-            "new.txt",
-        ]
-    )
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert "## Review Scope" in packet_text
-    assert "## Session Context" in packet_text
-    assert payload["session_context_provided"] is True
-    assert payload["session_context_bytes"] > 0
-    assert payload["scope_of_work_file"] == str(context.resolve())
-    assert payload["primary_files"] == ["tracked.txt"]
-    assert payload["background_files"] == ["new.txt"]
-    assert payload["packet_bytes"] == len(packet_text.encode("utf-8"))
-
-
-def test_build_packet_allows_clean_repo_with_manual_scope(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    run(["git", "add", "tracked.txt", "new.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "settle worktree"], cwd=repo)
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：manual scoped review\n"
-        "- 本 turn 主会话实际完成的工作：仓库当前 clean；本轮审查范围来自用户显式指定\n"
-        "- Scope：审查 tracked.txt 的现有实现面\n",
-        encoding="utf-8",
-    )
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-            "--primary-file",
-            "tracked.txt",
-        ]
-    )
-
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert "## Review Scope" in packet_text
-    assert "Primary files for this turn:" in packet_text
-    assert "tracked.txt" in packet_text
-    assert "## Git Status\n\n```text\n(clean)\n```" in packet_text
-    assert "## Git Diff HEAD\n\n```diff\n(no tracked diff)\n```" in packet_text
-    assert payload["status_bytes"] == 0
-    assert payload["diff_bytes"] == 0
-    assert payload["primary_files"] == ["tracked.txt"]
-    assert payload["session_context_provided"] is True
-
-
-def test_session_manifest_extracts_apply_patch_and_command_candidates(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
-    (repo / "generated.txt").write_text("generated\n", encoding="utf-8")
-    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
-    manifest_path = tmp_path / "manifest.json"
-
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest_path),
-        ]
-    )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["session_id"] == "session-tracking-test"
-    assert manifest["confidence"] == "medium"
-    assert "tracked.txt" in manifest["owned_paths"]
-    assert "owned-new.txt" in manifest["owned_paths"]
-    assert "removed.txt" in manifest["owned_paths"]
-    assert "generated.txt" in manifest["owned_paths"]
-    assert "tracked.txt" in manifest["owned_dirty_paths"]
-    assert "generated.txt" in manifest["owned_dirty_paths"]
-    assert "background.txt" in manifest["unattributed_dirty_paths"]
-    assert "new.txt" in manifest["unattributed_dirty_paths"]
-    assert manifest["apply_patch_operations"][0]["operation"] == "update"
-    assert manifest["command_path_candidates"][0]["reason"] == "shell_redirect"
-
-
-def test_session_manifest_does_not_claim_post_commit_same_path_background_dirty(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    transcript = tmp_path / "session.jsonl"
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        "-base\n"
-        "+owned\n"
-        "*** End Patch\n"
-    )
-    records = [
-        {"timestamp": "2020-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "S"}},
-        {
-            "timestamp": "2020-01-01T00:00:01Z",
-            "type": "response_item",
-            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-old"},
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "commit owned change"], cwd=repo)
-    (repo / "a.txt").write_text("background\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    assert manifest["owned_paths"] == ["a.txt"]
-    assert manifest["owned_dirty_paths"] == []
-    assert manifest["unattributed_dirty_paths"] == ["a.txt"]
-    assert manifest["ownership_baseline"]["mode"] == "head_commit_time"
-    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
-
-
-def test_session_manifest_claims_apply_patch_after_commit_cutoff(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    old_patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        "-base\n"
-        "+owned\n"
-        "*** End Patch\n"
-    )
-    new_patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " owned\n"
-        "+new\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": old_patch}},
-        {
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "arguments": json.dumps({"cmd": "git commit -m owned", "workdir": str(repo)}),
-                "call_id": "commit-call",
-            },
-        },
-        {"type": "event_msg", "payload": {"type": "exec_command_end", "call_id": "commit-call", "exit_code": 0}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": new_patch}},
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("owned\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "owned"], cwd=repo)
-    (repo / "a.txt").write_text("owned\nnew\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    assert manifest["owned_paths"] == ["a.txt"]
-    assert manifest["owned_dirty_paths"] == ["a.txt"]
-    assert manifest["unattributed_dirty_paths"] == []
-    assert manifest["ownership_baseline"]["mode"] == "line_cutoff"
-    assert manifest["ownership_baseline"]["included_tool_record_count"] == 1
-    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
-
-
-def test_session_manifest_only_claims_matching_apply_patch_hunk(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text(
-        "top\n"
-        "keep\n"
-        "middle\n"
-        "keep\n"
-        "bottom\n",
-        encoding="utf-8",
-    )
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " bottom\n"
-        "+session-owned\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text(
-        "top\n"
-        "background\n"
-        "middle\n"
-        "keep\n"
-        "bottom\n"
-        "session-owned\n",
-        encoding="utf-8",
-    )
-    log_root = tmp_path / "state"
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-            ],
-            env=env,
-        ).stdout
-    )
-
-    owned_units = manifest["tracker"]["owned_units"]
-    assert manifest["owned_dirty_paths"] == ["a.txt"]
-    assert len(owned_units) == 1
-    assert owned_units[0]["unit"] == "hunk"
-    assert "session-owned" in run(["git", "diff", "HEAD", "--", "a.txt"], cwd=repo).stdout
-
-
-def test_session_manifest_records_edit_claim_user_context(tmp_path: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " base\n"
-        "+claimed\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {"type": "event_msg", "payload": {"type": "user_message", "message": "first request"}},
-        {"type": "event_msg", "payload": {"type": "user_message", "message": "keep the claimed line"}},
-        {
-            "type": "response_item",
-            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("base\nclaimed\n", encoding="utf-8")
-    log_root = tmp_path / "logs"
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--tracker-run-id",
-                "run-1",
-            ],
-            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
-        ).stdout
-    )
-
-    assert len(manifest["edit_claims"]) == 1
-    claim = manifest["edit_claims"][0]
-    assert claim["path"] == "a.txt"
-    assert claim["call_id"] == "patch-1"
-    assert claim["latest_user_message"] == "keep the claimed line"
-    assert claim["latest_user_line_number"] == 3
-    assert claim["mapped_unit_ids"]
-    assert manifest["edit_claim_registration"]["status"] == "ok"
-    assert manifest["edit_claim_registration"]["registered_count"] == 1
-
-    tracker_dir = Path(manifest["tracker"]["tracker_dir"])
-    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            SELECT claim_id, session_id, call_id, path, status, latest_user_line_number, latest_user_message
-              FROM edit_claims
-            """
-        ).fetchone()
-        assert row is not None
-        assert row["session_id"] == "S"
-        assert row["call_id"] == "patch-1"
-        assert row["path"] == "a.txt"
-        assert row["status"] == "pending"
-        assert row["latest_user_line_number"] == 3
-        assert row["latest_user_message"] == "keep the claimed line"
-        unit_count = conn.execute(
-            "SELECT COUNT(*) FROM edit_claim_units WHERE claim_id=?",
-            (row["claim_id"],),
-        ).fetchone()[0]
-        assert unit_count == len(claim["mapped_unit_ids"])
-        conn.execute("DELETE FROM session_units WHERE session_id='S'")
-
-    allocated = module.allocate_review_scope(
-        repo=repo,
-        session_id="S",
-        run_id="review-run",
-        reviewer_id="reviewer-1",
-        log_root_override=log_root,
-        transcript_max_line_number=4,
-    )
-    assert allocated["status"] == "allocated"
-    completed = module.complete_review_scope(
-        repo=repo,
-        lease_id=allocated["lease_id"],
-        unit_ids=allocated["scope"]["unit_ids"],
-        scope_hash=allocated["scope_hash"],
-        run_id="review-run",
-        log_root_override=log_root,
-    )
-    assert completed["status"] == "released"
-    assert completed["reviewed_edit_claim_count"] == 1
-    with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
-        status = conn.execute("SELECT status FROM edit_claims").fetchone()[0]
-        assert status == "reviewed"
-
-
-def test_session_manifest_records_codex_message_user_context(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " base\n"
-        "+claimed\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "codex message user context"}],
-            },
-        },
-        {
-            "type": "response_item",
-            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("base\nclaimed\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    assert manifest["apply_patch_operations"][0]["latest_user_line_number"] == 2
-    assert manifest["apply_patch_operations"][0]["latest_user_message"] == "codex message user context"
-    claim = manifest["edit_claims"][0]
-    assert claim["latest_user_line_number"] == 2
-    assert claim["latest_user_message"] == "codex message user context"
-
-
 def test_complete_review_scope_waits_for_all_edit_claim_units(tmp_path: Path) -> None:
     module = load_diff_tracker_module()
     repo = tmp_path / "repo"
@@ -3948,346 +2573,6 @@ def test_complete_review_scope_waits_for_all_edit_claim_units(tmp_path: Path) ->
     assert second["reviewed_edit_claim_count"] == 1
     with sqlite3.connect(tracker_dir / module.SQLITE_FILENAME) as conn:
         assert conn.execute("SELECT status FROM edit_claims WHERE claim_id='edit-two-units'").fetchone()[0] == "reviewed"
-
-
-def test_session_manifest_suppresses_unresolved_without_tracker_watermark(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        "-base\n"
-        "+owned\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {
-            "type": "response_item",
-            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("base\nbackground\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    unresolved = manifest["patch_ownership"]["unresolved_owned_patch_hunks"]
-    assert manifest["owned_dirty_paths"] == []
-    assert manifest["unattributed_dirty_paths"] == ["a.txt"]
-    assert unresolved == []
-
-
-def test_session_manifest_reports_unresolved_apply_patch_hunk_after_tracker_watermark(tmp_path: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    (repo / "a.txt").write_text("base\nleased\n", encoding="utf-8")
-    log_root = tmp_path / "logs"
-    seeded = module.allocate_review_scope(
-        repo=repo,
-        session_id="S",
-        run_id="run-1",
-        reviewer_id="reviewer-1",
-        log_root_override=log_root,
-        transcript_max_line_number=1,
-    )
-    assert seeded["status"] == "allocated"
-
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        "-base\n"
-        "+owned\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {"type": "event_msg", "payload": {"note": "prior turn"}},
-        {
-            "type": "response_item",
-            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "patch-1"},
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("base\nbackground\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--tracker-run-id",
-                "run-2",
-            ],
-            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
-        ).stdout
-    )
-
-    unresolved = manifest["patch_ownership"]["unresolved_owned_patch_hunks"]
-    assert len(unresolved) == 1
-    assert unresolved[0]["path"] == "a.txt"
-    assert unresolved[0]["call_id"] == "patch-1"
-    assert unresolved[0]["reason"] == "no_current_diff_hunk_contains_patch_mutations"
-
-
-def test_session_manifest_uses_tracker_transcript_watermark(tmp_path: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text("base\n", encoding="utf-8")
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    (repo / "a.txt").write_text("base\nold\n", encoding="utf-8")
-    log_root = tmp_path / "logs"
-    first = module.allocate_review_scope(
-        repo=repo,
-        session_id="S",
-        run_id="run-1",
-        reviewer_id="reviewer-1",
-        log_root_override=log_root,
-        transcript_max_line_number=2,
-    )
-    assert first["status"] == "allocated"
-
-    old_patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " base\n"
-        "+old\n"
-        "*** End Patch\n"
-    )
-    new_patch = (
-        "*** Begin Patch\n"
-        "*** Update File: a.txt\n"
-        "@@\n"
-        " base\n"
-        "+new\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "S"}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": old_patch}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": new_patch}},
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-    (repo / "a.txt").write_text("base\nnew\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--tracker-run-id",
-                "run-2",
-            ],
-            env={**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)},
-        ).stdout
-    )
-
-    assert manifest["ownership_baseline"]["tracker_transcript_max_line_number"] == 2
-    assert manifest["ownership_baseline"]["included_tool_record_count"] == 1
-    assert manifest["ownership_baseline"]["ignored_tool_record_count"] == 1
-    assert manifest["patch_ownership"]["transcript_max_line_number"] == 3
-    assert manifest["patch_ownership"]["expected_apply_patch_paths"] == ["a.txt"]
-
-
-def test_session_manifest_legacy_timestampless_transcript_fallback_warns(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    patch = (
-        "*** Begin Patch\n"
-        "*** Update File: tracked.txt\n"
-        "@@\n"
-        "-base\n"
-        "+base\n"
-        "+legacy\n"
-        "*** End Patch\n"
-    )
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": "legacy-session"}},
-        {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}},
-    ]
-    transcript.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    assert manifest["ownership_baseline"]["mode"] == "legacy_full_transcript"
-    assert any("ownership_baseline_fallback" in warning for warning in manifest["warnings"])
-
-
-def test_session_manifest_resolves_exec_paths_from_command_workdir(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    docs = repo / "docs"
-    docs.mkdir()
-    (docs / "note.md").write_text("x\n", encoding="utf-8")
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {
-            "timestamp": "2999-04-27T00:00:00.000Z",
-            "type": "session_meta",
-            "payload": {"id": "session-subdir-test", "cwd": str(repo)},
-        },
-        {
-            "timestamp": "2999-04-27T00:00:01.000Z",
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "arguments": json.dumps({"cmd": "printf x > note.md", "workdir": str(docs)}),
-                "call_id": "call_exec",
-            },
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
-    manifest_path = tmp_path / "manifest.json"
-
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest_path),
-        ]
-    )
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert "docs/note.md" in manifest["owned_paths"]
-    assert "note.md" not in manifest["owned_paths"]
-    assert "docs/note.md" in manifest["owned_dirty_paths"]
-    assert "docs/note.md" not in manifest["unattributed_dirty_paths"]
-
-
-def test_session_manifest_claims_claude_write_tool_paths(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    (repo / "tracked.txt").write_text("base\nclaude\n", encoding="utf-8")
-    notebook = repo / "analysis.ipynb"
-    notebook.write_text('{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}\n', encoding="utf-8")
-    run(["git", "add", "analysis.ipynb"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "add notebook"], cwd=repo)
-    notebook.write_text('{"cells":[{"cell_type":"code"}],"metadata":{},"nbformat":4,"nbformat_minor":5}\n', encoding="utf-8")
-    (repo / "background.txt").write_text("background\n", encoding="utf-8")
-    transcript = tmp_path / "claude-session.jsonl"
-    records = [
-        {"timestamp": "2999-04-27T00:00:00.000Z", "sessionId": "claude-session-1"},
-        {
-            "timestamp": "2999-04-27T00:00:01.000Z",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "Edit",
-                        "input": {
-                            "file_path": str(repo / "tracked.txt"),
-                            "old_string": "base\n",
-                            "new_string": "base\nclaude\n",
-                        },
-                    }
-                ]
-            },
-        },
-        {
-            "timestamp": "2999-04-27T00:00:02.000Z",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "NotebookEdit",
-                        "input": {
-                            "notebook_path": str(notebook),
-                            "new_source": "print('rvf')",
-                            "cell_type": "code",
-                        },
-                    }
-                ]
-            },
-        },
-    ]
-    transcript.write_text("\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n", encoding="utf-8")
-
-    manifest = json.loads(
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(repo),
-                "--transcript",
-                str(transcript),
-                "--no-tracker",
-            ]
-        ).stdout
-    )
-
-    assert manifest["session_id"] == "claude-session-1"
-    assert manifest["confidence"] == "medium"
-    assert manifest["owned_paths"] == ["analysis.ipynb", "tracked.txt"]
-    assert manifest["owned_dirty_paths"] == ["analysis.ipynb", "tracked.txt"]
-    assert "background.txt" in manifest["unattributed_dirty_paths"]
-    assert "new.txt" in manifest["unattributed_dirty_paths"]
-    assert manifest["claude_write_events"] == [
-        {"line_number": 2, "name": "Edit", "path": "tracked.txt"},
-        {"line_number": 3, "name": "NotebookEdit", "path": "analysis.ipynb"},
-    ]
-    assert manifest["ownership_baseline"]["mode"] == "head_commit_time"
-    assert manifest["ownership_baseline"]["included_tool_record_count"] == 2
 
 
 def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp_path: Path) -> None:
@@ -4380,750 +2665,6 @@ def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp
     assert "claude_writes_not_attributed" in codes
     assert "runtime_session_manifest_differs_from_reference" in codes
     assert "runtime_session_manifest_lacks_tracker_field" in codes
-
-
-def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
-        encoding="utf-8",
-    )
-    (repo / "owned-new.txt").write_text("owned contents\n", encoding="utf-8")
-    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
-    manifest = tmp_path / "manifest.json"
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest),
-        ]
-    )
-
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ]
-    )
-
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert "## Session Manifest" in packet_text
-    assert "## Session-Owned Git Diff" in packet_text
-    assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
-    assert "Session-owned paths:" in packet_text
-    assert "- tracked.txt" in packet_text
-    assert "- background.txt" in packet_text
-    assert "Background untracked paths below were not attributed to this session and are not inlined" in packet_text
-    assert "### owned-new.txt" in packet_text
-    assert "owned contents" in packet_text
-    assert "### background.txt" not in packet_text
-    assert "background contents" not in packet_text
-    assert payload["session_manifest_provided"] is True
-    assert payload["session_owned_path_count"] >= 3
-    assert payload["owned_untracked_count"] == 1
-    assert payload["background_untracked_count"] >= 2
-
-
-def test_build_packet_filters_session_owned_diff_to_tracker_hunk(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    (repo / "a.txt").write_text(
-        "top\n" + "\n".join(f"keep-{index}" for index in range(20)) + "\nbottom\n",
-        encoding="utf-8",
-    )
-    run(["git", "add", "a.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    (repo / "a.txt").write_text(
-        "top\n"
-        "background\n"
-        + "\n".join(f"keep-{index}" for index in range(20))
-        + "\nbottom\n"
-        + "session-owned\n",
-        encoding="utf-8",
-    )
-    diff_text = run(["git", "diff", "-U3", "HEAD", "--", "a.txt"], cwd=repo).stdout
-    selected_header: str | None = None
-    current_header: str | None = None
-    for line in diff_text.splitlines():
-        if line.startswith("@@"):
-            current_header = line
-        if "+session-owned" in line:
-            selected_header = current_header
-            break
-    assert selected_header is not None
-
-    context = tmp_path / "context.md"
-    context.write_text("session context\n", encoding="utf-8")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repo": str(repo.resolve()),
-                "session_id": "S",
-                "confidence": "medium",
-                "owned_paths": ["a.txt"],
-                "owned_dirty_paths": ["a.txt"],
-                "unattributed_dirty_paths": [],
-                "tracker": {
-                    "status": "ok",
-                    "session_id": "S",
-                    "tracker_scope": {
-                        "unit_ids": ["unit-session"],
-                        "lease_id": "lse-test",
-                        "scope_hash": "sha256:" + "a" * 64,
-                        "paths": ["a.txt"],
-                        "hunks": [
-                            {
-                                "unit_id": "unit-session",
-                                "path": "a.txt",
-                                "hunk_header": selected_header,
-                            }
-                        ],
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ]
-    )
-
-    packet_text = packet.read_text(encoding="utf-8")
-    session_owned_diff = packet_text.split("## Full Git Diff HEAD", 1)[0]
-    assert "+session-owned" in session_owned_diff
-    assert "+background" not in session_owned_diff
-    assert "+background" in packet_text
-
-
-def test_build_packet_rejects_session_manifest_for_different_repo(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：reject mismatched manifest\n",
-        encoding="utf-8",
-    )
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repo": str(tmp_path / "other-repo"),
-                "owned_paths": ["tracked.txt"],
-                "owned_dirty_paths": ["tracked.txt"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode != 0
-    assert "session manifest repo does not match current repo" in completed.stderr
-
-
-def test_build_packet_rejects_empty_session_owned_scope(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：reject empty manifest scope\n",
-        encoding="utf-8",
-    )
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "repo": str(repo.resolve()),
-                "owned_paths": [],
-                "owned_dirty_paths": [],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode != 0
-    assert "session manifest has no owned paths" in completed.stderr
-
-
-def test_build_packet_requires_session_context(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode != 0
-    assert "session context is required" in completed.stderr
-
-
-def test_build_packet_honors_review_validate_fix_ignore(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：prepared ignored artifacts\n",
-        encoding="utf-8",
-    )
-    (repo / ".review-validate-fix-ignore").write_text("slide-versions/\nsecret\n", encoding="utf-8")
-    (repo / "secret.txt").write_text("committed secret contents\n", encoding="utf-8")
-    run(["git", "add", "secret.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "add secret"], cwd=repo)
-    ignored = repo / "slide-versions" / "claude cowork 1"
-    ignored.mkdir(parents=True)
-    (ignored / "deck.txt").write_text("ignored deck contents\n", encoding="utf-8")
-    (repo / "secret.txt").write_text("ignored secret contents\n", encoding="utf-8")
-    (repo / "secret-alpha.txt").write_text("ignored secret prefix contents\n", encoding="utf-8")
-    (repo / "kept.txt").write_text("visible contents\n", encoding="utf-8")
-
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ]
-    )
-
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert payload["excluded_path_prefixes"] == ["secret", "slide-versions/"]
-    assert payload["untracked_count"] == 3
-    assert "## Excluded Paths" in packet_text
-    assert "- secret" in packet_text
-    assert "- slide-versions/" in packet_text
-    assert "### .review-validate-fix-ignore" in packet_text
-    assert "### kept.txt" in packet_text
-    assert "### new.txt" in packet_text
-    assert "slide-versions/claude cowork 1/deck.txt" not in packet_text
-    assert "ignored deck contents" not in packet_text
-    assert "### secret.txt" not in packet_text
-    assert "secret.txt |" not in packet_text
-    assert "### secret-alpha.txt" not in packet_text
-    assert "committed secret contents" not in packet_text
-    assert "ignored secret contents" not in packet_text
-    assert "ignored secret prefix contents" not in packet_text
-
-
-def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：prepared literal ignore paths\n",
-        encoding="utf-8",
-    )
-    (repo / ".review-validate-fix-ignore").write_text("literal[glob]/\nsecret*.txt\n", encoding="utf-8")
-    literal_dir = repo / "literal[glob]"
-    wildcard_dir = repo / "literalx"
-    literal_dir.mkdir()
-    wildcard_dir.mkdir()
-    (literal_dir / "hidden.txt").write_text("hidden literal dir\n", encoding="utf-8")
-    (wildcard_dir / "visible.txt").write_text("visible wildcard-like dir\n", encoding="utf-8")
-    (repo / "secret*.txt").write_text("hidden literal file\n", encoding="utf-8")
-    (repo / "secret-alpha.txt").write_text("visible wildcard-like file\n", encoding="utf-8")
-
-    packet = tmp_path / "packet.md"
-    metadata = tmp_path / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ]
-    )
-
-    packet_text = packet.read_text(encoding="utf-8")
-    assert "literal[glob]/hidden.txt" not in packet_text
-    assert "hidden literal dir" not in packet_text
-    assert "### secret*.txt" not in packet_text
-    assert "hidden literal file" not in packet_text
-    assert "### literalx/visible.txt" in packet_text
-    assert "visible wildcard-like dir" in packet_text
-    assert "### secret-alpha.txt" in packet_text
-    assert "visible wildcard-like file" in packet_text
-
-
-def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：prepared review run\n",
-        encoding="utf-8",
-    )
-    (repo / "secret.txt").write_text("hidden\n", encoding="utf-8")
-    result = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--base-dir",
-            str(tmp_path / "runs"),
-            "--primary-file",
-            "tracked.txt",
-            "--exclude-path-prefix",
-            "secret.txt",
-        ]
-    )
-    payload = json.loads(result.stdout)
-    assert Path(payload["review_packet"]).exists()
-    assert Path(payload["review_packet_metadata"]).exists()
-    assert Path(payload["before_workspace_snapshot"]).exists()
-    assert Path(payload["scope_of_work_file"]).exists()
-    assert Path(payload["inputs_dir"]).exists()
-    assert Path(payload["scope_contract"]).exists()
-    assert payload["scope_contract"].endswith("artifacts/inputs/scope.contract.json")
-    assert Path(payload["review_env_file"]).exists()
-    assert Path(payload["review_agent_context_file"]).exists()
-    assert payload["session_context"] == payload["scope_of_work_file"]
-    assert payload["source_session_context"] == str(context.resolve())
-    assert payload["session_context_provided"] is True
-    assert payload["excluded_path_prefixes"] == ["secret.txt"]
-    assert payload["review_env"]["RVF_REPO"] == str(repo.resolve())
-    assert payload["review_env"]["RVF_INPUTS_DIR"] == payload["inputs_dir"]
-    assert payload["review_env"]["RVF_SCOPE_CONTRACT"] == payload["scope_contract"]
-    assert payload["review_env"]["RVF_SCOPE_OF_WORK"] == payload["scope_of_work_file"]
-    assert payload["review_env"]["RVF_REVIEW_PACKET"] == payload["review_packet"]
-    assert payload["review_env"]["RVF_WRITE_REVIEW_RESULT"].endswith("scripts/write_review_result.py")
-    assert payload["review_env"]["RVF_CHECK_REVIEW_RESULT"].endswith("scripts/check_review_result.py")
-    assert payload["review_env"]["RVF_REVIEW_RESULT"].endswith("artifacts/reviewers/reviewer/review-result.json")
-    assert "${" not in payload["review_env"]["RVF_REVIEW_RESULT"]
-    assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
-    assert payload["review_env"]["RVF_RUN_ID"] == payload["run_id"]
-    assert payload["review_env"]["RVF_RUN_DIR"] == payload["run_dir"]
-    assert payload["review_env"]["RVF_BACKEND"] == "manual"
-    assert payload["rvf_backend"] == "manual"
-    assert payload["rvf_state_phase"] == "prepare"
-    assert payload["rvf_scope_contract_path"] == payload["scope_contract"]
-    assert payload["rvf_review_packet_path"] == payload["review_packet"]
-    review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
-    assert "export RVF_RUN_DIR=" in review_env_text
-    assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
-    assert "export RVF_RUN_ID=" in review_env_text
-    assert "CODEX_RVF_RUN_ID" not in review_env_text
-    assert "CODEX_RVF_RUN_DIR" not in review_env_text
-    assert "export RVF_BACKEND=manual" in review_env_text
-    assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
-    assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text
-    assert 'export RVF_SCOPE_CONTRACT="$RVF_INPUTS_DIR/scope.contract.json"' in review_env_text
-    assert 'export RVF_SCOPE_OF_WORK="$RVF_ARTIFACTS_DIR/scope-of-work.md"' in review_env_text
-    assert 'export RVF_REVIEW_PACKET="$RVF_ARTIFACTS_DIR/review-packet.md"' in review_env_text
-    assert 'export RVF_REVIEW_RESULT="$RVF_ARTIFACTS_DIR/reviewers/${RVF_REVIEWER_ID:-reviewer}/review-result.json"' in review_env_text
-    review_agent_context_text = Path(payload["review_agent_context_file"]).read_text(encoding="utf-8")
-    assert payload["review_agent_context"] == review_agent_context_text
-    assert "## RVF Generated Reviewer Context" in review_agent_context_text
-    assert f". {payload['review_env_file']}" in review_agent_context_text
-    assert "- scope contract: `$RVF_SCOPE_CONTRACT`" in review_agent_context_text
-    assert "- scope-of-work: `$RVF_SCOPE_OF_WORK`" in review_agent_context_text
-    assert "- review packet: `$RVF_REVIEW_PACKET`" in review_agent_context_text
-    assert "- command lock wrapper: `$RVF_COMMAND_LOCK`" in review_agent_context_text
-    assert "- review result writer: `$RVF_WRITE_REVIEW_RESULT`" in review_agent_context_text
-    assert "- reviewer result artifact: `$RVF_REVIEW_RESULT`" in review_agent_context_text
-    assert "Scope precedence: read `$RVF_SCOPE_CONTRACT` first" in review_agent_context_text
-    assert "`primary_units` is non-empty" in review_agent_context_text
-    assert "not the final scope contract" in review_agent_context_text
-    assert payload["scope_of_work_file"] not in review_agent_context_text
-    assert payload["review_packet"] not in review_agent_context_text
-    metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
-    packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
-    assert metadata["excluded_path_prefixes"] == ["secret.txt"]
-    assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
-    assert "## Excluded Paths" in packet_text
-    assert "- secret.txt" in packet_text
-    assert "### secret.txt" not in packet_text
-    contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
-    assert contract["version"] == 2
-    assert contract["run_id"] == payload["run_id"]
-    assert contract["scope_mode"] == "custom"
-    assert contract["canonical_issues"] == []
-    assert contract["primary_files"] == ["tracked.txt"]
-    assert contract["fix_allowlist"] == ["tracked.txt"]
-    assert contract["review_packet_path"] == payload["input_review_packet"]
-    assert contract["start_snapshot_path"] == payload["input_before_workspace_snapshot"]
-    assert contract["scope_hash"] == payload["scope_contract_payload"]["scope_hash"]
-    assert contract["primary_units"] is None
-    assert contract["tracker_lease_id"] is None
-    assert contract["tracker_scope_hash"] is None
-
-    locked = run(
-        [
-            sys.executable,
-            str(COMMAND_LOCK),
-            "--repo",
-            str(repo),
-            "--name",
-            "contract-test",
-            "--",
-            sys.executable,
-            "-c",
-            "print('locked')",
-        ]
-    )
-    assert "locked" in locked.stdout
-
-
-def test_alternative_reviewer_prompt_uses_session_env_refs(tmp_path: Path) -> None:
-    module = load_alternative_reviewer_module()
-    repo = init_repo(tmp_path / "repo")
-    prompt_file = tmp_path / "review-prompt.md"
-    prompt_file.write_text("# Review Prompt\n\nBody\n", encoding="utf-8")
-    context = tmp_path / "very" / "long" / "artifacts" / "scope-of-work.md"
-    context.parent.mkdir(parents=True)
-    context.write_text("scope\n", encoding="utf-8")
-    packet = tmp_path / "very" / "long" / "artifacts" / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    scope_contract = packet.parent / "inputs" / "scope.contract.json"
-    scope_contract.parent.mkdir()
-    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
-
-    result_path = tmp_path / "run" / "artifacts" / "reviewers" / "test" / "review-result.json"
-    prompt = module.build_prompt(prompt_file, context, packet, repo, scope_contract, result_path)
-
-    assert "$RVF_SCOPE_CONTRACT" in prompt
-    assert "$RVF_SCOPE_OF_WORK" in prompt
-    assert "$RVF_REVIEW_PACKET" in prompt
-    assert "$RVF_COMMAND_LOCK" in prompt
-    assert "$RVF_WRITE_REVIEW_RESULT" in prompt
-    assert "$RVF_CHECK_REVIEW_RESULT" in prompt
-    assert "$RVF_REVIEW_RESULT" in prompt
-    assert "$RVF_REPO" in prompt
-    assert "`primary_units` takes precedence over session manifest paths" in prompt
-    assert "not as the final scope contract" in prompt
-    assert str(scope_contract) not in prompt
-    assert str(context) not in prompt
-    assert str(result_path) not in prompt
-    assert str(module.COMMAND_LOCK) not in prompt
-
-
-def test_alternative_reviewer_infers_scope_contract_from_inputs_layout(tmp_path: Path) -> None:
-    module = load_alternative_reviewer_module()
-    inputs = tmp_path / "run" / "artifacts" / "inputs"
-    inputs.mkdir(parents=True)
-    packet = inputs / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    scope_contract = inputs / "scope.contract.json"
-    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
-
-    assert module.infer_scope_contract(packet) == scope_contract.resolve()
-
-
-def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scope_contract(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "scope-of-work.md"
-    context.write_text("scope\n", encoding="utf-8")
-    packet = tmp_path / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    scope_contract = tmp_path / "scope.contract.json"
-    scope_contract.write_text('{"scope_hash":"abc"}\n', encoding="utf-8")
-    reviewer_code = (
-        "import os, sys; "
-        "sys.stdin.read(); "
-        f"expected = {str(context.resolve())!r}; "
-        f"expected_scope = {str(scope_contract.resolve())!r}; "
-        "assert os.environ['RVF_SCOPE_OF_WORK'] == expected; "
-        "assert os.environ['RVF_SESSION_CONTEXT'] == expected; "
-        "assert os.environ['RVF_SCOPE_CONTRACT'] == expected_scope; "
-        "assert os.environ['RVF_REVIEW_RESULT']; "
-        "import subprocess; "
-        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-        "print('artifact written')"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--review-packet",
-            str(packet),
-            "--scope-contract",
-            str(scope_contract),
-        ]
-    )
-
-    assert completed.stdout.strip() == "artifact written"
-
-
-def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    stale_run_dir = tmp_path / "stale-run"
-    stale_run_dir.mkdir()
-    token = tmp_path / "health-token"
-    order = tmp_path / "order.txt"
-    health_code = (
-        "from pathlib import Path; "
-        f"Path({str(token)!r}).write_text('ready', encoding='utf-8'); "
-        f"Path({str(order)!r}).write_text('health\\n', encoding='utf-8'); "
-        "print('HEALTH_OK')"
-    )
-    reviewer_code = (
-        "import os, subprocess, sys; "
-        "from pathlib import Path; "
-        "sys.stdin.read(); "
-        f"assert Path({str(token)!r}).read_text(encoding='utf-8') == 'ready'; "
-        f"Path({str(order)!r}).write_text(Path({str(order)!r}).read_text(encoding='utf-8') + 'reviewer\\n', encoding='utf-8'); "
-        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-        "print('artifact written')"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        health_command=[sys.executable, "-c", health_code],
-        pre_run_health=True,
-    )
-    env = os.environ.copy()
-    env["RVF_RUN_DIR"] = str(stale_run_dir)
-    env["RVF_REVIEW_RESULT"] = str(stale_run_dir / "wrong" / "review-result.json")
-
-    completed = run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env=env,
-    )
-
-    assert completed.stdout.strip() == "artifact written"
-    assert order.read_text(encoding="utf-8") == "health\nreviewer\n"
-    assert not (stale_run_dir / "wrong" / "review-result.json").exists()
-
-
-def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp_path / "reviewer-ran"
-    reviewer_code = (
-        "from pathlib import Path; "
-        "import sys; "
-        "sys.stdin.read(); "
-        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        health_command=[sys.executable, "-c", "import sys; print('login failed'); sys.exit(7)"],
-        pre_run_health=True,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert "login failed" in completed.stderr
-    assert not marker.exists()
-
-
-def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "review-packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp_path / "reviewer-ran"
-    reviewer_code = (
-        "from pathlib import Path; "
-        "import sys; "
-        "sys.stdin.read(); "
-        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        health_command=[sys.executable, "-c", "import time; time.sleep(2)"],
-        pre_run_health=True,
-    )
-    payload = json.loads(config.read_text(encoding="utf-8"))
-    payload["health_timeout_seconds"] = 0.1
-    config.write_text(json.dumps(payload), encoding="utf-8")
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 1
-    assert completed.stdout == ""
-    assert "health command timed out after" in completed.stderr
-    assert "Traceback" not in completed.stderr
-    assert not marker.exists()
-
-
-def test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text("scope\n", encoding="utf-8")
-
-    completed = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--base-dir",
-            str(tmp_path / "runs"),
-        ]
-    )
-
-    payload = json.loads(completed.stdout)
-    contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
-    assert contract["scope_mode"] == "manual-all-uncommitted"
-    assert contract["primary_files"] == ["new.txt", "tracked.txt"]
-    assert contract["fix_allowlist"] == ["new.txt", "tracked.txt"]
 
 
 def test_command_lock_writes_lifecycle_events(tmp_path: Path) -> None:
@@ -5296,1184 +2837,6 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
     assert "contended-test" in str(timeout_event["holder_metadata"])
 
 
-def test_prepare_review_run_can_build_session_manifest_from_transcript(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：test\n"
-        "- 本 turn 主会话实际完成的工作：prepared transcript-scoped review run\n",
-        encoding="utf-8",
-    )
-    (repo / "owned-new.txt").write_text("owned\n", encoding="utf-8")
-    (repo / "background.txt").write_text("background contents\n", encoding="utf-8")
-    transcript = write_codex_transcript(tmp_path / "session.jsonl", repo)
-
-    result = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--transcript",
-            str(transcript),
-            "--base-dir",
-            str(tmp_path / "runs"),
-        ]
-    )
-    payload = json.loads(result.stdout)
-    assert Path(payload["session_manifest"]).exists()
-    assert payload["session_manifest_provided"] is True
-    assert payload["source_session_manifest"] == f"transcript:{transcript.resolve()}"
-    packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
-    assert "## Session Manifest" in packet_text
-    assert "background contents" not in packet_text
-
-
-def test_prepare_review_run_requires_session_context(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--base-dir",
-            str(tmp_path / "runs"),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode != 0
-    assert "session context is required" in completed.stderr
-
-
-def test_alternative_reviewer_idle_timeout_flag(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-c",
-            "import sys, time; sys.stdin.read(); time.sleep(1.0)",
-        ],
-        idle_timeout_seconds=0.2,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 124
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-
-
-def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-c",
-            "import time; time.sleep(0.25); " + clean_review_result_python(stdout="NO_ISSUES"),
-        ],
-        idle_timeout_seconds=0.08,
-        activity_check_interval_seconds=0.03,
-        activity_probe_command=[
-            sys.executable,
-            "-c",
-            "import os; print('PROBE ' + os.environ.get('RVF_REVIEWER_PID', ''))",
-        ],
-        activity_probe_timeout_seconds=0.5,
-        activity_probe_failure_threshold=2,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-id",
-            "probe-success-test",
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES"
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["activity_probe_configured"] is True
-    assert summary["activity_probe_history"]
-    assert any(
-        item["status"] == "completed" and item["stdout"].startswith("PROBE")
-        for item in summary["activity_probe_history"]
-    )
-    normalized = Path(summary["paths"]["normalized"]).read_text(encoding="utf-8")
-    assert normalized.strip() == "NO_ISSUES"
-    assert "PROBE" not in normalized
-    assert summary["review_result_valid"] is True
-    result_summary = json.loads(Path(summary["paths"]["review_result_summary"]).read_text(encoding="utf-8"))
-    assert result_summary["kind"] == "no_issues"
-
-
-def test_alternative_reviewer_requires_review_result_artifact(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-c",
-            "import sys; sys.stdin.read(); print('NO_ISSUES')",
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-id",
-            "missing-result-test",
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode != 0
-    assert "missing review result artifact" in completed.stderr
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["reason_code"] == "reviewer_result_invalid"
-    assert summary["review_result_valid"] is False
-
-
-def test_alternative_reviewer_records_request_as_pending_state(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    reviewer_code = (
-        "import os, subprocess, sys; "
-        "sys.stdin.read(); "
-        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-        "'lock-request', '--out', os.environ['RVF_REVIEW_RESULT'], "
-        "'--name', 'pytest', '--command', 'python3 -m pytest', "
-        "'--reason', 'needs serialized test cache'], check=True); "
-        "print('request written')"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-id",
-            "request-pending-test",
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "request written"
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "pending"
-    assert summary["reason_code"] == "reviewer_request_pending"
-    assert summary["returncode"] == 0
-    assert summary["review_result_valid"] is True
-    assert summary["review_result_kind"] == "request"
-    assert summary["review_result_complete"] is False
-    assert summary["review_request_pending"] is True
-    assert summary["review_result_summary"]["request_types"] == ["lock_request"]
-    events = read_jsonl(run_dir / "events.jsonl")
-    assert any(
-        event["event"] == "request_pending"
-        and event["reason_code"] == "reviewer_request_pending"
-        and event["review_result_kind"] == "request"
-        for event in events
-    )
-
-
-def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-c",
-            "import sys, time; sys.stdin.read(); time.sleep(1.0)",
-        ],
-        idle_timeout_seconds=0.08,
-        activity_check_interval_seconds=0.03,
-        activity_probe_command=[
-            sys.executable,
-            "-c",
-            "import sys; print('inactive'); sys.exit(2)",
-        ],
-        activity_probe_timeout_seconds=0.5,
-        activity_probe_failure_threshold=2,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-id",
-            "probe-failure-test",
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 124
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["reason_code"] == "reviewer_timeout"
-    assert summary["timeout_reason"] == "no_observable_activity_probe_failed"
-    assert summary["pid"] is not None
-    assert summary["terminated_signal"] == "SIGKILL"
-    assert len(summary["activity_probe_history"]) == 2
-    assert all(item["returncode"] == 2 for item in summary["activity_probe_history"])
-    normalized = Path(summary["paths"]["normalized"]).read_text(encoding="utf-8")
-    assert normalized.strip() == "RVF_EXTERNAL_REVIEWER_TIMEOUT"
-
-
-def test_alternative_reviewer_timeout_kills_child_process_group(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    marker = tmp_path / "child-survived.txt"
-    child_code = (
-        "import pathlib, time; "
-        "time.sleep(1.0); "
-        f"pathlib.Path({str(marker)!r}).write_text('survived', encoding='utf-8')"
-    )
-    parent_code = (
-        "import subprocess, sys, time; "
-        "sys.stdin.read(); "
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
-        "time.sleep(10.0)"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-c", parent_code],
-        idle_timeout_seconds=0.5,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 124
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-    # Wait past the (now 1s) child sleep so a *surviving* child would have
-    # written the marker; the process-group kill at the ~0.5s idle timeout
-    # happens regardless of the child's sleep length, so the proof and its
-    # margin are unchanged.
-    time.sleep(1.3)
-    assert not marker.exists()
-
-
-def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import os, subprocess, sys, time; sys.stdin.read(); "
-                "[print(f'tick-{i}', flush=True) or time.sleep(0.08) for i in range(4)]; "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print('NO_ISSUES', flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=0.6,
-        activity_check_interval_seconds=0.05,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert "NO_ISSUES" in completed.stdout
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
-
-
-def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import json, os, subprocess, sys, time; sys.stdin.read(); "
-                "print(json.dumps({'type':'assistant','message':{'content':["
-                "{'type':'tool_use','id':'toolu_1','name':'Bash','input':{'command':'sleep 1'}}"
-                "]}}), flush=True); "
-                "time.sleep(1.5); "
-                "print(json.dumps({'type':'user','message':{'content':["
-                "{'type':'tool_result','tool_use_id':'toolu_1','content':''}"
-                "]}}), flush=True); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=1.0,
-        activity_check_interval_seconds=0.03,
-        output_format="claude_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES"
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" not in completed.stderr
-
-
-def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-c",
-            clean_review_result_python(stdout="NO_ISSUES"),
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-    )
-    command = [
-        sys.executable,
-        str(RUN_ALTERNATIVE_REVIEWER),
-        "--config",
-        str(config),
-        "--repo",
-        str(repo),
-        "--review-packet",
-        str(packet),
-        "--rvf-run-id",
-        "repeat-artifact-test",
-        "--rvf-run-dir",
-        str(run_dir),
-    ]
-
-    first = run(command)
-    second = run(command)
-
-    assert first.stdout.strip() == "NO_ISSUES"
-    assert second.stdout.strip() == "NO_ISSUES"
-    artifacts = run_dir / "artifacts" / "reviewers" / "test"
-    for name in [
-        "reviewer.prompt.txt",
-        "reviewer.prompt.2.txt",
-        "reviewer.stdout.txt",
-        "reviewer.stdout.2.txt",
-        "reviewer.stderr.txt",
-        "reviewer.stderr.2.txt",
-        "reviewer.normalized.txt",
-        "reviewer.normalized.2.txt",
-        "reviewer.summary.json",
-        "reviewer.summary.2.json",
-    ]:
-        assert (artifacts / name).exists()
-    assert not (run_dir / "artifacts" / "reviewer.prompt.txt").exists()
-
-
-def test_alternative_reviewer_long_command_wait_uses_check_interval() -> None:
-    module = load_alternative_reviewer_module()
-    assert module.next_wait_seconds(
-        activity_check_interval_seconds=5.0,
-        remaining_idle_seconds=2.0,
-        max_runtime_remaining_seconds=None,
-        waiting_on_long_command=False,
-    ) == 2.0
-    assert module.next_wait_seconds(
-        activity_check_interval_seconds=5.0,
-        remaining_idle_seconds=0.0,
-        max_runtime_remaining_seconds=None,
-        waiting_on_long_command=True,
-    ) == 5.0
-    assert module.next_wait_seconds(
-        activity_check_interval_seconds=5.0,
-        remaining_idle_seconds=0.0,
-        max_runtime_remaining_seconds=2.0,
-        waiting_on_long_command=True,
-    ) == 2.0
-    assert module.next_wait_seconds(
-        activity_check_interval_seconds=5.0,
-        remaining_idle_seconds=0.0,
-        max_runtime_remaining_seconds=None,
-        waiting_on_long_command=False,
-    ) == 0.01
-
-
-def test_alternative_reviewer_claude_stream_monitor_tracks_bash_tool_state() -> None:
-    module = load_alternative_reviewer_module()
-    monitor = module.ClaudeStreamActivityMonitor()
-    tool_use_event = json.dumps(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_1",
-                        "name": "Bash",
-                        "input": {"command": "sleep 1"},
-                    }
-                ]
-            },
-        }
-    )
-    split_at = len(tool_use_event) // 2
-
-    monitor.ingest(tool_use_event[:split_at])
-    assert monitor.waiting_on_long_command is False
-    monitor.ingest(tool_use_event[split_at:] + "\n")
-    assert monitor.waiting_on_long_command is True
-    monitor.ingest(
-        json.dumps(
-            {
-                "type": "user",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_1",
-                            "content": "",
-                        }
-                    ]
-                },
-            }
-        )
-        + "\n"
-    )
-    assert monitor.waiting_on_long_command is False
-
-    monitor.ingest(
-        json.dumps(
-            {
-                "type": "assistant",
-                "message": {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "name": "Bash",
-                            "input": {"command": "sleep 1"},
-                        }
-                    ]
-                },
-            }
-        )
-        + "\n"
-    )
-    assert monitor.waiting_on_long_command is True
-    monitor.ingest(json.dumps({"type": "result", "result": "NO_ISSUES"}) + "\n")
-    assert monitor.waiting_on_long_command is False
-
-
-def test_alternative_reviewer_claude_stream_json_extracts_result(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import os, subprocess, sys, time, json; sys.stdin.read(); "
-                "print(json.dumps({'type':'system','subtype':'init'}), flush=True); "
-                "print(json.dumps({'type':'assistant','message':{'content':[{'type':'text','text':'working'}]}}), flush=True); "
-                "time.sleep(0.08); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="claude_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-
-
-def test_alternative_reviewer_codex_json_extracts_agent_message(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import json, os, subprocess, sys; sys.stdin.read(); "
-                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'working'}}), flush=True); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-
-
-def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import json, os, subprocess, sys; sys.stdin.read(); "
-                "print('non-json warning line', flush=True); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'NO_ISSUES'}}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-
-
-def test_alternative_reviewer_codex_json_reports_backend_challenge_html(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    html = (
-        "<!DOCTYPE html><html><head><title>Just a moment...</title></head>"
-        "<body><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1\"></script>"
-        "Cloudflare challenge</body></html>"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            f"import sys; sys.stdin.read(); print({html!r})",
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 1
-    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stdout
-    assert "RVF_CODEX_BACKEND_CHALLENGE" in completed.stderr
-    reviewer_dir = run_dir / "artifacts" / "reviewers" / "test"
-    normalized = next(reviewer_dir.glob("reviewer.normalized*.txt")).read_text(encoding="utf-8")
-    raw_stdout = next(reviewer_dir.glob("reviewer.stdout*.txt")).read_text(encoding="utf-8")
-    summary = json.loads(next(reviewer_dir.glob("reviewer.summary*.json")).read_text(encoding="utf-8"))
-    assert normalized.startswith("RVF_CODEX_BACKEND_CHALLENGE")
-    assert "challenge-platform" in raw_stdout
-    assert summary["output_error_reason"] == "codex_backend_challenge"
-
-
-def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    shim = tmp_path / "codex"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["codex", "exec"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == [
-        "--disable",
-        "hooks",
-        "exec",
-        "--json",
-        "--add-dir",
-        str(run_dir.resolve()),
-        "-",
-    ]
-
-
-def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    shim = tmp_path / "codex"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["codex", "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == [
-        "--ask-for-approval",
-        "never",
-        "--disable",
-        "hooks",
-        "exec",
-        "--sandbox",
-        "workspace-write",
-        "--json",
-        "--add-dir",
-        str(run_dir.resolve()),
-        "-",
-    ]
-
-
-def test_alternative_reviewer_codex_hooks_disable_is_not_duplicated() -> None:
-    module = load_alternative_reviewer_module()
-    command = ["codex", "--disable", "hooks", "exec", "--json", "-"]
-    assert module.ensure_codex_hooks_disabled_command(command) == command
-    assert module.ensure_codex_hooks_disabled_command(
-        ["codex", "--disable=hooks", "exec", "--json", "-"]
-    ) == ["codex", "--disable=hooks", "exec", "--json", "-"]
-
-
-def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "codex"
-    sink = tmp_path / "env.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps({"
-                "'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK'), "
-                "'thread': os.environ.get('CODEX_THREAD_ID')"
-                "}))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["codex", "exec"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="codex_json",
-    )
-
-    env = os.environ.copy()
-    env["PATH"] = f"{tmp_path}:{env.get('PATH', '')}"
-    env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
-    env.pop("RVF_SUPPRESS_STOP_HOOK", None)
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    payload = json.loads(sink.read_text(encoding="utf-8"))
-    assert payload == {
-        "suppress": "1",
-        "thread": "parent-thread-id-for-regression-test",
-    }
-
-
-def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "claude"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["claude", "-p"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format=None,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert "--output-format" in argv
-    assert "stream-json" in argv
-    assert "--include-hook-events" in argv
-    assert "--include-partial-messages" in argv
-    assert "--verbose" in argv
-    assert "--disable-slash-commands" in argv
-
-
-def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "claude"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print('NO_ISSUES', flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["claude", "-p", "--output-format", "text"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format=None,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["-p", "--output-format", "text"]
-
-
-def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "stream_wrapper"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'result','result':'NO_ISSUES'}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-u", str(shim), "--native-stream"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="claude_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    assert json.loads(sink.read_text(encoding="utf-8")) == ["--native-stream"]
-
-
-def test_alternative_reviewer_cursor_stream_json_extracts_result(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [
-            sys.executable,
-            "-u",
-            "-c",
-            (
-                "import os, subprocess, sys, time, json; sys.stdin.read(); "
-                "print(json.dumps({'type':'system','subtype':'init','model':'Composer 2.5'}), flush=True); "
-                "print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'working'}]}}), flush=True); "
-                "time.sleep(0.08); "
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
-                "print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'NO_ISSUES'}), flush=True)"
-            ),
-        ],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="cursor_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-
-
 def _cursor_tool_call_line(tool_key: str, result: dict) -> str:
     return json.dumps(
         {
@@ -6525,1020 +2888,6 @@ def test_cursor_stream_tool_layer_health_classifier_and_summary() -> None:
         ]
     )
     assert health.summarize_cursor_stream_tool_layer(healthy_stream)["healthy"] is True
-
-
-def test_alternative_reviewer_cursor_stream_monitor_detects_tool_layer_failure() -> None:
-    module = load_alternative_reviewer_module()
-    spawn_error = _cursor_tool_call_line(
-        "shellToolCall", {"spawnError": {"command": "", "workingDirectory": "", "error": "returned no exit status"}}
-    )
-
-    # 阈值前不触发；达到阈值（且零成功）触发；split 字节边界仍能识别
-    monitor = module.CursorStreamActivityMonitor(tool_failure_threshold=3)
-    monitor.ingest(spawn_error + "\n")
-    monitor.ingest(spawn_error + "\n")
-    assert monitor.tool_layer_unavailable is False
-    half = len(spawn_error) // 2
-    monitor.ingest(spawn_error[:half])
-    assert monitor.tool_layer_unavailable is False
-    monitor.ingest(spawn_error[half:] + "\n")
-    assert monitor.tool_layer_unavailable is True
-    # cursor monitor 刻意不抑制 idle 超时
-    assert monitor.waiting_on_long_command is False
-
-    # 出现过一次成功 => 工具层是好的，后续失败也不判不可用
-    mixed = module.CursorStreamActivityMonitor(tool_failure_threshold=2)
-    mixed.ingest(_cursor_tool_call_line("readToolCall", {"success": {"content": "x"}}) + "\n")
-    for _ in range(5):
-        mixed.ingest(spawn_error + "\n")
-    assert mixed.tool_successes == 1
-    assert mixed.tool_runtime_failures == 5
-    assert mixed.tool_layer_unavailable is False
-
-
-def test_alternative_reviewer_cursor_tool_layer_failure_fast_aborts(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    spawn_error_event = {
-        "type": "tool_call",
-        "subtype": "completed",
-        "tool_call": {
-            "shellToolCall": {"result": {"spawnError": {"command": "", "workingDirectory": "", "error": "returned no exit status"}}}
-        },
-    }
-    # 假 reviewer：发 init/叙述，再连发 3 条 spawnError（工具层坏），然后长睡。
-    # idle_timeout 设很大（30s）：若 fast-abort 失效，测试会因等到 idle 而超慢/原因不符而失败。
-    fake = (
-        "import sys, time, json; sys.stdin.read(); "
-        "print(json.dumps({'type':'system','subtype':'init','model':'Composer 2.5'}), flush=True); "
-        "print(json.dumps({'type':'assistant','message':{'role':'assistant','content':[{'type':'text','text':'probing tools'}]}}), flush=True); "
-        f"ev = {json.dumps(spawn_error_event)}; "
-        "[ (print(json.dumps(ev), flush=True), time.sleep(0.05)) for _ in range(3) ]; "
-        "time.sleep(30)"
-    )
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        [sys.executable, "-u", "-c", fake],
-        idle_timeout_seconds=30.0,
-        activity_check_interval_seconds=0.05,
-        tool_failure_threshold=3,
-        output_format="cursor_stream_json",
-    )
-
-    started = time.monotonic()
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-            "--rvf-run-id",
-            "cursor-tool-layer-fast-abort",
-            "--rvf-run-dir",
-            str(run_dir),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    elapsed = time.monotonic() - started
-
-    assert completed.returncode == 124, completed.stderr
-    assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
-    # 关键：远早于 idle_timeout(30s) 就因工具层判定而终止
-    assert elapsed < 15.0, f"fast-abort 应远早于 idle_timeout，实际 {elapsed:.1f}s"
-    summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    assert summary["timeout_reason"] == "cursor_tool_layer_unavailable", summary
-    assert summary["terminated_signal"] == "SIGKILL"
-
-
-def test_alternative_reviewer_cursor_command_not_claude_patched(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "cursor-agent"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["cursor-agent", "-p"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format="cursor_stream_json",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    # ensure_cursor_stream_json_command 只补 print + stream-json，绝不注入 claude 专属 flag。
-    assert argv == ["-p", "--output-format", "stream-json"], argv
-    for claude_only_flag in (
-        "--include-hook-events",
-        "--include-partial-messages",
-        "--verbose",
-        "--disable-slash-commands",
-    ):
-        assert claude_only_flag not in argv, claude_only_flag
-
-
-def test_alternative_reviewer_cursor_autodetects_stream_json(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    shim = tmp_path / "cursor-agent"
-    sink = tmp_path / "argv.json"
-    shim.write_text(
-        "\n".join(
-            [
-                f"#!{sys.executable}",
-                "import json, os, subprocess, sys",
-                "open(%r, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))" % str(sink),
-                "sys.stdin.read()",
-                "print(json.dumps({'type':'system','subtype':'init'}), flush=True)",
-                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
-                "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True)",
-                "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)",
-            ]
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    shim.chmod(0o755)
-    # 故意不在 config 中写 output_format：依赖 is_cursor_print_command 自动判定为 cursor_stream_json。
-    config = write_alternative_reviewer_config(
-        tmp_path / "alternative-reviewer.json",
-        ["cursor-agent", "-p"],
-        idle_timeout_seconds=5.0,
-        activity_check_interval_seconds=0.05,
-        output_format=None,
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(RUN_ALTERNATIVE_REVIEWER),
-            "--config",
-            str(config),
-            "--repo",
-            str(repo),
-            "--review-packet",
-            str(packet),
-        ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    # 若 autodetect 误判为 text，stdout 会含 init JSON 行；等于 NO_ISSUES 证明走了 result 提取。
-    assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
-    argv = json.loads(sink.read_text(encoding="utf-8"))
-    assert argv == ["-p", "--output-format", "stream-json"], argv
-
-
-def test_cline_kanban_client_detects_runtime_port() -> None:
-    module = load_cline_kanban_client_module()
-    assert module.DEFAULT_START_CMD == "kanban --no-open"
-    assert module.DEFAULT_TASK_CMD == "kanban task"
-    assert module.resolve_runtime_port(
-        start_cmd=module.DEFAULT_START_CMD,
-        task_cmd=module.DEFAULT_TASK_CMD,
-        env={},
-    ) == 3484
-    assert module.resolve_runtime_port(
-        start_cmd="kanban --port 3499 --no-open",
-        task_cmd="kanban task",
-        env={},
-    ) == 3499
-    assert module.resolve_runtime_port(
-        start_cmd="kanban --port=3500 --no-open",
-        task_cmd="kanban --port=3500 task",
-        env={},
-    ) == 3500
-    assert module.resolve_runtime_port(task_cmd="env KANBAN_RUNTIME_PORT=3502 kanban task", env={}) == 3502
-    assert module.resolve_runtime_port(task_cmd="kanban task", env={"KANBAN_RUNTIME_PORT": "3501"}) == 3501
-
-
-def test_cline_kanban_client_rejects_ambiguous_runtime_ports() -> None:
-    module = load_cline_kanban_client_module()
-    for kwargs, expected in (
-        (
-            {
-                "start_cmd": "kanban --port auto --no-open",
-                "task_cmd": "kanban task",
-                "env": {},
-            },
-            "--port auto is not supported",
-        ),
-        (
-            {
-                "start_cmd": "kanban --port 3499 --no-open",
-                "task_cmd": "kanban --port 3500 task",
-                "env": {},
-            },
-            "conflicting Cline Kanban runtime ports",
-        ),
-    ):
-        try:
-            module.resolve_runtime_port(**kwargs)
-        except module.KanbanError as exc:
-            assert expected in str(exc)
-        else:
-            raise AssertionError(f"expected KanbanError containing {expected!r}")
-
-
-def test_cline_kanban_client_reports_missing_stable_binary() -> None:
-    module = load_cline_kanban_client_module()
-    try:
-        module.run_command(["rvf-missing-kanban-command-for-test"], check=False)
-    except module.KanbanError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("expected missing kanban command to raise KanbanError")
-    assert "Cline Kanban command not found" in message
-    assert "npm install -g kanban@0.1.67" in message
-    assert "does not use npx" in message
-
-
-def test_cline_kanban_client_accepts_cline_tmux_listener_from_foreign_cwd(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    repo.mkdir(parents=True)
-    other.mkdir()
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json\n"
-        "print(json.dumps({'ok': True, 'tasks': []}))\n",
-        encoding="utf-8",
-    )
-
-    original_listener_pids = module.listener_pids_for_port
-    original_process_cwd = module.process_cwd
-    original_process_command = module.process_command
-    original_tmux_sessions = module.tmux_sessions_for_pid
-    try:
-        module.listener_pids_for_port = lambda port: [4242]
-        module.process_cwd = lambda pid: other
-        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
-        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
-        result = module.ensure_kanban(
-            task_cmd=f"{sys.executable} {fake_task}",
-            start_cmd="kanban --no-open",
-            repo=repo,
-            tmux_session="unused",
-            timeout_seconds=0,
-            start_if_needed=False,
-        )
-    finally:
-        module.listener_pids_for_port = original_listener_pids
-        module.process_cwd = original_process_cwd
-        module.process_command = original_process_command
-        module.tmux_sessions_for_pid = original_tmux_sessions
-
-    assert result["started"] is False
-    assert result["list"]["ok"] is True
-
-
-def test_cline_kanban_client_accepts_cline_tmux_listener_through_parent_pane() -> None:
-    module = load_cline_kanban_client_module()
-    original_run_command = module.run_command
-    original_process_parent_pid = module.process_parent_pid
-    try:
-        module.process_parent_pid = lambda pid: {4242: 1000, 1000: 1}.get(pid)
-
-        def fake_run_command(command, **kwargs):
-            if command[:3] == ["tmux", "list-panes", "-a"]:
-                return subprocess.CompletedProcess(
-                    command,
-                    0,
-                    stdout="cline-kanban-3484\t1000\nrvf-other\t7777\n",
-                    stderr="",
-                )
-            raise AssertionError(f"unexpected command: {command!r}")
-
-        module.run_command = fake_run_command
-        sessions = module.tmux_sessions_for_pid(4242)
-    finally:
-        module.run_command = original_run_command
-        module.process_parent_pid = original_process_parent_pid
-
-    assert sessions == ["cline-kanban-3484"]
-
-
-def test_cline_kanban_client_rejects_listener_without_cline_tmux_session(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    repo.mkdir(parents=True)
-    other.mkdir()
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json\n"
-        "print(json.dumps({'ok': True, 'tasks': []}))\n",
-        encoding="utf-8",
-    )
-
-    original_listener_pids = module.listener_pids_for_port
-    original_process_cwd = module.process_cwd
-    original_process_command = module.process_command
-    original_tmux_sessions = module.tmux_sessions_for_pid
-    try:
-        module.listener_pids_for_port = lambda port: [4242]
-        module.process_cwd = lambda pid: other
-        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
-        module.tmux_sessions_for_pid = lambda pid: ["rvf-vibe-kanban"]
-        try:
-            module.ensure_kanban(
-                task_cmd=f"{sys.executable} {fake_task}",
-                start_cmd="kanban --no-open",
-                repo=repo,
-                tmux_session="unused",
-                timeout_seconds=0,
-                start_if_needed=False,
-            )
-        except module.KanbanError as exc:
-            message = str(exc)
-        else:
-            raise AssertionError("expected non-Cline Kanban tmux listener to be rejected")
-    finally:
-        module.listener_pids_for_port = original_listener_pids
-        module.process_cwd = original_process_cwd
-        module.process_command = original_process_command
-        module.tmux_sessions_for_pid = original_tmux_sessions
-
-    assert "no listener pane belongs to tmux session `cline-kanban`" in message
-    assert "rvf-vibe-kanban" in message
-
-
-def test_cline_kanban_client_accepts_workspace_payload_from_cline_tmux_listener(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    repo.mkdir(parents=True)
-    other.mkdir()
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json, sys\n"
-        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
-        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
-        encoding="utf-8",
-    )
-
-    original_listener_pids = module.listener_pids_for_port
-    original_process_cwd = module.process_cwd
-    original_process_command = module.process_command
-    original_tmux_sessions = module.tmux_sessions_for_pid
-    try:
-        module.listener_pids_for_port = lambda port: [4242]
-        module.process_cwd = lambda pid: other
-        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
-        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
-        result = module.ensure_kanban(
-            task_cmd=f"{sys.executable} {fake_task}",
-            start_cmd="npx -y kanban@0.1.66 --no-open",
-            repo=repo,
-            tmux_session="unused",
-            timeout_seconds=0,
-            start_if_needed=False,
-        )
-    finally:
-        module.listener_pids_for_port = original_listener_pids
-        module.process_cwd = original_process_cwd
-        module.process_command = original_process_command
-        module.tmux_sessions_for_pid = original_tmux_sessions
-
-    assert result["started"] is False
-    assert result["list"]["workspacePath"] == str(repo)
-
-
-def test_cline_kanban_client_rejects_workspace_payload_without_cline_tmux_listener(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    repo.mkdir(parents=True)
-    other.mkdir()
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json, sys\n"
-        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
-        "print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': []}))\n",
-        encoding="utf-8",
-    )
-
-    original_listener_pids = module.listener_pids_for_port
-    original_process_cwd = module.process_cwd
-    original_process_command = module.process_command
-    original_tmux_sessions = module.tmux_sessions_for_pid
-    try:
-        module.listener_pids_for_port = lambda port: [4242]
-        module.process_cwd = lambda pid: other
-        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
-        module.tmux_sessions_for_pid = lambda pid: []
-        try:
-            module.ensure_kanban(
-                task_cmd=f"{sys.executable} {fake_task}",
-                start_cmd="npx -y kanban@0.1.66 --no-open",
-                repo=repo,
-                tmux_session="unused",
-                timeout_seconds=0,
-                start_if_needed=False,
-            )
-        except module.KanbanError as exc:
-            message = str(exc)
-        else:
-            raise AssertionError("expected workspace echo without Cline Kanban tmux listener to be rejected")
-    finally:
-        module.listener_pids_for_port = original_listener_pids
-        module.process_cwd = original_process_cwd
-        module.process_command = original_process_command
-        module.tmux_sessions_for_pid = original_tmux_sessions
-
-    assert "no listener pane belongs to tmux session `cline-kanban`" in message
-    assert str(other) in message
-
-
-def test_cline_kanban_client_does_not_start_when_listener_exists_but_list_fails(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = tmp_path / "repo"
-    other = tmp_path / "other"
-    repo.mkdir(parents=True)
-    other.mkdir()
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import sys\n"
-        "print('task list failed', file=sys.stderr)\n"
-        "raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-
-    started: list[object] = []
-    original_listener_pids = module.listener_pids_for_port
-    original_process_cwd = module.process_cwd
-    original_process_command = module.process_command
-    original_tmux_sessions = module.tmux_sessions_for_pid
-    original_start = module.start_kanban_server
-    try:
-        module.listener_pids_for_port = lambda port: [4242]
-        module.process_cwd = lambda pid: other
-        module.process_command = lambda pid: "node /usr/local/bin/kanban --no-open"
-        module.tmux_sessions_for_pid = lambda pid: ["cline-kanban-3484"]
-        module.start_kanban_server = lambda **kwargs: started.append(kwargs) or {}
-        try:
-            module.ensure_kanban(
-                task_cmd=f"{sys.executable} {fake_task}",
-                start_cmd="npx -y kanban@0.1.66 --no-open",
-                repo=repo,
-                tmux_session="unused",
-                timeout_seconds=0,
-                start_if_needed=True,
-            )
-        except module.KanbanError as exc:
-            message = str(exc)
-        else:
-            raise AssertionError("expected existing listener connection failure")
-    finally:
-        module.listener_pids_for_port = original_listener_pids
-        module.process_cwd = original_process_cwd
-        module.process_command = original_process_command
-        module.tmux_sessions_for_pid = original_tmux_sessions
-        module.start_kanban_server = original_start
-
-    assert started == []
-    assert "will not start another Kanban server" in message
-    assert "task list failed" in message
-
-
-def test_cline_kanban_client_create_and_start_task(tmp_path: Path) -> None:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    fake_task = tmp_path / "fake_kanban_task.py"
-    calls = tmp_path / "calls.jsonl"
-    fake_task.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({\n"
-        "        'argv': sys.argv[1:],\n"
-        "        'port': os.environ.get('KANBAN_RUNTIME_PORT'),\n"
-        "    }) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': []}))\n"
-        "elif sys.argv[1] == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-1'}))\n"
-        "elif sys.argv[1] == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-1', 'status': 'started'}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-1', 'message_id': 'msg-1', 'status': 'queued'}))\n"
-        "elif sys.argv[1] == 'trash':\n"
-        "    print(json.dumps({'task_id': 'task-1', 'status': 'trashed'}))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-    repo = init_repo(tmp_path / "repo")
-    env = os.environ.copy()
-    env.pop("KANBAN_RUNTIME_PORT", None)
-    env["CODEX_RVF_CLINE_KANBAN_START_CMD"] = "kanban --port 45678"
-    env["KANBAN_CALLS"] = str(calls)
-    task_cmd = f"{sys.executable} {fake_task}"
-    ensure = run(
-        [
-            sys.executable,
-            str(CLINE_KANBAN_CLIENT),
-            "ensure",
-            "--repo",
-            str(repo),
-            "--task-cmd",
-            task_cmd,
-        ],
-        env=env,
-    )
-    assert json.loads(ensure.stdout)["started"] is False
-    prep_file = tmp_path / "dispatch-prep.json"
-    create = run([
-        sys.executable,
-        str(CLINE_KANBAN_CLIENT),
-        "create",
-        "--repo",
-        str(repo),
-        "--task-cmd",
-        task_cmd,
-        "--base-ref",
-        "HEAD",
-        "--prompt",
-        "hello",
-        "--title",
-        "RVF test",
-        "--agent-id",
-        "codex",
-        "--parent-session-id",
-        "parent-session",
-        "--worktree-mode",
-        "branch",
-        "--prep-file-path",
-        str(prep_file),
-    ], env=env)
-    assert json.loads(create.stdout)["task_id"] == "task-1"
-    started = run([
-        sys.executable,
-        str(CLINE_KANBAN_CLIENT),
-        "start",
-        "--repo",
-        str(repo),
-        "--task-cmd",
-        task_cmd,
-        "--task-id",
-        "task-1",
-        "--worktree-mode",
-        "inplace",
-    ], env=env)
-    started_payload = json.loads(started.stdout)
-    assert started_payload["status"] == "started"
-    assert Path(started_payload["workspace_path"]).resolve() == repo.resolve()
-    prompt_file = tmp_path / "prompt.md"
-    prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
-    message = run([
-        sys.executable,
-        str(CLINE_KANBAN_CLIENT),
-        "message",
-        "--repo",
-        str(repo),
-        "--task-cmd",
-        task_cmd,
-        "--task-id",
-        "task-1",
-        "--prompt-file",
-        str(prompt_file),
-        "--source",
-        "review-validate-fix",
-        "--idempotency-key",
-        "run-1",
-    ], env=env)
-    assert json.loads(message.stdout)["message_id"] == "msg-1"
-    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert [entry["argv"][0] for entry in recorded] == ["list", "create", "start", "list", "message"]
-    assert [entry["port"] for entry in recorded] == ["45678", "45678", "45678", "45678", "45678"]
-    create_call = recorded[1]["argv"]
-    assert create_call[create_call.index("--title") + 1] == "RVF test"
-    assert create_call[create_call.index("--agent-id") + 1] == "codex"
-    assert create_call[create_call.index("--parent-session-id") + 1] == "parent-session"
-    assert create_call[create_call.index("--worktree-mode") + 1] == "branch"
-    assert create_call[create_call.index("--prep-file-path") + 1] == str(prep_file.resolve())
-    start_call = recorded[2]["argv"]
-    assert start_call[start_call.index("--task-id") + 1] == "task-1"
-    message_call = recorded[4]["argv"]
-    assert message_call[message_call.index("--task-id") + 1] == "task-1"
-    assert message_call[message_call.index("--prompt-file") + 1] == str(prompt_file.resolve())
-    assert message_call[message_call.index("--idempotency-key") + 1] == "run-1"
-
-
-def test_cline_kanban_client_rejects_main_worktree_mode(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(CLINE_KANBAN_CLIENT),
-            "create",
-            "--repo",
-            str(repo),
-            "--base-ref",
-            "HEAD",
-            "--prompt",
-            "hello",
-            "--worktree-mode",
-            "main",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 2
-    assert "invalid choice: 'main'" in completed.stderr
-
-
-def test_cline_kanban_client_start_task_uses_session_cwd_workspace(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = init_repo(tmp_path / "repo")
-    task_repo = init_repo(tmp_path / "task-worktree" / "repo")
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json, sys\n"
-        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
-        "if sys.argv[1] == 'start':\n"
-        "    print(json.dumps({'ok': True, 'task': {'id': 'task-1', 'workspacePath': project_path}}))\n"
-        "elif sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
-        "        {'id': 'task-1', 'workspacePath': project_path, 'session': {'pid': 4242}}\n"
-        "    ]}))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-
-    original_process_cwd = module.process_cwd
-    try:
-        module.process_cwd = lambda pid: task_repo if pid == 4242 else None
-        payload = module.start_task(
-            task_cmd=f"{sys.executable} {fake_task}",
-            repo=repo,
-            task_id="task-1",
-            worktree_mode="branch",
-        )
-    finally:
-        module.process_cwd = original_process_cwd
-
-    assert payload["task_id"] == "task-1"
-    assert Path(payload["workspace_path"]).resolve() == task_repo.resolve()
-    assert Path(payload["project_path"]).resolve() == repo.resolve()
-    assert payload["workspace_path_source"] == "task_session_cwd"
-
-
-def test_cline_kanban_client_branch_mode_prefers_task_workspace_over_project_path(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = init_repo(tmp_path / "repo")
-    task_repo = init_repo(tmp_path / "task-worktree" / "repo")
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json, sys\n"
-        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
-        f"task_path = {str(task_repo)!r}\n"
-        "if sys.argv[1] == 'start':\n"
-        "    print(json.dumps({'ok': True, 'projectPath': project_path, 'task': {\n"
-        "        'id': 'task-1', 'workspacePath': task_path\n"
-        "    }}))\n"
-        "elif sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
-        "        {'id': 'task-1', 'workspacePath': task_path, 'session': None}\n"
-        "    ]}))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-
-    payload = module.start_task(
-        task_cmd=f"{sys.executable} {fake_task}",
-        repo=repo,
-        task_id="task-1",
-        worktree_mode="branch",
-    )
-
-    assert Path(payload["workspace_path"]).resolve() == task_repo.resolve()
-    assert Path(payload["project_path"]).resolve() == repo.resolve()
-    assert payload["workspace_path_source"] == "task_payload_workspace_path"
-
-
-def test_cline_kanban_client_branch_mode_rejects_parent_project_workspace(tmp_path: Path) -> None:
-    module = load_cline_kanban_client_module()
-    repo = init_repo(tmp_path / "repo")
-    fake_task = tmp_path / "fake_kanban_task.py"
-    fake_task.write_text(
-        "import json, sys\n"
-        "project_path = sys.argv[sys.argv.index('--project-path') + 1]\n"
-        "if sys.argv[1] == 'start':\n"
-        "    print(json.dumps({'ok': True, 'task': {'id': 'task-1', 'workspacePath': project_path}}))\n"
-        "elif sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'workspacePath': project_path, 'tasks': [\n"
-        "        {'id': 'task-1', 'workspacePath': project_path, 'session': None}\n"
-        "    ]}))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-
-    original_timeout = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT")
-    try:
-        os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT"] = "0"
-        module.start_task(
-            task_cmd=f"{sys.executable} {fake_task}",
-            repo=repo,
-            task_id="task-1",
-            worktree_mode="branch",
-        )
-    except module.KanbanError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("expected branch mode parent project workspace to be rejected")
-    finally:
-        if original_timeout is None:
-            os.environ.pop("CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT", None)
-        else:
-            os.environ["CODEX_RVF_CLINE_KANBAN_WORKSPACE_TIMEOUT"] = original_timeout
-
-    assert "parent project path in branch mode" in message
-    assert str(repo) in message
-
-
-def test_cline_kanban_client_message_accepts_response_without_task_id(tmp_path: Path) -> None:
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    fake_task = tmp_path / "fake_kanban_task.py"
-    calls = tmp_path / "calls.jsonl"
-    fake_task.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-        "if sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'message_id': 'msg-1', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-    repo = init_repo(tmp_path / "repo")
-    prompt_file = tmp_path / "prompt.md"
-    prompt_file.write_text("$review-validate-fix\n", encoding="utf-8")
-    env = os.environ.copy()
-    env["KANBAN_CALLS"] = str(calls)
-    task_cmd = f"{sys.executable} {fake_task}"
-
-    message = run([
-        sys.executable,
-        str(CLINE_KANBAN_CLIENT),
-        "message",
-        "--repo",
-        str(repo),
-        "--task-cmd",
-        task_cmd,
-        "--task-id",
-        "task-1",
-        "--prompt-file",
-        str(prompt_file),
-        "--source",
-        "review-validate-fix",
-        "--idempotency-key",
-        "run-1",
-    ], env=env)
-
-    payload = json.loads(message.stdout)
-    assert payload["task_id"] == "task-1"
-    assert payload["message_id"] == "msg-1"
-    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-1"
-
-
-def test_prepare_review_run_writes_worktree_bootstrap(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
-    (repo / "tracked.txt").write_text("base\n\n", encoding="utf-8")
-    run(["git", "add", "tracked.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "blank context"], cwd=repo)
-    (repo / "tracked.txt").write_text("changed\n\n", encoding="utf-8")
-    (repo / "owned.txt").write_text("owned untracked\n", encoding="utf-8")
-    (repo / "background.txt").write_text("background\n", encoding="utf-8")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(json.dumps({
-        "repo": str(repo),
-        "owned_paths": ["tracked.txt", "owned.txt"],
-        "owned_dirty_paths": ["tracked.txt", "owned.txt"],
-        "unattributed_dirty_paths": ["background.txt"],
-        "confidence": "high",
-    }), encoding="utf-8")
-    context = tmp_path / "context.md"
-    context.write_text("scope\n", encoding="utf-8")
-    completed = run([
-        sys.executable,
-        str(PREPARE_REVIEW_RUN),
-        "--repo",
-        str(repo),
-        "--session-context",
-        str(context),
-        "--session-manifest",
-        str(manifest),
-    ])
-    payload = json.loads(completed.stdout)
-    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
-    assert bootstrap["tracked_paths"] == ["tracked.txt"]
-    # Full-dirty bootstrap: both session-owned and unattributed untracked files
-    # are now copied; background.txt is part of the bootstrap snapshot too.
-    assert sorted(item["path"] for item in bootstrap["untracked_files"]) == [
-        "background.txt",
-        "owned.txt",
-    ]
-    assert bootstrap["bootstrap_kind"] == "full-dirty"
-    assert bootstrap["session_owned_dirty_paths"] == ["owned.txt", "tracked.txt"]
-    assert bootstrap["unattributed_dirty_paths"] == ["background.txt"]
-    assert bootstrap["unattributed_path_count"] == 1
-    assert "tracked.txt" in Path(payload["worktree_bootstrap_patch"]).read_text(encoding="utf-8")
-    clean = tmp_path / "clean"
-    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp_path)
-    run(["git", "apply", "--check", str(payload["worktree_bootstrap_patch"])], cwd=clean)
-
-
-def test_prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore(
-    tmp_path: Path,
-) -> None:
-    repo = init_repo(tmp_path / "repo")
-    run(["git", "checkout", "--", "tracked.txt"], cwd=repo)
-    (repo / "tracked.txt").write_text("base\n\n", encoding="utf-8")
-    run(["git", "add", "tracked.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "blank context"], cwd=repo)
-    (repo / "tracked.txt").write_text("changed\n\n", encoding="utf-8")
-    (repo / "dist").mkdir()
-    (repo / "dist" / "build.js").write_text("compiled\n", encoding="utf-8")
-    (repo / "node_modules").mkdir()
-    (repo / "node_modules" / "lib.js").write_text("vendor\n", encoding="utf-8")
-    (repo / "owned.txt").write_text("real owned\n", encoding="utf-8")
-    (repo / ".review-validate-fix-ignore").write_text("dist/\nnode_modules/\n", encoding="utf-8")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "repo": str(repo),
-                "owned_paths": ["tracked.txt", "owned.txt"],
-                "owned_dirty_paths": ["tracked.txt", "owned.txt"],
-                "unattributed_dirty_paths": ["dist/build.js", "node_modules/lib.js"],
-                "confidence": "high",
-            }
-        ),
-        encoding="utf-8",
-    )
-    context = tmp_path / "context.md"
-    context.write_text("scope\n", encoding="utf-8")
-    completed = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-        ]
-    )
-    payload = json.loads(completed.stdout)
-    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
-    paths_in_bootstrap = set(bootstrap["owned_dirty_paths"])
-    assert "dist/build.js" not in paths_in_bootstrap
-    assert "node_modules/lib.js" not in paths_in_bootstrap
-    assert "owned.txt" in paths_in_bootstrap
-    assert "tracked.txt" in paths_in_bootstrap
-    assert bootstrap["bootstrap_kind"] == "session-owned-only"
-    # Both ignored paths land in ignored_dirty_paths for transparency.
-    ignored = set(bootstrap.get("ignored_dirty_paths") or [])
-    assert "dist/build.js" in ignored
-    assert "node_modules/lib.js" in ignored
-
-
-def test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide(
-    tmp_path: Path,
-) -> None:
-    repo = init_repo(tmp_path / "repo")
-    (repo / "a").mkdir()
-    (repo / "a" / "b.txt").write_text("slash path\n", encoding="utf-8")
-    (repo / "a__b.txt").write_text("flat path\n", encoding="utf-8")
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "repo": str(repo),
-                "owned_paths": ["a/b.txt", "a__b.txt"],
-                "owned_dirty_paths": ["a/b.txt", "a__b.txt"],
-                "unattributed_dirty_paths": [],
-                "confidence": "high",
-            }
-        ),
-        encoding="utf-8",
-    )
-    context = tmp_path / "context.md"
-    context.write_text("scope\n", encoding="utf-8")
-
-    completed = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest),
-        ]
-    )
-    payload = json.loads(completed.stdout)
-    bootstrap = json.loads(Path(payload["worktree_bootstrap"]).read_text(encoding="utf-8"))
-    stored_paths = [item["stored_path"] for item in bootstrap["untracked_files"]]
-    assert [item["path"] for item in bootstrap["untracked_files"]] == ["a/b.txt", "a__b.txt"]
-    assert len(set(stored_paths)) == 2
-
-    clean = tmp_path / "clean"
-    run(["git", "clone", "-q", str(repo), str(clean)], cwd=tmp_path)
-    run(
-        [
-            sys.executable,
-            str(APPLY_WORKTREE_BOOTSTRAP),
-            "--metadata",
-            str(payload["worktree_bootstrap"]),
-            "--repo",
-            str(clean),
-        ]
-    )
-    assert (clean / "a" / "b.txt").read_text(encoding="utf-8") == "slash path\n"
-    assert (clean / "a__b.txt").read_text(encoding="utf-8") == "flat path\n"
-
-
-def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    context = tmp_path / "context.md"
-    context.write_text("scope\n", encoding="utf-8")
-    real_state = tmp_path / "real-state"
-    real_state.mkdir()
-    symlink_state = tmp_path / "state-link"
-    symlink_state.symlink_to(real_state, target_is_directory=True)
-    env = os.environ.copy()
-    env["CODEX_RVF_STATE_DIR"] = str(symlink_state)
-
-    completed = run(
-        [
-            sys.executable,
-            str(PREPARE_REVIEW_RUN),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-        ],
-        env=env,
-    )
-
-    payload = json.loads(completed.stdout)
-    metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
-    assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
-    assert str(real_state.resolve()) in payload["scope_of_work_file"]
 
 
 def test_apply_worktree_bootstrap_replays_tracked_and_untracked(tmp_path: Path) -> None:
@@ -7752,130 +3101,6 @@ def _write_session_transcript(path: Path, repo: Path, *, session_id: str, target
     return path
 
 
-def test_diff_tracker_register_creates_sqlite_and_events(tmp: Path) -> None:
-    import sqlite3 as _sqlite
-
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    result = module.register_claims(
-        repo=repo,
-        session_id="session-1",
-        run_id="run-1",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    assert result.status == "ok"
-    assert result.repo_key
-    assert result.tracker_dir
-    tracker_path = Path(result.tracker_dir)
-    # Slice 2-A: tracker dir lives under diff-tracker/repos/<key>/
-    assert "diff-tracker" in tracker_path.parts and "repos" in tracker_path.parts
-    db_path = tracker_path / "tracker.sqlite3"
-    assert db_path.is_file()
-    assert (tracker_path / "events.jsonl").is_file()
-    assert (tracker_path / "meta.json").is_file()
-    conn = _sqlite.connect(str(db_path))
-    try:
-        units = conn.execute(
-            "SELECT path, kind, observed_state, review_state FROM units"
-        ).fetchall()
-        assert len(units) == 1, units
-        assert units[0][0] == "tracked.txt"
-        assert units[0][1] == "tracked_hunk"
-        assert units[0][2] == "dirty"
-        assert units[0][3] == "available"
-        sessions = conn.execute(
-            "SELECT session_id FROM sessions"
-        ).fetchall()
-        assert {row[0] for row in sessions} == {"session-1"}
-        session_units = conn.execute(
-            "SELECT session_id, assignment_kind FROM session_units"
-        ).fetchall()
-        assert session_units == [("session-1", "owned")]
-    finally:
-        conn.close()
-    events = read_jsonl(tracker_path / "events.jsonl")
-    assert any(event.get("event") == "claim_added" for event in events)
-    # claim_ids are now content-addressed sha256 unit_ids — sanity check shape.
-    assert len(result.claim_ids) == 1
-    assert len(result.claim_ids[0]) == 64
-
-
-def test_diff_tracker_register_concurrent_writers(tmp: Path) -> None:
-    load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    (repo / "second.txt").write_text("base\nedit b\n", encoding="utf-8")
-    run(["git", "add", "second.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "add second"], cwd=repo)
-    (repo / "second.txt").write_text("base\nedit b session-2\n", encoding="utf-8")
-    log_root = tmp / "logs"
-
-    # Both child processes block until the same absolute wall-clock timestamp
-    # before calling register_claims. Without this barrier the first proc
-    # routinely finishes before the second one even imports diff_tracker, so
-    # the flock/contention path is never exercised — the test would only
-    # confirm "two sequential writers don't drop each other's claims".
-    snippet = (
-        "import os, sys, time, json\n"
-        f"sys.path.insert(0, {str(ROOT)!r})\n"
-        "from pathlib import Path\n"
-        # Bump busy_timeout high enough that the second writer can wait out
-        # the first's lock even under load (4-shard contract checks run several
-        # tests in parallel, slowing each register_claims's git calls).
-        "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
-        f"log_root = Path({str(log_root)!r})\n"
-        f"repo = Path({str(repo)!r})\n"
-        "session = sys.argv[1]\n"
-        "path = sys.argv[2]\n"
-        "wait_until = float(os.environ['CONCURRENT_WAIT_UNTIL'])\n"
-        "remaining = wait_until - time.time()\n"
-        "if remaining > 0:\n"
-        "    time.sleep(remaining)\n"
-        "result = dt.register_claims(\n"
-        "    repo=repo, session_id=session, run_id=session,\n"
-        "    worktree=None, branch=None,\n"
-        "    owned_paths=[path], apply_patch_paths={path}, exec_only_paths=set(),\n"
-        "    log_root_override=log_root,\n"
-        ")\n"
-        "print(json.dumps(result.to_dict()))\n"
-    )
-    # Give both subprocesses ~1.5s to start and import before they unblock.
-    wait_until = time.time() + 1.5
-    env = {**os.environ, "CONCURRENT_WAIT_UNTIL": f"{wait_until:.6f}"}
-    procs = []
-    for session, path in (("session-A", "tracked.txt"), ("session-B", "second.txt")):
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, "-c", snippet, session, path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-        )
-    outputs = [proc.communicate() for proc in procs]
-    for stdout, stderr in outputs:
-        if stderr.strip():
-            raise AssertionError(stderr.strip())
-        payload = json.loads(stdout.strip().splitlines()[-1])
-        assert payload["status"] == "ok"
-    import sqlite3 as _sqlite
-    repo_key = json.loads(outputs[0][0].splitlines()[-1])["repo_key"]
-    db_path = log_root / "diff-tracker" / "repos" / repo_key / "tracker.sqlite3"
-    conn = _sqlite.connect(str(db_path))
-    try:
-        sessions = {row[0] for row in conn.execute("SELECT session_id FROM sessions").fetchall()}
-    finally:
-        conn.close()
-    assert sessions == {"session-A", "session-B"}
-
-
 def test_canonical_patch_hash_stable_across_reruns(tmp: Path) -> None:
     import sqlite3 as _sqlite
 
@@ -7913,360 +3138,6 @@ def test_canonical_patch_hash_stable_across_reruns(tmp: Path) -> None:
     finally:
         conn.close()
     assert len(units) == 1
-
-
-def test_diff_tracker_hunk_anchor_distinguishes_close_hunks(tmp: Path) -> None:
-    """Two distinct edits in the same file must yield two distinct claim_ids
-    on first register, and rerunning the same session must NOT drop or fold
-    them together. This guards against the regression where deriving anchors
-    via `git diff -U0` produced empty `context_lines`, collapsing every
-    fuzzy-match decision down to "ranges within ±5 lines".
-    """
-    module = load_diff_tracker_module()
-    repo = tmp / "repo"
-    repo.mkdir(parents=True)
-    run(["git", "init", "-q"], cwd=repo)
-    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
-    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
-    # 14-line baseline so two well-separated edits stay as two distinct hunks
-    # under -U3 (gap of 8 unchanged lines between them — beyond the 6-line
-    # context window where git would otherwise merge adjacent hunks).
-    baseline = "".join(f"line-{i}\n" for i in range(1, 15))
-    (repo / "tracked.txt").write_text(baseline, encoding="utf-8")
-    run(["git", "add", "tracked.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
-    edited_lines = [f"line-{i}\n" for i in range(1, 15)]
-    edited_lines[0] = "LINE-1\n"    # change line 1
-    edited_lines[9] = "LINE-10\n"   # change line 10 → 2 hunks under -U3
-    (repo / "tracked.txt").write_text("".join(edited_lines), encoding="utf-8")
-    log_root = tmp / "logs"
-
-    import sqlite3 as _sqlite
-
-    first = module.register_claims(
-        repo=repo,
-        session_id="session-close-hunks",
-        run_id="run-1",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    assert first.status == "ok", first.to_dict()
-    # Two distinct hunks → two distinct unit_ids.
-    assert len(first.claim_ids) == 2, first.claim_ids
-    assert len(set(first.claim_ids)) == 2, first.claim_ids
-
-    db_path = Path(first.tracker_dir) / "tracker.sqlite3"
-    conn = _sqlite.connect(str(db_path))
-    try:
-        rows = conn.execute(
-            "SELECT unit_id, hunk_header FROM units WHERE kind='tracked_hunk' ORDER BY hunk_header"
-        ).fetchall()
-    finally:
-        conn.close()
-    assert len(rows) == 2, rows
-    headers = {row[1] for row in rows}
-    assert len(headers) == 2, headers
-    unit_ids = {row[0] for row in rows}
-    assert len(unit_ids) == 2, unit_ids
-
-    # Rerun must be idempotent: same unit_ids, no stale drops, units unchanged.
-    second = module.register_claims(
-        repo=repo,
-        session_id="session-close-hunks",
-        run_id="run-1",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    assert second.status == "ok"
-    assert sorted(first.claim_ids) == sorted(second.claim_ids)
-    assert second.dropped_stale_claim_ids == []
-    conn = _sqlite.connect(str(db_path))
-    try:
-        rows2 = conn.execute("SELECT unit_id FROM units WHERE kind='tracked_hunk'").fetchall()
-    finally:
-        conn.close()
-    assert len(rows2) == 2
-
-
-def test_diff_tracker_register_empty_owned_paths_preserves_session_claim(tmp: Path) -> None:
-    """A second register call with an empty owned_paths list must NOT drop
-    the session's existing claims — that path used to fall through to the
-    drop-all branch, silently moving every claim into tombstones.
-    """
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    seed = module.register_claims(
-        repo=repo,
-        session_id="session-empty",
-        run_id="run-1",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    import sqlite3 as _sqlite
-
-    assert seed.status == "ok"
-    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
-    conn = _sqlite.connect(str(db_path))
-    try:
-        before = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
-        before_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
-    finally:
-        conn.close()
-    assert len(before) == 1
-    assert len(before_tomb) == 0
-
-    noop = module.register_claims(
-        repo=repo,
-        session_id="session-empty",
-        run_id="run-1",
-        worktree=None,
-        branch=None,
-        owned_paths=[],
-        apply_patch_paths=set(),
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    assert noop.status == "no_paths", noop.to_dict()
-    assert noop.claim_ids == []
-    assert noop.dropped_stale_claim_ids == []
-
-    conn = _sqlite.connect(str(db_path))
-    try:
-        after = conn.execute("SELECT unit_id FROM session_units WHERE session_id='session-empty'").fetchall()
-        after_tomb = conn.execute("SELECT tombstone_id FROM tombstones").fetchall()
-    finally:
-        conn.close()
-    assert len(after) == 1
-    assert after[0][0] == seed.claim_ids[0]
-    assert len(after_tomb) == 0
-
-
-def test_diff_tracker_list_conflicts_reports_other_session_overlap(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    module.register_claims(
-        repo=repo,
-        session_id="session-A",
-        run_id="run-A",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
-    conflicts = module.list_conflicts(
-        repo,
-        current_session_id="session-B",
-        owned_units=units,
-        log_root_override=log_root,
-    )
-    assert len(conflicts) == 1
-    payload = conflicts[0].to_dict()
-    assert payload["other_session_id"] == "session-A"
-    assert payload["path"] == "tracked.txt"
-    same_session = module.list_conflicts(
-        repo,
-        current_session_id="session-A",
-        owned_units=units,
-        log_root_override=log_root,
-    )
-    assert same_session == []
-
-
-def test_diff_tracker_path_claim_conflicts_with_hunk_claim(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    # session-A claims tracked.txt with hunk evidence (apply_patch).
-    module.register_claims(
-        repo=repo,
-        session_id="session-A",
-        run_id="run-A",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    # session-B comes in with only a path-level claim — it must overlap.
-    units = [module.OwnedUnit(path="tracked.txt", unit="path", hunk_anchor=None)]
-    conflicts = module.list_conflicts(
-        repo,
-        current_session_id="session-B",
-        owned_units=units,
-        log_root_override=log_root,
-    )
-    assert len(conflicts) == 1
-    assert conflicts[0].to_dict()["unit"] == "hunk"
-
-
-def test_session_manifest_writes_tracker_claim(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
-    manifest_path = tmp / "manifest.json"
-    log_root = tmp / "logs"
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest_path),
-            "--tracker-run-id",
-            "run-tracker",
-        ],
-        env=env,
-    )
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    tracker = payload.get("tracker")
-    assert isinstance(tracker, dict)
-    assert tracker["status"] == "ok"
-    assert tracker["repo_key"]
-    assert tracker["claim_ids"]
-    assert tracker["tracker_dir"]
-    assert any(unit.get("unit") in {"hunk", "path"} for unit in tracker.get("owned_units", []))
-
-
-def test_build_packet_emits_cross_session_conflict_section(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    # Pre-register a claim from a different session so the current run sees a conflict.
-    module.register_claims(
-        repo=repo,
-        session_id="other-session",
-        run_id="run-other",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
-    manifest_path = tmp / "manifest.json"
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest_path),
-            "--tracker-run-id",
-            "run-current",
-        ],
-        env=env,
-    )
-    context = tmp / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：cross-session conflict test\n"
-        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
-        encoding="utf-8",
-    )
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest_path),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ],
-        env=env,
-    )
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert "## Cross-Session Conflicts" in packet_text
-    assert "other-session" in packet_text
-    assert payload["cross_session_conflicts"]
-    assert payload["cross_session_conflicts"][0]["other_session_id"] == "other-session"
-
-
-def test_build_packet_omits_cross_session_section_when_clean(tmp: Path) -> None:
-    repo = init_repo(tmp / "repo")
-    transcript = write_codex_transcript(tmp / "session.jsonl", repo)
-    manifest_path = tmp / "manifest.json"
-    log_root = tmp / "logs"
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root)}
-    run(
-        [
-            sys.executable,
-            str(SESSION_MANIFEST),
-            "--repo",
-            str(repo),
-            "--transcript",
-            str(transcript),
-            "--output",
-            str(manifest_path),
-            "--tracker-run-id",
-            "run-1",
-        ],
-        env=env,
-    )
-    context = tmp / "context.md"
-    context.write_text(
-        "## Session context\n"
-        "- 用户最初的请求 / 意图：no conflict path\n"
-        "- 本 turn 主会话实际完成的工作：updated tracked.txt\n",
-        encoding="utf-8",
-    )
-    packet = tmp / "packet.md"
-    metadata = tmp / "packet.json"
-    run(
-        [
-            sys.executable,
-            str(BUILD_PACKET),
-            "--repo",
-            str(repo),
-            "--session-context",
-            str(context),
-            "--session-manifest",
-            str(manifest_path),
-            "--output",
-            str(packet),
-            "--metadata-output",
-            str(metadata),
-        ],
-        env=env,
-    )
-    packet_text = packet.read_text(encoding="utf-8")
-    payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert "## Cross-Session Conflicts" not in packet_text
-    assert payload["cross_session_conflicts"] == []
 
 
 def test_canonical_patch_hash_stable_under_line_shift(tmp: Path) -> None:
@@ -8663,106 +3534,6 @@ def test_migration_phase1_recovers_when_archive_predates_db_marker(tmp: Path) ->
         e.get("event") == "claim_added" and e.get("claim_id") == "clm-recover-001"
         for e in replayed
     ), new_events
-
-
-def test_diff_tracker_disable_env_short_circuits(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    previous = os.environ.get("RVF_TRACKER_DISABLE")
-
-    def _run_with_disable_value(value: str | None) -> object:
-        if value is None:
-            os.environ.pop("RVF_TRACKER_DISABLE", None)
-        else:
-            os.environ["RVF_TRACKER_DISABLE"] = value
-        return module.register_claims(
-            repo=repo,
-            session_id="session-1",
-            run_id="run-1",
-            worktree=None,
-            branch=None,
-            owned_paths=["tracked.txt"],
-            apply_patch_paths={"tracked.txt"},
-            exec_only_paths=set(),
-            log_root_override=log_root,
-        )
-
-    try:
-        # Truthy values disable.
-        assert _run_with_disable_value("1").status == "disabled"
-        assert not (log_root / "diff-tracker").exists()
-        # `no` / `off` / `false` must NOT disable — they read as "do not
-        # disable", matching user intuition. Previously they silently
-        # disabled because the check was a blacklist.
-        for falsy in ("no", "off", "false", "False", "NO"):
-            res = _run_with_disable_value(falsy)
-            assert res.status == "ok", f"value={falsy!r} unexpectedly disabled tracker"
-    finally:
-        if previous is None:
-            os.environ.pop("RVF_TRACKER_DISABLE", None)
-        else:
-            os.environ["RVF_TRACKER_DISABLE"] = previous
-
-
-def test_diff_tracker_lock_timeout_degrades_gracefully(tmp: Path) -> None:
-    module = load_diff_tracker_module()
-    repo = init_repo(tmp / "repo")
-    log_root = tmp / "logs"
-    # Pre-register so the sqlite file exists.
-    seed = module.register_claims(
-        repo=repo,
-        session_id="seed",
-        run_id="seed",
-        worktree=None,
-        branch=None,
-        owned_paths=["tracked.txt"],
-        apply_patch_paths={"tracked.txt"},
-        exec_only_paths=set(),
-        log_root_override=log_root,
-    )
-    assert seed.status == "ok"
-    db_path = Path(seed.tracker_dir) / "tracker.sqlite3"
-    # External holder takes a BEGIN IMMEDIATE write lock and sleeps so the
-    # next BEGIN IMMEDIATE inside register_claims must contend for it.
-    blocker_script = (
-        "import sqlite3, sys, time\n"
-        "conn = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=10)\n"
-        "conn.execute('BEGIN IMMEDIATE')\n"
-        "sys.stdout.write('LOCKED\\n'); sys.stdout.flush()\n"
-        "time.sleep(float(sys.argv[2]))\n"
-        "conn.execute('ROLLBACK')\n"
-        "conn.close()\n"
-    )
-    blocker = subprocess.Popen(
-        [sys.executable, "-c", blocker_script, str(db_path), "5"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        line = blocker.stdout.readline()
-        assert line.strip() == "LOCKED", f"blocker did not acquire lock; got: {line!r}"
-        # Shrink busy_timeout so the test stays fast.
-        os.environ["RVF_TRACKER_BUSY_TIMEOUT_MS"] = "300"
-        try:
-            result = module.register_claims(
-                repo=repo,
-                session_id="session-blocked",
-                run_id="run-blocked",
-                worktree=None,
-                branch=None,
-                owned_paths=["tracked.txt"],
-                apply_patch_paths={"tracked.txt"},
-                exec_only_paths=set(),
-                log_root_override=log_root,
-            )
-        finally:
-            os.environ.pop("RVF_TRACKER_BUSY_TIMEOUT_MS", None)
-    finally:
-        blocker.terminate()
-        blocker.wait(timeout=5)
-    assert result.status == "lock_timeout"
 
 
 def _slice_2b_repo_with_two_dirty(tmp: Path) -> Path:
@@ -9274,26 +4045,6 @@ def _session_units_evidence_by_path(tracker_dir: str, path: str) -> set[str]:
     return {row[0] for row in rows}
 
 
-def test_diff_tracker_observes_committed_round_units(tmp: Path) -> None:
-    """A committed hunk yields the SAME unit_id as the equivalent dirty
-    observation — the content-identity invariant that makes dedup free (§2/§4)."""
-    dt, _sm, _rbm = _round_baseline_committed_modules()
-    repo, baseline = _committed_round_repo(tmp)
-    # Observe the change while dirty.
-    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
-    dirty_obs = dt._classify_path(repo, "f.txt")
-    dirty_ids = sorted(s.unit_id for s in dt._specs_from_observation(dirty_obs, "f.txt"))
-    # Commit it; worktree is now clean.
-    run(["git", "add", "f.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "work"], cwd=repo)
-    assert run(["git", "status", "--porcelain"], cwd=repo).stdout.strip() == ""
-    committed_obs = dt._classify_committed_path(repo, "f.txt", baseline)
-    assert committed_obs is not None and committed_obs.kind == "tracked_hunk"
-    committed_ids = sorted(s.unit_id for s in dt._specs_from_observation(committed_obs, "f.txt"))
-    assert committed_ids == dirty_ids, (committed_ids, dirty_ids)
-    assert dt._list_committed_round_changed_paths(repo, baseline) == ["f.txt"]
-
-
 def test_committed_unit_dedup_reviewed_not_resurrected(tmp: Path) -> None:
     """A reviewed dirty unit, once committed, must NOT re-enter the candidate
     pool: same unit_id, review_state stays 'reviewed' (§4)."""
@@ -9773,6 +4524,106 @@ def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> Non
     assert "base_only.txt" not in paths, paths
 
 
+def test_committed_round_changed_paths_excludes_rebased_base_commits(tmp: Path) -> None:
+    """The dual of the merge test for the path a *rebase* takes: when base work is
+    REPLAYED onto the round's first-parent line (`git rebase` / `pull --rebase` /
+    base-branch-sync diverged handback), `--first-parent --no-merges` no longer
+    drops it (only merge SECOND parents are dropped). Supplying the live base ref
+    (`main`) subtracts the base-reachable commits; own first-parent work stays.
+
+    Reproduces the reported committed-round over-trigger: 34 base 'monthly-deck'
+    files surfaced as this session's committed-but-unreviewed work after a rebase.
+    `base_ref=None` keeps today's (buggy) behaviour — proving the fallback is safe
+    and that the exclusion is the load-bearing change."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _c0 = _committed_round_repo(tmp)
+    run(["git", "checkout", "-q", "-b", "feature"], cwd=repo)
+    # Own work done THIS round, then the round baseline is pinned at its tip
+    # (mirrors the marker UserPromptSubmit writes at the task's HEAD).
+    (repo / "feature.txt").write_text("agent work\n", encoding="utf-8")
+    run(["git", "add", "feature.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "feature work"], cwd=repo)
+    baseline = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    # main advances with a base-only file (the 'monthly-deck' analogue)...
+    run(["git", "checkout", "-q", "main"], cwd=repo)
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base advance"], cwd=repo)
+    # ...and the diverged feature branch absorbs it via REBASE (base commit lands
+    # on the first-parent line as an ordinary non-merge commit).
+    run(["git", "checkout", "-q", "feature"], cwd=repo)
+    run(["git", "rebase", "-q", "main"], cwd=repo)
+    # New own work committed after the rebase, so we can prove own work is kept.
+    (repo / "own2.txt").write_text("more agent work\n", encoding="utf-8")
+    run(["git", "add", "own2.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "more feature work"], cwd=repo)
+
+    excluded = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert excluded == ["own2.txt"], excluded  # base_only.txt subtracted, own kept
+
+    # Safe fallback: without a base ref the base file leaks back in (today's bug).
+    leaked = dt._list_committed_round_changed_paths(repo, baseline, base_ref=None)
+    assert "base_only.txt" in leaked and "own2.txt" in leaked, leaked
+    # An unresolvable base ref degrades to the same no-exclusion behaviour.
+    assert dt._base_ref_exclude_revs(repo, "no/such/ref") == []
+
+
+def test_committed_round_base_ref_self_disables_when_head_on_base(tmp: Path) -> None:
+    """Regression guard for the plain-repo flow: when the agent commits directly
+    ON the base branch (HEAD == `main`), `^main` would subtract the session's OWN
+    commits and silently disable committed-round entirely. `_base_ref_exclude_revs`
+    must self-disable (return []) whenever HEAD is an ancestor-or-equal of base, so
+    own committed work is still observed."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)  # HEAD is on `main`
+    (repo / "own.txt").write_text("on-main work\n", encoding="utf-8")
+    run(["git", "add", "own.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "work on main"], cwd=repo)
+    # HEAD == main tip → no safe base to subtract → exclusion disabled.
+    assert dt._base_ref_exclude_revs(repo, "main") == []
+    kept = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert kept == ["own.txt"], kept  # NOT empty — own work survives
+
+
+def test_committed_round_base_ref_excludes_ff_to_base(tmp: Path) -> None:
+    """The sibling of the rebase test, for the path a *fast-forward* takes: when a
+    task worktree (detached HEAD, or a non-base feature branch with no own commits)
+    is quick-forwarded onto the base tip (``git merge --ff-only main`` /
+    base-branch-sync non-divergent handback), ``HEAD == base tip`` but the checkout
+    is NOT on the base branch ref. The previous ``merge-base --is-ancestor HEAD
+    base`` guard saw ``HEAD == base tip`` and self-disabled → ``^base`` never fired →
+    the base commits in ``baseline..HEAD`` leaked back as this session's committed-
+    but-unreviewed work (the reported committed-round over-trigger).
+
+    ``_base_ref_exclude_revs`` must NOT self-disable here (ff implies the branch has
+    no own commits, so ``baseline..HEAD`` is pure base work): it returns ``^<tip>``
+    and the committed-round window holds no base file. The on-base self-disable
+    regression (committing directly on ``main``) is covered by the sibling test."""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)  # HEAD on `main`, baseline at base
+    # main advances with a base-only file the session does NOT own.
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base advance"], cwd=repo)
+    base_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    # Detached HEAD fast-forwarded to the base tip (worktree quick-forward).
+    run(["git", "checkout", "-q", "--detach", base_tip], cwd=repo)
+    assert dt._base_ref_exclude_revs(repo, "main") == [f"^{base_tip}"]
+    detached_paths = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert "base_only.txt" not in detached_paths, detached_paths  # base work subtracted
+    assert detached_paths == [], detached_paths  # pure base ff → empty window
+
+    # Same for a NON-base feature branch fast-forwarded onto the base tip: ff only
+    # succeeds because `feat` has no own commits, so the window is still pure base.
+    run(["git", "checkout", "-q", "-b", "feat", baseline], cwd=repo)
+    run(["git", "merge", "-q", "--ff-only", "main"], cwd=repo)
+    assert dt._base_ref_exclude_revs(repo, "main") == [f"^{base_tip}"]
+    feat_paths = dt._list_committed_round_changed_paths(repo, baseline, base_ref="main")
+    assert "base_only.txt" not in feat_paths, feat_paths
+    assert feat_paths == [], feat_paths
+
+
 def test_build_manifest_includes_committed_round_owned_paths(tmp: Path) -> None:
     """An apply_patch-attributed file committed clean within the round still
     lands in owned_committed_round_paths and registers tracker ownership (§5)."""
@@ -9930,44 +4781,6 @@ def test_round_baseline_marker_round_trip(tmp: Path) -> None:
     # No keys / empty head => no write.
     assert rbm.write_round_baseline_marker(task_id=None, session_id=None, baseline_head=head_a, repo=None, root=root) is None
     assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head="", repo=None, root=root) is None
-
-
-def test_rvf_user_prompt_submit_captures_round_baseline(tmp: Path) -> None:
-    """A genuine user prompt records HEAD as the next round's baseline marker;
-    the captured value matches the repo HEAD."""
-    submit = load_rvf_user_prompt_submit_module()
-    _dt, _sm, rbm = _round_baseline_committed_modules()
-    repo, _baseline = _committed_round_repo(tmp)
-    # advance HEAD so the captured baseline is the post-advance HEAD.
-    (repo / "f.txt").write_text("base\nmore\n", encoding="utf-8")
-    run(["git", "add", "f.txt"], cwd=repo)
-    run(["git", "commit", "-q", "-m", "advance"], cwd=repo)
-    head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    state_root = tmp / "state"
-    # Isolate from any ambient Kanban task id in the runner env so the marker is
-    # deterministically session-keyed (task_id takes precedence when present).
-    kanban_env_keys = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
-    saved_env = {k: os.environ.get(k) for k in (*kanban_env_keys, "CODEX_RVF_LOG_ROOT")}
-    for k in kanban_env_keys:
-        os.environ.pop(k, None)
-    os.environ["CODEX_RVF_LOG_ROOT"] = str(state_root)
-    try:
-        event = {
-            "session_id": "sess-capture",
-            "cwd": str(repo),
-            "hook_event_name": "UserPromptSubmit",
-            "prompt": "please refactor the parser",
-        }
-        submit.inspect_user_prompt_submit(event, prep_root=tmp / "prep")
-    finally:
-        for k, v in saved_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    marker = rbm.read_round_baseline_marker(task_id=None, session_id="sess-capture", root=state_root)
-    assert marker is not None, "expected a round-baseline marker to be written"
-    assert marker["baseline_head"] == head, (marker.get("baseline_head"), head)
 
 
 def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
@@ -10139,117 +4952,6 @@ def _detached_status_payload() -> dict:
     }
 
 
-def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
-    """real-exec tmux：launch 写 launched，wrapper 退出后 --finalize-status 回写 returncode/finished_at。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_realexec_tmux_script(root / "tmux.py")
-    saved = os.environ.get("RVF_TMUX_BIN")
-    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
-    try:
-        status_path = root / "s.status.json"
-        result = module.launch_detached(
-            session_name="rvf-detached-unit",
-            argv=[sys.executable, "-c", "import sys; sys.exit(5)"],
-            log_path=root / "s.log",
-            status_path=status_path,
-            lock_path=root / "s.lock",
-            status_payload=_detached_status_payload(),
-        )
-    finally:
-        if saved is None:
-            os.environ.pop("RVF_TMUX_BIN", None)
-        else:
-            os.environ["RVF_TMUX_BIN"] = saved
-    assert result["launch_status"] == "launched", result
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert status["launch_status"] == "launched"  # 启动期字段保留
-    assert status["returncode"] == 5  # 退出码经 finalize 回写
-    assert status["finished_at"]
-    assert (root / "s.lock").exists()
-    assert (root / "s.log").exists()
-
-
-def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
-    """每-run O_EXCL 锁：第二次 launch 命中 already_running，不再起 tmux。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
-    calls = root / "calls.jsonl"
-    saved = {
-        k: os.environ.get(k)
-        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
-    }
-    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
-    os.environ["FAKE_TMUX_CALLS"] = str(calls)
-    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
-    try:
-        kw = dict(
-            session_name="rvf-detached-unit",
-            argv=["echo", "hi"],
-            log_path=root / "s.log",
-            status_path=root / "s.status.json",
-            lock_path=root / "s.lock",
-        )
-        first = module.launch_detached(status_payload=_detached_status_payload(), **kw)
-        second = module.launch_detached(status_payload=_detached_status_payload(), **kw)
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    assert first["launch_status"] == "launched", first
-    assert second["launch_status"] == "already_running", second
-    # 第二次 launch 现在会先 has-session 探活（session 存活 → already_running），
-    # 故按 new-session 子命令计数：全程只起过一次 tmux。
-    recorded = [json.loads(line)["argv"] for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert len([a for a in recorded if a[:1] == ["new-session"]]) == 1, recorded
-
-
-def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
-    """tmux 非零退出 → launch_failed：status 记 error、锁被释放（便于重试）。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
-    saved = {
-        k: os.environ.get(k)
-        for k in (
-            "RVF_TMUX_BIN",
-            "FAKE_TMUX_CALLS",
-            "FAKE_TMUX_RETURNCODE",
-            "FAKE_TMUX_STDERR",
-        )
-    }
-    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
-    os.environ["FAKE_TMUX_CALLS"] = str(root / "calls.jsonl")
-    os.environ["FAKE_TMUX_RETURNCODE"] = "1"
-    os.environ["FAKE_TMUX_STDERR"] = "boom: cannot create session"
-    lock_path = root / "s.lock"
-    status_path = root / "s.status.json"
-    try:
-        result = module.launch_detached(
-            session_name="rvf-detached-unit",
-            argv=["echo", "hi"],
-            log_path=root / "s.log",
-            status_path=status_path,
-            lock_path=lock_path,
-            status_payload=_detached_status_payload(),
-        )
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    assert result["launch_status"] == "launch_failed", result
-    assert "boom" in (result["error"] or "")
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-    assert status["launch_status"] == "launch_failed"
-    assert "boom" in (status["error"] or "")
-    assert not lock_path.exists()  # 锁释放，可重试
-
-
 def _seed_detached_stale_lock(root: Path, *, returncode: object) -> tuple[Path, Path]:
     """预置一个「持锁线程已退出」的现场：写锁文件 + 带指定 returncode 的 status.json。
 
@@ -10314,614 +5016,6 @@ def _launch_detached_with_staleness_env(
         else []
     )
     return result, recorded
-
-
-def test_rvf_detached_thread_reclaims_stale_lock_when_session_dead(root: Path) -> None:
-    """FU-2：持锁 detached 线程已死（has-session≠0）且 run 未干净完成 → 重夺锁、重新 launch。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
-    result, recorded = _launch_detached_with_staleness_env(
-        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
-    )
-    assert result["launch_status"] == "launched", result  # 重夺并重派
-    assert ["has-session", "-t", "rvf-detached-unit"] in recorded  # 确实先探活
-    assert any(a[:1] == ["new-session"] for a in recorded), recorded  # 确实重新起 tmux
-    assert lock_path.exists()  # 重夺后锁仍由本次持有
-
-
-def test_rvf_detached_thread_keeps_lock_when_session_alive(root: Path) -> None:
-    """FU-2：持锁 session 仍存活（has-session==0）→ already_running，绝不重派。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)
-    result, recorded = _launch_detached_with_staleness_env(
-        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="0"
-    )
-    assert result["launch_status"] == "already_running", result
-    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 未起新 tmux
-    assert lock_path.exists()  # 活锁保留
-
-
-def test_rvf_detached_thread_keeps_lock_on_clean_finish(root: Path) -> None:
-    """FU-2：session 已死但 run 已干净完成（returncode==0）→ already_running，幂等不重跑。"""
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path, status_path = _seed_detached_stale_lock(root, returncode=0)
-    result, recorded = _launch_detached_with_staleness_env(
-        module, root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
-    )
-    assert result["launch_status"] == "already_running", result
-    assert all(a[:1] != ["new-session"] for a in recorded), recorded  # 不重跑已完成的 run
-    assert lock_path.exists()
-
-
-def test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(root: Path) -> None:
-    """FU-2 安全不变量（RVF cursor review 发现）：tmux 探活本身失败（binary 不可用 / 超时
-    / 异常）时无法确认 session 已死 → 保守保持 already_running、绝不删可能仍活的锁。
-
-    回归：旧实现 `_tmux_session_alive` 异常→False，会被调用方当成「session 已死」误入重夺，
-    在 tmux 临时不可用时删掉仍在跑的 detached session 的锁（破坏「绝不误删活锁」不变量）。
-    """
-    module = load_rvf_detached_thread_module()
-    root.mkdir(parents=True, exist_ok=True)
-    lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)  # 未干净完成
-    saved = {
-        k: os.environ.get(k)
-        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
-    }
-    # 指向不存在的 tmux 二进制 → subprocess.run 抛 FileNotFoundError（模拟 tmux 临时不可用）。
-    os.environ["RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
-    os.environ.pop("FAKE_TMUX_CALLS", None)
-    os.environ.pop("FAKE_TMUX_RETURNCODE", None)
-    try:
-        result = module.launch_detached(
-            session_name="rvf-detached-unit",
-            argv=["echo", "hi"],
-            log_path=root / "s.log",
-            status_path=status_path,
-            lock_path=lock_path,
-            status_payload=_detached_status_payload(),
-        )
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    # 无法确认死亡 → 保守 already_running，锁保留（不重夺、不 launch）。
-    assert result["launch_status"] == "already_running", result
-    assert lock_path.exists()
-
-
-def test_rvf_detached_thread_run_with_timeout(_root: Path | None = None) -> None:
-    """--run-with-timeout：正常退出码透传；超时 killpg 整组并返回 124。"""
-    helper = SCRIPT_DIR / "rvf_detached_thread.py"
-    passthrough = subprocess.run(
-        [
-            sys.executable,
-            str(helper),
-            "--run-with-timeout",
-            "30",
-            "--",
-            sys.executable,
-            "-c",
-            "import sys; sys.exit(3)",
-        ]
-    ).returncode
-    assert passthrough == 3
-    timed_out = subprocess.run(
-        [
-            sys.executable,
-            str(helper),
-            "--run-with-timeout",
-            "1",
-            "--",
-            sys.executable,
-            "-c",
-            "import time; time.sleep(10)",
-        ]
-    ).returncode
-    assert timed_out == 124
-
-
-def test_rvf_detached_thread_finalize_status_cli(root: Path) -> None:
-    """--finalize-status：merge returncode/finished_at，保留 launch 期字段。"""
-    root.mkdir(parents=True, exist_ok=True)
-    helper = SCRIPT_DIR / "rvf_detached_thread.py"
-    status_path = root / "s.status.json"
-    status_path.write_text(
-        json.dumps(
-            {
-                "launch_status": "launched",
-                "started_at": "t0",
-                "returncode": None,
-                "finished_at": None,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    rc = subprocess.run(
-        [
-            sys.executable,
-            str(helper),
-            "--finalize-status",
-            "--status-path",
-            str(status_path),
-            "--returncode",
-            "7",
-        ]
-    ).returncode
-    assert rc == 0
-    payload = json.loads(status_path.read_text(encoding="utf-8"))
-    assert payload["returncode"] == 7 and payload["finished_at"]
-    assert payload["launch_status"] == "launched" and payload["started_at"] == "t0"
-
-
-def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
-    """--execute --detached：self-fork dispatch_reviewers.py --execute 进 tmux，立即返回 status 路径。"""
-    import contextlib
-    import io
-
-    d = load_dispatch_reviewers_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
-    calls = root / "calls.jsonl"
-    run_dir = root / "runs" / "rvf-disp-unit"
-    reviewers_dir = run_dir / "artifacts" / "reviewers"
-    reviewers_dir.mkdir(parents=True, exist_ok=True)
-
-    class _Ledger:
-        run_id = "rvf-disp-unit"
-
-        def __init__(self, rd: Path) -> None:
-            self.run_dir = rd
-
-        def env(self) -> dict:
-            return {"RVF_RUN_ID": self.run_id}
-
-        def event(self, **_kw) -> None:
-            pass
-
-    args = argparse.Namespace(
-        registry="reg.json",
-        probe_mode="preflight",
-        probe_timeout=60.0,
-        main_harness="auto",
-        transcript=None,
-        main_harness_file=None,
-        assume_available=None,
-        require_external=False,
-        total_timeout=2700.0,
-    )
-    saved = {
-        k: os.environ.get(k)
-        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
-    }
-    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
-    os.environ["FAKE_TMUX_CALLS"] = str(calls)
-    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            rc = d.launch_detached_dispatch(
-                args,
-                _Ledger(run_dir),
-                reviewers_dir,
-                repo="/repo",
-                review_packet="/pkt",
-                session_context="/sow",
-                scope_contract="/sc",
-            )
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    out = buf.getvalue()
-    assert rc == 0, out
-    assert "RVF_DISPATCH_STATUS=" in out and "RVF_DISPATCH_LAUNCH=launched" in out
-    status = json.loads(
-        (reviewers_dir / ".dispatch-thread.status.json").read_text(encoding="utf-8")
-    )
-    assert status["launch_status"] == "launched"
-    assert status["tmux_session"] == "rvf-dispatch-rvf-disp-unit"
-    child = status["command"]
-    assert "--execute" in child and "--detached" not in child
-    assert "--rvf-run-id" in child and "rvf-disp-unit" in child
-    assert "--rvf-run-dir" in child and "--repo" in child and "/repo" in child
-    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert len(recorded) == 1
-    assert recorded[0]["argv"][:4] == [
-        "new-session",
-        "-d",
-        "-s",
-        "rvf-dispatch-rvf-disp-unit",
-    ]
-
-
-def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> None:
-    """FU-3：detached 派发把 ``ledger.env()``（含 CODEX_RVF_LOG_ROOT）显式写进 tmux 内层
-    wrapper shell 的 ``export X=Y;`` 行——reviewer 子进程不再依赖 tmux server 的 env 继承，
-    其 diff-tracker DB 与 prepare 写 lease 的库一致，消除 lease_not_found。"""
-    import contextlib
-    import io
-
-    d = load_dispatch_reviewers_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_tmux = write_fake_tmux_script(root / "tmux.py")
-    calls = root / "calls.jsonl"
-    run_dir = root / "runs" / "rvf-disp-unit"
-    reviewers_dir = run_dir / "artifacts" / "reviewers"
-    reviewers_dir.mkdir(parents=True, exist_ok=True)
-    log_root = root / "rvf-log-root"
-
-    class _Ledger:
-        run_id = "rvf-disp-unit"
-
-        def __init__(self, rd: Path) -> None:
-            self.run_dir = rd
-
-        def env(self) -> dict:
-            # 模拟 RunLedger.env()：含决定 diff-tracker DB 落点的 CODEX_RVF_LOG_ROOT。
-            return {
-                "RVF_RUN_ID": self.run_id,
-                "CODEX_RVF_LOG_ROOT": str(log_root),
-                "RVF_RUN_DIR": str(self.run_dir),
-            }
-
-        def event(self, **_kw) -> None:
-            pass
-
-    args = argparse.Namespace(
-        registry="reg.json",
-        probe_mode="preflight",
-        probe_timeout=60.0,
-        main_harness="auto",
-        transcript=None,
-        main_harness_file=None,
-        assume_available=None,
-        require_external=False,
-        total_timeout=2700.0,
-    )
-    saved = {
-        k: os.environ.get(k)
-        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
-    }
-    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
-    os.environ["FAKE_TMUX_CALLS"] = str(calls)
-    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            rc = d.launch_detached_dispatch(
-                args,
-                _Ledger(run_dir),
-                reviewers_dir,
-                repo="/repo",
-                review_packet="/pkt",
-                session_context="/sow",
-                scope_contract="/sc",
-            )
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-    assert rc == 0, buf.getvalue()
-    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
-    assert len(recorded) == 1
-    # tmux new-session -d -s <name> <shell>：内层 wrapper shell 是最后一个参数。
-    shell_command = recorded[0]["argv"][-1]
-    # 关键断言：CODEX_RVF_LOG_ROOT 必须以正确的值显式 export 进内层 shell。
-    assert (
-        f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
-    ), shell_command
-    assert f"export RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
-
-
-def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:
-    """waiter 终态判定：running / done(finished_at) / done(launch_failed) / 缺文件→running。"""
-    d = load_dispatch_reviewers_module()
-    root.mkdir(parents=True, exist_ok=True)
-    status_path = root / "s.json"
-
-    status_path.write_text(
-        json.dumps({"launch_status": "launched", "finished_at": None, "returncode": None}),
-        encoding="utf-8",
-    )
-    running = d.wait_for_dispatch_status(status_path, max_wait=0.0)
-    assert running["state"] == "running", running
-
-    status_path.write_text(
-        json.dumps({"launch_status": "launched", "finished_at": "t1", "returncode": 0}),
-        encoding="utf-8",
-    )
-    done = d.wait_for_dispatch_status(status_path, max_wait=0.0)
-    assert done["state"] == "done" and done["returncode"] == 0, done
-
-    status_path.write_text(
-        json.dumps({"launch_status": "launch_failed", "finished_at": None, "error": "boom"}),
-        encoding="utf-8",
-    )
-    failed = d.wait_for_dispatch_status(status_path, max_wait=0.0)
-    assert failed["state"] == "done" and failed["launch_status"] == "launch_failed", failed
-
-    missing = d.wait_for_dispatch_status(root / "missing.json", max_wait=0.0)
-    assert missing["state"] == "running", missing
-
-
-def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
-    """路由矩阵 R0–R4：测试用例名 ↔ 规则 id。
-
-    | 场景 | M | A | rule | slots |
-    |------|---|---|------|-------|
-    | R0 main=claude | claude_code | cursor,claude_code,codex | R0 | cursor,codex |
-    | R0 main=codex  | codex       | cursor,claude_code,codex | R0 | cursor,claude_code |
-    | R0 main=cursor(override) | cursor | cursor,claude_code,codex | R0 | claude_code,codex |
-    | R1 cursor+codex | claude_code | cursor,codex | R1 | cursor,codex |
-    | R1 no-cursor (R4) | claude_code | claude_code,codex | R1 | claude_code,codex + cursor_unavailable |
-    | R2 only==M | codex | codex | R2 | codex-cli-a,codex-cli-b |
-    | R2 only!=M | claude_code | codex | R2 | codex-cli-a,codex-cli-b + mismatch |
-    | R3 zero | claude_code | (none) | R3 | needs_last_resort_fallback |
-    """
-    d = load_dispatch_reviewers_module()
-    reg = _dispatch_registry()
-
-    def harnesses(plan):
-        return [r["harness_id"] for r in plan["reviewers"]]
-
-    def warns(plan):
-        return {w["code"] for w in plan["warnings"]}
-
-    # R0 — 默认两路非主，cursor 必选一腿
-    p = d.route("claude_code", ["cursor", "claude_code", "codex"], reg)
-    assert p["routing_rule"] == "R0", p
-    assert harnesses(p) == ["cursor", "codex"], p
-    assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
-    assert p["status"] == "planned" and p["needs_last_resort_fallback"] is False
-
-    p = d.route("codex", ["cursor", "claude_code", "codex"], reg)
-    assert p["routing_rule"] == "R0" and harnesses(p) == ["cursor", "claude_code"], p
-
-    # R0 主=cursor（仅显式覆盖可达）→ 两路非主，cursor 不占 slot
-    p = d.route("cursor", ["cursor", "claude_code", "codex"], reg)
-    assert p["routing_rule"] == "R0" and set(harnesses(p)) == {"claude_code", "codex"}, p
-
-    # R1 — 恰两路 external（含 cursor）
-    p = d.route("claude_code", ["cursor", "codex"], reg)
-    assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"cursor", "codex"}, p
-
-    # R1 + R4 — cursor 不可用：仍两路 external（主以 external 跑），记 cursor_unavailable
-    p = d.route("claude_code", ["claude_code", "codex"], reg)
-    assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"claude_code", "codex"}, p
-    assert "cursor_unavailable" in warns(p), p
-    assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
-
-    # R2 — 同 harness 双 external，only==M（info）
-    p = d.route("codex", ["codex"], reg)
-    assert p["routing_rule"] == "R2", p
-    assert [r["reviewer_id"] for r in p["reviewers"]] == ["codex-cli-a", "codex-cli-b"], p
-    assert "only_main_harness_available" in warns(p), p
-    assert "cursor_unavailable" not in warns(p), p  # R2 不叠加 R4
-
-    # R2 — only!=M：必须 mismatch warning
-    p = d.route("claude_code", ["codex"], reg)
-    assert p["routing_rule"] == "R2" and "available_reviewer_harness_mismatch" in warns(p), p
-
-    # R3 — 零可用：默认 needs_last_resort_fallback，不 fail
-    p = d.route("claude_code", [], reg)
-    assert p["routing_rule"] == "R3" and p["needs_last_resort_fallback"] is True, p
-    assert p["status"] == "planned" and p["reviewers"] == [], p
-
-    # R3 — require_external：fail-close
-    p = d.route("claude_code", [], reg, require_external_only=True)
-    assert p["status"] == "failed" and p.get("reason") == "no_reviewer_harness_available", p
-
-
-def test_dispatch_reviewers_same_harness_double_instance_distinct_ids(root: Path) -> None:
-    d = load_dispatch_reviewers_module()
-    reg = _dispatch_registry()
-    p = d.route("cursor", ["cursor"], reg)
-    ids = [r["reviewer_id"] for r in p["reviewers"]]
-    labels = [r["label"] for r in p["reviewers"]]
-    assert len(set(ids)) == 2, ids
-    assert ids == ["cursor-cli-a", "cursor-cli-b"], ids
-    assert labels == [
-        "alternative-reviewer:cursor-cli#a",
-        "alternative-reviewer:cursor-cli#b",
-    ], labels
-
-
-def test_dispatch_reviewers_plan_artifact_schema(root: Path) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    reg_path = root / "registry.json"
-    reg_path.write_text(json.dumps(_dispatch_registry()), encoding="utf-8")
-    run_dir = root / "run"
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "dispatch_reviewers.py"),
-            "--registry",
-            str(reg_path),
-            "--assume-available",
-            "cursor,codex",
-            "--main-harness",
-            "codex",
-            "--rvf-run-dir",
-            str(run_dir),
-            "--plan-only",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    plan_path = run_dir / "artifacts" / "reviewers" / "reviewer-plan.json"
-    assert plan_path.exists(), completed.stdout
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    for key in (
-        "schema_version",
-        "main_harness",
-        "available_harnesses",
-        "routing_rule",
-        "reviewers",
-        "warnings",
-        "needs_last_resort_fallback",
-        "fallbacks",
-        "status",
-    ):
-        assert key in plan, (key, plan)
-    assert plan["fallbacks"] == [], plan
-    assert plan["status"] == "planned" and plan["main_harness"] == "codex"
-    assert plan["routing_rule"] == "R1" and len(plan["reviewers"]) == 2
-    for r in plan["reviewers"]:
-        for key in ("slot", "harness_id", "dispatch_mode", "label", "config_path", "reviewer_id"):
-            assert key in r, (key, r)
-        assert r["dispatch_mode"] == "external_cli", r
-
-
-def test_dispatch_reviewers_executes_two_external(root: Path) -> None:
-    """fake CLI shim 并行双 external：两路 review-result.json 路径存在、reviewer_id 唯一不撞目录。"""
-    d = load_dispatch_reviewers_module()
-    root.mkdir(parents=True, exist_ok=True)
-    fake_cmd = [
-        "bash",
-        "-c",
-        'cat >/dev/null; python3 "$RVF_WRITE_REVIEW_RESULT" no-issues '
-        '--out "$RVF_REVIEW_RESULT" --audit-summary "fake $RVF_REVIEWER_ID reviewed scope"',
-    ]
-    reg = {"schema_version": 1, "harnesses": {}}
-    for hid in ("alpha", "beta"):
-        config_path = root / f"alt-{hid}.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "label": f"alternative-reviewer:{hid}-cli",
-                    "command": fake_cmd,
-                    "allow_repo_cwd": True,
-                    "pre_run_health": False,
-                    "output_format": "text",
-                }
-            ),
-            encoding="utf-8",
-        )
-        reg["harnesses"][hid] = {
-            "harness_id": hid,
-            "label_prefix": f"alternative-reviewer:{hid}-cli",
-            "config_path": str(config_path),
-            "dispatch_mode": "external_cli",
-            "enabled": True,
-            "priority_default": 100 if hid == "alpha" else 50,
-        }
-    plan = d.route("codex", ["alpha", "beta"], reg)
-    assert plan["routing_rule"] == "R1" and len(plan["reviewers"]) == 2
-    run_dir = root / "run"
-    artifacts_dir = run_dir / "artifacts"
-    packet = root / "packet.md"
-    packet.write_text("## Review Packet\n\nintegration test\n", encoding="utf-8")
-    plan = d.execute_plan(
-        plan,
-        repo=None,
-        review_packet=str(packet),
-        session_context=None,
-        scope_contract=None,
-        run_id="dispatch-exec-test",
-        run_dir=str(run_dir),
-        artifacts_dir=artifacts_dir,
-    )
-    assert plan["status"] == "completed", plan
-    reviewer_dirs = sorted(p.name for p in (artifacts_dir / "reviewers").iterdir() if p.is_dir())
-    assert reviewer_dirs == ["alpha-cli", "beta-cli"], reviewer_dirs
-    seen_paths = set()
-    for r in plan["reviewers"]:
-        assert r["returncode"] == 0, r
-        result_path = Path(r["review_result_path"])
-        assert result_path.exists(), r
-        seen_paths.add(str(result_path))
-    assert len(seen_paths) == 2, seen_paths
-
-
-def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
-    """回归（RVF-001）：`source review-env.sh; dispatch_reviewers.py --execute` 不带显式
-    --repo/--review-packet/--session-context 时，应从 review-env.sh 导出的
-    RVF_REPO / RVF_REVIEW_PACKET / RVF_SCOPE_OF_WORK 回填，否则子进程 reviewer 因缺参失败。"""
-    root.mkdir(parents=True, exist_ok=True)
-    fake_cmd = [
-        "bash",
-        "-c",
-        'cat >/dev/null; python3 "$RVF_WRITE_REVIEW_RESULT" no-issues '
-        '--out "$RVF_REVIEW_RESULT" --audit-summary "env-backfill ok"',
-    ]
-    reg = {"schema_version": 1, "harnesses": {}}
-    for hid in ("alpha", "beta"):
-        config_path = root / f"alt-{hid}.json"
-        config_path.write_text(
-            json.dumps(
-                {
-                    "enabled": True,
-                    "label": f"alternative-reviewer:{hid}-cli",
-                    "command": fake_cmd,
-                    "allow_repo_cwd": True,
-                    "pre_run_health": False,
-                    "output_format": "text",
-                }
-            ),
-            encoding="utf-8",
-        )
-        reg["harnesses"][hid] = {
-            "harness_id": hid,
-            "label_prefix": f"alternative-reviewer:{hid}-cli",
-            "config_path": str(config_path),
-            "dispatch_mode": "external_cli",
-            "enabled": True,
-            "priority_default": 100 if hid == "alpha" else 50,
-        }
-    reg_path = root / "registry.json"
-    reg_path.write_text(json.dumps(reg), encoding="utf-8")
-    packet = root / "packet.md"
-    packet.write_text("## Review Packet\n\nenv backfill\n", encoding="utf-8")
-    sow = root / "scope-of-work.md"
-    sow.write_text("## scope\n", encoding="utf-8")
-    run_dir = root / "run"
-    env = {k: v for k, v in os.environ.items() if not (k.startswith("CODEX_RVF_") or k.startswith("RVF_"))}
-    # emulate `source review-env.sh`: packet/scope only via env, NOT CLI args.
-    # (RVF_REPO omitted — review-packet alone is sufficient for the reviewer kernel;
-    # setting it to a non-git tmp dir would trip check_repo. The env-backfill code path
-    # is identical for repo/packet/scope.)
-    env["RVF_REVIEW_PACKET"] = str(packet)
-    env["RVF_SCOPE_OF_WORK"] = str(sow)
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(SCRIPT_DIR / "dispatch_reviewers.py"),
-            "--registry",
-            str(reg_path),
-            "--main-harness",
-            "codex",
-            "--assume-available",
-            "alpha,beta",
-            "--rvf-run-id",
-            "env-backfill",
-            "--rvf-run-dir",
-            str(run_dir),
-            "--execute",
-        ],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert completed.returncode == 0, completed.stderr
-    plan = json.loads(
-        (run_dir / "artifacts" / "reviewers" / "reviewer-plan.json").read_text(encoding="utf-8")
-    )
-    assert plan["status"] == "completed", plan
-    for r in plan["reviewers"]:
-        assert r["returncode"] == 0, r
-        assert Path(r["review_result_path"]).exists(), r
 
 
 def _run_alternative_reviewer_summary(run_dir: Path, reviewer_id: str = "test") -> dict:
@@ -11174,181 +5268,6 @@ def _with_cooldown_env(cooldown_root: Path):
     return _ctx()
 
 
-def test_dispatch_reviewers_reroutes_on_usage_limit(tmp_path: Path) -> None:
-    """alpha 撞额度(125) → 轮内 reroute 到 gamma：status completed、fallbacks 记录、cooldown 落盘。"""
-    d = load_dispatch_reviewers_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    cooldown_root = tmp_path / "cooldown"
-    reg = _make_usage_or_clean_registry(
-        tmp_path, {"alpha": ("usage", 100), "beta": ("clean", 90), "gamma": ("clean", 80)}
-    )
-    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
-    assert plan["routing_rule"] == "R0", plan
-    run_dir = tmp_path / "run"
-    artifacts_dir = run_dir / "artifacts"
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
-    repo = init_repo(tmp_path / "repo")
-    with _with_cooldown_env(cooldown_root):
-        plan = d.execute_plan(
-            plan,
-            repo=str(repo),
-            review_packet=str(packet),
-            session_context=None,
-            scope_contract=None,
-            run_id="reroute-test",
-            run_dir=str(run_dir),
-            artifacts_dir=artifacts_dir,
-            registry=reg,
-            main_harness="codex",
-            available=["alpha", "beta", "gamma"],
-        )
-    assert plan["status"] == "completed", plan
-    assert "alpha" in plan["cooldown_recorded"], plan
-    assert (cooldown_root / "harness-alpha.json").exists(), list(cooldown_root.glob("*"))
-    assert len(plan["fallbacks"]) == 1, plan["fallbacks"]
-    fb = plan["fallbacks"][0]
-    assert fb["from"] == "alpha" and fb["to"] == "gamma", fb
-    assert len(plan["reviewers"]) == 2
-    assert {r["harness_id"] for r in plan["reviewers"]} == {"beta", "gamma"}
-    for r in plan["reviewers"]:
-        assert r["returncode"] == 0, r
-        assert Path(r["review_result_path"]).exists(), r
-
-
-def test_dispatch_reviewers_reroute_id_collision(tmp_path: Path) -> None:
-    """两腿均撞额度、只剩一个 eligible harness → 两替换 leg id 不碰撞(-fb1/-fb2)、两份 artifact 都在。"""
-    d = load_dispatch_reviewers_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    cooldown_root = tmp_path / "cooldown"
-    reg = _make_usage_or_clean_registry(
-        tmp_path, {"alpha": ("usage", 100), "beta": ("usage", 90), "gamma": ("clean", 80)}
-    )
-    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
-    assert plan["routing_rule"] == "R0"
-    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
-    run_dir = tmp_path / "run"
-    artifacts_dir = run_dir / "artifacts"
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
-    repo = init_repo(tmp_path / "repo")
-    with _with_cooldown_env(cooldown_root):
-        plan = d.execute_plan(
-            plan,
-            repo=str(repo),
-            review_packet=str(packet),
-            session_context=None,
-            scope_contract=None,
-            run_id="collision-test",
-            run_dir=str(run_dir),
-            artifacts_dir=artifacts_dir,
-            registry=reg,
-            main_harness="codex",
-            available=["alpha", "beta", "gamma"],
-        )
-    assert plan["status"] == "completed", plan
-    assert {"alpha", "beta"} <= set(plan["cooldown_recorded"]), plan
-    assert len(plan["fallbacks"]) == 2, plan["fallbacks"]
-    ids = sorted(r["reviewer_id"] for r in plan["reviewers"])
-    assert ids == ["gamma-cli-fb1", "gamma-cli-fb2"], ids
-    seen = set()
-    for r in plan["reviewers"]:
-        assert r["returncode"] == 0, r
-        assert Path(r["review_result_path"]).exists(), r
-        seen.add(r["review_result_path"])
-    assert len(seen) == 2, seen
-
-
-def test_dispatch_reviewers_probe_excludes_cooldown(tmp_path: Path) -> None:
-    """tmp root 预置 alpha 冷却 → 真实 probe 排除 alpha → route 落他者 + harness_limit_cooldown_active 警告。"""
-    cd = load_harness_limit_cooldown_module()
-    load_dispatch_reviewers_module()  # 确保 SCRIPT_DIR 在 sys.path
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    cooldown_root = tmp_path / "cooldown"
-    reg_path = tmp_path / "registry.json"
-    reg = {"schema_version": 1, "harnesses": {}}
-    for hid, prio in (("alpha", 100), ("beta", 50)):
-        cfg = tmp_path / f"alt-{hid}.json"
-        write_alternative_reviewer_config(
-            cfg,
-            [sys.executable, "-c", "pass"],
-            idle_timeout_seconds=5.0,
-            activity_check_interval_seconds=0.05,
-            output_format="text",
-            health_command=[sys.executable, "-c", ""],
-            pre_run_health=True,
-        )
-        reg["harnesses"][hid] = {
-            "harness_id": hid,
-            "label_prefix": f"alternative-reviewer:{hid}-cli",
-            "config_path": str(cfg),
-            "dispatch_mode": "external_cli",
-            "enabled": True,
-            "priority_default": prio,
-        }
-    reg_path.write_text(json.dumps(reg), encoding="utf-8")
-    with _with_cooldown_env(cooldown_root):
-        # env 已指向 cooldown_root（无 SUBDIR）；用 env 路径 record，确保子进程读同一处。
-        cd.record("alpha", reason="usage_limit_exhausted")
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(SCRIPT_DIR / "dispatch_reviewers.py"),
-                "--registry",
-                str(reg_path),
-                "--main-harness",
-                "codex",
-                "--probe-mode",
-                "preflight",
-                "--dry-run",
-            ],
-            capture_output=True,
-            text=True,
-            env=dict(os.environ),
-            check=False,
-        )
-    assert "harness_limit_cooldown_active" in completed.stderr, completed.stderr
-    plan = json.loads(completed.stdout)
-    assert "alpha" not in plan["available_harnesses"], plan
-    assert "beta" in plan["available_harnesses"], plan
-
-
-def test_dispatch_reviewers_failclose_when_main_exhausted(tmp_path: Path) -> None:
-    """external 补不上 + 主 harness 耗尽 → status=failed + main_harness_usage_limit_exhausted，不置伪 R3。"""
-    d = load_dispatch_reviewers_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    cooldown_root = tmp_path / "cooldown"
-    reg = _make_usage_or_clean_registry(
-        tmp_path, {"alpha": ("usage", 100), "beta": ("clean", 90)}
-    )
-    plan = d.route("alpha", ["alpha", "beta"], reg)
-    assert plan["routing_rule"] == "R1", plan
-    run_dir = tmp_path / "run"
-    artifacts_dir = run_dir / "artifacts"
-    packet = tmp_path / "packet.md"
-    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
-    repo = init_repo(tmp_path / "repo")
-    with _with_cooldown_env(cooldown_root):
-        plan = d.execute_plan(
-            plan,
-            repo=str(repo),
-            review_packet=str(packet),
-            session_context=None,
-            scope_contract=None,
-            run_id="failclose-test",
-            run_dir=str(run_dir),
-            artifacts_dir=artifacts_dir,
-            registry=reg,
-            main_harness="alpha",
-            available=["alpha", "beta"],
-        )
-    assert plan["status"] == "failed", plan
-    assert plan.get("reason") == "main_harness_usage_limit_exhausted", plan
-    assert plan["needs_last_resort_fallback"] is False, plan
-    assert any(w["code"] == "main_harness_usage_limit_exhausted" for w in plan["warnings"]), plan["warnings"]
-    assert "alpha" in plan["cooldown_recorded"], plan
-
-
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -11470,6 +5389,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "committed_observation_excludes_base_branch_sync_merge",
             lambda: test_committed_observation_excludes_base_branch_sync_merge(root / "committed-merge"),
+        ),
+        (
+            "committed_round_changed_paths_excludes_rebased_base_commits",
+            lambda: test_committed_round_changed_paths_excludes_rebased_base_commits(
+                root / "committed-rebase"
+            ),
+        ),
+        (
+            "committed_round_base_ref_self_disables_when_head_on_base",
+            lambda: test_committed_round_base_ref_self_disables_when_head_on_base(
+                root / "committed-base-self-disable"
+            ),
+        ),
+        (
+            "committed_round_base_ref_excludes_ff_to_base",
+            lambda: test_committed_round_base_ref_excludes_ff_to_base(
+                root / "committed-base-ff-to-base"
+            ),
         ),
         (
             "build_manifest_includes_committed_round_owned_paths",
@@ -11623,6 +5560,34 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "claude_plugin_hooks_declare_user_prompt_submit",
             lambda: test_claude_plugin_hooks_declare_user_prompt_submit(),
+        ),
+        (
+            "claude_plugin_hooks_declare_post_tool_use_with_write_matcher",
+            lambda: test_claude_plugin_hooks_declare_post_tool_use_with_write_matcher(),
+        ),
+        (
+            "cline_kanban_client_park_unpark_is_parked",
+            lambda: test_cline_kanban_client_park_unpark_is_parked(root / "cline-kanban-park"),
+        ),
+        (
+            "post_tool_use_parks_eligible_edit_turn",
+            lambda: test_post_tool_use_parks_eligible_edit_turn(root / "post-tool-use-park"),
+        ),
+        (
+            "post_tool_use_skips_token_turn",
+            lambda: test_post_tool_use_skips_token_turn(root / "post-tool-use-skip-token"),
+        ),
+        (
+            "post_tool_use_skips_non_edit_or_non_kanban",
+            lambda: test_post_tool_use_skips_non_edit_or_non_kanban(
+                root / "post-tool-use-skip-nonedit"
+            ),
+        ),
+        (
+            "user_prompt_submit_marks_park_eligibility",
+            lambda: test_user_prompt_submit_marks_park_eligibility(
+                root / "ups-park-eligibility"
+            ),
         ),
         (
             "claude_hook_entry_detects_foreign_invocation",
@@ -12045,6 +6010,7 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
                 root / "alternative-wrapper"
             ),
         ),
+        ("cline_kanban_client_session_field_readers", test_cline_kanban_client_session_field_readers),
         ("cline_kanban_client_detects_runtime_port", lambda: test_cline_kanban_client_detects_runtime_port()),
         (
             "cline_kanban_client_rejects_ambiguous_runtime_ports",
@@ -12123,6 +6089,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "prepare_review_run_writes_worktree_bootstrap",
             lambda: test_prepare_review_run_writes_worktree_bootstrap(root / "worktree-bootstrap"),
+        ),
+        (
+            "prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore",
+            lambda: test_prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore(
+                root / "worktree-bootstrap-ignore"
+            ),
         ),
         (
             "prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide",
@@ -12665,6 +6637,15 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    # 分片之前无条件跑一次完整性守卫：注册表 = 唯一索引，任何 def test_* 漏登记即红。
+    # 用任意 root 构造未分片的全量注册表即可（lambda 不被调用，root 值无关）。
+    assert_every_defined_test_is_registered(
+        globals(),
+        registered_names_from_case_tuples(review_support_test_cases(Path("/"))),
+        source_path=__file__,
+        intentionally_unregistered=INTENTIONALLY_UNREGISTERED,
+    )
+
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
         if args.shard_count > 1
@@ -12751,6 +6732,140 @@ _alt.inject(
     RUN_ALTERNATIVE_REVIEWER=RUN_ALTERNATIVE_REVIEWER,
 )
 globals().update({_n: getattr(_alt, _n) for _n in _alt.__all__})
+
+
+# 有界拆分：rvf_user_prompt_submit hook 测试簇移入子模块；inject 共享依赖后重绑 18 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import rvf_user_prompt_submit_hook as _ups
+_ups.inject(
+    run=run,
+    read_jsonl=read_jsonl,
+    load_rvf_user_prompt_submit_module=load_rvf_user_prompt_submit_module,
+    load_rvf_prep_file_module=load_rvf_prep_file_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    _committed_round_repo=_committed_round_repo,
+    _round_baseline_committed_modules=_round_baseline_committed_modules,
+    RVF_USER_PROMPT_SUBMIT=RVF_USER_PROMPT_SUBMIT,
+    SCRIPT_DIR=SCRIPT_DIR,
+)
+globals().update({_n: getattr(_ups, _n) for _n in _ups.__all__})
+
+
+# 有界拆分：alternative reviewer CLI 适配器行为（codex/cursor/claude 流式、空闲、路由、预检） 测试簇移入子模块；inject 共享依赖后重绑 33 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import alternative_reviewer_cli_adapter_behaviors as _altrev
+_altrev.inject(
+    RUN_ALTERNATIVE_REVIEWER=RUN_ALTERNATIVE_REVIEWER,
+    clean_review_result_python=clean_review_result_python,
+    init_repo=init_repo,
+    load_alternative_reviewer_module=load_alternative_reviewer_module,
+    read_jsonl=read_jsonl,
+    run=run,
+    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    _cursor_tool_call_line=_cursor_tool_call_line,
+)
+globals().update({_n: getattr(_altrev, _n) for _n in _altrev.__all__})
+
+
+# 有界拆分：cline-kanban client 与通知 测试簇移入子模块；inject 共享依赖后重绑 15 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import cline_kanban_client_and_notify as _clkb
+_clkb.inject(
+    run=run,
+    init_repo=init_repo,
+    load_cline_kanban_client_module=load_cline_kanban_client_module,
+    CLINE_KANBAN_CLIENT=CLINE_KANBAN_CLIENT,
+)
+globals().update({_n: getattr(_clkb, _n) for _n in _clkb.__all__})
+
+
+# 有界拆分：session manifest 记录与 ownership claims 测试簇移入子模块；inject 共享依赖后重绑 13 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import session_manifest_records_and_claims as _sessman
+_sessman.inject(
+    run=run,
+    init_repo=init_repo,
+    write_codex_transcript=write_codex_transcript,
+    load_diff_tracker_module=load_diff_tracker_module,
+    SESSION_MANIFEST=SESSION_MANIFEST,
+)
+globals().update({_n: getattr(_sessman, _n) for _n in _sessman.__all__})
+
+
+# 有界拆分：dispatch reviewers 选路与 detached 派发 测试簇移入子模块；inject 共享依赖后重绑 12 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import dispatch_reviewers_routing_and_detached as _disprev
+_disprev.inject(
+    load_dispatch_reviewers_module=load_dispatch_reviewers_module,
+    load_harness_limit_cooldown_module=load_harness_limit_cooldown_module,
+    write_fake_tmux_script=write_fake_tmux_script,
+    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    _dispatch_registry=_dispatch_registry,
+    _make_usage_or_clean_registry=_make_usage_or_clean_registry,
+    _with_cooldown_env=_with_cooldown_env,
+    init_repo=init_repo,
+    SCRIPT_DIR=SCRIPT_DIR,
+)
+globals().update({_n: getattr(_disprev, _n) for _n in _disprev.__all__})
+
+
+# 有界拆分：review packet 组装与省略规则 测试簇移入子模块；inject 共享依赖后重绑 11 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import build_packet_assembly_and_omissions as _bldpkt
+_bldpkt.inject(
+    init_repo=init_repo,
+    run=run,
+    write_codex_transcript=write_codex_transcript,
+    load_diff_tracker_module=load_diff_tracker_module,
+    BUILD_PACKET=BUILD_PACKET,
+    SESSION_MANIFEST=SESSION_MANIFEST,
+)
+globals().update({_n: getattr(_bldpkt, _n) for _n in _bldpkt.__all__})
+
+
+# 有界拆分：rvf detached 线程生命周期 测试簇移入子模块；inject 共享依赖后重绑 9 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import rvf_detached_thread_lifecycle as _detthread
+_detthread.inject(
+    load_rvf_detached_thread_module=load_rvf_detached_thread_module,
+    write_realexec_tmux_script=write_realexec_tmux_script,
+    write_fake_tmux_script=write_fake_tmux_script,
+    _detached_status_payload=_detached_status_payload,
+    _seed_detached_stale_lock=_seed_detached_stale_lock,
+    _launch_detached_with_staleness_env=_launch_detached_with_staleness_env,
+    SCRIPT_DIR=SCRIPT_DIR,
+)
+globals().update({_n: getattr(_detthread, _n) for _n in _detthread.__all__})
+
+
+# 有界拆分：diff tracker 注册与 scope 测试簇移入子模块；inject 共享依赖后重绑 9 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import diff_tracker_register_and_scope as _difftrk
+_difftrk.inject(
+    run=run,
+    read_jsonl=read_jsonl,
+    init_repo=init_repo,
+    load_diff_tracker_module=load_diff_tracker_module,
+    _round_baseline_committed_modules=_round_baseline_committed_modules,
+    _committed_round_repo=_committed_round_repo,
+    SCRIPT_DIR=SCRIPT_DIR,
+    ROOT=ROOT,
+)
+globals().update({_n: getattr(_difftrk, _n) for _n in _difftrk.__all__})
+
+
+# 有界拆分：prepare review run 与 worktree bootstrap 测试簇移入子模块；inject 共享依赖后重绑 8 个测试名，
+# 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_review_support import prepare_review_run_bootstrap as _preprev
+_preprev.inject(
+    run=run,
+    init_repo=init_repo,
+    write_codex_transcript=write_codex_transcript,
+    PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
+    COMMAND_LOCK=COMMAND_LOCK,
+    APPLY_WORKTREE_BOOTSTRAP=APPLY_WORKTREE_BOOTSTRAP,
+)
+globals().update({_n: getattr(_preprev, _n) for _n in _preprev.__all__})
 
 
 

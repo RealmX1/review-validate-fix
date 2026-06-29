@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-DEFAULT_KANBAN_VERSION = "0.1.67"
+DEFAULT_KANBAN_VERSION = "0.1.68"
 DEFAULT_START_CMD = "kanban --no-open"
 DEFAULT_TASK_CMD = "kanban task"
 DEFAULT_START_TIMEOUT_SECONDS = 90.0
@@ -23,8 +23,11 @@ CLINE_KANBAN_WORKTREE_MODES = ("branch", "inplace")
 DEFAULT_WORKSPACE_RESOLVE_TIMEOUT_SECONDS = 5.0
 
 # 契约边界：这个 wrapper 只 shell 到 `kanban task create`、
-# `kanban task start`、`kanban task trash`，以及 RVF 定制的
-# `kanban task message` follow-up 用户消息注入命令。
+# `kanban task start`、`kanban task trash`，RVF 定制的
+# `kanban task message` follow-up 用户消息注入命令，以及
+# `kanban task park` / `kanban task unpark` / `kanban task is-parked`
+# 这组 park sidecar 命令（让卡片在主 agent 停下等注入式 followup 唤回时
+# 维持在 in_progress、不误移 review / 不误发通知）。
 
 
 class KanbanError(RuntimeError):
@@ -382,6 +385,33 @@ def task_session_pid(task: dict[str, Any]) -> int | None:
     return None
 
 
+def task_session_state(task: dict[str, Any]) -> str | None:
+    session = task.get("session")
+    if not isinstance(session, dict):
+        return None
+    value = session.get("state")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def task_session_exit_code(task: dict[str, Any]) -> int | None:
+    session = task.get("session")
+    if not isinstance(session, dict):
+        return None
+    value = session.get("exitCode")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def task_execution_workspace_from_session(task: dict[str, Any]) -> Path | None:
     pid = task_session_pid(task)
     if pid is None:
@@ -731,6 +761,49 @@ def trash_task(*, task_cmd: str, repo: Path, task_id: str, start_cmd: str | None
     return payload
 
 
+def park_task(
+    *,
+    task_cmd: str,
+    repo: Path,
+    task_id: str,
+    label: str | None = None,
+    start_cmd: str | None = None,
+) -> dict[str, Any]:
+    port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
+    command = task_command(task_cmd, "park", "--project-path", str(repo), "--task-id", task_id)
+    if label:
+        command.extend(["--label", label])
+    payload = parse_json_stdout(run_command(command, cwd=repo, env=runtime_env(port)))
+    payload.setdefault("task_id", task_id)
+    return payload
+
+
+def unpark_task(*, task_cmd: str, repo: Path, task_id: str, start_cmd: str | None = None) -> dict[str, Any]:
+    port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
+    payload = parse_json_stdout(
+        run_command(
+            task_command(task_cmd, "unpark", "--project-path", str(repo), "--task-id", task_id),
+            cwd=repo,
+            env=runtime_env(port),
+        )
+    )
+    payload.setdefault("task_id", task_id)
+    return payload
+
+
+def is_parked_task(*, task_cmd: str, repo: Path, task_id: str, start_cmd: str | None = None) -> dict[str, Any]:
+    port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
+    payload = parse_json_stdout(
+        run_command(
+            task_command(task_cmd, "is-parked", "--project-path", str(repo), "--task-id", task_id),
+            cwd=repo,
+            env=runtime_env(port),
+        )
+    )
+    payload.setdefault("task_id", task_id)
+    return payload
+
+
 def send_task_message(
     *,
     task_cmd: str,
@@ -772,7 +845,10 @@ def send_task_message(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cline Kanban CLI client for RVF.")
-    parser.add_argument("action", choices=["ensure", "list", "create", "start", "trash", "message"])
+    parser.add_argument(
+        "action",
+        choices=["ensure", "list", "create", "start", "trash", "message", "park", "unpark", "is-parked"],
+    )
     parser.add_argument("--task-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_TASK_CMD))
     parser.add_argument("--start-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD", DEFAULT_START_CMD))
     parser.add_argument("--start-timeout", type=float, default=float(os.environ.get("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", DEFAULT_START_TIMEOUT_SECONDS)))
@@ -788,6 +864,7 @@ def main() -> int:
     parser.add_argument("--worktree-mode", choices=CLINE_KANBAN_WORKTREE_MODES)
     parser.add_argument("--prep-file-path")
     parser.add_argument("--task-id")
+    parser.add_argument("--label")
     parser.add_argument("--attempt-id")
     parser.add_argument("--source", default="review-validate-fix")
     parser.add_argument("--idempotency-key")
@@ -843,6 +920,24 @@ def main() -> int:
             if not args.task_id:
                 raise KanbanError("--task-id is required for trash")
             payload = trash_task(task_cmd=args.task_cmd, start_cmd=args.start_cmd, repo=repo, task_id=args.task_id)
+        elif args.action == "park":
+            if not args.task_id:
+                raise KanbanError("--task-id is required for park")
+            payload = park_task(
+                task_cmd=args.task_cmd,
+                start_cmd=args.start_cmd,
+                repo=repo,
+                task_id=args.task_id,
+                label=args.label,
+            )
+        elif args.action == "unpark":
+            if not args.task_id:
+                raise KanbanError("--task-id is required for unpark")
+            payload = unpark_task(task_cmd=args.task_cmd, start_cmd=args.start_cmd, repo=repo, task_id=args.task_id)
+        elif args.action == "is-parked":
+            if not args.task_id:
+                raise KanbanError("--task-id is required for is-parked")
+            payload = is_parked_task(task_cmd=args.task_cmd, start_cmd=args.start_cmd, repo=repo, task_id=args.task_id)
         else:
             if not args.task_id:
                 raise KanbanError("--task-id is required for message")

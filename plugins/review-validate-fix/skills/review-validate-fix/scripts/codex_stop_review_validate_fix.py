@@ -69,6 +69,8 @@ from kanban_followup_lock import (
     clear_marker as clear_kanban_followup_lock,
     marker_status as kanban_followup_lock_status,
     read_marker as read_kanban_followup_lock,
+    reengage_nudge_count as kanban_followup_lock_nudge_count,
+    bump_reengage_nudge_count as bump_kanban_followup_lock_nudge_count,
     clear_pending_marker as clear_kanban_followup_pending,
     iter_pending_markers as iter_kanban_followup_pending,
     pending_status as kanban_followup_pending_status,
@@ -106,7 +108,12 @@ from cline_kanban_client import (
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
     DEFAULT_TASK_CMD as DEFAULT_CLINE_KANBAN_TASK_CMD,
     DEFAULT_TMUX_SESSION as DEFAULT_CLINE_KANBAN_TMUX_SESSION,
+    task_payload_from_list,
+    task_session_exit_code,
+    task_session_state,
+    unpark_task as cline_kanban_unpark_task,
 )
+import rvf_post_tool_use
 from session_label import (
     DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS,
     first_user_message,
@@ -2115,6 +2122,117 @@ def _kanban_followup_delivery_channel(message_id: Any) -> str:
     return "app-server"
 
 
+# launch_backend 返回的是 ``ledger.hook_payload(...)`` = ``{"continue","systemMessage"}`` 两键，
+# **顶层没有 status 键**（status 只进 summary / systemMessage 文本）。故不能用 result["status"] 判断
+# 是否成功派发。改由「成功派发 self-rising followup」那一条返回路径显式置内部键
+# ``_rvf_keep_self_park=True`` 作为 main 的保留-park 信号（main 在 emit 前 pop 掉、不泄漏给 Claude）。
+# 命中 → resume 在路上 → 保留 park；缺失（派发失败 / kanban 早退 skip / 非 followup backend）→ unpark。
+_RVF_KEEP_SELF_PARK_FLAG = "_rvf_keep_self_park"
+
+
+def _launch_result_keeps_self_park(result: Any) -> bool:
+    return bool(isinstance(result, dict) and result.get(_RVF_KEEP_SELF_PARK_FLAG))
+
+
+# skip 分支中「followup 仍活跃 / resume 仍在途」的 reason_code：这些 skip 不代表无 resume，
+# 必须保留 park（绝不在 dispatch-in-flight / in-progress 期间提前 unpark，否则 followup 落地前
+# 卡片抑制就被误解除）。其余 skip（handoff 完成、无 owned dirty 等）= 无 resume → 照常 unpark。
+_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS = frozenset(
+    {
+        "kanban_followup_in_progress",
+        "kanban_followup_dispatch_in_flight",
+        # re-engage force-continue：现有 RVF run 仍在进行、agent 被续跑令其收尾该轮，
+        # resume 在路上 → 必须保留 park，否则 handoff 落地前卡片抑制会被误解除。
+        "kanban_followup_in_progress_reengage",
+    }
+)
+
+
+def _skip_decision_should_unpark(decision: StopDecision) -> bool:
+    """skip / 不 launch 分支：是否应触发 self-park 安全阀。
+
+    resume 仍在途 / followup 仍活跃的 skip（见 ``_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS``）必须
+    保留 park、返回 False；其余 skip（handoff 完成、无 owned dirty 等）无 resume → True。
+    """
+    return decision.reason_code not in _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS
+
+
+def _unpark_stranded_task(project_path: Any, task_id: str) -> bool:
+    """跨 task 幂等 unpark（stranded-sweep 用）：直接按 marker 的 task_id/project_path unpark。
+
+    与 ``unpark_self_parked_card`` 不同——这里处理的是**别的** task 遗留的泄漏 park（派发成功但
+    resume 静默丢投），无本会话 self-park 标记可读，故直接按 marker 字段 unpark。best-effort、永不抛。
+    """
+    try:
+        if not (isinstance(task_id, str) and task_id.strip()):
+            return False
+        repo = (
+            Path(project_path).expanduser()
+            if isinstance(project_path, str) and project_path.strip()
+            else None
+        )
+        if repo is None:
+            return False
+        task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+        cline_kanban_unpark_task(task_cmd=task_cmd, repo=repo, task_id=task_id.strip())
+        return True
+    except Exception:
+        return False
+
+
+def unpark_self_parked_card(event: dict[str, Any], ledger: RunLedger, *, reason: str) -> None:
+    """park 泄漏安全阀（proposer §②）：若本会话本轮经 PostToolUse self-park、但本次 Stop 不会有
+    resume（派发失败 / 非 followup backend / skip / 不 launch），则幂等 unpark 父卡片并清 self-park
+    标记。Kanban park 无 TTL（Option A 把 TTL 所有权留给编排层），故必须由 RVF 显式清，否则
+    泄漏的 park 会把下一次**真实** Stop 的通知误抑制。
+
+    成功派发（resume 在路上）的路径**不**调本函数——交 Turn2 UPS 的 to_in_progress 自动 unpark /
+    stranded-sweep 兜底。整段 best-effort、永不抛、不改主流程结果；未 self-park 时是极廉价的一次
+    小文件读后即返回。
+    """
+    try:
+        session_id = event.get("session_id")
+        state = rvf_post_tool_use.read_self_park_state(
+            session_id if isinstance(session_id, str) else None
+        )
+        if not isinstance(state, dict):
+            return
+        task_id = state.get("task_id")
+        if not (isinstance(task_id, str) and task_id.strip()):
+            return
+        project_path = state.get("project_path")
+        repo = (
+            Path(project_path).expanduser()
+            if isinstance(project_path, str) and project_path.strip()
+            else Path(str(event.get("cwd") or ".")).expanduser()
+        )
+        task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+        ok = True
+        detail: str | None = None
+        try:
+            cline_kanban_unpark_task(task_cmd=task_cmd, repo=repo, task_id=task_id.strip())
+        except Exception as exc:  # best-effort：unpark 失败仅记日志，不抛
+            ok = False
+            detail = f"{type(exc).__name__}: {exc}"
+        # 无论 unpark 成败都清 self-park 标记：成功→已清；失败→避免每次 Stop 重复 unpark 刷屏，
+        # 残留 park 仍有 kanban onExit / 磁盘重载 / stranded-sweep 作 backstop。
+        rvf_post_tool_use.clear_self_park_state(session_id if isinstance(session_id, str) else None)
+        ledger.event(
+            phase="complete",
+            event="kanban_followup_self_park_unparked",
+            status="completed" if ok else "warning",
+            reason_code=f"self_park_unpark_{reason}",
+            level=None if ok else "warn",
+            cline_kanban_task_id=task_id.strip(),
+            cline_kanban_project_path=str(repo),
+            kanban_self_park_unpark_ok=ok,
+            kanban_self_park_unpark_error=detail,
+        )
+    except Exception:
+        # 安全阀本身绝不能影响主 Stop 流程。
+        pass
+
+
 def clear_kanban_followup_lock_for_event(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2228,6 +2346,18 @@ KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX
 KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
 KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
+# 搁浅判定改读 kanban session.state 时，那一次 best-effort `task list` 子进程的 timeout 上限，
+# 防在 30s Codex 链路预算内卡在不可达/慢 kanban server。见 _kanban_task_list_payload。
+KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_ENV = (
+    "CODEX_RVF_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS"
+)
+DEFAULT_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS = 10
+# in-progress 锁 active 时，「认锁前先 re-engage 几次再退回静默 skip」的预算上限。
+# 0 = 关掉 re-engage（永远静默放行，回到历史行为）。见 kanban_followup_in_progress_decision。
+KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV = (
+    "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET"
+)
+DEFAULT_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET = 2
 # verify-consumed 精修读 transcript 的体积上限（超过则跳过精修、按 stranded 处理），
 # 防在 30s Codex 链路预算内读超大 JSONL transcript 卡顿。
 KANBAN_FOLLOWUP_CONSUMED_SCAN_MAX_BYTES = 32 * 1024 * 1024
@@ -2428,6 +2558,77 @@ def _maybe_redispatch_stranded_kanban_followup(
     }
 
 
+def _kanban_task_list_payload(project_path: str) -> dict[str, Any] | None:
+    """Best-effort 拉一次 kanban ``task list``（只读、带 timeout），失败返回 None。
+
+    用 codex_stop 既有的「shell cline_kanban_client.py list」惯用法（见 lookup_kanban_task_workspace），
+    但带显式 timeout——本调用挂在每次 Stop 的搁浅 sweep 上，不能让不可达/慢 kanban server 卡满 30s 预算。
+    """
+    client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
+    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+    timeout = _kanban_followup_env_float(
+        KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(client), "list", "--repo", project_path, "--task-cmd", task_cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _kanban_task_session_liveness(
+    task_id: str,
+    project_path: Any,
+    list_cache: dict[str, dict[str, Any] | None],
+) -> str:
+    """读 kanban ``task list`` 的 session 真相，判某 task 的 follow-up 投递是否搁浅。
+
+    返回 ``"stopped"`` / ``"alive"`` / ``"unknown"``：
+    - ``"stopped"``：目标 session 已退出（``exitCode`` 非空）、停在 user review/input gate
+      （``awaiting_review``）或无 live turn（``idle``）——这些 session 不会在无人干预下消费排队的
+      follow-up，即已搁浅；应按搁浅处理，无需等 15min TTL。
+    - ``"alive"``：session 处于活跃 turn（``running``）——可能正在消费本 follow-up，不应升级
+      （留给真实投递的 UPS-arm 清 marker），即便 marker 已 TTL-stale 也不报，砍掉「活着却因超时被误升级」。
+    - ``"unknown"``：project_path 缺失 / list 不可达 / task 不在 list / session 缺失或 state 不识别
+      ——调用方退回原 TTL 行为，绝不比现状更差。
+
+    ``state`` 是这里的判别真相而非 ``liveness`` 字段：``awaiting_review`` 的 ``liveness`` 也是
+    ``live``（进程在、但停在 user gate、不会消费），故只能按 ``state`` 区分「会消费 vs 不会消费」。
+    list 结果按 project_path 缓存在传入的 ``list_cache``（单次 sweep 内每 project 至多拉一次）。
+    """
+    if not (isinstance(project_path, str) and project_path.strip()):
+        return "unknown"
+    if project_path not in list_cache:
+        list_cache[project_path] = _kanban_task_list_payload(project_path)
+    payload = list_cache.get(project_path)
+    if not isinstance(payload, dict):
+        return "unknown"
+    task = task_payload_from_list(payload, task_id)
+    if not isinstance(task, dict):
+        return "unknown"
+    if task_session_exit_code(task) is not None:
+        return "stopped"
+    state = task_session_state(task)
+    if state in {"awaiting_review", "idle"}:
+        return "stopped"
+    if state == "running":
+        return "alive"
+    return "unknown"
+
+
 def sweep_stranded_kanban_followup_pending(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2452,6 +2653,8 @@ def sweep_stranded_kanban_followup_pending(
         markers = iter_kanban_followup_pending()
         now_ts = datetime.now(timezone.utc).timestamp()
         processed = 0
+        # 单次 sweep 内按 project_path 缓存 kanban `task list` payload，每 project 至多拉一次。
+        session_list_cache: dict[str, dict[str, Any] | None] = {}
         for marker in markers:
             if processed >= sweep_max:
                 break
@@ -2464,8 +2667,21 @@ def sweep_stranded_kanban_followup_pending(
             # 避免两条路径语义打架。
             if current_task_id and marker_task_id == current_task_id:
                 continue
-            if kanban_followup_pending_status(marker, now_ts=now_ts) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+            # 真相驱动搁浅判定：优先读 kanban session.state（投递落地与否的地面真相），
+            # 15min 挂钟 TTL 仅作拿不到 state 时的降级兜底。见 _kanban_task_session_liveness。
+            liveness = _kanban_task_session_liveness(
+                marker_task_id, marker.get("kanban_project_path"), session_list_cache
+            )
+            if liveness == "alive":
+                # 目标 session 仍在活跃 turn（可能正消费本 follow-up）——即便 marker 已 TTL-stale 也不报，
+                # 留给真实投递的 UPS-arm 清 marker；砍掉「活着却因超时被误升级 / 误重投」的假阳。
                 continue
+            if liveness == "unknown":
+                # 拿不到可信 state（task 不在 list / list 不可达）→ 退回原 TTL 行为。
+                if kanban_followup_pending_status(marker, now_ts=now_ts) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+                    continue
+            # liveness == "stopped"：session 已停在 user gate / idle / 已退出 → 当场即搁浅，不等 TTL。
+            # 仍先走下方 late-consumption 精修，覆盖「已落地但 UPS-arm 漏清」的假阳。
             token = marker.get("token") if isinstance(marker.get("token"), str) else None
             # 可选 best-effort 精修：迟到消费 → 清 marker、不通知。
             if _kanban_followup_marker_consumed(marker):
@@ -2494,6 +2710,12 @@ def sweep_stranded_kanban_followup_pending(
             )
             stamp_kanban_followup_pending_notified(task_id=marker_task_id, token=token)
             redispatch = _maybe_redispatch_stranded_kanban_followup(marker, ledger, token=token)
+            # park 泄漏兜底（proposer §②，量级对齐 pending 15min TTL）：stranded = 派发成功但 resume
+            # 静默丢投 → 该 task 的 PostToolUse self-park 已泄漏。幂等 unpark 清掉它，避免泄漏的 park
+            # 误抑制该 task 下一次真实 Stop 的通知（redispatch 若成功，其 followup 落地不依赖 park）。
+            stranded_unparked = _unpark_stranded_task(
+                marker.get("kanban_project_path"), marker_task_id
+            )
             ledger.event(
                 phase="gate",
                 event="kanban_followup_pending_stranded_escalated",
@@ -2507,6 +2729,8 @@ def sweep_stranded_kanban_followup_pending(
                 kanban_followup_stranded_notify_reason=notify_result.get("reason"),
                 kanban_followup_stranded_dispatched_at=marker.get("dispatched_at"),
                 kanban_followup_stranded_redispatch=redispatch,
+                kanban_followup_stranded_unparked=stranded_unparked,
+                kanban_followup_stranded_session_liveness=liveness,
             )
             processed += 1
     except Exception:
@@ -2566,6 +2790,80 @@ def kanban_followup_in_progress_decision(
                 removed_kanban_followup_in_progress_marker_paths=removed_lock,
             )
             return None
+        # B（re-engage nudge）：锁 active 但 agent 停在「未 handoff」处时，历史行为是无条件
+        # 返回 {"continue":true} 静默放行 → agent 当回合干停、RVF 不再 force-continue，于是它
+        # 被这把锁一路静默挡停直到 handoff/TTL（实测曾冻 47min）。这里改为：在 nudge 预算内
+        # 不静默放行，而是 return None 把判定让回常规 gate——若 latest turn 不是注入的 follow-up
+        # trigger 且仍有未审改动，常规 gate 会重新派发 review / 重新唤起 agent（把「让 agent 停」
+        # 与「不派重复 review」解耦）。预算（marker.reengage_nudge_count vs 默认 2）用尽再退回
+        # 静默 skip，防 review↔fix 死循环；配合 1h 锁 TTL，一把卡死锁最坏只冻「预算次 + ≤1h」。
+        #
+        # 仅在本回合「不会被随后的 followup/analyze trigger-skip 无条件挡停」时才消耗预算 nudge：
+        # evaluate_stop_event 在调用本函数之后还排了三道 trigger-skip（RVF_ANALYZE_FOLLOWUP /
+        # 显式 $rvf-analyze / KANBAN_FOLLOWUP），若本 Stop 的 latest_user 命中其一，本函数 return
+        # None 也换不来 re-engage（trigger-skip 会接管挡停本回合），只会空耗预算、把真正能 re-engage
+        # 的 non-trigger turn 的预算削掉。故这种 trigger turn 直接 return None 不 bump，预算留到后面
+        # 能真正生效的 non-trigger turn。（committed-round RVF review elevated 修复：原实现在 trigger
+        # turn 上先 bump 再被 trigger-skip 挡停，stall-on-trigger-turn 场景下预算白花、re-engage 失效。）
+        latest_user_for_nudge = latest_user_message_from_event(event)
+        if (
+            latest_user_for_nudge
+            and (
+                RVF_ANALYZE_FOLLOWUP_MARKER in latest_user_for_nudge
+                or KANBAN_FOLLOWUP_MARKER in latest_user_for_nudge
+            )
+        ) or _rvf_analyze_manually_invoked(event, latest_user_for_nudge):
+            return None
+        nudge_budget = _kanban_followup_env_int(
+            KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET,
+        )
+        nudge_count = kanban_followup_lock_nudge_count(marker)
+        if nudge_budget > 0 and nudge_count < nudge_budget:
+            bumped = bump_kanban_followup_lock_nudge_count(marker)
+            active_rvf_run_dir = marker.get("run_dir")
+            ledger.event(
+                phase="gate",
+                event="kanban_followup_in_progress_nudged",
+                status="completed",
+                reason_code="kanban_followup_in_progress_reengage_nudge",
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                kanban_followup_in_progress_nudge_count=bumped,
+                kanban_followup_in_progress_nudge_budget=nudge_budget,
+                active_rvf_run_id=blocking_run_id,
+                active_rvf_run_dir=active_rvf_run_dir,
+            )
+            # re-engage = force-continue 现有 run，**不**经常规 gate 重派新 RVF（修根因：原
+            # return None 让回常规 gate，reset --mixed 物化的 dirty 使常规 gate 每次都判「有未审
+            # 改动」→ mint 重复 run）。把「唤醒 agent 收尾」与「派发 review」彻底解耦。
+            return reengage_decision(
+                f"task {task_id or '<unknown>'} 的 RVF run "
+                f"{blocking_run_id or '<unknown>'} 仍在进行且未 handoff"
+                f"（run_dir={active_rvf_run_dir or '<unknown>'}）。请继续收尾**这一轮**——"
+                "跑完 / 合并 reviewer 结果后，第一行输出 "
+                "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>` 完成 handoff，**不要新开 review**。"
+                "若你正在等后台 reviewer，请先确认其状态再 finalize。",
+                ledger,
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                kanban_followup_in_progress_nudge_count=bumped,
+                kanban_followup_in_progress_nudge_budget=nudge_budget,
+                active_rvf_run_id=blocking_run_id,
+                active_rvf_run_dir=active_rvf_run_dir,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw="kanban-followup",
+                    completion_gate="kanban_followup_in_progress_reengage",
+                ),
+            )
         return skip_decision(
             "已有 Cline Kanban RVF follow-up 仍在进行"
             f"（阻塞 run_id={blocking_run_id or '<unknown>'}，"
@@ -4914,7 +5212,7 @@ def launch_backend(
                 backend_raw=decision.backend,
             ),
         )
-        return ledger.hook_payload(
+        success_payload = ledger.hook_payload(
             status=status,
             reason_code=reason_code,
             message=(
@@ -4959,6 +5257,10 @@ def launch_backend(
                 if key != "rvf_state" and not key.startswith("rvf_")
             },
         )
+        # 仅本「成功派发 self-rising followup」路径置位：resume 在路上 → main 据此保留 park（不 unpark）。
+        # hook_payload 顶层无 status 键，故必须用这个显式内部信号；main 在 emit 前 pop 掉、不泄漏给 Claude。
+        success_payload[_RVF_KEEP_SELF_PARK_FLAG] = True
+        return success_payload
     if not decision.parent_thread_id:
         return skip_payload(
             "Stop event did not expose a parent thread id.",
@@ -5148,22 +5450,31 @@ def refresh_global_diff_tracker(
     # 用同一下界）。无任一可用下界 → None ⇒ committed 观测整支静默关闭、与今日 dirty-only 一致。
     # best-effort，绝不阻断 refresh。
     committed_baseline: str | None = None
+    committed_base_ref: str | None = None
     try:
         event = context.get("event")
         if isinstance(event, dict):
+            repo_resolved = Path(repo).expanduser().resolve()
             committed_baseline = _resolve_committed_round_baseline(
-                Path(repo).expanduser().resolve(),
+                repo_resolved,
                 current_kanban_task_id(event),
                 session_hook_id_from_event(event),
             )
+            # base 分支 ref：排除 rebase/cherry 压平到第一父链的 base 工作。与 detection 端
+            # `maybe_route_committed_round_scope` 走同一个 `_resolve_committed_round_base_ref`
+            # （入参仅 repo），detection 与 allocation 同源——见 ac042be 的下界同源教训。
+            committed_base_ref = _resolve_committed_round_base_ref(repo_resolved)
     except Exception:
         committed_baseline = None
+        committed_base_ref = None
     context["committed_baseline"] = committed_baseline
+    context["committed_base_ref"] = committed_base_ref
     try:
         manifest = build_manifest(
             Path(repo).expanduser().resolve(),
             transcript,
             committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
         )
     except Exception as exc:
         # build_manifest 失败时 emit `tracker_refresh_failed`（保持原 ledger
@@ -5559,6 +5870,7 @@ def allocate_auto_review_scope(
                 lease_ttl_seconds=lease_ttl_seconds,
                 transcript_max_line_number=transcript_max_line_number,
                 committed_baseline=context.get("committed_baseline"),
+                committed_base_ref=context.get("committed_base_ref"),
             )
             incomplete = patch_ownership_incomplete_details(manifest if isinstance(manifest, dict) else None, result)
             if incomplete is not None:
@@ -5599,6 +5911,7 @@ def allocate_auto_review_scope(
             # transcript intent.
             auto_claim_observed=False,
             committed_baseline=context.get("committed_baseline"),
+            committed_base_ref=context.get("committed_base_ref"),
         )
     except Exception as exc:
         ledger.event(
@@ -6136,6 +6449,54 @@ def skip_decision(
     )
 
 
+def reengage_decision(
+    reason: str,
+    ledger: RunLedger,
+    reason_code: str = "kanban_followup_in_progress_reengage",
+    *,
+    repo: str | None = None,
+    cwd: str | None = None,
+    backend: str = "off",
+    **summary_fields: Any,
+) -> StopDecision:
+    """force-continue 决策：阻止本次 Stop、把 reason 回灌 agent 令其继续收尾**现有** RVF run，
+    既不经 launch gate、也不 dispatch 新 review / 不写 pending marker / 不新建 run_dir。
+
+    用于 in-progress 锁 active + agent 停在「未 handoff」处的 re-engage——破「锁 active 时静默
+    放行使 agent 干停、被一路挡停到 handoff/TTL」的同时，**不再 mint 重复 RVF run**（修
+    9f9fb78 的 nudge 用「return None → 常规 gate 重派新 run」唤醒、无法区分 agent 真卡住 vs
+    合法等待异步 reviewer 的设计缺陷）。
+
+    Claude Stop hook 的 force-continue 契约 = ``{"decision": "block", "reason": <text>}``：
+    ``decision=block`` 阻止本次 stop，``reason`` 作为续跑提示喂回 model（与 skip_payload 的
+    ``{"continue": True, ...}`` 不同——后者放任 agent 干停）。
+    """
+    payload_fields = dict(summary_fields)
+    if repo is not None:
+        payload_fields.setdefault("repo", repo)
+    if cwd is not None:
+        payload_fields.setdefault("cwd", cwd)
+    if backend != "off":
+        payload_fields.setdefault("backend", backend)
+    ledger.summary(
+        status="reengaged",
+        reason_code=reason_code,
+        message=reason,
+        **payload_fields,
+    )
+    return StopDecision(
+        action="emit",
+        reason_code=reason_code,
+        repo=repo,
+        cwd=cwd,
+        backend=backend,
+        message=reason,
+        summary_fields=payload_fields,
+        payload={"decision": "block", "reason": reason},
+        status="reengaged",
+    )
+
+
 def session_hook_control_decision(
     event: dict[str, Any],
     latest_user: str | None,
@@ -6420,6 +6781,47 @@ def _commit_is_ancestor_of_head(repo_path: Path, commit: str) -> bool:
     return result.returncode == 0
 
 
+COMMITTED_ROUND_BASE_REF_ENV = "CODEX_RVF_COMMITTED_ROUND_BASE_REF"
+
+
+def _local_branch_exists(repo_path: Path, branch: str) -> bool:
+    """``refs/heads/<branch>`` 是否存在（best-effort，任何失败返回 False）。"""
+    try:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    return result.returncode == 0
+
+
+def _resolve_committed_round_base_ref(repo_path: Path) -> str | None:
+    """committed-round 的 base 分支 ref——把「被 rebase / cherry-pick 压平到本轮第一父链
+    的 base 工作」排除出可审窗口（见 ``diff_tracker._base_ref_exclude_revs`` /
+    ``_list_committed_round_changed_paths``）。
+
+    返回的是**活的 base 分支引用**（如 ``main``），不是 bootstrap 冻结的 base SHA：
+    ``base-branch-sync`` 把 main 顶到 worktree 创建之后才追加的 base 提交（如 monthly-deck）
+    重放进第一父链，只有活引用才能覆盖到它们——冻结 SHA 是这些提交的祖先，``^SHA`` 排不掉。
+
+    优先级：① 环境变量 ``CODEX_RVF_COMMITTED_ROUND_BASE_REF`` 显式覆盖（逃生口 / 测试注入）；
+    ② 本地 ``main`` 分支（base-branch-sync 默认 base，两起实测过触发用的都是它）；③ None。
+    HEAD 在 base 上/之下时绝不排除（否则会减掉会话自己的提交）的发散守卫，统一兜底在
+    diff_tracker 侧，故这里只做纯引用选择。base 是非-main 的特性分支栈式 task 是已记录的残留
+    （main-only 仍严格优于今天的「rebase 路径完全不排除」）。同一 hook 调用内 detection 与
+    allocation 都调本函数、入参只有 repo_path，天然同源（无 ac042be 式不同源风险）。"""
+    override = os.environ.get(COMMITTED_ROUND_BASE_REF_ENV, "").strip()
+    if override:
+        return override
+    if _local_branch_exists(repo_path, "main"):
+        return "main"
+    return None
+
+
 def _resolve_committed_round_baseline(
     repo_path: Path,
     task_id: str | None,
@@ -6473,12 +6875,17 @@ def maybe_route_committed_round_scope(
     )
     if not baseline:
         return None
+    # base 分支 ref：把 rebase/cherry 压平到第一父链的 base 工作排除出可审窗口。
+    # 与 allocation 端 `refresh_global_diff_tracker` 调**同一个**
+    # `_resolve_committed_round_base_ref`（入参仅 repo_path，天然同源），否则 detection
+    # 选中的窗口与 allocation 重建的窗口不一致 → no_session_owned_dirty 误判（ac042be 教训）。
+    base_ref = _resolve_committed_round_base_ref(repo_path)
     # Per-commit opt-out audit: surface which round commits the `RVF-Skip-Review`
     # trailer excluded BEFORE the empty-set early return, so even a round whose
     # commits are all opted-out (committed_paths == []) leaves an audit trace
     # instead of looking indistinguishable from "no committed work".
     try:
-        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline))
+        skip_review_shas = sorted(_list_round_skip_review_commit_shas(repo_path, baseline, base_ref))
     except Exception:
         skip_review_shas = []
     if skip_review_shas:
@@ -6497,6 +6904,7 @@ def maybe_route_committed_round_scope(
         committed_paths = _list_committed_round_changed_paths(
             repo_path,
             baseline,
+            base_ref,
         )
     except Exception:
         committed_paths = []
@@ -6828,6 +7236,7 @@ def main() -> int:
     # 整体 suppress 必须早于 handoff、dirty gate 和 backend launch，避免子会话停止时继续生成 review/fork artifact。
     if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
         decision = suppressed_decision(event, ledger)
+        unpark_self_parked_card(event, ledger, reason="suppressed")
         if decision.payload is not None:
             emit(decision.payload)
         return 0
@@ -6836,6 +7245,7 @@ def main() -> int:
     if decision.action == "launch":
         provider_health_decision = provider_health_guard_decision(decision, event, ledger)
         if provider_health_decision is not None and provider_health_decision.payload is not None:
+            unpark_self_parked_card(event, ledger, reason="provider_health_block")
             emit(provider_health_decision.payload)
             return 0
         workspace_guard_payload = kanban_task_workspace_guard_payload(
@@ -6844,10 +7254,25 @@ def main() -> int:
             ledger=ledger,
         )
         if workspace_guard_payload is not None:
+            unpark_self_parked_card(event, ledger, reason="workspace_guard_block")
             emit(workspace_guard_payload)
             return 0
-        emit(launch_backend(decision, event, ledger))
+        result = launch_backend(decision, event, ledger)
+        # park 泄漏安全阀：仅当本次 Stop 成功派发了 self-rising followup（resume 在路上）才保留
+        # park。成功信号是 dispatch 成功路径置的内部键 `_rvf_keep_self_park`（hook_payload 顶层无
+        # status 键，不能用 result["status"] 判断）；其余结局（派发失败 / kanban 早退 skip / 非
+        # followup backend）= 无 resume → unpark。emit 前 pop 掉该内部键，不泄漏给 Claude。
+        keep_park = _launch_result_keeps_self_park(result)
+        if isinstance(result, dict):
+            result.pop(_RVF_KEEP_SELF_PARK_FLAG, None)
+        if not keep_park:
+            unpark_self_parked_card(event, ledger, reason="no_followup_dispatch")
+        emit(result)
         return 0
+    # skip / 不 launch（含 handoff 完成）= 一般无 resume → unpark；但 followup 仍活跃 / dispatch
+    # 仍在途的 skip（resume 在路上）必须保留 park，否则会在 followup 落地前误解除卡片抑制。
+    if _skip_decision_should_unpark(decision):
+        unpark_self_parked_card(event, ledger, reason="stop_no_launch")
     if decision.payload is not None:
         emit(decision.payload)
     return 0

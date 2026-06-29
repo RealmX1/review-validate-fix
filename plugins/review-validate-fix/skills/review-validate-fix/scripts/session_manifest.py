@@ -896,6 +896,7 @@ def build_manifest(
     tracker_log_root: Path | None = None,
     include_all_transcript_ownership: bool = False,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
     records = parse_jsonl(transcript)
@@ -941,7 +942,9 @@ def build_manifest(
     if committed_baseline:
         try:
             committed_round_set = set(
-                reviewable_unit_diff_tracker._list_committed_round_changed_paths(root, committed_baseline)
+                reviewable_unit_diff_tracker._list_committed_round_changed_paths(
+                    root, committed_baseline, committed_base_ref
+                )
             )
         except Exception:
             committed_round_set = set()

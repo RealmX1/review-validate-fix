@@ -962,18 +962,86 @@ def _commit_message_has_skip_review_trailer(message: str) -> bool:
     return False
 
 
-def _list_round_skip_review_commit_shas(repo: Path, baseline: str) -> set[str]:
+def _base_ref_exclude_revs(repo: Path, base_ref: str | None) -> list[str]:
+    """``["^<base-sha>"]`` to subtract base-branch commits that a rebase / cherry
+    replayed onto this round's first-parent line, or ``[]`` when no *safe*
+    exclusion applies.
+
+    The committed-round walks use ``--first-parent --no-merges``, which only drops
+    base work imported through a *merge* second parent (``git merge`` / ``git
+    pull``). A ``git rebase`` / ``git pull --rebase`` / ``base-branch-sync`` rebase
+    replays the base commits as ordinary first-parent commits, so they survive the
+    walk and get mis-attributed as this session's committed-but-unreviewed work.
+    Appending ``^<base_ref>`` removes every commit reachable from the live base
+    branch — exactly the replayed base work — while leaving the session's own
+    commits (not on base) in scope.
+
+    Safe-exclude preconditions (any miss → ``[]``, i.e. today's no-exclusion
+    behaviour, so this can never *over*-exclude):
+
+    - ``base_ref`` resolves to a real commit (unknown / ambiguous ref degrades
+      silently rather than breaking the walk);
+    - the current checkout's branch ref is NOT the base branch ref. Only when the
+      session is committing *on* the base branch itself (``symbolic-ref HEAD`` equals
+      ``<base_ref>``'s full ref, e.g. both ``refs/heads/main``) would ``^base_ref``
+      subtract the session's OWN commits → self-disable there (plain repo, agent on
+      ``main``). A *fast-forward* to the base tip (detached HEAD, or a non-base
+      feature branch quick-forwarded onto base — ``git merge --ff-only`` /
+      base-branch-sync non-divergent handback) leaves ``HEAD == base tip`` but NOT
+      on the base branch ref; ff can only succeed when the branch carries no own
+      commits, so ``baseline..HEAD`` is then pure base work and ``^base_ref`` safely
+      drops it. (The earlier ``merge-base --is-ancestor HEAD base`` guard treated
+      every ``HEAD == base tip`` alike and mis-self-disabled the ff-to-base case,
+      leaking base commits into committed-round.)
+
+    Resolving to a SHA pins the exclusion against ref churn and keeps all three
+    committed-round walks (skip-sha, count, allowlist) consistent within a call."""
+    if not base_ref:
+        return []
+    try:
+        sha = _run_git(repo, ["rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"]).strip()
+    except RuntimeError:
+        return []
+    if not sha:
+        return []
+    # Self-disable ONLY when the current checkout's branch ref IS the base branch
+    # ref — i.e. the session is committing on the base branch itself, where
+    # ``^base_ref`` would subtract its OWN commits. A detached HEAD (``symbolic-ref``
+    # fails) or any non-base branch — including one fast-forwarded onto the base tip
+    # — is safe to exclude: ff implies the branch carries no own commits, so
+    # ``baseline..HEAD`` minus base is empty / own-only, never the base's work.
+    try:
+        head_ref = _run_git(repo, ["symbolic-ref", "--quiet", "HEAD"]).strip()
+    except RuntimeError:
+        head_ref = ""  # detached HEAD → not on the base branch → apply exclusion
+    if head_ref:
+        try:
+            base_branch_ref = _run_git(
+                repo, ["rev-parse", "--symbolic-full-name", base_ref]
+            ).strip()
+        except RuntimeError:
+            base_branch_ref = ""
+        if base_branch_ref and head_ref == base_branch_ref:
+            return []
+    return [f"^{sha}"]
+
+
+def _list_round_skip_review_commit_shas(
+    repo: Path, baseline: str, base_ref: str | None = None
+) -> set[str]:
     """SHAs of this round's first-parent, non-merge commits that carry the
     ``RVF-Skip-Review`` opt-out trailer (see ``RVF_SKIP_REVIEW_COMMIT_TRAILER``).
 
-    Walks the same first-parent/no-merges window the path collector uses, so an
-    excluded commit's changes drop out of every committed-round consumer at
-    once."""
+    Walks the same first-parent/no-merges window the path collector uses (incl. the
+    same ``^<base_ref>`` exclusion of rebase-replayed base commits), so an excluded
+    commit's changes drop out of every committed-round consumer at once."""
+    base_excludes = _base_ref_exclude_revs(repo, base_ref)
     try:
         # %H<US>%B<RS> — unit-sep between sha and body, record-sep between commits.
         out = _run_git(
             repo,
-            ["log", "--first-parent", "--no-merges", "--format=%H%x1f%B%x1e", f"{baseline}..HEAD"],
+            ["log", "--first-parent", "--no-merges", "--format=%H%x1f%B%x1e",
+             f"{baseline}..HEAD", *base_excludes],
         )
     except RuntimeError:
         return set()
@@ -989,21 +1057,34 @@ def _list_round_skip_review_commit_shas(repo: Path, baseline: str) -> set[str]:
     return skip
 
 
-def _list_committed_round_changed_paths(repo: Path, baseline: str) -> list[str]:
+def _list_committed_round_changed_paths(
+    repo: Path, baseline: str, base_ref: str | None = None
+) -> list[str]:
     """Paths whose content differs between the `baseline` tree and `HEAD`,
     restricted to the work introduced by *this round's own* first-parent,
-    non-merge commits, minus any commit that opted out via the
+    non-merge, non-base commits, minus any commit that opted out via the
     ``RVF-Skip-Review`` trailer.
 
     Pillar ③ (exclude background WIP / base-branch sync): the ``baseline..HEAD``
     range already floors at this round's start, and when the round contains a
     merge (e.g. the agent ran `git merge main` / `git pull`) the first-parent +
     no-merges commit walk drops the merge commit and the base commits it imports
-    via its second parent. A first-parent commit may additionally opt out of
-    review via the ``RVF-Skip-Review`` trailer; such commits' exclusive changes
-    are removed here (a path also touched by a non-skip round commit stays, since
-    it remains in that commit's name-only block). This function is the cheap
-    structural pre-filter; `build_manifest` then attributes the survivors."""
+    via its second parent. But a *rebase* (`git rebase` / `git pull --rebase` /
+    `base-branch-sync` diverged handback) replays the base commits as ordinary
+    first-parent commits, so ``--first-parent --no-merges`` alone keeps them and
+    over-attributes base work as this session's committed-but-unreviewed changes.
+    When `base_ref` (the live base branch, e.g. `main`) is supplied,
+    ``_base_ref_exclude_revs`` adds ``^<base-sha>`` to drop every base-reachable
+    commit from the window — covering the rebase path that merge exclusion misses,
+    and harmlessly redundant on the merge path. It self-disables (no exclusion)
+    when HEAD is on/behind base, so committing directly on the base branch is
+    unaffected.
+
+    A first-parent commit may additionally opt out of review via the
+    ``RVF-Skip-Review`` trailer; such commits' exclusive changes are removed here
+    (a path also touched by a non-skip round commit stays, since it remains in
+    that commit's name-only block). This function is the cheap structural
+    pre-filter; `build_manifest` then attributes the survivors."""
     try:
         net = _run_git(repo, ["diff", "--no-renames", "--name-only", "-z", f"{baseline}..HEAD"])
     except RuntimeError:
@@ -1011,30 +1092,44 @@ def _list_committed_round_changed_paths(repo: Path, baseline: str) -> list[str]:
     net_paths = sorted({item for item in net.split("\0") if item})
     if not net_paths:
         return []
-    skip_shas = _list_round_skip_review_commit_shas(repo, baseline)
-    # Fast path: when the round contains no merges AND no opt-out commits, the net
-    # diff already reflects only reviewable first-parent work — no allowlist pass.
+    skip_shas = _list_round_skip_review_commit_shas(repo, baseline, base_ref)
+    base_excludes = _base_ref_exclude_revs(repo, base_ref)
+    # Fast path: the net (tree) diff already reflects only reviewable first-parent
+    # own work when the round has no merges, no opt-out commits, AND no
+    # base-reachable commit replayed onto the first-parent line. Any of those means
+    # a path in the net diff might belong to non-session work, so fall to the
+    # allowlist pass (the net tree diff cannot itself honour `^base_ref`, so base
+    # exclusion is realised by intersecting against the base-excluded walk below).
     try:
         total = _run_git(repo, ["rev-list", "--count", f"{baseline}..HEAD"]).strip()
         first_parent = _run_git(
             repo, ["rev-list", "--count", "--first-parent", "--no-merges", f"{baseline}..HEAD"]
         ).strip()
         no_merges = total == first_parent
+        base_in_window = bool(base_excludes) and (
+            _run_git(
+                repo, ["rev-list", "--count", f"{baseline}..HEAD", *base_excludes]
+            ).strip()
+            != total
+        )
     except RuntimeError:
         # Counts unavailable: only safe to fast-return when nothing must be
         # filtered out; otherwise fall through to the per-commit allowlist.
-        if not skip_shas:
+        if not skip_shas and not base_excludes:
             return net_paths
         no_merges = False
-    if no_merges and not skip_shas:
+        base_in_window = bool(base_excludes)
+    if no_merges and not skip_shas and not base_in_window:
         return net_paths
-    # Merges and/or opt-out commits present: keep only paths touched by a
-    # first-parent, non-merge, non-skip commit. The `%x1e%H` record marker lets
+    # Merges, opt-out commits, and/or rebase-replayed base commits present: keep
+    # only paths touched by a first-parent, non-merge, non-base, non-skip commit.
+    # `^<base-sha>` drops base-reachable commits; the `%x1e%H` record marker lets
     # us attribute each name-only block to its commit so skip commits drop out.
     try:
         log_out = _run_git(
             repo,
-            ["log", "--first-parent", "--no-merges", "--no-renames", "--name-only", "--format=%x1e%H", f"{baseline}..HEAD"],
+            ["log", "--first-parent", "--no-merges", "--no-renames", "--name-only",
+             "--format=%x1e%H", f"{baseline}..HEAD", *base_excludes],
         )
     except RuntimeError:
         return net_paths
@@ -4753,6 +4848,7 @@ def _observe_and_upsert_units_in_txn(
     worktree_value: str,
     now_iso: str,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
 ) -> dict[str, Any]:
     """Walk the worktree (and, when `committed_baseline` is set, the net
     committed-round diff), upsert units for every observed change, and mark
@@ -4771,7 +4867,7 @@ def _observe_and_upsert_units_in_txn(
 
     committed_observed_unit_ids: set[str] = set()
     if committed_baseline:
-        for path in _list_committed_round_changed_paths(repo, committed_baseline):
+        for path in _list_committed_round_changed_paths(repo, committed_baseline, committed_base_ref):
             observation = _classify_committed_path(repo, path, committed_baseline)
             if observation is None:
                 continue
@@ -5113,6 +5209,7 @@ def allocate_review_scope(
     auto_claim_observed: bool = True,
     transcript_max_line_number: int | None = None,
     committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
 ) -> dict[str, Any]:
     """Producer half of the global reviewed-diff tracker.
 
@@ -5201,6 +5298,7 @@ def allocate_review_scope(
                 worktree_value=worktree_value,
                 now_iso=now_iso,
                 committed_baseline=committed_baseline,
+                committed_base_ref=committed_base_ref,
             )
             worktree_key = observation["worktree_key"]
 

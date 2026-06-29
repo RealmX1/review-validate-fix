@@ -16,6 +16,15 @@ import time
 from pathlib import Path
 
 from _rvf_test_support.repo import templated_repo
+from _rvf_test_support.registry_completeness_guard import (
+    assert_every_defined_test_is_registered,
+    registered_names_from_callables,
+)
+
+
+# 注册表完整性守卫的豁免名单（唯一合法出口）：仅放确属暂时隔离、暂时跑不过的测试，
+# 每项须附 `# quarantined: <原因+issue>`。当前为空 = 严格模式：任何 def test_* 漏登记即红。
+INTENTIONALLY_UNREGISTERED: frozenset[str] = frozenset()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -403,29 +412,6 @@ def test_plugin_deploy_metadata_is_in_prompt_and_summary(tmp_path: Path) -> None
         logging_module.SKILL_DIR = original_logging_skill_dir
 
 
-def test_cline_kanban_worktree_mode_rejects_main_env(tmp_path: Path) -> None:
-    module = load_hook_module()
-    original = os.environ.get("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE")
-    try:
-        os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "main"
-        try:
-            module.cline_kanban_worktree_mode_from_env()
-        except ValueError as exc:
-            message = str(exc)
-        else:
-            raise AssertionError("expected CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE=main to be rejected")
-    finally:
-        if original is None:
-            os.environ.pop("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", None)
-        else:
-            os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = original
-
-    assert "invalid CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE" in message
-    assert "branch" in message
-    assert "inplace" in message
-    assert "main" not in message.split("expected one of:", 1)[-1]
-
-
 def seed_finalize_run_dir(
     *,
     state: Path,
@@ -623,381 +609,6 @@ def test_dispatch_flow_helpers_lock_route_and_fallback_contract(tmp_path: Path) 
     )
 
 
-def test_parent_conversation_origin_prefers_app_server_chat_name(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    origin = module.parent_conversation_origin(
-        parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-        parent_thread_path=transcript,
-        run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-        parent_thread_name="Find RVF_STOP_HOOK behavior",
-        name_lookup={"name": "Find RVF_STOP_HOOK behavior", "source": "desktop-control"},
-    )
-
-    assert origin["label"] == "Find RVF_STOP_HOOK behavior"
-    assert origin["name_source"] == "app_server_name"
-    assert origin["task_title"] == "RVF from Find RVF_STOP_HOOK behavior run 562915ad"
-    assert origin["codex_url"] == "codex://local/019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    assert origin["transcript_file"] == transcript.name
-
-
-def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_unnamed(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    first_prompt = (
-        "for the path in RVF hook fork to cline kanban, we need way to trace "
-        "which original conversation the fork comes from"
-    )
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": first_prompt},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["label"] == '"for the path in RVF hook fork to cline kanban, we need way t"'
-    assert origin["name_source"] == "first_user_prompt_fallback"
-    assert origin["task_title"] == (
-        'RVF from "for the path in RVF hook fork to cline kanban, we need way t" run 562915ad'
-    )
-
-
-def test_parent_conversation_origin_strips_stitched_codex_context_when_chat_unnamed(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    user_prompt = (
-        "currently the fallback chat session name in handoff as well as cline-task "
-        "is incorrectly using the stitched prompt"
-    )
-    stitched_prompt = (
-        "# AGENTS.md instructions for /Users/bominzhang/Documents/GitHub/review-validate-fix\n\n"
-        "<INSTRUCTIONS>\n"
-        "你应该默认使用中文作为主要语言进行回复。\n"
-        "</INSTRUCTIONS><environment_context>\n"
-        "  <cwd>/Users/bominzhang/Documents/GitHub/review-validate-fix</cwd>\n"
-        "</environment_context>\n"
-        f"{user_prompt}"
-    )
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": stitched_prompt},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    expected_excerpt = module.single_line_excerpt(
-        user_prompt,
-        module.DEFAULT_PARENT_CONVERSATION_FALLBACK_CHARS,
-    )
-    assert origin["label"] == f'"{expected_excerpt}"'
-    assert "AGENTS.md instructions" not in origin["task_title"]
-    assert origin["name_source"] == "first_user_prompt_fallback"
-
-
-def test_parent_conversation_origin_skips_context_only_user_messages_when_chat_unnamed(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    context_only = (
-        "# AGENTS.md instructions for /Users/bominzhang/Documents/GitHub/review-validate-fix\n\n"
-        "<INSTRUCTIONS>\n"
-        "project instructions\n"
-        "</INSTRUCTIONS><environment_context>\n"
-        "  <cwd>/Users/bominzhang/Documents/GitHub/review-validate-fix</cwd>\n"
-        "</environment_context>\n"
-    )
-    user_prompt = "please run review validate fix for the current change"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": context_only},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": user_prompt},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "thread_found": True, "source": "desktop-control"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["label"] == f'"{user_prompt}"'
-    assert "AGENTS.md instructions" not in origin["task_title"]
-
-
-def test_parent_conversation_origin_uses_session_index_when_chat_lookup_fails(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    transcript = tmp_path / f"rollout-2026-05-01T11-25-17-{session_id}.jsonl"
-    session_index = tmp_path / "session_index.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": session_id},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": "this prompt is lower priority"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    session_index.write_text(
-        json.dumps({"id": session_id, "thread_name": "Trace original chat names"})
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = os.environ.get("CODEX_SESSION_INDEX_PATH")
-    try:
-        os.environ["CODEX_SESSION_INDEX_PATH"] = str(session_index)
-        origin = module.parent_conversation_origin(
-            parent_session_id=session_id,
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["label"] == "Trace original chat names"
-    assert origin["name_source"] == "session_index_thread_name"
-    assert origin["task_title"] == "RVF from Trace original chat names run 562915ad"
-
-
-def test_parent_conversation_origin_quotes_first_user_prompt_when_chat_lookup_fails(tmp_path: Path) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n"
-        + json.dumps(
-            {
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": "this prompt should be quoted"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["label"] == '"this prompt should be quoted"'
-    assert origin["name_source"] == "first_user_prompt_fallback"
-    assert origin["task_title"] == 'RVF from "this prompt should be quoted" run 562915ad'
-
-
-def test_parent_conversation_origin_uses_stable_ref_when_prompt_fallback_unavailable(
-    tmp_path: Path,
-) -> None:
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191-ba6c-7b13-9874-65eeabb6a6a7.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "session_meta",
-                "payload": {"id": "019de191-ba6c-7b13-9874-65eeabb6a6a7"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id="019de191-ba6c-7b13-9874-65eeabb6a6a7",
-            parent_thread_path=transcript,
-            run_id="rvf-20260501T032651Z-stop-hook-562915ad",
-            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["label"] == "Codex 2026-05-01T11-25-17 019de191"
-    assert origin["name_source"] == "session_ref_fallback"
-    assert '"' not in origin["task_title"]
-    # host=Codex 兜底无回归：host_kind 标 Codex、codex:// URL 仍铸造。
-    assert origin["host_kind"] == module.HOST_CODEX
-    assert origin["codex_url"] == "codex://local/019de191-ba6c-7b13-9874-65eeabb6a6a7"
-
-
-def test_parent_conversation_origin_labels_claude_host_when_codex_lookups_miss(
-    tmp_path: Path,
-) -> None:
-    """Claude Code 会话：前置 Codex-only lookup 全落空时，前缀应为 Claude 而非 Codex，
-    且不再铸造 codex:// URL（复现并锁死 board.json 里 ``RVF from Codex … / agentId=claude``
-    的矛盾根因）。"""
-    module = load_hook_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    session_id = "57f1d2ff-8470-48e5-a259-0b51e2002603"
-    # Claude transcript：文件名是裸 UUID（非 rollout-…），记录用 Claude schema
-    # （type=user/assistant），Codex 侧 first_user_message 解析不到 → 落到 host-aware 兜底。
-    transcript = tmp_path / f"{session_id}.jsonl"
-    transcript.write_text(
-        json.dumps({"type": "user", "message": {"role": "user", "content": "codex 解析器读不到"}})
-        + "\n"
-        + json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "ok"}})
-        + "\n",
-        encoding="utf-8",
-    )
-
-    original_session_index = isolate_codex_session_index(tmp_path)
-    try:
-        origin = module.parent_conversation_origin(
-            parent_session_id=session_id,
-            parent_thread_path=transcript,
-            run_id="rvf-20260620T153456Z-stop-hook-134fa44d",
-            name_lookup={"name": None, "source": "unavailable", "error": "socket unavailable"},
-        )
-    finally:
-        restore_env_var("CODEX_SESSION_INDEX_PATH", original_session_index)
-
-    assert origin["host_kind"] == module.HOST_CLAUDE
-    assert origin["name_source"] == "session_ref_fallback"
-    assert origin["label"] == "Claude 57f1d2ff"
-    assert origin["task_title"] == "RVF from Claude 57f1d2ff run 134fa44d"
-    assert "Codex" not in origin["task_title"]
-    assert origin["codex_url"] is None
-
-
-def test_parent_origin_prompt_block_uses_claude_heading_for_claude_host(tmp_path: Path) -> None:
-    """prompt-block 人类可读文案随 host_kind 走：Claude 会话不应再写 'Original Codex …'
-    标题，codex_url 缺失时渲染 <unavailable>。"""
-    module = load_hook_module()
-    block = module.parent_origin_prompt_block(
-        parent_origin={
-            "label": "Claude 57f1d2ff",
-            "name_source": "session_ref_fallback",
-            "host_kind": module.HOST_CLAUDE,
-            "codex_url": None,
-            "session_id": "57f1d2ff-8470-48e5-a259-0b51e2002603",
-            "transcript_path": "/Users/x/.claude/projects/p/57f1d2ff.jsonl",
-            "transcript_file": "57f1d2ff.jsonl",
-        },
-        origin_path="/tmp/origin.json",
-    )
-    assert "Original Claude Code conversation metadata:" in block
-    assert "Original Codex conversation metadata:" not in block
-    assert "original Claude Code conversation name/ref" in block
-    assert "RVF_PARENT_CODEX_URL: <unavailable>" in block
-    # Codex host 仍写 'Original Codex …'（兜底口径，无回归）。
-    codex_block = module.parent_origin_prompt_block(
-        parent_origin={
-            "label": "Codex 019de191",
-            "name_source": "session_ref_fallback",
-            "host_kind": module.HOST_CODEX,
-            "codex_url": "codex://local/019de191",
-        },
-        origin_path="/tmp/origin.json",
-    )
-    assert "Original Codex conversation metadata:" in codex_block
-    assert "RVF_PARENT_CODEX_URL: codex://local/019de191" in codex_block
-
-
 def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp_path: Path) -> None:
     module = load_hook_module()
     state = tmp_path / "state"
@@ -1049,59 +660,6 @@ def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp_path
     turn_input = requests[1]["params"]["input"][0]
     assert isinstance(turn_input, dict)
     assert turn_input["text"] == prompt
-
-
-def test_parent_thread_name_from_app_server_reads_thread_name(tmp_path: Path) -> None:
-    module = load_hook_module()
-    socket_path = tmp_path / "app-server.sock"
-    calls: list[tuple[str, dict[str, object] | None]] = []
-    notifications: list[dict[str, object]] = []
-
-    class FakeClient:
-        def __init__(self, socket: Path) -> None:
-            assert socket == socket_path
-            self.notifications: list[dict[str, object]] = []
-
-        def request(self, method: str, params: dict[str, object] | None) -> dict[str, object]:
-            calls.append((method, params))
-            if method == "initialize":
-                return {}
-            if method == "thread/read":
-                return {
-                    "thread": {
-                        "id": "parent-thread",
-                        "name": "Find RVF_STOP_HOOK behavior",
-                    }
-                }
-            raise AssertionError(method)
-
-        def send_json(self, payload: dict[str, object]) -> None:
-            notifications.append(payload)
-
-        def close(self) -> None:
-            pass
-
-    original_client = appserver.AppServerWebSocket
-    original_select = appserver.select_existing_app_server_socket_for_metadata
-    try:
-        appserver.AppServerWebSocket = FakeClient
-        appserver.select_existing_app_server_socket_for_metadata = lambda: (
-            socket_path,
-            "desktop-control",
-            {},
-        )
-        lookup = module.parent_thread_name_from_app_server("parent-thread", str(tmp_path))
-    finally:
-        appserver.AppServerWebSocket = original_client
-        appserver.select_existing_app_server_socket_for_metadata = original_select
-
-    assert lookup["name"] == "Find RVF_STOP_HOOK behavior"
-    assert lookup["thread_found"] is True
-    assert lookup["source"] == "desktop-control"
-    assert lookup["method"] == "thread/read"
-    assert calls[0][0] == "initialize"
-    assert calls[1] == ("thread/read", {"threadId": "parent-thread", "includeTurns": False})
-    assert notifications == [{"method": "initialized"}]
 
 
 def write_subagent_session(path: Path) -> None:
@@ -1712,107 +1270,6 @@ def test_patch_ownership_incomplete_skip_payload_does_not_duplicate_reason_code(
     assert "patch_ownership_incomplete" in events_text
 
 
-def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp / "dirty")
-    transcript = tmp / "session.jsonl"
-    write_apply_patch_transcript(transcript, repo, session_id="sess-followup-ttl")
-    state = tmp / "state"
-    original_log = os.environ.get("CODEX_RVF_LOG_ROOT")
-    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
-    try:
-        os.environ["CODEX_RVF_FORK_MODE"] = "kanban-followup"
-        ledger = _make_test_ledger(module, state)
-        event = {"cwd": str(repo), "transcript_path": str(transcript), "task_id": "task-ttl"}
-        context = module.resolve_stop_context(event, str(repo), ledger)
-        module.refresh_global_diff_tracker(context, ledger)
-        result = module.allocate_auto_review_scope(context, ledger, dry_run=False)
-    finally:
-        if original_log is None:
-            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
-        else:
-            os.environ["CODEX_RVF_LOG_ROOT"] = original_log
-        if original_mode is None:
-            os.environ.pop("CODEX_RVF_FORK_MODE", None)
-        else:
-            os.environ["CODEX_RVF_FORK_MODE"] = original_mode
-
-    assert result is None
-    meta = getattr(ledger, "tracker_scope_meta", None)
-    assert isinstance(meta, dict)
-    db_path = Path(meta["tracker_dir"]) / "tracker.sqlite3"
-    conn = sqlite3.connect(str(db_path))
-    try:
-        row = conn.execute(
-            "SELECT ttl_seconds FROM leases WHERE lease_id=?",
-            (meta["tracker_lease_id"],),
-        ).fetchone()
-    finally:
-        conn.close()
-    assert row is not None
-    assert row[0] == 3600
-
-
-def test_kanban_followup_without_task_id_does_not_allocate_review_scope(tmp: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp / "dirty")
-    transcript = tmp / "session.jsonl"
-    write_apply_patch_transcript(transcript, repo, session_id="sess-followup-no-task")
-    state = tmp / "state"
-    original_log = os.environ.get("CODEX_RVF_LOG_ROOT")
-    original_mode = os.environ.get("CODEX_RVF_FORK_MODE")
-    task_env_names = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
-    original_task_env = {name: os.environ.get(name) for name in task_env_names}
-    try:
-        os.environ["CODEX_RVF_FORK_MODE"] = "kanban-followup"
-        for name in task_env_names:
-            os.environ.pop(name, None)
-        ledger = _make_test_ledger(module, state)
-        event = {"cwd": str(repo), "transcript_path": str(transcript)}
-        context = module.resolve_stop_context(event, str(repo), ledger)
-        module.refresh_global_diff_tracker(context, ledger)
-        result = module.allocate_auto_review_scope(context, ledger, dry_run=False)
-    finally:
-        if original_log is None:
-            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
-        else:
-            os.environ["CODEX_RVF_LOG_ROOT"] = original_log
-        if original_mode is None:
-            os.environ.pop("CODEX_RVF_FORK_MODE", None)
-        else:
-            os.environ["CODEX_RVF_FORK_MODE"] = original_mode
-        for name, value in original_task_env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-    assert result is not None
-    assert "reason=kanban_followup_missing_task_id" in result["systemMessage"]
-    meta = getattr(ledger, "tracker_scope_meta", None)
-    assert meta is None
-
-    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
-    _, _, tracker_dir, db_path, _, _ = diff_tracker._lease_repo_paths(
-        repo,
-        log_root_override=state / "global-diff-tracker",
-    )
-    assert Path(tracker_dir).exists()
-    conn = sqlite3.connect(str(db_path))
-    try:
-        has_leases_table = conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='leases'"
-        ).fetchone()[0]
-        count = (
-            conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
-            if has_leases_table
-            else 0
-        )
-    finally:
-        conn.close()
-    assert count == 0
-
-
 def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "dirty")
@@ -2066,188 +1523,6 @@ def test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_f
     raw = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
     assert "tracker_refresh_failed" in raw
     assert "session_manifest_failed" in raw
-
-
-def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp_path: Path) -> None:
-    old_state = os.environ.pop("CODEX_RVF_STATE_DIR", None)
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    try:
-        module = load_hook_module()
-        expected = SCRIPT.parents[1] / "state" / "session-hook"
-        assert module.session_hook_state_dir() == expected
-    finally:
-        if old_state is not None:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
-
-
-def test_session_hook_state_dir_respects_state_dir_override(tmp_path: Path) -> None:
-    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state-root")
-    try:
-        module = load_hook_module()
-        assert module.session_hook_state_dir() == tmp_path / "state-root" / "session-hook"
-    finally:
-        if old_state is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
-
-
-def test_manual_rvf_session_marker_write_read_clear_preserves_hook_state(tmp_path: Path) -> None:
-    module = load_hook_module()
-    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state-root")
-    try:
-        module.set_session_hook_enabled(
-            session_id="manual/session",
-            enabled=False,
-            latest_user="RVF_STOP_HOOK: off",
-        )
-        path = module.write_manual_rvf_session_marker(
-            session_id="manual/session",
-            run_id="rvf-manual-run",
-            completed_at="2999-04-30T00:00:00+00:00",
-        )
-        assert path == tmp_path / "state-root" / "session-hook" / "manual_session.json"
-
-        marker = module.read_manual_rvf_session_marker("manual/session")
-        assert marker is not None
-        assert marker["manual_rvf_run_id"] == "rvf-manual-run"
-        assert marker["manual_rvf_completed_at"] == "2999-04-30T00:00:00+00:00"
-        assert module.session_hook_disabled("manual/session") is True
-
-        cleared = module.clear_manual_rvf_session_marker("manual/session")
-        assert cleared == path
-        assert module.read_manual_rvf_session_marker("manual/session") is None
-        assert module.session_hook_disabled("manual/session") is True
-        assert json.loads(path.read_text(encoding="utf-8"))["enabled"] is False
-    finally:
-        if old_state is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
-
-
-def test_manual_rvf_session_marker_skips_before_fork_gate(tmp_path: Path) -> None:
-    module = load_hook_module()
-    dirty = init_repo_with_head(tmp_path / "dirty")
-    state = tmp_path / "state"
-    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-    try:
-        module.set_session_hook_enabled(
-            session_id="manual-rvf-session",
-            enabled=False,
-            latest_user="RVF_STOP_HOOK: off",
-        )
-        module.write_manual_rvf_session_marker(
-            session_id="manual-rvf-session",
-            run_id="rvf-manual-run",
-            repo=dirty,
-            completed_at="2999-04-30T00:00:00+00:00",
-        )
-    finally:
-        if old_state is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "manual-rvf-session",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-
-    assert "decision" not in payload
-    assert "reason=manual_rvf_already_ran" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "manual_rvf_already_ran"
-    assert summary["manual_rvf_run_id"] == "rvf-manual-run"
-    assert summary["manual_rvf_completed_at"] == "2999-04-30T00:00:00+00:00"
-    assert summary["manual_rvf_repo"] == str(dirty.resolve())
-    assert summary["manual_rvf_dirty_hash"]
-    assert "app_server_requests_path" not in summary
-    assert latest_pointer(state)["reason_code"] == "manual_rvf_already_ran"
-
-
-def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp_path: Path) -> None:
-    module = load_hook_module()
-    dirty = init_repo_with_head(tmp_path / "dirty")
-    state = tmp_path / "state"
-    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-    try:
-        module.write_manual_rvf_session_marker(
-            session_id="manual-rvf-session-dirty-changed",
-            run_id="rvf-manual-run",
-            repo=dirty,
-            completed_at="2999-04-30T00:00:00+00:00",
-        )
-    finally:
-        if old_state is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
-
-    (dirty / "changed.txt").write_text("new dirty content\n", encoding="utf-8")
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "manual-rvf-session-dirty-changed",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-
-    assert "reason=manual_rvf_already_ran" not in payload["systemMessage"]
-    assert "reason=dry_run" in payload["systemMessage"]
-
-
-def test_manual_rvf_session_marker_expired_does_not_read(tmp_path: Path) -> None:
-    module = load_hook_module()
-    dirty = init_repo_with_head(tmp_path / "dirty")
-    old_state = os.environ.get("CODEX_RVF_STATE_DIR")
-    old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
-    os.environ["CODEX_RVF_STATE_DIR"] = str(tmp_path / "state")
-    try:
-        module.write_manual_rvf_session_marker(
-            session_id="manual-expired",
-            run_id="rvf-manual-run",
-            repo=dirty,
-            completed_at="2000-01-01T00:00:00+00:00",
-            ttl_seconds=1,
-        )
-        assert module.read_manual_rvf_session_marker("manual-expired", dirty) is None
-    finally:
-        if old_state is None:
-            os.environ.pop("CODEX_RVF_STATE_DIR", None)
-        else:
-            os.environ["CODEX_RVF_STATE_DIR"] = old_state
-        if old_session_state is not None:
-            os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
 
 
 def test_socket_probe_reports_unavailable_reason(tmp_path: Path) -> None:
@@ -2780,470 +2055,6 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
     assert "failed to load configuration" in result["bridge_retry"]["first_error"]
 
 
-def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    prep_root = tmp_path / "prep-root"
-    prep_root.mkdir()
-    stale_prep = prep_root / "cccccccccccccccc.json"
-    stale_prep.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "token": "cccccccccccccccc",
-                "created_at": "2026-05-07T00:00:00Z",
-                "expires_at": "2026-05-07T00:00:01Z",
-                "origin_session_id": "old-session",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True, 'started': False}))\n"
-        "elif action == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-123', 'workspacePath': '/tmp/task-worktree'}))\n"
-        "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-123', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-            "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
-            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
-            "RVF_SUPPRESS_STOP_HOOK",
-            "CODEX_RVF_PREP_ROOT",
-            "FAKE_CLIENT_CALLS",
-        )
-    }
-    original_lookup = module.parent_thread_name_from_app_server
-    try:
-        module.parent_thread_name_from_app_server = lambda *_: {
-            "name": None,
-            "thread_found": False,
-            "source": "test",
-            "reason": "disabled-in-test",
-        }
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
-        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
-        os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
-        os.environ["RVF_SUPPRESS_STOP_HOOK"] = "1"
-        os.environ["CODEX_RVF_PREP_ROOT"] = str(prep_root)
-        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model="gpt-test",
-            reasoning_effort="high",
-            parent_thread_path=transcript,
-        )
-    finally:
-        module.parent_thread_name_from_app_server = original_lookup
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
-    assert "pause_origin_edits=true" in payload["systemMessage"]
-    assert "workspace=/tmp/task-worktree" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-started"
-    assert "请暂停在 origin worktree 继续编辑" in latest["message"]
-    assert latest["rvf_backend"] == "kanban-task"
-    assert latest["rvf_backend_raw"] == "cline-kanban"
-    assert latest["rvf_state_phase"] == "prepare"
-    assert latest["rvf_scope_contract_path"].endswith("artifacts/inputs/scope.contract.json")
-    assert latest["rvf_review_packet_path"].endswith("artifacts/review-packet.md")
-    assert latest["rvf_state"]["phases"] == [
-        "prepare",
-        "review",
-        "merge",
-        "validate_fix",
-        "verify",
-        "handoff",
-        "complete",
-    ]
-    assert latest["cline_kanban_task_id"] == "task-123"
-    assert latest["cline_kanban_worktree_mode"] == "branch"
-    assert latest["cline_kanban_prep_file_path"] == latest["rvf_dispatch_prep_file_path"]
-    assert latest["workspace_path"] == "/tmp/task-worktree"
-    assert "app_server_requests_path" not in latest
-    assert Path(latest["startup_prepare_metadata_path"]).exists()
-    assert Path(latest["worktree_bootstrap_path"]).exists()
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
-    create_argv = calls[1]["argv"]
-    assert "--base-ref" in create_argv
-    assert "--prompt" in create_argv
-    assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
-    assert create_argv[create_argv.index("--worktree-mode") + 1] == "branch"
-    assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
-    prompt_text = create_argv[create_argv.index("--prompt") + 1]
-    assert "RVF_CLINE_KANBAN_TASK" in prompt_text
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
-    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
-    assert "RVF_TARGET_REPO: ." in prompt_text
-    assert f"RVF_PARENT_REPO: {repo}" in prompt_text
-    assert f"RVF_PARENT_CWD: {repo}" in prompt_text
-    assert f"RVF_TARGET_REPO: {repo}" not in prompt_text
-    assert "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts" in prompt_text
-    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
-    assert "export CODEX_RVF_LOG_ROOT=" in prompt_text
-    assert "export RVF_RUN_ID=" in prompt_text
-    assert "export RVF_RUN_DIR=" in prompt_text
-    assert "CODEX_RVF_RUN_DIR" not in prompt_text
-    assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in prompt_text
-    assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
-    assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text
-    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' in prompt_text
-    assert "- scope contract: `$RVF_SCOPE_CONTRACT`" in prompt_text
-    assert "- review packet: `$RVF_REVIEW_PACKET`" in prompt_text
-    assert "- session manifest: `$RVF_SESSION_MANIFEST`" in prompt_text
-    assert "review scope 只能以 `$RVF_SCOPE_CONTRACT`" in prompt_text
-    assert "和 review packet 为准" not in prompt_text
-    assert "review packet 仅作为冻结 reviewer 输入" in prompt_text
-    assert "session manifest 只作为 ownership evidence" in prompt_text
-    assert "`$RVF_ARTIFACTS_DIR/handoff.md`" in prompt_text
-    # 不再指示 agent 手动打开 handoff；改由 Stop hook 在 run 结束时发 OS 系统通知。
-    assert "rvf_handoff.py" not in prompt_text
-    assert 'open "$RVF_ARTIFACTS_DIR/handoff.md"' not in prompt_text
-    assert "OS 系统" in prompt_text
-    assert "不要在当前 Cline Kanban worktree 里重新运行 `prepare_review_run.py`" not in prompt_text
-    assert "由 UserPromptSubmit hook 调用 shared prepare 入口" in prompt_text
-    artifacts_dir = latest["artifacts_dir"]
-    assert f"{artifacts_dir}/review-packet.md" not in prompt_text
-    assert f"{artifacts_dir}/session-manifest.json" not in prompt_text
-    assert f"{artifacts_dir}/worktree-bootstrap.json" not in prompt_text
-    startup_scope = (Path(artifacts_dir) / "startup-scope-of-work.md").read_text(encoding="utf-8")
-    assert "scope 只能以本 run artifacts 中已经生成的 scope.contract.json" in startup_scope
-    assert "review packet、session manifest、workspace snapshot 和 worktree bootstrap 仅作为冻结证据" in startup_scope
-    assert "作为启动时 scope anchor" not in startup_scope
-    task_title = create_argv[create_argv.index("--title") + 1]
-    assert task_title.startswith("RVF from Codex parent-thread run ")
-    assert " repo " not in task_title
-    assert latest["parent_conversation_ref"] == "Codex parent-thread"
-    assert latest["parent_codex_url"] == "codex://local/parent-thread"
-    assert Path(latest["parent_origin_path"]).exists()
-    prep = dispatch_prep_payload(latest)
-    prep_token = prep["token"]
-    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
-    assert f"RVF_DISPATCH=token={prep_token}" in prompt_text
-    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt_text
-    assert prep["origin_session_id"] == "parent-thread"
-    assert Path(str(prep["origin_repo"])).resolve() == repo.resolve()
-    assert prep["target_flow"] == "flow-2-branch"
-    assert prep["target_worktree"] == "/tmp/task-worktree"
-    assert prep["target_kanban_task_id"] == "task-123"
-    assert latest["rvf_dispatch_target_worktree"] == "/tmp/task-worktree"
-    assert latest["rvf_dispatch_target_kanban_task_id"] == "task-123"
-    assert not stale_prep.exists()
-    sweep_events = [
-        event
-        for event in latest_events(state)
-        if event.get("event") == "dispatch_prep_file_sweep_completed"
-    ]
-    assert sweep_events
-    assert sweep_events[-1]["removed_count"] == 1
-    assert sweep_events[-1]["removed_paths"] == [str(stale_prep)]
-    assert prep["rvf_run"]["run_id"] == latest["run_id"]
-    assert "RVF_PARENT_CONVERSATION_REF: Codex parent-thread" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_NAME: Codex parent-thread" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: session_ref_fallback" in prompt_text
-    assert "RVF_PARENT_CODEX_URL: codex://local/parent-thread" in prompt_text
-    assert "## Origin" in prompt_text
-    assert "origin metadata: `$RVF_ARTIFACTS_DIR/origin.json`" in prompt_text
-    assert create_argv[create_argv.index("--agent-id") + 1] == "codex"
-    assert all(call["suppress"] is None for call in calls)
-    suppression_path = Path(latest["cline_kanban_stop_hook_suppression_path"])
-    assert suppression_path.exists()
-    suppression_marker = json.loads(suppression_path.read_text(encoding="utf-8"))
-    assert suppression_marker["task_id"] == "task-123"
-    assert suppression_marker["suppress_stop_hook"] is True
-    assert suppression_marker["run_id"] == latest["run_id"]
-    # Regression for the freeze/update race: after Cline Kanban dispatch the
-    # prep file on disk must still carry the shared_workflow_state that
-    # freeze_cline_kanban_dispatch_artifacts wrote. Previously the caller
-    # held a stale dispatch_prep record and update_dispatch_prep_file would
-    # merge over it, wiping shared_workflow_state. update_dispatch_prep_file
-    # now reloads the prep payload from disk before merging.
-    final_prep_path = Path(latest["rvf_dispatch_prep_file_path"])
-    final_prep_payload = json.loads(final_prep_path.read_text(encoding="utf-8"))
-    final_state = final_prep_payload.get("rvf_run", {}).get("shared_workflow_state")
-    assert isinstance(final_state, dict), final_prep_payload
-    assert final_state.get("status") == "completed"
-    assert final_state.get("rvf_backend") == "kanban-task"
-    assert final_state.get("target_flow") == "flow-2-branch"
-    # The same payload must reflect the post-task update_dispatch_prep_file
-    # write (target_worktree / target_kanban_task_id), proving the merge ran
-    # against the freshly reloaded payload rather than a pre-freeze copy.
-    assert final_prep_payload.get("target_worktree") == "/tmp/task-worktree"
-    assert final_prep_payload.get("target_kanban_task_id") == "task-123"
-
-
-def test_cline_kanban_automatic_task_ignores_base_ref_and_worktree_env(tmp_path: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    workspace = tmp_path / "task-worktree"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True, 'started': False}))\n"
-        "elif action == 'create':\n"
-        f"    print(json.dumps({{'task_id': 'task-auto', 'workspacePath': {str(workspace)!r}}}))\n"
-        "elif action == 'start':\n"
-        f"    print(json.dumps({{'task_id': 'task-auto', 'status': 'started', 'workspacePath': {str(workspace)!r}}}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-            "CODEX_RVF_CLINE_KANBAN_BASE_REF",
-            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
-            "FAKE_CLIENT_CALLS",
-        )
-    }
-    original_lookup = module.parent_thread_name_from_app_server
-    try:
-        module.parent_thread_name_from_app_server = lambda *_: {
-            "name": None,
-            "thread_found": False,
-            "source": "test",
-            "reason": "disabled-in-test",
-        }
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
-        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
-        os.environ["CODEX_RVF_CLINE_KANBAN_BASE_REF"] = "stale-user-selected-branch"
-        os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "inplace"
-        os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
-        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            parent_thread_path=transcript,
-        )
-    finally:
-        module.parent_thread_name_from_app_server = original_lookup
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
-    assert "pause_origin_edits=true" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-started"
-    assert latest["cline_kanban_worktree_mode"] == "branch"
-    assert latest["workspace_path"] == str(workspace)
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    create_argv = calls[1]["argv"]
-    expected_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert create_argv[create_argv.index("--base-ref") + 1] == expected_head
-    assert create_argv[create_argv.index("--parent-session-id") + 1] == "parent-thread"
-    assert create_argv[create_argv.index("--worktree-mode") + 1] == "branch"
-    assert create_argv[create_argv.index("--prep-file-path") + 1] == latest["rvf_dispatch_prep_file_path"]
-    prompt_text = create_argv[create_argv.index("--prompt") + 1]
-    assert "独立 git worktree" in prompt_text
-    assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
-    assert "apply_worktree_bootstrap.py" in prompt_text
-    assert '--metadata "$RVF_WORKTREE_BOOTSTRAP" --repo "$RVF_REPO"' in prompt_text
-    prep = dispatch_prep_payload(latest)
-    assert prep["target_flow"] == "flow-2-branch"
-    assert prep["target_worktree"] == str(workspace)
-    assert prep["target_kanban_task_id"] == "task-auto"
-    assert prep["workflow_constraints"] == {
-        "pause_origin_edits": True,
-        "in_place_mode": False,
-    }
-
-
-def test_cline_kanban_mode_requires_workspace_path(tmp_path: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    fake_client.write_text(
-        "import json, sys\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True, 'started': False}))\n"
-        "elif action == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-no-workspace'}))\n"
-        "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-no-workspace', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-        )
-    }
-    original_lookup = module.parent_thread_name_from_app_server
-    try:
-        module.parent_thread_name_from_app_server = lambda *_: {
-            "name": None,
-            "thread_found": False,
-            "source": "test",
-            "reason": "disabled-in-test",
-        }
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
-        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
-        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            parent_thread_path=transcript,
-        )
-    finally:
-        module.parent_thread_name_from_app_server = original_lookup
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-unavailable"
-    assert "task execution workspace_path/workspacePath" in latest["error"]
-    assert "workspace_path" not in latest
-    assert latest["rvf_dispatch_target_worktree"] is None
-    prep = dispatch_prep_payload(latest)
-    assert prep["target_worktree"] is None
-
-
-def test_cline_kanban_workspace_path_reads_nested_task_workspace_path(tmp_path: Path) -> None:
-    module = load_hook_module()
-
-    assert module.cline_kanban_workspace_path(
-        {"task": {"workspacePath": "/tmp/task-worktree"}},
-    ) == "/tmp/task-worktree"
-
-
-def test_cline_kanban_branch_mode_rejects_parent_project_workspace(tmp_path: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    fake_client.write_text(
-        "import json, sys\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True, 'started': False}))\n"
-        "elif action == 'create':\n"
-        f"    print(json.dumps({{'task_id': 'task-parent-workspace', 'task': {{'id': 'task-parent-workspace', 'workspacePath': {str(repo)!r}}}}}))\n"
-        "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-parent-workspace', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in (
-            "CODEX_RVF_STATE_DIR",
-            "CODEX_RVF_FORK_MODE",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
-        )
-    }
-    original_lookup = module.parent_thread_name_from_app_server
-    try:
-        module.parent_thread_name_from_app_server = lambda *_: {
-            "name": None,
-            "thread_found": False,
-            "source": "test",
-            "reason": "disabled-in-test",
-        }
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
-        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
-        transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            parent_thread_path=transcript,
-        )
-    finally:
-        module.parent_thread_name_from_app_server = original_lookup
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    assert "reason=cline_kanban_unavailable" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-unavailable"
-    assert "parent project path" in latest["error"]
-    assert "workspace_path" not in latest
-
-
 def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
     repo = init_repo_with_head(tmp_path / "repo")
     state = tmp_path / "state"
@@ -3525,439 +2336,6 @@ def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp_path: 
     assert "legacy_gui_fallback" not in latest
 
 
-def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True}))\n"
-        "elif action == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-123'}))\n"
-        "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-123', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": "parent-thread",
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "cline-kanban",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=cline_kanban_missing_scope_anchor" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "cline_kanban_missing_scope_anchor"
-    assert latest["backend"] == "kanban"
-    assert "startup_prepare_metadata_path" not in latest
-    assert not client_calls.exists()
-
-
-def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-    fake_codex = tmp_path / "fake_codex.py"
-    fake_codex.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "if sys.argv[1:3] == ['login', 'status']:\n"
-        "    print('session expired; please login again', file=sys.stderr)\n"
-        "    raise SystemExit(1)\n"
-        "raise SystemExit(f'unexpected codex argv: {sys.argv[1:]}')\n",
-        encoding="utf-8",
-    )
-    fake_codex.chmod(0o755)
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "print(json.dumps({'task_id': 'should-not-start'}))\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "cline-kanban",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CODEX_BIN": str(fake_codex),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=provider_health_failed" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "provider_health_failed"
-    assert latest["backend"] == "kanban"
-    assert latest["gate_status"] == "DIRTY"
-    assert "codex login" in str(latest["message"])
-    assert "startup_prepare_metadata_path" not in latest
-    assert not client_calls.exists()
-    health = read_json_artifact(latest, "provider_health_path")
-    assert isinstance(health, dict)
-    results = health["results"]
-    assert isinstance(results, list)
-    assert results[0]["provider"] == "codex"
-    assert results[0]["status"] == "failed"
-    assert "session expired" in results[0]["stderr"]
-
-
-def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
-    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    write_apply_patch_transcript(transcript, repo, session_id=session_id)
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued', 'checkpoint_id': 'checkpoint-1'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_ATTEMPT_ID": "attempt-9",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "kanban-followup-enqueued"
-    assert latest["backend"] == "kanban-followup"
-    assert latest["rvf_backend"] == "kanban-followup"
-    assert latest["rvf_state_phase"] == "prepare"
-    assert latest["cline_kanban_task_id"] == "task-77"
-    assert latest["cline_kanban_attempt_id"] == "attempt-9"
-    assert latest["cline_kanban_message_id"] == "msg-77"
-    assert latest["cline_kanban_checkpoint_id"] == "checkpoint-1"
-    # 新契约：Stop dispatch 不再 arm in-progress 锁；arm 已移交目标 session 的
-    # UserPromptSubmit hook，仅在注入的 follow-up trigger 真正投递落地时才上锁。
-    # 因此 dispatch 这一刻没有 marker 被写出（治本 squat：投递静默失败不留空转锁）。
-    assert latest.get("kanban_followup_in_progress_marker_path") is None
-    assert latest["cline_kanban_task_title"] == "Fix RVF follow-up source metadata"
-    assert latest["cline_kanban_task_title_source"] == "cline_kanban_task_lookup"
-    assert latest["parent_thread_id"] == session_id
-    assert latest["parent_thread_path"] == str(transcript.resolve())
-    assert latest["parent_source_kind"] == "cline-kanban-task"
-    assert latest["parent_conversation_ref"] == "Fix RVF follow-up source metadata"
-    assert latest["parent_conversation_name"] == latest["parent_conversation_ref"]
-    assert latest["parent_conversation_name_source"] == "cline_kanban_task_lookup"
-    assert latest["parent_source_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
-    assert latest["parent_source_session_name_source"] == "session_ref_fallback"
-    assert latest["parent_codex_url"] == f"codex://local/{session_id}"
-    assert Path(str(latest["parent_origin_path"])).exists()
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
-    message_argv = calls[2]["argv"]
-    assert "--task-id" in message_argv
-    assert message_argv[message_argv.index("--task-id") + 1] == "task-77"
-    assert "--attempt-id" in message_argv
-    assert message_argv[message_argv.index("--attempt-id") + 1] == "attempt-9"
-    assert "--prompt-file" in message_argv
-    prompt_path = Path(message_argv[message_argv.index("--prompt-file") + 1])
-    prompt_text = prompt_path.read_text(encoding="utf-8")
-    assert prompt_text.startswith("$review-validate-fix\n")
-    assert "RVF_KANBAN_FOLLOWUP_TRIGGER" in prompt_text
-    assert "RVF_CURRENT_TASK_ID: task-77" in prompt_text
-    assert "RVF_CURRENT_ATTEMPT_ID: attempt-9" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_REF: Fix RVF follow-up source metadata" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_NAME: Fix RVF follow-up source metadata" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_task_lookup" in prompt_text
-    assert "RVF_PARENT_SOURCE_KIND: cline-kanban-task" in prompt_text
-    assert "RVF_PARENT_KANBAN_TASK_ID: task-77" in prompt_text
-    assert "RVF_PARENT_KANBAN_ATTEMPT_ID: attempt-9" in prompt_text
-    assert "RVF_PARENT_KANBAN_TASK_TITLE: Fix RVF follow-up source metadata" in prompt_text
-    assert "`source Kanban task id`" in prompt_text
-    assert "`source Kanban attempt id`" in prompt_text
-    assert "`source Kanban task title at trigger`" in prompt_text
-    assert "RVF_PARENT_SOURCE_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
-    assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
-    assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
-    prep = dispatch_prep_payload(latest)
-    prep_token = prep["token"]
-    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
-    assert f"RVF_DISPATCH=token={prep_token}" in prompt_text
-    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt_text
-    assert prep["origin_session_id"] == session_id
-    assert Path(str(prep["origin_repo"])).resolve() == repo.resolve()
-    assert prep["target_flow"] == "flow-1-self-rising"
-    assert prep["target_kanban_task_id"] == "task-77"
-    assert prep["rvf_run"]["run_id"] == latest["run_id"]
-    assert "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task" in prompt_text
-    assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
-    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
-    assert calls[0]["suppress"] is None
-    assert calls[1]["suppress"] is None
-
-
-def test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pending(
-    tmp_path: Path,
-) -> None:
-    """terminal fallback 投递（message_id 以 ``terminal:`` 开头）→ 诚实上报 dispatched-unconfirmed + 写 pending。
-
-    无 app-server socket 时外部 CLI 走 terminal fallback、返回乐观 ``status:started``，但消息未必
-    成为真实 turn。RVF 不再谎报 injected/started，而是 dispatched-unconfirmed，并写 pending 供对账。
-    """
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
-    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    write_apply_patch_transcript(transcript, repo, session_id=session_id)
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'terminal:task-77:rvf-run', 'turn_id': '3', 'status': 'started', 'checkpoint_id': 'checkpoint-1'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_ATTEMPT_ID": "attempt-9",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "kanban-followup-dispatched-unconfirmed"
-    assert latest["kanban_followup_delivery_channel"] == "terminal"
-    assert latest["kanban_followup_delivery_confirmed"] is False
-    # dispatch 这一刻仍不 arm in-progress 锁（arm 仍归 UPS）。
-    assert latest.get("kanban_followup_in_progress_marker_path") is None
-    # 写了 pending marker，内容自洽（state / token / channel）。
-    pending_path = latest.get("kanban_followup_pending_marker_path")
-    assert isinstance(pending_path, str) and Path(pending_path).exists()
-    pending = json.loads(Path(pending_path).read_text(encoding="utf-8"))
-    assert pending["state"] == "dispatched_unconfirmed"
-    assert pending["delivery_channel"] == "terminal"
-    prep_token = dispatch_prep_payload(latest)["token"]
-    assert pending["token"] == prep_token
-    assert pending["kanban_task_id"] == "task-77"
-
-
-def test_kanban_followup_active_pending_skips_redispatch(tmp_path: Path) -> None:
-    """active pending（dispatch→delivery 在途窗口内）→ 本次 Stop 跳过重复 dispatch，避免双注入。"""
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
-    pending_dir.mkdir(parents=True)
-    pending_path = pending_dir / "task-task-active.json"
-    pending_path.write_text(
-        json.dumps(
-            {
-                "marker_version": 1,
-                "state": "dispatched_unconfirmed",
-                "dispatched_at": "2026-05-21T15:57:55Z",
-                "expires_at": "2999-01-01T00:00:00Z",
-                "kanban_task_id": "task-active",
-                "session_id": "session-active",
-                "run_id": "rvf-inflight",
-                "token": "inflighttoken000",
-                "delivery_channel": "terminal",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "print(json.dumps({'task_id': 'task-active', 'message_id': 'should-not-enqueue'}))\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "session-active",
-            "stop_hook_active": False,
-            "last_user_message": "测试在途窗口去重。",
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "KANBAN_TASK_ID": "task-active",
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_dispatch_in_flight" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "kanban_followup_dispatch_in_flight"
-    # 跳过发生在任何 kanban client 调用之前。
-    assert not client_calls.exists()
-    # pending 仍在（未被清，等其落地或超时）。
-    assert pending_path.exists()
-
-
-def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) -> None:
-    """stale pending（在途窗口已过仍未确认）→ 判定上次静默丢投：上报 + 清旧 pending + 放行重投。"""
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
-    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    write_apply_patch_transcript(transcript, repo, session_id=session_id)
-    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
-    pending_dir.mkdir(parents=True)
-    pending_path = pending_dir / "task-task-77.json"
-    pending_path.write_text(
-        json.dumps(
-            {
-                "marker_version": 1,
-                "state": "dispatched_unconfirmed",
-                "dispatched_at": "2026-05-01T00:00:00Z",
-                "expires_at": "2026-05-01T00:00:00Z",
-                "kanban_task_id": "task-77",
-                "session_id": session_id,
-                "run_id": "rvf-dropped",
-                "token": "oldtokenold00000",
-                "delivery_channel": "terminal",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'terminal:task-77:rvf-redispatch', 'turn_id': '4', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_ATTEMPT_ID": "attempt-9",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    parse_json(stdout)
-    latest = latest_summary(state)
-    # 没有被 pending 挡住——重投真的发生（terminal 再投 → 又是 unconfirmed）。
-    assert latest["status"] == "kanban-followup-dispatched-unconfirmed"
-    assert client_calls.exists()
-    actions = [json.loads(line)["argv"][0] for line in client_calls.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert "message" in actions
-    # 上报了「上次静默丢投」事件。
-    assert any(
-        event.get("event") == "kanban_followup_prior_dispatch_unconfirmed"
-        for event in latest_events(state)
-    )
-    # 旧 pending 被新 dispatch 覆盖为新 token。
-    assert pending_path.exists()
-    refreshed = json.loads(pending_path.read_text(encoding="utf-8"))
-    assert refreshed["token"] != "oldtokenold00000"
-    assert refreshed["token"] == dispatch_prep_payload(latest)["token"]
-
-
 def _write_stranded_pending(
     pending_dir: Path,
     *,
@@ -4007,878 +2385,6 @@ def _logging_notifier(path: Path, log: Path) -> Path:
     )
     path.chmod(0o755)
     return path
-
-
-def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: Path) -> None:
-    """S1b：任意会话的 Stop 在入口扫荡——升级**别的** task 的 stale pending（OS 通知 + 盖戳 + 保留
-    marker），但**跳过当前 Stop 的 task**（交既有同 task 对账）；二次立即 Stop 被 RENOTIFY 抑制。"""
-    repo = init_repo(tmp_path / "clean", dirty=False)  # 干净 repo → 主流程 skip，但 sweep 仍在入口跑
-    state = tmp_path / "state"
-    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
-    pending_dir.mkdir(parents=True)
-    other = _write_stranded_pending(
-        pending_dir, task_id="taskOTHER", token="aaaaaaaaaaaaaaaa",
-        project_path=str(repo), title="修复登录",
-    )
-    current = _write_stranded_pending(
-        pending_dir, task_id="taskCURRENT", token="cccccccccccccccc",
-        project_path=str(repo), title="当前任务",
-    )
-    notify_log = tmp_path / "notify.log"
-    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
-    extra = {
-        "RVF_PROVIDER_HEALTH_CHECK": "0",
-        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
-        "NOTIFY_LOG": str(notify_log),
-        # 让 sweep 把 taskCURRENT 视为当前 task（current_kanban_task_id 读 env）。
-        "KANBAN_TASK_ID": "taskCURRENT",
-    }
-    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
-
-    events = latest_events(state)
-    escalated = [
-        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
-    ]
-    # 只升级 taskOTHER，绝不升级当前 task。
-    assert [e.get("cline_kanban_task_id") for e in escalated] == ["taskOTHER"]
-    # S2 默认关：升级事件里 redispatch 为 disabled（已接线、但不开则纯通知，不重投）。
-    assert escalated[0].get("kanban_followup_stranded_redispatch", {}).get("reason") == "disabled"
-    # OS 通知发了一次、带 -open。
-    calls = [
-        json.loads(line)
-        for line in notify_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1 and "-open" in calls[0]
-    # taskOTHER marker 保留 + 盖 last_notified_at + token 原样保留。
-    assert other.exists()
-    other_after = json.loads(other.read_text(encoding="utf-8"))
-    assert other_after.get("last_notified_at")
-    assert other_after.get("token") == "aaaaaaaaaaaaaaaa"
-    # 当前 task 未被 sweep 升级/通知（escalated 列表里没有它；通知只发了 taskOTHER 一次）。
-    # 注：当前 task 的 stale marker 交既有同 task 对账（_kanban_followup_pending_decision）
-    # 处理，可能被它清除——这正是 sweep 跳过当前 task 的目的，故此处不对该 marker 存留做断言。
-    assert "taskCURRENT" not in [e.get("cline_kanban_task_id") for e in escalated]
-    assert all("taskCURRENT" not in str(arg) for call in calls for arg in call)
-
-    # 二次立即 Stop → RENOTIFY 抑制，不再新发通知。
-    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
-    calls2 = [
-        json.loads(line)
-        for line in notify_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls2) == 1
-
-
-def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_path: Path) -> None:
-    """S1b 可选精修：marker 的 origin_transcript_path 命中 RVF_DISPATCH=token=<token> → 判迟到消费，
-    清 marker、不通知；transcript 无该 token → 不据此判 consumed，仍按 stranded 升级。"""
-    repo = init_repo(tmp_path / "clean", dirty=False)
-    state = tmp_path / "state"
-    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
-    pending_dir.mkdir(parents=True)
-    # consumed：transcript 含该 token。
-    consumed_tx = tmp_path / "consumed.jsonl"
-    consumed_tx.write_text(
-        '{"role":"user","content":"... RVF_DISPATCH=token=dddddddddddddddd ..."}\n',
-        encoding="utf-8",
-    )
-    consumed = _write_stranded_pending(
-        pending_dir, task_id="taskConsumed", token="dddddddddddddddd",
-        project_path=str(repo), origin_transcript_path=str(consumed_tx),
-    )
-    # not-consumed：transcript 不含该 token。
-    miss_tx = tmp_path / "miss.jsonl"
-    miss_tx.write_text('{"role":"user","content":"no dispatch token here"}\n', encoding="utf-8")
-    stranded = _write_stranded_pending(
-        pending_dir, task_id="taskStranded", token="eeeeeeeeeeeeeeee",
-        project_path=str(repo), origin_transcript_path=str(miss_tx),
-    )
-    notify_log = tmp_path / "notify.log"
-    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
-    extra = {
-        "RVF_PROVIDER_HEALTH_CHECK": "0",
-        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
-        "NOTIFY_LOG": str(notify_log),
-    }
-    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
-
-    events = latest_events(state)
-    # consumed marker 被清、记 reconciled_consumed、不通知。
-    assert not consumed.exists()
-    assert any(
-        e.get("event") == "kanban_followup_pending_reconciled_consumed"
-        and e.get("cline_kanban_task_id") == "taskConsumed"
-        for e in events
-    )
-    # 未命中 token 的 marker → 仍按 stranded 升级、保留。
-    assert stranded.exists()
-    assert any(
-        e.get("event") == "kanban_followup_pending_stranded_escalated"
-        and e.get("cline_kanban_task_id") == "taskStranded"
-        for e in events
-    )
-    # 只为 stranded（taskStranded）发了一次通知，consumed 不通知。
-    calls = [
-        json.loads(line)
-        for line in notify_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1
-
-
-def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_path: Path) -> None:
-    """S2（RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
-    仍发通知 + 保留 marker，绝不谎报已自动跑。"""
-    repo = init_repo(tmp_path / "clean", dirty=False)
-    state = tmp_path / "state"
-    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
-    pending_dir.mkdir(parents=True)
-    # 真实 stranded marker 总带已渲染的 prompt（含旧 dispatch 注入块），让 S2 走到 app-server 闸门。
-    old_prompt = tmp_path / "old-prompt.md"
-    old_prompt.write_text(
-        "$review-validate-fix\n\nRVF dispatch prep file:\nRVF_DISPATCH=token=abcabcabcabcabca\n",
-        encoding="utf-8",
-    )
-    marker = _write_stranded_pending(
-        pending_dir, task_id="taskS2", token="abcabcabcabcabca",
-        project_path=str(repo), title="S2 重投", prompt_path=str(old_prompt),
-    )
-    notify_log = tmp_path / "notify.log"
-    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
-    extra = {
-        "RVF_PROVIDER_HEALTH_CHECK": "0",
-        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
-        "NOTIFY_LOG": str(notify_log),
-        "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
-        # 显式指向不存在的 app-server socket，确定性不可达（避免误连真机 app-server）。
-        "CODEX_RVF_APP_SERVER_SOCKET": str(tmp_path / "no-such.sock"),
-    }
-    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
-
-    events = latest_events(state)
-    escalated = [
-        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
-    ]
-    assert len(escalated) == 1
-    redispatch = escalated[0].get("kanban_followup_stranded_redispatch", {})
-    assert redispatch.get("redispatched") is False
-    assert redispatch.get("reason") == "app-server-unreachable"
-    # marker 保留（未重投、未确认）；通知仍发了一次。
-    assert marker.exists()
-    calls = [
-        line for line in notify_log.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
-    assert len(calls) == 1
-
-
-def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp_path: Path) -> None:
-    """S2 重投可达路径回归（RVF-001 / RVF-002）：in-process 调用 _maybe_redispatch_*，monkeypatch
-    app-server 可达 + 假派发，断言——
-      RVF-001：idempotency_key 必须绑定**稳定** stranded token（传入的 token），不含每次新铸的
-        fresh prep token；
-      RVF-002：terminal 未确认重投改写 pending 必须带上新派发的 prompt_path/turn_id（否则下次
-        重投 missing-prompt-path）。
-    e2e 路径需 websocket-协议假 socket（过重），故此处走 in-process 单测直接锁住两个修复。"""
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("cs_s2_under_test", SCRIPT)
-    cs = importlib.util.module_from_spec(spec)
-    sys.modules["cs_s2_under_test"] = cs
-    spec.loader.exec_module(cs)
-
-    old_prompt = tmp_path / "old-prompt.md"
-    old_prompt.write_text(
-        "$review-validate-fix\n\nRVF dispatch prep file:\nRVF_DISPATCH=token=oldoldoldoldoldo\n",
-        encoding="utf-8",
-    )
-
-    class _FakePrep:
-        token = "freshtoken000000"
-        path = tmp_path / "fresh-prep.json"
-
-    class _FakeLedger:
-        run_id = "run-redispatch"
-        run_dir = str(tmp_path / "rd")
-
-    recorded: dict[str, dict] = {}
-    cs.select_existing_app_server_socket_for_metadata = lambda: (tmp_path / "sock", "explicit", {})
-    cs.can_connect_app_server_socket = lambda p: True
-    cs.write_dispatch_prep_file = lambda **kw: _FakePrep()
-
-    def _fake_start(**kw):
-        recorded["start"] = kw
-        return {
-            "message_id": "terminal:taskX:redispatch",
-            "prompt_path": "/new/redispatch-prompt.md",
-            "turn_id": "7",
-        }
-
-    cs.start_cline_kanban_followup_message = _fake_start
-
-    def _fake_write_pending(**kw):
-        recorded["pending"] = kw
-        return tmp_path / "pending.json"
-
-    cs.write_kanban_followup_pending = _fake_write_pending
-    cs.clear_kanban_followup_pending = lambda **kw: []
-
-    marker = {
-        "kanban_task_id": "taskX",
-        "kanban_project_path": "/repo",
-        "prompt_path": str(old_prompt),
-        "session_id": "sX",
-        "repo": "/repo",
-        "cwd": "/repo",
-        "run_dir": str(tmp_path / "origin-run"),
-        "kanban_attempt_id": "att",
-        "kanban_task_title": "标题",
-        "kanban_task_title_source": "src",
-        "origin_transcript_path": str(tmp_path / "tx.jsonl"),
-    }
-    saved = os.environ.get("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
-    os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
-    try:
-        result = cs._maybe_redispatch_stranded_kanban_followup(
-            marker, _FakeLedger(), token="stabletoken00000"
-        )
-    finally:
-        if saved is None:
-            os.environ.pop("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
-        else:
-            os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
-
-    assert result.get("redispatched") is True
-    # RVF-001：idem 绑定稳定 token，绝不含 fresh prep token。
-    idem = recorded["start"]["idempotency_key"]
-    assert idem == f"rvf-redispatch-{cs.safe_token('taskX')}-stabletoken00000"
-    assert "freshtoken000000" not in idem
-    # 重投子进程带 timeout（有界）。
-    assert recorded["start"].get("timeout")
-    # RVF-002：terminal 未确认重投改写 pending 带新 prompt_path/turn_id + 新 token。
-    pending = recorded["pending"]
-    assert pending["prompt_path"] == "/new/redispatch-prompt.md"
-    assert pending["turn_id"] == "7"
-    assert pending["token"] == "freshtoken000000"
-
-
-def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = tmp_path / "rollout-2026-05-01T11-25-17-019de191.jsonl"
-    session_id = "019de191-ba6c-7b13-9874-65eeabb6a6a7"
-    write_apply_patch_transcript(transcript, repo, session_id=session_id)
-    kanban_state = tmp_path / "kanban"
-    workspace = kanban_state / "workspaces" / "repo"
-    workspace.mkdir(parents=True)
-    (workspace / "board.json").write_text(
-        json.dumps(
-            {
-                "columns": [
-                    {
-                        "id": "in_progress",
-                        "cards": [
-                            {
-                                "id": "task-77",
-                                "title": 'The kanban "follow up" rvf handoff source chat title',
-                            }
-                        ],
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-77', 'attempt_id': 'attempt-9', 'message_id': 'msg-77', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "transcript_path": str(transcript),
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_ATTEMPT_ID": "attempt-9",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
-    latest = latest_summary(state)
-    expected_title = 'The kanban "follow up" rvf handoff source chat title'
-    assert latest["cline_kanban_task_title"] == expected_title
-    assert latest["cline_kanban_task_title_source"] == "cline_kanban_board_lookup"
-    assert latest["parent_conversation_ref"] == expected_title
-    assert latest["parent_conversation_name_source"] == "cline_kanban_board_lookup"
-    task_lookup = latest["cline_kanban_task_lookup"]
-    assert task_lookup["source"] == "cline_kanban_board_lookup"
-    assert task_lookup["task_list_lookup"]["source"] == "cline_kanban_task_lookup_missing_title"
-    assert Path(task_lookup["artifact"]).exists()
-
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
-    prompt_path = Path(calls[2]["argv"][calls[2]["argv"].index("--prompt-file") + 1])
-    prompt_text = prompt_path.read_text(encoding="utf-8")
-    assert f"RVF_PARENT_CONVERSATION_REF: {expected_title}" in prompt_text
-    assert "RVF_PARENT_CONVERSATION_NAME_SOURCE: cline_kanban_board_lookup" in prompt_text
-    assert f"RVF_PARENT_KANBAN_TASK_TITLE: {expected_title}" in prompt_text
-    assert "`source Kanban task id`" in prompt_text
-
-
-def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    kanban_state = tmp_path / "kanban"
-    stale_workspace = kanban_state / "workspaces" / "stale-project"
-    stale_workspace.mkdir(parents=True)
-    (stale_workspace / "board.json").write_text(
-        json.dumps(
-            {
-                "tasks": [
-                    {
-                        "id": "task-77",
-                        "title": "Wrong stale workspace title",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["cline_kanban_task_title"] is None
-    assert latest["cline_kanban_task_title_source"] is None
-    assert latest["parent_conversation_ref"] == "Cline Kanban task task-77"
-    assert latest["parent_conversation_name_source"] == "cline_kanban_task_id_fallback"
-    task_lookup = latest["cline_kanban_task_lookup"]
-    assert task_lookup["source"] == "cline_kanban_task_lookup_missing_title"
-
-
-def test_kanban_followup_title_uses_session_matched_board_state(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    kanban_state = tmp_path / "kanban"
-    matched_workspace = kanban_state / "workspaces" / "task-workspace"
-    matched_workspace.mkdir(parents=True)
-    (matched_workspace / "sessions.json").write_text(
-        json.dumps(
-            {
-                "session-1": {
-                    "taskId": "task-77",
-                    "workspacePath": str(repo),
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-    (matched_workspace / "board.json").write_text(
-        json.dumps(
-            {
-                "columns": [
-                    {
-                        "cards": [
-                            {
-                                "id": "task-77",
-                                "title": "Session matched workspace title",
-                            }
-                        ]
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    stale_workspace = kanban_state / "workspaces" / "aaa-stale-project"
-    stale_workspace.mkdir(parents=True)
-    (stale_workspace / "board.json").write_text(
-        json.dumps(
-            {
-                "tasks": [
-                    {
-                        "id": "task-77",
-                        "title": "Wrong stale workspace title",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        "    print(json.dumps({'ok': True, 'tasks': [{'id': 'task-77'}]}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "RVF_PROVIDER_HEALTH_CHECK": "0",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["cline_kanban_task_title"] == "Session matched workspace title"
-    assert latest["cline_kanban_task_title_source"] == "cline_kanban_board_lookup"
-    assert latest["parent_conversation_ref"] == "Session matched workspace title"
-    task_lookup = latest["cline_kanban_task_lookup"]
-    assert task_lookup["source"] == "cline_kanban_board_lookup"
-    board_lookup = json.loads(Path(task_lookup["artifact"]).read_text(encoding="utf-8"))
-    assert board_lookup["matched_board"] == str(matched_workspace / "board.json")
-    assert str(stale_workspace / "board.json") not in board_lookup["checked"]
-
-
-def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    subdir = repo / "nested"
-    subdir.mkdir()
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "if sys.argv[1] == 'list':\n"
-        f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Subdir follow-up', 'workspacePath': {str(repo)!r}}}]}}))\n"
-        "elif sys.argv[1] == 'message':\n"
-        "    print(json.dumps({'task_id': 'task-77', 'message_id': 'msg-77', 'status': 'queued'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.pop(key, None)
-        for key in ("KANBAN_PROJECT_PATH", "CLINE_KANBAN_PROJECT_PATH")
-    }
-    try:
-        stdout, _ = invoke(
-            {
-                "cwd": str(subdir),
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_FORK_MODE": "kanban-followup",
-                "RVF_PROVIDER_HEALTH_CHECK": "0",
-                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-                "KANBAN_TASK_ID": "task-77",
-                "FAKE_CLIENT_CALLS": str(client_calls),
-            },
-            state_dir=state,
-        )
-    finally:
-        for key, value in original_env.items():
-            if value is not None:
-                os.environ[key] = value
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["cwd"] == str(subdir.resolve())
-    assert latest["cline_kanban_project_path"] == str(repo.resolve())
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["list", "list", "message"]
-    list_argv = calls[0]["argv"]
-    assert list_argv[list_argv.index("--repo") + 1] == str(repo.resolve())
-    message_argv = calls[2]["argv"]
-    assert message_argv[message_argv.index("--repo") + 1] == str(repo.resolve())
-
-
-def test_kanban_followup_blocks_expired_codex_login_before_message(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_codex = tmp_path / "fake_codex.py"
-    fake_codex.write_text(
-        "#!/usr/bin/env python3\n"
-        "import sys\n"
-        "if sys.argv[1:3] == ['login', 'status']:\n"
-        "    print('session expired; please login again', file=sys.stderr)\n"
-        "    raise SystemExit(1)\n"
-        "raise SystemExit(f'unexpected codex argv: {sys.argv[1:]}')\n",
-        encoding="utf-8",
-    )
-    fake_codex.chmod(0o755)
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "print(json.dumps({'task_id': 'task-77', 'message_id': 'should-not-enqueue'}))\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-            "CODEX_RVF_CODEX_BIN": str(fake_codex),
-            "KANBAN_TASK_ID": "task-77",
-            "KANBAN_PROJECT_PATH": str(repo),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=provider_health_failed" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "provider_health_failed"
-    assert latest["backend"] == "kanban-followup"
-    assert "codex login" in str(latest["message"])
-    assert not client_calls.exists()
-    health = read_json_artifact(latest, "provider_health_path")
-    results = health["results"]
-    assert results[0]["provider"] == "codex"
-    assert results[0]["status"] == "failed"
-    assert "session expired" in results[0]["stderr"]
-
-
-def test_kanban_followup_mode_without_task_id_reports_without_fallback(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_missing_task_id" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "kanban_followup_missing_task_id"
-    assert latest["backend"] == "kanban-followup"
-    assert not client_calls.exists()
-
-
-def test_kanban_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "last_user_message": "$review-validate-fix\n\nRVF_KANBAN_FOLLOWUP_TRIGGER",
-        },
-        extra_env={"CODEX_RVF_FORK_MODE": "kanban-followup"},
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_trigger_turn" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "kanban_followup_trigger_turn"
-
-
-def test_kanban_followup_in_progress_marker_skips_new_followup(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    marker_dir = state / "kanban-followup-in-progress"
-    marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "marker_version": 1,
-                "state": "in_progress",
-                "armed_at": "2026-05-21T15:57:55Z",
-                "expires_at": "2999-01-01T00:00:00Z",
-                "kanban_task_id": "task-active",
-                "session_id": "session-active",
-                "run_id": "rvf-existing",
-                "run_dir": str(tmp_path / "existing-run"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "print(json.dumps({'task_id': 'task-active', 'message_id': 'should-not-enqueue'}))\n",
-        encoding="utf-8",
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "session-active",
-            "stop_hook_active": False,
-            "last_user_message": "测试再次后台跑。等完成后 finalize handoff.md。",
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "KANBAN_TASK_ID": "task-active",
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state,
-    )
-
-    payload = parse_json(stdout)
-    assert "reason=kanban_followup_in_progress" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "kanban_followup_in_progress"
-    assert latest["active_rvf_run_id"] == "rvf-existing"
-    assert latest["kanban_followup_in_progress_marker_path"] == str(marker_path)
-    assert marker_path.exists()
-    assert not client_calls.exists()
-
-
-def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: Path) -> None:
-    module = load_kanban_followup_lock_module()
-    root = tmp_path / "locks"
-    marker_path = module.marker_paths(task_id="task-race", session_id=None, root=root)[0]
-    marker_path.parent.mkdir(parents=True)
-    stale_marker = {
-        "marker_version": 1,
-        "state": "in_progress",
-        "armed_at": "2026-05-21T15:57:55Z",
-        "expires_at": "2000-01-01T00:00:00Z",
-        "kanban_task_id": "task-race",
-        "session_id": "session-race",
-        "run_id": "rvf-stale",
-        "run_dir": str(tmp_path / "stale-run"),
-    }
-    active_marker = {
-        "marker_version": 1,
-        "state": "in_progress",
-        "armed_at": "2026-05-21T15:57:56Z",
-        "expires_at": "2999-01-01T00:00:00Z",
-        "kanban_task_id": "task-race",
-        "session_id": "session-race",
-        "run_id": "rvf-active",
-        "run_dir": str(tmp_path / "active-run"),
-    }
-    marker_path.write_text(json.dumps(stale_marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    original_read_marker = module.read_marker
-    swapped_to_active = False
-
-    def racing_read_marker(*, task_id: str | None, session_id: str | None, root: Path | None = None):
-        nonlocal swapped_to_active
-        marker = original_read_marker(task_id=task_id, session_id=session_id, root=root)
-        if not swapped_to_active and isinstance(marker, dict) and marker.get("run_id") == "rvf-stale":
-            swapped_to_active = True
-            marker_path.write_text(
-                json.dumps(active_marker, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
-        return marker
-
-    module.read_marker = racing_read_marker
-    try:
-        result = module.acquire_marker(
-            task_id="task-race",
-            session_id=None,
-            run_id="rvf-new",
-            run_dir=str(tmp_path / "new-run"),
-            repo=str(tmp_path / "repo"),
-            cwd=str(tmp_path / "repo"),
-            root=root,
-        )
-    finally:
-        module.read_marker = original_read_marker
-
-    assert swapped_to_active
-    assert not result.acquired
-    assert result.status == module.STATUS_ACTIVE
-    assert isinstance(result.marker, dict)
-    assert result.marker["run_id"] == "rvf-active"
-    final_marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    assert final_marker["run_id"] == "rvf-active"
-
-
-def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots(
-    tmp_path: Path,
-) -> None:
-    # 新契约：Stop dispatch 不再 arm 锁（arm 移交 UserPromptSubmit 投递确认）。本测试
-    # 模拟「上一轮 follow-up trigger 已投递落地、UPS 已在共享 lock root arm」之后，
-    # 另一个 state dir 的 Stop 仍被该共享锁（按 task_id、跨 state root）挡住、不重复
-    # dispatch——即读侧（kanban_followup_in_progress_decision）的跨 state-root 共享语义
-    # 在新 arm 模型下保持不变。
-    repo = init_repo(tmp_path / "repo", dirty=True)
-    session_id = "session-shared"
-    shared_lock_root = tmp_path / "shared-followup-lock"
-    shared_lock_root.mkdir(parents=True)
-    # 直接写一份 marker，等价于 UPS 在投递确认时 arm 的结果（env 模式：marker 直接落在
-    # RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
-    marker_path = shared_lock_root / "task-task-shared.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "marker_version": 1,
-                "state": "in_progress",
-                "armed_at": "2026-06-04T02:29:26Z",
-                "expires_at": "2999-01-01T00:00:00Z",
-                "kanban_task_id": "task-shared",
-                "session_id": session_id,
-                "run_id": "rvf-delivered",
-                "run_dir": str(tmp_path / "delivered-run"),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "print(json.dumps({'task_id': 'task-shared', 'message_id': 'should-not-enqueue'}))\n",
-        encoding="utf-8",
-    )
-    state_b = tmp_path / "state-b"
-
-    stdout_b, _ = invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "session_id": session_id,
-            "last_user_message": "继续推进实现。",
-        },
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
-            "KANBAN_TASK_ID": "task-shared",
-            "FAKE_CLIENT_CALLS": str(client_calls),
-        },
-        state_dir=state_b,
-    )
-
-    payload_b = parse_json(stdout_b)
-    assert "reason=kanban_followup_in_progress" in payload_b["systemMessage"]
-    latest_b = latest_summary(state_b)
-    assert latest_b["status"] == "skipped"
-    assert latest_b["reason_code"] == "kanban_followup_in_progress"
-    assert latest_b["active_rvf_run_id"] == "rvf-delivered"
-    assert latest_b["kanban_followup_in_progress_marker_path"] == str(marker_path)
-    # 读侧短路发生在任何 kanban client 调用之前：不会有 list / message。
-    assert not client_calls.exists()
 
 
 def test_rvf_analyze_followup_trigger_marker_skips_one_turn(tmp_path: Path) -> None:
@@ -5241,59 +2747,6 @@ def test_kanban_task_workspace_mismatch_uses_task_lookup_without_workspace_env(t
         if line.strip()
     ]
     assert [call["argv"][0] for call in calls] == ["list"]
-
-
-def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:
-    module = load_hook_module()
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    fake_client.write_text(
-        "import json, sys\n"
-        "if sys.argv[1] == 'ensure':\n"
-        "    print(json.dumps({'ok': True}))\n"
-        "elif sys.argv[1] == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-123'}))\n"
-        "else:\n"
-        "    print('start boom', file=sys.stderr)\n"
-        "    raise SystemExit(2)\n",
-        encoding="utf-8",
-    )
-    original_env = {
-        key: os.environ.get(key)
-        for key in ("CODEX_RVF_STATE_DIR", "CODEX_RVF_FORK_MODE", "CODEX_RVF_CLINE_KANBAN_CLIENT")
-    }
-    original_lookup = module.parent_thread_name_from_app_server
-    try:
-        module.parent_thread_name_from_app_server = lambda *_: {
-            "name": None,
-            "thread_found": False,
-            "source": "test",
-            "reason": "disabled-in-test",
-        }
-        os.environ["CODEX_RVF_STATE_DIR"] = str(state)
-        os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
-        os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        module.run_codex_fork(
-            parent_session_id="parent-thread",
-            cwd=str(repo),
-            prompt="$review-validate-fix",
-            log_prefix="review-validate-fix-fork",
-            model=None,
-            reasoning_effort=None,
-            parent_thread_path=write_apply_patch_transcript(tmp_path / "session.jsonl", repo),
-        )
-    finally:
-        module.parent_thread_name_from_app_server = original_lookup
-        for key, value in original_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-unavailable"
-    assert "start boom" in str(latest["message"])
 
 
 def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuation(
@@ -5797,278 +3250,6 @@ def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp_path: Path) ->
     assert calls == []
 
 
-def test_session_hook_control_disables_current_session(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    write_user_session(
-        transcript,
-        "session-disabled",
-        "先不要自动 review。\nRVF_STOP_HOOK: off",
-    )
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "session_hook_gate_disabled"
-    assert summary["control_action"] == "off"
-    assert summary["session_hook_gate_state"] == "disabled"
-    assert "disabled" in str(summary["message"])
-    assert "不是关闭全局 Stop hook" in str(summary["message"])
-    assert "dispatcher 仍会运行" in str(summary["message"])
-    assert (state / "session-hook" / "session-disabled.json").exists()
-    assert latest_pointer(state)["status"] == "session-hook-control"
-
-    write_user_session(
-        transcript,
-        "session-disabled",
-        "这次普通停止也不应触发 hook。",
-    )
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-        },
-        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已禁用")
-    assert latest_pointer(state)["status"] == "skipped"
-
-
-def test_session_hook_control_status_reports_current_session(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    write_user_session(
-        transcript,
-        "session-status",
-        "RVF_STOP_HOOK: off",
-    )
-    invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-        },
-        state_dir=state,
-    )
-
-    write_user_session(
-        transcript,
-        "session-status",
-        "RVF_STOP_HOOK: status",
-    )
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-            },
-            state_dir=state,
-        )[0]
-    )
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "session_hook_gate_status"
-    assert summary["control_action"] == "status"
-    assert summary["session_hook_gate_state"] == "disabled"
-    assert "disabled" in str(summary["message"])
-    assert "不表示全局 Stop hook 是否安装或运行" in str(summary["message"])
-    assert "session-status" in str(summary["message"])
-
-
-def test_session_hook_control_status_works_when_env_suppressed(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    write_user_session(
-        transcript,
-        "session-status-suppressed",
-        "RVF_STOP_HOOK: status",
-    )
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-            },
-            extra_env={"RVF_SUPPRESS_STOP_HOOK": "1"},
-            state_dir=state,
-        )[0]
-    )
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "session_hook_gate_status"
-    assert summary["session_hook_gate_state"] == "enabled"
-    assert "enabled" in str(summary["message"])
-    assert "session-status-suppressed" in str(summary["message"])
-
-
-def test_session_hook_control_reenables_current_session(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    write_user_session(
-        transcript,
-        "session-reenabled",
-        "RVF_STOP_HOOK: off",
-    )
-    invoke(
-        {
-            "cwd": str(dirty),
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-        },
-        state_dir=state,
-    )
-    assert (state / "session-hook" / "session-reenabled.json").exists()
-
-    write_apply_patch_transcript(transcript, dirty, session_id="session-reenabled")
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-                "last_user_message": "RVF_STOP_HOOK: on",
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "dry_run"
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    assert not (state / "session-hook" / "session-reenabled.json").exists()
-    assert latest_pointer(state)["status"] == "dry-run"
-    events = latest_events(state)
-    assert any(
-        event["event"] == "session_hook_control_continue"
-        and event["reason_code"] == "session_hook_gate_enabled"
-        for event in events
-    )
-
-
-def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) -> None:
-    repo = init_repo_with_head(tmp_path / "repo")
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    write_user_session(
-        transcript,
-        "session-kanban-reenabled",
-        "RVF_STOP_HOOK: off",
-    )
-    invoke(
-        {
-            "cwd": str(repo),
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-        },
-        state_dir=state,
-    )
-    assert (state / "session-hook" / "session-kanban-reenabled.json").exists()
-
-    fake_client = tmp_path / "fake_cline_kanban_client.py"
-    client_calls = tmp_path / "client-calls.jsonl"
-    fake_client.write_text(
-        "import json, os, sys\n"
-        "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
-        "action = sys.argv[1]\n"
-        "if action == 'ensure':\n"
-        "    print(json.dumps({'ok': True, 'started': False}))\n"
-        "elif action == 'create':\n"
-        "    print(json.dumps({'task_id': 'task-reenabled', 'workspace_path': '/tmp/task-worktree'}))\n"
-        "elif action == 'start':\n"
-        "    print(json.dumps({'task_id': 'task-reenabled', 'status': 'started'}))\n"
-        "else:\n"
-        "    raise SystemExit(f'unexpected action {action}')\n",
-        encoding="utf-8",
-    )
-    write_apply_patch_transcript(transcript, repo, session_id="session-kanban-reenabled")
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(repo),
-                "stop_hook_active": False,
-                "transcript_path": str(transcript),
-                "last_user_message": "RVF_STOP_HOOK: on",
-            },
-            extra_env={
-                "CODEX_RVF_FORK_MODE": "cline-kanban",
-                "RVF_PROVIDER_HEALTH_CHECK": "0",
-                "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
-                "FAKE_CLIENT_CALLS": str(client_calls),
-            },
-            state_dir=state,
-        )[0]
-    )
-
-    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
-    assert not (state / "session-hook" / "session-kanban-reenabled.json").exists()
-    latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-started"
-    assert latest["cline_kanban_task_id"] == "task-reenabled"
-    prep = dispatch_prep_payload(latest)
-    prep_tracker_scope = prep["rvf_run"]["tracker_scope_path"]
-    assert isinstance(prep_tracker_scope, str)
-    assert prep_tracker_scope.endswith("artifacts/tracker-scope.json")
-    assert prep["rvf_run"]["tracker_lease_id"]
-    assert prep["rvf_run"]["tracker_scope_hash"]
-    tracker_scope_payload = json.loads(Path(prep_tracker_scope).read_text(encoding="utf-8"))
-    assert tracker_scope_payload["lease_ttl_seconds"] > 0
-    startup_command = json.loads(
-        (Path(latest["artifacts_dir"]) / "cline-kanban-dispatch-prepare-command.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    command = startup_command["command"]
-    assert command[command.index("--tracker-scope") + 1] == prep_tracker_scope
-    startup_metadata = read_json_artifact(latest, "startup_prepare_metadata_path")
-    assert isinstance(startup_metadata, dict)
-    assert startup_metadata["input_tracker_scope_file"].endswith("artifacts/inputs/tracker-scope.json")
-    assert startup_metadata["tracker_scope_file"].endswith("artifacts/tracker-scope.json")
-    scope_contract = json.loads(Path(startup_metadata["scope_contract"]).read_text(encoding="utf-8"))
-    assert scope_contract["primary_files"] == ["changed.txt"]
-    assert scope_contract["fix_allowlist"] == ["changed.txt"]
-    assert scope_contract["primary_units"]
-    assert scope_contract["tracker_lease_id"]
-    assert scope_contract["tracker_scope_hash"]
-    assert startup_metadata["worktree_bootstrap_metadata"]["owned_dirty_paths"] == ["changed.txt"]
-    packet_metadata = json.loads(
-        Path(startup_metadata["review_packet_metadata"]).read_text(encoding="utf-8")
-    )
-    assert packet_metadata["tracker_scope_present"] is True
-    assert packet_metadata["tracker_scope_unit_count"] == len(scope_contract["primary_units"])
-    events = latest_events(state)
-    assert any(
-        event["event"] == "session_hook_control_continue"
-        and event["reason_code"] == "session_hook_gate_enabled"
-        for event in events
-    )
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
-
-
 def test_disabled_session_skips_fork_experiment_marker(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     state = tmp_path / "state"
@@ -6560,6 +3741,60 @@ def test_committed_round_skip_review_trailer_excludes_and_audits(tmp_path: Path)
     assert "committed_round_route_selected" not in events, events
 
 
+def test_committed_round_excludes_rebased_base_branch_commits(tmp_path: Path) -> None:
+    """e2e dual of the merge-exclusion path for a REBASE: base work absorbed by
+    `git rebase` (base-branch-sync diverged handback / `pull --rebase`) lands on the
+    round's first-parent line, which `--first-parent --no-merges` alone keeps. With
+    the live base ref (`main`) auto-resolved, committed-round subtracts the
+    base-reachable commits, the reviewable window is empty, and
+    `committed_round_route_selected` never fires — the reported over-trigger (a batch
+    of base 'monthly-deck' files spuriously routed as committed-but-unreviewed) no
+    longer dispatches a redundant review."""
+    repo = _init_committed_round_repo(tmp_path)  # on `main`, f.txt committed
+    state = tmp_path / "state"
+    session_id = "abababab-cdcd-efef-0101-232345456767"
+    # This round's own work on a diverged feature branch; the round baseline is
+    # pinned at its tip (mirrors the marker UserPromptSubmit writes at task HEAD).
+    run(["git", "checkout", "-q", "-b", "feature"], repo)
+    (repo / "feature.txt").write_text("agent work\n", encoding="utf-8")
+    run(["git", "add", "feature.txt"], repo)
+    run(["git", "commit", "-q", "-m", "feature work"], repo)
+    transcript = _committed_round_session(tmp_path, repo, session_id)
+    invoke_ups(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "prompt": "继续推进",
+            "transcript_path": str(transcript),
+        },
+        state_dir=state,
+    )
+    # main advances with a base-only file; the feature branch absorbs it via REBASE
+    # (the base commit is replayed onto the first-parent line as a non-merge commit).
+    run(["git", "checkout", "-q", "main"], repo)
+    (repo / "base_only.txt").write_text("from base\n", encoding="utf-8")
+    run(["git", "add", "base_only.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base advance"], repo)
+    run(["git", "checkout", "-q", "feature"], repo)
+    run(["git", "rebase", "-q", "main"], repo)
+    assert _porcelain(repo) == ""
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
+        state_dir=state,
+    )
+
+    assert_skip_reason(stdout, "clean")
+    events = {e.get("event") for e in latest_events(state)}
+    assert "committed_round_route_selected" not in events, events
+
+
 def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "doc-plan", dirty=False)
     state = tmp_path / "state"
@@ -6646,140 +3881,6 @@ def test_plan_document_route_does_not_hide_source_rename(tmp_path: Path) -> None
     assert "reason=plan_document_only" not in payload["systemMessage"], payload["systemMessage"]
     summary = latest_summary(state)
     assert summary["status"] == "dry-run"
-
-
-def test_dirty_repo_dry_run_prepares_legacy_gui_requests(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000002",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "dry-run"
-    assert latest["mode"] == "dry-run"
-    requests = app_server_requests(latest)
-    prompt = prompt_text(latest)
-    assert requests[0]["method"] == "thread/fork"
-    assert requests[1]["method"] == "turn/start"
-    assert "$review-validate-fix" in prompt
-    assert str(dirty) in prompt
-
-
-def test_dirty_repo_manual_mode_only_prepares_prompt(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000022",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "manual",
-            },
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: manual-prepared; reason=manual_prepared;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "manual-prepared"
-    assert latest["rvf_backend"] == "manual"
-    assert latest["rvf_state_phase"] == "prepare"
-    assert Path(latest["prompt_path"]).exists()
-
-
-def test_dirty_repo_fork_dry_run(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    state = tmp_path / "state"
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000003",
-                "model": "gpt-test",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "dry-run",
-                "CODEX_RVF_FORK_REASONING_EFFORT": "high",
-            },
-            state_dir=state,
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    prompt = prompt_text(latest)
-    prep = dispatch_prep_payload(latest)
-    prep_token = prep["token"]
-    assert isinstance(prep_token, str) and re.fullmatch(r"[0-9a-f]{16}", prep_token)
-    assert "$review-validate-fix" in prompt
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
-    assert f"RVF_DISPATCH=token={prep_token}" in prompt
-    assert f"RVF_PREP_FILE: {latest['rvf_dispatch_prep_file_path']}" in prompt
-    assert prep["origin_session_id"] == "00000000-0000-0000-0000-000000000003"
-    assert prep["origin_repo"] == str(dirty.resolve())
-    assert prep["target_flow"] == "flow-3-inplace"
-    assert prep["rvf_run"]["run_id"] == latest["run_id"]
-    assert str(dirty) in prompt
-    assert "RVF_STOP_HOOK: off" in prompt
-    assert "会话控制元数据" in prompt
-    assert "不要把它们当成用户分配的代码任务" in prompt
-    assert latest["suppress_child_stop_hook"] is False
-    assert latest["model"] == "gpt-test"
-    assert latest["reasoning_effort"] == "high"
-    requests = app_server_requests(latest)
-    assert requests[0]["method"] == "thread/fork"
-    assert requests[0]["params"]["model"] == "gpt-test"
-    assert requests[1]["method"] == "turn/start"
-    assert requests[1]["params"]["model"] == "gpt-test"
-    assert requests[1]["params"]["effort"] == "high"
-
-
-def test_dirty_repo_fork_inherits_parent_cwd_inside_worktree(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    subdir = dirty / "nested"
-    subdir.mkdir()
-    state = tmp_path / "state"
-
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(subdir),
-                "session_id": "00000000-0000-0000-0000-000000000103",
-                "stop_hook_active": False,
-            },
-            extra_env={
-                "CODEX_RVF_MODE": "fork",
-                "CODEX_RVF_FORK_MODE": "dry-run",
-            },
-            state_dir=state,
-        )[0]
-    )
-
-    assert "decision" not in payload
-    latest = latest_summary(state)
-    requests = app_server_requests(latest)
-    prompt = prompt_text(latest)
-    assert latest["cwd"] == str(subdir.resolve())
-    assert requests[0]["params"]["cwd"] == str(subdir.resolve())
-    assert requests[1]["params"]["cwd"] == str(subdir.resolve())
-    assert f"RVF_PARENT_CWD: {subdir.resolve()}" in prompt
-    assert f"RVF_TARGET_REPO: {dirty.resolve()}" in prompt
 
 
 def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp_path: Path) -> None:
@@ -6873,93 +3974,6 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) ->
     assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000100"
     assert latest["parent_thread_path"] is None
     assert "path" not in app_server_requests(latest)[0]["params"]
-
-
-def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
-    payload = parse_json(
-        invoke(
-            {
-                "cwd": str(dirty),
-                "session_id": "00000000-0000-0000-0000-000000000004",
-                "stop_hook_active": False,
-            },
-            extra_env={"CODEX_RVF_MODE": "continuation"},
-        )[0]
-    )
-    assert "decision" not in payload
-    assert payload["continue"] is True
-    assert "reason=continuation_disabled" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert "$review-validate-fix" in str(summary["message"])
-    assert str(dirty) in str(summary["message"])
-    assert "Stop continuation prompt 已禁用" in str(summary["message"])
-
-
-def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
-    handoff.parent.mkdir(parents=True, exist_ok=True)
-    handoff.write_text("# handoff\n", encoding="utf-8")
-    notifier_log = tmp_path / "notify.log"
-    notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    event = {
-        "cwd": str(tmp_path),
-        "session_id": "child-session",
-        "stop_hook_active": False,
-        "last_user_message": fork_prompt,
-        "last_assistant_message": f"完成。\nRVF_HANDOFF_FILE: {handoff}",
-    }
-    payload = parse_json(
-        invoke(
-            event,
-            state_dir=state,
-            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
-        )[0]
-    )
-    assert "decision" not in payload
-    assert "reason=handoff_file_ready" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["handoff_path"] == str(handoff.resolve())
-    assert summary["rvf_state_phase"] == "complete"
-    assert summary["rvf_completion_gate"] == "handoff_file_ready"
-    assert summary["rvf_handoff_path"] == str(handoff.resolve())
-    assert summary["handoff_notify_result"]["notified"] is True
-    calls = [
-        json.loads(line)
-        for line in notifier_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1
-    assert "-title" in calls[0] and "RVF" in calls[0]
-    # 非 kanban 来源 → 信息-only，不带 -open。
-    assert "-open" not in calls[0]
-    assert summary["handoff_task_url"] is None
-
-    stdout, _ = invoke(
-        event,
-        state_dir=state,
-        extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
-    )
-    payload = parse_json(stdout)
-    summary = summary_from_payload(payload)
-    assert summary["already_notified"] is True
-    assert summary["handoff_notify_result"]["reason"] == "already_notified"
-    # 去重：第二次 Stop 不应再调用 notifier。
-    calls = [
-        json.loads(line)
-        for line in notifier_log.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert len(calls) == 1
 
 
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
@@ -7430,53 +4444,6 @@ def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -
     assert "app_server_requests_path" not in summary
 
 
-def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(tmp_path),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "last_user_message": fork_prompt,
-            "last_assistant_message": "我还需要继续检查，尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-notified").exists()
-
-
-def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -> None:
-    state = tmp_path / "state"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {tmp_path / 'repo'}\n"
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(tmp_path),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "last_user_message": fork_prompt,
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert not (state / "handoff-notified").exists()
-
-
 def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
@@ -7491,75 +4458,6 @@ def test_invalid_handoff_marker_continues_existing_gate(tmp_path: Path) -> None:
         state_dir=state,
     )
     assert_skip_reason(stdout, "当前 cwd 不在 git repo/worktree 内")
-
-
-def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_message(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "repo", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {dirty}\n"
-    )
-    write_user_session_messages(
-        transcript,
-        "child-session",
-        [
-            fork_prompt,
-            "后续用户消息遮住了最初的 fork marker。",
-        ],
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-            "last_assistant_message": "尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
-
-
-def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "repo", dirty=True)
-    state = tmp_path / "state"
-    transcript = tmp_path / "session.jsonl"
-    fork_prompt = (
-        "$review-validate-fix\n\n"
-        "RVF_FORKED_REVIEW_VALIDATE_FIX\n"
-        "RVF_PARENT_SESSION_ID: parent-session\n"
-        f"RVF_PARENT_CWD: {tmp_path}\n"
-        f"RVF_TARGET_REPO: {dirty}\n"
-    )
-    write_user_session_messages(
-        transcript,
-        "child-session",
-        [
-            "早先普通讨论里提到了 RVF_FORKED_REVIEW_VALIDATE_FIX，但没有完整 metadata。",
-            fork_prompt,
-            "后续用户消息遮住了最初的 fork marker。",
-        ],
-    )
-
-    stdout, _ = invoke(
-        {
-            "cwd": str(dirty),
-            "session_id": "child-session",
-            "stop_hook_active": False,
-            "transcript_path": str(transcript),
-            "last_assistant_message": "尚未生成 handoff。",
-        },
-        state_dir=state,
-    )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
 
 
 def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp_path: Path) -> None:
@@ -7637,18 +4535,6 @@ def test_log_unavailable_does_not_break_hook_payload(tmp_path: Path) -> None:
     assert "log_unavailable=true" in payload["systemMessage"]
 
 
-def test_parent_thread_path_for_origin_returns_codex_validated_path(tmp_path: Path) -> None:
-    module = load_hook_module()
-    rollout = tmp_path / "rollout.jsonl"
-    rollout.write_text(
-        json.dumps({"type": "session_meta", "payload": {"id": "codex-sess"}}) + "\n",
-        encoding="utf-8",
-    )
-    event = {"transcript_path": str(rollout)}
-    result = module.parent_thread_path_for_origin(event)
-    assert result == rollout.resolve()
-
-
 def _read_ledger_events(ledger) -> list[dict]:
     events_path = Path(ledger.events_path)
     if not events_path.exists():
@@ -7662,40 +4548,6 @@ def _read_ledger_events(ledger) -> list[dict]:
         except json.JSONDecodeError:
             continue
     return out
-
-
-def test_parent_thread_path_for_origin_falls_back_to_existing_file(tmp_path: Path) -> None:
-    """Claude transcript：file 存在但 session_meta 校验失败 → 走 fallback。"""
-    module = load_hook_module()
-    transcript = tmp_path / "claude.jsonl"
-    transcript.write_text(
-        json.dumps({"type": "permission-mode", "permissionMode": "plan", "sessionId": "claude"})
-        + "\n",
-        encoding="utf-8",
-    )
-    event = {"transcript_path": str(transcript)}
-    ledger = module.start_run(component="stop-hook-test", run_dir=tmp_path / "run")
-    result = module.parent_thread_path_for_origin(
-        event, ledger=ledger, repo=str(tmp_path), cwd=str(tmp_path)
-    )
-    assert result == transcript.resolve()
-    events = _read_ledger_events(ledger)
-    assert any(
-        e.get("event") == "origin_metadata_transcript_path_fallback" for e in events
-    )
-
-
-def test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty(tmp_path: Path) -> None:
-    module = load_hook_module()
-    ledger = module.start_run(component="stop-hook-test", run_dir=tmp_path / "run")
-    result = module.parent_thread_path_for_origin(
-        {}, ledger=ledger, repo=str(tmp_path), cwd=str(tmp_path)
-    )
-    assert result is None
-    events = _read_ledger_events(ledger)
-    assert any(
-        e.get("event") == "origin_metadata_missing_transcript_path" for e in events
-    )
 
 
 def test_resolve_cline_kanban_agent_id_mirrors_parent_harness(tmp_path: Path) -> None:
@@ -7724,6 +4576,351 @@ def test_resolve_cline_kanban_agent_id_mirrors_parent_harness(tmp_path: Path) ->
     os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "cline"
     assert hook.resolve_cline_kanban_agent_id(codex_tx) == "cline"
     assert hook.resolve_cline_kanban_agent_id(claude_tx) == "cline"
+
+
+# 有界拆分：kanban followup 派发与锁 测试簇（20 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import kanban_followup_dispatch_and_lock as _kbfu
+_kbfu.inject(
+    SCRIPT=SCRIPT,
+    init_repo=init_repo,
+    init_repo_with_head=init_repo_with_head,
+    invoke=invoke,
+    load_hook_module=load_hook_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    parse_json=parse_json,
+    read_json_artifact=read_json_artifact,
+    latest_summary=latest_summary,
+    latest_events=latest_events,
+    dispatch_prep_payload=dispatch_prep_payload,
+    write_apply_patch_transcript=write_apply_patch_transcript,
+    _make_test_ledger=_make_test_ledger,
+    _logging_notifier=_logging_notifier,
+    _write_stranded_pending=_write_stranded_pending,
+)
+globals().update({_n: getattr(_kbfu, _n) for _n in _kbfu.__all__})
+
+
+# 有界拆分：cline-kanban stop-hook 派发 测试簇（9 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import cline_kanban_stop_hook_dispatch as _f2clkb
+_f2clkb.inject(
+    dispatch_prep_payload=dispatch_prep_payload,
+    init_repo_with_head=init_repo_with_head,
+    invoke=invoke,
+    latest_events=latest_events,
+    latest_summary=latest_summary,
+    load_hook_module=load_hook_module,
+    parse_json=parse_json,
+    read_json_artifact=read_json_artifact,
+    write_apply_patch_transcript=write_apply_patch_transcript,
+)
+globals().update({_n: getattr(_f2clkb, _n) for _n in _f2clkb.__all__})
+
+
+# 有界拆分：parent conversation / thread origin 解析与标签 测试簇（13 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import parent_conversation_and_thread_origin as _f2parent
+_f2parent.inject(
+    _read_ledger_events=_read_ledger_events,
+    isolate_codex_session_index=isolate_codex_session_index,
+    load_hook_module=load_hook_module,
+    restore_env_var=restore_env_var,
+)
+globals().update({_n: getattr(_f2parent, _n) for _n in _f2parent.__all__})
+
+
+# 有界拆分：session-hook 状态 I/O 测试簇（7 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import session_hook_state_io as _f2shook
+_f2shook.inject(
+    SCRIPT=SCRIPT,
+    assert_skip_reason=assert_skip_reason,
+    dispatch_prep_payload=dispatch_prep_payload,
+    init_repo=init_repo,
+    init_repo_with_head=init_repo_with_head,
+    invoke=invoke,
+    latest_events=latest_events,
+    latest_pointer=latest_pointer,
+    latest_summary=latest_summary,
+    load_hook_module=load_hook_module,
+    parse_json=parse_json,
+    read_json_artifact=read_json_artifact,
+    summary_from_payload=summary_from_payload,
+    write_apply_patch_transcript=write_apply_patch_transcript,
+    write_user_session=write_user_session,
+)
+globals().update({_n: getattr(_f2shook, _n) for _n in _f2shook.__all__})
+
+
+# 有界拆分：forked RVF 实验模式 测试簇（5 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import forked_rvf_experiment_mode as _f2forked
+_f2forked.inject(
+    assert_skip_reason=assert_skip_reason,
+    init_repo=init_repo,
+    invoke=invoke,
+    latest_pointer=latest_pointer,
+    parse_json=parse_json,
+    summary_from_payload=summary_from_payload,
+    write_fake_notifier=write_fake_notifier,
+    write_user_session_messages=write_user_session_messages,
+)
+globals().update({_n: getattr(_f2forked, _n) for _n in _f2forked.__all__})
+
+
+# 有界拆分：dirty repo 闸 测试簇（5 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import dirty_repo_gate as _f2dirty
+_f2dirty.inject(
+    app_server_requests=app_server_requests,
+    dispatch_prep_payload=dispatch_prep_payload,
+    init_repo=init_repo,
+    invoke=invoke,
+    latest_summary=latest_summary,
+    parse_json=parse_json,
+    prompt_text=prompt_text,
+    summary_from_payload=summary_from_payload,
+)
+globals().update({_n: getattr(_f2dirty, _n) for _n in _f2dirty.__all__})
+
+
+# 有界拆分：manual RVF scope 测试簇（4 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+from _rvf_stop_hook_support import manual_rvf_scope as _f2manual
+_f2manual.inject(
+    init_repo_with_head=init_repo_with_head,
+    invoke=invoke,
+    latest_pointer=latest_pointer,
+    load_hook_module=load_hook_module,
+    parse_json=parse_json,
+    summary_from_payload=summary_from_payload,
+)
+globals().update({_n: getattr(_f2manual, _n) for _n in _f2manual.__all__})
+
+
+def _write_fake_kanban_recorder(tmp_path: Path) -> tuple[str, Path]:
+    """写一个假 `kanban` 脚本：记录 argv 到 calls.jsonl、对任意 action 回 {ok:true}。"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fake = tmp_path / "fake_kanban.py"
+    calls = tmp_path / "calls.jsonl"
+    fake.write_text(
+        "import json, os, sys\n"
+        "with open(os.environ['KANBAN_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'ok': True, 'taskId': sys.argv[sys.argv.index('--task-id')+1], 'parked': sys.argv[0]=='park'}))\n",
+        encoding="utf-8",
+    )
+    os.environ["KANBAN_CALLS"] = str(calls)
+    return f"{sys.executable} {fake}", calls
+
+
+def test_launch_keep_park_signal_uses_real_hook_payload_shape(tmp_path: Path) -> None:
+    """回归 REAL/high（reviewer claude-code 发现）：``ledger.hook_payload`` 顶层只有
+    ``continue`` / ``systemMessage``、**没有 status 键**，故保留-park 信号必须走显式内部键，
+    绝不能靠 ``result['status']``（旧实现因此对成功派发也 unpark、100% 破坏 park）。"""
+    module = load_hook_module()
+    ledger = module.start_run(component="stop-hook", run_dir=tmp_path / "run")
+    payload = ledger.hook_payload(
+        status="kanban-followup-started", reason_code="kanban_followup_started"
+    )
+    # 这正是当初的坑：成功派发的 hook_payload 顶层没有 status 键。
+    assert payload.get("status") is None
+    assert set(payload.keys()) == {"continue", "systemMessage"}
+    # 缺信号（= 旧的「靠 status」实现路径）→ 不保留 park（会 unpark）。
+    assert module._launch_result_keeps_self_park(payload) is False
+    # dispatch 成功路径显式置位后 → 保留 park。
+    payload[module._RVF_KEEP_SELF_PARK_FLAG] = True
+    assert module._launch_result_keeps_self_park(payload) is True
+    # 非 dict / None 安全。
+    assert module._launch_result_keeps_self_park(None) is False
+
+
+def test_skip_decision_should_unpark_keeps_park_for_resume_pending(tmp_path: Path) -> None:
+    """回归 REAL/medium（reviewer cursor-cli 发现）：dispatch-in-flight / in-progress 的 skip
+    表示 resume 在路上，main 的 skip 分支必须保留 park（这些 reason 上不 unpark）。"""
+    module = load_hook_module()
+    SD = module.StopDecision
+    # resume 在路上的 skip → 不 unpark。
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="kanban_followup_dispatch_in_flight")
+    ) is False
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="kanban_followup_in_progress")
+    ) is False
+    # 无 resume 的普通 skip（handoff 完成、无 owned dirty 等）→ 照常 unpark。
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="handoff_file_ready")
+    ) is True
+    assert module._skip_decision_should_unpark(
+        SD(action="skip", reason_code="session_scope_clean")
+    ) is True
+
+
+def test_stop_unparks_on_dispatch_failure_and_no_dispatch(tmp_path: Path) -> None:
+    """安全阀：本会话 self-park 过但本次 Stop 无 resume → 幂等 unpark + 清 self-park 标记。"""
+    module = load_hook_module()
+    park = module.rvf_post_tool_use
+    state_root = tmp_path / "park-state"
+    os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(state_root)
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    session_id = "sess-abc"
+    # 模拟 PostToolUse 已写下的 self-park 标记。
+    park._atomic_write(
+        park._parked_path(session_id),
+        {"nonce": "n1", "task_id": "task-7", "project_path": str(repo), "parked_at": "now"},
+    )
+    assert park.read_self_park_state(session_id) is not None
+
+    class _FakeLedger:
+        def __init__(self) -> None:
+            self.events: list[dict] = []
+
+        def event(self, **kw: object) -> dict:
+            self.events.append(kw)
+            return kw
+
+    ledger = _FakeLedger()
+    module.unpark_self_parked_card(
+        {"session_id": session_id, "cwd": str(repo)}, ledger, reason="no_followup_dispatch"
+    )
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded, "expected an unpark call to the kanban client"
+    assert recorded[0][0] == "unpark"
+    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-7"
+    # self-park 标记已清（避免下一次 Stop 重复 unpark）。
+    assert park.read_self_park_state(session_id) is None
+    assert any(e.get("event") == "kanban_followup_self_park_unparked" for e in ledger.events)
+
+
+def test_stop_safety_valve_noop_when_not_self_parked(tmp_path: Path) -> None:
+    """未 self-park 的会话：安全阀是廉价 noop（不触 kanban、不报错）。"""
+    module = load_hook_module()
+    os.environ["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(tmp_path / "empty-state")
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    class _FakeLedger:
+        def event(self, **kw: object) -> dict:
+            return kw
+
+    module.unpark_self_parked_card(
+        {"session_id": "never-parked", "cwd": str(tmp_path)}, _FakeLedger(), reason="stop_no_launch"
+    )
+    assert not calls.exists() or calls.read_text(encoding="utf-8").strip() == ""
+
+
+def test_stranded_sweep_unparks_on_giveup(tmp_path: Path) -> None:
+    """stranded-sweep 兜底：按 marker 的 task_id/project_path 幂等 unpark 泄漏的 park。"""
+    module = load_hook_module()
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    task_cmd, calls = _write_fake_kanban_recorder(tmp_path / "fake")
+    os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = task_cmd
+
+    assert module._unpark_stranded_task(str(repo), "task-9") is True
+    recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+    assert recorded[0][0] == "unpark"
+    assert recorded[0][recorded[0].index("--task-id") + 1] == "task-9"
+    # 缺 project_path → 直接 False、不调 kanban。
+    assert module._unpark_stranded_task(None, "task-9") is False
+
+
+def test_kanban_task_session_liveness_classifies_from_session_state(tmp_path: Path) -> None:
+    """搁浅判定真相源：从 kanban `task list` 的 session.state/exitCode 分类 stopped/alive/unknown。
+
+    in-process 直测谓词（monkeypatch _kanban_task_list_payload），不起子进程。
+    """
+    module = load_hook_module()
+    box: dict[str, object] = {"payload": None, "calls": 0}
+
+    def fake_list(project_path: str):
+        box["calls"] = int(box["calls"]) + 1  # type: ignore[arg-type]
+        return box["payload"]
+
+    original = module._kanban_task_list_payload
+    try:
+        module._kanban_task_list_payload = fake_list
+
+        def verdict(session: dict, *, task_id: str = "t1", project: str = "/repo") -> str:
+            box["payload"] = {"ok": True, "tasks": [{"id": task_id, "session": session}]}
+            return module._kanban_task_session_liveness(task_id, project, {})
+
+        assert verdict({"state": "running"}) == "alive"
+        assert verdict({"state": "awaiting_review"}) == "stopped"
+        assert verdict({"state": "idle"}) == "stopped"
+        # exitCode 非空优先判 stopped（即便 state 还显示 running）。
+        assert verdict({"state": "running", "exitCode": 0}) == "stopped"
+        # 不识别的 state / 无 session 字段 → unknown（调用方退回 TTL）。
+        assert verdict({"state": "starting_up"}) == "unknown"
+        assert verdict({}) == "unknown"
+        # task 不在 list → unknown。
+        box["payload"] = {"ok": True, "tasks": []}
+        assert module._kanban_task_session_liveness("t1", "/repo", {}) == "unknown"
+        # list 不可达（None）→ unknown。
+        box["payload"] = None
+        assert module._kanban_task_session_liveness("t1", "/repo", {}) == "unknown"
+        # project_path 缺失 → unknown，且不触发 list 子进程。
+        before = int(box["calls"])  # type: ignore[arg-type]
+        assert module._kanban_task_session_liveness("t1", "", {}) == "unknown"
+        assert int(box["calls"]) == before  # type: ignore[arg-type]
+        # 同一 sweep 内按 project_path 缓存：两次只拉一次 list。
+        box["payload"] = {"ok": True, "tasks": [{"id": "t1", "session": {"state": "running"}}]}
+        cache: dict[str, object] = {}
+        c0 = int(box["calls"])  # type: ignore[arg-type]
+        module._kanban_task_session_liveness("t1", "/repo", cache)
+        module._kanban_task_session_liveness("t1", "/repo", cache)
+        assert int(box["calls"]) == c0 + 1  # type: ignore[arg-type]
+    finally:
+        module._kanban_task_list_payload = original
+
+
+def test_kanban_followup_stranded_sweep_skips_alive_session(tmp_path: Path) -> None:
+    """真相驱动 e2e：marker 已 TTL-stale，但 kanban session.state=running（活着、可能正消费本
+    follow-up）→ sweep 不升级、不通知、保留 marker（留给真实投递的 UPS-arm 清）。"""
+    repo = init_repo(tmp_path / "clean", dirty=False)
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    marker = _write_stranded_pending(
+        pending_dir, task_id="taskALIVE", token="ffffffffffffffff",
+        project_path=str(repo), title="活着的任务",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import json, sys\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': ["
+        "{'id': 'taskALIVE', 'session': {'state': 'running', 'exitCode': None}}]}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+    notify_log = tmp_path / "notify.log"
+    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
+    extra = {
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "NOTIFY_LOG": str(notify_log),
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+    }
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+
+    events = latest_events(state)
+    escalated = [
+        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
+    ]
+    # 活着 → 不升级，即便 marker 已 stale。
+    assert escalated == []
+    # 不发任何 OS 通知。
+    assert (not notify_log.exists()) or not notify_log.read_text(encoding="utf-8").strip()
+    # marker 保留。
+    assert marker.exists()
 
 
 def main() -> int:
@@ -7820,6 +5017,10 @@ def main() -> int:
         test_kanban_followup_mode_without_task_id_reports_without_fallback,
         test_kanban_followup_trigger_marker_skips_one_turn,
         test_kanban_followup_in_progress_marker_skips_new_followup,
+        test_kanban_followup_in_progress_lock_reengage_nudges_within_budget,
+        test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted,
+        test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rearm,
+        test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn,
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
@@ -7854,6 +5055,7 @@ def main() -> int:
         test_committed_round_highwater_routes_orphan_below_advanced_baseline,
         test_committed_round_without_transcript_evidence_routes_to_review,
         test_committed_round_skip_review_trailer_excludes_and_audits,
+        test_committed_round_excludes_rebased_base_branch_commits,
         test_clean_repo_with_committed_work_but_no_marker_skips,
         test_plan_document_only_routes_out_of_full_rvf,
         test_read_only_session_with_background_plan_docs_does_not_plan_route,
@@ -7888,7 +5090,23 @@ def main() -> int:
         test_missing_cwd_skips_and_requests_target_repo,
         test_log_unavailable_does_not_break_hook_payload,
         test_resolve_cline_kanban_agent_id_mirrors_parent_harness,
+        test_parent_thread_path_for_origin_returns_codex_validated_path,
+        test_parent_thread_path_for_origin_falls_back_to_existing_file,
+        test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty,
+        test_launch_keep_park_signal_uses_real_hook_payload_shape,
+        test_skip_decision_should_unpark_keeps_park_for_resume_pending,
+        test_stop_unparks_on_dispatch_failure_and_no_dispatch,
+        test_stop_safety_valve_noop_when_not_self_parked,
+        test_stranded_sweep_unparks_on_giveup,
+        test_kanban_task_session_liveness_classifies_from_session_state,
+        test_kanban_followup_stranded_sweep_skips_alive_session,
     ]
+    assert_every_defined_test_is_registered(
+        globals(),
+        registered_names_from_callables(tests),
+        source_path=__file__,
+        intentionally_unregistered=INTENTIONALLY_UNREGISTERED,
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         selected = [

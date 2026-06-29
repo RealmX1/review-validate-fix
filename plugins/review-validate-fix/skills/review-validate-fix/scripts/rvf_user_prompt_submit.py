@@ -867,6 +867,30 @@ def inspect_user_prompt_submit(
         else "none"
     )
     is_manual = manual_decision == "manual"
+
+    # PostToolUse-park 资格：在回合开头标记「本回合是否该在首次编辑时 park 父 Kanban 卡片」。
+    # 仅「非 token、非 kanban-followup marker、非 manual、且在 kanban task」的回合（=Turn 1 实现
+    # 回合）eligible；Turn 2（被注入 followup 唤回、带 token+marker，是终态「待人审」回合）与手动
+    # 回合 eligible=false，绝不 park。best-effort、纯副作用：永不阻断 prompt。
+    try:
+        from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+        park_session_id = event.get("session_id")
+        # 仅 kanban task 内的会话才写资格标记（task 外 PostToolUse 本就早退、不读资格 → 不写省 clutter）。
+        if (
+            isinstance(park_session_id, str)
+            and park_session_id.strip()
+            and current_kanban_task_id(event)
+        ):
+            import rvf_post_tool_use  # noqa: PLC0415 - lazy, stdlib-only, off hot import path
+
+            rvf_post_tool_use.mark_park_eligibility(
+                park_session_id.strip(),
+                eligible=(token is None and origin_marker is None and not is_manual),
+            )
+    except Exception:
+        pass
+
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
     record: rvf_prep_file.PrepFileRecord | None = None
