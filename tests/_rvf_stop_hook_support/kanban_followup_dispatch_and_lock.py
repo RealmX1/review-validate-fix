@@ -1255,13 +1255,16 @@ def test_kanban_followup_in_progress_marker_skips_new_followup(tmp_path: Path) -
 def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
     tmp_path: Path,
 ) -> None:
-    """锁 active + nudge 预算未尽：不静默 skip，而是 re-engage（return None → 让回常规 gate）。
+    """锁 active + nudge 预算未尽 + 仍有未审 dirty：不静默 skip、也**不再让回常规 gate 重派新 run**，
+    而是 force-continue 现有 run（{"decision":"block","reason":...}）唤醒 agent 收尾该轮。
 
-    用 clean repo 让「让回常规 gate」后落到轻量的 dirty-gate clean skip（不触发重派发的重活），
-    只断言**这把锁没有把本次 Stop 静默挡停**：systemMessage 不含 kanban_followup_in_progress、
-    并记了一条 kanban_followup_in_progress_nudged、且 marker 的 reengage_nudge_count 自增到 1。
+    刻意用 **dirty** repo（复现事故：reset --mixed 物化的未审 dirty 让常规 gate 每次都能找到可审
+    scope）证明根因已修——旧实现 return None → 常规 gate 会 mint 重复 RVF run；新实现短路在常规
+    gate 之前，绝不派发新 review。断言：输出是 force-continue block payload（不是 skip 的
+    {"continue":...}、也不是 launch fork payload）、reason 带阻塞 run_id、summary 记
+    kanban_followup_in_progress_reengage、nudge 计数自增到 1。
     """
-    clean = init_repo(tmp_path / "clean", dirty=False)
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
@@ -1287,7 +1290,7 @@ def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
 
     stdout, _ = invoke(
         {
-            "cwd": str(clean),
+            "cwd": str(dirty),
             "session_id": "session-active",
             "stop_hook_active": False,
             "last_user_message": "测试再次后台跑。等完成后 finalize handoff.md。",
@@ -1301,13 +1304,16 @@ def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
         state_dir=state,
     )
 
-    parse_json(stdout)  # 仍是合法 hook 输出
-    # nudge 让回常规 gate → clean repo 落到 dirty-gate clean skip，而非被锁静默挡停。
-    # （注意：不能用 systemMessage 子串判定——tmp_path 含测试名 "kanban_followup_in_progress"
-    #  会假阳性；改用精确 reason_code。）
+    payload = parse_json(stdout)
+    # force-continue 契约：恰好 {"decision":"block","reason":...}——既非 skip 的 {"continue":...}，
+    # 也非 launch 的 fork payload（证明没经常规 gate 重派新 run）。
+    assert set(payload.keys()) == {"decision", "reason"}, payload
+    assert payload["decision"] == "block"
+    assert "rvf-existing" in payload["reason"]  # reason 带阻塞 run_id，指明续跑哪一轮
+    assert "RVF_HANDOFF_FILE" in payload["reason"]  # 指引 agent 用 handoff 收尾、而非新开 review
     latest = latest_summary(state)
-    assert latest["reason_code"] == "clean_repo"
-    assert latest["reason_code"] != "kanban_followup_in_progress"
+    assert latest["reason_code"] == "kanban_followup_in_progress_reengage"
+    assert latest["status"] == "reengaged"
     events = latest_events(state)
     nudged = [
         event

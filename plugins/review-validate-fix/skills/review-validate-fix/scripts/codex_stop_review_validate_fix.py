@@ -2384,6 +2384,9 @@ _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS = frozenset(
     {
         "kanban_followup_in_progress",
         "kanban_followup_dispatch_in_flight",
+        # re-engage force-continue：现有 RVF run 仍在进行、agent 被续跑令其收尾该轮，
+        # resume 在路上 → 必须保留 park，否则 handoff 落地前卡片抑制会被误解除。
+        "kanban_followup_in_progress_reengage",
     }
 )
 
@@ -3061,6 +3064,7 @@ def kanban_followup_in_progress_decision(
         nudge_count = kanban_followup_lock_nudge_count(marker)
         if nudge_budget > 0 and nudge_count < nudge_budget:
             bumped = bump_kanban_followup_lock_nudge_count(marker)
+            active_rvf_run_dir = marker.get("run_dir")
             ledger.event(
                 phase="gate",
                 event="kanban_followup_in_progress_nudged",
@@ -3074,9 +3078,35 @@ def kanban_followup_in_progress_decision(
                 kanban_followup_in_progress_nudge_count=bumped,
                 kanban_followup_in_progress_nudge_budget=nudge_budget,
                 active_rvf_run_id=blocking_run_id,
-                active_rvf_run_dir=marker.get("run_dir"),
+                active_rvf_run_dir=active_rvf_run_dir,
             )
-            return None
+            # re-engage = force-continue 现有 run，**不**经常规 gate 重派新 RVF（修根因：原
+            # return None 让回常规 gate，reset --mixed 物化的 dirty 使常规 gate 每次都判「有未审
+            # 改动」→ mint 重复 run）。把「唤醒 agent 收尾」与「派发 review」彻底解耦。
+            return reengage_decision(
+                f"task {task_id or '<unknown>'} 的 RVF run "
+                f"{blocking_run_id or '<unknown>'} 仍在进行且未 handoff"
+                f"（run_dir={active_rvf_run_dir or '<unknown>'}）。请继续收尾**这一轮**——"
+                "跑完 / 合并 reviewer 结果后，第一行输出 "
+                "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>` 完成 handoff，**不要新开 review**。"
+                "若你正在等后台 reviewer，请先确认其状态再 finalize。",
+                ledger,
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_in_progress_marker=marker,
+                kanban_followup_in_progress_marker_path=marker_path,
+                kanban_followup_in_progress_nudge_count=bumped,
+                kanban_followup_in_progress_nudge_budget=nudge_budget,
+                active_rvf_run_id=blocking_run_id,
+                active_rvf_run_dir=active_rvf_run_dir,
+                **stop_hook_rvf_state_fields(
+                    phase="complete",
+                    backend="kanban-followup",
+                    backend_raw="kanban-followup",
+                    completion_gate="kanban_followup_in_progress_reengage",
+                ),
+            )
         return skip_decision(
             "已有 Cline Kanban RVF follow-up 仍在进行"
             f"（阻塞 run_id={blocking_run_id or '<unknown>'}，"
@@ -7745,6 +7775,54 @@ def skip_decision(
         summary_fields=payload_fields,
         payload=payload,
         status="skipped",
+    )
+
+
+def reengage_decision(
+    reason: str,
+    ledger: RunLedger,
+    reason_code: str = "kanban_followup_in_progress_reengage",
+    *,
+    repo: str | None = None,
+    cwd: str | None = None,
+    backend: str = "off",
+    **summary_fields: Any,
+) -> StopDecision:
+    """force-continue 决策：阻止本次 Stop、把 reason 回灌 agent 令其继续收尾**现有** RVF run，
+    既不经 launch gate、也不 dispatch 新 review / 不写 pending marker / 不新建 run_dir。
+
+    用于 in-progress 锁 active + agent 停在「未 handoff」处的 re-engage——破「锁 active 时静默
+    放行使 agent 干停、被一路挡停到 handoff/TTL」的同时，**不再 mint 重复 RVF run**（修
+    9f9fb78 的 nudge 用「return None → 常规 gate 重派新 run」唤醒、无法区分 agent 真卡住 vs
+    合法等待异步 reviewer 的设计缺陷）。
+
+    Claude Stop hook 的 force-continue 契约 = ``{"decision": "block", "reason": <text>}``：
+    ``decision=block`` 阻止本次 stop，``reason`` 作为续跑提示喂回 model（与 skip_payload 的
+    ``{"continue": True, ...}`` 不同——后者放任 agent 干停）。
+    """
+    payload_fields = dict(summary_fields)
+    if repo is not None:
+        payload_fields.setdefault("repo", repo)
+    if cwd is not None:
+        payload_fields.setdefault("cwd", cwd)
+    if backend != "off":
+        payload_fields.setdefault("backend", backend)
+    ledger.summary(
+        status="reengaged",
+        reason_code=reason_code,
+        message=reason,
+        **payload_fields,
+    )
+    return StopDecision(
+        action="emit",
+        reason_code=reason_code,
+        repo=repo,
+        cwd=cwd,
+        backend=backend,
+        message=reason,
+        summary_fields=payload_fields,
+        payload={"decision": "block", "reason": reason},
+        status="reengaged",
     )
 
 
