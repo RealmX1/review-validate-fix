@@ -49,6 +49,23 @@ def inject(**deps: object) -> None:
     globals().update(deps)
 
 
+def _write_fake_kanban_empty_list_client(path: Path) -> str:
+    """Hermetic fake：让 sweep 的 liveness `task list` 子进程拿到空 tasks → 判 unknown → 退回 TTL。
+
+    本测试簇验的是「stale marker → TTL 兜底升级」，不应依赖真机 kanban server；session.state 真相
+    路径（stopped→即升级 / alive→不升级）由 test_kanban_*_liveness / *_skips_alive_session 专测。
+    """
+    path.write_text(
+        "import json, sys\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': []}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
 def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "dirty")
@@ -502,6 +519,11 @@ def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: 
         "NOTIFY_LOG": str(notify_log),
         # 让 sweep 把 taskCURRENT 视为当前 task（current_kanban_task_id 读 env）。
         "KANBAN_TASK_ID": "taskCURRENT",
+        # liveness `list` 走 hermetic fake（空 tasks → unknown → TTL 兜底），不碰真机 server。
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": _write_fake_kanban_empty_list_client(
+            tmp_path / "fake_list_client.py"
+        ),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
     }
     invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
 
@@ -571,6 +593,11 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
         "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
         "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
+        # liveness `list` 走 hermetic fake（空 tasks → unknown → TTL 兜底），不碰真机 server。
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": _write_fake_kanban_empty_list_client(
+            tmp_path / "fake_list_client.py"
+        ),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
     }
     invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
 
@@ -624,6 +651,11 @@ def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_p
         "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
         # 显式指向不存在的 app-server socket，确定性不可达（避免误连真机 app-server）。
         "CODEX_RVF_APP_SERVER_SOCKET": str(tmp_path / "no-such.sock"),
+        # liveness `list` 走 hermetic fake（空 tasks → unknown → TTL 兜底），不碰真机 server。
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": _write_fake_kanban_empty_list_client(
+            tmp_path / "fake_list_client.py"
+        ),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
     }
     invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
 

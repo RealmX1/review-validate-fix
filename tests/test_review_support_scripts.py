@@ -897,6 +897,32 @@ def _restore_park_env(saved: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def test_cline_kanban_client_session_field_readers() -> None:
+    """task_session_state / task_session_exit_code / task_payload_from_list：从 kanban task 的
+    session 子对象稳健取值（搁浅判定真相源；缺失/非法类型 → None，exitCode str 数字 → int）。"""
+    mod = load_cline_kanban_client_module()
+    # state：取字符串；空白 / 缺失 / 非 dict session → None。
+    assert mod.task_session_state({"session": {"state": "awaiting_review"}}) == "awaiting_review"
+    assert mod.task_session_state({"session": {"state": "  "}}) is None
+    assert mod.task_session_state({"session": {}}) is None
+    assert mod.task_session_state({"session": None}) is None
+    assert mod.task_session_state({}) is None
+    # exitCode：int 原样；str 数字 → int；bool / 非数字 / 缺失 → None（bool 不当作退出码）。
+    assert mod.task_session_exit_code({"session": {"exitCode": 0}}) == 0
+    assert mod.task_session_exit_code({"session": {"exitCode": 137}}) == 137
+    assert mod.task_session_exit_code({"session": {"exitCode": "137"}}) == 137
+    assert mod.task_session_exit_code({"session": {"exitCode": None}}) is None
+    assert mod.task_session_exit_code({"session": {"exitCode": True}}) is None
+    assert mod.task_session_exit_code({"session": {"exitCode": "oops"}}) is None
+    assert mod.task_session_exit_code({"session": {}}) is None
+    assert mod.task_session_exit_code({}) is None
+    # task_payload_from_list：按 id 命中；未命中 / tasks 非 list → None。
+    payload = {"tasks": [{"id": "x", "session": {"state": "running"}}]}
+    assert mod.task_payload_from_list(payload, "x")["id"] == "x"
+    assert mod.task_payload_from_list(payload, "y") is None
+    assert mod.task_payload_from_list({"tasks": "bad"}, "x") is None
+
+
 def test_cline_kanban_client_park_unpark_is_parked(tmp_path: Path) -> None:
     """client 新增三 verb：park（带 --label）/ unpark / is-parked，argv 路由正确 + JSON 透传。"""
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -5982,6 +6008,7 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
                 root / "alternative-wrapper"
             ),
         ),
+        ("cline_kanban_client_session_field_readers", test_cline_kanban_client_session_field_readers),
         ("cline_kanban_client_detects_runtime_port", lambda: test_cline_kanban_client_detects_runtime_port()),
         (
             "cline_kanban_client_rejects_ambiguous_runtime_ports",

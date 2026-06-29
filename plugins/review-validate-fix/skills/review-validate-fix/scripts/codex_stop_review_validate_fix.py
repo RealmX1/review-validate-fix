@@ -93,6 +93,9 @@ from cline_kanban_client import (
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
     DEFAULT_TASK_CMD as DEFAULT_CLINE_KANBAN_TASK_CMD,
     DEFAULT_TMUX_SESSION as DEFAULT_CLINE_KANBAN_TMUX_SESSION,
+    task_payload_from_list,
+    task_session_exit_code,
+    task_session_state,
     unpark_task as cline_kanban_unpark_task,
 )
 import rvf_post_tool_use
@@ -2586,6 +2589,12 @@ KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_SWE
 KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
 KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
+# 搁浅判定改读 kanban session.state 时，那一次 best-effort `task list` 子进程的 timeout 上限，
+# 防在 30s Codex 链路预算内卡在不可达/慢 kanban server。见 _kanban_task_list_payload。
+KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_ENV = (
+    "CODEX_RVF_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS"
+)
+DEFAULT_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS = 10
 # in-progress 锁 active 时，「认锁前先 re-engage 几次再退回静默 skip」的预算上限。
 # 0 = 关掉 re-engage（永远静默放行，回到历史行为）。见 kanban_followup_in_progress_decision。
 KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET_ENV = (
@@ -2792,6 +2801,77 @@ def _maybe_redispatch_stranded_kanban_followup(
     }
 
 
+def _kanban_task_list_payload(project_path: str) -> dict[str, Any] | None:
+    """Best-effort 拉一次 kanban ``task list``（只读、带 timeout），失败返回 None。
+
+    用 codex_stop 既有的「shell cline_kanban_client.py list」惯用法（见 lookup_kanban_task_workspace），
+    但带显式 timeout——本调用挂在每次 Stop 的搁浅 sweep 上，不能让不可达/慢 kanban server 卡满 30s 预算。
+    """
+    client = cline_kanban_script_path("CODEX_RVF_CLINE_KANBAN_CLIENT", DEFAULT_CLINE_KANBAN_CLIENT)
+    task_cmd = os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD)
+    timeout = _kanban_followup_env_float(
+        KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_SECONDS,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(client), "list", "--repo", project_path, "--task-cmd", task_cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _kanban_task_session_liveness(
+    task_id: str,
+    project_path: Any,
+    list_cache: dict[str, dict[str, Any] | None],
+) -> str:
+    """读 kanban ``task list`` 的 session 真相，判某 task 的 follow-up 投递是否搁浅。
+
+    返回 ``"stopped"`` / ``"alive"`` / ``"unknown"``：
+    - ``"stopped"``：目标 session 已退出（``exitCode`` 非空）、停在 user review/input gate
+      （``awaiting_review``）或无 live turn（``idle``）——这些 session 不会在无人干预下消费排队的
+      follow-up，即已搁浅；应按搁浅处理，无需等 15min TTL。
+    - ``"alive"``：session 处于活跃 turn（``running``）——可能正在消费本 follow-up，不应升级
+      （留给真实投递的 UPS-arm 清 marker），即便 marker 已 TTL-stale 也不报，砍掉「活着却因超时被误升级」。
+    - ``"unknown"``：project_path 缺失 / list 不可达 / task 不在 list / session 缺失或 state 不识别
+      ——调用方退回原 TTL 行为，绝不比现状更差。
+
+    ``state`` 是这里的判别真相而非 ``liveness`` 字段：``awaiting_review`` 的 ``liveness`` 也是
+    ``live``（进程在、但停在 user gate、不会消费），故只能按 ``state`` 区分「会消费 vs 不会消费」。
+    list 结果按 project_path 缓存在传入的 ``list_cache``（单次 sweep 内每 project 至多拉一次）。
+    """
+    if not (isinstance(project_path, str) and project_path.strip()):
+        return "unknown"
+    if project_path not in list_cache:
+        list_cache[project_path] = _kanban_task_list_payload(project_path)
+    payload = list_cache.get(project_path)
+    if not isinstance(payload, dict):
+        return "unknown"
+    task = task_payload_from_list(payload, task_id)
+    if not isinstance(task, dict):
+        return "unknown"
+    if task_session_exit_code(task) is not None:
+        return "stopped"
+    state = task_session_state(task)
+    if state in {"awaiting_review", "idle"}:
+        return "stopped"
+    if state == "running":
+        return "alive"
+    return "unknown"
+
+
 def sweep_stranded_kanban_followup_pending(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2816,6 +2896,8 @@ def sweep_stranded_kanban_followup_pending(
         markers = iter_kanban_followup_pending()
         now_ts = datetime.now(timezone.utc).timestamp()
         processed = 0
+        # 单次 sweep 内按 project_path 缓存 kanban `task list` payload，每 project 至多拉一次。
+        session_list_cache: dict[str, dict[str, Any] | None] = {}
         for marker in markers:
             if processed >= sweep_max:
                 break
@@ -2828,8 +2910,21 @@ def sweep_stranded_kanban_followup_pending(
             # 避免两条路径语义打架。
             if current_task_id and marker_task_id == current_task_id:
                 continue
-            if kanban_followup_pending_status(marker, now_ts=now_ts) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+            # 真相驱动搁浅判定：优先读 kanban session.state（投递落地与否的地面真相），
+            # 15min 挂钟 TTL 仅作拿不到 state 时的降级兜底。见 _kanban_task_session_liveness。
+            liveness = _kanban_task_session_liveness(
+                marker_task_id, marker.get("kanban_project_path"), session_list_cache
+            )
+            if liveness == "alive":
+                # 目标 session 仍在活跃 turn（可能正消费本 follow-up）——即便 marker 已 TTL-stale 也不报，
+                # 留给真实投递的 UPS-arm 清 marker；砍掉「活着却因超时被误升级 / 误重投」的假阳。
                 continue
+            if liveness == "unknown":
+                # 拿不到可信 state（task 不在 list / list 不可达）→ 退回原 TTL 行为。
+                if kanban_followup_pending_status(marker, now_ts=now_ts) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+                    continue
+            # liveness == "stopped"：session 已停在 user gate / idle / 已退出 → 当场即搁浅，不等 TTL。
+            # 仍先走下方 late-consumption 精修，覆盖「已落地但 UPS-arm 漏清」的假阳。
             token = marker.get("token") if isinstance(marker.get("token"), str) else None
             # 可选 best-effort 精修：迟到消费 → 清 marker、不通知。
             if _kanban_followup_marker_consumed(marker):
@@ -2878,6 +2973,7 @@ def sweep_stranded_kanban_followup_pending(
                 kanban_followup_stranded_dispatched_at=marker.get("dispatched_at"),
                 kanban_followup_stranded_redispatch=redispatch,
                 kanban_followup_stranded_unparked=stranded_unparked,
+                kanban_followup_stranded_session_liveness=liveness,
             )
             processed += 1
     except Exception:
