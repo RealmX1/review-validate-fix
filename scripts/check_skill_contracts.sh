@@ -964,6 +964,16 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.host_adap
 # 真相源已迁走：trajectory_distill facade 不得再定义 host 探测原语（防回灌到旧位置）。
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_distill.py" 'def detect_transcript_format'
 
+# S9（收尾）：HostAdapter 注入契约——core 业务逻辑唯一认识的 host 表面，S10 装配 concrete
+# bundle + resolver 时注入。守住 v1 注入面 4 方法名 + 包级 re-export，防 S10 relocation 时漂移。
+require_repo_file "core/host_adapter/host_adapter_protocol.py"
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'class HostAdapter(Protocol)'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def host_display_name'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def session_deep_link'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def cline_kanban_agent_id'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def detect_host_skip_mode'
+require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'
