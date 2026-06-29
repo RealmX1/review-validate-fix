@@ -385,6 +385,33 @@ def task_session_pid(task: dict[str, Any]) -> int | None:
     return None
 
 
+def task_session_state(task: dict[str, Any]) -> str | None:
+    session = task.get("session")
+    if not isinstance(session, dict):
+        return None
+    value = session.get("state")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def task_session_exit_code(task: dict[str, Any]) -> int | None:
+    session = task.get("session")
+    if not isinstance(session, dict):
+        return None
+    value = session.get("exitCode")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def task_execution_workspace_from_session(task: dict[str, Any]) -> Path | None:
     pid = task_session_pid(task)
     if pid is None:

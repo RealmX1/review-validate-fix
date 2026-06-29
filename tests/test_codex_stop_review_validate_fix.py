@@ -4817,6 +4817,99 @@ def test_stranded_sweep_unparks_on_giveup(tmp_path: Path) -> None:
     assert module._unpark_stranded_task(None, "task-9") is False
 
 
+def test_kanban_task_session_liveness_classifies_from_session_state(tmp_path: Path) -> None:
+    """搁浅判定真相源：从 kanban `task list` 的 session.state/exitCode 分类 stopped/alive/unknown。
+
+    in-process 直测谓词（monkeypatch _kanban_task_list_payload），不起子进程。
+    """
+    module = load_hook_module()
+    box: dict[str, object] = {"payload": None, "calls": 0}
+
+    def fake_list(project_path: str):
+        box["calls"] = int(box["calls"]) + 1  # type: ignore[arg-type]
+        return box["payload"]
+
+    original = module._kanban_task_list_payload
+    try:
+        module._kanban_task_list_payload = fake_list
+
+        def verdict(session: dict, *, task_id: str = "t1", project: str = "/repo") -> str:
+            box["payload"] = {"ok": True, "tasks": [{"id": task_id, "session": session}]}
+            return module._kanban_task_session_liveness(task_id, project, {})
+
+        assert verdict({"state": "running"}) == "alive"
+        assert verdict({"state": "awaiting_review"}) == "stopped"
+        assert verdict({"state": "idle"}) == "stopped"
+        # exitCode 非空优先判 stopped（即便 state 还显示 running）。
+        assert verdict({"state": "running", "exitCode": 0}) == "stopped"
+        # 不识别的 state / 无 session 字段 → unknown（调用方退回 TTL）。
+        assert verdict({"state": "starting_up"}) == "unknown"
+        assert verdict({}) == "unknown"
+        # task 不在 list → unknown。
+        box["payload"] = {"ok": True, "tasks": []}
+        assert module._kanban_task_session_liveness("t1", "/repo", {}) == "unknown"
+        # list 不可达（None）→ unknown。
+        box["payload"] = None
+        assert module._kanban_task_session_liveness("t1", "/repo", {}) == "unknown"
+        # project_path 缺失 → unknown，且不触发 list 子进程。
+        before = int(box["calls"])  # type: ignore[arg-type]
+        assert module._kanban_task_session_liveness("t1", "", {}) == "unknown"
+        assert int(box["calls"]) == before  # type: ignore[arg-type]
+        # 同一 sweep 内按 project_path 缓存：两次只拉一次 list。
+        box["payload"] = {"ok": True, "tasks": [{"id": "t1", "session": {"state": "running"}}]}
+        cache: dict[str, object] = {}
+        c0 = int(box["calls"])  # type: ignore[arg-type]
+        module._kanban_task_session_liveness("t1", "/repo", cache)
+        module._kanban_task_session_liveness("t1", "/repo", cache)
+        assert int(box["calls"]) == c0 + 1  # type: ignore[arg-type]
+    finally:
+        module._kanban_task_list_payload = original
+
+
+def test_kanban_followup_stranded_sweep_skips_alive_session(tmp_path: Path) -> None:
+    """真相驱动 e2e：marker 已 TTL-stale，但 kanban session.state=running（活着、可能正消费本
+    follow-up）→ sweep 不升级、不通知、保留 marker（留给真实投递的 UPS-arm 清）。"""
+    repo = init_repo(tmp_path / "clean", dirty=False)
+    state = tmp_path / "state"
+    pending_dir = state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    pending_dir.mkdir(parents=True)
+    marker = _write_stranded_pending(
+        pending_dir, task_id="taskALIVE", token="ffffffffffffffff",
+        project_path=str(repo), title="活着的任务",
+    )
+    fake_client = tmp_path / "fake_cline_kanban_client.py"
+    fake_client.write_text(
+        "import json, sys\n"
+        "if sys.argv[1] == 'list':\n"
+        "    print(json.dumps({'ok': True, 'tasks': ["
+        "{'id': 'taskALIVE', 'session': {'state': 'running', 'exitCode': None}}]}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+        encoding="utf-8",
+    )
+    notify_log = tmp_path / "notify.log"
+    notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
+    extra = {
+        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "NOTIFY_LOG": str(notify_log),
+        "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
+        "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+    }
+    invoke({"cwd": str(repo), "stop_hook_active": False}, extra_env=extra, state_dir=state)
+
+    events = latest_events(state)
+    escalated = [
+        e for e in events if e.get("event") == "kanban_followup_pending_stranded_escalated"
+    ]
+    # 活着 → 不升级，即便 marker 已 stale。
+    assert escalated == []
+    # 不发任何 OS 通知。
+    assert (not notify_log.exists()) or not notify_log.read_text(encoding="utf-8").strip()
+    # marker 保留。
+    assert marker.exists()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shard-count", type=int, default=1)
@@ -4992,6 +5085,8 @@ def main() -> int:
         test_stop_unparks_on_dispatch_failure_and_no_dispatch,
         test_stop_safety_valve_noop_when_not_self_parked,
         test_stranded_sweep_unparks_on_giveup,
+        test_kanban_task_session_liveness_classifies_from_session_state,
+        test_kanban_followup_stranded_sweep_skips_alive_session,
     ]
     assert_every_defined_test_is_registered(
         globals(),
