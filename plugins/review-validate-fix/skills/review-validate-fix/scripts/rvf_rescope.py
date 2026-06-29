@@ -32,7 +32,9 @@ from typing import Any
 import diff_tracker
 import review_reopen_marker
 from rvf_handoff_intake import RVF_RUN_RE
-from rvf_logging import log_root
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import log_root  # noqa: E402
 
 
 KANBAN_TASK_ID_ENV_KEYS = (

@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from rvf_logging import RunLedger, rvf_state_fields, safe_token
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import RunLedger, rvf_state_fields, safe_token  # noqa: E402
 
 
 HANDOFF_FILE_MARKER = "RVF_HANDOFF_FILE"

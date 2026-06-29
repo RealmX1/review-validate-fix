@@ -10,9 +10,26 @@ from pathlib import Path
 from typing import Any
 
 
-SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_LOG_ROOT = SKILL_DIR / "state"
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
+
+
+def installed_plugin_skill_dir() -> Path:
+    """已部署 RVF plugin 的 skill 目录（布局无关）。
+
+    本模块从 ``scripts/`` 迁入 ``core/run_ledger/`` 后，``Path(__file__).parents[N]``
+    不再能稳健回指 skill 目录——skill 目录是 ``plugins/.../skills/...`` 旁系子树而非
+    本文件的祖先，且「哨兵→skill」层数在 repo 与已部署 payload 下不同。故 ``SKILL_DIR``
+    改由本函数解析：优先 ``CODEX_RVF_INSTALLED_SKILL_DIR`` env，回退
+    ``~/plugins/review-validate-fix/skills/review-validate-fix``。
+    （该 env 名的去-codex 改名属部署耦合 env，留待 S11。）
+    """
+    configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
+
+
+SKILL_DIR = installed_plugin_skill_dir()
 DEFAULT_INLINE_BYTES = 2048
 COMPONENTS = {
     "command-lock",
@@ -234,13 +251,6 @@ def new_run_id(component: str) -> str:
 
 def new_event_id() -> str:
     return f"evt-{secrets.token_hex(8)}"
-
-
-def installed_plugin_skill_dir() -> Path:
-    configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
-    if configured and configured.strip():
-        return Path(configured).expanduser()
-    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
 
 
 def default_log_root_for_skill_dir(skill_dir: Path) -> Path:

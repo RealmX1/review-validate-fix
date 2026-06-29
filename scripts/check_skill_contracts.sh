@@ -413,7 +413,6 @@ required_files=(
   "scripts/apply_worktree_bootstrap.py"
   "scripts/cline_kanban_client.py"
   "scripts/cancel_rvf_run.py"
-  "scripts/rvf_logging.py"
   "scripts/rvf_prep_file.py"
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
@@ -439,6 +438,7 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
+  "core/run_ledger/run_ledger.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -510,7 +510,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/apply_worktree_bootstrap.py" \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
-  "$skill_dir/scripts/rvf_logging.py" \
+  "$repo_root/core/run_ledger/run_ledger.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
@@ -689,7 +689,7 @@ require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/command_lock.py" 'lock_acquired'
 require_literal "scripts/command_lock.py" 'lock_timeout'
 require_literal "scripts/command_lock.py" 'lock_released'
-require_literal "scripts/rvf_logging.py" 'command-lock'
+require_repo_literal "core/run_ledger/run_ledger.py" 'command-lock'
 require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
 require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
 require_literal "scripts/prepare_review_run.py" 'scope.contract.json'
@@ -704,16 +704,16 @@ require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-id'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-dir'
 require_literal "scripts/prepare_review_run.py" '--rvf-backend'
-require_literal "scripts/rvf_logging.py" 'class RunLedger'
-require_literal "scripts/rvf_logging.py" 'cline-kanban'
-require_literal "scripts/rvf_logging.py" 'RVF_STATE_PHASES'
-require_literal "scripts/rvf_logging.py" 'kanban-task'
-require_literal "scripts/rvf_logging.py" 'rvf_state_fields'
-require_literal "scripts/rvf_logging.py" 'events.jsonl'
-require_literal "scripts/rvf_logging.py" 'summary.json'
-require_literal "scripts/rvf_logging.py" 'reason_code'
-require_literal "scripts/rvf_logging.py" 'RVF_RUN_DIR'
-require_literal "scripts/rvf_logging.py" 'log_unavailable'
+require_repo_literal "core/run_ledger/run_ledger.py" 'class RunLedger'
+require_repo_literal "core/run_ledger/run_ledger.py" 'cline-kanban'
+require_repo_literal "core/run_ledger/run_ledger.py" 'RVF_STATE_PHASES'
+require_repo_literal "core/run_ledger/run_ledger.py" 'kanban-task'
+require_repo_literal "core/run_ledger/run_ledger.py" 'rvf_state_fields'
+require_repo_literal "core/run_ledger/run_ledger.py" 'events.jsonl'
+require_repo_literal "core/run_ledger/run_ledger.py" 'summary.json'
+require_repo_literal "core/run_ledger/run_ledger.py" 'reason_code'
+require_repo_literal "core/run_ledger/run_ledger.py" 'RVF_RUN_DIR'
+require_repo_literal "core/run_ledger/run_ledger.py" 'log_unavailable'
 require_literal "scripts/session_manifest.py" 'owned_paths'
 require_literal "scripts/session_manifest.py" 'unattributed_dirty_paths'
 require_literal "scripts/build_review_packet.py" 'metadata-output'

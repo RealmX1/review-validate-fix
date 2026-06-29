@@ -17,7 +17,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import diff_tracker
 from cursor_stream_tool_layer_health import classify_cursor_tool_call_outcome
-from rvf_logging import start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import start_run  # noqa: E402
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]

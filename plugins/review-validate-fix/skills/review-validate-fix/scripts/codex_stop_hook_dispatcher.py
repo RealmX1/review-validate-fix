@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (

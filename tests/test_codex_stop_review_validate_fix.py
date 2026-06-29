@@ -378,7 +378,7 @@ def load_workspace_snapshot_module():
 
 def test_plugin_deploy_metadata_is_in_prompt_and_summary(tmp_path: Path) -> None:
     module = load_hook_module()
-    logging_module = sys.modules["rvf_logging"]
+    logging_module = sys.modules["core.run_ledger.run_ledger"]
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(

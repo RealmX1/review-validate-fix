@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
 import rvf_bootstrap_confirm
 import rvf_prep_file
-from rvf_logging import log_root, start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import log_root, start_run  # noqa: E402
 from session_label import text_from_message_payload
 
 try:

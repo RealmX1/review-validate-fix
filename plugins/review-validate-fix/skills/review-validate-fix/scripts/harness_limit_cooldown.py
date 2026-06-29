@@ -25,7 +25,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import safe_token
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import safe_token  # noqa: E402
 
 
 SUBDIR_NAME = "harness-limit-cooldown"

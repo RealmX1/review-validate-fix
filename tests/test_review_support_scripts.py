@@ -44,7 +44,7 @@ CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
 SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
 DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
-RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
+RUN_LEDGER = ROOT / "core" / "run_ledger" / "run_ledger.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
@@ -84,10 +84,10 @@ def load_cancel_rvf_run_module():
     return module
 
 
-def load_rvf_logging_module():
-    spec = importlib.util.spec_from_file_location("rvf_logging", RVF_LOGGING)
+def load_run_ledger_module():
+    spec = importlib.util.spec_from_file_location("rvf_run_ledger_for_tests", RUN_LEDGER)
     if spec is None or spec.loader is None:
-        raise AssertionError("failed to load rvf_logging module")
+        raise AssertionError("failed to load core.run_ledger.run_ledger module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -120,7 +120,7 @@ def load_rvf_user_prompt_submit_module():
 
 
 def load_kanban_followup_lock_module():
-    # kanban_followup_lock 依赖 ``from rvf_logging import safe_token``，需 SCRIPT_DIR 在 path 上。
+    # kanban_followup_lock 依赖 ``from core.run_ledger.run_ledger import safe_token``，需 SCRIPT_DIR 在 path 上（其自带 _rvf_pyroot bootstrap 解析 pyroot）。
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     spec = importlib.util.spec_from_file_location(
@@ -156,7 +156,7 @@ def load_cline_kanban_client_module():
 
 
 def load_rvf_analyze_thread_module():
-    # rvf_analyze_thread top-level imports rvf_logging / trajectory_distill，且
+    # rvf_analyze_thread top-level imports core.run_ledger.run_ledger / trajectory_distill，且
     # launch_detached_analyze_thread 会 lazy import rvf_analyze_advisory，全部需
     # 要 SCRIPT_DIR 在 sys.path 上才能解析；以真实模块名注册进 sys.modules，让
     # advisory 的 `from rvf_analyze_thread import ...` 命中同一实例。
@@ -3256,7 +3256,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
 
 
 def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     ledger = module.RunLedger(
         component="dispatcher",
         run_id="rvf-contract-timing-preserve",
@@ -3288,7 +3288,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
 def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
     tmp_path: Path,
 ) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     installed_skill = tmp_path / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     installed_skill.mkdir(parents=True)
     (installed_skill / "SKILL.md").write_text("# skill\n", encoding="utf-8")
@@ -3324,7 +3324,7 @@ def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
 def test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
     tmp_path: Path,
 ) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     installed_skill = tmp_path / "home" / "plugins" / "missing" / "skills" / "review-validate-fix"
     dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
 
@@ -7589,7 +7589,7 @@ def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp_path: Path) ->
 
 
 def test_run_ledger_summary_preserves_cline_kanban_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     run_dir = tmp_path / "run"
     ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
@@ -7606,7 +7606,7 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp_path: Path) -> Non
 
 
 def test_run_ledger_summary_preserves_rvf_state_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     run_dir = tmp_path / "run"
     ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
@@ -9993,7 +9993,7 @@ def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
 
 
 def load_dispatch_reviewers_module():
-    # dispatch_reviewers imports rvf_logging / run_alternative_reviewer / trajectory_distill
+    # dispatch_reviewers imports core.run_ledger.run_ledger / run_alternative_reviewer / trajectory_distill
     # from SCRIPT_DIR, so SCRIPT_DIR must be importable.
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
