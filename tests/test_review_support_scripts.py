@@ -52,7 +52,7 @@ VERIFY_CURSOR_TOOL_LAYER = SCRIPT_DIR / "verify_cursor_tool_layer.py"
 CANCEL_RVF_RUN = SCRIPT_DIR / "cancel_rvf_run.py"
 CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
-SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
+SESSION_MANIFEST = ROOT / "core" / "session_scope_allocation" / "session_change_manifest.py"
 DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
 RUN_LEDGER = ROOT / "core" / "run_ledger" / "run_ledger.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
@@ -3963,7 +3963,7 @@ def _round_baseline_committed_modules():
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
-    import session_manifest as _sm  # noqa: PLC0415
+    import core.session_scope_allocation.session_change_manifest as _sm  # noqa: PLC0415
     import round_baseline_marker as _rbm  # noqa: PLC0415
 
     return _dt, _sm, _rbm

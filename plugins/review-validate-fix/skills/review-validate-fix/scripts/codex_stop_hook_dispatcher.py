@@ -20,7 +20,7 @@ from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
     surface_rvf_analyze_advisory,
 )
-from session_manifest import build_manifest
+from core.session_scope_allocation.session_change_manifest import build_manifest
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]

@@ -29,7 +29,7 @@ from core.transcript.patch_parsing import (  # noqa: E402
     extract_apply_patch_text_from_bash_command,
     parse_apply_patch_operations_without_repo,
 )
-from session_manifest import parse_apply_patch  # noqa: E402
+from core.session_scope_allocation.session_change_manifest import parse_apply_patch  # noqa: E402
 
 
 def _claude_tool_call_artifact_refs(

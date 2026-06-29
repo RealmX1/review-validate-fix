@@ -34,7 +34,7 @@ from core.transcript.patch_parsing import (  # noqa: E402
     parse_apply_patch_operations_without_repo,
 )
 from session_label import text_from_message_payload  # noqa: E402 — S9b：Codex rollout user-message 文本抽取（leaf, stdlib-only，无环）
-from session_manifest import parse_apply_patch  # noqa: E402
+from core.session_scope_allocation.session_change_manifest import parse_apply_patch  # noqa: E402
 
 
 def read_codex_originator(rollout_path: Path) -> str | None:

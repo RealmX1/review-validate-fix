@@ -41,7 +41,11 @@ TARGET_FLOW_BACKEND = {
 SKILL_DIR = Path(__file__).resolve().parents[1]
 BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
-SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
+# session_change_manifest 已迁入 core/session_scope_allocation/（去-codex S10c）；作为子进程
+# 直接调用，路径取自其同包邻居 reviewable_unit_diff_tracker 的 __file__（depth-robust，repo /
+# 部署 payload / worktree 同口径，免固定 parents[N]）。常量沿用 SESSION_MANIFEST 助记名（同
+# BUILD_PACKET 约定）。
+SESSION_MANIFEST = Path(reviewable_unit_diff_tracker.__file__).resolve().parent / "session_change_manifest.py"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"

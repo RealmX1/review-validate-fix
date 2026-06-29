@@ -416,7 +416,6 @@ required_files=(
   "scripts/rvf_prep_file.py"
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
-  "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
   "scripts/codex_stop_hook_router.py"
@@ -436,6 +435,7 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
   "core/session_scope_allocation/reviewable_unit_diff_tracker.py"
+  "core/session_scope_allocation/session_change_manifest.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -514,7 +514,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
-  "$skill_dir/scripts/session_manifest.py" \
+  "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
@@ -714,8 +714,8 @@ require_repo_literal "core/run_ledger/run_ledger.py" 'summary.json'
 require_repo_literal "core/run_ledger/run_ledger.py" 'reason_code'
 require_repo_literal "core/run_ledger/run_ledger.py" 'RVF_RUN_DIR'
 require_repo_literal "core/run_ledger/run_ledger.py" 'log_unavailable'
-require_literal "scripts/session_manifest.py" 'owned_paths'
-require_literal "scripts/session_manifest.py" 'unattributed_dirty_paths'
+require_repo_literal "core/session_scope_allocation/session_change_manifest.py" 'owned_paths'
+require_repo_literal "core/session_scope_allocation/session_change_manifest.py" 'unattributed_dirty_paths'
 require_literal "scripts/build_review_packet.py" 'metadata-output'
 require_literal "scripts/build_review_packet.py" 'session-manifest'
 require_literal "scripts/build_review_packet.py" 'primary-file'

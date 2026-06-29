@@ -78,7 +78,7 @@ from kanban_followup_lock import (
     stamp_pending_notified as stamp_kanban_followup_pending_notified,
     write_pending_marker as write_kanban_followup_pending,
 )
-from session_manifest import build_manifest
+from core.session_scope_allocation.session_change_manifest import build_manifest
 from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
     LEGACY_REASON_SESSION_OWNED_DIRTY,

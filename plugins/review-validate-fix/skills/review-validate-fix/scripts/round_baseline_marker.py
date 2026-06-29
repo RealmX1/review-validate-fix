@@ -6,7 +6,7 @@
 ``baseline_head..HEAD`` 的 first-parent 净 diff 派生 committed 观测单元，与
 dirty 观测合流后再交集 transcript 归属，得到「本轮已提交、属于本会话、尚未审」
 的范围（见 ``reviewable_unit_diff_tracker._list_committed_round_changed_paths`` /
-``session_manifest.build_manifest(committed_baseline=...)``）。
+``session_change_manifest.build_manifest(committed_baseline=...)``）。
 
 存储与原子写镜像 ``review_reopen_marker``：env-root、
 task+session 双键、原子 rename 写、TTL 状态（active/stale/invalid）。

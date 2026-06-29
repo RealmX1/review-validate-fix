@@ -18,7 +18,7 @@ from typing import Any
 def parse_apply_patch_operations_without_repo(
     patch_text: str, line_number: int
 ) -> tuple[list[dict[str, Any]], set[str]]:
-    """Repo-less apply_patch parser；与 ``session_manifest.parse_apply_patch``
+    """Repo-less apply_patch parser；与 ``session_change_manifest.parse_apply_patch``
     返回 shape 一致，但跳过 path 归一化（无 repo 上下文时的 fallback）。
     识别 ``*** Add File: ...`` / ``*** Delete File: ...`` / ``*** Update File: ...``。
     """
