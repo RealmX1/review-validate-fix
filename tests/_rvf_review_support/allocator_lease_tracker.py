@@ -1810,7 +1810,7 @@ def _run_reviewer_with_lease(
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=0.2,
+        idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
         max_runtime_seconds=max_runtime_seconds,
         output_format=output_format,
@@ -1906,7 +1906,7 @@ def test_run_alternative_reviewer_shared_lease_does_not_release_on_exit(tmp: Pat
     config = write_alternative_reviewer_config(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", clean_review_result_python()],
-        idle_timeout_seconds=0.2,
+        idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
     )
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}

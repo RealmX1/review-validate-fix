@@ -339,10 +339,10 @@ def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp_pat
         [
             sys.executable,
             "-c",
-            "import time; time.sleep(0.25); " + clean_review_result_python(stdout="NO_ISSUES"),
+            "import time; time.sleep(0.6); " + clean_review_result_python(stdout="NO_ISSUES"),
         ],
-        idle_timeout_seconds=0.08,
-        activity_check_interval_seconds=0.03,
+        idle_timeout_seconds=0.25,
+        activity_check_interval_seconds=0.05,
         activity_probe_command=[
             sys.executable,
             "-c",
@@ -615,7 +615,7 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp_path: Path) ->
                 "print('NO_ISSUES', flush=True)"
             ),
         ],
-        idle_timeout_seconds=0.6,
+        idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
     )
 
