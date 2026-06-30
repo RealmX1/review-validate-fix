@@ -442,6 +442,8 @@ repo_required_files=(
   "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "core/provider_health/provider_health_guard.py"
   "adapters/codex/codex_provider_login.py"
+  "adapters/codex/codex_host_adapter.py"
+  "adapters/claude_code/claude_code_host_adapter.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -525,6 +527,9 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$repo_root/core/provider_health/provider_health_guard.py" \
   "$repo_root/adapters/codex/codex_provider_login.py" \
+  "$repo_root/adapters/codex/codex_host_adapter.py" \
+  "$repo_root/adapters/claude_code/claude_code_host_adapter.py" \
+  "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
@@ -1000,6 +1005,22 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'output_failure_pred
 forbid_repo_literal "core/provider_health/provider_health_guard.py" 'provider == "codex"'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def codex_bin'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def maybe_start_codex_login'
+
+# S10 装配（HostAdapter 注入面）：host_adapter_resolver 按 detect_transcript_format 装配
+# Codex / Claude concrete bundle 注入 core——host 判断只在 resolver 一处。引擎
+# default_cline_kanban_agent_id 经 bundle.cline_kanban_agent_id() 取 host-镜像默认值，
+# 不再内联 host_kind 分支（中性 pin / 兜底仍留 resolve_cline_kanban_agent_id）。
+require_repo_file "adapters/codex/codex_host_adapter.py"
+require_repo_literal "adapters/codex/codex_host_adapter.py" 'class CodexHostAdapter'
+require_repo_literal "adapters/codex/codex_host_adapter.py" 'codex_goal_mode_context_from_event'
+require_repo_file "adapters/claude_code/claude_code_host_adapter.py"
+require_repo_literal "adapters/claude_code/claude_code_host_adapter.py" 'class ClaudeCodeHostAdapter'
+require_file "scripts/host_adapter_resolver.py"
+require_literal "scripts/host_adapter_resolver.py" 'def resolve_host_adapter'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from host_adapter_resolver import resolve_host_adapter'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'resolve_host_adapter(host).cline_kanban_agent_id()'
+# resolver self-check：两 bundle 满足 HostAdapter Protocol、装配口径正确、各方法行为正确。
+run_step "host adapter resolver self-check" python3 "$skill_dir/scripts/host_adapter_resolver.py"
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'

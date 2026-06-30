@@ -161,8 +161,13 @@ from session_label import (
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
-from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
+    HOST_CLAUDE,
+    HOST_CODEX,
+    detect_transcript_format,
+)
 import rvf_parent_context
+from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -1696,21 +1701,19 @@ def event_or_env_text(
 def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
     """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
 
-    复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 做 host 识别：
-    Claude Code transcript → ``claude``；Codex rollout → ``codex``；
-    无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
-    保证既有 Codex-only 用例零回归。
+    经 ``host_adapter_resolver.resolve_host_adapter`` 装配的具体 ``HostAdapter`` bundle
+    索取 ``cline_kanban_agent_id``（Codex→``codex`` / Claude→``claude``）——host-镜像
+    默认值这一 host 行为归注入面，引擎不再内联 ``host_kind ==`` 分支。host 识别仍复用
+    ``detect_transcript_format``；无法识别（父 transcript 缺失 / 未知格式 / 探测异常）时
+    resolver 兜底 ``CodexHostAdapter`` → ``codex``，保证既有 Codex-only 用例零回归。
     """
+    host: str | None = None
     if parent_thread_path is not None:
         try:
-            host_kind = detect_transcript_format(parent_thread_path)
+            host = detect_transcript_format(parent_thread_path)
         except Exception:
-            host_kind = None
-        if host_kind == HOST_CLAUDE:
-            return "claude"
-        if host_kind == HOST_CODEX:
-            return "codex"
-    return "codex"
+            host = None
+    return resolve_host_adapter(host).cline_kanban_agent_id()
 
 
 def resolve_cline_kanban_agent_id(
