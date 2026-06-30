@@ -439,6 +439,7 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
+  "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -511,6 +512,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
   "$repo_root/core/run_ledger/run_ledger.py" \
+  "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
@@ -804,7 +806,7 @@ require_literal "scripts/cancel_rvf_run.py" 'trash_task'
 require_literal "references/cancel-rvf-run.md" 'cline-kanban-rvf-cancelled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_MODE=cline-kanban'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'kanban-followup'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_KANBAN_FOLLOWUP_TRIGGER'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_KANBAN_FOLLOWUP_TRIGGER'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_DISPATCH=token='
 require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_prep_file_path'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_target_worktree'
@@ -855,8 +857,8 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'stop_hook_active'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'systemMessage'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'desktop-control-unavailable-report'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'desktop-control-unavailable-fail'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_FORK_EXPERIMENT'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_FORKED_REVIEW_VALIDATE_FIX'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_FORK_EXPERIMENT'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_FORKED_REVIEW_VALIDATE_FIX'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'DEFAULT_RVF_MODE = "fork"'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'DEFAULT_FORK_LAUNCH_MODE = "auto"'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_MODE'

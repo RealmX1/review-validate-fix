@@ -41,6 +41,28 @@ from core.run_ledger.run_ledger import (
     skill_deploy_metadata,
     start_run,
 )
+from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
+    CLINE_KANBAN_TASK_MARKER,
+    CLINE_KANBAN_WORKTREE_MODES,
+    DEFAULT_CLINE_KANBAN_WORKTREE_MODE,
+    FORK_EXPERIMENT_MARKER,
+    HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION,
+    KANBAN_FOLLOWUP_MARKER,
+    MANUAL_RVF_COMPLETED_AT_KEY,
+    MANUAL_RVF_MARKER_KEYS,
+    MANUAL_RVF_MARKER_TTL_SECONDS,
+    MANUAL_RVF_RUN_ID_KEY,
+    PARENT_CONTEXT_ARTIFACT_NAME,
+    PARENT_CONTEXT_ENV,
+    PARENT_CONTEXT_MAX_BYTES_ENV,
+    PARENT_CONTEXT_PROMPT_KEY,
+    RVF_FORK_MARKER,
+    SESSION_HOOK_CONTROL_KEY,
+    SESSION_PATH_KEYS,
+    SESSION_SCOPE_PATH_KEYS,
+    SUPPRESS_ENV_NAMES,
+    SUPPRESS_STOP_HOOK_MARKER,
+)
 from rvf_handoff import (
     handoff_completion_payload,
     handoff_path_from_event,
@@ -151,67 +173,16 @@ DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
-FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
-RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
-CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
-KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
-CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
-DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
-# 主 agent 最终回复里 `RVF_HANDOFF_FILE:` marker 之后那段摘要的固定结构指令。
-# 单一来源，供 fork / kanban-followup / kanban-dispatch 三处 prompt builder 复用，
-# 避免再次像历史那样三份拷贝各自漂移成「1-3 句」自由散文、导致输出成无结构 paragraph。
-# 与 references/handoff-template.md 的 `Reviewers：`/`Validate/fixers：` 两行结构、
-# 以及 check_review_output.py 已保留的同名标签一致。
-HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION = (
-    "空一行后按固定结构分两行追加极短中文摘要："
-    "`Reviewers：<reviewers 检查了什么、发现几项或没问题>` 一行、"
-    "`Validate/fixers：<validate/fixers 验证/修复/驳回/升级了什么>` 一行，"
-    "每行各自一句、不要挤成一段"
-)
-# 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
-# artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
-PARENT_CONTEXT_ENV = "RVF_PARENT_CONTEXT"
-"""开关：默认开启；设 ``0`` / ``false`` / ``no`` / ``off`` 关闭父对话 context 生成。"""
-PARENT_CONTEXT_MAX_BYTES_ENV = "RVF_PARENT_CONTEXT_MAX_BYTES"
-"""总字节上限覆盖；缺省用 rvf_parent_context.DEFAULT_MAX_BYTES (64KB)，超限保留最近内容。"""
-PARENT_CONTEXT_ARTIFACT_NAME = "parent-conversation-context.md"
-"""run artifacts 中父对话 context 的文件名，与 task prompt / review-env 引用一致。"""
-PARENT_CONTEXT_PROMPT_KEY = "RVF_PARENT_CONVERSATION_CONTEXT"
-"""task prompt / review-env 中标记父对话 context 路径的键名。"""
+# 以下为引擎簇私有常量（仅单簇引用），随其所属簇在 S10e–S10j 一并迁出；
+# 被 ≥2 簇引用的共享常量已上提到 core/rvf_shared_runtime_constants（S10d，见顶部 import）。
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
 KANBAN_FOLLOWUP_LEASE_TTL_ENV = "RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
-SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
-SUPPRESS_STOP_HOOK_MARKER = "RVF_SUPPRESS_STOP_HOOK=1"
-MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
-MANUAL_RVF_RUN_ID_KEY = "manual_rvf_run_id"
-MANUAL_RVF_MARKER_KEYS = (
-    MANUAL_RVF_COMPLETED_AT_KEY,
-    MANUAL_RVF_RUN_ID_KEY,
-    "manual_rvf_updated_at",
-    "manual_rvf_expires_at",
-    "manual_rvf_repo",
-    "manual_rvf_head",
-    "manual_rvf_dirty_hash",
-)
-MANUAL_RVF_MARKER_TTL_SECONDS = 12 * 60 * 60
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "auto"
-SUPPRESS_ENV_NAMES = (
-    "RVF_SUPPRESS",
-    "RVF_SUPPRESS_STOP_HOOK",
-)
 # detached $rvf-analyze 线程注入的标记 env。语义上与 SUPPRESS_ENV_NAMES 区分开：
 # 这是「这是 analyze 线程自己的 Stop event」的显式信号，用于 evaluate_stop_event
 # 早退守卫，短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF。
 RVF_ANALYZE_THREAD = "RVF_ANALYZE_THREAD"
-SESSION_PATH_KEYS = (
-    "transcript_path",
-    "session_path",
-    "conversation_path",
-    "log_path",
-    "session_file",
-)
-SESSION_SCOPE_PATH_KEYS = tuple(key for key in SESSION_PATH_KEYS if key != "log_path")
 PLAN_DOC_REVIEW_DIR_PREFIXES = ("docs/", "doc/", ".claude/plans/")
 PLAN_DOC_REVIEW_NAME_MARKERS = (
     "plan",
