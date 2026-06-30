@@ -68,6 +68,12 @@ PLAN_SCHEMA_VERSION = 1
 # Detached 派发线程（--detached / --wait-status）：把「agent 前台 Bash 调用 ↔ 整轮
 # 派发 wall-clock」解耦，突破 Bash 工具 600s 硬上限。status/log/lock 落在
 # <artifacts>/reviewers/ 下，与 reviewer-plan.json / 各 reviewer artifact 同处。
+#
+# ponytail: awaiting orchestration overhaul —— 这套「主 agent 派后台 reviewer 并等它」
+# 的 detached-thread + status.json + in-progress 锁（Fix A）是「RVF 内 reviewer 等待」的
+# 手搓实例。与 RVF 外实现期派发的 wait-on 登记（rvf_awaiting_dispatched_agent_marker）同源，
+# 都该收敛进待建 orchestration 系统的同一套 dispatch + wait-on 登记：让「RVF 内 reviewer 等待」
+# 与「RVF 外实现期派发等待」走同一条 arm/clear/query 路径，Stop 侧只需读一处。
 DISPATCH_STATUS_SCHEMA_VERSION = 1
 DISPATCH_STATUS_FILENAME = ".dispatch-thread.status.json"
 DISPATCH_LOG_FILENAME = ".dispatch-thread.log"

@@ -5023,6 +5023,7 @@ def main() -> int:
         test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigger_turn,
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
+        test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
         test_rvf_analyze_manual_invocation_skips_one_turn,
         test_review_reopen_marker_reopens_run_scope_before_dispatch,

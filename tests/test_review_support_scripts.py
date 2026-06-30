@@ -59,6 +59,7 @@ RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
+AWAITING_DISPATCHED_AGENT_MARKER = SCRIPT_DIR / "rvf_awaiting_dispatched_agent_marker.py"
 RVF_POST_TOOL_USE = SCRIPT_DIR / "rvf_post_tool_use.py"
 HOOKS_JSON = (
     ROOT / "plugins" / "review-validate-fix" / "hooks" / "hooks.json"
@@ -142,6 +143,22 @@ def load_kanban_followup_lock_module():
     )
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load kanban_followup_lock module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_awaiting_dispatched_agent_marker_module():
+    # rvf_awaiting_dispatched_agent_marker 依赖 ``from rvf_logging import safe_token`` 与
+    # ``from kanban_followup_lock import ...``，需 SCRIPT_DIR 在 path 上。
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_awaiting_dispatched_agent_marker", AWAITING_DISPATCHED_AGENT_MARKER
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_awaiting_dispatched_agent_marker module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -714,6 +731,115 @@ def test_kanban_followup_iter_pending_and_stamp_notified(tmp_path: Path) -> None
     assert k.stamp_pending_notified(task_id="taskA", token="aaaaaaaaaaaaaaaa", root=root) is False
     # iter 在空/不存在目录上返回 []（不抛）。
     assert k.iter_pending_markers(root=tmp_path / "nonexistent") == []
+
+
+def test_awaiting_dispatched_agent_marker_arm_iter_clear_round_trip(tmp_path: Path) -> None:
+    """wait-on 派发登记 marker：arm → iter 命中 → clear → 不再命中；一个 session 多条派发并存。
+
+    这是 RVF 内外统一 shield 的 writer/reader 契约单测：dispatch 层 arm、Stop hook 的 reader
+    （iter_active_awaiting_for_session）查「本 session 是否还有未完成 wait-on 派发」。
+    """
+    a = load_awaiting_dispatched_agent_marker_module()
+    root = tmp_path / "lock-root"
+    path = a.arm_awaiting_dispatched_agent(
+        main_session_id="sess-X",
+        dispatched_agent_id="bg-impl-1",
+        dispatcher="delegate-to-cursor",
+        description="后台实现 agent",
+        repo="/repo",
+        cwd="/repo",
+        root=root,
+    )
+    assert path is not None and path.exists()
+    # 物理隔离：落在独立子目录，不与 in-progress / pending marker 同名互相覆盖。
+    assert path.parent.name == a.SUBDIR_NAME == "awaiting-dispatched-agent"
+    active = a.iter_active_awaiting_for_session("sess-X", root=root)
+    assert len(active) == 1
+    marker = active[0]
+    assert marker["state"] == a.AWAITING_STATE == "awaiting_dispatched_agent"
+    assert marker["wait_on"] is True
+    assert marker["dispatched_agent_id"] == "bg-impl-1"
+    assert marker["dispatcher"] == "delegate-to-cursor"
+    assert marker.get("expires_at")
+    assert marker.get("_marker_path")
+    # 一个 session 可有多条未完成 wait-on 派发：第二条并存。
+    a.arm_awaiting_dispatched_agent(
+        main_session_id="sess-X", dispatched_agent_id="bg-impl-2", root=root
+    )
+    ids = {m["dispatched_agent_id"] for m in a.iter_active_awaiting_for_session("sess-X", root=root)}
+    assert ids == {"bg-impl-1", "bg-impl-2"}
+    # 另一个 session 的 marker 不串台。
+    a.arm_awaiting_dispatched_agent(
+        main_session_id="sess-Y", dispatched_agent_id="other", root=root
+    )
+    assert {m["dispatched_agent_id"] for m in a.iter_active_awaiting_for_session("sess-X", root=root)} == {
+        "bg-impl-1",
+        "bg-impl-2",
+    }
+    # clear 一条，另一条仍在。
+    removed = a.clear_awaiting_dispatched_agent(
+        main_session_id="sess-X", dispatched_agent_id="bg-impl-1", root=root
+    )
+    assert removed == [str(path)]
+    assert {m["dispatched_agent_id"] for m in a.iter_active_awaiting_for_session("sess-X", root=root)} == {
+        "bg-impl-2"
+    }
+    # 缺 session/dispatch-id → no-op（不抛）。
+    assert a.arm_awaiting_dispatched_agent(main_session_id=None, dispatched_agent_id="x", root=root) is None
+    assert a.clear_awaiting_dispatched_agent(main_session_id="sess-X", dispatched_agent_id="absent", root=root) == []
+    # iter 在不存在目录上返回 []（不抛）。
+    assert a.iter_active_awaiting_for_session("sess-X", root=tmp_path / "nonexistent") == []
+
+
+def test_awaiting_dispatched_agent_marker_stale_is_lazily_cleared(tmp_path: Path) -> None:
+    """STALE（TTL 过期）的 wait-on marker：iter 不计入「还在等」(→ Stop 放行)，并惰性删除该文件。
+
+    这把「writer 忘 clear / 后台 agent 静默死」的 masking 上界钉死在 TTL：过期即不再挡停。
+    """
+    a = load_awaiting_dispatched_agent_marker_module()
+    root = tmp_path / "lock-root"
+    path = a.arm_awaiting_dispatched_agent(
+        main_session_id="sess-stale",
+        dispatched_agent_id="bg-dead",
+        ttl_seconds_override=0,  # expires_at = arm 时刻 → 检查时必已过期
+        root=root,
+    )
+    assert path is not None and path.exists()
+    # iter 不返回它（STALE 不计入 active），且顺手把过期文件惰性清掉。
+    assert a.iter_active_awaiting_for_session("sess-stale", root=root) == []
+    assert not Path(path).exists()
+
+
+def test_awaiting_dispatched_agent_marker_cli_round_trip(tmp_path: Path) -> None:
+    """CLI helper（dispatcher 接入点）：subprocess 跑 arm → list(1) → clear → list(0)。"""
+    root = tmp_path / "cli-root"
+    env = dict(os.environ)
+    env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(root)
+
+    def cli(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(AWAITING_DISPATCHED_AGENT_MARKER), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(SCRIPT_DIR),
+        )
+
+    armed = cli(
+        "arm", "--session", "cli-sess", "--dispatch-id", "cli-bg",
+        "--dispatcher", "delegate-to-cursor", "--description", "后台 agent",
+    )
+    assert armed.returncode == 0, armed.stderr
+    assert Path(armed.stdout.strip()).exists()
+    listed = cli("list", "--session", "cli-sess")
+    assert listed.returncode == 0, listed.stderr
+    active = json.loads(listed.stdout)
+    assert [m["dispatched_agent_id"] for m in active] == ["cli-bg"]
+    cleared = cli("clear", "--session", "cli-sess", "--dispatch-id", "cli-bg")
+    assert cleared.returncode == 0, cleared.stderr
+    assert json.loads(cleared.stdout)  # 返回被删路径列表（非空）
+    listed_after = cli("list", "--session", "cli-sess")
+    assert json.loads(listed_after.stdout) == []
 
 
 def test_notify_kanban_followup_stranded(tmp_path: Path) -> None:
@@ -5505,6 +5631,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "kanban_followup_iter_pending_and_stamp_notified",
             lambda: test_kanban_followup_iter_pending_and_stamp_notified(
                 root / "kanban-followup-iter-stamp"
+            ),
+        ),
+        (
+            "awaiting_dispatched_agent_marker_arm_iter_clear_round_trip",
+            lambda: test_awaiting_dispatched_agent_marker_arm_iter_clear_round_trip(
+                root / "awaiting-dispatched-arm-iter-clear"
+            ),
+        ),
+        (
+            "awaiting_dispatched_agent_marker_stale_is_lazily_cleared",
+            lambda: test_awaiting_dispatched_agent_marker_stale_is_lazily_cleared(
+                root / "awaiting-dispatched-stale"
+            ),
+        ),
+        (
+            "awaiting_dispatched_agent_marker_cli_round_trip",
+            lambda: test_awaiting_dispatched_agent_marker_cli_round_trip(
+                root / "awaiting-dispatched-cli"
             ),
         ),
         (
