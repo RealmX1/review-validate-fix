@@ -73,7 +73,6 @@ from core.provider_health.provider_health_guard import (  # noqa: E402 — provi
     ProviderHealthRequirement,
     command_output_text,
     run_provider_health_requirement,
-    subprocess_output_text,
 )
 from rvf_handoff import (
     handoff_completion_payload,
