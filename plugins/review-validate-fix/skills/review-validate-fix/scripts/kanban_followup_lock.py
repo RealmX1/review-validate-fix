@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import safe_token
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import safe_token  # noqa: E402
 
 
 SUBDIR_NAME = "kanban-followup-in-progress"
@@ -23,8 +27,8 @@ MARKER_VERSION = 1
 # 最坏冻结时长。砍到 1h：既覆盖正常长 follow-up，又把卡死锁最坏自释放窗口从 6h 压到 ≤1h
 # （锁过期→STALE→读侧惰性清）。需要更长可经 TTL_ENV 覆盖。
 DEFAULT_TTL_SECONDS = 60 * 60
-TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_TTL_SECONDS"
-LOCK_ROOT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"
+TTL_ENV = "RVF_KANBAN_FOLLOWUP_IN_PROGRESS_TTL_SECONDS"
+LOCK_ROOT_ENV = "RVF_KANBAN_FOLLOWUP_LOCK_ROOT"
 STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"
 STATUS_INVALID = "invalid"
@@ -389,7 +393,7 @@ def bump_reengage_nudge_count(marker: dict[str, Any]) -> int:
 PENDING_SUBDIR_NAME = "kanban-followup-dispatched"
 PENDING_STATE = "dispatched_unconfirmed"
 DEFAULT_PENDING_TTL_SECONDS = 15 * 60
-PENDING_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_PENDING_TTL_SECONDS"
+PENDING_TTL_ENV = "RVF_KANBAN_FOLLOWUP_PENDING_TTL_SECONDS"
 
 
 def _pending_root(root: Path | None = None) -> Path:

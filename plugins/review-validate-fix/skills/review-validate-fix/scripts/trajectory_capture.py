@@ -27,7 +27,7 @@
 
 Host 耦合说明:
 本模块支持 **Codex** rollout JSONL 与 **Claude Code** transcript NDJSON 两种
-schema，按 transcript 文件首条 record type 探测（``trajectory_distill.detect_transcript_format``）
+schema，按 transcript 文件首条 record type 探测（``core.host_adapter.host_transcript_format_detection.detect_transcript_format``）
 后分派到对应 helper：
 
 - Codex 路径：``_codex_user_message_text`` / ``find_rvf_start_in_jsonl`` /
@@ -67,12 +67,15 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+
 from subagent_capture import capture_all_subagents  # noqa: E402
-from trajectory_distill import (  # noqa: E402
+from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIND,
     detect_transcript_format,
+)
+from trajectory_distill import (  # noqa: E402
     distill_claude_jsonl,
     distill_codex_jsonl,
     distill_reviewer_stream,

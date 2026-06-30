@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
 import rvf_bootstrap_confirm
 import rvf_prep_file
-from rvf_logging import log_root, start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import log_root, start_run  # noqa: E402
 from session_label import text_from_message_payload
 
 try:
@@ -453,7 +454,7 @@ def _run_shared_workflow(
     timeout_seconds: float,
     extra_primary_files: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Import prepare_review_run lazily to avoid pulling diff_tracker on early-exit paths."""
+    """Import prepare_review_run lazily to avoid pulling reviewable_unit_diff_tracker on early-exit paths."""
     import prepare_review_run  # noqa: PLC0415 - intentional lazy import
 
     return prepare_review_run.prepare_run_from_prep_file(
@@ -751,7 +752,7 @@ def arm_kanban_followup_lock_on_delivery(
     锁主键是 task_id（task-path），故 ``target_kanban_task_id`` 的一致性是关键——它取自 prep
     payload（权威，与 Stop hook 旧 arm 用的同一来源）。run/repo/cwd 同样取自 prep。
     best-effort：缺 task_id 则不 arm；任何异常都不阻断本次 prompt（只记 diagnostic）。
-    锁根路径走 ``kanban_followup_lock`` 的默认解析（``CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
+    锁根路径走 ``kanban_followup_lock`` 的默认解析（``RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
     env 或 ``~/.rvf``），与 Stop hook 读/清侧一致。
     """
     payload = record.payload

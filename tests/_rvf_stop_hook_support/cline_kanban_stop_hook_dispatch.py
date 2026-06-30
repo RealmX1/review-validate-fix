@@ -81,7 +81,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "action = sys.argv[1]\n"
         "if action == 'ensure':\n"
         "    print(json.dumps({'ok': True, 'started': False}))\n"
@@ -102,7 +102,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD",
             "CODEX_RVF_CLINE_KANBAN_AGENT_ID",
             "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE",
-            "CODEX_RVF_SUPPRESS_STOP_HOOK",
+            "RVF_SUPPRESS_STOP_HOOK",
             "CODEX_RVF_PREP_ROOT",
             "FAKE_CLIENT_CALLS",
         )
@@ -120,7 +120,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         os.environ["CODEX_RVF_CLINE_KANBAN_AGENT_ID"] = "codex"
-        os.environ["CODEX_RVF_SUPPRESS_STOP_HOOK"] = "1"
+        os.environ["RVF_SUPPRESS_STOP_HOOK"] = "1"
         os.environ["CODEX_RVF_PREP_ROOT"] = str(prep_root)
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
@@ -183,7 +183,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     prompt_text = create_argv[create_argv.index("--prompt") + 1]
     assert "RVF_CLINE_KANBAN_TASK" in prompt_text
     assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt_text
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
+    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert "RVF_TARGET_REPO: ." in prompt_text
     assert f"RVF_PARENT_REPO: {repo}" in prompt_text
     assert f"RVF_PARENT_CWD: {repo}" in prompt_text
@@ -191,8 +191,8 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
     assert "RVF_ARTIFACTS_DIR: $RVF_RUN_DIR/artifacts" in prompt_text
     assert 'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"' in prompt_text
     assert "export CODEX_RVF_LOG_ROOT=" in prompt_text
-    assert "export CODEX_RVF_RUN_ID=" in prompt_text
-    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in prompt_text
+    assert "export RVF_RUN_ID=" in prompt_text
+    assert "export RVF_RUN_DIR=" in prompt_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in prompt_text
     assert '. "$RVF_ARTIFACTS_DIR/review-env.sh"' in prompt_text
     assert 'export RVF_REPO="$RVF_TASK_REPO"' in prompt_text

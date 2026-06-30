@@ -52,7 +52,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
         invoke(
             event,
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert "decision" not in payload
@@ -77,7 +77,7 @@ def test_forked_rvf_session_gets_programmatic_handoff_advisory(tmp_path: Path) -
     stdout, _ = invoke(
         event,
         state_dir=state,
-        extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+        extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
     )
     payload = parse_json(stdout)
     summary = summary_from_payload(payload)

@@ -103,7 +103,7 @@ def test_cancel_run_invokes_finalize_and_writes_lock(
     _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir, log_root = _bootstrap_run(tmp_path, repo, run_id="rvf-cancel-1")
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
-    monkeypatch.delenv("CODEX_RVF_RUN_DIR", raising=False)
+    monkeypatch.delenv("RVF_RUN_DIR", raising=False)
 
     payload = cancel.cancel_run(_make_args(run_dir=run_dir))
     assert payload["status"] == "cancelled"
@@ -126,7 +126,7 @@ def test_cancel_after_normal_finalize_keeps_first_lock(
     _write_transcript(transcript, capture.RVF_SKILL_TRIGGER)
     run_dir, log_root = _bootstrap_run(tmp_path, repo, run_id="rvf-cancel-2")
     monkeypatch.setenv("CODEX_RVF_LOG_ROOT", str(log_root))
-    monkeypatch.delenv("CODEX_RVF_RUN_DIR", raising=False)
+    monkeypatch.delenv("RVF_RUN_DIR", raising=False)
 
     # Pretend a normal handoff already finalized this run.
     event = {"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)}

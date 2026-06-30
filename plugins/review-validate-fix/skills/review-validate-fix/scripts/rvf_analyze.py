@@ -42,7 +42,8 @@ from orphan_detect import (  # noqa: E402
     classify_run,
     write_interrupted_marker,
 )
-from rvf_logging import log_root  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import log_root  # noqa: E402
 
 EXIT_OK = 0
 EXIT_RUNNING = 2

@@ -37,7 +37,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import safe_token
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import safe_token  # noqa: E402
 
 # 复用 in-progress 锁族的 marker 原语，不重写：原子写 / 过期判定 / iso 时间 / 锁根 env / 版本。
 # 本模块与 kanban_followup_lock 同属一族紧耦合的 ~/.rvf marker，复用其稳定私有原语是刻意选择

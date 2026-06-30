@@ -58,7 +58,7 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
             self.run_dir = rd
 
         def env(self) -> dict:
-            return {"CODEX_RVF_RUN_ID": self.run_id}
+            return {"RVF_RUN_ID": self.run_id}
 
         def event(self, **_kw) -> None:
             pass
@@ -76,9 +76,9 @@ def test_dispatch_reviewers_detached_launch_wiring(root: Path) -> None:
     )
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     buf = io.StringIO()
@@ -146,9 +146,9 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
         def env(self) -> dict:
             # 模拟 RunLedger.env()：含决定 diff-tracker DB 落点的 CODEX_RVF_LOG_ROOT。
             return {
-                "CODEX_RVF_RUN_ID": self.run_id,
+                "RVF_RUN_ID": self.run_id,
                 "CODEX_RVF_LOG_ROOT": str(log_root),
-                "CODEX_RVF_RUN_DIR": str(self.run_dir),
+                "RVF_RUN_DIR": str(self.run_dir),
             }
 
         def event(self, **_kw) -> None:
@@ -167,9 +167,9 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
     )
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     buf = io.StringIO()
@@ -199,7 +199,7 @@ def test_dispatch_reviewers_detached_exports_codex_rvf_log_root(root: Path) -> N
     assert (
         f"export CODEX_RVF_LOG_ROOT={shlex.quote(str(log_root))};" in shell_command
     ), shell_command
-    assert f"export CODEX_RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
+    assert f"export RVF_RUN_DIR={shlex.quote(str(run_dir))};" in shell_command
 
 
 def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:

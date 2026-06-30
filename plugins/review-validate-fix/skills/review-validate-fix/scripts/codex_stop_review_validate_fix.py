@@ -17,7 +17,22 @@ from pathlib import Path
 from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import (
+import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
+from adapters.codex.codex_gui_fork_app_server_bridge import (  # noqa: E402 — codex fork 执行缝（S9a 抽出）
+    app_server_fork_requests,
+    can_connect_app_server_socket,
+    parent_thread_name_from_app_server,
+    path_is_relative_to,
+    run_app_server_fork,
+    select_existing_app_server_socket_for_metadata,
+)
+from adapters.codex.transcript import (  # noqa: E402 — codex rollout / goal-mode 解析缝（S9b 抽出）
+    codex_goal_mode_context_from_event,
+    latest_user_message,
+    session_id_from_path,
+    user_messages_containing,
+)
+from core.run_ledger.run_ledger import (
     RunLedger,
     log_root,
     normalize_rvf_backend,
@@ -25,6 +40,28 @@ from rvf_logging import (
     safe_token,
     skill_deploy_metadata,
     start_run,
+)
+from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
+    CLINE_KANBAN_TASK_MARKER,
+    CLINE_KANBAN_WORKTREE_MODES,
+    DEFAULT_CLINE_KANBAN_WORKTREE_MODE,
+    FORK_EXPERIMENT_MARKER,
+    HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION,
+    KANBAN_FOLLOWUP_MARKER,
+    MANUAL_RVF_COMPLETED_AT_KEY,
+    MANUAL_RVF_MARKER_KEYS,
+    MANUAL_RVF_MARKER_TTL_SECONDS,
+    MANUAL_RVF_RUN_ID_KEY,
+    PARENT_CONTEXT_ARTIFACT_NAME,
+    PARENT_CONTEXT_ENV,
+    PARENT_CONTEXT_MAX_BYTES_ENV,
+    PARENT_CONTEXT_PROMPT_KEY,
+    RVF_FORK_MARKER,
+    SESSION_HOOK_CONTROL_KEY,
+    SESSION_PATH_KEYS,
+    SESSION_SCOPE_PATH_KEYS,
+    SUPPRESS_ENV_NAMES,
+    SUPPRESS_STOP_HOOK_MARKER,
 )
 from rvf_handoff import (
     handoff_completion_payload,
@@ -66,8 +103,8 @@ from kanban_followup_lock import (
 from rvf_awaiting_dispatched_agent_marker import (
     iter_active_awaiting_for_session as iter_active_awaiting_dispatched_agent_for_session,
 )
-from session_manifest import build_manifest
-from diff_tracker import (
+from core.session_scope_allocation.session_change_manifest import build_manifest
+from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
     LEGACY_REASON_SESSION_OWNED_DIRTY,
     REASON_NO_UNASSIGNED_REVIEW_SCOPE,
@@ -113,7 +150,7 @@ from session_label import (
 import rvf_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
-from trajectory_distill import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
 import rvf_parent_context
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
@@ -134,95 +171,21 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_STATE_DIR = SKILL_DIR / "state"
-DEFAULT_APP_SERVER_CONTROL_SOCKET = (
-    Path.home() / ".codex" / "app-server-control" / "app-server-control.sock"
-)
-DEFAULT_BRIDGE_SOCKET = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.sock"
-DEFAULT_BRIDGE_LOG = Path.home() / ".codex" / "app-server-control" / "rvf-app-server.log"
-DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
-DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS = 8.0
-DEFAULT_OPEN_GUI_FORK_ATTEMPTS = 3
-DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS = 5
-DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY = "auto"
-FORK_EXPERIMENT_MARKER = "RVF_FORK_EXPERIMENT"
-RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
-CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
-KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
-CLINE_KANBAN_WORKTREE_MODES = {"branch", "inplace"}
-DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
-# 主 agent 最终回复里 `RVF_HANDOFF_FILE:` marker 之后那段摘要的固定结构指令。
-# 单一来源，供 fork / kanban-followup / kanban-dispatch 三处 prompt builder 复用，
-# 避免再次像历史那样三份拷贝各自漂移成「1-3 句」自由散文、导致输出成无结构 paragraph。
-# 与 references/handoff-template.md 的 `Reviewers：`/`Validate/fixers：` 两行结构、
-# 以及 check_review_output.py 已保留的同名标签一致。
-HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION = (
-    "空一行后按固定结构分两行追加极短中文摘要："
-    "`Reviewers：<reviewers 检查了什么、发现几项或没问题>` 一行、"
-    "`Validate/fixers：<validate/fixers 验证/修复/驳回/升级了什么>` 一行，"
-    "每行各自一句、不要挤成一段"
-)
-# 父会话对话 context 注入（dispatch 期把父 transcript 抽成可读 blob 写进 run
-# artifacts，供 cline-kanban child agent 在 review 前阅读作背景；不重定义 scope）。
-PARENT_CONTEXT_ENV = "CODEX_RVF_PARENT_CONTEXT"
-"""开关：默认开启；设 ``0`` / ``false`` / ``no`` / ``off`` 关闭父对话 context 生成。"""
-PARENT_CONTEXT_MAX_BYTES_ENV = "CODEX_RVF_PARENT_CONTEXT_MAX_BYTES"
-"""总字节上限覆盖；缺省用 rvf_parent_context.DEFAULT_MAX_BYTES (64KB)，超限保留最近内容。"""
-PARENT_CONTEXT_ARTIFACT_NAME = "parent-conversation-context.md"
-"""run artifacts 中父对话 context 的文件名，与 task prompt / review-env 引用一致。"""
-PARENT_CONTEXT_PROMPT_KEY = "RVF_PARENT_CONVERSATION_CONTEXT"
-"""task prompt / review-env 中标记父对话 context 路径的键名。"""
+# 以下为引擎簇私有常量（仅单簇引用），随其所属簇在 S10e–S10j 一并迁出；
+# 被 ≥2 簇引用的共享常量已上提到 core/rvf_shared_runtime_constants（S10d，见顶部 import）。
 DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
-KANBAN_FOLLOWUP_LEASE_TTL_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
-SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
-SUPPRESS_STOP_HOOK_MARKER = "CODEX_RVF_SUPPRESS_STOP_HOOK=1"
-MANUAL_RVF_COMPLETED_AT_KEY = "manual_rvf_completed_at"
-MANUAL_RVF_RUN_ID_KEY = "manual_rvf_run_id"
-MANUAL_RVF_MARKER_KEYS = (
-    MANUAL_RVF_COMPLETED_AT_KEY,
-    MANUAL_RVF_RUN_ID_KEY,
-    "manual_rvf_updated_at",
-    "manual_rvf_expires_at",
-    "manual_rvf_repo",
-    "manual_rvf_head",
-    "manual_rvf_dirty_hash",
-)
-MANUAL_RVF_MARKER_TTL_SECONDS = 12 * 60 * 60
+KANBAN_FOLLOWUP_LEASE_TTL_ENV = "RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "auto"
-APP_SERVER_CLIENT_INFO = {
-    "name": "review-validate-fix-stop-hook",
-    "title": "review-validate-fix Stop hook",
-    "version": "0.1.0",
-}
-SUPPRESS_ENV_NAMES = (
-    "CODEX_RVF_SUPPRESS",
-    "CODEX_RVF_SUPPRESS_STOP_HOOK",
-)
 # detached $rvf-analyze 线程注入的标记 env。语义上与 SUPPRESS_ENV_NAMES 区分开：
 # 这是「这是 analyze 线程自己的 Stop event」的显式信号，用于 evaluate_stop_event
 # 早退守卫，短路所有昂贵 gate，避免后台 analyze 递归触发新一轮 RVF。
-CODEX_RVF_ANALYZE_THREAD = "CODEX_RVF_ANALYZE_THREAD"
-CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
-CODEX_GOAL_INCOMPLETE_STATUSES = {
-    "active",
-    "paused",
-    "budgetlimited",
-    "budget_limited",
-    "budget-limited",
-}
-SESSION_PATH_KEYS = (
-    "transcript_path",
-    "session_path",
-    "conversation_path",
-    "log_path",
-    "session_file",
-)
-SESSION_SCOPE_PATH_KEYS = tuple(key for key in SESSION_PATH_KEYS if key != "log_path")
+RVF_ANALYZE_THREAD = "RVF_ANALYZE_THREAD"
 PLAN_DOC_REVIEW_DIR_PREFIXES = ("docs/", "doc/", ".claude/plans/")
 PLAN_DOC_REVIEW_NAME_MARKERS = (
     "plan",
@@ -265,16 +228,6 @@ class ProviderHealthRequirement:
     reason: str
     command: tuple[str, ...]
     remediation: str
-
-
-class AppServerError(RuntimeError):
-    pass
-
-
-class AppServerSocketSelectionError(AppServerError):
-    def __init__(self, message: str, socket_selection: dict[str, Any]) -> None:
-        super().__init__(message)
-        self.socket_selection = socket_selection
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -406,11 +359,11 @@ def is_falsey(value: str | None) -> bool:
 
 
 def provider_health_check_enabled() -> bool:
-    return not is_falsey(os.environ.get("CODEX_RVF_PROVIDER_HEALTH_CHECK"))
+    return not is_falsey(os.environ.get("RVF_PROVIDER_HEALTH_CHECK"))
 
 
 def provider_health_timeout_seconds() -> float:
-    raw = os.environ.get("CODEX_RVF_PROVIDER_HEALTH_TIMEOUT_SECONDS")
+    raw = os.environ.get("RVF_PROVIDER_HEALTH_TIMEOUT_SECONDS")
     if raw is None or not raw.strip():
         return 12.0
     try:
@@ -424,7 +377,7 @@ def codex_bin() -> str:
 
 
 def parent_context_enabled() -> bool:
-    """父会话对话 context 注入是否开启（默认开启，``CODEX_RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
+    """父会话对话 context 注入是否开启（默认开启，``RVF_PARENT_CONTEXT=0/false`` 关闭）。"""
     return not is_falsey(os.environ.get(PARENT_CONTEXT_ENV))
 
 
@@ -561,65 +514,6 @@ def first_readable_session_path(event: dict[str, Any]) -> Path | None:
     return None
 
 
-def latest_user_message(path: Path) -> str | None:
-    latest: str | None = None
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    if isinstance(message, str):
-                        latest = message
-                    continue
-
-                if record.get("type") == "response_item":
-                    if payload.get("type") == "message" and payload.get("role") == "user":
-                        text = text_from_message_payload(payload)
-                        if text:
-                            latest = text
-    except OSError:
-        return None
-    return latest
-
-
-def user_messages_containing(path: Path, marker: str) -> list[str]:
-    messages: list[str] = []
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-
-                text = ""
-                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
-                    message = payload.get("message")
-                    text = message if isinstance(message, str) else ""
-                elif record.get("type") == "response_item":
-                    if payload.get("type") == "message" and payload.get("role") == "user":
-                        text = text_from_message_payload(payload)
-
-                if marker in text:
-                    messages.append(text)
-    except OSError:
-        return []
-    return messages
-
-
 def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
     direct = event.get("last_user_message")
     if isinstance(direct, str) and direct:
@@ -629,172 +523,6 @@ def latest_user_message_from_event(event: dict[str, Any]) -> str | None:
         message = latest_user_message(path)
         if message:
             return message
-    return None
-
-
-def session_id_from_path(path: Path) -> str | None:
-    meta = session_meta_from_path(path)
-    value = meta.get("id")
-    return value if isinstance(value, str) and value else None
-
-
-def session_meta_from_path(path: Path) -> dict[str, Any]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for _ in range(20):
-                line = handle.readline()
-                if not line:
-                    return {}
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                return payload if isinstance(payload, dict) else {}
-    except (OSError, UnicodeDecodeError):
-        return {}
-    return {}
-
-
-def _normalized_goal_status(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value.strip().replace(" ", "").replace("-", "").replace("_", "").lower()
-
-
-def _goal_status_from_mapping(value: Any) -> str | None:
-    if not isinstance(value, dict):
-        return None
-    goal = value.get("goal")
-    if isinstance(goal, dict):
-        status = _normalized_goal_status(goal.get("status"))
-        if status is not None:
-            return status
-    return _normalized_goal_status(
-        value.get("goal_status")
-        or value.get("goalStatus")
-        or value.get("thread_goal_status")
-        or value.get("threadGoalStatus")
-    )
-
-
-def _goal_status_from_text(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return None
-    return _goal_status_from_mapping(parsed)
-
-
-def _record_goal_status(payload: Any) -> str | None:
-    status = _goal_status_from_mapping(payload)
-    if status is not None:
-        return status
-    if not isinstance(payload, dict):
-        return None
-    return _goal_status_from_text(payload.get("output"))
-
-
-def _record_text_contains_goal_continuation(payload: Any) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("role") != "developer":
-        return False
-    for key in ("content", "message", "text"):
-        value = payload.get(key)
-        if isinstance(value, str) and CODEX_GOAL_CONTINUATION_MARKER in value:
-            return True
-        if isinstance(value, list):
-            for item in value:
-                if (
-                    isinstance(item, dict)
-                    and isinstance(item.get("text"), str)
-                    and CODEX_GOAL_CONTINUATION_MARKER in item["text"]
-                ):
-                    return True
-    return False
-
-
-def _codex_session_meta_details(path: Path) -> dict[str, Any]:
-    meta = session_meta_from_path(path)
-    source = meta.get("source")
-    originator = meta.get("originator")
-    cli_version = meta.get("cli_version")
-    codex_originator = isinstance(originator, str) and "codex" in originator.lower()
-    return {
-        "is_codex": codex_originator or isinstance(cli_version, str),
-        "is_subagent": source_marks_subagent(source),
-        "originator": originator if isinstance(originator, str) else None,
-        "cli_version": cli_version if isinstance(cli_version, str) else None,
-    }
-
-
-def _scan_codex_goal_transcript(path: Path) -> dict[str, Any]:
-    latest_status: str | None = None
-    has_goal_continuation = False
-    try:
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = record.get("payload")
-                status = _record_goal_status(payload)
-                if status is not None:
-                    latest_status = status
-                if _record_text_contains_goal_continuation(payload):
-                    has_goal_continuation = True
-    except (OSError, UnicodeDecodeError):
-        return {
-            "readable": False,
-            "latest_goal_status": None,
-            "has_goal_continuation": False,
-        }
-    return {
-        "readable": True,
-        "latest_goal_status": latest_status,
-        "has_goal_continuation": has_goal_continuation,
-    }
-
-
-def codex_goal_mode_context_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    """Temporary stop-hook guard: skip RVF while a Codex main session is in /goal."""
-    if source_marks_subagent(event.get("source")):
-        return None
-
-    for path in event_session_paths(event):
-        try:
-            resolved = path.expanduser().resolve()
-        except OSError:
-            continue
-        if not resolved.is_file():
-            continue
-
-        meta_details = _codex_session_meta_details(resolved)
-        if not meta_details["is_codex"] or meta_details["is_subagent"]:
-            continue
-
-        goal_scan = _scan_codex_goal_transcript(resolved)
-        latest_status = goal_scan.get("latest_goal_status")
-        if isinstance(latest_status, str):
-            if latest_status not in CODEX_GOAL_INCOMPLETE_STATUSES:
-                continue
-        elif not goal_scan.get("has_goal_continuation"):
-            continue
-
-        return {
-            "transcript_path": str(resolved),
-            "goal_status": latest_status,
-            "goal_continuation_marker": bool(goal_scan.get("has_goal_continuation")),
-            "codex_originator": meta_details.get("originator"),
-            "codex_cli_version": meta_details.get("cli_version"),
-            "temporary_fix": True,
-        }
     return None
 
 
@@ -1067,8 +795,8 @@ def source_origin_for_kanban_task(
             "kanban_attempt_id": attempt_id,
             "kanban_task_title": title or None,
             "kanban_task_title_source": task_title_source,
-            "codex_session_label": fallback_origin.get("label"),
-            "codex_session_name_source": fallback_origin.get("name_source"),
+            "source_session_label": fallback_origin.get("label"),
+            "source_session_name_source": fallback_origin.get("name_source"),
         }
     )
     return origin
@@ -1116,10 +844,10 @@ def parent_origin_prompt_block(
             f"RVF_PARENT_KANBAN_TASK_TITLE: {value_or_unavailable(parent_origin.get('kanban_task_title'))}\n"
             "RVF_PARENT_KANBAN_TASK_TITLE_SOURCE: "
             f"{value_or_unavailable(parent_origin.get('kanban_task_title_source'))}\n"
-            "RVF_PARENT_CODEX_SESSION_REF: "
-            f"{value_or_unavailable(parent_origin.get('codex_session_label'))}\n"
-            "RVF_PARENT_CODEX_SESSION_NAME_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('codex_session_name_source'))}\n"
+            "RVF_PARENT_SOURCE_SESSION_REF: "
+            f"{value_or_unavailable(parent_origin.get('source_session_label'))}\n"
+            "RVF_PARENT_SOURCE_SESSION_NAME_SOURCE: "
+            f"{value_or_unavailable(parent_origin.get('source_session_name_source'))}\n"
         )
     lines.append(
         "\n"
@@ -1155,8 +883,8 @@ def parent_origin_summary_fields(
         "parent_kanban_attempt_id": parent_origin.get("kanban_attempt_id"),
         "parent_kanban_task_title": parent_origin.get("kanban_task_title"),
         "parent_kanban_task_title_source": parent_origin.get("kanban_task_title_source"),
-        "parent_codex_session_ref": parent_origin.get("codex_session_label"),
-        "parent_codex_session_name_source": parent_origin.get("codex_session_name_source"),
+        "parent_source_session_ref": parent_origin.get("source_session_label"),
+        "parent_source_session_name_source": parent_origin.get("source_session_name_source"),
     }
 
 
@@ -1980,7 +1708,7 @@ def is_codex_agent_id(agent_id: str | None) -> bool:
 def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
     """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
 
-    复用 ``trajectory_distill.detect_transcript_format`` 做 host 识别：
+    复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 做 host 识别：
     Claude Code transcript → ``claude``；Codex rollout → ``codex``；
     无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
     保证既有 Codex-only 用例零回归。
@@ -2587,10 +2315,10 @@ def _kanban_followup_pending_decision(
 
 DEFAULT_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS = 3600
 DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX = 8
-KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
-KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
-KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
-KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "CODEX_RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
+KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
+KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
+KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
+KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
 # 搁浅判定改读 kanban session.state 时，那一次 best-effort `task list` 子进程的 timeout 上限，
 # 防在 30s Codex 链路预算内卡在不可达/慢 kanban server。见 _kanban_task_list_payload。
@@ -2689,7 +2417,7 @@ def _maybe_redispatch_stranded_kanban_followup(
     *,
     token: str | None,
 ) -> dict[str, Any]:
-    """S2（可选，``CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1`` 开启）：app-server 此刻可达时
+    """S2（可选，``RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1`` 开启）：app-server 此刻可达时
     对 stranded marker 机会式重投一次。
 
     诚实边界：即便 app-server 活着，已停 session 也未必消费 → best-effort，绝不谎报已跑。
@@ -3738,8 +3466,7 @@ def cline_kanban_task_prompt(
             "```sh\n"
             f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
             f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
-            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
-            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            f"export RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
             'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
             '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
             "```\n\n"
@@ -3754,8 +3481,7 @@ def cline_kanban_task_prompt(
             'RVF_TASK_REPO="$(git rev-parse --show-toplevel)"\n'
             f"export RVF_RUN_DIR={shell_quote(str(ledger.run_dir))}\n"
             f"export CODEX_RVF_LOG_ROOT={shell_quote(str(ledger.root))}\n"
-            f"export CODEX_RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
-            'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"\n'
+            f"export RVF_RUN_ID={shell_quote(str(ledger.run_id))}\n"
             'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"\n'
             '. "$RVF_ARTIFACTS_DIR/review-env.sh"\n'
             'export RVF_REPO="$RVF_TASK_REPO"\n'
@@ -3799,7 +3525,7 @@ def cline_kanban_task_prompt(
         "开始任何 review/validate/fix 前，先 `cat $RVF_PREP_FILE` 确认 `rvf_run.shared_workflow_state.status == \"completed\"` 且 "
         "`artifacts` 字段齐全；齐全则跳过手动跑 `prepare_review_run.py`，直接 source `$RVF_REVIEW_ENV` 继续既有模式。"
         "若 `shared_workflow_state.status` 是 `failed` / `timeout` / `pending`，再按 SKILL.md fallback 手动跑 prepare。"
-        "本 task 已经复用 `RVF_RUN_DIR` / `CODEX_RVF_RUN_DIR`，所有 handoff、reviewer 输出、summary 和 events 都必须继续写入该 installed plugin state run。"
+        "本 task 已经复用 `RVF_RUN_DIR`，所有 handoff、reviewer 输出、summary 和 events 都必须继续写入该 installed plugin state run。"
         "Handoff 默认开启时，必须持续维护 "
         "`$RVF_ARTIFACTS_DIR/handoff.md`，并在文件顶部保留 `## Origin` 区块，"
         "逐字写入上面的 original Codex conversation name/ref、name source、codex URL、transcript path、"
@@ -5088,1090 +4814,6 @@ def run_codex_fork(
     )
 
 
-def app_server_fork_requests(
-    *,
-    parent_thread_id: str,
-    parent_thread_path: Path | None,
-    cwd: str | None,
-    prompt: str,
-    model: str | None,
-    reasoning_effort: str | None,
-) -> list[dict[str, Any]]:
-    fork_params: dict[str, Any] = {
-        "threadId": parent_thread_id,
-        "cwd": cwd,
-        "excludeTurns": True,
-        "persistExtendedHistory": True,
-    }
-    if parent_thread_path is not None:
-        fork_params["path"] = str(parent_thread_path)
-    if model:
-        fork_params["model"] = model
-
-    turn_params: dict[str, Any] = {
-        "threadId": "<fork_thread_id>",
-        "input": [{"type": "text", "text": prompt, "text_elements": []}],
-        "cwd": cwd,
-        "summary": "auto",
-        "personality": None,
-        "outputSchema": None,
-    }
-    if model:
-        turn_params["model"] = model
-    if reasoning_effort:
-        turn_params["effort"] = reasoning_effort
-
-    return [
-        {"method": "thread/fork", "params": fork_params},
-        {"method": "turn/start", "params": turn_params},
-    ]
-
-
-class AppServerWebSocket:
-    def __init__(self, socket_path: Path, timeout: float = 15) -> None:
-        self.socket_path = socket_path
-        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(timeout)
-        self.socket.connect(str(socket_path))
-        self.recv_buffer = b""
-        self.perform_handshake()
-        self.next_id = 1
-        self.notifications: list[dict[str, Any]] = []
-
-    def close(self) -> None:
-        try:
-            self.socket.close()
-        except OSError:
-            pass
-
-    def perform_handshake(self) -> None:
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            "GET / HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n"
-        ).encode("ascii")
-        self.socket.sendall(request)
-
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = self.socket.recv(4096)
-            if not chunk:
-                raise AppServerError("app-server websocket handshake closed")
-            response += chunk
-            if len(response) > 16384:
-                raise AppServerError("app-server websocket handshake response too large")
-
-        header_bytes, self.recv_buffer = response.split(b"\r\n\r\n", 1)
-        header_text = header_bytes.decode("iso-8859-1")
-        lines = header_text.split("\r\n")
-        status_line = lines[0] if lines else ""
-        if not status_line.startswith("HTTP/1.1 101") and not status_line.startswith(
-            "HTTP/1.0 101"
-        ):
-            raise AppServerError(f"app-server websocket handshake failed: {status_line}")
-
-        headers: dict[str, str] = {}
-        for line in lines[1:]:
-            name, sep, value = line.partition(":")
-            if sep:
-                headers[name.strip().lower()] = value.strip()
-        accept = headers.get("sec-websocket-accept")
-        expected = base64.b64encode(
-            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
-        ).decode("ascii")
-        if accept != expected:
-            raise AppServerError("app-server websocket handshake accept mismatch")
-
-    def send_json(self, payload: dict[str, Any]) -> None:
-        data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        mask = os.urandom(4)
-        if len(data) < 126:
-            header = bytes([0x81, 0x80 | len(data)])
-        elif len(data) < 65536:
-            header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(data))
-        else:
-            header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", len(data))
-        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
-        self.socket.sendall(header + mask + masked)
-
-    def recv_exact(self, length: int) -> bytes:
-        chunks: list[bytes] = []
-        remaining = length
-        if self.recv_buffer:
-            chunk = self.recv_buffer[:remaining]
-            chunks.append(chunk)
-            remaining -= len(chunk)
-            self.recv_buffer = self.recv_buffer[len(chunk) :]
-        while remaining > 0:
-            chunk = self.socket.recv(remaining)
-            if not chunk:
-                raise AppServerError("app-server websocket closed")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def recv_json(self) -> dict[str, Any]:
-        first, second = self.recv_exact(2)
-        opcode = first & 0x0F
-        length = second & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", self.recv_exact(2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", self.recv_exact(8))[0]
-
-        mask = self.recv_exact(4) if second & 0x80 else None
-        payload = self.recv_exact(length)
-        if mask is not None:
-            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-
-        if opcode == 0x8:
-            raise AppServerError("app-server websocket closed")
-        if opcode == 0x9:
-            self.send_pong(payload)
-            return self.recv_json()
-        if opcode != 0x1:
-            raise AppServerError(f"unsupported websocket opcode {opcode}")
-        return json.loads(payload.decode("utf-8"))
-
-    def send_pong(self, payload: bytes) -> None:
-        if len(payload) >= 126:
-            return
-        mask = os.urandom(4)
-        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-        self.socket.sendall(bytes([0x8A, 0x80 | len(payload)]) + mask + masked)
-
-    def request(self, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
-        request_id = self.next_id
-        self.next_id += 1
-        payload: dict[str, Any] = {"id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
-        self.send_json(payload)
-        while True:
-            response = self.recv_json()
-            if response.get("id") != request_id:
-                self.notifications.append(response)
-                continue
-            error = response.get("error")
-            if error:
-                raise AppServerError(json.dumps(error, ensure_ascii=False))
-            result = response.get("result")
-            return result if isinstance(result, dict) else {}
-
-
-def can_connect_app_server_socket(socket_path: Path) -> bool:
-    return bool(probe_app_server_socket(socket_path).get("protocol_ok"))
-
-
-def app_server_probe_ready(probe: dict[str, Any]) -> bool:
-    if "protocol_ok" in probe:
-        return bool(probe.get("protocol_ok"))
-    return bool(probe.get("connect_ok"))
-
-
-def probe_app_server_socket(socket_path: Path) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "path": str(socket_path),
-        "exists": socket_path.exists(),
-        "parent_exists": socket_path.parent.exists(),
-        "is_socket": False,
-        "connect_ok": False,
-        "protocol_ok": False,
-        "reason": None,
-    }
-    try:
-        if socket_path.exists():
-            result["is_socket"] = socket_path.is_socket()
-    except OSError as exc:
-        result.update(
-            {
-                "reason": "stat-error",
-                "error": f"{type(exc).__name__}: {exc}",
-                "errno": getattr(exc, "errno", None),
-            }
-        )
-        return result
-
-    if not result["exists"]:
-        result["reason"] = "missing"
-        return result
-    if not result["is_socket"]:
-        result["reason"] = "not-a-socket"
-        return result
-
-    try:
-        probe = AppServerWebSocket(socket_path, timeout=0.5)
-        result["connect_ok"] = True
-        result["protocol_ok"] = True
-        result["reason"] = "websocket-ok"
-        return result
-    except AppServerError as exc:
-        result.update(
-            {
-                "connect_ok": True,
-                "reason": "websocket-failed",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        return result
-    except OSError as exc:
-        result.update(
-            {
-                "reason": "connect-failed",
-                "error": f"{type(exc).__name__}: {exc}",
-                "errno": getattr(exc, "errno", None),
-            }
-        )
-        return result
-    finally:
-        try:
-            probe.close()
-        except UnboundLocalError:
-            pass
-
-
-def bridge_socket_path() -> Path:
-    env_value = os.environ.get("CODEX_RVF_BRIDGE_SOCKET")
-    if env_value and env_value.strip():
-        return Path(env_value).expanduser().resolve()
-    return DEFAULT_BRIDGE_SOCKET.resolve()
-
-
-def bridge_log_path() -> Path:
-    env_value = os.environ.get("CODEX_RVF_BRIDGE_LOG")
-    if env_value and env_value.strip():
-        return Path(env_value).expanduser().resolve()
-    return DEFAULT_BRIDGE_LOG.resolve()
-
-
-def select_app_server_socket() -> tuple[Path, str, dict[str, Any]]:
-    explicit = os.environ.get("CODEX_RVF_APP_SERVER_SOCKET")
-    if explicit and explicit.strip():
-        socket_path = Path(explicit).expanduser().resolve()
-        return socket_path, "explicit", {"explicit": probe_app_server_socket(socket_path)}
-
-    desktop_probe = probe_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
-    if app_server_probe_ready(desktop_probe):
-        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control", {
-            "desktop_control": desktop_probe,
-        }
-
-    bridge_policy = bridge_gui_unverified_policy()
-    if bridge_policy not in {"auto", "bridge"}:
-        socket_selection = {
-            "desktop_control": desktop_probe,
-            "bridge": probe_app_server_socket(bridge_socket_path()),
-            "bridge_policy": bridge_policy,
-        }
-        raise AppServerSocketSelectionError(
-            "desktop-control unavailable; bridge fallback disabled by "
-            f"CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY={bridge_policy}",
-            socket_selection,
-        )
-
-    bridge_probe = probe_app_server_socket(bridge_socket_path())
-    if bridge_policy == "auto" and app_server_probe_ready(bridge_probe):
-        return bridge_socket_path(), "bridge", {
-            "desktop_control": desktop_probe,
-            "bridge": bridge_probe,
-            "bridge_policy": bridge_policy,
-            "bridge_decision": "existing-bridge-connect-ok",
-        }
-
-    try:
-        socket_path = ensure_bridge_app_server()
-    except Exception as exc:
-        socket_selection = {
-            "desktop_control": desktop_probe,
-            "bridge": probe_app_server_socket(bridge_socket_path()),
-            "bridge_policy": bridge_policy,
-        }
-        raise AppServerSocketSelectionError(
-            f"desktop-control unavailable and bridge fallback failed: {exc}",
-            socket_selection,
-        ) from exc
-    return socket_path, "bridge", {
-        "desktop_control": desktop_probe,
-        "bridge": probe_app_server_socket(socket_path),
-        "bridge_policy": bridge_policy,
-    }
-
-
-def select_existing_app_server_socket_for_metadata() -> tuple[Path, str, dict[str, Any]]:
-    explicit = os.environ.get("CODEX_RVF_APP_SERVER_SOCKET")
-    if explicit and explicit.strip():
-        socket_path = Path(explicit).expanduser().resolve()
-        probe = probe_app_server_socket(socket_path)
-        if app_server_probe_ready(probe):
-            return socket_path, "explicit", {"explicit": probe}
-        raise AppServerSocketSelectionError(
-            "explicit app-server socket unavailable for metadata lookup",
-            {"explicit": probe},
-        )
-
-    desktop_probe = probe_app_server_socket(DEFAULT_APP_SERVER_CONTROL_SOCKET)
-    if app_server_probe_ready(desktop_probe):
-        return DEFAULT_APP_SERVER_CONTROL_SOCKET, "desktop-control", {
-            "desktop_control": desktop_probe,
-        }
-
-    bridge_path = bridge_socket_path()
-    bridge_probe = probe_app_server_socket(bridge_path)
-    if app_server_probe_ready(bridge_probe):
-        return bridge_path, "bridge", {
-            "desktop_control": desktop_probe,
-            "bridge": bridge_probe,
-        }
-
-    raise AppServerSocketSelectionError(
-        "no existing app-server socket available for metadata lookup",
-        {"desktop_control": desktop_probe, "bridge": bridge_probe},
-    )
-
-
-def bridge_gui_unverified_policy() -> str:
-    if is_truthy(os.environ.get("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER")):
-        return "bridge"
-    raw = os.environ.get(
-        "CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY",
-        DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY,
-    )
-    value = raw.strip().lower() if raw else DEFAULT_BRIDGE_GUI_UNVERIFIED_POLICY
-    if value in {"auto", "detect", "fallback"}:
-        return "auto"
-    if value in {"bridge", "allow", "allowed", "fork", "app-server", "appserver"}:
-        return "bridge"
-    if value in {"manual", "prepare", "prepared", "log-only"}:
-        return "manual"
-    if value in {"fail", "error"}:
-        return "fail"
-    return "report"
-
-
-def ensure_bridge_app_server(restart_existing: bool = False) -> Path:
-    socket_path = bridge_socket_path()
-    if (
-        not restart_existing
-        and socket_path.exists()
-        and can_connect_app_server_socket(socket_path)
-    ):
-        return socket_path
-
-    socket_path.parent.mkdir(parents=True, exist_ok=True)
-    if restart_existing:
-        stop_existing_bridge_app_servers(socket_path)
-    if socket_path.exists():
-        socket_path.unlink()
-
-    log_path = bridge_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as log_file:
-        subprocess.Popen(
-            [
-                codex_bin(),
-                "app-server",
-                "--listen",
-                f"unix://{socket_path}",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=log_file,
-            start_new_session=True,
-        )
-
-    deadline = time.monotonic() + 8
-    while time.monotonic() < deadline:
-        if socket_path.exists() and can_connect_app_server_socket(socket_path):
-            return socket_path
-        time.sleep(0.1)
-    raise AppServerError(f"app-server bridge socket did not become ready: {socket_path}")
-
-
-def bridge_app_server_listener_pids(socket_path: Path) -> list[int]:
-    try:
-        result = subprocess.run(
-            ["lsof", "-nP", "-U"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if result.returncode not in {0, 1}:
-        return []
-
-    pids: list[int] = []
-    socket_text = str(socket_path)
-    for line in result.stdout.splitlines():
-        if socket_text not in line:
-            continue
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[1])
-        except ValueError:
-            continue
-        if pid in pids:
-            continue
-        try:
-            command = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "command="],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        command_text = command.stdout.strip()
-        if (
-            command.returncode == 0
-            and "codex app-server" in command_text
-            and f"unix://{socket_text}" in command_text
-        ):
-            pids.append(pid)
-    return pids
-
-
-def process_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def stop_existing_bridge_app_servers(socket_path: Path) -> dict[str, Any]:
-    pids = [pid for pid in bridge_app_server_listener_pids(socket_path) if pid != os.getpid()]
-    stopped: list[int] = []
-    failed: list[dict[str, Any]] = []
-    force_killed: list[int] = []
-    for pid in pids:
-        try:
-            os.kill(pid, 15)
-            stopped.append(pid)
-        except ProcessLookupError:
-            stopped.append(pid)
-        except OSError as exc:
-            failed.append({"pid": pid, "error": str(exc)})
-
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        alive = [pid for pid in stopped if process_is_running(pid)]
-        if not alive:
-            break
-        time.sleep(0.1)
-
-    still_running = [pid for pid in stopped if process_is_running(pid)]
-    if still_running and not is_falsey(
-        os.environ.get("CODEX_RVF_BRIDGE_FORCE_KILL_ON_RESTART", "1")
-    ):
-        for pid in still_running:
-            try:
-                os.kill(pid, 9)
-                force_killed.append(pid)
-            except ProcessLookupError:
-                force_killed.append(pid)
-            except OSError as exc:
-                failed.append({"pid": pid, "signal": 9, "error": str(exc)})
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            alive = [pid for pid in force_killed if process_is_running(pid)]
-            if not alive:
-                break
-            time.sleep(0.1)
-        still_running = [pid for pid in stopped if process_is_running(pid)]
-    return {
-        "pids": pids,
-        "stopped": stopped,
-        "force_killed": force_killed,
-        "failed": failed,
-        "still_running": still_running,
-    }
-
-
-def bridge_retry_after_app_server_error(error: Exception) -> bool:
-    if is_falsey(os.environ.get("CODEX_RVF_BRIDGE_RETRY_ON_APP_SERVER_ERROR")):
-        return False
-    text = str(error).lower()
-    return (
-        "failed to load configuration" in text
-        or "operation not permitted" in text
-        or "os error 1" in text
-    )
-
-
-def maybe_open_fork_in_codex(fork_thread_id: str) -> bool:
-    if os.environ.get("CODEX_RVF_OPEN_GUI_FORK", "1").strip().lower() in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
-        return False
-    if sys.platform != "darwin":
-        return False
-    url = f"codex://local/{fork_thread_id}"
-    try:
-        subprocess.Popen(
-            ["open", url],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        return True
-    except OSError:
-        return False
-
-
-def open_gui_fork_unavailable_reason() -> str | None:
-    if os.environ.get("CODEX_RVF_OPEN_GUI_FORK", "1").strip().lower() in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
-        return "disabled"
-    if sys.platform != "darwin":
-        return "unsupported-platform"
-    return None
-
-
-def open_gui_fork_attempts() -> int:
-    raw = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
-    if raw is None or not raw.strip():
-        return DEFAULT_OPEN_GUI_FORK_ATTEMPTS
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return DEFAULT_OPEN_GUI_FORK_ATTEMPTS
-
-
-def open_gui_fork_retry_delay_seconds() -> float:
-    raw = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
-    if raw is None or not raw.strip():
-        return DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return DEFAULT_OPEN_GUI_FORK_RETRY_DELAY_SECONDS
-
-
-def open_fork_in_codex_with_retries(fork_thread_id: str) -> dict[str, Any]:
-    max_attempts = open_gui_fork_attempts()
-    retry_delay = open_gui_fork_retry_delay_seconds()
-    attempts: list[dict[str, Any]] = []
-    started = time.monotonic()
-    unavailable_reason = open_gui_fork_unavailable_reason()
-    if unavailable_reason is not None:
-        opened = maybe_open_fork_in_codex(fork_thread_id)
-        attempts.append(
-            {
-                "attempt": 1,
-                "opened": opened,
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
-        )
-        return {
-            "opened": opened,
-            "attempts": attempts,
-            "retry_delay_seconds": retry_delay,
-            "skipped_retries_reason": unavailable_reason,
-        }
-    for attempt in range(1, max_attempts + 1):
-        opened = maybe_open_fork_in_codex(fork_thread_id)
-        attempts.append(
-            {
-                "attempt": attempt,
-                "opened": opened,
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-            }
-        )
-        if opened:
-            break
-        if attempt < max_attempts:
-            time.sleep(retry_delay)
-    return {
-        "opened": any(item["opened"] for item in attempts),
-        "attempts": attempts,
-        "retry_delay_seconds": retry_delay,
-    }
-
-
-def fork_visibility_timeout_seconds() -> float:
-    raw = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
-    if raw is None or not raw.strip():
-        return DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return DEFAULT_FORK_VISIBILITY_TIMEOUT_SECONDS
-
-
-def path_is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def notification_thread_path(
-    notifications: list[dict[str, Any]],
-    thread_id: str,
-) -> str | None:
-    for notification in reversed(notifications):
-        if notification.get("method") != "thread/started":
-            continue
-        params = notification.get("params")
-        thread = params.get("thread") if isinstance(params, dict) else None
-        if not isinstance(thread, dict) or thread.get("id") != thread_id:
-            continue
-        path = thread.get("path")
-        if isinstance(path, str) and path:
-            return path
-    return None
-
-
-def fork_session_visibility(
-    thread_id: str,
-    hinted_path: str | None,
-) -> dict[str, Any]:
-    active_paths: list[str] = []
-    hinted = Path(hinted_path).expanduser() if hinted_path else None
-    hinted_exists = False
-    if hinted is not None:
-        try:
-            hinted_exists = hinted.exists()
-        except OSError:
-            hinted_exists = False
-        if hinted_exists and path_is_relative_to(hinted, DEFAULT_CODEX_SESSIONS_DIR):
-            active_paths.append(str(hinted))
-
-    if not active_paths and DEFAULT_CODEX_SESSIONS_DIR.exists():
-        active_paths.extend(
-            str(path)
-            for path in DEFAULT_CODEX_SESSIONS_DIR.rglob(f"*{thread_id}*.jsonl")
-        )
-
-    location = "active" if active_paths else "missing"
-
-    return {
-        "thread_id": thread_id,
-        "hinted_path": str(hinted) if hinted is not None else None,
-        "hinted_exists": hinted_exists,
-        "location": location,
-        "active_paths": active_paths,
-    }
-
-
-def wait_for_fork_session_visibility(
-    thread_id: str,
-    hinted_path: str | None,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    timeout = fork_visibility_timeout_seconds() if timeout_seconds is None else timeout_seconds
-    deadline = time.monotonic() + timeout
-    checks = 0
-    while True:
-        checks += 1
-        visibility = fork_session_visibility(thread_id, hinted_path)
-        visibility["checks"] = checks
-        visibility["timeout_seconds"] = timeout
-        if visibility["location"] != "missing" or time.monotonic() >= deadline:
-            return visibility
-        time.sleep(0.1)
-
-
-def compact_app_server_thread(thread: dict[str, Any]) -> dict[str, Any]:
-    status = thread.get("status")
-    return {
-        "id": thread.get("id"),
-        "name": thread.get("name"),
-        "path": thread.get("path"),
-        "cwd": thread.get("cwd"),
-        "source": thread.get("source"),
-        "createdAt": thread.get("createdAt"),
-        "updatedAt": thread.get("updatedAt"),
-        "status": status if isinstance(status, dict) else None,
-    }
-
-
-def initialize_app_server_client(client: Any) -> None:
-    client.request(
-        "initialize",
-        {
-            "clientInfo": APP_SERVER_CLIENT_INFO,
-            "capabilities": {
-                "experimentalApi": True,
-                "optOutNotificationMethods": [],
-            },
-        },
-    )
-    send_json = getattr(client, "send_json", None)
-    if callable(send_json):
-        send_json({"method": "initialized"})
-
-
-def request_app_server_diagnostic(
-    client: AppServerWebSocket,
-    method: str,
-    params: dict[str, Any] | None,
-) -> dict[str, Any]:
-    try:
-        return {"ok": True, "result": client.request(method, params)}
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-
-def app_server_thread_visibility_diagnostics(
-    client: AppServerWebSocket,
-    thread_id: str,
-    cwd: str | None,
-) -> dict[str, Any]:
-    diagnostics: dict[str, Any] = {"thread_id": thread_id}
-
-    read_probe = request_app_server_diagnostic(
-        client,
-        "thread/read",
-        {"threadId": thread_id, "includeTurns": False},
-    )
-    if read_probe.get("ok"):
-        result = read_probe.get("result")
-        thread = result.get("thread") if isinstance(result, dict) else None
-        read_probe = {
-            "ok": True,
-            "contains_thread": isinstance(thread, dict) and thread.get("id") == thread_id,
-            "thread": compact_app_server_thread(thread) if isinstance(thread, dict) else None,
-        }
-    diagnostics["thread_read"] = read_probe
-
-    list_params: dict[str, Any] = {
-        "limit": 50,
-        "sortKey": "updated_at",
-        "sortDirection": "desc",
-        "archived": False,
-        "useStateDbOnly": False,
-    }
-    if cwd:
-        list_params["cwd"] = cwd
-    list_probe = request_app_server_diagnostic(client, "thread/list", list_params)
-    if list_probe.get("ok"):
-        result = list_probe.get("result")
-        data = result.get("data") if isinstance(result, dict) else None
-        threads = data if isinstance(data, list) else []
-        matches = [
-            compact_app_server_thread(thread)
-            for thread in threads
-            if isinstance(thread, dict) and thread.get("id") == thread_id
-        ]
-        list_probe = {
-            "ok": True,
-            "params": list_params,
-            "contains_thread": bool(matches),
-            "matches": matches,
-            "returned": len(threads),
-            "nextCursor": result.get("nextCursor") if isinstance(result, dict) else None,
-        }
-    diagnostics["thread_list"] = list_probe
-
-    loaded_probe = request_app_server_diagnostic(
-        client,
-        "thread/loaded/list",
-        {"limit": 200},
-    )
-    if loaded_probe.get("ok"):
-        result = loaded_probe.get("result")
-        data = result.get("data") if isinstance(result, dict) else None
-        loaded_ids = (
-            [item for item in data if isinstance(item, str)]
-            if isinstance(data, list)
-            else []
-        )
-        loaded_probe = {
-            "ok": True,
-            "contains_thread": thread_id in loaded_ids,
-            "returned": len(loaded_ids),
-            "nextCursor": result.get("nextCursor") if isinstance(result, dict) else None,
-        }
-    diagnostics["thread_loaded_list"] = loaded_probe
-
-    return diagnostics
-
-
-def app_server_thread_name_from_result(result: dict[str, Any], thread_id: str) -> str | None:
-    thread = result.get("thread")
-    if isinstance(thread, dict) and thread.get("id") == thread_id:
-        name = thread.get("name")
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    return None
-
-
-def app_server_thread_metadata_from_result(result: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
-    thread = result.get("thread")
-    if not isinstance(thread, dict) or thread.get("id") != thread_id:
-        return None
-    name = thread.get("name")
-    return {"thread_found": True, "name": name.strip() if isinstance(name, str) and name.strip() else None}
-
-
-def parent_thread_name_from_app_server(
-    thread_id: str | None,
-    cwd: str | None,
-) -> dict[str, Any]:
-    if not thread_id:
-        return {"name": None, "thread_found": False, "source": "missing-thread-id"}
-    try:
-        socket_path, socket_source, socket_selection = select_existing_app_server_socket_for_metadata()
-    except Exception as exc:
-        return {
-            "name": None,
-            "thread_found": False,
-            "source": "unavailable",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-
-    try:
-        client = AppServerWebSocket(socket_path)
-    except Exception as exc:
-        return {
-            "name": None,
-            "thread_found": False,
-            "source": socket_source,
-            "socket_path": str(socket_path),
-            "socket_selection": socket_selection,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    try:
-        initialize_app_server_client(client)
-        read_error = None
-        try:
-            read_result = client.request(
-                "thread/read",
-                {"threadId": thread_id, "includeTurns": False},
-            )
-            read_metadata = app_server_thread_metadata_from_result(read_result, thread_id)
-            name = read_metadata.get("name") if read_metadata else None
-        except Exception as exc:
-            read_metadata = None
-            name = None
-            read_error = f"{type(exc).__name__}: {exc}"
-        if name:
-            return {
-                "name": name,
-                "thread_found": True,
-                "source": socket_source,
-                "method": "thread/read",
-                "socket_path": str(socket_path),
-                "socket_selection": socket_selection,
-            }
-        if read_metadata is not None:
-            return {
-                "name": None,
-                "thread_found": True,
-                "source": socket_source,
-                "method": "thread/read",
-                "socket_path": str(socket_path),
-                "socket_selection": socket_selection,
-                "reason": "thread-unnamed",
-            }
-
-        list_params: dict[str, Any] = {
-            "limit": 50,
-            "sortKey": "updated_at",
-            "sortDirection": "desc",
-            "archived": False,
-            "useStateDbOnly": False,
-        }
-        if cwd:
-            list_params["cwd"] = cwd
-        list_result = client.request("thread/list", list_params)
-        data = list_result.get("data")
-        threads = data if isinstance(data, list) else []
-        for thread in threads:
-            if not isinstance(thread, dict) or thread.get("id") != thread_id:
-                continue
-            name_value = thread.get("name")
-            name = name_value.strip() if isinstance(name_value, str) else ""
-            lookup = {
-                "name": name or None,
-                "thread_found": True,
-                "source": socket_source,
-                "method": "thread/list",
-                "socket_path": str(socket_path),
-                "socket_selection": socket_selection,
-            }
-            if not name:
-                lookup["reason"] = "thread-unnamed"
-            return lookup
-        return {
-            "name": None,
-            "thread_found": False,
-            "source": socket_source,
-            "method": "thread/list",
-            "socket_path": str(socket_path),
-            "socket_selection": socket_selection,
-            "reason": "thread-not-found",
-            "thread_read_error": read_error,
-        }
-    except Exception as exc:
-        return {
-            "name": None,
-            "thread_found": False,
-            "source": socket_source,
-            "socket_path": str(socket_path),
-            "socket_selection": socket_selection,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    finally:
-        client.close()
-
-
-def run_app_server_fork_with_socket(
-    *,
-    socket_path: Path,
-    socket_source: str,
-    socket_selection: dict[str, Any],
-    parent_thread_id: str,
-    parent_thread_path: Path | None,
-    cwd: str | None,
-    prompt: str,
-    model: str | None,
-    reasoning_effort: str | None,
-    bridge_retry: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    client = AppServerWebSocket(socket_path)
-    try:
-        initialize_app_server_client(client)
-        requests = app_server_fork_requests(
-            parent_thread_id=parent_thread_id,
-            parent_thread_path=parent_thread_path,
-            cwd=cwd,
-            prompt=prompt,
-            model=model,
-            reasoning_effort=reasoning_effort,
-        )
-        fork_result = client.request("thread/fork", requests[0]["params"])
-        fork_thread = fork_result.get("thread")
-        if not isinstance(fork_thread, dict) or not isinstance(fork_thread.get("id"), str):
-            raise AppServerError("thread/fork did not return a fork thread id")
-        fork_thread_id = fork_thread["id"]
-        fork_thread_path = (
-            fork_thread.get("path") if isinstance(fork_thread.get("path"), str) else None
-        )
-        turn_params = dict(requests[1]["params"])
-        turn_params["threadId"] = fork_thread_id
-        turn_result = client.request("turn/start", turn_params)
-        turn = turn_result.get("turn")
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        session_hint = fork_thread_path or notification_thread_path(
-            client.notifications,
-            fork_thread_id,
-        )
-        session_visibility = wait_for_fork_session_visibility(fork_thread_id, session_hint)
-        app_server_visibility = app_server_thread_visibility_diagnostics(
-            client,
-            fork_thread_id,
-            cwd,
-        )
-        open_result = open_fork_in_codex_with_retries(fork_thread_id)
-        session_location = session_visibility.get("location")
-        gui_visibility = "unverified-bridge-only"
-        if socket_source == "desktop-control":
-            gui_visibility = (
-                "verified"
-                if session_location == "active"
-                else f"unverified-session-{session_location or 'unknown'}"
-            )
-        result = {
-            "status": "app-server-started",
-            "socket_path": str(socket_path),
-            "socket_source": socket_source,
-            "socket_selection": socket_selection,
-            "fork_thread_id": fork_thread_id,
-            "fork_thread_path": fork_thread_path,
-            "turn_id": turn_id,
-            "session_visibility": session_visibility,
-            "app_server_visibility": app_server_visibility,
-            "gui_visibility": gui_visibility,
-            "opened_gui_deeplink": open_result["opened"],
-            "open_gui_deeplink": open_result,
-            "notifications": client.notifications[-20:],
-        }
-        if bridge_retry is not None:
-            result["bridge_retry"] = bridge_retry
-        return result
-    finally:
-        client.close()
-
-
-def run_app_server_fork(
-    *,
-    parent_thread_id: str,
-    parent_thread_path: Path | None,
-    cwd: str | None,
-    prompt: str,
-    model: str | None,
-    reasoning_effort: str | None,
-    log_path: Path,
-) -> dict[str, Any]:
-    socket_path, socket_source, socket_selection = select_app_server_socket()
-    try:
-        return run_app_server_fork_with_socket(
-            socket_path=socket_path,
-            socket_source=socket_source,
-            socket_selection=socket_selection,
-            parent_thread_id=parent_thread_id,
-            parent_thread_path=parent_thread_path,
-            cwd=cwd,
-            prompt=prompt,
-            model=model,
-            reasoning_effort=reasoning_effort,
-        )
-    except AppServerError as first_error:
-        if socket_source != "bridge" or not bridge_retry_after_app_server_error(first_error):
-            raise
-
-        retry_socket = ensure_bridge_app_server(restart_existing=True)
-        retry_selection = {
-            "desktop_control": socket_selection.get("desktop_control"),
-            "bridge": probe_app_server_socket(retry_socket),
-            "bridge_policy": socket_selection.get("bridge_policy", "auto"),
-            "bridge_decision": "restarted-after-app-server-error",
-        }
-        retry = {
-            "reason": "app-server-error",
-            "first_error": f"{type(first_error).__name__}: {first_error}",
-            "first_socket_path": str(socket_path),
-            "first_socket_selection": socket_selection,
-            "restarted_socket_path": str(retry_socket),
-        }
-        return run_app_server_fork_with_socket(
-            socket_path=retry_socket,
-            socket_source="bridge",
-            socket_selection=retry_selection,
-            parent_thread_id=parent_thread_id,
-            parent_thread_path=parent_thread_path,
-            cwd=cwd,
-            prompt=prompt,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            bridge_retry=retry,
-        )
-
-
 def run_fork_experiment(
     event: dict[str, Any],
     latest_user: str,
@@ -6797,7 +5439,7 @@ def refresh_global_diff_tracker(
 ) -> dict[str, Any]:
     """Emit the Slice 3 shape-compliance ledger event and seed session-unit
     attribution from the transcript via `build_manifest`. The manifest helper
-    transitively calls `diff_tracker.register_claims`, which writes
+    transitively calls `reviewable_unit_diff_tracker.register_claims`, which writes
     `session_units` rows for transcript-attributed owned paths. The allocator
     then reads those rows directly without re-deriving them.
 
@@ -7459,7 +6101,7 @@ def legacy_session_scope_gate_payload(
     repo: str,
     ledger: RunLedger,
 ) -> dict[str, Any] | None:
-    """Phase-0/1 gate body, kept verbatim so `CODEX_RVF_TRACKER_DISABLE=1`
+    """Phase-0/1 gate body, kept verbatim so `RVF_TRACKER_DISABLE=1`
     users see no behavior change. Reason-code literals stay
     `no_session_owned_dirty` / `session_owned_dirty` here on purpose."""
     session_paths = event_session_scope_paths(event)
@@ -7642,7 +6284,7 @@ def manual_rvf_session_marker_payload(
     return skip_payload(
         "当前 chat session 已完成手动 $review-validate-fix；"
         "installed Stop hook 跳过自动 RVF fork/review，"
-        "但这不是 CODEX_RVF_SUPPRESS_STOP_HOOK 全 hook suppress。"
+        "但这不是 RVF_SUPPRESS_STOP_HOOK 全 hook suppress。"
         f"session_id={session_id}; manual_rvf_run_id={run_id}; "
         f"manual_rvf_completed_at={completed_at}",
         ledger,
@@ -8321,7 +6963,7 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
     user turn 天然不命中，故只抑制 analyze 自身那一次 Stop，绝不波及后续轮。这取代
     了已退役的 task-keyed + 6h ``post_analyze_quiet`` marker（旧 marker 会顺带把父
     会话后续真实改动也误抑制）。自动 / detached analyze 线程的再入由其注入的
-    ``CODEX_RVF_ANALYZE_THREAD`` env 守卫（本函数上方早退）覆盖，不依赖本检测。
+    ``RVF_ANALYZE_THREAD`` env 守卫（本函数上方早退）覆盖，不依赖本检测。
 
     两路检测（任一命中即真），均复用 vendored ``codex_invoked_skill``，避免再造第三套
     anchored-regex：
@@ -8361,9 +7003,9 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
         )
 
-    if is_truthy(os.environ.get(CODEX_RVF_ANALYZE_THREAD)):
+    if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
-            "检测到 CODEX_RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
+            "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
             "$rvf-analyze 后台线程自身，短路所有 gate 跳过，避免后台 analyze "
             "递归触发新一轮 RVF。",
             ledger,

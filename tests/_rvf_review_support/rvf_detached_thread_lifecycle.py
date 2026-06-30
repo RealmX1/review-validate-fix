@@ -38,8 +38,8 @@ def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
     module = load_rvf_detached_thread_module()
     root.mkdir(parents=True, exist_ok=True)
     fake_tmux = write_realexec_tmux_script(root / "tmux.py")
-    saved = os.environ.get("CODEX_RVF_TMUX_BIN")
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = os.environ.get("RVF_TMUX_BIN")
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     try:
         status_path = root / "s.status.json"
         result = module.launch_detached(
@@ -52,9 +52,9 @@ def test_rvf_detached_thread_status_two_phase(root: Path) -> None:
         )
     finally:
         if saved is None:
-            os.environ.pop("CODEX_RVF_TMUX_BIN", None)
+            os.environ.pop("RVF_TMUX_BIN", None)
         else:
-            os.environ["CODEX_RVF_TMUX_BIN"] = saved
+            os.environ["RVF_TMUX_BIN"] = saved
     assert result["launch_status"] == "launched", result
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["launch_status"] == "launched"  # 启动期字段保留
@@ -72,9 +72,9 @@ def test_rvf_detached_thread_lock_idempotent(root: Path) -> None:
     calls = root / "calls.jsonl"
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -109,13 +109,13 @@ def test_rvf_detached_thread_launch_failed_releases_lock(root: Path) -> None:
     saved = {
         k: os.environ.get(k)
         for k in (
-            "CODEX_RVF_TMUX_BIN",
+            "RVF_TMUX_BIN",
             "FAKE_TMUX_CALLS",
             "FAKE_TMUX_RETURNCODE",
             "FAKE_TMUX_STDERR",
         )
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(root / "calls.jsonl")
     os.environ["FAKE_TMUX_RETURNCODE"] = "1"
     os.environ["FAKE_TMUX_STDERR"] = "boom: cannot create session"
@@ -196,10 +196,10 @@ def test_rvf_detached_thread_keeps_lock_when_tmux_probe_fails(root: Path) -> Non
     lock_path, status_path = _seed_detached_stale_lock(root, returncode=None)  # 未干净完成
     saved = {
         k: os.environ.get(k)
-        for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+        for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
     }
     # 指向不存在的 tmux 二进制 → subprocess.run 抛 FileNotFoundError（模拟 tmux 临时不可用）。
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
+    os.environ["RVF_TMUX_BIN"] = str(root / "nonexistent-tmux-binary")
     os.environ.pop("FAKE_TMUX_CALLS", None)
     os.environ.pop("FAKE_TMUX_RETURNCODE", None)
     try:

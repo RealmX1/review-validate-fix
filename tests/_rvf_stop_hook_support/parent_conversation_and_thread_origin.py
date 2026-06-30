@@ -412,6 +412,9 @@ def test_parent_origin_prompt_block_uses_claude_heading_for_claude_host(tmp_path
 
 def test_parent_thread_name_from_app_server_reads_thread_name(tmp_path: Path) -> None:
     module = load_hook_module()
+    # S9a 后 app-server client 等 adapter-内部符号已迁出引擎，monkeypatch 须打在 adapter 模块上
+    # （引擎只 re-import 公开入口 parent_thread_name_from_app_server，其内部调用解析的是 adapter 自身的 globals）。
+    import adapters.codex.codex_gui_fork_app_server_bridge as appserver
     socket_path = tmp_path / "app-server.sock"
     calls: list[tuple[str, dict[str, object] | None]] = []
     notifications: list[dict[str, object]] = []
@@ -440,19 +443,19 @@ def test_parent_thread_name_from_app_server_reads_thread_name(tmp_path: Path) ->
         def close(self) -> None:
             pass
 
-    original_client = module.AppServerWebSocket
-    original_select = module.select_existing_app_server_socket_for_metadata
+    original_client = appserver.AppServerWebSocket
+    original_select = appserver.select_existing_app_server_socket_for_metadata
     try:
-        module.AppServerWebSocket = FakeClient
-        module.select_existing_app_server_socket_for_metadata = lambda: (
+        appserver.AppServerWebSocket = FakeClient
+        appserver.select_existing_app_server_socket_for_metadata = lambda: (
             socket_path,
             "desktop-control",
             {},
         )
         lookup = module.parent_thread_name_from_app_server("parent-thread", str(tmp_path))
     finally:
-        module.AppServerWebSocket = original_client
-        module.select_existing_app_server_socket_for_metadata = original_select
+        appserver.AppServerWebSocket = original_client
+        appserver.select_existing_app_server_socket_for_metadata = original_select
 
     assert lookup["name"] == "Find RVF_STOP_HOOK behavior"
     assert lookup["thread_found"] is True

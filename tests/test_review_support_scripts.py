@@ -52,9 +52,9 @@ VERIFY_CURSOR_TOOL_LAYER = SCRIPT_DIR / "verify_cursor_tool_layer.py"
 CANCEL_RVF_RUN = SCRIPT_DIR / "cancel_rvf_run.py"
 CLINE_KANBAN_CLIENT = SCRIPT_DIR / "cline_kanban_client.py"
 APPLY_WORKTREE_BOOTSTRAP = SCRIPT_DIR / "apply_worktree_bootstrap.py"
-SESSION_MANIFEST = SCRIPT_DIR / "session_manifest.py"
+SESSION_MANIFEST = ROOT / "core" / "session_scope_allocation" / "session_change_manifest.py"
 DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
-RVF_LOGGING = SCRIPT_DIR / "rvf_logging.py"
+RUN_LEDGER = ROOT / "core" / "run_ledger" / "run_ledger.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
@@ -66,7 +66,7 @@ HOOKS_JSON = (
 )
 
 for _name in tuple(os.environ):
-    if _name.startswith("CODEX_RVF_"):
+    if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
 
@@ -99,10 +99,10 @@ def load_cancel_rvf_run_module():
     return module
 
 
-def load_rvf_logging_module():
-    spec = importlib.util.spec_from_file_location("rvf_logging", RVF_LOGGING)
+def load_run_ledger_module():
+    spec = importlib.util.spec_from_file_location("rvf_run_ledger_for_tests", RUN_LEDGER)
     if spec is None or spec.loader is None:
-        raise AssertionError("failed to load rvf_logging module")
+        raise AssertionError("failed to load core.run_ledger.run_ledger module")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -135,7 +135,7 @@ def load_rvf_user_prompt_submit_module():
 
 
 def load_kanban_followup_lock_module():
-    # kanban_followup_lock 依赖 ``from rvf_logging import safe_token``，需 SCRIPT_DIR 在 path 上。
+    # kanban_followup_lock 依赖 ``from core.run_ledger.run_ledger import safe_token``，需 SCRIPT_DIR 在 path 上（其自带 _rvf_pyroot bootstrap 解析 pyroot）。
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     spec = importlib.util.spec_from_file_location(
@@ -197,7 +197,7 @@ def load_rvf_post_tool_use_module():
 
 
 def load_rvf_analyze_thread_module():
-    # rvf_analyze_thread top-level imports rvf_logging / trajectory_distill，且
+    # rvf_analyze_thread top-level imports core.run_ledger.run_ledger / trajectory_distill，且
     # launch_detached_analyze_thread 会 lazy import rvf_analyze_advisory，全部需
     # 要 SCRIPT_DIR 在 sys.path 上才能解析；以真实模块名注册进 sys.modules，让
     # advisory 的 `from rvf_analyze_thread import ...` 命中同一实例。
@@ -329,8 +329,8 @@ def test_rvf_analyze_thread_status_file_schema(root: Path) -> None:
     fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
     tmux_calls = root / "tmux-calls.jsonl"
 
-    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = {k: os.environ.get(k) for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -385,8 +385,8 @@ def test_rvf_analyze_thread_lock_blocks_second_launch(root: Path) -> None:
     fake_tmux = write_fake_tmux_script(root / "fake_tmux.py")
     tmux_calls = root / "tmux-calls.jsonl"
 
-    saved = {k: os.environ.get(k) for k in ("CODEX_RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    saved = {k: os.environ.get(k) for k in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")}
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = "0"
     try:
@@ -814,7 +814,7 @@ def test_awaiting_dispatched_agent_marker_cli_round_trip(tmp_path: Path) -> None
     """CLI helper（dispatcher 接入点）：subprocess 跑 arm → list(1) → clear → list(0)。"""
     root = tmp_path / "cli-root"
     env = dict(os.environ)
-    env["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(root)
+    env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(root)
 
     def cli(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -1491,7 +1491,7 @@ def test_rvf_handoff_cli_notify(tmp_path: Path) -> None:
     handoff.write_text("# handoff\n", encoding="utf-8")
     notifier_log = tmp_path / "notify.log"
     notifier = _write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
-    env = {**os.environ, "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)}
+    env = {**os.environ, "RVF_TERMINAL_NOTIFIER_BIN": str(notifier)}
 
     completed = run(
         [
@@ -2475,7 +2475,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
 
 
 def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     ledger = module.RunLedger(
         component="dispatcher",
         run_id="rvf-contract-timing-preserve",
@@ -2507,7 +2507,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
 def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
     tmp_path: Path,
 ) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     installed_skill = tmp_path / "home" / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     installed_skill.mkdir(parents=True)
     (installed_skill / "SKILL.md").write_text("# skill\n", encoding="utf-8")
@@ -2543,7 +2543,7 @@ def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
 def test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
     tmp_path: Path,
 ) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     installed_skill = tmp_path / "home" / "plugins" / "missing" / "skills" / "review-validate-fix"
     dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
 
@@ -2799,8 +2799,8 @@ def test_command_lock_writes_lifecycle_events(tmp_path: Path) -> None:
     run_id = "test-command-lock-lifecycle"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
-    env["CODEX_RVF_RUN_ID"] = run_id
-    env.pop("CODEX_RVF_RUN_DIR", None)
+    env["RVF_RUN_ID"] = run_id
+    env.pop("RVF_RUN_DIR", None)
 
     locked = run(
         [
@@ -2839,8 +2839,8 @@ def test_command_lock_respects_env_run_dir(tmp_path: Path) -> None:
     run_dir = tmp_path / "custom-run-dir"
     env = os.environ.copy()
     env["CODEX_RVF_LOG_ROOT"] = str(state)
-    env["CODEX_RVF_RUN_ID"] = "test-command-lock-custom-dir"
-    env["CODEX_RVF_RUN_DIR"] = str(run_dir)
+    env["RVF_RUN_ID"] = "test-command-lock-custom-dir"
+    env["RVF_RUN_DIR"] = str(run_dir)
 
     run(
         [
@@ -2870,12 +2870,12 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
     lock_dir = tmp_path / "locks"
     holder_env = os.environ.copy()
     holder_env["CODEX_RVF_LOG_ROOT"] = str(state)
-    holder_env["CODEX_RVF_RUN_ID"] = "test-command-lock-holder"
-    holder_env.pop("CODEX_RVF_RUN_DIR", None)
+    holder_env["RVF_RUN_ID"] = "test-command-lock-holder"
+    holder_env.pop("RVF_RUN_DIR", None)
     contender_env = os.environ.copy()
     contender_env["CODEX_RVF_LOG_ROOT"] = str(state)
-    contender_env["CODEX_RVF_RUN_ID"] = "test-command-lock-contender"
-    contender_env.pop("CODEX_RVF_RUN_DIR", None)
+    contender_env["RVF_RUN_ID"] = "test-command-lock-contender"
+    contender_env.pop("RVF_RUN_DIR", None)
 
     lock_path_result = run(
         [
@@ -3064,7 +3064,7 @@ def test_apply_worktree_bootstrap_rejects_mismatched_base_ref(tmp_path: Path) ->
 
 
 def test_run_ledger_summary_preserves_cline_kanban_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     run_dir = tmp_path / "run"
     ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
@@ -3081,7 +3081,7 @@ def test_run_ledger_summary_preserves_cline_kanban_fields(tmp_path: Path) -> Non
 
 
 def test_run_ledger_summary_preserves_rvf_state_fields(tmp_path: Path) -> None:
-    module = load_rvf_logging_module()
+    module = load_run_ledger_module()
     run_dir = tmp_path / "run"
     ledger = module.RunLedger(component="stop-hook", repo=tmp_path, cwd=tmp_path, run_id="run-1", run_dir=run_dir)
     ledger.summary(
@@ -3178,7 +3178,7 @@ def test_cancel_rvf_run_ignores_stale_runner_pid_without_matching_command() -> N
     assert candidates == {4343: "/usr/local/bin/codex exec --output-last-message /tmp/rvf-live/final.md -"}
 
 
-DIFF_TRACKER = SCRIPT_DIR / "diff_tracker.py"
+DIFF_TRACKER = ROOT / "core" / "session_scope_allocation" / "reviewable_unit_diff_tracker.py"
 
 
 def load_diff_tracker_module():
@@ -4084,10 +4084,12 @@ def test_existing_cross_session_conflicts_path_unchanged_with_tracker_scope(tmp:
 # ---------------------------------------------------------------------------
 
 def _round_baseline_committed_modules():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import diff_tracker as _dt  # noqa: PLC0415
-    import session_manifest as _sm  # noqa: PLC0415
+    import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
+    import core.session_scope_allocation.session_change_manifest as _sm  # noqa: PLC0415
     import round_baseline_marker as _rbm  # noqa: PLC0415
 
     return _dt, _sm, _rbm
@@ -4932,7 +4934,7 @@ def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
 
 
 def load_dispatch_reviewers_module():
-    # dispatch_reviewers imports rvf_logging / run_alternative_reviewer / trajectory_distill
+    # dispatch_reviewers imports core.run_ledger.run_ledger / run_alternative_reviewer / trajectory_distill
     # from SCRIPT_DIR, so SCRIPT_DIR must be importable.
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
@@ -5109,13 +5111,13 @@ def _launch_detached_with_staleness_env(
     saved = {
         k: os.environ.get(k)
         for k in (
-            "CODEX_RVF_TMUX_BIN",
+            "RVF_TMUX_BIN",
             "FAKE_TMUX_CALLS",
             "FAKE_TMUX_RETURNCODE",
             "FAKE_TMUX_HAS_SESSION_RETURNCODE",
         )
     }
-    os.environ["CODEX_RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
     os.environ["FAKE_TMUX_CALLS"] = str(calls)
     os.environ["FAKE_TMUX_RETURNCODE"] = new_session_rc
     os.environ["FAKE_TMUX_HAS_SESSION_RETURNCODE"] = has_session_rc
@@ -6867,6 +6869,7 @@ _alt.inject(
     load_diff_tracker_module=load_diff_tracker_module,
     _slice_2b_repo_with_two_dirty=_slice_2b_repo_with_two_dirty,
     _slice_2b_prepare=_slice_2b_prepare,
+    ROOT=ROOT,
     SCRIPT_DIR=SCRIPT_DIR,
     DIFF_TRACKER=DIFF_TRACKER,
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
@@ -6990,6 +6993,7 @@ _difftrk.inject(
     _round_baseline_committed_modules=_round_baseline_committed_modules,
     _committed_round_repo=_committed_round_repo,
     SCRIPT_DIR=SCRIPT_DIR,
+    ROOT=ROOT,
 )
 globals().update({_n: getattr(_difftrk, _n) for _n in _difftrk.__all__})
 

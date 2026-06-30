@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, log_root
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import RunLedger, log_root  # noqa: E402
 from cline_kanban_client import DEFAULT_TASK_CMD, trash_task
 
 

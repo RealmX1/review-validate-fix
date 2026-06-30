@@ -99,7 +99,7 @@ def test_codex_compression_rules() -> None:
         lines = blob.splitlines()
 
         # 自检：探测为 codex host
-        from trajectory_distill import HOST_CODEX, detect_transcript_format
+        from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 
         assert detect_transcript_format(path) == HOST_CODEX
 
@@ -188,7 +188,7 @@ def test_claude_plaintext_reasoning_preserved() -> None:
         assert blob is not None, "claude blob should not be None"
         lines = blob.splitlines()
 
-        from trajectory_distill import HOST_CLAUDE, detect_transcript_format
+        from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, detect_transcript_format
 
         assert detect_transcript_format(path) == HOST_CLAUDE
 

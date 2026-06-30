@@ -7,8 +7,8 @@
 tmux 线程后台运行。它不直接运行 ``rvf_analyze.py``，也不在当前会话内同步触发
 LLM skill —— 原会话/task finalize 完即可 idle，无需等待 analyze 完成。
 
-detached analyze 线程靠注入的 ``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
-``CODEX_RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 时自抑制，无需再 arm 任何
+detached analyze 线程靠注入的 ``RVF_SUPPRESS_STOP_HOOK`` /
+``RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 时自抑制，无需再 arm 任何
 task 级 quiet marker 来挡父会话——父会话下一轮真实改动的 Stop 应正常触发 RVF。
 """
 
@@ -234,8 +234,8 @@ def surface_rvf_analyze_advisory(
     里 detached 跑 analyze agent，原会话 finalize 完即可 idle。手动 ``$rvf-analyze``
     路径不受影响。
 
-    detached 线程靠注入的 ``CODEX_RVF_SUPPRESS_STOP_HOOK`` /
-    ``CODEX_RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 自抑制，不再 arm 任何
+    detached 线程靠注入的 ``RVF_SUPPRESS_STOP_HOOK`` /
+    ``RVF_ANALYZE_THREAD`` env 守卫在自己那次 Stop 自抑制，不再 arm 任何
     task 级 quiet marker——父会话下一轮真实改动会正常触发 RVF。launch 失败按
     fail-open 处理（``thread-launch-failed``），不阻断 handoff，用户可手动
     ``$rvf-analyze`` 收尾。

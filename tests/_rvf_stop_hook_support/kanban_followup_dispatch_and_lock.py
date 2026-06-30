@@ -147,7 +147,7 @@ def test_kanban_followup_without_task_id_does_not_allocate_review_scope(tmp: Pat
     meta = getattr(ledger, "tracker_scope_meta", None)
     assert meta is None
 
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     _, _, tracker_dir, db_path, _, _ = diff_tracker._lease_repo_paths(
         repo,
         log_root_override=state / "global-diff-tracker",
@@ -179,7 +179,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     fake_client.write_text(
         "import json, os, sys\n"
         "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
-        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
+        "    handle.write(json.dumps({'argv': sys.argv[1:], 'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK')}) + '\\n')\n"
         "if sys.argv[1] == 'list':\n"
         f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'Fix RVF follow-up source metadata', 'workspacePath': {str(repo)!r}}}]}}))\n"
         "elif sys.argv[1] == 'message':\n"
@@ -198,7 +198,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -232,8 +232,8 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert latest["parent_conversation_ref"] == "Fix RVF follow-up source metadata"
     assert latest["parent_conversation_name"] == latest["parent_conversation_ref"]
     assert latest["parent_conversation_name_source"] == "cline_kanban_task_lookup"
-    assert latest["parent_codex_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
-    assert latest["parent_codex_session_name_source"] == "session_ref_fallback"
+    assert latest["parent_source_session_ref"] == "Codex 2026-05-01T11-25-17 019de191"
+    assert latest["parent_source_session_name_source"] == "session_ref_fallback"
     assert latest["parent_codex_url"] == f"codex://local/{session_id}"
     assert Path(str(latest["parent_origin_path"])).exists()
     calls = [
@@ -264,7 +264,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert "`source Kanban task id`" in prompt_text
     assert "`source Kanban attempt id`" in prompt_text
     assert "`source Kanban task title at trigger`" in prompt_text
-    assert "RVF_PARENT_CODEX_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
+    assert "RVF_PARENT_SOURCE_SESSION_REF: Codex 2026-05-01T11-25-17 019de191" in prompt_text
     assert f"RVF_PARENT_CODEX_URL: codex://local/{session_id}" in prompt_text
     assert f"RVF_PARENT_TRANSCRIPT_PATH: {transcript.resolve()}" in prompt_text
     prep = dispatch_prep_payload(latest)
@@ -279,7 +279,7 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     assert prep["rvf_run"]["run_id"] == latest["run_id"]
     assert "如果当前会话位于 Cline Kanban task 内，它们应优先使用 Kanban task" in prompt_text
     assert "RVF_CLINE_KANBAN_TASK" not in prompt_text
-    assert "CODEX_RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
+    assert "RVF_SUPPRESS_STOP_HOOK=1" not in prompt_text
     assert calls[0]["suppress"] is None
     assert calls[1]["suppress"] is None
 
@@ -321,7 +321,7 @@ def test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pendin
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -467,7 +467,7 @@ def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) 
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "KANBAN_TASK_ID": "task-77",
@@ -515,8 +515,8 @@ def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: 
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
         # 让 sweep 把 taskCURRENT 视为当前 task（current_kanban_task_id 读 env）。
         "KANBAN_TASK_ID": "taskCURRENT",
@@ -591,8 +591,8 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
         # liveness `list` 走 hermetic fake（空 tasks → unknown → TTL 兜底），不碰真机 server。
         "CODEX_RVF_CLINE_KANBAN_CLIENT": _write_fake_kanban_empty_list_client(
@@ -627,7 +627,7 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
 
 
 def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_path: Path) -> None:
-    """S2（CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
+    """S2（RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
     仍发通知 + 保留 marker，绝不谎报已自动跑。"""
     repo = init_repo(tmp_path / "clean", dirty=False)
     state = tmp_path / "state"
@@ -646,10 +646,10 @@ def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_p
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
-        "CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
+        "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH": "1",
         # 显式指向不存在的 app-server socket，确定性不可达（避免误连真机 app-server）。
         "CODEX_RVF_APP_SERVER_SOCKET": str(tmp_path / "no-such.sock"),
         # liveness `list` 走 hermetic fake（空 tasks → unknown → TTL 兜底），不碰真机 server。
@@ -741,17 +741,17 @@ def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp
         "kanban_task_title_source": "src",
         "origin_transcript_path": str(tmp_path / "tx.jsonl"),
     }
-    saved = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
+    saved = os.environ.get("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
+    os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
     try:
         result = cs._maybe_redispatch_stranded_kanban_followup(
             marker, _FakeLedger(), token="stabletoken00000"
         )
     finally:
         if saved is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
+            os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
 
     assert result.get("redispatched") is True
     # RVF-001：idem 绑定稳定 token，绝不含 fresh prep token。
@@ -818,7 +818,7 @@ def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -898,7 +898,7 @@ def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_pat
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -991,7 +991,7 @@ def test_kanban_followup_title_uses_session_matched_board_state(tmp_path: Path) 
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
-            "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
             "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
             "CODEX_RVF_CLINE_KANBAN_STATE_DIR": str(kanban_state),
@@ -1046,7 +1046,7 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
             },
             extra_env={
                 "CODEX_RVF_FORK_MODE": "kanban-followup",
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "KANBAN_TASK_ID": "task-77",
@@ -1575,7 +1575,7 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
     shared_lock_root = tmp_path / "shared-followup-lock"
     shared_lock_root.mkdir(parents=True)
     # 直接写一份 marker，等价于 UPS 在投递确认时 arm 的结果（env 模式：marker 直接落在
-    # CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
+    # RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
     marker_path = shared_lock_root / "task-task-shared.json"
     marker_path.write_text(
         json.dumps(
@@ -1616,7 +1616,7 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
         extra_env={
             "CODEX_RVF_FORK_MODE": "kanban-followup",
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(shared_lock_root),
             "KANBAN_TASK_ID": "task-shared",
             "FAKE_CLIENT_CALLS": str(client_calls),
             # 本测试只验「跨 state-root 共享锁挡住第二次 dispatch」的 skip 短路语义，与
@@ -1653,7 +1653,7 @@ def test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dis
     awaiting_root.mkdir(parents=True)
 
     # writer = dispatch 层：加载 marker 模块并 arm 一条 wait-on marker（root 指向 subprocess
-    # 将经 CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT 读到的同一基目录）。
+    # 将经 RVF_KANBAN_FOLLOWUP_LOCK_ROOT 读到的同一基目录）。
     load_kanban_followup_lock_module()  # 副作用：加载 stop hook，连带 import 同目录 marker 模块
     awaiting = sys.modules["rvf_awaiting_dispatched_agent_marker"]
     marker_path = awaiting.arm_awaiting_dispatched_agent(
@@ -1685,7 +1685,7 @@ def test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dis
         },
         extra_env={
             "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
-            "CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(awaiting_root),
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT": str(awaiting_root),
             "FAKE_CLIENT_CALLS": str(client_calls),
         },
         state_dir=state,

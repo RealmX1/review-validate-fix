@@ -5,8 +5,8 @@
 判定「本轮 agent 已提交但未审改动」的下界 baseline。Stop hook 以
 ``baseline_head..HEAD`` 的 first-parent 净 diff 派生 committed 观测单元，与
 dirty 观测合流后再交集 transcript 归属，得到「本轮已提交、属于本会话、尚未审」
-的范围（见 ``diff_tracker._list_committed_round_changed_paths`` /
-``session_manifest.build_manifest(committed_baseline=...)``）。
+的范围（见 ``reviewable_unit_diff_tracker._list_committed_round_changed_paths`` /
+``session_change_manifest.build_manifest(committed_baseline=...)``）。
 
 存储与原子写镜像 ``review_reopen_marker``：env-root、
 task+session 双键、原子 rename 写、TTL 状态（active/stale/invalid）。
@@ -28,13 +28,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from rvf_logging import log_root, safe_token
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import log_root, safe_token  # noqa: E402
 
 
 SUBDIR_NAME = "round-baseline-pending"
 MARKER_VERSION = 1
 DEFAULT_TTL_SECONDS = 6 * 60 * 60
-TTL_ENV = "CODEX_RVF_ROUND_BASELINE_TTL_SECONDS"
+TTL_ENV = "RVF_ROUND_BASELINE_TTL_SECONDS"
 PROMPT_EXCERPT_MAX_CHARS = 200
 STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"

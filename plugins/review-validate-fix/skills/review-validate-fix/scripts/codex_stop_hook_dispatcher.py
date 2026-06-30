@@ -12,14 +12,15 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 from rvf_handoff import handoff_completion_payload, handoff_path_from_event
 from rvf_run_finalize import finalize_for_handoff, surface_finalize_record_errors
 from rvf_analyze_advisory import (
     RVF_ANALYZE_FOLLOWUP_MARKER,
     surface_rvf_analyze_advisory,
 )
-from session_manifest import build_manifest
+from core.session_scope_allocation.session_change_manifest import build_manifest
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -39,8 +40,8 @@ SESSION_PATH_KEYS = (
 )
 SESSION_HOOK_CONTROL_KEY = "RVF_STOP_HOOK"
 SUPPRESS_ENV_NAMES = (
-    "CODEX_RVF_SUPPRESS",
-    "CODEX_RVF_SUPPRESS_STOP_HOOK",
+    "RVF_SUPPRESS",
+    "RVF_SUPPRESS_STOP_HOOK",
 )
 PLAN_OPERATION_MARKERS = (
     "<proposed_plan>",
@@ -143,7 +144,16 @@ def coerce_text(value: object) -> str:
 
 
 def sync_child_env() -> dict[str, str]:
-    return {key: value for key, value in os.environ.items() if not key.startswith("CODEX_RVF_")}
+    # dev-sync 子进程（contract-check / installer / 重入 hook）必须拿到不含父会话 RVF
+    # run 状态的干净 env，否则子进程会误继承父 RVF run 的 run_dir / suppress marker /
+    # tracker 开关。RVF env 命名空间横跨两个前缀：``CODEX_RVF_``（部署 + codex-specific）
+    # 与裸 ``RVF_``（去-codex 后的中性运行时变量，如 RVF_RUN_DIR / RVF_SUPPRESS_STOP_HOOK /
+    # RVF_TRACKER_*），两者都要剥离。
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not (key.startswith("CODEX_RVF_") or key.startswith("RVF_"))
+    }
 
 
 def git_root(path: Path) -> Path | None:
@@ -277,7 +287,7 @@ def should_sync_session_scope(
         refresh_global_diff_tracker,
         allocate_auto_review_scope,
     )
-    from diff_tracker import (
+    from core.session_scope_allocation.reviewable_unit_diff_tracker import (
         LEGACY_REASON_NO_SESSION_OWNED_DIRTY,
         LEGACY_REASON_SESSION_OWNED_DIRTY,
         REASON_NO_UNASSIGNED_REVIEW_SCOPE,
@@ -1345,8 +1355,7 @@ def main() -> int:
         # `no_session_owned_dirty` (emitted by tracker-disabled fallback) and
         # the new `no_unassigned_review_scope` (emitted by the allocator dry
         # run). The detail message branches on the same set.
-        sys.path.insert(0, str(SKILL_DIR / "scripts"))
-        from diff_tracker import REASON_NO_UNASSIGNED_REVIEW_SCOPE
+        from core.session_scope_allocation.reviewable_unit_diff_tracker import REASON_NO_UNASSIGNED_REVIEW_SCOPE
         clean_scope_codes = ("no_session_owned_dirty", REASON_NO_UNASSIGNED_REVIEW_SCOPE)
         if session_reason_code in clean_scope_codes and is_session_hook_control_event(event):
             ledger.event(

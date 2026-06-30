@@ -168,7 +168,7 @@ def test_session_hook_control_status_works_when_env_suppressed(tmp_path: Path) -
                 "stop_hook_active": False,
                 "transcript_path": str(transcript),
             },
-            extra_env={"CODEX_RVF_SUPPRESS_STOP_HOOK": "1"},
+            extra_env={"RVF_SUPPRESS_STOP_HOOK": "1"},
             state_dir=state,
         )[0]
     )
@@ -272,7 +272,7 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
             },
             extra_env={
                 "CODEX_RVF_FORK_MODE": "cline-kanban",
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "FAKE_CLIENT_CALLS": str(client_calls),

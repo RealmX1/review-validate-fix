@@ -185,7 +185,7 @@ observed -> diagnosed -> fix-proposed -> fixed -> validated -> deployed -> obser
 RVF 已经形成这个方向，但这个原则不应被理解为“每个复杂 `if` 都要单独维护一个诊断脚本”。诊断面的价值不是创造第二事实源，而是提供一个可重复、可测试的解释器：它读取 canonical artifacts，然后说明一次 gate 为什么做出某个决定。
 
 - `diagnose_stop_hook_scope.py` 用 summary 诊断 scope gate。
-- `diagnose_codex_fork.py` 用 dry-run 写 requests。
+- `diagnose_fork.py` 用 dry-run 写 requests。
 - `debug/troubleshooting.md` 要求优先跑 deterministic diagnostic scripts。
 
 推广规则：
@@ -360,7 +360,7 @@ Backward compatibility work is a project hygiene concern, not a core workflow in
 交付：
 
 - `rvf_logging.py` 增加 `observation()` helper。
-- `diagnose_stop_hook_scope.py`、`diagnose_codex_fork.py`、installer post-check 写 observation summary 和 expected post-fix observation。
+- `diagnose_stop_hook_scope.py`、`diagnose_fork.py`、installer post-check 写 observation summary 和 expected post-fix observation。
 - flow analyzer 读取 observation JSON。
 
 验收：

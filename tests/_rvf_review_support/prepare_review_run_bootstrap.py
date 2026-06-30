@@ -82,8 +82,8 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert payload["review_env"]["RVF_REVIEW_RESULT"].endswith("artifacts/reviewers/reviewer/review-result.json")
     assert "${" not in payload["review_env"]["RVF_REVIEW_RESULT"]
     assert payload["review_env"]["CODEX_RVF_LOG_ROOT"] == str(Path(payload["run_dir"]).parents[1])
-    assert payload["review_env"]["CODEX_RVF_RUN_ID"] == payload["run_id"]
-    assert payload["review_env"]["CODEX_RVF_RUN_DIR"] == payload["run_dir"]
+    assert payload["review_env"]["RVF_RUN_ID"] == payload["run_id"]
+    assert payload["review_env"]["RVF_RUN_DIR"] == payload["run_dir"]
     assert payload["review_env"]["RVF_BACKEND"] == "manual"
     assert payload["rvf_backend"] == "manual"
     assert payload["rvf_state_phase"] == "prepare"
@@ -92,8 +92,7 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     review_env_text = Path(payload["review_env_file"]).read_text(encoding="utf-8")
     assert "export RVF_RUN_DIR=" in review_env_text
     assert "export CODEX_RVF_LOG_ROOT=" in review_env_text
-    assert 'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"' in review_env_text
-    assert 'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"' in review_env_text
+    assert "export RVF_RUN_ID=" in review_env_text
     assert "export RVF_BACKEND=manual" in review_env_text
     assert 'export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"' in review_env_text
     assert 'export RVF_INPUTS_DIR="$RVF_ARTIFACTS_DIR/inputs"' in review_env_text

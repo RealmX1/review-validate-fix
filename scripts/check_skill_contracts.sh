@@ -413,11 +413,9 @@ required_files=(
   "scripts/apply_worktree_bootstrap.py"
   "scripts/cline_kanban_client.py"
   "scripts/cancel_rvf_run.py"
-  "scripts/rvf_logging.py"
   "scripts/rvf_prep_file.py"
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
-  "scripts/session_manifest.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
   "scripts/codex_stop_hook_router.py"
@@ -436,9 +434,12 @@ repo_required_files=(
   "plugins/review-validate-fix/commands/rvf-handoff-commit.md"
   "plugins/review-validate-fix/skills/rvf-land/SKILL.md"
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
-  "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py"
+  "core/session_scope_allocation/reviewable_unit_diff_tracker.py"
+  "core/session_scope_allocation/session_change_manifest.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
+  "core/run_ledger/run_ledger.py"
+  "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -510,15 +511,16 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/apply_worktree_bootstrap.py" \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
-  "$skill_dir/scripts/rvf_logging.py" \
+  "$repo_root/core/run_ledger/run_ledger.py" \
+  "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
-  "$skill_dir/scripts/session_manifest.py" \
+  "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
-  "$skill_dir/scripts/diff_tracker.py" \
+  "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
@@ -563,7 +565,7 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py" 'def resolve_target_run_id'
-require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/diff_tracker.py" 'def invalidate_reviewed_units_for_run'
+require_repo_literal "core/session_scope_allocation/reviewable_unit_diff_tracker.py" 'def invalidate_reviewed_units_for_run'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'review_scope_reopened_for_failed_impl'
 require_literal "SKILL.md" '本 skill 只处理显式 `$review-validate-fix`、`/review-validate-fix` 或 `:review-validate-fix` 调用'
 require_literal "SKILL.md" 'policy.allow_implicit_invocation'
@@ -689,7 +691,7 @@ require_literal "scripts/command_lock.py" 'RVF_LOCK_DIR'
 require_literal "scripts/command_lock.py" 'lock_acquired'
 require_literal "scripts/command_lock.py" 'lock_timeout'
 require_literal "scripts/command_lock.py" 'lock_released'
-require_literal "scripts/rvf_logging.py" 'command-lock'
+require_repo_literal "core/run_ledger/run_ledger.py" 'command-lock'
 require_literal "scripts/prepare_review_run.py" 'review-packet.metadata.json'
 require_literal "scripts/prepare_review_run.py" 'session-manifest.json'
 require_literal "scripts/prepare_review_run.py" 'scope.contract.json'
@@ -704,18 +706,18 @@ require_literal "scripts/prepare_review_run.py" 'allow-missing-session-context'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-id'
 require_literal "scripts/prepare_review_run.py" '--rvf-run-dir'
 require_literal "scripts/prepare_review_run.py" '--rvf-backend'
-require_literal "scripts/rvf_logging.py" 'class RunLedger'
-require_literal "scripts/rvf_logging.py" 'cline-kanban'
-require_literal "scripts/rvf_logging.py" 'RVF_STATE_PHASES'
-require_literal "scripts/rvf_logging.py" 'kanban-task'
-require_literal "scripts/rvf_logging.py" 'rvf_state_fields'
-require_literal "scripts/rvf_logging.py" 'events.jsonl'
-require_literal "scripts/rvf_logging.py" 'summary.json'
-require_literal "scripts/rvf_logging.py" 'reason_code'
-require_literal "scripts/rvf_logging.py" 'CODEX_RVF_RUN_DIR'
-require_literal "scripts/rvf_logging.py" 'log_unavailable'
-require_literal "scripts/session_manifest.py" 'owned_paths'
-require_literal "scripts/session_manifest.py" 'unattributed_dirty_paths'
+require_repo_literal "core/run_ledger/run_ledger.py" 'class RunLedger'
+require_repo_literal "core/run_ledger/run_ledger.py" 'cline-kanban'
+require_repo_literal "core/run_ledger/run_ledger.py" 'RVF_STATE_PHASES'
+require_repo_literal "core/run_ledger/run_ledger.py" 'kanban-task'
+require_repo_literal "core/run_ledger/run_ledger.py" 'rvf_state_fields'
+require_repo_literal "core/run_ledger/run_ledger.py" 'events.jsonl'
+require_repo_literal "core/run_ledger/run_ledger.py" 'summary.json'
+require_repo_literal "core/run_ledger/run_ledger.py" 'reason_code'
+require_repo_literal "core/run_ledger/run_ledger.py" 'RVF_RUN_DIR'
+require_repo_literal "core/run_ledger/run_ledger.py" 'log_unavailable'
+require_repo_literal "core/session_scope_allocation/session_change_manifest.py" 'owned_paths'
+require_repo_literal "core/session_scope_allocation/session_change_manifest.py" 'unattributed_dirty_paths'
 require_literal "scripts/build_review_packet.py" 'metadata-output'
 require_literal "scripts/build_review_packet.py" 'session-manifest'
 require_literal "scripts/build_review_packet.py" 'primary-file'
@@ -804,7 +806,7 @@ require_literal "scripts/cancel_rvf_run.py" 'trash_task'
 require_literal "references/cancel-rvf-run.md" 'cline-kanban-rvf-cancelled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_MODE=cline-kanban'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'kanban-followup'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_KANBAN_FOLLOWUP_TRIGGER'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_KANBAN_FOLLOWUP_TRIGGER'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_DISPATCH=token='
 require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_prep_file_path'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_target_worktree'
@@ -855,8 +857,8 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'stop_hook_active'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'systemMessage'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'desktop-control-unavailable-report'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'desktop-control-unavailable-fail'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_FORK_EXPERIMENT'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_FORKED_REVIEW_VALIDATE_FIX'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_FORK_EXPERIMENT'
+require_repo_literal "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" 'RVF_FORKED_REVIEW_VALIDATE_FIX'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'DEFAULT_RVF_MODE = "fork"'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'DEFAULT_FORK_LAUNCH_MODE = "auto"'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_MODE'
@@ -870,17 +872,18 @@ require_literal "scripts/codex_stop_review_validate_fix.py" '不是关闭全局 
 require_literal "scripts/codex_stop_review_validate_fix.py" 'dispatcher 仍会运行'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'manual-prepared'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'no Terminal was launched'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'thread/fork'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'turn/start'
+# S9a：app-server fork-request 构造（thread/fork、turn/start）已抽到 adapters/codex
+require_repo_literal "adapters/codex/codex_gui_fork_app_server_bridge.py" 'thread/fork'
+require_repo_literal "adapters/codex/codex_gui_fork_app_server_bridge.py" 'turn/start'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'Terminal/CLI fork launch is intentionally disabled'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'CODEX_RVF_FORK_REASONING_EFFORT'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'review-validate-fix-fork'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'RVF_HANDOFF_FILE'
-require_literal "scripts/diagnose_codex_fork.py" 'run_fork_experiment'
-require_literal "scripts/diagnose_codex_fork.py" 'CODEX_RVF_FORK_EXPERIMENT_MODE'
+require_literal "scripts/diagnose_fork.py" 'run_fork_experiment'
+require_literal "scripts/diagnose_fork.py" 'CODEX_RVF_FORK_EXPERIMENT_MODE'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'fork'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_fork_experiment_marker_no_longer_triggers_stop_hook_fork'
-require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_diagnose_codex_fork_dry_run_writes_requests'
+require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_diagnose_fork_dry_run_writes_requests'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_dirty_repo_dry_run_prepares_legacy_gui_requests'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_auto_mode_creates_cline_kanban_task_by_default'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback'
@@ -953,6 +956,26 @@ require_literal "scripts/trajectory_distill.py" 'from core.transcript'
 require_literal "scripts/trajectory_distill.py" 'from adapters.codex.transcript import'
 require_literal "scripts/trajectory_distill.py" 'from adapters.claude_code.transcript import'
 
+# S9c: host 探测组合根（HOST_CODEX/HOST_CLAUDE/detect_transcript_format）从 trajectory_distill
+# facade 上提到 core/host_adapter/——host 身份真相源住 core 注入契约包，不再住名为 "distill" 的脚本。
+require_repo_file "core/host_adapter/host_transcript_format_detection.py"
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'def detect_transcript_format'
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'HOST_CODEX = "codex"'
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" 'HOST_CLAUDE = "claude_code"'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.host_adapter.host_transcript_format_detection import'
+# 真相源已迁走：trajectory_distill facade 不得再定义 host 探测原语（防回灌到旧位置）。
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_distill.py" 'def detect_transcript_format'
+
+# S9（收尾）：HostAdapter 注入契约——core 业务逻辑唯一认识的 host 表面，S10 装配 concrete
+# bundle + resolver 时注入。守住 v1 注入面 4 方法名 + 包级 re-export，防 S10 relocation 时漂移。
+require_repo_file "core/host_adapter/host_adapter_protocol.py"
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'class HostAdapter(Protocol)'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def host_display_name'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def session_deep_link'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def cline_kanban_agent_id'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def detect_host_skip_mode'
+require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'
@@ -1020,6 +1043,11 @@ require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md"
 require_repo_literal "docs/multi-harness-plugin-guideline/06-rvf-application.md" '已对齐 S0 v2'
 # 反模式 ② 已脱离：04 不得再宣称本仓库"当前正是该反模式的样本"。
 forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '本仓库当前正是该反模式的样本'
+
+# S8.0（去-codex 重构）：env-namespace 碰撞 gate。防 CODEX_RVF_* → RVF_* 改名半完成
+# ——同一 base 在 CODEX_RVF_ 与裸 RVF_ 两命名空间都被 env 访问 = 运行时变量分裂、
+# 静默损坏（无语法/import 错，未覆盖路径假绿）。ALLOWLIST 在脚本内随坍缩切片收窄。
+python3 "$repo_root/scripts/check_env_namespace_collision.py"
 
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'

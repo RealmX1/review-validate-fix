@@ -10,9 +10,26 @@ from pathlib import Path
 from typing import Any
 
 
-SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_LOG_ROOT = SKILL_DIR / "state"
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
+
+
+def installed_plugin_skill_dir() -> Path:
+    """已部署 RVF plugin 的 skill 目录（布局无关）。
+
+    本模块从 ``scripts/`` 迁入 ``core/run_ledger/`` 后，``Path(__file__).parents[N]``
+    不再能稳健回指 skill 目录——skill 目录是 ``plugins/.../skills/...`` 旁系子树而非
+    本文件的祖先，且「哨兵→skill」层数在 repo 与已部署 payload 下不同。故 ``SKILL_DIR``
+    改由本函数解析：优先 ``CODEX_RVF_INSTALLED_SKILL_DIR`` env，回退
+    ``~/plugins/review-validate-fix/skills/review-validate-fix``。
+    （该 env 名的去-codex 改名属部署耦合 env，留待 S11。）
+    """
+    configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    if configured and configured.strip():
+        return Path(configured).expanduser()
+    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
+
+
+SKILL_DIR = installed_plugin_skill_dir()
 DEFAULT_INLINE_BYTES = 2048
 COMPONENTS = {
     "command-lock",
@@ -236,13 +253,6 @@ def new_event_id() -> str:
     return f"evt-{secrets.token_hex(8)}"
 
 
-def installed_plugin_skill_dir() -> Path:
-    configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
-    if configured and configured.strip():
-        return Path(configured).expanduser()
-    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
-
-
 def default_log_root_for_skill_dir(skill_dir: Path) -> Path:
     installed_skill_dir = installed_plugin_skill_dir()
     if (
@@ -262,7 +272,7 @@ def log_root() -> Path:
 
 
 def max_inline_bytes(default: int = DEFAULT_INLINE_BYTES) -> int:
-    value = os.environ.get("CODEX_RVF_LOG_MAX_INLINE_BYTES")
+    value = os.environ.get("RVF_LOG_MAX_INLINE_BYTES")
     if not value or not value.strip():
         return default
     try:
@@ -272,7 +282,7 @@ def max_inline_bytes(default: int = DEFAULT_INLINE_BYTES) -> int:
 
 
 def log_level() -> str:
-    value = os.environ.get("CODEX_RVF_LOG_LEVEL", "info").strip().lower()
+    value = os.environ.get("RVF_LOG_LEVEL", "info").strip().lower()
     return value if value in {"debug", "info", "warn", "error"} else "info"
 
 
@@ -313,16 +323,16 @@ class RunLedger:
         self.cwd = str(cwd) if cwd is not None else None
         self.run_id = (
             run_id
-            or os.environ.get("CODEX_RVF_RUN_ID")
+            or os.environ.get("RVF_RUN_ID")
             or new_run_id(component)
         )
         self.correlation_id = (
             correlation_id
-            or os.environ.get("CODEX_RVF_CORRELATION_ID")
+            or os.environ.get("RVF_CORRELATION_ID")
             or self.run_id
         )
         self.root = log_root()
-        env_run_dir = os.environ.get("CODEX_RVF_RUN_DIR")
+        env_run_dir = os.environ.get("RVF_RUN_DIR")
         self.run_dir = (
             Path(run_dir).expanduser()
             if run_dir
@@ -357,10 +367,10 @@ class RunLedger:
 
     def env(self) -> dict[str, str]:
         return {
-            "CODEX_RVF_RUN_ID": self.run_id,
-            "CODEX_RVF_CORRELATION_ID": self.correlation_id,
+            "RVF_RUN_ID": self.run_id,
+            "RVF_CORRELATION_ID": self.correlation_id,
             "CODEX_RVF_LOG_ROOT": str(self.root),
-            "CODEX_RVF_RUN_DIR": str(self.run_dir),
+            "RVF_RUN_DIR": str(self.run_dir),
         }
 
     def artifact_path(self, name: str) -> Path:

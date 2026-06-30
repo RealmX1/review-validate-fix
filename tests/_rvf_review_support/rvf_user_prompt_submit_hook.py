@@ -335,9 +335,9 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
     try:
         now = prep.parse_timestamp("2026-06-04T00:00:00Z")
         # kanban-followup 风格 prep：target_kanban_task_id + flow-1-self-rising + run 信息。
@@ -425,9 +425,9 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
         else:
             os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
         if prev_lock is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
 
 
 def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> None:
@@ -441,9 +441,9 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
-    prev_lock = os.environ.get("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
     try:
         now = prep.parse_timestamp("2026-06-07T00:00:00Z")
         prep.write_prep_file(
@@ -506,9 +506,9 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
         else:
             os.environ["CODEX_RVF_PREP_ROOT"] = prev_prep
         if prev_lock is None:
-            os.environ.pop("CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
         else:
-            os.environ["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = prev_lock
 
 
 def test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(tmp_path: Path) -> None:

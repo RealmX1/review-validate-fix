@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 
-# 本回合首次编辑才 park：只认写型工具，与 ``session_manifest.CLAUDE_WRITE_TOOL_NAMES`` 同集。
+# 本回合首次编辑才 park：只认写型工具，与 ``session_change_manifest.CLAUDE_WRITE_TOOL_NAMES`` 同集。
 # 内联而非 import，保 hook 热路径 stdlib-only、零重依赖。
 WRITE_TOOL_NAMES = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 

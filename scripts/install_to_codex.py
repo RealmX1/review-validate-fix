@@ -288,8 +288,6 @@ def latest_run_from_root(root: Path) -> dict[str, Any] | None:
 
 def rvf_session_context(plugin_skill_dir: Path) -> dict[str, Any]:
     env_keys = [
-        "CODEX_RVF_RUN_ID",
-        "CODEX_RVF_RUN_DIR",
         "RVF_RUN_ID",
         "RVF_RUN_DIR",
         "CODEX_RVF_LOG_ROOT",
@@ -298,7 +296,7 @@ def rvf_session_context(plugin_skill_dir: Path) -> dict[str, Any]:
         "CODEX_THREAD_ID",
     ]
     env = {key: os.environ[key] for key in env_keys if os.environ.get(key)}
-    run_dir_text = env.get("CODEX_RVF_RUN_DIR") or env.get("RVF_RUN_DIR")
+    run_dir_text = env.get("RVF_RUN_DIR")
     roots: list[Path] = []
     for key in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR"):
         value = os.environ.get(key)

@@ -36,7 +36,7 @@ review 前能读到父会话背景。
 
 Host-aware
 ----------
-复用 ``trajectory_distill.detect_transcript_format`` 判定父 transcript 格式：
+复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 判定父 transcript 格式：
 ``HOST_CODEX`` 走 Codex rollout schema，``HOST_CLAUDE`` 走 Claude transcript
 schema；探测失败（空文件/异常 schema）fallback 到 Codex 解析，与既有
 Codex-only 用例保持一致。
@@ -51,7 +51,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trajectory_distill import (  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
+
+from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
     detect_transcript_format,
@@ -65,7 +67,7 @@ from trajectory_distill import (  # noqa: E402
 TOOL_ARGS_LIMIT_BYTES = 800
 #: tool_result / exec 输出渲染上限（字节，UTF-8）。超出截断并标注。
 TOOL_RESULT_LIMIT_BYTES = 400
-#: 默认总字节预算（与 codex_stop hook 的 CODEX_RVF_PARENT_CONTEXT_MAX_BYTES 默认对齐）。
+#: 默认总字节预算（与 codex_stop hook 的 RVF_PARENT_CONTEXT_MAX_BYTES 默认对齐）。
 DEFAULT_MAX_BYTES = 64 * 1024
 
 #: Codex ``event_msg`` 中视为纯噪声、整条丢弃的 subtype。

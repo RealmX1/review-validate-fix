@@ -42,8 +42,9 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import harness_limit_cooldown
-from rvf_logging import safe_token, start_run
+from core.run_ledger.run_ledger import safe_token, start_run
 from rvf_detached_thread import (
     LAUNCH_FAILED,
     LAUNCH_LAUNCHED,
@@ -56,7 +57,7 @@ from run_alternative_reviewer import (
     reviewer_id_from_label,
     safe_artifact_token,
 )
-from trajectory_distill import HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]

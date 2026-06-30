@@ -37,11 +37,24 @@ SCRIPT = (
     / "scripts"
     / "codex_stop_review_validate_fix.py"
 )
-DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_codex_fork.py")
+DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_fork.py")
 RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")
 
+# S9a：codex app-server/bridge fork 执行缝已从引擎抽到 adapters/codex/
+# codex_gui_fork_app_server_bridge.py；引擎只 re-import 少数公开入口
+# （run_app_server_fork / app_server_fork_requests / parent_thread_name_from_app_server
+# / path_is_relative_to）。测试里对 **adapter 内部符号**（AppServerWebSocket / bridge_* /
+# ensure_bridge_app_server / select_app_server_socket / can_connect_app_server_socket /
+# select_existing_app_server_socket_for_metadata 等）的 monkeypatch 必须打在 adapter 模块上：
+# 引擎里这些名字已不存在，且 adapter 函数在自身命名空间里解析它们。下面取到的 ``appserver``
+# 与引擎 re-import 的是同一个 sys.modules 单例，故经它 patch 能同时影响引擎 run_codex_fork
+# 路由下游与 adapter 函数自身。
+sys.path.insert(0, str(SCRIPT.parent))
+import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
+import adapters.codex.codex_gui_fork_app_server_bridge as appserver  # noqa: E402
+
 for _name in tuple(os.environ):
-    if _name.startswith("CODEX_RVF_"):
+    if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
 
@@ -219,25 +232,25 @@ def invoke(
 ) -> tuple[str, str]:
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             env.pop(name, None)
     env.pop("CODEX_THREAD_ID", None)
     if config is not None:
         env["CODEX_RVF_CONFIG"] = str(config)
     if state_dir is not None:
         env["CODEX_RVF_STATE_DIR"] = str(state_dir)
-        env["CODEX_RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
+        env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
             state_dir / "kanban-followup-in-progress"
         )
     if extra_env is not None:
         env.update(extra_env)
     # 默认把 detached analyze 线程的 tmux 指向假 tmux，避免任意触发 handoff→
     # advisory 路径的测试在后台真的拉起 analyze agent；需要断言 tmux 行为的
-    # 测试自行传入 CODEX_RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
-    env.setdefault("CODEX_RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
+    # 测试自行传入 RVF_TMUX_BIN / FAKE_TMUX_CALLS 覆盖。
+    env.setdefault("RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))
     # 默认把 terminal-notifier 指向无副作用的假 notifier，确保没有测试会在真机弹出
-    # 真实 OS 通知；需要断言通知行为的测试自行传入 CODEX_RVF_TERMINAL_NOTIFIER_BIN。
-    env.setdefault("CODEX_RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
+    # 真实 OS 通知；需要断言通知行为的测试自行传入 RVF_TERMINAL_NOTIFIER_BIN。
+    env.setdefault("RVF_TERMINAL_NOTIFIER_BIN", str(_DEFAULT_FAKE_NOTIFIER))
     completed = subprocess.run(
         [sys.executable, str(SCRIPT)],
         input=json.dumps(event),
@@ -374,7 +387,7 @@ def load_workspace_snapshot_module():
 
 def test_plugin_deploy_metadata_is_in_prompt_and_summary(tmp_path: Path) -> None:
     module = load_hook_module()
-    logging_module = sys.modules["rvf_logging"]
+    logging_module = sys.modules["core.run_ledger.run_ledger"]
     skill_dir = tmp_path / "skill"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(
@@ -469,8 +482,8 @@ def write_fake_tmux(path: Path) -> Path:
         "    with open(calls, 'a', encoding='utf-8') as fh:\n"
         "        fh.write(json.dumps({\n"
         "            'argv': sys.argv[1:],\n"
-        "            'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'),\n"
-        "            'analyze_thread': os.environ.get('CODEX_RVF_ANALYZE_THREAD'),\n"
+        "            'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK'),\n"
+        "            'analyze_thread': os.environ.get('RVF_ANALYZE_THREAD'),\n"
         "        }) + '\\n')\n"
         "stderr = os.environ.get('FAKE_TMUX_STDERR')\n"
         "if stderr:\n"
@@ -731,12 +744,12 @@ def test_fork_experiment_marker_no_longer_triggers_stop_hook_fork(tmp_path: Path
     assert "app_server_requests_path" not in latest
 
 
-def test_diagnose_codex_fork_dry_run_writes_requests(tmp_path: Path) -> None:
+def test_diagnose_fork_dry_run_writes_requests(tmp_path: Path) -> None:
     state = tmp_path / "state"
     message = "RVF_FORK_EXPERIMENT: custom diagnostic message"
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_"):
             env.pop(name, None)
     env["CODEX_RVF_STATE_DIR"] = str(state)
     completed = subprocess.run(
@@ -843,9 +856,9 @@ def test_env_suppression_skips(tmp_path: Path) -> None:
     stdout, _ = invoke(
         {"cwd": str(dirty), "stop_hook_active": False},
         extra_env={
-            "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-            "CODEX_RVF_RUN_ID": "rvf-child",
-            "CODEX_RVF_RUN_DIR": str(run_dir),
+            "RVF_SUPPRESS_STOP_HOOK": "1",
+            "RVF_RUN_ID": "rvf-child",
+            "RVF_RUN_DIR": str(run_dir),
         },
     )
     payload = parse_json(stdout)
@@ -865,7 +878,7 @@ def test_prompt_suppression_marker_skips(tmp_path: Path) -> None:
     write_user_session(
         transcript,
         "00000000-0000-0000-0000-000000000201",
-        "diagnostic fork\n\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+        "diagnostic fork\n\nRVF_SUPPRESS_STOP_HOOK=1",
     )
     stdout, _ = invoke(
         {
@@ -891,7 +904,7 @@ def test_prior_cline_kanban_task_marker_skips_after_later_user_message(tmp_path:
         transcript,
         "00000000-0000-0000-0000-000000000202",
         [
-            "$review-validate-fix\n\nRVF_CLINE_KANBAN_TASK\nCODEX_RVF_SUPPRESS_STOP_HOOK=1",
+            "$review-validate-fix\n\nRVF_CLINE_KANBAN_TASK\nRVF_SUPPRESS_STOP_HOOK=1",
             "later Kanban user turn without the suppress marker",
         ],
     )
@@ -978,7 +991,7 @@ def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
 
 
 def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -> None:
-    """`CODEX_RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
+    """`RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
     for-byte so disable-mode users see no churn during the Slice 3 rename."""
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
@@ -997,7 +1010,7 @@ def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -
         },
         extra_env={
             "CODEX_RVF_FORK_MODE": "dry-run",
-            "CODEX_RVF_TRACKER_DISABLE": "1",
+            "RVF_TRACKER_DISABLE": "1",
         },
         state_dir=state,
     )
@@ -1085,7 +1098,7 @@ def test_evaluate_session_gate_suppresses_on_manual_marker(tmp: Path) -> None:
 
 
 def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path) -> None:
-    """With `CODEX_RVF_TRACKER_DISABLE=1`, the orchestrator must delegate to
+    """With `RVF_TRACKER_DISABLE=1`, the orchestrator must delegate to
     the verbatim Phase-0 body so legacy `session_owned_dirty` reason codes
     flow through unchanged."""
     module = load_hook_module()
@@ -1122,8 +1135,8 @@ def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path)
     )
     state = tmp / "state"
     old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
-    old_disable = os.environ.get("CODEX_RVF_TRACKER_DISABLE")
-    os.environ["CODEX_RVF_TRACKER_DISABLE"] = "1"
+    old_disable = os.environ.get("RVF_TRACKER_DISABLE")
+    os.environ["RVF_TRACKER_DISABLE"] = "1"
     try:
         ledger = _make_test_ledger(module, state)
         event = {
@@ -1137,9 +1150,9 @@ def test_legacy_session_scope_gate_payload_used_when_tracker_disabled(tmp: Path)
         else:
             os.environ["CODEX_RVF_LOG_ROOT"] = old_log
         if old_disable is None:
-            os.environ.pop("CODEX_RVF_TRACKER_DISABLE", None)
+            os.environ.pop("RVF_TRACKER_DISABLE", None)
         else:
-            os.environ["CODEX_RVF_TRACKER_DISABLE"] = old_disable
+            os.environ["RVF_TRACKER_DISABLE"] = old_disable
     assert result is None  # session-owned dirty → legacy path returns None to continue
     # Verify the legacy reason code went through the events log.
     events_path = ledger.events_path
@@ -1273,7 +1286,7 @@ def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp
         assert dry is not None and dry["would_proceed"] is True
         scope_hash = dry["result"]["scope_hash"]
 
-        diff_tracker = sys.modules["diff_tracker"]
+        diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
         diff_tracker.record_manual_rvf_run(
             repo=repo,
             session_id="manual-db-session",
@@ -1300,7 +1313,7 @@ def test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash(tmp
 
 def test_manual_scope_suppression_sweeps_expired_lease_before_probe(tmp: Path) -> None:
     module = load_hook_module()
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     repo = init_repo_with_head(tmp / "dirty")
     transcript = tmp / "session.jsonl"
     write_apply_patch_transcript(transcript, repo, session_id="sess-manual-stale")
@@ -1358,7 +1371,7 @@ def test_manual_scope_suppression_sweeps_expired_lease_before_probe(tmp: Path) -
 
 def test_manual_scope_suppression_does_not_transfer_parent_takeover_units(tmp: Path) -> None:
     module = load_hook_module()
-    diff_tracker = sys.modules["diff_tracker"]
+    diff_tracker = sys.modules["core.session_scope_allocation.reviewable_unit_diff_tracker"]
     repo = init_repo_with_head(tmp / "dirty")
     state = tmp / "state"
     old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
@@ -1517,14 +1530,14 @@ def test_socket_probe_reports_unavailable_reason(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
 
     missing = tmp_path / "missing.sock"
-    missing_probe = module.probe_app_server_socket(missing)
+    missing_probe = appserver.probe_app_server_socket(missing)
     assert missing_probe["connect_ok"] is False
     assert missing_probe["reason"] == "missing"
     assert missing_probe["parent_exists"] is True
 
     regular = tmp_path / "regular.sock"
     regular.write_text("not a socket\n", encoding="utf-8")
-    regular_probe = module.probe_app_server_socket(regular)
+    regular_probe = appserver.probe_app_server_socket(regular)
     assert regular_probe["connect_ok"] is False
     assert regular_probe["reason"] == "not-a-socket"
     assert regular_probe["exists"] is True
@@ -1581,7 +1594,7 @@ def test_app_server_websocket_sends_http_upgrade(tmp_path: Path) -> None:
     original_socket = module.socket.socket
     try:
         module.socket.socket = fake_socket
-        client = module.AppServerWebSocket(tmp_path / "app-server.sock", timeout=2)
+        client = appserver.AppServerWebSocket(tmp_path / "app-server.sock", timeout=2)
         client.close()
     finally:
         module.socket.socket = original_socket
@@ -1604,7 +1617,7 @@ def test_app_server_websocket_masks_pong_frame(tmp_path: Path) -> None:
             self.sent += data
 
     sock = FakeSocket()
-    client = module.AppServerWebSocket.__new__(module.AppServerWebSocket)
+    client = appserver.AppServerWebSocket.__new__(appserver.AppServerWebSocket)
     client.socket = sock
 
     original_urandom = module.os.urandom
@@ -1628,7 +1641,7 @@ def test_socket_probe_requires_websocket_upgrade(tmp_path: Path) -> None:
     socket_path.write_text("socket placeholder\n", encoding="utf-8")
 
     original_is_socket = Path.is_socket
-    original_client = module.AppServerWebSocket
+    original_client = appserver.AppServerWebSocket
 
     def fake_is_socket(path: Path) -> bool:
         if path == socket_path:
@@ -1639,15 +1652,15 @@ def test_socket_probe_requires_websocket_upgrade(tmp_path: Path) -> None:
         def __init__(self, path: Path, timeout: float = 15) -> None:
             assert path == socket_path
             assert timeout == 0.5
-            raise module.AppServerError("app-server websocket handshake failed: HTTP/1.1 200 OK")
+            raise appserver.AppServerError("app-server websocket handshake failed: HTTP/1.1 200 OK")
 
     try:
         Path.is_socket = fake_is_socket
-        module.AppServerWebSocket = FailingHandshakeClient
-        probe = module.probe_app_server_socket(socket_path)
+        appserver.AppServerWebSocket = FailingHandshakeClient
+        probe = appserver.probe_app_server_socket(socket_path)
     finally:
         Path.is_socket = original_is_socket
-        module.AppServerWebSocket = original_client
+        appserver.AppServerWebSocket = original_client
 
     assert probe["connect_ok"] is True
     assert probe["protocol_ok"] is False
@@ -1663,20 +1676,20 @@ def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
     original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
-    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
-    original_bridge_socket_path = module.bridge_socket_path
-    original_ensure_bridge = module.ensure_bridge_app_server
+    original_desktop_socket = appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = appserver.bridge_socket_path
+    original_ensure_bridge = appserver.ensure_bridge_app_server
     try:
         os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "bridge"
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
-        module.bridge_socket_path = lambda: bridge_socket
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        appserver.bridge_socket_path = lambda: bridge_socket
 
         def fail_bridge():
-            raise module.AppServerError("simulated bridge startup failure")
+            raise appserver.AppServerError("simulated bridge startup failure")
 
-        module.ensure_bridge_app_server = fail_bridge
+        appserver.ensure_bridge_app_server = fail_bridge
         payload = module.run_codex_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
@@ -1699,9 +1712,9 @@ def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
             os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
         else:
             os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
-        module.bridge_socket_path = original_bridge_socket_path
-        module.ensure_bridge_app_server = original_ensure_bridge
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        appserver.bridge_socket_path = original_bridge_socket_path
+        appserver.ensure_bridge_app_server = original_ensure_bridge
 
     assert "reason=app_server_fork_failed" in payload["systemMessage"]
     latest = latest_summary(state)
@@ -1720,16 +1733,16 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
-    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
-    original_bridge_socket_path = module.bridge_socket_path
-    original_ensure_bridge = module.ensure_bridge_app_server
+    original_desktop_socket = appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = appserver.bridge_socket_path
+    original_ensure_bridge = appserver.ensure_bridge_app_server
     try:
         os.environ["CODEX_RVF_LOG_ROOT"] = str(state)
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "report"
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
-        module.bridge_socket_path = lambda: bridge_socket
-        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        appserver.bridge_socket_path = lambda: bridge_socket
+        appserver.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
             AssertionError("bridge should not start by default")
         )
         payload = module.run_codex_fork(
@@ -1757,9 +1770,9 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_
             os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
         if original_allow_bridge is not None:
             os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
-        module.bridge_socket_path = original_bridge_socket_path
-        module.ensure_bridge_app_server = original_ensure_bridge
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        appserver.bridge_socket_path = original_bridge_socket_path
+        appserver.ensure_bridge_app_server = original_ensure_bridge
 
     assert "decision" not in payload
     assert payload["continue"] is True
@@ -1778,13 +1791,13 @@ def test_missing_desktop_control_auto_uses_existing_bridge(tmp_path: Path) -> No
     bridge_socket = tmp_path / "bridge.sock"
     original_bridge_policy = os.environ.pop("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY", None)
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
-    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
-    original_bridge_socket_path = module.bridge_socket_path
-    original_probe = module.probe_app_server_socket
-    original_ensure_bridge = module.ensure_bridge_app_server
+    original_desktop_socket = appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = appserver.bridge_socket_path
+    original_probe = appserver.probe_app_server_socket
+    original_ensure_bridge = appserver.ensure_bridge_app_server
     try:
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
-        module.bridge_socket_path = lambda: bridge_socket
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        appserver.bridge_socket_path = lambda: bridge_socket
 
         def fake_probe(path: Path) -> dict[str, object]:
             if path == bridge_socket:
@@ -1805,21 +1818,21 @@ def test_missing_desktop_control_auto_uses_existing_bridge(tmp_path: Path) -> No
                 "reason": "missing",
             }
 
-        module.probe_app_server_socket = fake_probe
-        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+        appserver.probe_app_server_socket = fake_probe
+        appserver.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
             AssertionError("existing bridge should be selected without restart")
         )
 
-        socket_path, source, selection = module.select_app_server_socket()
+        socket_path, source, selection = appserver.select_app_server_socket()
     finally:
         if original_bridge_policy is not None:
             os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
         if original_allow_bridge is not None:
             os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
-        module.bridge_socket_path = original_bridge_socket_path
-        module.probe_app_server_socket = original_probe
-        module.ensure_bridge_app_server = original_ensure_bridge
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        appserver.bridge_socket_path = original_bridge_socket_path
+        appserver.probe_app_server_socket = original_probe
+        appserver.ensure_bridge_app_server = original_ensure_bridge
 
     assert socket_path == bridge_socket
     assert source == "bridge"
@@ -1867,7 +1880,7 @@ def test_bridge_app_server_listener_pids_filters_rvf_socket(tmp_path: Path) -> N
     original_run = module.subprocess.run
     try:
         module.subprocess.run = fake_run
-        assert module.bridge_app_server_listener_pids(bridge_socket) == [111]
+        assert appserver.bridge_app_server_listener_pids(bridge_socket) == [111]
     finally:
         module.subprocess.run = original_run
 
@@ -1887,28 +1900,28 @@ def test_restart_bridge_stops_existing_listener_before_relaunch(tmp_path: Path) 
             started = True
             bridge_socket.write_text("fresh", encoding="utf-8")
 
-    original_bridge_socket_path = module.bridge_socket_path
-    original_bridge_log_path = module.bridge_log_path
-    original_stop = module.stop_existing_bridge_app_servers
-    original_can_connect = module.can_connect_app_server_socket
+    original_bridge_socket_path = appserver.bridge_socket_path
+    original_bridge_log_path = appserver.bridge_log_path
+    original_stop = appserver.stop_existing_bridge_app_servers
+    original_can_connect = appserver.can_connect_app_server_socket
     original_popen = module.subprocess.Popen
     original_codex_bin = module.codex_bin
     try:
-        module.bridge_socket_path = lambda: bridge_socket
-        module.bridge_log_path = lambda: tmp_path / "rvf-app-server.log"
-        module.stop_existing_bridge_app_servers = lambda path: calls.append(
+        appserver.bridge_socket_path = lambda: bridge_socket
+        appserver.bridge_log_path = lambda: tmp_path / "rvf-app-server.log"
+        appserver.stop_existing_bridge_app_servers = lambda path: calls.append(
             ("stop", path)
         ) or {"pids": [111], "stopped": [111], "failed": [], "still_running": []}
-        module.can_connect_app_server_socket = lambda path: started and path == bridge_socket
+        appserver.can_connect_app_server_socket = lambda path: started and path == bridge_socket
         module.subprocess.Popen = FakePopen
         module.codex_bin = lambda: "codex"
 
-        assert module.ensure_bridge_app_server(restart_existing=True) == bridge_socket
+        assert appserver.ensure_bridge_app_server(restart_existing=True) == bridge_socket
     finally:
-        module.bridge_socket_path = original_bridge_socket_path
-        module.bridge_log_path = original_bridge_log_path
-        module.stop_existing_bridge_app_servers = original_stop
-        module.can_connect_app_server_socket = original_can_connect
+        appserver.bridge_socket_path = original_bridge_socket_path
+        appserver.bridge_log_path = original_bridge_log_path
+        appserver.stop_existing_bridge_app_servers = original_stop
+        appserver.can_connect_app_server_socket = original_can_connect
         module.subprocess.Popen = original_popen
         module.codex_bin = original_codex_bin
 
@@ -1938,7 +1951,7 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
             if method == "initialize":
                 return {}
             if self.instance == 1 and method == "thread/fork":
-                raise module.AppServerError(
+                raise appserver.AppServerError(
                     '{"code": -32600, "message": "failed to load configuration: Operation not permitted (os error 1)"}'
                 )
             if method == "thread/fork":
@@ -1979,25 +1992,25 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
         def close(self) -> None:
             pass
 
-    original_client = module.AppServerWebSocket
-    original_select = module.select_app_server_socket
-    original_ensure = module.ensure_bridge_app_server
-    original_probe = module.probe_app_server_socket
-    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
-    original_open = module.maybe_open_fork_in_codex
+    original_client = appserver.AppServerWebSocket
+    original_select = appserver.select_app_server_socket
+    original_ensure = appserver.ensure_bridge_app_server
+    original_probe = appserver.probe_app_server_socket
+    original_sessions_dir = appserver.DEFAULT_CODEX_SESSIONS_DIR
+    original_open = appserver.maybe_open_fork_in_codex
     original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
     original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
     try:
-        module.AppServerWebSocket = FakeClient
-        module.select_app_server_socket = lambda: (
+        appserver.AppServerWebSocket = FakeClient
+        appserver.select_app_server_socket = lambda: (
             first_socket,
             "bridge",
             {"bridge_policy": "auto", "bridge": {"reason": "connect-ok"}},
         )
-        module.ensure_bridge_app_server = lambda restart_existing=False: (
+        appserver.ensure_bridge_app_server = lambda restart_existing=False: (
             retry_socket if restart_existing else first_socket
         )
-        module.probe_app_server_socket = lambda path: {
+        appserver.probe_app_server_socket = lambda path: {
             "path": str(path),
             "exists": True,
             "parent_exists": True,
@@ -2005,8 +2018,8 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
             "connect_ok": True,
             "reason": "connect-ok",
         }
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
-        module.maybe_open_fork_in_codex = lambda _: True
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
+        appserver.maybe_open_fork_in_codex = lambda _: True
         os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "0"
         os.environ["CODEX_RVF_OPEN_GUI_FORK"] = "0"
         result = module.run_app_server_fork(
@@ -2019,12 +2032,12 @@ def test_bridge_app_server_error_restarts_bridge_once(tmp_path: Path) -> None:
             log_path=tmp_path / "hook.json",
         )
     finally:
-        module.AppServerWebSocket = original_client
-        module.select_app_server_socket = original_select
-        module.ensure_bridge_app_server = original_ensure
-        module.probe_app_server_socket = original_probe
-        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
-        module.maybe_open_fork_in_codex = original_open
+        appserver.AppServerWebSocket = original_client
+        appserver.select_app_server_socket = original_select
+        appserver.ensure_bridge_app_server = original_ensure
+        appserver.probe_app_server_socket = original_probe
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        appserver.maybe_open_fork_in_codex = original_open
         if original_timeout is None:
             os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
         else:
@@ -2073,7 +2086,7 @@ def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
                 "transcript_path": str(transcript),
             },
             extra_env={
-                "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
+                "RVF_PROVIDER_HEALTH_CHECK": "0",
                 "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
                 "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
                 "FAKE_CLIENT_CALLS": str(client_calls),
@@ -2440,7 +2453,7 @@ def _dirty_repo_with_units_for_reopen(path: Path) -> Path:
 def _seed_reviewed_run_for_reopen(state: Path, repo: Path, run_id: str) -> str:
     """allocate + lease-release via the diff_tracker CLI so `run_id` leaves
     durable `reviewed` units under `state` log root. Returns repo_key."""
-    diff_tracker = SCRIPT.with_name("diff_tracker.py")
+    diff_tracker = ROOT / "core" / "session_scope_allocation" / "reviewable_unit_diff_tracker.py"
     alloc = subprocess.run(
         [
             sys.executable, str(diff_tracker), "allocate-review-scope",
@@ -2744,7 +2757,7 @@ def test_fork_experiment_missing_desktop_control_prepares_manual_not_continuatio
     home.mkdir(parents=True)
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_"):
             env.pop(name, None)
     env["HOME"] = str(home)
     env["CODEX_RVF_STATE_DIR"] = str(state)
@@ -2778,15 +2791,15 @@ def test_missing_desktop_control_fail_policy_reports(tmp_path: Path) -> None:
     original_state_dir = os.environ.get("CODEX_RVF_STATE_DIR")
     original_bridge_policy = os.environ.get("CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY")
     original_allow_bridge = os.environ.pop("CODEX_RVF_ALLOW_BRIDGE_APP_SERVER", None)
-    original_desktop_socket = module.DEFAULT_APP_SERVER_CONTROL_SOCKET
-    original_bridge_socket_path = module.bridge_socket_path
-    original_ensure_bridge = module.ensure_bridge_app_server
+    original_desktop_socket = appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET
+    original_bridge_socket_path = appserver.bridge_socket_path
+    original_ensure_bridge = appserver.ensure_bridge_app_server
     try:
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = "fail"
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
-        module.bridge_socket_path = lambda: bridge_socket
-        module.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = desktop_socket
+        appserver.bridge_socket_path = lambda: bridge_socket
+        appserver.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
             AssertionError("bridge should not start when policy=fail")
         )
         payload = module.run_codex_fork(
@@ -2810,9 +2823,9 @@ def test_missing_desktop_control_fail_policy_reports(tmp_path: Path) -> None:
             os.environ["CODEX_RVF_BRIDGE_GUI_UNVERIFIED_POLICY"] = original_bridge_policy
         if original_allow_bridge is not None:
             os.environ["CODEX_RVF_ALLOW_BRIDGE_APP_SERVER"] = original_allow_bridge
-        module.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
-        module.bridge_socket_path = original_bridge_socket_path
-        module.ensure_bridge_app_server = original_ensure_bridge
+        appserver.DEFAULT_APP_SERVER_CONTROL_SOCKET = original_desktop_socket
+        appserver.bridge_socket_path = original_bridge_socket_path
+        appserver.ensure_bridge_app_server = original_ensure_bridge
 
     assert "decision" not in payload
     assert payload["continue"] is True
@@ -2826,11 +2839,11 @@ def test_missing_desktop_control_fail_policy_reports(tmp_path: Path) -> None:
 
 def test_fork_session_visibility_waits_only_for_active_session(tmp_path: Path) -> None:
     module = load_hook_module()
-    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_sessions_dir = appserver.DEFAULT_CODEX_SESSIONS_DIR
     try:
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         active_path = (
-            module.DEFAULT_CODEX_SESSIONS_DIR
+            appserver.DEFAULT_CODEX_SESSIONS_DIR
             / "2026"
             / "04"
             / "26"
@@ -2839,13 +2852,13 @@ def test_fork_session_visibility_waits_only_for_active_session(tmp_path: Path) -
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text("{}\n", encoding="utf-8")
 
-        active = module.fork_session_visibility("fork-visible", str(active_path))
+        active = appserver.fork_session_visibility("fork-visible", str(active_path))
         assert active["location"] == "active"
         assert active["hinted_exists"] is True
         assert str(active_path) in active["active_paths"]
 
         active_path.unlink()
-        missing = module.wait_for_fork_session_visibility(
+        missing = appserver.wait_for_fork_session_visibility(
             "fork-visible",
             str(active_path),
             timeout_seconds=0,
@@ -2853,7 +2866,7 @@ def test_fork_session_visibility_waits_only_for_active_session(tmp_path: Path) -
         assert missing["location"] == "missing"
         assert missing["active_paths"] == []
     finally:
-        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
 
 
 def test_app_server_fork_waits_for_session_file_before_deeplink(tmp_path: Path) -> None:
@@ -2909,18 +2922,18 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp_path: Path) 
         def close(self) -> None:
             pass
 
-    original_client = module.AppServerWebSocket
-    original_select = module.select_app_server_socket
-    original_open = module.maybe_open_fork_in_codex
-    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_client = appserver.AppServerWebSocket
+    original_select = appserver.select_app_server_socket
+    original_open = appserver.maybe_open_fork_in_codex
+    original_sessions_dir = appserver.DEFAULT_CODEX_SESSIONS_DIR
     original_platform = module.sys.platform
     original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
     original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
     original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
     try:
-        module.AppServerWebSocket = FakeClient
-        module.select_app_server_socket = lambda: (socket_path, "bridge", {})
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
+        appserver.AppServerWebSocket = FakeClient
+        appserver.select_app_server_socket = lambda: (socket_path, "bridge", {})
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         module.sys.platform = "darwin"
 
         def fake_open(thread_id: str) -> bool:
@@ -2929,7 +2942,7 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp_path: Path) 
             assert active_path.exists()
             return True
 
-        module.maybe_open_fork_in_codex = fake_open
+        appserver.maybe_open_fork_in_codex = fake_open
         os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "1"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "2"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0"
@@ -2943,10 +2956,10 @@ def test_app_server_fork_waits_for_session_file_before_deeplink(tmp_path: Path) 
             log_path=tmp_path / "hook.json",
         )
     finally:
-        module.AppServerWebSocket = original_client
-        module.select_app_server_socket = original_select
-        module.maybe_open_fork_in_codex = original_open
-        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        appserver.AppServerWebSocket = original_client
+        appserver.select_app_server_socket = original_select
+        appserver.maybe_open_fork_in_codex = original_open
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
         module.sys.platform = original_platform
         if original_timeout is None:
             os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
@@ -3022,18 +3035,18 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
         def close(self) -> None:
             pass
 
-    original_client = module.AppServerWebSocket
-    original_select = module.select_app_server_socket
-    original_open = module.maybe_open_fork_in_codex
-    original_sessions_dir = module.DEFAULT_CODEX_SESSIONS_DIR
+    original_client = appserver.AppServerWebSocket
+    original_select = appserver.select_app_server_socket
+    original_open = appserver.maybe_open_fork_in_codex
+    original_sessions_dir = appserver.DEFAULT_CODEX_SESSIONS_DIR
     original_platform = module.sys.platform
     original_timeout = os.environ.get("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS")
     original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
     original_open_delay = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS")
     try:
-        module.AppServerWebSocket = FakeClient
-        module.select_app_server_socket = lambda: (socket_path, "desktop-control", {})
-        module.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
+        appserver.AppServerWebSocket = FakeClient
+        appserver.select_app_server_socket = lambda: (socket_path, "desktop-control", {})
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = tmp_path / "sessions"
         module.sys.platform = "darwin"
 
         def fake_open(thread_id: str) -> bool:
@@ -3042,7 +3055,7 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
             assert not missing_path.exists()
             return True
 
-        module.maybe_open_fork_in_codex = fake_open
+        appserver.maybe_open_fork_in_codex = fake_open
         os.environ["CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS"] = "0"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "1"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0"
@@ -3056,10 +3069,10 @@ def test_desktop_control_fork_requires_active_session_for_verified_gui(
             log_path=tmp_path / "hook.json",
         )
     finally:
-        module.AppServerWebSocket = original_client
-        module.select_app_server_socket = original_select
-        module.maybe_open_fork_in_codex = original_open
-        module.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
+        appserver.AppServerWebSocket = original_client
+        appserver.select_app_server_socket = original_select
+        appserver.maybe_open_fork_in_codex = original_open
+        appserver.DEFAULT_CODEX_SESSIONS_DIR = original_sessions_dir
         module.sys.platform = original_platform
         if original_timeout is None:
             os.environ.pop("CODEX_RVF_FORK_VISIBILITY_TIMEOUT_SECONDS", None)
@@ -3137,7 +3150,7 @@ def test_open_gui_fork_disabled_skips_retry_sleep(tmp_path: Path) -> None:
         os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
 
-        result = module.open_fork_in_codex_with_retries("fork-disabled")
+        result = appserver.open_fork_in_codex_with_retries("fork-disabled")
     finally:
         module.time.sleep = original_sleep
         if original_open_gui is None:
@@ -3163,7 +3176,7 @@ def test_open_gui_fork_success_stops_retries(tmp_path: Path) -> None:
     module = load_hook_module()
     calls: list[str] = []
     original_sleep = module.time.sleep
-    original_open = module.maybe_open_fork_in_codex
+    original_open = appserver.maybe_open_fork_in_codex
     original_platform = module.sys.platform
     original_open_gui = os.environ.get("CODEX_RVF_OPEN_GUI_FORK")
     original_open_attempts = os.environ.get("CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS")
@@ -3171,15 +3184,15 @@ def test_open_gui_fork_success_stops_retries(tmp_path: Path) -> None:
     try:
         module.time.sleep = lambda delay: calls.append(f"sleep:{delay}")
         module.sys.platform = "darwin"
-        module.maybe_open_fork_in_codex = lambda thread_id: calls.append(thread_id) or True
+        appserver.maybe_open_fork_in_codex = lambda thread_id: calls.append(thread_id) or True
         os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
         os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
 
-        result = module.open_fork_in_codex_with_retries("fork-success")
+        result = appserver.open_fork_in_codex_with_retries("fork-success")
     finally:
         module.time.sleep = original_sleep
-        module.maybe_open_fork_in_codex = original_open
+        appserver.maybe_open_fork_in_codex = original_open
         module.sys.platform = original_platform
         if original_open_gui is None:
             os.environ.pop("CODEX_RVF_OPEN_GUI_FORK", None)
@@ -3214,7 +3227,7 @@ def test_open_gui_fork_unsupported_platform_skips_retry_sleep(tmp_path: Path) ->
         os.environ["CODEX_RVF_OPEN_GUI_FORK_ATTEMPTS"] = "3"
         os.environ["CODEX_RVF_OPEN_GUI_FORK_RETRY_DELAY_SECONDS"] = "0.75"
 
-        result = module.open_fork_in_codex_with_retries("fork-unsupported")
+        result = appserver.open_fork_in_codex_with_retries("fork-unsupported")
     finally:
         module.time.sleep = original_sleep
         module.sys.platform = original_platform
@@ -3332,7 +3345,7 @@ def invoke_ups(event: dict[str, object], *, state_dir: Path) -> None:
     drift that would silently turn a committed-round test into a no-op."""
     env = os.environ.copy()
     for name in tuple(env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             env.pop(name, None)
     env.pop("CODEX_THREAD_ID", None)
     env["CODEX_RVF_STATE_DIR"] = str(state_dir)
@@ -3527,7 +3540,7 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
     seal_script = SCRIPT.with_name("seal_round_baseline_to_head.py")
     seal_env = os.environ.copy()
     for name in tuple(seal_env):
-        if name.startswith("CODEX_RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
             seal_env.pop(name, None)
     seal_env["CODEX_RVF_STATE_DIR"] = str(state)
     seal_env["RVF_SESSION_ID"] = session_id
@@ -4040,7 +4053,7 @@ def test_handoff_advisory_marker_records_kanban_followup(tmp_path: Path) -> None
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     summary = summary_from_payload(payload)
@@ -4123,7 +4136,7 @@ def test_handoff_advisory_launches_detached_analyze_thread(tmp_path: Path) -> No
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
         )[0]
@@ -4179,7 +4192,7 @@ def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
             },
         )[0]
@@ -4191,8 +4204,8 @@ def test_analyze_thread_env_sets_suppress_stop_hook(tmp_path: Path) -> None:
     assert call["analyze_thread"] == "1"
     # 同样把 export 烘进 tmux 内 shell，保证不依赖 tmux server env。
     shell_command = call["argv"][4]
-    assert "export CODEX_RVF_SUPPRESS_STOP_HOOK=1" in shell_command
-    assert "export CODEX_RVF_ANALYZE_THREAD=1" in shell_command
+    assert "export RVF_SUPPRESS_STOP_HOOK=1" in shell_command
+    assert "export RVF_ANALYZE_THREAD=1" in shell_command
 
 
 def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
@@ -4209,8 +4222,8 @@ def test_analyze_thread_self_stop_is_suppressed(tmp_path: Path) -> None:
         },
         state_dir=state,
         extra_env={
-            "CODEX_RVF_ANALYZE_THREAD": "1",
-            "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+            "RVF_ANALYZE_THREAD": "1",
+            "RVF_TMUX_BIN": str(fake_tmux),
             "FAKE_TMUX_CALLS": str(tmux_calls),
         },
     )
@@ -4246,7 +4259,7 @@ def test_analyze_thread_idempotent_when_session_exists(tmp_path: Path) -> None:
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "1",
                 "FAKE_TMUX_STDERR": "duplicate session: rvf-analyze-rvf-child",
@@ -4286,7 +4299,7 @@ def test_analyze_thread_launch_failure_does_not_break_handoff(tmp_path: Path) ->
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_TMUX_BIN": str(fake_tmux),
+                "RVF_TMUX_BIN": str(fake_tmux),
                 "FAKE_TMUX_CALLS": str(tmux_calls),
                 "FAKE_TMUX_RETURNCODE": "3",
                 "FAKE_TMUX_STDERR": "tmux: command failed for unknown reason",
@@ -4322,7 +4335,7 @@ def test_handoff_advisory_records_notify_failure(tmp_path: Path) -> None:
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     # 通知失败不阻断 run；handoff 仍被认定 ready（continue=True），但记为 warning。
@@ -4364,8 +4377,8 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
             },
             state_dir=state,
             extra_env={
-                "CODEX_RVF_SUPPRESS_STOP_HOOK": "1",
-                "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+                "RVF_SUPPRESS_STOP_HOOK": "1",
+                "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
             },
         )[0]
     )
@@ -4396,7 +4409,7 @@ def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
         )[0]
     )
     assert payload["continue"] is True
@@ -4890,8 +4903,8 @@ def test_kanban_followup_stranded_sweep_skips_alive_session(tmp_path: Path) -> N
     notify_log = tmp_path / "notify.log"
     notifier = _logging_notifier(tmp_path / "fake_notifier.py", notify_log)
     extra = {
-        "CODEX_RVF_PROVIDER_HEALTH_CHECK": "0",
-        "CODEX_RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+        "RVF_PROVIDER_HEALTH_CHECK": "0",
+        "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
         "NOTIFY_LOG": str(notify_log),
         "CODEX_RVF_CLINE_KANBAN_CLIENT": str(fake_client),
         "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
@@ -4936,7 +4949,7 @@ def main() -> int:
         test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui,
         test_parent_thread_name_from_app_server_reads_thread_name,
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
-        test_diagnose_codex_fork_dry_run_writes_requests,
+        test_diagnose_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
         test_codex_goal_mode_skips_direct_stop_hook,
         test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook,
@@ -5103,18 +5116,18 @@ def main() -> int:
             if args.shard_count <= 1 or index % args.shard_count == args.shard_index
         ]
         for test in selected:
-            codex_rvf_env = {
+            rvf_env_snapshot = {
                 key: value
                 for key, value in os.environ.items()
-                if key.startswith("CODEX_RVF_")
+                if key.startswith("CODEX_RVF_") or key.startswith("RVF_")
             }
             try:
                 test(root / test.__name__)
             finally:
                 for key in tuple(os.environ):
-                    if key.startswith("CODEX_RVF_"):
+                    if key.startswith("CODEX_RVF_") or key.startswith("RVF_"):
                         os.environ.pop(key, None)
-                os.environ.update(codex_rvf_env)
+                os.environ.update(rvf_env_snapshot)
     suffix = (
         f" shard {args.shard_index + 1}/{args.shard_count}"
         if args.shard_count > 1

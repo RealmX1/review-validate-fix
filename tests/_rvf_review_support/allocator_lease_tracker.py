@@ -77,7 +77,7 @@ def _alloc_invoke(
     completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False, timeout=timeout)
     if completed.returncode != 0:
         raise AssertionError(
-            f"diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
+            f"reviewable_unit_diff_tracker.py allocate-review-scope failed (exit {completed.returncode}):\n"
             f"stdout=\n{completed.stdout}\nstderr=\n{completed.stderr}"
         )
     last_line = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else "{}"
@@ -312,10 +312,10 @@ def test_allocate_review_scope_concurrent_writers_serialize(tmp: Path) -> None:
     log_root = tmp / "logs"
     snippet = (
         "import os, sys, time, json\n"
-        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from pathlib import Path\n"
-        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import diff_tracker as dt\n"
+        "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"repo = Path({str(repo)!r})\n"
         "session = sys.argv[1]\n"
@@ -838,7 +838,7 @@ def test_allocate_review_scope_disable_env_short_circuits(tmp: Path) -> None:
         session_id="sess-disable",
         run_id="run-disable",
         output_scope=tmp / "scope.json",
-        extra_env={"CODEX_RVF_TRACKER_DISABLE": "1"},
+        extra_env={"RVF_TRACKER_DISABLE": "1"},
     )
     assert result["status"] == "disabled"
     assert not (tmp / "scope.json").exists()
@@ -872,7 +872,7 @@ def test_allocate_review_scope_busy_timeout_degrades(tmp: Path) -> None:
             session_id="sess-busy",
             run_id="run-busy",
             output_scope=tmp / "busy.json",
-            extra_env={"CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS": "300"},
+            extra_env={"RVF_TRACKER_BUSY_TIMEOUT_MS": "300"},
             timeout=30.0,
         )
     finally:
@@ -1815,7 +1815,7 @@ def _run_reviewer_with_lease(
         max_runtime_seconds=max_runtime_seconds,
         output_format=output_format,
     )
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
     return subprocess.run(
         [
             sys.executable,
@@ -1909,7 +1909,7 @@ def test_run_alternative_reviewer_shared_lease_does_not_release_on_exit(tmp: Pat
         idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
     )
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
     completed = subprocess.run(
         [
             sys.executable,
@@ -1994,7 +1994,7 @@ def test_run_alternative_reviewer_sigterm_kills_child_before_release(tmp: Path) 
         activity_check_interval_seconds=0.05,
         max_runtime_seconds=60,
     )
-    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "CODEX_RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -2051,10 +2051,10 @@ def test_lease_acquire_concurrent_writers_serialize(tmp: Path) -> None:
     _module, repo, log_root, unit_ids, _repo_key = _lease_seed(tmp)
     snippet = (
         "import json, os, sys, time\n"
-        f"sys.path.insert(0, {str(SCRIPT_DIR)!r})\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
         "from pathlib import Path\n"
-        "os.environ.setdefault('CODEX_RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
-        "import diff_tracker as dt\n"
+        "os.environ.setdefault('RVF_TRACKER_BUSY_TIMEOUT_MS', '30000')\n"
+        "import core.session_scope_allocation.reviewable_unit_diff_tracker as dt\n"
         f"repo = Path({str(repo)!r})\n"
         f"log_root = Path({str(log_root)!r})\n"
         f"unit_id = {unit_ids[0]!r}\n"

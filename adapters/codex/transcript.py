@@ -7,15 +7,13 @@ Codex 把 ``apply_patch`` 调用走 ``custom_tool_call`` (``payload.input``)；
 ``exec_command`` 等仍走 ``function_call`` (``payload.arguments``)；两条路径都识别。
 output 既可能是 ``function_call_output`` 也可能是 ``custom_tool_call_output``。
 
-``apply_patch`` patch-text 解析 helper（``_codex_parse_apply_patch_fallback`` /
-``_patch_lines_for_op`` / ``_patch_op_name`` / ``_extract_apply_patch_from_bash``）
-是 Codex 原生格式，Claude adapter 的 Bash ``apply_patch`` 检测复用它们。
+``apply_patch`` custom-format patch-text 的纯文本解析 helper 已上提到
+``core.transcript.patch_parsing``（host-中性：Codex rollout 与 Claude Bash 共用）。
 """
 
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +28,13 @@ from core.transcript.io import (  # noqa: E402
     _truncate,
 )
 from core.transcript.models import TranscriptRecord  # noqa: E402
-from session_manifest import parse_apply_patch  # noqa: E402
+from core.transcript.patch_parsing import (  # noqa: E402
+    apply_patch_hunk_line_range_for_path,
+    apply_patch_operation_to_artifact_verb,
+    parse_apply_patch_operations_without_repo,
+)
+from session_label import text_from_message_payload  # noqa: E402 — S9b：Codex rollout user-message 文本抽取（leaf, stdlib-only，无环）
+from core.session_scope_allocation.session_change_manifest import parse_apply_patch  # noqa: E402
 
 
 def read_codex_originator(rollout_path: Path) -> str | None:
@@ -65,93 +69,6 @@ def read_codex_originator(rollout_path: Path) -> str | None:
                 return None
     except OSError:
         return None
-    return None
-
-
-def _codex_parse_apply_patch_fallback(patch_text: str, line_number: int) -> tuple[list[dict[str, Any]], set[str]]:
-    """Repo-less Codex apply_patch parser; mirrors session_manifest.parse_apply_patch
-    shape but skips path normalization. Codex-specific patch text format
-    (``*** Add File: ...`` / ``*** Update File: ...``).
-    """
-    operations: list[dict[str, Any]] = []
-    paths: set[str] = set()
-    for raw_line in patch_text.splitlines():
-        for prefix, op in (
-            ("*** Add File: ", "add"),
-            ("*** Delete File: ", "delete"),
-            ("*** Update File: ", "update"),
-        ):
-            if raw_line.startswith(prefix):
-                rel = raw_line.removeprefix(prefix).strip()
-                if rel:
-                    operations.append({"operation": op, "path": rel, "line_number": line_number})
-                    paths.add(rel)
-                break
-    return operations, paths
-
-
-def _patch_lines_for_op(patch_text: str, path: str | None) -> list[int]:
-    """从 apply_patch 文本中提取该 path 下首段 hunk 的 @@ -X,Y +A,B @@ 中的 A 与 A+B-1。"""
-    if not path:
-        return []
-    in_path = False
-    for raw_line in patch_text.splitlines():
-        if raw_line.startswith("*** ") and "File:" in raw_line:
-            in_path = raw_line.endswith(": " + path) or raw_line.endswith(":" + path) or raw_line.endswith(path)
-            continue
-        if not in_path:
-            continue
-        if raw_line.startswith("@@"):
-            try:
-                # @@ -a,b +c,d @@
-                parts = raw_line.split(" ")
-                plus = next(p for p in parts if p.startswith("+"))
-                plus = plus.lstrip("+")
-                if "," in plus:
-                    start_str, length_str = plus.split(",", 1)
-                    start = int(start_str)
-                    length = int(length_str)
-                    return [start, start + max(length, 1) - 1]
-                return [int(plus), int(plus)]
-            except (StopIteration, ValueError):
-                continue
-    return []
-
-
-def _patch_op_name(operation: str | None) -> str:
-    if operation == "add":
-        return "create"
-    if operation == "delete":
-        return "delete"
-    return "edit"
-
-
-_HEREDOC_RE = re.compile(
-    r"<<\s*['\"]?(?P<token>[A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\n(?P<body>.*?)\n(?P=token)\s*$",
-    re.DOTALL | re.MULTILINE,
-)
-
-
-def _extract_apply_patch_from_bash(command: str) -> str | None:
-    """从 Bash ``apply_patch`` 调用中抽出 patch 文本。
-
-    支持两种形式：
-    - heredoc: ``apply_patch <<'EOF'\n*** Begin Patch...\nEOF``
-    - 内联 stdin: ``apply_patch '*** Begin Patch...\n*** End Patch'``
-    无 ``apply_patch`` 关键字 → 返回 None。
-    """
-    if "apply_patch" not in command:
-        return None
-    match = _HEREDOC_RE.search(command)
-    if match:
-        body = match.group("body")
-        if "*** Begin Patch" in body or "*** Add File:" in body or "*** Update File:" in body or "*** Delete File:" in body:
-            return body
-    if "*** Begin Patch" in command:
-        start = command.find("*** Begin Patch")
-        end = command.rfind("*** End Patch")
-        if end > start:
-            return command[start:end + len("*** End Patch")]
     return None
 
 
@@ -264,13 +181,13 @@ def _distill_codex_record(
                     if repo is not None:
                         ops, _ = parse_apply_patch(repo, patch_text, line_number)
                     else:
-                        ops, _ = _codex_parse_apply_patch_fallback(patch_text, line_number)
+                        ops, _ = parse_apply_patch_operations_without_repo(patch_text, line_number)
                     for op in ops:
                         artifact_refs.append(
                             {
                                 "path": op.get("path"),
-                                "lines": _patch_lines_for_op(patch_text, op.get("path")),
-                                "op": _patch_op_name(op.get("operation")),
+                                "lines": apply_patch_hunk_line_range_for_path(patch_text, op.get("path")),
+                                "op": apply_patch_operation_to_artifact_verb(op.get("operation")),
                             }
                         )
                     summary_parts.append(
@@ -358,3 +275,279 @@ def distill_codex_jsonl(
         "kind_counts": counts,
     }
     return distilled, index
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S9b：Codex rollout / goal-mode 解析缝（从共享审查引擎抽出）
+#
+# Codex rollout JSONL 的逐行解析（latest_user_message / user_messages_containing）、
+# session_meta 读取（session_meta_from_path / session_id_from_path）、以及 /goal
+# mode 扫描（codex_goal_mode_context_from_event 及其私有 helper）属 Codex-specific，
+# 落在此 Codex transcript adapter。共享审查引擎经
+# ``from adapters.codex.transcript import (...)`` re-import 下列入口委派执行。
+#
+# 本 adapter 只 import stdlib + ``session_label``（leaf, stdlib-only）；绝不 import
+# 引擎，杜绝 ``adapters → engine`` 循环。下面三个 host-中性符号
+# （``SESSION_PATH_KEYS`` / ``event_session_paths`` / ``source_marks_subagent``）
+# 本应住 core/；S9b 阶段引擎尚未进 core/，故按本仓既有惯例（router / dispatcher /
+# rvf_handoff / rvf_analyze_advisory / rvf_analyze_thread 各自 inline 一份
+# SESSION_PATH_KEYS 以避免循环 import）在此自带副本，与
+# ``codex_stop_review_validate_fix.SESSION_PATH_KEYS`` 保持一致；待 S10 中性体迁
+# core/ 后统一上提共享。
+# ─────────────────────────────────────────────────────────────────────────────
+
+SESSION_PATH_KEYS = (
+    "transcript_path",
+    "session_path",
+    "conversation_path",
+    "log_path",
+    "session_file",
+)
+
+
+def event_session_paths(event: dict[str, Any]) -> list[Path]:
+    paths: list[Path] = []
+    for key in SESSION_PATH_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            paths.append(Path(value))
+    return paths
+
+
+def source_marks_subagent(source: Any) -> bool:
+    return isinstance(source, dict) and isinstance(source.get("subagent"), dict)
+
+
+CODEX_GOAL_CONTINUATION_MARKER = "Continue working toward the active thread goal"
+CODEX_GOAL_INCOMPLETE_STATUSES = {
+    "active",
+    "paused",
+    "budgetlimited",
+    "budget_limited",
+    "budget-limited",
+}
+
+
+def latest_user_message(path: Path) -> str | None:
+    latest: str | None = None
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    if isinstance(message, str):
+                        latest = message
+                    continue
+
+                if record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+                        if text:
+                            latest = text
+    except OSError:
+        return None
+    return latest
+
+
+def user_messages_containing(path: Path, marker: str) -> list[str]:
+    messages: list[str] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                text = ""
+                if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+                    message = payload.get("message")
+                    text = message if isinstance(message, str) else ""
+                elif record.get("type") == "response_item":
+                    if payload.get("type") == "message" and payload.get("role") == "user":
+                        text = text_from_message_payload(payload)
+
+                if marker in text:
+                    messages.append(text)
+    except OSError:
+        return []
+    return messages
+
+
+def session_id_from_path(path: Path) -> str | None:
+    meta = session_meta_from_path(path)
+    value = meta.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def session_meta_from_path(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for _ in range(20):
+                line = handle.readline()
+                if not line:
+                    return {}
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                return payload if isinstance(payload, dict) else {}
+    except (OSError, UnicodeDecodeError):
+        return {}
+    return {}
+
+
+def _normalized_goal_status(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().replace(" ", "").replace("-", "").replace("_", "").lower()
+
+
+def _goal_status_from_mapping(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    goal = value.get("goal")
+    if isinstance(goal, dict):
+        status = _normalized_goal_status(goal.get("status"))
+        if status is not None:
+            return status
+    return _normalized_goal_status(
+        value.get("goal_status")
+        or value.get("goalStatus")
+        or value.get("thread_goal_status")
+        or value.get("threadGoalStatus")
+    )
+
+
+def _goal_status_from_text(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return _goal_status_from_mapping(parsed)
+
+
+def _record_goal_status(payload: Any) -> str | None:
+    status = _goal_status_from_mapping(payload)
+    if status is not None:
+        return status
+    if not isinstance(payload, dict):
+        return None
+    return _goal_status_from_text(payload.get("output"))
+
+
+def _record_text_contains_goal_continuation(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("role") != "developer":
+        return False
+    for key in ("content", "message", "text"):
+        value = payload.get(key)
+        if isinstance(value, str) and CODEX_GOAL_CONTINUATION_MARKER in value:
+            return True
+        if isinstance(value, list):
+            for item in value:
+                if (
+                    isinstance(item, dict)
+                    and isinstance(item.get("text"), str)
+                    and CODEX_GOAL_CONTINUATION_MARKER in item["text"]
+                ):
+                    return True
+    return False
+
+
+def _codex_session_meta_details(path: Path) -> dict[str, Any]:
+    meta = session_meta_from_path(path)
+    source = meta.get("source")
+    originator = meta.get("originator")
+    cli_version = meta.get("cli_version")
+    codex_originator = isinstance(originator, str) and "codex" in originator.lower()
+    return {
+        "is_codex": codex_originator or isinstance(cli_version, str),
+        "is_subagent": source_marks_subagent(source),
+        "originator": originator if isinstance(originator, str) else None,
+        "cli_version": cli_version if isinstance(cli_version, str) else None,
+    }
+
+
+def _scan_codex_goal_transcript(path: Path) -> dict[str, Any]:
+    latest_status: str | None = None
+    has_goal_continuation = False
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = record.get("payload")
+                status = _record_goal_status(payload)
+                if status is not None:
+                    latest_status = status
+                if _record_text_contains_goal_continuation(payload):
+                    has_goal_continuation = True
+    except (OSError, UnicodeDecodeError):
+        return {
+            "readable": False,
+            "latest_goal_status": None,
+            "has_goal_continuation": False,
+        }
+    return {
+        "readable": True,
+        "latest_goal_status": latest_status,
+        "has_goal_continuation": has_goal_continuation,
+    }
+
+
+def codex_goal_mode_context_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Temporary stop-hook guard: skip RVF while a Codex main session is in /goal."""
+    if source_marks_subagent(event.get("source")):
+        return None
+
+    for path in event_session_paths(event):
+        try:
+            resolved = path.expanduser().resolve()
+        except OSError:
+            continue
+        if not resolved.is_file():
+            continue
+
+        meta_details = _codex_session_meta_details(resolved)
+        if not meta_details["is_codex"] or meta_details["is_subagent"]:
+            continue
+
+        goal_scan = _scan_codex_goal_transcript(resolved)
+        latest_status = goal_scan.get("latest_goal_status")
+        if isinstance(latest_status, str):
+            if latest_status not in CODEX_GOAL_INCOMPLETE_STATUSES:
+                continue
+        elif not goal_scan.get("has_goal_continuation"):
+            continue
+
+        return {
+            "transcript_path": str(resolved),
+            "goal_status": latest_status,
+            "goal_continuation_marker": bool(goal_scan.get("has_goal_continuation")),
+            "codex_originator": meta_details.get("originator"),
+            "codex_cli_version": meta_details.get("cli_version"),
+            "temporary_fix": True,
+        }
+    return None

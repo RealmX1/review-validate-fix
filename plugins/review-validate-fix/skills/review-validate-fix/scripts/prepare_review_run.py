@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import concurrent.futures
-import diff_tracker
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
-from rvf_logging import normalize_rvf_backend, rvf_state_fields, start_run
-from trajectory_distill import HOST_CODEX, detect_transcript_format
+from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
+from core.session_scope_allocation import reviewable_unit_diff_tracker
+from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
 
 
 # 合法的主 dispatch harness（与 dispatch_reviewers / reviewer-registry 对齐）。
@@ -40,7 +41,11 @@ TARGET_FLOW_BACKEND = {
 SKILL_DIR = Path(__file__).resolve().parents[1]
 BUILD_PACKET = SKILL_DIR / "scripts" / "build_review_packet.py"
 WORKSPACE_SNAPSHOT = SKILL_DIR / "scripts" / "workspace_snapshot.py"
-SESSION_MANIFEST = SKILL_DIR / "scripts" / "session_manifest.py"
+# session_change_manifest 已迁入 core/session_scope_allocation/（去-codex S10c）；作为子进程
+# 直接调用，路径取自其同包邻居 reviewable_unit_diff_tracker 的 __file__（depth-robust，repo /
+# 部署 payload / worktree 同口径，免固定 parents[N]）。常量沿用 SESSION_MANIFEST 助记名（同
+# BUILD_PACKET 约定）。
+SESSION_MANIFEST = Path(reviewable_unit_diff_tracker.__file__).resolve().parent / "session_change_manifest.py"
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
@@ -115,8 +120,6 @@ def review_env_exports(
         "RVF_CHECK_REVIEW_RESULT": str(CHECK_REVIEW_RESULT),
         "RVF_REVIEW_RESULT": str(artifacts_dir / "reviewers" / "reviewer" / "review-result.json"),
         "CODEX_RVF_LOG_ROOT": str(log_root),
-        "CODEX_RVF_RUN_ID": run_id,
-        "CODEX_RVF_RUN_DIR": str(run_dir),
     }
     if main_harness:
         env["RVF_MAIN_HARNESS"] = main_harness
@@ -147,8 +150,6 @@ def review_env_exports(
         f"export RVF_RUN_ID={shlex.quote(env['RVF_RUN_ID'])}",
         f"export RVF_RUN_DIR={shlex.quote(env['RVF_RUN_DIR'])}",
         f"export CODEX_RVF_LOG_ROOT={shlex.quote(env['CODEX_RVF_LOG_ROOT'])}",
-        'export CODEX_RVF_RUN_ID="$RVF_RUN_ID"',
-        'export CODEX_RVF_RUN_DIR="$RVF_RUN_DIR"',
     ]
     if artifacts_dir == run_dir / "artifacts":
         lines.append('export RVF_ARTIFACTS_DIR="$RVF_RUN_DIR/artifacts"')
@@ -866,7 +867,7 @@ def prepare_run(
                 heartbeat_session = tracker_meta.get("session_id") or manifest_payload.get("session_id")
                 if isinstance(heartbeat_session, str) and heartbeat_session:
                     try:
-                        diff_tracker.heartbeat(
+                        reviewable_unit_diff_tracker.heartbeat(
                             root,
                             session_id=heartbeat_session,
                             run_id=ledger.run_id,

@@ -8,7 +8,7 @@ Use this only when an RVF script fails, the user asks for runtime debugging, or 
 2. Inspect `events.jsonl` in the same run directory if the summary is insufficient.
 3. Prefer deterministic diagnostic scripts over reading runtime code:
    - Stop hook scope: `scripts/diagnose_stop_hook_scope.py --summary <summary.json>`
-   - Codex fork / GUI path: `scripts/diagnose_codex_fork.py`
+   - Codex fork / GUI path: `scripts/diagnose_fork.py`
    - Cancel stuck run: `scripts/cancel_rvf_run.py`
 
 ## When More Context Is Needed

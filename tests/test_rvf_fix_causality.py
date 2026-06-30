@@ -159,7 +159,7 @@ def _upsert_issue(repo: Path, run_dir: Path, issue_file: Path, log_root: Path) -
 
 
 def test_diff_tracker_creates_and_migrates_rvf_causality_tables(tmp_path: Path) -> None:
-    diff_tracker = _load("diff_tracker")
+    diff_tracker = _load("reviewable_unit_diff_tracker")
     db_path = tmp_path / "tracker.sqlite3"
     conn = diff_tracker._open_conn(db_path)
     try:

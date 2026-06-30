@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import diff_tracker
 from cursor_stream_tool_layer_health import classify_cursor_tool_call_outcome
-from rvf_logging import start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import start_run  # noqa: E402
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -38,7 +39,7 @@ DEFAULT_ACTIVITY_PROBE_FAILURE_THRESHOLD = 3
 DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float | None = None
 DEFAULT_LEASE_HEARTBEAT_SECONDS = 60.0
-LEASE_HEARTBEAT_ENV = "CODEX_RVF_LEASE_HEARTBEAT_SECONDS"
+LEASE_HEARTBEAT_ENV = "RVF_LEASE_HEARTBEAT_SECONDS"
 EXTERNAL_REVIEWER_TIMEOUT_FLAG = "RVF_EXTERNAL_REVIEWER_TIMEOUT"
 EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE = 124
 # reviewer 背后的 agentic/coding 订阅额度耗尽（usage limit / quota exhausted）专用退出码 + flag。
@@ -69,7 +70,7 @@ OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
 OUTPUT_FORMAT_CURSOR_STREAM_JSON = "cursor_stream_json"
-SUPPRESS_STOP_HOOK_ENV = "CODEX_RVF_SUPPRESS_STOP_HOOK"
+SUPPRESS_STOP_HOOK_ENV = "RVF_SUPPRESS_STOP_HOOK"
 SUPPORTED_OUTPUT_FORMATS = {
     OUTPUT_FORMAT_TEXT,
     OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
@@ -509,7 +510,7 @@ class TrackerLeaseRuntime:
         existing = self.scope_contract.get("tracker_lease_id")
         if isinstance(existing, str) and existing:
             self.lease_id = existing
-            result = diff_tracker.lease_participant_join(
+            result = reviewable_unit_diff_tracker.lease_participant_join(
                 repo=self.repo,
                 lease_id=existing,
                 reviewer_id=self.reviewer_id,
@@ -527,7 +528,7 @@ class TrackerLeaseRuntime:
         session_id = tracker_scope.get("source_session_id")
         if not isinstance(session_id, str) or not session_id:
             session_id = os.environ.get("CODEX_SESSION_ID") or "alternative-reviewer"
-        result = diff_tracker.lease_acquire(
+        result = reviewable_unit_diff_tracker.lease_acquire(
             repo=self.repo,
             session_id=session_id,
             run_id=str(self.scope_contract.get("run_id") or self.run_id),
@@ -544,7 +545,7 @@ class TrackerLeaseRuntime:
             raise RuntimeError("tracker lease acquire returned no lease_id")
         self.lease_id = lease_id
         self._owns_lease = True
-        joined = diff_tracker.lease_participant_join(
+        joined = reviewable_unit_diff_tracker.lease_participant_join(
             repo=self.repo,
             lease_id=lease_id,
             reviewer_id=self.reviewer_id,
@@ -582,7 +583,7 @@ class TrackerLeaseRuntime:
         )
         active_participant_count = 0
         if self._participant_joined:
-            result = diff_tracker.lease_participant_finish(
+            result = reviewable_unit_diff_tracker.lease_participant_finish(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reviewer_id=self.reviewer_id,
@@ -595,7 +596,7 @@ class TrackerLeaseRuntime:
         else:
             owning_participant_count = 1 if self._owns_lease else 0
         if self._owns_lease and owning_participant_count > 0 and active_participant_count == 0:
-            diff_tracker.lease_release(
+            reviewable_unit_diff_tracker.lease_release(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reason=reason,
@@ -610,7 +611,7 @@ class TrackerLeaseRuntime:
         assert self.lease_id is not None
         interval = lease_heartbeat_seconds()
         while not self._stop.wait(interval):
-            diff_tracker.lease_participant_refresh(
+            reviewable_unit_diff_tracker.lease_participant_refresh(
                 repo=self.repo,
                 lease_id=self.lease_id,
                 reviewer_id=self.reviewer_id,

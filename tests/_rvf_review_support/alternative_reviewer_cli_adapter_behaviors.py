@@ -1165,7 +1165,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
                 f"#!{sys.executable}",
                 "import json, os, subprocess, sys",
                 "open(%r, 'w', encoding='utf-8').write(json.dumps({"
-                "'suppress': os.environ.get('CODEX_RVF_SUPPRESS_STOP_HOOK'), "
+                "'suppress': os.environ.get('RVF_SUPPRESS_STOP_HOOK'), "
                 "'thread': os.environ.get('CODEX_THREAD_ID')"
                 "}))" % str(sink),
                 "sys.stdin.read()",
@@ -1189,7 +1189,7 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
     env = os.environ.copy()
     env["PATH"] = f"{tmp_path}:{env.get('PATH', '')}"
     env["CODEX_THREAD_ID"] = "parent-thread-id-for-regression-test"
-    env.pop("CODEX_RVF_SUPPRESS_STOP_HOOK", None)
+    env.pop("RVF_SUPPRESS_STOP_HOOK", None)
     completed = subprocess.run(
         [
             sys.executable,

@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rvf_logging import RunLedger, start_run
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 
 
 def fail(message: str, code: int = 1) -> int:

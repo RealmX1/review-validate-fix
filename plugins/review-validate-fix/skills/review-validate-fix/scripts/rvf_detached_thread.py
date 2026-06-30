@@ -50,7 +50,7 @@ _HELPER_PATH = Path(__file__).resolve()
 
 
 def tmux_bin() -> str:
-    return os.environ.get("CODEX_RVF_TMUX_BIN", "tmux")
+    return os.environ.get("RVF_TMUX_BIN", "tmux")
 
 
 def _iso_now() -> str:

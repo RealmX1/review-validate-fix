@@ -13,8 +13,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import diff_tracker
+# 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.session_change_manifest``
+# import、也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里
+# 含 ``core/`` 的 PYROOT 尚不在 ``sys.path``，且 ``_rvf_pyroot.py`` 不在本目录（它在
+# ``scripts/``），无法沿用 scripts 侧「同目录 ``import _rvf_pyroot``」自举。故内联哨兵自举：
+# 自底向上找同时含 ``.rvf-pyroot`` 哨兵与 ``core/`` 的最近祖先（与 ``_rvf_pyroot`` 同口径、
+# depth-robust），把它插入 ``sys.path``，使下面的 ``core.*`` import 在 repo / 部署 payload /
+# worktree / 测试四种上下文走同一条码路。被当作 ``core.*`` import 时 PYROOT 已在 path，幂等无副作用。
+_pyroot_search_start = Path(__file__).resolve()
+for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
+    if (_pyroot_candidate / ".rvf-pyroot").is_file() and (_pyroot_candidate / "core").is_dir():
+        if str(_pyroot_candidate) not in sys.path:
+            sys.path.insert(0, str(_pyroot_candidate))
+        break
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:>>?|1>|2>|&>)\s*(?P<path>[^&|;\s]+)")
@@ -36,13 +48,13 @@ class PatchHunk:
 @dataclass(frozen=True)
 class CurrentHunk:
     path: str
-    anchor: diff_tracker.HunkAnchor
+    anchor: reviewable_unit_diff_tracker.HunkAnchor
     mutations: tuple[str, ...]
 
 
 @dataclass
 class PatchOwnershipCoverage:
-    units: list[tuple[diff_tracker.OwnedUnit, str]]
+    units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]]
     covered_hunks: list[dict[str, Any]]
     path_fallback_hunks: list[dict[str, Any]]
     unresolved_hunks: list[dict[str, Any]]
@@ -690,9 +702,9 @@ def current_diff_hunks(repo: Path, path: str) -> list[CurrentHunk]:
         hunks.append(
             CurrentHunk(
                 path=path,
-                anchor=diff_tracker.HunkAnchor(
-                    header=diff_tracker._normalize_header(pending_header_line),
-                    context_hash=diff_tracker._context_hash(context_lines),
+                anchor=reviewable_unit_diff_tracker.HunkAnchor(
+                    header=reviewable_unit_diff_tracker._normalize_header(pending_header_line),
+                    context_hash=reviewable_unit_diff_tracker._context_hash(context_lines),
                     old_range=old_range,
                     new_range=new_range,
                 ),
@@ -703,7 +715,7 @@ def current_diff_hunks(repo: Path, path: str) -> list[CurrentHunk]:
     for raw_line in diff.splitlines():
         if raw_line.startswith("@@"):
             flush()
-            parsed = diff_tracker._hunk_header_parts(raw_line)
+            parsed = reviewable_unit_diff_tracker._hunk_header_parts(raw_line)
             if parsed is None:
                 pending_header = None
                 pending_header_line = ""
@@ -737,7 +749,7 @@ def live_apply_patch_units(
     *,
     report_unresolved: bool = False,
 ) -> PatchOwnershipCoverage:
-    units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     covered_hunks: list[dict[str, Any]] = []
     path_fallback_hunks: list[dict[str, Any]] = []
     unresolved_hunks: list[dict[str, Any]] = []
@@ -767,7 +779,7 @@ def live_apply_patch_units(
                     seen.add(key)
                     units.append(
                         (
-                            diff_tracker.OwnedUnit(path=path, unit="hunk", hunk_anchor=current_hunk.anchor),
+                            reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="hunk", hunk_anchor=current_hunk.anchor),
                             "apply_patch",
                         )
                     )
@@ -793,7 +805,7 @@ def live_apply_patch_units(
             key = (path, "path", "")
             if key not in seen:
                 seen.add(key)
-                units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "apply_patch"))
+                units.append((reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "apply_patch"))
     return PatchOwnershipCoverage(
         units=units,
         covered_hunks=covered_hunks,
@@ -908,7 +920,7 @@ def build_manifest(
     tracker_watermark: dict[str, Any] = {"status": "skipped"}
     tracker_cutoff_line: int | None = None
     if tracker_enabled and session_id and not include_all_transcript_ownership:
-        tracker_watermark = diff_tracker.latest_transcript_watermark(
+        tracker_watermark = reviewable_unit_diff_tracker.latest_transcript_watermark(
             repo=root,
             session_id=session_id,
             log_root_override=tracker_log_root,
@@ -941,7 +953,7 @@ def build_manifest(
     if committed_baseline:
         try:
             committed_round_set = set(
-                diff_tracker._list_committed_round_changed_paths(
+                reviewable_unit_diff_tracker._list_committed_round_changed_paths(
                     root, committed_baseline, committed_base_ref
                 )
             )
@@ -974,7 +986,7 @@ def build_manifest(
         line_number = record.get("_line_number")
         return isinstance(line_number, int) and line_number > round_window_cutoff_line
 
-    live_owned_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    live_owned_units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     live_exec_paths: set[str] = set()
     included_tool_record_count = 0
     ignored_tool_record_count = 0
@@ -1058,7 +1070,7 @@ def build_manifest(
                         included_tool_line_numbers.append(int(record["_line_number"]))
                     if path in dirty_set:
                         live_owned_units.append(
-                            (diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "claude_write")
+                            (reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "claude_write")
                         )
                 else:
                     ignored_tool_record_count += 1
@@ -1112,7 +1124,7 @@ def build_manifest(
         command_events.append(event)
 
     seen_live_units: set[tuple[str, str, str]] = set()
-    deduped_live_units: list[tuple[diff_tracker.OwnedUnit, str]] = []
+    deduped_live_units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     for owned_unit, evidence in live_owned_units:
         key = (
             owned_unit.path,
@@ -1128,7 +1140,7 @@ def build_manifest(
         if key in seen_live_units:
             continue
         seen_live_units.add(key)
-        deduped_live_units.append((diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "exec_command"))
+        deduped_live_units.append((reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), "exec_command"))
 
     # Committed-round owned paths: paths whose round work lives in this round's
     # commits (clean at HEAD, hence absent from dirty_set). Registered as
@@ -1161,7 +1173,7 @@ def build_manifest(
             continue
         seen_live_units.add(key)
         deduped_live_units.append(
-            (diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), evidence)
+            (reviewable_unit_diff_tracker.OwnedUnit(path=path, unit="path", hunk_anchor=None), evidence)
         )
         committed_round_owned.append(path)
     committed_round_owned_set = set(committed_round_owned)
@@ -1201,12 +1213,12 @@ def build_manifest(
                 "unit": owned_unit.unit,
                 "evidence": evidence,
                 "hunk_anchor": owned_unit.hunk_anchor.to_dict() if owned_unit.hunk_anchor is not None else None,
-                "unit_ids": diff_tracker.unit_ids_for_owned_unit(root, owned_unit),
+                "unit_ids": reviewable_unit_diff_tracker.unit_ids_for_owned_unit(root, owned_unit),
             }
             for owned_unit, evidence in deduped_live_units
             if owned_unit.path in owned_dirty_set
         ]
-        result = diff_tracker.register_claims(
+        result = reviewable_unit_diff_tracker.register_claims(
             repo=root,
             session_id=register_session_id,
             run_id=tracker_run_id,
@@ -1256,7 +1268,7 @@ def build_manifest(
     edit_claim_registration: dict[str, Any] = {"status": "skipped"}
 
     if tracker_enabled and tracker_payload.get("status") == "ok" and edit_claims:
-        edit_claim_registration = diff_tracker.register_edit_claims(
+        edit_claim_registration = reviewable_unit_diff_tracker.register_edit_claims(
             repo=root,
             session_id=session_id or (tracker_run_id or f"transcript-{transcript.name}"),
             run_id=tracker_run_id,

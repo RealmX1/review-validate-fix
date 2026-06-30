@@ -25,7 +25,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import diff_tracker  # noqa: E402
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 from session_label import codex_session_label  # noqa: E402
 
 
@@ -364,7 +365,7 @@ def _enrich_sessions_with_codex_meta(sessions: list[dict[str, Any]], *, cache_di
 
 def collect_snapshot(repo: Path, *, log_root_override: Path | None = None, events_limit: int = 100,
                     include_tombstones: bool = False) -> dict[str, Any]:
-    paths = diff_tracker._lease_repo_paths(repo, log_root_override)
+    paths = reviewable_unit_diff_tracker._lease_repo_paths(repo, log_root_override)
     repo_resolved, key, directory, db_path, events_path, common_dir = paths
     snapshot: dict[str, Any] = {
         "generated_at": _utc_now_iso(),
@@ -395,7 +396,7 @@ def collect_snapshot(repo: Path, *, log_root_override: Path | None = None, event
         snapshot["events"] = _read_events_tail(events_path, events_limit)
         snapshot["counters"] = _compute_counters(snapshot)
         return snapshot
-    conn = diff_tracker._open_conn(db_path)
+    conn = reviewable_unit_diff_tracker._open_conn(db_path)
     try:
         snapshot["meta"] = _read_meta(conn)
         snapshot["branches"] = _fetch_all(conn, "SELECT * FROM branches ORDER BY last_seen_at DESC")
@@ -1382,7 +1383,7 @@ def _main(argv: list[str] | None = None) -> int:
             return 2
         repo = Path(args.repo).expanduser().resolve()
         try:
-            paths = diff_tracker._lease_repo_paths(repo, log_root_override)
+            paths = reviewable_unit_diff_tracker._lease_repo_paths(repo, log_root_override)
             repo_key = paths[1]
         except Exception as exc:
             repo_key = f"<error: {exc}>"
