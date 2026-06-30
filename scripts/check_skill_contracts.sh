@@ -440,6 +440,8 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
   "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
+  "core/provider_health/provider_health_guard.py"
+  "adapters/codex/codex_provider_login.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -521,6 +523,8 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
+  "$repo_root/core/provider_health/provider_health_guard.py" \
+  "$repo_root/adapters/codex/codex_provider_login.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
   "$tests_dir/test_codex_stop_hook_dispatcher.py" \
@@ -975,6 +979,27 @@ require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def session_d
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def cline_kanban_agent_id'
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def detect_host_skip_mode'
 require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
+
+# S10f: provider 健康探测中性内核迁 core/provider_health；codex 登录/二进制发现下沉
+# adapters/codex/codex_provider_login。core runner 经 requirement 的 command 元组 +
+# output_failure_predicate 保持 host-agnostic；codex 特异性（codex_bin / login status /
+# auth-marker / login 拉起）全住 adapter，引擎只 import + 注入 predicate。
+require_repo_file "core/provider_health/provider_health_guard.py"
+require_repo_literal "core/provider_health/provider_health_guard.py" 'class ProviderHealthRequirement'
+require_repo_literal "core/provider_health/provider_health_guard.py" 'output_failure_predicate'
+require_repo_literal "core/provider_health/provider_health_guard.py" 'def run_provider_health_requirement'
+require_repo_file "adapters/codex/codex_provider_login.py"
+require_repo_literal "adapters/codex/codex_provider_login.py" 'def codex_bin'
+require_repo_literal "adapters/codex/codex_provider_login.py" 'def maybe_start_codex_login'
+require_repo_literal "adapters/codex/codex_provider_login.py" 'def codex_login_output_indicates_failure'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.provider_health.provider_health_guard import'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from adapters.codex.codex_provider_login import'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'output_failure_predicate=codex_login_output_indicates_failure'
+# S10f 反模式护栏：core runner 不得回退成按 provider == "codex" 判断输出健康（host-token 泄漏）；
+# 真相源已迁走，引擎不得再定义这些 codex provider 原语（防回灌到旧位置）。
+forbid_repo_literal "core/provider_health/provider_health_guard.py" 'provider == "codex"'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def codex_bin'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def maybe_start_codex_login'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'

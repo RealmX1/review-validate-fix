@@ -32,6 +32,12 @@ from adapters.codex.transcript import (  # noqa: E402 — codex rollout / goal-m
     session_id_from_path,
     user_messages_containing,
 )
+from adapters.codex.codex_provider_login import (  # noqa: E402 — codex provider 登录/二进制发现缝（S10f 抽出）
+    codex_bin,
+    codex_login_output_indicates_failure,
+    is_codex_agent_id,
+    maybe_start_codex_login,
+)
 from core.run_ledger.run_ledger import (
     RunLedger,
     log_root,
@@ -62,6 +68,12 @@ from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
     SESSION_SCOPE_PATH_KEYS,
     SUPPRESS_ENV_NAMES,
     SUPPRESS_STOP_HOOK_MARKER,
+)
+from core.provider_health.provider_health_guard import (  # noqa: E402 — provider 健康探测中性内核（S10f 抽出）
+    ProviderHealthRequirement,
+    command_output_text,
+    run_provider_health_requirement,
+    subprocess_output_text,
 )
 from rvf_handoff import (
     handoff_completion_payload,
@@ -222,14 +234,6 @@ class StopDecision:
     status: str = "skipped"
 
 
-@dataclass(frozen=True)
-class ProviderHealthRequirement:
-    provider: str
-    reason: str
-    command: tuple[str, ...]
-    remediation: str
-
-
 def emit(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
@@ -370,10 +374,6 @@ def provider_health_timeout_seconds() -> float:
         return max(1.0, float(raw))
     except ValueError:
         return 12.0
-
-
-def codex_bin() -> str:
-    return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
 
 
 def parent_context_enabled() -> bool:
@@ -1684,17 +1684,6 @@ def event_or_env_text(
     return string_event_value(event, event_keys)
 
 
-def is_codex_agent_id(agent_id: str | None) -> bool:
-    if agent_id is None:
-        return False
-    normalized = agent_id.strip().lower()
-    return (
-        normalized in {"codex", "codex-cli", "openai-codex"}
-        or normalized.startswith("codex:")
-        or "codex" in re.split(r"[^a-z0-9]+", normalized)
-    )
-
-
 # ⚠️ cline-kanban 的 `kanban task create --agent-id <id>` 决定该 task 用哪个 executor
 # 跑（合法值：cline | claude | codex | droid | gemini | opencode | default）。
 # RVF dispatch 只要传 `--agent-id`，就**覆盖了 cline-kanban 自身的默认 executor 选择**
@@ -1753,6 +1742,7 @@ def provider_health_requirements(
                 reason="Legacy GUI/app-server RVF fallback uses Codex as the child session provider.",
                 command=(codex_bin(), "login", "status"),
                 remediation="请先运行 `codex login`，或使用 `codex login --with-api-key` 配置可用认证。",
+                output_failure_predicate=codex_login_output_indicates_failure,
             )
         ]
 
@@ -1770,6 +1760,7 @@ def provider_health_requirements(
                         "请先运行 `codex login`，确认 `codex login status` 成功后再让 "
                         "Stop hook 创建 Cline Kanban RVF task。"
                     ),
+                    output_failure_predicate=codex_login_output_indicates_failure,
                 )
             ]
 
@@ -1789,141 +1780,11 @@ def provider_health_requirements(
                     reason=f"Cline Kanban follow-up is targeting agent_id={agent_id!r}.",
                     command=(codex_bin(), "login", "status"),
                     remediation="请先运行 `codex login`，再重试 RVF follow-up 注入。",
+                    output_failure_predicate=codex_login_output_indicates_failure,
                 )
             ]
 
     return []
-
-
-def command_output_text(stdout: str | None, stderr: str | None) -> str:
-    return "\n".join(part for part in (stdout or "", stderr or "") if part).strip()
-
-
-def subprocess_output_text(value: bytes | str | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
-def codex_login_output_indicates_failure(output: str) -> bool:
-    normalized = output.strip().lower()
-    if not normalized:
-        return False
-    failure_markers = (
-        "not logged in",
-        "not authenticated",
-        "logged out",
-        "login expired",
-        "session expired",
-        "expired session",
-        "authentication expired",
-        "auth expired",
-        "invalid credentials",
-        "credential expired",
-        "token expired",
-    )
-    return any(marker in normalized for marker in failure_markers)
-
-
-def run_provider_health_requirement(
-    requirement: ProviderHealthRequirement,
-    timeout_seconds: float,
-) -> dict[str, Any]:
-    command = list(requirement.command)
-    record: dict[str, Any] = {
-        "provider": requirement.provider,
-        "reason": requirement.reason,
-        "command": command,
-        "remediation": requirement.remediation,
-        "status": "failed",
-    }
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except FileNotFoundError as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": "",
-                "stderr": f"{type(exc).__name__}: {exc}",
-                "failure_reason": "command_missing",
-            }
-        )
-        return record
-    except subprocess.TimeoutExpired as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": subprocess_output_text(exc.stdout),
-                "stderr": subprocess_output_text(exc.stderr),
-                "failure_reason": "timeout",
-                "timeout_seconds": timeout_seconds,
-            }
-        )
-        return record
-    except Exception as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": "",
-                "stderr": f"{type(exc).__name__}: {exc}",
-                "failure_reason": "error",
-            }
-        )
-        return record
-
-    output = command_output_text(completed.stdout, completed.stderr)
-    failed = completed.returncode != 0
-    if requirement.provider == "codex" and codex_login_output_indicates_failure(output):
-        failed = True
-    record.update(
-        {
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "status": "failed" if failed else "ok",
-            "failure_reason": "nonzero_or_auth_unhealthy" if failed else None,
-        }
-    )
-    return record
-
-
-def maybe_start_codex_login(ledger: RunLedger) -> dict[str, Any] | None:
-    if not is_truthy(os.environ.get("CODEX_RVF_AUTO_CODEX_LOGIN")):
-        return None
-
-    log_path = ledger.artifacts_dir / "codex-login.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with log_path.open("ab") as log_file:
-            process = subprocess.Popen(
-                [codex_bin(), "login"],
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True,
-            )
-    except Exception as exc:
-        return {
-            "started": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "command": [codex_bin(), "login"],
-            "log_path": str(log_path),
-        }
-
-    return {
-        "started": True,
-        "pid": process.pid,
-        "command": [codex_bin(), "login"],
-        "log_path": str(log_path),
-    }
 
 
 def provider_health_failure_message(
