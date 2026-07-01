@@ -173,6 +173,10 @@ from core.parent_conversation_context.parent_conversation_origin_freeze import (
     parent_origin_summary_fields,
     source_origin_for_kanban_task,
 )
+from core.review_prompt_assembly.review_validate_fix_fork_prompt import (  # noqa: E402 — fork prompt 父会话来源块装配中性核（S10g 迁 core）
+    add_parent_origin_to_rvf_fork_prompt as _core_add_parent_origin_to_rvf_fork_prompt,
+    parent_origin_prompt_block as _core_parent_origin_prompt_block,
+)
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -709,71 +713,24 @@ def parent_conversation_origin(
     return origin
 
 
-def parent_conversation_host_label(host_kind: str | None) -> str:
-    """父会话 harness 的人类可读名，用于 prompt-block 文案标题。
-
-    Claude transcript → ``Claude Code``；其余（Codex / host 未知 / parent_origin 缺
-    ``host_kind`` 键）→ ``Codex``，与 ``parent_conversation_origin`` 的兜底口径一致。
-    """
-    return "Claude Code" if host_kind == HOST_CLAUDE else "Codex"
-
-
-def value_or_unavailable(value: Any) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if value is not None:
-        text = str(value).strip()
-        if text:
-            return text
-    return "<unavailable>"
-
-
 def parent_origin_prompt_block(
     *,
     parent_origin: dict[str, Any],
     origin_path: str | None,
 ) -> str:
-    parent_conversation_ref = value_or_unavailable(
-        parent_origin.get("label") or parent_origin.get("session_id")
+    """assembly wrapper：解析 host 人类可读名后委派 core 装配父会话来源块。
+
+    host 显示名（"Claude Code" / "Codex"）经注入的 ``HostAdapter.host_display_name()``
+    从 ``parent_origin`` 的 host 归属键解析，与旧 ``parent_conversation_host_label`` 的
+    三情形（Claude / Codex / host 未知兜底 Codex）逐字等价，再以 ``host_display_label``
+    传入 core（守 R-1：host 判定留 assembly 层）。
+    """
+    host_display_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
+    return _core_parent_origin_prompt_block(
+        parent_origin=parent_origin,
+        origin_path=origin_path,
+        host_display_label=host_display_label,
     )
-    parent_conversation_source = value_or_unavailable(parent_origin.get("name_source"))
-    parent_codex_url = value_or_unavailable(parent_origin.get("codex_url"))
-    parent_transcript_path = value_or_unavailable(parent_origin.get("transcript_path"))
-    parent_transcript_file = value_or_unavailable(parent_origin.get("transcript_file"))
-    parent_origin_path = value_or_unavailable(origin_path)
-    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
-    lines = [
-        f"Original {host_label} conversation metadata:\n"
-        f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
-        f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
-        f"RVF_PARENT_CONVERSATION_NAME_SOURCE: {parent_conversation_source}\n"
-        f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
-        f"RVF_PARENT_TRANSCRIPT_PATH: {parent_transcript_path}\n"
-        f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
-        f"RVF_ORIGIN_METADATA: {parent_origin_path}\n"
-    ]
-    if parent_origin.get("source_kind") == "cline-kanban-task":
-        lines.append(
-            "RVF_PARENT_SOURCE_KIND: cline-kanban-task\n"
-            f"RVF_PARENT_KANBAN_TASK_ID: {value_or_unavailable(parent_origin.get('kanban_task_id'))}\n"
-            f"RVF_PARENT_KANBAN_ATTEMPT_ID: {value_or_unavailable(parent_origin.get('kanban_attempt_id'))}\n"
-            f"RVF_PARENT_KANBAN_TASK_TITLE: {value_or_unavailable(parent_origin.get('kanban_task_title'))}\n"
-            "RVF_PARENT_KANBAN_TASK_TITLE_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('kanban_task_title_source'))}\n"
-            "RVF_PARENT_SOURCE_SESSION_REF: "
-            f"{value_or_unavailable(parent_origin.get('source_session_label'))}\n"
-            "RVF_PARENT_SOURCE_SESSION_NAME_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('source_session_name_source'))}\n"
-        )
-    lines.append(
-        "\n"
-        "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
-        f"{host_label} conversation name/ref、name source、codex URL、transcript path "
-        "和 origin metadata path；如果存在 `RVF_PARENT_KANBAN_TASK_ID`，还必须写入 "
-        "`source Kanban task id` 和 `source Kanban attempt id`，以便任务改名后仍可反查"
-        "当前 task title；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
-    )
-    return "".join(lines)
 
 
 def plugin_deploy_prompt_block() -> str:
@@ -792,13 +749,13 @@ def add_parent_origin_to_rvf_fork_prompt(
     parent_origin: dict[str, Any],
     origin_path: str | None,
 ) -> str:
-    if RVF_FORK_MARKER not in prompt:
-        return prompt
-    if "RVF_PARENT_CONVERSATION_NAME_SOURCE:" in prompt:
-        return prompt
-    return (
-        f"{prompt.rstrip()}\n\n"
-        f"{parent_origin_prompt_block(parent_origin=parent_origin, origin_path=origin_path)}"
+    """assembly wrapper：解析 host 显示名后委派 core 追加父会话来源块（幂等不变）。"""
+    host_display_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
+    return _core_add_parent_origin_to_rvf_fork_prompt(
+        prompt,
+        parent_origin=parent_origin,
+        origin_path=origin_path,
+        host_display_label=host_display_label,
     )
 
 
@@ -3182,7 +3139,7 @@ def cline_kanban_task_prompt(
     worktree_mode: str,
 ) -> str:
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
-    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
+    host_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
     parent_conversation_ref = str(
         parent_origin.get("label") or f"<unknown {host_label} conversation>"
     )

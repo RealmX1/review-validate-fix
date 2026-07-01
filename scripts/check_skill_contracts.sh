@@ -445,6 +445,7 @@ repo_required_files=(
   "adapters/codex/codex_host_adapter.py"
   "adapters/claude_code/claude_code_host_adapter.py"
   "core/parent_conversation_context/parent_conversation_origin_freeze.py"
+  "core/review_prompt_assembly/review_validate_fix_fork_prompt.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -531,6 +532,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
   "$repo_root/adapters/claude_code/claude_code_host_adapter.py" \
   "$repo_root/core/parent_conversation_context/parent_conversation_origin_freeze.py" \
+  "$repo_root/core/review_prompt_assembly/review_validate_fix_fork_prompt.py" \
   "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
@@ -1041,6 +1043,21 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'freeze_parent_conve
 # 反模式护栏：中性冻结核不得回灌 host 身份字面（前缀经 session_ref_prefix 注入、深链经
 # host_adapter.session_deep_link；host 归属键由 wrapper 注入，core 内不得出现）。
 forbid_repo_literal "core/parent_conversation_context/parent_conversation_origin_freeze.py" 'codex://local'
+
+# S10g fork prompt 父会话来源块装配（PROMPT_ASSEM 簇 → core）：value_or_unavailable +
+# parent_origin_prompt_block + add_parent_origin_to_rvf_fork_prompt 迁 core/review_prompt_assembly；
+# 引擎留两个保签名 assembly wrapper（解析 HostAdapter.host_display_name() 后注入
+# host_display_label）；旧 parent_conversation_host_label 折入 host_display_name() 注入、已删。
+require_repo_file "core/review_prompt_assembly/review_validate_fix_fork_prompt.py"
+require_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'def parent_origin_prompt_block'
+require_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'def add_parent_origin_to_rvf_fork_prompt'
+require_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'host_display_label: str'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.review_prompt_assembly.review_validate_fix_fork_prompt import'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()'
+# 反模式护栏：装配核不得内联 host 判定（host 显示名经注入的 host_display_label 传入，
+# core 内不得出现 host 身份常量）。
+forbid_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'HOST_CLAUDE'
+forbid_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'def parent_conversation_host_label'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
