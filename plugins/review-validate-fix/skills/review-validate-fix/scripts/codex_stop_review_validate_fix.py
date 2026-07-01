@@ -137,8 +137,8 @@ from review_reopen_marker import (
     read_review_reopen_marker,
     review_reopen_status,
 )
-from round_baseline_marker import resolve_round_baseline_head
-import review_highwater_marker
+from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head
+from core.session_scope_allocation import review_highwater_marker
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,

@@ -335,7 +335,7 @@ def _advance_review_highwater(
     if not reviewed_head:
         return {"status": "skipped", "reason": "no_head"}
 
-    import review_highwater_marker  # noqa: PLC0415 - lazy, off the hot import path
+    from core.session_scope_allocation import review_highwater_marker  # noqa: PLC0415 - lazy, off the hot import path
 
     event_ctx = event or {}
     try:

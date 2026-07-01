@@ -436,6 +436,8 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md"
   "core/session_scope_allocation/reviewable_unit_diff_tracker.py"
   "core/session_scope_allocation/session_change_manifest.py"
+  "core/session_scope_allocation/round_baseline_marker.py"
+  "core/session_scope_allocation/review_highwater_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -527,6 +529,8 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
+  "$repo_root/core/session_scope_allocation/round_baseline_marker.py" \
+  "$repo_root/core/session_scope_allocation/review_highwater_marker.py" \
   "$repo_root/core/provider_health/provider_health_guard.py" \
   "$repo_root/adapters/codex/codex_provider_login.py" \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
@@ -1058,6 +1062,15 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'resolve_host_adapte
 # core 内不得出现 host 身份常量）。
 forbid_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'HOST_CLAUDE'
 forbid_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt.py" 'def parent_conversation_host_label'
+
+# S10h-a review-cycle marker 迁 core（SESSION_ALLOC 依赖前置）：round_baseline_marker +
+# review_highwater_marker 是 host-中性（stdlib + core.run_ledger，git 为唯一 subprocess）的
+# review-cycle 标记模块，迁 core/session_scope_allocation/ 使 committed-round baseline 解析
+# （S10h-b/c）可从 core self-contained 消费（否则 core→scripts 反向边）。
+require_repo_literal "core/session_scope_allocation/round_baseline_marker.py" 'def resolve_round_baseline_head'
+require_repo_literal "core/session_scope_allocation/review_highwater_marker.py" 'def resolve_review_highwater_head'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation import review_highwater_marker'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'

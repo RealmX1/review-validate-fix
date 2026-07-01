@@ -337,7 +337,7 @@ def _capture_round_baseline(event: dict[str, Any], prompt: str | None) -> dict[s
     boundaries and must not move the baseline.
     """
     try:
-        import round_baseline_marker  # noqa: PLC0415 - lazy, off the hot import path
+        from core.session_scope_allocation import round_baseline_marker  # noqa: PLC0415 - lazy, off the hot import path
 
         cwd = event.get("cwd")
         if not isinstance(cwd, str) or not cwd.strip():

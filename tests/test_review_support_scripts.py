@@ -4090,7 +4090,7 @@ def _round_baseline_committed_modules():
         sys.path.insert(0, str(SCRIPT_DIR))
     import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
     import core.session_scope_allocation.session_change_manifest as _sm  # noqa: PLC0415
-    import round_baseline_marker as _rbm  # noqa: PLC0415
+    from core.session_scope_allocation import round_baseline_marker as _rbm  # noqa: PLC0415
 
     return _dt, _sm, _rbm
 
@@ -4496,7 +4496,7 @@ def test_review_highwater_marker_round_trip(tmp: Path) -> None:
     committed-round reads (same (task,session) under the same log_root())."""
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     root = tmp / "state"
     head_a = "a" * 40
     head_b = "b" * 40
@@ -4524,7 +4524,7 @@ def test_seal_advances_review_highwater(tmp: Path) -> None:
     (over-dispatch) because the high-water still pointed at the prior review's HEAD."""
     _dt, _sm, _rbm = _round_baseline_committed_modules()
     import seal_round_baseline_to_head as seal  # noqa: PLC0415
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     logs = tmp / "logs"
     original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
@@ -4558,7 +4558,7 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
         fin = sys.modules["rvf_run_finalize"]
     else:
         fin = importlib.import_module("rvf_run_finalize")
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     logs = tmp / "logs"
     head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
@@ -4601,7 +4601,7 @@ def test_review_highwater_write_is_monotonic_with_repo(tmp: Path) -> None:
     （对抗式 review 发现，over-dispatch-regression lens）。"""
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     root = tmp / "state"
     (repo / "f.txt").write_text("base\nc1\n", encoding="utf-8")

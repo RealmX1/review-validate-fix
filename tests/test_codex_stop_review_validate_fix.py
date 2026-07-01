@@ -3588,8 +3588,8 @@ def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_pat
 
     if str(SCRIPT.parent) not in sys.path:
         sys.path.insert(0, str(SCRIPT.parent))
-    hwm = importlib.import_module("review_highwater_marker")
-    rbm = importlib.import_module("round_baseline_marker")
+    hwm = importlib.import_module("core.session_scope_allocation.review_highwater_marker")
+    rbm = importlib.import_module("core.session_scope_allocation.round_baseline_marker")
 
     # First round: agent commits work1 (C1); a review completed → high-water = C1.
     # (Plant the high-water exactly as finalize would, keyed/rooted like the Stop
