@@ -1121,6 +1121,20 @@ forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scri
 require_literal "scripts/codex_stop_review_validate_fix.py" 'def run_review_validate_fix_child_fork('
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'run_codex_fork'
 
+# S10i-d-0（去-codex adapter 抽取 · tracker_dashboard codex-meta 族）：两个纯 Codex-schema 读取器
+# —— rollout 文件名→session_id 索引（codex_transcript_index_by_session_id）+ session_meta 来源字段
+# （read_codex_session_origin_fields）—— 从中性 tracker_dashboard.py 下沉 adapters/codex/transcript.py
+# （read 版重建在既有 session_meta_from_path 上去重、复用 codex_sessions_root 加 $CODEX_HOME 支持）。
+# dashboard 编排器 _enrich_sessions_with_codex_meta 留原处、改从 adapter import 委派。forbid 锁死旧 def/常量回归。
+require_repo_literal "adapters/codex/transcript.py" 'def codex_transcript_index_by_session_id'
+require_repo_literal "adapters/codex/transcript.py" 'def read_codex_session_origin_fields'
+require_literal "scripts/tracker_dashboard.py" 'from adapters.codex.transcript import'
+require_literal "scripts/tracker_dashboard.py" 'codex_transcript_index_by_session_id'
+require_literal "scripts/tracker_dashboard.py" 'read_codex_session_origin_fields'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py" 'def _build_codex_transcript_index'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py" 'def _read_codex_session_meta'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py" '_CODEX_SESSIONS_DIR'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'

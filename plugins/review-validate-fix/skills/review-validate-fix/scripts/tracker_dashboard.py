@@ -28,6 +28,10 @@ if str(SCRIPT_DIR) not in sys.path:
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 from session_label import codex_session_label  # noqa: E402
+from adapters.codex.transcript import (  # noqa: E402 — Codex-schema 读取器（rollout 索引 / session_meta 来源字段）下沉 adapter
+    codex_transcript_index_by_session_id,
+    read_codex_session_origin_fields,
+)
 
 
 _APP_SERVER_NAME_CACHE: dict[str, str | None] = {}
@@ -238,74 +242,6 @@ def _compute_counters(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
-
-
-def _build_codex_transcript_index(root: Path | None = None) -> dict[str, Path]:
-    """Map session_id (UUIDv7, 36 chars) → newest matching transcript path.
-
-    Codex transcript filenames are `rollout-<timestamp>-<uuid>.jsonl`. We pull
-    the trailing 36 chars before `.jsonl` as the session id and keep the most
-    recently-modified file for each id.
-    """
-    base = root or _CODEX_SESSIONS_DIR
-    idx: dict[str, Path] = {}
-    if not base.is_dir():
-        return idx
-    try:
-        for path in base.rglob("rollout-*.jsonl"):
-            name = path.name
-            if not name.endswith(".jsonl") or len(name) < 42:
-                continue
-            sid = name[-42:-6]
-            if sid.count("-") != 4:
-                continue
-            existing = idx.get(sid)
-            if existing is None:
-                idx[sid] = path
-                continue
-            try:
-                if path.stat().st_mtime > existing.stat().st_mtime:
-                    idx[sid] = path
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return idx
-
-
-def _read_codex_session_meta(path: Path) -> dict[str, Any]:
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for _ in range(20):
-                line = handle.readline()
-                if not line:
-                    return {}
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict):
-                    continue
-                if record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    payload = {}
-                git = payload.get("git")
-                if not isinstance(git, dict):
-                    git = {}
-                return {
-                    "cwd": payload.get("cwd") or "",
-                    "originator": payload.get("originator") or "",
-                    "branch": git.get("branch") or "",
-                    "commit": (git.get("commit_hash") or "")[:8],
-                }
-    except (OSError, UnicodeDecodeError):
-        return {}
-    return {}
-
-
 def _short_cwd_label(cwd: str) -> str:
     if not cwd:
         return ""
@@ -331,7 +267,7 @@ def _enrich_sessions_with_codex_meta(sessions: list[dict[str, Any]], *, cache_di
     }
     if not needed:
         return
-    idx = _build_codex_transcript_index()
+    idx = codex_transcript_index_by_session_id()
     if not idx:
         return
     for s in sessions:
@@ -339,7 +275,7 @@ def _enrich_sessions_with_codex_meta(sessions: list[dict[str, Any]], *, cache_di
         if not sid or sid not in idx:
             continue
         transcript_path = idx[sid]
-        meta = _read_codex_session_meta(transcript_path)
+        meta = read_codex_session_origin_fields(transcript_path)
         cwd_value = ""
         if meta:
             cwd_value = meta.get("cwd", "")

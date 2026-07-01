@@ -35,6 +35,7 @@ from core.transcript.patch_parsing import (  # noqa: E402
 )
 from session_label import text_from_message_payload  # noqa: E402 — S9b：Codex rollout user-message 文本抽取（leaf, stdlib-only，无环）
 from core.session_scope_allocation.session_change_manifest import parse_apply_patch  # noqa: E402
+from adapters.codex.subagent import codex_sessions_root  # noqa: E402 — Codex sessions 根目录（$CODEX_HOME/sessions > ~/.codex/sessions）；subagent 仅依赖 core，无环
 
 
 def read_codex_originator(rollout_path: Path) -> str | None:
@@ -411,6 +412,61 @@ def session_meta_from_path(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeDecodeError):
         return {}
     return {}
+
+
+def codex_transcript_index_by_session_id(root: Path | None = None) -> dict[str, Path]:
+    """Map session_id (UUIDv7, 36 chars) → newest matching Codex rollout path.
+
+    Codex transcript filenames are ``rollout-<timestamp>-<uuid>.jsonl``. We pull
+    the trailing 36 chars before ``.jsonl`` as the session id and keep the most
+    recently-modified file for each id. Defaults to the Codex sessions root
+    (``$CODEX_HOME/sessions`` > ``~/.codex/sessions``).
+    """
+    base = root or codex_sessions_root()
+    idx: dict[str, Path] = {}
+    if not base.is_dir():
+        return idx
+    try:
+        for path in base.rglob("rollout-*.jsonl"):
+            name = path.name
+            if not name.endswith(".jsonl") or len(name) < 42:
+                continue
+            sid = name[-42:-6]
+            if sid.count("-") != 4:
+                continue
+            existing = idx.get(sid)
+            if existing is None:
+                idx[sid] = path
+                continue
+            try:
+                if path.stat().st_mtime > existing.stat().st_mtime:
+                    idx[sid] = path
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return idx
+
+
+def read_codex_session_origin_fields(path: Path) -> dict[str, Any]:
+    """从 Codex rollout 的 ``session_meta`` 读取来源展示字段。
+
+    返回 ``{cwd, originator, branch, commit}``（commit 截断到 8 位）；当
+    transcript 无 ``session_meta`` payload 时返回空 dict，调用方据此判断是否
+    做 enrich。复用 ``session_meta_from_path`` 的首 20 行扫描，避免重复解析。
+    """
+    payload = session_meta_from_path(path)
+    if not payload:
+        return {}
+    git = payload.get("git")
+    if not isinstance(git, dict):
+        git = {}
+    return {
+        "cwd": payload.get("cwd") or "",
+        "originator": payload.get("originator") or "",
+        "branch": git.get("branch") or "",
+        "commit": (git.get("commit_hash") or "")[:8],
+    }
 
 
 def _normalized_goal_status(value: Any) -> str | None:
