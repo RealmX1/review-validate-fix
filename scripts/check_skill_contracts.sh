@@ -1115,6 +1115,12 @@ require_repo_literal "core/review_dispatch/review_validate_fix_dispatch_flow.py"
 require_literal "scripts/codex_stop_review_validate_fix.py" 'import core.review_dispatch.review_validate_fix_dispatch_flow as dispatch_flow'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'import rvf_dispatch_flow as dispatch_flow'
 
+# S10i-c-0（去-codex rename）：run_codex_fork（plan R-2 实证的跨后端 fork 枢纽误名）→ 中性
+# run_review_validate_fix_child_fork（函数体不动，R-2）。forbid 锁死旧名，维持 sibling 切片一致性
+# （S10i-a-0 forbid 旧 import、S10h-c forbid 旧 defs）——补 claude-code dogfood 指出的 gate-completeness 缺口。
+require_literal "scripts/codex_stop_review_validate_fix.py" 'def run_review_validate_fix_child_fork('
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'run_codex_fork'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'
