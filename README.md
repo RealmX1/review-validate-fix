@@ -61,7 +61,7 @@ scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugi
 tests/                                     # 开发和契约测试；不随 plugin runtime 分发
 plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
-plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
+plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py
                                             # Stop hook channel router：按 session marker 选择 stable/dev
 ```
 
@@ -137,7 +137,7 @@ python3 scripts/install_to_codex.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `codex_stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 不属于 tmux `cline-kanban` / `cline-kanban-*` session），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 不属于 tmux `cline-kanban` / `cline-kanban-*` session），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
 
 如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Cline Kanban 模式：
 
@@ -190,7 +190,7 @@ python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode kanban-fol
 
 该模式写入 `CODEX_RVF_FORK_MODE=kanban-followup`，也接受别名 `kanban-message` / `kanban-inject`。dirty gate 通过后，hook 不 fork、不创建新 task，而是要求环境或 Stop event 提供 `KANBAN_TASK_ID`（兼容 `CLINE_KANBAN_TASK_ID` / `task_id`），再调用定制的 `kanban task message --project-path <repo> --task-id <id> --prompt-file <prompt> --source review-validate-fix --idempotency-key <run_id>`。这个命令必须走 Kanban host 的真实用户消息通道，把 `$review-validate-fix` prompt 注入当前 task 的 active coding-agent chat session；不得实现为 card activity、metadata、hook context、system message 或 `contextModification`。注入失败时 hook 只报告 `kanban_followup_unavailable` / `kanban_followup_missing_task_id` 并停止，不回退到 continuation、新 task 或 GUI fork。
 
-实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_router.py`，不是直接调用 `codex_stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。stable channel 转发到 installed stable dispatcher，并关闭子 dispatcher 的 repo-path dev sync；选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并允许它在 `CODEX_RVF_DEV_REPO` 匹配当前 Stop event repo 时运行 repo 级 contract check，但会设置 `CODEX_RVF_DEV_SYNC_INSTALL=0`，避免 Stop hook 把 dev checkout 自动安装进 stable plugin。dispatcher 的完整 dev-only sync 安装能力仍保留给直接调用 dispatcher 的受控开发路径使用：
+实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/stop_hook_router.py`，不是直接调用 `codex_stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。stable channel 转发到 installed stable dispatcher，并关闭子 dispatcher 的 repo-path dev sync；选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并允许它在 `CODEX_RVF_DEV_REPO` 匹配当前 Stop event repo 时运行 repo 级 contract check，但会设置 `CODEX_RVF_DEV_SYNC_INSTALL=0`，避免 Stop hook 把 dev checkout 自动安装进 stable plugin。dispatcher 的完整 dev-only sync 安装能力仍保留给直接调用 dispatcher 的受控开发路径使用：
 
 ```bash
 python3 scripts/check_plugin_contracts.py
@@ -240,9 +240,9 @@ hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没�
 
 ```mermaid
 flowchart TD
-    Install["安装或更新 plugin\nscripts/install_to_codex.py --configure-stop-hook"] --> Hooks["~/.codex/hooks.json\nStop: codex_stop_hook_router.py\nCODEX_RVF_MODE=fork\nCODEX_RVF_FORK_MODE=auto"]
+    Install["安装或更新 plugin\nscripts/install_to_codex.py --configure-stop-hook"] --> Hooks["~/.codex/hooks.json\nStop: stop_hook_router.py\nCODEX_RVF_MODE=fork\nCODEX_RVF_FORK_MODE=auto"]
     Hooks --> Stop["Codex 主会话停止\nStop event JSON"]
-    Stop --> Router["installed router\ncodex_stop_hook_router.py"]
+    Stop --> Router["installed router\nstop_hook_router.py"]
     Router --> Channel{"session channel"}
     Channel -- "stable/default" --> Dispatcher["stable dispatcher\ncodex_stop_hook_dispatcher.py"]
     Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\ncodex_stop_hook_dispatcher.py"]

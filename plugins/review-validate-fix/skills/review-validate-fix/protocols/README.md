@@ -33,6 +33,6 @@ Normative source:
 Normative source:
 
 - Ledger helpers: `scripts/rvf_logging.py`
-- Stop hook dispatcher/runtime: `scripts/codex_stop_hook_router.py`, `scripts/codex_stop_hook_dispatcher.py`, `scripts/codex_stop_review_validate_fix.py`
+- Stop hook dispatcher/runtime: `scripts/stop_hook_router.py`, `scripts/codex_stop_hook_dispatcher.py`, `scripts/codex_stop_review_validate_fix.py`
 
 内部字段说明属于 `internals/`；失败排查入口属于 `debug/`。

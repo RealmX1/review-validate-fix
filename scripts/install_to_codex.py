@@ -811,7 +811,7 @@ def configure_stop_hook(
 
     hooks = data.setdefault("hooks", {})
     stop_groups = hooks.setdefault("Stop", [])
-    router = plugin_skill_dir / "scripts" / "codex_stop_hook_router.py"
+    router = plugin_skill_dir / "scripts" / "stop_hook_router.py"
     stable_dispatcher = plugin_skill_dir / "scripts" / "codex_stop_hook_dispatcher.py"
     dev_dispatcher = ROOT / "plugins" / PLUGIN_DIR_NAME / PLUGIN_SKILL_REL / "scripts" / "codex_stop_hook_dispatcher.py"
     env_parts = [
@@ -871,7 +871,7 @@ def configure_stop_hook(
                 and (
                     "codex_stop_review_validate_fix.py" in command_value
                     or "codex_stop_hook_dispatcher.py" in command_value
-                    or "codex_stop_hook_router.py" in command_value
+                    or "stop_hook_router.py" in command_value
                 )
             )
             if is_rvf_hook:

@@ -21,7 +21,7 @@ SCRIPT = (
     / "scripts"
     / "codex_stop_hook_dispatcher.py"
 )
-ROUTER_SCRIPT = SCRIPT.with_name("codex_stop_hook_router.py")
+ROUTER_SCRIPT = SCRIPT.with_name("stop_hook_router.py")
 
 
 def load_dispatcher_module():
@@ -2142,7 +2142,7 @@ def test_hook_config_extracts_router_env_when_current_dispatcher_is_second_targe
     hooks_path = home / ".codex" / "hooks.json"
     hooks_path.parent.mkdir(parents=True)
     stable_dispatcher = tmp_path / "stable" / "codex_stop_hook_dispatcher.py"
-    router = tmp_path / "stable" / "codex_stop_hook_router.py"
+    router = tmp_path / "stable" / "stop_hook_router.py"
     hooks_path.write_text(
         json.dumps(
             {

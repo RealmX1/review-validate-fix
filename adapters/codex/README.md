@@ -5,7 +5,7 @@ Codex adapter（native 实装）。
 ## 当前状态
 
 - **hooks chain**：仍在 `plugins/review-validate-fix/skills/review-validate-fix/scripts/`：
-  - `codex_stop_hook_router.py`（609 行）
+  - `stop_hook_router.py`（609 行）
   - `codex_stop_hook_dispatcher.py`（1470 行）
   - `codex_stop_review_validate_fix.py`（6594 行 main dispatch）
   - 物理迁移到 `adapters/codex/hooks/` 需要 `~/.codex/hooks.json` 路径同步；S3 之后再考虑。

@@ -418,7 +418,7 @@ required_files=(
   "scripts/rvf_handoff_intake.py"
   "scripts/workspace_snapshot.py"
   "scripts/codex_stop_hook_dispatcher.py"
-  "scripts/codex_stop_hook_router.py"
+  "scripts/stop_hook_router.py"
   "scripts/codex_stop_review_validate_fix.py"
   "scripts/discover_santa_alternative_agents.sh"
   "scripts/read_mcp_setup_once.sh"

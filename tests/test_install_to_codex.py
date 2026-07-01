@@ -155,7 +155,7 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     matching = rvf_hooks(data)
     assert len(matching) == 1
     command = matching[0]["command"]
-    assert "codex_stop_hook_router.py" in command
+    assert "stop_hook_router.py" in command
     assert "CODEX_RVF_STABLE_STOP_HOOK=" in command
     assert "codex_stop_hook_dispatcher.py" in command
     assert "/plugins/review-validate-fix/skills/review-validate-fix/" in command
@@ -734,7 +734,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
-    assert str(plugin_skill / "scripts" / "codex_stop_hook_router.py") in matching[0]["command"]
+    assert str(plugin_skill / "scripts" / "stop_hook_router.py") in matching[0]["command"]
     assert str(plugin_skill / "scripts" / "codex_stop_hook_dispatcher.py") in matching[0]["command"]
     assert "CODEX_RVF_FORK_MODE=auto" in matching[0]["command"]
     assert matching[0]["statusMessage"] == "Review-Validate-Fix：选择通道并运行停止检查"
