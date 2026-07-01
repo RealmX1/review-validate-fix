@@ -71,6 +71,10 @@ def _self_check() -> None:
     # path → goal-mode 不命中 → None）。
     assert claude.detect_host_skip_mode({}) is None
     assert codex.detect_host_skip_mode({}) is None
+    # parent_transcript_quoted_session_name：Claude 恒 None；Codex 对 None/不存在 path 返 None
+    # （真实摘录行为由 parent_conversation_origin 端到端测试覆盖）。
+    assert claude.parent_transcript_quoted_session_name(None) is None
+    assert codex.parent_transcript_quoted_session_name(None) is None
     print("host_adapter_resolver self-check OK")
 
 

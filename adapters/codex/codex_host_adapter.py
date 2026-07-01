@@ -24,6 +24,11 @@ import _rvf_pyroot  # noqa: F401  — 确保 pyroot 在 sys.path 上，供 adapt
 from adapters.codex.transcript import (  # noqa: E402
     codex_goal_mode_context_from_event,
 )
+from session_label import (  # noqa: E402 — Codex rollout 首条 user message 抽取 + preamble 剥离 + 摘录
+    first_user_message,
+    parent_conversation_fallback_chars,
+    single_line_excerpt,
+)
 
 
 class CodexHostAdapter:
@@ -42,3 +47,15 @@ class CodexHostAdapter:
         self, event: Mapping[str, Any]
     ) -> Mapping[str, Any] | None:
         return codex_goal_mode_context_from_event(dict(event))
+
+    def parent_transcript_quoted_session_name(self, path: Any) -> str | None:
+        # Codex rollout schema：首条 user message（已剥 stitched preamble）→ 单行摘录 → 带引号。
+        if path is None:
+            return None
+        message = first_user_message(path)
+        if not message:
+            return None
+        excerpt = single_line_excerpt(message, parent_conversation_fallback_chars())
+        if not excerpt:
+            return None
+        return f'"{excerpt}"'

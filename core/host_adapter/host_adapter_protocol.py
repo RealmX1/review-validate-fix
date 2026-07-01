@@ -85,6 +85,21 @@ class HostAdapter(Protocol):
         """
         ...
 
+    def parent_transcript_quoted_session_name(self, path: Any) -> str | None:
+        """从父 transcript 首条 user message 取一段带引号的会话名摘录；无则返回 None。
+
+        S10e 引入（path-A「读父 transcript 首条 user message」能力）：core 的
+        ``freeze_parent_conversation_origin`` 在 app-server 名 / session-index 名均落空时，
+        用它作 ``first_user_prompt_fallback`` 级会话标签。首条 user message 的抽取与
+        preamble 剥离是 host-schema 相关（Codex 需 ``strip_codex_user_message_preamble``
+        去掉 stitched 上下文），故整段是 host 行为、归注入面：Codex 委派
+        ``session_label``（first_user_message + single_line_excerpt），返回 ``"摘录"``；
+        Claude Code 无该 Codex-schema 抽取路径、恒返回 None（其会话名由 session_ref
+        兜底承担）。``path`` 是父 transcript 路径（``pathlib.Path``；用 ``Any`` 避免 core
+        对 host 侧路径类型的形态假设）。
+        """
+        ...
+
 
 def _self_check() -> None:
     """runtime_checkable 一致性自检：齐方法的 stub 通过 isinstance、缺方法的不通过。
@@ -104,6 +119,9 @@ def _self_check() -> None:
             return "codex"
 
         def detect_host_skip_mode(self, event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+            return None
+
+        def parent_transcript_quoted_session_name(self, path: Any) -> str | None:
             return None
 
     class _MissingSkipMode:
@@ -126,6 +144,7 @@ def _self_check() -> None:
         "session_deep_link",
         "cline_kanban_agent_id",
         "detect_host_skip_mode",
+        "parent_transcript_quoted_session_name",
     }
     actual = {name for name in dir(HostAdapter) if not name.startswith("_")}
     assert actual == expected, f"HostAdapter 注入面漂移：{actual} != {expected}"

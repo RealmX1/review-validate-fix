@@ -36,3 +36,7 @@ class ClaudeCodeHostAdapter:
         self, event: Mapping[str, Any]
     ) -> Mapping[str, Any] | None:
         return None
+
+    def parent_transcript_quoted_session_name(self, path: Any) -> str | None:
+        # Claude Code 无 Codex-schema 首条-user-message 抽取路径；会话名由 session_ref 兜底承担。
+        return None

@@ -168,6 +168,11 @@ from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 �
 )
 import rvf_parent_context
 from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
+from core.parent_conversation_context.parent_conversation_origin_freeze import (  # noqa: E402 — 父会话来源冻结中性核（S10e 迁 core）
+    freeze_parent_conversation_origin,
+    parent_origin_summary_fields,
+    source_origin_for_kanban_task,
+)
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -630,52 +635,10 @@ def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
     return session_id_from_event(event)
 
 
-def short_identifier(value: str | None, fallback: str = "unknown") -> str:
-    if not value:
-        return fallback
-    stripped = value.strip()
-    if not stripped:
-        return fallback
-    first_segment = stripped.split("-", 1)[0]
-    if re.match(r"^[A-Fa-f0-9]{8,}(?:-|$)", stripped):
-        return first_segment[:12]
-    return stripped[:32]
-
-
-def short_run_ref(run_id: str) -> str:
-    match = re.search(r"-([A-Fa-f0-9]{8,})$", run_id)
-    if match:
-        return match.group(1)[:12]
-    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
-
-
-def transcript_origin_label(path: Path | None, session_id: str | None) -> str | None:
-    if path is None:
-        return None
-    stem = path.stem
-    if stem.startswith("rollout-"):
-        stem = stem.removeprefix("rollout-")
-    match = re.match(
-        r"(?P<started>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(?P<session>[A-Za-z0-9]{8,12})",
-        stem,
-    )
-    if match:
-        return f"{match.group('started')} {match.group('session')}"
-    if session_id:
-        return short_identifier(session_id)
-    return path.name
-
-
-def quoted_prompt_session_name(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    message = first_user_message(path)
-    if not message:
-        return None
-    excerpt = single_line_excerpt(message, parent_conversation_fallback_chars())
-    if not excerpt:
-        return None
-    return f'"{excerpt}"'
+# short_identifier / short_run_ref / transcript_origin_label 已迁 core（S10e）：
+# core.parent_conversation_context.parent_conversation_origin_freeze（顶部 re-import）。
+# quoted_prompt_session_name（首条-user-message 摘录）已下沉 adapters/codex/codex_host_adapter
+# 的 CodexHostAdapter.parent_transcript_quoted_session_name（Codex-schema 抽取归 adapter）。
 
 
 def codex_session_index_path() -> Path:
@@ -715,54 +678,35 @@ def parent_conversation_origin(
     parent_thread_name: str | None = None,
     name_lookup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    session_id = parent_session_id or (
-        session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
-    )
-    transcript_path = str(parent_thread_path) if parent_thread_path is not None else None
-    # host_kind 复用 executor 选择的同一探测（detect_transcript_format）：同输入→同结果、
-    # 不与 resolve_cline_kanban_agent_id 漂移。它决定 session_ref_fallback 前缀与 codex_url
-    # 是否成立——避免把 Claude Code 会话硬贴成 "Codex" 标签 / `codex://` URL。
+    """引擎 assembly wrapper（S10e）：预解析 host 元数据 + 注入 HostAdapter → core freeze。
+
+    ``core.parent_conversation_context.freeze_parent_conversation_origin`` 持中性冻结逻辑；
+    本 wrapper 只负责 host 相关的预解析（``detect_transcript_format`` 探测、``session_id``
+    兜底 ``session_id_from_path``、Codex ``session_index`` 查名、session-ref 短前缀
+    Codex/Claude）与返回后注入 ``host_kind`` 键——这些是 host-身份 / Codex-read 职责，随
+    S10j 折入 ``codex_stop_hook_entry``，暂留引擎 assembly 层（core host-free 不承担）。
+    """
     host_kind: str | None = None
     if parent_thread_path is not None:
         try:
             host_kind = detect_transcript_format(parent_thread_path)
         except Exception:
             host_kind = None
-    name_source = "app_server_name"
-    label = parent_thread_name.strip() if isinstance(parent_thread_name, str) else ""
-    if not label:
-        label = session_index_thread_name(session_id) or ""
-        name_source = "session_index_thread_name" if label else "session_ref_fallback"
-    if not label:
-        label = quoted_prompt_session_name(parent_thread_path) or ""
-        name_source = "first_user_prompt_fallback" if label else "session_ref_fallback"
-    if not label:
-        # 前三级 lookup 全是 Codex-only schema（session_index / Codex 记录的首条 user
-        # message），在 Claude 会话上必然落空。这里按 host_kind 给出正确前缀；host 未知
-        # （transcript 缺失/不可识别）时仍兜底 "Codex"，与既有 Codex-only 用例零回归。
-        host_prefix = "Claude" if host_kind == HOST_CLAUDE else "Codex"
-        label = f"{host_prefix} {transcript_origin_label(parent_thread_path, session_id) or short_identifier(session_id)}"
-        name_source = "session_ref_fallback"
-    run_ref = short_run_ref(run_id)
-    return {
-        "label": label,
-        "task_title": f"RVF from {label} run {run_ref}",
-        "name_source": name_source,
-        "name_lookup": name_lookup,
-        "session_id": session_id,
-        "session_short_id": short_identifier(session_id),
-        "host_kind": host_kind,
-        # codex:// 只对 Codex（含 host 未知兜底）成立；Claude Code 会话无该 scheme，
-        # 置 None（prompt block 经 value_or_unavailable 渲染为 <unavailable>），
-        # 其「打开」入口由已输出的 RVF_PARENT_TRANSCRIPT_PATH 承担。
-        "codex_url": (
-            f"codex://local/{session_id}" if session_id and host_kind != HOST_CLAUDE else None
-        ),
-        "transcript_path": transcript_path,
-        "transcript_file": parent_thread_path.name if parent_thread_path is not None else None,
-        "run_id": run_id,
-        "run_ref": run_ref,
-    }
+    session_id = parent_session_id or (
+        session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
+    )
+    origin = freeze_parent_conversation_origin(
+        parent_thread_path=parent_thread_path,
+        run_id=run_id,
+        host_adapter=resolve_host_adapter(host_kind),
+        session_id=session_id,
+        thread_name_from_index=session_index_thread_name(session_id),
+        session_ref_prefix="Claude" if host_kind == HOST_CLAUDE else "Codex",
+        parent_thread_name=parent_thread_name,
+        name_lookup=name_lookup,
+    )
+    origin["host_kind"] = host_kind
+    return origin
 
 
 def parent_conversation_host_label(host_kind: str | None) -> str:
@@ -772,38 +716,6 @@ def parent_conversation_host_label(host_kind: str | None) -> str:
     ``host_kind`` 键）→ ``Codex``，与 ``parent_conversation_origin`` 的兜底口径一致。
     """
     return "Claude Code" if host_kind == HOST_CLAUDE else "Codex"
-
-
-def source_origin_for_kanban_task(
-    *,
-    task_id: str,
-    attempt_id: str | None,
-    task_title: str | None,
-    task_title_source: str | None,
-    fallback_origin: dict[str, Any],
-) -> dict[str, Any]:
-    title = task_title.strip() if isinstance(task_title, str) else ""
-    origin = dict(fallback_origin)
-    if title:
-        label = title
-        name_source = task_title_source or "cline_kanban_task_title"
-    else:
-        label = f"Cline Kanban task {task_id}"
-        name_source = "cline_kanban_task_id_fallback"
-    origin.update(
-        {
-            "label": label,
-            "name_source": name_source,
-            "source_kind": "cline-kanban-task",
-            "kanban_task_id": task_id,
-            "kanban_attempt_id": attempt_id,
-            "kanban_task_title": title or None,
-            "kanban_task_title_source": task_title_source,
-            "source_session_label": fallback_origin.get("label"),
-            "source_session_name_source": fallback_origin.get("name_source"),
-        }
-    )
-    return origin
 
 
 def value_or_unavailable(value: Any) -> str:
@@ -862,34 +774,6 @@ def parent_origin_prompt_block(
         "当前 task title；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
     )
     return "".join(lines)
-
-
-def parent_origin_summary_fields(
-    *,
-    parent_session_id: str | None,
-    parent_thread_path: Path | None,
-    parent_origin: dict[str, Any],
-    parent_name_lookup: dict[str, Any],
-    origin_path: str | None,
-) -> dict[str, Any]:
-    return {
-        "parent_thread_id": parent_session_id,
-        "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
-        "parent_conversation_ref": parent_origin.get("label"),
-        "parent_conversation_name": parent_origin.get("label"),
-        "parent_conversation_name_source": parent_origin.get("name_source"),
-        "parent_thread_name_lookup": parent_name_lookup,
-        "parent_codex_url": parent_origin.get("codex_url"),
-        "parent_origin_path": origin_path,
-        "parent_transcript_file": parent_origin.get("transcript_file"),
-        "parent_source_kind": parent_origin.get("source_kind"),
-        "parent_kanban_task_id": parent_origin.get("kanban_task_id"),
-        "parent_kanban_attempt_id": parent_origin.get("kanban_attempt_id"),
-        "parent_kanban_task_title": parent_origin.get("kanban_task_title"),
-        "parent_kanban_task_title_source": parent_origin.get("kanban_task_title_source"),
-        "parent_source_session_ref": parent_origin.get("source_session_label"),
-        "parent_source_session_name_source": parent_origin.get("source_session_name_source"),
-    }
 
 
 def plugin_deploy_prompt_block() -> str:

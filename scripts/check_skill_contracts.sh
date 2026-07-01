@@ -444,6 +444,7 @@ repo_required_files=(
   "adapters/codex/codex_provider_login.py"
   "adapters/codex/codex_host_adapter.py"
   "adapters/claude_code/claude_code_host_adapter.py"
+  "core/parent_conversation_context/parent_conversation_origin_freeze.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -529,6 +530,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/adapters/codex/codex_provider_login.py" \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
   "$repo_root/adapters/claude_code/claude_code_host_adapter.py" \
+  "$repo_root/core/parent_conversation_context/parent_conversation_origin_freeze.py" \
   "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
@@ -983,6 +985,7 @@ require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def host_disp
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def session_deep_link'
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def cline_kanban_agent_id'
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def detect_host_skip_mode'
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def parent_transcript_quoted_session_name'
 require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
 
 # S10f: provider 健康探测中性内核迁 core/provider_health；codex 登录/二进制发现下沉
@@ -1021,6 +1024,23 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'from host_adapter_r
 require_literal "scripts/codex_stop_review_validate_fix.py" 'resolve_host_adapter(host).cline_kanban_agent_id()'
 # resolver self-check：两 bundle 满足 HostAdapter Protocol、装配口径正确、各方法行为正确。
 run_step "host adapter resolver self-check" python3 "$skill_dir/scripts/host_adapter_resolver.py"
+
+# S10e 父会话来源冻结（PARENT_CONTEXT 簇 → core）：中性冻结核迁
+# core/parent_conversation_context；引擎 parent_conversation_origin 退化为 assembly wrapper
+# （预解析 host 元数据 + 注入 HostAdapter + 返回后注 host 归属键）。首条-user-message 摘录
+# 下沉 CodexHostAdapter.parent_transcript_quoted_session_name（Codex-schema 抽取归 adapter，
+# Claude 恒 None）。
+require_repo_file "core/parent_conversation_context/parent_conversation_origin_freeze.py"
+require_repo_literal "core/parent_conversation_context/parent_conversation_origin_freeze.py" 'def freeze_parent_conversation_origin'
+require_repo_literal "core/parent_conversation_context/parent_conversation_origin_freeze.py" 'def source_origin_for_kanban_task'
+require_repo_literal "core/parent_conversation_context/parent_conversation_origin_freeze.py" 'def parent_origin_summary_fields'
+require_repo_literal "adapters/codex/codex_host_adapter.py" 'def parent_transcript_quoted_session_name'
+require_repo_literal "adapters/claude_code/claude_code_host_adapter.py" 'def parent_transcript_quoted_session_name'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.parent_conversation_context.parent_conversation_origin_freeze import'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'freeze_parent_conversation_origin('
+# 反模式护栏：中性冻结核不得回灌 host 身份字面（前缀经 session_ref_prefix 注入、深链经
+# host_adapter.session_deep_link；host 归属键由 wrapper 注入，core 内不得出现）。
+forbid_repo_literal "core/parent_conversation_context/parent_conversation_origin_freeze.py" 'codex://local'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
