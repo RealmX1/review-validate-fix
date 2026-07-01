@@ -4010,7 +4010,7 @@ def lookup_cline_kanban_task_title(
     }
 
 
-def run_codex_fork(
+def run_review_validate_fix_child_fork(
     *,
     parent_session_id: str,
     cwd: str | None,
@@ -4541,7 +4541,7 @@ def run_fork_experiment(
     prompt = fork_experiment_prompt(session_id or "", cwd)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    payload = run_codex_fork(
+    payload = run_review_validate_fix_child_fork(
         parent_session_id=session_id or "",
         cwd=cwd,
         prompt=prompt,
@@ -4630,7 +4630,7 @@ def fork_review_validate_fix(
     prompt = fork_review_validate_fix_prompt(parent_session_id, cwd, repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    return run_codex_fork(
+    return run_review_validate_fix_child_fork(
         parent_session_id=parent_session_id,
         cwd=cwd,
         prompt=prompt,
@@ -5016,7 +5016,7 @@ def launch_backend(
     prompt = fork_review_validate_fix_prompt(decision.parent_thread_id, cwd, decision.repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    return run_codex_fork(
+    return run_review_validate_fix_child_fork(
         parent_session_id=decision.parent_thread_id,
         cwd=cwd,
         prompt=prompt,

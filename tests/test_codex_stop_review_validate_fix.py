@@ -47,7 +47,7 @@ RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")
 # ensure_bridge_app_server / select_app_server_socket / can_connect_app_server_socket /
 # select_existing_app_server_socket_for_metadata 等）的 monkeypatch 必须打在 adapter 模块上：
 # 引擎里这些名字已不存在，且 adapter 函数在自身命名空间里解析它们。下面取到的 ``appserver``
-# 与引擎 re-import 的是同一个 sys.modules 单例，故经它 patch 能同时影响引擎 run_codex_fork
+# 与引擎 re-import 的是同一个 sys.modules 单例，故经它 patch 能同时影响引擎 run_review_validate_fix_child_fork
 # 路由下游与 adapter 函数自身。
 sys.path.insert(0, str(SCRIPT.parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
@@ -624,7 +624,7 @@ def test_rvf_fork_prompt_includes_parent_origin_metadata_for_legacy_gui(tmp_path
             "thread_found": True,
             "source": "test",
         }
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
             prompt=module.fork_review_validate_fix_prompt(
@@ -1690,7 +1690,7 @@ def test_bridge_failure_preserves_desktop_probe(tmp_path: Path) -> None:
             raise appserver.AppServerError("simulated bridge startup failure")
 
         appserver.ensure_bridge_app_server = fail_bridge
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
             prompt="$review-validate-fix",
@@ -1745,7 +1745,7 @@ def test_missing_desktop_control_reports_failure_not_bridge_or_continuation(tmp_
         appserver.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
             AssertionError("bridge should not start by default")
         )
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
             prompt="fork prompt should not be used",
@@ -2145,7 +2145,7 @@ def test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback(tmp_p
             "status": "app-server-started",
             "fork_thread_id": "unexpected-gui-fork",
         }
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -2224,7 +2224,7 @@ def test_auto_mode_can_opt_into_legacy_gui_as_backup_of_backup(tmp_path: Path) -
             "open_gui_deeplink": {"opened": False, "attempts": []},
             "notifications": [],
         }
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -2302,7 +2302,7 @@ def test_auto_mode_reports_stale_kanban_listener_without_gui_fallback(tmp_path: 
             "status": "app-server-started",
             "fork_thread_id": "unexpected-gui-fork",
         }
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -2802,7 +2802,7 @@ def test_missing_desktop_control_fail_policy_reports(tmp_path: Path) -> None:
         appserver.ensure_bridge_app_server = lambda: (_ for _ in ()).throw(
             AssertionError("bridge should not start when policy=fail")
         )
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
             prompt="fork prompt should not be used",
@@ -3115,7 +3115,7 @@ def test_bridge_fork_message_marks_gui_visibility_unverified(tmp_path: Path) -> 
             }
 
         module.run_app_server_fork = fake_run_app_server_fork
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(tmp_path),
             prompt="$review-validate-fix",

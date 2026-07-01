@@ -11,7 +11,7 @@ bridge app-server）创建并可见化 GUI fork 线程、查询父线程名、�
 「每个脚本自含这些 trivial helper」，见 ``codex_stop_hook_dispatcher.is_truthy`` /
 ``rvf_analyze_thread.codex_bin``），**刻意不反向 import 共享审查引擎**，以保持
 ``adapters → engine`` 零依赖边、无循环。引擎侧的中性 fork 路由骨架
-（``run_codex_fork``）通过 import 本模块的少数公开入口
+（``run_review_validate_fix_child_fork``）通过 import 本模块的少数公开入口
 （``run_app_server_fork`` / ``app_server_fork_requests`` /
 ``parent_thread_name_from_app_server`` / ``can_connect_app_server_socket`` /
 ``select_existing_app_server_socket_for_metadata`` / ``path_is_relative_to``）来委派
