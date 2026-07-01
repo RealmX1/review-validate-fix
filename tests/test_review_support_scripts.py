@@ -1296,7 +1296,7 @@ def test_claude_hook_entry_dispatches_claude_invocation() -> None:
                     "skills",
                     "review-validate-fix",
                     "scripts",
-                    "codex_stop_review_validate_fix.py",
+                    "stop_review_validate_fix.py",
                 ),
                 timeout_env="CLAUDE_RVF_STOP_HOOK_TIMEOUT",
                 default_timeout="115",
@@ -1313,7 +1313,7 @@ def test_claude_hook_entry_dispatches_claude_invocation() -> None:
     calls = _run_once({"session_id": "claude-abc"})
     assert len(calls) == 1, "Claude invocation must dispatch the core exactly once"
     assert calls[0]["argv"][0] == sys.executable
-    assert calls[0]["argv"][1].endswith("codex_stop_review_validate_fix.py")
+    assert calls[0]["argv"][1].endswith("stop_review_validate_fix.py")
     forwarded = json.loads(calls[0]["input"])
     assert forwarded["hook_event_name"] == "Stop"
     assert forwarded["source"] == {"provider": "claude-code", "plugin": "review-validate-fix"}
@@ -2366,8 +2366,8 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
             "test_rvf_handoff_intake.py",
             "test_review_reopen_marker.py",
             "test_review_support_scripts.py",
-            "test_codex_stop_hook_dispatcher.py",
-            "test_codex_stop_review_validate_fix.py",
+            "test_stop_hook_dispatcher.py",
+            "test_stop_review_validate_fix.py",
         ):
             (tests_dir / name).write_text(
                 "#!/usr/bin/env python3\n"
@@ -2412,12 +2412,12 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         "tests: review_support_scripts shard 2/4",
         "tests: review_support_scripts shard 3/4",
         "tests: review_support_scripts shard 4/4",
-        "tests: codex_stop_hook_dispatcher shard 1/2",
-        "tests: codex_stop_hook_dispatcher shard 2/2",
-        "tests: codex_stop_review_validate_fix shard 1/4",
-        "tests: codex_stop_review_validate_fix shard 2/4",
-        "tests: codex_stop_review_validate_fix shard 3/4",
-        "tests: codex_stop_review_validate_fix shard 4/4",
+        "tests: stop_hook_dispatcher shard 1/2",
+        "tests: stop_hook_dispatcher shard 2/2",
+        "tests: stop_review_validate_fix shard 1/4",
+        "tests: stop_review_validate_fix shard 2/4",
+        "tests: stop_review_validate_fix shard 3/4",
+        "tests: stop_review_validate_fix shard 4/4",
     }
 
 
@@ -2455,7 +2455,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
                 "duration_ms": 200,
             },
             {
-                "label": "tests: codex_stop_review_validate_fix",
+                "label": "tests: stop_review_validate_fix",
                 "source": "check_skill_contracts.sh",
                 "status": "completed",
                 "returncode": 0,
@@ -2464,7 +2464,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
         ],
     )
 
-    assert report["slowest_step"]["label"] == "tests: codex_stop_review_validate_fix"
+    assert report["slowest_step"]["label"] == "tests: stop_review_validate_fix"
     assert report["slowest_step"]["percentage_of_total"] == 60.0
     assert report["slowest_step"]["percentage_of_wall_time"] == 60.0
     assert report["slowest_step"]["percentage_of_measured_work"] == 63.16
@@ -2489,7 +2489,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
         contract_check_timing_report_path="/tmp/contract-check.timing.json",
         contract_check_timing={
             "path": "/tmp/contract-check.timing.json",
-            "slowest_step": {"label": "tests: codex_stop_review_validate_fix"},
+            "slowest_step": {"label": "tests: stop_review_validate_fix"},
         },
     )
     later = ledger.summary(
@@ -2500,7 +2500,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
     assert later["dev_sync_steps"] == [{"name": "contract-check"}]
     assert later["contract_check_timing_report_path"] == "/tmp/contract-check.timing.json"
     assert later["contract_check_timing"]["slowest_step"]["label"] == (
-        "tests: codex_stop_review_validate_fix"
+        "tests: stop_review_validate_fix"
     )
 
 
@@ -2764,7 +2764,7 @@ def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp
         "    return {'owned_dirty_paths': []}\n",
         encoding="utf-8",
     )
-    (old_scripts / "codex_stop_review_validate_fix.py").write_text(
+    (old_scripts / "stop_review_validate_fix.py").write_text(
         "def legacy_session_scope_gate_payload():\n"
         "    pass\n",
         encoding="utf-8",
@@ -4090,7 +4090,7 @@ def _round_baseline_committed_modules():
         sys.path.insert(0, str(SCRIPT_DIR))
     import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
     import core.session_scope_allocation.session_change_manifest as _sm  # noqa: PLC0415
-    import round_baseline_marker as _rbm  # noqa: PLC0415
+    from core.session_scope_allocation import round_baseline_marker as _rbm  # noqa: PLC0415
 
     return _dt, _sm, _rbm
 
@@ -4496,7 +4496,7 @@ def test_review_highwater_marker_round_trip(tmp: Path) -> None:
     committed-round reads (same (task,session) under the same log_root())."""
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     root = tmp / "state"
     head_a = "a" * 40
     head_b = "b" * 40
@@ -4524,7 +4524,7 @@ def test_seal_advances_review_highwater(tmp: Path) -> None:
     (over-dispatch) because the high-water still pointed at the prior review's HEAD."""
     _dt, _sm, _rbm = _round_baseline_committed_modules()
     import seal_round_baseline_to_head as seal  # noqa: PLC0415
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     logs = tmp / "logs"
     original_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
@@ -4558,7 +4558,7 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
         fin = sys.modules["rvf_run_finalize"]
     else:
         fin = importlib.import_module("rvf_run_finalize")
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     logs = tmp / "logs"
     head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
@@ -4601,7 +4601,7 @@ def test_review_highwater_write_is_monotonic_with_repo(tmp: Path) -> None:
     （对抗式 review 发现，over-dispatch-regression lens）。"""
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
-    import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
     repo, _baseline = _committed_round_repo(tmp)
     root = tmp / "state"
     (repo / "f.txt").write_text("base\nc1\n", encoding="utf-8")

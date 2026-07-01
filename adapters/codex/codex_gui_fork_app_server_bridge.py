@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Codex GUI-fork / app-server / bridge 子系统（adapters/codex 的 fork 执行维）。
 
-S9a：从共享审查引擎（``codex_stop_review_validate_fix.py``）抽出的 **Codex 专属**
+S9a：从共享审查引擎（``stop_review_validate_fix.py``）抽出的 **Codex 专属**
 fork 执行缝——通过 Codex Desktop 的 app-server control socket（含 RVF 自管的
 bridge app-server）创建并可见化 GUI fork 线程、查询父线程名、做 socket 选择/探活/
 重启与可见性诊断。
 
 这是 host-specific 实现：只依赖 stdlib 与本文件自带的几个 1-3 行纯工具副本
 （``is_truthy`` / ``is_falsey`` / ``codex_bin``，与引擎同源——本仓既有惯例即
-「每个脚本自含这些 trivial helper」，见 ``codex_stop_hook_dispatcher.is_truthy`` /
+「每个脚本自含这些 trivial helper」，见 ``stop_hook_dispatcher.is_truthy`` /
 ``rvf_analyze_thread.codex_bin``），**刻意不反向 import 共享审查引擎**，以保持
 ``adapters → engine`` 零依赖边、无循环。引擎侧的中性 fork 路由骨架
-（``run_codex_fork``）通过 import 本模块的少数公开入口
+（``run_review_validate_fix_child_fork``）通过 import 本模块的少数公开入口
 （``run_app_server_fork`` / ``app_server_fork_requests`` /
 ``parent_thread_name_from_app_server`` / ``can_connect_app_server_socket`` /
 ``select_existing_app_server_socket_for_metadata`` / ``path_is_relative_to``）来委派

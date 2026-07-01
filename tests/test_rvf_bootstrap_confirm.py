@@ -201,7 +201,7 @@ def test_user_prompt_submit_resumes_on_yes(tmp_path: Path, monkeypatch) -> None:
             called["payload"] = payload
             return {"status": "cline-kanban-started", "cline_kanban_task_id": "T1"}
 
-    monkeypatch.setitem(sys.modules, "codex_stop_review_validate_fix", FakeStopHook)
+    monkeypatch.setitem(sys.modules, "stop_review_validate_fix", FakeStopHook)
 
     result = ups.inspect_user_prompt_submit(
         {"prompt": "yes", "session_id": "sess-yes"},
@@ -239,7 +239,7 @@ def test_user_prompt_submit_cancels_on_other(tmp_path: Path, monkeypatch) -> Non
         def resume_dispatch_from_confirmation_marker(payload):
             raise AssertionError("must not be called on cancel")
 
-    monkeypatch.setitem(sys.modules, "codex_stop_review_validate_fix", FakeStopHook)
+    monkeypatch.setitem(sys.modules, "stop_review_validate_fix", FakeStopHook)
 
     result = ups.inspect_user_prompt_submit(
         {"prompt": "actually let's not", "session_id": "sess-no"},

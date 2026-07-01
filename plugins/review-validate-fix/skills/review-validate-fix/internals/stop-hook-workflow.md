@@ -4,9 +4,9 @@ Audience: RVF maintainers. Normal RVF agents should not read this file.
 
 Normative sources:
 
-- Router: `scripts/codex_stop_hook_router.py`
-- Dispatcher: `scripts/codex_stop_hook_dispatcher.py`
-- Runtime: `scripts/codex_stop_review_validate_fix.py`
+- Router: `scripts/stop_hook_router.py`
+- Dispatcher: `scripts/stop_hook_dispatcher.py`
+- Runtime: `scripts/stop_review_validate_fix.py`
 - Kanban client: `scripts/cline_kanban_client.py`
 
 ## Intended Shape

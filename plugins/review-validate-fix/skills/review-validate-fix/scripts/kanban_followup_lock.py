@@ -212,7 +212,7 @@ def write_marker(
     # Option A（兑现 nudge 预算的 loop-break 契约）：本函数是 in-progress 锁唯一的 arm 入口
     # （arm_kanban_followup_lock_on_delivery 投递确认时调用），整份覆盖 marker。重派发的
     # delivery re-arm 若不保留既有 reengage_nudge_count，会把『预算用尽再退回静默 skip 防
-    # review↔fix 死循环』的计数每轮清回 0（见 codex_stop_review_validate_fix.py 的 nudge 分支）。
+    # review↔fix 死循环』的计数每轮清回 0（见 stop_review_validate_fix.py 的 nudge 分支）。
     # 故在覆盖前读出同 task 既有 marker 的计数并带入新 payload：首次 arm（无既有 marker）自然从
     # 0 起，re-arm 则让计数跨投递存活。best-effort：read_marker 吞读错、reengage_nudge_count
     # 坏值按 0（保守：宁可多给一次 nudge，也不因坏值误判预算耗尽而静默挡停）。

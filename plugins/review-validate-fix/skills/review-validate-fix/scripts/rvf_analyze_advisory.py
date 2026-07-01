@@ -25,9 +25,9 @@ RVF_ANALYZE_FOLLOWUP_MARKER = "RVF_KANBAN_ANALYZE_TRIGGER"
 from rvf_analyze_thread import launch_detached_analyze_thread
 
 
-# 与 codex_stop_review_validate_fix.SESSION_PATH_KEYS 保持一致，便于 advisory 在
+# 与 stop_review_validate_fix.SESSION_PATH_KEYS 保持一致，便于 advisory 在
 # 没有显式 session_id 字段时回退到 transcript 文件解析。Inline 一份是为了避免
-# advisory 反向 import codex_stop_review_validate_fix 造成循环（主 hook 已经
+# advisory 反向 import stop_review_validate_fix 造成循环（主 hook 已经
 # import 本模块）。
 _SESSION_PATH_KEYS = (
     "transcript_path",
@@ -41,7 +41,7 @@ _SESSION_PATH_KEYS = (
 def _session_id_from_transcript(path: Path) -> str | None:
     """从 Codex 风格 jsonl 头部 session_meta 中解析 session id。
 
-    与 codex_stop_review_validate_fix.session_id_from_path 等价：最多扫描前 20
+    与 stop_review_validate_fix.session_id_from_path 等价：最多扫描前 20
     行，找到 ``type == "session_meta"`` 即返回 ``payload.id``。Claude Code
     transcript 通常没有 session_meta 头，此函数会返回 None，由调用方决定后续
     行为（fail-open）。
@@ -80,7 +80,7 @@ def _session_id_from_transcript(path: Path) -> str | None:
 def parent_session_id_from_event(event: dict[str, Any]) -> str | None:
     """从 Stop hook event 中提取 parent session id，覆盖 codex 与 claude-code 命名。
 
-    解析顺序与 codex_stop_review_validate_fix.session_hook_id_from_event 保持
+    解析顺序与 stop_review_validate_fix.session_hook_id_from_event 保持
     对称：先尝试 event 字段（claude-code Stop hook 通常带 session_id；codex 各
     种 thread/parent/conversation 别名也覆盖），再回退到 transcript 路径里的
     ``session_meta.id``，让 advisory 写 marker 时与主 hook 读 marker 时使用同

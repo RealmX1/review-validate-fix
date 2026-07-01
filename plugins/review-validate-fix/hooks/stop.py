@@ -2,7 +2,7 @@
 """Claude Code Stop hook shim for review-validate-fix.
 
 薄 shim：把 Claude Stop event 转发给同 plugin 内的 RVF 核心
-``skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py``。所有
+``skills/review-validate-fix/scripts/stop_review_validate_fix.py``。所有
 共享逻辑（host-ownership 守卫 + stdin→normalize→subprocess→fail-open 骨架）
 收在 sibling ``_claude_hook_entry`` 单一契约里（S3 / handoff G）。
 """
@@ -26,7 +26,7 @@ def main() -> int:
             "skills",
             "review-validate-fix",
             "scripts",
-            "codex_stop_review_validate_fix.py",
+            "stop_review_validate_fix.py",
         ),
         timeout_env="CLAUDE_RVF_STOP_HOOK_TIMEOUT",
         default_timeout="115",

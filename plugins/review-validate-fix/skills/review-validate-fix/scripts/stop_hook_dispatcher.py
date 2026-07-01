@@ -24,7 +24,7 @@ from core.session_scope_allocation.session_change_manifest import build_manifest
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "codex_stop_review_validate_fix.py"
+DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "stop_review_validate_fix.py"
 DEV_SYNC_CONTRACT_SCRIPT = Path("scripts") / "check_plugin_contracts.py"
 DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"
 LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
@@ -281,7 +281,7 @@ def should_sync_session_scope(
     pre-Slice-3 manifest-based legacy gate so disable-mode behavior matches
     Phase 0/1 byte-for-byte."""
     sys.path.insert(0, str(SKILL_DIR / "scripts"))
-    from codex_stop_review_validate_fix import (
+    from stop_review_validate_fix import (
         _StopContextError,
         resolve_stop_context,
         refresh_global_diff_tracker,
@@ -597,7 +597,7 @@ def _command_targets_current_dispatcher(command: str) -> bool:
         return False
     current = Path(__file__).resolve()
     for token in tokens:
-        if not token.endswith("codex_stop_hook_dispatcher.py"):
+        if not token.endswith("stop_hook_dispatcher.py"):
             continue
         candidate = token.split("=", 1)[1] if "=" in token else token
         try:
@@ -635,7 +635,7 @@ def hook_config_from_hooks_json() -> dict[str, str]:
             command = hook.get("command") if isinstance(hook, dict) else None
             if not isinstance(command, str):
                 continue
-            if "review-validate-fix" not in command or "codex_stop_hook_dispatcher.py" not in command:
+            if "review-validate-fix" not in command or "stop_hook_dispatcher.py" not in command:
                 continue
             if not _command_targets_current_dispatcher(command):
                 continue
@@ -811,7 +811,7 @@ def event_marks_plan_operation(event: dict[str, Any]) -> bool:
 
 def detect_codex_goal_mode_context(event: dict[str, Any]) -> dict[str, Any] | None:
     sys.path.insert(0, str(SKILL_DIR / "scripts"))
-    from codex_stop_review_validate_fix import codex_goal_mode_context_from_event
+    from stop_review_validate_fix import codex_goal_mode_context_from_event
 
     return codex_goal_mode_context_from_event(event)
 

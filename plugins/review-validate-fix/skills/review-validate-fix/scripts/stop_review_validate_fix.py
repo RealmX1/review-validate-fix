@@ -32,6 +32,12 @@ from adapters.codex.transcript import (  # noqa: E402 — codex rollout / goal-m
     session_id_from_path,
     user_messages_containing,
 )
+from adapters.codex.codex_provider_login import (  # noqa: E402 — codex provider 登录/二进制发现缝（S10f 抽出）
+    codex_bin,
+    codex_login_output_indicates_failure,
+    is_codex_agent_id,
+    maybe_start_codex_login,
+)
 from core.run_ledger.run_ledger import (
     RunLedger,
     log_root,
@@ -62,6 +68,11 @@ from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
     SESSION_SCOPE_PATH_KEYS,
     SUPPRESS_ENV_NAMES,
     SUPPRESS_STOP_HOOK_MARKER,
+)
+from core.provider_health.provider_health_guard import (  # noqa: E402 — provider 健康探测中性内核（S10f 抽出）
+    ProviderHealthRequirement,
+    command_output_text,
+    run_provider_health_requirement,
 )
 from rvf_handoff import (
     handoff_completion_payload,
@@ -126,8 +137,19 @@ from review_reopen_marker import (
     read_review_reopen_marker,
     review_reopen_status,
 )
-from round_baseline_marker import resolve_round_baseline_head
-import review_highwater_marker
+from core.session_scope_allocation.committed_round_detection import (  # noqa: E402 — committed-round 窗口下界检测中性核（S10h-b 迁 core；内部消费已迁 core 的 round_baseline/review_highwater marker）
+    _resolve_committed_round_base_ref,
+    _resolve_committed_round_baseline,
+)
+from core.session_scope_allocation.session_scope_gate_pure_helpers import (  # noqa: E402 — stop-session-scope gate 纯 helper 中性核（S10h-c 精简迁；引擎留 event-边界解析器 + ledger 主体）
+    REASON_PATCH_OWNERSHIP_INCOMPLETE,
+    SessionScopePrecheck,
+    _StopContextError,
+    _positive_int_from_env,
+    _string_list,
+    patch_ownership_incomplete_details,
+    session_change_type_from_manifest,
+)
 from cline_kanban_client import (
     DEFAULT_START_CMD as DEFAULT_CLINE_KANBAN_START_CMD,
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
@@ -147,11 +169,25 @@ from session_label import (
     strip_codex_user_message_preamble,
     text_from_message_payload,
 )
-import rvf_dispatch_flow as dispatch_flow
+import core.review_dispatch.review_validate_fix_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
-from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
+    HOST_CLAUDE,
+    HOST_CODEX,
+    detect_transcript_format,
+)
 import rvf_parent_context
+from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
+from core.parent_conversation_context.parent_conversation_origin_freeze import (  # noqa: E402 — 父会话来源冻结中性核（S10e 迁 core）
+    freeze_parent_conversation_origin,
+    parent_origin_summary_fields,
+    source_origin_for_kanban_task,
+)
+from core.review_prompt_assembly.review_validate_fix_fork_prompt import (  # noqa: E402 — fork prompt 父会话来源块装配中性核（S10g 迁 core）
+    add_parent_origin_to_rvf_fork_prompt as _core_add_parent_origin_to_rvf_fork_prompt,
+    parent_origin_prompt_block as _core_parent_origin_prompt_block,
+)
 from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
@@ -220,14 +256,6 @@ class StopDecision:
     summary_fields: dict[str, Any] | None = None
     payload: dict[str, Any] | None = None
     status: str = "skipped"
-
-
-@dataclass(frozen=True)
-class ProviderHealthRequirement:
-    provider: str
-    reason: str
-    command: tuple[str, ...]
-    remediation: str
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -370,10 +398,6 @@ def provider_health_timeout_seconds() -> float:
         return max(1.0, float(raw))
     except ValueError:
         return 12.0
-
-
-def codex_bin() -> str:
-    return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
 
 
 def parent_context_enabled() -> bool:
@@ -626,52 +650,10 @@ def parent_thread_id_from_event(event: dict[str, Any]) -> str | None:
     return session_id_from_event(event)
 
 
-def short_identifier(value: str | None, fallback: str = "unknown") -> str:
-    if not value:
-        return fallback
-    stripped = value.strip()
-    if not stripped:
-        return fallback
-    first_segment = stripped.split("-", 1)[0]
-    if re.match(r"^[A-Fa-f0-9]{8,}(?:-|$)", stripped):
-        return first_segment[:12]
-    return stripped[:32]
-
-
-def short_run_ref(run_id: str) -> str:
-    match = re.search(r"-([A-Fa-f0-9]{8,})$", run_id)
-    if match:
-        return match.group(1)[:12]
-    return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
-
-
-def transcript_origin_label(path: Path | None, session_id: str | None) -> str | None:
-    if path is None:
-        return None
-    stem = path.stem
-    if stem.startswith("rollout-"):
-        stem = stem.removeprefix("rollout-")
-    match = re.match(
-        r"(?P<started>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(?P<session>[A-Za-z0-9]{8,12})",
-        stem,
-    )
-    if match:
-        return f"{match.group('started')} {match.group('session')}"
-    if session_id:
-        return short_identifier(session_id)
-    return path.name
-
-
-def quoted_prompt_session_name(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    message = first_user_message(path)
-    if not message:
-        return None
-    excerpt = single_line_excerpt(message, parent_conversation_fallback_chars())
-    if not excerpt:
-        return None
-    return f'"{excerpt}"'
+# short_identifier / short_run_ref / transcript_origin_label 已迁 core（S10e）：
+# core.parent_conversation_context.parent_conversation_origin_freeze（顶部 re-import）。
+# quoted_prompt_session_name（首条-user-message 摘录）已下沉 adapters/codex/codex_host_adapter
+# 的 CodexHostAdapter.parent_transcript_quoted_session_name（Codex-schema 抽取归 adapter）。
 
 
 def codex_session_index_path() -> Path:
@@ -711,105 +693,35 @@ def parent_conversation_origin(
     parent_thread_name: str | None = None,
     name_lookup: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    session_id = parent_session_id or (
-        session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
-    )
-    transcript_path = str(parent_thread_path) if parent_thread_path is not None else None
-    # host_kind 复用 executor 选择的同一探测（detect_transcript_format）：同输入→同结果、
-    # 不与 resolve_cline_kanban_agent_id 漂移。它决定 session_ref_fallback 前缀与 codex_url
-    # 是否成立——避免把 Claude Code 会话硬贴成 "Codex" 标签 / `codex://` URL。
+    """引擎 assembly wrapper（S10e）：预解析 host 元数据 + 注入 HostAdapter → core freeze。
+
+    ``core.parent_conversation_context.freeze_parent_conversation_origin`` 持中性冻结逻辑；
+    本 wrapper 只负责 host 相关的预解析（``detect_transcript_format`` 探测、``session_id``
+    兜底 ``session_id_from_path``、Codex ``session_index`` 查名、session-ref 短前缀
+    Codex/Claude）与返回后注入 ``host_kind`` 键——这些是 host-身份 / Codex-read 职责，随
+    S10j 折入 ``codex_stop_hook_entry``，暂留引擎 assembly 层（core host-free 不承担）。
+    """
     host_kind: str | None = None
     if parent_thread_path is not None:
         try:
             host_kind = detect_transcript_format(parent_thread_path)
         except Exception:
             host_kind = None
-    name_source = "app_server_name"
-    label = parent_thread_name.strip() if isinstance(parent_thread_name, str) else ""
-    if not label:
-        label = session_index_thread_name(session_id) or ""
-        name_source = "session_index_thread_name" if label else "session_ref_fallback"
-    if not label:
-        label = quoted_prompt_session_name(parent_thread_path) or ""
-        name_source = "first_user_prompt_fallback" if label else "session_ref_fallback"
-    if not label:
-        # 前三级 lookup 全是 Codex-only schema（session_index / Codex 记录的首条 user
-        # message），在 Claude 会话上必然落空。这里按 host_kind 给出正确前缀；host 未知
-        # （transcript 缺失/不可识别）时仍兜底 "Codex"，与既有 Codex-only 用例零回归。
-        host_prefix = "Claude" if host_kind == HOST_CLAUDE else "Codex"
-        label = f"{host_prefix} {transcript_origin_label(parent_thread_path, session_id) or short_identifier(session_id)}"
-        name_source = "session_ref_fallback"
-    run_ref = short_run_ref(run_id)
-    return {
-        "label": label,
-        "task_title": f"RVF from {label} run {run_ref}",
-        "name_source": name_source,
-        "name_lookup": name_lookup,
-        "session_id": session_id,
-        "session_short_id": short_identifier(session_id),
-        "host_kind": host_kind,
-        # codex:// 只对 Codex（含 host 未知兜底）成立；Claude Code 会话无该 scheme，
-        # 置 None（prompt block 经 value_or_unavailable 渲染为 <unavailable>），
-        # 其「打开」入口由已输出的 RVF_PARENT_TRANSCRIPT_PATH 承担。
-        "codex_url": (
-            f"codex://local/{session_id}" if session_id and host_kind != HOST_CLAUDE else None
-        ),
-        "transcript_path": transcript_path,
-        "transcript_file": parent_thread_path.name if parent_thread_path is not None else None,
-        "run_id": run_id,
-        "run_ref": run_ref,
-    }
-
-
-def parent_conversation_host_label(host_kind: str | None) -> str:
-    """父会话 harness 的人类可读名，用于 prompt-block 文案标题。
-
-    Claude transcript → ``Claude Code``；其余（Codex / host 未知 / parent_origin 缺
-    ``host_kind`` 键）→ ``Codex``，与 ``parent_conversation_origin`` 的兜底口径一致。
-    """
-    return "Claude Code" if host_kind == HOST_CLAUDE else "Codex"
-
-
-def source_origin_for_kanban_task(
-    *,
-    task_id: str,
-    attempt_id: str | None,
-    task_title: str | None,
-    task_title_source: str | None,
-    fallback_origin: dict[str, Any],
-) -> dict[str, Any]:
-    title = task_title.strip() if isinstance(task_title, str) else ""
-    origin = dict(fallback_origin)
-    if title:
-        label = title
-        name_source = task_title_source or "cline_kanban_task_title"
-    else:
-        label = f"Cline Kanban task {task_id}"
-        name_source = "cline_kanban_task_id_fallback"
-    origin.update(
-        {
-            "label": label,
-            "name_source": name_source,
-            "source_kind": "cline-kanban-task",
-            "kanban_task_id": task_id,
-            "kanban_attempt_id": attempt_id,
-            "kanban_task_title": title or None,
-            "kanban_task_title_source": task_title_source,
-            "source_session_label": fallback_origin.get("label"),
-            "source_session_name_source": fallback_origin.get("name_source"),
-        }
+    session_id = parent_session_id or (
+        session_id_from_path(parent_thread_path) if parent_thread_path is not None else None
     )
+    origin = freeze_parent_conversation_origin(
+        parent_thread_path=parent_thread_path,
+        run_id=run_id,
+        host_adapter=resolve_host_adapter(host_kind),
+        session_id=session_id,
+        thread_name_from_index=session_index_thread_name(session_id),
+        session_ref_prefix="Claude" if host_kind == HOST_CLAUDE else "Codex",
+        parent_thread_name=parent_thread_name,
+        name_lookup=name_lookup,
+    )
+    origin["host_kind"] = host_kind
     return origin
-
-
-def value_or_unavailable(value: Any) -> str:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if value is not None:
-        text = str(value).strip()
-        if text:
-            return text
-    return "<unavailable>"
 
 
 def parent_origin_prompt_block(
@@ -817,75 +729,19 @@ def parent_origin_prompt_block(
     parent_origin: dict[str, Any],
     origin_path: str | None,
 ) -> str:
-    parent_conversation_ref = value_or_unavailable(
-        parent_origin.get("label") or parent_origin.get("session_id")
-    )
-    parent_conversation_source = value_or_unavailable(parent_origin.get("name_source"))
-    parent_codex_url = value_or_unavailable(parent_origin.get("codex_url"))
-    parent_transcript_path = value_or_unavailable(parent_origin.get("transcript_path"))
-    parent_transcript_file = value_or_unavailable(parent_origin.get("transcript_file"))
-    parent_origin_path = value_or_unavailable(origin_path)
-    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
-    lines = [
-        f"Original {host_label} conversation metadata:\n"
-        f"RVF_PARENT_CONVERSATION_REF: {parent_conversation_ref}\n"
-        f"RVF_PARENT_CONVERSATION_NAME: {parent_conversation_ref}\n"
-        f"RVF_PARENT_CONVERSATION_NAME_SOURCE: {parent_conversation_source}\n"
-        f"RVF_PARENT_CODEX_URL: {parent_codex_url}\n"
-        f"RVF_PARENT_TRANSCRIPT_PATH: {parent_transcript_path}\n"
-        f"RVF_PARENT_TRANSCRIPT_FILE: {parent_transcript_file}\n"
-        f"RVF_ORIGIN_METADATA: {parent_origin_path}\n"
-    ]
-    if parent_origin.get("source_kind") == "cline-kanban-task":
-        lines.append(
-            "RVF_PARENT_SOURCE_KIND: cline-kanban-task\n"
-            f"RVF_PARENT_KANBAN_TASK_ID: {value_or_unavailable(parent_origin.get('kanban_task_id'))}\n"
-            f"RVF_PARENT_KANBAN_ATTEMPT_ID: {value_or_unavailable(parent_origin.get('kanban_attempt_id'))}\n"
-            f"RVF_PARENT_KANBAN_TASK_TITLE: {value_or_unavailable(parent_origin.get('kanban_task_title'))}\n"
-            "RVF_PARENT_KANBAN_TASK_TITLE_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('kanban_task_title_source'))}\n"
-            "RVF_PARENT_SOURCE_SESSION_REF: "
-            f"{value_or_unavailable(parent_origin.get('source_session_label'))}\n"
-            "RVF_PARENT_SOURCE_SESSION_NAME_SOURCE: "
-            f"{value_or_unavailable(parent_origin.get('source_session_name_source'))}\n"
-        )
-    lines.append(
-        "\n"
-        "维护 handoff.md 时，`## Origin` 必须逐字保留上面的 original "
-        f"{host_label} conversation name/ref、name source、codex URL、transcript path "
-        "和 origin metadata path；如果存在 `RVF_PARENT_KANBAN_TASK_ID`，还必须写入 "
-        "`source Kanban task id` 和 `source Kanban attempt id`，以便任务改名后仍可反查"
-        "当前 task title；不要把 `RVF_PARENT_SESSION_ID` 当成 conversation name source。"
-    )
-    return "".join(lines)
+    """assembly wrapper：解析 host 人类可读名后委派 core 装配父会话来源块。
 
-
-def parent_origin_summary_fields(
-    *,
-    parent_session_id: str | None,
-    parent_thread_path: Path | None,
-    parent_origin: dict[str, Any],
-    parent_name_lookup: dict[str, Any],
-    origin_path: str | None,
-) -> dict[str, Any]:
-    return {
-        "parent_thread_id": parent_session_id,
-        "parent_thread_path": str(parent_thread_path) if parent_thread_path is not None else None,
-        "parent_conversation_ref": parent_origin.get("label"),
-        "parent_conversation_name": parent_origin.get("label"),
-        "parent_conversation_name_source": parent_origin.get("name_source"),
-        "parent_thread_name_lookup": parent_name_lookup,
-        "parent_codex_url": parent_origin.get("codex_url"),
-        "parent_origin_path": origin_path,
-        "parent_transcript_file": parent_origin.get("transcript_file"),
-        "parent_source_kind": parent_origin.get("source_kind"),
-        "parent_kanban_task_id": parent_origin.get("kanban_task_id"),
-        "parent_kanban_attempt_id": parent_origin.get("kanban_attempt_id"),
-        "parent_kanban_task_title": parent_origin.get("kanban_task_title"),
-        "parent_kanban_task_title_source": parent_origin.get("kanban_task_title_source"),
-        "parent_source_session_ref": parent_origin.get("source_session_label"),
-        "parent_source_session_name_source": parent_origin.get("source_session_name_source"),
-    }
+    host 显示名（"Claude Code" / "Codex"）经注入的 ``HostAdapter.host_display_name()``
+    从 ``parent_origin`` 的 host 归属键解析，与旧 ``parent_conversation_host_label`` 的
+    三情形（Claude / Codex / host 未知兜底 Codex）逐字等价，再以 ``host_display_label``
+    传入 core（守 R-1：host 判定留 assembly 层）。
+    """
+    host_display_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
+    return _core_parent_origin_prompt_block(
+        parent_origin=parent_origin,
+        origin_path=origin_path,
+        host_display_label=host_display_label,
+    )
 
 
 def plugin_deploy_prompt_block() -> str:
@@ -904,13 +760,13 @@ def add_parent_origin_to_rvf_fork_prompt(
     parent_origin: dict[str, Any],
     origin_path: str | None,
 ) -> str:
-    if RVF_FORK_MARKER not in prompt:
-        return prompt
-    if "RVF_PARENT_CONVERSATION_NAME_SOURCE:" in prompt:
-        return prompt
-    return (
-        f"{prompt.rstrip()}\n\n"
-        f"{parent_origin_prompt_block(parent_origin=parent_origin, origin_path=origin_path)}"
+    """assembly wrapper：解析 host 显示名后委派 core 追加父会话来源块（幂等不变）。"""
+    host_display_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
+    return _core_add_parent_origin_to_rvf_fork_prompt(
+        prompt,
+        parent_origin=parent_origin,
+        origin_path=origin_path,
+        host_display_label=host_display_label,
     )
 
 
@@ -1684,17 +1540,6 @@ def event_or_env_text(
     return string_event_value(event, event_keys)
 
 
-def is_codex_agent_id(agent_id: str | None) -> bool:
-    if agent_id is None:
-        return False
-    normalized = agent_id.strip().lower()
-    return (
-        normalized in {"codex", "codex-cli", "openai-codex"}
-        or normalized.startswith("codex:")
-        or "codex" in re.split(r"[^a-z0-9]+", normalized)
-    )
-
-
 # ⚠️ cline-kanban 的 `kanban task create --agent-id <id>` 决定该 task 用哪个 executor
 # 跑（合法值：cline | claude | codex | droid | gemini | opencode | default）。
 # RVF dispatch 只要传 `--agent-id`，就**覆盖了 cline-kanban 自身的默认 executor 选择**
@@ -1708,21 +1553,19 @@ def is_codex_agent_id(agent_id: str | None) -> bool:
 def default_cline_kanban_agent_id(parent_thread_path: Path | None) -> str:
     """根据父会话 transcript 推断应镜像的 cline-kanban agent_id。
 
-    复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 做 host 识别：
-    Claude Code transcript → ``claude``；Codex rollout → ``codex``；
-    无法识别（父 transcript 缺失 / 未知格式）→ 退回历史默认 ``codex``，
-    保证既有 Codex-only 用例零回归。
+    经 ``host_adapter_resolver.resolve_host_adapter`` 装配的具体 ``HostAdapter`` bundle
+    索取 ``cline_kanban_agent_id``（Codex→``codex`` / Claude→``claude``）——host-镜像
+    默认值这一 host 行为归注入面，引擎不再内联 ``host_kind ==`` 分支。host 识别仍复用
+    ``detect_transcript_format``；无法识别（父 transcript 缺失 / 未知格式 / 探测异常）时
+    resolver 兜底 ``CodexHostAdapter`` → ``codex``，保证既有 Codex-only 用例零回归。
     """
+    host: str | None = None
     if parent_thread_path is not None:
         try:
-            host_kind = detect_transcript_format(parent_thread_path)
+            host = detect_transcript_format(parent_thread_path)
         except Exception:
-            host_kind = None
-        if host_kind == HOST_CLAUDE:
-            return "claude"
-        if host_kind == HOST_CODEX:
-            return "codex"
-    return "codex"
+            host = None
+    return resolve_host_adapter(host).cline_kanban_agent_id()
 
 
 def resolve_cline_kanban_agent_id(
@@ -1753,6 +1596,7 @@ def provider_health_requirements(
                 reason="Legacy GUI/app-server RVF fallback uses Codex as the child session provider.",
                 command=(codex_bin(), "login", "status"),
                 remediation="请先运行 `codex login`，或使用 `codex login --with-api-key` 配置可用认证。",
+                output_failure_predicate=codex_login_output_indicates_failure,
             )
         ]
 
@@ -1770,6 +1614,7 @@ def provider_health_requirements(
                         "请先运行 `codex login`，确认 `codex login status` 成功后再让 "
                         "Stop hook 创建 Cline Kanban RVF task。"
                     ),
+                    output_failure_predicate=codex_login_output_indicates_failure,
                 )
             ]
 
@@ -1789,141 +1634,11 @@ def provider_health_requirements(
                     reason=f"Cline Kanban follow-up is targeting agent_id={agent_id!r}.",
                     command=(codex_bin(), "login", "status"),
                     remediation="请先运行 `codex login`，再重试 RVF follow-up 注入。",
+                    output_failure_predicate=codex_login_output_indicates_failure,
                 )
             ]
 
     return []
-
-
-def command_output_text(stdout: str | None, stderr: str | None) -> str:
-    return "\n".join(part for part in (stdout or "", stderr or "") if part).strip()
-
-
-def subprocess_output_text(value: bytes | str | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
-def codex_login_output_indicates_failure(output: str) -> bool:
-    normalized = output.strip().lower()
-    if not normalized:
-        return False
-    failure_markers = (
-        "not logged in",
-        "not authenticated",
-        "logged out",
-        "login expired",
-        "session expired",
-        "expired session",
-        "authentication expired",
-        "auth expired",
-        "invalid credentials",
-        "credential expired",
-        "token expired",
-    )
-    return any(marker in normalized for marker in failure_markers)
-
-
-def run_provider_health_requirement(
-    requirement: ProviderHealthRequirement,
-    timeout_seconds: float,
-) -> dict[str, Any]:
-    command = list(requirement.command)
-    record: dict[str, Any] = {
-        "provider": requirement.provider,
-        "reason": requirement.reason,
-        "command": command,
-        "remediation": requirement.remediation,
-        "status": "failed",
-    }
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-    except FileNotFoundError as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": "",
-                "stderr": f"{type(exc).__name__}: {exc}",
-                "failure_reason": "command_missing",
-            }
-        )
-        return record
-    except subprocess.TimeoutExpired as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": subprocess_output_text(exc.stdout),
-                "stderr": subprocess_output_text(exc.stderr),
-                "failure_reason": "timeout",
-                "timeout_seconds": timeout_seconds,
-            }
-        )
-        return record
-    except Exception as exc:
-        record.update(
-            {
-                "returncode": None,
-                "stdout": "",
-                "stderr": f"{type(exc).__name__}: {exc}",
-                "failure_reason": "error",
-            }
-        )
-        return record
-
-    output = command_output_text(completed.stdout, completed.stderr)
-    failed = completed.returncode != 0
-    if requirement.provider == "codex" and codex_login_output_indicates_failure(output):
-        failed = True
-    record.update(
-        {
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "status": "failed" if failed else "ok",
-            "failure_reason": "nonzero_or_auth_unhealthy" if failed else None,
-        }
-    )
-    return record
-
-
-def maybe_start_codex_login(ledger: RunLedger) -> dict[str, Any] | None:
-    if not is_truthy(os.environ.get("CODEX_RVF_AUTO_CODEX_LOGIN")):
-        return None
-
-    log_path = ledger.artifacts_dir / "codex-login.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with log_path.open("ab") as log_file:
-            process = subprocess.Popen(
-                [codex_bin(), "login"],
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=log_file,
-                start_new_session=True,
-            )
-    except Exception as exc:
-        return {
-            "started": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "command": [codex_bin(), "login"],
-            "log_path": str(log_path),
-        }
-
-    return {
-        "started": True,
-        "pid": process.pid,
-        "command": [codex_bin(), "login"],
-        "log_path": str(log_path),
-    }
 
 
 def provider_health_failure_message(
@@ -3435,7 +3150,7 @@ def cline_kanban_task_prompt(
     worktree_mode: str,
 ) -> str:
     transcript = str(parent_thread_path) if parent_thread_path is not None else "<unknown>"
-    host_label = parent_conversation_host_label(parent_origin.get("host_kind"))
+    host_label = resolve_host_adapter(parent_origin.get("host_kind")).host_display_name()
     parent_conversation_ref = str(
         parent_origin.get("label") or f"<unknown {host_label} conversation>"
     )
@@ -4295,7 +4010,7 @@ def lookup_cline_kanban_task_title(
     }
 
 
-def run_codex_fork(
+def run_review_validate_fix_child_fork(
     *,
     parent_session_id: str,
     cwd: str | None,
@@ -4826,7 +4541,7 @@ def run_fork_experiment(
     prompt = fork_experiment_prompt(session_id or "", cwd)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    payload = run_codex_fork(
+    payload = run_review_validate_fix_child_fork(
         parent_session_id=session_id or "",
         cwd=cwd,
         prompt=prompt,
@@ -4915,7 +4630,7 @@ def fork_review_validate_fix(
     prompt = fork_review_validate_fix_prompt(parent_session_id, cwd, repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    return run_codex_fork(
+    return run_review_validate_fix_child_fork(
         parent_session_id=parent_session_id,
         cwd=cwd,
         prompt=prompt,
@@ -5301,7 +5016,7 @@ def launch_backend(
     prompt = fork_review_validate_fix_prompt(decision.parent_thread_id, cwd, decision.repo)
     model = string_event_value(event, ("model",))
     reasoning_effort = reasoning_effort_for_fork(event)
-    return run_codex_fork(
+    return run_review_validate_fix_child_fork(
         parent_session_id=decision.parent_thread_id,
         cwd=cwd,
         prompt=prompt,
@@ -5335,7 +5050,7 @@ def review_validate_fix_dispatch(
             repo=repo,
         )
     if mode == "report":
-        report = fork_failure_report(repo)
+        report = report_only_no_auto_fork_message(repo)
         if ledger is not None:
             ledger.event(
                 phase="fork",
@@ -5353,40 +5068,6 @@ def review_validate_fix_dispatch(
             )
         return {"continue": True, "systemMessage": report}
     return fork_review_validate_fix(event, repo, ledger)
-
-
-class _StopContextError(Exception):
-    """Raised by `resolve_stop_context` when the Stop event provided a session
-    transcript path but it isn't readable. The orchestrator unwraps the
-    `skip_payload` attribute and short-circuits the gate."""
-
-    def __init__(self, skip_payload_value: dict[str, Any]) -> None:
-        super().__init__("stop context unresolved")
-        self.skip_payload = skip_payload_value
-
-
-@dataclass
-class SessionScopePrecheck:
-    checked: bool = False
-    context: dict[str, Any] | None = None
-    skip_payload: dict[str, Any] | None = None
-    route_paths: list[str] | None = None
-
-
-def _string_list(value: Any) -> list[str]:
-    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
-
-
-def session_change_type_from_manifest(manifest: dict[str, Any] | None) -> str | None:
-    if not isinstance(manifest, dict):
-        return None
-    owned_paths = _string_list(manifest.get("owned_paths"))
-    owned_dirty_paths = _string_list(manifest.get("owned_dirty_paths"))
-    if not owned_paths:
-        return "no_codebase_changes"
-    if not owned_dirty_paths:
-        return "no_dirty_codebase_changes"
-    return "dirty_codebase_changes"
 
 
 def resolve_stop_context(
@@ -5557,17 +5238,6 @@ def evaluate_session_gate(
     return None
 
 
-def _positive_int_from_env(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
 def auto_review_lease_ttl_seconds(context: dict[str, Any]) -> int | None:
     event = context.get("event")
     backend = normalize_backend_from_env(event if isinstance(event, dict) else None)
@@ -5577,64 +5247,6 @@ def auto_review_lease_ttl_seconds(context: dict[str, Any]) -> int | None:
             DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS,
         )
     return None
-
-
-REASON_PATCH_OWNERSHIP_INCOMPLETE = "patch_ownership_incomplete"
-
-
-def _patch_ownership_expected(manifest: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(manifest, dict):
-        return {"unit_ids": [], "paths": [], "unresolved": []}
-    ownership = manifest.get("patch_ownership")
-    if not isinstance(ownership, dict):
-        return {"unit_ids": [], "paths": [], "unresolved": []}
-    return {
-        "unit_ids": _string_list(ownership.get("expected_apply_patch_unit_ids")),
-        "paths": _string_list(ownership.get("expected_apply_patch_paths")),
-        "unresolved": (
-            [item for item in ownership.get("unresolved_owned_patch_hunks", []) if isinstance(item, dict)]
-            if isinstance(ownership.get("unresolved_owned_patch_hunks"), list)
-            else []
-        ),
-    }
-
-
-def _allocated_unit_ids_from_result(result: dict[str, Any]) -> list[str]:
-    scope = result.get("scope")
-    if isinstance(scope, dict):
-        return _string_list(scope.get("unit_ids"))
-    return _string_list(result.get("unit_ids"))
-
-
-def _allocated_paths_from_result(result: dict[str, Any]) -> list[str]:
-    scope = result.get("scope")
-    if isinstance(scope, dict):
-        return _string_list(scope.get("paths"))
-    return _string_list(result.get("paths"))
-
-
-def patch_ownership_incomplete_details(
-    manifest: dict[str, Any] | None,
-    result: dict[str, Any],
-) -> dict[str, Any] | None:
-    expected = _patch_ownership_expected(manifest)
-    expected_unit_ids = set(expected["unit_ids"])
-    allocated_unit_ids = set(_allocated_unit_ids_from_result(result))
-    missing_unit_ids = sorted(expected_unit_ids - allocated_unit_ids)
-    expected_paths = set(expected["paths"])
-    allocated_paths = set(_allocated_paths_from_result(result))
-    missing_paths = sorted(expected_paths - allocated_paths)
-    unresolved = expected["unresolved"]
-    if not unresolved and not missing_unit_ids:
-        return None
-    return {
-        "reason_code": REASON_PATCH_OWNERSHIP_INCOMPLETE,
-        "unresolved_owned_patch_hunks": unresolved,
-        "missing_apply_patch_unit_ids": missing_unit_ids,
-        "missing_apply_patch_paths": missing_paths,
-        "expected_apply_patch_unit_count": len(expected_unit_ids),
-        "allocated_unit_count": len(allocated_unit_ids),
-    }
 
 
 def patch_ownership_incomplete_skip_payload(
@@ -6405,6 +6017,18 @@ def plan_doc_review_classification(paths: list[str]) -> dict[str, Any]:
     }
 
 
+def report_only_no_auto_fork_message(repo: str) -> str:
+    # report-only 模式（CODEX_RVF_MODE=continuation/block）是「刻意不自动 fork」，
+    # 非 fork 失败——host-中性消息，不提任何 host 专属 fork 机制（去-codex：原先复用
+    # fork_failure_report 会向此中性路泄漏 "Codex GUI fork" / "Codex Desktop control socket"）。
+    return (
+        "review-validate-fix 处于 report-only 模式（CODEX_RVF_MODE=continuation/block）："
+        "本轮不自动创建 review fork。Stop continuation prompt 已禁用，因为它不会创建真正的"
+        "新用户 prompt，只会作为 hook system context 出现在当前轨迹中。"
+        f" target_repo={repo}。需要用户手动触发 $review-validate-fix。"
+    )
+
+
 def fork_failure_report(repo: str) -> str:
     return (
         "review-validate-fix Stop hook 未运行：无法创建 Codex GUI fork，"
@@ -6593,7 +6217,7 @@ def session_hook_control_decision(
 
 
 def report_only_decision(repo: str, ledger: RunLedger) -> StopDecision:
-    report = fork_failure_report(repo)
+    report = report_only_no_auto_fork_message(repo)
     ledger.event(
         phase="fork",
         event="skipped",
@@ -6779,95 +6403,6 @@ def route_reviewable_scope(
         },
         status="started",
     )
-
-
-def _commit_is_ancestor_of_head(repo_path: Path, commit: str) -> bool:
-    """``commit`` 是否为当前 HEAD 的祖先（含等于 HEAD）。best-effort：任何失败返回 False。
-
-    high-water 仅在通过本判定时才被 committed-round 采纳为窗口下界——分支被 reset/rebase
-    到 high-water 之前时，旧 high-water 不再是 HEAD 祖先，``baseline..HEAD`` 会退化，故视为
-    失效、回退 round-baseline。
-    """
-    if not commit:
-        return False
-    try:
-        result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return False
-    return result.returncode == 0
-
-
-COMMITTED_ROUND_BASE_REF_ENV = "CODEX_RVF_COMMITTED_ROUND_BASE_REF"
-
-
-def _local_branch_exists(repo_path: Path, branch: str) -> bool:
-    """``refs/heads/<branch>`` 是否存在（best-effort，任何失败返回 False）。"""
-    try:
-        result = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except (FileNotFoundError, OSError):
-        return False
-    return result.returncode == 0
-
-
-def _resolve_committed_round_base_ref(repo_path: Path) -> str | None:
-    """committed-round 的 base 分支 ref——把「被 rebase / cherry-pick 压平到本轮第一父链
-    的 base 工作」排除出可审窗口（见 ``diff_tracker._base_ref_exclude_revs`` /
-    ``_list_committed_round_changed_paths``）。
-
-    返回的是**活的 base 分支引用**（如 ``main``），不是 bootstrap 冻结的 base SHA：
-    ``base-branch-sync`` 把 main 顶到 worktree 创建之后才追加的 base 提交（如 monthly-deck）
-    重放进第一父链，只有活引用才能覆盖到它们——冻结 SHA 是这些提交的祖先，``^SHA`` 排不掉。
-
-    优先级：① 环境变量 ``CODEX_RVF_COMMITTED_ROUND_BASE_REF`` 显式覆盖（逃生口 / 测试注入）；
-    ② 本地 ``main`` 分支（base-branch-sync 默认 base，两起实测过触发用的都是它）；③ None。
-    HEAD 在 base 上/之下时绝不排除（否则会减掉会话自己的提交）的发散守卫，统一兜底在
-    diff_tracker 侧，故这里只做纯引用选择。base 是非-main 的特性分支栈式 task 是已记录的残留
-    （main-only 仍严格优于今天的「rebase 路径完全不排除」）。同一 hook 调用内 detection 与
-    allocation 都调本函数、入参只有 repo_path，天然同源（无 ac042be 式不同源风险）。"""
-    override = os.environ.get(COMMITTED_ROUND_BASE_REF_ENV, "").strip()
-    if override:
-        return override
-    if _local_branch_exists(repo_path, "main"):
-        return "main"
-    return None
-
-
-def _resolve_committed_round_baseline(
-    repo_path: Path,
-    task_id: str | None,
-    session_id: str | None,
-) -> str | None:
-    """committed-round 窗口下界：优先「最近一次完成 review 覆盖到的 HEAD」高水位
-    （``review_highwater_marker``，仅当其为当前 HEAD 祖先时采用），仅当某 task/session
-    从未完成过 review（无高水位）时才回退 round-baseline（上一条 prompt 的 HEAD）作 bootstrap。
-
-    这样『在某轮提交、却没在该轮自己的 Stop 里被审』的孤儿提交不会因后续任意 prompt 推进
-    round-baseline 而落出窗口——它们留在 ``high-water..HEAD`` 内直到真被审，修掉
-    "since last user prompt" 语义下的第三面漏审盲区（见 ``review_highwater_marker`` 模块头）。
-    best-effort：高水位读取异常时静默回退 round-baseline。
-    """
-    try:
-        highwater = review_highwater_marker.resolve_review_highwater_head(
-            task_id=task_id,
-            session_id=session_id,
-        )
-    except Exception:  # pragma: no cover - 高水位读取永不阻断
-        highwater = None
-    if highwater and _commit_is_ancestor_of_head(repo_path, highwater):
-        return highwater
-    return resolve_round_baseline_head(task_id=task_id, session_id=session_id)
 
 
 def maybe_route_committed_round_scope(

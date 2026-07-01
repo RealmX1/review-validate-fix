@@ -20,7 +20,7 @@ matching 的多个 hook **并行执行、顺序不确定**，且各源 hook 合�
 绝不 park（它是终态「待人审」回合，必须让 kanban to_review 正常发）。
 
 park 泄漏的清标（dispatch 失败/不派发/stranded）由 Stop hook 侧的幂等 unpark 安全阀兜底
-（见 ``codex_stop_review_validate_fix`` 的 self-park 安全阀 + stranded-sweep）；本文件只负责置标。
+（见 ``stop_review_validate_fix`` 的 self-park 安全阀 + stranded-sweep）；本文件只负责置标。
 
 刻意 stdlib-only、全程 best-effort 永不抛：hook 是最该 fail-open 的安全面。park 失败 = 无抑制
 （与今日同），但会记一行 ledger，绝不静默假装成功。

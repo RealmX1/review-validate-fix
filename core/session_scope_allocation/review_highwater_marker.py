@@ -3,7 +3,7 @@
 
 Stop-finalize（``rvf_run_finalize.finalize_run`` 在 ``did_review`` 完成时）与
 rvf-land 封窗（``seal_round_baseline_to_head``）**写**，committed-round 漏审检测
-（``codex_stop_review_validate_fix.maybe_route_committed_round_scope``）**读**。
+（``stop_review_validate_fix.maybe_route_committed_round_scope``）**读**。
 
 为什么需要它（committed-round 第三面盲区 = 落到 baseline 之下的孤儿提交）：
 ``round_baseline_marker`` 记录「上一条 user prompt 提交时的 HEAD」，UserPromptSubmit
@@ -39,8 +39,18 @@ from typing import Any
 
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+# 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.review_highwater_marker`` import、
+# 也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里含 ``core/``
+# 的 PYROOT 尚不在 ``sys.path``，且 ``_rvf_pyroot.py`` 不在本目录（它在 ``scripts/``），无法沿用
+# scripts 侧「同目录 ``import _rvf_pyroot``」自举。故内联哨兵自举：自底向上找同时含 ``.rvf-pyroot``
+# 哨兵与 ``core/`` 的最近祖先（与 ``_rvf_pyroot`` 同口径、depth-robust），插入 ``sys.path``。被当作
+# ``core.*`` import 时 PYROOT 已在 path，幂等无副作用。
+_pyroot_search_start = Path(__file__).resolve()
+for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
+    if (_pyroot_candidate / ".rvf-pyroot").is_file() and (_pyroot_candidate / "core").is_dir():
+        if str(_pyroot_candidate) not in sys.path:
+            sys.path.insert(0, str(_pyroot_candidate))
+        break
 from core.run_ledger.run_ledger import log_root, safe_token  # noqa: E402
 
 

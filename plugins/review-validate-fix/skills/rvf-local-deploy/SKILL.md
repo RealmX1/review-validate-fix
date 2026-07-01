@@ -53,8 +53,8 @@ installer 还会写入部署日志，用于追踪「哪些 plugin 状态已经�
 
 ```bash
 test -f /Users/bominzhang/plugins/review-validate-fix/.codex-plugin/plugin.json
-test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
-python3 -m py_compile /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
+test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py
+python3 -m py_compile /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py
 test -f /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state/deployments/latest-deployment.json
 test -f /Users/bominzhang/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/skills/review-validate-fix/state/deployments/latest-deployment.json
 rg -n "\\[deployed [0-9a-f]{12}(-dirty)?\\]" /Users/bominzhang/plugins/review-validate-fix/skills/*/SKILL.md

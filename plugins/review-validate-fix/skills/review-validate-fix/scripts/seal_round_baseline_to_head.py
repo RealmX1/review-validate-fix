@@ -29,8 +29,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import round_baseline_marker
-import review_highwater_marker
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import（marker 迁 core 后需自举）
+from core.session_scope_allocation import round_baseline_marker  # noqa: E402
+from core.session_scope_allocation import review_highwater_marker  # noqa: E402
 
 SEAL_PROMPT_EXCERPT = "rvf-land seal (round baseline advanced to landed HEAD)"
 

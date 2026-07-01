@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pure helpers for deriving a human-readable label for a Codex session.
 
-Extracted from codex_stop_review_validate_fix so dashboards and other tools
+Extracted from stop_review_validate_fix so dashboards and other tools
 can reuse the label/excerpt logic without importing the Stop-hook module.
 """
 from __future__ import annotations

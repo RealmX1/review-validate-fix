@@ -337,7 +337,7 @@ def _capture_round_baseline(event: dict[str, Any], prompt: str | None) -> dict[s
     boundaries and must not move the baseline.
     """
     try:
-        import round_baseline_marker  # noqa: PLC0415 - lazy, off the hot import path
+        from core.session_scope_allocation import round_baseline_marker  # noqa: PLC0415 - lazy, off the hot import path
 
         cwd = event.get("cwd")
         if not isinstance(cwd, str) or not cwd.strip():
@@ -509,7 +509,7 @@ def _handle_bootstrap_confirmation(
     if rvf_bootstrap_confirm.is_yes_literal(prompt):
         rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
         try:
-            import codex_stop_review_validate_fix as stop_hook  # noqa: PLC0415
+            import stop_review_validate_fix as stop_hook  # noqa: PLC0415
 
             task_payload = stop_hook.resume_dispatch_from_confirmation_marker(marker)
             return {

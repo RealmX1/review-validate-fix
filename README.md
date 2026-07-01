@@ -59,9 +59,9 @@ scripts/check_plugin_contracts.py          # 仓库级契约检查入口，委�
 scripts/check_skill_contracts.sh           # 覆盖 plugin runtime、安装脚本和 tests/ 的契约检查
 scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间 + 同步 Claude Code marketplace
 tests/                                     # 开发和契约测试；不随 plugin runtime 分发
-plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
+plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
-plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_router.py
+plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py
                                             # Stop hook channel router：按 session marker 选择 stable/dev
 ```
 
@@ -105,8 +105,8 @@ python3 scripts/check_plugin_contracts.py --timing-report /tmp/rvf-contract-timi
 新增测试时不需要手写 shard 逻辑；只需要把测试函数加入对应文件的集中 runner 清单：
 
 - `tests/test_review_support_scripts.py`：加入 `review_support_test_cases(root)`。
-- `tests/test_codex_stop_review_validate_fix.py`：加入 `main()` 里的 `tests` 列表。
-- `tests/test_codex_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
+- `tests/test_stop_review_validate_fix.py`：加入 `main()` 里的 `tests` 列表。
+- `tests/test_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
 - `tests/test_review_reopen_marker.py`：rescope marker（失败再入）单测，加入 `main()` 里的 `tests` 列表；该文件已登记进 `check_skill_contracts.sh` 的合约门 runner，新增测试函数务必同步进 `tests` 列表，否则静默假绿。
 
 新测试应继续使用传入的 `tmp` / `tmp_path` 派生独立目录，避免共享固定路径、端口、全局环境或可长期存在的进程。确实需要临时修改 `os.environ`、模块 monkeypatch、socket/port、sleep/timeout 的测试，必须在 `finally` 中恢复状态；这类测试在高并发下容易成为 flake，应优先使用更宽松的超时边界，或放在默认不拆分的测试组中。
@@ -137,7 +137,7 @@ python3 scripts/install_to_codex.py
 python3 scripts/install_to_codex.py --configure-stop-hook
 ```
 
-这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `codex_stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/codex_stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 不属于 tmux `cline-kanban` / `cline-kanban-*` session），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
+这会更新 `~/.codex/hooks.json`，让 Stop hook 用 `CODEX_RVF_MODE=fork CODEX_RVF_FORK_MODE=auto` 调用 installed plugin skill 的 `stop_hook_router.py`。router 默认选择 stable dispatcher；只有当前 session 显式设置 `RVF_STOP_HOOK_CHANNEL: dev` 或已有 dev channel marker 时，才转发到 dev checkout 的 dispatcher。router 选定 channel 后再由 dispatcher 转交给 `scripts/stop_review_validate_fix.py`。`auto` 会在 Stop event 或环境里发现 `KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id` 时选择 `kanban-followup`，否则默认创建新的 Cline Kanban task。Codex GUI fork 是 legacy backup-of-backup：只有自动模式下 Cline Kanban task 启动失败且失败不属于可诊断的 Kanban 管理面错误（例如端口 listener 不属于 tmux `cline-kanban` / `cline-kanban-*` session），或用户显式配置 `CODEX_RVF_FORK_MODE=gui` 时才使用。GUI fallback 不会打开 Terminal；它通过 Codex app-server 的 `thread/fork` + `turn/start` 创建一个新的 GUI fork 会话，并在新会话中提交以 `$review-validate-fix` 开头的 prompt。如果 Codex Desktop control socket 不可用，hook 会自动使用可连通的 RVF app-server bridge；bridge 仍不可用时只报告无法创建 legacy GUI fallback，不回退到 Stop continuation。
 
 如果需要让 RVF 子流程完全脱离 Codex GUI，可显式配置 Cline Kanban 模式：
 
@@ -190,7 +190,7 @@ python3 scripts/install_to_codex.py --configure-stop-hook --fork-mode kanban-fol
 
 该模式写入 `CODEX_RVF_FORK_MODE=kanban-followup`，也接受别名 `kanban-message` / `kanban-inject`。dirty gate 通过后，hook 不 fork、不创建新 task，而是要求环境或 Stop event 提供 `KANBAN_TASK_ID`（兼容 `CLINE_KANBAN_TASK_ID` / `task_id`），再调用定制的 `kanban task message --project-path <repo> --task-id <id> --prompt-file <prompt> --source review-validate-fix --idempotency-key <run_id>`。这个命令必须走 Kanban host 的真实用户消息通道，把 `$review-validate-fix` prompt 注入当前 task 的 active coding-agent chat session；不得实现为 card activity、metadata、hook context、system message 或 `contextModification`。注入失败时 hook 只报告 `kanban_followup_unavailable` / `kanban_followup_missing_task_id` 并停止，不回退到 continuation、新 task 或 GUI fork。
 
-实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/codex_stop_hook_router.py`，不是直接调用 `codex_stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。stable channel 转发到 installed stable dispatcher，并关闭子 dispatcher 的 repo-path dev sync；选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并允许它在 `CODEX_RVF_DEV_REPO` 匹配当前 Stop event repo 时运行 repo 级 contract check，但会设置 `CODEX_RVF_DEV_SYNC_INSTALL=0`，避免 Stop hook 把 dev checkout 自动安装进 stable plugin。dispatcher 的完整 dev-only sync 安装能力仍保留给直接调用 dispatcher 的受控开发路径使用：
+实际写入 `~/.codex/hooks.json` 的入口是 installed plugin skill 中的 `scripts/stop_hook_router.py`，不是直接调用 `stop_review_validate_fix.py`。router 只按显式 `RVF_STOP_HOOK_CHANNEL` 控制行或 session marker 选择 stable/dev channel；默认永远是 stable，不因当前 repo 是 RVF 源仓库而自动切 dev。stable channel 转发到 installed stable dispatcher，并关闭子 dispatcher 的 repo-path dev sync；选择 dev channel 后，router 会转发到 dev checkout 的 dispatcher，并允许它在 `CODEX_RVF_DEV_REPO` 匹配当前 Stop event repo 时运行 repo 级 contract check，但会设置 `CODEX_RVF_DEV_SYNC_INSTALL=0`，避免 Stop hook 把 dev checkout 自动安装进 stable plugin。dispatcher 的完整 dev-only sync 安装能力仍保留给直接调用 dispatcher 的受控开发路径使用：
 
 ```bash
 python3 scripts/check_plugin_contracts.py
@@ -208,9 +208,9 @@ python3 scripts/install_to_codex.py --configure-stop-hook
 
 如果当前 Stop hook command 是 `auto`、Cline Kanban 或 Kanban follow-up 模式，dispatcher 在执行自同步安装时会保留 `--fork-mode ...` 和全部 `--cline-kanban-*` 配置，避免把已配置的管理模式覆盖回默认值。
 
-如果受控开发路径启用了 dispatcher dev sync，且 Stop event 提供 transcript path，dispatcher 会先生成 session manifest；只有存在当前 chat session 归属的 `owned_dirty_paths` 时，才执行 dev sync 并转交 installed `codex_stop_review_validate_fix.py`。这避免其他 session 或其他 agent 留下的 dirty WIP 触发本 session 的同步、安装或自动 review。没有 transcript 时，dispatcher 仍保留旧行为，按 dev repo 主会话执行 sync。
+如果受控开发路径启用了 dispatcher dev sync，且 Stop event 提供 transcript path，dispatcher 会先生成 session manifest；只有存在当前 chat session 归属的 `owned_dirty_paths` 时，才执行 dev sync 并转交 installed `stop_review_validate_fix.py`。这避免其他 session 或其他 agent 留下的 dirty WIP 触发本 session 的同步、安装或自动 review。没有 transcript 时，dispatcher 仍保留旧行为，按 dev repo 主会话执行 sync。
 
-只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `codex_stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 只通过 stdout 输出一个不会触发模型续跑的 hook payload，并把失败详情写入 run ledger；不要把这类 breaking error 写成非零 stderr，因为 Codex Desktop 可能把 hook stderr 包装成当前会话的 `<hook_prompt>` continuation。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
+只有 contract check 和 plugin 安装成功后，dispatcher 才会把同一份 Stop event JSON 转交给 installed `stop_review_validate_fix.py`。如果检查、安装或 installed hook 执行失败，dispatcher 只通过 stdout 输出一个不会触发模型续跑的 hook payload，并把失败详情写入 run ledger；不要把这类 breaking error 写成非零 stderr，因为 Codex Desktop 可能把 hook stderr 包装成当前会话的 `<hook_prompt>` continuation。对其他仓库或 subagent Stop event，dispatcher 不做同步，只转交给 installed hook 正常执行。
 
 ### Dev-only 标准
 
@@ -240,16 +240,16 @@ hook 会优先使用 Stop event 暴露的 rollout path 进行 fork；只有没�
 
 ```mermaid
 flowchart TD
-    Install["安装或更新 plugin\nscripts/install_to_codex.py --configure-stop-hook"] --> Hooks["~/.codex/hooks.json\nStop: codex_stop_hook_router.py\nCODEX_RVF_MODE=fork\nCODEX_RVF_FORK_MODE=auto"]
+    Install["安装或更新 plugin\nscripts/install_to_codex.py --configure-stop-hook"] --> Hooks["~/.codex/hooks.json\nStop: stop_hook_router.py\nCODEX_RVF_MODE=fork\nCODEX_RVF_FORK_MODE=auto"]
     Hooks --> Stop["Codex 主会话停止\nStop event JSON"]
-    Stop --> Router["installed router\ncodex_stop_hook_router.py"]
+    Stop --> Router["installed router\nstop_hook_router.py"]
     Router --> Channel{"session channel"}
-    Channel -- "stable/default" --> Dispatcher["stable dispatcher\ncodex_stop_hook_dispatcher.py"]
-    Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\ncodex_stop_hook_dispatcher.py"]
+    Channel -- "stable/default" --> Dispatcher["stable dispatcher\nstop_hook_dispatcher.py"]
+    Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\nstop_hook_dispatcher.py"]
 
     Dispatcher --> DevCheck{"是否 RVF dev repo\n且需要 dev sync？"}
     DevDispatcher --> DevContract{"是否 RVF dev repo\n且需要 dev 预检？"}
-    DevCheck -- "否" --> InstalledHook["installed hook\ncodex_stop_review_validate_fix.py"]
+    DevCheck -- "否" --> InstalledHook["installed hook\nstop_review_validate_fix.py"]
     DevCheck -- "是" --> Sync["dev sync\ncheck_plugin_contracts.py\ninstall_to_codex.py --configure-stop-hook"]
     DevContract -- "否" --> InstalledHook
     DevContract -- "是" --> ContractOnly["dev channel preflight\ncheck_plugin_contracts.py\n不安装 stable"]
@@ -358,7 +358,7 @@ bash scripts/check_skill_contracts.sh
 python3 scripts/check_plugin_contracts.py
 ```
 
-这两个入口默认并行运行重测试，并把 `test_review_support_scripts.py` 与 `test_codex_stop_review_validate_fix.py` 做进程级分片。需要串行复现时：
+这两个入口默认并行运行重测试，并把 `test_review_support_scripts.py` 与 `test_stop_review_validate_fix.py` 做进程级分片。需要串行复现时：
 
 ```bash
 RVF_CONTRACT_PARALLEL_TESTS=0 bash scripts/check_skill_contracts.sh
@@ -369,11 +369,11 @@ RVF_CONTRACT_PARALLEL_TESTS=0 python3 scripts/check_plugin_contracts.py
 
 ```bash
 python3 tests/test_review_support_scripts.py --shard-count 4 --shard-index 0
-python3 tests/test_codex_stop_review_validate_fix.py --shard-count 4 --shard-index 0
-python3 tests/test_codex_stop_hook_dispatcher.py --shard-count 2 --shard-index 0
+python3 tests/test_stop_review_validate_fix.py --shard-count 4 --shard-index 0
+python3 tests/test_stop_hook_dispatcher.py --shard-count 2 --shard-index 0
 ```
 
-默认没有拆分 dispatcher 测试；`test_codex_stop_hook_dispatcher.py` 的 shard 参数主要用于本地诊断，开启 `RVF_CONTRACT_DISPATCHER_SHARDS` 前应确认没有放大时序敏感测试。
+默认没有拆分 dispatcher 测试；`test_stop_hook_dispatcher.py` 的 shard 参数主要用于本地诊断，开启 `RVF_CONTRACT_DISPATCHER_SHARDS` 前应确认没有放大时序敏感测试。
 
 需要详细输出时运行：
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """dirty repo 闸 测试簇。
 
-从 tests/test_codex_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
+从 tests/test_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
 按裸名引用，故共享 helper/常量经模块级 inject()（def main() 之前）推入本模块 globals 并重绑测试名，
 让注册表在 main() 运行时解析到它们。注册表与分片逻辑不动 -> 注册顺序 / 分片身份保持不变。
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-# 由 aggregator（tests/test_codex_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
+# 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
     'test_dirty_repo_dry_run_prepares_legacy_gui_requests',
     'test_dirty_repo_manual_mode_only_prepares_prompt',
@@ -178,5 +178,7 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -
     summary = summary_from_payload(payload)
     assert "$review-validate-fix" in str(summary["message"])
     assert str(dirty) in str(summary["message"])
+    # 去-codex：report-only（刻意不 fork）的 host-中性消息不得泄漏任何 Codex 专属 fork 机制。
+    assert "Codex" not in str(summary["message"])
     assert "Stop continuation prompt 已禁用" in str(summary["message"])
 

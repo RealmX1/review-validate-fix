@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """cline-kanban stop-hook 派发 测试簇。
 
-从 tests/test_codex_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
+从 tests/test_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
 按裸名引用，故共享 helper/常量经模块级 inject()（def main() 之前）推入本模块 globals 并重绑测试名，
 让注册表在 main() 运行时解析到它们。注册表与分片逻辑不动 -> 注册顺序 / 分片身份保持不变。
 """
@@ -14,7 +14,7 @@ import re
 import subprocess
 from pathlib import Path
 
-# 由 aggregator（tests/test_codex_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
+# 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
     'test_cline_kanban_worktree_mode_rejects_main_env',
     'test_cline_kanban_mode_creates_and_starts_task_with_same_run',
@@ -124,7 +124,7 @@ def test_cline_kanban_mode_creates_and_starts_task_with_same_run(tmp_path: Path)
         os.environ["CODEX_RVF_PREP_ROOT"] = str(prep_root)
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -331,7 +331,7 @@ def test_cline_kanban_automatic_task_ignores_base_ref_and_worktree_env(tmp_path:
         os.environ["CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE"] = "inplace"
         os.environ["FAKE_CLIENT_CALLS"] = str(client_calls)
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -424,7 +424,7 @@ def test_cline_kanban_mode_requires_workspace_path(tmp_path: Path) -> None:
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -497,7 +497,7 @@ def test_cline_kanban_branch_mode_rejects_parent_project_workspace(tmp_path: Pat
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
         os.environ["CODEX_RVF_CLINE_KANBAN_TASK_CMD"] = "fake task"
         transcript = write_apply_patch_transcript(tmp_path / "session.jsonl", repo)
-        payload = module.run_codex_fork(
+        payload = module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",
@@ -654,7 +654,7 @@ def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Pat
         os.environ["CODEX_RVF_STATE_DIR"] = str(state)
         os.environ["CODEX_RVF_FORK_MODE"] = "cline-kanban"
         os.environ["CODEX_RVF_CLINE_KANBAN_CLIENT"] = str(fake_client)
-        module.run_codex_fork(
+        module.run_review_validate_fix_child_fork(
             parent_session_id="parent-thread",
             cwd=str(repo),
             prompt="$review-validate-fix",

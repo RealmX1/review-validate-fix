@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import codex_stop_review_validate_fix as stop_hook
+import stop_review_validate_fix as stop_hook
 
 
 def read_event() -> dict[str, Any]:
