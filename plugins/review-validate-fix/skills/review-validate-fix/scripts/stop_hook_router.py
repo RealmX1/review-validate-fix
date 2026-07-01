@@ -17,7 +17,7 @@ from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_STABLE_STOP_HOOK = SKILL_DIR / "scripts" / "codex_stop_hook_dispatcher.py"
+DEFAULT_STABLE_STOP_HOOK = SKILL_DIR / "scripts" / "stop_hook_dispatcher.py"
 SESSION_PATH_KEYS = (
     "transcript_path",
     "session_path",
@@ -299,7 +299,7 @@ def target_for_channel(channel: str) -> tuple[Path | None, str | None]:
             / "skills"
             / "review-validate-fix"
             / "scripts"
-            / "codex_stop_hook_dispatcher.py",
+            / "stop_hook_dispatcher.py",
             None,
         )
     return None, "dev channel requested but CODEX_RVF_DEV_STOP_HOOK/CODEX_RVF_DEV_REPO is not configured"

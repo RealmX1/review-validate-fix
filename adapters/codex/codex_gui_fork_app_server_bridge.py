@@ -8,7 +8,7 @@ bridge app-server）创建并可见化 GUI fork 线程、查询父线程名、�
 
 这是 host-specific 实现：只依赖 stdlib 与本文件自带的几个 1-3 行纯工具副本
 （``is_truthy`` / ``is_falsey`` / ``codex_bin``，与引擎同源——本仓既有惯例即
-「每个脚本自含这些 trivial helper」，见 ``codex_stop_hook_dispatcher.is_truthy`` /
+「每个脚本自含这些 trivial helper」，见 ``stop_hook_dispatcher.is_truthy`` /
 ``rvf_analyze_thread.codex_bin``），**刻意不反向 import 共享审查引擎**，以保持
 ``adapters → engine`` 零依赖边、无循环。引擎侧的中性 fork 路由骨架
 （``run_review_validate_fix_child_fork``）通过 import 本模块的少数公开入口

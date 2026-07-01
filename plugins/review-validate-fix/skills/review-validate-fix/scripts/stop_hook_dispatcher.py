@@ -597,7 +597,7 @@ def _command_targets_current_dispatcher(command: str) -> bool:
         return False
     current = Path(__file__).resolve()
     for token in tokens:
-        if not token.endswith("codex_stop_hook_dispatcher.py"):
+        if not token.endswith("stop_hook_dispatcher.py"):
             continue
         candidate = token.split("=", 1)[1] if "=" in token else token
         try:
@@ -635,7 +635,7 @@ def hook_config_from_hooks_json() -> dict[str, str]:
             command = hook.get("command") if isinstance(hook, dict) else None
             if not isinstance(command, str):
                 continue
-            if "review-validate-fix" not in command or "codex_stop_hook_dispatcher.py" not in command:
+            if "review-validate-fix" not in command or "stop_hook_dispatcher.py" not in command:
                 continue
             if not _command_targets_current_dispatcher(command):
                 continue

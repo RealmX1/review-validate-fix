@@ -212,13 +212,13 @@ run_parallel_test_steps() {
   done
   for ((shard_index = 0; shard_index < dispatcher_shards; shard_index++)); do
     if [ "$dispatcher_shards" -eq 1 ]; then
-      labels+=("tests: codex_stop_hook_dispatcher")
+      labels+=("tests: stop_hook_dispatcher")
       args+=("")
     else
-      labels+=("tests: codex_stop_hook_dispatcher shard $((shard_index + 1))/$dispatcher_shards")
+      labels+=("tests: stop_hook_dispatcher shard $((shard_index + 1))/$dispatcher_shards")
       args+=("--shard-count $dispatcher_shards --shard-index $shard_index")
     fi
-    scripts+=("$tests_dir/test_codex_stop_hook_dispatcher.py")
+    scripts+=("$tests_dir/test_stop_hook_dispatcher.py")
   done
   for ((shard_index = 0; shard_index < stop_hook_shards; shard_index++)); do
     if [ "$stop_hook_shards" -eq 1 ]; then
@@ -417,7 +417,7 @@ required_files=(
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
   "scripts/workspace_snapshot.py"
-  "scripts/codex_stop_hook_dispatcher.py"
+  "scripts/stop_hook_dispatcher.py"
   "scripts/stop_hook_router.py"
   "scripts/codex_stop_review_validate_fix.py"
   "scripts/discover_santa_alternative_agents.sh"
@@ -454,7 +454,7 @@ repo_required_files=(
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
-  "tests/test_codex_stop_hook_dispatcher.py"
+  "tests/test_stop_hook_dispatcher.py"
   "tests/test_codex_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
   "tests/test_review_support_scripts.py"
@@ -529,7 +529,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
-  "$skill_dir/scripts/codex_stop_hook_dispatcher.py" \
+  "$skill_dir/scripts/stop_hook_dispatcher.py" \
   "$skill_dir/scripts/codex_stop_review_validate_fix.py" \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$repo_root/core/session_scope_allocation/round_baseline_marker.py" \
@@ -546,7 +546,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
-  "$tests_dir/test_codex_stop_hook_dispatcher.py" \
+  "$tests_dir/test_stop_hook_dispatcher.py" \
   "$tests_dir/test_codex_stop_review_validate_fix.py" \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_review_support_scripts.py" \
@@ -835,8 +835,8 @@ require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_prep_f
 require_literal "scripts/codex_stop_review_validate_fix.py" 'rvf_dispatch_target_worktree'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'cline-kanban-started'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'cline_kanban_task_started'
-require_literal "scripts/codex_stop_hook_dispatcher.py" 'DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"'
-require_literal "scripts/codex_stop_hook_dispatcher.py" 'dev_sync_step_specs'
+require_literal "scripts/stop_hook_dispatcher.py" 'DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"'
+require_literal "scripts/stop_hook_dispatcher.py" 'dev_sync_step_specs'
 require_repo_literal "README.md" 'Dev-only 标准'
 require_repo_literal "README.md" 'RVF_CONTRACT_PARALLEL_TESTS'
 require_repo_literal "README.md" 'RVF_CONTRACT_REVIEW_SUPPORT_SHARDS'
@@ -845,7 +845,7 @@ require_repo_literal "README.md" '--shard-count'
 require_repo_literal "README.md" 'Dev-only 标准'
 require_repo_literal "scripts/install_to_codex.py" 'DEV_ONLY_NAMES'
 require_repo_literal "tests/test_install_to_codex.py" 'test_copy_tree_excludes_dev_only_paths'
-require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_resolve_repo_level_dev_scripts'
+require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_resolve_repo_level_dev_scripts'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-cmd'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-task-cmd'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-timeout'
@@ -862,12 +862,12 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.
 # vendor-on-install post-deploy 校验固化进 rvf-local-deploy SKILL（防 vendored payload 静默漂移：检查全过但运行期 ModuleNotFoundError）
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'trajectory_distill.py -h'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'core/subagents/models.py'
-require_literal "scripts/codex_stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
-require_literal "scripts/codex_stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
+require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
+require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
 require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_write_cline_kanban_mode'
 require_repo_literal "tests/test_install_to_codex.py" 'test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks'
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_can_configure_user_prompt_submit_hook'
-require_repo_literal "tests/test_codex_stop_hook_dispatcher.py" 'test_dev_sync_preserves_cline_kanban_installer_args'
+require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_preserves_cline_kanban_installer_args'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_cline_kanban_mode_creates_and_starts_task_with_same_run'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'test_kanban_followup_mode_injects_current_task_message'
 require_repo_literal "tests/test_codex_stop_review_validate_fix.py" 'dispatch_prep_payload'

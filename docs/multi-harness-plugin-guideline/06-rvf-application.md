@@ -13,7 +13,7 @@
 - 仓库内 `plugins/review-validate-fix/` 是跨 harness plugin payload，同时被 Claude Code 与 Codex 的本机 marketplace 枚举。
 - **两份 nested plugin manifest 的 `name` 已统一为 `"review-validate-fix"`**（S0 v2 消除反模式 ②）：`plugins/review-validate-fix/.claude-plugin/plugin.json` 与 `.codex-plugin/plugin.json` 同 id；版本均 `0.1.0`。
 - **采用 (M+N) Marketplace + Nested 变体**：repo-root `.claude-plugin/marketplace.json`（S0 v2 补齐）列出 plugin，`plugins[0].source` 指向 `./plugins/review-validate-fix`；plugin manifest 留在 nested 位置。这是对指南「repo-root 双 manifest」字面形态的有意偏离，理由见下「Pattern A 的 marketplace 变体」节。
-- Stop hook 调度链：`stop_hook_router.py → codex_stop_hook_dispatcher.py → codex_stop_review_validate_fix.py`，同时面向 Codex 与 Claude Code 两栈。Claude Code 侧经 `hooks/{stop.py,user_prompt_submit.py}` 薄 shim 转发到该 core（路径 C，trigger-only）；两入口共享单一 host-ownership 契约 `hooks/_claude_hook_entry.py`（S3 守卫单源化）。
+- Stop hook 调度链：`stop_hook_router.py → stop_hook_dispatcher.py → codex_stop_review_validate_fix.py`，同时面向 Codex 与 Claude Code 两栈。Claude Code 侧经 `hooks/{stop.py,user_prompt_submit.py}` 薄 shim 转发到该 core（路径 C，trigger-only）；两入口共享单一 host-ownership 契约 `hooks/_claude_hook_entry.py`（S3 守卫单源化）。
 - **core ↔ adapter 边界已显式化**：transcript 解析（`core/transcript/` + `adapters/{codex,claude_code}/transcript.py`，S1）、write-op 计数与子区间窗口（S1.5）、子代理捕获与调用向量（`core/subagents/` + 各 adapter，S2）均 host-agnostic，不消费 host 工具名、不硬编码 host 布局。`HOST_CODEX="codex"` / `HOST_CLAUDE="claude_code"` 仍是 adapter 分派常量。
 - skill 文档：`review-validate-fix` 是 Claude Code 一等公民（plugin 暴露 1 command + 6 skill；slash 入口统一走 namespaced `/review-validate-fix:<name>` skill 形态，不再保留与同名 skill 重复的薄 shim 命令）；Codex 侧通过 plugin manifest + 安装器注册的 `~/.codex/hooks.json` 绑定。
 

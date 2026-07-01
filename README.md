@@ -59,7 +59,7 @@ scripts/check_plugin_contracts.py          # 仓库级契约检查入口，委�
 scripts/check_skill_contracts.sh           # 覆盖 plugin runtime、安装脚本和 tests/ 的契约检查
 scripts/install_to_codex.py                # 安装 plugin 到本机 Codex plugin 空间 + 同步 Claude Code marketplace
 tests/                                     # 开发和契约测试；不随 plugin runtime 分发
-plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_hook_dispatcher.py
+plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_dispatcher.py
                                             # Stop hook 稳定入口：必要时先检查并安装本 repo plugin
 plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_hook_router.py
                                             # Stop hook channel router：按 session marker 选择 stable/dev
@@ -106,7 +106,7 @@ python3 scripts/check_plugin_contracts.py --timing-report /tmp/rvf-contract-timi
 
 - `tests/test_review_support_scripts.py`：加入 `review_support_test_cases(root)`。
 - `tests/test_codex_stop_review_validate_fix.py`：加入 `main()` 里的 `tests` 列表。
-- `tests/test_codex_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
+- `tests/test_stop_hook_dispatcher.py`：加入 `main()` 里的 `tests` 列表。
 - `tests/test_review_reopen_marker.py`：rescope marker（失败再入）单测，加入 `main()` 里的 `tests` 列表；该文件已登记进 `check_skill_contracts.sh` 的合约门 runner，新增测试函数务必同步进 `tests` 列表，否则静默假绿。
 
 新测试应继续使用传入的 `tmp` / `tmp_path` 派生独立目录，避免共享固定路径、端口、全局环境或可长期存在的进程。确实需要临时修改 `os.environ`、模块 monkeypatch、socket/port、sleep/timeout 的测试，必须在 `finally` 中恢复状态；这类测试在高并发下容易成为 flake，应优先使用更宽松的超时边界，或放在默认不拆分的测试组中。
@@ -244,8 +244,8 @@ flowchart TD
     Hooks --> Stop["Codex 主会话停止\nStop event JSON"]
     Stop --> Router["installed router\nstop_hook_router.py"]
     Router --> Channel{"session channel"}
-    Channel -- "stable/default" --> Dispatcher["stable dispatcher\ncodex_stop_hook_dispatcher.py"]
-    Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\ncodex_stop_hook_dispatcher.py"]
+    Channel -- "stable/default" --> Dispatcher["stable dispatcher\nstop_hook_dispatcher.py"]
+    Channel -- "dev marker" --> DevDispatcher["dev checkout dispatcher\nstop_hook_dispatcher.py"]
 
     Dispatcher --> DevCheck{"是否 RVF dev repo\n且需要 dev sync？"}
     DevDispatcher --> DevContract{"是否 RVF dev repo\n且需要 dev 预检？"}
@@ -370,10 +370,10 @@ RVF_CONTRACT_PARALLEL_TESTS=0 python3 scripts/check_plugin_contracts.py
 ```bash
 python3 tests/test_review_support_scripts.py --shard-count 4 --shard-index 0
 python3 tests/test_codex_stop_review_validate_fix.py --shard-count 4 --shard-index 0
-python3 tests/test_codex_stop_hook_dispatcher.py --shard-count 2 --shard-index 0
+python3 tests/test_stop_hook_dispatcher.py --shard-count 2 --shard-index 0
 ```
 
-默认没有拆分 dispatcher 测试；`test_codex_stop_hook_dispatcher.py` 的 shard 参数主要用于本地诊断，开启 `RVF_CONTRACT_DISPATCHER_SHARDS` 前应确认没有放大时序敏感测试。
+默认没有拆分 dispatcher 测试；`test_stop_hook_dispatcher.py` 的 shard 参数主要用于本地诊断，开启 `RVF_CONTRACT_DISPATCHER_SHARDS` 前应确认没有放大时序敏感测试。
 
 需要详细输出时运行：
 

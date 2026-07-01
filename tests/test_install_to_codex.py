@@ -157,7 +157,7 @@ def test_configure_stop_hook_deduplicates_existing_rvf_hooks(tmp_path: Path) -> 
     command = matching[0]["command"]
     assert "stop_hook_router.py" in command
     assert "CODEX_RVF_STABLE_STOP_HOOK=" in command
-    assert "codex_stop_hook_dispatcher.py" in command
+    assert "stop_hook_dispatcher.py" in command
     assert "/plugins/review-validate-fix/skills/review-validate-fix/" in command
     assert "CODEX_RVF_FORK_MODE=auto" in command
     assert "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180" in command
@@ -217,7 +217,7 @@ def test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks(tmp_p
     command = matching[0]["command"]
     assert "rvf_user_prompt_submit.py" in command
     assert str(tmp_path / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix") in command
-    assert "codex_stop_hook" not in command
+    assert "stop_hook" not in command
     assert "CODEX_RVF_MODE" not in command
     assert matching[0]["timeout"] == 5
     assert "python3 /tmp/other_prompt_hook.py" in json.dumps(data)
@@ -562,7 +562,7 @@ def test_copy_tree_excludes_dev_only_paths(tmp_path: Path) -> None:
     dst = tmp_path / "dst"
     runtime_scripts = src / "skills" / "review-validate-fix" / "scripts"
     runtime_scripts.mkdir(parents=True)
-    (runtime_scripts / "codex_stop_hook_dispatcher.py").write_text("runtime\n", encoding="utf-8")
+    (runtime_scripts / "stop_hook_dispatcher.py").write_text("runtime\n", encoding="utf-8")
     (runtime_scripts / "install_to_codex.py").write_text("dev installer\n", encoding="utf-8")
     (runtime_scripts / "dev_only").mkdir()
     (runtime_scripts / "dev_only" / "probe.py").write_text("dev helper\n", encoding="utf-8")
@@ -572,7 +572,7 @@ def test_copy_tree_excludes_dev_only_paths(tmp_path: Path) -> None:
     module.copy_tree(src, dst, module.PRESERVE_IN_PLUGIN, True)
 
     deployed_scripts = dst / "skills" / "review-validate-fix" / "scripts"
-    assert (deployed_scripts / "codex_stop_hook_dispatcher.py").exists()
+    assert (deployed_scripts / "stop_hook_dispatcher.py").exists()
     assert not (deployed_scripts / "install_to_codex.py").exists()
     assert not (deployed_scripts / "dev_only").exists()
     assert not (dst / "dev-only").exists()
@@ -735,7 +735,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     matching = rvf_hooks(hooks_data)
     assert len(matching) == 1
     assert str(plugin_skill / "scripts" / "stop_hook_router.py") in matching[0]["command"]
-    assert str(plugin_skill / "scripts" / "codex_stop_hook_dispatcher.py") in matching[0]["command"]
+    assert str(plugin_skill / "scripts" / "stop_hook_dispatcher.py") in matching[0]["command"]
     assert "CODEX_RVF_FORK_MODE=auto" in matching[0]["command"]
     assert matching[0]["statusMessage"] == "Review-Validate-Fix：选择通道并运行停止检查"
     codex_config = (home / ".codex" / "config.toml").read_text(encoding="utf-8")

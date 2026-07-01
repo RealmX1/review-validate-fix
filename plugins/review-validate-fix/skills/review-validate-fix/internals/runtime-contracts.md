@@ -6,7 +6,7 @@ Audience: RVF maintainers. Normal RVF agents should not read this file.
 
 - Backend selection: `scripts/codex_stop_review_validate_fix.py`
 - Router channel selection: `scripts/stop_hook_router.py`
-- Dispatcher dev/stable handoff: `scripts/codex_stop_hook_dispatcher.py`
+- Dispatcher dev/stable handoff: `scripts/stop_hook_dispatcher.py`
 - Kanban CLI integration: `scripts/cline_kanban_client.py`
 - Run ledger fields: `scripts/rvf_logging.py`
 - Review prep artifacts: `scripts/prepare_review_run.py`

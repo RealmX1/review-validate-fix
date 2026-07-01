@@ -60,7 +60,7 @@ flowchart TD
   Legend["Legend<br/>绿色 unchanged<br/>橙色 changed-before<br/>蓝色 changed-after<br/>紫色 changed-new"]:::unchanged
 
   Event["Codex Stop Event JSON<br/>stdin"]:::unchanged
-  Dispatcher["codex_stop_hook_dispatcher.py"]:::unchanged
+  Dispatcher["stop_hook_dispatcher.py"]:::unchanged
   Hook["codex_stop_review_validate_fix.py"]:::unchanged
 
   Event --> Dispatcher
@@ -212,7 +212,7 @@ state/
 
 ### 3. 替换 dispatcher dev sync 日志
 
-- `codex_stop_hook_dispatcher.py` 使用同一 `correlation_id`。
+- `stop_hook_dispatcher.py` 使用同一 `correlation_id`。
 - dev sync 的每一步命令写入 `events.jsonl`，stdout/stderr 作为 artifact 保存或按大小截断。
 - sync 失败时不运行 installed hook，并通过 stdout hook payload 给出 summary path；不要以非零 stderr 报告，否则 Codex Desktop 可能把失败包装成当前会话 continuation。
 - 删除 `*.rvf-dev-sync.json` 作为主日志；如需兼容，只写一份指向新 run 的短 JSON pointer。

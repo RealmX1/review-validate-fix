@@ -2366,7 +2366,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
             "test_rvf_handoff_intake.py",
             "test_review_reopen_marker.py",
             "test_review_support_scripts.py",
-            "test_codex_stop_hook_dispatcher.py",
+            "test_stop_hook_dispatcher.py",
             "test_codex_stop_review_validate_fix.py",
         ):
             (tests_dir / name).write_text(
@@ -2412,8 +2412,8 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         "tests: review_support_scripts shard 2/4",
         "tests: review_support_scripts shard 3/4",
         "tests: review_support_scripts shard 4/4",
-        "tests: codex_stop_hook_dispatcher shard 1/2",
-        "tests: codex_stop_hook_dispatcher shard 2/2",
+        "tests: stop_hook_dispatcher shard 1/2",
+        "tests: stop_hook_dispatcher shard 2/2",
         "tests: codex_stop_review_validate_fix shard 1/4",
         "tests: codex_stop_review_validate_fix shard 2/4",
         "tests: codex_stop_review_validate_fix shard 3/4",
