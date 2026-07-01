@@ -5050,7 +5050,7 @@ def review_validate_fix_dispatch(
             repo=repo,
         )
     if mode == "report":
-        report = fork_failure_report(repo)
+        report = report_only_no_auto_fork_message(repo)
         if ledger is not None:
             ledger.event(
                 phase="fork",
@@ -6017,6 +6017,18 @@ def plan_doc_review_classification(paths: list[str]) -> dict[str, Any]:
     }
 
 
+def report_only_no_auto_fork_message(repo: str) -> str:
+    # report-only 模式（CODEX_RVF_MODE=continuation/block）是「刻意不自动 fork」，
+    # 非 fork 失败——host-中性消息，不提任何 host 专属 fork 机制（去-codex：原先复用
+    # fork_failure_report 会向此中性路泄漏 "Codex GUI fork" / "Codex Desktop control socket"）。
+    return (
+        "review-validate-fix 处于 report-only 模式（CODEX_RVF_MODE=continuation/block）："
+        "本轮不自动创建 review fork。Stop continuation prompt 已禁用，因为它不会创建真正的"
+        "新用户 prompt，只会作为 hook system context 出现在当前轨迹中。"
+        f" target_repo={repo}。需要用户手动触发 $review-validate-fix。"
+    )
+
+
 def fork_failure_report(repo: str) -> str:
     return (
         "review-validate-fix Stop hook 未运行：无法创建 Codex GUI fork，"
@@ -6205,7 +6217,7 @@ def session_hook_control_decision(
 
 
 def report_only_decision(repo: str, ledger: RunLedger) -> StopDecision:
-    report = fork_failure_report(repo)
+    report = report_only_no_auto_fork_message(repo)
     ledger.event(
         phase="fork",
         event="skipped",

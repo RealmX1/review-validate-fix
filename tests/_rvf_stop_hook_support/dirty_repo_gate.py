@@ -178,5 +178,7 @@ def test_dirty_repo_continuation_mode_reports_removed_fallback(tmp_path: Path) -
     summary = summary_from_payload(payload)
     assert "$review-validate-fix" in str(summary["message"])
     assert str(dirty) in str(summary["message"])
+    # 去-codex：report-only（刻意不 fork）的 host-中性消息不得泄漏任何 Codex 专属 fork 机制。
+    assert "Codex" not in str(summary["message"])
     assert "Stop continuation prompt 已禁用" in str(summary["message"])
 
