@@ -1135,6 +1135,12 @@ forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scri
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py" 'def _read_codex_session_meta'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py" '_CODEX_SESSIONS_DIR'
 
+# S10i-d-1（去-codex singleton dedup · codex_bin）：rvf_analyze_thread 内与 adapter canonical 字节等价的
+# codex_bin 副本（注释误引已下沉的 engine.codex_bin）删除，改 import adapters/codex/codex_provider_login.codex_bin
+# （S10f home）。forbid 本地 def 回归、require import。
+require_literal "scripts/rvf_analyze_thread.py" 'from adapters.codex.codex_provider_login import codex_bin'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_analyze_thread.py" 'def codex_bin'
+
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
 require_literal "scripts/analysis_artifacts.py" 'def _rvf_window_start'

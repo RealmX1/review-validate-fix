@@ -53,6 +53,7 @@ from rvf_detached_thread import (  # noqa: E402
 from adapters.codex.subagent import (  # noqa: E402
     build_analyze_command as _codex_build_analyze_command,
 )
+from adapters.codex.codex_provider_login import codex_bin  # noqa: E402 — Codex 二进制发现（S10f canonical，去本文件内重复副本）
 from adapters.claude_code.subagent import (  # noqa: E402
     build_analyze_command as _claude_build_analyze_command,
 )
@@ -80,11 +81,6 @@ _SESSION_PATH_KEYS = (
 
 def claude_bin() -> str:
     return os.environ.get("CODEX_RVF_CLAUDE_BIN", "claude")
-
-
-def codex_bin() -> str:
-    # 与 codex_stop_review_validate_fix.codex_bin 等价；inline 避免循环 import。
-    return os.environ.get("CODEX_RVF_CODEX_BIN", "codex")
 
 
 def _parent_transcript_path(event: dict[str, Any]) -> Path | None:
