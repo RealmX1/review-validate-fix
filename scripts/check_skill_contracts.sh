@@ -439,6 +439,7 @@ repo_required_files=(
   "core/session_scope_allocation/round_baseline_marker.py"
   "core/session_scope_allocation/review_highwater_marker.py"
   "core/session_scope_allocation/committed_round_detection.py"
+  "core/session_scope_allocation/session_scope_gate_pure_helpers.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -533,6 +534,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/session_scope_allocation/round_baseline_marker.py" \
   "$repo_root/core/session_scope_allocation/review_highwater_marker.py" \
   "$repo_root/core/session_scope_allocation/committed_round_detection.py" \
+  "$repo_root/core/session_scope_allocation/session_scope_gate_pure_helpers.py" \
   "$repo_root/core/provider_health/provider_health_guard.py" \
   "$repo_root/adapters/codex/codex_provider_login.py" \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
@@ -1083,6 +1085,24 @@ require_repo_literal "core/session_scope_allocation/committed_round_detection.py
 require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head'
 require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'from core.session_scope_allocation import review_highwater_marker'
 require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation.committed_round_detection import'
+
+# S10h-c stop-session-scope gate 纯 helper 迁 core（精简迁）：9 个零引擎耦合的纯值类型/分类器/
+# patch-ownership 完整性计算 + 常量 REASON_PATCH_OWNERSHIP_INCOMPLETE 迁
+# core/session_scope_allocation/session_scope_gate_pure_helpers.py。gate/allocator 的 event-边界
+# 解析器 + ledger 驱动主体本轮刻意留引擎。引擎 re-import 7 个仍用符号；3 个私有 helper
+# （_patch_ownership_expected / _allocated_*_from_result）仅被同迁的 details 消费、引擎不 re-import
+# 避死 import。forbid 断言引擎不再 def 这些（防迁走后重复 def / 回归）。
+require_repo_literal "core/session_scope_allocation/session_scope_gate_pure_helpers.py" 'def patch_ownership_incomplete_details'
+require_repo_literal "core/session_scope_allocation/session_scope_gate_pure_helpers.py" 'def session_change_type_from_manifest'
+require_repo_literal "core/session_scope_allocation/session_scope_gate_pure_helpers.py" 'class _StopContextError'
+require_repo_literal "core/session_scope_allocation/session_scope_gate_pure_helpers.py" 'class SessionScopePrecheck'
+require_repo_literal "core/session_scope_allocation/session_scope_gate_pure_helpers.py" 'REASON_PATCH_OWNERSHIP_INCOMPLETE = "patch_ownership_incomplete"'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation.session_scope_gate_pure_helpers import'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def patch_ownership_incomplete_details'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def session_change_type_from_manifest'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def _string_list'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'class _StopContextError'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'REASON_PATCH_OWNERSHIP_INCOMPLETE = "patch_ownership_incomplete"'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
