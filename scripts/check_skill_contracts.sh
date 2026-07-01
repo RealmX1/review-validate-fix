@@ -438,6 +438,7 @@ repo_required_files=(
   "core/session_scope_allocation/session_change_manifest.py"
   "core/session_scope_allocation/round_baseline_marker.py"
   "core/session_scope_allocation/review_highwater_marker.py"
+  "core/session_scope_allocation/committed_round_detection.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -531,6 +532,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$repo_root/core/session_scope_allocation/round_baseline_marker.py" \
   "$repo_root/core/session_scope_allocation/review_highwater_marker.py" \
+  "$repo_root/core/session_scope_allocation/committed_round_detection.py" \
   "$repo_root/core/provider_health/provider_health_guard.py" \
   "$repo_root/adapters/codex/codex_provider_login.py" \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
@@ -1069,8 +1071,18 @@ forbid_repo_literal "core/review_prompt_assembly/review_validate_fix_fork_prompt
 # （S10h-b/c）可从 core self-contained 消费（否则 core→scripts 反向边）。
 require_repo_literal "core/session_scope_allocation/round_baseline_marker.py" 'def resolve_round_baseline_head'
 require_repo_literal "core/session_scope_allocation/review_highwater_marker.py" 'def resolve_review_highwater_head'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head'
-require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation import review_highwater_marker'
+
+# S10h-b committed-round 窗口下界检测迁 core：4 helper（_commit_is_ancestor_of_head /
+# _local_branch_exists / _resolve_committed_round_base_ref / _resolve_committed_round_baseline）
+# + COMMITTED_ROUND_BASE_REF_ENV 迁 core/session_scope_allocation/committed_round_detection.py，
+# 内部消费已迁 core 的 round_baseline_marker / review_highwater_marker（真实 marker 消费者从
+# 引擎下移到本 core 模块）；引擎 refresh_global_diff_tracker / maybe_route_committed_round_scope
+# 改从 core import 两 resolver。
+require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'def _resolve_committed_round_baseline'
+require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'def _resolve_committed_round_base_ref'
+require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'from core.session_scope_allocation.round_baseline_marker import resolve_round_baseline_head'
+require_repo_literal "core/session_scope_allocation/committed_round_detection.py" 'from core.session_scope_allocation import review_highwater_marker'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'from core.session_scope_allocation.committed_round_detection import'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'
