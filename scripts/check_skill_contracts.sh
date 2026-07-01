@@ -450,6 +450,7 @@ repo_required_files=(
   "adapters/claude_code/claude_code_host_adapter.py"
   "core/parent_conversation_context/parent_conversation_origin_freeze.py"
   "core/review_prompt_assembly/review_validate_fix_fork_prompt.py"
+  "core/review_dispatch/review_validate_fix_dispatch_flow.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -541,6 +542,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/adapters/claude_code/claude_code_host_adapter.py" \
   "$repo_root/core/parent_conversation_context/parent_conversation_origin_freeze.py" \
   "$repo_root/core/review_prompt_assembly/review_validate_fix_fork_prompt.py" \
+  "$repo_root/core/review_dispatch/review_validate_fix_dispatch_flow.py" \
   "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
@@ -1103,6 +1105,15 @@ forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scri
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'def _string_list'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'class _StopContextError'
 forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'REASON_PATCH_OWNERSHIP_INCOMPLETE = "patch_ownership_incomplete"'
+
+# S10i-a-0（DISPATCH 首刀 · 纯机械）：backend/launch-mode 选择的纯中性 stdlib-only leaf
+# rvf_dispatch_flow.py 从 scripts 迁入 core/review_dispatch/review_validate_fix_dispatch_flow.py
+# （verbatim 字节等价；引擎改 `import core.review_dispatch...as dispatch_flow`，所有
+# dispatch_flow.X 调用点零改）。forbid 断言引擎不再引旧 scripts-level 模块。
+require_repo_literal "core/review_dispatch/review_validate_fix_dispatch_flow.py" 'def backend_from_values'
+require_repo_literal "core/review_dispatch/review_validate_fix_dispatch_flow.py" 'def should_attempt_legacy_gui_fallback'
+require_literal "scripts/codex_stop_review_validate_fix.py" 'import core.review_dispatch.review_validate_fix_dispatch_flow as dispatch_flow'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/codex_stop_review_validate_fix.py" 'import rvf_dispatch_flow as dispatch_flow'
 
 # S1.5: 分析/归因层 host 归一（A1 write-op 计数 + C same-session-full 子区间窗口）。
 require_literal "scripts/analysis_artifacts.py" 'def _is_write_op'

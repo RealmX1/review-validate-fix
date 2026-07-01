@@ -169,7 +169,7 @@ from session_label import (
     strip_codex_user_message_preamble,
     text_from_message_payload,
 )
-import rvf_dispatch_flow as dispatch_flow
+import core.review_dispatch.review_validate_fix_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
 from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
