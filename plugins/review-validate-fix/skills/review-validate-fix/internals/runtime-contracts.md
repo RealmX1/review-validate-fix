@@ -4,7 +4,7 @@ Audience: RVF maintainers. Normal RVF agents should not read this file.
 
 ## Single Sources Of Truth
 
-- Backend selection: `scripts/codex_stop_review_validate_fix.py`
+- Backend selection: `scripts/stop_review_validate_fix.py`
 - Router channel selection: `scripts/stop_hook_router.py`
 - Dispatcher dev/stable handoff: `scripts/stop_hook_dispatcher.py`
 - Kanban CLI integration: `scripts/cline_kanban_client.py`

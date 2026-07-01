@@ -61,7 +61,7 @@ flowchart TD
 
   Event["Codex Stop Event JSON<br/>stdin"]:::unchanged
   Dispatcher["stop_hook_dispatcher.py"]:::unchanged
-  Hook["codex_stop_review_validate_fix.py"]:::unchanged
+  Hook["stop_review_validate_fix.py"]:::unchanged
 
   Event --> Dispatcher
   Dispatcher --> Hook
@@ -204,7 +204,7 @@ state/
 
 ### 2. 替换 Stop hook 日志
 
-- `codex_stop_review_validate_fix.py` 在 gate、skip、fork、handoff advisory 各阶段写事件。
+- `stop_review_validate_fix.py` 在 gate、skip、fork、handoff advisory 各阶段写事件。
 - `systemMessage` 缩短为状态摘要和 summary path。
 - prompt 继续写文件，但主 JSON 只保存 `prompt_path` 和摘要字段。
 - 删除 timestamp 扁平 JSON 作为主日志的角色；同等信息进入 `events.jsonl` 和 `summary.json`。

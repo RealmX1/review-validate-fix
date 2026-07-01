@@ -1,6 +1,6 @@
 """Host-中性的 stop-session-scope gate 纯 helper（去-codex S10h-c · 精简迁）。
 
-从引擎 `codex_stop_review_validate_fix.py` 的 SESSION_ALLOC 簇里抽出**零引擎耦合**
+从引擎 `stop_review_validate_fix.py` 的 SESSION_ALLOC 簇里抽出**零引擎耦合**
 的纯值类型 / 分类器 / patch-ownership 完整性计算：它们不做 I/O、不碰 host/event、不驱动
 ledger，只在 manifest / allocator-result / env / 内存数据结构上做纯函数计算。gate/allocator
 的 event-边界解析器与 ledger 驱动主体本轮刻意留引擎（见计划 S10h-c 决策：B 精简迁）。

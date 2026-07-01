@@ -314,14 +314,14 @@ def hook_wrapper_info() -> dict[str, Any]:
 
 def runtime_versions(script_dirs: list[Path], reference_scripts_dir: Path) -> list[dict[str, Any]]:
     reference_manifest = reference_scripts_dir / "session_manifest.py"
-    reference_stop = reference_scripts_dir / "codex_stop_review_validate_fix.py"
+    reference_stop = reference_scripts_dir / "stop_review_validate_fix.py"
     reference_manifest_sha = sha256_file(reference_manifest)
     reference_stop_sha = sha256_file(reference_stop)
 
     versions: list[dict[str, Any]] = []
     for script_dir in script_dirs:
         manifest = script_dir / "session_manifest.py"
-        stop = script_dir / "codex_stop_review_validate_fix.py"
+        stop = script_dir / "stop_review_validate_fix.py"
         manifest_info = source_features(manifest)
         stop_info = source_features(stop)
         versions.append(

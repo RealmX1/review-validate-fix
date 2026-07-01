@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """manual RVF scope 测试簇。
 
-从 tests/test_codex_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
+从 tests/test_stop_review_validate_fix.py 有界抽出（导航用拆分，行为不变）。扁平 tests=[...] 注册表
 按裸名引用，故共享 helper/常量经模块级 inject()（def main() 之前）推入本模块 globals 并重绑测试名，
 让注册表在 main() 运行时解析到它们。注册表与分片逻辑不动 -> 注册顺序 / 分片身份保持不变。
 """
@@ -12,7 +12,7 @@ import json
 import os
 from pathlib import Path
 
-# 由 aggregator（tests/test_codex_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
+# 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
     'test_manual_rvf_session_marker_write_read_clear_preserves_hook_state',
     'test_manual_rvf_session_marker_skips_before_fork_gate',

@@ -81,7 +81,7 @@ def write_timing_dev_scripts(repo: Path, marker: Path) -> None:
         "    'returncode': 0,\n"
         "    'groups': [{'name': 'tests', 'duration_seconds': 2.0}],\n"
         "    'slowest_step': {\n"
-        "        'label': 'tests: codex_stop_review_validate_fix',\n"
+        "        'label': 'tests: stop_review_validate_fix',\n"
         "        'duration_seconds': 2.0,\n"
         "        'percentage_of_total': 80.0,\n"
         "    },\n"
@@ -743,7 +743,7 @@ def test_dev_repo_main_session_syncs_before_running_installed_hook(tmp_path: Pat
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     event = {
@@ -766,7 +766,7 @@ def test_handoff_marker_opens_before_dev_sync_or_installed_hook(tmp_path: Path) 
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     handoff = tmp_path / "state" / "runs" / "rvf-child" / "artifacts" / "handoff.md"
     handoff.parent.mkdir(parents=True)
@@ -900,7 +900,7 @@ def test_handoff_marker_finalizes_run_artifacts_same_session(tmp_path: Path) -> 
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
@@ -966,7 +966,7 @@ def test_handoff_marker_surfaces_finalize_record_errors(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(state=state, repo=repo)
@@ -1014,7 +1014,7 @@ def test_handoff_marker_finalizes_run_artifacts_forked_session(tmp_path: Path) -
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
     run_dir, handoff = _seed_finalize_run_dir(
@@ -1087,7 +1087,7 @@ def test_rvf_analyze_followup_trigger_skips_dispatcher_sync(tmp_path: Path) -> N
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -1113,7 +1113,7 @@ def test_plan_operation_skips_before_dev_sync_or_installed_hook(tmp_path: Path) 
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_assistant_plan_transcript(tmp_path / "session.jsonl")
     state = tmp_path / "state"
@@ -1150,7 +1150,7 @@ def test_codex_goal_mode_skips_before_dev_sync_or_installed_hook(tmp_path: Path)
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="active")
     state = tmp_path / "state"
@@ -1188,7 +1188,7 @@ def test_non_codex_goal_like_transcript_runs_installed_hook(tmp_path: Path) -> N
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_codex_goal_transcript(
         tmp_path / "session.jsonl",
@@ -1215,7 +1215,7 @@ def test_codex_goal_mode_subagent_runs_installed_hook(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="active", subagent=True)
     event = {
@@ -1237,7 +1237,7 @@ def test_codex_user_text_goal_marker_without_status_runs_installed_hook(tmp_path
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_codex_goal_transcript(
         tmp_path / "session.jsonl",
@@ -1264,7 +1264,7 @@ def test_codex_completed_goal_runs_installed_hook(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_codex_goal_transcript(tmp_path / "session.jsonl", status="complete")
     event = {
@@ -1287,7 +1287,7 @@ def test_literal_plan_markers_in_completion_do_not_skip_hook(tmp_path: Path) -> 
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     event = {
@@ -1314,7 +1314,7 @@ def test_prior_plan_output_does_not_suppress_future_turn(tmp_path: Path) -> None
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = write_plan_then_normal_transcript(tmp_path / "session.jsonl")
 
@@ -1347,7 +1347,7 @@ def test_session_hook_off_still_syncs_before_running_installed_hook(tmp_path: Pa
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     event = {
@@ -1371,7 +1371,7 @@ def test_dev_channel_sync_skips_stable_install(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     event = {
@@ -1401,7 +1401,7 @@ def test_non_matching_repo_runs_installed_hook_without_sync(tmp_path: Path) -> N
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -1423,7 +1423,7 @@ def test_subagent_stop_runs_installed_hook_without_sync(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     transcript = tmp_path / "subagent.jsonl"
     transcript.write_text(
@@ -1461,7 +1461,7 @@ def test_suppress_env_skips_before_sync_and_installed_hook(tmp_path: Path) -> No
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     completed = invoke_result(
@@ -1495,7 +1495,7 @@ def test_suppress_env_skips_handoff_marker_before_opening(tmp_path: Path) -> Non
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
@@ -1537,7 +1537,7 @@ def test_sync_failure_skips_installed_hook_to_avoid_stale_fork(tmp_path: Path) -
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker, fail_sync=True)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
 
@@ -1566,7 +1566,7 @@ def test_dev_sync_registers_contract_check_timing_report(tmp_path: Path) -> None
     marker = tmp_path / "marker"
     marker.mkdir()
     write_timing_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
 
@@ -1583,7 +1583,7 @@ def test_dev_sync_registers_contract_check_timing_report(tmp_path: Path) -> None
     report_path = Path(str(summary["contract_check_timing_report_path"]))
     assert report_path.is_file()
     assert summary["contract_check_timing"]["slowest_step"]["label"] == (
-        "tests: codex_stop_review_validate_fix"
+        "tests: stop_review_validate_fix"
     )
     assert summary["contract_check_timing"]["measured_work_duration_seconds"] == 4.0
     assert summary["dev_sync_steps"][0]["paths"]["timing_report"] == str(report_path)
@@ -1591,7 +1591,7 @@ def test_dev_sync_registers_contract_check_timing_report(tmp_path: Path) -> None
 
 def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_failing_installed_hook(hook)
 
     completed = invoke_result(
@@ -1610,7 +1610,7 @@ def test_installed_hook_failure_blocks_instead_of_continuing(tmp_path: Path) -> 
 
 def test_missing_installed_hook_blocks_instead_of_continuing(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
-    hook = tmp_path / "missing" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "missing" / "stop_review_validate_fix.py"
 
     completed = invoke_result(
         {"cwd": str(repo), "hook_event_name": "Stop"},
@@ -1628,7 +1628,7 @@ def test_missing_installed_hook_blocks_instead_of_continuing(tmp_path: Path) -> 
 
 def test_installed_hook_timeout_blocks_instead_of_continuing(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_slow_installed_hook(hook)
 
     completed = invoke_result(
@@ -1653,7 +1653,7 @@ def test_dev_repo_without_session_owned_dirty_skips_sync_and_hook(tmp_path: Path
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     completed = invoke_result(
@@ -1693,7 +1693,7 @@ def test_dispatcher_falls_back_to_legacy_when_tracker_disabled(tmp_path: Path) -
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     completed = invoke_result(
@@ -1726,7 +1726,7 @@ def test_session_hook_control_forwards_without_session_owned_dirty(tmp_path: Pat
         marker = root / "marker"
         marker.mkdir()
         write_fake_dev_scripts(repo, marker)
-        hook = root / "installed" / "codex_stop_review_validate_fix.py"
+        hook = root / "installed" / "stop_review_validate_fix.py"
         write_fake_installed_hook(hook, marker)
         event = {
             "cwd": str(repo),
@@ -1757,7 +1757,7 @@ def test_session_manifest_failure_skips_sync_and_installed_hook(tmp_path: Path) 
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
 
@@ -1791,7 +1791,7 @@ def test_provided_missing_transcript_skips_sync_and_installed_hook(tmp_path: Pat
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     state = tmp_path / "state"
 
@@ -1826,7 +1826,7 @@ def test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook(tmp_path: Path) -
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -1858,7 +1858,7 @@ def test_committed_session_edit_with_later_same_path_dirty_skips_tracker_gate(tm
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     completed = invoke_result(
@@ -1892,7 +1892,7 @@ def test_committed_session_edit_with_later_same_path_dirty_skips_legacy_gate(tmp
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     completed = invoke_result(
@@ -1928,14 +1928,14 @@ def test_should_sync_session_scope_emits_session_manifest_failed_when_refresh_fa
     repo = init_repo(tmp_path / "rvf")
     transcript = write_user_transcript(tmp_path / "session.jsonl", repo)
 
-    # 直接加载 codex_stop_review_validate_fix 模块，把它的 `build_manifest`
+    # 直接加载 stop_review_validate_fix 模块，把它的 `build_manifest`
     # 替换成立即抛错的 stub。dispatcher 在 should_sync_session_scope 里用
-    # `from codex_stop_review_validate_fix import refresh_global_diff_tracker`
+    # `from stop_review_validate_fix import refresh_global_diff_tracker`
     # 后调用，所以替换该模块全局即可生效。
     skill_scripts = SCRIPT.parent
     sys.path.insert(0, str(skill_scripts))
     try:
-        import codex_stop_review_validate_fix as hook_module
+        import stop_review_validate_fix as hook_module
     finally:
         # 保留 sys.path 修改：dispatcher 也会用同一前缀路径。
         pass
@@ -1990,7 +1990,7 @@ def test_sync_subprocesses_do_not_inherit_rvf_runtime_env(tmp_path: Path) -> Non
     hook_marker = tmp_path / "hook"
     hook_marker.mkdir()
     write_env_check_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, hook_marker)
 
     stdout = invoke(
@@ -2048,7 +2048,7 @@ def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -2191,7 +2191,7 @@ def test_dev_sync_preserves_kanban_followup_installer_args(tmp_path: Path) -> No
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -2218,7 +2218,7 @@ def test_dev_sync_preserves_auto_installer_kanban_args(tmp_path: Path) -> None:
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
 
     stdout = invoke(
@@ -2245,7 +2245,7 @@ def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> No
     marker = tmp_path / "marker"
     marker.mkdir()
     write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     write_fake_installed_hook(hook, marker)
     home = tmp_path / "home"
     hooks_path = home / ".codex" / "hooks.json"
@@ -2305,7 +2305,7 @@ def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path:
     repo = init_repo(tmp_path / "repo")
     marker = tmp_path / "marker"
     marker.mkdir()
-    hook = tmp_path / "installed" / "codex_stop_review_validate_fix.py"
+    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
     hook.parent.mkdir(parents=True)
     hook.write_text(
         "#!/usr/bin/env python3\n"

@@ -709,7 +709,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
 
     plugin_skill = home / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix"
     assert (plugin_skill / "SKILL.md").exists()
-    assert (plugin_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert (plugin_skill / "scripts" / "stop_review_validate_fix.py").exists()
     assert not (plugin_skill / "scripts" / "install_to_codex.py").exists()
     assert not (cache_skill / "scripts" / "install_to_codex.py").exists()
     heading_label = deployed_heading_label(module)
@@ -728,7 +728,7 @@ def test_main_installs_plugin_and_configures_stop_hook(tmp_path: Path) -> None:
     assert "[deployed " not in (
         module.PLUGIN_SRC / "skills" / "review-validate-fix" / "SKILL.md"
     ).read_text(encoding="utf-8")
-    assert (cache_skill / "scripts" / "codex_stop_review_validate_fix.py").exists()
+    assert (cache_skill / "scripts" / "stop_review_validate_fix.py").exists()
     assert (cache_config / "reviewer-registry.json").read_text(encoding="utf-8") == "local cache config\n"
     assert (cache_state / "run.json").read_text(encoding="utf-8") == "local cache state\n"
     hooks_data = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))

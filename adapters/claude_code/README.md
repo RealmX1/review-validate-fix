@@ -13,7 +13,7 @@ Claude Code adapter（路径 C：trigger-only，转发到 Codex core）。
 ## 为什么 hooks 不迁到 adapters/claude_code/hooks/（S3 决策）
 
 - Claude Code marketplace 通过 nested plugin 的 `${CLAUDE_PLUGIN_ROOT}` 解析 hook 入口（`hooks/hooks.json` 的 command 是 `python3 ${CLAUDE_PLUGIN_ROOT}/hooks/stop.py`）。把 hooks 物理迁到 `adapters/claude_code/` 需要 `hooks.json` 跨目录引用 `../../../adapters/claude_code/hooks/stop.py`，`${CLAUDE_PLUGIN_ROOT}` 跨目录解析行为**未实测**（plan Risk #5），失败模式是「整个 Claude 触发路径静默中断」——风险高、回报仅外观一致。
-- 当前两入口本质上只是触发器：接 Claude Code Stop / UserPromptSubmit event，转发 stdin 给同 plugin 内的核心脚本（Stop → `skills/.../codex_stop_review_validate_fix.py`；UPS → `skills/.../rvf_user_prompt_submit.py`）。逻辑薄，物理位置与 marketplace 卷一致即可。
+- 当前两入口本质上只是触发器：接 Claude Code Stop / UserPromptSubmit event，转发 stdin 给同 plugin 内的核心脚本（Stop → `skills/.../stop_review_validate_fix.py`；UPS → `skills/.../rvf_user_prompt_submit.py`）。逻辑薄，物理位置与 marketplace 卷一致即可。
 - transcript 不在 hook 入口处理：入口纯 trigger-only，transcript 归一在被转发的核心脚本内完成（消费 `adapters/claude_code/transcript.py`）。故无「hook 入口的 transcript 用法对齐」之活。
 
 ## handoff G（维度 1 · hook 唯一注册）现状与 deferred

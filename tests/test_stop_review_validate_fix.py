@@ -35,7 +35,7 @@ SCRIPT = (
     / "skills"
     / "review-validate-fix"
     / "scripts"
-    / "codex_stop_review_validate_fix.py"
+    / "stop_review_validate_fix.py"
 )
 DIAGNOSTIC_SCRIPT = SCRIPT.with_name("diagnose_fork.py")
 RVF_HANDOFF = SCRIPT.with_name("rvf_handoff.py")

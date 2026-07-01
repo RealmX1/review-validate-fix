@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Codex provider 登录 / 二进制发现缝（adapters/codex 的 provider-login 维）。
 
-S10f：从共享审查引擎（``codex_stop_review_validate_fix.py``）抽出的 **Codex 专属**
+S10f：从共享审查引擎（``stop_review_validate_fix.py``）抽出的 **Codex 专属**
 provider 健康接入——codex 二进制发现 (``codex_bin``)、codex auth 失败输出 marker 判定
 (``codex_login_output_indicates_failure``)、codex agent_id 识别 (``is_codex_agent_id``)、
 以及 ``CODEX_RVF_AUTO_CODEX_LOGIN=1`` 时后台拉起 ``codex login``

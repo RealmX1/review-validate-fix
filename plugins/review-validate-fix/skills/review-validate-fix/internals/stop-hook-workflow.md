@@ -6,7 +6,7 @@ Normative sources:
 
 - Router: `scripts/stop_hook_router.py`
 - Dispatcher: `scripts/stop_hook_dispatcher.py`
-- Runtime: `scripts/codex_stop_review_validate_fix.py`
+- Runtime: `scripts/stop_review_validate_fix.py`
 - Kanban client: `scripts/cline_kanban_client.py`
 
 ## Intended Shape

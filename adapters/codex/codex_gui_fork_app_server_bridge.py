@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Codex GUI-fork / app-server / bridge 子系统（adapters/codex 的 fork 执行维）。
 
-S9a：从共享审查引擎（``codex_stop_review_validate_fix.py``）抽出的 **Codex 专属**
+S9a：从共享审查引擎（``stop_review_validate_fix.py``）抽出的 **Codex 专属**
 fork 执行缝——通过 Codex Desktop 的 app-server control socket（含 RVF 自管的
 bridge app-server）创建并可见化 GUI fork 线程、查询父线程名、做 socket 选择/探活/
 重启与可见性诊断。

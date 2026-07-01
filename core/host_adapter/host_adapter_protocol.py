@@ -7,7 +7,7 @@
 host 身份词汇（守卫 `rg 'HOST_CLAUDE|HOST_CODEX|host_kind' core/ --glob '!core/host_adapter/**'`==0；
 ``core/host_adapter/**`` 本身是契约包，是 host 身份词汇的法定唯一归属，故 carve-out）。
 
-当前引擎 ``codex_stop_review_validate_fix.py`` 里仍有若干 **inline** ``host_kind ==``
+当前引擎 ``stop_review_validate_fix.py`` 里仍有若干 **inline** ``host_kind ==``
 分支，它们随 S10「中性体迁 core/」搬进 core 后就会触发该守卫。``HostAdapter`` 把
 这些 host-身份相关行为收成一个**注入面**：core 持有一个已绑定到具体 host 的
 ``HostAdapter`` 实例，只调它的方法拿 host 行为，绝不命名 host 常量。

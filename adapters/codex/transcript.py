@@ -293,7 +293,7 @@ def distill_codex_jsonl(
 # 本应住 core/；S9b 阶段引擎尚未进 core/，故按本仓既有惯例（router / dispatcher /
 # rvf_handoff / rvf_analyze_advisory / rvf_analyze_thread 各自 inline 一份
 # SESSION_PATH_KEYS 以避免循环 import）在此自带副本，与
-# ``codex_stop_review_validate_fix.SESSION_PATH_KEYS`` 保持一致；待 S10 中性体迁
+# ``stop_review_validate_fix.SESSION_PATH_KEYS`` 保持一致；待 S10 中性体迁
 # core/ 后统一上提共享。
 # ─────────────────────────────────────────────────────────────────────────────
 

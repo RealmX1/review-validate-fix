@@ -55,7 +55,7 @@ def _load_app_server_module() -> Any:
     if _disable_app_server_lookup():
         return None
     try:
-        import codex_stop_review_validate_fix as mod  # heavy; lazy
+        import stop_review_validate_fix as mod  # heavy; lazy
         _APP_SERVER_MODULE = mod
     except Exception:
         _APP_SERVER_MODULE = None

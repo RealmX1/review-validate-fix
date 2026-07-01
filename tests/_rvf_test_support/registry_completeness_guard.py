@@ -8,7 +8,7 @@
 经 ``check_skill_contracts.sh`` 每个 shard 子进程各调用一次，因此每个 shard 都重跑、无法被分片绕过。
 
 两个 god test file 用两种注册表形态，各自的 ``registered_names`` 由对应 helper 计算：
-- 扁平 ``[func, ...]``（``test_codex_stop_review_validate_fix.py``）→ ``registered_names_from_callables``
+- 扁平 ``[func, ...]``（``test_stop_review_validate_fix.py``）→ ``registered_names_from_callables``
 - ``[(name, lambda|func), ...]``（``test_review_support_scripts.py``）→ ``registered_names_from_case_tuples``
 """
 

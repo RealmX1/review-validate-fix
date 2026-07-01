@@ -509,7 +509,7 @@ def _handle_bootstrap_confirmation(
     if rvf_bootstrap_confirm.is_yes_literal(prompt):
         rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
         try:
-            import codex_stop_review_validate_fix as stop_hook  # noqa: PLC0415
+            import stop_review_validate_fix as stop_hook  # noqa: PLC0415
 
             task_payload = stop_hook.resume_dispatch_from_confirmation_marker(marker)
             return {

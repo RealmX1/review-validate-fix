@@ -869,7 +869,7 @@ def configure_stop_hook(
             is_rvf_hook = (
                 isinstance(command_value, str)
                 and (
-                    "codex_stop_review_validate_fix.py" in command_value
+                    "stop_review_validate_fix.py" in command_value
                     or "stop_hook_dispatcher.py" in command_value
                     or "stop_hook_router.py" in command_value
                 )

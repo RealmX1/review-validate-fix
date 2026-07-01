@@ -3,7 +3,7 @@
 
 Stop-finalize（``rvf_run_finalize.finalize_run`` 在 ``did_review`` 完成时）与
 rvf-land 封窗（``seal_round_baseline_to_head``）**写**，committed-round 漏审检测
-（``codex_stop_review_validate_fix.maybe_route_committed_round_scope``）**读**。
+（``stop_review_validate_fix.maybe_route_committed_round_scope``）**读**。
 
 为什么需要它（committed-round 第三面盲区 = 落到 baseline 之下的孤儿提交）：
 ``round_baseline_marker`` 记录「上一条 user prompt 提交时的 HEAD」，UserPromptSubmit

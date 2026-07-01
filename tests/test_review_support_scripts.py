@@ -1296,7 +1296,7 @@ def test_claude_hook_entry_dispatches_claude_invocation() -> None:
                     "skills",
                     "review-validate-fix",
                     "scripts",
-                    "codex_stop_review_validate_fix.py",
+                    "stop_review_validate_fix.py",
                 ),
                 timeout_env="CLAUDE_RVF_STOP_HOOK_TIMEOUT",
                 default_timeout="115",
@@ -1313,7 +1313,7 @@ def test_claude_hook_entry_dispatches_claude_invocation() -> None:
     calls = _run_once({"session_id": "claude-abc"})
     assert len(calls) == 1, "Claude invocation must dispatch the core exactly once"
     assert calls[0]["argv"][0] == sys.executable
-    assert calls[0]["argv"][1].endswith("codex_stop_review_validate_fix.py")
+    assert calls[0]["argv"][1].endswith("stop_review_validate_fix.py")
     forwarded = json.loads(calls[0]["input"])
     assert forwarded["hook_event_name"] == "Stop"
     assert forwarded["source"] == {"provider": "claude-code", "plugin": "review-validate-fix"}
@@ -2367,7 +2367,7 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
             "test_review_reopen_marker.py",
             "test_review_support_scripts.py",
             "test_stop_hook_dispatcher.py",
-            "test_codex_stop_review_validate_fix.py",
+            "test_stop_review_validate_fix.py",
         ):
             (tests_dir / name).write_text(
                 "#!/usr/bin/env python3\n"
@@ -2414,10 +2414,10 @@ def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
         "tests: review_support_scripts shard 4/4",
         "tests: stop_hook_dispatcher shard 1/2",
         "tests: stop_hook_dispatcher shard 2/2",
-        "tests: codex_stop_review_validate_fix shard 1/4",
-        "tests: codex_stop_review_validate_fix shard 2/4",
-        "tests: codex_stop_review_validate_fix shard 3/4",
-        "tests: codex_stop_review_validate_fix shard 4/4",
+        "tests: stop_review_validate_fix shard 1/4",
+        "tests: stop_review_validate_fix shard 2/4",
+        "tests: stop_review_validate_fix shard 3/4",
+        "tests: stop_review_validate_fix shard 4/4",
     }
 
 
@@ -2455,7 +2455,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
                 "duration_ms": 200,
             },
             {
-                "label": "tests: codex_stop_review_validate_fix",
+                "label": "tests: stop_review_validate_fix",
                 "source": "check_skill_contracts.sh",
                 "status": "completed",
                 "returncode": 0,
@@ -2464,7 +2464,7 @@ def test_contract_check_timing_report_accounts_internal_steps() -> None:
         ],
     )
 
-    assert report["slowest_step"]["label"] == "tests: codex_stop_review_validate_fix"
+    assert report["slowest_step"]["label"] == "tests: stop_review_validate_fix"
     assert report["slowest_step"]["percentage_of_total"] == 60.0
     assert report["slowest_step"]["percentage_of_wall_time"] == 60.0
     assert report["slowest_step"]["percentage_of_measured_work"] == 63.16
@@ -2489,7 +2489,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
         contract_check_timing_report_path="/tmp/contract-check.timing.json",
         contract_check_timing={
             "path": "/tmp/contract-check.timing.json",
-            "slowest_step": {"label": "tests: codex_stop_review_validate_fix"},
+            "slowest_step": {"label": "tests: stop_review_validate_fix"},
         },
     )
     later = ledger.summary(
@@ -2500,7 +2500,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
     assert later["dev_sync_steps"] == [{"name": "contract-check"}]
     assert later["contract_check_timing_report_path"] == "/tmp/contract-check.timing.json"
     assert later["contract_check_timing"]["slowest_step"]["label"] == (
-        "tests: codex_stop_review_validate_fix"
+        "tests: stop_review_validate_fix"
     )
 
 
@@ -2764,7 +2764,7 @@ def test_diagnose_stop_hook_scope_reports_stale_runtime_and_claude_write_gap(tmp
         "    return {'owned_dirty_paths': []}\n",
         encoding="utf-8",
     )
-    (old_scripts / "codex_stop_review_validate_fix.py").write_text(
+    (old_scripts / "stop_review_validate_fix.py").write_text(
         "def legacy_session_scope_gate_payload():\n"
         "    pass\n",
         encoding="utf-8",
