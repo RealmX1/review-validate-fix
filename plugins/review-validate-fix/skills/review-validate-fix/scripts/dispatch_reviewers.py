@@ -32,6 +32,7 @@ R4 = cursor probe 失败的降级修饰：cursor∉A 时记 warning ``cursor_una
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 import secrets
@@ -57,7 +58,11 @@ from run_alternative_reviewer import (
     reviewer_id_from_label,
     safe_artifact_token,
 )
-from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
+from core.host_adapter.host_transcript_format_detection import (
+    HOST_CLAUDE,
+    HOST_CODEX,
+    detect_transcript_format,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -87,9 +92,56 @@ DEFAULT_DISPATCH_TOTAL_TIMEOUT_SECONDS = 2700.0
 CURSOR_HARNESS = "cursor"
 DEFAULT_MAIN_HARNESS = HOST_CODEX  # 与现有 Kanban 兜底一致
 
+# 临时 external reviewer policy：按用户 2026-07-02 指示，Claude Code 在
+# 2026-07-09 结束前不可作为 RVF external reviewer。过期点覆盖美国时区的
+# 2026-07-09 全日，避免当前运行机器为 Asia/Shanghai 时提前失效。
+TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC = datetime(
+    2026,
+    7,
+    10,
+    12,
+    0,
+    0,
+    tzinfo=timezone.utc,
+)
+TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_REASON = (
+    "temporary_disable_claude_code_external_reviewer_until_2026_07_09_us_timezones"
+)
+
 # 已知存在并行 headless session/auth 全局锁、需要顺序执行的 harness。
 # 由 S3 同 CLI 并行 spike 填充；空集合表示默认全部可并行。
 SEQUENTIAL_HARNESSES: frozenset[str] = frozenset()
+
+
+def temporary_disable_claude_code_external_reviewer_override(
+    now_utc: datetime | None = None,
+) -> dict[str, str] | None:
+    """返回当前是否命中临时 Claude Code external reviewer 禁用策略。"""
+    current = now_utc or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    if current >= TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC:
+        return None
+    return {
+        "reason": TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_REASON,
+        "disabled_harness": HOST_CLAUDE,
+        "expires_at_utc": TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "expires_after_requested_date": "2026-07-09",
+        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
+    }
+
+
+def _temporarily_disabled_external_reviewer_harnesses(
+    now_utc: datetime | None = None,
+) -> dict[str, dict[str, str]]:
+    override = temporary_disable_claude_code_external_reviewer_override(now_utc)
+    if override is None:
+        return {}
+    return {HOST_CLAUDE: override}
 
 
 def load_registry(path: Path) -> dict[str, Any]:
@@ -180,6 +232,7 @@ def route(
     *,
     require_external_only: bool = False,
     sequential_harnesses: frozenset[str] = SEQUENTIAL_HARNESSES,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """纯路由函数：给定主 harness + 可用集 + registry，返回 plan dict（无 IO）。
 
@@ -188,7 +241,18 @@ def route(
     harness 并按 priority 排序。
     """
     enabled = set(_enabled_harnesses(registry))
-    A = _order_by_priority(registry, [h for h in available if h in enabled])
+    temporarily_disabled = _temporarily_disabled_external_reviewer_harnesses(now_utc)
+    excluded_by_temporary_policy = [
+        h for h in available if h in temporarily_disabled
+    ]
+    A = _order_by_priority(
+        registry,
+        [
+            h
+            for h in available
+            if h in enabled and h not in temporarily_disabled
+        ],
+    )
     warnings: list[dict[str, str]] = []
 
     plan: dict[str, Any] = {
@@ -205,6 +269,22 @@ def route(
         "fallbacks": [],
         "status": "planned",
     }
+    if temporarily_disabled:
+        plan["external_reviewer_selection_override"] = {
+            "active": True,
+            "disabled_harnesses": sorted(temporarily_disabled),
+            "excluded_available_harnesses": sorted(set(excluded_by_temporary_policy)),
+            "policy": next(iter(temporarily_disabled.values())),
+        }
+    if temporarily_disabled:
+        warnings.append(
+            _warn(
+                "claude_code_external_reviewer_temporarily_disabled",
+                "warning",
+                "Claude Code external reviewer is temporarily disabled; "
+                "routing will exclude claude_code and use the remaining external reviewers.",
+            )
+        )
 
     # R4 降级修饰：cursor 是 R0/R1 默认必选一腿，仅在 |A|>=2 时缺席才记 warning。
     # R2（|A|==1）有自己的 mismatch / only_main warning，不再叠加 cursor_unavailable。
@@ -306,6 +386,7 @@ def probe_available(
     timeout: float = 60.0,
     assume_available: list[str] | None = None,
     cooldown_active: set[str] | None = None,
+    now_utc: datetime | None = None,
 ) -> list[str]:
     """对每个 enabled harness 跑 ``run_alternative_reviewer.py --config <path> --<probe_mode>``。
 
@@ -317,12 +398,17 @@ def probe_available(
     ``codex login status`` 之类 auth probe 仍返回 0，单看 auth 发现不了，故需独立额度信号）。
     """
     enabled = _enabled_harnesses(registry)
+    temporarily_disabled = _temporarily_disabled_external_reviewer_harnesses(now_utc)
     if assume_available is not None:
-        return [h for h in assume_available if h in enabled]
+        return [
+            h
+            for h in assume_available
+            if h in enabled and h not in temporarily_disabled
+        ]
     cooled = cooldown_active or set()
     available: list[str] = []
     for harness_id in enabled:
-        if harness_id in cooled:
+        if harness_id in cooled or harness_id in temporarily_disabled:
             continue
         spec = registry["harnesses"][harness_id]
         config_path = SKILL_DIR / spec["config_path"]
@@ -447,6 +533,8 @@ def _reroute_candidates(
     available: list[str],
     cooled: set[str],
     registry: dict[str, Any],
+    *,
+    now_utc: datetime | None = None,
 ) -> list[str]:
     """对 ``A' = available − cooled`` 重调 ``route()`` 取替换候选 harness 顺序（R-c 单源）。
 
@@ -456,7 +544,7 @@ def _reroute_candidates(
     a_prime = [h for h in available if h not in cooled]
     candidates: list[str] = []
     if main_harness is not None and a_prime:
-        sub_plan = route(main_harness, a_prime, registry)
+        sub_plan = route(main_harness, a_prime, registry, now_utc=now_utc)
         for reviewer in sub_plan.get("reviewers", []):
             hid = reviewer.get("harness_id")
             if hid and hid not in candidates:

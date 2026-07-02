@@ -5427,6 +5427,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_dispatch_reviewers_routing_matrix(root / "dispatch-routing"),
         ),
         (
+            "dispatch_reviewers_temporarily_disables_claude_code_external_reviewer",
+            lambda: test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer(
+                root / "dispatch-disable-claude-reviewer"
+            ),
+        ),
+        (
             "dispatch_reviewers_same_harness_double_instance_distinct_ids",
             lambda: test_dispatch_reviewers_same_harness_double_instance_distinct_ids(
                 root / "dispatch-double-instance"
@@ -6962,7 +6968,7 @@ _sessman.inject(
 globals().update({_n: getattr(_sessman, _n) for _n in _sessman.__all__})
 
 
-# 有界拆分：dispatch reviewers 选路与 detached 派发 测试簇移入子模块；inject 共享依赖后重绑 12 个测试名，
+# 有界拆分：dispatch reviewers 选路与 detached 派发 测试簇移入子模块；inject 共享依赖后重绑 13 个测试名，
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import dispatch_reviewers_routing_and_detached as _disprev
 _disprev.inject(

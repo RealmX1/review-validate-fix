@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import shlex
@@ -22,6 +23,7 @@ __all__ = [
     'test_dispatch_reviewers_detached_exports_codex_rvf_log_root',
     'test_dispatch_reviewers_wait_status_branches',
     'test_dispatch_reviewers_routing_matrix',
+    'test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer',
     'test_dispatch_reviewers_same_harness_double_instance_distinct_ids',
     'test_dispatch_reviewers_plan_artifact_schema',
     'test_dispatch_reviewers_executes_two_external',
@@ -249,6 +251,9 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     """
     d = load_dispatch_reviewers_module()
     reg = _dispatch_registry()
+    after_temporary_override_expiry = datetime.datetime(
+        2026, 7, 10, 12, 1, tzinfo=datetime.timezone.utc
+    )
 
     def harnesses(plan):
         return [r["harness_id"] for r in plan["reviewers"]]
@@ -257,48 +262,116 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
         return {w["code"] for w in plan["warnings"]}
 
     # R0 — 默认两路非主，cursor 必选一腿
-    p = d.route("claude_code", ["cursor", "claude_code", "codex"], reg)
+    p = d.route(
+        "claude_code",
+        ["cursor", "claude_code", "codex"],
+        reg,
+        now_utc=after_temporary_override_expiry,
+    )
     assert p["routing_rule"] == "R0", p
     assert harnesses(p) == ["cursor", "codex"], p
     assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
     assert p["status"] == "planned" and p["needs_last_resort_fallback"] is False
 
-    p = d.route("codex", ["cursor", "claude_code", "codex"], reg)
+    p = d.route(
+        "codex",
+        ["cursor", "claude_code", "codex"],
+        reg,
+        now_utc=after_temporary_override_expiry,
+    )
     assert p["routing_rule"] == "R0" and harnesses(p) == ["cursor", "claude_code"], p
 
     # R0 主=cursor（仅显式覆盖可达）→ 两路非主，cursor 不占 slot
-    p = d.route("cursor", ["cursor", "claude_code", "codex"], reg)
+    p = d.route(
+        "cursor",
+        ["cursor", "claude_code", "codex"],
+        reg,
+        now_utc=after_temporary_override_expiry,
+    )
     assert p["routing_rule"] == "R0" and set(harnesses(p)) == {"claude_code", "codex"}, p
 
     # R1 — 恰两路 external（含 cursor）
-    p = d.route("claude_code", ["cursor", "codex"], reg)
+    p = d.route("claude_code", ["cursor", "codex"], reg, now_utc=after_temporary_override_expiry)
     assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"cursor", "codex"}, p
 
     # R1 + R4 — cursor 不可用：仍两路 external（主以 external 跑），记 cursor_unavailable
-    p = d.route("claude_code", ["claude_code", "codex"], reg)
+    p = d.route(
+        "claude_code",
+        ["claude_code", "codex"],
+        reg,
+        now_utc=after_temporary_override_expiry,
+    )
     assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"claude_code", "codex"}, p
     assert "cursor_unavailable" in warns(p), p
     assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
 
     # R2 — 同 harness 双 external，only==M（info）
-    p = d.route("codex", ["codex"], reg)
+    p = d.route("codex", ["codex"], reg, now_utc=after_temporary_override_expiry)
     assert p["routing_rule"] == "R2", p
     assert [r["reviewer_id"] for r in p["reviewers"]] == ["codex-cli-a", "codex-cli-b"], p
     assert "only_main_harness_available" in warns(p), p
     assert "cursor_unavailable" not in warns(p), p  # R2 不叠加 R4
 
     # R2 — only!=M：必须 mismatch warning
-    p = d.route("claude_code", ["codex"], reg)
+    p = d.route("claude_code", ["codex"], reg, now_utc=after_temporary_override_expiry)
     assert p["routing_rule"] == "R2" and "available_reviewer_harness_mismatch" in warns(p), p
 
     # R3 — 零可用：默认 needs_last_resort_fallback，不 fail
-    p = d.route("claude_code", [], reg)
+    p = d.route("claude_code", [], reg, now_utc=after_temporary_override_expiry)
     assert p["routing_rule"] == "R3" and p["needs_last_resort_fallback"] is True, p
     assert p["status"] == "planned" and p["reviewers"] == [], p
 
     # R3 — require_external：fail-close
-    p = d.route("claude_code", [], reg, require_external_only=True)
+    p = d.route(
+        "claude_code",
+        [],
+        reg,
+        require_external_only=True,
+        now_utc=after_temporary_override_expiry,
+    )
     assert p["status"] == "failed" and p.get("reason") == "no_reviewer_harness_available", p
+
+
+def test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer(root: Path) -> None:
+    """临时 policy：覆盖期内 Claude Code 不作为 external reviewer。
+
+    关键场景：主实现 agent 是 Codex，三路 harness 本来都可用时，external reviewer
+    从历史默认的 cursor+claude_code 改为 cursor+codex；过期后恢复历史矩阵。
+    """
+    d = load_dispatch_reviewers_module()
+    reg = _dispatch_registry()
+    before_expiry = datetime.datetime(2026, 7, 10, 11, 59, tzinfo=datetime.timezone.utc)
+    after_expiry = datetime.datetime(2026, 7, 10, 12, 1, tzinfo=datetime.timezone.utc)
+
+    def harnesses(plan):
+        return [r["harness_id"] for r in plan["reviewers"]]
+
+    def warns(plan):
+        return {w["code"] for w in plan["warnings"]}
+
+    override = d.temporary_disable_claude_code_external_reviewer_override(before_expiry)
+    assert override is not None
+    assert override["disabled_harness"] == d.HOST_CLAUDE
+    assert override["expires_at_utc"] == "2026-07-10T12:00:00Z"
+    assert override["expires_after_requested_date"] == "2026-07-09"
+
+    p = d.route("codex", ["cursor", "claude_code", "codex"], reg, now_utc=before_expiry)
+    assert p["routing_rule"] == "R1", p
+    assert harnesses(p) == ["cursor", "codex"], p
+    assert "claude_code_external_reviewer_temporarily_disabled" in warns(p), p
+    assert p["external_reviewer_selection_override"]["disabled_harnesses"] == ["claude_code"], p
+    assert p["external_reviewer_selection_override"]["excluded_available_harnesses"] == [
+        "claude_code"
+    ], p
+
+    p = d.route("claude_code", ["claude_code"], reg, now_utc=before_expiry)
+    assert p["routing_rule"] == "R3", p
+    assert p["reviewers"] == [], p
+
+    p = d.route("codex", ["cursor", "claude_code", "codex"], reg, now_utc=after_expiry)
+    assert p["routing_rule"] == "R0", p
+    assert harnesses(p) == ["cursor", "claude_code"], p
+    assert "external_reviewer_selection_override" not in p, p
 
 
 def test_dispatch_reviewers_same_harness_double_instance_distinct_ids(root: Path) -> None:
@@ -676,4 +749,3 @@ def test_dispatch_reviewers_failclose_when_main_exhausted(tmp_path: Path) -> Non
     assert plan["needs_last_resort_fallback"] is False, plan
     assert any(w["code"] == "main_harness_usage_limit_exhausted" for w in plan["warnings"]), plan["warnings"]
     assert "alpha" in plan["cooldown_recorded"], plan
-
