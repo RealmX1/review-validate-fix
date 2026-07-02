@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import concurrent.futures
+import datetime
 import functools
 import json
 import importlib.util
@@ -313,11 +314,36 @@ def test_rvf_analyze_thread_select_host(root: Path) -> None:
     codex_t = root / "codex.jsonl"
     codex_t.write_text(json.dumps({"type": "session_meta", "payload": {"id": "s"}}) + "\n", encoding="utf-8")
 
-    assert module.select_host({"transcript_path": str(claude_t)}) == module.HOST_CLAUDE
-    assert module.select_host({"transcript_path": str(codex_t)}) == module.HOST_CODEX
+    before_override_expiry = datetime.datetime(2026, 7, 10, 11, 59, tzinfo=datetime.timezone.utc)
+    after_override_expiry = datetime.datetime(2026, 7, 10, 12, 1, tzinfo=datetime.timezone.utc)
+
+    override = module.temporary_force_codex_analysis_host_override(before_override_expiry)
+    assert override is not None
+    assert override["forced_host"] == module.HOST_CODEX
+    assert override["expires_after_requested_date"] == "2026-07-09"
+    assert override["expiry_timezone_policy"] == "covers_end_of_2026_07_09_across_us_timezones"
+
+    assert (
+        module.select_host({"transcript_path": str(claude_t)}, now_utc=before_override_expiry)
+        == module.HOST_CODEX
+    )
+    assert (
+        module.select_host({"transcript_path": str(claude_t)}, now_utc=after_override_expiry)
+        == module.HOST_CLAUDE
+    )
+    assert (
+        module.select_host({"transcript_path": str(codex_t)}, now_utc=after_override_expiry)
+        == module.HOST_CODEX
+    )
     # transcript 缺失 → 兜底 codex。
-    assert module.select_host({}) == module.HOST_CODEX
-    assert module.select_host({"transcript_path": str(root / "missing.jsonl")}) == module.HOST_CODEX
+    assert module.select_host({}, now_utc=after_override_expiry) == module.HOST_CODEX
+    assert (
+        module.select_host(
+            {"transcript_path": str(root / "missing.jsonl")},
+            now_utc=after_override_expiry,
+        )
+        == module.HOST_CODEX
+    )
 
 
 def test_rvf_analyze_thread_status_file_schema(root: Path) -> None:

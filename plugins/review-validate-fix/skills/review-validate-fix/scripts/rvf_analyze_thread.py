@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,22 @@ STATUS_SCHEMA_VERSION = 1
 SUPPRESS_STOP_HOOK_ENV = "RVF_SUPPRESS_STOP_HOOK"
 ANALYZE_THREAD_ENV = "RVF_ANALYZE_THREAD"
 
+# 临时运行期 override：按用户 2026-07-02 指示，RVF analysis detached
+# agent 持续到 2026-07-09 结束前一律走 Codex。过期点故意覆盖美国时区的
+# 2026-07-09 全日，避免因当前运行机器是 Asia/Shanghai 而提前失效。
+TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC = datetime(
+    2026,
+    7,
+    10,
+    12,
+    0,
+    0,
+    tzinfo=timezone.utc,
+)
+TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_REASON = (
+    "temporary_force_codex_analysis_host_until_2026_07_09_us_timezones"
+)
+
 PROMPT_FILENAME = ".analyze-thread.prompt.md"
 LOG_FILENAME = ".analyze-thread.log"
 STATUS_FILENAME = ".analyze-thread.status.json"
@@ -97,13 +114,45 @@ def _parent_transcript_path(event: dict[str, Any]) -> Path | None:
     return None
 
 
-def select_host(event: dict[str, Any]) -> str:
+def temporary_force_codex_analysis_host_override(
+    now_utc: datetime | None = None,
+) -> dict[str, str] | None:
+    """返回当前是否命中临时 Codex analysis host override。
+
+    ``expires_at_utc`` 对应 2026-07-10 12:00:00Z，也就是用户说的
+    「持续到 July 9」按美国时区整天生效并留出余量。
+    """
+    current = now_utc or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+    if current >= TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC:
+        return None
+    return {
+        "reason": TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_REASON,
+        "forced_host": HOST_CODEX,
+        "expires_at_utc": TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC.isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "expires_after_requested_date": "2026-07-09",
+        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
+    }
+
+
+def select_host(event: dict[str, Any], *, now_utc: datetime | None = None) -> str:
     """根据父会话 transcript 选 analyze 线程的 harness。
 
     Claude Code transcript → ``HOST_CLAUDE``；Codex rollout → ``HOST_CODEX``；
     无法识别（transcript 缺失 / 未知格式）→ 回退 ``HOST_CODEX``，与
     ``default_cline_kanban_agent_id`` 的兜底约定一致。
+
+    临时 override 生效期间（覆盖美国时区 2026-07-09 全日），不看 transcript，
+    直接返回 Codex；到期后自动恢复原逻辑。
     """
+    if temporary_force_codex_analysis_host_override(now_utc) is not None:
+        return HOST_CODEX
+
     path = _parent_transcript_path(event)
     if path is not None:
         try:
@@ -181,6 +230,7 @@ def launch_detached_analyze_thread(
     }
 
     try:
+        host_selection_override = temporary_force_codex_analysis_host_override()
         host = select_host(event)
         agent_argv, uses_stdin = build_analyze_command(host)
 
@@ -212,6 +262,8 @@ def launch_detached_analyze_thread(
             "launch_status": LAUNCH_LAUNCHED,
             "error": None,
         }
+        if host_selection_override is not None:
+            status_payload["host_selection_override"] = host_selection_override
 
         # analyze prompt 一律走 stdin（``cat <prompt> | <agent>``）；不施加总超时
         # backstop（analyze 补全自有边界，保持既有行为不变）。
