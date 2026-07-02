@@ -31,7 +31,7 @@
 | latest pointer | 已降级为 `run_id`、`summary_path`、`events_path`、`status`、`reason_code`、`updated_at` | 任何主程序逻辑不得把 `latest.json` 当完整状态源 |
 | Stop hook stdout | 保持只输出 Codex hook payload JSON | 诊断信息只能进 `systemMessage` 摘要或 run ledger；dispatcher 失败也不走非零 stderr |
 | dispatcher dev sync | 已接入同一 run ledger，失败时输出 hook payload 并给 summary path | 不允许把 stale installed plugin 的继续执行作为 fallback，也不要让 stderr 变成当前会话 continuation |
-| Stop hook suppress | 已接入最小 run ledger，用户可见 `systemMessage` 保留 summary path | suppress 仍必须早于 handoff、dirty gate 和 backend launch；只记录 stop event、suppressed/skipped 事件和 summary |
+| Stop hook suppress | 已接入最小 run ledger，用户可见 `systemMessage` 用醒目块保留 summary path | suppress 仍必须早于 handoff、dirty gate 和 backend launch；只记录 stop event、suppressed/skipped 事件和 summary |
 | prepare/reviewer | 已支持 `--rvf-run-id` 和 `--rvf-run-dir` | manual run 和 external reviewer 必须可通过 run ledger 排障 |
 | 日志失败 | helper 返回 `log_unavailable` diagnostics，hook payload 仍可用 | 不得让日志目录不可写破坏 Stop hook 协议 |
 
@@ -85,7 +85,7 @@ flowchart TD
     AfterSummary["summary.json"]:::changedAfter
     AfterLatest["latest.json pointer<br/>compat retained"]:::changedAfter
     AfterArtifacts["artifacts/<br/>prompt stdout stderr packet snapshot"]:::changedAfter
-    AfterSystem["short systemMessage<br/>status + summary path"]:::changedAfter
+    AfterSystem["prominent systemMessage<br/>status + summary path"]:::changedAfter
     NewFailure["logging failure is non-fatal<br/>log_unavailable"]:::changedNew
   end
 
@@ -205,7 +205,7 @@ state/
 ### 2. 替换 Stop hook 日志
 
 - `stop_review_validate_fix.py` 在 gate、skip、fork、handoff advisory 各阶段写事件。
-- `systemMessage` 缩短为状态摘要和 summary path。
+- `systemMessage` 使用无 ANSI 的醒目多行块，首行是 `=== REVIEW-VALIDATE-FIX HOOK ===`，并在块内保留原状态摘要和 summary path 兼容行。
 - prompt 继续写文件，但主 JSON 只保存 `prompt_path` 和摘要字段。
 - 删除 timestamp 扁平 JSON 作为主日志的角色；同等信息进入 `events.jsonl` 和 `summary.json`。
 - `run_codex_fork()` 不再手写 `log_path` / `latest_path` / `prompt_path` 的散落逻辑，改由 `rvf_logging.py` 分配。

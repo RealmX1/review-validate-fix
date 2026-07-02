@@ -1219,10 +1219,23 @@ def test_rvf_user_prompt_submit_render_hook_payload_merges_channels(tmp_path: Pa
     render = submit._render_hook_payload
 
     hook_block = {"hookEventName": "UserPromptSubmit", "additionalContext": "ctx"}
+    formatted_success = submit._trigger_system_message(
+        kind="success",
+        dispatch_origin="post_user_prompt_manual",
+        run_id="rvf-test",
+        status="completed",
+        token="aaaaaaaaaaaaaaaa",
+    )
+    assert "=== RVF USER-PROMPT HOOK ===" in formatted_success
+    assert "status=completed" in formatted_success
+    assert "origin=post_user_prompt_manual" in formatted_success
+    assert "run=rvf-test" in formatted_success
+    assert "token=aaaaaaaaaaaaaaaa" in formatted_success
     # 1) 两通道并存（manual 成功路径）：合并、不互相顶掉。
-    both = render({"systemMessage": "RVF UPS：派发已就绪", "hookSpecificOutput": hook_block, "continue": True})
+    both = render({"systemMessage": formatted_success, "hookSpecificOutput": hook_block, "continue": True})
     assert both is not None
-    assert both["systemMessage"] == "RVF UPS：派发已就绪"
+    assert both["systemMessage"] == formatted_success
+    assert "=== RVF USER-PROMPT HOOK ===" in both["systemMessage"]
     assert both["hookSpecificOutput"] == hook_block
     assert both["continue"] is True
     # 2) 仅 systemMessage（token 派发 / marker / invalid）：user-facing 行，无 hook 块。
@@ -1272,4 +1285,3 @@ def test_rvf_user_prompt_submit_captures_round_baseline(tmp: Path) -> None:
     marker = rbm.read_round_baseline_marker(task_id=None, session_id="sess-capture", root=state_root)
     assert marker is not None, "expected a round-baseline marker to be written"
     assert marker["baseline_head"] == head, (marker.get("baseline_head"), head)
-

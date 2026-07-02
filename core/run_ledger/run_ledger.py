@@ -555,17 +555,51 @@ class RunLedger:
             **summary_fields,
         )
         if summary.get("log_unavailable"):
-            system_message = (
-                f"review-validate-fix: {status}; reason={reason_code}; "
-                "log_unavailable=true"
+            legacy_line = f"review-validate-fix: {status}; reason={reason_code}; log_unavailable=true"
+            system_message = format_review_validate_fix_user_visible_hook_notice(
+                legacy_line=legacy_line,
+                status=status,
+                reason_code=reason_code,
+                log_unavailable=True,
             )
         else:
             detail_note = f"; detail={detail}" if detail else ""
-            system_message = (
+            legacy_line = (
                 f"review-validate-fix: {status}; reason={reason_code}{detail_note}; "
                 f"summary={self.summary_path}"
             )
+            system_message = format_review_validate_fix_user_visible_hook_notice(
+                legacy_line=legacy_line,
+                status=status,
+                reason_code=reason_code,
+                detail=detail,
+                summary_path=self.summary_path,
+            )
         return {"continue": continue_, "systemMessage": system_message}
+
+
+def format_review_validate_fix_user_visible_hook_notice(
+    *,
+    legacy_line: str,
+    status: str,
+    reason_code: str,
+    detail: str | None = None,
+    summary_path: str | Path | None = None,
+    log_unavailable: bool = False,
+) -> str:
+    lines = [
+        "=== REVIEW-VALIDATE-FIX HOOK ===",
+        legacy_line,
+        f"status={status}",
+        f"reason={reason_code}",
+    ]
+    if detail:
+        lines.append(f"detail={detail}")
+    if log_unavailable:
+        lines.append("log_unavailable=true")
+    elif summary_path is not None:
+        lines.append(f"summary={summary_path}")
+    return "\n".join(lines)
 
 
 def start_run(

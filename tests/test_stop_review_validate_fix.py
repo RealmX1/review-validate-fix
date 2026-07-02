@@ -283,7 +283,8 @@ def parse_json(stdout: str) -> dict[str, object]:
 def summary_path_from_message(message: str) -> Path:
     marker = "summary="
     assert marker in message, message
-    return Path(message.split(marker, 1)[1].split(";", 1)[0].strip())
+    summary_tail = message.split(marker, 1)[1]
+    return Path(summary_tail.splitlines()[0].split(";", 1)[0].strip())
 
 
 def summary_from_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -351,7 +352,8 @@ def app_server_requests(summary: dict[str, object]) -> list[dict[str, object]]:
 def assert_skip_reason(stdout: str, expected: str) -> dict[str, object]:
     payload = parse_json(stdout)
     assert "decision" not in payload
-    assert str(payload["systemMessage"]).startswith("review-validate-fix: skipped;")
+    assert str(payload["systemMessage"]).startswith("=== REVIEW-VALIDATE-FIX HOOK ===")
+    assert "review-validate-fix: skipped;" in str(payload["systemMessage"])
     summary = summary_from_payload(payload)
     assert summary["status"] == "skipped"
     assert expected in str(summary.get("message"))
@@ -4727,6 +4729,10 @@ def test_launch_keep_park_signal_uses_real_hook_payload_shape(tmp_path: Path) ->
     # 这正是当初的坑：成功派发的 hook_payload 顶层没有 status 键。
     assert payload.get("status") is None
     assert set(payload.keys()) == {"continue", "systemMessage"}
+    assert "=== REVIEW-VALIDATE-FIX HOOK ===" in payload["systemMessage"]
+    assert "status=kanban-followup-started" in payload["systemMessage"]
+    assert "reason=kanban_followup_started" in payload["systemMessage"]
+    assert "summary=" in payload["systemMessage"]
     # 缺信号（= 旧的「靠 status」实现路径）→ 不保留 park（会 unpark）。
     assert module._launch_result_keeps_self_park(payload) is False
     # dispatch 成功路径显式置位后 → 保留 park。

@@ -1232,34 +1232,49 @@ def _trigger_system_message(
     run_ref = run_id or "—"
     origin = dispatch_origin or "—"
     tok = token or "—"
+
+    def notice(*, status_value: str, message: str, extra_fields: tuple[str, ...] = ()) -> str:
+        lines = [
+            "=== RVF USER-PROMPT HOOK ===",
+            f"RVF UPS: {message}",
+            f"status={status_value}",
+            f"origin={origin}",
+            f"run={run_ref}",
+            f"token={tok}",
+        ]
+        lines.extend(extra_fields)
+        return "\n".join(lines)
+
     if kind == "success":
-        return (
-            f"RVF UPS：派发已就绪 · origin={origin} · run={run_ref} · "
-            f"status={status or 'completed'} · token={tok}"
-        )
+        return notice(status_value=status or "completed", message="派发已就绪")
     if kind == "failed":
-        return (
-            f"RVF UPS：派发已跑但未就绪 · origin={origin} · run={run_ref} · "
-            f"status={status or '—'} · token={tok}"
-        )
+        return notice(status_value=status or "—", message="派发已跑但未就绪")
     if kind == "already_completed":
-        return (
-            f"RVF UPS：该 prep 已 RVF 过、本次未重跑 · origin={origin} · "
-            f"run={run_ref} · token={tok}"
+        return notice(
+            status_value="already_completed",
+            message="该 prep 已 RVF 过、本次未重跑",
         )
     if kind == "dispatch_no_prep":
-        return (
-            f"RVF UPS：检测到 dispatch token={tok} 但 prep "
-            f"{status or 'unavailable'}（缺失 / 过期 / 不可读），未跑"
+        return notice(
+            status_value=status or "unavailable",
+            message="检测到 dispatch token 但 prep 不可用，未跑",
+            extra_fields=("detail=prep 缺失 / 过期 / 不可读",),
         )
     if kind == "marker_without_token":
-        return f"RVF UPS：自注入 marker '{marker or '—'}' 无 token（不一致态），未派发"
-    if kind == "suppressed_handoff_literal":
-        return (
-            "RVF UPS：检测到 review-validate-fix 字面量，但识别为 handoff 正文 / 姊妹命令参数，"
-            "未启动 review；如需手动 review，请单独发送 $review-validate-fix / /review-validate-fix"
+        return notice(
+            status_value="marker_without_token",
+            message="自注入 marker 无 token（不一致态），未派发",
+            extra_fields=(f"marker={marker or '—'}",),
         )
-    return f"RVF UPS：{kind}"
+    if kind == "suppressed_handoff_literal":
+        return notice(
+            status_value="suppressed_handoff_literal",
+            message=(
+                "检测到 review-validate-fix 字面量，但识别为 handoff 正文 / 姊妹命令参数，"
+                "未启动 review；如需手动 review，请单独发送 $review-validate-fix / /review-validate-fix"
+            ),
+        )
+    return notice(status_value=kind, message=kind)
 
 
 def _render_hook_payload(result: dict[str, Any]) -> dict[str, Any] | None:
