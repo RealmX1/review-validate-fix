@@ -796,6 +796,9 @@ def test_main_syncs_existing_claude_plugin_install(tmp_path: Path) -> None:
     for root in (marketplace_plugin, cache_plugin):
         assert (root / ".claude-plugin" / "plugin.json").exists()
         assert (root / "hooks" / "hooks.json").exists()
+        assert set(json.loads((root / "hooks" / "hooks.json").read_text(encoding="utf-8"))) == {
+            "hooks"
+        }
         assert (root / "hooks" / "stop.py").exists()
         assert (root / "commands" / "rvf-handoff-commit.md").exists()
 
