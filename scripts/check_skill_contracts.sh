@@ -583,7 +583,10 @@ require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md
 # $rvf-land 入口已统一为 namespaced skill（薄 shim command 已删，见 docs/architecture/cross-harness.md §3）
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_handoff_intake.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_worktree_differs_from_current'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不自动运行 base-branch-sync'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'base-branch-sync 不是本 skill 的默认步骤'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '用户已经明确要求后续运行'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不要停下询问“是否现在运行”'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '如果用户没有明确要求后续 base 同步'
 # 失败再入 $rvf-reopen skill + 确定性后端脚本（防部署门漂移、漏部署）；入口已统一为 namespaced skill
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'

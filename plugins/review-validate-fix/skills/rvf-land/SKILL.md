@@ -1,11 +1,11 @@
 ---
 name: rvf-land
-description: Use only when the user explicitly invokes $rvf-land or /rvf-land. 在同一个 worktree 中收尾一段由 future-self 跑完的 RVF 工作：吃下用户粘贴的 RVF handoff / finalization 正文，sanity-check 已经应用在当前 worktree 的修复，必要时做最小修正，验证后提交。不启动新的 RVF review，也不自动运行 base-branch-sync。
+description: Use only when the user explicitly invokes $rvf-land or /rvf-land. 在同一个 worktree 中收尾一段由 future-self 跑完的 RVF 工作：吃下用户粘贴的 RVF handoff / finalization 正文，sanity-check 已经应用在当前 worktree 的修复，必要时做最小修正，验证后提交。不启动新的 RVF review；仅当用户已明确请求后续 base-branch-sync 时，封窗后继续执行该 follow-up。
 ---
 
 # RVF Land
 
-本 skill 用于在「同一个 worktree」中收尾一段已经由 future-self 跑完的 RVF 工作并提交。它不启动新的 RVF review，也不自动运行 base-branch-sync。
+本 skill 用于在「同一个 worktree」中收尾一段已经由 future-self 跑完的 RVF 工作并提交。它不启动新的 RVF review。base-branch-sync 不是本 skill 的默认步骤；仅当用户在同一 prompt、相邻明确请求、或本轮任务指令中已经要求后续同步回 base branch 时，封窗后继续执行 base-branch-sync follow-up。
 
 典型场景（cline-kanban native task 收尾）：
 
@@ -83,7 +83,11 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
    - 脚本严格 best-effort：打印 `RVF_ROUND_BASELINE_SEALED ...` 即封窗成功；打印 `RVF_ROUND_BASELINE_SEAL_SKIPPED reason=...` 表示本环境无法封窗（非 kanban 会话等），可忽略，不影响提交。
    - 在最终输出里记一行封窗结果（已封窗到 `<HEAD>` 或已跳过及原因）。
 
-本命令到封窗为止结束，不自动运行 base-branch-sync。
+7. **可选 follow-up：按用户已明确请求继续 base-branch-sync。** 封窗完成后检查本轮用户输入和相邻任务指令：
+
+   - 如果用户已经明确要求后续运行 `/base-branch-sync`、`$base-branch-sync`、同步回 base branch、hand back / apply back 到本地 base 分支，继续使用 `base-branch-sync` skill；不要停下询问“是否现在运行”。
+   - 如果用户没有明确要求后续 base 同步，本命令到封窗为止结束，不自动执行 base-branch-sync，只在最终输出中提示可手动运行。
+   - 如果 base-branch-sync 自己的 preflight guard 阻断或需要冲突决策，按 `base-branch-sync` skill 的升级规则处理；不要在 rvf-land 阶段提前替它做风险放行。
 
 ## Failure Gates
 
@@ -103,4 +107,4 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 - 运行过的验证命令及结果。
 - commit hash 和 commit message。
 - 仍然保留的 unrelated dirty 文件或风险。
-- 提示用户：如需把本次改动同步回 task 的 base branch，可手动运行 `/base-branch-sync`（Claude Code）或 `$base-branch-sync`（Codex）；本命令不会自动执行。
+- base-branch-sync follow-up：说明是否检测到用户已明确请求；若已请求，报告后续 `base-branch-sync` 的执行结果；若未请求，提示用户可手动运行 `/base-branch-sync`（Claude Code）或 `$base-branch-sync`（Codex）。
