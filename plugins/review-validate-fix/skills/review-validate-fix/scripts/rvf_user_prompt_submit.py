@@ -12,10 +12,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
-import rvf_bootstrap_confirm
 import rvf_prep_file
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
-from core.run_ledger.run_ledger import log_root, start_run  # noqa: E402
 from session_label import text_from_message_payload
 
 try:
@@ -368,109 +366,6 @@ def _capture_round_baseline(event: dict[str, Any], prompt: str | None) -> dict[s
         return None
 
 
-def _create_manual_prep_file(
-    *,
-    event: dict[str, Any],
-    prompt: str,
-) -> tuple[rvf_prep_file.PrepFileRecord, dict[str, Any]]:
-    """Create a prep file for a same-session manual /review-validate-fix invocation.
-
-    The hook owns this prep file (Stop hook didn't write one). Returns the prep record
-    plus a debug dict describing where cwd / transcript came from.
-    """
-    cwd, cwd_inferred = _resolve_cwd(event)
-    origin_repo = _git_resolved_repo(cwd) or cwd
-    session_id = event.get("session_id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        session_id = None
-    transcript_raw = event.get("transcript_path") or event.get("conversation_path") or event.get("session_path")
-    transcript_path: Path | None = None
-    if isinstance(transcript_raw, str) and transcript_raw.strip():
-        candidate = Path(transcript_raw).expanduser()
-        if candidate.exists():
-            transcript_path = candidate.resolve()
-
-    ledger = start_run("user-prompt-submit-manual", repo=origin_repo, cwd=cwd)
-    artifacts_dir = ledger.artifacts_dir
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    target_flow = "flow-manual"
-    payload: dict[str, Any] = {
-        "origin_session_id": session_id,
-        "origin_repo": origin_repo,
-        "origin_cwd": cwd,
-        "origin_transcript_path": str(transcript_path) if transcript_path else None,
-        "target_flow": target_flow,
-        "target_worktree": cwd,
-        "target_kanban_task_id": None,
-        "target_session_id": session_id,
-        "dispatch_origin": "post_user_prompt_manual",
-        "dispatch_cwd_inferred": cwd_inferred,
-        "rvf_run": {
-            "run_id": ledger.run_id,
-            "run_dir": str(ledger.run_dir),
-            "artifacts_dir": str(artifacts_dir),
-            "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
-            "tracker_scope_path": None,
-            "tracker_lease_id": None,
-            "tracker_scope_hash": None,
-        },
-        "handoff_expectations": {
-            "handoff_path": str(artifacts_dir / "handoff.md"),
-            "expected_artifacts": ["review-result.json", "merge-table.md", "handoff.md"],
-        },
-        "workflow_constraints": {
-            "pause_origin_edits": False,
-            "in_place_mode": True,
-        },
-    }
-    # B1: if this session has committed-but-unreviewed work (e.g. a clean worktree after the
-    # agent committed its slice), stamp the committed-round baseline so prepare_run builds a
-    # committed-round manifest and the packet renders `git diff <baseline>` — letting a manual
-    # /review-validate-fix review already-committed work without the fragile `git reset` hack.
-    # Empty committed set (pure-dirty / nothing committed this round) → left unset → zero change.
-    # 去-codex 后：检测/attribution 原语落在 core，直接导入（不再经 Stop hook 引擎重导入）。
-    try:
-        from core.session_scope_allocation import committed_round_detection  # noqa: PLC0415 - lazy, off the hot import path (manual triggers only)
-        from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: PLC0415
-        from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
-
-        committed_repo = Path(origin_repo)
-        committed_baseline = committed_round_detection._resolve_committed_round_baseline(
-            committed_repo, current_kanban_task_id(event), session_id
-        )
-        committed_base_ref = committed_round_detection._resolve_committed_round_base_ref(committed_repo)
-        if committed_baseline and reviewable_unit_diff_tracker._list_committed_round_changed_paths(
-            committed_repo, committed_baseline, committed_base_ref
-        ):
-            payload["committed_round_baseline"] = committed_baseline
-            if committed_base_ref:
-                payload["committed_round_base_ref"] = committed_base_ref
-    except Exception:
-        pass
-    rvf_prep_file.sweep_stale()
-    record = rvf_prep_file.write_prep_file(payload)
-    ledger.event(
-        phase="prepare",
-        event="manual_dispatch_prep_file_written",
-        status="completed",
-        reason_code="manual_dispatch_prep_file_written",
-        repo=origin_repo,
-        cwd=cwd,
-        paths={"prep_file": str(record.path)},
-        target_flow=target_flow,
-        dispatch_origin="post_user_prompt_manual",
-    )
-    debug = {
-        "cwd": cwd,
-        "cwd_inferred": cwd_inferred,
-        "origin_repo": origin_repo,
-        "session_id": session_id,
-        "transcript_path": str(transcript_path) if transcript_path else None,
-    }
-    return record, debug
-
-
 def _run_shared_workflow(
     *,
     record: rvf_prep_file.PrepFileRecord,
@@ -497,74 +392,6 @@ def _existing_shared_workflow_state(payload: dict[str, Any]) -> dict[str, Any] |
     if isinstance(state, dict):
         return state
     return None
-
-
-def _bootstrap_confirm_state_root(state_root: str | Path | None) -> Path:
-    if state_root is not None:
-        return Path(state_root).expanduser()
-    return log_root()
-
-
-def _handle_bootstrap_confirmation(
-    event: dict[str, Any],
-    prompt: str | None,
-    *,
-    state_root: Path,
-) -> dict[str, Any] | None:
-    session_id = event.get("session_id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        return None
-    marker = rvf_bootstrap_confirm.read_marker(state_root, session_id.strip())
-    if marker is None:
-        rvf_bootstrap_confirm.sweep_expired(state_root)
-        return None
-    if rvf_bootstrap_confirm.marker_is_expired(marker):
-        rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
-        rvf_bootstrap_confirm.sweep_expired(state_root)
-        return {
-            "continue": True,
-            "status": "bootstrap_confirm_expired",
-            "workflow_started": False,
-            "systemMessage": (
-                "review-validate-fix: 上一次 bootstrap 确认 marker 已过期，已自动清理。"
-                "若仍需触发 RVF，请重新调用。"
-            ),
-        }
-    if rvf_bootstrap_confirm.is_yes_literal(prompt):
-        rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
-        try:
-            import stop_review_validate_fix as stop_hook  # noqa: PLC0415
-
-            task_payload = stop_hook.resume_dispatch_from_confirmation_marker(marker)
-            return {
-                "continue": True,
-                "status": "bootstrap_confirm_resumed",
-                "workflow_started": True,
-                "systemMessage": (
-                    "review-validate-fix: 已收到 yes 确认，bootstrap dispatch 已恢复。"
-                ),
-                "resume_payload": task_payload,
-            }
-        except Exception as exc:
-            return {
-                "continue": True,
-                "status": "bootstrap_confirm_resume_failed",
-                "workflow_started": False,
-                "systemMessage": (
-                    "review-validate-fix: bootstrap dispatch 恢复失败："
-                    f"{type(exc).__name__}: {exc}"
-                ),
-            }
-    rvf_bootstrap_confirm.delete_marker(state_root, session_id.strip())
-    return {
-        "continue": True,
-        "status": "bootstrap_confirm_cancelled",
-        "workflow_started": False,
-        "systemMessage": (
-            "review-validate-fix: 未严格匹配 yes/Yes/YES，bootstrap dispatch 已取消。"
-            "本次用户 prompt 将按正常流程处理。"
-        ),
-    }
 
 
 def _claude_projects_root() -> Path:
@@ -861,13 +688,272 @@ def _run_artifacts_present(payload: dict[str, Any]) -> bool:
         return False
 
 
+def _manual_decision_additional_context_text(
+    *,
+    summary: dict[str, Any],
+    token: str,
+    newly_minted: bool,
+    inline_scope: list[str] | None = None,
+) -> str:
+    """manual 决策点注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
+
+    复用 Stop hook 的 ``_render_decision_point_injection_prompt`` 作**单一真相源**——渲染候选摘要 +
+    ``RVF_DECISION_TOKEN`` + rvf-agent ``start/scope/dispatch/decline`` 样例命令 + 「简析后立刻
+    start/decline」指引 + R24 递归护栏文案；仅在前面加一行 manual 触发前缀，末尾附用户内联 ``scope:``
+    提示。Stop 引擎 import 失败时降级为精简自包含提示（token + 关键命令），绝不阻断。
+    """
+    lines: list[str] = []
+    if newly_minted:
+        lines.append("你手动触发了 /review-validate-fix。已为本 worktree 铸一枚发起决策 token；")
+    else:
+        lines.append(
+            "你手动触发了 /review-validate-fix；本候选指纹已有一枚活跃决策 token 在等待（幂等复用）；"
+        )
+    lines.append("请简要评估后用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。")
+    lines.append("")
+    try:
+        import stop_review_validate_fix as stop_hook  # noqa: PLC0415 - 惰性、仅 manual 触发
+
+        lines.append(
+            stop_hook._render_decision_point_injection_prompt(
+                summary=summary, token=token, fork_context=None
+            )
+        )
+    except Exception:  # pragma: no cover - 渲染降级永不阻断
+        cli = "rvf_agent_decision_cli.py"
+        lines.append(f"RVF_DECISION_TOKEN={token}")
+        lines.append(f"候选文件数: {summary.get('candidate_path_count')}")
+        lines.append(f"发起: python3 {cli} start --token {token} --reason \"<一句话理由>\"")
+        lines.append(f"谢绝: python3 {cli} decline --token {token} --reason \"<一句话理由>\"")
+    if inline_scope:
+        lines.append("")
+        lines.append(
+            "用户在触发串里内联指定了 scope: "
+            + ", ".join(inline_scope)
+            + "。start（acknowledged 态）后可用 `rvf-agent scope include/exclude` 据此收窄。"
+        )
+    return "\n".join(lines)
+
+
+def _handle_manual_decision_point(
+    event: dict[str, Any],
+    prompt: str,
+    *,
+    base_payload: dict[str, Any],
+    payload: dict[str, Any],
+    prep_root: str | Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """manual ``/review-validate-fix`` 触发 → 铸决策 token → ``additionalContext`` 注入决策点（S5·R22）。
+
+    与 Stop hook 的 ``decision_point_injection_decision`` 对偶（同 S2 候选摘要 + S1 三闸铸造 + S4
+    注入尝试 ledger），差别仅在交付通道：UPS 用**合法专属**的
+    ``hookSpecificOutput.additionalContext`` 把决策提示喂进主 agent 上下文（Stop 只能用
+    decision/block）。manual 是用户显式意图：候选非空时 minted / deduplicated 均 surface
+    additionalContext（附 token + rvf-agent CLI 样例命令）；declined 冷却 / 铸造熔断只出 user-facing
+    systemMessage（尊重三闸，指纹未变不 nag）。
+
+    负路径不变量（计划 §五.3）：候选非空的每种结局都写 injection-attempt ledger；候选为空则只出
+    systemMessage、不写 ledger（与 Stop hook 无候选路径一致，保持 canary 分母干净）。
+
+    落盘根走 ``$RVF_HOME``/相应 env（S1/S4 默认解析），测试靠 ``RVF_HOME`` 隔离，绝不写真实
+    ``~/.rvf``。整段 best-effort，任何异常都收敛成结构化结果 + systemMessage，不阻断本次 prompt。
+    """
+    # 惰性 import：仅 manual 触发（罕见）才拉起 S1/S2/S4 与 Stop 引擎（renderer 复用），
+    # 不污染普通 prompt 的检测热路径。S2 摘要生成器的默认 resolver 本就会惰性 import Stop 引擎，
+    # 故复用 renderer 不引入额外 import 成本。
+    import rvf_decision_token_store as decision_token_store  # noqa: PLC0415
+    import stop_decision_candidate_summary  # noqa: PLC0415
+    import agentic_initiation_injection_attempt_ledger as injection_attempt_ledger  # noqa: PLC0415
+
+    now_dt = decision_token_store.parse_timestamp(now) if now else None
+
+    cwd, _cwd_inferred = _resolve_cwd(event)
+    repo = _git_resolved_repo(cwd) or cwd
+    raw_session = event.get("session_id")
+    event_session_id = raw_session.strip() if isinstance(raw_session, str) and raw_session.strip() else None
+
+    manual_payload: dict[str, Any] = {**payload, "dispatch_origin": "post_user_prompt_manual"}
+    inline_scope = parse_manual_scope_directive(prompt)
+
+    # ① 候选摘要（S2；纯 git+tracker 缓存，含 committed-but-unreviewed）。best-effort：
+    # 构造失败 → 只出 systemMessage，不铸 token、不写 ledger。ledger=None → 跳过 kanban
+    # workspace 守卫（manual 无 RunLedger，与旧 manual 路径不做守卫一致）。
+    try:
+        summary = stop_decision_candidate_summary.build_candidate_summary(
+            event=event, cwd=cwd, repo=repo, ledger=None
+        )
+    except Exception as exc:  # pragma: no cover - 摘要构造永不阻断
+        return {
+            **manual_payload,
+            "status": "manual_decision_summary_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "systemMessage": _trigger_system_message(
+                kind="manual_summary_failed", dispatch_origin="post_user_prompt_manual"
+            ),
+        }
+
+    worktree = str(summary.get("repo") or repo)
+    candidate_count = int(summary.get("candidate_path_count") or 0)
+    fingerprint = str(summary.get("candidate_fingerprint") or "")
+    has_committed = bool(summary.get("has_committed_but_unreviewed"))
+    summary_session_id = summary.get("session_id") or event_session_id
+
+    # ② 无候选：manual 显式触发但本 worktree 自上次 review 以来无可审改动 → 只出 systemMessage
+    # （不写 injection ledger，保持 canary 分母干净，与 Stop hook 无候选路径一致）。
+    if candidate_count <= 0:
+        return {
+            **manual_payload,
+            "status": "manual_decision_no_candidates",
+            "candidate_path_count": 0,
+            "systemMessage": _trigger_system_message(
+                kind="manual_no_candidates",
+                dispatch_origin="post_user_prompt_manual",
+                detail=f"repo={worktree}",
+            ),
+        }
+
+    # ③ 铸 token（S1 三闸内建：去重幂等 / declined 冷却 / 铸造频率熔断）。异常兜底写 ledger。
+    try:
+        mint = decision_token_store.mint_decision_token(
+            worktree=worktree,
+            session_id=summary_session_id or "",
+            candidate_fingerprint=fingerprint,
+            candidate_summary=summary,
+            now=now_dt,
+        )
+    except Exception as exc:  # pragma: no cover - 铸造异常兜底
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=summary_session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_MINT_ANOMALY,
+            injected=False,
+            note=f"{type(exc).__name__}: {exc}",
+        )
+        return {
+            **manual_payload,
+            "status": "manual_decision_mint_anomaly",
+            "error": f"{type(exc).__name__}: {exc}",
+            "systemMessage": _trigger_system_message(
+                kind="manual_mint_anomaly", dispatch_origin="post_user_prompt_manual"
+            ),
+        }
+
+    outcome = mint.outcome
+
+    # ④ minted / deduplicated：surface 决策点 additionalContext（manual 显式意图，两者均注入）。
+    if (
+        outcome
+        in (
+            decision_token_store.MINT_OUTCOME_MINTED,
+            decision_token_store.MINT_OUTCOME_DEDUPLICATED,
+        )
+        and mint.token
+    ):
+        token = mint.token
+        newly_minted = outcome == decision_token_store.MINT_OUTCOME_MINTED
+        if newly_minted:
+            # 确认要经 additionalContext 投递注入 → minted→injected。UPS 的 additionalContext 与
+            # stdout 同步落地（host 契约通道，非 kanban 那种可能静默失败的异步消息），故此处推进
+            # 不是 87e9338 所诫的乐观预 arm。dedup 命中的 token 可能已 acknowledged，mark_injected
+            # 会拒非法迁移，故仅对新铸 token 打 injected。
+            try:
+                decision_token_store.mark_injected(token, now=now_dt)
+            except decision_token_store.DecisionTokenError:
+                pass
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=summary_session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=(
+                injection_attempt_ledger.INJECTION_OUTCOME_INJECTED
+                if newly_minted
+                else injection_attempt_ledger.INJECTION_OUTCOME_DEDUPLICATED_PENDING
+            ),
+            decision_token=token,
+            injected=newly_minted,
+        )
+        additional_context = _manual_decision_additional_context_text(
+            summary=summary, token=token, newly_minted=newly_minted, inline_scope=inline_scope
+        )
+        manual_payload.update(
+            {
+                "status": "manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
+                "token": token,
+                "candidate_path_count": candidate_count,
+                "candidate_fingerprint": fingerprint,
+                "has_committed_but_unreviewed": has_committed,
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": additional_context,
+                },
+                "systemMessage": _trigger_system_message(
+                    kind="manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
+                    dispatch_origin="post_user_prompt_manual",
+                    token=token,
+                    detail=f"候选 {candidate_count} 文件",
+                ),
+            }
+        )
+        if inline_scope:
+            manual_payload["manual_scope_files"] = inline_scope
+        return manual_payload
+
+    # ⑤ declined 冷却：写 ledger + 只出 systemMessage（尊重 agent 早前的谢绝，指纹未变不 nag）。
+    if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=summary_session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DECLINED_COOLDOWN,
+            injected=False,
+        )
+        return {
+            **manual_payload,
+            "status": "manual_decision_declined_cooldown",
+            "candidate_path_count": candidate_count,
+            "systemMessage": _trigger_system_message(
+                kind="manual_decision_declined_cooldown",
+                dispatch_origin="post_user_prompt_manual",
+            ),
+        }
+
+    # ⑥ circuit_breaker_tripped（或其它未识别 outcome）：写 ledger + 熔断告警 systemMessage。
+    injection_attempt_ledger.record_injection_attempt(
+        worktree=worktree,
+        session_id=summary_session_id,
+        candidate_fingerprint=fingerprint,
+        candidate_path_count=candidate_count,
+        has_committed_but_unreviewed=has_committed,
+        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+        injected=False,
+        note=mint.message,
+    )
+    return {
+        **manual_payload,
+        "status": "manual_decision_circuit_breaker",
+        "candidate_path_count": candidate_count,
+        "systemMessage": mint.message
+        or _trigger_system_message(
+            kind="manual_decision_circuit_breaker",
+            dispatch_origin="post_user_prompt_manual",
+        ),
+    }
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
     prep_root: str | Path | None = None,
     now: str | None = None,
     shared_workflow_timeout_seconds: float = 60.0,
-    bootstrap_confirm_state_root: str | Path | None = None,
 ) -> dict[str, Any]:
     prompt, prompt_source = prompt_text_from_event(event)
     base_payload: dict[str, Any] = {
@@ -875,11 +961,9 @@ def inspect_user_prompt_submit(
         "workflow_started": False,
         "prompt_source": prompt_source,
     }
-    confirm_root = _bootstrap_confirm_state_root(bootstrap_confirm_state_root)
-    confirm_result = _handle_bootstrap_confirmation(event, prompt, state_root=confirm_root)
-    if confirm_result is not None:
-        confirm_result.setdefault("prompt_source", prompt_source)
-        return confirm_result
+    # S5（R22）：bootstrap 独立确认闸已废除。旧路径在此拦截用户 yes/no 以 resume 一次被
+    # bootstrap-size 阻断的 dispatch；overhaul 后重量级准备后置到 rvf-agent CLI `start`，
+    # 发起决策统一走「铸决策 token → agent 显式 start/decline」，不再需要 UPS 侧确认闸。
     if prompt is None:
         return {**base_payload, "status": "no_prompt"}
 
@@ -920,9 +1004,6 @@ def inspect_user_prompt_submit(
     record: rvf_prep_file.PrepFileRecord | None = None
     dispatch_origin: str | None = None
     payload: dict[str, Any] = {**base_payload}
-    # manual 路径解析出的内联 scope（primary 文件），喂给 shared workflow；
-    # 其它 dispatch 路径保持空（scope 由 Stop hook / prep payload 决定）。
-    manual_extra_primary_files: list[str] = []
 
     # 仅对「真正的用户 prompt」记录本轮 baseline（dispatch token / origin marker 是
     # RVF 自注入的机器 prompt，不是用户轮边界，不得前移 baseline）。纯副作用 +
@@ -1051,27 +1132,20 @@ def inspect_user_prompt_submit(
             ),
         }
     elif is_manual:
-        try:
-            record, debug = _create_manual_prep_file(event=event, prompt=prompt)
-            dispatch_origin = "post_user_prompt_manual"
-            manual_extra_primary_files = parse_manual_scope_directive(prompt)
-            payload.update(
-                {
-                    "status": "manual_prep_created",
-                    "token": record.token,
-                    "prep_file_path": str(record.path),
-                    "dispatch_origin": dispatch_origin,
-                    "manual_dispatch_debug": debug,
-                }
-            )
-            if manual_extra_primary_files:
-                payload["manual_scope_files"] = manual_extra_primary_files
-        except Exception as exc:
-            return {
-                **payload,
-                "status": "manual_prep_failed",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+        # S5（R22）：manual 触发不再预置 packet/prepare（旧 `_create_manual_prep_file` +
+        # shared-workflow 预置逻辑已退役至 rvf-agent CLI `start`）。改为与 Stop hook 决策点
+        # `decision_point_injection_decision` 对偶——铸决策 token（S1 三闸内建）并经 UPS 专属的
+        # `additionalContext` 交付「候选摘要（S2）+ token + rvf-agent start/scope/dispatch/decline
+        # 样例命令 + 简析后立刻 start/decline 指引」，由主 agent 显式发起或谢绝。此分支自成终局，
+        # 提前返回，不再落入下方 token 派发的 shared-workflow 块。
+        return _handle_manual_decision_point(
+            event,
+            prompt,
+            base_payload=base_payload,
+            payload=payload,
+            prep_root=prep_root,
+            now=now,
+        )
     elif manual_decision == "suppressed":
         # 触发字面量在场但识别为 handoff 正文 / 姊妹命令参数：不新建 manual prep、
         # 不派发 review。给用户一条可见诊断行（user-facing systemMessage，不进模型
@@ -1134,11 +1208,12 @@ def inspect_user_prompt_submit(
         pass
 
     try:
+        # S5 后本块只由 token 派发路径（Stop hook / kanban 注入的 child 到达）到达；manual 已在
+        # 上方自成终局。故不再传 manual 内联 scope（inline scope 现由 rvf-agent CLI scope 阶段处理）。
         result_state = _run_shared_workflow(
             record=record,
             user_prompt_excerpt=prompt[:2000] if prompt else None,
             timeout_seconds=shared_workflow_timeout_seconds,
-            extra_primary_files=manual_extra_primary_files or None,
         )
     except Exception as exc:
         result_state = {
@@ -1170,23 +1245,9 @@ def inspect_user_prompt_submit(
         )
     except (OSError, rvf_prep_file.PrepFileError):
         pass
-    # Manual same-session path: the hook does not modify the user's prompt and
-    # does not export RVF env vars into the agent process, so the agent has no
-    # other way to discover the prep file path. Emit a `hookSpecificOutput`
-    # block with `additionalContext` so the harness can inject the path /
-    # next-step pointer into the main agent's context.
-    if dispatch_origin == "post_user_prompt_manual":
-        additional_context = _manual_additional_context_text(
-            prep_file_path=str(record.path),
-            shared_workflow_state=result_state,
-            scope_files=manual_extra_primary_files or None,
-        )
-        payload["hookSpecificOutput"] = {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": additional_context,
-        }
-    # 成功路径（token 派发 + manual 在此汇合）：每个触发都给用户一条可见 systemMessage。
-    # manual 同时保留上面的 additionalContext（model-facing）；token 派发仅此 user-facing 行。
+    # token 派发路径（child 到达跑 shared workflow）：给用户一条可见 systemMessage。
+    # S5 后 manual 已不再落入本块（manual 走 additionalContext 决策点注入并自成终局），
+    # 故此处只服务 token 派发，不再产出 manual 的 additionalContext。
     _state_status = result_state.get("status") if isinstance(result_state, dict) else None
     payload["systemMessage"] = _trigger_system_message(
         kind="success" if _state_status == "completed" else "failed",
@@ -1198,34 +1259,6 @@ def inspect_user_prompt_submit(
     return payload
 
 
-def _manual_additional_context_text(
-    *,
-    prep_file_path: str,
-    shared_workflow_state: dict[str, Any],
-    scope_files: list[str] | None = None,
-) -> str:
-    status = shared_workflow_state.get("status")
-    artifacts = shared_workflow_state.get("artifacts") if isinstance(shared_workflow_state, dict) else None
-    review_env = (
-        artifacts.get("review_env") if isinstance(artifacts, dict) else None
-    )
-    lines = [
-        "RVF dispatch prep (post-user-prompt manual auto-prep):",
-        f"- prep_file: {prep_file_path}",
-        f"- shared_workflow_state.status: {status}",
-    ]
-    if isinstance(review_env, str) and review_env:
-        lines.append(f"- review_env: {review_env}")
-    if scope_files:
-        # 触发串里的 `scope:` 已把这些文件作为 primary scope 注入 scope.contract；
-        # 提示 agent 无需再手动指定，仍可按需覆盖 scope-of-work。
-        lines.append(f"- inline scope (primary): {', '.join(scope_files)}")
-    lines.append(
-        "- next: source the review env, then `cat $RVF_PREP_FILE` for full payload."
-    )
-    return "\n".join(lines)
-
-
 def _trigger_system_message(
     *,
     kind: str,
@@ -1234,24 +1267,32 @@ def _trigger_system_message(
     run_id: str | None = None,
     status: str | None = None,
     marker: str | None = None,
+    detail: str | None = None,
 ) -> str:
     """构造一行 **user-facing** 的 RVF 触发状态串（用作 ``systemMessage``）。
 
     受众语义（已从 Claude Code 2.1.x bundle 字面实证）：``systemMessage`` =
     "Display a message to the user (all hooks)" —— **只对用户可见、不注入模型
     上下文**。因此每个 RVF 触发都用它给用户留一条可见痕迹，而不污染 agent
-    的上下文。manual 路径另用 ``hookSpecificOutput.additionalContext``
-    （"Text injected into model context"）把 prep 路径喂给同会话 agent
-    （见 ``_manual_additional_context_text``）—— 这是「选择性 agent 可见」。
+    的上下文。manual 决策点另用 ``hookSpecificOutput.additionalContext``
+    （"Text injected into model context"）把候选摘要 + 决策 token + rvf-agent CLI
+    样例命令喂给同会话 agent（见 ``_manual_decision_additional_context_text``）——
+    这是「选择性 agent 可见」。
 
-    ``kind``：
-    - ``success``：token 派发 / manual prepare 成功就绪。
-    - ``failed``：prepare 已跑但 run 状态非 completed（failed / timeout）。
-    - ``already_completed``：同一 prep 已 RVF 过，本次未重跑。
+    ``kind``（token 派发路径 = Stop hook / kanban 注入的 child 到达；manual 决策点 = 用户
+    手动 ``/review-validate-fix`` 铸决策 token）：
+    - ``success`` / ``failed``：**token 派发路径**的 child shared-workflow 就绪 / 未就绪
+      （S5 后 manual 不再走 prepare，故不再有「manual prepare 成功」口径）。
+    - ``already_completed``：同一 prep 已 RVF 过，本次未重跑（token 派发路径）。
     - ``dispatch_no_prep``：prompt 带 dispatch token 但 prep 缺失 / 过期 / 不可读。
     - ``marker_without_token``：自注入 origin marker 却无 token（不一致态）。
-    - ``suppressed_handoff_literal``：检测到 review-validate-fix 字面量但识别为 handoff
-      正文 / 姊妹命令参数，未启动 review。
+    - ``suppressed_handoff_literal``：检测到字面量但识别为 handoff 正文 / 姊妹命令参数，未启动 review。
+    - ``manual_decision_injected``：manual 触发**已铸决策 token，等待 agent 决策**（区分旧「审查已开始」）。
+    - ``manual_decision_deduplicated``：manual 触发命中同键活跃决策 token（幂等复用），未重铸。
+    - ``manual_decision_no_candidates``：manual 触发但本 worktree 自上次 review 以来无可审候选。
+    - ``manual_decision_declined_cooldown``：候选指纹处于 declined 冷却，未铸（尊重 agent 早前谢绝）。
+    - ``manual_decision_circuit_breaker``：决策 token 铸造频率熔断，疑似递归发起，未铸。
+    - ``manual_summary_failed`` / ``manual_mint_anomaly``：manual 决策点摘要构造 / 铸造异常兜底。
     """
     run_ref = run_id or "—"
     origin = dispatch_origin or "—"
@@ -1268,6 +1309,8 @@ def _trigger_system_message(
         ]
         lines.extend(extra_fields)
         return "\n".join(lines)
+
+    detail_fields: tuple[str, ...] = (f"detail={detail}",) if detail else ()
 
     if kind == "success":
         return notice(status_value=status or "completed", message="派发已就绪")
@@ -1298,6 +1341,51 @@ def _trigger_system_message(
                 "未启动 review；如需手动 review，请单独发送 $review-validate-fix / /review-validate-fix"
             ),
         )
+    if kind == "manual_decision_injected":
+        return notice(
+            status_value="manual_decision_injected",
+            message="已铸决策 token，等待 agent 决策（非自动审查已开始）",
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_decision_deduplicated":
+        return notice(
+            status_value="manual_decision_deduplicated",
+            message="同键活跃决策 token 已在等待，未重铸（幂等），等待 agent 决策",
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_no_candidates":
+        return notice(
+            status_value="manual_decision_no_candidates",
+            message="手动触发但本 worktree 自上次 review 以来无可审候选改动，未铸 token",
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_decision_declined_cooldown":
+        return notice(
+            status_value="manual_decision_declined_cooldown",
+            message=(
+                "候选指纹处于 declined 冷却（agent 早前已谢绝且改动未变），未铸 token；"
+                "如仍需审查，请改动候选或让 agent 清冷却后重试"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_decision_circuit_breaker":
+        return notice(
+            status_value="manual_decision_circuit_breaker",
+            message="决策 token 铸造频率熔断，疑似递归发起，未铸 token",
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_summary_failed":
+        return notice(
+            status_value="manual_decision_summary_failed",
+            message="手动触发但候选摘要构造失败，未铸 token（best-effort，不阻断）",
+            extra_fields=detail_fields,
+        )
+    if kind == "manual_mint_anomaly":
+        return notice(
+            status_value="manual_decision_mint_anomaly",
+            message="手动触发但决策 token 铸造异常，未注入（best-effort，不阻断）",
+            extra_fields=detail_fields,
+        )
     return notice(status_value=kind, message=kind)
 
 
@@ -1306,9 +1394,10 @@ def _render_hook_payload(result: dict[str, Any]) -> dict[str, Any] | None:
 
     ``systemMessage``（user-facing —— 每个 RVF 触发都对用户可见、不注入模型
     上下文）与 ``hookSpecificOutput.additionalContext``（model-facing —— manual
-    路径把 prep 路径喂给同会话 agent）可在同一 JSON **共存**。改自旧的互斥
-    elif（旧逻辑里 systemMessage 会顶掉 manual 的 additionalContext）。二者皆无
-    时返回 ``None``（普通 prompt → 不打印 → 静默）。抽成纯函数便于直接单测。
+    决策点把候选摘要 + 决策 token + rvf-agent CLI 样例命令喂给同会话 agent）可在
+    同一 JSON **共存**。改自旧的互斥 elif（旧逻辑里 systemMessage 会顶掉 manual 的
+    additionalContext）。二者皆无时返回 ``None``（普通 prompt → 不打印 → 静默）。
+    抽成纯函数便于直接单测。
     """
     out: dict[str, Any] = {}
     system_message = result.get("systemMessage")
@@ -1348,11 +1437,6 @@ def main() -> int:
         help="Hard timeout for in-process shared prepare execution (seconds).",
     )
     parser.add_argument("--json", action="store_true", help="Emit detector result JSON. Actual hook mode stays silent.")
-    parser.add_argument(
-        "--bootstrap-confirm-state-root",
-        default=None,
-        help="Override RVF state root for bootstrap-confirmation marker lookup (tests only).",
-    )
     args = parser.parse_args()
 
     result = inspect_user_prompt_submit(
@@ -1360,7 +1444,6 @@ def main() -> int:
         prep_root=args.prep_root,
         now=args.now,
         shared_workflow_timeout_seconds=args.shared_workflow_timeout_seconds,
-        bootstrap_confirm_state_root=args.bootstrap_confirm_state_root,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))

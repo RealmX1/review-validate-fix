@@ -3416,6 +3416,14 @@ def maybe_block_dispatch_on_bootstrap_size(
     worktree_mode: str,
     prompt_path: str,
 ) -> None:
+    # S5（R22）：bootstrap 独立确认闸已废除 —— 无条件短路，不再计算 decision、不再写确认
+    # marker、不再 raise BootstrapConfirmationRequired。超大 bootstrap 的把关职责移交发起决策点：
+    # 候选摘要（S2）携带 bootstrap_size，agent 在 start/decline 时据 R24 护栏（超大改动本应开工前
+    # elevate 给用户）自行裁量。UPS 侧的 yes/no resume 闸已同步废除（rvf_user_prompt_submit S5），
+    # 若此处仍写 marker 将成为无人应答的悬空流。函数体与 BootstrapConfirmationRequired /
+    # resume_dispatch_from_confirmation_marker 保留作观察期考古（R11/R23 fallback 冻结），下方
+    # 代码在废除期内不可达。
+    return
     metadata = startup_prepare.get("metadata") if isinstance(startup_prepare.get("metadata"), dict) else {}
     bootstrap_payload = metadata.get("worktree_bootstrap_metadata")
     if not isinstance(bootstrap_payload, dict):

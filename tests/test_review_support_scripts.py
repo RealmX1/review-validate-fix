@@ -7400,17 +7400,43 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare",
-            lambda: test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(root / "prompt-submit-manual"),
+            "rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context",
+            lambda: test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context(
+                root / "prompt-submit-manual-mint"
+            ),
         ),
         (
             "parse_manual_scope_directive_variants",
             lambda: test_parse_manual_scope_directive_variants(),
         ),
         (
-            "rvf_user_prompt_submit_manual_scope_directive_passes_primary_files",
-            lambda: test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(
+            "rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection",
+            lambda: test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection(
                 root / "prompt-submit-manual-scope"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger",
+            lambda: test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger(
+                root / "prompt-submit-manual-empty"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+                root / "prompt-submit-manual-cooldown"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed",
+            lambda: test_rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed(
+                root / "prompt-submit-manual-retired"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_bootstrap_confirm_gate_abolished",
+            lambda: test_rvf_user_prompt_submit_bootstrap_confirm_gate_abolished(
+                root / "prompt-submit-bootstrap-abolished"
             ),
         ),
         (
@@ -8683,7 +8709,8 @@ _alt.inject(
 globals().update({_n: getattr(_alt, _n) for _n in _alt.__all__})
 
 
-# 有界拆分：rvf_user_prompt_submit hook 测试簇移入子模块；inject 共享依赖后重绑 18 个测试名，
+# 有界拆分：rvf_user_prompt_submit hook 测试簇移入子模块；inject 共享依赖后重绑 22 个测试名
+# （S5 退役 2 个 manual packet/prepare 用例，新增 6 个 manual 决策点 + bootstrap 废除用例），
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import rvf_user_prompt_submit_hook as _ups
 _ups.inject(

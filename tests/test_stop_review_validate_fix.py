@@ -4773,6 +4773,59 @@ def test_preserved_guards_short_circuit_before_decision_point_injection(tmp_path
         assert injection_attempt_records(state) == [], (label, "护栏短路不应写注入尝试 ledger")
 
 
+def test_bootstrap_size_confirmation_gate_abolished_never_blocks(tmp_path: Path) -> None:
+    """S5（R22）：bootstrap 独立确认闸已废除——即便 bootstrap payload 大到旧闸必然要求确认，
+    ``maybe_block_dispatch_on_bootstrap_size`` 也无条件短路：不 raise BootstrapConfirmationRequired、
+    不写确认 marker、不产生任何 ledger event。超大 bootstrap 的把关移交发起决策点（S2 摘要携带
+    bootstrap_size + R24 护栏），UPS 侧 yes/no resume 闸已同步废除，此处若仍写 marker 即悬空流。"""
+    hook = load_hook_module()
+    state = tmp_path / "state"
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    try:
+
+        class _RecordingLedger:
+            def __init__(self) -> None:
+                self.events: list[dict] = []
+
+            def event(self, **kw: object) -> dict:
+                self.events.append(dict(kw))
+                return dict(kw)
+
+        ledger = _RecordingLedger()
+        huge_bootstrap = {
+            "bootstrap_kind": "full-dirty",
+            "unattributed_paths": [f"p{i}.py" for i in range(64)],
+            "unattributed_bytes": 32 * 1024 * 1024,
+            "total_bytes": 32 * 1024 * 1024,
+        }
+
+        class _FakePrep:
+            token = "0a0b0c0d0e0f1011"
+            path = tmp_path / "prep.json"
+            payload: dict = {}
+
+        hook.maybe_block_dispatch_on_bootstrap_size(
+            ledger=ledger,
+            startup_prepare={"metadata": {"worktree_bootstrap_metadata": huge_bootstrap}},
+            dispatch_prep=_FakePrep(),
+            parent_session_id="sess-bootstrap-abolished",
+            parent_thread_path=None,
+            parent_origin={},
+            cwd=str(tmp_path),
+            task_title="demo",
+            base_ref="main",
+            worktree_mode="branch",
+            prompt_path=str(tmp_path / "prompt.txt"),
+        )
+        # 短路：无 ledger event（旧闸 exempt / blocked 两路都会记 event）、无确认 marker 落盘。
+        assert ledger.events == []
+        assert not state.exists() or not [
+            p for p in state.rglob("*") if p.is_file() and "bootstrap" in p.name
+        ]
+    finally:
+        os.environ.pop("CODEX_RVF_STATE_DIR", None)
+
+
 def _read_ledger_events(ledger) -> list[dict]:
     events_path = Path(ledger.events_path)
     if not events_path.exists():
@@ -5354,6 +5407,8 @@ def main() -> int:
         test_decision_point_circuit_breaker_suppresses_after_repeated_mints,
         test_decision_point_receipt_ttl_lost_warns_without_retry,
         test_preserved_guards_short_circuit_before_decision_point_injection,
+        # S5：bootstrap 独立确认闸废除（Stop 侧闸中和；UPS 侧 resume 闸退役见 UPS 套件）。
+        test_bootstrap_size_confirmation_gate_abolished_never_blocks,
     ]
     assert_every_defined_test_is_registered(
         globals(),

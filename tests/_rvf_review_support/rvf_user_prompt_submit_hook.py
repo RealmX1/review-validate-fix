@@ -25,8 +25,12 @@ __all__ = [
     'test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery',
     'test_rvf_user_prompt_submit_clears_pending_on_delivery',
     'test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced',
-    'test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare',
-    'test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files',
+    'test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context',
+    'test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection',
+    'test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger',
+    'test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject',
+    'test_rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed',
+    'test_rvf_user_prompt_submit_bootstrap_confirm_gate_abolished',
     'test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger',
     'test_rvf_user_prompt_submit_handoff_literal_does_not_falsely_trigger',
     'test_rvf_user_prompt_submit_namespaced_subskill_does_not_falsely_trigger',
@@ -559,145 +563,273 @@ def test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced(t
     ) is False
 
 
-def test_rvf_user_prompt_submit_manual_path_creates_prep_and_runs_prepare(tmp_path: Path) -> None:
-    prep = load_rvf_prep_file_module()
-    submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
+# ---------------------------------------------------------------------------
+# S5（R22）manual 决策点：铸决策 token + additionalContext 注入的测试簇 helper
+# ---------------------------------------------------------------------------
+
+def _load_manual_decision_modules():
+    """加载 manual 决策点用到的 S1/S4/S2 模块（决策 token store / 注入尝试 ledger / 候选摘要）。
+
+    仅需 SCRIPT_DIR 在 sys.path 上（候选摘要模块自理 pyroot + core.* import）。
+    """
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_decision_token_store as _dts  # noqa: PLC0415
+    import agentic_initiation_injection_attempt_ledger as _il  # noqa: PLC0415
+    import stop_decision_candidate_summary as _summary  # noqa: PLC0415
+
+    return _dts, _il, _summary
+
+
+def _manual_candidate_repo(tmp_path: Path, *, dirty: bool = True) -> Path:
+    """初始化隔离 git repo（单文件 base 提交）；``dirty=True`` 时叠加一处未提交改动 → 1 个候选。"""
     repo = tmp_path / "repo"
-    repo.mkdir()
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
-    try:
-        captured: list[dict[str, object]] = []
+    repo.mkdir(parents=True, exist_ok=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    if dirty:
+        (repo / "f.txt").write_text("base\ndirty-line\n", encoding="utf-8")
+    return repo
 
-        def fake_prepare(record, *, timeout_seconds=60.0, user_prompt_excerpt=None, **_):
-            captured.append(
-                {
-                    "token": record.token,
-                    "target_flow": record.payload.get("target_flow"),
-                    "dispatch_origin": record.payload.get("dispatch_origin"),
-                    "excerpt": user_prompt_excerpt,
-                }
-            )
-            state = {
-                "started_at": "2026-05-07T00:00:00Z",
-                "completed_at": "2026-05-07T00:00:01Z",
-                "status": "completed",
-                "target_flow": record.payload.get("target_flow"),
-                "artifacts": {},
-            }
-            new_rvf_run = dict(record.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
-            return state
 
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
+def _manual_decision_env(tmp_path: Path):
+    """上下文：把 RVF 落盘根隔离到 tmp（RVF_HOME 统辖 token/ledger/冷却/熔断；CODEX_RVF_LOG_ROOT
+    供候选摘要默认下界 resolver），并清掉环境里可能干扰 task_id 解析的 Kanban env，退出后原样还原。
+    绝不写真实 ``~/.rvf``。"""
+    import contextlib  # noqa: PLC0415
 
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
+    @contextlib.contextmanager
+    def _ctx():
+        overrides = {
+            "RVF_HOME": str(tmp_path / "rvf-home"),
+            "CODEX_RVF_LOG_ROOT": str(tmp_path / "rvf-log-root"),
+        }
+        kanban_keys = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
+        saved = {k: os.environ.get(k) for k in (*overrides, *kanban_keys)}
+        for key, value in overrides.items():
+            os.environ[key] = value
+        for key in kanban_keys:
+            os.environ.pop(key, None)
         try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "/review-validate-fix please review my work",
-                    "cwd": str(repo),
-                    "session_id": "manual-session",
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-            )
-            assert payload["status"] == "manual_prep_created"
-            assert payload["dispatch_origin"] == "post_user_prompt_manual"
-            assert payload["workflow_started"] is True
-            assert payload["shared_workflow_state"]["status"] == "completed"
-            assert len(captured) == 1
-            assert captured[0]["target_flow"] == "flow-manual"
-            assert captured[0]["dispatch_origin"] == "post_user_prompt_manual"
-            # Prep file must exist on disk under the configured root.
-            prep_path = root / f"{payload['token']}.json"
-            assert prep_path.is_file()
-            # Manual same-session path must inject the prep file path back into
-            # the agent context via hookSpecificOutput.additionalContext.
-            assert "hookSpecificOutput" in payload
-            hook_specific = payload["hookSpecificOutput"]
-            assert hook_specific["hookEventName"] == "UserPromptSubmit"
-            additional_context = hook_specific["additionalContext"]
-            assert "RVF dispatch prep" in additional_context
-            assert str(prep_path) in additional_context
-            assert "shared_workflow_state.status: completed" in additional_context
-            # 成功触发须同时给用户一条可见 systemMessage（user-facing，不进模型
-            # 上下文），与上面 model-facing 的 additionalContext **共存**。
-            assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"]
-            assert "RVF UPS" in payload["systemMessage"]
-            assert "post_user_prompt_manual" in payload["systemMessage"]
-            assert "status=completed" in payload["systemMessage"]
+            yield
         finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return _ctx()
 
 
-def test_rvf_user_prompt_submit_manual_scope_directive_passes_primary_files(tmp_path: Path) -> None:
-    """manual 触发内联 `scope:` → 解析出的 primary 文件作为 extra_primary_files 传入 prepare。"""
-    prep = load_rvf_prep_file_module()
+def test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context(
+    tmp_path: Path,
+) -> None:
+    """S5·R22 正路径：manual ``/review-validate-fix`` → 铸决策 token（S1 三闸）→ 经
+    ``additionalContext`` 注入「候选摘要 + token + rvf-agent start/scope/dispatch/decline 样例命令 +
+    指引」；同时写 injection-attempt ledger（负路径不变量：候选非空 ⇒ 有记录），且**不再**预置 packet。
+    """
     submit = load_rvf_user_prompt_submit_module()
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    root = tmp_path / "prep-root"
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
-    os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp_path / "rvf-state")
-    try:
-        captured: list[dict[str, object]] = []
+    dts, il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)  # 1 个 dirty 候选
+    prep_root = tmp_path / "prep-root"
+    with _manual_decision_env(tmp_path):
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "/review-validate-fix please review my work",
+                "cwd": str(repo),
+                "session_id": "manual-sess",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=str(prep_root),
+            now="2026-07-11T00:00:00Z",
+        )
+        assert payload["status"] == "manual_decision_injected", payload
+        assert payload["dispatch_origin"] == "post_user_prompt_manual"
+        assert payload["candidate_path_count"] == 1
+        token = payload["token"]
+        assert dts.TOKEN_RE.fullmatch(token), token
 
-        def fake_prepare(
-            record, *, timeout_seconds=60.0, user_prompt_excerpt=None, extra_primary_files=None, **_
-        ):
-            captured.append({"extra_primary_files": extra_primary_files})
-            state = {
-                "started_at": "2026-05-07T00:00:00Z",
-                "completed_at": "2026-05-07T00:00:01Z",
-                "status": "completed",
-                "artifacts": {},
-            }
-            new_rvf_run = dict(record.payload.get("rvf_run") or {})
-            new_rvf_run["shared_workflow_state"] = state
-            prep.update_prep_file(record, {"rvf_run": new_rvf_run})
-            return state
+        # additionalContext（model-facing）：候选摘要 + token + rvf-agent 四类命令样例 + 指引。
+        hook_specific = payload["hookSpecificOutput"]
+        assert hook_specific["hookEventName"] == "UserPromptSubmit"
+        additional_context = hook_specific["additionalContext"]
+        assert f"RVF_DECISION_TOKEN={token}" in additional_context
+        assert f"start --token {token}" in additional_context
+        assert "scope exclude --token" in additional_context
+        assert f"dispatch --token {token}" in additional_context
+        assert f"decline --token {token}" in additional_context
+        assert "简析后立刻 start" in additional_context
+        assert "你手动触发了 /review-validate-fix" in additional_context
 
-        if str(SCRIPT_DIR) not in sys.path:
-            sys.path.insert(0, str(SCRIPT_DIR))
-        import importlib
+        # systemMessage（user-facing）用「已铸决策 token，等待 agent 决策」口径（区分旧「审查已开始」）。
+        assert isinstance(payload.get("systemMessage"), str)
+        assert "已铸决策 token" in payload["systemMessage"]
+        assert "post_user_prompt_manual" in payload["systemMessage"]
 
-        prepare_module = importlib.import_module("prepare_review_run")
-        original_prepare = prepare_module.prepare_run_from_prep_file
-        prepare_module.prepare_run_from_prep_file = fake_prepare
-        try:
-            payload = submit.inspect_user_prompt_submit(
-                {
-                    "prompt": "/review-validate-fix please review scope: src/a.py, src/b.py",
-                    "cwd": str(repo),
-                    "session_id": "manual-scope-session",
-                    "hook_event_name": "UserPromptSubmit",
-                },
-                prep_root=root,
-            )
-            assert payload["status"] == "manual_prep_created"
-            assert payload["workflow_started"] is True
-            assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
-            assert len(captured) == 1
-            assert captured[0]["extra_primary_files"] == ["src/a.py", "src/b.py"]
-            additional_context = payload["hookSpecificOutput"]["additionalContext"]
-            assert "inline scope (primary): src/a.py, src/b.py" in additional_context
-        finally:
-            prepare_module.prepare_run_from_prep_file = original_prepare
-    finally:
-        os.environ.pop("CODEX_RVF_PREP_ROOT", None)
-        os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        # token 落盘于 RVF_HOME（隔离），状态 = injected。
+        lookup = dts.read_decision_token(token, now=dts.parse_timestamp("2026-07-11T00:01:00Z"))
+        assert lookup.status == "valid", lookup
+        assert lookup.state == dts.STATE_INJECTED
+
+        # 负路径不变量：候选非空 ⇒ injection-attempt ledger 有一条 injected 记录。
+        records = il.read_injection_attempts(worktree=str(repo.resolve()))
+        assert len(records) == 1, records
+        assert records[0]["mint_outcome"] == il.INJECTION_OUTCOME_INJECTED
+        assert records[0]["injected"] is True
+        assert records[0]["candidate_path_count"] == 1
+        assert records[0]["decision_token"] == token
+        assert records[0]["has_committed_but_unreviewed"] is False
+
+    # 退役 packet：manual 不再预置 prep/packet（prep_root 从未被创建），也无 shared_workflow_state。
+    assert not prep_root.exists()
+    assert "shared_workflow_state" not in payload
+    assert "prep_file_path" not in payload
+
+
+def test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection(
+    tmp_path: Path,
+) -> None:
+    """manual 内联 ``scope:`` → 决策点 additionalContext 附「内联 scope 提示」（不再喂 prepare；
+    scope 现由 rvf-agent CLI scope 阶段定稿）。``manual_scope_files`` 仍回填供诊断。"""
+    submit = load_rvf_user_prompt_submit_module()
+    _dts, _il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "/review-validate-fix please review scope: src/a.py, src/b.py",
+                "cwd": str(repo),
+                "session_id": "manual-scope-sess",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=str(tmp_path / "prep-root"),
+            now="2026-07-11T00:00:00Z",
+        )
+    assert payload["status"] == "manual_decision_injected", payload
+    assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
+    additional_context = payload["hookSpecificOutput"]["additionalContext"]
+    assert "内联指定了 scope: src/a.py, src/b.py" in additional_context
+    assert "rvf-agent scope include/exclude" in additional_context
+
+
+def test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger(
+    tmp_path: Path,
+) -> None:
+    """manual 触发但 clean worktree（自上次 review 无可审候选）→ 只出 user-facing systemMessage，
+    不铸 token、不写 injection ledger（保持 canary 分母干净，与 Stop hook 无候选路径一致）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path, dirty=False)  # clean：无候选
+    with _manual_decision_env(tmp_path):
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "/review-validate-fix",
+                "cwd": str(repo),
+                "session_id": "clean-sess",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=str(tmp_path / "prep-root"),
+            now="2026-07-11T00:00:00Z",
+        )
+        assert payload["status"] == "manual_decision_no_candidates", payload
+        assert payload["candidate_path_count"] == 0
+        assert "hookSpecificOutput" not in payload  # 无候选不注入 additionalContext
+        assert isinstance(payload.get("systemMessage"), str)
+        assert "无可审候选" in payload["systemMessage"]
+        # 无 token 落盘、无 injection ledger 记录。
+        token_dir = dts.decision_token_root()
+        assert not token_dir.exists() or not list(token_dir.glob("*.json"))
+        assert il.read_injection_attempts(worktree=str(repo.resolve())) == []
+
+
+def test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+    tmp_path: Path,
+) -> None:
+    """候选指纹处于 declined 冷却（agent 早前谢绝、改动未变）→ manual 触发只出 systemMessage、
+    不重铸 token、不再注入 additionalContext（尊重三闸，指纹未变不 nag），但仍写 ledger（候选非空）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        # 先算出该候选集指纹，写入 declined 冷却表（模拟 agent 早前对同一候选 decline）。
+        summ = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo)}, cwd=str(repo), repo=str(repo), ledger=None
+        )
+        fingerprint = summ["candidate_fingerprint"]
+        dts.record_declined_fingerprint(
+            worktree=str(repo.resolve()),
+            candidate_fingerprint=fingerprint,
+            reason="agent declined earlier",
+        )
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "/review-validate-fix",
+                "cwd": str(repo),
+                "session_id": "cooldown-sess",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=str(tmp_path / "prep-root"),
+            now="2026-07-11T00:00:00Z",
+        )
+        assert payload["status"] == "manual_decision_declined_cooldown", payload
+        assert "hookSpecificOutput" not in payload  # 不再注入
+        assert "declined 冷却" in payload["systemMessage"]
+        # ledger 记一条 declined_cooldown（候选非空 ⇒ 有记录），未新铸 token。
+        records = il.read_injection_attempts(worktree=str(repo.resolve()))
+        assert len(records) == 1, records
+        assert records[0]["mint_outcome"] == il.INJECTION_OUTCOME_DECLINED_COOLDOWN
+        assert records[0]["injected"] is False
+        assert not list(dts.decision_token_root().glob("*.json"))
+
+
+def test_rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed(
+    tmp_path: Path,
+) -> None:
+    """退役坐实：manual 路径旧的 packet/prepare 预置逻辑（``_create_manual_prep_file`` /
+    ``_manual_additional_context_text``）与 bootstrap 独立确认闸（``_handle_bootstrap_confirmation`` /
+    ``_bootstrap_confirm_state_root``）已从 UPS 模块删除；``inspect_user_prompt_submit`` 不再接受
+    ``bootstrap_confirm_state_root`` 参数。"""
+    import inspect as _inspect  # noqa: PLC0415
+
+    submit = load_rvf_user_prompt_submit_module()
+    for retired in (
+        "_create_manual_prep_file",
+        "_manual_additional_context_text",
+        "_handle_bootstrap_confirmation",
+        "_bootstrap_confirm_state_root",
+    ):
+        assert not hasattr(submit, retired), f"{retired} 应已退役删除"
+    signature = _inspect.signature(submit.inspect_user_prompt_submit)
+    assert "bootstrap_confirm_state_root" not in signature.parameters
+    # 新决策点入口就位。
+    assert hasattr(submit, "_handle_manual_decision_point")
+    assert hasattr(submit, "_manual_decision_additional_context_text")
+
+
+def test_rvf_user_prompt_submit_bootstrap_confirm_gate_abolished(tmp_path: Path) -> None:
+    """bootstrap 独立确认闸废除后的行为：裸 ``yes`` prompt 不再被 UPS 拦截去 resume dispatch，
+    直接按普通 prompt 处理（无 token、无 manual 触发 → ``no_token``，静默无 systemMessage）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    with _manual_decision_env(tmp_path):
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "yes",
+                "cwd": str(tmp_path),
+                "session_id": "sess-yes",
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=str(tmp_path / "prep-root"),
+            now="2026-07-11T00:00:00Z",
+        )
+    assert payload["status"] == "no_token", payload
+    assert payload["continue"] is True
+    assert "systemMessage" not in payload
+    assert "hookSpecificOutput" not in payload
 
 
 def test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger(tmp_path: Path) -> None:
