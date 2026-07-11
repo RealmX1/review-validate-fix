@@ -6062,6 +6062,389 @@ def test_decision_token_read_missing_and_corrupt(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# rvf_agent_decision_cli（RVF overhaul S3：主 agent 发起审查的单一入口）
+# 全部落盘根经显式 AgentDecisionRoots 注入 tmp 隔离；prepare / dispatch 一律 stub，
+# 绝不真拉起 reviewer、绝不触碰真实 ~/.rvf / ~/.codex。
+# ---------------------------------------------------------------------------
+
+RVF_AGENT_DECISION_CLI = SCRIPT_DIR / "rvf_agent_decision_cli.py"
+
+
+def load_rvf_agent_decision_cli_module():
+    """加载 rvf_agent_decision_cli 模块。它 top-level import 兄弟脚本
+    （rvf_decision_token_store / rvf_prep_file）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
+    SCRIPT_DIR 在 sys.path 上；spec 载入 + sys.modules 注册（与 dataclass 家族一致）。"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location("rvf_agent_decision_cli", RVF_AGENT_DECISION_CLI)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_agent_decision_cli module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _agent_cli_roots(cli, tmp: Path):
+    """一组 tmp 隔离的 AgentDecisionRoots（token / 冷却 / scope 产出 / 遥测 / issue / 谢绝理由）。"""
+    return cli.AgentDecisionRoots(
+        token_root=tmp / "decision-tokens",
+        cooldown_root=tmp / "declined-fingerprints",
+        scope_adjustment_root=tmp / "scope-adjustments",
+        telemetry_root=tmp / "decision-telemetry",
+        scope_issue_ledger_root=tmp / "scope-issue-ledger",
+        declined_reason_ledger_root=tmp / "declined-reasons",
+    )
+
+
+def _mint_agent_decision_token(
+    dts, roots, *, worktree: str, fingerprint: str = "fp1", session_id: str = "s1",
+    candidate_summary=None, now=None,
+):
+    """经 token store 铸一枚决策 token（roots 与 CLI 共用同一 tmp token 根）。"""
+    return dts.mint_decision_token(
+        worktree=worktree, session_id=session_id, candidate_fingerprint=fingerprint,
+        candidate_summary=candidate_summary, now=now,
+        root=roots.token_root, cooldown_root=roots.cooldown_root,
+        circuit_breaker_root_dir=roots.token_root.parent / "circuit-breaker",
+    ).token
+
+
+def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files=None, fail_first_n: int = 0):
+    """构造一个 stub prepare pipeline：写出假的 run_dir + scope.contract.json，返回归一化 dict。
+
+    ``fail_first_n``：头 N 次返回 status=failed（供 start 失败回退 + --retry 测试）。
+    """
+    state = {"calls": 0}
+
+    def _stub(*, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0):
+        state["calls"] += 1
+        if state["calls"] <= fail_first_n:
+            return {"status": "failed", "error": "stub prepare 故意失败", "run_id": None, "run_dir": None, "artifacts": {}}
+        run_dir = tmp / "runs" / run_name
+        inputs = run_dir / "artifacts" / "inputs"
+        inputs.mkdir(parents=True, exist_ok=True)
+        scope_contract = inputs / "scope.contract.json"
+        scope_contract.write_text(
+            json.dumps({
+                "version": 2, "run_id": run_name, "repo": repo, "scope_mode": "manual-all-uncommitted",
+                "primary_files": list(primary_files or []), "background_files": [], "protected_files": [],
+                "canonical_issues": [], "fix_allowlist": [], "excluded_path_prefixes": [], "scope_hash": "stub-old-hash",
+            }),
+            encoding="utf-8",
+        )
+        packet = run_dir / "artifacts" / "review-packet.md"; packet.write_text("stub packet", encoding="utf-8")
+        sow = run_dir / "artifacts" / "scope-of-work.md"; sow.write_text("stub scope of work", encoding="utf-8")
+        return {
+            "status": "completed", "run_id": run_name, "run_dir": str(run_dir),
+            "artifacts": {"scope_contract": str(scope_contract), "review_packet": str(packet), "scope_of_work": str(sow)},
+            "error": None,
+        }
+
+    return _stub
+
+
+def _agent_cli_worktree(tmp: Path) -> str:
+    """建一个「像 git 仓」的假 worktree（default_launch_preflight 只查 .git 是否存在）。"""
+    wt = tmp / "worktree"
+    (wt / ".git").mkdir(parents=True, exist_ok=True)
+    return str(wt)
+
+
+def test_agent_cli_start_success_chain_and_auto_scope(tmp: Path) -> None:
+    """start 成功链：token minted→acknowledged、挂 run 锚点、自动 scope = 候选摘要纳入集、
+    scope 产出落盘、遥测记 start_acknowledged + start_prepared。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    candidate_summary = {
+        "committed_round_baseline": "abc123", "committed_round_base_ref": "^main",
+        "candidates": [
+            {"path": "a.py", "included_in_candidate_set": True},
+            {"path": "b.py", "included_in_candidate_set": True},
+            {"path": "other-session.py", "included_in_candidate_set": False},
+        ],
+    }
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, candidate_summary=candidate_summary, now=t0)
+
+    result = cli.run_start(
+        token=tok, reason="小改动，开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp),
+    )
+    assert result.status == "ok" and result.exit_code == cli.EXIT_OK, result.message
+    assert result.token_state == dts.STATE_ACKNOWLEDGED
+    # 自动 scope = 纳入候选集的路径（排除 other_session_owned）。
+    assert result.detail["auto_scope_paths"] == ["a.py", "b.py"], result.detail["auto_scope_paths"]
+
+    # token 推进到 acknowledged 且挂了 run 锚点。
+    lookup = dts.read_decision_token(tok, root=roots.token_root, now=t0)
+    assert lookup.state == dts.STATE_ACKNOWLEDGED
+    assert lookup.payload.get("run_anchor_dir")
+    assert lookup.payload.get("start_attempt_count") == 1
+
+    # scope 产出落盘。
+    overlay = cli.read_scope_adjustment(tok, root=roots.scope_adjustment_root)
+    assert overlay is not None and overlay["auto_scope_paths"] == ["a.py", "b.py"]
+    assert overlay["exclusions"] == [] and overlay["inclusions"] == []
+
+    # 遥测轨迹含 acknowledged + prepared。
+    tele = read_jsonl(roots.telemetry_root / f"{tok}.jsonl")
+    events = [r["event"] for r in tele]
+    assert "start_acknowledged" in events and "start_prepared" in events, events
+
+
+def test_agent_cli_start_failure_rollback_and_retry(tmp: Path) -> None:
+    """start prepare 失败 → record_start_failure 回退保持 acknowledged（不吞决策）；--retry 再跑成功。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, now=t0)
+
+    flaky = _agent_cli_stub_prepare(tmp, fail_first_n=1)
+    first = cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=flaky)
+    assert first.status == "start_failed" and first.exit_code == cli.EXIT_START_FAILED
+    assert first.detail.get("phase") == "prepare"
+    # token 仍 acknowledged、记了 last_start_failure。
+    lk = dts.read_decision_token(tok, root=roots.token_root, now=t0)
+    assert lk.state == dts.STATE_ACKNOWLEDGED
+    assert lk.payload.get("last_start_failure", {}).get("reason")
+
+    second = cli.run_start(token=tok, reason="重试", retry=True, roots=roots, now=t0, prepare_pipeline=flaky)
+    assert second.status == "ok" and second.exit_code == cli.EXIT_OK
+    lk2 = dts.read_decision_token(tok, root=roots.token_root, now=t0)
+    assert lk2.state == dts.STATE_ACKNOWLEDGED
+    # 两次 acknowledge（首次 + retry）。
+    assert lk2.payload.get("start_attempt_count") == 2
+
+
+def test_agent_cli_start_preflight_and_provider_health_gates(tmp: Path) -> None:
+    """start 前两道门：backend/launch 前置校验（非 git 仓）与 provider-health 门（注入失败）都各自
+    回退保持 acknowledged、可 --retry；且都记对应 phase。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+
+    # ① launch 前置校验失败：repo 不是 git 仓。
+    tok1 = _mint_agent_decision_token(dts, roots, worktree=str(tmp / "nogit"), fingerprint="fpA", session_id="sA", now=t0)
+    r1 = cli.run_start(
+        token=tok1, reason="x", repo=str(tmp / "nogit"), roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp),
+    )
+    assert r1.status == "start_failed" and r1.detail.get("phase") == "launch_preflight"
+    assert dts.read_decision_token(tok1, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # ② provider-health 门失败（注入一个 requirement + 失败 runner）。
+    wt = _agent_cli_worktree(tmp)
+    tok2 = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpB", session_id="sB", now=t0)
+    r2 = cli.run_start(
+        token=tok2, reason="x", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp),
+        provider_health_requirements_resolver=lambda backend: [object()],
+        provider_health_runner=lambda req, timeout: {"status": "failed", "provider": "codex"},
+    )
+    assert r2.status == "start_failed" and r2.detail.get("phase") == "provider_health"
+    assert dts.read_decision_token(tok2, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+
+def test_agent_cli_scope_operations_and_state_guard(tmp: Path) -> None:
+    """scope annotate/exclude/include 改动自动 scope + 落遥测；净效果 = auto − exclude ∪ include；
+    非 acknowledged 态（minted）拒绝。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    candidate_summary = {"candidates": [
+        {"path": "a.py", "included_in_candidate_set": True},
+        {"path": "b.py", "included_in_candidate_set": True},
+    ]}
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, candidate_summary=candidate_summary, now=t0)
+    cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+
+    ann = cli.run_scope_annotate(token=tok, entries=[("a.py", "核心改动: 注意边界")], roots=roots, now=t0)
+    assert ann.status == "ok"
+    exc = cli.run_scope_exclude(token=tok, paths=["b.py"], reason="纯 reformat", roots=roots, now=t0)
+    assert exc.status == "ok" and exc.detail["effective_primary_files"] == ["a.py"]
+    inc = cli.run_scope_include(token=tok, paths=["runtime-artifact.json"], reason="R10 运行时产物追加", roots=roots, now=t0)
+    assert inc.status == "ok"
+    assert inc.detail["effective_primary_files"] == ["a.py", "runtime-artifact.json"]
+
+    # overlay 落盘反映三操作。
+    overlay = cli.read_scope_adjustment(tok, root=roots.scope_adjustment_root)
+    assert overlay["annotations"] == {"a.py": "核心改动: 注意边界"}
+    assert {e["path"] for e in overlay["exclusions"]} == {"b.py"}
+    assert {i["path"] for i in overlay["inclusions"]} == {"runtime-artifact.json"}
+
+    # 遥测记了 scope_annotate / scope_exclude / scope_include。
+    events = [r["event"] for r in read_jsonl(roots.telemetry_root / f"{tok}.jsonl")]
+    assert "scope_annotate" in events and "scope_exclude" in events and "scope_include" in events
+
+    # 非 acknowledged 态守卫：新铸的 minted token 上 scope 操作被拒。
+    tok_minted = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fp-minted", session_id="s-minted", now=t0)
+    guard = cli.run_scope_exclude(token=tok_minted, paths=["x"], reason="r", roots=roots, now=t0)
+    assert guard.status == "error" and guard.exit_code == cli.EXIT_TOKEN_STATE
+
+
+def test_agent_cli_scope_issue_ledger_threshold_idempotent(tmp: Path) -> None:
+    """R17：同源+同类型 scope 例外去重路径数 ≥3 自动立本地 issue；第 3 次首次立项、其后不重复立、
+    重复同路径不灌水计数。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, now=t0)
+    cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+
+    r1 = cli.run_scope_exclude(token=tok, paths=["p1.py"], reason="r", roots=roots, now=t0)
+    r2 = cli.run_scope_exclude(token=tok, paths=["p2.py"], reason="r", roots=roots, now=t0)
+    r3 = cli.run_scope_exclude(token=tok, paths=["p3.py"], reason="r", roots=roots, now=t0)
+    assert r1.detail["scope_issue"]["issue_filed"] is False
+    assert r2.detail["scope_issue"]["issue_filed"] is False
+    # 第 3 个不同路径跨阈值：首次立项。
+    assert r3.detail["scope_issue"]["issue_filed"] is True
+    assert r3.detail["scope_issue"]["newly_filed"] is True
+    assert r3.detail["scope_issue"]["distinct_path_count"] == 3
+    issue_path = Path(r3.detail["scope_issue"]["issue_path"])
+    assert issue_path.is_file()
+    issue = json.loads(issue_path.read_text(encoding="utf-8"))
+    assert issue["operation_type"] == "exclude" and sorted(issue["paths"]) == ["p1.py", "p2.py", "p3.py"]
+
+    # 第 4 个不同路径：issue 更新但非首次立项（幂等，一键一 issue）。
+    r4 = cli.run_scope_exclude(token=tok, paths=["p4.py"], reason="r", roots=roots, now=t0)
+    assert r4.detail["scope_issue"]["issue_filed"] is True and r4.detail["scope_issue"]["newly_filed"] is False
+    assert r4.detail["scope_issue"]["distinct_path_count"] == 4
+
+    # 重复排除已有路径：去重路径数不变。
+    r5 = cli.run_scope_exclude(token=tok, paths=["p1.py"], reason="r", roots=roots, now=t0)
+    assert r5.detail["scope_issue"]["distinct_path_count"] == 4
+
+    # include 是不同「类型」→ 独立幂等键，独立计数（不与 exclude 混）。
+    inc = cli.run_scope_include(token=tok, paths=["q1.py"], reason="r", roots=roots, now=t0)
+    assert inc.detail["scope_issue"]["operation_type"] == "include"
+    assert inc.detail["scope_issue"]["distinct_path_count"] == 1
+    assert inc.detail["scope_issue"]["issue_filed"] is False
+
+
+def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) -> None:
+    """dispatch：scope 定稿写回 scope.contract.json（primary_files/excluded/重算 hash）+ 严格度终选
+    读 preset + 派发（stub）+ token 终态 dispatched；dispatcher 失败 → dispatch_failed，token 仍
+    acknowledged 可重试。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    candidate_summary = {"candidates": [
+        {"path": "a.py", "included_in_candidate_set": True},
+        {"path": "b.py", "included_in_candidate_set": True},
+    ]}
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, candidate_summary=candidate_summary, now=t0)
+    cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+    cli.run_scope_exclude(token=tok, paths=["b.py"], reason="reformat", roots=roots, now=t0)
+    cli.run_scope_include(token=tok, paths=["c.py"], reason="遗漏", roots=roots, now=t0)
+
+    # ① dispatcher 失败：dispatch_failed、token 仍 acknowledged。
+    def _failing_dispatcher(**kw):
+        return {"status": "failed", "error": "no external harness available"}
+    fail = cli.run_dispatch(token=tok, strictness="standard", roots=roots, now=t0, reviewer_dispatcher=_failing_dispatcher)
+    assert fail.status == "dispatch_failed" and fail.exit_code == cli.EXIT_DISPATCH_FAILED
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # ② dispatcher 成功。
+    seen = {}
+
+    def _ok_dispatcher(*, repo, review_packet, scope_contract, session_context, run_id, run_dir, strictness, preset, dry_run):
+        seen.update({"scope_contract": scope_contract, "strictness": strictness,
+                     "external_target": preset.get("external_reviewer_count_target"), "dry_run": dry_run})
+        return {"status": "ok", "plan_path": str(tmp / "reviewer-plan.json")}
+
+    ok = cli.run_dispatch(token=tok, strictness="strict", roots=roots, now=t0, reviewer_dispatcher=_ok_dispatcher)
+    assert ok.status == "ok" and ok.exit_code == cli.EXIT_OK
+    assert ok.detail["effective_primary_files"] == ["a.py", "c.py"]
+    # 严格度终选读 preset：strict = external target 3。
+    assert seen["strictness"] == "strict" and seen["external_target"] == 3
+    assert ok.detail["preset"]["reviewer_reasoning_effort_level"] == "high"
+
+    # token 终态 dispatched，记严格度。
+    lk = dts.read_decision_token(tok, root=roots.token_root, now=t0)
+    assert lk.state == dts.STATE_DISPATCHED
+    assert lk.payload.get("dispatched_strictness") == "strict"
+
+    # scope.contract.json 已定稿：primary_files 反映净效果、excluded 含 b.py、hash 变了。
+    contract = json.loads(Path(seen["scope_contract"]).read_text(encoding="utf-8"))
+    assert contract["primary_files"] == ["a.py", "c.py"]
+    assert "b.py" in contract["excluded_path_prefixes"]
+    assert contract["scope_hash"] != "stub-old-hash"
+
+
+def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
+    """decline：token 终态 declined、理由落 append-only 磁盘 ledger（rewind 不可抹）、指纹入冷却表；
+    再次 decline 已终态 → 错误。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpDecline", now=t0)
+
+    result = cli.run_decline(token=tok, reason="fork 噪声，无真实改动，不再自审", roots=roots, now=t0)
+    assert result.status == "ok" and result.exit_code == cli.EXIT_OK
+    assert result.token_state == dts.STATE_DECLINED
+
+    # 理由落 append-only ledger。
+    ledger_path = Path(result.detail["declined_reason_ledger"])
+    assert ledger_path.is_file()
+    rows = read_jsonl(ledger_path)
+    assert any(r.get("token") == tok and "fork 噪声" in str(r.get("reason")) for r in rows)
+
+    # 指纹入 declined 冷却表（指纹未变不再注入）。
+    assert dts.is_fingerprint_in_declined_cooldown(
+        worktree=wt, candidate_fingerprint="fpDecline", cooldown_root=roots.cooldown_root
+    )
+    # 遥测记 declined。
+    assert "declined" in [r["event"] for r in read_jsonl(roots.telemetry_root / f"{tok}.jsonl")]
+
+    # 已终态再次 decline → 错误。
+    again = cli.run_decline(token=tok, reason="再次", roots=roots, now=t0)
+    assert again.status == "error" and again.exit_code == cli.EXIT_TOKEN_STATE
+
+
+def test_agent_cli_error_paths_missing_and_terminal_tokens(tmp: Path) -> None:
+    """错误路径：不存在的 token 在 start / dispatch / scope 上都归 EXIT_TOKEN_STATE；dispatched 终态
+    token 上 scope / dispatch 亦被拒。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+
+    missing = "0" * 16
+    s = cli.run_start(token=missing, reason="x", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+    assert s.status == "error" and s.exit_code == cli.EXIT_TOKEN_STATE
+    d = cli.run_dispatch(token=missing, strictness="standard", roots=roots, now=t0, reviewer_dispatcher=lambda **k: {"status": "ok"})
+    assert d.status == "error" and d.exit_code == cli.EXIT_TOKEN_STATE
+    sc = cli.run_scope_exclude(token=missing, paths=["x"], reason="r", roots=roots, now=t0)
+    assert sc.status == "error" and sc.exit_code == cli.EXIT_TOKEN_STATE
+
+    # dispatched 终态 token 上 scope / dispatch 被拒（走完整链到 dispatched 后再试）。
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpTerm", now=t0)
+    cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+    cli.run_dispatch(token=tok, strictness="light", roots=roots, now=t0, reviewer_dispatcher=lambda **k: {"status": "ok"})
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_DISPATCHED
+    guard_scope = cli.run_scope_exclude(token=tok, paths=["x"], reason="r", roots=roots, now=t0)
+    assert guard_scope.status == "error" and guard_scope.exit_code == cli.EXIT_TOKEN_STATE
+    guard_dispatch = cli.run_dispatch(token=tok, strictness="light", roots=roots, now=t0, reviewer_dispatcher=lambda **k: {"status": "ok"})
+    assert guard_dispatch.status == "error" and guard_dispatch.exit_code == cli.EXIT_TOKEN_STATE
+
+
+# ---------------------------------------------------------------------------
 # S2：候选摘要（stop_decision_candidate_summary）+ 严格度参考档
 # （review_strictness_reference_calculator / review-strictness-presets.json）
 # ---------------------------------------------------------------------------
@@ -7905,6 +8288,39 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "decision_token_read_missing_and_corrupt",
             lambda: test_decision_token_read_missing_and_corrupt(root / "dts-read-robust"),
+        ),
+        # --- S3：rvf-agent 决策 CLI（单一入口） ---
+        (
+            "agent_cli_start_success_chain_and_auto_scope",
+            lambda: test_agent_cli_start_success_chain_and_auto_scope(root / "agent-cli-start-ok"),
+        ),
+        (
+            "agent_cli_start_failure_rollback_and_retry",
+            lambda: test_agent_cli_start_failure_rollback_and_retry(root / "agent-cli-start-retry"),
+        ),
+        (
+            "agent_cli_start_preflight_and_provider_health_gates",
+            lambda: test_agent_cli_start_preflight_and_provider_health_gates(root / "agent-cli-gates"),
+        ),
+        (
+            "agent_cli_scope_operations_and_state_guard",
+            lambda: test_agent_cli_scope_operations_and_state_guard(root / "agent-cli-scope"),
+        ),
+        (
+            "agent_cli_scope_issue_ledger_threshold_idempotent",
+            lambda: test_agent_cli_scope_issue_ledger_threshold_idempotent(root / "agent-cli-issue"),
+        ),
+        (
+            "agent_cli_dispatch_finalizes_scope_and_records_strictness",
+            lambda: test_agent_cli_dispatch_finalizes_scope_and_records_strictness(root / "agent-cli-dispatch"),
+        ),
+        (
+            "agent_cli_decline_persists_reason_and_cooldown",
+            lambda: test_agent_cli_decline_persists_reason_and_cooldown(root / "agent-cli-decline"),
+        ),
+        (
+            "agent_cli_error_paths_missing_and_terminal_tokens",
+            lambda: test_agent_cli_error_paths_missing_and_terminal_tokens(root / "agent-cli-errors"),
         ),
     ]
 
