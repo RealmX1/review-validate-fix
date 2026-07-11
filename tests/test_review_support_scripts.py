@@ -6061,8 +6061,455 @@ def test_decision_token_read_missing_and_corrupt(tmp: Path) -> None:
     assert dts.read_decision_token(real.token, root=tok_root, now=t0).status == "invalid_json"
 
 
+# ---------------------------------------------------------------------------
+# S2：候选摘要（stop_decision_candidate_summary）+ 严格度参考档
+# （review_strictness_reference_calculator / review-strictness-presets.json）
+# ---------------------------------------------------------------------------
+
+STOP_DECISION_CANDIDATE_SUMMARY = SCRIPT_DIR / "stop_decision_candidate_summary.py"
+REVIEW_STRICTNESS_REFERENCE_CALCULATOR = SCRIPT_DIR / "review_strictness_reference_calculator.py"
+REVIEW_STRICTNESS_PRESETS = (
+    SCRIPT_DIR.parent / "config" / "review-strictness-presets.json"
+)
+
+
+def _load_candidate_summary_modules():
+    """加载 S2 三件套所需模块（候选摘要 / 严格度计算器 / 高水位 / diff_tracker）。
+
+    候选摘要模块 top-level import 中性核 committed_round_detection 的同源下界 resolver，并惰性
+    import Stop hook 引擎 stop_review_validate_fix（复用 workspace 守卫 / id 提取）；此处只需保证
+    ROOT + SCRIPT_DIR 在 sys.path 上，pyroot 与 core.* import 即可解析。review_highwater_marker
+    随 S10h 迁 core，故从 core.session_scope_allocation import。
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import review_strictness_reference_calculator as _calc  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as _hw  # noqa: PLC0415
+    import stop_decision_candidate_summary as _summary  # noqa: PLC0415
+    import core.session_scope_allocation.reviewable_unit_diff_tracker as _dt  # noqa: PLC0415
+
+    return _summary, _calc, _hw, _dt
+
+
+def _stop_candidate_repo(tmp: Path) -> tuple[Path, str]:
+    """初始化隔离 git repo（单文件 base 提交），返回 (repo, base_sha)。"""
+    repo = tmp / "repo"
+    repo.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=repo)
+    run(["git", "config", "user.name", "RVF Test"], cwd=repo)
+    (repo / "f.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base"], cwd=repo)
+    base = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    return repo, base
+
+
+def _candidate_summary_log_root_env(log_root: Path):
+    """上下文：把 CODEX_RVF_LOG_ROOT 指到 tmp，退出还原（默认 resolver 经 log_root() 读高水位/
+    round-baseline；隔离防污染真实 ~/.rvf）。"""
+    import contextlib  # noqa: PLC0415
+
+    @contextlib.contextmanager
+    def _ctx():
+        key = "CODEX_RVF_LOG_ROOT"
+        prev = os.environ.get(key)
+        os.environ[key] = str(log_root)
+        try:
+            yield
+        finally:
+            if prev is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prev
+
+    return _ctx()
+
+
+def test_review_strictness_reference_weights_and_classification(tmp: Path) -> None:
+    """R13：路径分类 + 非空行计数 + 删除降权 + 代码1.0/文档0.3 + generated归零 + 不拆comment。"""
+    _summary, calc, _hw, _dt = _load_candidate_summary_modules()
+
+    # 分类优先级：generated > documentation > test > code。
+    assert calc.classify_review_path("src/app.py") == calc.CATEGORY_CODE
+    assert calc.classify_review_path("docs/guide.md") == calc.CATEGORY_DOCUMENTATION
+    assert calc.classify_review_path("tests/test_x.py") == calc.CATEGORY_TEST
+    assert calc.classify_review_path("pkg/foo_test.go") == calc.CATEGORY_TEST
+    assert calc.classify_review_path("a/FooTest.java") == calc.CATEGORY_TEST
+    # 'latest.py' / 'manifest.py' 不得被误判 test（词尾 test 但非测试）。
+    assert calc.classify_review_path("latest.py") == calc.CATEGORY_CODE
+    assert calc.classify_review_path("manifest.py") == calc.CATEGORY_CODE
+    assert calc.classify_review_path("dist/app.min.js") == calc.CATEGORY_GENERATED
+    assert calc.classify_review_path("pnpm-lock.yaml") == calc.CATEGORY_GENERATED
+    # 文档判定先于 test：tests/ 下的 .md 仍按文档计。
+    assert calc.classify_review_path("tests/fixtures/sample.md") == calc.CATEGORY_DOCUMENTATION
+
+    res = calc.compute_strictness_reference(
+        [
+            {
+                "path": "src/a.py",
+                # 非空 added=3（x=1 / # comment kept / y=2），2 行空白被忽略；不拆 comment，
+                # 注释行照常计入非空 added。
+                "added_lines": ["x=1", "", "  ", "# comment kept", "y=2"],
+                "deleted_lines": ["old1", "old2", "old3", "old4"],
+            },
+            {"path": "docs/g.md", "added_lines": ["line"] * 10, "deleted_lines": []},
+            {
+                "path": "dist/b.min.js",
+                "added_lines": ["z"] * 999,
+                "deleted_lines": ["w"] * 999,
+            },
+        ]
+    )
+    per = {f["path"]: f for f in res["per_file"]}
+    assert per["src/a.py"]["nonblank_added_lines"] == 3
+    assert per["src/a.py"]["blank_lines_ignored"] == 2
+    assert per["src/a.py"]["nonblank_deleted_lines"] == 4
+    # 加权 = 1.0 * (3 + 0.25*4) = 4.0（删除降权 0.25）。
+    assert per["src/a.py"]["weighted_effective_lines"] == 4.0
+    # 文档 0.3：10 * 0.3 = 3.0。
+    assert per["docs/g.md"]["weighted_effective_lines"] == 3.0
+    # generated 归零（增删都不计）。
+    assert per["dist/b.min.js"]["weighted_effective_lines"] == 0.0
+    assert per["dist/b.min.js"]["generated_zeroed"] is True
+    # 不拆 comment 规则显式化。
+    assert res["rule_parameters"]["comment_lines_are_not_split_out"] is True
+    # 总加权 7.0 < 40 → light。
+    assert res["totals"]["weighted_effective_lines"] == 7.0
+    assert res["suggested_strictness_tier"] == calc.STRICTNESS_TIER_LIGHT
+
+
+def test_review_strictness_reference_oversized_elevate_and_tiers(tmp: Path) -> None:
+    """R24：非测试非生成物 >1000 非空行 → 建议 elevate；档位阈值边界。"""
+    _summary, calc, _hw, _dt = _load_candidate_summary_modules()
+
+    big_code = calc.compute_strictness_reference(
+        [{"path": "src/big.py", "added_lines": ["x"] * 1201, "deleted_lines": []}]
+    )
+    assert big_code["oversized_change_elevate_recommended"] is True
+    assert big_code["suggested_strictness_tier"] == calc.STRICTNESS_TIER_STRICT
+
+    # 测试文件不计入 elevate（R24「不含测试」）。
+    big_test = calc.compute_strictness_reference(
+        [{"path": "tests/test_big.py", "added_lines": ["x"] * 1201, "deleted_lines": []}]
+    )
+    assert big_test["oversized_change_elevate_recommended"] is False
+
+    # generated 不计入 elevate。
+    big_gen = calc.compute_strictness_reference(
+        [{"path": "dist/x.min.js", "added_lines": ["x"] * 5000, "deleted_lines": []}]
+    )
+    assert big_gen["oversized_change_elevate_recommended"] is False
+
+    # 空输入 → light、不 elevate（稳定空态）。
+    empty = calc.compute_strictness_reference([])
+    assert empty["suggested_strictness_tier"] == calc.STRICTNESS_TIER_LIGHT
+    assert empty["oversized_change_elevate_recommended"] is False
+
+    # standard 档边界：加权落在 [light上限, standard上限) → standard。
+    mid = calc.compute_strictness_reference(
+        [{"path": "src/mid.py", "added_lines": ["x"] * 100, "deleted_lines": []}]
+    )
+    assert mid["suggested_strictness_tier"] == calc.STRICTNESS_TIER_STANDARD
+
+
+def test_review_strictness_presets_schema(tmp: Path) -> None:
+    """R14：3 档 preset schema —— light 单 reviewer 不用廉价模型；strict 提升 effort +
+    更多 provider + per-phase 模型选择。"""
+    data = json.loads(REVIEW_STRICTNESS_PRESETS.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 1
+    presets = data["presets"]
+    assert set(presets) == {"light", "standard", "strict"}
+
+    required_fields = {
+        "strictness_tier_name",
+        "external_reviewer_count_target",
+        "single_reviewer_forbids_cheap_model",
+        "reviewer_model_cost_tier_floor",
+        "reviewer_reasoning_effort_level",
+        "additional_external_provider_count_beyond_double_review_baseline",
+        "use_all_available_external_providers",
+        "per_phase_model_selection_enabled",
+    }
+    for name, preset in presets.items():
+        missing = required_fields - set(preset)
+        assert not missing, (name, missing)
+        assert preset["strictness_tier_name"] == name
+
+    effort_order = data["reasoning_effort_level_ascending_order"]
+    cost_order = data["reviewer_model_cost_tier_ascending_order"]
+    light = presets["light"]
+    standard = presets["standard"]
+    strict = presets["strict"]
+
+    # light：恰好 1 路 reviewer，且禁用廉价模型（cost floor 不是最廉价档）。
+    assert light["external_reviewer_count_target"] == 1
+    assert light["single_reviewer_forbids_cheap_model"] is True
+    assert light["reviewer_model_cost_tier_floor"] in cost_order
+    assert cost_order.index(light["reviewer_model_cost_tier_floor"]) >= 1
+
+    # reviewer 数单调不减：light <= standard <= strict。
+    assert (
+        light["external_reviewer_count_target"]
+        <= standard["external_reviewer_count_target"]
+        <= strict["external_reviewer_count_target"]
+    )
+
+    # strict：reasoning effort 相对 standard 提升。
+    assert effort_order.index(strict["reviewer_reasoning_effort_level"]) > effort_order.index(
+        standard["reviewer_reasoning_effort_level"]
+    )
+    # strict：更多 external provider（额外计数 > standard 或拉满可用池）。
+    assert (
+        strict["additional_external_provider_count_beyond_double_review_baseline"]
+        > standard["additional_external_provider_count_beyond_double_review_baseline"]
+        or strict["use_all_available_external_providers"] is True
+    )
+    # per-phase 模型选择并入 strict（仅 strict 开启）。
+    assert strict["per_phase_model_selection_enabled"] is True
+    assert standard["per_phase_model_selection_enabled"] is False
+    assert light["per_phase_model_selection_enabled"] is False
+
+    # Tier-1 池全集 = {claude_code, codex, cursor}（R15/R20 补集 − 主 harness 在 S7 落地）。
+    assert set(data["reviewer_harness_pool_tier1_full_membership"]) == {
+        "claude_code",
+        "codex",
+        "cursor",
+    }
+
+
+def test_candidate_summary_includes_committed_but_unreviewed(tmp: Path) -> None:
+    """R1/R18：候选摘要必含「已提交但未审」的 committed-round 改动（下界经同源高水位 resolver）。"""
+    summary_mod, _calc, hw, _dt = _load_candidate_summary_modules()
+    repo, base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+
+    # 本轮提交（committed-but-unreviewed）。
+    (repo / "f.txt").write_text("base\ncommitted-line\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "round1"], cwd=repo)
+    # 叠加未提交改动 + 一个 untracked 文件。
+    (repo / "f.txt").write_text("base\ncommitted-line\ndirty-line\n", encoding="utf-8")
+    (repo / "g.py").write_text("new\ncontent\n", encoding="utf-8")
+
+    with _candidate_summary_log_root_env(log_root):
+        # 高水位 = base（== 上一次 review 覆盖到的 HEAD）；默认 resolver 经 log_root() 读它。
+        hw.write_review_highwater(
+            task_id=None, session_id="sess-A", reviewed_head=base, repo=str(repo), root=log_root
+        )
+        summ = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo)},
+            cwd=str(repo),
+            repo=str(repo),
+            ledger=None,
+            log_root_override=log_root,
+            session_id_resolver=lambda _e: "sess-A",
+            task_id_resolver=lambda _e: None,
+        )
+
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert "f.txt" in by_path
+    assert by_path["f.txt"]["change_state"] in (
+        summary_mod.CHANGE_STATE_COMMITTED,
+        summary_mod.CHANGE_STATE_COMMITTED_AND_UNCOMMITTED,
+    )
+    assert "g.py" in by_path
+    assert by_path["g.py"]["change_state"] == summary_mod.CHANGE_STATE_UNCOMMITTED
+    assert summ["has_committed_but_unreviewed"] is True
+    assert summ["committed_round_baseline"] == base
+    assert summ["lower_bound_source"] == summary_mod.LOWER_BOUND_SOURCE_REVIEW_HIGHWATER
+    # bootstrap-size 并入摘要（R25）。
+    assert summ["bootstrap_size"]["candidate_path_count"] == 2
+    # 严格度参考档随附（调 2 号交付物）。
+    assert "suggested_strictness_tier" in summ["strictness_reference"]
+
+
+def test_candidate_summary_fingerprint_stable_and_change_sensitive(tmp: Path) -> None:
+    """R25：候选集指纹在内容不变时稳定；文件内容变化时敏感变化；复原后回到原值。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    repo, base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    (repo / "f.txt").write_text("base\ndirtyA\n", encoding="utf-8")
+
+    def build():
+        return summary_mod.build_candidate_summary(
+            event={"cwd": str(repo)},
+            cwd=str(repo),
+            repo=str(repo),
+            ledger=None,
+            log_root_override=log_root,
+            workspace_guard=lambda **_k: None,
+            task_id_resolver=lambda _e: None,
+            session_id_resolver=lambda _e: "sess-A",
+            committed_baseline_resolver=lambda _rp, _t, _s: base,
+            committed_base_ref_resolver=lambda _rp: None,
+        )
+
+    fp1 = build()["candidate_fingerprint"]
+    # 稳定性：不改内容再算一次。
+    assert build()["candidate_fingerprint"] == fp1
+    assert fp1.startswith("sha256:")
+
+    # 变化敏感性：改内容 → 指纹变。
+    original = (repo / "f.txt").read_text(encoding="utf-8")
+    (repo / "f.txt").write_text(original + "extra\n", encoding="utf-8")
+    fp2 = build()["candidate_fingerprint"]
+    assert fp2 != fp1
+
+    # 复原 → 回到原指纹。
+    (repo / "f.txt").write_text(original, encoding="utf-8")
+    assert build()["candidate_fingerprint"] == fp1
+
+
+def test_candidate_summary_ownership_filters_other_session(tmp: Path) -> None:
+    """Q4=a：ownership 作为 filter —— tracker 缓存归属他 session 的路径被排除出候选。"""
+    summary_mod, _calc, _hw, dt = _load_candidate_summary_modules()
+    repo, _base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    (repo / "b.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "b.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add-b"], cwd=repo)
+    (repo / "f.txt").write_text("base\ndirtyF\n", encoding="utf-8")
+    (repo / "b.txt").write_text("base\ndirtyB\n", encoding="utf-8")
+
+    # 播种 tracker：f.txt 归 sess-OTHER，b.txt 归 sess-A（当前）。
+    for session_id, run_id, path in (
+        ("sess-OTHER", "rO", "f.txt"),
+        ("sess-A", "rA", "b.txt"),
+    ):
+        owned = dt.OwnedUnit(path=path, unit="path", hunk_anchor=None)
+        dt.register_claims(
+            repo=repo,
+            session_id=session_id,
+            run_id=run_id,
+            worktree=repo,
+            branch=None,
+            owned_paths=[path],
+            apply_patch_paths={path},
+            exec_only_paths=set(),
+            owned_units_override=[(owned, "apply_patch")],
+            log_root_override=log_root,
+        )
+
+    summ = summary_mod.build_candidate_summary(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        log_root_override=log_root,
+        workspace_guard=lambda **_k: None,
+        task_id_resolver=lambda _e: None,
+        session_id_resolver=lambda _e: "sess-A",
+        committed_baseline_resolver=lambda _rp, _t, _s: None,
+        committed_base_ref_resolver=lambda _rp: None,
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["f.txt"]["ownership"] == summary_mod.OWNERSHIP_OTHER_SESSION_OWNED
+    assert by_path["f.txt"]["included_in_candidate_set"] is False
+    assert by_path["b.txt"]["ownership"] == summary_mod.OWNERSHIP_SESSION_OWNED
+    assert by_path["b.txt"]["included_in_candidate_set"] is True
+    assert summ["candidate_path_count"] == 1
+    assert summ["filtered_out_other_session_path_count"] == 1
+
+
+def test_candidate_summary_workspace_guard_short_circuits(tmp: Path) -> None:
+    """先过 kanban_task_workspace_guard：命中 → 短路空候选（不审 unrelated dirty repo）。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    repo, _base = _stop_candidate_repo(tmp)
+    (repo / "f.txt").write_text("base\ndirty\n", encoding="utf-8")
+
+    blocked = summary_mod.build_candidate_summary(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        workspace_guard=lambda **_k: {
+            "action": "skip",
+            "reason_code": "kanban_task_workspace_mismatch",
+        },
+    )
+    assert blocked["workspace_guard_blocked"] is True
+    assert blocked["candidate_path_count"] == 0
+    assert blocked["candidates"] == []
+    assert blocked["workspace_guard_payload"]["reason_code"] == "kanban_task_workspace_mismatch"
+
+
+def test_candidate_fingerprint_serialization_format(tmp: Path) -> None:
+    """R25 指纹序列化格式：空态稳定、顺序无关、分隔符安全、内容摘要敏感。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    fp = summary_mod.compute_candidate_fingerprint
+
+    # 空态稳定且带版本前缀。
+    empty = fp([])
+    assert empty == fp([])
+    assert empty.startswith("sha256:")
+
+    # 顺序无关（内部按 UTF-8 字节序排序）。
+    a = fp([("src/a.py", "h1"), ("src/b.py", "h2")])
+    b = fp([("src/b.py", "h2"), ("src/a.py", "h1")])
+    assert a == b
+
+    # 内容摘要敏感：同路径不同摘要 → 不同指纹。
+    assert fp([("src/a.py", "h1")]) != fp([("src/a.py", "h2")])
+    # 路径集敏感：多一个候选 → 不同指纹。
+    assert fp([("src/a.py", "h1")]) != fp([("src/a.py", "h1"), ("src/b.py", "h2")])
+
+    # 分隔符安全：naive 拼接会让 ("ab","") 与 ("a","b") 撞车；NUL 分隔杜绝此歧义。
+    assert fp([("ab", "")]) != fp([("a", "b")])
+    assert fp([("a", "bc"), ("d", "")]) != fp([("a", "b"), ("cd", "")])
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
+        # --- S2：候选摘要 + 严格度参考档 ---
+        (
+            "review_strictness_reference_weights_and_classification",
+            lambda: test_review_strictness_reference_weights_and_classification(
+                root / "strictness-weights"
+            ),
+        ),
+        (
+            "review_strictness_reference_oversized_elevate_and_tiers",
+            lambda: test_review_strictness_reference_oversized_elevate_and_tiers(
+                root / "strictness-elevate"
+            ),
+        ),
+        (
+            "review_strictness_presets_schema",
+            lambda: test_review_strictness_presets_schema(root / "strictness-presets"),
+        ),
+        (
+            "candidate_summary_includes_committed_but_unreviewed",
+            lambda: test_candidate_summary_includes_committed_but_unreviewed(
+                root / "candidate-committed"
+            ),
+        ),
+        (
+            "candidate_summary_fingerprint_stable_and_change_sensitive",
+            lambda: test_candidate_summary_fingerprint_stable_and_change_sensitive(
+                root / "candidate-fingerprint"
+            ),
+        ),
+        (
+            "candidate_summary_ownership_filters_other_session",
+            lambda: test_candidate_summary_ownership_filters_other_session(
+                root / "candidate-ownership"
+            ),
+        ),
+        (
+            "candidate_summary_workspace_guard_short_circuits",
+            lambda: test_candidate_summary_workspace_guard_short_circuits(
+                root / "candidate-workspace-guard"
+            ),
+        ),
+        (
+            "candidate_fingerprint_serialization_format",
+            lambda: test_candidate_fingerprint_serialization_format(
+                root / "candidate-fp-format"
+            ),
+        ),
         (
             "dispatch_reviewers_routing_matrix",
             lambda: test_dispatch_reviewers_routing_matrix(root / "dispatch-routing"),

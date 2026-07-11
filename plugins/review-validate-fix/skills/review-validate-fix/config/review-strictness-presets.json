@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "description": "RVF 审查严格度 3 档 preset（R14）。主 agent 开启审查后只从这三档里**选一档**（R16 有界决策之一）；不构造、不枚举候选全集（R1），也不逐项调旋钮（R14「agent 只选档」）。本文件是各档的声明式参数表，被 S7 的 reviewer 选择模块 / dispatch 消费。字段一律过度指定命名，语义自解释。",
+  "preset_selection_is_single_tier_choice_by_agent": true,
+  "reasoning_effort_level_ascending_order": ["medium", "high", "xhigh"],
+  "reviewer_model_cost_tier_ascending_order": ["cheap", "standard", "premium"],
+  "reviewer_harness_pool_tier1_full_membership": ["claude_code", "codex", "cursor"],
+  "reviewer_harness_pool_selection_note": "实际可派发池 = Tier-1 全集 − 主 harness（R15/R20），池内伪随机选二；各 preset 的 external_reviewer_count_target 会被 clamp 到当时可用池大小，不足则按降级路径（R1–R3）处理。",
+  "presets": {
+    "light": {
+      "strictness_tier_name": "light",
+      "human_readable_intent": "小改动 / 低风险：单路 external reviewer，省预算但**不省质量**——单 reviewer 仍必须用非廉价模型（R14），因为只有一双眼睛时更不能瞎。",
+      "external_reviewer_count_target": 1,
+      "single_reviewer_forbids_cheap_model": true,
+      "reviewer_model_cost_tier_floor": "standard",
+      "reviewer_reasoning_effort_level": "medium",
+      "additional_external_provider_count_beyond_double_review_baseline": 0,
+      "use_all_available_external_providers": false,
+      "per_phase_model_selection_enabled": false
+    },
+    "standard": {
+      "strictness_tier_name": "standard",
+      "human_readable_intent": "默认档：santa 双 review（两路异构 external reviewer），中等 reasoning effort。多数改动落这里。",
+      "external_reviewer_count_target": 2,
+      "single_reviewer_forbids_cheap_model": false,
+      "reviewer_model_cost_tier_floor": "standard",
+      "reviewer_reasoning_effort_level": "medium",
+      "additional_external_provider_count_beyond_double_review_baseline": 0,
+      "use_all_available_external_providers": false,
+      "per_phase_model_selection_enabled": false
+    },
+    "strict": {
+      "strictness_tier_name": "strict",
+      "human_readable_intent": "高风险 / 大改动：相对 standard **提升 reasoning effort**、并**动用更多 external provider**（尽可能拉满可用 Tier-1 池），且启用 per-phase 模型选择（R14：per-phase 并入 strict）。",
+      "external_reviewer_count_target": 3,
+      "single_reviewer_forbids_cheap_model": false,
+      "reviewer_model_cost_tier_floor": "premium",
+      "reviewer_reasoning_effort_level": "high",
+      "reviewer_reasoning_effort_level_is_uplifted_from_standard": true,
+      "additional_external_provider_count_beyond_double_review_baseline": 1,
+      "use_all_available_external_providers": true,
+      "per_phase_model_selection_enabled": true
+    }
+  }
+}
