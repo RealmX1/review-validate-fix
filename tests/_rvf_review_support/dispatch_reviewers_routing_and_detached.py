@@ -23,6 +23,8 @@ __all__ = [
     'test_dispatch_reviewers_detached_exports_codex_rvf_log_root',
     'test_dispatch_reviewers_wait_status_branches',
     'test_dispatch_reviewers_routing_matrix',
+    'test_dispatch_reviewers_pseudo_random_selection_seed_reproducible',
+    'test_temporary_disable_window_generalized_component',
     'test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer',
     'test_dispatch_reviewers_same_harness_double_instance_distinct_ids',
     'test_dispatch_reviewers_plan_artifact_schema',
@@ -236,18 +238,22 @@ def test_dispatch_reviewers_wait_status_branches(root: Path) -> None:
 
 
 def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
-    """路由矩阵 R0–R4：测试用例名 ↔ 规则 id。
+    """路由矩阵 R0–R3（S7·R15/R20 后）：测试用例名 ↔ 规则 id。
 
     | 场景 | M | A | rule | slots |
     |------|---|---|------|-------|
-    | R0 main=claude | claude_code | cursor,claude_code,codex | R0 | cursor,codex |
-    | R0 main=codex  | codex       | cursor,claude_code,codex | R0 | cursor,claude_code |
+    | R0 main=claude | claude_code | cursor,claude_code,codex | R0 | cursor,codex（受迫配对，保 priority 序） |
+    | R0 main=codex  | codex       | cursor,claude_code,codex | R0 | cursor,claude_code（受迫配对） |
     | R0 main=cursor(override) | cursor | cursor,claude_code,codex | R0 | claude_code,codex |
     | R1 cursor+codex | claude_code | cursor,codex | R1 | cursor,codex |
-    | R1 no-cursor (R4) | claude_code | claude_code,codex | R1 | claude_code,codex + cursor_unavailable |
+    | R1 no-cursor | claude_code | claude_code,codex | R1 | claude_code,codex（旧 R4 修饰已退役，无 cursor_unavailable） |
     | R2 only==M | codex | codex | R2 | codex-cli-a,codex-cli-b |
     | R2 only!=M | claude_code | codex | R2 | codex-cli-a,codex-cli-b + mismatch |
     | R3 zero | claude_code | (none) | R3 | needs_last_resort_fallback |
+
+    三路 Tier-1 registry 下非主池恒 ≤2，故本矩阵全部落受迫配对（selection_mode=
+    forced_pair，无 seed）；伪随机选二的可复现性由
+    ``test_dispatch_reviewers_pseudo_random_selection_seed_reproducible`` 覆盖。
     """
     d = load_dispatch_reviewers_module()
     reg = _dispatch_registry()
@@ -261,7 +267,7 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     def warns(plan):
         return {w["code"] for w in plan["warnings"]}
 
-    # R0 — 默认两路非主，cursor 必选一腿
+    # R0 — 两路非主（三路 registry：非主池恰 2 → 受迫配对，保 priority 序）
     p = d.route(
         "claude_code",
         ["cursor", "claude_code", "codex"],
@@ -272,6 +278,10 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     assert harnesses(p) == ["cursor", "codex"], p
     assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
     assert p["status"] == "planned" and p["needs_last_resort_fallback"] is False
+    # 选材遥测块：受迫配对不含 seed，池与选择一致可审计。
+    assert p["reviewer_selection"]["selection_mode"] == "forced_pair", p
+    assert p["reviewer_selection"]["selected_harnesses"] == ["cursor", "codex"], p
+    assert "selection_seed" not in p["reviewer_selection"], p
 
     p = d.route(
         "codex",
@@ -294,7 +304,8 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     p = d.route("claude_code", ["cursor", "codex"], reg, now_utc=after_temporary_override_expiry)
     assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"cursor", "codex"}, p
 
-    # R1 + R4 — cursor 不可用：仍两路 external（主以 external 跑），记 cursor_unavailable
+    # R1 — cursor 不可用：仍两路 external（主以 external 跑）。旧 R4 cursor_unavailable
+    # 修饰随「池内无偏序」退役（R15/R20）：cursor 缺席只是池组成，不再是降级 warning。
     p = d.route(
         "claude_code",
         ["claude_code", "codex"],
@@ -302,7 +313,8 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
         now_utc=after_temporary_override_expiry,
     )
     assert p["routing_rule"] == "R1" and set(harnesses(p)) == {"claude_code", "codex"}, p
-    assert "cursor_unavailable" in warns(p), p
+    assert "cursor_unavailable" not in warns(p), p
+    assert p["reviewer_selection"]["main_harness_used_as_external"] is True, p
     assert all(r["dispatch_mode"] == "external_cli" for r in p["reviewers"]), p
 
     # R2 — 同 harness 双 external，only==M（info）
@@ -310,7 +322,7 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
     assert p["routing_rule"] == "R2", p
     assert [r["reviewer_id"] for r in p["reviewers"]] == ["codex-cli-a", "codex-cli-b"], p
     assert "only_main_harness_available" in warns(p), p
-    assert "cursor_unavailable" not in warns(p), p  # R2 不叠加 R4
+    assert p["reviewer_selection"]["selection_mode"] == "same_harness_double", p
 
     # R2 — only!=M：必须 mismatch warning
     p = d.route("claude_code", ["codex"], reg, now_utc=after_temporary_override_expiry)
@@ -330,6 +342,95 @@ def test_dispatch_reviewers_routing_matrix(root: Path) -> None:
         now_utc=after_temporary_override_expiry,
     )
     assert p["status"] == "failed" and p.get("reason") == "no_reviewer_harness_available", p
+
+
+def test_dispatch_reviewers_pseudo_random_selection_seed_reproducible(root: Path) -> None:
+    """S7·R15/R20 池内无偏序 = 伪随机选二，seed 落遥测且严格可复现。
+
+    构造选择池 >2 的场景（主 harness 不在 Tier-1 可用集 → 非主池 = 3）：
+    - 同 seed 两次 route → 选择（含 slot 顺序）逐位相同；
+    - seed 缺省 → 现场生成并记录进 ``reviewer_selection.selection_seed``，用该 seed
+      重放 route 得到完全相同的选择（记录在案即可复现）；
+    - 选择恒 ⊆ 池、恒两腿、池按字典序规范化。
+    """
+    d = load_dispatch_reviewers_module()
+    reg = _dispatch_registry()
+    now = datetime.datetime(2026, 7, 10, 12, 1, tzinfo=datetime.timezone.utc)
+    tier1 = ["cursor", "claude_code", "codex"]
+
+    def harnesses(plan):
+        return [r["harness_id"] for r in plan["reviewers"]]
+
+    # 同 seed 可复现（含 slot 顺序）。
+    p_a = d.route("outside_tier1_main", tier1, reg, now_utc=now, selection_seed=42)
+    p_b = d.route("outside_tier1_main", tier1, reg, now_utc=now, selection_seed=42)
+    assert p_a["reviewer_selection"]["selection_mode"] == "pseudo_random_two", p_a
+    assert p_a["reviewer_selection"]["selection_seed"] == 42, p_a
+    assert harnesses(p_a) == harnesses(p_b), (p_a, p_b)
+    assert p_a["reviewer_selection"]["selection_pool"] == sorted(tier1), p_a
+
+    # seed 缺省 → 生成并记录；用记录的 seed 重放得到相同选择。
+    p_auto = d.route("outside_tier1_main", tier1, reg, now_utc=now)
+    recorded_seed = p_auto["reviewer_selection"]["selection_seed"]
+    assert isinstance(recorded_seed, int), p_auto
+    p_replay = d.route(
+        "outside_tier1_main", tier1, reg, now_utc=now, selection_seed=recorded_seed
+    )
+    assert harnesses(p_replay) == harnesses(p_auto), (p_auto, p_replay)
+
+    # 选择恒两腿且 ⊆ 池；入序无关（池先做字典序规范化再采样）。
+    p_shuffled_input = d.route(
+        "outside_tier1_main",
+        ["codex", "cursor", "claude_code"],
+        reg,
+        now_utc=now,
+        selection_seed=42,
+    )
+    assert harnesses(p_shuffled_input) == harnesses(p_a), (p_shuffled_input, p_a)
+    assert len(harnesses(p_a)) == 2 and set(harnesses(p_a)) <= set(tier1), p_a
+
+
+def test_temporary_disable_window_generalized_component(root: Path) -> None:
+    """R21 时间盒泛化：core/temporary_disable_window 声明式组件的通用语义。
+
+    - 生效中：active_override 返回「reason + disabled_subject + expires_at_utc(Z 格式)
+      + metadata 原样并入」的载荷;
+    - 到期即自动失效（含恰好等于截止时刻）,无需改码;
+    - naive datetime 按 UTC 解释；
+    - dispatch_reviewers 的 claude-code 时间盒已改为本组件声明式实例（委托 + 键名
+      remap ``disabled_subject``→``disabled_harness`` 保持既有契约）。
+    """
+    d = load_dispatch_reviewers_module()
+    window_cls = d.TemporaryDisableWindow
+    window = window_cls(
+        disabled_subject="demo_capability",
+        reason="temporary_disable_demo_capability_for_incident_123",
+        expires_at_utc=datetime.datetime(2026, 8, 1, 0, 0, 0, tzinfo=datetime.timezone.utc),
+        metadata={"incident": "123"},
+    )
+    active_at = datetime.datetime(2026, 7, 31, 23, 59, tzinfo=datetime.timezone.utc)
+    override = window.active_override(active_at)
+    assert override == {
+        "reason": "temporary_disable_demo_capability_for_incident_123",
+        "disabled_subject": "demo_capability",
+        "expires_at_utc": "2026-08-01T00:00:00Z",
+        "incident": "123",
+    }, override
+    # 恰达截止时刻 → 失效（窗口是 [声明, expires_at) 半开区间）。
+    assert window.active_override(datetime.datetime(2026, 8, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)) is None
+    # naive datetime 按 UTC 解释。
+    assert window.active_override(datetime.datetime(2026, 7, 31, 23, 59)) is not None
+    assert window.is_active(datetime.datetime(2026, 9, 1)) is False
+
+    # 既有 claude-code 用例已声明为本组件实例，且委托层保持 disabled_harness 键名契约。
+    declared = d.TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_WINDOW
+    assert isinstance(declared, window_cls), declared
+    assert declared.disabled_subject == d.HOST_CLAUDE
+    legacy = d.temporary_disable_claude_code_external_reviewer_override(
+        datetime.datetime(2026, 7, 10, 11, 59, tzinfo=datetime.timezone.utc)
+    )
+    assert legacy is not None and legacy["disabled_harness"] == d.HOST_CLAUDE, legacy
+    assert "disabled_subject" not in legacy, legacy
 
 
 def test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer(root: Path) -> None:
@@ -584,8 +685,11 @@ def test_dispatch_reviewers_reroutes_on_usage_limit(tmp_path: Path) -> None:
     reg = _make_usage_or_clean_registry(
         tmp_path, {"alpha": ("usage", 100), "beta": ("clean", 90), "gamma": ("clean", 80)}
     )
-    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
+    # 主 harness 不在池 → 池 3 路触发伪随机选二；钉死 seed=4（选出 alpha+beta）
+    # 使「alpha 撞额度 → reroute 到 gamma」的剧本确定可复现。
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg, selection_seed=4)
     assert plan["routing_rule"] == "R0", plan
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
     run_dir = tmp_path / "run"
     artifacts_dir = run_dir / "artifacts"
     packet = tmp_path / "packet.md"
@@ -626,7 +730,8 @@ def test_dispatch_reviewers_reroute_id_collision(tmp_path: Path) -> None:
     reg = _make_usage_or_clean_registry(
         tmp_path, {"alpha": ("usage", 100), "beta": ("usage", 90), "gamma": ("clean", 80)}
     )
-    plan = d.route("codex", ["alpha", "beta", "gamma"], reg)
+    # 钉死 seed=4（伪随机选出 alpha+beta）使「双腿全撞额度 → 全 reroute 到 gamma」确定复现。
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg, selection_seed=4)
     assert plan["routing_rule"] == "R0"
     assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
     run_dir = tmp_path / "run"

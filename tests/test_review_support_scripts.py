@@ -7087,6 +7087,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_dispatch_reviewers_routing_matrix(root / "dispatch-routing"),
         ),
         (
+            "dispatch_reviewers_pseudo_random_selection_seed_reproducible",
+            lambda: test_dispatch_reviewers_pseudo_random_selection_seed_reproducible(
+                root / "dispatch-selection-seed"
+            ),
+        ),
+        (
+            "temporary_disable_window_generalized_component",
+            lambda: test_temporary_disable_window_generalized_component(
+                root / "temporary-disable-window"
+            ),
+        ),
+        (
             "dispatch_reviewers_temporarily_disables_claude_code_external_reviewer",
             lambda: test_dispatch_reviewers_temporarily_disables_claude_code_external_reviewer(
                 root / "dispatch-disable-claude-reviewer"

@@ -13,21 +13,24 @@ double-review 的一腿。它只：
 **恰好两路 external_cli reviewer** → 写 ``artifacts/reviewers/reviewer-plan.json`` →
 （``--execute`` 时）并行复用 ``run_alternative_reviewer.py`` 执行内核派发两路 external。
 
-路由规则（``route()`` 为纯函数、可单测）：
+路由规则（``route()`` 为纯函数、可单测；选择纯核已抽至
+``core/reviewer_harness_selection/``，S7·R15/R20）：
 
 - ``M`` = 主 dispatch harness（本轮 RVF 主会话所在 harness）
 - ``A`` = 本机 probe 通过的 harness 集合（``reviewer-registry.json`` 中 enabled 且 probe OK）
 
 | |A| | rule | 选择 |
 |-----|------|------|
-| ≥3  | R0   | 两路非主 external，cursor 必选一腿（cursor∈A 恒成立） |
-| ==2 | R1   | 这两路 external（M∈A 时 M 也以 external 跑，不退回 in-harness） |
+| ≥3  | R0   | 两腿选择池 = A − M（非主不足两路时 M 也以 external 跑，绝不退回 in-harness）；|
+|     |      | **池内无偏序 = 伪随机选二**（seed 落 plan 的 ``reviewer_selection`` 块，可复现）；|
+|     |      | 池恰两路时为受迫配对（无随机、保 priority 序） |
+| ==2 | R1   | 这两路 external（受迫配对；M∈A 时 M 也以 external 跑） |
 | ==1 | R2   | 同 harness 双 external 实例（reviewer_id 后缀 ``-a``/``-b``） |
 | ==0 | R3   | 默认 needs_last_resort_fallback（交主会话按 last-resort reference 兜底）；
 |     |      | 仅 ``--require-external`` 时 fail |
 
-R4 = cursor probe 失败的降级修饰：cursor∉A 时记 warning ``cursor_unavailable``，
-在剩余非主 harness 中另选；只剩一个非主则落入 R2。
+旧 R4（cursor 必选一腿 + ``cursor_unavailable`` 降级修饰）随「池内无偏序」语义退役
+（R15/R20 裁决：cursor 不再是默认必选腿，缺席只是池组成变化而非降级）。
 """
 from __future__ import annotations
 
@@ -63,6 +66,11 @@ from core.host_adapter.host_transcript_format_detection import (
     HOST_CODEX,
     detect_transcript_format,
 )
+from core.reviewer_harness_selection import (
+    SELECTION_MODE_SAME_HARNESS_DOUBLE,
+    compute_reviewer_harness_selection,
+)
+from core.temporary_disable_window import TemporaryDisableWindow
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -89,23 +97,21 @@ DEFAULT_DISPATCH_MAX_WAIT_SECONDS = 480.0
 # 保证 detached 派发 status.json 终会落终态，又不误杀正当长 review。
 DEFAULT_DISPATCH_TOTAL_TIMEOUT_SECONDS = 2700.0
 
-CURSOR_HARNESS = "cursor"
 DEFAULT_MAIN_HARNESS = HOST_CODEX  # 与现有 Kanban 兜底一致
 
-# 临时 external reviewer policy：按用户 2026-07-02 指示，Claude Code 在
-# 2026-07-09 结束前不可作为 RVF external reviewer。过期点覆盖美国时区的
-# 2026-07-09 全日，避免当前运行机器为 Asia/Shanghai 时提前失效。
-TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC = datetime(
-    2026,
-    7,
-    10,
-    12,
-    0,
-    0,
-    tzinfo=timezone.utc,
-)
-TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_REASON = (
-    "temporary_disable_claude_code_external_reviewer_until_2026_07_09_us_timezones"
+# 临时 external reviewer policy（R21 时间盒泛化后的声明式实例）：按用户 2026-07-02
+# 指示，Claude Code 在 2026-07-09 结束前不可作为 RVF external reviewer。过期点覆盖
+# 美国时区的 2026-07-09 全日，避免当前运行机器为 Asia/Shanghai 时提前失效。
+# 已于 2026-07-10T12:00Z 自动过期——按 core/temporary_disable_window.py 的约定，
+# 过期声明保留在原地即是「已过期时间盒」的考古记录，同时充当泛化组件的活用例。
+TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_WINDOW = TemporaryDisableWindow(
+    disabled_subject=HOST_CLAUDE,
+    reason="temporary_disable_claude_code_external_reviewer_until_2026_07_09_us_timezones",
+    expires_at_utc=datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc),
+    metadata={
+        "expires_after_requested_date": "2026-07-09",
+        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
+    },
 )
 
 # 已知存在并行 headless session/auth 全局锁、需要顺序执行的 harness。
@@ -116,23 +122,16 @@ SEQUENTIAL_HARNESSES: frozenset[str] = frozenset()
 def temporary_disable_claude_code_external_reviewer_override(
     now_utc: datetime | None = None,
 ) -> dict[str, str] | None:
-    """返回当前是否命中临时 Claude Code external reviewer 禁用策略。"""
-    current = now_utc or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    else:
-        current = current.astimezone(timezone.utc)
-    if current >= TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC:
+    """返回当前是否命中临时 Claude Code external reviewer 禁用策略。
+
+    R21 泛化后委托 :data:`TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_WINDOW`；
+    对外载荷契约保持不变（``disabled_harness`` 键名沿用，供既有 plan/警告消费者）。
+    """
+    override = TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_WINDOW.active_override(now_utc)
+    if override is None:
         return None
-    return {
-        "reason": TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_REASON,
-        "disabled_harness": HOST_CLAUDE,
-        "expires_at_utc": TEMPORARY_DISABLE_CLAUDE_CODE_EXTERNAL_REVIEWER_EXPIRES_AT_UTC.isoformat().replace(
-            "+00:00", "Z"
-        ),
-        "expires_after_requested_date": "2026-07-09",
-        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
-    }
+    override["disabled_harness"] = override.pop("disabled_subject")
+    return override
 
 
 def _temporarily_disabled_external_reviewer_harnesses(
@@ -233,12 +232,17 @@ def route(
     require_external_only: bool = False,
     sequential_harnesses: frozenset[str] = SEQUENTIAL_HARNESSES,
     now_utc: datetime | None = None,
+    selection_seed: int | None = None,
 ) -> dict[str, Any]:
     """纯路由函数：给定主 harness + 可用集 + registry，返回 plan dict（无 IO）。
 
-    返回 dict 含 routing_rule / reviewers / warnings / needs_last_resort_fallback /
-    sequential_execution / status。``available`` 会先过滤到 registry 中 enabled 的
-    harness 并按 priority 排序。
+    返回 dict 含 routing_rule / reviewers / reviewer_selection / warnings /
+    needs_last_resort_fallback / sequential_execution / status。``available`` 会先
+    过滤到 registry 中 enabled 的 harness 并按 priority 排序。R0–R3 分类与两腿选材
+    （含池内无偏序伪随机选二）单源于
+    :func:`core.reviewer_harness_selection.compute_reviewer_harness_selection`；
+    ``selection_seed`` 缺省时由纯核现场生成并记录进 ``reviewer_selection`` 块
+    （同 seed 严格可复现）。
     """
     enabled = set(_enabled_harnesses(registry))
     temporarily_disabled = _temporarily_disabled_external_reviewer_harnesses(now_utc)
@@ -286,21 +290,19 @@ def route(
             )
         )
 
-    # R4 降级修饰：cursor 是 R0/R1 默认必选一腿，仅在 |A|>=2 时缺席才记 warning。
-    # R2（|A|==1）有自己的 mismatch / only_main warning，不再叠加 cursor_unavailable。
-    cursor_preferred = main_harness != CURSOR_HARNESS
-    if cursor_preferred and CURSOR_HARNESS not in A and len(A) >= 2:
-        warnings.append(
-            _warn(
-                "cursor_unavailable",
-                "warning",
-                "cursor probe 失败或未启用；已在剩余 harness 中选择 reviewer（R4 降级）。",
-            )
-        )
+    # R0–R3 分类 + 两腿选材单源于 core 纯核（S7·R15/R20：Tier-1 池 − 主 harness、
+    # 池内无偏序伪随机选二、R1–R3 降级维持既有语义）。旧 R4 cursor 必选腿修饰随之退役。
+    selection = compute_reviewer_harness_selection(
+        main_harness=main_harness,
+        available_harnesses=A,
+        selection_seed=selection_seed,
+    )
+    plan["routing_rule"] = selection.routing_rule
+    # 选材遥测块（seed 落此处，可复现；schema additive，既有消费者忽略未知 key）。
+    plan["reviewer_selection"] = selection.telemetry_payload()
 
     # R3 — 零可用
-    if len(A) == 0:
-        plan["routing_rule"] = "R3"
+    if not selection.selected_harnesses:
         if require_external_only:
             plan["status"] = "failed"
             plan["reason"] = "no_reviewer_harness_available"
@@ -324,10 +326,9 @@ def route(
         return plan
 
     # R2 — 仅一个可用：同 harness 双 external 实例
-    if len(A) == 1:
-        only = A[0]
-        plan["routing_rule"] = "R2"
-        if only != main_harness:
+    if selection.selection_mode == SELECTION_MODE_SAME_HARNESS_DOUBLE:
+        only = selection.selected_harnesses[0]
+        if not selection.only_available_is_main:
             warnings.append(
                 _warn(
                     "available_reviewer_harness_mismatch",
@@ -359,22 +360,10 @@ def route(
             )
         return plan
 
-    # |A| >= 2 — R1（==2）或 R0（>=3）：选两路非主 external，cursor 优先
-    plan["routing_rule"] = "R0" if len(A) >= 3 else "R1"
-    non_main = [h for h in A if h != main_harness]
-    prefs: list[str] = []
-    if CURSOR_HARNESS in non_main:
-        prefs.append(CURSOR_HARNESS)
-    for h in non_main:
-        if h not in prefs:
-            prefs.append(h)
-    if main_harness in A and main_harness not in prefs:
-        # 仅当非主 harness 不足两路时，主 harness 也以 external 跑（绝不退回 in-harness）。
-        prefs.append(main_harness)
-    selected = prefs[:2]
+    # R0/R1 — 受迫配对或伪随机选二（纯核已定 slot 顺序）
     plan["reviewers"] = [
         _reviewer_spec(registry, hid, slot=index + 1)
-        for index, hid in enumerate(selected)
+        for index, hid in enumerate(selection.selected_harnesses)
     ]
     return plan
 
@@ -538,8 +527,9 @@ def _reroute_candidates(
 ) -> list[str]:
     """对 ``A' = available − cooled`` 重调 ``route()`` 取替换候选 harness 顺序（R-c 单源）。
 
-    候选 = route 在 A' 上的两腿选择（已含 R0–R4 的 cursor 优先 / main-as-external / R2 双实例
-    偏好），再按 priority 补齐 A' 其余，保证「需补两腿但 route 只给两腿」时仍有后备。
+    候选 = route 在 A' 上的两腿选择（已含 R0–R3 的池内无偏序选二 / main-as-external /
+    R2 双实例语义；选择池 >2 时该两腿为伪随机，seed 落 sub-plan 遥测块），再按
+    priority 补齐 A' 其余，保证「需补两腿但 route 只给两腿」时仍有后备。
     """
     a_prime = [h for h in available if h not in cooled]
     candidates: list[str] = []
@@ -842,6 +832,10 @@ def _build_detached_child_argv(
             argv += [flag, value]
     if args.require_external:
         argv.append("--require-external")
+    # getattr 兜底：程序化调用方（含测试）可能手拼 Namespace 而缺该属性。
+    selection_seed = getattr(args, "selection_seed", None)
+    if selection_seed is not None:
+        argv += ["--selection-seed", str(selection_seed)]
     return argv
 
 
@@ -979,6 +973,13 @@ def main() -> int:
         action="store_true",
         help="Fail (no last-resort fallback) when 0 external harness available.",
     )
+    parser.add_argument(
+        "--selection-seed",
+        type=int,
+        default=None,
+        help="Override pseudo-random reviewer selection seed (reproduce a recorded "
+        "reviewer_selection.selection_seed; default: freshly generated and recorded).",
+    )
     parser.add_argument("--plan-only", action="store_true", help="Plan + write reviewer-plan.json; do not execute.")
     parser.add_argument("--execute", action="store_true", help="Plan then execute reviewers in parallel.")
     parser.add_argument("--dry-run", action="store_true", help="Print plan JSON to stdout; do not write or execute.")
@@ -1115,6 +1116,7 @@ def main() -> int:
         available,
         registry,
         require_external_only=args.require_external,
+        selection_seed=args.selection_seed,
     )
 
     # 被 cooldown 排除的 enabled harness：逐一发可观测 warning（O2 契约 code）。
