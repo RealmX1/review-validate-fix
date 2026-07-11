@@ -5107,6 +5107,133 @@ def test_skip_decision_should_unpark_keeps_park_for_resume_pending(tmp_path: Pat
     ) is True
 
 
+def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> None:
+    """S9 §五.6 E2E dogfood(tmp 隔离):改动→Stop→注入→start→scope→dispatch(dry-run)
+    →analyze 完成→守护计数+1。
+
+    全链真实件:真实 git repo 的 dirty 改动、真实 Stop hook 子进程(铸 token+注入)、
+    CLI ``run_start`` 走**真实 default prepare 全套**(分配 run+写 prep+prepare_run_from_prep_file)、
+    真实 scope annotate/exclude 落盘、dispatch 定稿 scope_hash + mark_dispatched。
+    受控替身仅三处:provider-health runner(避免真探 provider 认证)、dispatch 的
+    reviewer_dispatcher(避免真拉 reviewer)、守护分析派发器(避免真拉 tmux)——
+    三者都是注入点而非链路本体。落盘全部隔离在 state 下,绝不触真实 ~/.rvf。
+    """
+    dirty = init_repo_with_head(tmp_path / "dirty")  # 带 base commit(prepare 需要可解析的 HEAD)
+    transcript = tmp_path / "session.jsonl"
+    state = tmp_path / "state"
+    write_user_session(transcript, "e2e-dogfood-session", "改了 changed.txt,准备收尾。")
+
+    # ① 改动→Stop→注入:真实 Stop hook 子进程,拿到决策 token。
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+            "session_id": "e2e-dogfood-session",
+        },
+        state_dir=state,
+    )
+    _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+
+    # ② in-process 对齐 invoke 的隔离根,驱动 CLI 决策链。
+    saved_env = {
+        k: os.environ.get(k)
+        for k in ("RVF_HOME", "CODEX_RVF_STATE_DIR", "CODEX_RVF_PREP_ROOT", "CODEX_RVF_LOG_ROOT")
+    }
+    os.environ["RVF_HOME"] = str(state / "rvf-home")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(state / "prep-root")
+    os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+    try:
+        if str(SCRIPT.parent) not in sys.path:
+            sys.path.insert(0, str(SCRIPT.parent))
+        import importlib.util as _ilu  # noqa: PLC0415
+
+        cli_spec = _ilu.spec_from_file_location(
+            "rvf_agent_decision_cli_e2e", SCRIPT.parent / "rvf_agent_decision_cli.py"
+        )
+        assert cli_spec is not None and cli_spec.loader is not None
+        cli = _ilu.module_from_spec(cli_spec)
+        sys.modules[cli_spec.name] = cli
+        cli_spec.loader.exec_module(cli)
+        import rvf_decision_token_store as dts  # noqa: PLC0415
+        import agentic_initiation_guardian_dispatch as guardian  # noqa: PLC0415
+        import agentic_initiation_injection_attempt_ledger as injection_ledger  # noqa: PLC0415
+
+        # start:真实 default prepare 全套;仅 provider-health runner 注入替身。
+        start_result = cli.run_start(
+            token=token,
+            reason="E2E dogfood:小改动,开审",
+            provider_health_runner=lambda req, timeout: {
+                "status": "ok",
+                "provider": getattr(req, "provider", None) or "stub",
+            },
+        )
+        assert start_result.status == "ok", (start_result.status, start_result.message)
+        assert start_result.token_state == dts.STATE_ACKNOWLEDGED
+        assert "changed.txt" in start_result.detail["auto_scope_paths"], start_result.detail
+        run_dir = Path(start_result.detail["run_dir"])
+        assert run_dir.is_dir(), run_dir
+        assert str(run_dir).startswith(str(state)), run_dir  # run 落盘同样被隔离
+        prepare_artifacts = start_result.detail["prepare_artifacts"]
+        assert Path(prepare_artifacts["review_packet"]).is_file(), prepare_artifacts
+        assert Path(prepare_artifacts["scope_contract"]).is_file(), prepare_artifacts
+
+        # scope:annotate(R19 批量)+ exclude 一个不存在的运行时 artifact(R10 反向剔除)。
+        annotate = cli.run_scope_annotate(
+            token=token, entries=[("changed.txt", "E2E:本轮唯一实质改动")]
+        )
+        assert annotate.status == "ok", annotate.message
+        exclude = cli.run_scope_exclude(
+            token=token, paths=["dist/generated.bundle.js"], reason="运行时 artifact,不入审"
+        )
+        assert exclude.status == "ok", exclude.message
+
+        # dispatch(dry-run):scope 物理定稿 + 重算 scope_hash + mark_dispatched;
+        # reviewer_dispatcher 注入替身捕获派发参数。
+        dispatched_calls: list[dict] = []
+
+        def fake_reviewer_dispatcher(**kwargs: object) -> dict:
+            dispatched_calls.append(dict(kwargs))
+            return {"status": "ok", "returncode": 0, "plan_path": None}
+
+        dispatch = cli.run_dispatch(
+            token=token,
+            strictness="standard",
+            dry_run=True,
+            reviewer_dispatcher=fake_reviewer_dispatcher,
+        )
+        assert dispatch.status == "ok", (dispatch.status, dispatch.message)
+        assert dispatch.token_state == dts.STATE_DISPATCHED
+        assert len(dispatched_calls) == 1, dispatched_calls
+        assert dispatched_calls[0]["dry_run"] is True
+        assert dispatched_calls[0]["strictness"] == "standard"
+        lookup = dts.read_decision_token(token)
+        assert lookup.state == dts.STATE_DISPATCHED, lookup
+
+        # ③ analyze 完成 → 守护计数 +1(首达节点 1 → 派守护分析,注入替身)。
+        guardian_dispatches: list[int] = []
+        record = guardian.record_analyze_completion(
+            run_dir=str(run_dir),
+            guardian_analysis_dispatcher=lambda **kw: guardian_dispatches.append(
+                kw["milestone"]
+            )
+            or {"launch_status": "faked"},
+        )
+        assert record["status"] == "recorded" and record["analyze_completion_count"] == 1
+        assert record["milestone_dispatched"] == 1 and guardian_dispatches == [1]
+
+        # 负路径不变量收口:本次注入在 injection-attempt ledger 有记录(canary 分子)。
+        attempts = injection_ledger.read_injection_attempts(worktree=str(dirty.resolve()))
+        assert attempts and any(r.get("decision_token") == token for r in attempts), attempts
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_stop_unparks_on_dispatch_failure_and_no_dispatch(tmp_path: Path) -> None:
     """安全阀：本会话 self-park 过但本次 Stop 无 resume → 幂等 unpark + 清 self-park 标记。"""
     module = load_hook_module()
@@ -5446,6 +5573,7 @@ def main() -> int:
         test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty,
         test_launch_keep_park_signal_uses_real_hook_payload_shape,
         test_guardian_liveness_alarm_merges_into_stop_payload,
+        test_agentic_initiation_e2e_dogfood_signal_to_guardian,
         test_skip_decision_should_unpark_keeps_park_for_resume_pending,
         test_stop_unparks_on_dispatch_failure_and_no_dispatch,
         test_stop_safety_valve_noop_when_not_self_parked,

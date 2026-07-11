@@ -6867,6 +6867,17 @@ def decision_point_injection_decision(
         - deduplicated：同键活跃 token 已在等待 → 不重注入（R25 幂等），静默停并提醒用户；
         - declined_cooldown / circuit_breaker_tripped：静默停（后者附熔断告警 systemMessage）。
     * **无论哪种候选非空结局都写 injection-attempt ledger**（负路径不变量：候选非空 ⇒ 有记录）。
+
+    接入点标注（S9；范围铁律：以下均**不在本 repo 实现**，录入 Linear 跟踪）：
+
+    * INTEGRATION-POINT(R6 self-injection queue)：本函数是未来 self-injection queue 的
+      唯一接管点——queue 系统落地后，「铸 token → 直接 block 注入」改为「铸 token →
+      入 queue → 由 queue 按主 agent 负载/优先级择机投递」；三闸、指纹冷却、注入
+      ledger 的语义与分母口径必须原样保留。
+    * INTEGRATION-POINT(R12 fork≽checkpoint)：决策注入现阶段一律发给**主 agent 本人**
+      （R12）。未来分身/task-force 系统若要把决策点改投给 fork 分身，验收条件 =
+      fork 机制在「上下文保真 + 决策可追溯 + decline 理由持久化」三项上**不劣于**
+      checkpoint/rewind 机制（fork≽checkpoint），否则不得切换注入对象。
     """
     try:
         summary = stop_decision_candidate_summary.build_candidate_summary(

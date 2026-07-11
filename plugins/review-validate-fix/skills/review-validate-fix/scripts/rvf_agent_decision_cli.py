@@ -1232,7 +1232,9 @@ def run_decline(
         )
 
     fingerprint = str(declined.payload.get("candidate_fingerprint") or "")
-    # 接入点（R7/R12 rewind-on-decline）：理由落 append-only 磁盘 ledger，rewind 不可抹。
+    # INTEGRATION-POINT(R7/R12 rewind-on-decline)：理由落 append-only 磁盘 ledger，rewind
+    # 不可抹；未来 rewind-on-decline 编排（不在本 repo 实现，Linear 跟踪)会读本 ledger
+    # 决定「decline 后回退到决策点前的上下文」——本切片只落盘 + 标注。
     ledger_path = _declined_reason_ledger_path(roots.declined_reason_ledger_root)
     _append_jsonl(
         ledger_path,
