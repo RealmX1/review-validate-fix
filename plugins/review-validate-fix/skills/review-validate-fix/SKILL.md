@@ -19,10 +19,12 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 1. 在目标仓库运行 `git status --porcelain`，或使用 `scripts/review_validate_fix_gate.sh <repo>`。
 2. 如果仓库 clean，只有用户本轮明确给出 manual review scope 时才继续；否则中文说明没有可审查改动并结束。
+   - **clean worktree ≠ 无可审范围**：若本会话有「已提交但未审」的工作，manual UPS hook 会自动检测 committed-round、把 baseline 写进 prep payload，`prepare_review_run` 据此建 committed-round manifest、packet 用 `git diff <baseline>` 渲染已提交改动（`scope_mode=session-owned`）。**不要再用 `git reset --mixed/--hard` 把已提交工作物化成 dirty**——尤其多个连续 commit 时复原脆弱。bootstrap 残留：仅「该 task 从未跑过 review、首轮跨 prompt」时 baseline 可能解析不到（与 auto 路径同源残留）。
 3. 写一份 scope-of-work / session context 文件，说明用户意图、本轮实际完成的工作或 manual scope、需要审查的文件、逐文件编辑明细、已跑验证、关键取舍和不确定点。
 4. Scope-of-work 不要只列 created/modified/deleted 文件。
 5. 若当前 prompt 或环境已提供冻结的 RVF run artifacts，复用既有 `review-env.sh`、scope contract 和 review packet；不要新建 run。
 6. 否则运行 `scripts/prepare_review_run.py --repo <repo> --session-context <file>`；在 transcript 或 manifest 可用时传入对应参数；在已知主修改文件、manual scope 文件或背景 WIP 时，分别传入 `--primary-file` / `--background-file`，避免无 manifest 时降级到 `manual-all-uncommitted` 把背景 WIP 纳入 `primary_files` / `fix_allowlist`。
+   - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
 ## 模式
