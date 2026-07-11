@@ -5011,6 +5011,56 @@ def _write_fake_kanban_recorder(tmp_path: Path) -> tuple[str, Path]:
     return f"{sys.executable} {fake}", calls
 
 
+def test_guardian_liveness_alarm_merges_into_stop_payload(tmp_path: Path) -> None:
+    """S8·R23 守护心跳:发起层静默死亡告警并入 Stop 出口。
+
+    - 无告警:payload 原样透传(``None`` 保持静默停;dict 不加键)。
+    - 有告警(窗口内 stop>0 且注入尝试==0 且 review 完成==0):``None`` 升格为
+      ``{"continue": True, "systemMessage": …}``;既有 payload 追加告警段。
+    - review 完成计数落盘后告警解除,恢复透传。
+    全程 RVF_HOME 隔离,绝不读写真实 ``~/.rvf``。
+    """
+    module = load_hook_module()
+    saved_rvf_home = os.environ.get("RVF_HOME")
+    os.environ["RVF_HOME"] = str(tmp_path / "rvf-home")
+    try:
+        import agentic_initiation_guardian_dispatch as guardian  # noqa: PLC0415 - hook 模块已把 SCRIPT_DIR 上 sys.path
+
+        # 无任何守护状态:透传。
+        assert module._apply_guardian_liveness_alarm(None) is None
+        untouched = {"continue": True}
+        assert module._apply_guardian_liveness_alarm(untouched) == {"continue": True}
+
+        # 冷启动护栏:发起层从未活跃过的环境,首个 Stop 心跳不触发误报。
+        module._record_guardian_stop_event_heartbeat()
+        assert guardian.evaluate_initiation_layer_liveness() is None
+        assert module._apply_guardian_liveness_alarm(None) is None
+
+        # seed 历史活跃证据(analyze 完成计数;fake 派发器避免真拉 tmux)→ 三条件命中 → 告警。
+        guardian.record_analyze_completion(
+            guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "faked"}
+        )
+        alarm = guardian.evaluate_initiation_layer_liveness()
+        assert alarm is not None and alarm["alarm"] == "initiation_layer_suspected_silent_death", alarm
+        upgraded = module._apply_guardian_liveness_alarm(None)
+        assert upgraded is not None and upgraded["continue"] is True, upgraded
+        assert "RVF GUARDIAN" in upgraded["systemMessage"]
+        assert "疑似静默死亡" in upgraded["systemMessage"]
+        merged = module._apply_guardian_liveness_alarm({"continue": True, "systemMessage": "既有通知"})
+        assert merged["systemMessage"].startswith("既有通知\n"), merged
+        assert "RVF GUARDIAN" in merged["systemMessage"]
+
+        # review 完成计数落盘 → 告警解除,恢复透传。
+        guardian.record_review_completion()
+        assert guardian.evaluate_initiation_layer_liveness() is None
+        assert module._apply_guardian_liveness_alarm(None) is None
+    finally:
+        if saved_rvf_home is None:
+            os.environ.pop("RVF_HOME", None)
+        else:
+            os.environ["RVF_HOME"] = saved_rvf_home
+
+
 def test_launch_keep_park_signal_uses_real_hook_payload_shape(tmp_path: Path) -> None:
     """回归 REAL/high（reviewer claude-code 发现）：``ledger.hook_payload`` 顶层只有
     ``continue`` / ``systemMessage``、**没有 status 键**，故保留-park 信号必须走显式内部键，
@@ -5395,6 +5445,7 @@ def main() -> int:
         test_parent_thread_path_for_origin_falls_back_to_existing_file,
         test_parent_thread_path_for_origin_emits_diagnostic_when_event_empty,
         test_launch_keep_park_signal_uses_real_hook_payload_shape,
+        test_guardian_liveness_alarm_merges_into_stop_payload,
         test_skip_decision_should_unpark_keeps_park_for_resume_pending,
         test_stop_unparks_on_dispatch_failure_and_no_dispatch,
         test_stop_safety_valve_noop_when_not_self_parked,

@@ -7439,6 +7439,46 @@ def suppressed_decision(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     )
 
 
+def _record_guardian_stop_event_heartbeat() -> None:
+    """S8·R23 wall-clock 心跳:每个到达本 hook 的 Stop 事件计一次(best-effort)。
+
+    守护体系据此获得「Stop 事件数非零」的分母——发起层若静默死亡,analyze 不会
+    着火,但 Stop 心跳仍在,由 :func:`_apply_guardian_liveness_alarm` 出告警。
+    绝不阻断 Stop hook 主流程。
+    """
+    try:
+        import agentic_initiation_guardian_dispatch as guardian_dispatch  # noqa: PLC0415
+
+        guardian_dispatch.record_stop_event_heartbeat()
+    except Exception:  # noqa: BLE001 - 心跳记录永不阻断
+        pass
+
+
+def _apply_guardian_liveness_alarm(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """把「发起层疑似静默死亡」告警(若有)并入即将 emit 的 payload(best-effort)。
+
+    - 无告警:原样返回(含 ``None`` = 保持静默停)。
+    - 有告警且 payload 为 ``None``:升格为 ``{"continue": True, "systemMessage": …}``——
+      告警的意义正是打破病态静默,值得为此放弃静默停。
+    - 有告警且 payload 存在:追加到既有 ``systemMessage`` 之后。
+    """
+    try:
+        import agentic_initiation_guardian_dispatch as guardian_dispatch  # noqa: PLC0415
+
+        alarm = guardian_dispatch.evaluate_initiation_layer_liveness()
+    except Exception:  # noqa: BLE001 - 判定失败按无告警处理
+        return payload
+    if not alarm:
+        return payload
+    alarm_text = "=== RVF GUARDIAN ===\n" + str(alarm.get("message") or alarm.get("alarm"))
+    if payload is None:
+        return {"continue": True, "systemMessage": alarm_text}
+    if isinstance(payload, dict):
+        existing = payload.get("systemMessage")
+        payload["systemMessage"] = (f"{existing}\n{alarm_text}" if existing else alarm_text)
+    return payload
+
+
 def main() -> int:
     event = read_event()
     if event is None:
@@ -7446,6 +7486,8 @@ def main() -> int:
 
     latest_user = latest_user_message_from_event(event)
     ledger = start_stop_hook_ledger(event)
+    # S8·R23:守护 wall-clock 心跳(独立于 analyze),每个 Stop 事件记一次,best-effort。
+    _record_guardian_stop_event_heartbeat()
     # S1b：与 backend 无关的跨 task stranded-pending 扫荡，必须早于 suppress/launch 分支——
     # 即便本次 Stop 自身被 suppress 或不 launch，也要让它把**别的** task 遗留的 stale pending
     # 浮现给用户（打破 flow-1-self-rising 自升循环）。整段 best-effort，永不抛、不改主流程结果。
@@ -7484,14 +7526,17 @@ def main() -> int:
             result.pop(_RVF_KEEP_SELF_PARK_FLAG, None)
         if not keep_park:
             unpark_self_parked_card(event, ledger, reason="no_followup_dispatch")
+        result = _apply_guardian_liveness_alarm(result)
         emit(result)
         return 0
     # skip / 不 launch（含 handoff 完成）= 一般无 resume → unpark；但 followup 仍活跃 / dispatch
     # 仍在途的 skip（resume 在路上）必须保留 park，否则会在 followup 落地前误解除卡片抑制。
     if _skip_decision_should_unpark(decision):
         unpark_self_parked_card(event, ledger, reason="stop_no_launch")
-    if decision.payload is not None:
-        emit(decision.payload)
+    # S8·R23:发起层静默死亡告警并入出口(告警在场时静默停升格为 systemMessage)。
+    skip_payload = _apply_guardian_liveness_alarm(decision.payload)
+    if skip_payload is not None:
+        emit(skip_payload)
     return 0
 
 

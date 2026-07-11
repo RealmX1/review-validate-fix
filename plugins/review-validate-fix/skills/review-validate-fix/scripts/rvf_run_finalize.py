@@ -321,6 +321,13 @@ def _advance_review_highwater(
     did_review = bool(lease_rel.get("did_review")) if isinstance(lease_rel, dict) else False
     if not did_review:
         return {"status": "skipped", "reason": "no_review_artifacts"}
+    # S8·R23:RVF review 真完成计数(守护心跳的分子之一),best-effort 绝不影响 finalize。
+    try:
+        import agentic_initiation_guardian_dispatch as guardian_dispatch  # noqa: PLC0415
+
+        guardian_dispatch.record_review_completion()
+    except Exception:  # noqa: BLE001
+        pass
     # 被审到的 HEAD = finalize 时的 HEAD：committed-round 审已提交工作时 HEAD 未动；dirty
     # review 时 dirty 工作尚未提交、HEAD 同样未动。复用 workspace_diff 已算的 head_after，
     # 缺失时现算 git rev-parse HEAD 兜底。

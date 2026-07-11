@@ -97,11 +97,16 @@ def _build_wrapper_shell(
     status_path: Path,
     exports: dict[str, str],
     stdin_path: Path | None = None,
+    post_exit_argv: list[str] | None = None,
 ) -> str:
     """拼 tmux 内执行的 shell：导出 env → 跑 ``argv``（log 落盘）→ 经 ``--finalize-status`` 回写 status。
 
     退出码经独立的 ``--finalize-status`` 回调写入 status.json，避免从 shell 手工拼
     JSON 丢字段。``$?`` 取最后一条命令（管道场景下是 ``argv``）的退出码。
+
+    ``post_exit_argv``（可选，S8 守护计数用）：被包命令退出**且** status 回写之后追加
+    执行的一条命令（同样 log 落盘）,以 ``|| true`` 兜底——post-exit 回调失败绝不改变
+    wrapper 的整体行为，也不影响已回写的 status。缺省时输出与旧版逐字节相同。
     """
     export_lines = "".join(
         f"export {name}={shlex.quote(value)}; " for name, value in exports.items()
@@ -122,11 +127,15 @@ def _build_wrapper_shell(
             str(status_path),
         ]
     )
-    return (
+    wrapper = (
         f"{export_lines}"
         f"{run_line}; rc=$?; "
         f"{finalize_cmd} --returncode \"$rc\" >> {log_q} 2>&1"
     )
+    if post_exit_argv:
+        post_cmd = " ".join(shlex.quote(token) for token in post_exit_argv)
+        wrapper += f"; {post_cmd} >> {log_q} 2>&1 || true"
+    return wrapper
 
 
 def _tmux_session_alive(session_name: str) -> bool:
@@ -214,6 +223,7 @@ def launch_detached(
     idempotency_key: str | None = None,
     total_timeout_seconds: float | None = None,
     tmux_timeout: float = 30.0,
+    post_exit_argv: list[str] | None = None,
 ) -> dict[str, Any]:
     """把 ``argv`` 派进 detached tmux session ``session_name``。
 
@@ -275,6 +285,7 @@ def launch_detached(
             status_path=status_path,
             exports=exports,
             stdin_path=stdin_path,
+            post_exit_argv=post_exit_argv,
         )
         tmux_command = [tmux_bin(), "new-session", "-d", "-s", session_name, shell_command]
         env = launch_env if launch_env is not None else {**os.environ, **exports}

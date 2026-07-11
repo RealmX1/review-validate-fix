@@ -39,6 +39,7 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 adap
 
 from core.run_ledger.run_ledger import safe_token  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import HOST_CLAUDE, HOST_CODEX, detect_transcript_format  # noqa: E402
+from core.temporary_disable_window import TemporaryDisableWindow  # noqa: E402
 
 # detached-launch 通用机制（O_EXCL 幂等锁 + 两阶段原子 status + catch-all）抽到共享
 # helper，analyze 线程与 reviewer dispatch 两路复用；analyze 专属决策（host 选择 /
@@ -64,20 +65,20 @@ STATUS_SCHEMA_VERSION = 1
 SUPPRESS_STOP_HOOK_ENV = "RVF_SUPPRESS_STOP_HOOK"
 ANALYZE_THREAD_ENV = "RVF_ANALYZE_THREAD"
 
-# 临时运行期 override：按用户 2026-07-02 指示，RVF analysis detached
-# agent 持续到 2026-07-09 结束前一律走 Codex。过期点故意覆盖美国时区的
-# 2026-07-09 全日，避免因当前运行机器是 Asia/Shanghai 而提前失效。
-TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC = datetime(
-    2026,
-    7,
-    10,
-    12,
-    0,
-    0,
-    tzinfo=timezone.utc,
-)
-TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_REASON = (
-    "temporary_force_codex_analysis_host_until_2026_07_09_us_timezones"
+# 临时运行期 override（R21 时间盒泛化后的声明式实例）：按用户 2026-07-02 指示，
+# RVF analysis detached agent 持续到 2026-07-09 结束前一律走 Codex。过期点故意
+# 覆盖美国时区的 2026-07-09 全日，避免因当前运行机器是 Asia/Shanghai 而提前失效。
+# 已于 2026-07-10T12:00Z 自动过期（S8·R23 核实：transcript-based host 选择已自动
+# 恢复）——按 core/temporary_disable_window.py 约定，过期声明保留原地即考古记录。
+TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_WINDOW = TemporaryDisableWindow(
+    disabled_subject="transcript_based_analysis_host_selection",
+    reason="temporary_force_codex_analysis_host_until_2026_07_09_us_timezones",
+    expires_at_utc=datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc),
+    metadata={
+        "forced_host": HOST_CODEX,
+        "expires_after_requested_date": "2026-07-09",
+        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
+    },
 )
 
 PROMPT_FILENAME = ".analyze-thread.prompt.md"
@@ -119,25 +120,15 @@ def temporary_force_codex_analysis_host_override(
 ) -> dict[str, str] | None:
     """返回当前是否命中临时 Codex analysis host override。
 
-    ``expires_at_utc`` 对应 2026-07-10 12:00:00Z，也就是用户说的
-    「持续到 July 9」按美国时区整天生效并留出余量。
+    R21 泛化后委托 :data:`TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_WINDOW`；对外载荷
+    契约不变（``forced_host`` 等键沿用，``disabled_subject`` 为组件内部键不外泄）。
+    ``expires_at_utc`` 对应 2026-07-10 12:00:00Z，已自动过期。
     """
-    current = now_utc or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    else:
-        current = current.astimezone(timezone.utc)
-    if current >= TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC:
+    override = TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_WINDOW.active_override(now_utc)
+    if override is None:
         return None
-    return {
-        "reason": TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_REASON,
-        "forced_host": HOST_CODEX,
-        "expires_at_utc": TEMPORARY_FORCE_CODEX_ANALYSIS_HOST_EXPIRES_AT_UTC.isoformat().replace(
-            "+00:00", "Z"
-        ),
-        "expires_after_requested_date": "2026-07-09",
-        "expiry_timezone_policy": "covers_end_of_2026_07_09_across_us_timezones",
-    }
+    override.pop("disabled_subject", None)
+    return override
 
 
 def select_host(event: dict[str, Any], *, now_utc: datetime | None = None) -> str:
@@ -267,6 +258,9 @@ def launch_detached_analyze_thread(
 
         # analyze prompt 一律走 stdin（``cat <prompt> | <agent>``）；不施加总超时
         # backstop（analyze 补全自有边界，保持既有行为不变）。
+        # post-exit 回调（S8·R23）：analyze agent 退出后守护计数 +1，节点首达则由
+        # guardian 模块派发守护分析；``|| true`` 兜底，绝不影响 analyze 本体与 status。
+        guardian_script = Path(__file__).resolve().parent / "agentic_initiation_guardian_dispatch.py"
         result = launch_detached(
             session_name=tmux_session,
             argv=agent_argv,
@@ -278,6 +272,13 @@ def launch_detached_analyze_thread(
             exports=exports,
             launch_env={**os.environ, **ledger.env(), **exports},
             idempotency_key=f"rvf-analyze:{run_name}",
+            post_exit_argv=[
+                sys.executable,
+                str(guardian_script),
+                "record-analyze-completion",
+                "--run-dir",
+                run_dir,
+            ],
         )
         return {
             **base,

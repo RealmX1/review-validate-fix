@@ -5206,6 +5206,159 @@ def load_dispatch_reviewers_module():
     return module
 
 
+def load_agentic_initiation_guardian_dispatch_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "agentic_initiation_guardian_dispatch",
+        SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load agentic_initiation_guardian_dispatch module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -> None:
+    """S8·R23 守护节点计数:analyze 完成累计 1/2/4/8/16 首达各派一次守护分析;
+    16 后守护下线(guardian_retired)并给出 R9 删除确认提示(含 reviewed_head 前置);
+    下线后不再派发;计数器落盘幂等。全程 RVF_HOME 隔离。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    saved_rvf_home = os.environ.get("RVF_HOME")
+    os.environ["RVF_HOME"] = str(tmp_path / "rvf-home")
+    try:
+        root = tmp_path / "guardian-root"
+        dispatched: list[int] = []
+
+        def fake_dispatcher(*, milestone: int, guardian_root: Path, metrics_snapshot: dict) -> dict:
+            dispatched.append(milestone)
+            assert guardian_root == root
+            assert "snapshot_at" in metrics_snapshot
+            return {"milestone": milestone, "launch_status": "launched"}
+
+        retirement_prompts: list[str] = []
+        for i in range(1, 18):
+            result = guardian.record_analyze_completion(
+                run_dir=f"/tmp/run-{i}",
+                root=root,
+                guardian_analysis_dispatcher=fake_dispatcher,
+            )
+            assert result["status"] == "recorded", result
+            assert result["analyze_completion_count"] == i
+            if result.get("retirement_prompt"):
+                retirement_prompts.append(result["retirement_prompt"])
+
+        assert dispatched == [1, 2, 4, 8, 16], dispatched
+        # 恰在 16 那次给出一次 R9 删除确认提示,含 reviewed_head 前置依赖。
+        assert len(retirement_prompts) == 1, retirement_prompts
+        assert "R9" in retirement_prompts[0]
+        assert "reviewed_head" in retirement_prompts[0]
+        counter = json.loads(
+            (root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).read_text(encoding="utf-8")
+        )
+        assert counter["analyze_completion_count"] == 17
+        assert counter["dispatched_milestones"] == [1, 2, 4, 8, 16]
+        assert counter["guardian_retired"] is True
+        # 派发器抛异常不阻断计数(best-effort)。
+        def broken_dispatcher(**_kwargs: object) -> dict:
+            raise RuntimeError("boom")
+
+        result = guardian.record_analyze_completion(
+            root=tmp_path / "guardian-root-2", guardian_analysis_dispatcher=broken_dispatcher
+        )
+        assert result["status"] == "recorded" and result["analyze_completion_count"] == 1
+        assert "dispatch_error" in result
+    finally:
+        if saved_rvf_home is None:
+            os.environ.pop("RVF_HOME", None)
+        else:
+            os.environ["RVF_HOME"] = saved_rvf_home
+
+
+def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
+    """S8·R23 wall-clock 心跳判定矩阵:
+    stop==0 → None;stop>0 且注入/review 双零 → 告警;注入非零或 review 非零 → None;
+    窗口外旧心跳不计入。全程 RVF_HOME 隔离(注入 ledger 与守护计数同根)。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    saved_rvf_home = os.environ.get("RVF_HOME")
+    os.environ["RVF_HOME"] = str(tmp_path / "rvf-home")
+    try:
+        import datetime as _dt
+
+        now = _dt.datetime(2026, 7, 12, 12, 0, tzinfo=_dt.timezone.utc)
+        noop_dispatcher = lambda **_kw: {"launch_status": "faked"}  # noqa: E731
+        # 零状态:无告警。
+        assert guardian.evaluate_initiation_layer_liveness(now=now) is None
+        # 窗口外旧心跳(5 天前)不计入 → 仍无告警。
+        guardian.record_stop_event_heartbeat(now=now - _dt.timedelta(days=5))
+        assert guardian.evaluate_initiation_layer_liveness(now=now) is None
+        # 窗口内心跳但发起层从未活跃(冷启动护栏)→ 仍无告警。
+        guardian.record_stop_event_heartbeat(now=now)
+        assert guardian.evaluate_initiation_layer_liveness(now=now) is None
+        # seed 历史活跃证据(analyze 完成计数)→ stop>0 且注入/review 双零 → 告警。
+        guardian.record_analyze_completion(guardian_analysis_dispatcher=noop_dispatcher)
+        alarm = guardian.evaluate_initiation_layer_liveness(now=now)
+        assert alarm is not None, alarm
+        assert alarm["alarm"] == "initiation_layer_suspected_silent_death"
+        assert alarm["stop_event_count"] == 1 and alarm["injection_attempt_count"] == 0
+        assert "疑似静默死亡" in alarm["message"]
+        # review 完成非零 → 解除(独立分支,先于注入分支验证,回避真实时钟)。
+        guardian.record_review_completion(now=now)
+        assert guardian.evaluate_initiation_layer_liveness(now=now) is None
+        # 注入尝试非零 → 解除:换一个干净 guardian 根重建「stop>0、review==0」态,
+        # 写一条注入 ledger 记录(recorded_at=真实当下,恒 >= 锚点窗口下界——真实时钟
+        # 只会晚于 2026-07-12 锚点,字典序比较对 ISO 日期单调安全)。
+        import agentic_initiation_injection_attempt_ledger as injection_ledger  # noqa: PLC0415
+
+        clean_root = tmp_path / "guardian-root-injection-branch"
+        guardian.record_stop_event_heartbeat(now=now, root=clean_root)
+        guardian.record_analyze_completion(root=clean_root, guardian_analysis_dispatcher=noop_dispatcher)
+        assert guardian.evaluate_initiation_layer_liveness(now=now, root=clean_root) is not None
+        injection_ledger.record_injection_attempt(
+            worktree=str(tmp_path / "repo"),
+            session_id="sess-guardian",
+            candidate_fingerprint="sha256:deadbeef",
+            candidate_path_count=1,
+            has_committed_but_unreviewed=False,
+            mint_outcome=injection_ledger.INJECTION_OUTCOME_INJECTED,
+            injected=True,
+        )
+        assert guardian.evaluate_initiation_layer_liveness(now=now, root=clean_root) is None
+    finally:
+        if saved_rvf_home is None:
+            os.environ.pop("RVF_HOME", None)
+        else:
+            os.environ["RVF_HOME"] = saved_rvf_home
+
+
+def test_detached_wrapper_post_exit_argv_appended_with_failsafe(tmp_path: Path) -> None:
+    """S8:detached wrapper 的可选 post-exit 回调——缺省时输出与旧版逐字节相同
+    (不含 ``|| true``);给定时追加在 finalize-status 之后、以 ``|| true`` 兜底。"""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_detached_thread as detached  # noqa: PLC0415
+
+    kwargs = dict(
+        argv=["echo", "hi"],
+        log_path=tmp_path / "t.log",
+        status_path=tmp_path / "t.status.json",
+        exports={"K": "v"},
+        stdin_path=None,
+    )
+    baseline = detached._build_wrapper_shell(**kwargs)
+    assert "|| true" not in baseline
+    default_none = detached._build_wrapper_shell(**kwargs, post_exit_argv=None)
+    assert default_none == baseline
+    with_post = detached._build_wrapper_shell(
+        **kwargs, post_exit_argv=["python3", "guardian.py", "record-analyze-completion"]
+    )
+    assert with_post.startswith(baseline), with_post
+    assert with_post.endswith("|| true"), with_post
+    assert "guardian.py record-analyze-completion" in with_post
+
+
 def load_harness_limit_cooldown_module():
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
@@ -7096,6 +7249,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "temporary_disable_window_generalized_component",
             lambda: test_temporary_disable_window_generalized_component(
                 root / "temporary-disable-window"
+            ),
+        ),
+        (
+            "guardian_analyze_completion_milestones_and_retirement",
+            lambda: test_guardian_analyze_completion_milestones_and_retirement(
+                root / "guardian-milestones"
+            ),
+        ),
+        (
+            "guardian_initiation_liveness_alarm_paths",
+            lambda: test_guardian_initiation_liveness_alarm_paths(
+                root / "guardian-liveness"
+            ),
+        ),
+        (
+            "detached_wrapper_post_exit_argv_appended_with_failsafe",
+            lambda: test_detached_wrapper_post_exit_argv_appended_with_failsafe(
+                root / "detached-post-exit"
             ),
         ),
         (
