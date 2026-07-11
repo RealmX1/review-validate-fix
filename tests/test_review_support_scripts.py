@@ -4197,6 +4197,224 @@ def _session_units_evidence_by_path(tracker_dir: str, path: str) -> set[str]:
     return {row[0] for row in rows}
 
 
+def _build_packet_with_manifest(
+    tmp: Path, repo: Path, manifest: dict, *, base_ref: str | None = None
+) -> tuple[str, dict]:
+    """Run build_review_packet.py against a hand-written manifest; return (packet_text, metadata).
+
+    Side-effect-free wrt the tracker (build_review_packet only reads the manifest), so it is
+    the right level to assert the committed-round diff-base behavior in isolation.
+    """
+    tmp.mkdir(parents=True, exist_ok=True)
+    manifest_path = tmp / "session-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    sow = tmp / "sow.md"
+    sow.write_text("Review the committed slice for the owned files.\n", encoding="utf-8")
+    out = tmp / "packet.md"
+    meta = tmp / "packet.metadata.json"
+    cmd = [
+        sys.executable,
+        str(BUILD_PACKET),
+        "--repo",
+        str(repo),
+        "--session-context",
+        str(sow),
+        "--session-manifest",
+        str(manifest_path),
+        "--output",
+        str(out),
+        "--metadata-output",
+        str(meta),
+    ]
+    if base_ref is not None:
+        cmd.extend(["--base-ref", base_ref])
+    run(cmd, cwd=repo)
+    return out.read_text(encoding="utf-8"), json.loads(meta.read_text(encoding="utf-8"))
+
+
+def test_committed_round_packet_diff_uses_baseline(tmp: Path) -> None:
+    """(a) committed_round_baseline set on a clean worktree -> owned-diff renders the
+    already-committed change via `git diff <baseline>` instead of an empty `git diff HEAD`."""
+    repo, baseline = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "slice"], cwd=repo)
+    assert run(["git", "status", "--porcelain"], cwd=repo).stdout.strip() == ""  # clean worktree
+    manifest = {
+        "version": 1,
+        "repo": str(repo),
+        "session_id": "s1",
+        "owned_paths": ["f.txt"],
+        "owned_dirty_paths": [],
+        "owned_committed_round_paths": ["f.txt"],
+        "committed_round_baseline": baseline,
+    }
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == baseline
+    assert meta["session_owned_diff_paths"] == ["f.txt"]
+    owned = packet.split("## Session-Owned Git Diff", 1)[1]
+    assert "diff --git a/f.txt" in owned and "COMMITTED" in owned
+
+
+def test_committed_round_packet_baseline_absent_is_head_equivalent(tmp: Path) -> None:
+    """(b) No committed_round_baseline -> base_ref resolves to HEAD and the owned-diff is
+    byte-identical to today's `git diff HEAD` (zero regression for the pure-dirty case)."""
+    repo, _ = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("base\nDIRTY\n", encoding="utf-8")  # uncommitted edit
+    manifest = {
+        "version": 1,
+        "repo": str(repo),
+        "session_id": "s1",
+        "owned_paths": ["f.txt"],
+        "owned_dirty_paths": ["f.txt"],
+    }
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == "HEAD"
+    direct = run(["git", "diff", "--find-renames", "HEAD", "--", "f.txt"], cwd=repo).stdout.rstrip()
+    assert direct and direct in packet  # exact HEAD-based diff body embedded verbatim
+
+
+def test_committed_round_packet_captures_committed_and_dirty(tmp: Path) -> None:
+    """(c) Mixed: one hunk committed, a second left dirty. `git diff <baseline>` (vs worktree)
+    must capture BOTH — this is why we diff against the baseline, not <baseline>..HEAD."""
+    repo, baseline = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "slice"], cwd=repo)
+    (repo / "f.txt").write_text("base\nCOMMITTED\nDIRTY\n", encoding="utf-8")  # extra dirty hunk
+    manifest = {
+        "version": 1,
+        "repo": str(repo),
+        "session_id": "s1",
+        "owned_paths": ["f.txt"],
+        "owned_dirty_paths": ["f.txt"],
+        "owned_committed_round_paths": ["f.txt"],
+        "committed_round_baseline": baseline,
+    }
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == baseline
+    owned = packet.split("## Session-Owned Git Diff", 1)[1]
+    assert "COMMITTED" in owned and "DIRTY" in owned
+
+
+def test_committed_round_packet_base_ref_falls_back_when_not_ancestor(tmp: Path) -> None:
+    """(d) Ancestor guard: a committed_round_baseline that is NOT an ancestor of HEAD
+    (divergent branch) falls back to HEAD instead of producing a reverse/divergent diff."""
+    repo, _ = _committed_round_repo(tmp)
+    run(["git", "checkout", "-q", "-b", "other"], cwd=repo)
+    (repo / "g.txt").write_text("x\n", encoding="utf-8")
+    run(["git", "add", "g.txt"], cwd=repo)
+    run(["git", "commit", "-qm", "divergent"], cwd=repo)
+    non_ancestor = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "checkout", "-q", "main"], cwd=repo)
+    (repo / "f.txt").write_text("base\nDIRTY\n", encoding="utf-8")
+    manifest = {
+        "version": 1,
+        "repo": str(repo),
+        "session_id": "s1",
+        "owned_paths": ["f.txt"],
+        "owned_dirty_paths": ["f.txt"],
+        "committed_round_baseline": non_ancestor,
+    }
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == "HEAD"  # guard rejected the non-ancestor baseline
+    direct = run(["git", "diff", "--find-renames", "HEAD", "--", "f.txt"], cwd=repo).stdout.rstrip()
+    assert direct and direct in packet
+
+
+def test_committed_round_manifest_to_packet_reviews_committed_work(tmp: Path) -> None:
+    """(e) B1 chain end-to-end: build_manifest(committed_baseline=) attributes the clean-worktree
+    committed paths into owned_committed_round_paths + committed_round_baseline, and feeding that
+    manifest to the packet renders the committed diff — the manual path's git-reset replacement."""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "slice"], cwd=repo)
+    transcript = tmp / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}}) + "\n",
+        encoding="utf-8",
+    )
+    manifest = sm.build_manifest(
+        repo, transcript, tracker_enabled=False, committed_baseline=baseline, committed_base_ref=None
+    )
+    assert manifest["committed_round_baseline"] == baseline
+    assert "f.txt" in manifest["owned_committed_round_paths"]
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == baseline
+    owned = packet.split("## Session-Owned Git Diff", 1)[1]
+    assert "diff --git a/f.txt" in owned and "COMMITTED" in owned
+
+
+def test_committed_round_tracker_scope_renders_path_level_when_baseline(tmp: Path) -> None:
+    """(F1 regression) With a committed-round baseline, the tracker-scope Allocated diff must NOT be
+    silently emptied by hunk-header filtering when a file has both a committed and a residual-dirty
+    hunk (the recorded headers were computed against a different base than baseline-vs-worktree).
+    base_ref != HEAD falls back to path-level diff of the allocated paths."""
+    repo, _ = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("L1\nL2\nL3\nL4\nL5\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "grow"], cwd=repo)
+    grow_baseline = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    (repo / "f.txt").write_text("L1\nL2-COMMITTED\nL3\nL4\nL5\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "slice"], cwd=repo)
+    (repo / "f.txt").write_text("L1\nL2-COMMITTED\nL3\nL4\nL5-DIRTY\n", encoding="utf-8")  # residual dirty hunk
+    dirty_header = ""
+    for ln in run(["git", "diff", "--find-renames", "HEAD", "--", "f.txt"], cwd=repo).stdout.splitlines():
+        if ln.startswith("@@"):
+            dirty_header = ln.split(" @@")[0] + " @@"
+            break
+    assert dirty_header
+    manifest = {
+        "version": 1, "repo": str(repo), "session_id": "s1",
+        "owned_paths": ["f.txt"], "owned_dirty_paths": ["f.txt"], "owned_committed_round_paths": ["f.txt"],
+        "committed_round_baseline": grow_baseline,
+        "tracker": {"status": "ok", "session_id": "s1", "tracker_scope": {
+            "unit_ids": ["u1"], "lease_id": "lse-1", "scope_hash": "h1",
+            "paths": ["f.txt"], "hunks": [{"path": "f.txt", "hunk_header": dirty_header}]}},
+    }
+    packet, meta = _build_packet_with_manifest(tmp, repo, manifest)
+    assert meta["owned_diff_base_ref"] == grow_baseline
+    parts = packet.split("## Allocated Git Diff", 1)
+    assert len(parts) > 1, "expected an Allocated Git Diff section when tracker scope is present"
+    section = parts[1]
+    assert "L2-COMMITTED" in section and "L5-DIRTY" in section  # both visible, not filtered to empty
+
+
+def test_committed_round_base_ref_drives_manifest_attribution(tmp: Path) -> None:
+    """(F2 regression) An explicit --base-ref on a clean already-committed worktree must drive the
+    manifest's committed-round attribution (not only the packet diff-base), so prepare builds a
+    session-owned packet instead of aborting with 'session manifest has no owned paths'."""
+    repo, _ = _committed_round_repo(tmp)
+    (repo / "f.txt").write_text("base\nCOMMITTED\n", encoding="utf-8")
+    run(["git", "commit", "-qam", "slice"], cwd=repo)
+    baseline = run(["git", "rev-parse", "HEAD~1"], cwd=repo).stdout.strip()
+    assert run(["git", "status", "--porcelain"], cwd=repo).stdout.strip() == ""  # clean worktree
+    transcript = tmp / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}}) + "\n",
+        encoding="utf-8",
+    )
+    context = tmp / "context.md"
+    context.write_text("Review the committed slice for f.txt.\n", encoding="utf-8")
+    output_json = tmp / "run.json"
+    base_dir = tmp / "runs"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, str(PREPARE_REVIEW_RUN), "--repo", str(repo),
+        "--session-context", str(context), "--transcript", str(transcript),
+        "--output-json", str(output_json), "--base-dir", str(base_dir),
+        "--base-ref", baseline, "--rvf-backend", "manual",
+    ]
+    env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(tmp / "logs")}
+    completed = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(output_json.read_text(encoding="utf-8"))
+    art = Path(payload["artifacts_dir"])
+    contract = json.loads((art / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
+    meta = json.loads((art / "inputs" / "review-packet.metadata.json").read_text(encoding="utf-8"))
+    assert contract["scope_mode"] == "session-owned"
+    assert meta["owned_diff_base_ref"] == baseline
+    assert "f.txt" in contract["primary_files"]
+
+
 def test_committed_unit_dedup_reviewed_not_resurrected(tmp: Path) -> None:
     """A reviewed dirty unit, once committed, must NOT re-enter the candidate
     pool: same unit_id, review_state stays 'reviewed' (§4)."""
@@ -5499,6 +5717,46 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "diff_tracker_observes_committed_round_units",
             lambda: test_diff_tracker_observes_committed_round_units(root / "committed-observe"),
+        ),
+        (
+            "committed_round_packet_diff_uses_baseline",
+            lambda: test_committed_round_packet_diff_uses_baseline(root / "committed-packet-baseline"),
+        ),
+        (
+            "committed_round_packet_baseline_absent_is_head_equivalent",
+            lambda: test_committed_round_packet_baseline_absent_is_head_equivalent(
+                root / "committed-packet-head-equiv"
+            ),
+        ),
+        (
+            "committed_round_packet_captures_committed_and_dirty",
+            lambda: test_committed_round_packet_captures_committed_and_dirty(
+                root / "committed-packet-mixed"
+            ),
+        ),
+        (
+            "committed_round_packet_base_ref_falls_back_when_not_ancestor",
+            lambda: test_committed_round_packet_base_ref_falls_back_when_not_ancestor(
+                root / "committed-packet-guard"
+            ),
+        ),
+        (
+            "committed_round_manifest_to_packet_reviews_committed_work",
+            lambda: test_committed_round_manifest_to_packet_reviews_committed_work(
+                root / "committed-manifest-to-packet"
+            ),
+        ),
+        (
+            "committed_round_tracker_scope_renders_path_level_when_baseline",
+            lambda: test_committed_round_tracker_scope_renders_path_level_when_baseline(
+                root / "committed-tracker-scope-pathlevel"
+            ),
+        ),
+        (
+            "committed_round_base_ref_drives_manifest_attribution",
+            lambda: test_committed_round_base_ref_drives_manifest_attribution(
+                root / "committed-base-ref-attribution"
+            ),
         ),
         (
             "committed_unit_dedup_reviewed_not_resurrected",

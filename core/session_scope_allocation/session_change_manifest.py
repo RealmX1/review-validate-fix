@@ -1331,6 +1331,17 @@ def main() -> int:
         action="store_true",
         help="Debug compatibility mode: derive ownership from the full transcript instead of filtering at the live HEAD baseline.",
     )
+    parser.add_argument(
+        "--committed-baseline",
+        help="Lower-bound commit for committed-round attribution. When set, paths changed in "
+        "<committed-baseline>..HEAD (this round's own first-parent commits) are attributed as "
+        "owned even with no transcript tool evidence, and recorded as committed_round_baseline.",
+    )
+    parser.add_argument(
+        "--committed-base-ref",
+        help="Base branch ref (e.g. main) whose reachable commits are excluded from the "
+        "committed-round window, so rebased/merged base-branch work is not mis-attributed.",
+    )
     args = parser.parse_args()
 
     try:
@@ -1343,6 +1354,8 @@ def main() -> int:
             tracker_enabled=not args.no_tracker,
             tracker_run_id=args.tracker_run_id,
             include_all_transcript_ownership=args.include_all_transcript_ownership,
+            committed_baseline=args.committed_baseline,
+            committed_base_ref=args.committed_base_ref,
         )
     except Exception as exc:
         return fail(str(exc), 2)

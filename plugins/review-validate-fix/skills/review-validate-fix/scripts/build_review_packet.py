@@ -39,6 +39,55 @@ def git_root(repo: Path) -> Path:
     return Path(run_git(repo, ["rev-parse", "--show-toplevel"]).strip()).resolve()
 
 
+def commit_is_ancestor_of_head(repo: Path, commit: str) -> bool:
+    """True iff <commit> is an ancestor of HEAD (or HEAD itself).
+
+    Mirrors core.session_scope_allocation.committed_round_detection._commit_is_ancestor_of_head;
+    kept local so the packet builder does not import the Stop hook / core detection module just
+    for this guard. Uses its own check=False subprocess because run_git raises on the non-zero
+    exit that simply means "not an ancestor". `git merge-base --is-ancestor A B` exits 0 when A
+    is an ancestor of B.
+    """
+    if not commit:
+        return False
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0
+
+
+def resolve_owned_diff_base_ref(
+    repo: Path,
+    session_manifest: dict[str, Any] | None,
+    base_ref_override: str | None = None,
+) -> str:
+    """Resolve the diff base for the path-restricted owned-diff.
+
+    Precedence: explicit override (--base-ref) > manifest committed_round_baseline > "HEAD".
+    A candidate is honored only when it is a non-empty string AND an ancestor of HEAD, so a
+    clean (already-committed) worktree renders `git diff <baseline>` (committed work plus any
+    still-dirty edits since the baseline) instead of an empty `git diff HEAD`. When no committed
+    baseline applies, the literal "HEAD" reproduces today's `git diff HEAD` byte-for-byte (zero
+    regression for the pure-dirty common case). The ancestor guard fails safe to "HEAD" when the
+    baseline is not reachable from HEAD (branch reset/rebased behind it), avoiding reverse diffs.
+    """
+    candidates: list[str] = []
+    if isinstance(base_ref_override, str) and base_ref_override.strip():
+        candidates.append(base_ref_override.strip())
+    if session_manifest is not None:
+        manifest_baseline = session_manifest.get("committed_round_baseline")
+        if isinstance(manifest_baseline, str) and manifest_baseline.strip():
+            candidates.append(manifest_baseline.strip())
+    for candidate in candidates:
+        if commit_is_ancestor_of_head(repo, candidate):
+            return candidate
+    return "HEAD"
+
+
 def normalize_exclude_prefix(prefix: str) -> str | None:
     normalized = prefix.strip().replace("\\", "/")
     if not normalized or normalized.startswith("#"):
@@ -152,7 +201,11 @@ def string_list(value: Any) -> list[str]:
 def session_owned_paths(manifest: dict[str, Any] | None) -> list[str]:
     if manifest is None:
         return []
-    return sorted(set(string_list(manifest.get("owned_paths"))) | set(string_list(manifest.get("owned_dirty_paths"))))
+    return sorted(
+        set(string_list(manifest.get("owned_paths")))
+        | set(string_list(manifest.get("owned_dirty_paths")))
+        | set(string_list(manifest.get("owned_committed_round_paths")))
+    )
 
 
 def session_owned_dirty_paths(manifest: dict[str, Any] | None) -> list[str]:
@@ -164,6 +217,15 @@ def session_owned_dirty_paths(manifest: dict[str, Any] | None) -> list[str]:
     return sorted(set(dirty))
 
 
+def session_owned_committed_round_paths(manifest: dict[str, Any] | None) -> list[str]:
+    """Paths the session committed this round (clean worktree). On a clean worktree these
+    live ONLY in owned_committed_round_paths — owned_dirty_paths is empty — so the owned-diff
+    must union these in or already-committed work is silently dropped from the packet."""
+    if manifest is None:
+        return []
+    return sorted(set(string_list(manifest.get("owned_committed_round_paths"))))
+
+
 def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path: Path | None) -> None:
     if manifest is None:
         return
@@ -172,14 +234,14 @@ def validate_session_manifest(manifest: dict[str, Any] | None, root: Path, path:
         raise ValueError(f"session manifest is missing repo: {path}")
     if Path(manifest_repo).expanduser().resolve() != root:
         raise ValueError(f"session manifest repo does not match current repo: {manifest_repo} != {root}")
-    if not string_list(manifest.get("owned_paths")):
+    if not session_owned_paths(manifest):
         raise ValueError(f"session manifest has no owned paths; refusing to build empty Session-Owned scope: {path}")
 
 
-def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str]) -> str:
+def diff_for_paths(repo: Path, paths: list[str], exclude_prefixes: list[str], base_ref: str = "HEAD") -> str:
     if not paths:
         return ""
-    args = ["diff", "--find-renames", "HEAD", "--", *paths]
+    args = ["diff", "--find-renames", base_ref, "--", *paths]
     if exclude_prefixes:
         args.extend(exclude_pathspecs(exclude_prefixes))
     return run_git(repo, args).rstrip()
@@ -218,10 +280,20 @@ def filter_diff_for_hunk_headers(diff_text: str, allowed_headers: set[str]) -> s
     return "\n".join(output).rstrip()
 
 
-def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str]) -> str:
+def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_prefixes: list[str], base_ref: str = "HEAD") -> str:
     paths = [path for path in tracker_scope.get("paths", []) if isinstance(path, str)]
     if not paths:
         return ""
+    # When diffing against a committed-round baseline (base_ref != HEAD), the tracker's recorded
+    # hunk_headers were computed against a different base (HEAD-vs-worktree for dirty units,
+    # baseline..HEAD for committed units). A baseline-vs-worktree diff renumbers/merges hunks —
+    # most acutely on a file with both a committed and a residual-dirty hunk — so hunk-header
+    # filtering would match nothing and silently drop the whole Allocated diff (false-green). Fall
+    # back to path-level diffs of the already-allocated paths to keep the committed (and dirty)
+    # work visible. base_ref == "HEAD" keeps the exact hunk-filtered behavior below (byte-equal).
+    if base_ref != "HEAD":
+        chunks = [diff_for_paths(repo, [path], exclude_prefixes, base_ref) for path in paths]
+        return "\n".join(chunk for chunk in chunks if chunk).rstrip()
     hunk_headers_by_path: dict[str, set[str]] = {}
     path_level_paths: set[str] = set()
     for entry in tracker_scope.get("hunks", []):
@@ -238,10 +310,10 @@ def diff_for_tracker_scope(repo: Path, tracker_scope: dict[str, Any], exclude_pr
     chunks: list[str] = []
     for path in paths:
         if path in path_level_paths or path not in hunk_headers_by_path:
-            chunk = diff_for_paths(repo, [path], exclude_prefixes)
+            chunk = diff_for_paths(repo, [path], exclude_prefixes, base_ref)
         else:
             chunk = filter_diff_for_hunk_headers(
-                diff_for_paths(repo, [path], exclude_prefixes),
+                diff_for_paths(repo, [path], exclude_prefixes, base_ref),
                 hunk_headers_by_path[path],
             )
         if chunk:
@@ -258,6 +330,7 @@ def build_packet(
     background_files: list[str],
     exclude_prefixes: list[str] | None = None,
     allow_missing_session_context: bool = False,
+    base_ref_override: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
     all_exclude_prefixes = load_exclude_prefixes(root, exclude_prefixes or [])
@@ -354,17 +427,20 @@ def build_packet(
         else None,
     }
     owned_dirty_paths = session_owned_dirty_paths(session_manifest)
+    owned_committed_round_paths = session_owned_committed_round_paths(session_manifest)
     owned_diff_paths = [
         path for path in metadata["tracker_scope_paths"] if isinstance(path, str)
-    ] if tracker_scope is not None else owned_dirty_paths
+    ] if tracker_scope is not None else sorted(set(owned_dirty_paths) | set(owned_committed_round_paths))
     owned_path_set = set(owned_diff_paths)
+    owned_diff_base_ref = resolve_owned_diff_base_ref(root, session_manifest, base_ref_override)
     if tracker_scope is not None:
-        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes)
+        owned_diff = diff_for_tracker_scope(root, tracker_scope, all_exclude_prefixes, owned_diff_base_ref)
     else:
-        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes) if session_manifest is not None else ""
+        owned_diff = diff_for_paths(root, owned_diff_paths, all_exclude_prefixes, owned_diff_base_ref) if session_manifest is not None else ""
     owned_untracked = [path for path in untracked if path in owned_path_set]
     background_untracked = [path for path in untracked if path not in owned_path_set]
     metadata["session_owned_diff_paths"] = owned_diff_paths
+    metadata["owned_diff_base_ref"] = owned_diff_base_ref
     metadata["owned_untracked_count"] = len(owned_untracked) if session_manifest is not None else len(untracked)
     metadata["background_untracked_count"] = len(background_untracked) if session_manifest is not None else 0
 
@@ -657,6 +733,12 @@ def main() -> int:
     parser.add_argument("--background-file", action="append", default=[], help="Path known to be pre-existing background WIP. May be repeated.")
     parser.add_argument("--exclude-path-prefix", action="append", default=[], help=f"Path prefix to omit from status, diff, and untracked packet sections. May be repeated. {IGNORE_FILE} is also honored when present.")
     parser.add_argument(
+        "--base-ref",
+        help="Diff base for the path-restricted owned-diff. Overrides the manifest's committed_round_baseline "
+        "when set; honored only if it is an ancestor of HEAD, else falls back to HEAD. Use to review "
+        "already-committed work (git diff <base-ref>) without re-dirtying it.",
+    )
+    parser.add_argument(
         "--allow-missing-session-context",
         action="store_true",
         help="Debug-only escape hatch. Normal review runs must pass --session-context.",
@@ -680,6 +762,7 @@ def main() -> int:
             args.background_file,
             args.exclude_path_prefix,
             args.allow_missing_session_context,
+            args.base_ref,
         )
         if args.max_packet_bytes and metadata["packet_bytes"] > args.max_packet_bytes:
             raise ValueError(

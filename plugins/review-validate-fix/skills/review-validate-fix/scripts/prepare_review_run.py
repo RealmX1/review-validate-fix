@@ -614,8 +614,17 @@ def prepare_run(
     rvf_run_dir: Path | None = None,
     rvf_backend: str | None = None,
     tracker_scope: Path | None = None,
+    base_ref: str | None = None,
+    committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
+    # An explicit --base-ref (the documented manual lever for reviewing already-committed work)
+    # must also drive the manifest's committed-round attribution; otherwise a clean worktree
+    # produces empty owned paths and the packet build aborts with "no owned paths". Derive the
+    # committed baseline from it when the caller did not already supply one.
+    if base_ref and not committed_baseline:
+        committed_baseline = base_ref
     canonical_backend = normalize_rvf_backend(rvf_backend) or "manual"
     ledger = start_run(
         "prepare-run",
@@ -664,20 +673,23 @@ def prepare_run(
     packet_session_manifest: Path | None = None
     source_session_manifest: str | None = None
     if transcript is not None:
-        run(
-            [
-                sys.executable,
-                str(SESSION_MANIFEST),
-                "--repo",
-                str(root),
-                "--transcript",
-                str(transcript),
-                "--output",
-                str(session_manifest_path),
-                "--tracker-run-id",
-                ledger.run_id,
-            ]
-        )
+        manifest_cmd = [
+            sys.executable,
+            str(SESSION_MANIFEST),
+            "--repo",
+            str(root),
+            "--transcript",
+            str(transcript),
+            "--output",
+            str(session_manifest_path),
+            "--tracker-run-id",
+            ledger.run_id,
+        ]
+        if committed_baseline:
+            manifest_cmd.extend(["--committed-baseline", committed_baseline])
+        if committed_base_ref:
+            manifest_cmd.extend(["--committed-base-ref", committed_base_ref])
+        run(manifest_cmd)
         packet_session_manifest = session_manifest_path
         source_session_manifest = f"transcript:{transcript}"
     elif session_manifest is not None:
@@ -733,6 +745,8 @@ def prepare_run(
         packet_cmd.extend(["--session-manifest", str(packet_session_manifest)])
     if allow_missing_session_context:
         packet_cmd.append("--allow-missing-session-context")
+    if base_ref:
+        packet_cmd.extend(["--base-ref", base_ref])
     for path in primary_files:
         packet_cmd.extend(["--primary-file", path])
     for path in background_files:
@@ -1106,6 +1120,14 @@ def prepare_run_from_prep_file(
 
     target_repo = _resolve_prep_target_repo(payload)
 
+    # B1: the manual UPS hook stamps these when the session has committed-but-unreviewed work,
+    # so prepare_run builds a committed-round manifest (git diff <baseline> in the packet)
+    # instead of an empty git-diff-HEAD on a clean worktree — no git reset needed.
+    committed_baseline = payload.get("committed_round_baseline")
+    committed_baseline = committed_baseline.strip() if isinstance(committed_baseline, str) and committed_baseline.strip() else None
+    committed_base_ref = payload.get("committed_round_base_ref")
+    committed_base_ref = committed_base_ref.strip() if isinstance(committed_base_ref, str) and committed_base_ref.strip() else None
+
     transcript_path: Path | None = None
     transcript_candidate = transcript_override
     if transcript_candidate is None:
@@ -1166,6 +1188,8 @@ def prepare_run_from_prep_file(
             rvf_run_dir=rvf_run_dir,
             rvf_backend=rvf_backend,
             tracker_scope=tracker_scope,
+            committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
         )
 
     completed_state = state
@@ -1235,6 +1259,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--base-ref",
+        help=(
+            "Diff base for the packet's path-restricted owned-diff. Forwarded to "
+            "build_review_packet.py --base-ref; overrides the manifest's committed_round_baseline "
+            "and is honored only when it is an ancestor of HEAD (else falls back to HEAD). Use to "
+            "review already-committed work (git diff <base-ref>) without re-dirtying it."
+        ),
+    )
+    parser.add_argument(
         "--allow-missing-session-context",
         action="store_true",
         help="Debug-only escape hatch. Normal review runs must pass --session-context.",
@@ -1288,6 +1321,7 @@ def main() -> int:
             rvf_run_dir=Path(args.rvf_run_dir).expanduser().resolve() if args.rvf_run_dir else None,
             rvf_backend=args.rvf_backend,
             tracker_scope=tracker_scope,
+            base_ref=args.base_ref,
         )
     except Exception as exc:
         return fail(str(exc), 2)

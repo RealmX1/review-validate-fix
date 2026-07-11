@@ -424,6 +424,30 @@ def _create_manual_prep_file(
             "in_place_mode": True,
         },
     }
+    # B1: if this session has committed-but-unreviewed work (e.g. a clean worktree after the
+    # agent committed its slice), stamp the committed-round baseline so prepare_run builds a
+    # committed-round manifest and the packet renders `git diff <baseline>` — letting a manual
+    # /review-validate-fix review already-committed work without the fragile `git reset` hack.
+    # Empty committed set (pure-dirty / nothing committed this round) → left unset → zero change.
+    # 去-codex 后：检测/attribution 原语落在 core，直接导入（不再经 Stop hook 引擎重导入）。
+    try:
+        from core.session_scope_allocation import committed_round_detection  # noqa: PLC0415 - lazy, off the hot import path (manual triggers only)
+        from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: PLC0415
+        from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+        committed_repo = Path(origin_repo)
+        committed_baseline = committed_round_detection._resolve_committed_round_baseline(
+            committed_repo, current_kanban_task_id(event), session_id
+        )
+        committed_base_ref = committed_round_detection._resolve_committed_round_base_ref(committed_repo)
+        if committed_baseline and reviewable_unit_diff_tracker._list_committed_round_changed_paths(
+            committed_repo, committed_baseline, committed_base_ref
+        ):
+            payload["committed_round_baseline"] = committed_baseline
+            if committed_base_ref:
+                payload["committed_round_base_ref"] = committed_base_ref
+    except Exception:
+        pass
     rvf_prep_file.sweep_stale()
     record = rvf_prep_file.write_prep_file(payload)
     ledger.event(
