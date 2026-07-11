@@ -150,8 +150,12 @@ def test_manual_rvf_session_marker_dirty_change_does_not_suppress(tmp_path: Path
         )[0]
     )
 
-    assert "reason=manual_rvf_already_ran" not in payload["systemMessage"]
-    assert "reason=dry_run" in payload["systemMessage"]
+    # S4：manual marker（TTL 守卫，保留）不抑制这次**不同 scope** 的 dirty change → 前进到决策点
+    # 注入（不是 manual_rvf_already_ran，也不再是自动 dry_run fork）。
+    assert "reason=manual_rvf_already_ran" not in str(payload.get("systemMessage", ""))
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "changed.txt" in str(payload["reason"]), payload["reason"]
 
 
 def test_manual_rvf_session_marker_expired_does_not_read(tmp_path: Path) -> None:

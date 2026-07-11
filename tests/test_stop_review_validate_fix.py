@@ -237,6 +237,13 @@ def invoke(
     env.pop("CODEX_THREAD_ID", None)
     if config is not None:
         env["CODEX_RVF_CONFIG"] = str(config)
+    # S4 隔离铁律：Stop hook 决策点信使会铸决策 token / 写注入尝试 ledger / declined 冷却，默认落盘根
+    # 为 $RVF_HOME/~/.rvf。上面的 env 清理已把 RVF_HOME 一并 pop（RVF_ 前缀），故此处**必须**显式把
+    # RVF_HOME 指向隔离 tmp，否则任何触达决策点的测试都会污染真实 ~/.rvf（live infra，假绿）。
+    if state_dir is not None:
+        env["RVF_HOME"] = str(state_dir / "rvf-home")
+    else:
+        env["RVF_HOME"] = tempfile.mkdtemp(prefix="rvf-test-home-")
     if state_dir is not None:
         env["CODEX_RVF_STATE_DIR"] = str(state_dir)
         env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
@@ -358,6 +365,56 @@ def assert_skip_reason(stdout: str, expected: str) -> dict[str, object]:
     assert summary["status"] == "skipped"
     assert expected in str(summary.get("message"))
     return payload
+
+
+# --- S4：Stop hook 决策点信使的测试辅助（读隔离 RVF_HOME 下的 token / 注入尝试 ledger）---
+def rvf_home_dir(state: Path) -> Path:
+    """invoke() 把 RVF_HOME 指向 ``state/"rvf-home"``；决策 token store / 注入 ledger 落盘于此。"""
+    return state / "rvf-home"
+
+
+def decision_token_records(state: Path) -> list[dict[str, object]]:
+    tdir = rvf_home_dir(state) / "agentic-initiation-decision-tokens"
+    if not tdir.is_dir():
+        return []
+    return [
+        json.loads(p.read_text(encoding="utf-8"))
+        for p in sorted(tdir.glob("*.json"))
+    ]
+
+
+def injection_attempt_records(state: Path) -> list[dict[str, object]]:
+    ldir = rvf_home_dir(state) / "agentic-initiation-injection-attempt-ledger"
+    records: list[dict[str, object]] = []
+    if not ldir.is_dir():
+        return records
+    for p in sorted(ldir.glob("*.jsonl")):
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
+def assert_decision_point_injection(
+    stdout: str,
+    *,
+    expect_paths: tuple[str, ...] = (),
+    forbid_paths: tuple[str, ...] = (),
+) -> tuple[dict[str, object], str]:
+    """断言 Stop hook 返回了 S4 决策点注入 block（模型可见 ``{"decision":"block","reason":...}``），
+    并回出注入的 token。可选断言 reason 里含/不含某些候选路径。"""
+    payload = parse_json(stdout)
+    assert payload.get("decision") == "block", payload
+    reason = str(payload["reason"])
+    assert "REVIEW-VALIDATE-FIX 发起决策点" in reason, reason[:200]
+    assert "RVF_DECISION_TOKEN=" in reason, reason[:200]
+    token = reason.split("RVF_DECISION_TOKEN=", 1)[1].splitlines()[0].strip()
+    for p in expect_paths:
+        assert p in reason, (p, reason)
+    for p in forbid_paths:
+        assert p not in reason, (p, reason)
+    assert "已注入 RVF 发起决策点" in str(payload.get("systemMessage", "")), payload
+    return payload, token
 
 
 def load_hook_module():
@@ -828,9 +885,11 @@ def test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_ho
         }
     )
 
-    payload = assert_skip_reason(stdout, "clean")
+    # goal 守卫**不**触发（reason 非 codex_goal_mode），Stop 正常前进；clean repo 无候选 → S4 的
+    # decision_point_no_candidates 静默停（原 clean_repo 的语义等价物）。
+    payload = assert_skip_reason(stdout, "无可审候选改动")
     summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "clean_repo"
+    assert summary["reason_code"] == "decision_point_no_candidates"
 
 
 def test_codex_completed_goal_does_not_skip_direct_stop_hook(tmp_path: Path) -> None:
@@ -847,9 +906,10 @@ def test_codex_completed_goal_does_not_skip_direct_stop_hook(tmp_path: Path) -> 
         }
     )
 
-    payload = assert_skip_reason(stdout, "clean")
+    # 同上：completed goal 也不触发 goal 守卫，Stop 前进到 clean 无候选 → decision_point_no_candidates。
+    payload = assert_skip_reason(stdout, "无可审候选改动")
     summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "clean_repo"
+    assert summary["reason_code"] == "decision_point_no_candidates"
 
 
 def test_env_suppression_skips(tmp_path: Path) -> None:
@@ -960,7 +1020,11 @@ def test_kanban_task_suppression_marker_skips_without_prompt_marker(tmp_path: Pa
     assert summary["reason_code"] == "suppressed"
 
 
-def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
+def test_session_without_owned_dirty_still_injects_decision_point(tmp_path: Path) -> None:
+    """S4 迁移（原 ..._skips_fork）：轻量候选摘要（R1）是 git-based，**不做 session-transcript 归属
+    的 no-session-owned-dirty 精细判定**（那属于 route_reviewable_scope 的重量级 precheck，已后置到
+    CLI start）。ownership 仅走 tracker 缓存 best-effort：背景 dirty 文件未登记 → unattributed →
+    默认纳入候选 → 注入决策点，由主 agent 收到注入后自行 decline「非我改动」。"""
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     transcript = tmp_path / "session.jsonl"
     state = tmp_path / "state"
@@ -976,25 +1040,16 @@ def test_session_without_owned_dirty_skips_fork(tmp_path: Path) -> None:
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
-        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
 
-    # Slice 3 reason-code rename: dispatcher / packet-side assertions still
-    # see the legacy substring (D4 transitional alias) but the structured
-    # reason_code field has flipped to the new name.
-    payload = assert_skip_reason(stdout, "no unassigned review scope")
-    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "no_unassigned_review_scope"
-    assert summary.get("reason_code_legacy_alias") == "no_session_owned_dirty"
-    assert summary["session_change_type"] == "no_codebase_changes"
-    assert "app_server_requests_path" not in summary
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
 
 
-def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -> None:
-    """`RVF_TRACKER_DISABLE=1` must preserve Phase-0 reason codes byte-
-    for-byte so disable-mode users see no churn during the Slice 3 rename."""
+def test_session_without_owned_dirty_injects_even_with_tracker_disabled(tmp: Path) -> None:
+    """S4 迁移（原 ..._legacy_disable_keeps_old_codes）：`RVF_TRACKER_DISABLE=1` 下候选摘要的
+    ownership 读取直接返回空（全 unattributed）→ 背景 dirty 文件仍纳入候选并注入。旧的
+    session-scope reason_code（no_session_owned_dirty）属已退役的 Stop 层 precheck，S4 不再经过。"""
     dirty = init_repo(tmp / "dirty", dirty=True)
     transcript = tmp / "session.jsonl"
     state = tmp / "state"
@@ -1011,16 +1066,12 @@ def test_session_without_owned_dirty_legacy_disable_keeps_old_codes(tmp: Path) -
             "transcript_path": str(transcript),
         },
         extra_env={
-            "CODEX_RVF_FORK_MODE": "dry-run",
             "RVF_TRACKER_DISABLE": "1",
         },
         state_dir=state,
     )
 
-    payload = assert_skip_reason(stdout, "no session-owned dirty paths")
-    assert "reason=no_session_owned_dirty" in payload["systemMessage"]
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "no_session_owned_dirty"
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
 
 
 def _make_test_ledger(module, state: Path):
@@ -2097,18 +2148,22 @@ def test_auto_mode_creates_cline_kanban_task_by_default(tmp_path: Path) -> None:
         )[0]
     )
 
-    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    # S4：auto 模式初始发起（backend=kanban，非 kanban-task 内）不再自动创建 Cline Kanban task，
+    # 改注入决策点给主 agent；task 创建后置到 rvf-agent dispatch。fake client 不应被调到 create/start。
+    assert payload.get("decision") == "block", payload
+    assert "已注入 RVF 发起决策点" in str(payload.get("systemMessage", "")), payload
     latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-started"
-    assert latest["backend"] == "kanban"
-    assert latest["backend_selection_mode"] == "auto"
-    assert latest["cline_kanban_task_id"] == "task-auto"
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
+    assert latest["status"] == "decision-point-injected"
+    calls = (
+        [
+            json.loads(line)
+            for line in client_calls.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if client_calls.exists()
+        else []
+    )
+    assert not any(call["argv"][0] in ("create", "start") for call in calls), calls
 
 
 def test_auto_mode_reports_kanban_unavailable_without_default_gui_fallback(tmp_path: Path) -> None:
@@ -3429,17 +3484,14 @@ def _committed_round_session_without_tool_evidence(path: Path, repo: Path, sessi
     return transcript
 
 
-def test_committed_round_clean_repo_routes_to_review(tmp_path: Path) -> None:
-    """Regression for the commit-9127824 gate gap: once the agent commits this
-    round's work the tree is clean, yet the committed-but-unreviewed change must
-    still be routed to review instead of short-circuiting at the dirty-only gate.
+def test_committed_round_clean_repo_injects_decision_point(tmp_path: Path) -> None:
+    """S4 迁移（原 test_committed_round_clean_repo_routes_to_review）：commit-9127824 gate 缺口的
+    committed-round e2e，现改挂到「signal→决策点注入」新路径上。
 
-    Exercises the REAL Stop path end-to-end (the e2e missing when 9127824
-    landed): UserPromptSubmit records baseline = HEAD@prompt, the work is
-    committed, then the Stop hook must take the new
-    `committed_round_route_selected` branch, reach the committed-aware downstream
-    (`tracker_refresh_started`), allocate the committed unit
-    (`tracker_scope_allocated`), and decide `dry_run` — NOT `clean_repo`."""
+    一旦 agent 提交本轮工作、工作树变 clean，「已提交但未审」的改动仍不得被 dirty-only gate 短路
+    吞掉——但 S4 后 Stop hook **不再自动 fork**，而是把该 committed-but-unreviewed 改动放进候选摘要、
+    铸决策 token、以 {"decision":"block"} 注入给主 agent（由 agent 显式 start/decline）。regression
+    仍成立：committed 改动必须出现在注入的候选摘要里，而非静默 clean skip。"""
     repo = _init_committed_round_repo(tmp_path)
     state = tmp_path / "state"
     session_id = "11111111-2222-3333-4444-555555555555"
@@ -3469,26 +3521,28 @@ def test_committed_round_clean_repo_routes_to_review(tmp_path: Path) -> None:
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
-        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
-    summary = latest_summary(state)
-    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    # committed-but-unreviewed 的 f.txt 必须出现在注入的候选摘要里，而非 clean skip。
+    _payload, token = assert_decision_point_injection(stdout, expect_paths=("f.txt",))
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_route_selected" in events, events
-    assert "tracker_refresh_started" in events, events
-    assert "tracker_scope_allocated" in events, events
+    assert "decision_point_injected" in events, events
+    # 决策 token 落盘 + 注入尝试 ledger 记录（含 committed-but-unreviewed 标注）。
+    tokens = decision_token_records(state)
+    assert any(t.get("token") == token and t.get("state") == "injected" for t in tokens), tokens
+    attempts = injection_attempt_records(state)
+    assert any(
+        a.get("mint_outcome") == "injected" and a.get("has_committed_but_unreviewed") is True
+        for a in attempts
+    ), attempts
 
 
 def test_clean_repo_with_committed_work_but_no_marker_skips(tmp_path: Path) -> None:
-    """Zero-regression guard: a clean tree with committed work but NO
-    round-baseline marker (UserPromptSubmit never ran / marker expired) must
-    still take the historical `clean_repo` skip. Without an active baseline the
-    committed detection stays fully off — byte-identical to pre-fix behavior."""
+    """Zero-regression guard（S4 迁移）：a clean tree with committed work but NO
+    round-baseline marker (UserPromptSubmit never ran / marker expired) 下界检测全关 →
+    候选摘要为空 → 决策点静默停（`decision_point_no_candidates`），不注入、不铸 token。等价于
+    pre-fix 的 clean skip：无 active baseline 时 committed 检测完全不生效。"""
     repo = _init_committed_round_repo(tmp_path)
     _commit_round_work(repo)
     assert _porcelain(repo) == ""
@@ -3501,7 +3555,10 @@ def test_clean_repo_with_committed_work_but_no_marker_skips(tmp_path: Path) -> N
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "clean")
+    assert_skip_reason(stdout, "无可审候选改动")
+    # 无候选 → 不写注入尝试 ledger（保持 canary 分母干净），不铸 token。
+    assert injection_attempt_records(state) == []
+    assert decision_token_records(state) == []
 
 
 def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -> None:
@@ -3554,7 +3611,8 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
     )
     assert f"RVF_ROUND_BASELINE_SEALED head={landed_head}" in seal.stdout, (seal.stdout, seal.stderr)
 
-    # Stop hook now sees an empty committed-round window -> clean skip, no route.
+    # Stop hook now sees an empty committed-round window -> 候选摘要为空 → 决策点静默停，不注入、不铸
+    # token（S4 迁移：rvf-land 封窗后无 over-dispatch 的对偶——现在是「无 over-injection」）。
     stdout, _ = invoke(
         {
             "cwd": str(repo),
@@ -3564,9 +3622,10 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "clean")
+    assert_skip_reason(stdout, "无可审候选改动")
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_route_selected" not in events, events
+    assert "decision_point_injected" not in events, events
+    assert decision_token_records(state) == []
 
 
 def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_path: Path) -> None:
@@ -3632,7 +3691,8 @@ def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_pat
         task_id=None, session_id=session_id, root=state
     ) == c2
 
-    # Stop hook must prefer high-water (C1) and route the orphan C1..C2 — not skip clean.
+    # Stop hook must prefer high-water (C1) and surface the orphan C1..C2 (g.txt) in the injected
+    # candidate summary — not skip clean（S4 迁移：高水位窗口修复的对偶，现在是「注入而非派发」）。
     stdout, _ = invoke(
         {
             "cwd": str(repo),
@@ -3640,28 +3700,19 @@ def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_pat
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
-        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
-    payload = parse_json(stdout)
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
-    summary = latest_summary(state)
-    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("g.txt",))
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_route_selected" in events, events
-    assert "tracker_scope_allocated" in events, events
+    assert "decision_point_injected" in events, events
 
 
-def test_committed_round_without_transcript_evidence_routes_to_review(tmp_path: Path) -> None:
-    """Second-gate regression — reproduces rvf-20260624T054404Z. The round's work
-    is committed by a sub-agent / headless runner, so the parent transcript carries
-    NO apply_patch/write/exec record. 218c5ed's first gate routes it, but pillar ③
-    previously dropped it for lack of transcript evidence → the downstream
-    `no_session_owned_dirty` (session_scope_clean) skip fired and the user had to
-    trigger RVF by hand. After the fix the path must be attributed
-    (evidence='committed_round_git'), reach `tracker_scope_allocated`, and decide
-    `dry_run` — NOT skip."""
+def test_committed_round_without_transcript_evidence_injects_decision_point(tmp_path: Path) -> None:
+    """Second-gate regression（S4 迁移，原 ..._routes_to_review）— reproduces
+    rvf-20260624T054404Z。本轮工作由 sub-agent / headless runner 提交，父 transcript **无**
+    apply_patch/write/exec 记录。候选摘要下界复用 committed-round 的 SHA 同源 resolver（不依赖
+    transcript 工具证据），故 committed f.txt 仍进候选摘要并被注入为决策点——而非 pillar ③ 的
+    `no_session_owned_dirty` 静默 skip。"""
     repo = _init_committed_round_repo(tmp_path)
     state = tmp_path / "state"
     session_id = "66666666-7777-8888-9999-aaaaaaaaaaaa"
@@ -3687,25 +3738,19 @@ def test_committed_round_without_transcript_evidence_routes_to_review(tmp_path: 
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
-        extra_env={"CODEX_RVF_MODE": "fork", "CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in str(payload["systemMessage"]), payload
-    summary = latest_summary(state)
-    assert summary["reason_code"] == "dry_run", summary["reason_code"]
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("f.txt",))
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_route_selected" in events, events
-    assert "tracker_scope_allocated" in events, events
+    assert "decision_point_injected" in events, events
 
 
-def test_committed_round_skip_review_trailer_excludes_and_audits(tmp_path: Path) -> None:
-    """Per-commit opt-out e2e: a round whose only commit carries the
-    `RVF-Skip-Review` trailer must NOT route to review (historical clean_repo
-    skip), yet must leave a `committed_round_skip_excluded` audit event so the
-    exclusion is never silent and `committed_round_route_selected` never fires."""
+def test_committed_round_skip_review_trailer_excludes_from_candidate_summary(tmp_path: Path) -> None:
+    """Per-commit opt-out e2e（S4 迁移，原 ..._excludes_and_audits）：a round whose only commit
+    carries the `RVF-Skip-Review` trailer 被候选摘要排除 → 候选为空 → 决策点静默停，绝不注入决策
+    token（opt-out 的 commit 不会被重新发起审查）。注：旧的 `committed_round_skip_excluded` 审计
+    事件属于已退役的 maybe_route_committed_round_scope 初始 fork 路径，S4 不再经过。"""
     repo = _init_committed_round_repo(tmp_path)
     state = tmp_path / "state"
     session_id = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
@@ -3737,10 +3782,13 @@ def test_committed_round_skip_review_trailer_excludes_and_audits(tmp_path: Path)
         state_dir=state,
     )
 
-    assert_skip_reason(stdout, "clean")
+    # S4 迁移：skip-review trailer 的 commit 被候选摘要（_list_committed_round_changed_paths 内建
+    # skip-review 排除）排除 → 候选为空 → 决策点静默停，不注入、不铸 token（保证 opt-out 的 commit
+    # 不会被重新发起审查）。
+    assert_skip_reason(stdout, "无可审候选改动")
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_skip_excluded" in events, events
-    assert "committed_round_route_selected" not in events, events
+    assert "decision_point_injected" not in events, events
+    assert decision_token_records(state) == []
 
 
 def test_committed_round_excludes_rebased_base_branch_commits(tmp_path: Path) -> None:
@@ -3792,12 +3840,19 @@ def test_committed_round_excludes_rebased_base_branch_commits(tmp_path: Path) ->
         state_dir=state,
     )
 
-    assert_skip_reason(stdout, "clean")
+    # S4 迁移：rebase 压平到第一父链的 base 提交被候选摘要的 base-ref（`^main`）排除 → 候选为空
+    # → 决策点静默停，不注入（over-trigger 的对偶：现在是「无 over-injection」）。
+    assert_skip_reason(stdout, "无可审候选改动")
     events = {e.get("event") for e in latest_events(state)}
-    assert "committed_round_route_selected" not in events, events
+    assert "decision_point_injected" not in events, events
+    assert decision_token_records(state) == []
 
 
-def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
+def test_plan_document_only_injects_decision_point(tmp_path: Path) -> None:
+    """S4 迁移（原 ..._routes_out_of_full_rvf）：plan/doc-only 的 Stop 层特化路由
+    （route_reviewable_scope 里的 `plan_doc_review_routed` → Plan/Doc Maintainer Review）已后置到
+    CLI start 的重量级准备阶段。Stop hook 只把 docs 计划文件放进候选摘要、注入决策点，由主 agent
+    start 后再决定 plan-doc 路由——故 Stop 层不再出现 `plan_doc_review_routed`。"""
     repo = init_repo(tmp_path / "doc-plan", dirty=False)
     state = tmp_path / "state"
     plan = repo / "docs" / "codebase-slimdown-plan.md"
@@ -3810,25 +3865,21 @@ def test_plan_document_only_routes_out_of_full_rvf(tmp_path: Path) -> None:
             "session_id": "plan-doc-session",
             "stop_hook_active": False,
         },
-        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "decision" not in payload
-    assert "reason=plan_document_only" in payload["systemMessage"], payload["systemMessage"]
-    summary = latest_summary(state)
-    assert summary["status"] == "skipped"
-    assert "Plan/Doc Maintainer Review" in summary["message"]
-    assert summary["reason_code"] == "plan_document_only"
-    assert summary["route"] == "plan-doc-maintainer-review"
-    assert summary["changed_paths"] == ["docs/codebase-slimdown-plan.md"]
-    assert summary["rvf_backend_raw"] == "plan-doc-review"
+    _payload, _token = assert_decision_point_injection(
+        stdout, expect_paths=("docs/codebase-slimdown-plan.md",)
+    )
     events = latest_events(state)
-    assert any(event.get("event") == "plan_doc_review_routed" for event in events)
+    assert not any(event.get("event") == "plan_doc_review_routed" for event in events)
 
 
-def test_read_only_session_with_background_plan_docs_does_not_plan_route(tmp_path: Path) -> None:
+def test_read_only_session_with_background_plan_docs_injects_decision_point(tmp_path: Path) -> None:
+    """S4 迁移（原 ..._does_not_plan_route）：轻量候选摘要（R1）是**git-based**、不做 session-transcript
+    归属，故背景里一份 untracked plan 文档（ownership=unattributed → 默认纳入）会进候选摘要并被注入
+    为决策点。read-only session 的 no-scope 语义已移出 Stop 层（agent 收到注入后可 decline「非我改动」）。
+    仍断言 Stop 层不再出现 plan-doc 特化路由事件。"""
     repo = init_repo(tmp_path / "doc-plan-background", dirty=False)
     state = tmp_path / "state"
     plan = repo / "docs" / "codebase-slimdown-plan.md"
@@ -3848,17 +3899,12 @@ def test_read_only_session_with_background_plan_docs_does_not_plan_route(tmp_pat
             "stop_hook_active": False,
             "transcript_path": str(transcript),
         },
-        extra_env={"CODEX_RVF_FORK_MODE": "dry-run"},
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "reason=plan_document_only" not in payload["systemMessage"], payload["systemMessage"]
-    assert "reason=no_unassigned_review_scope" in payload["systemMessage"], payload["systemMessage"]
-    summary = latest_summary(state)
-    assert summary["reason_code"] == "no_unassigned_review_scope"
-    assert summary["session_change_type"] == "no_codebase_changes"
-    assert summary["session_owned_dirty_paths"] == []
+    _payload, _token = assert_decision_point_injection(
+        stdout, expect_paths=("docs/codebase-slimdown-plan.md",)
+    )
     events = latest_events(state)
     assert not any(event.get("event") == "plan_doc_review_routed" for event in events)
 
@@ -3879,10 +3925,11 @@ def test_plan_document_route_does_not_hide_source_rename(tmp_path: Path) -> None
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "reason=plan_document_only" not in payload["systemMessage"], payload["systemMessage"]
-    summary = latest_summary(state)
-    assert summary["status"] == "dry-run"
+    # S4：rename 到 plan 路径不再在 Stop 层被 plan-doc 分类吞掉——候选摘要含 source（changed.txt
+    # 删除侧）与 target（docs/…md 新增侧）两侧路径，由 agent start 后再判 plan-doc 路由。
+    _payload, _token = assert_decision_point_injection(
+        stdout, expect_paths=("changed.txt", "docs/codebase-slimdown-plan.md")
+    )
 
 
 def test_no_git_cwd_skips_even_with_dirty_trusted_repo(tmp_path: Path) -> None:
@@ -3942,13 +3989,11 @@ def test_stop_event_transcript_path_overrides_bad_env_thread_id(tmp_path: Path) 
             state_dir=state,
         )[0]
     )
-    assert "decision" not in payload
-    latest = latest_summary(state)
-    assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000099"
-    assert latest["parent_thread_path"] == str(transcript.resolve())
-    fork_params = app_server_requests(latest)[0]["params"]
-    assert fork_params["threadId"] == "00000000-0000-0000-0000-000000000099"
-    assert fork_params["path"] == str(transcript.resolve())
+    # S4：dirty repo 初始发起注入决策点。legacy-gui fork 的 threadId/rollout-path 解析随 auto-fork
+    # 退场（其解析器仍供 kanban-followup 延续路径复用，在别处覆盖），故此处只断言注入本身成立。
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "changed.txt" in str(payload["reason"]), payload["reason"]
 
 
 def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) -> None:
@@ -3971,11 +4016,10 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) ->
             state_dir=state,
         )[0]
     )
-    assert "decision" not in payload
-    latest = latest_summary(state)
-    assert latest["parent_thread_id"] == "00000000-0000-0000-0000-000000000100"
-    assert latest["parent_thread_path"] is None
-    assert "path" not in app_server_requests(latest)[0]["params"]
+    # S4：同上，dirty repo 初始发起注入决策点；log_path 从不被当作 fork rollout（该路径已退场）。
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "changed.txt" in str(payload["reason"]), payload["reason"]
 
 
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
@@ -4509,13 +4553,13 @@ def test_incomplete_fork_marker_in_transcript_does_not_skip_dirty_repo(tmp_path:
             state_dir=state,
         )[0]
     )
-    assert "decision" not in payload
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
-    latest = latest_summary(state)
-    assert latest["status"] == "dry-run"
-    prompt = prompt_text(latest)
-    assert "RVF_FORKED_REVIEW_VALIDATE_FIX" in prompt
-    assert str(dirty) in prompt
+    # S4：不完整 fork marker（无 metadata）→ fork_context **不**命中 → dirty repo 注入决策点，
+    # 且注入 reason 里**不含** fork 标注（未误把普通会话当成 fork）。
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "changed.txt" in str(payload["reason"]), payload["reason"]
+    assert "疑似已在一个 RVF fork 上下文内" not in str(payload["reason"]), payload["reason"]
+    assert str(dirty) in str(payload["reason"])
 
 
 def test_missing_cwd_skips_and_requests_target_repo(tmp_path: Path) -> None:
@@ -4535,6 +4579,198 @@ def test_log_unavailable_does_not_break_hook_payload(tmp_path: Path) -> None:
     assert "decision" not in payload
     assert payload["continue"] is True
     assert "log_unavailable=true" in payload["systemMessage"]
+
+
+# ---------------------------------------------------------------------------
+# S4：决策点信使新增用例（负路径不变量 / 失效路径 TTL-lost·declined·熔断 / 护栏矩阵）
+# ---------------------------------------------------------------------------
+
+RVF_AGENT_CLI = SCRIPT.with_name("rvf_agent_decision_cli.py")
+
+
+def _run_rvf_agent(state: Path, cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """在与 Stop hook 同一隔离 RVF_HOME（state/"rvf-home"）下驱动**真实** rvf-agent 决策 CLI。
+
+    这样 CLI 铸/读的决策 token 与 Stop hook 落在同一根，验证 hook↔CLI 的落盘协同（生产环境靠
+    共享 $HOME/~/.rvf，测试靠共享 RVF_HOME）。绝不写真实 ~/.rvf / ~/.codex。"""
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith("CODEX_RVF_") or name.startswith("RVF_") or name.startswith("KANBAN_") or name.startswith("CLINE_KANBAN_"):
+            env.pop(name, None)
+    env["RVF_HOME"] = str(state / "rvf-home")
+    env["CODEX_RVF_STATE_DIR"] = str(state)
+    return subprocess.run(
+        [sys.executable, str(RVF_AGENT_CLI), *args],
+        cwd=str(cwd),
+        input="",
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def _expire_decision_token_on_disk(state: Path, token: str) -> None:
+    """把某决策 token 的 ``expires_at`` 改写到过去（测试用 TTL 快进，无副作用地模拟超时）。"""
+    token_path = rvf_home_dir(state) / "agentic-initiation-decision-tokens" / f"{token}.json"
+    payload = json.loads(token_path.read_text(encoding="utf-8"))
+    payload["expires_at"] = "2000-01-01T00:00:00Z"
+    token_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def test_decision_point_nonempty_candidates_always_leave_injection_ledger_record(tmp_path: Path) -> None:
+    """负路径不变量（计划 §五.3，评审共识）：候选非空 ⇒ 注入尝试 ledger 必有一条记录（走注入路径），
+    **或**在候选阶段之前被护栏显式短路并留下 skip 记录。两条分支都验证，杜绝「静默吞掉可审改动」。"""
+    # 分支 A：dirty repo（候选非空）→ 注入 → 注入尝试 ledger 有 injected 记录。
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    stdout, _ = invoke(
+        {"cwd": str(dirty), "session_id": "inv-a", "stop_hook_active": False},
+        state_dir=state,
+    )
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+    attempts = injection_attempt_records(state)
+    assert attempts, "候选非空必须在注入尝试 ledger 留记录"
+    assert any(a.get("mint_outcome") == "injected" and a.get("candidate_path_count", 0) >= 1 for a in attempts), attempts
+
+    # 分支 B：同样 dirty（候选非空）但 suppress 护栏在候选阶段之前短路 → 无注入 ledger、但有显式
+    # skip 记录（护栏生效）。
+    state_b = tmp_path / "state-b"
+    stdout_b, _ = invoke(
+        {"cwd": str(dirty), "session_id": "inv-b", "stop_hook_active": False},
+        extra_env={"RVF_SUPPRESS_STOP_HOOK": "1"},
+        state_dir=state_b,
+    )
+    assert "reason=suppressed" in parse_json(stdout_b)["systemMessage"]
+    assert injection_attempt_records(state_b) == [], "护栏短路时不应写注入尝试 ledger"
+    assert any(e.get("status") == "skipped" for e in latest_events(state_b)), "护栏短路必须留显式 skip 记录"
+
+
+def test_decision_point_declined_cooldown_suppresses_reinjection(tmp_path: Path) -> None:
+    """失效路径（declined 冷却）：agent 经 rvf-agent decline 谢绝后，同一候选指纹的下一次 Stop 不再
+    注入（R25：指纹未变不再 nag），且注入尝试 ledger 留 declined_cooldown 记录。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    stdout, _ = invoke(
+        {"cwd": str(dirty), "session_id": "decl-1", "stop_hook_active": False},
+        state_dir=state,
+    )
+    _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+
+    # 真实 CLI 谢绝该 token（指纹入 declined 冷却表）。
+    result = _run_rvf_agent(state, dirty, "decline", "--token", token, "--reason", "这是我刚跑完的 RVF 结果，不重复审")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    # 同一 dirty（同指纹）再次 Stop → 命中 declined 冷却 → 不注入、静默停。
+    stdout2, _ = invoke(
+        {"cwd": str(dirty), "session_id": "decl-1", "stop_hook_active": False},
+        state_dir=state,
+    )
+    payload2 = parse_json(stdout2)
+    assert "decision" not in payload2, payload2
+    attempts = injection_attempt_records(state)
+    assert any(a.get("mint_outcome") == "declined_cooldown" for a in attempts), attempts
+
+
+def test_decision_point_circuit_breaker_suppresses_after_repeated_mints(tmp_path: Path) -> None:
+    """失效路径（铸造频率熔断，R24 裁决 b）：同 session 短窗口内第 3 次铸造请求（不同指纹，避开去重）
+    触发熔断 → 静默停、不注入，注入尝试 ledger 留 circuit_breaker_tripped 记录 + systemMessage 告警。"""
+    repo = init_repo(tmp_path / "repo", dirty=False)
+    run(["git", "config", "user.email", "t@t.t"], repo)
+    run(["git", "config", "user.name", "T"], repo)
+    (repo / "f.txt").write_text("v0\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base"], repo)
+    state = tmp_path / "state"
+    session = "breaker-1"
+
+    # 前两次：不同内容（不同指纹）→ 各自铸 token 并注入。
+    for i in (1, 2):
+        (repo / "f.txt").write_text(f"v0\nchange {i}\n", encoding="utf-8")
+        stdout, _ = invoke(
+            {"cwd": str(repo), "session_id": session, "stop_hook_active": False},
+            state_dir=state,
+        )
+        assert_decision_point_injection(stdout, expect_paths=("f.txt",))
+
+    # 第三次：又是不同内容（第 3 次铸造请求）→ 熔断 → 静默停、不注入。
+    (repo / "f.txt").write_text("v0\nchange 3\n", encoding="utf-8")
+    stdout3, _ = invoke(
+        {"cwd": str(repo), "session_id": session, "stop_hook_active": False},
+        state_dir=state,
+    )
+    payload3 = parse_json(stdout3)
+    assert "decision" not in payload3, payload3
+    assert "reason=decision_point_circuit_breaker_tripped" in str(payload3["systemMessage"]), payload3
+    assert "熔断" in str(summary_from_payload(payload3)["message"]), payload3
+    attempts = injection_attempt_records(state)
+    assert any(a.get("mint_outcome") == "circuit_breaker_tripped" for a in attempts), attempts
+
+
+def test_decision_point_receipt_ttl_lost_warns_without_retry(tmp_path: Path) -> None:
+    """失效路径（投递回执 TTL lost）：上一枚 token TTL 超时、且 transcript 无投递痕迹 → 下一次 Stop 的
+    回执 reconcile 标其为 lost 并 systemMessage 告警用户，**绝不自动重试**（87e9338 pure-arm 教训）。"""
+    repo = init_repo(tmp_path / "repo", dirty=False)
+    run(["git", "config", "user.email", "t@t.t"], repo)
+    run(["git", "config", "user.name", "T"], repo)
+    (repo / "f.txt").write_text("v0\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base"], repo)
+    state = tmp_path / "state"
+    session = "lost-1"
+    # 用一个不含 token 痕迹的 transcript（回执信号 (b) 探不到 → 判 lost 而非 expired）。
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": session, "cwd": str(repo)}}) + "\n",
+        encoding="utf-8",
+    )
+
+    # 第一次：dirty → 注入 token T1。
+    (repo / "f.txt").write_text("v0\nchange 1\n", encoding="utf-8")
+    stdout, _ = invoke(
+        {"cwd": str(repo), "session_id": session, "stop_hook_active": False, "transcript_path": str(transcript)},
+        state_dir=state,
+    )
+    _payload, token1 = assert_decision_point_injection(stdout)
+
+    # 快进 T1 的 TTL 到过去（模拟超时无任一回执信号）。
+    _expire_decision_token_on_disk(state, token1)
+
+    # 第二次：改内容（不同指纹）→ reconcile 上一枚 T1：TTL 过期 + transcript 无痕迹 → 标 lost + 告警。
+    (repo / "f.txt").write_text("v0\nchange 2\n", encoding="utf-8")
+    stdout2, _ = invoke(
+        {"cwd": str(repo), "session_id": session, "stop_hook_active": False, "transcript_path": str(transcript)},
+        state_dir=state,
+    )
+    payload2 = parse_json(stdout2)
+    # 第二次仍会为**新**指纹注入自己的决策点，但 systemMessage 必须并入 T1 的 lost 告警。
+    assert "lost" in str(payload2["systemMessage"]), payload2
+    # T1 落盘状态为 lost（未被自动重试/复活）。
+    t1 = next(t for t in decision_token_records(state) if t.get("token") == token1)
+    assert t1["state"] == "lost", t1
+    lost_events = [e for e in latest_events(state) if e.get("event") == "decision_token_receipt_lost"]
+    assert lost_events, latest_events(state)
+
+
+def test_preserved_guards_short_circuit_before_decision_point_injection(tmp_path: Path) -> None:
+    """护栏矩阵：保留的递归/身份/抑制类护栏在**候选阶段之前**短路，绝不铸 token、绝不注入
+    （每个护栏「仍然生效」的 S4 专属断言：护栏优先于决策点）。dirty repo（候选本非空）+ 各护栏 →
+    skip，且决策 token 目录为空、注入尝试 ledger 为空。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    # (env 名, 事件字段) 形式的护栏矩阵；每个都应短路且不铸 token。
+    guard_cases = [
+        ("stop_hook_active", {"cwd": str(dirty), "session_id": "g1", "stop_hook_active": True}, {}),
+        ("rvf_analyze_thread", {"cwd": str(dirty), "session_id": "g2", "stop_hook_active": False}, {"RVF_ANALYZE_THREAD": "1"}),
+        ("suppressed", {"cwd": str(dirty), "session_id": "g3", "stop_hook_active": False}, {"RVF_SUPPRESS_STOP_HOOK": "1"}),
+        ("subagent", {"cwd": str(dirty), "session_id": "g4", "stop_hook_active": False, "source": {"subagent": {"thread_spawn": {"depth": 1}}}}, {}),
+    ]
+    for label, event, extra_env in guard_cases:
+        state = tmp_path / f"state-{label}"
+        stdout, _ = invoke(event, extra_env=extra_env or None, state_dir=state)
+        payload = parse_json(stdout)
+        assert "decision" not in payload, (label, payload)
+        assert decision_token_records(state) == [], (label, "护栏短路不应铸决策 token")
+        assert injection_attempt_records(state) == [], (label, "护栏短路不应写注入尝试 ledger")
 
 
 def _read_ledger_events(ledger) -> list[dict]:
@@ -4607,6 +4843,7 @@ globals().update({_n: getattr(_kbfu, _n) for _n in _kbfu.__all__})
 # 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_stop_hook_support import cline_kanban_stop_hook_dispatch as _f2clkb
 _f2clkb.inject(
+    assert_decision_point_injection=assert_decision_point_injection,
     dispatch_prep_payload=dispatch_prep_payload,
     init_repo_with_head=init_repo_with_head,
     invoke=invoke,
@@ -4638,6 +4875,7 @@ from _rvf_stop_hook_support import session_hook_state_io as _f2shook
 _f2shook.inject(
     SCRIPT=SCRIPT,
     assert_skip_reason=assert_skip_reason,
+    assert_decision_point_injection=assert_decision_point_injection,
     dispatch_prep_payload=dispatch_prep_payload,
     init_repo=init_repo,
     init_repo_with_head=init_repo_with_head,
@@ -4660,6 +4898,7 @@ globals().update({_n: getattr(_f2shook, _n) for _n in _f2shook.__all__})
 from _rvf_stop_hook_support import forked_rvf_experiment_mode as _f2forked
 _f2forked.inject(
     assert_skip_reason=assert_skip_reason,
+    assert_decision_point_injection=assert_decision_point_injection,
     init_repo=init_repo,
     invoke=invoke,
     latest_pointer=latest_pointer,
@@ -4676,6 +4915,7 @@ globals().update({_n: getattr(_f2forked, _n) for _n in _f2forked.__all__})
 from _rvf_stop_hook_support import dirty_repo_gate as _f2dirty
 _f2dirty.inject(
     app_server_requests=app_server_requests,
+    assert_decision_point_injection=assert_decision_point_injection,
     dispatch_prep_payload=dispatch_prep_payload,
     init_repo=init_repo,
     invoke=invoke,
@@ -4691,6 +4931,7 @@ globals().update({_n: getattr(_f2dirty, _n) for _n in _f2dirty.__all__})
 # 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_stop_hook_support import manual_rvf_scope as _f2manual
 _f2manual.inject(
+    assert_decision_point_injection=assert_decision_point_injection,
     init_repo_with_head=init_repo_with_head,
     invoke=invoke,
     latest_pointer=latest_pointer,
@@ -4964,8 +5205,8 @@ def main() -> int:
         test_prompt_suppression_marker_skips,
         test_prior_cline_kanban_task_marker_skips_after_later_user_message,
         test_kanban_task_suppression_marker_skips_without_prompt_marker,
-        test_session_without_owned_dirty_skips_fork,
-        test_session_without_owned_dirty_legacy_disable_keeps_old_codes,
+        test_session_without_owned_dirty_still_injects_decision_point,
+        test_session_without_owned_dirty_injects_even_with_tracker_disabled,
         test_resolve_stop_context_returns_session_branch_worktree,
         test_evaluate_session_gate_suppresses_on_manual_marker,
         test_legacy_session_scope_gate_payload_used_when_tracker_disabled,
@@ -5057,19 +5298,19 @@ def main() -> int:
         test_subagent_source_skips,
         test_subagent_session_meta_skips,
         test_clean_repo_skips,
-        test_committed_round_clean_repo_routes_to_review,
+        test_committed_round_clean_repo_injects_decision_point,
         test_committed_round_seal_after_land_suppresses_redispatch,
         test_committed_round_highwater_routes_orphan_below_advanced_baseline,
-        test_committed_round_without_transcript_evidence_routes_to_review,
-        test_committed_round_skip_review_trailer_excludes_and_audits,
+        test_committed_round_without_transcript_evidence_injects_decision_point,
+        test_committed_round_skip_review_trailer_excludes_from_candidate_summary,
         test_committed_round_excludes_rebased_base_branch_commits,
         test_clean_repo_with_committed_work_but_no_marker_skips,
-        test_plan_document_only_routes_out_of_full_rvf,
-        test_read_only_session_with_background_plan_docs_does_not_plan_route,
+        test_plan_document_only_injects_decision_point,
+        test_read_only_session_with_background_plan_docs_injects_decision_point,
         test_plan_document_route_does_not_hide_source_rename,
-        test_dirty_repo_dry_run_prepares_legacy_gui_requests,
-        test_dirty_repo_manual_mode_only_prepares_prompt,
-        test_dirty_repo_fork_dry_run,
+        test_dirty_repo_dry_run_injects_decision_point,
+        test_dirty_repo_manual_mode_injects_decision_point,
+        test_dirty_repo_fork_dry_run_injects_decision_point,
         test_dirty_repo_fork_inherits_parent_cwd_inside_worktree,
         test_no_git_cwd_skips_even_with_dirty_trusted_repo,
         test_stop_event_transcript_path_overrides_bad_env_thread_id,
@@ -5107,6 +5348,12 @@ def main() -> int:
         test_stranded_sweep_unparks_on_giveup,
         test_kanban_task_session_liveness_classifies_from_session_state,
         test_kanban_followup_stranded_sweep_skips_alive_session,
+        # S4：决策点信使新增用例（负路径不变量 / 失效路径 / 护栏矩阵）。
+        test_decision_point_nonempty_candidates_always_leave_injection_ledger_record,
+        test_decision_point_declined_cooldown_suppresses_reinjection,
+        test_decision_point_circuit_breaker_suppresses_after_repeated_mints,
+        test_decision_point_receipt_ttl_lost_warns_without_retry,
+        test_preserved_guards_short_circuit_before_decision_point_injection,
     ]
     assert_every_defined_test_is_registered(
         globals(),

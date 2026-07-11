@@ -192,6 +192,12 @@ from rvf_dispatch_prompts import (
     cline_kanban_artifact_reference_lines,
     dispatch_scope_of_work_text,
 )
+# S4：Stop hook 降级为决策点信使——候选摘要（S2）+ 决策 token store（S1）+ 注入尝试 ledger（S4）。
+# stop_decision_candidate_summary 顶层不反向 import 本模块（它用惰性 _load_stop_hook_module()
+# 破 S4 环），故此处可安全 top-level import，不成环。
+import rvf_decision_token_store as decision_token_store  # noqa: E402
+import stop_decision_candidate_summary  # noqa: E402
+import agentic_initiation_injection_attempt_ledger as injection_attempt_ledger  # noqa: E402
 
 
 class BootstrapConfirmationRequired(Exception):
@@ -1840,10 +1846,16 @@ _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS = frozenset(
 def _skip_decision_should_unpark(decision: StopDecision) -> bool:
     """skip / 不 launch 分支：是否应触发 self-park 安全阀。
 
-    resume 仍在途 / followup 仍活跃的 skip（见 ``_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS``）必须
-    保留 park、返回 False；其余 skip（handoff 完成、无 owned dirty 等）无 resume → True。
+    resume 仍在途 / followup 仍活跃的 skip（``_KANBAN_FOLLOWUP_RESUME_PENDING_REASONS``），以及
+    S4 决策点仍在途的 skip（``_DECISION_POINT_RESUME_PENDING_REASONS``：token 仍 minted/injected/
+    acknowledged，等 agent start/decline）必须保留 park、返回 False；其余 skip（handoff 完成、无
+    owned dirty、决策点 declined/熔断/无候选等无 resume）→ True（照常 unpark）。
     """
-    return decision.reason_code not in _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS
+    if decision.reason_code in _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS:
+        return False
+    if decision.reason_code in _DECISION_POINT_RESUME_PENDING_REASONS:
+        return False
+    return True
 
 
 def _unpark_stranded_task(project_path: Any, task_id: str) -> bool:
@@ -6524,6 +6536,585 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
     return False
 
 
+# ---------------------------------------------------------------------------
+# S4：Stop hook 决策点信使（RVF overhaul 核心切片 / 计划 §三·§四 S4·R23·R24·R25）
+#
+# RVF overhaul 把「要不要审、审什么」的发起决策权从 Stop hook 交给主 agent：Stop hook 不再自动
+# fork（拆掉 route_reviewable_scope→run_review_validate_fix_child_fork 的**初始 auto-fork** 链，
+# 两函数本体保留作 fallback/观察期，仅其在 evaluate_stop_event 的初始发起调用被替换），而是
+#   ① 生成一份**轻量**候选摘要（S2 stop_decision_candidate_summary）+ 指纹；
+#   ② 铸一枚决策 token（S1 rvf_decision_token_store，去重/declined 冷却/铸造熔断三闸内建于 mint）；
+#   ③ 以 Claude Stop hook 的模型可见通道 {"decision":"block","reason":<注入提示>} 把 token + 摘要
+#      + CLI 命令样例注入给主 agent；主 agent 简析后经 rvf-agent CLI 显式 start / decline。
+# systemMessage 仅通知用户（agent 不可见）。
+#
+# ## 边界：只拆**初始发起**，不动延续/特殊后端（忠实于「→run_review_validate_fix_child_fork」措辞）
+# 延续/特殊后端不是「是否发起 RVF」的决策点，保留原 route_reviewable_scope→launch 语义：
+#   * ``kanban-followup``：flow-1-self-rising 子 run 的自我延续（message dispatch，非 child fork）；
+#   * ``report-only`` / ``off``：特殊/禁用模式。
+# ``normalize_backend_from_env`` 的 ``in_kanban_task`` 天然区分自升子 run（kanban-followup，保留）
+# 与主会话初始发起（kanban，注入）。
+#
+# ## 投递回执三信号归并（评审修正，非乐观预 arm；87e9338 pure-arm 教训）
+# 注入投递不可乐观确认。下一次 Stop 事件先 reconcile 上一枚 token：
+#   (a) token 已被 CLI 触碰（状态离开 injected → acknowledged/dispatched/declined）= confirmed；
+#   (b) TTL 过期但在 transcript 探到注入痕迹（needle ``RVF_DECISION_TOKEN=<token>``，复用
+#       _kanban_followup_marker_consumed 的扫描模式）= 投递已确认、只是未决 → 标 expired，静默；
+#   (c) TTL 过期且无任一信号 = lost → mark_lost + systemMessage 告警用户，**绝不自动重试**。
+#
+# ## park / unpark ⟵ token 状态（决策点在途 = 保留 park；显式状态转换表，先表后码）
+# | token 状态（本次 Stop 结束时） | 在途? | park 处置              |
+# |------------------------------|-------|----------------------|
+# | minted / injected            | 是    | 保留 park（决策点等 agent）|
+# | acknowledged                 | 是    | 保留 park（start 在途）    |
+# | dispatched                   | 否    | unpark（已派发，交常规流程）|
+# | declined / declined_cooldown | 否    | unpark（已谢绝）          |
+# | lost / expired               | 否    | unpark（决策点已死）      |
+# | 无候选 / 熔断 / 无 token       | 否    | unpark（无 resume）      |
+# 实现：注入/dedup-pending 决策用「resume 在途」reason_code（见 _DECISION_POINT_RESUME_PENDING_REASONS，
+# 经 _skip_decision_should_unpark 保留 park）；其余静默停用普通 reason_code → 照常 unpark。
+# ---------------------------------------------------------------------------
+
+# 延续/特殊后端集合（保留原派发语义，不替换为注入）。
+_RVF_CONTINUATION_OR_SPECIAL_BACKENDS = frozenset({"kanban-followup", "report-only", "off"})
+
+# 决策点注入的 reason_code（模型可见 block）。
+REASON_DECISION_POINT_INJECTED = "decision_point_injected"
+REASON_DECISION_POINT_DEDUPLICATED_PENDING = "decision_point_deduplicated_pending"
+REASON_DECISION_POINT_DECLINED_COOLDOWN = "decision_point_declined_cooldown"
+REASON_DECISION_POINT_CIRCUIT_BREAKER = "decision_point_circuit_breaker_tripped"
+REASON_DECISION_POINT_NO_CANDIDATES = "decision_point_no_candidates"
+REASON_DECISION_POINT_MINT_ANOMALY = "decision_point_mint_anomaly"
+
+# park 保留集：这些 skip/emit 决策代表「决策点仍在途」（token minted/injected/acknowledged），
+# resume 尚未落定，必须保留 self-park（对偶于 kanban-followup 的 resume-pending 语义）。
+_DECISION_POINT_RESUME_PENDING_REASONS = frozenset(
+    {
+        REASON_DECISION_POINT_INJECTED,
+        REASON_DECISION_POINT_DEDUPLICATED_PENDING,
+    }
+)
+
+
+def _rvf_agent_cli_path() -> Path:
+    """rvf-agent 决策 CLI（S3）的落盘路径——与本 Stop hook 同目录的兄弟脚本，注入提示里渲染成
+    可复制粘贴的命令样例。"""
+    return Path(__file__).resolve().with_name("rvf_agent_decision_cli.py")
+
+
+def _render_decision_point_injection_prompt(
+    *,
+    summary: dict[str, Any],
+    token: str,
+    fork_context: dict[str, str] | None,
+) -> str:
+    """渲染注入给主 agent 的决策点提示（Claude Stop hook 的模型可见 ``reason`` 正文）。
+
+    必含（计划 §四 S4 bullet 3）：候选摘要渲染 + token 字符串 + start/scope/dispatch/decline CLI 命令
+    样例 + 「简析后立刻 start 或 decline，不要搁置」指引 + R24 递归护栏文案；fork-context（已在 RVF
+    fork 内）降级为一行标注（R24 硬闸退役）。needle ``RVF_DECISION_TOKEN=<token>`` 供下一次 Stop 的
+    投递回执 (b) 信号在 transcript 中探测。"""
+    cli = str(_rvf_agent_cli_path())
+    repo = str(summary.get("repo") or "")
+    count = summary.get("candidate_path_count") or 0
+    has_committed = bool(summary.get("has_committed_but_unreviewed"))
+    bootstrap = summary.get("bootstrap_size") or {}
+    strictness = summary.get("strictness_reference") or {}
+    suggested_tier = strictness.get("suggested_strictness_tier") or "standard"
+    oversized = bool(strictness.get("oversized_change_elevate_recommended"))
+    totals = strictness.get("totals") or {}
+    candidates = [
+        c
+        for c in (summary.get("candidates") or [])
+        if isinstance(c, dict) and c.get("included_in_candidate_set")
+    ]
+
+    lines: list[str] = []
+    lines.append("=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===")
+    lines.append(
+        "本轮工作停下时检测到**本 worktree 自上次 review 以来**存在可审改动。是否发起 RVF 由你"
+        "（主 agent）决定：简要评估后，用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。"
+    )
+    lines.append(f"RVF_DECISION_TOKEN={token}")
+    lines.append("")
+    lines.append("— 候选摘要（程序化构造，你不需要自己枚举全集）—")
+    lines.append(f"  目标 worktree: {repo}")
+    lines.append(
+        f"  候选文件数: {count}"
+        + (f"（含已提交但未审改动）" if has_committed else "（均为未提交改动）")
+    )
+    lines.append(
+        "  规模: 非空新增 {added} 行 / 删除 {deleted} 行 / 工作树 {bytes} 字节".format(
+            added=bootstrap.get("total_nonblank_added_lines", 0),
+            deleted=bootstrap.get("total_nonblank_deleted_lines", 0),
+            bytes=bootstrap.get("total_working_tree_bytes", 0),
+        )
+    )
+    lines.append(
+        "  严格度参考档（仅参考，最终你选）: {tier}；加权有效行={weighted}；"
+        "非测试非生成改动行={core}{elevate}".format(
+            tier=suggested_tier,
+            weighted=totals.get("weighted_effective_lines", 0),
+            core=totals.get("nonblank_change_lines_excluding_tests_and_generated", 0),
+            elevate="；⚠ 改动量超大，建议开工前 elevate 给用户" if oversized else "",
+        )
+    )
+    if candidates:
+        lines.append("  候选路径（change_state / ownership）:")
+        for c in candidates[:40]:
+            lines.append(
+                f"    - {c.get('path')}  [{c.get('change_state')} / {c.get('ownership')}]"
+            )
+        if len(candidates) > 40:
+            lines.append(f"    …… 其余 {len(candidates) - 40} 个路径略")
+    if fork_context is not None:
+        lines.append("")
+        lines.append(
+            "  标注：当前会话本身疑似已在一个 RVF fork 上下文内（fork-context 命中）。"
+            "递归护栏见下方——若这是在审你自己 RVF 的结果，通常应 decline。"
+        )
+    lines.append("")
+    lines.append("— 决策命令（token 已在上方 RVF_DECISION_TOKEN=；把它显式回传）—")
+    lines.append(f"  发起（简析后开审）: python3 {cli} start --token {token} --reason \"<一句话理由>\"")
+    lines.append(
+        f"  自动 scope 微调（可选，仅 start 后 acknowledged 态）: "
+        f"python3 {cli} scope exclude --token {token} <path>... --reason \"<理由>\""
+    )
+    lines.append(
+        f"  定稿派发（选严格度档 light|standard|strict）: "
+        f"python3 {cli} dispatch --token {token} --strictness {suggested_tier}"
+    )
+    lines.append(f"  谢绝（不发起）: python3 {cli} decline --token {token} --reason \"<一句话理由>\"")
+    lines.append("")
+    lines.append(
+        "指引：**简析后立刻 start 或 decline，不要搁置**——决策 token 有 TTL，超时无任一信号会被标"
+        "为 lost 并告警。start 后紧接着 dispatch 才真正派发 reviewer；start 只是重量级准备，失败可"
+        "`start --retry`。"
+    )
+    lines.append("")
+    lines.append(
+        "递归护栏（R24）：不应对自己 RVF 的 result 再次 RVF，除非该 result 有效改动量超大（不含"
+        "测试 >1000 行）—— 而超大改动本应在**开工前 elevate 给用户**，而非直接进行。若本次候选就是"
+        "你刚跑完的一轮 RVF 的产物，请 decline 并在 reason 里说明。"
+    )
+    return "\n".join(lines)
+
+
+def _iter_session_decision_tokens(
+    *, worktree: str, session_id: str | None, now: datetime | None = None
+) -> list[decision_token_store.DecisionTokenLookup]:
+    """枚举**本 (worktree, session) 名下**的决策 token（glob token 根 + payload 过滤）。
+
+    只用 S1 的公开 accessor（decision_token_root / read_decision_token），不碰其私有实现；读取
+    失败一律跳过（best-effort，永不抛）。供投递回执 reconcile 与去重观测。"""
+    results: list[decision_token_store.DecisionTokenLookup] = []
+    if not session_id:
+        return results
+    try:
+        base = decision_token_store.decision_token_root()
+        if not base.is_dir():
+            return results
+        token_files = sorted(base.glob("*.json"))
+    except OSError:
+        return results
+    for path in token_files:
+        try:
+            lookup = decision_token_store.read_decision_token(path.stem, now=now)
+        except decision_token_store.DecisionTokenError:
+            continue
+        payload = lookup.payload
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("worktree") != worktree or payload.get("session_id") != session_id:
+            continue
+        results.append(lookup)
+    return results
+
+
+def _decision_token_transcript_trace_present(event: dict[str, Any], token: str) -> bool:
+    """投递回执信号 (b)：在父会话 transcript 里探 needle ``RVF_DECISION_TOKEN=<token>``（复用
+    _kanban_followup_marker_consumed 的扫描模式）。文件缺失/过大/异常 → False（保守判「无痕迹」，
+    宁可把「投递成功但未决」误判为 lost 告警，也不漏报静默丢投）。"""
+    transcript = first_readable_session_path(event)
+    if transcript is None:
+        return False
+    try:
+        if transcript.stat().st_size > KANBAN_FOLLOWUP_CONSUMED_SCAN_MAX_BYTES:
+            return False
+        needle = f"RVF_DECISION_TOKEN={token}"
+        return needle in transcript.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def reconcile_pending_decision_token_receipts(
+    event: dict[str, Any],
+    *,
+    worktree: str,
+    session_id: str | None,
+    ledger: RunLedger,
+) -> list[str]:
+    """在铸新 token 前 reconcile 本 (worktree, session) 名下的上一枚决策 token 的投递回执。
+
+    对每枚**仍处 minted/injected（未被 CLI 触碰）且 TTL 已过期**的 token：
+      * transcript 探到注入痕迹 (b) → mark_expired（投递已确认、只是 agent 未决），静默不告警；
+      * 否则 (c) → mark_lost + 收集一条 systemMessage 告警文案，**绝不自动重试**。
+    acknowledged（start 在途）/ 终态 token 一律跳过。整段 best-effort，永不抛、不阻断主流程。
+    返回给用户的 lost 告警文案列表（并入 systemMessage）。"""
+    warnings: list[str] = []
+    try:
+        lookups = _iter_session_decision_tokens(worktree=worktree, session_id=session_id)
+    except Exception:  # pragma: no cover - 枚举永不阻断
+        return warnings
+    for lookup in lookups:
+        # 仅 TTL 已过期且仍在 minted/injected（未被 CLI 触碰、未复活）的 token 才需要 reconcile。
+        if lookup.status != "expired":
+            continue
+        if lookup.state not in (decision_token_store.STATE_MINTED, decision_token_store.STATE_INJECTED):
+            continue
+        token = lookup.token
+        try:
+            if _decision_token_transcript_trace_present(event, token):
+                decision_token_store.mark_expired(
+                    token, reason="delivery-confirmed-but-no-decision-within-ttl"
+                )
+                ledger.event(
+                    phase="gate",
+                    event="decision_token_receipt_expired",
+                    status="completed",
+                    reason_code="decision_token_delivery_confirmed_no_decision",
+                    decision_token=token,
+                    worktree=worktree,
+                    session_id=session_id,
+                )
+                continue
+            decision_token_store.mark_lost(token, reason="no-delivery-signal-within-ttl")
+            ledger.event(
+                phase="gate",
+                event="decision_token_receipt_lost",
+                status="warning",
+                level="warn",
+                reason_code="decision_token_delivery_lost",
+                decision_token=token,
+                worktree=worktree,
+                session_id=session_id,
+            )
+            warnings.append(
+                f"决策 token {token} 在 TTL 内既未被 rvf-agent CLI 触碰、也未在 transcript 探到"
+                "投递痕迹，已标记为 lost（发起层疑似静默丢投）。**不会自动重试**；如仍需审查，"
+                "请在下一轮真实改动后重新触发，或手动 $review-validate-fix。"
+            )
+        except decision_token_store.DecisionTokenError:
+            continue
+    return warnings
+
+
+def decision_point_injection_decision(
+    event: dict[str, Any],
+    repo: str,
+    ledger: RunLedger,
+    cwd: str | None,
+    *,
+    gate_status: str,
+    fork_context: dict[str, str] | None,
+) -> StopDecision:
+    """初始发起决策点：轻量候选摘要 → mint（三闸内建）→ 注入 block 或静默停（计划 §三④⑤⑥）。
+
+    * 候选摘要经 S2 build_candidate_summary（纯 git+tracker 缓存，含 committed-but-unreviewed，先过
+      workspace 守卫）；无候选 → 静默停（不写 injection ledger，避免污染 canary 分母）。
+    * 候选非空 → 先 reconcile 上一枚 token 的投递回执（lost 告警并入 systemMessage）→ mint：
+        - minted：mark_injected + 以 {"decision":"block","reason":<注入提示>} 返回（模型可见）；
+        - deduplicated：同键活跃 token 已在等待 → 不重注入（R25 幂等），静默停并提醒用户；
+        - declined_cooldown / circuit_breaker_tripped：静默停（后者附熔断告警 systemMessage）。
+    * **无论哪种候选非空结局都写 injection-attempt ledger**（负路径不变量：候选非空 ⇒ 有记录）。
+    """
+    try:
+        summary = stop_decision_candidate_summary.build_candidate_summary(
+            event=event,
+            cwd=cwd,
+            repo=repo,
+            ledger=ledger,
+        )
+    except Exception as exc:  # pragma: no cover - 摘要构造永不阻断 Stop hook
+        ledger.event(
+            phase="gate",
+            event="decision_point_summary_failed",
+            status="warning",
+            level="warn",
+            reason_code="decision_point_summary_error",
+            repo=repo,
+            cwd=cwd,
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
+        return skip_decision(
+            "候选摘要构造失败，本次 Stop 静默停（best-effort，不阻断）。",
+            ledger,
+            REASON_DECISION_POINT_NO_CANDIDATES,
+            repo=repo,
+            cwd=cwd,
+        )
+
+    session_id = summary.get("session_id") or session_hook_id_from_event(event)
+    candidate_count = int(summary.get("candidate_path_count") or 0)
+    fingerprint = str(summary.get("candidate_fingerprint") or "")
+    has_committed = bool(summary.get("has_committed_but_unreviewed"))
+    worktree = str(summary.get("repo") or repo)
+
+    # 无候选（含 workspace 守卫短路的空摘要）→ 静默停，不写 injection ledger（保持 canary 分母干净：
+    # 只有「候选非空」才是发起层该表态的分母）。
+    if candidate_count <= 0:
+        ledger.event(
+            phase="gate",
+            event="decision_point_no_candidates",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_NO_CANDIDATES,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            workspace_guard_blocked=bool(summary.get("workspace_guard_blocked")),
+        )
+        return skip_decision(
+            f"本 worktree 自上次 review 以来无可审候选改动，Stop 静默停。repo={worktree}",
+            ledger,
+            REASON_DECISION_POINT_NO_CANDIDATES,
+            repo=repo,
+            cwd=cwd,
+        )
+
+    # 候选非空：先 reconcile 上一枚 token 的投递回执（lost 告警并入 systemMessage）。
+    lost_warnings = reconcile_pending_decision_token_receipts(
+        event, worktree=worktree, session_id=session_id, ledger=ledger
+    )
+
+    # mint：去重/declined 冷却/铸造熔断三闸内建（默认落盘根 = $RVF_HOME/~/.rvf，与 rvf-agent CLI
+    # 共享，故生产环境 hook 与 CLI 天然同根；测试靠 RVF_HOME 隔离）。
+    try:
+        mint = decision_token_store.mint_decision_token(
+            worktree=worktree,
+            session_id=session_id or "",
+            candidate_fingerprint=fingerprint,
+            candidate_summary=summary,
+        )
+    except Exception as exc:  # pragma: no cover - 铸造异常兜底
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_MINT_ANOMALY,
+            injected=False,
+            note=f"{type(exc).__name__}: {exc}",
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_mint_anomaly",
+            status="warning",
+            level="warn",
+            reason_code=REASON_DECISION_POINT_MINT_ANOMALY,
+            repo=repo,
+            cwd=cwd,
+            error={"kind": type(exc).__name__, "message": str(exc)},
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_MINT_ANOMALY,
+            message="决策 token 铸造异常，本次 Stop 静默停。",
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
+    outcome = mint.outcome
+    if outcome == decision_token_store.MINT_OUTCOME_MINTED and mint.token:
+        token = mint.token
+        reason_text = _render_decision_point_injection_prompt(
+            summary=summary, token=token, fork_context=fork_context
+        )
+        # mark_injected 反映「本次 Stop 确实要发出注入 block」：block 由 main() 在本函数返回后**同步**
+        # 写 stdout 投递（非 kanban followup 那种可能静默失败的异步消息），故此处推进 minted→injected
+        # 不是 87e9338 所诫的「乐观预 arm」。真正的「是否被 agent 消费」由下一次 Stop 的回执 reconcile
+        # 三信号（CLI 触碰 / transcript 痕迹 / TTL lost）判定，绝不自动重试。
+        try:
+            decision_token_store.mark_injected(token)
+        except decision_token_store.DecisionTokenError:
+            pass
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_INJECTED,
+            decision_token=token,
+            injected=True,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_injected",
+            status="started",
+            reason_code=REASON_DECISION_POINT_INJECTED,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            decision_token=token,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            candidate_fingerprint=fingerprint,
+            gate_status=gate_status,
+        )
+        ledger.summary(
+            status="decision-point-injected",
+            reason_code=REASON_DECISION_POINT_INJECTED,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            decision_token=token,
+            candidate_path_count=candidate_count,
+        )
+        user_notice = (
+            f"review-validate-fix: 已注入 RVF 发起决策点（token={token}，候选 {candidate_count} 文件），"
+            "等待主 agent 显式 start / decline（非自动审查已开始）。"
+        )
+        if lost_warnings:
+            user_notice = user_notice + " " + " ".join(lost_warnings)
+        return StopDecision(
+            action="emit",
+            reason_code=REASON_DECISION_POINT_INJECTED,
+            repo=repo,
+            cwd=cwd,
+            message=reason_text,
+            payload={"decision": "block", "reason": reason_text, "systemMessage": user_notice},
+            status="decision-point-injected",
+        )
+
+    if outcome == decision_token_store.MINT_OUTCOME_DEDUPLICATED and mint.token:
+        # 同键活跃 token 已在等待（R25 注入幂等）→ 不重注入，避免 decline 前的 nag。静默停但保留 park
+        # （决策点仍在途）。
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DEDUPLICATED_PENDING,
+            decision_token=mint.token,
+            injected=False,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_deduplicated_pending",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_DEDUPLICATED_PENDING,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            decision_token=mint.token,
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_DEDUPLICATED_PENDING,
+            message=(
+                f"review-validate-fix: 同一候选指纹的决策 token {mint.token} 已在等待主 agent 处理，"
+                "本次 Stop 不重复注入（幂等）。"
+            ),
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
+    if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DECLINED_COOLDOWN,
+            injected=False,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_declined_cooldown",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_DECLINED_COOLDOWN,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_DECLINED_COOLDOWN,
+            message=(
+                "review-validate-fix: 候选指纹处于 declined 冷却中（agent 已谢绝且改动未变），"
+                "本次 Stop 静默停，不再注入。"
+            ),
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
+    # circuit_breaker_tripped（或其它未识别 outcome）：静默停 + 熔断告警（R24 裁决 b）。
+    injection_attempt_ledger.record_injection_attempt(
+        worktree=worktree,
+        session_id=session_id,
+        candidate_fingerprint=fingerprint,
+        candidate_path_count=candidate_count,
+        has_committed_but_unreviewed=has_committed,
+        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+        injected=False,
+        note=mint.message,
+    )
+    ledger.event(
+        phase="gate",
+        event="decision_point_circuit_breaker_tripped",
+        status="warning",
+        level="warn",
+        reason_code=REASON_DECISION_POINT_CIRCUIT_BREAKER,
+        repo=repo,
+        cwd=cwd,
+        session_id=session_id,
+        circuit_breaker_message=mint.message,
+    )
+    breaker_notice = mint.message or (
+        "review-validate-fix: 决策 token 铸造频率熔断，疑似递归发起，本次 Stop 静默停。"
+    )
+    return _decision_point_silent_stop(
+        ledger,
+        reason_code=REASON_DECISION_POINT_CIRCUIT_BREAKER,
+        message=breaker_notice,
+        repo=repo,
+        cwd=cwd,
+        lost_warnings=lost_warnings,
+    )
+
+
+def _decision_point_silent_stop(
+    ledger: RunLedger,
+    *,
+    reason_code: str,
+    message: str,
+    repo: str | None,
+    cwd: str | None,
+    lost_warnings: list[str],
+) -> StopDecision:
+    """决策点静默停（continue:true）的收口：把 message + lost 告警合成 systemMessage。
+
+    park 处置由 reason_code 经 _skip_decision_should_unpark 决定（dedup-pending 保留 park，
+    其余 unpark）。"""
+    full_message = message
+    if lost_warnings:
+        full_message = full_message + " " + " ".join(lost_warnings)
+    return skip_decision(
+        full_message,
+        ledger,
+        reason_code,
+        repo=repo,
+        cwd=cwd,
+    )
+
+
 def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecision:
     latest_user = latest_user_message_from_event(event)
     cwd_value = event.get("cwd")
@@ -6637,14 +7228,11 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             ),
         )
 
+    # R24 裁决 b（电路熔断替代硬闸）：``already_rvf_fork`` 硬闸**退役**——递归防护改由 S1 mint 侧的
+    # 铸造频率熔断（同 session/小时 >K 拒铸）+ agent 自觉承担。fork-context 不再硬跳过，降级为候选
+    # 摘要注入提示里的一行标注（若命中，提示 agent「若在审自己 RVF 的结果通常应 decline」），仍计算
+    # 供 decision_point_injection_decision 使用。
     fork_context = rvf_fork_context(latest_user) or rvf_fork_context_from_event(event)
-    if fork_context is not None:
-        return skip_decision(
-            "当前会话已是 review-validate-fix fork，会等待最终 RVF_HANDOFF_FILE，不会再次 fork。",
-            ledger,
-            "already_rvf_fork",
-            cwd=cwd,
-        )
 
     if event_marks_subagent(event):
         return skip_decision(
@@ -6693,34 +7281,62 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             cwd=cwd,
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
+        # S4 手术边界：区分「初始发起决策点」与「延续/特殊后端」。
+        #   * fresh-initiation（kanban / gui / dry-run / manual / 默认）：拆掉 auto-fork，改为
+        #     轻量候选摘要 → mint → 注入决策点给主 agent（无论 DIRTY / CLEAN，候选摘要都统一枚举
+        #     dirty ∪ committed-but-unreviewed）。
+        #   * 延续/特殊后端（kanban-followup=flow-1-self-rising 自升延续 / report-only / off）不是
+        #     「是否发起 RVF」的决策点，保留原 route_reviewable_scope→launch 语义（忠实于计划
+        #     「移除 …→run_review_validate_fix_child_fork 的初始 auto-fork 链」，两函数本体亦保留）。
+        backend_for_initiation = normalize_backend_from_env(event)
+        is_continuation_backend = backend_for_initiation in _RVF_CONTINUATION_OR_SPECIAL_BACKENDS
         if cwd_result.status == "DIRTY" and cwd_result.repo:
-            return route_reviewable_scope(
+            if is_continuation_backend:
+                return route_reviewable_scope(
+                    event,
+                    cwd_result.repo,
+                    changed_paths_from_gate_output(cwd_result.output),
+                    ledger,
+                    cwd,
+                    source="dirty_working_tree",
+                    gate_status=cwd_result.status,
+                )
+            return decision_point_injection_decision(
                 event,
                 cwd_result.repo,
-                changed_paths_from_gate_output(cwd_result.output),
                 ledger,
                 cwd,
-                source="dirty_working_tree",
                 gate_status=cwd_result.status,
+                fork_context=fork_context,
             )
         if cwd_result.status == "CLEAN":
-            # gate 只看 dirty 工作区；工作区 clean 时再看本轮有没有「已提交但未审」
-            # 的改动（commit 9127824 的下游 committed 检测就是为这一幕而做，却一直被
-            # 这个 dirty-only gate 挡在外面）。有则照常进 review，没有才 clean skip。
-            committed_decision = maybe_route_committed_round_scope(
+            if is_continuation_backend:
+                # 延续后端：工作区 clean 时仍查「本轮已提交但未审」改动（commit 9127824 的下游
+                # committed 检测），有则照常延续路由，没有才 clean skip。
+                committed_decision = maybe_route_committed_round_scope(
+                    event,
+                    cwd_result.repo or cwd,
+                    ledger,
+                    cwd,
+                )
+                if committed_decision is not None:
+                    return committed_decision
+                return skip_decision(
+                    f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
+                    ledger,
+                    "clean_repo",
+                    repo=cwd_result.repo or cwd,
+                    cwd=cwd,
+                )
+            # fresh-initiation + CLEAN：候选摘要含 committed-but-unreviewed，故 clean 工作区也可能
+            # 有已提交待审改动 → 走注入决策点；真正无候选时摘要为空 → 静默停。
+            return decision_point_injection_decision(
                 event,
                 cwd_result.repo or cwd,
                 ledger,
                 cwd,
-            )
-            if committed_decision is not None:
-                return committed_decision
-            return skip_decision(
-                f"当前 cwd 仓库是 clean。repo={cwd_result.repo or cwd}",
-                ledger,
-                "clean_repo",
-                repo=cwd_result.repo or cwd,
-                cwd=cwd,
+                gate_status=cwd_result.status,
+                fork_context=fork_context,
             )
 
     if cwd_result is not None:

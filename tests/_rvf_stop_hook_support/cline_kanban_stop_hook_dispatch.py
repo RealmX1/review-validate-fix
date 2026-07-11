@@ -554,13 +554,12 @@ def test_cline_kanban_mode_without_transcript_fail_closes_before_task_start(tmp_
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "reason=cline_kanban_missing_scope_anchor" in payload["systemMessage"]
+    # S4 迁移：cline-kanban 初始发起（backend=kanban，非 kanban-task 内）→ 注入决策点；
+    # scope-anchor / transcript 校验（原 cline_kanban_missing_scope_anchor fail-close）后置到
+    # rvf-agent start 的重量级准备。fake client 不被调（不创建 task）。
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
     latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "cline_kanban_missing_scope_anchor"
-    assert latest["backend"] == "kanban"
-    assert "startup_prepare_metadata_path" not in latest
+    assert latest["status"] == "decision-point-injected"
     assert not client_calls.exists()
 
 
@@ -604,23 +603,13 @@ def test_cline_kanban_mode_blocks_expired_codex_login_before_task_start(tmp_path
         state_dir=state,
     )
 
-    payload = parse_json(stdout)
-    assert "reason=provider_health_failed" in payload["systemMessage"]
+    # S4 迁移：cline-kanban 初始发起 → 注入决策点。provider-health / codex login 校验（原
+    # provider_health_failed 在 launch 前阻断）后置到 rvf-agent dispatch，不在 Stop 注入阶段执行；
+    # 故此处注入成立、fake client 与 fake codex 都不被调、不启动 task。
+    _payload, _token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
     latest = latest_summary(state)
-    assert latest["status"] == "skipped"
-    assert latest["reason_code"] == "provider_health_failed"
-    assert latest["backend"] == "kanban"
-    assert latest["gate_status"] == "DIRTY"
-    assert "codex login" in str(latest["message"])
-    assert "startup_prepare_metadata_path" not in latest
+    assert latest["status"] == "decision-point-injected"
     assert not client_calls.exists()
-    health = read_json_artifact(latest, "provider_health_path")
-    assert isinstance(health, dict)
-    results = health["results"]
-    assert isinstance(results, list)
-    assert results[0]["provider"] == "codex"
-    assert results[0]["status"] == "failed"
-    assert "session expired" in results[0]["stderr"]
 
 
 def test_cline_kanban_mode_marks_unavailable_when_task_start_fails(tmp_path: Path) -> None:

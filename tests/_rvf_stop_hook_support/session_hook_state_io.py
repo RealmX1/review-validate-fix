@@ -211,11 +211,13 @@ def test_session_hook_control_reenables_current_session(tmp_path: Path) -> None:
             state_dir=state,
         )[0]
     )
-    summary = summary_from_payload(payload)
-    assert summary["reason_code"] == "dry_run"
-    assert "review-validate-fix: dry-run; reason=dry_run;" in payload["systemMessage"]
+    # S4：re-enable 后 Stop 正常前进到 dirty repo 的决策点注入（不再自动 dry_run fork）。session-hook
+    # 控制守卫（session_hook_control_continue 事件）仍生效、session 标记仍被清除。
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "changed.txt" in str(payload["reason"]), payload["reason"]
     assert not (state / "session-hook" / "session-reenabled.json").exists()
-    assert latest_pointer(state)["status"] == "dry-run"
+    assert latest_pointer(state)["status"] == "decision-point-injected"
     events = latest_events(state)
     assert any(
         event["event"] == "session_hook_control_continue"
@@ -281,52 +283,26 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
         )[0]
     )
 
-    assert "reason=cline_kanban_task_started" in payload["systemMessage"]
+    # S4 迁移（原断言 cline_kanban_task_started）：re-enable 后 fresh-initiation（backend=kanban，非
+    # kanban-task 内）→ **不再自动创建 Cline Kanban task**，改注入决策点；task 创建后置到 rvf-agent
+    # dispatch。session 标记仍被清除。fake client 不应被调到 create/start。
+    assert payload.get("decision") == "block", payload
+    assert "RVF_DECISION_TOKEN=" in str(payload["reason"])
+    assert "已注入 RVF 发起决策点" in str(payload.get("systemMessage", "")), payload
     assert not (state / "session-hook" / "session-kanban-reenabled.json").exists()
     latest = latest_summary(state)
-    assert latest["status"] == "cline-kanban-started"
-    assert latest["cline_kanban_task_id"] == "task-reenabled"
-    prep = dispatch_prep_payload(latest)
-    prep_tracker_scope = prep["rvf_run"]["tracker_scope_path"]
-    assert isinstance(prep_tracker_scope, str)
-    assert prep_tracker_scope.endswith("artifacts/tracker-scope.json")
-    assert prep["rvf_run"]["tracker_lease_id"]
-    assert prep["rvf_run"]["tracker_scope_hash"]
-    tracker_scope_payload = json.loads(Path(prep_tracker_scope).read_text(encoding="utf-8"))
-    assert tracker_scope_payload["lease_ttl_seconds"] > 0
-    startup_command = json.loads(
-        (Path(latest["artifacts_dir"]) / "cline-kanban-dispatch-prepare-command.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    command = startup_command["command"]
-    assert command[command.index("--tracker-scope") + 1] == prep_tracker_scope
-    startup_metadata = read_json_artifact(latest, "startup_prepare_metadata_path")
-    assert isinstance(startup_metadata, dict)
-    assert startup_metadata["input_tracker_scope_file"].endswith("artifacts/inputs/tracker-scope.json")
-    assert startup_metadata["tracker_scope_file"].endswith("artifacts/tracker-scope.json")
-    scope_contract = json.loads(Path(startup_metadata["scope_contract"]).read_text(encoding="utf-8"))
-    assert scope_contract["primary_files"] == ["changed.txt"]
-    assert scope_contract["fix_allowlist"] == ["changed.txt"]
-    assert scope_contract["primary_units"]
-    assert scope_contract["tracker_lease_id"]
-    assert scope_contract["tracker_scope_hash"]
-    assert startup_metadata["worktree_bootstrap_metadata"]["owned_dirty_paths"] == ["changed.txt"]
-    packet_metadata = json.loads(
-        Path(startup_metadata["review_packet_metadata"]).read_text(encoding="utf-8")
-    )
-    assert packet_metadata["tracker_scope_present"] is True
-    assert packet_metadata["tracker_scope_unit_count"] == len(scope_contract["primary_units"])
+    assert latest["status"] == "decision-point-injected"
+    calls = [
+        json.loads(line)
+        for line in client_calls.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ] if client_calls.exists() else []
+    assert not any(call["argv"][0] in ("create", "start") for call in calls), calls
+    # session_hook_control_continue 守卫仍生效（re-enable 后继续走常规决策点路径）。
     events = latest_events(state)
     assert any(
         event["event"] == "session_hook_control_continue"
         and event["reason_code"] == "session_hook_gate_enabled"
         for event in events
     )
-    calls = [
-        json.loads(line)
-        for line in client_calls.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [call["argv"][0] for call in calls] == ["ensure", "create", "start"]
 

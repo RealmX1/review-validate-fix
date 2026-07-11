@@ -112,7 +112,9 @@ def test_forked_rvf_session_waits_for_handoff_before_advisory(tmp_path: Path) ->
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
+    # S4（R24 裁决 b）：already_rvf_fork 硬闸退役。此处 cwd=tmp_path 非 git repo，故 fork 会话的
+    # Stop 落到 cwd_not_git_repo skip（fork-context 仅作注入标注，此处无候选可注入）。仍不处理 handoff。
+    assert_skip_reason(stdout, "不在 git repo/worktree 内")
     assert not (state / "handoff-notified").exists()
 
 
@@ -135,7 +137,8 @@ def test_forked_rvf_session_waits_when_handoff_message_missing(tmp_path: Path) -
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
+    # S4：同上，cwd=tmp_path 非 git repo → cwd_not_git_repo skip；不处理 handoff。
+    assert_skip_reason(stdout, "不在 git repo/worktree 内")
     assert not (state / "handoff-notified").exists()
 
 
@@ -169,8 +172,10 @@ def test_forked_rvf_marker_in_transcript_prevents_refork_after_later_user_messag
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
+    # S4（R24 裁决 b）：already_rvf_fork 硬闸退役 → dirty repo 的 fork 会话现在收到**带 fork 标注**的
+    # 决策点注入（递归防护改由 mint 侧频率熔断 + agent 自觉承担；agent 见 fork 标注应 decline）。
+    _payload, _token = assert_decision_point_injection(stdout)
+    assert "疑似已在一个 RVF fork 上下文内" in str(_payload["reason"]), _payload["reason"]
 
 
 def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp_path: Path) -> None:
@@ -204,6 +209,7 @@ def test_forked_rvf_marker_scan_skips_incomplete_earlier_marker(tmp_path: Path) 
         },
         state_dir=state,
     )
-    assert_skip_reason(stdout, "已是 review-validate-fix fork")
-    assert latest_pointer(state)["status"] == "skipped"
+    # S4：完整 fork marker（被后续消息遮住但仍能扫到）→ dirty repo 注入带 fork 标注的决策点。
+    _payload, _token = assert_decision_point_injection(stdout)
+    assert "疑似已在一个 RVF fork 上下文内" in str(_payload["reason"]), _payload["reason"]
 
