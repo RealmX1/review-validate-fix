@@ -58,6 +58,7 @@ DIAGNOSE_STOP_HOOK_SCOPE = SCRIPT_DIR / "diagnose_stop_hook_scope.py"
 RUN_LEDGER = ROOT / "core" / "run_ledger" / "run_ledger.py"
 RVF_HANDOFF = SCRIPT_DIR / "rvf_handoff.py"
 RVF_PREP_FILE = SCRIPT_DIR / "rvf_prep_file.py"
+RVF_DECISION_TOKEN_STORE = SCRIPT_DIR / "rvf_decision_token_store.py"
 RVF_USER_PROMPT_SUBMIT = SCRIPT_DIR / "rvf_user_prompt_submit.py"
 KANBAN_FOLLOWUP_LOCK = SCRIPT_DIR / "kanban_followup_lock.py"
 AWAITING_DISPATCHED_AGENT_MARKER = SCRIPT_DIR / "rvf_awaiting_dispatched_agent_marker.py"
@@ -113,6 +114,18 @@ def load_rvf_prep_file_module():
     spec = importlib.util.spec_from_file_location("rvf_prep_file", RVF_PREP_FILE)
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load rvf_prep_file module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_decision_token_store_module():
+    # 与 load_rvf_prep_file_module 同构：spec 载入 + sys.modules 注册（dataclass 在 3.9 下做
+    # ClassVar 检测时需要模块出现在 sys.modules，否则 _is_type 取不到模块命名空间而报错）。
+    spec = importlib.util.spec_from_file_location("rvf_decision_token_store", RVF_DECISION_TOKEN_STORE)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_decision_token_store module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -5638,6 +5651,416 @@ def _with_cooldown_env(cooldown_root: Path):
     return _ctx()
 
 
+# ---------------------------------------------------------------------------
+# rvf_decision_token_store（RVF overhaul S1：agentic-initiation 决策 token 基建）
+# 全部落盘根目录经显式参数注入 tmp 隔离，绝不触碰真实 ~/.rvf。
+# ---------------------------------------------------------------------------
+
+def _decision_token_store_roots(tmp: Path) -> dict[str, Path]:
+    """给 mint_decision_token 一组 tmp 隔离的三根目录（token / 冷却表 / 熔断 ledger）。"""
+    return {
+        "root": tmp / "decision-tokens",
+        "cooldown_root": tmp / "declined-fingerprints",
+        "circuit_breaker_root_dir": tmp / "circuit-breaker",
+    }
+
+
+def _fixed_utc(seconds_from_zero: int = 0):
+    import datetime as _dt  # noqa: PLC0415
+
+    return _dt.datetime(2026, 7, 11, 12, 0, 0, tzinfo=_dt.timezone.utc) + _dt.timedelta(
+        seconds=seconds_from_zero
+    )
+
+
+def test_decision_token_mint_and_legal_state_machine(tmp: Path) -> None:
+    """合法状态链 minted→injected→acknowledged→dispatched：每步打对应时间戳、追加 history，
+    mark_injected 幂等、acknowledged 记 start_attempt_count、dispatched 为终态且携带严格度。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root = roots["root"]
+    t0 = _fixed_utc(0)
+
+    minted = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp1",
+        candidate_summary={"paths": ["a.py"]}, now=t0, **roots,
+    )
+    assert minted.outcome == dts.MINT_OUTCOME_MINTED, minted.outcome
+    assert minted.record.state == dts.STATE_MINTED
+    assert minted.record.payload["start_attempt_count"] == 0
+    assert minted.record.payload["candidate_summary"] == {"paths": ["a.py"]}
+    assert minted.record.payload["history"][0] == {"from": None, "to": "minted", "at": dts.format_timestamp(t0)}
+    token = minted.token
+
+    injected = dts.mark_injected(token, root=tok_root, now=t0)
+    assert injected.state == dts.STATE_INJECTED
+    assert "injected_at" in injected.payload
+    # mark_injected 幂等：再调不报错、状态不变、不重复追加 history。
+    history_len = len(injected.payload["history"])
+    injected_again = dts.mark_injected(token, root=tok_root, now=t0)
+    assert injected_again.state == dts.STATE_INJECTED
+    assert len(injected_again.payload["history"]) == history_len
+
+    acked = dts.acknowledge_decision_token(token, root=tok_root, now=t0)
+    assert acked.state == dts.STATE_ACKNOWLEDGED
+    assert acked.payload["start_attempt_count"] == 1
+    assert "acknowledged_at" in acked.payload
+
+    dispatched = dts.mark_dispatched(token, strictness="strict", root=tok_root, now=t0)
+    assert dispatched.state == dts.STATE_DISPATCHED
+    assert dispatched.payload["dispatched_strictness"] == "strict"
+    assert "dispatched_at" in dispatched.payload
+
+    lookup = dts.read_decision_token(token, root=tok_root, now=t0)
+    assert lookup.status == "valid" and lookup.state == dts.STATE_DISPATCHED
+
+
+def test_decision_token_direct_minted_paths_to_ack_and_decline(tmp: Path) -> None:
+    """两条不经 injected 的合法直迁：minted→acknowledged（manual 路径）与 minted→declined。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root, cd_root = roots["root"], roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    m1 = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpA", now=t0, **roots)
+    acked = dts.acknowledge_decision_token(m1.token, root=tok_root, now=t0)
+    assert acked.state == dts.STATE_ACKNOWLEDGED
+
+    m2 = dts.mint_decision_token(worktree="/wt", session_id="sb", candidate_fingerprint="fpB", now=t0, **roots)
+    declined = dts.mark_declined(m2.token, reason="not this round", root=tok_root, now=t0, cooldown_root=cd_root)
+    assert declined.state == dts.STATE_DECLINED
+    assert declined.payload["decline_reason"] == "not this round"
+    # decline 顺带把指纹写入冷却表。
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpB", cooldown_root=cd_root)
+
+
+def test_decision_token_illegal_transitions_rejected(tmp: Path) -> None:
+    """非法迁移一律显式抛 DecisionTokenStateError：跳步、逆向、以及从终态再迁移。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root, cd_root = roots["root"], roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    def _mint(session, fp):
+        return dts.mint_decision_token(worktree="/wt", session_id=session, candidate_fingerprint=fp, now=t0, **roots).token
+
+    # minted 直接 dispatch = 跳过 acknowledge（start）→ 非法。
+    tk = _mint("s1", "f1")
+    try:
+        dts.mark_dispatched(tk, root=tok_root, now=t0)
+        raise AssertionError("minted→dispatched 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+    # injected 直接 dispatch（仍未 start）→ 非法。
+    tk2 = _mint("s2", "f2")
+    dts.mark_injected(tk2, root=tok_root, now=t0)
+    try:
+        dts.mark_dispatched(tk2, root=tok_root, now=t0)
+        raise AssertionError("injected→dispatched 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+    # acknowledged 逆向回 injected → 非法。
+    tk3 = _mint("s3", "f3")
+    dts.mark_injected(tk3, root=tok_root, now=t0)
+    dts.acknowledge_decision_token(tk3, root=tok_root, now=t0)
+    try:
+        dts.mark_injected(tk3, root=tok_root, now=t0)
+        raise AssertionError("acknowledged→injected 逆向应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+    # 从终态 dispatched 再任何迁移 → 非法。
+    tk4 = _mint("s4", "f4")
+    dts.mark_injected(tk4, root=tok_root, now=t0)
+    dts.acknowledge_decision_token(tk4, root=tok_root, now=t0)
+    dts.mark_dispatched(tk4, root=tok_root, now=t0)
+    for op in (
+        lambda: dts.mark_injected(tk4, root=tok_root, now=t0),
+        lambda: dts.acknowledge_decision_token(tk4, root=tok_root, now=t0),
+        lambda: dts.mark_declined(tk4, reason="x", root=tok_root, now=t0, cooldown_root=cd_root),
+        lambda: dts.mark_dispatched(tk4, root=tok_root, now=t0),
+    ):
+        try:
+            op()
+            raise AssertionError("从终态 dispatched 再迁移应被拒绝")
+        except dts.DecisionTokenStateError:
+            pass
+
+    # 从终态 declined 再迁移 → 非法。
+    tk5 = _mint("s5", "f5")
+    dts.mark_declined(tk5, reason="done", root=tok_root, now=t0, cooldown_root=cd_root)
+    try:
+        dts.acknowledge_decision_token(tk5, root=tok_root, now=t0)
+        raise AssertionError("从终态 declined 再 acknowledge 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+
+def test_decision_token_acknowledged_retry_and_rollback(tmp: Path) -> None:
+    """acknowledged 非终态：start 失败经 record_start_failure 回退保持 acknowledged，
+    start --retry 再 acknowledge 递增计数，最终 dispatch；rollback 仅在 acknowledged 合法。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root, cd_root = roots["root"], roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    tk = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="f1", now=t0, **roots).token
+
+    # 尚未 acknowledge（minted）时记录 start 失败 → 非法。
+    try:
+        dts.record_start_failure(tk, reason="too early", root=tok_root, now=t0)
+        raise AssertionError("minted 状态 rollback 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+    first = dts.acknowledge_decision_token(tk, root=tok_root, now=t0)
+    assert first.payload["start_attempt_count"] == 1
+
+    # 重量级准备失败 → 回退保持 acknowledged，落盘失败诊断。
+    rolled = dts.record_start_failure(tk, reason="provider health gate failed", root=tok_root, now=t0)
+    assert rolled.state == dts.STATE_ACKNOWLEDGED
+    assert rolled.payload["last_start_failure"]["reason"] == "provider health gate failed"
+
+    # start --retry：再 acknowledge，计数前进。
+    second = dts.acknowledge_decision_token(tk, root=tok_root, now=t0)
+    assert second.state == dts.STATE_ACKNOWLEDGED
+    assert second.payload["start_attempt_count"] == 2
+
+    dispatched = dts.mark_dispatched(tk, root=tok_root, now=t0)
+    assert dispatched.state == dts.STATE_DISPATCHED
+
+    # dispatched（终态）后再 rollback → 非法（坐实「dispatched 前才可回退」）。
+    try:
+        dts.record_start_failure(tk, reason="late", root=tok_root, now=t0)
+        raise AssertionError("dispatched 后 rollback 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+
+def test_decision_token_dedup_same_key_returns_existing(tmp: Path) -> None:
+    """去重键 (worktree, session_id, candidate_fingerprint)：同键活跃 token 幂等返回既有 token，
+    且不计入熔断；任一维度不同则新铸；同键既有 token 达终态后允许新铸（陈旧索引被覆盖）。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root, cb_root = roots["root"], roots["circuit_breaker_root_dir"]
+    # 本测试专注去重：把熔断阈值抬高到不干扰，避免同 session 多次新铸误触频率熔断。
+    mint_kwargs = {**roots, "circuit_breaker_max_requests": 1000}
+    t0 = _fixed_utc(0)
+
+    a = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="fp1", now=t0, **mint_kwargs)
+    assert a.outcome == dts.MINT_OUTCOME_MINTED
+    assert dts.count_recent_mint_requests("s1", now=t0, root=cb_root) == 1
+
+    # 同键重铸 → 幂等返回同 token，且不再记一次铸造请求。
+    a2 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="fp1", now=t0, **mint_kwargs)
+    assert a2.outcome == dts.MINT_OUTCOME_DEDUPLICATED
+    assert a2.token == a.token
+    assert dts.count_recent_mint_requests("s1", now=t0, root=cb_root) == 1, "去重命中不应计入熔断"
+
+    # 指纹不同 → 新铸。
+    b = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="fp2", now=t0, **mint_kwargs)
+    assert b.outcome == dts.MINT_OUTCOME_MINTED and b.token != a.token
+    # session 不同 → 新铸。
+    c = dts.mint_decision_token(worktree="/wt", session_id="s2", candidate_fingerprint="fp1", now=t0, **mint_kwargs)
+    assert c.outcome == dts.MINT_OUTCOME_MINTED and c.token != a.token
+    # worktree 不同 → 新铸。
+    d = dts.mint_decision_token(worktree="/wt-other", session_id="s1", candidate_fingerprint="fp1", now=t0, **mint_kwargs)
+    assert d.outcome == dts.MINT_OUTCOME_MINTED and d.token != a.token
+
+    # 把 token a 推到终态 dispatched，同键再 mint → 新铸（陈旧索引覆盖）。
+    dts.mark_injected(a.token, root=tok_root, now=t0)
+    dts.acknowledge_decision_token(a.token, root=tok_root, now=t0)
+    dts.mark_dispatched(a.token, root=tok_root, now=t0)
+    e = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="fp1", now=t0, **mint_kwargs)
+    assert e.outcome == dts.MINT_OUTCOME_MINTED and e.token != a.token
+
+
+def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> None:
+    """declined 指纹冷却表读写：record/is/read/clear 按 (worktree, fingerprint) 键；
+    冷却命中时 mint 返回 declined_cooldown 且不计入熔断。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root, cb_root = roots["cooldown_root"], roots["circuit_breaker_root_dir"]
+    t0 = _fixed_utc(0)
+
+    path = dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpX", reason="too small", token="0123456789abcdef",
+        now=t0, cooldown_root=cd_root,
+    )
+    assert path.is_file()
+    assert dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    # 键隔离：不同 worktree / 不同指纹都不命中。
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt2", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpY", cooldown_root=cd_root)
+
+    payload = dts.read_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert payload is not None and payload["reason"] == "too small"
+
+    # 冷却命中 → mint 拒铸为 declined_cooldown，且不记铸造请求。
+    result = dts.mint_decision_token(worktree="/wt", session_id="sc", candidate_fingerprint="fpX", now=t0, **roots)
+    assert result.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+    assert result.record is None and result.message
+    assert dts.count_recent_mint_requests("sc", now=t0, root=cb_root) == 0, "冷却拒铸不应计入熔断"
+
+    # clear 幂等：首删 True、再删 False，删后不再命中。
+    assert dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+    assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+
+
+def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
+    """铸造频率熔断（R24 裁决 b）：同 session 3600s 窗口内第 ≥3 次铸造请求拒铸，写 tripped ledger；
+    纯计数、零语义；请求滑出窗口后计数重置。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cb_root = roots["circuit_breaker_root_dir"]
+    t0 = _fixed_utc(0)
+
+    r1 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g1", now=t0, **roots)
+    r2 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g2", now=t0, **roots)
+    assert r1.outcome == dts.MINT_OUTCOME_MINTED and r2.outcome == dts.MINT_OUTCOME_MINTED
+
+    r3 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g3", now=t0, **roots)
+    assert r3.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
+    assert r3.record is None and r3.message
+    assert r3.circuit_breaker.tripped and r3.circuit_breaker.request_count == 3
+    assert r3.circuit_breaker.ledger_path.is_file()
+
+    r4 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g4", now=t0, **roots)
+    assert r4.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
+    assert r4.circuit_breaker.request_count == 4
+
+    assert dts.count_recent_mint_requests("s1", now=t0, root=cb_root) == 4
+    # tripped ledger 记了两条（第 3、4 次）。
+    tripped_lines = [ln for ln in r3.circuit_breaker.ledger_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(tripped_lines) == 2, tripped_lines
+
+    # 其它 session 不受影响。
+    other = dts.mint_decision_token(worktree="/wt", session_id="s2", candidate_fingerprint="g1", now=t0, **roots)
+    assert other.outcome == dts.MINT_OUTCOME_MINTED
+
+    # 窗口滑动：3601s 后原有请求全部滑出，计数重置，可再铸。
+    later = _fixed_utc(3601)
+    assert dts.count_recent_mint_requests("s1", now=later, root=cb_root) == 0
+    r5 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g5", now=later, **roots)
+    assert r5.outcome == dts.MINT_OUTCOME_MINTED
+
+
+def test_decision_token_ttl_expiry_and_run_dir_revival(tmp: Path) -> None:
+    """TTL 过期 + run_dir 复活（FU-1 方案 B）：无 run 锚点的过期 token 判 expired 不复活；
+    挂载在途 run_dir 后过期 token 可复活为原状态、递增 revived_count；复活拒绝 valid/终态。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root = roots["root"]
+    t0 = _fixed_utc(0)
+
+    # 短 TTL 铸造。
+    tk = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fpR", ttl_seconds=60, now=t0, **roots,
+    ).token
+    dts.acknowledge_decision_token(tk, root=tok_root, now=t0)
+
+    # 尚未挂 run 锚点：过 TTL → expired 且不可复活；此时 acknowledge 直接抛 expired。
+    late = _fixed_utc(120)
+    lk = dts.read_decision_token(tk, root=tok_root, now=late)
+    assert lk.status == "expired" and lk.revivable is False
+    try:
+        dts.acknowledge_decision_token(tk, root=tok_root, now=late)
+        raise AssertionError("无 run 锚点的过期 token 应抛 DecisionTokenExpiredError")
+    except dts.DecisionTokenExpiredError:
+        pass
+
+    # 挂载在途 run_dir（run 在磁盘）后，过期 token 判 revivable。
+    run_dir = tmp / "run-in-flight"
+    run_dir.mkdir(parents=True)
+    dts.attach_run_anchor(tk, run_dir=str(run_dir), root=tok_root, now=t0)
+    lk2 = dts.read_decision_token(tk, root=tok_root, now=late)
+    assert lk2.status == "expired" and lk2.revivable is True
+
+    # 显式复活：续期、保持 acknowledged 状态、revived_count 前进。
+    revived = dts.revive_decision_token(tk, root=tok_root, now=late, ttl_seconds=60)
+    assert revived.state == dts.STATE_ACKNOWLEDGED
+    assert revived.payload["revived_count"] == 1
+    assert dts.read_decision_token(tk, root=tok_root, now=late).status == "valid"
+
+    # acknowledge 遇过期可复活 token 会自动复活再推进（_load_active_record 内联复活）；
+    # 显式传短 ttl_seconds=60，令复活续期同样短命，便于后续 run_dir 消失后判 expired。
+    later2 = _fixed_utc(240)
+    acked = dts.acknowledge_decision_token(tk, root=tok_root, now=later2, ttl_seconds=60)
+    assert acked.state == dts.STATE_ACKNOWLEDGED and acked.payload["revived_count"] == 2
+
+    # 复活拒绝 valid（未过期）token。
+    fresh = dts.mint_decision_token(worktree="/wt", session_id="s2", candidate_fingerprint="fresh", now=t0, **roots).token
+    try:
+        dts.revive_decision_token(fresh, root=tok_root, now=t0)
+        raise AssertionError("复活 valid token 应被拒绝")
+    except dts.DecisionTokenError:
+        pass
+
+    # run_dir 消失后不再可复活。
+    import shutil as _shutil  # noqa: PLC0415
+    _shutil.rmtree(run_dir)
+    gone = _fixed_utc(400)
+    lk3 = dts.read_decision_token(tk, root=tok_root, now=gone)
+    assert lk3.status == "expired" and lk3.revivable is False
+
+
+def test_decision_token_bypass_lost_expired_states(tmp: Path) -> None:
+    """旁路终态 lost/expired：可作用于已 TTL 过期的活跃 token（S4 投递回执丢失场景），
+    但从 dispatched/declined 终态标注旁路终态为非法。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root, cd_root = roots["root"], roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    # injected 后 TTL 过期 → mark_lost（投递回执超时无信号）。
+    tk = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="f1", ttl_seconds=60, now=t0, **roots,
+    ).token
+    dts.mark_injected(tk, root=tok_root, now=t0)
+    late = _fixed_utc(120)
+    lost = dts.mark_lost(tk, reason="no delivery signal within ttl", root=tok_root, now=late)
+    assert lost.state == dts.STATE_LOST and lost.payload["lost_reason"].startswith("no delivery")
+
+    # 另一枚：minted 过期 → mark_expired 显式终局化。
+    tk2 = dts.mint_decision_token(
+        worktree="/wt", session_id="s2", candidate_fingerprint="f2", ttl_seconds=60, now=t0, **roots,
+    ).token
+    expired = dts.mark_expired(tk2, reason="ttl dead", root=tok_root, now=late)
+    assert expired.state == dts.STATE_EXPIRED
+
+    # 从 dispatched 终态标注 lost → 非法。
+    tk3 = dts.mint_decision_token(worktree="/wt", session_id="s3", candidate_fingerprint="f3", now=t0, **roots).token
+    dts.mark_injected(tk3, root=tok_root, now=t0)
+    dts.acknowledge_decision_token(tk3, root=tok_root, now=t0)
+    dts.mark_dispatched(tk3, root=tok_root, now=t0)
+    try:
+        dts.mark_lost(tk3, root=tok_root, now=t0)
+        raise AssertionError("dispatched→lost 应被拒绝")
+    except dts.DecisionTokenStateError:
+        pass
+
+
+def test_decision_token_read_missing_and_corrupt(tmp: Path) -> None:
+    """读取健壮性：缺失/损坏 JSON/非法 token 各归对应 status，不抛异常。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    tok_root = roots["root"]
+    t0 = _fixed_utc(0)
+
+    # 不存在 → missing。
+    assert dts.read_decision_token("0011223344556677", root=tok_root, now=t0).status == "missing"
+    # 非法 token 值 → invalid_token。
+    assert dts.read_decision_token("not-a-token", root=tok_root, now=t0).status == "invalid_token"
+
+    # 损坏 JSON → invalid_json。
+    real = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="f1", now=t0, **roots)
+    real.record.path.write_text("{ this is not json", encoding="utf-8")
+    assert dts.read_decision_token(real.token, root=tok_root, now=t0).status == "invalid_json"
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         (
@@ -6995,6 +7418,46 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "dispatch_reviewers_wait_status_branches",
             lambda: test_dispatch_reviewers_wait_status_branches(root / "dispatch-wait"),
+        ),
+        (
+            "decision_token_mint_and_legal_state_machine",
+            lambda: test_decision_token_mint_and_legal_state_machine(root / "dts-legal-fsm"),
+        ),
+        (
+            "decision_token_direct_minted_paths_to_ack_and_decline",
+            lambda: test_decision_token_direct_minted_paths_to_ack_and_decline(root / "dts-direct-paths"),
+        ),
+        (
+            "decision_token_illegal_transitions_rejected",
+            lambda: test_decision_token_illegal_transitions_rejected(root / "dts-illegal"),
+        ),
+        (
+            "decision_token_acknowledged_retry_and_rollback",
+            lambda: test_decision_token_acknowledged_retry_and_rollback(root / "dts-retry-rollback"),
+        ),
+        (
+            "decision_token_dedup_same_key_returns_existing",
+            lambda: test_decision_token_dedup_same_key_returns_existing(root / "dts-dedup"),
+        ),
+        (
+            "decision_token_declined_fingerprint_cooldown_write_query",
+            lambda: test_decision_token_declined_fingerprint_cooldown_write_query(root / "dts-cooldown"),
+        ),
+        (
+            "decision_token_mint_circuit_breaker_window",
+            lambda: test_decision_token_mint_circuit_breaker_window(root / "dts-breaker"),
+        ),
+        (
+            "decision_token_ttl_expiry_and_run_dir_revival",
+            lambda: test_decision_token_ttl_expiry_and_run_dir_revival(root / "dts-revival"),
+        ),
+        (
+            "decision_token_bypass_lost_expired_states",
+            lambda: test_decision_token_bypass_lost_expired_states(root / "dts-bypass"),
+        ),
+        (
+            "decision_token_read_missing_and_corrupt",
+            lambda: test_decision_token_read_missing_and_corrupt(root / "dts-read-robust"),
         ),
     ]
 
