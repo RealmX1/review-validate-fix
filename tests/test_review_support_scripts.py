@@ -6702,7 +6702,15 @@ def test_candidate_summary_includes_committed_but_unreviewed(tmp: Path) -> None:
     assert by_path["g.py"]["change_state"] == summary_mod.CHANGE_STATE_UNCOMMITTED
     assert summ["has_committed_but_unreviewed"] is True
     assert summ["committed_round_baseline"] == base
-    assert summ["lower_bound_source"] == summary_mod.LOWER_BOUND_SOURCE_REVIEW_HIGHWATER
+    # R9 口径切换（S6）：lower_bound_source = 「已审」裁决权威 = review_state（有 committed 窗口种子）；
+    # 窗口种子来源另置 committed_round_window_seed_source（此处 baseline==高水位）；无 reviewed 单元
+    # 故 review_state 过滤为空。
+    assert summ["lower_bound_source"] == summary_mod.LOWER_BOUND_SOURCE_TRACKER_REVIEW_STATE
+    assert (
+        summ["committed_round_window_seed_source"]
+        == summary_mod.COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER
+    )
+    assert summ["review_state_filtered_committed_path_count"] == 0
     # bootstrap-size 并入摘要（R25）。
     assert summ["bootstrap_size"]["candidate_path_count"] == 2
     # 严格度参考档随附（调 2 号交付物）。
@@ -6844,6 +6852,168 @@ def test_candidate_fingerprint_serialization_format(tmp: Path) -> None:
     assert fp([("a", "bc"), ("d", "")]) != fp([("a", "b"), ("cd", "")])
 
 
+# ---------------------------------------------------------------------------
+# S6：R9 真相源迁移（SHA marker → tracker review_state；方案 A）
+# ---------------------------------------------------------------------------
+
+def test_select_committed_paths_reviewed_by_session_filters_reviewed_owned(tmp: Path) -> None:
+    """# OBSERVATION-WINDOW(R9) 过滤器单元用例：本 session 拥有且全 reviewed 的 committed 路径被
+    判「已审」剔除；无 tracker 记录（bootstrap）返回空集；review 前（assigned/available）不剔除；
+    他 session 视角 / 缺 session_id 一律不剔除（保守偏「重审」）。review_state='reviewed' 的读取
+    幂等（durable，重复读仍剔除）——覆盖「有记录 / 无记录 bootstrap / 单调性」三态。"""
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)  # f.txt base 提交
+    logs = tmp / "logs"
+
+    # 无记录 bootstrap：tracker DB 尚不存在 → 空集（退化 SHA-only 窗口，不误剔）。
+    assert dt.select_committed_paths_reviewed_by_session(
+        repo=repo, session_id="s1", candidate_paths={"f.txt"}, log_root_override=logs
+    ) == set()
+
+    # 本轮提交 f.txt（committed 单元），transcript 归属 s1。
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "round work"], cwd=repo)
+    sm.build_manifest(
+        repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=baseline
+    )
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    assert alloc["status"] == "allocated", alloc
+
+    # review 前（assigned，未 reviewed）：不剔除。
+    assert dt.select_committed_paths_reviewed_by_session(
+        repo=repo, session_id="s1", candidate_paths={"f.txt"}, log_root_override=logs
+    ) == set()
+
+    # 完成 review（mark_reviewed 默认 True）→ f.txt review_state='reviewed'。
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    after = _units_full_by_path(alloc["tracker_dir"], "f.txt")
+    assert any(rev == "reviewed" for (_obs, rev) in after.values()), after
+    assert all(obs == "committed" for (obs, _rev) in after.values()), after
+
+    # 有记录（reviewed + 本 session 拥有）→ 剔除。durable：重复读幂等仍剔除。
+    for _ in range(2):
+        assert dt.select_committed_paths_reviewed_by_session(
+            repo=repo, session_id="s1", candidate_paths={"f.txt"}, log_root_override=logs
+        ) == {"f.txt"}
+    # 他 session 视角：非本 session 拥有 → 不剔除（review_state 全局为真，但归属不匹配）。
+    assert dt.select_committed_paths_reviewed_by_session(
+        repo=repo, session_id="sess-OTHER", candidate_paths={"f.txt"}, log_root_override=logs
+    ) == set()
+    # session_id 缺失 → 空集（无法确认归属，保守不剔除）。
+    assert dt.select_committed_paths_reviewed_by_session(
+        repo=repo, session_id=None, candidate_paths={"f.txt"}, log_root_override=logs
+    ) == set()
+
+
+def test_select_committed_paths_reviewed_by_session_partial_reviewed_not_excluded(tmp: Path) -> None:
+    """过滤器只在**全部** committed 单元 reviewed 时才剔除：同路径有未审 committed 单元残留则保留
+    （偏「重审」安全方向）。这里用『review 后同路径再提交新 committed 改动』制造未审残留单元。"""
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "round work 1"], cwd=repo)
+    sm.build_manifest(
+        repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=baseline
+    )
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    # 同路径再提交一处新改动 → 引入一个新的 committed 单元（未审 available）。
+    (repo / "f.txt").write_text("changed\nmore-unreviewed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "round work 2 (unreviewed)"], cwd=repo)
+    dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r2", reviewer_id="rev2",
+        log_root_override=logs, auto_claim_observed=True, committed_baseline=baseline, dry_run=True,
+    )
+    states = {rev for (_obs, rev) in _units_full_by_path(alloc["tracker_dir"], "f.txt").values()}
+    assert "reviewed" in states and states - {"reviewed"}, states  # 混合：有 reviewed 也有未审
+    # 非全 reviewed → 不剔除。
+    assert dt.select_committed_paths_reviewed_by_session(
+        repo=repo, session_id="s1", candidate_paths={"f.txt"}, log_root_override=logs
+    ) == set()
+
+
+def test_candidate_summary_excludes_reviewed_committed_keeps_dirty(tmp: Path) -> None:
+    """S6 联调：build_candidate_summary 经 review_state 过滤剔除已被本 session 审过的 committed
+    路径，同时保留未审 dirty 改动；``lower_bound_source`` 口径切到 review_state 权威、窗口种子来源
+    另置 ``committed_round_window_seed_source``（与 detection/allocation 同一 commit 原子切换）。"""
+    summary_mod, _calc, _hw, dt = _load_candidate_summary_modules()
+    _dt2, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # committed 本轮工作 f.txt（将被审），transcript 归属 s1。
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    run(["git", "add", "f.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "round work"], cwd=repo)
+    sm.build_manifest(
+        repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=baseline
+    )
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=False, committed_baseline=baseline,
+    )
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    # 未审 dirty 改动 g.py（应保留）。
+    (repo / "g.py").write_text("new\ncontent\n", encoding="utf-8")
+
+    summ = summary_mod.build_candidate_summary(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        log_root_override=logs,
+        workspace_guard=lambda **_k: None,
+        task_id_resolver=lambda _e: None,
+        session_id_resolver=lambda _e: "s1",
+        committed_baseline_resolver=lambda _rp, _t, _s: baseline,
+        committed_base_ref_resolver=lambda _rp: None,
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    # 已审 committed f.txt 被 review_state 过滤剔除（不在候选）。
+    assert "f.txt" not in by_path, summ["candidates"]
+    # 未审 dirty g.py 保留。
+    assert "g.py" in by_path
+    assert by_path["g.py"]["change_state"] == summary_mod.CHANGE_STATE_UNCOMMITTED
+    assert summ["review_state_filtered_committed_path_count"] == 1
+    assert summ["candidate_path_count"] == 1  # 仅 g.py
+    assert summ["has_committed_but_unreviewed"] is False
+    # lower_bound_source 口径=review_state 权威；窗口种子来源另行透明化（round-baseline 兜底或高水位）。
+    assert summ["lower_bound_source"] == summary_mod.LOWER_BOUND_SOURCE_TRACKER_REVIEW_STATE
+    assert summ["committed_round_window_seed_source"] in (
+        summary_mod.COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER,
+        summary_mod.COMMITTED_ROUND_WINDOW_SEED_ROUND_BASELINE,
+    )
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         # --- S2：候选摘要 + 严格度参考档 ---
@@ -6891,6 +7061,25 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "candidate_fingerprint_serialization_format",
             lambda: test_candidate_fingerprint_serialization_format(
                 root / "candidate-fp-format"
+            ),
+        ),
+        # --- S6：R9 真相源迁移（SHA marker → tracker review_state；方案 A）---
+        (
+            "select_committed_paths_reviewed_by_session_filters_reviewed_owned",
+            lambda: test_select_committed_paths_reviewed_by_session_filters_reviewed_owned(
+                root / "s6-review-state-filter-reviewed-owned"
+            ),
+        ),
+        (
+            "select_committed_paths_reviewed_by_session_partial_reviewed_not_excluded",
+            lambda: test_select_committed_paths_reviewed_by_session_partial_reviewed_not_excluded(
+                root / "s6-review-state-filter-partial"
+            ),
+        ),
+        (
+            "candidate_summary_excludes_reviewed_committed_keeps_dirty",
+            lambda: test_candidate_summary_excludes_reviewed_committed_keeps_dirty(
+                root / "s6-summary-excludes-reviewed-committed"
             ),
         ),
         (

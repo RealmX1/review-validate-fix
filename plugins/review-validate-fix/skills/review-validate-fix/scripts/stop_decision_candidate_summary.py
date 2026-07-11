@@ -12,15 +12,25 @@ RVF overhaul 把「要不要审、审什么」的发起决策权交给主 agent�
   读取，读不到就标 ``unattributed``（默认纳入）。
 * **候选全集程序化构造**（R1）：本 worktree「自上次 review 以来」的 committed ∪ uncommitted
   改动，ownership 过滤。agent 不枚举全集。
-* **必含 committed-but-unreviewed**（committed-round 漏审盲区家族教训）：committed 分支用
-  committed-round 的 SHA 同源 resolver（下界 = review 高水位 / round-baseline），因此
-  ``baseline..工作树`` 里「已提交但未审」的孤儿提交一定进候选。
-* **真相源分期**（S2 决策，防 S2/S6 双源撕裂）：S6 落地前，下界**一律复用**现有 SHA 同源
-  resolver（``core.session_scope_allocation.committed_round_detection._resolve_committed_round_baseline``
-  家族 + ``core.session_scope_allocation.review_highwater_marker``），**不另起第二真相源**。S6
-  落地时摘要生成器与 allocation 在同一 commit 内一起切到 tracker ``review_state`` 下界。这些
-  resolver 现住在**中性核** ``committed_round_detection``（S10h-b 迁 core），与 Stop hook 引擎
-  解耦，故**直接 top-level import**（见 ``_default_committed_baseline_resolver``），不涉 S4 环。
+* **必含 committed-but-unreviewed**（committed-round 漏审盲区家族教训）：committed 分支的**窗口
+  种子**用 committed-round 的 SHA 同源 resolver（种子 = review 高水位 / round-baseline），因此
+  ``种子..工作树`` 里「已提交但未审」的孤儿提交先进枚举窗口，再由 review_state 过滤掉其中已审的。
+* **真相源分期**（S2/S6 决策，防 S2/S6 双源撕裂）—— **S6 已落地（方案 A，本 commit）**：
+  * **窗口种子（bootstrap）** 仍复用现有 SHA 同源 resolver
+    （``committed_round_detection._resolve_committed_round_baseline`` 家族 + ``review_highwater_marker``），
+    **不删码**（R9 登记簿：SHA marker 家族 reroute 不删码，观察期后用户确认才物理删除）。
+  * **「已审/未审」裁决权** 改由 tracker unit ``review_state`` 承担：committed 枚举后经
+    ``reviewable_unit_diff_tracker.select_committed_paths_reviewed_by_session``（owner 经 sessions 表
+    session_units 归属）过滤掉已审 committed 路径。detection / allocation / summary 三处同一 commit
+    原子切换（allocation 的单元选择本就 ``review_state IN ('available','assigned')``，天然同源）。
+    ``lower_bound_source`` 字段口径随之从窗口种子 SHA（``review_highwater``/``round_baseline``）改为
+    「已审裁决权威」（``tracker_review_state``/``none``）；窗口种子来源另置
+    ``committed_round_window_seed_source`` 字段透明化。
+  * **R9 终局物理删除 SHA marker 前，须先把 reviewed_head 持久化进 tracker（方案 B 写侧）**，届时
+    marker 才能卸下「窗口种子」角色——见 ``select_committed_paths_reviewed_by_session`` 函数头。
+  * 这些 resolver / 过滤器现住在**中性核**（``committed_round_detection`` S10h-b 迁 core、
+    ``reviewable_unit_diff_tracker`` 本就在 core），与 Stop hook 引擎解耦，故**直接 top-level import**，
+    不涉 S4 环。
 * **先过 workspace 守卫**：Cline Kanban task 的 Stop event，若 cwd/git-root 与该 task 的执行
   worktree 不一致，直接短路（不审 unrelated dirty repo）。默认走 Stop hook 引擎模块
   ``stop_review_validate_fix`` 的 ``kanban_task_workspace_guard_payload``（**惰性 import** 破 S4
@@ -78,6 +88,7 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa
     _worktree_key,
     git_common_dir,
     repo_key,
+    select_committed_paths_reviewed_by_session,
     tracker_dir,
 )
 from core.run_ledger.run_ledger import log_root  # noqa: E402
@@ -98,10 +109,19 @@ OWNERSHIP_SESSION_OWNED = "session_owned"
 OWNERSHIP_OTHER_SESSION_OWNED = "other_session_owned"
 OWNERSHIP_UNATTRIBUTED = "unattributed"
 
-# 下界来源标签。
-LOWER_BOUND_SOURCE_REVIEW_HIGHWATER = "review_highwater"
-LOWER_BOUND_SOURCE_ROUND_BASELINE = "round_baseline"
+# ``lower_bound_source``（R9 真相源迁移后=「已审/未审」**裁决权威**，非窗口种子 SHA 来源）：
+# review_state 是 committed 候选「是否已审」的真相源。有 committed 窗口种子时=tracker_review_state，
+# 无种子时=none。口径切换与 detection/allocation 同一 commit 原子完成（S6）。
+LOWER_BOUND_SOURCE_TRACKER_REVIEW_STATE = "tracker_review_state"
 LOWER_BOUND_SOURCE_NONE = "none"
+
+# ``committed_round_window_seed_source``：committed-round git 窗口下界**种子**（bootstrap）来源。
+# R9 观察期内，窗口种子仍由 SHA marker 家族（review 高水位 / round-baseline）提供（见模块 docstring
+# 「真相源分期」），review_state 只接管「已审」裁决、不接管窗口种子。R9 终局物理删除 marker 前须先把
+# reviewed_head 持久化进 tracker（方案 B 写侧），marker 才能卸下窗口种子角色。
+COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER = "review_highwater"
+COMMITTED_ROUND_WINDOW_SEED_ROUND_BASELINE = "round_baseline"
+COMMITTED_ROUND_WINDOW_SEED_NONE = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +163,29 @@ def _default_committed_baseline_resolver(
 
 def _default_committed_base_ref_resolver(repo_path: Path) -> str | None:
     return _resolve_committed_round_base_ref(repo_path)
+
+
+def _default_reviewed_committed_paths_resolver(
+    repo_path: Path, session_id: str | None, candidate_committed_paths: set[str], log_root_override: Path | None
+) -> set[str]:
+    """# OBSERVATION-WINDOW(R9) —— 委托给中性核 tracker 的 review_state「已审」过滤器。
+
+    返回 ``candidate_committed_paths`` 中**已被本 session 审过**的路径子集（其 committed 单元全
+    ``review_state='reviewed'`` 且本 session 拥有），供摘要从 committed 候选里剔除。与 Stop hook
+    detection 端 ``maybe_route_committed_round_scope`` 调**同一个** tracker 过滤器，保证 detection /
+    allocation / summary 三处「已审」裁决同源（S6 原子切换）。best-effort：任何异常退化为空集。
+
+    R9 终局物理删除 SHA marker 家族前，须先把 reviewed_head 持久化进 tracker（方案 B 写侧），
+    marker 才能卸下窗口种子角色——见 ``select_committed_paths_reviewed_by_session`` 函数头。"""
+    try:
+        return select_committed_paths_reviewed_by_session(
+            repo=repo_path,
+            session_id=session_id,
+            candidate_paths=candidate_committed_paths,
+            log_root_override=log_root_override,
+        )
+    except Exception:  # pragma: no cover - 过滤器永不阻断摘要
+        return set()
 
 
 def _default_workspace_guard(
@@ -381,18 +424,20 @@ def compute_candidate_fingerprint(entries: list[tuple[str, str]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 下界来源标注
+# committed-round 窗口种子来源标注（R9 后：种子=bootstrap，非「已审」裁决权威）
 # ---------------------------------------------------------------------------
 
-def _classify_lower_bound_source(
+def _classify_committed_round_window_seed_source(
     baseline: str | None,
     task_id: str | None,
     session_id: str | None,
     log_root_override: Path | None,
 ) -> str:
-    """标注下界来自 review 高水位还是 round-baseline（仅用于摘要透明度，不影响候选枚举）。"""
+    """标注 committed-round git 窗口下界**种子**来自 review 高水位还是 round-baseline（仅摘要透明度，
+    不影响候选枚举）。R9 后种子仅作 bootstrap；「已审/未审」裁决权威改由 ``review_state`` 承担
+    （见 ``lower_bound_source`` 字段），二者分工见模块 docstring「真相源分期」。"""
     if not baseline:
-        return LOWER_BOUND_SOURCE_NONE
+        return COMMITTED_ROUND_WINDOW_SEED_NONE
     try:
         highwater = review_highwater_marker.resolve_review_highwater_head(
             task_id=task_id, session_id=session_id, root=log_root_override
@@ -400,8 +445,8 @@ def _classify_lower_bound_source(
     except Exception:  # pragma: no cover - 标注读取永不阻断
         highwater = None
     if highwater and highwater == baseline:
-        return LOWER_BOUND_SOURCE_REVIEW_HIGHWATER
-    return LOWER_BOUND_SOURCE_ROUND_BASELINE
+        return COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER
+    return COMMITTED_ROUND_WINDOW_SEED_ROUND_BASELINE
 
 
 # ---------------------------------------------------------------------------
@@ -420,19 +465,23 @@ def build_candidate_summary(
     session_id_resolver: Callable[[Mapping[str, Any]], str | None] | None = None,
     committed_baseline_resolver: Callable[[Path, str | None, str | None], str | None] | None = None,
     committed_base_ref_resolver: Callable[[Path], str | None] | None = None,
+    reviewed_committed_paths_resolver: Callable[[Path, str | None, set[str], Path | None], set[str]] | None = None,
     strictness_rule_parameters: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 Stop hook 注入用的候选摘要（结构见返回 dict / 模块 docstring）。
 
-    所有外部依赖都可注入（默认复用中性核 committed_round_detection 的同源下界 resolver + Stop
-    hook 引擎的 workspace 守卫 / id 提取）。best-effort：git / tracker 读取失败一律退化，绝不抛
-    异常阻断 Stop hook。
+    所有外部依赖都可注入（默认复用中性核 committed_round_detection 的同源下界种子 resolver +
+    tracker 的 review_state「已审」过滤器 + Stop hook 引擎的 workspace 守卫 / id 提取）。
+    best-effort：git / tracker 读取失败一律退化，绝不抛异常阻断 Stop hook。
     """
     workspace_guard = workspace_guard or _default_workspace_guard
     task_id_resolver = task_id_resolver or _default_task_id_resolver
     session_id_resolver = session_id_resolver or _default_session_id_resolver
     committed_baseline_resolver = committed_baseline_resolver or _default_committed_baseline_resolver
     committed_base_ref_resolver = committed_base_ref_resolver or _default_committed_base_ref_resolver
+    reviewed_committed_paths_resolver = (
+        reviewed_committed_paths_resolver or _default_reviewed_committed_paths_resolver
+    )
 
     # ① 先过 workspace 守卫（Kanban task worktree 一致性）。命中 → 短路，空候选。
     guard_payload = workspace_guard(event=event, cwd=cwd, ledger=ledger)
@@ -450,7 +499,8 @@ def build_candidate_summary(
     task_id = task_id_resolver(event)
     session_id = session_id_resolver(event)
 
-    # ② 下界：committed-round 的 SHA 同源 resolver（高水位 / round-baseline）。
+    # ② 窗口种子（bootstrap）：committed-round 的 SHA 同源 resolver（高水位 / round-baseline）。
+    # R9 后种子仅作 committed 枚举窗口的下界；「已审/未审」裁决权改由 review_state 承担（③.5）。
     try:
         baseline = committed_baseline_resolver(repo_path, task_id, session_id)
     except Exception:  # pragma: no cover - resolver 永不阻断
@@ -459,11 +509,11 @@ def build_candidate_summary(
         base_ref = committed_base_ref_resolver(repo_path)
     except Exception:  # pragma: no cover
         base_ref = None
-    lower_bound_source = _classify_lower_bound_source(
+    committed_round_window_seed_source = _classify_committed_round_window_seed_source(
         baseline, task_id, session_id, log_root_override
     )
 
-    # ③ 枚举：committed（下界..工作树，必含 committed-but-unreviewed）∪ uncommitted（dirty）。
+    # ③ 枚举：committed（种子..工作树，含 committed-but-unreviewed）∪ uncommitted（dirty）。
     committed_paths: list[str] = []
     if baseline:
         try:
@@ -477,6 +527,22 @@ def build_candidate_summary(
 
     committed_set = set(committed_paths)
     uncommitted_set = set(uncommitted_paths)
+
+    # ③.5 OBSERVATION-WINDOW(R9): review_state「已审」真相源过滤 —— 把已被本 session 审过的
+    # committed 路径（其 committed 单元全 reviewed 且本 session 拥有）从 committed_set 剔除，不再
+    # 作为「已提交待审」候选注入。仅剔除 committed 维度：若同路径仍有未提交 dirty 改动，经
+    # uncommitted_set 保留（re-dirtied 未审工作不被误剔）。与 detection 端调同一 tracker 过滤器，
+    # 三处「已审」裁决同源。lower_bound_source 字段口径随之从窗口种子 SHA 切到 review_state 权威。
+    reviewed_committed_paths = reviewed_committed_paths_resolver(
+        repo_path, session_id, committed_set, log_root_override
+    )
+    review_state_filtered_committed_paths = sorted(committed_set & reviewed_committed_paths)
+    committed_set = committed_set - reviewed_committed_paths
+    # R9 后 lower_bound_source = 「已审/未审」裁决权威：有 committed 窗口种子即 review_state 主导。
+    lower_bound_source = (
+        LOWER_BOUND_SOURCE_TRACKER_REVIEW_STATE if baseline else LOWER_BOUND_SOURCE_NONE
+    )
+
     all_paths = sorted(committed_set | uncommitted_set)
     untracked = _untracked_paths(repo_path)
     ownership_labels = _read_tracker_ownership(repo_path, session_id, log_root_override)
@@ -562,6 +628,8 @@ def build_candidate_summary(
         "committed_round_baseline": baseline,
         "committed_round_base_ref": base_ref,
         "lower_bound_source": lower_bound_source,
+        "committed_round_window_seed_source": committed_round_window_seed_source,
+        "review_state_filtered_committed_path_count": len(review_state_filtered_committed_paths),
         "candidates": [c.to_public_dict() for c in candidates],
         "candidate_path_count": len(included_candidates),
         "filtered_out_other_session_path_count": filtered_out_count,
@@ -591,6 +659,8 @@ def _empty_summary(
         "committed_round_baseline": None,
         "committed_round_base_ref": None,
         "lower_bound_source": LOWER_BOUND_SOURCE_NONE,
+        "committed_round_window_seed_source": COMMITTED_ROUND_WINDOW_SEED_NONE,
+        "review_state_filtered_committed_path_count": 0,
         "candidates": [],
         "candidate_path_count": 0,
         "filtered_out_other_session_path_count": 0,
@@ -639,9 +709,11 @@ __all__ = [
     "OWNERSHIP_SESSION_OWNED",
     "OWNERSHIP_OTHER_SESSION_OWNED",
     "OWNERSHIP_UNATTRIBUTED",
-    "LOWER_BOUND_SOURCE_REVIEW_HIGHWATER",
-    "LOWER_BOUND_SOURCE_ROUND_BASELINE",
+    "LOWER_BOUND_SOURCE_TRACKER_REVIEW_STATE",
     "LOWER_BOUND_SOURCE_NONE",
+    "COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER",
+    "COMMITTED_ROUND_WINDOW_SEED_ROUND_BASELINE",
+    "COMMITTED_ROUND_WINDOW_SEED_NONE",
     "CandidateFileChange",
     "compute_candidate_fingerprint",
     "build_candidate_summary",

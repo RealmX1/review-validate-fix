@@ -129,6 +129,7 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     find_manual_rvf_run_for_scope_hash,
     invalidate_reviewed_units_for_run,
     lease_release,
+    select_committed_paths_reviewed_by_session,
     sweep_stale,
 )
 from review_reopen_marker import (
@@ -6478,6 +6479,37 @@ def maybe_route_committed_round_scope(
     except Exception:
         committed_paths = []
     if not committed_paths:
+        return None
+    # OBSERVATION-WINDOW(R9): review_state「已审」真相源过滤 —— 把已被本 session 审过的
+    # committed 路径（其 committed 单元全 reviewed 且本 session 拥有）从候选里剔除，使 detection
+    # 与 allocation（其单元选择本就 `review_state IN ('available','assigned')`）同源，不再对
+    # 已审工作过度 route。SHA 窗口种子（baseline）保留作 bootstrap，保住 orphan 高水位检测；
+    # R9 终局删 marker 前须先把 reviewed_head 持久化进 tracker（方案 B），marker 才能卸下窗口
+    # 种子角色（见 select_committed_paths_reviewed_by_session 函数头）。best-effort：过滤失败退化
+    # 为今日 SHA-only 行为，绝不误剔未审工作。
+    try:
+        reviewed_committed_paths = select_committed_paths_reviewed_by_session(
+            repo=repo_path,
+            session_id=session_hook_id_from_event(event),
+            candidate_paths=committed_paths,
+        )
+    except Exception:
+        reviewed_committed_paths = set()
+    if reviewed_committed_paths:
+        committed_paths = [p for p in committed_paths if p not in reviewed_committed_paths]
+        ledger.event(
+            phase="gate",
+            event="committed_round_review_state_filtered",
+            status="committed",
+            reason_code="committed_round_already_reviewed",
+            repo=repo,
+            cwd=cwd,
+            committed_baseline=baseline,
+            review_state_filtered_path_count=len(reviewed_committed_paths),
+            remaining_committed_path_count=len(committed_paths),
+        )
+    if not committed_paths:
+        # 全部 committed 路径都已被本 session 审过 → 与 allocation 空 scope 同结果，静默停（不 route）。
         return None
     ledger.event(
         phase="gate",

@@ -5193,6 +5193,107 @@ def _empty_allocate_result(
     }
 
 
+def select_committed_paths_reviewed_by_session(
+    *,
+    repo: Path,
+    session_id: str | None,
+    candidate_paths: Iterable[str],
+    log_root_override: Path | None = None,
+) -> set[str]:
+    """# OBSERVATION-WINDOW(R9) —— review_state「已审/未审」真相源过滤器（R9 真相源迁移落点）。
+
+    给定一组「本轮已提交」候选路径，返回其中**已被本 session 审过**的路径子集，供 detection /
+    候选摘要从 committed 候选里剔除。判据（per-unit ``review_state`` 为「已审」裁决真相源，owner
+    归属经 ``sessions`` / ``session_units`` 表）：
+
+      * 该路径在本 worktree 存在 ``observed_state='committed'`` 且未 tombstone 的单元；
+      * 这些 committed 单元 **全部** ``review_state='reviewed'``；
+      * 且其中 **至少一个** 归属本 session（``session_units`` ``assignment_kind IN
+        ('owned','takeover')``，与候选摘要 ``_read_tracker_ownership`` 同口径）。
+
+    任一不满足（无登记单元 / 存在 ``available``|``assigned`` 未审单元 / 仅归属他 session）→ **不
+    剔除**（保守偏「重审」方向，与 finalize 高水位『纯 no-op 不推进』同向；宁可多审一次也不漏审）。
+    只看 committed 维度：同路径若仍有未提交 dirty 改动，那份未审工作由调用方经 dirty 候选保留，
+    不被本过滤器误剔。
+
+    ## R9 真相源迁移的角色分工（方案 A）与 marker 卸载前置依赖
+
+    committed-round 的 **git 窗口下界种子** 仍由 SHA marker 家族（review 高水位 / round-baseline，
+    见 ``committed_round_detection._resolve_committed_round_baseline``）提供——本过滤器只把「已审」
+    **裁决权** 交给 ``review_state``，不接管窗口种子。这样保住 orphan 高水位窗口检测（ac042be /
+    a296266 教训：孤儿提交靠高水位 SHA 才落在 ``high-water..HEAD`` 窗口内）。
+
+    **R9 终局物理删除 SHA marker 家族前，须先把 ``reviewed_head`` 持久化进 tracker（方案 B 写侧），
+    届时 marker 才能卸下「窗口种子」角色。** 在那之前 marker 家族不可删（R9 登记簿：『SHA marker 家族
+    reroute 不删码；观察期后用户确认才物理删除』）——本函数头的 ``# OBSERVATION-WINDOW(R9)`` 标注
+    与本段即把该前置依赖固化在代码里，避免观察期结束时误删。
+
+    best-effort：tracker 禁用 / DB 不存在 / 任何 sqlite 异常 → 返回空集（不剔除，退化为今日
+    SHA-only 窗口行为，绝不误剔除未审工作）。
+    """
+    paths = [p for p in candidate_paths if p]
+    if not paths or not session_id:
+        return set()
+    if _disabled():
+        return set()
+    common_dir = git_common_dir(repo)
+    if common_dir is None:
+        return set()
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    db_path = tracker_dir(base, key) / SQLITE_FILENAME
+    if not db_path.exists():
+        return set()
+    worktree = _worktree_key(str(repo.resolve()))
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" for _ in paths)
+        rows = conn.execute(
+            f"""
+            SELECT u.path AS path,
+                   u.review_state AS review_state,
+                   CASE WHEN EXISTS (
+                       SELECT 1
+                         FROM session_units su
+                        WHERE su.unit_id = u.unit_id
+                          AND su.session_id = ?
+                          AND su.assignment_kind IN ('owned', 'takeover')
+                   ) THEN 1 ELSE 0 END AS owned_by_session
+              FROM units u
+             WHERE u.worktree_key = ?
+               AND u.is_tombstoned = 0
+               AND u.observed_state = 'committed'
+               AND u.path IN ({placeholders})
+            """,
+            (session_id, worktree, *paths),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # 按路径聚合 per-unit review_state 与本 session 归属：全 reviewed 且本 session 拥有才算「已审」。
+    per_path: dict[str, dict[str, bool]] = {}
+    for row in rows:
+        agg = per_path.setdefault(
+            row["path"],
+            {"has_committed_unit": False, "all_reviewed": True, "owned_by_session": False},
+        )
+        agg["has_committed_unit"] = True
+        if row["review_state"] != "reviewed":
+            agg["all_reviewed"] = False
+        if row["owned_by_session"]:
+            agg["owned_by_session"] = True
+    return {
+        path
+        for path, agg in per_path.items()
+        if agg["has_committed_unit"] and agg["all_reviewed"] and agg["owned_by_session"]
+    }
+
+
 def allocate_review_scope(
     *,
     repo: Path,
