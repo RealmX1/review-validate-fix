@@ -166,6 +166,7 @@ def _run_phase(
         argv,
         cwd=repo,
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,

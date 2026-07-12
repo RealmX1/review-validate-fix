@@ -36,8 +36,10 @@ def _fake_canonical_repo(tmp_path: Path) -> Path:
         repo / "scripts/check_plugin_contracts.py",
         """
         import os
+        import sys
         from pathlib import Path
 
+        sys.stdin.read()
         with Path(os.environ["RVF_LOCAL_DEPLOY_TEST_TRACE"]).open("a", encoding="utf-8") as handle:
             handle.write("contract\\n")
         """,
@@ -106,24 +108,39 @@ def _installed_log(home: Path, head: str) -> None:
     path.write_text(json.dumps({"source": {"head": head}}), encoding="utf-8")
 
 
-def _run(repo: Path, home: Path, trace: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--repo",
-            str(repo),
-            "--home",
-            str(home),
-            "--skip-claude-plugin",
-            "--json",
-        ],
-        cwd=ROOT,
-        env={**os.environ, "RVF_LOCAL_DEPLOY_TEST_TRACE": str(trace)},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _run(
+    repo: Path,
+    home: Path,
+    trace: Path,
+    *,
+    keep_stdin_open: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    argv = [
+        sys.executable,
+        str(RUNNER),
+        "--repo",
+        str(repo),
+        "--home",
+        str(home),
+        "--skip-claude-plugin",
+        "--json",
+    ]
+    run_kwargs = {
+        "cwd": ROOT,
+        "env": {**os.environ, "RVF_LOCAL_DEPLOY_TEST_TRACE": str(trace)},
+        "capture_output": True,
+        "text": True,
+        "check": False,
+        "timeout": 10,
+    }
+    if not keep_stdin_open:
+        return subprocess.run(argv, **run_kwargs)
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(read_fd, "rb") as read_handle:
+            return subprocess.run(argv, stdin=read_handle, **run_kwargs)
+    finally:
+        os.close(write_fd)
 
 
 def test_stale_installed_skill_delegates_to_canonical_runner(tmp_path: Path) -> None:
@@ -133,7 +150,7 @@ def test_stale_installed_skill_delegates_to_canonical_runner(tmp_path: Path) -> 
     trace = tmp_path / "trace.txt"
     _installed_log(home, "old-installed-head")
 
-    completed = _run(repo, home, trace)
+    completed = _run(repo, home, trace, keep_stdin_open=True)
 
     assert completed.returncode == 0, completed.stderr
     result = json.loads(completed.stdout)
