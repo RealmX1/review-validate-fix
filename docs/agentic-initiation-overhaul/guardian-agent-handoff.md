@@ -14,6 +14,12 @@ RVF 完成了「hook 发起 → agent 发起」overhaul:Stop hook 从自行裁�
 显式 `start / scope / dispatch / decline`。守护体系的职责是在观察期内确认这条新
 发起链路**活着且不假绿**。
 
+节点派发采用 **at-least-once** 语义，而不是 exactly-once：计数与派发结果分别在两个短锁
+区间写入，外部 detached 启动刻意放在锁外，避免守护可观测性阻断 analyze 主流程。并发调用
+可能重复尝试同一节点，生产 dispatcher 以 `rvf-guardian:milestone-N` 作为稳定 idempotency
+key 收敛副作用；较高的成功节点会吸收尚未记账的较低 due 节点，避免恢复后形成补派风暴。
+因此审计时应检查幂等结果与最终节点集合，不应把“dispatcher 恰好调用一次”当作契约。
+
 实施计划真相源:`~/.claude/plans/hook-handoff-recurring-nifty-fairy.md`(rev2)。
 落地切片:S0–S9(见该计划 §四;进度快照见 memory
 `project_rvf_agentic_initiation_overhaul_progress`)。
