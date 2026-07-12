@@ -7497,26 +7497,30 @@ def main() -> int:
 
     latest_user = latest_user_message_from_event(event)
     ledger = start_stop_hook_ledger(event)
-    # S8·R23:守护 wall-clock 心跳(独立于 analyze),每个 Stop 事件记一次,best-effort。
-    _record_guardian_stop_event_heartbeat()
     # S1b：与 backend 无关的跨 task stranded-pending 扫荡，必须早于 suppress/launch 分支——
     # 即便本次 Stop 自身被 suppress 或不 launch，也要让它把**别的** task 遗留的 stale pending
     # 浮现给用户（打破 flow-1-self-rising 自升循环）。整段 best-effort，永不抛、不改主流程结果。
     sweep_stranded_kanban_followup_pending(event, ledger)
     # 整体 suppress 必须早于 handoff、dirty gate 和 backend launch，避免子会话停止时继续生成 review/fork artifact。
     if explicit_suppress_requested(event, latest_user) and parse_session_hook_control(latest_user) is None:
+        # detached RVF/analyze/guardian 子会话显式 suppress：它们按设计永不产生发起注入，
+        # 因此既不计 liveness 分母，也不向无用户受众的子会话回灌 guardian 告警。
         decision = suppressed_decision(event, ledger)
         unpark_self_parked_card(event, ledger, reason="suppressed")
         if decision.payload is not None:
             emit(decision.payload)
         return 0
 
+    # S8·R23:只统计通过 explicit suppress 的用户侧 Stop。无候选 Stop 仍会进入分母，
+    # 这是当前保守 canary 的已知限制，guardian liveness 文档已明确。
+    _record_guardian_stop_event_heartbeat()
+
     decision = evaluate_stop_event(event, ledger)
     if decision.action == "launch":
         provider_health_decision = provider_health_guard_decision(decision, event, ledger)
         if provider_health_decision is not None and provider_health_decision.payload is not None:
             unpark_self_parked_card(event, ledger, reason="provider_health_block")
-            emit(provider_health_decision.payload)
+            emit(_apply_guardian_liveness_alarm(provider_health_decision.payload))
             return 0
         workspace_guard_payload = kanban_task_workspace_guard_payload(
             event=event,
@@ -7525,7 +7529,7 @@ def main() -> int:
         )
         if workspace_guard_payload is not None:
             unpark_self_parked_card(event, ledger, reason="workspace_guard_block")
-            emit(workspace_guard_payload)
+            emit(_apply_guardian_liveness_alarm(workspace_guard_payload))
             return 0
         result = launch_backend(decision, event, ledger)
         # park 泄漏安全阀：仅当本次 Stop 成功派发了 self-rising followup（resume 在路上）才保留

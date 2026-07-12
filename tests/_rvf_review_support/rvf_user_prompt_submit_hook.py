@@ -13,6 +13,7 @@ import importlib
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +27,8 @@ __all__ = [
     'test_rvf_user_prompt_submit_clears_pending_on_delivery',
     'test_rvf_user_prompt_submit_structured_manual_detection_catches_namespaced',
     'test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context',
+    'test_rvf_user_prompt_submit_manual_dedup_retries_minted_delivery_receipt',
+    'test_rvf_user_prompt_submit_hook_stdout_confirms_manual_delivery',
     'test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection',
     'test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger',
     'test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject',
@@ -671,9 +674,17 @@ def test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_addi
         assert "已铸决策 token" in payload["systemMessage"]
         assert "post_user_prompt_manual" in payload["systemMessage"]
 
-        # token 落盘于 RVF_HOME（隔离），状态 = injected。
+        # inspect 只构造待 emit payload：stdout 尚未 flush，token/ledger 不得乐观推进。
         lookup = dts.read_decision_token(token, now=dts.parse_timestamp("2026-07-11T00:01:00Z"))
         assert lookup.status == "valid", lookup
+        assert lookup.state == dts.STATE_MINTED
+        assert submit._RVF_PENDING_MANUAL_INJECTION_RECEIPT in payload
+        assert il.read_injection_attempts(worktree=str(repo.resolve())) == []
+
+        # 模拟 main() 已成功 print+flush：此后才推进 injected 并写真实投递回执。
+        submit._confirm_manual_decision_delivery(payload, now="2026-07-11T00:00:00Z")
+        assert submit._RVF_PENDING_MANUAL_INJECTION_RECEIPT not in payload
+        lookup = dts.read_decision_token(token, now=dts.parse_timestamp("2026-07-11T00:01:00Z"))
         assert lookup.state == dts.STATE_INJECTED
 
         # 负路径不变量：候选非空 ⇒ injection-attempt ledger 有一条 injected 记录。
@@ -689,6 +700,81 @@ def test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_addi
     assert not prep_root.exists()
     assert "shared_workflow_state" not in payload
     assert "prep_file_path" not in payload
+
+
+def test_rvf_user_prompt_submit_manual_dedup_retries_minted_delivery_receipt(
+    tmp_path: Path,
+) -> None:
+    """首轮在 emit 前中断留下 minted；同指纹 manual dedup 重投后，stdout 回执应推进
+    原 token，并把本次 additionalContext 如实记为 ``injected=True``。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    event = {
+        "prompt": "/review-validate-fix",
+        "cwd": str(repo),
+        "session_id": "manual-dedup-sess",
+        "hook_event_name": "UserPromptSubmit",
+    }
+    with _manual_decision_env(tmp_path):
+        first = submit.inspect_user_prompt_submit(event, now="2026-07-11T00:00:00Z")
+        token = first["token"]
+        assert dts.read_decision_token(
+            token, now=dts.parse_timestamp("2026-07-11T00:00:00Z")
+        ).state == dts.STATE_MINTED
+        assert il.read_injection_attempts(worktree=str(repo.resolve())) == []
+
+        second = submit.inspect_user_prompt_submit(event, now="2026-07-11T00:00:01Z")
+        assert second["status"] == "manual_decision_deduplicated", second
+        assert second["token"] == token
+        submit._confirm_manual_decision_delivery(second, now="2026-07-11T00:00:01Z")
+
+        assert dts.read_decision_token(
+            token, now=dts.parse_timestamp("2026-07-11T00:00:02Z")
+        ).state == dts.STATE_INJECTED
+        records = il.read_injection_attempts(worktree=str(repo.resolve()))
+        assert len(records) == 1, records
+        assert records[0]["mint_outcome"] == il.INJECTION_OUTCOME_DEDUPLICATED_PENDING
+        assert records[0]["injected"] is True
+        assert records[0]["decision_token"] == token
+
+
+def test_rvf_user_prompt_submit_hook_stdout_confirms_manual_delivery(
+    tmp_path: Path,
+) -> None:
+    """真实 hook-mode 子进程 stdout 成功后，manual token 与 ledger 回执均已兑现。"""
+    dts, il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    event = {
+        "prompt": "/review-validate-fix",
+        "cwd": str(repo),
+        "session_id": "manual-hook-stdout-sess",
+        "hook_event_name": "UserPromptSubmit",
+    }
+    with _manual_decision_env(tmp_path):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RVF_USER_PROMPT_SUBMIT),
+                "--prep-root",
+                str(tmp_path / "prep-root"),
+                "--now",
+                "2026-07-11T00:00:00Z",
+            ],
+            input=json.dumps(event),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=os.environ.copy(),
+        )
+        output = json.loads(completed.stdout)
+        context = output["hookSpecificOutput"]["additionalContext"]
+        token = context.split("RVF_DECISION_TOKEN=", 1)[1].splitlines()[0].strip()
+        assert dts.read_decision_token(
+            token, now=dts.parse_timestamp("2026-07-11T00:01:00Z")
+        ).state == dts.STATE_INJECTED
+        records = il.read_injection_attempts(worktree=str(repo.resolve()))
+        assert len(records) == 1 and records[0]["injected"] is True, records
 
 
 def test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection(

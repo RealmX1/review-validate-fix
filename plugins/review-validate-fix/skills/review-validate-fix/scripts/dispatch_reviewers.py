@@ -528,8 +528,9 @@ def _reroute_candidates(
     """对 ``A' = available − cooled`` 重调 ``route()`` 取替换候选 harness 顺序（R-c 单源）。
 
     候选 = route 在 A' 上的两腿选择（已含 R0–R3 的池内无偏序选二 / main-as-external /
-    R2 双实例语义；选择池 >2 时该两腿为伪随机，seed 落 sub-plan 遥测块），再按
-    priority 补齐 A' 其余，保证「需补两腿但 route 只给两腿」时仍有后备。
+    R2 双实例语义；选择池 >2 时该两腿为伪随机），再按 priority 补齐 A' 其余，保证
+    「需补两腿但 route 只给两腿」时仍有后备。当前 reroute 只消费 sub-plan 的 harness
+    顺序，未持久化其 reviewer_selection/seed；池扩到 >2 后若要求逐次复现，须先补该遥测。
     """
     a_prime = [h for h in available if h not in cooled]
     candidates: list[str] = []

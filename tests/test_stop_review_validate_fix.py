@@ -5109,14 +5109,16 @@ def test_skip_decision_should_unpark_keeps_park_for_resume_pending(tmp_path: Pat
 
 def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> None:
     """S9 §五.6 E2E dogfood(tmp 隔离):改动→Stop→注入→start→scope→dispatch(dry-run)
-    →analyze 完成→守护计数+1。
+    →直接调用守护库函数计数+1。
 
     全链真实件:真实 git repo 的 dirty 改动、真实 Stop hook 子进程(铸 token+注入)、
     CLI ``run_start`` 走**真实 default prepare 全套**(分配 run+写 prep+prepare_run_from_prep_file)、
     真实 scope annotate/exclude 落盘、dispatch 定稿 scope_hash + mark_dispatched。
     受控替身仅三处:provider-health runner(避免真探 provider 认证)、dispatch 的
     reviewer_dispatcher(避免真拉 reviewer)、守护分析派发器(避免真拉 tmux)——
-    三者都是注入点而非链路本体。落盘全部隔离在 state 下,绝不触真实 ~/.rvf。
+    三者都是注入点。该用例不覆盖 analyze detached wrapper→guardian CLI 的生产接缝，
+    那一接缝由 review-support 的真实 shell/CLI 测试负责。落盘全部隔离在 state 下,
+    绝不触真实 ~/.rvf。
     """
     dirty = init_repo_with_head(tmp_path / "dirty")  # 带 base commit(prepare 需要可解析的 HEAD)
     transcript = tmp_path / "session.jsonl"
@@ -5211,7 +5213,7 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         lookup = dts.read_decision_token(token)
         assert lookup.state == dts.STATE_DISPATCHED, lookup
 
-        # ③ analyze 完成 → 守护计数 +1(首达节点 1 → 派守护分析,注入替身)。
+        # ③ 直接调用守护库函数模拟 analyze 完成后的计数动作；不宣称覆盖 detached/CLI 接缝。
         guardian_dispatches: list[int] = []
         record = guardian.record_analyze_completion(
             run_dir=str(run_dir),
@@ -5232,6 +5234,76 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_guardian_main_exit_policy_excludes_suppress_and_covers_early_blocks(
+    tmp_path: Path,
+) -> None:
+    """main 出口策略：suppress 不计心跳/不告警；provider/workspace 早退均合并告警。"""
+
+    def base_module():
+        module = load_hook_module()
+        emitted: list[dict[str, object]] = []
+        heartbeat_calls: list[bool] = []
+        alarm_inputs: list[dict[str, object] | None] = []
+        event = {"cwd": str(tmp_path)}
+        ledger = object()
+        module.read_event = lambda: event
+        module.latest_user_message_from_event = lambda _event: None
+        module.start_stop_hook_ledger = lambda _event: ledger
+        module.sweep_stranded_kanban_followup_pending = lambda *_args: None
+        module.parse_session_hook_control = lambda _latest: None
+        module.unpark_self_parked_card = lambda *_args, **_kwargs: None
+        module._record_guardian_stop_event_heartbeat = lambda: heartbeat_calls.append(True)
+
+        def apply_alarm(payload):
+            alarm_inputs.append(payload)
+            merged = dict(payload or {})
+            merged["guardian_alarm_applied"] = True
+            return merged
+
+        module._apply_guardian_liveness_alarm = apply_alarm
+        module.emit = lambda payload: emitted.append(payload)
+        return module, event, ledger, emitted, heartbeat_calls, alarm_inputs
+
+    # explicit suppress：detached 子会话无用户受众，既不进分母也不并入告警。
+    module, _event, _ledger, emitted, heartbeats, alarm_inputs = base_module()
+    module.explicit_suppress_requested = lambda *_args: True
+    module.suppressed_decision = lambda *_args: module.StopDecision(
+        action="skip", reason_code="suppressed", payload={"continue": True}
+    )
+    assert module.main() == 0
+    assert heartbeats == [] and alarm_inputs == []
+    assert emitted == [{"continue": True}]
+
+    # provider-health 早退：心跳已计，payload 经 guardian alarm 合并再 emit。
+    module, _event, _ledger, emitted, heartbeats, alarm_inputs = base_module()
+    module.explicit_suppress_requested = lambda *_args: False
+    launch = module.StopDecision(action="launch", reason_code="launch", cwd=str(tmp_path))
+    provider_block = module.StopDecision(
+        action="skip", reason_code="provider_health_failed", payload={"systemMessage": "provider"}
+    )
+    module.evaluate_stop_event = lambda *_args: launch
+    module.provider_health_guard_decision = lambda *_args: provider_block
+    module.kanban_task_workspace_guard_payload = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("provider 早退后不应再跑 workspace guard")
+    )
+    assert module.main() == 0
+    assert len(heartbeats) == 1
+    assert alarm_inputs == [provider_block.payload]
+    assert emitted[0]["guardian_alarm_applied"] is True
+
+    # workspace guard 早退：同样必须合并告警。
+    module, _event, _ledger, emitted, heartbeats, alarm_inputs = base_module()
+    module.explicit_suppress_requested = lambda *_args: False
+    module.evaluate_stop_event = lambda *_args: launch
+    module.provider_health_guard_decision = lambda *_args: None
+    workspace_payload = {"systemMessage": "workspace"}
+    module.kanban_task_workspace_guard_payload = lambda **_kwargs: workspace_payload
+    assert module.main() == 0
+    assert len(heartbeats) == 1
+    assert alarm_inputs == [workspace_payload]
+    assert emitted[0]["guardian_alarm_applied"] is True
 
 
 def test_stop_unparks_on_dispatch_failure_and_no_dispatch(tmp_path: Path) -> None:
@@ -5574,6 +5646,7 @@ def main() -> int:
         test_launch_keep_park_signal_uses_real_hook_payload_shape,
         test_guardian_liveness_alarm_merges_into_stop_payload,
         test_agentic_initiation_e2e_dogfood_signal_to_guardian,
+        test_guardian_main_exit_policy_excludes_suppress_and_covers_early_blocks,
         test_skip_decision_should_unpark_keeps_park_for_resume_pending,
         test_stop_unparks_on_dispatch_failure_and_no_dispatch,
         test_stop_safety_valve_noop_when_not_self_parked,

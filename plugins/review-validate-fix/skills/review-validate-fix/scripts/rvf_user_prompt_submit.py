@@ -89,6 +89,10 @@ RVF_MANUAL_SCOPE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# 仅供本进程 main() 在 stdout flush 成功后兑现投递回执；_render_hook_payload 不会
+# 把该内部键暴露给 host。调试 --json 也会丢弃它且不推进 token（未实际注入）。
+_RVF_PENDING_MANUAL_INJECTION_RECEIPT = "_rvf_pending_manual_injection_receipt"
+
 
 def _latest_user_message_from_transcript(path: Path) -> str | None:
     latest: str | None = None
@@ -753,8 +757,9 @@ def _handle_manual_decision_point(
     additionalContext（附 token + rvf-agent CLI 样例命令）；declined 冷却 / 铸造熔断只出 user-facing
     systemMessage（尊重三闸，指纹未变不 nag）。
 
-    负路径不变量（计划 §五.3）：候选非空的每种结局都写 injection-attempt ledger；候选为空则只出
-    systemMessage、不写 ledger（与 Stop hook 无候选路径一致，保持 canary 分母干净）。
+    负路径不变量（计划 §五.3）：候选非空的每种结局都写 injection-attempt ledger；成功投递路径
+    由 :func:`_confirm_manual_decision_delivery` 在 stdout flush 后写回执，避免尚未 emit 就把 token /
+    ledger 乐观推进。候选为空则只出 systemMessage、不写 ledger（与 Stop hook 无候选路径一致）。
 
     落盘根走 ``$RVF_HOME``/相应 env（S1/S4 默认解析），测试靠 ``RVF_HOME`` 隔离，绝不写真实
     ``~/.rvf``。整段 best-effort，任何异常都收敛成结构化结果 + systemMessage，不阻断本次 prompt。
@@ -855,29 +860,6 @@ def _handle_manual_decision_point(
     ):
         token = mint.token
         newly_minted = outcome == decision_token_store.MINT_OUTCOME_MINTED
-        if newly_minted:
-            # 确认要经 additionalContext 投递注入 → minted→injected。UPS 的 additionalContext 与
-            # stdout 同步落地（host 契约通道，非 kanban 那种可能静默失败的异步消息），故此处推进
-            # 不是 87e9338 所诫的乐观预 arm。dedup 命中的 token 可能已 acknowledged，mark_injected
-            # 会拒非法迁移，故仅对新铸 token 打 injected。
-            try:
-                decision_token_store.mark_injected(token, now=now_dt)
-            except decision_token_store.DecisionTokenError:
-                pass
-        injection_attempt_ledger.record_injection_attempt(
-            worktree=worktree,
-            session_id=summary_session_id,
-            candidate_fingerprint=fingerprint,
-            candidate_path_count=candidate_count,
-            has_committed_but_unreviewed=has_committed,
-            mint_outcome=(
-                injection_attempt_ledger.INJECTION_OUTCOME_INJECTED
-                if newly_minted
-                else injection_attempt_ledger.INJECTION_OUTCOME_DEDUPLICATED_PENDING
-            ),
-            decision_token=token,
-            injected=newly_minted,
-        )
         additional_context = _manual_decision_additional_context_text(
             summary=summary, token=token, newly_minted=newly_minted, inline_scope=inline_scope
         )
@@ -898,6 +880,19 @@ def _handle_manual_decision_point(
                     token=token,
                     detail=f"候选 {candidate_count} 文件",
                 ),
+                _RVF_PENDING_MANUAL_INJECTION_RECEIPT: {
+                    "token": token,
+                    "worktree": worktree,
+                    "session_id": summary_session_id,
+                    "candidate_fingerprint": fingerprint,
+                    "candidate_path_count": candidate_count,
+                    "has_committed_but_unreviewed": has_committed,
+                    "mint_outcome": (
+                        injection_attempt_ledger.INJECTION_OUTCOME_INJECTED
+                        if newly_minted
+                        else injection_attempt_ledger.INJECTION_OUTCOME_DEDUPLICATED_PENDING
+                    ),
+                },
             }
         )
         if inline_scope:
@@ -946,6 +941,43 @@ def _handle_manual_decision_point(
             dispatch_origin="post_user_prompt_manual",
         ),
     }
+
+
+def _confirm_manual_decision_delivery(
+    result: dict[str, Any], *, now: str | None = None
+) -> None:
+    """stdout 已 flush 后推进 manual token，并写与本次真实投递一致的 ledger 回执。"""
+    receipt = result.pop(_RVF_PENDING_MANUAL_INJECTION_RECEIPT, None)
+    if not isinstance(receipt, dict):
+        return
+    try:
+        import rvf_decision_token_store as decision_token_store  # noqa: PLC0415
+        import agentic_initiation_injection_attempt_ledger as injection_attempt_ledger  # noqa: PLC0415
+
+        token = receipt.get("token")
+        if not isinstance(token, str) or not token:
+            return
+        now_dt = decision_token_store.parse_timestamp(now) if now else None
+        # dedup 可能命中 minted（上次在 emit 前中断）/injected/acknowledged。前两者可
+        # 合法或幂等推进；后者及终态会拒绝回退，仍不影响「本次已交付」ledger 事实。
+        try:
+            decision_token_store.mark_injected(token, now=now_dt)
+        except decision_token_store.DecisionTokenError:
+            pass
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=str(receipt.get("worktree") or ""),
+            session_id=receipt.get("session_id"),
+            candidate_fingerprint=str(receipt.get("candidate_fingerprint") or ""),
+            candidate_path_count=int(receipt.get("candidate_path_count") or 0),
+            has_committed_but_unreviewed=bool(
+                receipt.get("has_committed_but_unreviewed")
+            ),
+            mint_outcome=str(receipt.get("mint_outcome") or ""),
+            decision_token=token,
+            injected=True,
+        )
+    except Exception:  # noqa: BLE001 - 投递后的可观测性回执永不反向拖红 UPS
+        pass
 
 
 def inspect_user_prompt_submit(
@@ -1446,11 +1478,15 @@ def main() -> int:
         shared_workflow_timeout_seconds=args.shared_workflow_timeout_seconds,
     )
     if args.json:
+        result.pop(_RVF_PENDING_MANUAL_INJECTION_RECEIPT, None)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
         return 0
     out = _render_hook_payload(result)
     if out is not None:
-        print(json.dumps(out, ensure_ascii=False))
+        # print+flush 成功才算 additionalContext 已交给 host；若 stdout 在此破裂，
+        # token 保持 minted、ledger 不伪记 injected，后续 manual dedup 可重投。
+        print(json.dumps(out, ensure_ascii=False), flush=True)
+        _confirm_manual_decision_delivery(result, now=args.now)
     return 0
 
 

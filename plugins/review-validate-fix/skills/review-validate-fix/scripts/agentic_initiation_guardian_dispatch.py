@@ -30,12 +30,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path,供 core.* import
@@ -113,6 +115,55 @@ def _read_json_dict(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+@contextmanager
+def _guardian_counter_file_lock(path: Path) -> Iterator[None]:
+    """用旁路 ``.lock`` 文件串行化守护计数 RMW；锁不可用时退化为无锁 best-effort。
+
+    正常锁持有区只包含本地 JSON 读写，不包含 detached 派发等外部操作，因此并发者
+    只会短暂等待。若目录/锁文件/``flock`` 本身不可用，仍让调用方尝试原有无锁路径；
+    守护可观测性故障不得阻断 Stop/finalize/analyze 主流程。
+    """
+    handle = None
+    locked = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.with_name(path.name + ".lock").open("a+", encoding="utf-8")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked = True
+    except OSError:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            handle = None
+    try:
+        yield
+    finally:
+        if handle is not None:
+            if locked:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _resolve_guardian_handoff_doc() -> Path | None:
+    """从当前脚本逐级上溯，解析可选的 repo 内 guardian handoff 文档。"""
+    for ancestor in Path(__file__).resolve().parents:
+        candidate = ancestor / GUARDIAN_HANDOFF_DOC_RELPATH
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 守护分析派发(analyze 完成节点计数)
 # ---------------------------------------------------------------------------
@@ -135,12 +186,20 @@ def _default_guardian_analysis_dispatcher(
 
     analysis_dir = guardian_root / f"guardian-analysis-{milestone}"
     analysis_dir.mkdir(parents=True, exist_ok=True)
-    handoff_doc = Path(__file__).resolve().parents[4] / GUARDIAN_HANDOFF_DOC_RELPATH
+    handoff_doc = _resolve_guardian_handoff_doc()
     prompt_lines = [
         "你是 RVF「hook 发起 → agent 发起」overhaul 的守护分析 agent(S8·R23,"
         f"第 {milestone}/16 节点)。",
         "",
-        f"职责手册(必读,含决策登记簿/审计 TOP/SANTA 评审发现/观察指标定义):{handoff_doc}",
+        (
+            "职责手册(必读,含决策登记簿/审计 TOP/SANTA 评审发现/观察指标定义):"
+            + str(handoff_doc)
+            if handoff_doc is not None
+            else (
+                f"职责手册相对路径:{GUARDIAN_HANDOFF_DOC_RELPATH}。当前部署副本未携带该文档;"
+                "请从目标仓库根查找该路径,并先按下方 metrics 快照完成基础健康度核对。"
+            )
+        ),
         "",
         "本节点 metrics 快照:",
         "```json",
@@ -206,12 +265,32 @@ def record_analyze_completion(
         current = _coerce_now(now)
         guardian_root = guardian_state_root(root)
         counter_path = guardian_root / ANALYZE_COMPLETION_COUNTER_FILENAME
-        counter = _read_json_dict(counter_path)
-        count = int(counter.get("analyze_completion_count") or 0) + 1
-        dispatched_milestones = [
-            int(v) for v in counter.get("dispatched_milestones") or [] if isinstance(v, (int, float))
-        ]
-        already_retired = bool(counter.get("guardian_retired"))
+        # 第一段短 RMW：先原子认领本次 analyze 完成计数。派发放在锁外，避免 tmux
+        # 启动等待把并发 Stop/analyze 路径拖住；派发成功后再做第二段合并 RMW。
+        with _guardian_counter_file_lock(counter_path):
+            counter = _read_json_dict(counter_path)
+            count = int(counter.get("analyze_completion_count") or 0) + 1
+            dispatched_milestones = sorted(
+                {
+                    int(v)
+                    for v in counter.get("dispatched_milestones") or []
+                    if isinstance(v, (int, float))
+                }
+            )
+            already_retired = bool(counter.get("guardian_retired")) or (
+                GUARDIAN_RETIREMENT_MILESTONE in dispatched_milestones
+            )
+            _atomic_write_json(
+                counter_path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "analyze_completion_count": count,
+                    "dispatched_milestones": dispatched_milestones,
+                    "guardian_retired": already_retired,
+                    "last_recorded_at": current.isoformat().replace("+00:00", "Z"),
+                    "last_run_dir": run_dir,
+                },
+            )
 
         result: dict[str, Any] = {
             "status": "recorded",
@@ -221,37 +300,56 @@ def record_analyze_completion(
             "retirement_prompt": None,
         }
 
-        if not already_retired and count in GUARDIAN_DISPATCH_MILESTONES and count not in dispatched_milestones:
+        due_milestones = [
+            milestone
+            for milestone in GUARDIAN_DISPATCH_MILESTONES
+            if count >= milestone and milestone not in dispatched_milestones
+        ]
+        if not already_retired and due_milestones:
+            milestone = max(due_milestones)
             dispatcher = guardian_analysis_dispatcher or _default_guardian_analysis_dispatcher
             try:
                 dispatch_result = dispatcher(
-                    milestone=count,
+                    milestone=milestone,
                     guardian_root=guardian_root,
                     metrics_snapshot=collect_guardian_metrics_snapshot(
                         now=current, root=guardian_root, run_dir=run_dir
                     ),
                 )
-                result["milestone_dispatched"] = count
+                if (
+                    isinstance(dispatch_result, dict)
+                    and dispatch_result.get("launch_status") == "launch_failed"
+                ):
+                    raise RuntimeError(
+                        str(dispatch_result.get("error") or "guardian detached launch failed")
+                    )
+                result["milestone_dispatched"] = milestone
                 result["dispatch_result"] = dispatch_result
-                dispatched_milestones.append(count)
+
+                # 第二段短 RMW：只在真实/幂等派发成功后合并节点。较高节点吸收所有
+                # 尚未记录的较低 due 节点，避免一次恢复后形成补派风暴。
+                with _guardian_counter_file_lock(counter_path):
+                    latest = _read_json_dict(counter_path)
+                    latest_dispatched = {
+                        int(v)
+                        for v in latest.get("dispatched_milestones") or []
+                        if isinstance(v, (int, float))
+                    }
+                    latest_dispatched.update(
+                        due for due in due_milestones if due <= milestone
+                    )
+                    was_retired = bool(latest.get("guardian_retired"))
+                    now_retired = GUARDIAN_RETIREMENT_MILESTONE in latest_dispatched
+                    latest["schema_version"] = SCHEMA_VERSION
+                    latest["dispatched_milestones"] = sorted(latest_dispatched)
+                    latest["guardian_retired"] = was_retired or now_retired
+                    _atomic_write_json(counter_path, latest)
+                dispatched_milestones = sorted(latest_dispatched)
+                result["guardian_retired"] = was_retired or now_retired
+                if now_retired and not was_retired:
+                    result["retirement_prompt"] = R9_DELETION_CONFIRMATION_PROMPT
             except Exception as exc:  # noqa: BLE001 - 守护派发失败绝不阻断 analyze 完成路径
                 result["dispatch_error"] = f"{type(exc).__name__}: {exc}"
-
-        if count >= GUARDIAN_RETIREMENT_MILESTONE and not already_retired:
-            result["guardian_retired"] = True
-            result["retirement_prompt"] = R9_DELETION_CONFIRMATION_PROMPT
-
-        _atomic_write_json(
-            counter_path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "analyze_completion_count": count,
-                "dispatched_milestones": sorted(set(dispatched_milestones)),
-                "guardian_retired": bool(result["guardian_retired"]),
-                "last_recorded_at": current.isoformat().replace("+00:00", "Z"),
-                "last_run_dir": run_dir,
-            },
-        )
         return result
     except Exception as exc:  # noqa: BLE001 - 守护记录永不阻断主流程
         return {"status": "guardian_record_failed", "error": f"{type(exc).__name__}: {exc}"}
@@ -271,16 +369,17 @@ def _bump_daily_count(
     """把 ``kind`` 在当日(UTC)的计数 +1;文件按日期分桶,并裁剪 30 天前的旧桶。"""
     guardian_root = guardian_state_root(root)
     path = guardian_root / DAILY_EVENT_COUNTS_FILENAME
-    payload = _read_json_dict(path)
-    counts = payload.get(kind)
-    counts = dict(counts) if isinstance(counts, dict) else {}
-    day = current_day = now.date().isoformat()
-    counts[day] = int(counts.get(current_day) or 0) + 1
-    cutoff = (now - timedelta(days=30)).date().isoformat()
-    counts = {d: c for d, c in counts.items() if d >= cutoff}
-    payload[kind] = counts
-    payload["schema_version"] = SCHEMA_VERSION
-    _atomic_write_json(path, payload)
+    with _guardian_counter_file_lock(path):
+        payload = _read_json_dict(path)
+        counts = payload.get(kind)
+        counts = dict(counts) if isinstance(counts, dict) else {}
+        day = current_day = now.date().isoformat()
+        counts[day] = int(counts.get(current_day) or 0) + 1
+        cutoff = (now - timedelta(days=30)).date().isoformat()
+        counts = {d: c for d, c in counts.items() if d >= cutoff}
+        payload[kind] = counts
+        payload["schema_version"] = SCHEMA_VERSION
+        _atomic_write_json(path, payload)
 
 
 def _window_total(payload: dict[str, Any], kind: str, *, since_day: str) -> int:
@@ -375,6 +474,10 @@ def evaluate_initiation_layer_liveness(
 ) -> dict[str, Any] | None:
     """wall-clock 心跳判定:窗口内 Stop 事件非零而注入尝试与 review 完成同时为零 → 告警。
 
+    ``window_days=N`` 按 UTC **日桶**计算:下界日与当日均包含,即共回看 ``N+1``
+    个日桶，从而保证至少覆盖完整 ``N×24h``。Stop 分母已排除显式 suppress 的 detached
+    会话；仍会包含通过护栏后但最终无候选的 Stop，这是当前保守 canary 的已知限制。
+
     前置冷启动护栏(见 :func:`_initiation_layer_has_historical_evidence`):发起层
     从未活跃过的环境不告警。返回告警 dict(调用方转 systemMessage)或 ``None``
     (健康/证据不足)。**best-effort**:任何异常返回 ``None``,绝不阻断 Stop hook。
@@ -403,7 +506,9 @@ def evaluate_initiation_layer_liveness(
             "injection_attempt_count": injection_attempts,
             "review_completion_count": review_completions,
             "message": (
-                f"RVF 发起层疑似静默死亡:最近 {window_days} 天内 Stop 事件 "
+                f"RVF 发起层疑似静默死亡:按 UTC 日桶回看 {window_days} 天边界"
+                f"(含当日共 {window_days + 1} 个桶,保证覆盖至少完整 {window_days * 24} 小时),"
+                "Stop 事件 "
                 f"{stop_events} 次,但注入尝试与 review 完成均为 0。"
                 "请检查 Stop hook 决策点注入链路(injection-attempt ledger / 决策 token store),"
                 "必要时按 docs/agentic-initiation-overhaul/guardian-agent-handoff.md 的恢复路径回滚。"

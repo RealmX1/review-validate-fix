@@ -78,9 +78,12 @@ RVF 完成了「hook 发起 → agent 发起」overhaul:Stop hook 从自行裁�
    发起或注入风暴,必须 elevate。
 4. **scope 例外 issue ledger**:`$RVF_HOME/agentic-initiation-scope-issue-ledger/`,
    n≥3 幂等立起的 issue = signal 质量问题清单,是「定期回访改进 signal」(R5)的输入。
-5. **发起层 liveness**:快照内 `liveness_alarm` 非 null 即红色——最近 N 天(默认 3)
-   Stop 事件非零而注入尝试与 review 完成同时为零。该告警同时会由 Stop hook 直接
-   systemMessage 给用户,你要做的是给出根因假设(hook 未部署?护栏全 skip?摘要
+5. **发起层 liveness**:快照内 `liveness_alarm` 非 null 即红色——`window_days=N`
+   按 UTC 日桶回看下界日到当日(含首尾,共 N+1 桶),保证覆盖至少完整 N×24h；该窗口内
+   Stop 事件非零而注入尝试与 review 完成同时为零即告警。显式 suppress 的 detached
+   RVF/analyze/guardian 会话不计 Stop 分母；通过 suppress 后但最终无候选的用户侧 Stop
+   仍会计入,这是保守 canary 的已知限制。该告警同时会由 Stop hook 直接 systemMessage
+   给用户,你要做的是给出根因假设(hook 未部署?护栏全 skip?无候选 Stop 占比过高?摘要
    构造挂了?)。**冷启动护栏**:发起层从未活跃过(analyze 计数 / 注入 ledger /
    review 完成史全零)的环境不告警——「尚未出生」≠「静默死亡」;部署第一天就坏的
    场景由 S9 E2E dogfood 与你的节点分析兜底,不靠心跳。

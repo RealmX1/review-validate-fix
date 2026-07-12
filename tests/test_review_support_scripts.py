@@ -5277,6 +5277,131 @@ def test_guardian_analyze_completion_milestones_and_retirement(tmp_path: Path) -
             os.environ["RVF_HOME"] = saved_rvf_home
 
 
+def test_guardian_handoff_doc_resolution_works_in_repo_and_degrades_when_absent(
+    tmp_path: Path,
+) -> None:
+    """默认派发器不依赖固定 parents 层级：repo 树能解析，vendored 无 docs 树返回 None。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    resolved = guardian._resolve_guardian_handoff_doc()
+    assert resolved == ROOT / "docs" / "agentic-initiation-overhaul" / "guardian-agent-handoff.md"
+    assert resolved.is_file()
+
+    original_file = guardian.__file__
+    guardian.__file__ = str(tmp_path / "vendored" / "skills" / "scripts" / "guardian.py")
+    try:
+        assert guardian._resolve_guardian_handoff_doc() is None
+    finally:
+        guardian.__file__ = original_file
+
+
+def test_guardian_failed_milestones_retry_and_retire_only_after_success(
+    tmp_path: Path,
+) -> None:
+    """节点失败不越过；更高 count 重试最高 due 并吸收低节点，16 成功前不得退休。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+
+    def broken_dispatcher(**_kwargs: object) -> dict:
+        raise RuntimeError("boom")
+
+    root = tmp_path / "retry"
+    first = guardian.record_analyze_completion(
+        root=root, guardian_analysis_dispatcher=broken_dispatcher
+    )
+    assert first["analyze_completion_count"] == 1
+    assert first["milestone_dispatched"] is None and "dispatch_error" in first
+    second = guardian.record_analyze_completion(
+        root=root,
+        guardian_analysis_dispatcher=lambda **kw: {
+            "launch_status": "launched",
+            "milestone": kw["milestone"],
+        },
+    )
+    assert second["analyze_completion_count"] == 2
+    assert second["milestone_dispatched"] == 2
+    counter = json.loads(
+        (root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).read_text(encoding="utf-8")
+    )
+    assert counter["dispatched_milestones"] == [1, 2]
+
+    # 返回 launch_failed（非抛异常）同样不能误记成功。
+    returned_failure = guardian.record_analyze_completion(
+        root=tmp_path / "returned-launch-failure",
+        guardian_analysis_dispatcher=lambda **_kw: {
+            "launch_status": "launch_failed",
+            "error": "tmux unavailable",
+        },
+    )
+    assert returned_failure["milestone_dispatched"] is None
+    assert "dispatch_error" in returned_failure
+
+    retirement_root = tmp_path / "retirement-retry"
+    retirement_root.mkdir(parents=True)
+    (retirement_root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "analyze_completion_count": 15,
+                "dispatched_milestones": [1, 2, 4, 8],
+                "guardian_retired": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed_16 = guardian.record_analyze_completion(
+        root=retirement_root, guardian_analysis_dispatcher=broken_dispatcher
+    )
+    assert failed_16["analyze_completion_count"] == 16
+    assert failed_16["guardian_retired"] is False
+    assert failed_16["retirement_prompt"] is None
+
+    retried_16 = guardian.record_analyze_completion(
+        root=retirement_root,
+        guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "already_running"},
+    )
+    assert retried_16["analyze_completion_count"] == 17
+    assert retried_16["milestone_dispatched"] == 16
+    assert retried_16["guardian_retired"] is True
+    assert "R9" in retried_16["retirement_prompt"]
+
+
+def test_guardian_counter_read_modify_write_is_serialized(tmp_path: Path) -> None:
+    """并发心跳/analyze 完成不丢增量；两个 JSON 计数文件各自以旁路 flock 串行化。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    now = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.timezone.utc)
+    total = 48
+
+    daily_root = tmp_path / "daily"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        list(
+            pool.map(
+                lambda _i: guardian.record_stop_event_heartbeat(now=now, root=daily_root),
+                range(total),
+            )
+        )
+    daily = json.loads(
+        (daily_root / guardian.DAILY_EVENT_COUNTS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert daily["stop_event_counts_by_utc_day"]["2026-07-12"] == total, daily
+
+    analyze_root = tmp_path / "analyze"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(
+            pool.map(
+                lambda _i: guardian.record_analyze_completion(
+                    root=analyze_root,
+                    guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},
+                ),
+                range(total),
+            )
+        )
+    assert all(result["status"] == "recorded" for result in results), results
+    counter = json.loads(
+        (analyze_root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).read_text(encoding="utf-8")
+    )
+    assert counter["analyze_completion_count"] == total, counter
+    assert counter["dispatched_milestones"] == [1, 2, 4, 8, 16], counter
+
+
 def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
     """S8·R23 wall-clock 心跳判定矩阵:
     stop==0 → None;stop>0 且注入/review 双零 → 告警;注入非零或 review 非零 → None;
@@ -5333,6 +5458,56 @@ def test_guardian_initiation_liveness_alarm_paths(tmp_path: Path) -> None:
             os.environ["RVF_HOME"] = saved_rvf_home
 
 
+def test_guardian_liveness_utc_day_bucket_boundary(tmp_path: Path) -> None:
+    """window_days=3 含下界日+当日共 4 个 UTC 桶：恰 3 天前抑制，4 天前不抑制。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    saved_rvf_home = os.environ.get("RVF_HOME")
+    os.environ["RVF_HOME"] = str(tmp_path / "rvf-home")
+    try:
+        import agentic_initiation_injection_attempt_ledger as injection_ledger  # noqa: PLC0415
+
+        now = datetime.datetime(2026, 7, 12, 12, 0, tzinfo=datetime.timezone.utc)
+        root = tmp_path / "guardian"
+        guardian.record_stop_event_heartbeat(now=now, root=root)
+        guardian.record_analyze_completion(
+            now=now,
+            root=root,
+            guardian_analysis_dispatcher=lambda **_kw: {"launch_status": "launched"},
+        )
+
+        def write_attempt_at(day_offset: int) -> Path:
+            path = injection_ledger.record_injection_attempt(
+                worktree=str(tmp_path / "repo"),
+                session_id="bucket-boundary",
+                candidate_fingerprint=f"sha256:{day_offset}",
+                candidate_path_count=1,
+                has_committed_but_unreviewed=False,
+                mint_outcome=injection_ledger.INJECTION_OUTCOME_INJECTED,
+                injected=True,
+            )
+            assert path is not None
+            record = json.loads(path.read_text(encoding="utf-8").splitlines()[-1])
+            record["recorded_at"] = (
+                now - datetime.timedelta(days=day_offset)
+            ).replace(hour=0, minute=0).isoformat().replace("+00:00", "Z")
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            return path
+
+        ledger_path = write_attempt_at(3)
+        assert guardian.evaluate_initiation_layer_liveness(now=now, root=root) is None
+        ledger_path.unlink()
+        write_attempt_at(4)
+        alarm = guardian.evaluate_initiation_layer_liveness(now=now, root=root)
+        assert alarm is not None, alarm
+        assert "含当日共 4 个桶" in alarm["message"]
+        assert "完整 72 小时" in alarm["message"]
+    finally:
+        if saved_rvf_home is None:
+            os.environ.pop("RVF_HOME", None)
+        else:
+            os.environ["RVF_HOME"] = saved_rvf_home
+
+
 def test_detached_wrapper_post_exit_argv_appended_with_failsafe(tmp_path: Path) -> None:
     """S8:detached wrapper 的可选 post-exit 回调——缺省时输出与旧版逐字节相同
     (不含 ``|| true``);给定时追加在 finalize-status 之后、以 ``|| true`` 兜底。"""
@@ -5357,6 +5532,85 @@ def test_detached_wrapper_post_exit_argv_appended_with_failsafe(tmp_path: Path) 
     assert with_post.startswith(baseline), with_post
     assert with_post.endswith("|| true"), with_post
     assert "guardian.py record-analyze-completion" in with_post
+
+
+def test_detached_wrapper_executes_real_guardian_cli_post_exit(tmp_path: Path) -> None:
+    """真实 sh wrapper → guardian CLI record-analyze-completion 接缝会把计数 +1。"""
+    guardian = load_agentic_initiation_guardian_dispatch_module()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_detached_thread as detached  # noqa: PLC0415
+
+    rvf_home = tmp_path / "rvf-home"
+    guardian_root = rvf_home / guardian.GUARDIAN_DIRNAME
+    guardian_root.mkdir(parents=True)
+    # 预记 milestone 1，避免本接缝测试真实拉起 guardian detached agent。
+    (guardian_root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "analyze_completion_count": 0,
+                "dispatched_milestones": [1],
+                "guardian_retired": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    wrapper = detached._build_wrapper_shell(
+        argv=["/usr/bin/true"],
+        log_path=tmp_path / "wrapper.log",
+        status_path=tmp_path / "wrapper.status.json",
+        exports={"RVF_HOME": str(rvf_home)},
+        post_exit_argv=[
+            sys.executable,
+            str(SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py"),
+            "record-analyze-completion",
+            "--run-dir",
+            str(run_dir),
+        ],
+    )
+    subprocess.run(["/bin/sh", "-c", wrapper], check=True)
+    counter = json.loads(
+        (guardian_root / guardian.ANALYZE_COMPLETION_COUNTER_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert counter["analyze_completion_count"] == 1
+    assert counter["last_run_dir"] == str(run_dir)
+
+
+def test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(tmp_path: Path) -> None:
+    """analyze launcher 生成的 tmux wrapper 含真实 guardian CLI 子命令与 run-dir 参数。"""
+    module = load_rvf_analyze_thread_module()
+    run_dir = tmp_path / "runs" / "rvf-post-exit-wire"
+    analysis = _seed_analysis_payload(run_dir)
+    fake_tmux = write_fake_tmux_script(tmp_path / "fake_tmux.py")
+    tmux_calls = tmp_path / "tmux-calls.jsonl"
+    saved = {
+        key: os.environ.get(key)
+        for key in ("RVF_TMUX_BIN", "FAKE_TMUX_CALLS", "FAKE_TMUX_RETURNCODE")
+    }
+    os.environ["RVF_TMUX_BIN"] = str(fake_tmux)
+    os.environ["FAKE_TMUX_CALLS"] = str(tmux_calls)
+    os.environ["FAKE_TMUX_RETURNCODE"] = "0"
+    try:
+        result = module.launch_detached_analyze_thread(
+            event={}, ledger=_AnalyzeLedgerStub(), analysis=analysis, finalize_record=None
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert result["launch_status"] == "launched"
+    tmux_argv = json.loads(tmux_calls.read_text(encoding="utf-8").splitlines()[0])["argv"]
+    wrapper = tmux_argv[-1]
+    assert str(SCRIPT_DIR / "agentic_initiation_guardian_dispatch.py") in wrapper
+    assert "record-analyze-completion" in wrapper
+    assert "--run-dir" in wrapper and str(run_dir) in wrapper
 
 
 def load_harness_limit_cooldown_module():
@@ -7258,15 +7512,51 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "guardian_handoff_doc_resolution_works_in_repo_and_degrades_when_absent",
+            lambda: test_guardian_handoff_doc_resolution_works_in_repo_and_degrades_when_absent(
+                root / "guardian-handoff-resolution"
+            ),
+        ),
+        (
+            "guardian_failed_milestones_retry_and_retire_only_after_success",
+            lambda: test_guardian_failed_milestones_retry_and_retire_only_after_success(
+                root / "guardian-milestone-retry"
+            ),
+        ),
+        (
+            "guardian_counter_read_modify_write_is_serialized",
+            lambda: test_guardian_counter_read_modify_write_is_serialized(
+                root / "guardian-counter-lock"
+            ),
+        ),
+        (
             "guardian_initiation_liveness_alarm_paths",
             lambda: test_guardian_initiation_liveness_alarm_paths(
                 root / "guardian-liveness"
             ),
         ),
         (
+            "guardian_liveness_utc_day_bucket_boundary",
+            lambda: test_guardian_liveness_utc_day_bucket_boundary(
+                root / "guardian-liveness-bucket-boundary"
+            ),
+        ),
+        (
             "detached_wrapper_post_exit_argv_appended_with_failsafe",
             lambda: test_detached_wrapper_post_exit_argv_appended_with_failsafe(
                 root / "detached-post-exit"
+            ),
+        ),
+        (
+            "detached_wrapper_executes_real_guardian_cli_post_exit",
+            lambda: test_detached_wrapper_executes_real_guardian_cli_post_exit(
+                root / "detached-real-guardian-cli"
+            ),
+        ),
+        (
+            "rvf_analyze_thread_wires_guardian_post_exit_cli_signature",
+            lambda: test_rvf_analyze_thread_wires_guardian_post_exit_cli_signature(
+                root / "analyze-guardian-post-exit-wire"
             ),
         ),
         (
@@ -7586,6 +7876,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context",
             lambda: test_rvf_user_prompt_submit_manual_mints_decision_token_and_injects_via_additional_context(
                 root / "prompt-submit-manual-mint"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_dedup_retries_minted_delivery_receipt",
+            lambda: test_rvf_user_prompt_submit_manual_dedup_retries_minted_delivery_receipt(
+                root / "prompt-submit-manual-dedup-receipt"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_hook_stdout_confirms_manual_delivery",
+            lambda: test_rvf_user_prompt_submit_hook_stdout_confirms_manual_delivery(
+                root / "prompt-submit-manual-stdout-receipt"
             ),
         ),
         (
