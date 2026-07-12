@@ -6,7 +6,9 @@ import os
 import subprocess
 import sys
 import textwrap
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +42,8 @@ def _fake_canonical_repo(tmp_path: Path) -> Path:
         from pathlib import Path
 
         sys.stdin.read()
+        if os.environ.get("RVF_LOCAL_DEPLOY_TEST_CONTRACT_FAIL") == "1":
+            raise SystemExit(9)
         with Path(os.environ["RVF_LOCAL_DEPLOY_TEST_TRACE"]).open("a", encoding="utf-8") as handle:
             handle.write("contract\\n")
         """,
@@ -56,6 +60,9 @@ def _fake_canonical_repo(tmp_path: Path) -> Path:
         assert "--configure-stop-hook" in sys.argv
         assert "--configure-user-prompt-submit-hook" in sys.argv
         assert "--skip-claude-plugin" in sys.argv
+        fail_mode = os.environ.get("RVF_LOCAL_DEPLOY_TEST_INSTALL_FAIL")
+        if fail_mode == "before":
+            raise SystemExit(8)
         trace = Path(os.environ["RVF_LOCAL_DEPLOY_TEST_TRACE"])
         with trace.open("a", encoding="utf-8") as handle:
             handle.write("install\\n")
@@ -77,6 +84,8 @@ def _fake_canonical_repo(tmp_path: Path) -> Path:
             path = root / "skills/review-validate-fix/state/deployments/latest-deployment.json"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(payload), encoding="utf-8")
+        if fail_mode == "after":
+            raise SystemExit(8)
         print("fake installer OK")
         """,
     )
@@ -90,6 +99,8 @@ def _fake_canonical_repo(tmp_path: Path) -> Path:
 
         with Path(os.environ["RVF_LOCAL_DEPLOY_TEST_TRACE"]).open("a", encoding="utf-8") as handle:
             handle.write("verify\\n")
+        if os.environ.get("RVF_LOCAL_DEPLOY_TEST_VERIFY_FAIL") == "1":
+            raise SystemExit(7)
         print(json.dumps({"status": "ok", "deployment_delta": {"forward_commits": ["new"]}}))
         """,
     )
@@ -114,6 +125,7 @@ def _run(
     trace: Path,
     *,
     keep_stdin_open: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     argv = [
         sys.executable,
@@ -127,7 +139,11 @@ def _run(
     ]
     run_kwargs = {
         "cwd": ROOT,
-        "env": {**os.environ, "RVF_LOCAL_DEPLOY_TEST_TRACE": str(trace)},
+        "env": {
+            **os.environ,
+            "RVF_LOCAL_DEPLOY_TEST_TRACE": str(trace),
+            **(extra_env or {}),
+        },
         "capture_output": True,
         "text": True,
         "check": False,
@@ -159,6 +175,11 @@ def test_stale_installed_skill_delegates_to_canonical_runner(tmp_path: Path) -> 
     assert result["installed_before"]["plugin"] == "old-installed-head"
     assert result["installed_after"]["plugin"] == result["canonical_head"]
     assert result["stale_before"] is True
+    receipt = json.loads(
+        (home / ".rvf/local-deploy/latest-result.json").read_text(encoding="utf-8")
+    )
+    assert receipt["status"] == "ok"
+    assert receipt["phase"] == "completed"
     assert trace.read_text(encoding="utf-8").splitlines() == [
         "contract",
         "install",
@@ -219,3 +240,107 @@ def test_skill_is_a_stable_canonical_trampoline() -> None:
     ) in text
     assert "scripts/install_to_codex.py" not in text
     assert "verify_local_deploy.py" not in text
+
+
+def test_contract_failure_is_structured_and_does_not_report_partial(tmp_path: Path) -> None:
+    repo = _fake_canonical_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    trace = tmp_path / "trace.txt"
+
+    completed = _run(
+        repo,
+        home,
+        trace,
+        extra_env={"RVF_LOCAL_DEPLOY_TEST_CONTRACT_FAIL": "1"},
+    )
+
+    assert completed.returncode == 1
+    result = json.loads(completed.stdout)
+    assert result["status"] == "failed"
+    assert result["phase"] == "plugin_contract_check"
+    assert result["installed_before"] == result["installed_after"]
+    assert "remediation" not in result
+    assert json.loads(
+        (home / ".rvf/local-deploy/latest-result.json").read_text(encoding="utf-8")
+    ) == result
+
+
+def test_verifier_failure_records_partial_installed_state(tmp_path: Path) -> None:
+    repo = _fake_canonical_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    trace = tmp_path / "trace.txt"
+    _installed_log(home, "old-installed-head")
+
+    completed = _run(
+        repo,
+        home,
+        trace,
+        extra_env={"RVF_LOCAL_DEPLOY_TEST_VERIFY_FAIL": "1"},
+    )
+
+    assert completed.returncode == 1
+    result = json.loads(completed.stdout)
+    assert result["status"] == "partial"
+    assert result["phase"] == "installed_runtime_verifier"
+    assert result["installed_before"]["plugin"] == "old-installed-head"
+    assert result["installed_after"]["plugin"] == result["canonical_head"]
+    assert "重新运行 canonical runner" in result["remediation"]
+    assert json.loads(
+        (home / ".rvf/local-deploy/latest-result.json").read_text(encoding="utf-8")
+    ) == result
+
+
+def test_installer_failure_after_writes_records_partial_state(tmp_path: Path) -> None:
+    repo = _fake_canonical_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    trace = tmp_path / "trace.txt"
+
+    completed = _run(
+        repo,
+        home,
+        trace,
+        extra_env={"RVF_LOCAL_DEPLOY_TEST_INSTALL_FAIL": "after"},
+    )
+
+    assert completed.returncode == 1
+    result = json.loads(completed.stdout)
+    assert result["status"] == "partial"
+    assert result["phase"] == "installer"
+    assert result["installed_after"]["plugin"] == result["canonical_head"]
+
+
+def test_installed_snapshot_is_taken_after_lock_acquisition(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("rvf_local_deploy_for_tests", RUNNER)
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+
+    repo = _fake_canonical_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    trace = tmp_path / "trace.txt"
+    _installed_log(home, "before-lock")
+    monkeypatch.setenv("RVF_LOCAL_DEPLOY_TEST_TRACE", str(trace))
+
+    @contextmanager
+    def lock_after_external_update(_home: Path) -> Iterator[Path]:
+        _installed_log(home, "at-lock")
+        yield home / ".rvf/local-deploy.lock"
+
+    monkeypatch.setattr(runner, "_deployment_lock", lock_after_external_update)
+
+    result = runner.run_local_deploy(
+        repo=repo,
+        home=home,
+        skip_claude_plugin=True,
+    )
+
+    assert result["installed_before"]["plugin"] == "at-lock"

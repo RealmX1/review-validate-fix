@@ -19,11 +19,18 @@ python3 /Users/bominzhang/Documents/GitHub/review-validate-fix/scripts/rvf_local
 runner 负责 canonical source 门禁、并发锁、部署、双 hook、installed-runtime 校验与 commit
 delta。默认拒绝 deploy scope 的未提交改动；只有用户明确授权 dirty deployment 后，才可重跑并
 追加 `--allow-dirty`。禁止在 canonical runner 失败后降级执行 installed payload 中的脚本。
+runner 会在 `~/.rvf/local-deploy/latest-result.json` 原子记录当前阶段；这份 receipt 用于区分
+尚未开始安装的 `failed` 与已经改写本机目标但尚未通过 verifier 的 `partial`。
 
 ## Completion
 
 仅当 runner 退出 0 且 JSON `status` 为 `ok` 才报告部署成功。最终回复包含 canonical HEAD、
 installed before/after、是否曾 stale、部署目标和 verification 中的 commit delta。
+
+JSON `status=failed` 表示安装尚未开始或门禁阶段失败；`status=partial` 表示 installer 已经开始
+改写本机目标，但 installed-runtime verifier 或 HEAD 收敛尚未成功。遇到 `partial` 必须报告
+`phase`、`installed_before/after` 与 `error`，修复原因后重新运行 canonical runner；不要假称
+自动回滚成功，也不得降级使用 installed payload。
 
 退出 2 表示 canonical source/dirty 门禁失败；退出 3 表示已有部署 writer。两者都必须停止，
 不得绕过。此 skill 不自动重启 Cline Kanban listener，也不 pull/fetch 远端。

@@ -560,8 +560,10 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_rvf_handoff_intake.py"
 
 run_parallel_test_steps
-run_step "tests: rvf_local_deploy_trampoline" \
-  python3 -m pytest -q "$tests_dir/test_rvf_local_deploy_trampoline.py"
+run_step "tests: rvf_local_deploy" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_local_deploy_trampoline.py" \
+    "$tests_dir/test_verify_local_deploy.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "prompts/reviewer.md" 'RVF_CHECK_REVIEW_RESULT'
@@ -886,11 +888,13 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/script
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'core/temporary_disable_window.py'
 require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_accepts_complete_agentic_overhaul_payload'
 require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_rejects_missing_user_prompt_submit_hook'
+require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_rejects_stale_claude_cache'
 require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_stale_installed_skill_delegates_to_canonical_runner'
 require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_dirty_canonical_repo_fails_before_deploy'
 require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_missing_canonical_repo_fails_before_creating_lock'
 require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_concurrent_deploy_writer_is_rejected'
 require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_skill_is_a_stable_canonical_trampoline'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_verifier_failure_records_partial_installed_state'
 require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
 require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
 require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_write_cline_kanban_mode'

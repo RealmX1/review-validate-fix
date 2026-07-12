@@ -28,12 +28,23 @@ DEPLOY_SCOPE_FILES = {
     "scripts/install_to_codex.py",
     "scripts/rvf_local_deploy.py",
 }
+RESULT_RELATIVE_PATH = Path(".rvf/local-deploy/latest-result.json")
+PARTIAL_REMEDIATION = (
+    "修复失败原因后重新运行 canonical runner；不要降级使用 installed payload。"
+)
 
 
 class DeployError(RuntimeError):
-    def __init__(self, message: str, *, exit_code: int = 1) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_code: int = 1,
+        result: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.result = result
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -103,6 +114,21 @@ def _installed_heads(home: Path) -> dict[str, str | None]:
             / PLUGIN_VERSION
         ),
     }
+
+
+def _write_result_receipt(home: Path, result: dict[str, Any]) -> Path:
+    path = home / RESULT_RELATIVE_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as exc:
+        raise DeployError(f"无法写入部署结果 receipt: {path}: {exc}") from exc
+    return path
 
 
 def _is_stale(heads: dict[str, str | None], canonical_head: str) -> bool:
@@ -187,7 +213,6 @@ def run_local_deploy(
     repo = repo.expanduser().resolve()
     home = home.expanduser().resolve()
     canonical_head, paths = _preflight(repo, allow_dirty=allow_dirty)
-    before = _installed_heads(home)
     env = {**os.environ, "HOME": str(home)}
     commands: list[list[str]] = []
 
@@ -222,42 +247,136 @@ def run_local_deploy(
     ]
 
     with _deployment_lock(home) as lock_path:
+        before = _installed_heads(home)
+        receipt_path = home / RESULT_RELATIVE_PATH
+
+        def result_for(
+            *,
+            status: str,
+            phase: str,
+            installed_after: dict[str, str | None] | None = None,
+            error: str | None = None,
+            remediation: str | None = None,
+            **extra: Any,
+        ) -> dict[str, Any]:
+            result: dict[str, Any] = {
+                "status": status,
+                "phase": phase,
+                "canonical_repo": str(repo),
+                "canonical_head": canonical_head,
+                "runner_path": str(Path(__file__).resolve()),
+                "installed_before": before,
+                "installed_after": installed_after if installed_after is not None else before,
+                "stale_before": _is_stale(before, canonical_head),
+                "lock_path": str(lock_path),
+                "receipt_path": str(receipt_path),
+                "commands": commands,
+            }
+            if error is not None:
+                result["error"] = error
+            if remediation is not None:
+                result["remediation"] = remediation
+            result.update(extra)
+            return result
+
         commands.append(contract_command)
-        contract_output = _run_phase(
-            "plugin contract check", contract_command, repo=repo, env=env
+        _write_result_receipt(
+            home,
+            result_for(status="running", phase="plugin_contract_check"),
         )
+        try:
+            contract_output = _run_phase(
+                "plugin contract check", contract_command, repo=repo, env=env
+            )
+        except DeployError as exc:
+            failed = result_for(
+                status="failed",
+                phase="plugin_contract_check",
+                installed_after=_installed_heads(home),
+                error=str(exc),
+            )
+            _write_result_receipt(home, failed)
+            raise DeployError(str(exc), exit_code=exc.exit_code, result=failed) from exc
+
         commands.append(installer_command)
-        installer_output = _run_phase(
-            "installer", installer_command, repo=repo, env=env
-        )
+        _write_result_receipt(home, result_for(status="running", phase="installer"))
+        try:
+            installer_output = _run_phase(
+                "installer", installer_command, repo=repo, env=env
+            )
+        except DeployError as exc:
+            partial = result_for(
+                status="partial",
+                phase="installer",
+                installed_after=_installed_heads(home),
+                error=str(exc),
+                remediation=PARTIAL_REMEDIATION,
+            )
+            _write_result_receipt(home, partial)
+            raise DeployError(str(exc), exit_code=exc.exit_code, result=partial) from exc
+
         commands.append(verifier_command)
-        verifier_output = _run_phase(
-            "installed runtime verifier", verifier_command, repo=repo, env=env
+        _write_result_receipt(
+            home,
+            result_for(
+                status="running",
+                phase="installed_runtime_verifier",
+                installed_after=_installed_heads(home),
+            ),
         )
+        try:
+            verifier_output = _run_phase(
+                "installed runtime verifier", verifier_command, repo=repo, env=env
+            )
+        except DeployError as exc:
+            partial = result_for(
+                status="partial",
+                phase="installed_runtime_verifier",
+                installed_after=_installed_heads(home),
+                error=str(exc),
+                remediation=PARTIAL_REMEDIATION,
+            )
+            _write_result_receipt(home, partial)
+            raise DeployError(str(exc), exit_code=exc.exit_code, result=partial) from exc
         try:
             verification = json.loads(verifier_output)
         except json.JSONDecodeError as exc:
-            raise DeployError("installed runtime verifier 未返回 JSON") from exc
+            partial = result_for(
+                status="partial",
+                phase="installed_runtime_verifier",
+                installed_after=_installed_heads(home),
+                error="installed runtime verifier 未返回 JSON",
+                remediation=PARTIAL_REMEDIATION,
+            )
+            _write_result_receipt(home, partial)
+            raise DeployError(
+                "installed runtime verifier 未返回 JSON",
+                result=partial,
+            ) from exc
 
-    after = _installed_heads(home)
-    if any(head != canonical_head for head in after.values()):
-        raise DeployError(
-            f"部署后 installed HEAD 未收敛到 canonical: {after} != {canonical_head}"
+        after = _installed_heads(home)
+        if any(head != canonical_head for head in after.values()):
+            message = f"部署后 installed HEAD 未收敛到 canonical: {after} != {canonical_head}"
+            partial = result_for(
+                status="partial",
+                phase="convergence",
+                installed_after=after,
+                error=message,
+                remediation=PARTIAL_REMEDIATION,
+            )
+            _write_result_receipt(home, partial)
+            raise DeployError(message, result=partial)
+
+        completed = result_for(
+            status="ok",
+            phase="completed",
+            installed_after=after,
+            contract_output=contract_output,
+            installer_output=installer_output.splitlines(),
+            verification=verification,
         )
-    return {
-        "status": "ok",
-        "canonical_repo": str(repo),
-        "canonical_head": canonical_head,
-        "runner_path": str(Path(__file__).resolve()),
-        "installed_before": before,
-        "installed_after": after,
-        "stale_before": _is_stale(before, canonical_head),
-        "lock_path": str(lock_path),
-        "commands": commands,
-        "contract_output": contract_output,
-        "installer_output": installer_output.splitlines(),
-        "verification": verification,
-    }
+        _write_result_receipt(home, completed)
+        return completed
 
 
 def _print_text(result: dict[str, Any]) -> None:
@@ -287,6 +406,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     except DeployError as exc:
         print(f"RVF canonical local deploy FAILED: {exc}", file=sys.stderr)
+        if args.json:
+            failure = exc.result or {
+                "status": "failed",
+                "phase": "preflight",
+                "error": str(exc),
+                "canonical_repo": str(args.repo.expanduser().resolve()),
+            }
+            print(json.dumps(failure, ensure_ascii=False, indent=2))
         return exc.exit_code
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

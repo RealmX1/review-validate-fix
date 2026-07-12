@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ PLUGIN_RELATIVE_FILES = (
     "skills/review-validate-fix/scripts/review_strictness_reference_calculator.py",
     "skills/review-validate-fix/scripts/agentic_initiation_injection_attempt_ledger.py",
     "skills/review-validate-fix/scripts/agentic_initiation_guardian_dispatch.py",
+    "skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
     "skills/review-validate-fix/state/deployments/latest-deployment.json",
 )
 SMOKE_SCRIPT_RELATIVE_PATHS = (
@@ -75,22 +77,30 @@ def _git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _hook_commands(payload: Any) -> list[str]:
+def _hook_commands_for_event(payload: Any, event: str) -> list[str]:
     commands: list[str] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            command = node.get("command")
+    hooks = payload.get("hooks") if isinstance(payload, dict) else None
+    groups = hooks.get(event) if isinstance(hooks, dict) else None
+    if not isinstance(groups, list):
+        return commands
+    for group in groups:
+        entries = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "command":
+                continue
+            command = entry.get("command")
             if isinstance(command, str):
                 commands.append(command)
-            for value in node.values():
-                walk(value)
-        elif isinstance(node, list):
-            for value in node:
-                walk(value)
-
-    walk(payload)
     return commands
+
+
+def _command_targets_script(command: str, expected: str) -> bool:
+    try:
+        return expected in shlex.split(command)
+    except ValueError:
+        return False
 
 
 def _first_h1(path: Path) -> str:
@@ -103,8 +113,23 @@ def _first_h1(path: Path) -> str:
     raise VerificationError(f"SKILL.md 缺少 H1: {path}")
 
 
-def _verify_payload_root(root: Path, source_head: str) -> dict[str, Any]:
-    missing = [relative for relative in PLUGIN_RELATIVE_FILES if not (root / relative).is_file()]
+def _verify_payload_root(
+    root: Path,
+    source_head: str,
+    *,
+    label: str,
+    require_deploy_log: bool = True,
+) -> dict[str, Any]:
+    required_files = (
+        PLUGIN_RELATIVE_FILES
+        if require_deploy_log
+        else tuple(
+            relative
+            for relative in PLUGIN_RELATIVE_FILES
+            if relative != "skills/review-validate-fix/state/deployments/latest-deployment.json"
+        )
+    )
+    missing = [relative for relative in required_files if not (root / relative).is_file()]
     _require(not missing, f"payload 缺文件: root={root}; missing={missing}")
 
     skill_paths = sorted(root.glob("skills/*/SKILL.md"))
@@ -112,20 +137,21 @@ def _verify_payload_root(root: Path, source_head: str) -> dict[str, Any]:
     unstamped = [str(path) for path in skill_paths if not DEPLOY_STAMP_RE.search(_first_h1(path))]
     _require(not unstamped, f"deployed heading stamp 缺失: {unstamped}")
 
-    latest_path = root / "skills/review-validate-fix/state/deployments/latest-deployment.json"
-    latest = _read_json(latest_path)
-    deployed_head = latest.get("source", {}).get("head")
-    _require(
-        deployed_head == source_head,
-        f"部署 HEAD 不匹配: root={root}; deployed={deployed_head}; source={source_head}",
-    )
-    options = latest.get("options")
-    _require(isinstance(options, dict), f"deploy log 缺 options: {latest_path}")
-    _require(options.get("configure_stop_hook") is True, "deploy log 未确认 Stop hook")
-    _require(
-        options.get("configure_user_prompt_submit_hook") is True,
-        "deploy log 未确认 UserPromptSubmit hook",
-    )
+    if require_deploy_log:
+        latest_path = root / "skills/review-validate-fix/state/deployments/latest-deployment.json"
+        latest = _read_json(latest_path)
+        deployed_head = latest.get("source", {}).get("head")
+        _require(
+            deployed_head == source_head,
+            f"部署 HEAD 不匹配: root={root}; deployed={deployed_head}; source={source_head}",
+        )
+        options = latest.get("options")
+        _require(isinstance(options, dict), f"deploy log 缺 options: {latest_path}")
+        _require(options.get("configure_stop_hook") is True, "deploy log 未确认 Stop hook")
+        _require(
+            options.get("configure_user_prompt_submit_hook") is True,
+            "deploy log 未确认 UserPromptSubmit hook",
+        )
 
     smoke_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     for relative in SMOKE_SCRIPT_RELATIVE_PATHS:
@@ -143,11 +169,26 @@ def _verify_payload_root(root: Path, source_head: str) -> dict[str, Any]:
         )
 
     return {
+        "label": label,
         "root": str(root),
-        "checked_file_count": len(PLUGIN_RELATIVE_FILES),
+        "checked_file_count": len(required_files),
         "skill_stamp_count": len(skill_paths),
         "smoke_count": len(SMOKE_SCRIPT_RELATIVE_PATHS),
     }
+
+
+def _require_payload_matches(reference: Path, candidate: Path, *, label: str) -> None:
+    compared = (
+        relative
+        for relative in PLUGIN_RELATIVE_FILES
+        if relative != "skills/review-validate-fix/state/deployments/latest-deployment.json"
+    )
+    mismatched = [
+        relative
+        for relative in compared
+        if (reference / relative).read_bytes() != (candidate / relative).read_bytes()
+    ]
+    _require(not mismatched, f"{label} 内容不一致: {mismatched}")
 
 
 def _deployment_delta(repo: Path, history_path: Path) -> dict[str, Any]:
@@ -195,20 +236,48 @@ def verify_local_deploy(
     source_head = _git(repo, "rev-parse", "HEAD")
 
     payloads = [
-        _verify_payload_root(plugin_root, source_head),
-        _verify_payload_root(cache_root, source_head),
+        _verify_payload_root(plugin_root, source_head, label="Codex plugin"),
+        _verify_payload_root(cache_root, source_head, label="Codex cache"),
     ]
+    latest_path = plugin_root / "skills/review-validate-fix/state/deployments/latest-deployment.json"
+    latest = _read_json(latest_path)
+    options = latest.get("options")
+    destinations = latest.get("destinations")
+    _require(isinstance(options, dict), f"deploy log 缺 options: {latest_path}")
+    _require(isinstance(destinations, dict), f"deploy log 缺 destinations: {latest_path}")
+    if options.get("sync_claude_plugin") is True:
+        for label, key in (
+            ("Claude marketplace", "claude_plugin_marketplace"),
+            ("Claude cache", "claude_plugin_cache"),
+        ):
+            value = destinations.get(key)
+            _require(isinstance(value, str) and bool(value), f"deploy log 缺 {label} 路径")
+            root = Path(value).expanduser().resolve()
+            payloads.append(
+                _verify_payload_root(
+                    root,
+                    source_head,
+                    label=label,
+                    require_deploy_log=False,
+                )
+            )
+            _require_payload_matches(plugin_root, root, label=label)
+
     hooks = _read_json(hooks_path)
-    commands = _hook_commands(hooks)
+    stop_commands = _hook_commands_for_event(hooks, "Stop")
+    ups_commands = _hook_commands_for_event(hooks, "UserPromptSubmit")
     expected_stop = str(
         plugin_root / "skills/review-validate-fix/scripts/stop_hook_router.py"
     )
     expected_ups = str(
         plugin_root / "skills/review-validate-fix/scripts/rvf_user_prompt_submit.py"
     )
-    _require(any(expected_stop in command for command in commands), "stable Stop hook 未指向 plugin root")
     _require(
-        any(expected_ups in command for command in commands),
+        any(_command_targets_script(command, expected_stop) for command in stop_commands),
+        "stable Stop hook 未指向 plugin root",
+    )
+    _require(
+        any(_command_targets_script(command, expected_ups) for command in ups_commands),
         "stable UserPromptSubmit hook 未指向 plugin root",
     )
 
