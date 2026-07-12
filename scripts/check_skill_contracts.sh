@@ -454,9 +454,12 @@ repo_required_files=(
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
+  "scripts/rvf_local_deploy.py"
   "tests/test_stop_hook_dispatcher.py"
   "tests/test_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
+  "tests/test_rvf_local_deploy_trampoline.py"
+  "tests/test_verify_local_deploy.py"
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
@@ -513,6 +516,7 @@ run_step "manifest sync: scripts/sync-manifest.sh" bash "$repo_root/scripts/sync
 run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
+  "$repo_root/scripts/rvf_local_deploy.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
   "$skill_dir/scripts/write_review_result.py" \
@@ -549,11 +553,15 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_stop_hook_dispatcher.py" \
   "$tests_dir/test_stop_review_validate_fix.py" \
   "$tests_dir/test_install_to_codex.py" \
+  "$tests_dir/test_rvf_local_deploy_trampoline.py" \
+  "$tests_dir/test_verify_local_deploy.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py"
 
 run_parallel_test_steps
+run_step "tests: rvf_local_deploy_trampoline" \
+  python3 -m pytest -q "$tests_dir/test_rvf_local_deploy_trampoline.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "prompts/reviewer.md" 'RVF_CHECK_REVIEW_RESULT'
@@ -861,9 +869,15 @@ require_repo_literal "scripts/install_to_codex.py" '--configure-user-prompt-subm
 require_repo_literal "scripts/install_to_codex.py" 'latest-deployment.json'
 require_repo_literal "scripts/install_to_codex.py" 'rvf-local-deploy'
 require_repo_literal "tests/test_install_to_codex.py" 'test_main_records_deploy_log_with_rvf_context'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '--configure-user-prompt-submit-hook'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/verify_local_deploy.py'
-# 确定性部署校验归 skill script 单一持有，SKILL.md 只保留步骤与完成判据。
+# Installed skill 只持有稳定 trampoline；部署语义归 canonical runner，确定性验收归 verifier。
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/rvf_local_deploy.py --json'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '禁止在 canonical runner 失败后降级'
+forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/install_to_codex.py'
+forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'verify_local_deploy.py'
+require_repo_literal "scripts/rvf_local_deploy.py" '--configure-stop-hook'
+require_repo_literal "scripts/rvf_local_deploy.py" '--configure-user-prompt-submit-hook'
+require_repo_literal "scripts/rvf_local_deploy.py" 'LOCK_EX | fcntl.LOCK_NB'
+require_repo_literal "scripts/rvf_local_deploy.py" 'canonical deploy scope 含未提交改动'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'deployments/latest-deployment.json'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'configure_user_prompt_submit_hook'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'trajectory_distill.py'
@@ -872,6 +886,11 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/script
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'core/temporary_disable_window.py'
 require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_accepts_complete_agentic_overhaul_payload'
 require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_rejects_missing_user_prompt_submit_hook'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_stale_installed_skill_delegates_to_canonical_runner'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_dirty_canonical_repo_fails_before_deploy'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_missing_canonical_repo_fails_before_creating_lock'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_concurrent_deploy_writer_is_rejected'
+require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_skill_is_a_stable_canonical_trampoline'
 require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
 require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
 require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_write_cline_kanban_mode'
