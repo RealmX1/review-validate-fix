@@ -32,6 +32,7 @@ from core.transcript.patch_parsing import (  # noqa: E402
     apply_patch_hunk_line_range_for_path,
     apply_patch_operation_to_artifact_verb,
     parse_apply_patch_operations_without_repo,
+    synthesize_apply_patch_text_from_patch_apply_end,
 )
 from session_label import text_from_message_payload  # noqa: E402 — S9b：Codex rollout user-message 文本抽取（leaf, stdlib-only，无环）
 from core.session_scope_allocation.session_change_manifest import parse_apply_patch  # noqa: E402
@@ -73,12 +74,45 @@ def read_codex_originator(rollout_path: Path) -> str | None:
     return None
 
 
+def _artifact_refs_from_patch_text(
+    patch_text: str, repo: Path | None, line_number: int
+) -> tuple[list[dict[str, Any]], int]:
+    """把 apply_patch 补丁文本解析为 ``artifact_refs``（path / lines / op）。
+    apply_patch 工具调用（旧 Codex）与由 patch_apply_end 合成的补丁文本（新 Codex）
+    共用这段，使两代 schema 的 trajectory artifact 提炼走同一路径。"""
+    if repo is not None:
+        ops, _ = parse_apply_patch(repo, patch_text, line_number)
+    else:
+        ops, _ = parse_apply_patch_operations_without_repo(patch_text, line_number)
+    artifact_refs: list[dict[str, Any]] = [
+        {
+            "path": op.get("path"),
+            "lines": apply_patch_hunk_line_range_for_path(patch_text, op.get("path")),
+            "op": apply_patch_operation_to_artifact_verb(op.get("operation")),
+        }
+        for op in ops
+    ]
+    return artifact_refs, len(ops)
+
+
+def _apply_patch_paths(patch_text: str, repo: Path | None) -> set[str]:
+    """一段 apply_patch 补丁文本覆盖的路径集合（repo 可用时归一化）。供 patch_apply_end 与
+    旧式 apply_patch 工具调用做**路径级去重**，两侧走同一 parser，故可直接比较。"""
+    if repo is not None:
+        _ops, paths = parse_apply_patch(repo, patch_text, 0)
+    else:
+        _ops, paths = parse_apply_patch_operations_without_repo(patch_text, 0)
+    return set(paths)
+
+
 def _distill_codex_record(
     record: dict[str, Any],
     *,
     repo: Path | None,
     rollout_filename: str,
     byte_offsets: list[int],
+    has_legacy_apply_patch_tool_call: bool = False,
+    legacy_apply_patch_paths: set[str] | None = None,
 ) -> TranscriptRecord | None:
     line_number = record.get("_line_number") or 0
     raw_ref = {
@@ -163,6 +197,37 @@ def _distill_codex_record(
                 ),
                 artifact_refs=[],
             )
+        if sub == "patch_apply_end":
+            # 新 Codex（gpt-5.6-sol 世代）把编辑工具统一成 custom_tool_call name=``exec``、
+            # apply_patch 以 JS 文本内嵌在 input，旧的 apply_patch 工具调用消失——那条
+            # tool_call 分支不再产出 artifact_refs，issue↔patch 因果归属会全盲。
+            # patch_apply_end 是跨版本稳定、结构化、带 success 的编辑真相源：由它合成
+            # apply_patch 补丁文本、复用同一 artifact 提炼，恢复 rvf-analyze 因果链。
+            # 旧格式两者并存（apply_patch tool_call 已带 artifact_refs），此时 patch_apply_end
+            # 保持旧行为（返回 None、不进 distilled），避免同一编辑被双重归属，且旧格式
+            # trajectory 逐字节不变。去重按**编辑路径**精确判定，而非「transcript 里存在任意
+            # 旧式调用即全局跳过」的布尔 gate：Codex resume / 切换模型的混合 session 里，后段
+            # 新编辑的 patch_apply_end 覆盖的路径未被旧式覆盖，必须照常产出 artifact_refs，
+            # 否则 rvf-analyze 因果链缺失（RVF-001 F1）。
+            patch_text = synthesize_apply_patch_text_from_patch_apply_end(payload)
+            if not patch_text:
+                return None
+            # 无任何旧式调用 → 照常产出（纯新格式）；否则仅当覆盖到旧式未覆盖的新路径时产出，
+            # 旧式已覆盖或路径无法解析（空集）时返回 None，保旧格式 trajectory 逐字节等价。
+            _pae_paths = _apply_patch_paths(patch_text, repo)
+            _legacy_paths = legacy_apply_patch_paths or set()
+            if has_legacy_apply_patch_tool_call and not (_pae_paths - _legacy_paths):
+                return None
+            artifact_refs, n_ops = _artifact_refs_from_patch_text(patch_text, repo, line_number)
+            return _rec(
+                kind="tool_result",
+                tool="apply_patch",
+                call_id=payload.get("call_id"),
+                summary=_truncate(
+                    f"patch_apply_end success={payload.get('success')} {n_ops} file(s)"
+                ),
+                artifact_refs=artifact_refs,
+            )
         return None
 
     if record_type == "response_item" and payload:
@@ -179,21 +244,9 @@ def _distill_codex_record(
             if tool == "apply_patch":
                 patch_text = arguments if isinstance(arguments, str) else None
                 if patch_text:
-                    if repo is not None:
-                        ops, _ = parse_apply_patch(repo, patch_text, line_number)
-                    else:
-                        ops, _ = parse_apply_patch_operations_without_repo(patch_text, line_number)
-                    for op in ops:
-                        artifact_refs.append(
-                            {
-                                "path": op.get("path"),
-                                "lines": apply_patch_hunk_line_range_for_path(patch_text, op.get("path")),
-                                "op": apply_patch_operation_to_artifact_verb(op.get("operation")),
-                            }
-                        )
-                    summary_parts.append(
-                        f"{len(ops)} hunk(s)"
-                    )
+                    refs, n_ops = _artifact_refs_from_patch_text(patch_text, repo, line_number)
+                    artifact_refs.extend(refs)
+                    summary_parts.append(f"{n_ops} hunk(s)")
             elif tool == "exec_command":
                 args = _safe_json_loads(arguments) or {}
                 cmd = args.get("cmd") if isinstance(args, dict) else None
@@ -257,12 +310,31 @@ def distill_codex_jsonl(
     records, offsets = _read_jsonl_with_offsets(rollout_path)
     distilled: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+    # 旧 Codex 对同一编辑同时发 apply_patch 工具调用与 patch_apply_end；工具调用已带 artifact_refs。
+    # 按**编辑路径**精确去重（而非全局布尔）：预收集所有旧式 apply_patch 工具调用覆盖的路径；某
+    # patch_apply_end 覆盖的路径若被旧式完整覆盖才跳过。resume / 切换模型的混合 session 里后段新
+    # 编辑（无旧式工具调用）覆盖的路径未被覆盖，照常产出 artifact_refs（RVF-001 F1，与 manifest 同源）。
+    has_legacy_apply_patch_tool_call = False
+    legacy_apply_patch_paths: set[str] = set()
+    for rec in records:
+        p = rec.get("payload")
+        if (
+            isinstance(p, dict)
+            and p.get("type") in ("function_call", "custom_tool_call")
+            and p.get("name") == "apply_patch"
+        ):
+            has_legacy_apply_patch_tool_call = True
+            arguments = p.get("arguments") if p.get("type") == "function_call" else p.get("input")
+            if isinstance(arguments, str) and arguments:
+                legacy_apply_patch_paths |= _apply_patch_paths(arguments, repo)
     for record in records:
         out = _distill_codex_record(
             record,
             repo=repo,
             rollout_filename=rollout_filename,
             byte_offsets=offsets,
+            has_legacy_apply_patch_tool_call=has_legacy_apply_patch_tool_call,
+            legacy_apply_patch_paths=legacy_apply_patch_paths,
         )
         if out is None:
             continue

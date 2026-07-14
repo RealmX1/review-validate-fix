@@ -5135,6 +5135,16 @@ def resolve_stop_context(
     }
 
 
+# 疑似 transcript schema 漂移时的 loud-skip error 文案（RVF-001 F3）。复用 `session_manifest_failed`
+# skip 通路的 `error` 字段承载，使 skip 原因对 dispatcher / systemMessage 显式可见。
+SCHEMA_DRIFT_SUSPECTED_ERROR = (
+    "session_transcript_schema_drift_suspected: transcript shows file-edit activity "
+    "(patch_apply_end or embedded apply_patch) and the worktree is dirty, yet ownership "
+    "attribution is empty — suspected Codex rollout schema drift; skipped RVF fork/review "
+    "instead of silently degrading to no_codebase_changes. Review manually."
+)
+
+
 def refresh_global_diff_tracker(
     context: dict[str, Any],
     ledger: RunLedger,
@@ -5220,6 +5230,28 @@ def refresh_global_diff_tracker(
         return {"observed": False, "manifest": None, "error": error_message}
     context["manifest"] = manifest
     context["session_change_type"] = session_change_type_from_manifest(manifest)
+    if isinstance(manifest, dict) and manifest.get("schema_drift_suspected"):
+        # Fail-loud（防静默盲）：transcript 有具体编辑证据（patch_apply_end / 内嵌
+        # apply_patch）且工作树 dirty，归属却为空——解析器与实际 transcript schema 失配的
+        # 签名。emit 一条显式 loud 事件，并返回与 build_manifest 失败同形的 `error`，让两个
+        # 调用方（session_scope_gate_payload / precheck_session_scope_for_dirty_route）走
+        # **同一个** `session_manifest_failed` loud-skip 通路，产出显式可见的 skip 原因，而非
+        # 继续走 allocator → 空 session_units → 静默降级为 no_unassigned_review_scope /
+        # no_codebase_changes（RVF-001 F3：守卫先前只 emit warning 后仍 observed=True 继续，
+        # 名不副实的 fail-loud）。
+        ledger.event(
+            phase="gate",
+            event="session_transcript_schema_drift_suspected",
+            status="warning",
+            reason_code="session_transcript_schema_drift_suspected",
+            repo=repo,
+            cwd=context.get("cwd"),
+        )
+        return {
+            "observed": False,
+            "manifest": manifest,
+            "error": SCHEMA_DRIFT_SUSPECTED_ERROR,
+        }
     return {"observed": True, "manifest": manifest}
 
 
@@ -5780,6 +5812,26 @@ def legacy_session_scope_gate_payload(
             error=f"{type(exc).__name__}: {exc}",
         )
 
+    if isinstance(manifest, dict) and manifest.get("schema_drift_suspected"):
+        # tracker-disabled / legacy gate 路径也必须消费 schema_drift 信号（RVF-001 F3）：
+        # 否则 `RVF_TRACKER_DISABLE=1` 会话在疑似漂移时仍走到下面 owned_dirty 空判 →
+        # no_session_owned_dirty 静默跳过。与非 legacy 路径同形，走 loud-skip。
+        ledger.event(
+            phase="gate",
+            event="session_transcript_schema_drift_suspected",
+            status="warning",
+            reason_code="session_transcript_schema_drift_suspected",
+            repo=repo,
+            cwd=event.get("cwd"),
+            paths={"transcript": str(transcript)},
+        )
+        return skip_payload(
+            "session manifest failed; skipped RVF fork/review.",
+            ledger,
+            "session_manifest_failed",
+            repo=repo,
+            error=SCHEMA_DRIFT_SUSPECTED_ERROR,
+        )
     manifest_path = ledger.artifact("session-manifest.json", manifest)
     owned_dirty = manifest.get("owned_dirty_paths")
     if isinstance(owned_dirty, list) and owned_dirty:

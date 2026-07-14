@@ -27,6 +27,9 @@ for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
             sys.path.insert(0, str(_pyroot_candidate))
         break
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.transcript.patch_parsing import (  # noqa: E402
+    synthesize_apply_patch_text_from_patch_apply_end,
+)
 
 
 REDIRECT_RE = re.compile(r"(?:^|\s)(?:>>?|1>|2>|&>)\s*(?P<path>[^&|;\s]+)")
@@ -556,8 +559,25 @@ def tool_name_for_record(record: dict[str, Any]) -> str | None:
     return payload_tool_name(payload) if isinstance(payload, dict) else None
 
 
+# 新 Codex（gpt-5.6-sol 世代）把 apply_patch 以 JS 文本内嵌在 exec input，真正的编辑调用形态是
+# ``text(await tools.apply_patch(patch))``。匹配 ``tools.apply_patch(`` 调用形态（容忍空白）作为
+# 编辑证据信号，避免裸子串 ``apply_patch`` 把 ``rg/grep apply_patch`` 之类只读命令误判为编辑。
+_EMBEDDED_APPLY_PATCH_CALL_RE = re.compile(r"tools\s*\.\s*apply_patch\s*\(")
+
+
+def is_patch_apply_end_record(record: dict[str, Any]) -> bool:
+    """新版 Codex（gpt-5.6-sol 世代）把 shell/编辑工具统一成 ``custom_tool_call``
+    name=``exec``，真正的 ``apply_patch`` 以 JS 文本内嵌在 input，旧的
+    ``exec_command_end`` 事件消失；唯一跨版本稳定的结构化编辑真相源是
+    ``event_msg`` 的 ``patch_apply_end``。归属解析据此识别它。"""
+    payload = record.get("payload")
+    return isinstance(payload, dict) and payload.get("type") == "patch_apply_end"
+
+
 def has_timestamp_comparable_tool(record: dict[str, Any]) -> bool:
     if tool_name_for_record(record) in {"apply_patch", "exec_command"}:
+        return True
+    if is_patch_apply_end_record(record):
         return True
     return any(item.get("name") in CLAUDE_WRITE_TOOL_NAMES for item in claude_tool_uses(record))
 
@@ -995,6 +1015,71 @@ def build_manifest(
     patch_fallback_hunks: list[dict[str, Any]] = []
     unresolved_owned_patch_hunks: list[dict[str, Any]] = []
     latest_user_context: dict[str, Any] | None = None
+    # 编辑活动证据：见过成功的 patch_apply_end，或 exec/工具 input 内嵌 apply_patch。
+    # 供 fail-loud 守卫在「有编辑证据却零归属」时精确报警（不误伤纯读/纯测试会话）。
+    saw_edit_evidence = False
+    # 旧 Codex 对同一编辑同时发 apply_patch 工具调用与 patch_apply_end event；两者都并入
+    # 会重复登记 edit_claims（call_id 命名空间不同：patch_apply_end 是 ``exec-<uuid>``、
+    # apply_patch 工具调用是 ``call_<...>``，无法按 call_id 对齐去重）。故按**编辑路径**精确
+    # 去重：预先收集所有旧式 apply_patch 工具调用覆盖的 repo 归一化路径；某 patch_apply_end
+    # 覆盖的路径若已被旧式工具调用完整覆盖，才跳过该条（避免同一编辑被两代 schema 双重登记）。
+    # 这取代了原先「transcript 里存在任意旧式调用即全局跳过所有 patch_apply_end」的布尔 gate：
+    # Codex 支持 resume / 切换模型，同一 session 跨 CLI 升级后会前段旧式、后段新式并存，后段
+    # 新编辑的 patch_apply_end 覆盖的路径未被旧式覆盖，必须照常摄入（RVF-001 F1）。
+    # `has_legacy_apply_patch_tool_call` 保留「是否存在旧式调用」这一布尔（用于在路径无法解析
+    # 时退化到旧全局行为，保旧格式逐字节等价）；`legacy_apply_patch_paths` 承载精确去重所需的
+    # 覆盖路径集。摄入判据：无任何旧式调用 → 照常摄入（纯新格式）；否则仅当本条覆盖到旧式未
+    # 覆盖的新路径时才摄入（混合 session 的后段新编辑）。
+    has_legacy_apply_patch_tool_call = False
+    legacy_apply_patch_paths: set[str] = set()
+    for _legacy_record in records:
+        _legacy_payload = _legacy_record.get("payload")
+        if isinstance(_legacy_payload, dict) and payload_tool_name(_legacy_payload) == "apply_patch":
+            has_legacy_apply_patch_tool_call = True
+            _legacy_text = payload_tool_input(_legacy_payload)
+            if _legacy_text:
+                _, _legacy_paths, _ = parse_apply_patch_details(
+                    root, _legacy_text, int(_legacy_record.get("_line_number", 0))
+                )
+                legacy_apply_patch_paths.update(_legacy_paths)
+
+    def _ingest_apply_patch_text(patch_text: str, record: dict[str, Any], call_id: str | None) -> None:
+        """把一段 apply_patch 补丁文本并入归属账本——apply_patch 工具调用（旧 Codex）与
+        由 patch_apply_end 合成的补丁文本（新 Codex）共用同一路径，避免两代 schema 各写一套
+        解析后再次一起过时。"""
+        nonlocal included_tool_record_count, ignored_tool_record_count
+        operations, paths, patch_hunks = parse_apply_patch_details(
+            root,
+            patch_text,
+            int(record.get("_line_number", 0)),
+            call_id,
+            latest_user_context=latest_user_context,
+        )
+        apply_patch_operations.extend(operations)
+        owned_paths.update(paths)
+        if _in_round_window(record):
+            round_window_apply_patch_paths.update(paths)
+        if should_include_tool_record(
+            record,
+            cutoff_line_number=cutoff_line_number,
+            cutoff_timestamp=cutoff_timestamp,
+            include_all=include_all_transcript_ownership,
+        ):
+            included_tool_record_count += 1
+            if isinstance(record.get("_line_number"), int):
+                included_tool_line_numbers.append(int(record["_line_number"]))
+            coverage = live_apply_patch_units(
+                root,
+                patch_hunks,
+                dirty_set,
+                report_unresolved=tracker_cutoff_line is not None,
+            )
+            live_owned_units.extend(coverage.units)
+            patch_covered_hunks.extend(coverage.covered_hunks)
+            patch_fallback_hunks.extend(coverage.path_fallback_hunks)
+            unresolved_owned_patch_hunks.extend(coverage.unresolved_hunks)
+        else:
+            ignored_tool_record_count += 1
 
     for record in records:
         user_message = user_message_from_record(record)
@@ -1005,46 +1090,54 @@ def build_manifest(
                 "message": user_message,
             }
         payload = record.get("payload")
+        # 新 Codex schema：patch_apply_end event 是结构化编辑真相源。合成为 apply_patch
+        # 补丁文本后复用同一归属路径（helper 仅对 success 记录返回非 None）。
+        if is_patch_apply_end_record(record):
+            assert isinstance(payload, dict)
+            patch_text = synthesize_apply_patch_text_from_patch_apply_end(payload)
+            if patch_text:
+                saw_edit_evidence = True
+                # 路径级去重：无任何旧式 apply_patch 工具调用 → 照常摄入（纯新格式）；否则仅当
+                # 本条 patch_apply_end 覆盖到旧式未覆盖的新路径时才摄入（resume 混合 session 的
+                # 后段新编辑）。旧式已覆盖或路径无法解析（空集）时跳过，保旧格式逐字节等价
+                # （RVF-001 F1）。
+                _, _pae_paths, _ = parse_apply_patch_details(
+                    root, patch_text, int(record.get("_line_number", 0))
+                )
+                if not has_legacy_apply_patch_tool_call or (_pae_paths - legacy_apply_patch_paths):
+                    _ingest_apply_patch_text(
+                        patch_text,
+                        record,
+                        payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
+                    )
+            continue
         tool_name = payload_tool_name(payload) if isinstance(payload, dict) else None
         if tool_name == "apply_patch":
             assert isinstance(payload, dict)
             patch_text = payload_tool_input(payload)
             if not patch_text:
                 continue
-            operations, paths, patch_hunks = parse_apply_patch_details(
-                root,
+            saw_edit_evidence = True
+            _ingest_apply_patch_text(
                 patch_text,
-                int(record.get("_line_number", 0)),
-                payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
-                latest_user_context=latest_user_context,
-            )
-            apply_patch_operations.extend(operations)
-            owned_paths.update(paths)
-            if _in_round_window(record):
-                round_window_apply_patch_paths.update(paths)
-            if should_include_tool_record(
                 record,
-                cutoff_line_number=cutoff_line_number,
-                cutoff_timestamp=cutoff_timestamp,
-                include_all=include_all_transcript_ownership,
-            ):
-                included_tool_record_count += 1
-                if isinstance(record.get("_line_number"), int):
-                    included_tool_line_numbers.append(int(record["_line_number"]))
-                coverage = live_apply_patch_units(
-                    root,
-                    patch_hunks,
-                    dirty_set,
-                    report_unresolved=tracker_cutoff_line is not None,
-                )
-                live_owned_units.extend(coverage.units)
-                patch_covered_hunks.extend(coverage.covered_hunks)
-                patch_fallback_hunks.extend(coverage.path_fallback_hunks)
-                unresolved_owned_patch_hunks.extend(coverage.unresolved_hunks)
-            else:
-                ignored_tool_record_count += 1
+                payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
+            )
             continue
         if tool_name != "exec_command":
+            # 新 Codex 把编辑工具统一成 custom_tool_call name=``exec``，apply_patch 以 JS
+            # 文本内嵌在 input。此处不解析该文本（编辑归属以 patch_apply_end 为权威源），
+            # 但记录「见过内嵌 apply_patch」作为编辑证据，供 fail-loud 守卫在未来 schema
+            # 再漂移（连 patch_apply_end 也变形）时仍能报警而非静默盲。
+            if isinstance(payload, dict):
+                tool_input = payload_tool_input(payload)
+                # 精确匹配实际调用形态 ``tools.apply_patch(``（新 Codex 把 apply_patch 以 JS
+                # 文本内嵌在 exec input 中，真正的调用是 ``text(await tools.apply_patch(patch))``）。
+                # 裸子串 ``apply_patch`` 会把只读命令误判为编辑证据——例如
+                # ``tools.exec_command({cmd: "rg -n apply_patch ..."})`` / ``grep apply_patch``——
+                # 与 F3 联动后会造成高频误跳过（RVF-001 F4）。
+                if isinstance(tool_input, str) and _EMBEDDED_APPLY_PATCH_CALL_RE.search(tool_input):
+                    saw_edit_evidence = True
             for item in claude_tool_uses(record):
                 name = item.get("name")
                 path = claude_write_path(root, item)
@@ -1187,6 +1280,13 @@ def build_manifest(
     baseline["ignored_tool_record_count"] = ignored_tool_record_count
     transcript_max_line_number = max(included_tool_line_numbers) if included_tool_line_numbers else None
 
+    # Fail-loud 守卫（防未来 transcript schema 再漂移时静默盲）：见过具体编辑证据
+    # （成功的 patch_apply_end，或工具 input 内嵌 apply_patch）却零归属，且工作树 dirty
+    # ——这正是解析器与实际 schema 失配的签名。以「有编辑证据 + dirty + 零归属」为闸，
+    # 纯读/纯测试（无编辑证据）会话不会误触发。调用方（refresh_global_diff_tracker）据此
+    # 走 loud-skip 而非静默 no_codebase_changes。
+    schema_drift_suspected = bool(saw_edit_evidence and dirty_set and not owned_paths)
+
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
     if tracker_enabled and owned_scope:
@@ -1286,6 +1386,7 @@ def build_manifest(
         "ownership_baseline": baseline,
         "owned_paths": sorted(owned_paths),
         "owned_dirty_paths": owned_dirty,
+        "schema_drift_suspected": schema_drift_suspected,
         "owned_committed_round_paths": committed_round_owned,
         "committed_round_baseline": committed_baseline,
         "unattributed_dirty_paths": unattributed_dirty,
@@ -1307,6 +1408,16 @@ def build_manifest(
         "tracker": tracker_payload,
         "warnings": [
             "Transcript-derived command side effects are conservative hints; without Pre/Post tool snapshots, shell writes cannot be fully attributed.",
+            *(
+                [
+                    "schema_drift_suspected: transcript shows file-edit activity "
+                    "(patch_apply_end or embedded apply_patch) and the worktree is dirty, "
+                    "yet ownership attribution is empty — the transcript schema likely drifted "
+                    "beyond what this parser recognizes; review manually."
+                ]
+                if schema_drift_suspected
+                else []
+            ),
             *baseline_warnings,
         ],
     }

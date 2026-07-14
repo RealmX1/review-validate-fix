@@ -9,6 +9,8 @@
     "--include-hook-events",
     "--include-partial-messages",
     "--no-session-persistence",
+    "--permission-mode",
+    "bypassPermissions",
     "--tools",
     "Bash,Read"
   ],

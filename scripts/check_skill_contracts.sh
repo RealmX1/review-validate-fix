@@ -564,6 +564,9 @@ run_step "tests: rvf_local_deploy" \
   python3 -m pytest -q \
     "$tests_dir/test_rvf_local_deploy_trampoline.py" \
     "$tests_dir/test_verify_local_deploy.py"
+run_step "tests: trajectory_distill" \
+  python3 -m pytest -q \
+    "$tests_dir/test_trajectory_distill.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "prompts/reviewer.md" 'RVF_CHECK_REVIEW_RESULT'

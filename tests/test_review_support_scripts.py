@@ -5054,6 +5054,349 @@ def test_build_manifest_attributes_committed_round_without_transcript_evidence(t
     assert evidence == {"committed_round_git"}, evidence
 
 
+def _new_codex_rollout(
+    tmp: Path,
+    repo: Path,
+    *,
+    session_id: str,
+    abs_path: str,
+    old: str,
+    new: str,
+    include_patch_apply_end: bool = True,
+    include_exec_embedded_apply_patch: bool = True,
+) -> Path:
+    """gpt-5.6-sol 世代 Codex rollout：编辑工具统一成 custom_tool_call name="exec"、
+    apply_patch 以 JS 文本内嵌 input，旧 apply_patch 工具调用与 exec_command_end 消失，
+    结构化编辑真相源是 event_msg/patch_apply_end。"""
+    records: list[dict] = [
+        {"timestamp": "2999-07-12T00:00:00.000Z", "type": "session_meta", "payload": {"id": session_id, "cwd": str(repo)}},
+    ]
+    if include_exec_embedded_apply_patch:
+        records.append(
+            {
+                "timestamp": "2999-07-12T00:00:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": f'const r = await tools.apply_patch("*** Begin Patch\\n*** Update File: {abs_path}\\n...");',
+                    "call_id": "call_exec",
+                },
+            }
+        )
+    if include_patch_apply_end:
+        records.append(
+            {
+                "timestamp": "2999-07-12T00:00:02.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "patch_apply_end",
+                    "call_id": "exec-abc",
+                    "turn_id": "turn-1",
+                    "success": True,
+                    "changes": {abs_path: {"type": "update", "unified_diff": f"@@ -1 +1 @@\n-{old}\n+{new}\n"}},
+                    "status": "completed",
+                },
+            }
+        )
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    return transcript
+
+
+def test_build_manifest_recovers_ownership_from_new_codex_patch_apply_end(tmp: Path) -> None:
+    """新 Codex（gpt-5.6-sol）把编辑走 exec custom_tool_call + patch_apply_end，旧解析器零
+    识别 → owned_paths 空 → no_codebase_changes → Stop hook 误 skip 待审工作（本次报告的 bug）。
+    修复后由 patch_apply_end 合成补丁文本恢复归属。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty
+    transcript = _new_codex_rollout(tmp, repo, session_id="s1", abs_path=str(repo / "f.txt"), old="base", new="changed")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_dirty_paths"] == ["f.txt"], manifest["owned_dirty_paths"]
+    assert manifest["owned_paths"] == ["f.txt"], manifest["owned_paths"]
+    assert manifest["schema_drift_suspected"] is False
+    from core.session_scope_allocation.session_scope_gate_pure_helpers import (  # noqa: PLC0415
+        session_change_type_from_manifest,
+    )
+    assert session_change_type_from_manifest(manifest) == "dirty_codebase_changes"
+
+
+def test_build_manifest_new_codex_guard_flags_schema_drift(tmp: Path) -> None:
+    """Fail-loud 守卫：有编辑证据（exec input 内嵌 apply_patch）却零归属 + 工作树 dirty
+    → schema_drift_suspected=True（防未来 transcript schema 再漂移时静默盲）。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty
+    # 有编辑证据（exec 内嵌 apply_patch）但无 patch_apply_end → 归属无法建立 → 守卫应触发。
+    transcript = _new_codex_rollout(
+        tmp, repo, session_id="s1", abs_path=str(repo / "f.txt"), old="base", new="changed",
+        include_patch_apply_end=False, include_exec_embedded_apply_patch=True,
+    )
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_paths"] == []
+    assert manifest["schema_drift_suspected"] is True
+    assert any("schema_drift_suspected" in w for w in manifest.get("warnings", []))
+
+
+def test_build_manifest_no_schema_drift_flag_without_edit_evidence(tmp: Path) -> None:
+    """守卫不误伤：纯读/纯命令（无编辑证据）+ dirty 工作树 → drift=False，避免把「本会话没
+    编辑、dirty 来自他处」的合法情形误报为漂移。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty（非本会话所致）
+    records = [
+        {"timestamp": "2999-07-12T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+        {
+            "timestamp": "2999-07-12T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "input": 'await tools.exec_command({cmd:"ls -la"});', "call_id": "c1"},
+        },
+    ]
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_paths"] == []
+    assert manifest["schema_drift_suspected"] is False
+
+
+def test_build_manifest_old_codex_patch_apply_end_not_double_counted(tmp: Path) -> None:
+    """旧 Codex 对同一编辑同时发 apply_patch 工具调用与 patch_apply_end；两者都并入会重复
+    登记 edit_claims。apply_patch 工具调用存在即旧格式，patch_apply_end 不再重复归属。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty
+    patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n-base\n+changed\n*** End Patch\n"
+    records = [
+        {"timestamp": "2999-07-02T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+        {
+            "timestamp": "2999-07-02T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "c1"},
+        },
+        {
+            "timestamp": "2999-07-02T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": "exec-xyz",
+                "success": True,
+                "changes": {str(repo / "f.txt"): {"type": "update", "unified_diff": "@@ -1 +1 @@\n-base\n+changed\n"}},
+                "status": "completed",
+            },
+        },
+    ]
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_dirty_paths"] == ["f.txt"], manifest["owned_dirty_paths"]
+    # patch_apply_end 被抑制 → apply_patch_operations 只来自单一 apply_patch 工具调用。
+    assert len(manifest["apply_patch_operations"]) == 1, manifest["apply_patch_operations"]
+    assert manifest["schema_drift_suspected"] is False
+
+
+def test_build_manifest_resume_mixed_apply_patch_and_patch_apply_end(tmp: Path) -> None:
+    """RVF-001 F1：resume / 切换模型的混合 session——前段旧式 apply_patch 工具调用编辑 f.txt、
+    后段新式 patch_apply_end 编辑 g.txt。旧的全局布尔 gate（存在任意旧式调用即跳过所有
+    patch_apply_end）会丢弃后段 g.txt 的归属；路径级去重后 g.txt 必须照常摄入。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)  # f.txt = "base"
+    logs = tmp / "logs"
+    (repo / "g.txt").write_text("gbase\n", encoding="utf-8")
+    run(["git", "add", "g.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add g"], cwd=repo)
+    # 两个文件都被本会话编辑（工作树 dirty）。
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    (repo / "g.txt").write_text("gchanged\n", encoding="utf-8")
+    legacy_patch = "*** Begin Patch\n*** Update File: f.txt\n@@\n-base\n+changed\n*** End Patch\n"
+    records = [
+        {"timestamp": "2999-07-13T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+        # 前段旧式（CLI 升级前）：apply_patch 工具调用编辑 f.txt。
+        {
+            "timestamp": "2999-07-13T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": legacy_patch, "call_id": "call_legacy"},
+        },
+        # 后段新式（CLI 升级后）：patch_apply_end 编辑 g.txt，无对应旧式工具调用。
+        {
+            "timestamp": "2999-07-13T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": "exec-g1",
+                "success": True,
+                "changes": {str(repo / "g.txt"): {"type": "update", "unified_diff": "@@ -1 +1 @@\n-gbase\n+gchanged\n"}},
+                "status": "completed",
+            },
+        },
+    ]
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_dirty_paths"] == ["f.txt", "g.txt"], manifest["owned_dirty_paths"]
+    assert manifest["schema_drift_suspected"] is False
+    ops_paths = sorted({op.get("path") for op in manifest["apply_patch_operations"]})
+    assert ops_paths == ["f.txt", "g.txt"], ops_paths
+
+
+def test_build_manifest_new_codex_rename_edit_attributes_target(tmp: Path) -> None:
+    """RVF-001 F2：新 Codex patch_apply_end 的 change 同时带 move_path 与 unified_diff（未暂存
+    的 rename+edit）。合成补丁文本必须把 `*** Move to:` 紧挨 `*** Update File:`、写在 hunk 之前，
+    否则 mutation hunk 会被归到已被 rename 走的源路径 → target 落入 unattributed_dirty、Stop
+    hook 误跳过。修复后 target 路径进入 owned_dirty。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)  # src 用 f.txt
+    logs = tmp / "logs"
+    (repo / "src.txt").write_text("l1\nl2\n", encoding="utf-8")
+    run(["git", "add", "src.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add src"], cwd=repo)
+    # 未暂存的 rename+edit：src.txt 删除、dst.txt 为改后新文件。
+    os.remove(repo / "src.txt")
+    (repo / "dst.txt").write_text("l1\nl2edited\n", encoding="utf-8")
+    records = [
+        {"timestamp": "2999-07-13T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+        {
+            "timestamp": "2999-07-13T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "patch_apply_end",
+                "call_id": "exec-r1",
+                "success": True,
+                "changes": {
+                    str(repo / "src.txt"): {
+                        "type": "update",
+                        "move_path": str(repo / "dst.txt"),
+                        "unified_diff": "@@ -1,2 +1,2 @@\n l1\n-l2\n+l2edited\n",
+                    }
+                },
+                "status": "completed",
+            },
+        },
+    ]
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert "dst.txt" in manifest["owned_dirty_paths"], manifest["owned_dirty_paths"]
+    assert "dst.txt" not in manifest["unattributed_dirty_paths"], manifest["unattributed_dirty_paths"]
+    assert manifest["schema_drift_suspected"] is False
+
+
+def test_build_manifest_readonly_command_with_apply_patch_substring_is_not_edit_evidence(tmp: Path) -> None:
+    """RVF-001 F4：新式 exec input 内的只读命令（``rg -n apply_patch`` / ``grep apply_patch``）
+    含子串 ``apply_patch`` 但不是真编辑。裸子串判定会把它误计为编辑证据 → 叠加背景 dirty 文件
+    → schema_drift_suspected 误报（F3 生效后会造成高频误跳过）。精确匹配 ``tools.apply_patch(``
+    调用形态后，只读命令不再计入编辑证据。"""
+    _dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "background.txt").write_text("bg\n", encoding="utf-8")  # 背景 dirty（非本会话编辑）
+    records = [
+        {"timestamp": "2999-07-13T00:00:00.000Z", "type": "session_meta", "payload": {"id": "s1", "cwd": str(repo)}},
+        {
+            "timestamp": "2999-07-13T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'const r = await tools.exec_command({cmd: "rg -n apply_patch core/"});',
+                "call_id": "c_ro",
+            },
+        },
+    ]
+    transcript = tmp / "session.jsonl"
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    manifest = sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs)
+    assert manifest["owned_paths"] == []
+    assert manifest["schema_drift_suspected"] is False
+
+
+def _load_stop_review_validate_fix_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "stop_review_validate_fix_for_rvf001", SCRIPT_DIR / "stop_review_validate_fix.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load stop_review_validate_fix module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_schema_drift_suspected_triggers_loud_skip_via_stop_gate(tmp: Path) -> None:
+    """RVF-001 F3：manifest 报 schema_drift_suspected（有编辑证据但零归属 + dirty）时，
+    `refresh_global_diff_tracker` 必须返回带 `error` 的 sentinel、走与 session_manifest_failed
+    同形的 loud-skip 通路（session_scope_gate_payload 与 tracker-disabled 的 legacy 路径均覆盖），
+    产出显式可见的 skip 原因，而非静默降级为 no_session_owned_dirty。修复前守卫只 emit warning
+    后仍 observed=True 继续 → allocator 空归属 → 静默跳过，名不副实的 fail-loud。"""
+    _dt, _sm, _rbm = _round_baseline_committed_modules()
+    stop = _load_stop_review_validate_fix_module()
+    repo, _baseline = _committed_round_repo(tmp)  # f.txt 已提交 "base"
+    (repo / "f.txt").write_text("dirty\n", encoding="utf-8")  # 工作树 dirty
+    transcript = tmp / "session.jsonl"
+    records = [
+        {"timestamp": "2999-07-13T00:00:00.000Z", "type": "session_meta", "payload": {"id": "sess-drift", "cwd": str(repo)}},
+        {"timestamp": "2999-07-13T00:00:01.000Z", "type": "event_msg", "payload": {"type": "user_message", "message": "改一下 f.txt。"}},
+        # 编辑证据：exec input 内嵌 tools.apply_patch(，但无 patch_apply_end → 归属无法建立。
+        {
+            "timestamp": "2999-07-13T00:00:02.000Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": 'text(await tools.apply_patch("*** Begin Patch\\n*** Update File: f.txt\\n@@\\n-base\\n+dirty\\n*** End Patch"));',
+                "call_id": "c1",
+            },
+        },
+    ]
+    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n", encoding="utf-8")
+    event = {"cwd": str(repo), "transcript_path": str(transcript)}
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_disable = os.environ.get("RVF_TRACKER_DISABLE")
+    try:
+        os.environ.pop("RVF_TRACKER_DISABLE", None)
+        # 1) tracker-enabled：refresh 返回带 error 的 sentinel；gate 转为 loud skip。
+        os.environ["CODEX_RVF_LOG_ROOT"] = str(tmp / "state-enabled")
+        (tmp / "state-enabled").mkdir(parents=True, exist_ok=True)
+        ledger = stop.start_run("rvf001-f3-enabled", repo=str(repo), cwd=str(repo))
+        refresh = stop.refresh_global_diff_tracker(stop.resolve_stop_context(event, str(repo), ledger), ledger)
+        assert refresh.get("error"), refresh
+        assert "schema_drift" in refresh["error"], refresh["error"]
+
+        ledger2 = stop.start_run("rvf001-f3-enabled-2", repo=str(repo), cwd=str(repo))
+        result = stop.session_scope_gate_payload(event, str(repo), ledger2)
+        assert result is not None
+        system_message = result.get("systemMessage", "")
+        assert "reason=session_manifest_failed" in system_message, system_message
+        assert "no_session_owned_dirty" not in system_message
+        raw2 = ledger2.events_path.read_text(encoding="utf-8") if ledger2.events_path.exists() else ""
+        assert "session_transcript_schema_drift_suspected" in raw2
+
+        # 2) tracker-disabled 的 legacy 路径：同样 loud skip（不落回 no_session_owned_dirty）。
+        ledger3 = stop.start_run("rvf001-f3-legacy", repo=str(repo), cwd=str(repo))
+        legacy_result = stop.legacy_session_scope_gate_payload(event, str(repo), ledger3)
+        assert legacy_result is not None
+        legacy_message = legacy_result.get("systemMessage", "")
+        assert "reason=session_manifest_failed" in legacy_message, legacy_message
+        assert "no_session_owned_dirty" not in legacy_message
+        raw3 = ledger3.events_path.read_text(encoding="utf-8") if ledger3.events_path.exists() else ""
+        assert "session_transcript_schema_drift_suspected" in raw3
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_disable is None:
+            os.environ.pop("RVF_TRACKER_DISABLE", None)
+        else:
+            os.environ["RVF_TRACKER_DISABLE"] = old_disable
+
+
 def test_committed_round_changed_paths_excludes_skip_review_trailer(tmp: Path) -> None:
     """Per-commit opt-out: a round commit carrying the `RVF-Skip-Review` trailer
     drops its EXCLUSIVE paths from the committed-round set, while a path also
@@ -7747,6 +8090,52 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "build_manifest_attributes_committed_round_without_transcript_evidence",
             lambda: test_build_manifest_attributes_committed_round_without_transcript_evidence(
                 root / "committed-no-evidence"
+            ),
+        ),
+        (
+            "build_manifest_recovers_ownership_from_new_codex_patch_apply_end",
+            lambda: test_build_manifest_recovers_ownership_from_new_codex_patch_apply_end(
+                root / "new-codex-patch-apply-end"
+            ),
+        ),
+        (
+            "build_manifest_new_codex_guard_flags_schema_drift",
+            lambda: test_build_manifest_new_codex_guard_flags_schema_drift(root / "new-codex-drift-guard"),
+        ),
+        (
+            "build_manifest_no_schema_drift_flag_without_edit_evidence",
+            lambda: test_build_manifest_no_schema_drift_flag_without_edit_evidence(
+                root / "new-codex-no-drift"
+            ),
+        ),
+        (
+            "build_manifest_old_codex_patch_apply_end_not_double_counted",
+            lambda: test_build_manifest_old_codex_patch_apply_end_not_double_counted(
+                root / "old-codex-no-double-count"
+            ),
+        ),
+        (
+            "build_manifest_resume_mixed_apply_patch_and_patch_apply_end",
+            lambda: test_build_manifest_resume_mixed_apply_patch_and_patch_apply_end(
+                root / "resume-mixed-apply-patch"
+            ),
+        ),
+        (
+            "build_manifest_new_codex_rename_edit_attributes_target",
+            lambda: test_build_manifest_new_codex_rename_edit_attributes_target(
+                root / "new-codex-rename-edit"
+            ),
+        ),
+        (
+            "build_manifest_readonly_command_with_apply_patch_substring_is_not_edit_evidence",
+            lambda: test_build_manifest_readonly_command_with_apply_patch_substring_is_not_edit_evidence(
+                root / "readonly-apply-patch-substring"
+            ),
+        ),
+        (
+            "schema_drift_suspected_triggers_loud_skip_via_stop_gate",
+            lambda: test_schema_drift_suspected_triggers_loud_skip_via_stop_gate(
+                root / "schema-drift-loud-skip"
             ),
         ),
         (
