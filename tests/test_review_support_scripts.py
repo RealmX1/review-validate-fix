@@ -8633,6 +8633,34 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "alternative_reviewer_user_local_override_applies_only_to_reviewer_process",
+            lambda: test_alternative_reviewer_user_local_override_applies_only_to_reviewer_process(
+                root / "alternative-user-local-override"
+            ),
+        ),
+        (
+            "alternative_reviewer_user_local_override_health_failure_fails_closed",
+            lambda: test_alternative_reviewer_user_local_override_health_failure_fails_closed(
+                root / "alternative-user-local-override-fail-closed"
+            ),
+        ),
+        (
+            "alternative_reviewer_environment_merge_precedence",
+            lambda: test_alternative_reviewer_environment_merge_precedence(),
+        ),
+        (
+            "alternative_reviewer_user_local_override_contract_rejects_invalid_configs",
+            lambda: test_alternative_reviewer_user_local_override_contract_rejects_invalid_configs(
+                root / "alternative-user-local-override-invalid-configs"
+            ),
+        ),
+        (
+            "alternative_reviewer_user_local_override_short_value_does_not_break_stream_json",
+            lambda: test_alternative_reviewer_user_local_override_short_value_does_not_break_stream_json(
+                root / "alternative-user-local-override-short-value"
+            ),
+        ),
+        (
             "prepare_review_run_manual_all_uncommitted_allows_dirty_paths",
             lambda: test_prepare_review_run_manual_all_uncommitted_allows_dirty_paths(root / "prepare-manual-all"),
         ),
@@ -9601,7 +9629,7 @@ _ups.inject(
 globals().update({_n: getattr(_ups, _n) for _n in _ups.__all__})
 
 
-# 有界拆分：alternative reviewer CLI 适配器行为（codex/cursor/claude 流式、空闲、路由、预检） 测试簇移入子模块；inject 共享依赖后重绑 33 个测试名，
+# 有界拆分：alternative reviewer CLI 适配器行为（codex/cursor/claude 流式、空闲、路由、预检） 测试簇移入子模块；inject 共享依赖后重绑 38 个测试名，
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import alternative_reviewer_cli_adapter_behaviors as _altrev
 _altrev.inject(

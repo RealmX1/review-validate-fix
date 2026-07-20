@@ -91,6 +91,25 @@ CHILD_RVF_ENV_KEYS = {
     "RVF_REVIEW_RESULT",
     "RVF_REVIEWER_ID",
 }
+USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY = (
+    Path(".rvf") / "alternative-reviewer-config-overrides"
+)
+USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_SCHEMA_VERSION = 1
+USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS = {
+    "env_set",
+    "health_command",
+    "health_timeout_seconds",
+    "pre_run_health",
+}
+STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES = {
+    "event",
+    "kind",
+    "name",
+    "role",
+    "status",
+    "subtype",
+    "type",
+}
 _ACTIVE_REVIEWER_PROCESS_LOCK = threading.Lock()
 _ACTIVE_REVIEWER_PROCESS: subprocess.Popen[str] | None = None
 
@@ -106,6 +125,190 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("config root must be a JSON object")
     return config
+
+
+def environment_variable_mapping(config: dict[str, Any], key: str) -> dict[str, str]:
+    configured_environment_variables = config.get(key, {})
+    if not isinstance(configured_environment_variables, dict):
+        raise ValueError(f"{key} must be a string-to-string object")
+    validated_environment_variables: dict[str, str] = {}
+    for variable_name, variable_value in configured_environment_variables.items():
+        if (
+            not isinstance(variable_name, str)
+            or not variable_name
+            or "=" in variable_name
+            or "\x00" in variable_name
+        ):
+            raise ValueError(f"{key} variable names must be non-empty environment variable names")
+        if not isinstance(variable_value, str) or "\x00" in variable_value:
+            raise ValueError(f"{key} values must be strings without NUL characters")
+        validated_environment_variables[variable_name] = variable_value
+    return validated_environment_variables
+
+
+def redact_configured_environment_variable_values(
+    text: str,
+    configured_environment_variables: dict[str, str],
+) -> str:
+    redacted_text = text
+    variables_by_descending_value_length = sorted(
+        configured_environment_variables.items(),
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )
+    for variable_name, variable_value in variables_by_descending_value_length:
+        if not variable_value:
+            continue
+        redacted_text = redacted_text.replace(
+            variable_value,
+            f"<redacted-env-value:{variable_name}>",
+        )
+    return redacted_text
+
+
+def redact_configured_environment_variable_values_in_json_value(
+    json_value: Any,
+    configured_environment_variables: dict[str, str],
+    *,
+    containing_field_name: str | None = None,
+) -> Any:
+    if isinstance(json_value, str):
+        if containing_field_name in STRUCTURED_REVIEWER_OUTPUT_PROTOCOL_CONTROL_FIELD_NAMES:
+            return json_value
+        return redact_configured_environment_variable_values(
+            json_value,
+            configured_environment_variables,
+        )
+    if isinstance(json_value, list):
+        return [
+            redact_configured_environment_variable_values_in_json_value(
+                item,
+                configured_environment_variables,
+                containing_field_name=containing_field_name,
+            )
+            for item in json_value
+        ]
+    if isinstance(json_value, dict):
+        return {
+            field_name: redact_configured_environment_variable_values_in_json_value(
+                field_value,
+                configured_environment_variables,
+                containing_field_name=str(field_name),
+            )
+            for field_name, field_value in json_value.items()
+        }
+    return json_value
+
+
+def redact_configured_environment_variable_values_in_json_lines(
+    text: str,
+    configured_environment_variables: dict[str, str],
+) -> str:
+    if not configured_environment_variables:
+        return text
+    redacted_lines: list[str] = []
+    for line in text.splitlines():
+        try:
+            parsed_line = json.loads(line)
+        except json.JSONDecodeError:
+            redacted_lines.append(
+                redact_configured_environment_variable_values(
+                    line,
+                    configured_environment_variables,
+                )
+            )
+            continue
+        redacted_lines.append(
+            json.dumps(
+                redact_configured_environment_variable_values_in_json_value(
+                    parsed_line,
+                    configured_environment_variables,
+                ),
+                ensure_ascii=False,
+            )
+        )
+    redacted_text = "\n".join(redacted_lines)
+    if text.endswith(("\n", "\r")):
+        redacted_text += "\n"
+    return redacted_text
+
+
+def user_local_alternative_reviewer_config_override_path(
+    reviewer_label: str,
+    *,
+    user_home: Path | None = None,
+) -> Path:
+    reviewer_identifier = reviewer_id_from_label(reviewer_label)
+    return (
+        (user_home if user_home is not None else Path.home())
+        / USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY
+        / f"{reviewer_identifier}.json"
+    )
+
+
+def load_effective_alternative_reviewer_config(
+    bundled_config_path: Path,
+    *,
+    user_home: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    bundled_config = load_config(bundled_config_path)
+    reviewer_label = bundled_config.get("label")
+    if not isinstance(reviewer_label, str) or not reviewer_label.startswith(
+        "alternative-reviewer:"
+    ):
+        return bundled_config, {
+            "applied": False,
+            "fields": [],
+            "env_set_names": [],
+        }
+
+    override_path = user_local_alternative_reviewer_config_override_path(
+        reviewer_label,
+        user_home=user_home,
+    )
+    if not override_path.exists():
+        return bundled_config, {
+            "applied": False,
+            "fields": [],
+            "env_set_names": [],
+        }
+
+    user_local_override = load_config(override_path)
+    if type(user_local_override.get("schema_version")) is not int or user_local_override.get(
+        "schema_version"
+    ) != USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_SCHEMA_VERSION:
+        raise ValueError(
+            "user-local alternative reviewer override schema_version must be 1"
+        )
+    if user_local_override.get("reviewer_label") != reviewer_label:
+        raise ValueError(
+            "user-local alternative reviewer override reviewer_label must match bundled config label"
+        )
+    metadata_fields = {"schema_version", "reviewer_label"}
+    unsupported_fields = sorted(
+        set(user_local_override)
+        - metadata_fields
+        - USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_ALLOWED_FIELDS
+    )
+    if unsupported_fields:
+        raise ValueError(
+            "user-local alternative reviewer override contains unsupported fields: "
+            + ", ".join(unsupported_fields)
+        )
+    applied_fields = sorted(set(user_local_override) - metadata_fields)
+    if not applied_fields:
+        raise ValueError(
+            "user-local alternative reviewer override must configure at least one supported field"
+        )
+    override_env_set = environment_variable_mapping(user_local_override, "env_set")
+    effective_config = dict(bundled_config)
+    for field_name in applied_fields:
+        effective_config[field_name] = user_local_override[field_name]
+    return effective_config, {
+        "applied": True,
+        "fields": applied_fields,
+        "env_set_names": sorted(override_env_set),
+    }
 
 
 def string_list(config: dict[str, Any], key: str) -> list[str]:
@@ -727,6 +930,19 @@ def scrub_env(env_unset: list[str]) -> dict[str, str]:
     return env
 
 
+def build_alternative_reviewer_subprocess_environment(
+    env_unset: list[str],
+    env_set: dict[str, str],
+) -> dict[str, str]:
+    reviewer_subprocess_environment = scrub_env(env_unset)
+    reviewer_subprocess_environment.update(env_set)
+    reviewer_subprocess_environment["RVF_SKILL_DIR"] = str(SKILL_DIR)
+    reviewer_subprocess_environment["RVF_COMMAND_LOCK"] = str(COMMAND_LOCK)
+    reviewer_subprocess_environment["RVF_WRITE_REVIEW_RESULT"] = str(WRITE_REVIEW_RESULT)
+    reviewer_subprocess_environment["RVF_CHECK_REVIEW_RESULT"] = str(CHECK_REVIEW_RESULT)
+    return reviewer_subprocess_environment
+
+
 def check_review_result_artifact(path: Path, scope_contract: Path | None) -> tuple[dict[str, Any], str]:
     command = [sys.executable, str(CHECK_REVIEW_RESULT), str(path), "--json"]
     if scope_contract is not None:
@@ -1063,7 +1279,8 @@ def run_with_activity_timeout(
     *,
     input_text: str,
     cwd: Path,
-    env: dict[str, str],
+    reviewer_subprocess_environment: dict[str, str],
+    activity_probe_subprocess_environment: dict[str, str],
     idle_timeout_seconds: float,
     activity_check_interval_seconds: float,
     activity_probe_command: list[str] | None,
@@ -1086,7 +1303,7 @@ def run_with_activity_timeout(
         stderr=subprocess.PIPE,
         cwd=cwd,
         text=True,
-        env=env,
+        env=reviewer_subprocess_environment,
         start_new_session=True,
     )
     set_active_reviewer_process(process)
@@ -1219,12 +1436,16 @@ def run_with_activity_timeout(
                 if activity_probe_command is not None:
                     if now < next_probe_at:
                         continue
-                    probe_env = env.copy()
-                    probe_env["RVF_REVIEWER_PID"] = str(process.pid)
+                    effective_activity_probe_subprocess_environment = (
+                        activity_probe_subprocess_environment.copy()
+                    )
+                    effective_activity_probe_subprocess_environment["RVF_REVIEWER_PID"] = str(
+                        process.pid
+                    )
                     probe = run_activity_probe(
                         activity_probe_command,
                         cwd=cwd,
-                        env=probe_env,
+                        env=effective_activity_probe_subprocess_environment,
                         timeout_seconds=activity_probe_timeout_seconds,
                         started_at=started_at,
                     )
@@ -1611,7 +1832,9 @@ def main() -> int:
         return fail(f"缺少 alternative reviewer 配置: {config_path}", 2)
 
     try:
-        config = load_config(config_path)
+        config, user_local_config_override_summary = load_effective_alternative_reviewer_config(
+            config_path
+        )
         if config.get("enabled") is not True:
             ledger.event(
                 phase="review",
@@ -1637,6 +1860,7 @@ def main() -> int:
         env_unset = config.get("env_unset", [])
         if not isinstance(env_unset, list) or not all(isinstance(item, str) for item in env_unset):
             raise ValueError("env_unset must be a string array")
+        env_set = environment_variable_mapping(config, "env_set")
         if "idle_timeout_seconds" in config:
             idle_timeout = positive_float(config, "idle_timeout_seconds", DEFAULT_IDLE_TIMEOUT_SECONDS)
         elif "timeout_seconds" in config:
@@ -1676,6 +1900,11 @@ def main() -> int:
             raise ValueError("pre_run_health must be a boolean")
         if pre_run_health and health_command is None:
             raise ValueError("pre_run_health requires health_command")
+        health_command_ledger_metadata = (
+            {"command": health_command}
+            if user_local_config_override_summary.get("applied") is not True
+            else {}
+        )
         output_format = config.get("output_format")
         if output_format is None and is_claude_print_command(command):
             cli_output_format = claude_output_format_arg(command)
@@ -1752,11 +1981,19 @@ def main() -> int:
         )
         return fail(f"找不到 alternative reviewer 命令: {command[0]}", 2)
 
-    env = scrub_env(env_unset)
-    env.update(ledger.env())
-    env[SUPPRESS_STOP_HOOK_ENV] = "1"
-    env["RVF_RUN_DIR"] = str(ledger.run_dir)
-    env["RVF_ARTIFACTS_DIR"] = str(ledger.artifacts_dir)
+    reviewer_subprocess_environment = build_alternative_reviewer_subprocess_environment(
+        env_unset,
+        env_set,
+    )
+    reviewer_support_subprocess_environment = scrub_env(env_unset)
+    for subprocess_environment in (
+        reviewer_subprocess_environment,
+        reviewer_support_subprocess_environment,
+    ):
+        subprocess_environment.update(ledger.env())
+        subprocess_environment[SUPPRESS_STOP_HOOK_ENV] = "1"
+        subprocess_environment["RVF_RUN_DIR"] = str(ledger.run_dir)
+        subprocess_environment["RVF_ARTIFACTS_DIR"] = str(ledger.artifacts_dir)
 
     if args.check:
         ledger.event(
@@ -1772,6 +2009,7 @@ def main() -> int:
             message=f"OK {label} {command_path}",
             command=command,
             command_path=command_path,
+            user_local_config_override=user_local_config_override_summary,
         )
         print(f"OK {label} {command_path}")
         return 0
@@ -1794,45 +2032,56 @@ def main() -> int:
                 command=command,
                 command_path=command_path,
                 health_configured=False,
+                user_local_config_override=user_local_config_override_summary,
             )
             print("health command not configured")
             return 0
-        returncode = run_health(health_command, env, health_timeout)
+        returncode = run_health(
+            health_command,
+            reviewer_support_subprocess_environment,
+            health_timeout,
+        )
         ledger.event(
             phase="review",
             event="health_completed",
             status="completed" if returncode == 0 else "failed",
             reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
-            command=health_command,
             returncode=returncode,
+            **health_command_ledger_metadata,
         )
         ledger.summary(
             status="completed" if returncode == 0 else "failed",
             reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
             message="alternative reviewer health command completed",
-            command=health_command,
             returncode=returncode,
+            user_local_config_override=user_local_config_override_summary,
+            **health_command_ledger_metadata,
         )
         return returncode
 
     if args.health:
         if health_command is None:
             return fail("health command not configured", 2)
-        returncode = run_health(health_command, env, health_timeout)
+        returncode = run_health(
+            health_command,
+            reviewer_support_subprocess_environment,
+            health_timeout,
+        )
         ledger.event(
             phase="review",
             event="health_completed",
             status="completed" if returncode == 0 else "failed",
             reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
-            command=health_command,
             returncode=returncode,
+            **health_command_ledger_metadata,
         )
         ledger.summary(
             status="completed" if returncode == 0 else "failed",
             reason_code="reviewer_health_completed" if returncode == 0 else "reviewer_health_failed",
             message="alternative reviewer health command completed",
-            command=health_command,
             returncode=returncode,
+            user_local_config_override=user_local_config_override_summary,
+            **health_command_ledger_metadata,
         )
         return returncode
 
@@ -1876,16 +2125,16 @@ def main() -> int:
         return fail(str(exc), 2)
 
     if repo is not None:
-        env["RVF_REPO"] = str(repo)
+        reviewer_subprocess_environment["RVF_REPO"] = str(repo)
     if session_context is not None:
-        env["RVF_SCOPE_OF_WORK"] = str(session_context)
-        env["RVF_SESSION_CONTEXT"] = str(session_context)
+        reviewer_subprocess_environment["RVF_SCOPE_OF_WORK"] = str(session_context)
+        reviewer_subprocess_environment["RVF_SESSION_CONTEXT"] = str(session_context)
     if review_packet is not None:
-        env["RVF_REVIEW_PACKET"] = str(review_packet)
+        reviewer_subprocess_environment["RVF_REVIEW_PACKET"] = str(review_packet)
     if scope_contract is not None:
-        env["RVF_SCOPE_CONTRACT"] = str(scope_contract)
-    env["RVF_REVIEWER_ID"] = reviewer_id
-    env["RVF_REVIEW_RESULT"] = str(review_result_path)
+        reviewer_subprocess_environment["RVF_SCOPE_CONTRACT"] = str(scope_contract)
+    reviewer_subprocess_environment["RVF_REVIEWER_ID"] = reviewer_id
+    reviewer_subprocess_environment["RVF_REVIEW_RESULT"] = str(review_result_path)
 
     if args.dry_run:
         cwd = str(repo) if repo is not None and allow_repo_cwd else str(review_packet.parent if review_packet is not None else SKILL_DIR)
@@ -1897,6 +2146,7 @@ def main() -> int:
             "activity_probe_configured": activity_probe_command is not None,
             "scope_contract": str(scope_contract) if scope_contract is not None else None,
             "review_result": str(review_result_path),
+            "user_local_config_override": user_local_config_override_summary,
         }
         ledger.event(
             phase="review",
@@ -1916,7 +2166,12 @@ def main() -> int:
         return 0
 
     if pre_run_health and health_command is not None:
-        returncode = run_health(health_command, env, health_timeout, emit_output=False)
+        returncode = run_health(
+            health_command,
+            reviewer_support_subprocess_environment,
+            health_timeout,
+            emit_output=False,
+        )
         ledger.event(
             phase="review",
             event="pre_run_health_completed",
@@ -1926,16 +2181,17 @@ def main() -> int:
                 if returncode == 0
                 else "reviewer_pre_run_health_failed"
             ),
-            command=health_command,
             returncode=returncode,
+            **health_command_ledger_metadata,
         )
         if returncode != 0:
             ledger.summary(
                 status="failed",
                 reason_code="reviewer_pre_run_health_failed",
                 message="alternative reviewer pre-run health command failed",
-                command=health_command,
                 returncode=returncode,
+                user_local_config_override=user_local_config_override_summary,
+                **health_command_ledger_metadata,
             )
             return returncode
 
@@ -1974,7 +2230,8 @@ def main() -> int:
                 command,
                 input_text=prompt,
                 cwd=cwd,
-                env=env,
+                reviewer_subprocess_environment=reviewer_subprocess_environment,
+                activity_probe_subprocess_environment=reviewer_support_subprocess_environment,
                 idle_timeout_seconds=idle_timeout,
                 activity_check_interval_seconds=activity_check_interval,
                 activity_probe_command=activity_probe_command,
@@ -2027,8 +2284,14 @@ def main() -> int:
             if completed.returncode == 0:
                 completed.returncode = 1
             raw_stderr = f"{raw_stderr.rstrip()}\n{exc}".strip()
-    stdout = normalize_review_output(stdout)
-    stderr = raw_stderr.strip()
+    stdout = redact_configured_environment_variable_values(
+        normalize_review_output(stdout),
+        env_set,
+    )
+    stderr = redact_configured_environment_variable_values(
+        raw_stderr.strip(),
+        env_set,
+    )
     timed_out = (
         completed.returncode == EXTERNAL_REVIEWER_TIMEOUT_EXIT_CODE
         and EXTERNAL_REVIEWER_TIMEOUT_FLAG in stderr
@@ -2048,7 +2311,10 @@ def main() -> int:
             scanned = raw_stdout
         if hit is not None:
             output_error_reason = "usage_limit_exhausted"
-            output_error_message = scanned.strip()[:2000]
+            output_error_message = redact_configured_environment_variable_values(
+                scanned.strip()[:2000],
+                env_set,
+            )
 
     # 命中额度耗尽：统一规整为专用退出码 125 + flag（对齐 timeout 124+flag 双条件先例），
     # 供 dispatch_reviewers 以「125 AND (flag in stderr OR summary.output_error_reason)」识别并回退。
@@ -2056,12 +2322,30 @@ def main() -> int:
         completed.returncode = EXTERNAL_REVIEWER_USAGE_LIMIT_EXIT_CODE
         if EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG not in raw_stderr:
             raw_stderr = f"{raw_stderr.rstrip()}\n{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG}".strip()
-        stderr = raw_stderr.strip()
+        stderr = redact_configured_environment_variable_values(
+            raw_stderr.strip(),
+            env_set,
+        )
         if output_error_message is None:
             output_error_message = stderr[:2000]
+    if output_format in {
+        OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
+        OUTPUT_FORMAT_CODEX_JSON,
+        OUTPUT_FORMAT_CURSOR_STREAM_JSON,
+    }:
+        redacted_raw_stdout = redact_configured_environment_variable_values_in_json_lines(
+            raw_stdout,
+            env_set,
+        )
+    else:
+        redacted_raw_stdout = redact_configured_environment_variable_values(
+            raw_stdout,
+            env_set,
+        )
+    redacted_raw_stderr = redact_configured_environment_variable_values(raw_stderr, env_set)
     normalized_path = write_child_artifact(reviewer_dir, "reviewer.normalized.txt", stdout + ("\n" if stdout else ""), unique=True)
-    stdout_path = write_child_artifact(reviewer_dir, "reviewer.stdout.txt", raw_stdout, unique=True)
-    stderr_path = write_child_artifact(reviewer_dir, "reviewer.stderr.txt", raw_stderr, unique=True)
+    stdout_path = write_child_artifact(reviewer_dir, "reviewer.stdout.txt", redacted_raw_stdout, unique=True)
+    stderr_path = write_child_artifact(reviewer_dir, "reviewer.stderr.txt", redacted_raw_stderr, unique=True)
     review_result_summary: dict[str, Any] | None = None
     review_result_check_stderr = ""
     review_result_summary_path: str | None = None
@@ -2117,6 +2401,7 @@ def main() -> int:
             "review_request_pending": review_request_pending,
             "output_error_reason": output_error_reason,
             "output_error_message": output_error_message,
+            "user_local_config_override": user_local_config_override_summary,
         },
         unique=True,
     )
@@ -2197,6 +2482,7 @@ def main() -> int:
         activity_probe_history=completed.probe_history,
         output_format=output_format,
         reviewer_id=reviewer_id,
+        user_local_config_override=user_local_config_override_summary,
     )
     ledger.summary(
         status=status,
@@ -2229,6 +2515,7 @@ def main() -> int:
         output_format=output_format,
         label=label,
         reviewer_id=reviewer_id,
+        user_local_config_override=user_local_config_override_summary,
     )
 
     if completed.returncode != 0:

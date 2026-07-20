@@ -345,6 +345,43 @@ python3 scripts/install_to_codex.py --replace-setup-config
 
 这条规则和当前 external reviewer config 的性质一致：workflow 本体应随仓库同步，机器相关配置应由 setup 流程或用户明确授权更新。
 
+Alternative reviewer 还支持按 reviewer label 自动发现持久的 user-local override：
+`~/.rvf/alternative-reviewer-config-overrides/<reviewer-id>.json`。例如
+`alternative-reviewer:claude-code` 对应 `claude-code.json`。该目录位于 plugin 发布与安装
+payload 之外，因此重新部署不会覆盖；没有对应文件时，bundled config 原样生效。
+
+override 必须声明 `schema_version: 1` 和与 bundled config 完全一致的 `reviewer_label`，只允许
+覆盖 `env_set`、`health_command`、`health_timeout_seconds`、`pre_run_health`。其中 `env_set`
+是字符串到字符串的映射，仅应用于目标 reviewer 子进程；环境合并顺序为继承环境、清除 RVF
+内部变量、应用 bundled `env_unset`、应用有效 `env_set`，最后写回 RVF 必需的内部变量。
+health 与 activity probe 子进程使用经过 `env_unset` 清理但未应用 `env_set` 的独立环境，避免
+个人路由值或凭据经 probe output/history 泄漏。
+`health_command` 会替换 bundled health 命令，适合把个人代理的健康检查设为强制 pre-run gate；
+health 失败时 reviewer 不会启动，而 `env_set` 中的代理路由仍使后续连接失败而非退回直连。
+
+dry-run、run ledger 与 reviewer summary 只记录 override 是否应用、覆盖字段名和 `env_set` 变量名，
+绝不记录环境变量值。示例结构如下（代理地址使用占位符，不能把凭据写入此文件）：
+
+```json
+{
+  "schema_version": 1,
+  "reviewer_label": "alternative-reviewer:claude-code",
+  "env_set": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:<proxy-port>"
+  },
+  "health_command": [
+    "/usr/bin/curl",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--max-time",
+    "5",
+    "http://127.0.0.1:<proxy-port>/health"
+  ],
+  "pre_run_health": true
+}
+```
+
 Stop hook 的默认 `CODEX_RVF_FORK_MODE=auto` 会按运行上下文选择 backend：当前 Stop event/环境提供 Kanban task id（`KANBAN_TASK_ID` / `CLINE_KANBAN_TASK_ID` / `KANBAN_HOOK_TASK_ID` / `task_id`）时使用 `kanban-followup`，否则创建新的 Cline Kanban task。Codex GUI/app-server fork 只是 legacy backup-of-backup；显式 `CODEX_RVF_FORK_MODE=gui` 或自动模式下 Cline Kanban task 启动失败且失败不属于可诊断 Kanban 管理面错误时才会使用。不要把 Terminal + `codex fork <session-id>` 作为 Desktop 自动路径：Desktop thread/session id 不一定存在于 CLI 的 saved sessions 中，会出现 Terminal 打开但 fork 失败的旧问题。`CODEX_RVF_MODE=continuation` 已废弃；当 Kanban 和 legacy GUI fallback 都不可用时，fork 模式只报告失败。
 
 显式 `CODEX_RVF_FORK_MODE=cline-kanban` 时，fork 模式不调用 Codex GUI fork；hook 会用官方 `kanban` CLI 创建并启动一张真实 Cline Kanban task。父 worktree 保持原样，session-owned dirty changes 会先冻结为 bootstrap artifact，再由 task 在 Kanban 独立 worktree 中重放。Kanban 服务不可用、task 创建/启动失败、bootstrap artifact 无法安全生成或重放时直接 fail-safe，不启动隐藏 runner。

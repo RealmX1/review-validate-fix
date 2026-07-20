@@ -23,6 +23,11 @@ __all__ = [
     'test_alternative_reviewer_pre_run_health_refreshes_before_reviewer',
     'test_alternative_reviewer_pre_run_health_failure_skips_reviewer',
     'test_alternative_reviewer_pre_run_health_timeout_skips_reviewer',
+    'test_alternative_reviewer_user_local_override_applies_only_to_reviewer_process',
+    'test_alternative_reviewer_user_local_override_health_failure_fails_closed',
+    'test_alternative_reviewer_environment_merge_precedence',
+    'test_alternative_reviewer_user_local_override_contract_rejects_invalid_configs',
+    'test_alternative_reviewer_user_local_override_short_value_does_not_break_stream_json',
     'test_alternative_reviewer_idle_timeout_flag',
     'test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive',
     'test_alternative_reviewer_requires_review_result_artifact',
@@ -293,6 +298,451 @@ def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp_path: Pa
     assert "health command timed out after" in completed.stderr
     assert "Traceback" not in completed.stderr
     assert not marker.exists()
+
+
+def test_alternative_reviewer_user_local_override_applies_only_to_reviewer_process(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    user_home = tmp_path / "user-home"
+    override_dir = user_home / ".rvf" / "alternative-reviewer-config-overrides"
+    override_dir.mkdir(parents=True)
+    health_order = tmp_path / "health-order.txt"
+    activity_probe_marker = tmp_path / "activity-probe-ran"
+    reviewer_environment_capture = tmp_path / "reviewer-environment.json"
+    sensitive_value = "metered-sensitive-value"
+    metered_base_url = "http://127.0.0.1:18080"
+    health_code = (
+        "import os; "
+        "from pathlib import Path; "
+        "assert 'ANTHROPIC_BASE_URL' not in os.environ; "
+        "assert 'RVF_TEST_SENSITIVE_VALUE' not in os.environ; "
+        f"Path({str(health_order)!r}).write_text('health\\n', encoding='utf-8')"
+    )
+    activity_probe_code = (
+        "import os; "
+        "from pathlib import Path; "
+        "assert 'ANTHROPIC_BASE_URL' not in os.environ; "
+        "assert 'RVF_TEST_SENSITIVE_VALUE' not in os.environ; "
+        f"Path({str(activity_probe_marker)!r}).write_text('probe', encoding='utf-8')"
+    )
+    reviewer_code = (
+        "import json, os, subprocess, sys, time; "
+        "from pathlib import Path; "
+        "sys.stdin.read(); "
+        f"Path({str(reviewer_environment_capture)!r}).write_text(json.dumps({{"
+        "'ANTHROPIC_BASE_URL': os.environ['ANTHROPIC_BASE_URL'], "
+        "'RVF_TEST_SENSITIVE_VALUE': os.environ['RVF_TEST_SENSITIVE_VALUE']}, sort_keys=True), encoding='utf-8'); "
+        f"Path({str(health_order)!r}).write_text("
+        f"Path({str(health_order)!r}).read_text(encoding='utf-8') + 'reviewer\\n', encoding='utf-8'); "
+        "print(os.environ['RVF_TEST_SENSITIVE_VALUE'], file=sys.stderr); "
+        "time.sleep(0.7); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
+        "'--audit-summary', 'audited metered override routing'], check=True); "
+        "print('artifact written')"
+    )
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.claude.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=0.25,
+        activity_check_interval_seconds=0.05,
+        activity_probe_command=[sys.executable, "-c", activity_probe_code],
+        activity_probe_timeout_seconds=2.0,
+        activity_probe_failure_threshold=3,
+        health_command=[sys.executable, "-c", "raise SystemExit('bundled health must be overridden')"],
+        pre_run_health=True,
+    )
+    base_payload = json.loads(config.read_text(encoding="utf-8"))
+    base_payload["label"] = "alternative-reviewer:claude-code"
+    base_payload["env_unset"] = ["ANTHROPIC_BASE_URL", "RVF_TEST_SENSITIVE_VALUE"]
+    config.write_text(json.dumps(base_payload), encoding="utf-8")
+    (override_dir / "claude-code.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "env_set": {
+                    "ANTHROPIC_BASE_URL": metered_base_url,
+                    "RVF_TEST_SENSITIVE_VALUE": sensitive_value,
+                },
+                "health_command": [sys.executable, "-c", health_code, sensitive_value],
+                "pre_run_health": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(user_home),
+            "ANTHROPIC_BASE_URL": "https://inherited-direct-route.invalid",
+            "RVF_TEST_SENSITIVE_VALUE": "inherited-pollution",
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "user-local-override-success",
+            "--rvf-run-dir",
+            str(tmp_path / "successful-run"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "artifact written"
+    assert health_order.read_text(encoding="utf-8") == "health\nreviewer\n"
+    assert activity_probe_marker.read_text(encoding="utf-8") == "probe"
+    assert json.loads(reviewer_environment_capture.read_text(encoding="utf-8")) == {
+        "ANTHROPIC_BASE_URL": metered_base_url,
+        "RVF_TEST_SENSITIVE_VALUE": sensitive_value,
+    }
+    assert os.environ.get("ANTHROPIC_BASE_URL") != metered_base_url
+    dry_run = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--dry-run",
+            "--rvf-run-id",
+            "user-local-override-dry-run",
+            "--rvf-run-dir",
+            str(tmp_path / "dry-run"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dry_run.returncode == 0, dry_run.stderr
+    dry_run_payload = json.loads(dry_run.stdout)
+    assert dry_run_payload["user_local_config_override"] == {
+        "applied": True,
+        "fields": ["env_set", "health_command", "pre_run_health"],
+        "env_set_names": ["ANTHROPIC_BASE_URL", "RVF_TEST_SENSITIVE_VALUE"],
+    }
+    assert sensitive_value not in dry_run.stdout
+    assert sensitive_value not in dry_run.stderr
+    assert sensitive_value not in (tmp_path / "dry-run" / "summary.json").read_text(encoding="utf-8")
+    for artifact_path in (tmp_path / "successful-run").rglob("*"):
+        if artifact_path.is_file():
+            assert sensitive_value.encode() not in artifact_path.read_bytes(), artifact_path
+
+
+def test_alternative_reviewer_user_local_override_health_failure_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    marker = tmp_path / "reviewer-ran"
+    reviewer_code = (
+        "import os, subprocess, sys; "
+        "from pathlib import Path; "
+        "sys.stdin.read(); "
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8'); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
+        "'--audit-summary', 'reviewer should not have run'], check=True)"
+    )
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.claude.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        health_command=[sys.executable, "-c", "print('bundled health ok')"],
+        pre_run_health=True,
+    )
+    base_payload = json.loads(config.read_text(encoding="utf-8"))
+    base_payload["label"] = "alternative-reviewer:claude-code"
+    config.write_text(json.dumps(base_payload), encoding="utf-8")
+    user_home = tmp_path / "user-home"
+    override_dir = user_home / ".rvf" / "alternative-reviewer-config-overrides"
+    override_dir.mkdir(parents=True)
+    (override_dir / "claude-code.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "env_set": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:1"},
+                "health_command": [
+                    sys.executable,
+                    "-c",
+                    "import sys; print('metered proxy unavailable'); sys.exit(7)",
+                ],
+                "pre_run_health": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(user_home)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "user-local-override-fail-closed",
+            "--rvf-run-dir",
+            str(tmp_path / "failed-run"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "metered proxy unavailable" in completed.stderr
+    assert not marker.exists()
+
+
+def test_alternative_reviewer_environment_merge_precedence() -> None:
+    module = load_alternative_reviewer_module()
+    inherited_shared = os.environ.get("RVF_TEST_ENVIRONMENT_MERGE_SHARED")
+    inherited_internal = os.environ.get("RVF_SKILL_DIR")
+    try:
+        os.environ["RVF_TEST_ENVIRONMENT_MERGE_SHARED"] = "inherited"
+        os.environ["RVF_SKILL_DIR"] = "inherited-internal"
+        merged = module.build_alternative_reviewer_subprocess_environment(
+            ["RVF_TEST_ENVIRONMENT_MERGE_SHARED", "RVF_SKILL_DIR"],
+            {
+                "RVF_TEST_ENVIRONMENT_MERGE_SHARED": "user-local",
+                "RVF_SKILL_DIR": "invalid-user-local-internal-value",
+            },
+        )
+        assert merged["RVF_TEST_ENVIRONMENT_MERGE_SHARED"] == "user-local"
+        assert merged["RVF_SKILL_DIR"] == str(module.SKILL_DIR)
+    finally:
+        if inherited_shared is None:
+            os.environ.pop("RVF_TEST_ENVIRONMENT_MERGE_SHARED", None)
+        else:
+            os.environ["RVF_TEST_ENVIRONMENT_MERGE_SHARED"] = inherited_shared
+        if inherited_internal is None:
+            os.environ.pop("RVF_SKILL_DIR", None)
+        else:
+            os.environ["RVF_SKILL_DIR"] = inherited_internal
+
+
+def test_alternative_reviewer_user_local_override_contract_rejects_invalid_configs(
+    tmp_path: Path,
+) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.claude.json",
+        [sys.executable, "-c", "raise SystemExit('check mode must not launch reviewer')"],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        health_command=[sys.executable, "-c", "print('bundled health ok')"],
+        pre_run_health=True,
+    )
+    base_payload = json.loads(config.read_text(encoding="utf-8"))
+    base_payload["label"] = "alternative-reviewer:claude-code"
+    config.write_text(json.dumps(base_payload), encoding="utf-8")
+    invalid_cases = [
+        (
+            "schema-version",
+            {
+                "schema_version": 2,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "env_set": {},
+            },
+            "schema_version must be 1",
+        ),
+        (
+            "reviewer-label",
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:cursor-cli",
+                "env_set": {},
+            },
+            "reviewer_label must match bundled config label",
+        ),
+        (
+            "unsupported-field",
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "command": ["unexpected-command"],
+            },
+            "contains unsupported fields: command",
+        ),
+        (
+            "invalid-env-set",
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "env_set": {"ANTHROPIC_BASE_URL": 8080},
+            },
+            "env_set values must be strings",
+        ),
+        (
+            "invalid-health-command",
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "health_command": "curl http://127.0.0.1/health",
+            },
+            "health_command must be a string array or null",
+        ),
+    ]
+    for case_name, override_payload, expected_error in invalid_cases:
+        user_home = tmp_path / f"user-home-{case_name}"
+        override_dir = user_home / ".rvf" / "alternative-reviewer-config-overrides"
+        override_dir.mkdir(parents=True)
+        (override_dir / "claude-code.json").write_text(
+            json.dumps(override_payload),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["HOME"] = str(user_home)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_ALTERNATIVE_REVIEWER),
+                "--config",
+                str(config),
+                "--check",
+                "--rvf-run-id",
+                f"invalid-user-local-override-{case_name}",
+                "--rvf-run-dir",
+                str(tmp_path / f"run-{case_name}"),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 2, (case_name, completed.stderr)
+        assert expected_error in completed.stderr, (case_name, completed.stderr)
+
+
+def test_alternative_reviewer_user_local_override_short_value_does_not_break_stream_json(
+    tmp_path: Path,
+) -> None:
+    module = load_alternative_reviewer_module()
+    byte_sensitive_stream = '{"type" : "result", "duration_ms": 1e+00}\n'
+    assert (
+        module.redact_configured_environment_variable_values_in_json_lines(
+            byte_sensitive_stream,
+            {},
+        )
+        == byte_sensitive_stream
+    )
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "review-packet.md"
+    packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
+    reviewer_code = (
+        "import json, os, subprocess, sys; "
+        "sys.stdin.read(); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
+        "'--audit-summary', 'stream JSON parsed before redaction'], check=True); "
+        "print(json.dumps({'type': 'result', 'subtype': 'success', "
+        "'result': 'NO_ISSUES', 'duration_ms': 1, "
+        "'debug': os.environ['RVF_TEST_SHORT_VALUE'], "
+        "'debug_protocol_collision': os.environ['RVF_TEST_PROTOCOL_COLLISION_VALUE']}))"
+    )
+    config = write_alternative_reviewer_config(
+        tmp_path / "alternative-reviewer.claude.json",
+        [sys.executable, "-c", reviewer_code],
+        idle_timeout_seconds=5.0,
+        activity_check_interval_seconds=0.05,
+        output_format="claude_stream_json",
+    )
+    base_payload = json.loads(config.read_text(encoding="utf-8"))
+    base_payload["label"] = "alternative-reviewer:claude-code"
+    config.write_text(json.dumps(base_payload), encoding="utf-8")
+    user_home = tmp_path / "user-home"
+    override_dir = user_home / ".rvf" / "alternative-reviewer-config-overrides"
+    override_dir.mkdir(parents=True)
+    (override_dir / "claude-code.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "reviewer_label": "alternative-reviewer:claude-code",
+                "env_set": {
+                    "RVF_TEST_SHORT_VALUE": "1",
+                    "RVF_TEST_PROTOCOL_COLLISION_VALUE": "result",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HOME"] = str(user_home)
+    run_dir = tmp_path / "run"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "user-local-override-short-value",
+            "--rvf-run-dir",
+            str(run_dir),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "NO_ISSUES"
+    reviewer_stdout_artifact = next(run_dir.glob("artifacts/reviewers/*/reviewer.stdout.txt"))
+    redacted_stream_record = json.loads(reviewer_stdout_artifact.read_text(encoding="utf-8"))
+    assert redacted_stream_record["type"] == "result"
+    assert redacted_stream_record["duration_ms"] == 1
+    assert redacted_stream_record["result"] == "NO_ISSUES"
+    assert redacted_stream_record["debug"] == "<redacted-env-value:RVF_TEST_SHORT_VALUE>"
+    assert redacted_stream_record["debug_protocol_collision"] == (
+        "<redacted-env-value:RVF_TEST_PROTOCOL_COLLISION_VALUE>"
+    )
+    from core.transcript.io import distill_reviewer_stream
+
+    distilled_trajectory = distill_reviewer_stream(
+        stdout_path=reviewer_stdout_artifact,
+        reviewer_id="claude-code",
+    )
+    assert any(
+        record["kind"] == "phase_marker"
+        and record["summary"] == "reviewer result: NO_ISSUES"
+        for record in distilled_trajectory
+    )
 
 
 def test_alternative_reviewer_idle_timeout_flag(tmp_path: Path) -> None:
@@ -1622,4 +2072,3 @@ def test_alternative_reviewer_cursor_autodetects_stream_json(tmp_path: Path) -> 
     assert completed.stdout.strip() == "NO_ISSUES", completed.stdout
     argv = json.loads(sink.read_text(encoding="utf-8"))
     assert argv == ["-p", "--output-format", "stream-json"], argv
-
