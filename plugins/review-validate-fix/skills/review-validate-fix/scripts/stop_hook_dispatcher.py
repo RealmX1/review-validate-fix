@@ -26,7 +26,6 @@ from core.session_scope_allocation.session_change_manifest import build_manifest
 SKILL_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_STOP_HOOK = SKILL_DIR / "scripts" / "stop_review_validate_fix.py"
 DEV_SYNC_CONTRACT_SCRIPT = Path("scripts") / "check_plugin_contracts.py"
-DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"
 LEGACY_DEFAULT_CLINE_KANBAN_ENV = {
     "CODEX_RVF_CLINE_KANBAN_START_CMD": "npx -y kanban@0.1.66 --no-open",
     "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "npx -y kanban@0.1.66 task",
@@ -643,43 +642,6 @@ def hook_config_from_hooks_json() -> dict[str, str]:
     return {}
 
 
-def installer_args_from_env() -> list[str]:
-    args = ["--configure-stop-hook"]
-    # Codex Desktop may invoke a cached hook command after hooks.json has been
-    # updated. Prefer the on-disk RVF hook config so dev self-sync does not roll
-    # a newer Cline Kanban hook back to stale gui mode.
-    hook_env = hook_config_from_hooks_json()
-    fork_mode = (
-        hook_env.get("CODEX_RVF_FORK_MODE")
-        or os.environ.get("CODEX_RVF_FORK_MODE", "")
-    ).strip()
-    if not fork_mode:
-        fork_mode = ""
-    if not fork_mode:
-        return args
-    if fork_mode in {"cline", "kanban", "ck"}:
-        fork_mode = "cline-kanban"
-    if fork_mode in {"kanban-message", "kanban-inject"}:
-        fork_mode = "kanban-followup"
-    args.extend(["--fork-mode", fork_mode])
-    if fork_mode in {"auto", "cline-kanban", "kanban-followup"}:
-        for env_name, option in (
-            ("CODEX_RVF_CLINE_KANBAN_START_CMD", "--cline-kanban-start-cmd"),
-            ("CODEX_RVF_CLINE_KANBAN_TASK_CMD", "--cline-kanban-task-cmd"),
-            ("CODEX_RVF_CLINE_KANBAN_START_TIMEOUT", "--cline-kanban-start-timeout"),
-            ("CODEX_RVF_CLINE_KANBAN_TMUX_SESSION", "--cline-kanban-tmux-session"),
-            ("CODEX_RVF_CLINE_KANBAN_BASE_REF", "--cline-kanban-base-ref"),
-            ("CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE", "--cline-kanban-worktree-mode"),
-            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED", "--cline-kanban-auto-review-enabled"),
-            ("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "--cline-kanban-auto-review-mode"),
-            ("CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE", "--cline-kanban-start-in-plan-mode"),
-        ):
-            value = (hook_env.get(env_name) or os.environ.get(env_name, "")).strip()
-            if value:
-                args.extend([option, value])
-    return args
-
-
 def latest_user_message(path: Path) -> str | None:
     latest: str | None = None
     try:
@@ -915,19 +877,9 @@ def dev_repo_script(repo: Path, rel_path: Path) -> Path:
 
 
 def dev_sync_step_specs(repo: Path) -> list[tuple[str, Path, list[str], str]]:
-    steps = [
+    return [
         ("contract-check", dev_repo_script(repo, DEV_SYNC_CONTRACT_SCRIPT), [], "contract-check"),
     ]
-    if is_truthy(os.environ.get("CODEX_RVF_DEV_SYNC_INSTALL"), default=True):
-        steps.append(
-            (
-                "installer",
-                dev_repo_script(repo, DEV_SYNC_INSTALL_SCRIPT),
-                installer_args_from_env(),
-                "installer",
-            )
-        )
-    return steps
 
 
 def sync_from_dev_repo(

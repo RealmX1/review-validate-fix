@@ -47,6 +47,7 @@ from core.run_ledger.run_ledger import (
     skill_deploy_metadata,
     start_run,
 )
+from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
     CLINE_KANBAN_TASK_MARKER,
     CLINE_KANBAN_WORKTREE_MODES,
@@ -211,10 +212,11 @@ class BootstrapConfirmationRequired(Exception):
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
+RVF_USER_LOCAL_DATA_PATHS = resolved_rvf_user_local_data_paths()
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
-DEFAULT_STATE_DIR = SKILL_DIR / "state"
-DEFAULT_SESSION_HOOK_STATE_DIR = SKILL_DIR / "state" / "session-hook"
+DEFAULT_STATE_DIR = RVF_USER_LOCAL_DATA_PATHS.runtime_state_root
+DEFAULT_SESSION_HOOK_STATE_DIR = DEFAULT_STATE_DIR / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"

@@ -3,7 +3,8 @@ set -euo pipefail
 
 skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 doc="$skill_dir/setup/mcp-setup-startup.md"
-marker="${CODEX_RVF_MCP_SETUP_MARKER:-$skill_dir/state/mcp-setup-startup.viewed}"
+user_local_data_root="${RVF_USER_LOCAL_DATA_ROOT:-$HOME/.rvf/user-local-data}"
+marker="${CODEX_RVF_MCP_SETUP_MARKER:-$user_local_data_root/runtime-state/mcp-setup-startup.viewed}"
 force=0
 
 if [ "${1:-}" = "--force" ]; then

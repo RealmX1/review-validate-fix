@@ -71,10 +71,13 @@ from core.reviewer_harness_selection import (
     compute_reviewer_harness_selection,
 )
 from core.temporary_disable_window import TemporaryDisableWindow
+from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_REGISTRY = SKILL_DIR / "config" / "reviewer-registry.json"
+DEFAULT_REGISTRY = resolved_rvf_reviewer_registry_path(
+    SKILL_DIR / "config" / "reviewer-registry.json"
+)
 RUN_ALTERNATIVE_REVIEWER = Path(__file__).resolve().parent / "run_alternative_reviewer.py"
 PLAN_SCHEMA_VERSION = 1
 

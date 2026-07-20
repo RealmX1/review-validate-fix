@@ -14,6 +14,9 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
+from core.rvf_user_local_data_paths import (  # noqa: E402
+    resolved_rvf_user_local_data_paths,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -68,7 +71,7 @@ def state_dir() -> Path:
     root = os.environ.get("CODEX_RVF_STATE_DIR") or os.environ.get("CODEX_RVF_LOG_ROOT")
     if root and root.strip():
         return Path(root).expanduser() / "session-hook"
-    return SKILL_DIR / "state" / "session-hook"
+    return resolved_rvf_user_local_data_paths().runtime_state_root / "session-hook"
 
 
 def state_path(session_id: str) -> Path:
@@ -388,12 +391,9 @@ def route_to_target(
     env.update(ledger.env())
     env["CODEX_RVF_SELECTED_CHANNEL"] = channel
     env["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = str(state_dir())
-    # Channel routing owns stable/dev selection. Stable must never be updated
-    # implicitly by Stop hook activity. Dev may run repository checks, but it
-    # must not copy dev code into the stable installed plugin.
+    # Channel routing owns stable/dev selection. Stop activity may run the dev
+    # repository contract check, but installation is never part of this path.
     env["CODEX_RVF_DEV_SYNC"] = "1" if channel == "dev" else "0"
-    if channel == "dev":
-        env["CODEX_RVF_DEV_SYNC_INSTALL"] = "0"
     ledger.event(
         phase="router",
         event="target_started",

@@ -1,6 +1,6 @@
 # Review Validate Fix MCP Setup Startup
 
-把本 markdown 作为一个新的 coding agent session 的启动提示，用来协助设置 `$review-validate-fix` 的 santa-method external reviewer harness 注册表（`config/reviewer-registry.json`）。目标只限于让 `scripts/dispatch_reviewers.py` 能 probe 到至少两路 external reviewer harness；不要顺手重写 review loop、Stop hook 或 legacy 逻辑。setup 未完成不能阻塞 `$review-validate-fix` 正常运行；运行期当 `dispatch_reviewers.py` 报告 0 个 external 可用时会按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走 in-harness 最后兜底。
+把本 markdown 作为一个新的 coding agent session 的启动提示，用来协助设置 `$review-validate-fix` 的 santa-method external reviewer harness 注册表（默认 `~/.rvf/user-local-data/reviewer-configuration/reviewer-registry.json`）。目标只限于让 `scripts/dispatch_reviewers.py` 能 probe 到至少两路 external reviewer harness；不要顺手重写 review loop、Stop hook 或 legacy 逻辑。setup 未完成不能阻塞 `$review-validate-fix` 正常运行；运行期当 `dispatch_reviewers.py` 报告 0 个 external 可用时会按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走 in-harness 最后兜底。
 
 ## 启动时先问用户
 
@@ -30,12 +30,12 @@
 
 ## 仓库已自带的 alternative reviewer 模板
 
-仓库已带三份 per-harness 模板，并由 `config/reviewer-registry.json` 统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
+仓库已带三份 per-harness 模板和 bundled registry 模板；首次部署会把 registry 初始化到 user-local 路径并由其统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 user-local registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
 
 - `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，默认路由的首选一腿；`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。`run_alternative_reviewer.py` 无 `--config` 时的默认即指向它。
 - `config/alternative-reviewer.claude.json` — Claude Code CLI 模板。
 - `config/alternative-reviewer.codex.json` — Codex CLI 模板。
-- `config/reviewer-registry.json` — 上述三者的注册表，是「本机启用哪些 external reviewer」的唯一事实源；`install_to_codex.py` 重装时保留本机这份 registry，不被仓库版本覆盖。
+- `~/.rvf/user-local-data/reviewer-configuration/reviewer-registry.json` — 上述三者的本机注册表，是「本机启用哪些 external reviewer」的唯一事实源；官方 CLI 重装 plugin cache 时不会覆盖。
 
 Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force --trust --sandbox disabled`，几个 flag 的理由：
 

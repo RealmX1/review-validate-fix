@@ -578,7 +578,7 @@ def test_router_defaults_to_dev_when_dev_terms_apply(tmp_path: Path) -> None:
     dev_env = json.loads((marker / "dev-env.json").read_text(encoding="utf-8"))
     assert dev_env["selected_channel"] == "dev"
     assert dev_env["dev_sync"] == "1"
-    assert dev_env["dev_sync_install"] == "0"
+    assert dev_env["dev_sync_install"] is None
 
 
 def test_router_defaults_to_stable_when_dev_terms_do_not_apply(tmp_path: Path) -> None:
@@ -646,7 +646,7 @@ def test_router_channel_dev_marker_routes_current_and_later_stops(tmp_path: Path
     dev_env = json.loads((marker / "dev-env.json").read_text(encoding="utf-8"))
     assert dev_env["selected_channel"] == "dev"
     assert dev_env["dev_sync"] == "1"
-    assert dev_env["dev_sync_install"] == "0"
+    assert dev_env["dev_sync_install"] is None
 
     (marker / "dev-input.json").unlink()
     stdout = invoke_router_stdout(
@@ -757,7 +757,7 @@ def test_dev_repo_main_session_syncs_before_running_installed_hook(tmp_path: Pat
     payload = json.loads(stdout)
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
-    assert (marker / "install-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
@@ -1305,7 +1305,7 @@ def test_literal_plan_markers_in_completion_do_not_skip_hook(tmp_path: Path) -> 
     payload = json.loads(stdout)
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
-    assert (marker / "install-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
@@ -1362,11 +1362,11 @@ def test_session_hook_off_still_syncs_before_running_installed_hook(tmp_path: Pa
     payload = json.loads(stdout)
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
-    assert (marker / "install-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert json.loads((marker / "hook-input.json").read_text(encoding="utf-8")) == event
 
 
-def test_dev_channel_sync_skips_stable_install(tmp_path: Path) -> None:
+def test_dev_channel_sync_never_installs_plugin(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "rvf")
     marker = tmp_path / "marker"
     marker.mkdir()
@@ -1380,13 +1380,7 @@ def test_dev_channel_sync_skips_stable_install(tmp_path: Path) -> None:
         "turn_id": "turn",
         "hook_event_name": "Stop",
     }
-    stdout = invoke(
-        event,
-        dev_repo=repo,
-        hook=hook,
-        state=tmp_path / "state",
-        extra_env={"CODEX_RVF_DEV_SYNC_INSTALL": "0"},
-    )
+    stdout = invoke(event, dev_repo=repo, hook=hook, state=tmp_path / "state")
 
     payload = json.loads(stdout)
     assert payload["systemMessage"] == "real hook ran"
@@ -1843,7 +1837,7 @@ def test_dev_repo_with_session_owned_dirty_syncs_and_runs_hook(tmp_path: Path) -
     payload = json.loads(stdout)
     assert payload["systemMessage"] == "real hook ran"
     assert (marker / "sync-ran").exists()
-    assert (marker / "install-ran").exists()
+    assert not (marker / "install-ran").exists()
     assert (marker / "hook-input.json").exists()
 
 
@@ -2021,69 +2015,18 @@ def test_dev_sync_step_specs_resolve_repo_level_dev_scripts(tmp_path: Path) -> N
 
     specs = module.dev_sync_step_specs(repo)
 
-    assert specs[0][1] == (repo / "scripts" / "check_plugin_contracts.py").resolve()
-    assert specs[1][1] == (repo / "scripts" / "install_to_codex.py").resolve()
-    assert specs[1][1] != module.SKILL_DIR / "scripts" / "install_to_codex.py"
-
-
-def test_dev_sync_step_specs_can_skip_installer_for_router_dev_channel(tmp_path: Path) -> None:
-    module = load_dispatcher_module()
-    repo = tmp_path / "rvf"
-    previous = os.environ.get("CODEX_RVF_DEV_SYNC_INSTALL")
-    os.environ["CODEX_RVF_DEV_SYNC_INSTALL"] = "0"
-    try:
-        specs = module.dev_sync_step_specs(repo)
-    finally:
-        if previous is None:
-            os.environ.pop("CODEX_RVF_DEV_SYNC_INSTALL", None)
-        else:
-            os.environ["CODEX_RVF_DEV_SYNC_INSTALL"] = previous
-
     assert [spec[0] for spec in specs] == ["contract-check"]
     assert specs[0][1] == (repo / "scripts" / "check_plugin_contracts.py").resolve()
 
 
-def test_dev_sync_preserves_cline_kanban_installer_args(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "rvf")
-    marker = tmp_path / "marker"
-    marker.mkdir()
-    write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
-    write_fake_installed_hook(hook, marker)
+def test_dev_sync_step_specs_never_include_an_installer(tmp_path: Path) -> None:
+    module = load_dispatcher_module()
+    repo = tmp_path / "rvf"
+    specs = module.dev_sync_step_specs(repo)
 
-    stdout = invoke(
-        {"cwd": str(repo), "hook_event_name": "Stop"},
-        dev_repo=repo,
-        hook=hook,
-        state=tmp_path / "state",
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "cline-kanban",
-            "CODEX_RVF_CLINE_KANBAN_START_CMD": "kanban --port 4567 --no-open",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "kanban --port 4567 task",
-            "CODEX_RVF_CLINE_KANBAN_START_TIMEOUT": "120",
-            "CODEX_RVF_CLINE_KANBAN_TMUX_SESSION": "rvf-test-kanban",
-            "CODEX_RVF_CLINE_KANBAN_BASE_REF": "main",
-            "CODEX_RVF_CLINE_KANBAN_WORKTREE_MODE": "inplace",
-            "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_ENABLED": "1",
-            "CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE": "commit",
-            "CODEX_RVF_CLINE_KANBAN_START_IN_PLAN_MODE": "1",
-        },
-    )
-
-    payload = json.loads(stdout)
-    assert payload["systemMessage"] == "real hook ran"
-    install_args = (marker / "install-ran").read_text(encoding="utf-8")
-    assert "--configure-stop-hook" in install_args
-    assert "--fork-mode cline-kanban" in install_args
-    assert "--cline-kanban-start-cmd" in install_args
-    assert "--cline-kanban-task-cmd" in install_args
-    assert "--cline-kanban-start-timeout 120" in install_args
-    assert "--cline-kanban-tmux-session rvf-test-kanban" in install_args
-    assert "--cline-kanban-base-ref main" in install_args
-    assert "--cline-kanban-worktree-mode inplace" in install_args
-    assert "--cline-kanban-auto-review-enabled 1" in install_args
-    assert "--cline-kanban-auto-review-mode commit" in install_args
-    assert "--cline-kanban-start-in-plan-mode 1" in install_args
+    assert [spec[0] for spec in specs] == ["contract-check"]
+    assert specs[0][1] == (repo / "scripts" / "check_plugin_contracts.py").resolve()
+    assert all(spec[1].name != "install_to_codex.py" for spec in specs)
 
 
 def test_hook_config_drops_legacy_npx_kanban_defaults(tmp_path: Path) -> None:
@@ -2186,121 +2129,6 @@ def test_hook_config_extracts_router_env_when_current_dispatcher_is_second_targe
     assert hook_env["CODEX_RVF_CLINE_KANBAN_BASE_REF"] == "main"
 
 
-def test_dev_sync_preserves_kanban_followup_installer_args(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "rvf")
-    marker = tmp_path / "marker"
-    marker.mkdir()
-    write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
-    write_fake_installed_hook(hook, marker)
-
-    stdout = invoke(
-        {"cwd": str(repo), "hook_event_name": "Stop"},
-        dev_repo=repo,
-        hook=hook,
-        state=tmp_path / "state",
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "kanban-message",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "kanban --port 4567 task",
-        },
-    )
-
-    payload = json.loads(stdout)
-    assert payload["systemMessage"] == "real hook ran"
-    install_args = (marker / "install-ran").read_text(encoding="utf-8")
-    assert "--configure-stop-hook" in install_args
-    assert "--fork-mode kanban-followup" in install_args
-    assert "--cline-kanban-task-cmd" in install_args
-
-
-def test_dev_sync_preserves_auto_installer_kanban_args(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "rvf")
-    marker = tmp_path / "marker"
-    marker.mkdir()
-    write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
-    write_fake_installed_hook(hook, marker)
-
-    stdout = invoke(
-        {"cwd": str(repo), "hook_event_name": "Stop"},
-        dev_repo=repo,
-        hook=hook,
-        state=tmp_path / "state",
-        extra_env={
-            "CODEX_RVF_FORK_MODE": "auto",
-            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "kanban --port 4567 task",
-        },
-    )
-
-    payload = json.loads(stdout)
-    assert payload["systemMessage"] == "real hook ran"
-    install_args = (marker / "install-ran").read_text(encoding="utf-8")
-    assert "--configure-stop-hook" in install_args
-    assert "--fork-mode auto" in install_args
-    assert "--cline-kanban-task-cmd" in install_args
-
-
-def test_dev_sync_prefers_hooks_json_over_stale_cached_env(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "rvf")
-    marker = tmp_path / "marker"
-    marker.mkdir()
-    write_fake_dev_scripts(repo, marker)
-    hook = tmp_path / "installed" / "stop_review_validate_fix.py"
-    write_fake_installed_hook(hook, marker)
-    home = tmp_path / "home"
-    hooks_path = home / ".codex" / "hooks.json"
-    hooks_path.parent.mkdir(parents=True)
-    hooks_path.write_text(
-        json.dumps(
-            {
-                "hooks": {
-                    "Stop": [
-                        {
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": (
-                                        "CODEX_RVF_MODE=fork "
-                                        "CODEX_RVF_FORK_MODE=cline-kanban "
-                                        "CODEX_RVF_CLINE_KANBAN_START_CMD='kanban --port 4567 --no-open' "
-                                        "CODEX_RVF_CLINE_KANBAN_TASK_CMD='kanban --port 4567 task' "
-                                        "CODEX_RVF_CLINE_KANBAN_BASE_REF=main "
-                                        f"python3 {SCRIPT}"
-                                    ),
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    stdout = invoke(
-        {"cwd": str(repo), "hook_event_name": "Stop"},
-        dev_repo=repo,
-        hook=hook,
-        state=tmp_path / "state",
-        extra_env={
-            "HOME": str(home),
-            "CODEX_RVF_FORK_MODE": "gui",
-            "CODEX_RVF_CLINE_KANBAN_BASE_REF": "stale-branch",
-        },
-    )
-
-    payload = json.loads(stdout)
-    assert payload["systemMessage"] == "real hook ran"
-    install_args = (marker / "install-ran").read_text(encoding="utf-8")
-    assert "--configure-stop-hook" in install_args
-    assert "--fork-mode cline-kanban" in install_args
-    assert "--cline-kanban-start-cmd" in install_args
-    assert "--cline-kanban-task-cmd" in install_args
-    assert "--cline-kanban-base-ref main" in install_args
-    assert "stale-branch" not in install_args
-
-
 def test_installed_hook_receives_hooks_json_mode_over_stale_cached_env(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     marker = tmp_path / "marker"
@@ -2399,7 +2227,7 @@ def main() -> int:
         test_literal_plan_markers_in_completion_do_not_skip_hook,
         test_prior_plan_output_does_not_suppress_future_turn,
         test_session_hook_off_still_syncs_before_running_installed_hook,
-        test_dev_channel_sync_skips_stable_install,
+        test_dev_channel_sync_never_installs_plugin,
         test_non_matching_repo_runs_installed_hook_without_sync,
         test_subagent_stop_runs_installed_hook_without_sync,
         test_suppress_env_skips_before_sync_and_installed_hook,
@@ -2421,13 +2249,9 @@ def main() -> int:
         test_coerce_text_handles_timeout_bytes,
         test_sync_subprocesses_do_not_inherit_rvf_runtime_env,
         test_dev_sync_step_specs_resolve_repo_level_dev_scripts,
-        test_dev_sync_step_specs_can_skip_installer_for_router_dev_channel,
-        test_dev_sync_preserves_cline_kanban_installer_args,
+        test_dev_sync_step_specs_never_include_an_installer,
         test_hook_config_drops_legacy_npx_kanban_defaults,
         test_hook_config_extracts_router_env_when_current_dispatcher_is_second_target,
-        test_dev_sync_preserves_kanban_followup_installer_args,
-        test_dev_sync_preserves_auto_installer_kanban_args,
-        test_dev_sync_prefers_hooks_json_over_stale_cached_env,
         test_installed_hook_receives_hooks_json_mode_over_stale_cached_env,
     ]
     with tempfile.TemporaryDirectory() as tmpdir:

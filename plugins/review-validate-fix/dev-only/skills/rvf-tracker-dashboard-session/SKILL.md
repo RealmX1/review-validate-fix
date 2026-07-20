@@ -20,7 +20,7 @@ Vibe-Kanban processes.
 - Use tmux for a persistent server. Do not use bare foreground commands,
   `nohup ... &`, or ad hoc background jobs for the final hosted dashboard.
 - Prefer the installed stable runtime:
-  `/Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py`.
+  `~/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py`.
 - Use the source checkout only when the user explicitly asks for a dev/source
   dashboard:
   `/Users/bominzhang/Documents/GitHub/review-validate-fix/plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py`.
@@ -71,7 +71,7 @@ Vibe-Kanban processes.
 
    ```bash
    tmux new-session -d -s rvf-tracker-dashboard-latest \
-     'cd /Users/bominzhang/Documents/GitHub/review-validate-fix && exec python3 /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py --repo /Users/bominzhang/Documents/GitHub/review-validate-fix --log-root /Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state --port <port> --no-open --poll-seconds 5'
+     'cd /Users/bominzhang/Documents/GitHub/review-validate-fix && exec python3 /Users/bominzhang/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/skills/review-validate-fix/scripts/tracker_dashboard.py --repo /Users/bominzhang/Documents/GitHub/review-validate-fix --log-root /Users/bominzhang/.rvf/user-local-data/run-logs --port <port> --no-open --poll-seconds 5'
    ```
 
    If the user is intentionally viewing another worktree, preserve that repo
@@ -88,7 +88,7 @@ Vibe-Kanban processes.
 
    The snapshot must show the expected `repo.repo_path` and installed
    `repo.tracker_dir` under
-   `/Users/bominzhang/plugins/review-validate-fix/skills/review-validate-fix/state/diff-tracker`.
+   `/Users/bominzhang/.rvf/user-local-data/run-logs/diff-tracker`.
 
 6. Refresh the browser.
 

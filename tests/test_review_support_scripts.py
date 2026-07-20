@@ -2543,7 +2543,7 @@ def test_run_ledger_summary_preserves_contract_timing_fields(tmp_path: Path) -> 
     )
 
 
-def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
+def test_rvf_logging_all_skill_dirs_default_to_user_local_run_logs(
     tmp_path: Path,
 ) -> None:
     module = load_run_ledger_module()
@@ -2564,37 +2564,48 @@ def test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
     )
     dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
 
-    original = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
-    os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
+    original = os.environ.get("RVF_USER_LOCAL_DATA_ROOT")
+    user_local_data_root = tmp_path / "rvf-user-local-data"
+    os.environ["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
     try:
-        assert module.default_log_root_for_skill_dir(cline_skill) == installed_skill / "state"
-        assert module.default_log_root_for_skill_dir(dev_skill) == installed_skill / "state"
+        expected_log_root = user_local_data_root / "run-logs"
+        assert module.default_log_root_for_skill_dir(cline_skill) == expected_log_root
+        assert module.default_log_root_for_skill_dir(dev_skill) == expected_log_root
         assert (
-            module.default_log_root_for_skill_dir(installed_skill) == installed_skill / "state"
+            module.default_log_root_for_skill_dir(installed_skill) == expected_log_root
         )
     finally:
         if original is None:
-            os.environ.pop("CODEX_RVF_INSTALLED_SKILL_DIR", None)
+            os.environ.pop("RVF_USER_LOCAL_DATA_ROOT", None)
         else:
-            os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = original
+            os.environ["RVF_USER_LOCAL_DATA_ROOT"] = original
 
 
-def test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
+def test_rvf_logging_does_not_fall_back_to_plugin_state_when_install_missing(
     tmp_path: Path,
 ) -> None:
     module = load_run_ledger_module()
     installed_skill = tmp_path / "home" / "plugins" / "missing" / "skills" / "review-validate-fix"
     dev_skill = tmp_path / "dev" / "skills" / "review-validate-fix"
 
-    original = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    original_installed_skill = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
+    original_user_local_data_root = os.environ.get("RVF_USER_LOCAL_DATA_ROOT")
+    user_local_data_root = tmp_path / "rvf-user-local-data"
     os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = str(installed_skill)
+    os.environ["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
     try:
-        assert module.default_log_root_for_skill_dir(dev_skill) == dev_skill / "state"
+        assert module.default_log_root_for_skill_dir(dev_skill) == (
+            user_local_data_root / "run-logs"
+        )
     finally:
-        if original is None:
+        if original_installed_skill is None:
             os.environ.pop("CODEX_RVF_INSTALLED_SKILL_DIR", None)
         else:
-            os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = original
+            os.environ["CODEX_RVF_INSTALLED_SKILL_DIR"] = original_installed_skill
+        if original_user_local_data_root is None:
+            os.environ.pop("RVF_USER_LOCAL_DATA_ROOT", None)
+        else:
+            os.environ["RVF_USER_LOCAL_DATA_ROOT"] = original_user_local_data_root
 
 
 def test_check_review_output_accepts_wrapped_issue_continuation() -> None:
@@ -8463,14 +8474,14 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state",
-            lambda: test_rvf_logging_non_canonical_skill_dirs_default_to_installed_plugin_state(
+            "rvf_logging_all_skill_dirs_default_to_user_local_run_logs",
+            lambda: test_rvf_logging_all_skill_dirs_default_to_user_local_run_logs(
                 root / "non-canonical-log-root"
             ),
         ),
         (
-            "rvf_logging_falls_back_to_skill_dir_state_when_install_missing",
-            lambda: test_rvf_logging_falls_back_to_skill_dir_state_when_install_missing(
+            "rvf_logging_does_not_fall_back_to_plugin_state_when_install_missing",
+            lambda: test_rvf_logging_does_not_fall_back_to_plugin_state_when_install_missing(
                 root / "skill-dir-fallback-state"
             ),
         ),

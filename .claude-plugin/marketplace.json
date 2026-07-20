@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "review-validate-fix-local",
+  "name": "review-validate-fix-local-main",
   "description": "Local RVF Claude Code plugin built from the review-validate-fix workspace.",
   "owner": {
     "name": "Bomin Zhang",

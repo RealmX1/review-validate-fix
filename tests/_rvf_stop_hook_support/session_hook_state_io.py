@@ -14,7 +14,7 @@ from pathlib import Path
 
 # 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
-    'test_session_hook_default_state_dir_is_skill_state_session_hook',
+    'test_session_hook_default_state_dir_is_user_local_runtime_state',
     'test_session_hook_state_dir_respects_state_dir_override',
     'test_session_hook_control_disables_current_session',
     'test_session_hook_control_status_reports_current_session',
@@ -29,18 +29,25 @@ def inject(**deps: object) -> None:
     globals().update(deps)
 
 
-def test_session_hook_default_state_dir_is_skill_state_session_hook(tmp_path: Path) -> None:
+def test_session_hook_default_state_dir_is_user_local_runtime_state(tmp_path: Path) -> None:
     old_state = os.environ.pop("CODEX_RVF_STATE_DIR", None)
     old_session_state = os.environ.pop("CODEX_RVF_SESSION_HOOK_STATE_DIR", None)
+    old_user_local_data_root = os.environ.get("RVF_USER_LOCAL_DATA_ROOT")
+    user_local_data_root = tmp_path / "rvf-user-local-data"
+    os.environ["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
     try:
         module = load_hook_module()
-        expected = SCRIPT.parents[1] / "state" / "session-hook"
+        expected = user_local_data_root / "runtime-state/session-hook"
         assert module.session_hook_state_dir() == expected
     finally:
         if old_state is not None:
             os.environ["CODEX_RVF_STATE_DIR"] = old_state
         if old_session_state is not None:
             os.environ["CODEX_RVF_SESSION_HOOK_STATE_DIR"] = old_session_state
+        if old_user_local_data_root is None:
+            os.environ.pop("RVF_USER_LOCAL_DATA_ROOT", None)
+        else:
+            os.environ["RVF_USER_LOCAL_DATA_ROOT"] = old_user_local_data_root
 
 
 def test_session_hook_state_dir_respects_state_dir_override(tmp_path: Path) -> None:
@@ -305,4 +312,3 @@ def test_session_hook_control_reenable_starts_cline_kanban_task(tmp_path: Path) 
         and event["reason_code"] == "session_hook_gate_enabled"
         for event in events
     )
-

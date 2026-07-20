@@ -18,7 +18,7 @@ Codex adapter（native 实装）。
 |---|---|
 | hook entry | `~/.codex/hooks.json` 注册 Stop hook（绝对路径，由 `install_to_codex.py` 写入） |
 | subagent | `codex exec` Popen，6–8 处调用点；S2 经 `invoke_subagent` 抽象 |
-| transcript | `state/runs/rvf-*/artifacts/trajectory.jsonl`（Codex JSONL 格式）→ `NormalizedTranscript` |
+| transcript | `RVF_USER_LOCAL_DATA_ROOT/run-logs/runs/rvf-*/artifacts/trajectory.jsonl`（Codex JSONL 格式）→ `NormalizedTranscript` |
 | permission | Codex CLI 标准（cwd/env merge，sandbox 由 codex 控制） |
-| config | nested `plugins/review-validate-fix/.codex-plugin/plugin.json`；`~/.agents/plugins/marketplace.json` 列出；`~/.codex/config.toml` 持 `[plugins."review-validate-fix@local-codex-plugins"]` slot |
-| discovery | `install_to_codex.py` 执行：copy_tree 到 `~/plugins/review-validate-fix/`、marketplace cache 到 `~/.codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0/`、写 `~/.codex/config.toml` 与 `~/.codex/hooks.json` |
+| config | nested `plugins/review-validate-fix/.codex-plugin/plugin.json`；生成的 `.agents/plugins/marketplace.json` 由官方 CLI 注册 selector `review-validate-fix@review-validate-fix-local-main` |
+| discovery | `rvf_local_deploy.py` 从干净 local `main` 生成 commit-addressed marketplace；Codex 官方 `plugin marketplace add` / `plugin add` 管理 cache 与 installed state。RVF wrapper 仅结构化维护 `~/.codex/hooks.json`。 |

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.rvf_user_local_data_paths import resolved_rvf_runtime_log_root
+
 
 INSTALLED_PLUGIN_SKILL_REL = Path("plugins") / "review-validate-fix" / "skills" / "review-validate-fix"
 
@@ -19,14 +21,18 @@ def installed_plugin_skill_dir() -> Path:
     本模块从 ``scripts/`` 迁入 ``core/run_ledger/`` 后，``Path(__file__).parents[N]``
     不再能稳健回指 skill 目录——skill 目录是 ``plugins/.../skills/...`` 旁系子树而非
     本文件的祖先，且「哨兵→skill」层数在 repo 与已部署 payload 下不同。故 ``SKILL_DIR``
-    改由本函数解析：优先 ``CODEX_RVF_INSTALLED_SKILL_DIR`` env，回退
-    ``~/plugins/review-validate-fix/skills/review-validate-fix``。
+    改由本函数解析：优先 ``CODEX_RVF_INSTALLED_SKILL_DIR`` env，回退到
+    local-main developer marketplace 的 active plugin skill。
     （该 env 名的去-codex 改名属部署耦合 env，留待 S11。）
     """
     configured = os.environ.get("CODEX_RVF_INSTALLED_SKILL_DIR")
     if configured and configured.strip():
         return Path(configured).expanduser()
-    return Path.home() / INSTALLED_PLUGIN_SKILL_REL
+    return (
+        Path.home()
+        / ".rvf/developer-plugin-marketplaces/review-validate-fix-local-main"
+        / INSTALLED_PLUGIN_SKILL_REL
+    )
 
 
 SKILL_DIR = installed_plugin_skill_dir()
@@ -254,13 +260,8 @@ def new_event_id() -> str:
 
 
 def default_log_root_for_skill_dir(skill_dir: Path) -> Path:
-    installed_skill_dir = installed_plugin_skill_dir()
-    if (
-        installed_skill_dir != skill_dir
-        and (installed_skill_dir / "SKILL.md").is_file()
-    ):
-        return installed_skill_dir / "state"
-    return skill_dir / "state"
+    del skill_dir
+    return resolved_rvf_runtime_log_root()
 
 
 def log_root() -> Path:

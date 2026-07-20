@@ -5522,7 +5522,7 @@ def main() -> int:
         test_manual_scope_suppression_does_not_transfer_parent_takeover_units,
         test_evaluate_session_gate_file_marker_takes_precedence_over_db_marker,
         test_session_scope_gate_payload_emits_session_manifest_failed_when_refresh_fails,
-        test_session_hook_default_state_dir_is_skill_state_session_hook,
+        test_session_hook_default_state_dir_is_user_local_runtime_state,
         test_session_hook_state_dir_respects_state_dir_override,
         test_manual_rvf_session_marker_write_read_clear_preserves_hook_state,
         test_manual_rvf_session_marker_skips_before_fork_gate,

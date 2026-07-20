@@ -443,6 +443,7 @@ repo_required_files=(
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
+  "core/rvf_user_local_data_paths.py"
   "core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py"
   "core/provider_health/provider_health_guard.py"
   "adapters/codex/codex_provider_login.py"
@@ -460,6 +461,11 @@ repo_required_files=(
   "tests/test_install_to_codex.py"
   "tests/test_rvf_local_deploy_trampoline.py"
   "tests/test_verify_local_deploy.py"
+  "tests/test_developer_local_main_installation.py"
+  "tests/test_official_cli_developer_plugin_installation.py"
+  "tests/test_official_cli_installation_hooks.py"
+  "tests/test_official_cli_local_deploy_verification.py"
+  "tests/test_rvf_user_local_data_paths.py"
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
@@ -527,6 +533,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
   "$repo_root/core/run_ledger/run_ledger.py" \
+  "$repo_root/core/rvf_user_local_data_paths.py" \
   "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
@@ -555,6 +562,11 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_install_to_codex.py" \
   "$tests_dir/test_rvf_local_deploy_trampoline.py" \
   "$tests_dir/test_verify_local_deploy.py" \
+  "$tests_dir/test_developer_local_main_installation.py" \
+  "$tests_dir/test_official_cli_developer_plugin_installation.py" \
+  "$tests_dir/test_official_cli_installation_hooks.py" \
+  "$tests_dir/test_official_cli_local_deploy_verification.py" \
+  "$tests_dir/test_rvf_user_local_data_paths.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py"
@@ -562,8 +574,8 @@ run_step "python compile" python3 -m py_compile \
 run_parallel_test_steps
 run_step "tests: rvf_local_deploy" \
   python3 -m pytest -q \
-    "$tests_dir/test_rvf_local_deploy_trampoline.py" \
-    "$tests_dir/test_verify_local_deploy.py"
+    "$tests_dir/test_developer_local_main_installation.py" \
+    "$tests_dir/test_official_cli_local_deploy_verification.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"
@@ -863,16 +875,16 @@ require_literal "scripts/stop_review_validate_fix.py" 'rvf_dispatch_prep_file_pa
 require_literal "scripts/stop_review_validate_fix.py" 'rvf_dispatch_target_worktree'
 require_literal "scripts/stop_review_validate_fix.py" 'cline-kanban-started'
 require_literal "scripts/stop_review_validate_fix.py" 'cline_kanban_task_started'
-require_literal "scripts/stop_hook_dispatcher.py" 'DEV_SYNC_INSTALL_SCRIPT = Path("scripts") / "install_to_codex.py"'
 require_literal "scripts/stop_hook_dispatcher.py" 'dev_sync_step_specs'
+forbid_literal "scripts/stop_hook_dispatcher.py" 'install_to_codex.py'
 require_repo_literal "README.md" 'Dev-only 标准'
 require_repo_literal "README.md" 'RVF_CONTRACT_PARALLEL_TESTS'
 require_repo_literal "README.md" 'RVF_CONTRACT_REVIEW_SUPPORT_SHARDS'
 require_repo_literal "README.md" 'RVF_CONTRACT_STOP_HOOK_SHARDS'
 require_repo_literal "README.md" '--shard-count'
 require_repo_literal "README.md" 'Dev-only 标准'
-require_repo_literal "scripts/install_to_codex.py" 'DEV_ONLY_NAMES'
-require_repo_literal "tests/test_install_to_codex.py" 'test_copy_tree_excludes_dev_only_paths'
+require_repo_literal "scripts/install_to_codex.py" 'BUNDLE_IGNORED_NAMES'
+require_repo_literal "tests/test_official_cli_installation_hooks.py" 'test_installer_has_no_manual_official_cache_or_installed_metadata_writer'
 require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_resolve_repo_level_dev_scripts'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-cmd'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-task-cmd'
@@ -883,39 +895,30 @@ require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-auto-review-e
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-auto-review-mode'
 require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-in-plan-mode'
 require_repo_literal "scripts/install_to_codex.py" '--configure-user-prompt-submit-hook'
-require_repo_literal "scripts/install_to_codex.py" 'latest-deployment.json'
-require_repo_literal "scripts/install_to_codex.py" 'rvf-local-deploy'
-require_repo_literal "tests/test_install_to_codex.py" 'test_main_records_deploy_log_with_rvf_context'
-# Installed skill 只持有稳定 trampoline；部署语义归 canonical runner，确定性验收归 verifier。
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/rvf_local_deploy.py --json'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '禁止在 canonical runner 失败后降级'
+require_repo_literal "scripts/install_to_codex.py" 'latest-official-cli-installation.json'
+require_repo_literal "scripts/install_to_codex.py" 'review-validate-fix-local-main'
+# Installed skill 只持有稳定 local-main trampoline；安装与 cache 写入归宿主官方 CLI。
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '--expected-local-main-commit HEAD --json'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '降级到手写'
 forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/install_to_codex.py'
 forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'verify_local_deploy.py'
 require_repo_literal "scripts/rvf_local_deploy.py" '--configure-stop-hook'
 require_repo_literal "scripts/rvf_local_deploy.py" '--configure-user-prompt-submit-hook'
 require_repo_literal "scripts/rvf_local_deploy.py" 'LOCK_EX | fcntl.LOCK_NB'
-require_repo_literal "scripts/rvf_local_deploy.py" 'canonical deploy scope 含未提交改动'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'deployments/latest-deployment.json'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'configure_user_prompt_submit_hook'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'trajectory_distill.py'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'agentic_initiation_guardian_dispatch.py'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'core/reviewer_harness_selection/__init__.py'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'core/temporary_disable_window.py'
-require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_accepts_complete_agentic_overhaul_payload'
-require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_rejects_missing_user_prompt_submit_hook'
-require_repo_literal "tests/test_verify_local_deploy.py" 'test_verify_local_deploy_rejects_stale_claude_cache'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_stale_installed_skill_delegates_to_canonical_runner'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_dirty_canonical_repo_fails_before_deploy'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_missing_canonical_repo_fails_before_creating_lock'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_concurrent_deploy_writer_is_rejected'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_skill_is_a_stable_canonical_trampoline'
-require_repo_literal "tests/test_rvf_local_deploy_trampoline.py" 'test_verifier_failure_records_partial_installed_state'
-require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-start-cmd'
-require_literal "scripts/stop_hook_dispatcher.py" '--cline-kanban-task-cmd'
-require_repo_literal "tests/test_install_to_codex.py" 'test_configure_stop_hook_can_write_cline_kanban_mode'
-require_repo_literal "tests/test_install_to_codex.py" 'test_configure_user_prompt_submit_hook_deduplicates_existing_rvf_hooks'
-require_repo_literal "tests/test_install_to_codex.py" 'test_main_can_configure_user_prompt_submit_hook'
-require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_preserves_cline_kanban_installer_args'
+require_repo_literal "scripts/rvf_local_deploy.py" 'local main worktree 含未提交改动'
+forbid_repo_literal "scripts/rvf_local_deploy.py" '--allow-dirty'
+forbid_repo_literal "scripts/rvf_local_deploy.py" 'parser.add_argument("--repo"'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'official cache 与 active plugin payload 不一致'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'RVF_USER_LOCAL_DATA_ROOT'
+require_repo_literal "tests/test_official_cli_local_deploy_verification.py" 'test_verifier_accepts_official_cli_installation_and_shared_user_state'
+require_repo_literal "tests/test_official_cli_local_deploy_verification.py" 'test_verifier_rejects_missing_official_codex_plugin'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_runner_loaded_from_task_worktree'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_dirty_local_main'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_expected_commit_mismatch'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_public_runner_cli_has_no_repo_or_dirty_bypass'
+require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_transaction_restores_previous_active_release_and_official_installation'
+require_repo_literal "tests/test_official_cli_installation_hooks.py" 'test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots'
+require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_never_include_an_installer'
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_cline_kanban_mode_creates_and_starts_task_with_same_run'
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_kanban_followup_mode_injects_current_task_message'
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'dispatch_prep_payload'
@@ -979,21 +982,19 @@ require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_handoff_mark
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_forked_rvf_session_waits_for_handoff_before_advisory'
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_missing_cwd_skips_and_requests_target_repo'
 require_repo_literal "tests/test_stop_review_validate_fix.py" 'test_log_unavailable_does_not_break_hook_payload'
-require_repo_literal "scripts/install_to_codex.py" 'sync_codex_plugin_cache'
-require_repo_literal "scripts/install_to_codex.py" 'sync_claude_plugin'
-require_repo_literal "scripts/install_to_codex.py" 'sync_claude_marketplace_metadata'
-require_repo_literal "scripts/install_to_codex.py" 'ensure_codex_plugin_enabled'
-require_repo_literal "scripts/install_to_codex.py" '[plugins."'
-require_repo_literal "scripts/install_to_codex.py" '".codex"'
-require_repo_literal "scripts/install_to_codex.py" '"cache"'
+forbid_repo_literal "scripts/install_to_codex.py" 'sync_codex_plugin_cache'
+forbid_repo_literal "scripts/install_to_codex.py" 'sync_claude_plugin'
+forbid_repo_literal "scripts/install_to_codex.py" 'installed_plugins.json'
+forbid_repo_literal "scripts/install_to_codex.py" '.codex/plugins/cache'
+forbid_repo_literal "scripts/install_to_codex.py" '.claude/plugins/cache'
 require_repo_literal "scripts/install_to_codex.py" 'PLUGIN_NAME = "review-validate-fix"'
-require_repo_literal "scripts/install_to_codex.py" 'CLAUDE_MARKETPLACE_SRC'
-require_repo_literal ".claude-plugin/marketplace.json" 'review-validate-fix-local'
+require_repo_literal "scripts/install_to_codex.py" 'install_developer_marketplace_with_official_clis'
+require_repo_literal "scripts/install_to_codex.py" 'subprocess.run('
+require_repo_literal ".agents/plugins/marketplace.json" 'review-validate-fix-local-main'
+require_repo_literal ".claude-plugin/marketplace.json" 'review-validate-fix-local-main'
 require_repo_literal ".claude-plugin/marketplace.json" './plugins/review-validate-fix'
-require_repo_literal "tests/test_install_to_codex.py" 'test_ensure_codex_plugin_enabled_updates_user_config'
-require_repo_literal "tests/test_install_to_codex.py" 'test_ensure_codex_plugin_enabled_writes_under_custom_marketplace'
-require_repo_literal "tests/test_install_to_codex.py" 'test_main_writes_claude_marketplace_json'
-require_repo_literal "tests/test_install_to_codex.py" 'stale cached skill'
+require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_official_cli_first_install_uses_marketplace_add_and_plugin_add'
+require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_official_cli_update_uses_codex_remove_add_and_claude_update'
 forbid_repo_literal "scripts/install_to_codex.py" 'remove_legacy_codex_skill_dir'
 forbid_repo_literal "scripts/install_to_codex.py" 'remove_legacy_plugin_cache'
 forbid_repo_literal "scripts/install_to_codex.py" 'legacy_plugin_config_ids'
@@ -1014,12 +1015,11 @@ require_repo_file "tests/test_normalized_transcript.py"
 require_repo_file "tests/test_vendored_payload_import.py"
 require_repo_literal "core/transcript/models.py" 'class TranscriptRecord'
 require_repo_literal "core/transcript/models.py" 'class NormalizedTranscript'
-require_repo_literal "scripts/install_to_codex.py" 'def vendor_pyroot'
-require_repo_literal "scripts/install_to_codex.py" 'def deploy_payload'
-require_repo_literal "scripts/install_to_codex.py" 'deploy_payload(PLUGIN_SRC'
+require_repo_literal "scripts/install_to_codex.py" 'for package_name in ("core", "adapters")'
+require_repo_literal "scripts/install_to_codex.py" 'generated_plugin_root / ".rvf-pyroot"'
 require_repo_literal "scripts/install_to_codex.py" '.rvf-pyroot'
-# vendor-on-install 单一收口：从 PLUGIN_SRC 产 payload 只能走 deploy_payload（带 vendor_pyroot）。
-forbid_repo_literal "scripts/install_to_codex.py" 'copy_tree(PLUGIN_SRC'
+# generated bundle 是唯一 vendoring 收口；不得再写官方宿主 cache。
+require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_build_release_is_self_contained_and_excludes_mutable_state'
 require_file "scripts/_rvf_pyroot.py"
 require_literal "scripts/_rvf_pyroot.py" '.rvf-pyroot'
 require_literal "scripts/trajectory_distill.py" 'import _rvf_pyroot'

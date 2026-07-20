@@ -1,36 +1,42 @@
 ---
 name: rvf-local-deploy
-description: 当在 review-validate-fix 仓库中，用户要求 deploy、local install、sync、发布到本机 Codex plugin cache，或从当前 checkout 配置本机 stable RVF plugin/Stop hook 时使用。
+description: 当在 review-validate-fix 仓库中，用户要求 deploy、local install、sync 或从 local main 安装本机 Codex/Claude Code RVF plugin 时使用。
 ---
 
-# RVF Local Deploy
+# RVF Local-Main Official CLI Deploy
 
-本 skill 是稳定 trampoline。即使当前内容来自过期的 installed cache，也只委托固定 canonical
-checkout 中的 runner；不要从 installed plugin/cache 反向部署，也不要在本文件复制部署实现。
+本 skill 是稳定 trampoline。它只委托唯一 checkout `refs/heads/main` 的 local-main
+worktree 中的 runner；installed plugin、官方 cache、task worktree 都不是 source checkout。
 
 ## Phase Zero
 
-确认用户明确要求本机部署后，运行：
+仅在用户明确要求本机部署，且工作已经完成 `rvf-land` 与 `base-branch-sync` handback 后：
+
+1. 用 `git worktree list --porcelain` 找到唯一 `branch refs/heads/main` 的 worktree。
+2. 从该 worktree 运行：
 
 ```bash
-python3 /Users/bominzhang/Documents/GitHub/review-validate-fix/scripts/rvf_local_deploy.py --json
+python3 scripts/rvf_local_deploy.py --expected-local-main-commit HEAD --json
 ```
 
-runner 负责 canonical source 门禁、并发锁、部署、双 hook、installed-runtime 校验与 commit
-delta。默认拒绝 deploy scope 的未提交改动；只有用户明确授权 dirty deployment 后，才可重跑并
-追加 `--allow-dirty`。禁止在 canonical runner 失败后降级执行 installed payload 中的脚本。
-runner 会在 `~/.rvf/local-deploy/latest-result.json` 原子记录当前阶段；这份 receipt 用于区分
-尚未开始安装的 `failed` 与已经改写本机目标但尚未通过 verifier 的 `partial`。
+runner 会自行验证：脚本来自 local main、HEAD 等于本地 `refs/heads/main`、整个 worktree
+干净、无进行中的 Git 操作，并串行执行 contract check、生成 commit-addressed marketplace
+bundle、Codex/Claude Code 官方 CLI 安装、双 cache/hook/user-local state verifier。
+
+禁止从 task worktree 执行旧 runner；禁止使用 dirty bypass；禁止在 local-main runner 失败后
+降级到手写 `~/.codex/plugins/cache`、`~/.claude/plugins/cache` 或 installed payload。此流程不
+fetch、不 push，也不要求 commit 存在于 remote。
 
 ## Completion
 
-仅当 runner 退出 0 且 JSON `status` 为 `ok` 才报告部署成功。最终回复包含 canonical HEAD、
-installed before/after、是否曾 stale、部署目标和 verification 中的 commit delta。
+仅当 runner 退出 0 且 JSON `status` 为 `ok` 才报告成功。最终证据必须包含：
 
-JSON `status=failed` 表示安装尚未开始或门禁阶段失败；`status=partial` 表示 installer 已经开始
-改写本机目标，但 installed-runtime verifier 或 HEAD 收敛尚未成功。遇到 `partial` 必须报告
-`phase`、`installed_before/after` 与 `error`，修复原因后重新运行 canonical runner；不要假称
-自动回滚成功，也不得降级使用 installed payload。
+- `local_main_worktree`、`local_main_commit` 与生成的 plugin version；
+- Codex/Claude marketplace 和 plugin selector；
+- 双官方 cache digest 与 active release 一致；
+- Stop/UserPromptSubmit hook 与 `RVF_USER_LOCAL_DATA_ROOT` 验证；
+- 真实 reviewer routing smoke 及 fail-closed 结果（任务要求时）。
 
-退出 2 表示 canonical source/dirty 门禁失败；退出 3 表示已有部署 writer。两者都必须停止，
-不得绕过。此 skill 不自动重启 Cline Kanban listener，也不 pull/fetch 远端。
+失败时报告 `phase`、`installed_before/after`、`error` 和 receipt path；修复后重新从干净
+local main 运行。本 skill 不自动执行 `rvf-land`、`base-branch-sync`、fetch、push 或 Cline
+Kanban listener restart。
