@@ -3857,7 +3857,7 @@ def test_tracker_scope_unlocks_scope_contract_v2_fields(tmp: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     assert artifacts_dir is not None
     contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
-    assert contract["version"] == 2
+    assert contract["version"] == 3
     assert contract["primary_units"] == sorted({"e" * 64, "d" * 64})
     assert contract["tracker_lease_id"] == payload["lease_id"]
     assert contract["tracker_scope_hash"] == payload["scope_hash"]
@@ -3876,12 +3876,12 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     assert artifacts_dir is not None
     contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
-    assert contract["version"] == 2
+    assert contract["version"] == 3
     assert contract["primary_units"] is None
     assert contract["tracker_lease_id"] is None
     assert contract["tracker_scope_hash"] is None
     canonical = contract["canonical_scope"]
-    assert canonical["version"] == 2
+    assert canonical["version"] == 3
     assert set(canonical.keys()) == {
         "version",
         "repo",
@@ -3892,6 +3892,23 @@ def test_scope_contract_v2_emitted_without_tracker_scope(tmp: Path) -> None:
         "canonical_issues",
         "fix_allowlist",
         "excluded_path_prefixes",
+        "review_kind",
+        "base_ref",
+        "remote_name",
+        "comparison_base_tip",
+        "reviewed_base_tip",
+        "reviewed_task_tip",
+        "candidate_task_tip",
+        "base_delta_paths",
+        "task_change_paths",
+        "interaction_primary_paths",
+        "base_delta_protected_paths",
+        "bootstrap_receipt_path",
+        "bootstrap_receipt_digest",
+        "candidate_evidence_path",
+        "candidate_evidence_digest",
+        "integration_candidate_receipt_path",
+        "integration_candidate_receipt_digest",
     }
 
 
@@ -8609,6 +8626,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore"),
         ),
         ("prepare_review_run_and_command_lock", lambda: test_prepare_review_run_and_command_lock(root / "prepare")),
+        (
+            "prepare_review_run_scope_contract_v3_records_base_drift_evidence",
+            lambda: test_prepare_review_run_scope_contract_v3_records_base_drift_evidence(
+                root / "prepare-scope-contract-v3"
+            ),
+        ),
+        (
+            "prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed",
+            lambda: test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed(
+                root / "prepare-local-base-bootstrap-gate"
+            ),
+        ),
+        (
+            "prepare_review_run_rejects_invalid_local_base_ref",
+            lambda: test_prepare_review_run_rejects_invalid_local_base_ref(
+                root / "prepare-invalid-local-base-ref"
+            ),
+        ),
         (
             "alternative_reviewer_prompt_uses_session_env_refs",
             lambda: test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env"),

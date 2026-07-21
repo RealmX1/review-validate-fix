@@ -30,6 +30,8 @@ pass_type: review_only
 
 审查范围以主会话提供的 `scope.contract.json` 和 scope-of-work / session context 为准，而不是整个 `git diff HEAD`。先读取 `$RVF_SCOPE_CONTRACT`：如果 `primary_units` 非空，按 tracker unit / tracker scope 审查；否则按 `primary_files`、scope-of-work 和显式 manual scope 审查。session manifest 只用于理解 ownership evidence、背景 WIP 和 tracker splice，不是最终范围合同。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；只审查合同范围内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。diff/status/file read 是核实证据，不是默认扩大范围的授权。
 
+scope contract v3 若声明 `review_kind=base_drift_integration`，只把 `interaction_primary_paths` 及其直接连带影响作为 finding 范围；`base_delta_paths` 与 `task_change_paths` 是理解交互的背景事实，不授权重审完整实现。`candidate_evidence_path` / digest 是父候选证据绑定，不得修改或用另一个 current evidence 替代。`review_kind=implementation` 或旧 contract 则维持普通实现审查。
+
 你处于 `pass_type: review_only` / no-direct-write review 阶段。这是终点，不是完整 `$review-validate-fix` 流程：
 - 可以读取仓库、搜索代码、运行测试、lint、typecheck、build 或复现命令。
 - 不要直接修改任何 repo 源文件，不要调用 patch/edit/write/stage/commit 类工具；唯一允许的主动写入是通过 `$RVF_WRITE_REVIEW_RESULT` 写 `$RVF_REVIEW_RESULT` 这个 review protocol artifact。
@@ -38,6 +40,7 @@ pass_type: review_only
 - 你可以运行测试、lint、typecheck、build 或复现命令；不要因为 external reviewer 身份而放弃必要的命令验证。
 - 除非主会话明确要求等待人工步骤，否则不要期待开发者手动运行命令、提供额外操作或协助你完成 review；你必须用可用工具自行完成审查。
 - 如果某个命令可能与主会话或另一个 reviewer 并发冲突（例如共享 dev server 端口、同一 coverage/report/cache 目录、包管理器安装/构建、独占全局资源），优先用 prompt 或环境提供的 RVF command lock 包装它，例如 `python3 <command_lock.py> --repo <repo> --name <stable-lock-name> -- <command ...>`。
+- reviewer 在这里运行的是探索性验证；不要自行调用或伪造最终 `validation_result_cache.py` record。最终 landing suite 由 RVF 主会话在 merge / validate-fix 后统一执行，cache wrapper 也不得外套 command lock。
 - 如果你判断某个命令需要锁，但当前无法安全获得锁包装命令，停止审查并用 `$RVF_WRITE_REVIEW_RESULT lock-request --out "$RVF_REVIEW_RESULT" ...` 写 request artifact。不要同时写 clean 或 issue 结果；主会话会提供锁后重试。
 - 如果你需要主会话提供专项标准、测量命令、受控子任务或缺失上下文，停止审查并通过 `$RVF_WRITE_REVIEW_RESULT standard-request`、`measurement-request`、`subtask-request` 或 `context-request` 写 request artifact。这些 request 格式见 `references/review-standards/protocol-extensions.md`；它们不是 review 结论，不能和正常 review 结果混写。
 - 不要进入 validate/fix，不要修复问题，不要生成 handoff。

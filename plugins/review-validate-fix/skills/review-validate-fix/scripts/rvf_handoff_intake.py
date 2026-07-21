@@ -10,10 +10,26 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from prepare_review_run import pre_review_base_sync_state, resolve_local_base_ref
+from validation_result_cache import clean_git_environment
+from write_reviewed_task_candidate_evidence import (
+    EVIDENCE_RELATIVE_PATH,
+    StaleReviewedTaskCandidateEvidence,
+    optional_receipt,
+    validate_bootstrap_receipt_subject,
+    validated_reviewed_task_candidate_evidence,
+)
+
 
 RVF_RUN_RE = re.compile(r"\b(rvf-\d{8}T\d{6}Z-[A-Za-z0-9_.:-]+)")
 PATH_VALUE_RE = re.compile(r"^\s*-\s*([^:\n]+):\s*`?([^`\n]+?)`?\s*$")
 HEADING_RE = re.compile(r"^##+\s+(.+?)\s*$")
+VALIDATION_SECTION_HEADINGS = {
+    "Validation",
+    "验证",
+    "Scoped verification (in-contract)",
+    "Full-suite results (unrelated)",
+}
 SCOPED_LIST_HEADINGS = {
     "Session-owned files reviewed",
     "Session-owned paths reviewed",
@@ -47,6 +63,10 @@ INTAKE_HINT_LABELS = {
     "rejected / not accepted changes": "rejected_changes",
     "main-session validation commands": "main_session_validation_commands",
 }
+RVF_LAND_BLOCKING_BASE_SYNC_STATUSES = {
+    "bootstrap_required_before_rvf_land",
+    "bootstrap_receipt_invalid_before_rvf_land",
+}
 
 
 def read_json(path: Path) -> Any:
@@ -63,6 +83,7 @@ def run_git(repo: Path, args: list[str]) -> tuple[int, str, str]:
             capture_output=True,
             text=True,
             check=False,
+            env=clean_git_environment(),
         )
     except OSError as exc:
         return 127, "", f"{type(exc).__name__}: {exc}"
@@ -75,6 +96,7 @@ def run_git_bytes(repo: Path, args: list[str]) -> tuple[int, bytes, str]:
             ["git", "-C", str(repo), *args],
             capture_output=True,
             check=False,
+            env=clean_git_environment(),
         )
     except OSError as exc:
         return 127, b"", f"{type(exc).__name__}: {exc}"
@@ -238,17 +260,180 @@ def parse_scoped_paths(text: str, sections: dict[str, str]) -> list[str]:
 
 
 def parse_validation_commands(sections: dict[str, str]) -> list[str]:
-    body = sections.get("Validation") or sections.get("验证") or ""
     commands: list[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("- "):
+    for heading, body in sections.items():
+        if heading not in VALIDATION_SECTION_HEADINGS:
             continue
-        item = stripped[2:].strip()
-        command = clean_path_value(item.split(" -> ", 1)[0].strip())
-        if command:
-            commands.append(command)
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            item = stripped[2:].strip()
+            if item.startswith("`") and "`" in item[1:]:
+                command = item[1 : item.index("`", 1)]
+            else:
+                command = clean_path_value(item.split(" -> ", 1)[0].strip())
+            if command and command not in commands:
+                commands.append(command)
     return commands
+
+
+def load_candidate_evidence(
+    repo: Path,
+    *,
+    expected_run_id: str | None,
+    expected_scope_contract_path: Path | None,
+) -> tuple[str, Path | None, str | None, list[dict[str, Any]]]:
+    code, absolute_git_dir, _stderr = run_git(repo, ["rev-parse", "--absolute-git-dir"])
+    if code != 0 or not absolute_git_dir:
+        return "missing", None, None, []
+    evidence_path = Path(absolute_git_dir) / EVIDENCE_RELATIVE_PATH
+    if not evidence_path.exists() and not Path(f"{evidence_path}.sha256").exists():
+        return "missing", evidence_path, None, []
+    try:
+        payload, _validated_path, digest = validated_reviewed_task_candidate_evidence(
+            repo, evidence_path
+        )
+    except StaleReviewedTaskCandidateEvidence:
+        try:
+            _payload, _validated_path, digest = validated_reviewed_task_candidate_evidence(
+                repo, evidence_path, require_current_subject=False
+            )
+        except (OSError, RuntimeError, ValueError):
+            return "invalid", evidence_path, None, []
+        return "stale", evidence_path, digest, []
+    except (OSError, RuntimeError, ValueError):
+        return "invalid", evidence_path, None, []
+    review = payload.get("review")
+    scope = payload.get("scope")
+    if (
+        expected_run_id is not None
+        and (not isinstance(review, dict) or review.get("run_id") != expected_run_id)
+    ):
+        return "foreign_run", evidence_path, digest, []
+    if expected_scope_contract_path is not None:
+        evidence_scope_path = scope.get("contract_path") if isinstance(scope, dict) else None
+        if (
+            not isinstance(evidence_scope_path, str)
+            or Path(evidence_scope_path).resolve()
+            != expected_scope_contract_path.resolve()
+        ):
+            return "foreign_scope", evidence_path, digest, []
+    records = payload.get("validation_records")
+    return "valid", evidence_path, digest, records if isinstance(records, list) else []
+
+
+def pre_rvf_land_base_sync_gate(
+    repo: Path, scope_contract_path: Path | None
+) -> dict[str, Any]:
+    """Fail closed before rvf-land can validate, stage, or commit a stale task.
+
+    The opt-in marker is always read from the current local base commit.  A
+    legacy handoff therefore cannot bypass the prepare-time gate merely because
+    its old worktree or scope contract predates the marker.
+    """
+    root = git_root(repo)
+    if root is None:
+        return {
+            "status": "bootstrap_receipt_invalid_before_rvf_land",
+            "reason": "current repository is not a verifiable Git worktree",
+        }
+    contract_payload = read_json(scope_contract_path) if scope_contract_path else None
+    contract = contract_payload if isinstance(contract_payload, dict) else {}
+    configured_base_ref = contract.get("base_ref")
+    explicit_base_ref = (
+        configured_base_ref.strip()
+        if isinstance(configured_base_ref, str) and configured_base_ref.strip()
+        else None
+    )
+    try:
+        local_base_ref = resolve_local_base_ref(
+            root,
+            explicit_local_base_ref=explicit_base_ref,
+            committed_base_ref=None,
+        )
+        sync_state = pre_review_base_sync_state(root, local_base_ref)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "status": "bootstrap_receipt_invalid_before_rvf_land",
+            "reason": f"local base identity could not be verified: {exc}",
+            "local_base_ref": explicit_base_ref,
+        }
+    if sync_state is None:
+        return {
+            "status": "not_applicable",
+            "reason": "local base does not opt into pre-review base sync",
+            "local_base_ref": local_base_ref,
+        }
+    if sync_state.get("status") == "bootstrap_required_before_rvf":
+        return {
+            **sync_state,
+            "status": "bootstrap_required_before_rvf_land",
+            "reason": "current task HEAD has not absorbed the current local base",
+        }
+
+    reviewed_base_tip = contract.get("reviewed_base_tip")
+    if (
+        isinstance(reviewed_base_tip, str)
+        and reviewed_base_tip
+        and reviewed_base_tip != sync_state.get("local_base_tip")
+    ):
+        return {
+            **sync_state,
+            "status": "bootstrap_required_before_rvf_land",
+            "reason": "local base moved after the RVF candidate was reviewed",
+            "reviewed_base_tip": reviewed_base_tip,
+        }
+
+    receipt_path_value = contract.get("bootstrap_receipt_path")
+    receipt_digest_value = contract.get("bootstrap_receipt_digest")
+    if receipt_path_value is not None or receipt_digest_value is not None:
+        code, absolute_git_dir, _stderr = run_git(root, ["rev-parse", "--absolute-git-dir"])
+        common_dir = git_common_dir(root)
+        if code != 0 or not absolute_git_dir or common_dir is None:
+            return {
+                **sync_state,
+                "status": "bootstrap_receipt_invalid_before_rvf_land",
+                "reason": "task git-dir/common-dir identity could not be verified",
+            }
+        try:
+            receipt_path, receipt_digest = optional_receipt(
+                receipt_path_value,
+                receipt_digest_value,
+                "bootstrap receipt",
+                required_path=(
+                    Path(absolute_git_dir)
+                    / "base-branch-sync"
+                    / "local-base-into-task-worktree-bootstrap-receipt.json"
+                ),
+            )
+            validate_bootstrap_receipt_subject(
+                receipt_path,
+                contract=contract,
+                repo=root,
+                common_dir=common_dir,
+                current_head=str(sync_state["task_head"]),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                **sync_state,
+                "status": "bootstrap_receipt_invalid_before_rvf_land",
+                "reason": f"bootstrap receipt could not be verified: {exc}",
+            }
+        return {
+            **sync_state,
+            "status": "ready",
+            "reason": "current local base is absorbed and the contracted receipt is valid",
+            "bootstrap_receipt_path": receipt_path,
+            "bootstrap_receipt_digest": receipt_digest,
+        }
+    return {
+        **sync_state,
+        "status": "ready",
+        "reason": "current local base was already absorbed; no bootstrap receipt was required",
+        "bootstrap_receipt_path": None,
+        "bootstrap_receipt_digest": None,
+    }
 
 
 def infer_run_dir(values: dict[str, str], run_id: str | None) -> Path | None:
@@ -390,6 +575,29 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
         )
     ]
 
+    expected_scope_contract_path = (
+        Path(artifacts["scope_contract"])
+        if isinstance(artifacts.get("scope_contract"), str)
+        else None
+    )
+    evidence_status, evidence_path, evidence_digest, validation_records = load_candidate_evidence(
+        repo,
+        expected_run_id=run_id,
+        expected_scope_contract_path=expected_scope_contract_path,
+    )
+    if evidence_status == "valid":
+        validation_evidence_source = "candidate_evidence"
+        validation_commands: list[str] = []
+    elif evidence_status in {"invalid", "stale", "foreign_run", "foreign_scope"}:
+        validation_evidence_source = f"{evidence_status}_candidate_evidence"
+        validation_commands = parse_validation_commands(sections)
+    else:
+        validation_evidence_source = "legacy_handoff_markdown"
+        validation_commands = parse_validation_commands(sections)
+    pre_land_base_sync_gate = pre_rvf_land_base_sync_gate(
+        repo, expected_scope_contract_path
+    )
+
     return {
         "handoff_path": str(handoff_path.expanduser()) if handoff_path else None,
         "run_id": run_id,
@@ -412,7 +620,13 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
         "reviewed_scope_paths": scoped_paths,
         "scoped_status_in_current_repo": scoped_status,
         "unrelated_dirty_paths_in_current_repo": unrelated_dirty,
-        "validation_commands": parse_validation_commands(sections),
+        "candidate_evidence_path": str(evidence_path) if evidence_path is not None else None,
+        "candidate_evidence_digest": evidence_digest,
+        "candidate_evidence_status": evidence_status,
+        "validation_evidence_source": validation_evidence_source,
+        "validation_records": validation_records,
+        "validation_commands": validation_commands,
+        "pre_rvf_land_base_sync_gate": pre_land_base_sync_gate,
         "conflict_hints": conflict_hints(text),
         "intake_hints": intake_hints,
         "summary_status": (summary or {}).get("status"),
@@ -429,6 +643,7 @@ def render_text(payload: dict[str, Any]) -> str:
         f"- current_repo: {payload.get('current_repo_snapshot', {}).get('repo') or '<unknown>'}",
         f"- same_git_common_dir: {payload.get('target_repo_same_git_common_dir_as_current')}",
         f"- rvf_worktree_differs_from_current: {payload.get('rvf_worktree_differs_from_current')}",
+        f"- pre_rvf_land_base_sync_gate: {(payload.get('pre_rvf_land_base_sync_gate') or {}).get('status')}",
         "",
         "Reviewed scope paths:",
     ]
@@ -478,6 +693,12 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(render_text(payload))
+    gate = payload.get("pre_rvf_land_base_sync_gate")
+    if (
+        isinstance(gate, dict)
+        and gate.get("status") in RVF_LAND_BLOCKING_BASE_SYNC_STATUSES
+    ):
+        return 3
     return 0
 
 

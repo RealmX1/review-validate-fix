@@ -27,6 +27,13 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
+### Opt-in 仓库的预审 base 同步
+
+- `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
+- 若返回 `status=bootstrap_required_before_rvf`（退出码 3），先调用标记指定的单向同步 skill，再对同一 scope 重新 prepare；不要在 RVF 内持有 base lock，也不要绕过 gate。
+- 单向同步只提供 bootstrap receipt 和 base delta 事实。其后的 implementation review 统一审查实现与该 delta，不再由同步流程重复做一轮完整语义审查。
+- 未 opt-in 的仓库、旧 scope contract 和普通用户维持原行为。
+
 ## 模式
 
 - `full`：默认完整流程，执行 prepare -> double review -> merge -> validate/fix -> handoff。
@@ -51,6 +58,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 - 随后**循环有界轮询**直到终态：`scripts/dispatch_reviewers.py --wait-status --status-path <上面打印的 status.json> --max-wait 480`，每次最多阻塞 480s（< 600s 上限，永不被砍断）。打印 `RVF_DISPATCH_STATE=running launch_status=<...>` 就再调一次继续等；打印 `RVF_DISPATCH_STATE=done launch_status=<...> returncode=<n>` 即派发结束——`returncode=0` 表示派发成功，非 0 读 status.json 的 `error` 与同目录 `.dispatch-thread.log` 排障。选路 / reroute / cooldown 全在 detached 的 `--execute` 本体内完成，主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
 - 轮询到 `done` 后，照常读取 `artifacts/reviewers/reviewer-plan.json` 与各路 reviewer artifact；只在该 plan 报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
+- scope contract v3 的 `review_kind=implementation` 仍审实现整体；`review_kind=base_drift_integration` 只审 `interaction_primary_paths` 所描述的 base/task 交互面，`base_delta_paths` 与 `task_change_paths` 是上下文事实，`candidate_evidence_path` / digest 是必须保持的父证据绑定。v1/v2 contract 继续按既有实现审查读取。
 - `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。
 - 每个 reviewer artifact 必须通过 `scripts/check_review_result.py` 校验；artifact 缺失、schema invalid、excluded path、clean/issues/request 混写都不能当作合格结果。
 - 合并 reviewer artifact 时使用 `references/review-merge-policy.md`。
@@ -63,6 +71,13 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 - 按根因、文件区域、测试路径或决策前提把 issue 分组；最终汇总要说明 validate/fix 分组和结果。
 - `--status elevated` 必须通过 `--result-file <elevation-detail.json>` 写入升级详情；自然语言 final 只作日志。
 - **elevated 不即时交开发者，先自解析、再延迟到末端。** 收到 reviewer / fixer 标记的 elevated concern 后，主会话先尝试自行决断：① 以自身 context 判断；② 依据不足则派 subagent 在代码库中找分辨/决策依据。只有 context + 代码库都不足以决断时，才真正记为 `elevated`（能决断的就地转 `fixed` / `false_positive`）。即便确属 elevated，也不当场打断流程去问，而是先把所有非 elevated issue 验证/修复完，到 workflow 末端再处理（见 Handoff）。
+
+## 最终验证证据
+
+- reviewer 的探索性命令仍按 `$RVF_COMMAND_LOCK` 协调，但不构成可供 landing 复用的最终验证证据。
+- merge / validate-fix 完成后，主会话把最终 landing suites 按 handoff 顺序命名为 `handoff-validation-001`、`handoff-validation-002`……，并通过 `scripts/validation_result_cache.py run --repo "$RVF_REPO" --name <name> --rvf-run-dir "$RVF_RUN_DIR" -- <argv...>` 执行。这个 cache wrapper 自己就是该 suite 的唯一 single-flight lock，**不得**再套 `$RVF_COMMAND_LOCK`。
+- handoff 的验证段记录与 cache record 完全相同的命令 argv / cwd；cache record、candidate content、命令或非秘密环境指纹任一变化都会自动失效。日志与 evidence 只保存 hash、状态和脱敏元数据。
+- 不要在 reviewer、validate-fix、handoff 与 landing 各跑一遍相同 suite；同一 candidate 的后续阶段应调用同一 wrapper/name，让它返回 `cache_status=hit`。
 
 ## Handoff
 

@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -12,7 +13,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
@@ -49,12 +50,32 @@ SESSION_MANIFEST = Path(reviewable_unit_diff_tracker.__file__).resolve().parent 
 COMMAND_LOCK = SKILL_DIR / "scripts" / "command_lock.py"
 WRITE_REVIEW_RESULT = SKILL_DIR / "scripts" / "write_review_result.py"
 CHECK_REVIEW_RESULT = SKILL_DIR / "scripts" / "check_review_result.py"
-SCOPE_CONTRACT_VERSION = 2
+SCOPE_CONTRACT_VERSION = 3
+PRE_REVIEW_BASE_SYNC_MARKER = "RVF-PRE-REVIEW-BASE-SYNC-SKILL:"
+REVIEW_KINDS = {"implementation", "base_drift_integration"}
+class BootstrapRequiredBeforeRvf(RuntimeError):
+    def __init__(self, payload: Mapping[str, Any]) -> None:
+        super().__init__("bootstrap_required_before_rvf")
+        self.payload = dict(payload)
 
 
 def fail(message: str, code: int = 1) -> int:
     print(message, file=sys.stderr)
     return code
+
+
+def git_repository_location_clean_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
 
 
 def run(cmd: list[str], *, cwd: Path | None = None) -> str:
@@ -64,6 +85,7 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> str:
         check=False,
         capture_output=True,
         text=True,
+        env=git_repository_location_clean_environment() if cmd and cmd[0] == "git" else None,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or f"{cmd[0]} failed")
@@ -72,6 +94,244 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> str:
 
 def git_root(repo: Path) -> Path:
     return Path(run(["git", "rev-parse", "--show-toplevel"], cwd=repo).strip()).resolve()
+
+
+def _local_base_ref_full_name(local_base_ref: str) -> str:
+    candidate = local_base_ref.strip()
+    if not candidate or candidate.startswith("-"):
+        raise ValueError("local base ref must be a non-empty local branch name")
+    if candidate.startswith("refs/heads/"):
+        full_ref = candidate
+    elif candidate.startswith("refs/"):
+        raise ValueError("local base ref must resolve below refs/heads/")
+    else:
+        full_ref = f"refs/heads/{candidate}"
+    valid = subprocess.run(
+        ["git", "check-ref-format", full_ref],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_repository_location_clean_environment(),
+    )
+    if valid.returncode != 0:
+        raise ValueError(f"invalid local base ref: {local_base_ref!r}")
+    return full_ref
+
+
+def _local_branch_exists(repo: Path, candidate: str) -> bool:
+    try:
+        full_ref = _local_base_ref_full_name(candidate)
+    except ValueError:
+        return False
+    completed = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", full_ref],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_repository_location_clean_environment(),
+    )
+    return completed.returncode == 0
+
+
+def resolve_local_base_ref(
+    repo: Path,
+    *,
+    explicit_local_base_ref: str | None,
+    committed_base_ref: str | None,
+) -> str | None:
+    if explicit_local_base_ref:
+        return explicit_local_base_ref.strip()
+    if committed_base_ref:
+        candidate = committed_base_ref.strip().lstrip("^")
+        if _local_branch_exists(repo, candidate):
+            return candidate
+    origin_head = subprocess.run(
+        ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_repository_location_clean_environment(),
+    )
+    if origin_head.returncode == 0:
+        remote_ref = origin_head.stdout.strip()
+        prefix = "refs/remotes/origin/"
+        candidate = remote_ref[len(prefix):] if remote_ref.startswith(prefix) else ""
+        if candidate and _local_branch_exists(repo, candidate):
+            return candidate
+    if _local_branch_exists(repo, "main"):
+        return "main"
+    return None
+
+
+def pre_review_base_sync_state(repo: Path, local_base_ref: str | None) -> dict[str, str] | None:
+    """Read the opt-in marker from the local base commit, never from a stale task checkout."""
+    if not local_base_ref:
+        return None
+    full_ref = _local_base_ref_full_name(local_base_ref)
+    local_base_tip = run(["git", "rev-parse", "--verify", f"{full_ref}^{{commit}}"], cwd=repo).strip()
+    agents = subprocess.run(
+        ["git", "show", f"{local_base_tip}:AGENTS.md"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_repository_location_clean_environment(),
+    )
+    if agents.returncode != 0:
+        return None
+    required_skill: str | None = None
+    for line in agents.stdout.splitlines():
+        if line.strip().startswith(PRE_REVIEW_BASE_SYNC_MARKER):
+            value = line.split(PRE_REVIEW_BASE_SYNC_MARKER, 1)[1].strip()
+            if value:
+                required_skill = value.split()[0]
+            break
+    if required_skill is None:
+        return None
+    task_head = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", local_base_tip, task_head],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_repository_location_clean_environment(),
+    )
+    if ancestor.returncode == 0:
+        return {
+            "status": "absorbed",
+            "required_skill": required_skill,
+            "local_base_ref": local_base_ref,
+            "local_base_tip": local_base_tip,
+            "task_head": task_head,
+        }
+    if ancestor.returncode != 1:
+        raise RuntimeError(ancestor.stderr.strip() or "git merge-base --is-ancestor failed")
+    return {
+        "status": "bootstrap_required_before_rvf",
+        "required_skill": required_skill,
+        "local_base_ref": local_base_ref,
+        "local_base_tip": local_base_tip,
+        "task_head": task_head,
+    }
+
+
+def git_diff_path_set(repo: Path, older_tip: str, newer_tip: str) -> list[str]:
+    completed = subprocess.run(
+        ["git", "diff", "--name-only", "-z", older_tip, newer_tip, "--"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        env=git_repository_location_clean_environment(),
+    )
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.decode(errors="replace").strip() or "git diff failed")
+    return sorted({os.fsdecode(path) for path in completed.stdout.split(b"\0") if path})
+
+
+def validated_bootstrap_receipt(
+    repo: Path, state: Mapping[str, str], receipt_path: Path
+) -> dict[str, Any]:
+    expected_path = (
+        Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).strip())
+        / "base-branch-sync"
+        / "local-base-into-task-worktree-bootstrap-receipt.json"
+    )
+    if receipt_path.absolute() != expected_path.absolute():
+        raise ValueError("bootstrap receipt must use the task absolute git-dir path")
+    _receipt_value, _receipt_digest = canonical_json_artifact_identity(receipt_path)
+    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    common_dir = Path(
+        run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo).strip()
+    ).resolve()
+    required_values = {
+        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
+        "schema_version": 1,
+        "absorbed_base_tip": state["local_base_tip"],
+        "base_ref": state["local_base_ref"],
+        "git_common_directory_realpath": str(common_dir),
+        "task_worktree_realpath": str(repo.resolve()),
+        "boundary_status": "VERIFIED",
+        "lock_status": "RELEASED",
+        "target_repository_hooks_status": "DISABLED",
+    }
+    if any(payload.get(name) != value for name, value in required_values.items()):
+        raise ValueError("bootstrap receipt identity does not match the opt-in repository")
+    if payload.get("wip_status") not in {
+        "NOT_REQUIRED_TASK_WORKTREE_CLEAN",
+        "RESTORED_AND_DROPPED",
+    }:
+        raise ValueError("bootstrap receipt WIP status is not reusable")
+    tips: dict[str, str] = {}
+    for name in (
+        "base_task_merge_base_tip",
+        "absorbed_base_tip",
+        "task_tip_before_base_absorption",
+        "task_tip_after_base_absorption",
+    ):
+        value = payload.get(name)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40,64}", value):
+            raise ValueError(f"bootstrap receipt {name} is invalid")
+        run(["git", "cat-file", "-e", f"{value}^{{commit}}"], cwd=repo)
+        tips[name] = value
+    actual_merge_base = run(
+        [
+            "git",
+            "merge-base",
+            tips["task_tip_before_base_absorption"],
+            tips["absorbed_base_tip"],
+        ],
+        cwd=repo,
+    ).strip()
+    if actual_merge_base != tips["base_task_merge_base_tip"]:
+        raise ValueError("bootstrap receipt merge-base identity is invalid")
+    for ancestor_tip in (
+        tips["absorbed_base_tip"],
+        tips["task_tip_before_base_absorption"],
+        tips["task_tip_after_base_absorption"],
+    ):
+        descendant = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor_tip, state["task_head"]],
+            cwd=repo,
+            env=git_repository_location_clean_environment(),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if descendant.returncode != 0:
+            raise ValueError("current task HEAD does not descend from the bootstrap receipt")
+    expected_base_delta_paths = git_diff_path_set(
+        repo, tips["base_task_merge_base_tip"], tips["absorbed_base_tip"]
+    )
+    expected_task_change_paths = git_diff_path_set(
+        repo, tips["base_task_merge_base_tip"], tips["task_tip_before_base_absorption"]
+    )
+    expected_interaction_paths = sorted(
+        set(expected_base_delta_paths).intersection(expected_task_change_paths)
+    )
+    for name, expected_paths in (
+        ("base_delta_paths", expected_base_delta_paths),
+        ("task_change_paths", expected_task_change_paths),
+        ("interaction_primary_paths", expected_interaction_paths),
+    ):
+        if payload.get(name) != expected_paths:
+            raise ValueError(f"bootstrap receipt {name} does not match the fixed Git tips")
+    return payload
+
+
+def default_bootstrap_receipt(repo: Path, state: Mapping[str, str]) -> Path | None:
+    absolute_git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).strip())
+    receipt_path = (
+        absolute_git_dir
+        / "base-branch-sync"
+        / "local-base-into-task-worktree-bootstrap-receipt.json"
+    )
+    if not receipt_path.exists() and not Path(f"{receipt_path}.sha256").exists():
+        return None
+    validated_bootstrap_receipt(repo, state, receipt_path)
+    return receipt_path
 
 
 def safe_repo_name(repo: Path) -> str:
@@ -251,6 +511,7 @@ def run_git(repo: Path, args: list[str], *, text: bool = True) -> str | bytes:
     completed = subprocess.run(
         ["git", *args],
         cwd=repo,
+        env=git_repository_location_clean_environment(),
         check=False,
         capture_output=True,
         text=text,
@@ -269,6 +530,7 @@ def is_tracked_path(repo: Path, rel_path: str) -> bool:
         check=False,
         capture_output=True,
         text=True,
+        env=git_repository_location_clean_environment(),
     )
     return completed.returncode == 0
 
@@ -394,6 +656,190 @@ def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def canonical_json_artifact_identity(path: Path | None) -> tuple[str | None, str | None]:
+    if path is None:
+        return None, None
+    expanded = path.expanduser()
+    if expanded.is_symlink() or not expanded.is_file():
+        raise ValueError(f"JSON artifact must be a regular file, not a symlink: {expanded}")
+    resolved = expanded.resolve()
+    try:
+        encoded = expanded.read_bytes()
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid JSON artifact {resolved}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON artifact must contain an object: {resolved}")
+    canonical_encoded = canonical_json_bytes(payload)
+    if encoded != canonical_encoded:
+        raise ValueError(f"JSON artifact must use canonical JSON bytes: {resolved}")
+    digest = hashlib.sha256(canonical_encoded).hexdigest()
+    sidecar = Path(f"{expanded}.sha256")
+    if sidecar.is_symlink() or not sidecar.is_file():
+        raise ValueError(f"JSON artifact digest sidecar must be a regular file: {sidecar}")
+    try:
+        declared_digest = sidecar.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"JSON artifact digest sidecar is required: {sidecar}") from exc
+    if declared_digest != f"{digest}\n".encode("ascii"):
+        raise ValueError(f"JSON artifact digest mismatch: {resolved}")
+    return str(resolved), digest
+
+
+def scope_contract_v3_extensions(
+    *,
+    review_kind: str = "implementation",
+    base_ref: str | None = None,
+    remote_name: str | None = None,
+    comparison_base_tip: str | None = None,
+    reviewed_base_tip: str | None = None,
+    reviewed_task_tip: str | None = None,
+    candidate_task_tip: str | None = None,
+    base_delta_paths: list[str] | None = None,
+    task_change_paths: list[str] | None = None,
+    interaction_primary_paths: list[str] | None = None,
+    base_delta_protected_paths: list[str] | None = None,
+    bootstrap_receipt: Path | None = None,
+    candidate_evidence: Path | None = None,
+    integration_candidate_receipt: Path | None = None,
+) -> dict[str, Any]:
+    if review_kind not in REVIEW_KINDS:
+        raise ValueError(f"unsupported review kind: {review_kind}")
+    bootstrap_path, bootstrap_digest = canonical_json_artifact_identity(bootstrap_receipt)
+    candidate_path, candidate_digest = canonical_json_artifact_identity(candidate_evidence)
+    integration_path, integration_digest = canonical_json_artifact_identity(
+        integration_candidate_receipt
+    )
+    return {
+        "review_kind": review_kind,
+        "base_ref": base_ref,
+        "remote_name": remote_name,
+        "comparison_base_tip": comparison_base_tip,
+        "reviewed_base_tip": reviewed_base_tip,
+        "reviewed_task_tip": reviewed_task_tip,
+        "candidate_task_tip": candidate_task_tip,
+        "base_delta_paths": normalized_scope_list(base_delta_paths or []),
+        "task_change_paths": normalized_scope_list(task_change_paths or []),
+        "interaction_primary_paths": normalized_scope_list(interaction_primary_paths or []),
+        "base_delta_protected_paths": normalized_scope_list(base_delta_protected_paths or []),
+        "bootstrap_receipt_path": bootstrap_path,
+        "bootstrap_receipt_digest": bootstrap_digest,
+        "candidate_evidence_path": candidate_path,
+        "candidate_evidence_digest": candidate_digest,
+        "integration_candidate_receipt_path": integration_path,
+        "integration_candidate_receipt_digest": integration_digest,
+    }
+
+
+def validated_integration_candidate_receipt(
+    repo: Path, receipt_path: Path
+) -> dict[str, Any]:
+    receipt_value, _receipt_digest = canonical_json_artifact_identity(receipt_path)
+    if receipt_value is None:
+        raise ValueError("integration candidate receipt is required")
+    receipt = json.loads(Path(receipt_value).read_text(encoding="utf-8"))
+    git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).strip()).resolve()
+    expected_receipt_path = (
+        git_dir
+        / "base-branch-sync"
+        / "reviewed-task-handback-integration-candidate.json"
+    )
+    if Path(receipt_value) != expected_receipt_path:
+        raise ValueError("integration candidate receipt must use the task git-dir path")
+    common_dir = Path(
+        run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo,
+        ).strip()
+    ).resolve()
+    required_identity = {
+        "schema_name": "reviewed-task-handback-integration-candidate",
+        "schema_version": 1,
+        "status": "INTEGRATION_DELTA_RVF_REQUIRED",
+        "risk_classification": "MEDIUM",
+        "git_common_directory_realpath": str(common_dir),
+        "task_worktree_realpath": str(repo),
+    }
+    if any(receipt.get(name) != value for name, value in required_identity.items()):
+        raise ValueError("integration candidate receipt identity/status is invalid")
+    required_string_fields = (
+        "base_ref",
+        "remote_name",
+        "reviewed_candidate_evidence_path",
+        "reviewed_candidate_evidence_sha256",
+        "reviewed_base_tip",
+        "base_tip_at_candidate",
+        "reviewed_task_tip",
+        "candidate_task_tip",
+    )
+    if any(
+        not isinstance(receipt.get(name), str) or not receipt[name]
+        for name in required_string_fields
+    ):
+        raise ValueError("integration candidate receipt is missing required identity fields")
+    configured_candidate_evidence_path = Path(
+        receipt["reviewed_candidate_evidence_path"]
+    )
+    expected_candidate_evidence_path = (
+        git_dir / "rvf" / "evidence" / "reviewed-task-candidate-evidence.json"
+    )
+    if configured_candidate_evidence_path != expected_candidate_evidence_path:
+        raise ValueError("integration receipt parent evidence path is invalid")
+    _candidate_path, candidate_digest = canonical_json_artifact_identity(
+        configured_candidate_evidence_path
+    )
+    if candidate_digest != receipt["reviewed_candidate_evidence_sha256"]:
+        raise ValueError("integration receipt parent evidence digest mismatch")
+    for name in (
+        "base_delta_paths",
+        "base_delta_protected_paths",
+        "task_change_paths",
+        "interaction_primary_paths",
+    ):
+        values = receipt.get(name)
+        if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+            raise ValueError(f"integration candidate receipt {name} is invalid")
+    current_head = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
+    if receipt["candidate_task_tip"] != current_head:
+        raise ValueError("integration candidate receipt candidate task tip is stale")
+    for tip_name in (
+        "reviewed_base_tip",
+        "base_tip_at_candidate",
+        "reviewed_task_tip",
+        "candidate_task_tip",
+    ):
+        run(["git", "cat-file", "-e", f"{receipt[tip_name]}^{{commit}}"], cwd=repo)
+
+    def changed_paths(older_tip: str, newer_tip: str) -> list[str]:
+        completed = subprocess.run(
+            ["git", "diff", "--name-only", "-z", older_tip, newer_tip],
+            cwd=repo,
+            env=git_repository_location_clean_environment(),
+            check=True,
+            capture_output=True,
+        )
+        return sorted(
+            path.decode("utf-8", "surrogateescape")
+            for path in completed.stdout.split(b"\0")
+            if path
+        )
+
+    expected_base_delta_paths = changed_paths(
+        receipt["reviewed_base_tip"], receipt["base_tip_at_candidate"]
+    )
+    expected_task_change_paths = changed_paths(
+        receipt["reviewed_base_tip"], receipt["reviewed_task_tip"]
+    )
+    if (
+        receipt["base_delta_paths"] != expected_base_delta_paths
+        or receipt["task_change_paths"] != expected_task_change_paths
+        or receipt["interaction_primary_paths"]
+        != sorted(set(expected_base_delta_paths) & set(expected_task_change_paths))
+    ):
+        raise ValueError("integration candidate receipt delta facts do not match fixed tips")
+    return receipt
+
+
 def write_scope_contract(
     *,
     path: Path,
@@ -416,7 +862,9 @@ def write_scope_contract(
     tracker_lease_id: str | None = None,
     tracker_scope_hash: str | None = None,
     tracker_transcript_max_line_number: int | None = None,
+    scope_contract_extensions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    extensions = dict(scope_contract_extensions or scope_contract_v3_extensions())
     canonical_scope = {
         "version": SCOPE_CONTRACT_VERSION,
         "repo": str(repo),
@@ -427,6 +875,7 @@ def write_scope_contract(
         "canonical_issues": canonical_issues,
         "fix_allowlist": fix_allowlist,
         "excluded_path_prefixes": excluded_path_prefixes,
+        **extensions,
     }
     scope_hash = hashlib.sha256(canonical_json_bytes(canonical_scope)).hexdigest()
     contract: dict[str, Any] = {
@@ -451,6 +900,7 @@ def write_scope_contract(
         "scope_of_work_path": str(scope_of_work_path) if scope_of_work_path is not None else None,
         "review_packet_metadata_path": str(review_packet_metadata_path),
         "canonical_scope": canonical_scope,
+        **extensions,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -617,8 +1067,110 @@ def prepare_run(
     base_ref: str | None = None,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    local_base_ref: str | None = None,
+    scope_contract_extensions: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = git_root(repo)
+    resolved_local_base_ref = resolve_local_base_ref(
+        root,
+        explicit_local_base_ref=local_base_ref,
+        committed_base_ref=committed_base_ref,
+    )
+    pre_review_sync_state = pre_review_base_sync_state(root, resolved_local_base_ref)
+    if pre_review_sync_state is not None and pre_review_sync_state["status"] == "bootstrap_required_before_rvf":
+        raise BootstrapRequiredBeforeRvf(pre_review_sync_state)
+    effective_scope_contract_extensions = dict(
+        scope_contract_extensions or scope_contract_v3_extensions()
+    )
+    if pre_review_sync_state is not None:
+        configured_base_ref = effective_scope_contract_extensions.get("base_ref")
+        if configured_base_ref not in {None, resolved_local_base_ref}:
+            raise ValueError("configured base_ref conflicts with the resolved local base ref")
+        effective_scope_contract_extensions["base_ref"] = resolved_local_base_ref
+        if not effective_scope_contract_extensions.get("remote_name"):
+            effective_scope_contract_extensions["remote_name"] = "origin"
+        default_tip_values = {
+            "comparison_base_tip": pre_review_sync_state["local_base_tip"],
+            "reviewed_base_tip": pre_review_sync_state["local_base_tip"],
+            "reviewed_task_tip": pre_review_sync_state["task_head"],
+            "candidate_task_tip": pre_review_sync_state["task_head"],
+        }
+        for name, value in default_tip_values.items():
+            if not effective_scope_contract_extensions.get(name):
+                effective_scope_contract_extensions[name] = value
+        configured_receipt_path = effective_scope_contract_extensions.get("bootstrap_receipt_path")
+        receipt_path = (
+            Path(configured_receipt_path)
+            if isinstance(configured_receipt_path, str)
+            else default_bootstrap_receipt(root, pre_review_sync_state)
+        )
+        if receipt_path is not None:
+            receipt_payload = validated_bootstrap_receipt(root, pre_review_sync_state, receipt_path)
+            receipt_value, receipt_digest = canonical_json_artifact_identity(receipt_path)
+            configured_receipt_digest = effective_scope_contract_extensions.get(
+                "bootstrap_receipt_digest"
+            )
+            if configured_receipt_digest not in {None, receipt_digest}:
+                raise ValueError("configured bootstrap receipt digest does not match its artifact")
+            effective_scope_contract_extensions["bootstrap_receipt_path"] = receipt_value
+            effective_scope_contract_extensions["bootstrap_receipt_digest"] = receipt_digest
+            for name in (
+                "base_delta_paths",
+                "task_change_paths",
+                "interaction_primary_paths",
+            ):
+                receipt_paths = receipt_payload[name]
+                configured_paths = effective_scope_contract_extensions.get(name)
+                if configured_paths:
+                    if normalized_scope_list(configured_paths) != receipt_paths:
+                        raise ValueError(f"configured {name} conflicts with the bootstrap receipt")
+                else:
+                    effective_scope_contract_extensions[name] = receipt_paths
+    integration_receipt_value = effective_scope_contract_extensions.get(
+        "integration_candidate_receipt_path"
+    )
+    if integration_receipt_value is not None:
+        if effective_scope_contract_extensions.get("review_kind") != "base_drift_integration":
+            raise ValueError(
+                "integration candidate receipt requires review_kind=base_drift_integration"
+            )
+        integration_receipt = validated_integration_candidate_receipt(
+            root, Path(str(integration_receipt_value))
+        )
+        derived_fields: dict[str, Any] = {
+            "base_ref": integration_receipt["base_ref"],
+            "remote_name": integration_receipt["remote_name"],
+            "comparison_base_tip": integration_receipt["base_tip_at_candidate"],
+            "reviewed_base_tip": integration_receipt["base_tip_at_candidate"],
+            "reviewed_task_tip": integration_receipt["reviewed_task_tip"],
+            "candidate_task_tip": integration_receipt["candidate_task_tip"],
+            "base_delta_paths": integration_receipt["base_delta_paths"],
+            "base_delta_protected_paths": integration_receipt[
+                "base_delta_protected_paths"
+            ],
+            "task_change_paths": integration_receipt["task_change_paths"],
+            "interaction_primary_paths": integration_receipt[
+                "interaction_primary_paths"
+            ],
+            "candidate_evidence_path": integration_receipt[
+                "reviewed_candidate_evidence_path"
+            ],
+            "candidate_evidence_digest": integration_receipt[
+                "reviewed_candidate_evidence_sha256"
+            ],
+        }
+        for name, derived_value in derived_fields.items():
+            configured_value = effective_scope_contract_extensions.get(name)
+            configured_value_is_empty = configured_value is None or configured_value == "" or configured_value == []
+            if not configured_value_is_empty and configured_value != derived_value:
+                raise ValueError(
+                    f"configured {name} conflicts with the integration candidate receipt"
+                )
+            effective_scope_contract_extensions[name] = derived_value
+    elif effective_scope_contract_extensions.get("review_kind") == "base_drift_integration":
+        raise ValueError(
+            "base_drift_integration requires a canonical integration candidate receipt"
+        )
     # An explicit --base-ref (the documented manual lever for reviewing already-committed work)
     # must also drive the manifest's committed-round attribution; otherwise a clean worktree
     # produces empty owned paths and the packet build aborts with "no owned paths". Derive the
@@ -855,6 +1407,7 @@ def prepare_run(
         tracker_lease_id=contract_tracker_lease_id,
         tracker_scope_hash=contract_tracker_scope_hash,
         tracker_transcript_max_line_number=contract_tracker_transcript_max_line_number,
+        scope_contract_extensions=effective_scope_contract_extensions,
     )
     bootstrap = build_worktree_bootstrap(
         repo=root,
@@ -1007,6 +1560,7 @@ def prepare_run(
         "primary_files": primary_files,
         "background_files": background_files,
         "excluded_path_prefixes": metadata.get("excluded_path_prefixes"),
+        "pre_review_base_sync_state": pre_review_sync_state,
         **rvf_state_fields(
             phase="prepare",
             backend=canonical_backend,
@@ -1088,6 +1642,92 @@ def _shared_workflow_artifacts(result: dict[str, Any]) -> dict[str, str | None]:
     }
 
 
+def scope_contract_v3_extensions_from_prep_payload(
+    payload: Mapping[str, Any], rvf_run: Mapping[str, Any]
+) -> dict[str, Any]:
+    def value(name: str) -> Any:
+        return rvf_run[name] if name in rvf_run else payload.get(name)
+
+    review_kind = value("review_kind") or "implementation"
+    if not isinstance(review_kind, str):
+        raise ValueError("prep review_kind must be a string")
+    base_ref = value("base_ref")
+    remote_name = value("remote_name")
+    for name, raw_value in (("base_ref", base_ref), ("remote_name", remote_name)):
+        if raw_value is not None and (
+            not isinstance(raw_value, str) or not raw_value.strip()
+        ):
+            raise ValueError(f"prep {name} must be a non-empty string")
+    tips: dict[str, str | None] = {}
+    for name in (
+        "comparison_base_tip",
+        "reviewed_base_tip",
+        "reviewed_task_tip",
+        "candidate_task_tip",
+    ):
+        raw = value(name)
+        if raw is not None and (
+            not isinstance(raw, str) or not re.fullmatch(r"[0-9a-f]{40,64}", raw)
+        ):
+            raise ValueError(f"prep {name} must be a lowercase commit OID")
+        tips[name] = raw
+    path_lists: dict[str, list[str]] = {}
+    for name in (
+        "base_delta_paths",
+        "task_change_paths",
+        "interaction_primary_paths",
+        "base_delta_protected_paths",
+    ):
+        raw = value(name)
+        if raw is None:
+            path_lists[name] = []
+        elif not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+            raise ValueError(f"prep {name} must be a list of strings")
+        else:
+            path_lists[name] = raw
+
+    artifact_paths: dict[str, Path | None] = {}
+    declared_digests: dict[str, str | None] = {}
+    for prefix in (
+        "bootstrap_receipt",
+        "candidate_evidence",
+        "integration_candidate_receipt",
+    ):
+        raw_path = value(f"{prefix}_path")
+        raw_digest = value(f"{prefix}_digest")
+        if (raw_path is None) != (raw_digest is None):
+            raise ValueError(f"prep {prefix} path and digest must both be present")
+        if raw_path is not None and (
+            not isinstance(raw_path, str)
+            or not isinstance(raw_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", raw_digest)
+        ):
+            raise ValueError(f"prep {prefix} path/digest is invalid")
+        artifact_paths[prefix] = Path(raw_path) if isinstance(raw_path, str) else None
+        declared_digests[prefix] = raw_digest if isinstance(raw_digest, str) else None
+
+    extensions = scope_contract_v3_extensions(
+        review_kind=review_kind,
+        base_ref=base_ref,
+        remote_name=remote_name,
+        **tips,
+        **path_lists,
+        bootstrap_receipt=artifact_paths["bootstrap_receipt"],
+        candidate_evidence=artifact_paths["candidate_evidence"],
+        integration_candidate_receipt=artifact_paths[
+            "integration_candidate_receipt"
+        ],
+    )
+    for prefix in (
+        "bootstrap_receipt",
+        "candidate_evidence",
+        "integration_candidate_receipt",
+    ):
+        if declared_digests[prefix] != extensions[f"{prefix}_digest"]:
+            raise ValueError(f"prep {prefix} digest does not match its canonical artifact")
+    return extensions
+
+
 def prepare_run_from_prep_file(
     prep: rvf_prep_file.PrepFileRecord,
     *,
@@ -1127,6 +1767,9 @@ def prepare_run_from_prep_file(
     committed_baseline = committed_baseline.strip() if isinstance(committed_baseline, str) and committed_baseline.strip() else None
     committed_base_ref = payload.get("committed_round_base_ref")
     committed_base_ref = committed_base_ref.strip() if isinstance(committed_base_ref, str) and committed_base_ref.strip() else None
+    local_base_ref_raw = payload.get("local_base_ref")
+    local_base_ref = local_base_ref_raw.strip() if isinstance(local_base_ref_raw, str) and local_base_ref_raw.strip() else None
+    contract_extensions = scope_contract_v3_extensions_from_prep_payload(payload, rvf_run)
 
     transcript_path: Path | None = None
     transcript_candidate = transcript_override
@@ -1190,6 +1833,8 @@ def prepare_run_from_prep_file(
             tracker_scope=tracker_scope,
             committed_baseline=committed_baseline,
             committed_base_ref=committed_base_ref,
+            local_base_ref=local_base_ref,
+            scope_contract_extensions=contract_extensions,
         )
 
     completed_state = state
@@ -1218,6 +1863,13 @@ def prepare_run_from_prep_file(
             "status": "timeout",
             "completed_at": _shared_workflow_now(),
             "error": f"prepare_run exceeded {timeout_seconds:.0f}s timeout",
+        }
+    except BootstrapRequiredBeforeRvf as exc:
+        executor.shutdown(wait=False, cancel_futures=True)
+        completed_state = {
+            **state,
+            **exc.payload,
+            "completed_at": _shared_workflow_now(),
         }
     except Exception as exc:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -1268,6 +1920,35 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--local-base-ref",
+        help=(
+            "Local branch whose committed AGENTS.md may opt into the pre-review one-way base sync gate. "
+            "Regular repositories remain unchanged when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--review-kind",
+        choices=sorted(REVIEW_KINDS),
+        default="implementation",
+        help="Scope contract v3 review kind.",
+    )
+    parser.add_argument("--scope-base-ref")
+    parser.add_argument("--scope-remote-name")
+    parser.add_argument("--comparison-base-tip")
+    parser.add_argument("--reviewed-base-tip")
+    parser.add_argument("--reviewed-task-tip")
+    parser.add_argument("--candidate-task-tip")
+    parser.add_argument("--base-delta-path", action="append", default=[])
+    parser.add_argument("--task-change-path", action="append", default=[])
+    parser.add_argument("--interaction-primary-path", action="append", default=[])
+    parser.add_argument("--base-delta-protected-path", action="append", default=[])
+    parser.add_argument("--bootstrap-receipt", help="Canonical JSON bootstrap receipt to bind into scope v3.")
+    parser.add_argument("--candidate-evidence", help="Canonical JSON candidate evidence to bind into scope v3.")
+    parser.add_argument(
+        "--integration-candidate-receipt",
+        help="Canonical JSON handback receipt for base-drift integration review.",
+    )
+    parser.add_argument(
         "--allow-missing-session-context",
         action="store_true",
         help="Debug-only escape hatch. Normal review runs must pass --session-context.",
@@ -1305,6 +1986,26 @@ def main() -> int:
             )
         if tracker_scope is not None and not tracker_scope.exists():
             raise ValueError(f"tracker scope file not found: {tracker_scope}")
+        contract_extensions = scope_contract_v3_extensions(
+            review_kind=args.review_kind,
+            base_ref=args.scope_base_ref,
+            remote_name=args.scope_remote_name,
+            comparison_base_tip=args.comparison_base_tip,
+            reviewed_base_tip=args.reviewed_base_tip,
+            reviewed_task_tip=args.reviewed_task_tip,
+            candidate_task_tip=args.candidate_task_tip,
+            base_delta_paths=args.base_delta_path,
+            task_change_paths=args.task_change_path,
+            interaction_primary_paths=args.interaction_primary_path,
+            base_delta_protected_paths=args.base_delta_protected_path,
+            bootstrap_receipt=Path(args.bootstrap_receipt) if args.bootstrap_receipt else None,
+            candidate_evidence=Path(args.candidate_evidence) if args.candidate_evidence else None,
+            integration_candidate_receipt=(
+                Path(args.integration_candidate_receipt)
+                if args.integration_candidate_receipt
+                else None
+            ),
+        )
         result = prepare_run(
             repo=Path(args.repo).expanduser().resolve(),
             session_context=session_context,
@@ -1322,7 +2023,16 @@ def main() -> int:
             rvf_backend=args.rvf_backend,
             tracker_scope=tracker_scope,
             base_ref=args.base_ref,
+            local_base_ref=args.local_base_ref,
+            scope_contract_extensions=contract_extensions,
         )
+    except BootstrapRequiredBeforeRvf as exc:
+        payload = json.dumps(exc.payload, ensure_ascii=False, indent=2) + "\n"
+        if args.output_json:
+            Path(args.output_json).expanduser().resolve().write_text(payload, encoding="utf-8")
+        else:
+            print(payload, end="")
+        return 3
     except Exception as exc:
         return fail(str(exc), 2)
 

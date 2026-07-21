@@ -32,7 +32,7 @@ handoff 应尽量把接收方需要反复推断的信息写成稳定字段，降
 - protected / background / cross-session paths：列出已发现但不得自动 stage/commit 的路径和原因。
 - accepted changes：列出应带回主会话 worktree 的变更类别。
 - rejected / not accepted changes：列出本次 RVF 明确移除、驳回或不应采纳的 suggestion / hunk。
-- validation commands：给出可在主会话 worktree 中重跑的命令；若原命令依赖 RVF run 环境变量，写出等价替代命令。
+- validation commands：按 `handoff-validation-001` 起的稳定顺序给出与 validation cache record 完全相同的 argv / cwd；若原命令依赖 RVF run 环境变量，写出等价替代命令。Markdown 只用于旧流程诊断，candidate evidence / validation record JSON 才是复用事实源，不要把 cache hit 注释伪装成结构化证据。
 
 接收方可用只读脚本生成机器可读摘要：
 
@@ -138,11 +138,11 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 
 ### Scoped verification (in-contract)
 
-- <命令>: <结果>
+- `<与 validation cache record 相同的命令>` -> <passed / failed；cache_status；suite handoff-validation-001>
 
 ### Full-suite results (unrelated)
 
-- <命令>: <结果（说明该失败/通过与本轮 fix_allowlist 路径无直接因果）>
+- `<与 validation cache record 相同的命令>` -> <结果；suite handoff-validation-002；说明该失败/通过与本轮 fix_allowlist 路径无直接因果>
 
 ## 继续指引（给 fork 出来的 earlier-self）
 

@@ -1016,7 +1016,9 @@ def finalize_scope_contract(
     canonical_issues = contract.get("canonical_issues") or []
     fix_allowlist = [str(p) for p in (contract.get("fix_allowlist") or [])]
     version = contract.get("version", prepare_review_run.SCOPE_CONTRACT_VERSION)
-    canonical_scope = {
+    prior_canonical_scope = contract.get("canonical_scope")
+    canonical_scope = dict(prior_canonical_scope) if isinstance(prior_canonical_scope, Mapping) else {}
+    canonical_scope.update({
         "version": version,
         "repo": contract.get("repo"),
         "scope_mode": contract.get("scope_mode"),
@@ -1026,11 +1028,12 @@ def finalize_scope_contract(
         "canonical_issues": canonical_issues,
         "fix_allowlist": fix_allowlist,
         "excluded_path_prefixes": merged_excluded,
-    }
+    })
     new_hash = hashlib.sha256(prepare_review_run.canonical_json_bytes(canonical_scope)).hexdigest()
     contract["primary_files"] = effective_primary_files
     contract["excluded_path_prefixes"] = merged_excluded
     contract["scope_hash"] = new_hash
+    contract["canonical_scope"] = canonical_scope
     _atomic_write_json(contract_path, contract)
     return {
         "finalized": True,

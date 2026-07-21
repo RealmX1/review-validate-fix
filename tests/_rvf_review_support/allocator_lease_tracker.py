@@ -947,7 +947,7 @@ def test_allocate_review_scope_output_consumed_by_prepare_run(tmp: Path) -> None
     )
     assert completed.returncode == 0
     contract = json.loads((artifacts_dir / "inputs" / "scope.contract.json").read_text(encoding="utf-8"))
-    assert contract["version"] == 2
+    assert contract["version"] == 3
     assert contract["primary_units"] == sorted(allocator["scope"]["unit_ids"])
     assert contract["tracker_lease_id"] == allocator["lease_id"]
     assert contract["tracker_scope_hash"] == allocator["scope_hash"]

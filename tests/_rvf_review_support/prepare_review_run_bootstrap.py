@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -24,6 +25,9 @@ __all__ = [
     'test_prepare_review_run_worktree_bootstrap_respects_review_validate_fix_ignore',
     'test_prepare_review_run_worktree_bootstrap_untracked_storage_names_do_not_collide',
     'test_prepare_review_run_scope_file_matches_metadata_through_symlink_state',
+    'test_prepare_review_run_scope_contract_v3_records_base_drift_evidence',
+    'test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed',
+    'test_prepare_review_run_rejects_invalid_local_base_ref',
 ]
 
 
@@ -123,7 +127,7 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert "- secret.txt" in packet_text
     assert "### secret.txt" not in packet_text
     contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
-    assert contract["version"] == 2
+    assert contract["version"] == 3
     assert contract["run_id"] == payload["run_id"]
     assert contract["scope_mode"] == "custom"
     assert contract["canonical_issues"] == []
@@ -135,6 +139,399 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert contract["primary_units"] is None
     assert contract["tracker_lease_id"] is None
     assert contract["tracker_scope_hash"] is None
+
+
+def test_prepare_review_run_scope_contract_v3_records_base_drift_evidence(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
+    context.write_text("review base drift integration\n", encoding="utf-8")
+    reviewed_base_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "switch", "-q", "-c", "base-drift"], cwd=repo)
+    (repo / "src").mkdir()
+    (repo / "src/base.ts").write_text("export const base = true;\n", encoding="utf-8")
+    (repo / "src/shared.ts").write_text("export const shared = true;\n", encoding="utf-8")
+    (repo / "package.json").write_text('{"private":true}\n', encoding="utf-8")
+    run(["git", "add", "src/base.ts", "src/shared.ts", "package.json"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "base drift"], cwd=repo)
+    base_tip_at_candidate = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "switch", "-q", "-c", "task", reviewed_base_tip], cwd=repo)
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "src/task.ts").write_text("export const task = true;\n", encoding="utf-8")
+    (repo / "src/shared.ts").write_text("export const shared = true;\n", encoding="utf-8")
+    run(["git", "add", "src/task.ts", "src/shared.ts"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "task change"], cwd=repo)
+    reviewed_task_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "merge", "-q", "--no-ff", "base-drift", "-m", "integrate base drift"], cwd=repo)
+    candidate_task_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip())
+    common_dir = Path(
+        run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo,
+        ).stdout.strip()
+    ).resolve()
+    bootstrap_receipt = tmp_path / "local-base-into-task-worktree-bootstrap-receipt.json"
+    bootstrap_receipt.write_text('{"schema_version":1}', encoding="utf-8")
+    Path(f"{bootstrap_receipt}.sha256").write_text(
+        hashlib.sha256(b'{"schema_version":1}').hexdigest() + "\n", encoding="ascii"
+    )
+    candidate_evidence = git_dir / "rvf/evidence/reviewed-task-candidate-evidence.json"
+    candidate_evidence.parent.mkdir(parents=True)
+    candidate_evidence.write_text('{"schema_version":1}', encoding="utf-8")
+    Path(f"{candidate_evidence}.sha256").write_text(
+        hashlib.sha256(b'{"schema_version":1}').hexdigest() + "\n", encoding="ascii"
+    )
+    integration_receipt = (
+        git_dir
+        / "base-branch-sync/reviewed-task-handback-integration-candidate.json"
+    )
+    integration_receipt.parent.mkdir(parents=True)
+    integration_receipt_payload = {
+        "schema_name": "reviewed-task-handback-integration-candidate",
+        "schema_version": 1,
+        "status": "INTEGRATION_DELTA_RVF_REQUIRED",
+        "risk_classification": "MEDIUM",
+        "git_common_directory_realpath": str(common_dir),
+        "task_worktree_realpath": str(repo.resolve()),
+        "base_ref": "main",
+        "remote_name": "origin",
+        "reviewed_candidate_evidence_path": str(candidate_evidence.resolve()),
+        "reviewed_candidate_evidence_sha256": hashlib.sha256(
+            b'{"schema_version":1}'
+        ).hexdigest(),
+        "reviewed_base_tip": reviewed_base_tip,
+        "base_tip_at_candidate": base_tip_at_candidate,
+        "reviewed_task_tip": reviewed_task_tip,
+        "candidate_task_tip": candidate_task_tip,
+        "base_delta_paths": ["package.json", "src/base.ts", "src/shared.ts"],
+        "base_delta_protected_paths": ["package.json"],
+        "task_change_paths": ["src/shared.ts", "src/task.ts"],
+        "interaction_primary_paths": ["src/shared.ts"],
+    }
+    encoded_integration_receipt = json.dumps(
+        integration_receipt_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    integration_receipt.write_bytes(encoded_integration_receipt)
+    Path(f"{integration_receipt}.sha256").write_text(
+        hashlib.sha256(encoded_integration_receipt).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+    completed = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "runs"),
+            "--review-kind",
+            "base_drift_integration",
+            "--comparison-base-tip",
+            base_tip_at_candidate,
+            "--reviewed-base-tip",
+            base_tip_at_candidate,
+            "--reviewed-task-tip",
+            reviewed_task_tip,
+            "--candidate-task-tip",
+            candidate_task_tip,
+            "--base-delta-path",
+            "package.json",
+            "--base-delta-path",
+            "src/base.ts",
+            "--base-delta-path",
+            "src/shared.ts",
+            "--task-change-path",
+            "src/shared.ts",
+            "--task-change-path",
+            "src/task.ts",
+            "--interaction-primary-path",
+            "src/shared.ts",
+            "--base-delta-protected-path",
+            "package.json",
+            "--bootstrap-receipt",
+            str(bootstrap_receipt),
+            "--candidate-evidence",
+            str(candidate_evidence),
+            "--integration-candidate-receipt",
+            str(integration_receipt),
+        ]
+    )
+
+    payload = json.loads(completed.stdout)
+    contract = json.loads(Path(payload["scope_contract"]).read_text(encoding="utf-8"))
+    assert contract["version"] == 3
+    assert contract["review_kind"] == "base_drift_integration"
+    assert contract["comparison_base_tip"] == base_tip_at_candidate
+    assert contract["reviewed_base_tip"] == base_tip_at_candidate
+    assert contract["reviewed_task_tip"] == reviewed_task_tip
+    assert contract["candidate_task_tip"] == candidate_task_tip
+    assert contract["base_delta_paths"] == ["package.json", "src/base.ts", "src/shared.ts"]
+    assert contract["task_change_paths"] == ["src/shared.ts", "src/task.ts"]
+    assert contract["interaction_primary_paths"] == ["src/shared.ts"]
+    assert contract["base_delta_protected_paths"] == ["package.json"]
+    assert contract["bootstrap_receipt_path"] == str(bootstrap_receipt.resolve())
+    assert len(contract["bootstrap_receipt_digest"]) == 64
+    assert contract["candidate_evidence_path"] == str(candidate_evidence.resolve())
+    assert len(contract["candidate_evidence_digest"]) == 64
+    assert contract["integration_candidate_receipt_path"] == str(
+        integration_receipt.resolve()
+    )
+    assert len(contract["integration_candidate_receipt_digest"]) == 64
+    for key in (
+        "review_kind",
+        "comparison_base_tip",
+        "base_delta_paths",
+        "interaction_primary_paths",
+        "bootstrap_receipt_digest",
+        "candidate_evidence_digest",
+    ):
+        assert contract["canonical_scope"][key] == contract[key]
+
+    symlink_receipt = tmp_path / "symlink-bootstrap-receipt.json"
+    symlink_receipt.symlink_to(bootstrap_receipt)
+    Path(f"{symlink_receipt}.sha256").write_text(
+        hashlib.sha256(b'{"schema_version":1}').hexdigest() + "\n", encoding="ascii"
+    )
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "rejected-runs"),
+            "--bootstrap-receipt",
+            str(symlink_receipt),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "regular file" in rejected.stderr
+
+    pretty_receipt = tmp_path / "pretty-bootstrap-receipt.json"
+    pretty_receipt.write_text('{\n  "schema_version": 1\n}\n', encoding="utf-8")
+    Path(f"{pretty_receipt}.sha256").write_text(
+        hashlib.sha256(b'{"schema_version":1}').hexdigest() + "\n", encoding="ascii"
+    )
+    noncanonical = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "noncanonical-runs"),
+            "--bootstrap-receipt",
+            str(pretty_receipt),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert noncanonical.returncode != 0
+    assert "canonical JSON bytes" in noncanonical.stderr
+
+    malformed_sidecar_receipt = tmp_path / "malformed-sidecar-receipt.json"
+    malformed_sidecar_receipt.write_text('{"schema_version":1}', encoding="utf-8")
+    Path(f"{malformed_sidecar_receipt}.sha256").write_text(
+        hashlib.sha256(b'{"schema_version":1}').hexdigest().upper(), encoding="ascii"
+    )
+    malformed_sidecar = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "malformed-sidecar-runs"),
+            "--bootstrap-receipt",
+            str(malformed_sidecar_receipt),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert malformed_sidecar.returncode != 0
+    assert "digest mismatch" in malformed_sidecar.stderr
+
+
+def test_prepare_review_run_blocks_opted_in_repo_until_local_base_is_absorbed(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    run(["git", "reset", "--hard", "HEAD"], cwd=repo)
+    (repo / "new.txt").unlink()
+    task_start = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "branch", "-m", "main"], cwd=repo)
+    local_base_ref = "main"
+    (repo / "AGENTS.md").write_text(
+        "RVF-PRE-REVIEW-BASE-SYNC-SKILL: sync-local-base-into-task-worktree-only\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "AGENTS.md"], cwd=repo)
+    run(["git", "commit", "-m", "base enables pre-review sync"], cwd=repo)
+    local_base_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run(["git", "checkout", "--detach", task_start], cwd=repo)
+    (repo / "tracked.txt").write_text("task change\n", encoding="utf-8")
+    context = tmp_path / "context.md"
+    context.write_text("task requires review\n", encoding="utf-8")
+    sacrificial_repo = init_repo(tmp_path / "sacrificial-repo")
+    sacrificial_head = run(["git", "rev-parse", "HEAD"], cwd=sacrificial_repo).stdout.strip()
+    poisoned_environment = {
+        **{name: value for name, value in os.environ.items() if not name.startswith("GIT_")},
+        "GIT_DIR": str(sacrificial_repo / ".git"),
+        "GIT_WORK_TREE": str(sacrificial_repo),
+        "GIT_COMMON_DIR": str(sacrificial_repo / ".git"),
+        "GIT_INDEX_FILE": str(sacrificial_repo / ".git" / "index"),
+        "GIT_OBJECT_DIRECTORY": str(sacrificial_repo / ".git" / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(sacrificial_repo / ".git" / "objects"),
+    }
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "runs"),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=poisoned_environment,
+    )
+
+    assert completed.returncode == 3
+    payload = json.loads(completed.stdout)
+    assert payload == {
+        "status": "bootstrap_required_before_rvf",
+        "required_skill": "sync-local-base-into-task-worktree-only",
+        "local_base_ref": local_base_ref,
+        "local_base_tip": local_base_tip,
+        "task_head": task_start,
+    }
+    assert run(["git", "rev-parse", "HEAD"], cwd=sacrificial_repo).stdout.strip() == sacrificial_head
+
+    run(["git", "merge", "--no-edit", local_base_ref], cwd=repo)
+    absorbed_task_tip = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    absolute_git_dir = Path(
+        run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip()
+    )
+    git_common_dir = Path(
+        run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo
+        ).stdout.strip()
+    ).resolve()
+    manifest = json.loads(
+        run(
+            [
+                sys.executable,
+                str(PREPARE_REVIEW_RUN.parent / "validation_result_cache.py"),
+                "manifest",
+                "--repo",
+                str(repo),
+            ]
+        ).stdout
+    )
+    receipt_path = (
+        absolute_git_dir
+        / "base-branch-sync"
+        / "local-base-into-task-worktree-bootstrap-receipt.json"
+    )
+    receipt_path.parent.mkdir(parents=True)
+    receipt = {
+        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
+        "schema_version": 1,
+        "base_task_merge_base_tip": task_start,
+        "absorbed_base_tip": local_base_tip,
+        "base_ref": local_base_ref,
+        "remote_name": "origin",
+        "task_tip_before_base_absorption": task_start,
+        "task_tip_after_base_absorption": absorbed_task_tip,
+        "base_delta_paths": ["AGENTS.md"],
+        "task_change_paths": [],
+        "interaction_primary_paths": [],
+        "candidate_tree_oid": run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo).stdout.strip(),
+        **manifest,
+        "git_common_directory_realpath": str(git_common_dir),
+        "task_worktree_realpath": str(repo.resolve()),
+        "boundary_status": "VERIFIED",
+        "lock_status": "RELEASED",
+        "target_repository_hooks_status": "DISABLED",
+        "wip_status": "RESTORED_AND_DROPPED",
+    }
+    receipt_bytes = json.dumps(
+        receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    receipt_path.write_bytes(receipt_bytes)
+    Path(f"{receipt_path}.sha256").write_text(
+        hashlib.sha256(receipt_bytes).hexdigest() + "\n", encoding="ascii"
+    )
+    prepared = run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "absorbed-runs"),
+        ]
+    )
+    prepared_payload = json.loads(prepared.stdout)
+    contract = json.loads(
+        Path(prepared_payload["scope_contract"]).read_text(encoding="utf-8")
+    )
+    assert contract["comparison_base_tip"] == local_base_tip
+    assert contract["reviewed_base_tip"] == local_base_tip
+    assert contract["reviewed_task_tip"] == absorbed_task_tip
+    assert contract["candidate_task_tip"] == absorbed_task_tip
+    assert contract["bootstrap_receipt_path"] == str(receipt_path.resolve())
+    assert len(contract["bootstrap_receipt_digest"]) == 64
+    assert contract["base_delta_paths"] == ["AGENTS.md"]
+    assert contract["task_change_paths"] == []
+    assert contract["interaction_primary_paths"] == []
+
+
+def test_prepare_review_run_rejects_invalid_local_base_ref(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
+    context.write_text("invalid ref must fail closed\n", encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PREPARE_REVIEW_RUN),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--base-dir",
+            str(tmp_path / "runs"),
+            "--local-base-ref",
+            "main^{commit}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "invalid local base ref" in completed.stderr
 
     locked = run(
         [
@@ -421,4 +818,3 @@ def test_prepare_review_run_scope_file_matches_metadata_through_symlink_state(tm
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
     assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
     assert str(real_state.resolve()) in payload["scope_of_work_file"]
-

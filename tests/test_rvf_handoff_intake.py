@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,12 +22,27 @@ SCRIPT = (
     / "scripts"
     / "rvf_handoff_intake.py"
 )
+VALIDATION_RESULT_CACHE = SCRIPT.parent / "validation_result_cache.py"
+
+
+def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    environment.update(extra or {})
+    return environment
 
 
 def run(cmd: list[str], cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         cmd,
         cwd=cwd,
+        env=clean_test_environment(),
         input=input_text,
         capture_output=True,
         text=True,
@@ -55,6 +72,174 @@ def init_clean_repo(path: Path) -> Path:
     run(["git", "config", "user.email", "rvf@example.test"], cwd=path)
     run(["git", "config", "user.name", "RVF Test"], cwd=path)
     return path
+
+
+def init_pre_review_base_sync_opt_in_repo(path: Path, *, task_absorbs_base: bool) -> Path:
+    path.mkdir(parents=True)
+    run(["git", "init", "-q", "-b", "main"], cwd=path)
+    run(["git", "config", "user.email", "rvf@example.test"], cwd=path)
+    run(["git", "config", "user.name", "RVF Test"], cwd=path)
+    (path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "tracked.txt"], cwd=path)
+    run(["git", "commit", "-q", "-m", "base"], cwd=path)
+    run(["git", "branch", "legacy-task"], cwd=path)
+    (path / "AGENTS.md").write_text(
+        "RVF-PRE-REVIEW-BASE-SYNC-SKILL: sync-local-base-into-task-worktree-only\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "AGENTS.md"], cwd=path)
+    run(["git", "commit", "-q", "-m", "opt in"], cwd=path)
+    if task_absorbs_base:
+        run(["git", "branch", "-f", "legacy-task", "main"], cwd=path)
+    run(["git", "switch", "-q", "legacy-task"], cwd=path)
+    return path
+
+
+def create_valid_reviewed_candidate_evidence_fixture(
+    tmp_path: Path,
+    repo: Path,
+    *,
+    cache_key_character: str,
+    command_digest_character: str,
+    environment_digest_character: str,
+) -> tuple[Path, dict[str, object], Path]:
+    git_dir = Path(run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip())
+    common_dir = Path(
+        run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            cwd=repo,
+        ).stdout.strip()
+    ).resolve()
+    manifest = json.loads(
+        run(
+            [sys.executable, str(VALIDATION_RESULT_CACHE), "manifest", "--repo", str(repo)]
+        ).stdout
+    )
+    cache_key = cache_key_character * 64
+    validation_process = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATION_RESULT_CACHE),
+            "run",
+            "--repo",
+            str(repo),
+            "--name",
+            f"targeted-{cache_key_character}",
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(0)",
+        ],
+        env=clean_test_environment(
+            {"RVF_USER_LOCAL_DATA_ROOT": str(tmp_path / "rvf-user-data")}
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    record = json.loads(validation_process.stdout)
+    record_path = Path(record["cache_record_path"])
+    record_digest = Path(f"{record_path}.sha256").read_text(
+        encoding="ascii"
+    ).strip()
+    command_digest = record["command_sha256"]
+    environment_digest = record["environment_fingerprint_sha256"]
+
+    head_oid = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    run_id = f"rvf-handoff-intake-{cache_key_character}"
+    canonical_scope = {
+        "version": 3,
+        "review_kind": "implementation",
+        "base_ref": "main",
+        "remote_name": "origin",
+    }
+    scope_digest = hashlib.sha256(
+        json.dumps(
+            canonical_scope, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    contract = {
+        **canonical_scope,
+        "run_id": run_id,
+        "scope_hash": scope_digest,
+        "canonical_scope": canonical_scope,
+    }
+    contract_path = tmp_path / f"scope-{cache_key_character}.contract.json"
+    contract_path.write_text(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    contract_digest = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    evidence_path = git_dir / "rvf/evidence/reviewed-task-candidate-evidence.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence: dict[str, object] = {
+        "schema": "rvf-reviewed-task-candidate-evidence",
+        "schema_version": 1,
+        "subject": {
+            "worktree_realpath": str(repo.resolve()),
+            "git_common_dir_realpath": str(common_dir),
+            "head_oid": head_oid,
+            "candidate_tree_oid": run(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=repo
+            ).stdout.strip(),
+            "comparison_base_tip": head_oid,
+            "reviewed_base_tip": head_oid,
+            "base_ref": "main",
+            "remote_name": "origin",
+            **manifest,
+        },
+        "review": {
+            "run_id": run_id,
+            "review_kind": "implementation",
+            "conclusion": "no_issues",
+            "protocol_valid": True,
+            "canonical_issue_count": 0,
+            "completed_at": "2026-07-21T00:00:00Z",
+        },
+        "scope": {
+            "contract_path": str(contract_path),
+            "contract_sha256": contract_digest,
+            "scope_digest": scope_digest,
+        },
+        "validation_records": [
+            {
+                "name": record["name"],
+                "status": "passed",
+                "exit_code": 0,
+                "command_sha256": command_digest,
+                "environment_fingerprint_sha256": environment_digest,
+                "cache_record_path": str(record_path),
+                "cache_record_sha256": record_digest,
+                "requires_base_worktree_context": False,
+                "validation_context_kind": record["validation_context_kind"],
+                "validation_context_worktree_realpath_sha256": record[
+                    "validation_context_worktree_realpath_sha256"
+                ],
+                "candidate_content_manifest_sha256": manifest[
+                    "candidate_content_manifest_sha256"
+                ],
+            }
+        ],
+        "receipts": {
+            "bootstrap_path": None,
+            "bootstrap_sha256": None,
+            "parent_evidence_path": None,
+            "parent_evidence_sha256": None,
+            "integration_candidate_path": None,
+            "integration_candidate_sha256": None,
+        },
+        "created_at": "2026-07-21T00:00:00Z",
+    }
+    encoded = json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    evidence_path.write_bytes(encoded)
+    Path(f"{evidence_path}.sha256").write_text(
+        hashlib.sha256(encoded).hexdigest() + "\n", encoding="ascii"
+    )
+    return evidence_path, evidence, record_path
 
 
 def test_handoff_intake_summarizes_scope_status_and_artifacts(tmp_path: Path) -> None:
@@ -292,6 +477,284 @@ def test_handoff_intake_parses_template_origin_metadata_and_path_run_dir(tmp_pat
     assert payload["run_dir"] == str(run_dir)
 
 
+def test_handoff_intake_uses_candidate_evidence_before_nested_markdown_validation(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    evidence_path, evidence, record_path = create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path,
+        repo,
+        cache_key_character="1",
+        command_digest_character="2",
+        environment_digest_character="3",
+    )
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text(
+        "## 验证\n\n### Scoped verification (in-contract)\n\n"
+        "- `pytest tests/test_example.py::test_case[param-id]` -> passed\n",
+        encoding="utf-8",
+    )
+    payload = json.loads(
+        run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout
+    )
+    assert payload["validation_evidence_source"] == "candidate_evidence"
+    assert payload["validation_records"] == evidence["validation_records"]
+    assert payload["validation_commands"] == []
+    assert payload["candidate_evidence_path"] == str(evidence_path)
+
+    record_path.write_text("tampered\n", encoding="utf-8")
+    tampered_payload = json.loads(
+        run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout
+    )
+    assert tampered_payload["candidate_evidence_status"] == "invalid"
+    assert tampered_payload["validation_evidence_source"] == "invalid_candidate_evidence"
+    assert tampered_payload["validation_records"] == []
+    assert tampered_payload["validation_commands"] == [
+        "pytest tests/test_example.py::test_case[param-id]"
+    ]
+
+
+def test_handoff_intake_refuses_stale_candidate_evidence_and_preserves_legacy_commands(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path,
+        repo,
+        cache_key_character="4",
+        command_digest_character="5",
+        environment_digest_character="6",
+    )
+    (repo / "other.txt").write_text("candidate drift\n", encoding="utf-8")
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text(
+        "## 验证\n\n### Scoped verification (in-contract)\n\n- `npm test` -> passed\n",
+        encoding="utf-8",
+    )
+    payload = json.loads(
+        run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout
+    )
+    assert payload["candidate_evidence_status"] == "stale"
+    assert payload["validation_evidence_source"] == "stale_candidate_evidence"
+    assert payload["validation_records"] == []
+    assert payload["validation_commands"] == ["npm test"]
+
+
+def test_handoff_intake_does_not_reuse_same_content_evidence_from_another_run(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path,
+        repo,
+        cache_key_character="a",
+        command_digest_character="b",
+        environment_digest_character="c",
+    )
+    run_dir = tmp_path / "rvf-20260721T120000Z-new-run"
+    handoff = run_dir / "artifacts/handoff.md"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text(
+        "RVF run rvf-20260721T120000Z-new-run\n\n"
+        "## 验证\n\n- `npm test` -> passed\n",
+        encoding="utf-8",
+    )
+    payload = json.loads(
+        run(
+            [sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]
+        ).stdout
+    )
+    assert payload["candidate_evidence_status"] == "foreign_run"
+    assert payload["validation_evidence_source"] == "foreign_run_candidate_evidence"
+    assert payload["validation_records"] == []
+    assert payload["validation_commands"] == ["npm test"]
+
+
+def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stale(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    evidence_path, evidence, _record_path = create_valid_reviewed_candidate_evidence_fixture(
+        tmp_path,
+        repo,
+        cache_key_character="7",
+        command_digest_character="8",
+        environment_digest_character="9",
+    )
+    review = evidence["review"]
+    assert isinstance(review, dict)
+    review.pop("review_kind")
+    encoded = json.dumps(
+        evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    evidence_path.write_bytes(encoded)
+    Path(f"{evidence_path}.sha256").write_text(
+        hashlib.sha256(encoded).hexdigest() + "\n", encoding="ascii"
+    )
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("## 验证\n\n- `npm test` -> passed\n", encoding="utf-8")
+
+    payload = json.loads(
+        run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout
+    )
+    assert payload["candidate_evidence_status"] == "invalid"
+    assert payload["validation_evidence_source"] == "invalid_candidate_evidence"
+    assert payload["validation_records"] == []
+    assert payload["validation_commands"] == ["npm test"]
+
+
+def test_handoff_intake_ignores_poisoned_git_repository_location_environment(
+    tmp_path: Path,
+) -> None:
+    repo = init_repo(tmp_path / "repo")
+    sacrificial = init_repo(tmp_path / "sacrificial")
+    sacrificial_head = run(["git", "rev-parse", "HEAD"], cwd=sacrificial).stdout.strip()
+    sacrificial_index = (sacrificial / ".git/index").read_bytes()
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("## 验证\n\n- `npm test` -> passed\n", encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)],
+        env=clean_test_environment(
+            {
+                "GIT_DIR": str(sacrificial / ".git"),
+                "GIT_WORK_TREE": str(sacrificial),
+                "GIT_COMMON_DIR": str(sacrificial / ".git"),
+                "GIT_INDEX_FILE": str(sacrificial / ".git/index"),
+                "GIT_OBJECT_DIRECTORY": str(sacrificial / ".git/objects"),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["current_repo_snapshot"]["repo"] == str(repo.resolve())
+    assert run(["git", "rev-parse", "HEAD"], cwd=sacrificial).stdout.strip() == sacrificial_head
+    assert (sacrificial / ".git/index").read_bytes() == sacrificial_index
+
+
+def test_handoff_intake_legacy_validation_collects_nested_subsections_and_bracketed_ids(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path / "repo")
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text(
+        "## 验证\n\n### Scoped verification (in-contract)\n\n"
+        "- `pytest tests/test_example.py::test_case[param-id]` -> passed\n\n"
+        "### Full-suite results (unrelated)\n\n- `npm test` -> passed\n",
+        encoding="utf-8",
+    )
+    payload = json.loads(
+        run([sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]).stdout
+    )
+    assert payload["validation_evidence_source"] == "legacy_handoff_markdown"
+    assert payload["validation_records"] == []
+    assert payload["validation_commands"] == [
+        "pytest tests/test_example.py::test_case[param-id]",
+        "npm test",
+    ]
+
+
+def test_rvf_land_intake_blocks_legacy_handoff_before_stale_task_absorbs_local_base(
+    tmp_path: Path,
+) -> None:
+    repo = init_pre_review_base_sync_opt_in_repo(
+        tmp_path / "repo", task_absorbs_base=False
+    )
+    handoff = tmp_path / "legacy-handoff.md"
+    handoff.write_text(
+        "## 验证\n\n- `python3 -c 'raise SystemExit(0)'` -> passed\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)],
+        env=clean_test_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 3
+    gate = json.loads(completed.stdout)["pre_rvf_land_base_sync_gate"]
+    assert gate["status"] == "bootstrap_required_before_rvf_land"
+    assert gate["required_skill"] == "sync-local-base-into-task-worktree-only"
+    assert gate["local_base_ref"] == "main"
+
+
+def test_rvf_land_intake_allows_opt_in_handoff_when_current_local_base_is_absorbed(
+    tmp_path: Path,
+) -> None:
+    repo = init_pre_review_base_sync_opt_in_repo(
+        tmp_path / "repo", task_absorbs_base=True
+    )
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text("## 验证\n\n- `python3 -m pytest` -> passed\n", encoding="utf-8")
+
+    completed = run(
+        [sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)]
+    )
+    gate = json.loads(completed.stdout)["pre_rvf_land_base_sync_gate"]
+    assert gate == {
+        "status": "ready",
+        "required_skill": "sync-local-base-into-task-worktree-only",
+        "local_base_ref": "main",
+        "local_base_tip": run(["git", "rev-parse", "main"], cwd=repo).stdout.strip(),
+        "task_head": run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip(),
+        "reason": "current local base was already absorbed; no bootstrap receipt was required",
+        "bootstrap_receipt_path": None,
+        "bootstrap_receipt_digest": None,
+    }
+
+
+def test_rvf_land_intake_rejects_tampered_contracted_bootstrap_receipt(
+    tmp_path: Path,
+) -> None:
+    repo = init_pre_review_base_sync_opt_in_repo(
+        tmp_path / "repo", task_absorbs_base=True
+    )
+    git_dir = Path(
+        run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip()
+    )
+    receipt_path = (
+        git_dir
+        / "base-branch-sync"
+        / "local-base-into-task-worktree-bootstrap-receipt.json"
+    )
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text("{}", encoding="utf-8")
+    Path(f"{receipt_path}.sha256").write_text("0" * 64 + "\n", encoding="ascii")
+    scope_contract = tmp_path / "scope.contract.json"
+    scope_contract.write_text(
+        json.dumps(
+            {
+                "base_ref": "main",
+                "remote_name": "origin",
+                "reviewed_base_tip": run(
+                    ["git", "rev-parse", "main"], cwd=repo
+                ).stdout.strip(),
+                "bootstrap_receipt_path": str(receipt_path),
+                "bootstrap_receipt_digest": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    handoff = tmp_path / "handoff.md"
+    handoff.write_text(
+        f"## Review scope\n\n- scope contract: {scope_contract}\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--handoff", str(handoff), "--repo", str(repo)],
+        env=clean_test_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 3
+    gate = json.loads(completed.stdout)["pre_rvf_land_base_sync_gate"]
+    assert gate["status"] == "bootstrap_receipt_invalid_before_rvf_land"
+    assert "digest mismatch" in gate["reason"]
+
+
 if __name__ == "__main__":
     test_handoff_intake_summarizes_scope_status_and_artifacts(
         Path(tempfile.mkdtemp(prefix="rvf-handoff-intake-test-"))
@@ -306,6 +769,12 @@ if __name__ == "__main__":
         Path(tempfile.mkdtemp(prefix="rvf-handoff-intake-test-"))
     )
     test_handoff_intake_parses_template_origin_metadata_and_path_run_dir(
+        Path(tempfile.mkdtemp(prefix="rvf-handoff-intake-test-"))
+    )
+    test_handoff_intake_uses_candidate_evidence_before_nested_markdown_validation(
+        Path(tempfile.mkdtemp(prefix="rvf-handoff-intake-test-"))
+    )
+    test_handoff_intake_legacy_validation_collects_nested_subsections_and_bracketed_ids(
         Path(tempfile.mkdtemp(prefix="rvf-handoff-intake-test-"))
     )
     print("rvf handoff intake tests OK")
