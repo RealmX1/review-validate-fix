@@ -345,6 +345,11 @@ def run_local_deploy(
     environment = {**os.environ, "HOME": str(home)}
     user_local_data_root = _user_local_data_root(home, environment)
     environment["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
+    contract_environment = dict(environment)
+    # Contract fixtures run nested synthetic deploys with disposable HOME
+    # directories. Exposing the real root lets those fixtures mistake the
+    # developer installation for their own and mutate its receipts.
+    contract_environment.pop("RVF_USER_LOCAL_DATA_ROOT", None)
     installation_receipt_path = (
         user_local_data_root
         / "deployment-receipts/latest-official-cli-installation.json"
@@ -425,7 +430,7 @@ def run_local_deploy(
                 "plugin contract check",
                 contract_command,
                 local_main_worktree=source.worktree_path,
-                environment=environment,
+                environment=contract_environment,
             )
             commands.append(installer_command)
             _write_result_receipt(

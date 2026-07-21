@@ -140,8 +140,14 @@ def test_public_runner_cli_has_no_repo_or_dirty_bypass() -> None:
 
 def test_run_local_deploy_records_local_main_and_official_cli_verification(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _load_runner()
+    configured_user_local_data_root = tmp_path / "configured-user-local-data"
+    monkeypatch.setenv(
+        "RVF_USER_LOCAL_DATA_ROOT",
+        str(configured_user_local_data_root),
+    )
     local_main_worktree = tmp_path / "review-validate-fix-local-main"
     local_main_worktree.mkdir()
     _git(local_main_worktree, "init", "-b", "main")
@@ -152,7 +158,14 @@ def test_run_local_deploy_records_local_main_and_official_cli_verification(
     local_main_runner = scripts_root / "rvf_local_deploy.py"
     local_main_runner.write_text("# local main runner\n", encoding="utf-8")
     contract_script = scripts_root / "check_plugin_contracts.py"
-    contract_script.write_text("print('contracts OK')\n", encoding="utf-8")
+    contract_script.write_text(
+        """\
+import os
+assert "RVF_USER_LOCAL_DATA_ROOT" not in os.environ
+print("contracts OK")
+""",
+        encoding="utf-8",
+    )
     installer_script = scripts_root / "install_to_codex.py"
     installer_script.write_text(
         """\
@@ -160,9 +173,9 @@ import json
 import os
 import pathlib
 import subprocess
-home = pathlib.Path(os.environ[\"HOME\"])
+user_local_data_root = pathlib.Path(os.environ[\"RVF_USER_LOCAL_DATA_ROOT\"])
 commit = subprocess.run([\"git\", \"rev-parse\", \"HEAD\"], check=True, capture_output=True, text=True).stdout.strip()
-receipt = home / \".rvf/user-local-data/deployment-receipts/latest-official-cli-installation.json\"
+receipt = user_local_data_root / \"deployment-receipts/latest-official-cli-installation.json\"
 receipt.parent.mkdir(parents=True, exist_ok=True)
 payload = {
     \"status\": \"installed\",
