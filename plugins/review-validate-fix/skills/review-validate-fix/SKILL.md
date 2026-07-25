@@ -31,6 +31,24 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 - `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
 - 若返回 `status=bootstrap_required_before_rvf`（退出码 3），先调用标记指定的单向同步 skill，再对同一 scope 重新 prepare；不要在 RVF 内持有 base lock，也不要绕过 gate。
+- 这**不是失败，而是一个可恢复的等待态**。经 dispatch prep 进入时（rvf-agent `start` / kanban follow-up），
+  prepare 返回 `status=waiting_local_base_bootstrap` 并附一枚 `bootstrap_gate` 子记录（见
+  `scripts/rvf_bootstrap_gate.py`）：
+  - `rvf-agent start` 以退出码 `6`（`bootstrap_required`）返回，token 保持 `acknowledged` 并挂上 run 锚点；
+    跑完同步 skill 后 `rvf-agent start --token <t> --retry` **复用同一 run** 接续，不是第二轮独立 RVF。
+  - kanban follow-up 的 in-progress 锁改记 `state=waiting_bootstrap`；锁 TTL 到期时会被**复活**而不是清掉重开。
+  - 恢复前一律重新校验 base 身份 / worktree 与 git common-dir 身份 / receipt digest；证据不可信或冲突未解时
+    维持等待（既不进 review 也不清等待态），只有等待期工件确实丢失才安全重来。receipt 首次校验通过后，
+    其路径与 digest 会被**写回仍在等待的 gate**（token payload / 锁 marker），使后续每一轮真的能判出
+    「receipt 被换过」——所以 bootstrap 完成后**不要**再跑一次同步 skill 或改动 receipt。
+  - prepare 重放的结果按类分流，不是一个成功/失败位：`artifact_lost`（prep 文件已过 TTL / 被 sweep）
+    立刻清等待态安全重来；`timeout` 与其余失败一样按**可重试等待**处理——重放跑在独立子进程里
+    （内层预算到点自己写结果退出，外层硬上限按进程组 SIGKILL），收尾后不留在途 prepare 写者，
+    故本轮释放在途占位、下一次 Stop 立刻重试同一个 run 的 prepare。
+  - 并发去重靠起重放**之前**那次 `O_EXCL` 占位：占位只在一次重放调用期间存在，
+    `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS` 是它的**接手**窗口（默认按
+    重放预算 + 子进程强杀余量 + 余量推导），只用于持有者崩在半路时让下一个 Stop 接手。
+- 调用同步 skill 时传 `BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF`，声明吸收后的审查归 RVF。
 - 单向同步只提供 bootstrap receipt 和 base delta 事实。其后的 implementation review 统一审查实现与该 delta，不再由同步流程重复做一轮完整语义审查。
 - 未 opt-in 的仓库、旧 scope contract 和普通用户维持原行为。
 

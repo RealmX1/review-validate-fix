@@ -33,6 +33,23 @@ STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"
 STATUS_INVALID = "invalid"
 
+# marker 的 ``state``：区分「已在跑 review」与「还卡在 pre-review local-base bootstrap 门前」。
+# 历史上只有一个笼统的 in_progress，于是读侧对一个**尚未开始 review**、只是在等 base 吸收的
+# agent 发出「继续收尾、输出 handoff」的错误提示；1h TTL 到期后又直接清锁回落常规 gate、重开
+# 一轮（32cad 家族）。拆成两个 state 后，等待态才能被读侧识别、复活并给出定向指令。
+STATE_IN_PROGRESS = "in_progress"
+STATE_WAITING_BOOTSTRAP = "waiting_bootstrap"
+
+# bootstrap receipt 校验通过后那次 prepare 重放的**持久占位**。它是入口 B 专属的进程外去重
+# 记账，不属于 gate 的白名单身份字段，故不落进 gate；也**刻意不落进 marker payload**：marker
+# 的每一个写侧（``stamp_bootstrap_gate`` / ``bump_*`` / ``revive_marker``）都是「读-改-写整份
+# payload」，两个并发 Stop 各持一份陈旧副本时，后写的一次会把前一次刚盖上的在途字段整份抹掉
+# ——占位于是失去原子性，两个进程各起一次 prepare 重放（同一 prep / 同一 run 目录被并发重复
+# 写）。改为 marker 旁的独立 sidecar 文件 + ``O_EXCL`` 抢占：这是「起 replay 之前先原子 claim」
+# 的最小原语，不受任何 marker 整份重写影响。文件名以 ``.`` 开头，故不会被锁根的 ``*.json``
+# 扫描（marker 枚举 / 测试断言）看成第二把锁。
+BOOTSTRAP_REPLAY_CLAIM_SUFFIX = ".bootstrap-replay-claim"
+
 
 @dataclass(frozen=True)
 class AcquireResult:
@@ -158,11 +175,14 @@ def marker_payload(
     message_id: str | None = None,
     turn_id: str | None = None,
     prompt_path: str | None = None,
+    state: str = STATE_IN_PROGRESS,
+    bootstrap_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ttl = ttl_seconds()
     return {
         "marker_version": MARKER_VERSION,
-        "state": "in_progress",
+        "state": state,
+        "bootstrap_gate": bootstrap_gate,
         "armed_at": _iso_now(),
         "expires_at": _iso_after(ttl),
         "ttl_seconds": ttl,
@@ -221,8 +241,233 @@ def write_marker(
     )
     if carried_nudge_count:
         payload["reengage_nudge_count"] = carried_nudge_count
+    # 新一轮 arm：上一轮遗留的重放占位（若有）必须清掉，否则它会在窗口内挡掉本轮的第一次重放。
+    try:
+        _bootstrap_replay_claim_path_for(target).unlink()
+    except (FileNotFoundError, OSError):
+        pass
     _atomic_write(target, payload)
     return target
+
+
+def stamp_bootstrap_gate(
+    marker: dict[str, Any],
+    *,
+    gate: dict[str, Any] | None,
+    state: str | None = None,
+) -> bool:
+    """读-改-写：把 pre-review bootstrap 等待 gate 盖进**这把**锁（``gate=None`` 即摘除）。
+
+    形状照抄 ``bump_reengage_nudge_count`` / ``stamp_pending_notified``：直接写
+    ``marker['_marker_path']``（``read_marker`` 注入的实际命中文件），不重新解析 marker_paths，
+    以免写到另一条路径上、也不会把同轮已累计的 ``reengage_nudge_count`` 冲掉。
+    best-effort：无 ``_marker_path`` 或写失败返回 False，绝不抛——锁记账永不阻断 Stop / UPS。
+    """
+    raw_path = marker.get("_marker_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    payload = {key: value for key, value in marker.items() if key != "_marker_path"}
+    payload["bootstrap_gate"] = dict(gate) if gate else None
+    if gate is None:
+        # 摘 gate = 这一轮的 bootstrap 等待已收尾。定向 re-engage 预算随之归零，免得日后同一把锁
+        # 再进等待态时，一开局就带着上一轮的计数被误判为「提示已给够」。在途重放占位同理：留着它
+        # 会让下一轮等待一开局就以为「上一次 replay 还在跑」而白白跳过一次重放。
+        payload.pop("bootstrap_reengage_count", None)
+    if state is not None:
+        payload["state"] = state
+    try:
+        _atomic_write(Path(raw_path), payload)
+    except OSError:
+        return False
+    if gate is None:
+        marker.pop("bootstrap_reengage_count", None)
+        release_bootstrap_replay_in_flight(marker)
+    marker.update(payload)
+    return True
+
+
+def _bootstrap_replay_claim_path_for(marker_path: Path) -> Path:
+    return marker_path.with_name(f".{marker_path.name}{BOOTSTRAP_REPLAY_CLAIM_SUFFIX}")
+
+
+def _bootstrap_replay_claim_path(marker: dict[str, Any] | None) -> Path | None:
+    """这把锁对应的 claim sidecar 路径（无 ``_marker_path`` 时 None）。"""
+    raw_path = marker.get("_marker_path") if isinstance(marker, dict) else None
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    return _bootstrap_replay_claim_path_for(Path(raw_path))
+
+
+def _bootstrap_replay_claim_age(claim_path: Path) -> float | None:
+    """claim 已持有多久（秒）。文件不在 / 内容坏了一律 None = 「没有可信的在途占位」。"""
+    try:
+        payload = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    claimed = _parse_iso_ts(payload.get("claimed_at"))
+    if claimed is None:
+        return None
+    return max(0.0, datetime.now(timezone.utc).timestamp() - claimed)
+
+
+def bootstrap_replay_in_flight_age_seconds(marker: dict[str, Any] | None) -> float | None:
+    """在途重放占位已存在多久（秒）。无占位 / 坏值一律 None = 「没有在途重放」（可以起新的）。
+
+    只交出「多久以前」，**替换窗口多长是调用方的策略**（Stop 侧按 env 可调），本模块只管存取。
+    纯读侧诊断；真正决定「本轮能不能起 replay」的是 ``claim_bootstrap_replay_in_flight``。
+    """
+    claim_path = _bootstrap_replay_claim_path(marker)
+    if claim_path is None:
+        return None
+    return _bootstrap_replay_claim_age(claim_path)
+
+
+def claim_bootstrap_replay_in_flight(
+    marker: dict[str, Any],
+    *,
+    window_seconds: float,
+) -> tuple[bool, float | None]:
+    """**起 prepare 重放之前**的原子占位，返回 ``(claimed, in_flight_age_seconds)``。
+
+    ``claimed=True`` = 本进程抢到了这一轮重放，调用方可以起 replay；``claimed=False`` = 已有
+    另一个进程在窗口内持有占位（``in_flight_age_seconds`` 是它的年龄），本轮**不得**再起第二次
+    ——否则同一 prep / 同一 run_id 会被并发重复 prepare、同一个 run 目录被重复写。
+
+    抢占用 ``O_EXCL`` 建 sidecar 文件（内核级互斥），**不是**「先读再写 marker」：后者两个并发
+    Stop 会同时读到「无在途标记」并各自进入 replay（占位是事后写的），而且 marker 的整份
+    读-改-写还会互相抹掉刚写下的字段。
+
+    上界仍在：占位超过 ``window_seconds`` 即视为过期（worker 卡死 / 进程被杀），在 takeover
+    flock 下重新校验后抢占，让本轮还能再试一次——一个卡死的 worker 不会永久堵死这把锁。
+
+    best-effort：拿不到 claim 路径 / 文件系统报错一律放行（返回 ``True``），记账永不阻断 Stop。
+    """
+    claim_path = _bootstrap_replay_claim_path(marker)
+    if claim_path is None:
+        return True, None
+    encoded = (
+        json.dumps(
+            {"claimed_at": _iso_now(), "claimed_by_pid": os.getpid()}, ensure_ascii=False
+        )
+        + "\n"
+    )
+    try:
+        claim_path.parent.mkdir(parents=True, exist_ok=True)
+        _open_marker_exclusive(claim_path, encoded)
+        return True, None
+    except FileExistsError:
+        pass
+    except OSError:
+        return True, None
+
+    age = _bootstrap_replay_claim_age(claim_path)
+    if age is not None and age < window_seconds:
+        return False, age
+    # 占位已过窗口（或内容不可信）→ 允许抢占，但抢占本身也必须互斥：拿 takeover flock 后重新
+    # 校验一次，避免两个进程同时判定「已过期」而双双接手。
+    try:
+        with _with_takeover_lock(claim_path):
+            age = _bootstrap_replay_claim_age(claim_path)
+            if age is not None and age < window_seconds:
+                return False, age
+            try:
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                _open_marker_exclusive(claim_path, encoded)
+            except FileExistsError:
+                return False, age
+            return True, age
+    except OSError:
+        return True, age
+
+
+def release_bootstrap_replay_in_flight(marker: dict[str, Any] | None) -> bool:
+    """释放在途重放占位（重放已收尾 / 已确定失败，允许下一次 Stop 立刻再试）。绝不抛。"""
+    claim_path = _bootstrap_replay_claim_path(marker)
+    if claim_path is None:
+        return False
+    try:
+        claim_path.unlink()
+    except (FileNotFoundError, OSError):
+        return False
+    return True
+
+
+def bootstrap_reengage_count(marker: dict[str, Any] | None) -> int:
+    """读出这把锁上已累计的 bootstrap 定向 re-engage 次数（缺省 0，坏值按 0）。
+
+    与 ``reengage_nudge_count`` 物理隔离：那把预算管的是「review 已在跑、催 agent 收尾」，
+    这把管的是「review 还没开始、催 agent 去吸收 base」。两者混用会互相削预算。
+    """
+    if not isinstance(marker, dict):
+        return 0
+    try:
+        return max(0, int(marker.get("bootstrap_reengage_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def bump_bootstrap_reengage_count(marker: dict[str, Any]) -> int:
+    """读-改-写：``bootstrap_reengage_count`` +1，原子写回其原文件，返回新计数。
+
+    形状与 ``bump_reengage_nudge_count`` 一致（直接写 ``_marker_path``、best-effort 不抛），
+    但**同时把新计数写回传入的 ``marker`` 字典**：等待态一次 Stop 里可能连着复活 + 计数两次
+    落盘，若各自从同一份陈旧内存副本重写整份 payload，后写的一次会把先写的字段抹掉。
+    """
+    current = bootstrap_reengage_count(marker)
+    raw_path = marker.get("_marker_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return current
+    payload = {key: value for key, value in marker.items() if key != "_marker_path"}
+    payload["bootstrap_reengage_count"] = current + 1
+    try:
+        _atomic_write(Path(raw_path), payload)
+    except OSError:
+        return current
+    marker.update(payload)
+    return current + 1
+
+
+def revive_count(marker: dict[str, Any] | None) -> int:
+    """读出这把锁已被就地复活过几次（缺省 0，坏值按 0）。"""
+    if not isinstance(marker, dict):
+        return 0
+    try:
+        return max(0, int(marker.get("revived_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def revive_marker(marker: dict[str, Any]) -> bool:
+    """把一把**已过 TTL 但本轮尚未完成**的锁就地续期为 active（参照 rvf_prep_file 的 FU-1 方案 B）。
+
+    只重写 ``expires_at`` / ``ttl_seconds`` 并递增 ``revived_count``，``armed_at`` 与
+    ``reengage_nudge_count`` / ``bootstrap_gate`` 原样保留——复活的是**同一轮**，不是新一轮。
+    用于 bootstrap 等待期跨过 1h 锁 TTL 的场景：此时清锁会让读侧回落常规 gate 并重开一轮
+    （32cad 家族），而这一轮其实只是还没等到 base 吸收完成。best-effort，绝不抛。
+
+    同 ``bump_bootstrap_reengage_count``：续期字段**同时写回传入的 ``marker`` 字典**，使同一次
+    Stop 里紧随其后的另一次整份重写不会把刚续的期抹回去。
+    """
+    raw_path = marker.get("_marker_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    ttl = ttl_seconds()
+    payload = {key: value for key, value in marker.items() if key != "_marker_path"}
+    payload["expires_at"] = _iso_after(ttl)
+    payload["ttl_seconds"] = ttl
+    payload["revived_at"] = _iso_now()
+    payload["revived_count"] = revive_count(marker) + 1
+    try:
+        _atomic_write(Path(raw_path), payload)
+    except OSError:
+        return False
+    marker.update(payload)
+    return True
 
 
 def acquire_marker(
@@ -317,6 +562,12 @@ def clear_marker(
 ) -> list[str]:
     removed: list[str] = []
     for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
+        # 锁没了，这把锁的重放占位就失去意义：不一并摘掉，它会在窗口内（默认 15min）把**下一
+        # 轮**的第一次重放白白挡掉。sidecar 不是锁本身，故不计入 removed。
+        try:
+            _bootstrap_replay_claim_path_for(path).unlink()
+        except (FileNotFoundError, OSError):
+            pass
         try:
             path.unlink()
         except FileNotFoundError:

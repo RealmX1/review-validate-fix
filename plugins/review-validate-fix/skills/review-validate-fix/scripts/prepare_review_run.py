@@ -18,6 +18,7 @@ from typing import Any, Mapping
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import concurrent.futures
+import rvf_bootstrap_gate
 import rvf_prep_file
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
@@ -1728,6 +1729,29 @@ def scope_contract_v3_extensions_from_prep_payload(
     return extensions
 
 
+def _bootstrap_gate_parent_attempt(
+    existing_state: Any, rvf_run_id: str | None
+) -> dict[str, str | None]:
+    """本轮等待的**上一次尝试** run 血缘（供 `build_bootstrap_gate` 的 parent_attempt_* 参数）。
+
+    同一个 run 上反复重放 prepare 不算「新一轮独立 RVF」，故 run_id 未变时把上一枚 gate 记的
+    parent 原样带下去；只有当本轮确实换了 run（旧工件丢失后重开）才把旧 run 记成 parent。
+    """
+    previous = rvf_bootstrap_gate.gate_of(existing_state)
+    if previous is None:
+        return {"parent_attempt_run_id": None, "parent_attempt_run_dir": None}
+    previous_run_id = previous.get("rvf_run_id")
+    if previous_run_id and previous_run_id != rvf_run_id:
+        return {
+            "parent_attempt_run_id": previous_run_id,
+            "parent_attempt_run_dir": previous.get("rvf_run_dir"),
+        }
+    return {
+        "parent_attempt_run_id": previous.get("parent_attempt_run_id"),
+        "parent_attempt_run_dir": previous.get("parent_attempt_run_dir"),
+    }
+
+
 def prepare_run_from_prep_file(
     prep: rvf_prep_file.PrepFileRecord,
     *,
@@ -1865,10 +1889,30 @@ def prepare_run_from_prep_file(
             "error": f"prepare_run exceeded {timeout_seconds:.0f}s timeout",
         }
     except BootstrapRequiredBeforeRvf as exc:
+        # 「等 local base bootstrap」不是失败，而是一个**可恢复的等待态**：给它独立的 status
+        # （不与真失败混同）并附一枚白名单 gate 子记录，让两条入口（rvf-agent decision-token /
+        # kanban follow-up）都能持久化、重验证、按同一 run 恢复。此路径在 start_run 之前抛出，
+        # 故不建 run、不分配 lease、不派 reviewer——gate 只描述「等什么、等谁、在哪等」。
         executor.shutdown(wait=False, cancel_futures=True)
         completed_state = {
             **state,
             **exc.payload,
+            "status": rvf_bootstrap_gate.WAITING_STATUS,
+            "bootstrap_gate": rvf_bootstrap_gate.build_bootstrap_gate(
+                target_repo,
+                exc.payload,
+                origin_kind=(
+                    rvf_bootstrap_gate.BOOTSTRAP_ORIGIN_KANBAN_FOLLOWUP
+                    if rvf_backend == "kanban-followup"
+                    else rvf_bootstrap_gate.BOOTSTRAP_ORIGIN_DECISION_TOKEN
+                ),
+                origin_prep_token=prep.token,
+                origin_kanban_task_id=payload.get("target_kanban_task_id"),
+                origin_session_id=payload.get("origin_session_id"),
+                rvf_run_id=rvf_run_id,
+                rvf_run_dir=rvf_run_dir,
+                **_bootstrap_gate_parent_attempt(existing_state, rvf_run_id),
+            ),
             "completed_at": _shared_workflow_now(),
         }
     except Exception as exc:

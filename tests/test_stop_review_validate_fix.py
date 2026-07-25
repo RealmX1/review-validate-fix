@@ -4874,6 +4874,7 @@ def test_resolve_cline_kanban_agent_id_mirrors_parent_harness(tmp_path: Path) ->
 from _rvf_stop_hook_support import kanban_followup_dispatch_and_lock as _kbfu
 _kbfu.inject(
     SCRIPT=SCRIPT,
+    run=run,
     init_repo=init_repo,
     init_repo_with_head=init_repo_with_head,
     invoke=invoke,
@@ -5573,6 +5574,15 @@ def main() -> int:
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch,
+        test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff,
+        test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening,
+        test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears,
+        test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock,
+        test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops,
+        test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption,
+        test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets,
+        test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout,
+        test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
         test_rvf_analyze_manual_invocation_skips_one_turn,
         test_review_reopen_marker_reopens_run_scope_before_dispatch,

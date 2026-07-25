@@ -12,7 +12,9 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 # 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
@@ -42,6 +44,15 @@ __all__ = [
     'test_kanban_followup_stale_takeover_rechecks_marker_before_unlink',
     'test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots',
     'test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch',
+    'test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff',
+    'test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening',
+    'test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears',
+    'test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock',
+    'test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops',
+    'test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption',
+    'test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets',
+    'test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout',
+    'test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending',
 ]
 
 
@@ -1703,3 +1714,1008 @@ def test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dis
     assert Path(marker_path).exists()
     assert not client_calls.exists()
 
+
+
+# ---------------------------------------------------------------------------
+# pre-review local-base bootstrap 等待态的 Stop 读侧（入口 B）
+#
+# 这一族守的是「锁上挂着 bootstrap 等待 gate」时的三条分支：ACTIVE 时不得发通用「去收尾
+# handoff」提示、STALE 时不得清锁重开（32cad 家族）、receipt 有效时按**原 run** 恢复且不
+# 产生第二把锁 / 第二轮 RVF。
+# ---------------------------------------------------------------------------
+
+def load_bootstrap_gate_module():
+    """加载 Stop hook 已 top-level import 的 rvf_bootstrap_gate（与锁模块同构的取法）。"""
+    load_hook_module()
+    module = sys.modules.get("rvf_bootstrap_gate")
+    assert module is not None
+    return module
+
+
+def _git_stdout(args: list[str], cwd: Path) -> str:
+    """取 git stdout。本簇注入的 ``run`` 只跑不取输出（返回 None），故 bootstrap fixture 自带一个。"""
+    completed = subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+def _bootstrap_opt_in_task_repo(path: Path) -> dict[str, object]:
+    """建一个「local base 声明了 pre-review 同步 marker、task 尚未吸收」的真实仓库。"""
+    repo = init_repo(path, dirty=False)
+    run(["git", "config", "user.email", "rvf@example.test"], repo)
+    run(["git", "config", "user.name", "RVF Test"], repo)
+    (repo / "changed.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", "changed.txt"], repo)
+    run(["git", "commit", "-q", "-m", "base"], repo)
+    task_start = _git_stdout(["rev-parse", "HEAD"], repo)
+    run(["git", "branch", "-M", "main"], repo)
+    (repo / "AGENTS.md").write_text(
+        "RVF-PRE-REVIEW-BASE-SYNC-SKILL: sync-local-base-into-task-worktree-only\n",
+        encoding="utf-8",
+    )
+    run(["git", "add", "AGENTS.md"], repo)
+    run(["git", "commit", "-q", "-m", "base enables pre-review sync"], repo)
+    local_base_tip = _git_stdout(["rev-parse", "HEAD"], repo)
+    run(["git", "checkout", "-q", "--detach", task_start], repo)
+    (repo / "changed.txt").write_text("task change\n", encoding="utf-8")
+    return {
+        "repo": repo,
+        "task_start": task_start,
+        "local_base_ref": "main",
+        "local_base_tip": local_base_tip,
+    }
+
+
+def _waiting_bootstrap_marker(
+    *,
+    state: Path,
+    fixture: dict[str, object],
+    run_dir: Path,
+    expires_at: str,
+    task_id: str = "task-bootstrap",
+    session_id: str = "session-bootstrap",
+    run_id: str = "rvf-bootstrap",
+) -> Path:
+    """在锁根下种一把 ``state=waiting_bootstrap`` 的 in-progress 锁（gate 经真模块构造）。"""
+    gate_module = load_bootstrap_gate_module()
+    repo = fixture["repo"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    gate = gate_module.build_bootstrap_gate(
+        repo,
+        {
+            "required_skill": "sync-local-base-into-task-worktree-only",
+            "local_base_ref": fixture["local_base_ref"],
+            "local_base_tip": fixture["local_base_tip"],
+            "task_head": _git_stdout(["rev-parse", "HEAD"], repo),
+        },
+        origin_kind=gate_module.BOOTSTRAP_ORIGIN_KANBAN_FOLLOWUP,
+        origin_prep_token="0123456789abcdef",
+        origin_kanban_task_id=task_id,
+        origin_session_id=session_id,
+        rvf_run_id=run_id,
+        rvf_run_dir=str(run_dir),
+    )
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = marker_dir / f"task-{task_id}.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "waiting_bootstrap",
+                "bootstrap_gate": gate,
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": expires_at,
+                "kanban_task_id": task_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker_path
+
+
+def test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff(
+    tmp_path: Path,
+) -> None:
+    """锁 active 且挂着 bootstrap 等待 gate：给**定向**同步指令，不发通用「去收尾 handoff」提示。
+
+    这一轮 review 根本还没开始（run/scope 未建、reviewer 未派），旧的 nudge/skip 两条分支都以
+    「review 正在跑、只差 handoff」为前提，对它是错误指令。断言：force-continue 的 reason 指向
+    同步 skill 与 receipt，而**不含** RVF_HANDOFF_FILE；且不消耗 re-engage nudge 预算。
+    """
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(fixture["repo"]),
+            "session_id": "session-bootstrap",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这轮任务。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-bootstrap",
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert set(payload.keys()) == {"decision", "reason"}, payload
+    assert payload["decision"] == "block"
+    reason = payload["reason"]
+    assert "sync-local-base-into-task-worktree-only" in reason
+    assert "BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF" in reason
+    assert "尚未开始 review" in reason
+    assert "RVF_HANDOFF_FILE" not in reason  # 不是「去收尾 handoff」那条通用提示
+    latest = latest_summary(state)
+    assert latest["status"] == "reengaged"
+    assert latest["reason_code"] == "kanban_followup_bootstrap_bootstrap_still_required"
+    events = latest_events(state)
+    assert [e for e in events if e.get("event") == "kanban_followup_bootstrap_gate_waiting"]
+    assert not [e for e in events if e.get("event") == "kanban_followup_in_progress_nudged"]
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "waiting_bootstrap"
+    assert "revived_count" not in persisted  # 锁还没过期，不该被复活
+
+
+def test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening(
+    tmp_path: Path,
+) -> None:
+    """32cad 重放：等待期跨过 1h 锁 TTL —— 锁必须被**复活**，绝不清锁 + 回落常规 gate 重开一轮。
+
+    旧行为：stale 分支无条件 clear_marker + return None → 常规 gate 判「没人在跑」→ 重铸 token /
+    新开 run，于是同一轮 bootstrap 等待被反复重开。断言：锁仍在、expires_at 被推到未来、
+    revived_count=1，且**没有** ..._marker_consumed_incomplete 事件、没有派发新 RVF。
+    """
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2000-01-01T00:00:00Z",  # 已过 TTL → STALE
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(fixture["repo"]),
+            "session_id": "session-bootstrap",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这轮任务。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-bootstrap",
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert set(payload.keys()) == {"decision", "reason"}, payload
+    assert payload["decision"] == "block"
+    assert "sync-local-base-into-task-worktree-only" in payload["reason"]
+
+    assert marker_path.exists(), "stale 的 bootstrap 等待锁被清掉了（32cad 回归）"
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["revived_count"] == 1
+    assert persisted["state"] == "waiting_bootstrap"
+    # 复活的判据是「锁重新变回 active」，由真锁模块判定，而不是拿字符串比字面量。
+    assert persisted["expires_at"] != "2000-01-01T00:00:00Z"
+    lock_module = load_kanban_followup_lock_module()
+    assert lock_module.marker_status(persisted) == lock_module.STATUS_ACTIVE
+    assert persisted["bootstrap_gate"]["rvf_run_id"] == "rvf-bootstrap"
+    events = latest_events(state)
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_consumed_incomplete"
+    ], events
+    waiting = [e for e in events if e.get("event") == "kanban_followup_bootstrap_gate_waiting"]
+    assert len(waiting) == 1
+    assert waiting[0].get("lock_revived") is True
+    assert waiting[0].get("bootstrap_phase") == "bootstrap_interrupted_retryable"
+    # 锁根下只该有这**一把**锁：恢复不得产生第二把 / 第二轮。
+    assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
+        "task-task-bootstrap.json"
+    ]
+
+
+def test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears(
+    tmp_path: Path,
+) -> None:
+    """receipt 有效 → 按**原 run** 重放并摘掉 gate（锁不清）；工件丢失 → 清锁安全回 fresh。
+
+    重放本身（prepare 全套）在别处已被覆盖，这里把 replay 注入成可控 stub，专测 Stop 读侧的
+    三条收尾动作：resolved 不清锁 / 不新开、重放未完成时维持等待、artifact_lost 才清锁。
+    """
+    module = load_hook_module()
+    gate_module = load_bootstrap_gate_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["_marker_path"] = str(marker_path)
+    gate = marker["bootstrap_gate"]
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    original_reconcile = gate_module.reconcile_bootstrap_gate
+    original_replay = gate_module.replay_prepare_for_gate
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+
+        # ① receipt 有效 + 重放成功 → 摘 gate、锁回 in_progress（**不清锁**）、force-continue 续审。
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_RECEIPT_VALID,
+                phase=gate_module.PHASE_REVIEWING,
+                reason="bootstrap_receipt_valid",
+                diagnostic="stub: receipt 有效",
+                resume_run_id=g.get("rvf_run_id"),
+                resume_run_dir=g.get("rvf_run_dir"),
+            )
+        )
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = lambda g, **kw: {
+            "status": "completed",
+            "run_id": g.get("rvf_run_id"),
+            "run_dir": g.get("rvf_run_dir"),
+        }
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=dict(marker),
+            task_id="task-bootstrap",
+            session_id="session-bootstrap",
+            cwd=str(fixture["repo"]),
+            store_expired=False,
+        )
+        assert handled is True
+        assert decision is not None and decision.payload.get("decision") == "block"
+        assert "rvf-bootstrap" in decision.payload["reason"]
+        assert "不要**新开 review" in decision.payload["reason"]
+        assert marker_path.exists(), "bootstrap 收尾时不得清锁（否则常规 gate 会重开一轮）"
+        resolved = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert resolved["bootstrap_gate"] is None
+        assert resolved["state"] == "in_progress"
+
+        # ② receipt 有效但重放没跑成 → 维持等待、锁仍在、gate 不摘。
+        marker_path.write_text(
+            json.dumps({**marker, "bootstrap_gate": gate}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = lambda g, **kw: {
+            "status": "timeout",
+            "error": "stub: 重放超时",
+        }
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=dict(marker),
+            task_id="task-bootstrap",
+            session_id="session-bootstrap",
+            cwd=str(fixture["repo"]),
+            store_expired=False,
+        )
+        assert handled is True
+        assert decision is not None and decision.payload.get("decision") == "block"
+        assert marker_path.exists()
+        assert json.loads(marker_path.read_text(encoding="utf-8"))["bootstrap_gate"] is not None
+
+        # ③ 等待期工件丢失 → 清锁安全回 fresh（无在途工作可撞），并显式落账原因。
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_ARTIFACT_LOST,
+                phase=gate_module.PHASE_BOOTSTRAP_INTERRUPTED_RETRYABLE,
+                reason="rvf_run_artifacts_missing",
+                diagnostic="stub: 工件丢失",
+            )
+        )
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=dict(marker),
+            task_id="task-bootstrap",
+            session_id="session-bootstrap",
+            cwd=str(fixture["repo"]),
+            store_expired=True,
+        )
+        assert handled is True
+        assert decision is None  # 回落常规 gate
+        assert not marker_path.exists()
+        events = latest_events(state / "log")
+        assert [
+            e for e in events if e.get("event") == "kanban_followup_bootstrap_gate_artifacts_lost"
+        ]
+    finally:
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = original_reconcile
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = original_replay
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+def test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout(
+    tmp_path: Path,
+) -> None:
+    """重放结果必须**分类**处理，不得一律折叠成 still_waiting（RVF-001 回归）。
+
+    ① ``artifact_lost``：prep 文件 TTL 只有 300s（远短于一次 bootstrap 等待，且 sweep_stale 会删
+       它），此时本轮没有任何在途工作可撞——必须立刻走「显式诊断 + 清锁安全重来」，而不是被硬等
+       到 re-engage / revive 预算耗尽。
+    ② ``timeout``：重放跑在独立子进程里（内层预算到点自己写结果 `os._exit`，外层硬上限按进程组
+       SIGKILL），收尾后**不留**在途 prepare 写者。故超时必须释放起 replay 前抢到的占位，让下一次
+       Stop **立刻**重试同一个 run 的 prepare（RVF-009 回归）——扣着占位只会把一轮本可立刻恢复的
+       等待白拖满替换窗口，还给 agent 一条「仍在后台进行」的事实错误 reason。
+    ③ 并发去重仍在，且是**有界**的：占位被别的持有者握着时本轮不起第二次重放；持有者崩在半路
+       （占位过接手窗口）则就地接手。
+    顺带守 RVF-002 在入口 B 的写侧：校验通过的 receipt digest 必须被盖回锁上的 gate。
+    """
+    module = load_hook_module()
+    gate_module = load_bootstrap_gate_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+    pristine = marker_path.read_text(encoding="utf-8")
+
+    def _marker() -> dict:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        payload["_marker_path"] = str(marker_path)
+        return payload
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    original_reconcile = gate_module.reconcile_bootstrap_gate
+    original_replay = gate_module.replay_prepare_for_gate
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    replay_calls: list[str] = []
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_RECEIPT_VALID,
+                phase=gate_module.PHASE_REVIEWING,
+                reason="bootstrap_receipt_valid",
+                diagnostic="stub: receipt 有效",
+                receipt_path=str(tmp_path / "receipt.json"),
+                receipt_digest="a" * 64,
+                resume_run_id=g.get("rvf_run_id"),
+                resume_run_dir=g.get("rvf_run_dir"),
+            )
+        )
+
+        def _replay_timeout(g, **kw):
+            replay_calls.append("timeout")
+            return {"status": "timeout", "error": "stub: 重放超时，后台 worker 仍在跑"}
+
+        def _replay_artifact_lost(g, **kw):
+            replay_calls.append("artifact_lost")
+            return {"status": "artifact_lost", "error": "stub: prep 文件已被 sweep"}
+
+        # ① 重放超时 → 维持等待，但**释放**占位；gate 上还必须带上已校验的 receipt digest。
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = _replay_timeout
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision is not None and decision.payload.get("decision") == "block"
+        # 已经吸收完、receipt 也验过了：定向指令必须**反过来**要求别再跑同步 skill、别动 receipt。
+        assert "**不要**再跑一次同步 skill" in decision.payload["reason"]
+        persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert persisted["bootstrap_gate"] is not None
+        assert persisted["bootstrap_gate"]["bootstrap_receipt_digest"] == "a" * 64
+        lock_module = load_kanban_followup_lock_module()
+        # 在途占位落在 marker **旁边**的 claim sidecar 上（不在 payload 里：payload 的整份
+        # 读-改-写会被并发 Stop 互相抹掉，占位就不再原子）。超时后子进程已收尾、没有在途写者，
+        # 占位必须被释放，否则下一轮什么都不能做，只能干等满替换窗口。
+        assert (
+            lock_module.bootstrap_replay_in_flight_age_seconds(
+                {"_marker_path": str(marker_path)}
+            )
+            is None
+        ), "重放超时后占位没被释放（本可立刻重试的一轮被白拖满替换窗口）"
+        assert replay_calls == ["timeout"]
+
+        # ② 紧接着的下一次 Stop（远在替换窗口之内）：必须**立刻**重新抢占并重试同一个 run 的
+        # prepare，而不是被上一轮超时留下的占位挡掉。
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision is not None and decision.payload.get("decision") == "block"
+        assert replay_calls == ["timeout", "timeout"], "超时后的下一次 Stop 没能立刻重试重放"
+        pending = [
+            e
+            for e in latest_events(state / "log")
+            if e.get("event") == "kanban_followup_bootstrap_gate_replay_pending"
+        ]
+        assert len(pending) == 2  # ① 与 ② 各一条，且与普通 waiting 事件区分
+        # 超时 = 「这次重放已收尾但没成功、可以立刻再试」，不是「还有人在跑」。
+        assert pending[-1]["reason_code"] == "kanban_followup_bootstrap_bootstrap_replay_incomplete"
+        assert not [
+            e
+            for e in latest_events(state / "log")
+            if e.get("event") == "kanban_followup_bootstrap_gate_waiting"
+        ]
+
+        # ③ 并发去重仍在：占位被**另一个仍在跑重放的持有者**握着时，本轮不得起第二次重放。
+        assert lock_module.claim_bootstrap_replay_in_flight(
+            {"_marker_path": str(marker_path)}, window_seconds=3600
+        )[0] is True
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert replay_calls == ["timeout", "timeout"], "占位在途时又起了第二次 prepare 重放"
+        in_flight = [
+            e
+            for e in latest_events(state / "log")
+            if e.get("event") == "kanban_followup_bootstrap_gate_replay_pending"
+        ]
+        assert in_flight[-1]["reason_code"] == "kanban_followup_bootstrap_bootstrap_replay_in_flight"
+
+        # ④ 接手窗口设为 0（持有者崩在半路）→ 允许接手再试，去重是**有界**的而非永久禁止重放。
+        os.environ[module.KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV] = "0"
+        try:
+            handled, decision = module._kanban_followup_bootstrap_gate_decision(
+                ledger, marker=_marker(), task_id="task-bootstrap",
+                session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+            )
+        finally:
+            os.environ.pop(module.KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_ENV, None)
+        assert handled is True
+        assert replay_calls == ["timeout", "timeout", "timeout"]
+
+        # ⑤ 重放报 artifact_lost → 清锁安全重来（不是继续空等），并落一条**可区分**的事件。
+        marker_path.write_text(pristine, encoding="utf-8")
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = _replay_artifact_lost
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision is None  # 回落常规 gate，而不是硬挡着继续等
+        assert not marker_path.exists()
+        assert replay_calls == ["timeout", "timeout", "timeout", "artifact_lost"]
+        events = latest_events(state / "log")
+        lost = [
+            e
+            for e in events
+            if e.get("event") == "kanban_followup_bootstrap_gate_replay_artifact_lost"
+        ]
+        assert len(lost) == 1
+        assert lost[0]["reason_code"] == "kanban_followup_bootstrap_bootstrap_replay_artifact_lost"
+        # 与「reconcile 级工件丢失」是两条可区分的路径，不共用同一个事件名。
+        assert not [
+            e for e in events if e.get("event") == "kanban_followup_bootstrap_gate_artifacts_lost"
+        ]
+    finally:
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = original_reconcile
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = original_replay
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+def test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock(
+    tmp_path: Path,
+) -> None:
+    """从 STALE 进入 + receipt 有效 + 重放成功：摘 gate 的**同时**必须把锁续回 active。
+
+    ``stamp_bootstrap_gate`` 是读-改-写，会原样保留已经过期的 ``expires_at``：只把 ``state``
+    写回 ``in_progress`` 的话，锁的 marker_status 仍是 stale。下一次 Stop：gate 已摘 →
+    bootstrap 分支 handled=False → 落到既有 stale 分支 clear_kanban_followup_lock + return
+    None → 常规 gate 判「没人在跑」→ 为同一个仍在继续的 run 再开一轮 review。正是这套改动
+    本来要根治的 32cad 失败模式在「恢复成功」这条路径上原样复活。
+    """
+    module = load_hook_module()
+    gate_module = load_bootstrap_gate_module()
+    lock_module = load_kanban_followup_lock_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2000-01-01T00:00:00Z",
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["_marker_path"] = str(marker_path)
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    original_reconcile = gate_module.reconcile_bootstrap_gate
+    original_replay = gate_module.replay_prepare_for_gate
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+        # 前提：这把锁**确实**已过 TTL（本轮就是从 stale 分支进来的）。
+        assert lock_module.marker_status(marker) == lock_module.STATUS_STALE
+
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_RECEIPT_VALID,
+                phase=gate_module.PHASE_REVIEWING,
+                reason="bootstrap_receipt_valid",
+                diagnostic="stub: receipt 有效",
+                resume_run_id=g.get("rvf_run_id"),
+                resume_run_dir=g.get("rvf_run_dir"),
+            )
+        )
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = lambda g, **kw: {
+            "status": "completed",
+            "run_id": g.get("rvf_run_id"),
+            "run_dir": g.get("rvf_run_dir"),
+        }
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=dict(marker),
+            task_id="task-bootstrap",
+            session_id="session-bootstrap",
+            cwd=str(fixture["repo"]),
+            store_expired=True,
+        )
+        assert handled is True
+        assert decision is not None and decision.payload.get("decision") == "block"
+        assert marker_path.exists(), "bootstrap 收尾时不得清锁（否则常规 gate 会重开一轮）"
+        persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert persisted["bootstrap_gate"] is None
+        assert persisted["state"] == "in_progress"
+        # 核心回归判据：锁重新变回 **active 的 in_progress 锁**（由真锁模块判定，不比字面量）。
+        assert persisted["expires_at"] != "2000-01-01T00:00:00Z"
+        assert lock_module.marker_status(persisted) == lock_module.STATUS_ACTIVE
+
+        # 复演下一次 Stop：读到的是 active 锁 → 走常规 active 分支（handled=False 交回上层的
+        # nudge/skip），而**不是** stale 清锁分支；锁仍在，且没有第二把锁 / 第二轮。
+        next_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        next_marker["_marker_path"] = str(marker_path)
+        assert lock_module.marker_status(next_marker) == lock_module.STATUS_ACTIVE
+        handled_next, decision_next = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=next_marker,
+            task_id="task-bootstrap",
+            session_id="session-bootstrap",
+            cwd=str(fixture["repo"]),
+            store_expired=False,
+        )
+        assert handled_next is False and decision_next is None
+        assert marker_path.exists()
+        assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
+            "task-task-bootstrap.json"
+        ]
+        resolved = [
+            e
+            for e in latest_events(state / "log")
+            if e.get("event") == "kanban_followup_bootstrap_gate_resolved"
+        ]
+        assert len(resolved) == 1
+    finally:
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = original_reconcile
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = original_replay
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+def test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops(
+    tmp_path: Path,
+) -> None:
+    """两个并发 Stop 同时判到「receipt 有效」时，只有**一个**能真正起 prepare 重放。
+
+    在途占位若是**事后**才写（只在 replay 返回 timeout 时盖），两个并发进入者会同时读到
+    「无在途标记」并各自起一次 replay —— 同一 prep / 同一 run_id 被并发 prepare、同一个 run
+    目录被重复写。故占位必须在起 replay **之前**原子抢占；且必须落在 marker payload 之外，
+    否则另一个 Stop 那次整份读-改-写（把 receipt digest 盖回 gate）会顺手把刚落的占位抹掉。
+
+    本用例刻意让两个进入者**各持一份在对方写盘之前读到的陈旧 marker 副本**（真实竞态形状）。
+    """
+    module = load_hook_module()
+    gate_module = load_bootstrap_gate_module()
+    lock_module = load_kanban_followup_lock_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+
+    def _stale_copy() -> dict:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        payload["_marker_path"] = str(marker_path)
+        return payload
+
+    first_marker = _stale_copy()
+    second_marker = _stale_copy()
+
+    entered_replay = threading.Event()
+    second_finished = threading.Event()
+    calls_lock = threading.Lock()
+    replay_calls: list[str] = []
+    results: dict[str, tuple] = {}
+    errors: list[BaseException] = []
+
+    def _replay(gate, **_kwargs):
+        name = threading.current_thread().name
+        with calls_lock:
+            replay_calls.append(name)
+        if name == "stop-first":
+            # 把「第一个 Stop 正卡在 replay 里」这段窗口撑开，让第二个 Stop 恰好在此期间进入。
+            entered_replay.set()
+            second_finished.wait(timeout=30)
+        return {"status": "timeout", "error": "stub: 重放超时，后台 worker 仍在跑"}
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    original_reconcile = gate_module.reconcile_bootstrap_gate
+    original_replay = gate_module.replay_prepare_for_gate
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    try:
+        # 两个 Stop 各写各的 ledger：本用例验的是重放去重，不该被两个线程往同一份
+        # events.jsonl 交错追加而变脆。
+        first_ledger = _make_test_ledger(module, state / "log-first")
+        second_ledger = _make_test_ledger(module, state / "log-second")
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_RECEIPT_VALID,
+                phase=gate_module.PHASE_REVIEWING,
+                reason="bootstrap_receipt_valid",
+                diagnostic="stub: receipt 有效",
+                receipt_path=str(tmp_path / "receipt.json"),
+                receipt_digest="b" * 64,
+                resume_run_id=g.get("rvf_run_id"),
+                resume_run_dir=g.get("rvf_run_dir"),
+            )
+        )
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = _replay
+
+        def _first() -> None:
+            try:
+                results["first"] = module._kanban_followup_bootstrap_gate_decision(
+                    first_ledger,
+                    marker=first_marker,
+                    task_id="task-bootstrap",
+                    session_id="session-bootstrap",
+                    cwd=str(fixture["repo"]),
+                    store_expired=False,
+                )
+            except BaseException as exc:  # noqa: BLE001 — 线程异常要带回主线程断言
+                errors.append(exc)
+            finally:
+                entered_replay.set()
+
+        def _second() -> None:
+            try:
+                assert entered_replay.wait(timeout=30), "第一个 Stop 始终没进入 replay"
+                results["second"] = module._kanban_followup_bootstrap_gate_decision(
+                    second_ledger,
+                    marker=second_marker,
+                    task_id="task-bootstrap",
+                    session_id="session-bootstrap",
+                    cwd=str(fixture["repo"]),
+                    store_expired=False,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                second_finished.set()
+
+        threads = [
+            threading.Thread(target=_first, name="stop-first"),
+            threading.Thread(target=_second, name="stop-second"),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not [t for t in threads if t.is_alive()], "并发 Stop 线程没能收尾"
+        assert not errors, errors
+
+        assert replay_calls == ["stop-first"], (
+            f"两个并发 Stop 各起了一次 prepare 重放（同一 run 目录并发重复写）：{replay_calls}"
+        )
+        handled_second, decision_second = results["second"]
+        assert handled_second is True
+        assert decision_second is not None
+        assert decision_second.payload.get("decision") == "block"
+        assert "正在跑本轮 prepare 重放" in decision_second.payload["reason"]
+        handled_first, decision_first = results["first"]
+        assert handled_first is True
+        assert decision_first is not None
+        # 占位的寿命 == 一次重放调用：持有者收尾（这里是超时）后必须释放，下一次 Stop 才能立刻
+        # 重试；去重只发生在「真的有人正在跑」的那段窗口里。
+        assert (
+            lock_module.bootstrap_replay_in_flight_age_seconds(
+                {"_marker_path": str(marker_path)}
+            )
+            is None
+        )
+        # 恢复不得产生第二把锁 / 第二轮。
+        assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
+            "task-task-bootstrap.json"
+        ]
+    finally:
+        second_finished.set()
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = original_reconcile
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = original_replay
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+def test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption(
+    tmp_path: Path,
+) -> None:
+    """非 opt-in / 无 gate 的旧锁：stale 语义**逐字不变**（仍是 consume + 回落常规 gate）。"""
+    module = load_hook_module()
+    state = tmp_path / "state"
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True)
+    marker_path = marker_dir / "task-legacy.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2000-01-01T00:00:00Z",
+                "kanban_task_id": "task-legacy",
+                "session_id": "session-legacy",
+                "run_id": "rvf-legacy",
+                "run_dir": str(tmp_path / "legacy-run"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["_marker_path"] = str(marker_path)
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger,
+            marker=marker,
+            task_id="task-legacy",
+            session_id="session-legacy",
+            cwd=str(tmp_path),
+            store_expired=True,
+        )
+        # 无 gate → 本分支完全不接手，旧的 active/stale 逻辑原样生效。
+        assert handled is False
+        assert decision is None
+        assert marker_path.exists()
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+
+
+def test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets(
+    tmp_path: Path,
+) -> None:
+    """等待态必须**终止**：护住一轮是对的，无界护住只是把「反复重开」换成「永久驻留」。
+
+    两条界各测一次：re-engage 预算用尽 → 退回静默 skip（不再硬挡 agent 干停，等待态仍保留）；
+    复活次数用尽 → 本分支不再接手（handled=False），交还既有 stale 语义清锁、明确放弃本轮。
+    """
+    module = load_hook_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+
+    def _marker(**overrides: object) -> dict:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        payload.update(overrides)
+        payload["_marker_path"] = str(marker_path)
+        return payload
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+
+        # ① 预算内：force-continue 定向指令，并把 bootstrap 专属计数（与 review nudge 预算隔离）+1。
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision.payload.get("decision") == "block"
+        persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+        assert persisted["bootstrap_reengage_count"] == 1
+        assert "reengage_nudge_count" not in persisted  # 不吃 review 收尾那把预算
+
+        # ② re-engage 预算用尽 → 静默 skip（{"continue":...}），等待态**不清**。
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(bootstrap_reengage_count=3), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision.payload.get("continue") is True
+        assert "decision" not in decision.payload
+        assert marker_path.exists()
+        assert json.loads(marker_path.read_text(encoding="utf-8"))["bootstrap_gate"] is not None
+
+        # ③ 复活预算用尽 → 不再复活、不接手，交回既有 stale 清锁语义（明确放弃本轮）。
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(revived_count=3), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=True,
+        )
+        assert handled is False
+        assert decision is None
+        events = latest_events(state / "log")
+        assert [
+            e
+            for e in events
+            if e.get("event") == "kanban_followup_bootstrap_gate_revive_budget_exhausted"
+        ]
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+def test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending(
+    tmp_path: Path,
+) -> None:
+    """re-engage 预算耗尽这条出口的诊断文案必须按「在等什么」分流（RVF-009 回归）。
+
+    预算检查排在 replay_pending 判定**之前**，所以这条出口同样会在「base 早已吸收、receipt 已
+    校验通过、只差 prepare 收尾」时到达。此时若照写「需要先跑同步 skill 吸收 local base」，就是
+    一条方向完全相反的记录——同一函数下方的 `bootstrap_replay_pending_reengage_reason` 明确写着
+    再跑一次同步 skill 会产出另一份 receipt、下一轮按 digest 判 tampered 把这一轮锁死。
+    """
+    module = load_hook_module()
+    gate_module = load_bootstrap_gate_module()
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",
+        expires_at="2999-01-01T00:00:00Z",
+    )
+
+    def _marker(**overrides: object) -> dict:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        payload.update(overrides)
+        payload["_marker_path"] = str(marker_path)
+        return payload
+
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    original_reconcile = gate_module.reconcile_bootstrap_gate
+    original_replay = gate_module.replay_prepare_for_gate
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+
+        # ① 「还没吸收 base」这条（reconcile 直接判 still_waiting）：文案照旧指向同步 skill。
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_STILL_WAITING,
+                phase=gate_module.PHASE_WAITING_FOR_LOCAL_BASE_BOOTSTRAP,
+                reason="bootstrap_receipt_missing",
+                diagnostic="stub: 还没吸收",
+            )
+        )
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(bootstrap_reengage_count=3), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision.payload.get("continue") is True
+        waiting_message = decision.message
+        assert "需要先跑" in waiting_message
+        assert "sync-local-base-into-task-worktree-only" in waiting_message
+
+        # ② 「只差 prepare 收尾」这条（receipt 已验 + 重放未完成）：**不得**再让人去跑同步 skill。
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = lambda g, **kw: (
+            gate_module.BootstrapGateReconciliation(
+                outcome=gate_module.OUTCOME_RECEIPT_VALID,
+                phase=gate_module.PHASE_REVIEWING,
+                reason="bootstrap_receipt_valid",
+                diagnostic="stub: receipt 有效",
+                receipt_path=str(tmp_path / "receipt.json"),
+                receipt_digest="c" * 64,
+                resume_run_id=g.get("rvf_run_id"),
+                resume_run_dir=g.get("rvf_run_dir"),
+            )
+        )
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = lambda g, **kw: {
+            "status": "timeout",
+            "error": "stub: 重放子进程被强杀",
+        }
+        handled, decision = module._kanban_followup_bootstrap_gate_decision(
+            ledger, marker=_marker(bootstrap_reengage_count=3), task_id="task-bootstrap",
+            session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
+        )
+        assert handled is True
+        assert decision.payload.get("continue") is True
+        pending_message = decision.message
+        assert "需要先跑" not in pending_message, pending_message
+        assert "已完成" in pending_message and "只差本轮 prepare 收尾" in pending_message
+        assert "**不要**再跑一次同步 skill" in pending_message
+        # 记录同样要落进 ledger 的 skipped 事件（事后排障读的就是它）。
+        skipped = [
+            e
+            for e in latest_events(state / "log")
+            if e.get("event") == "skipped"
+            and e.get("reason_code") == "kanban_followup_waiting_local_base_bootstrap"
+        ]
+        assert len(skipped) == 2
+        assert "需要先跑" not in str(skipped[-1].get("message"))
+        assert marker_path.exists()
+        assert json.loads(marker_path.read_text(encoding="utf-8"))["bootstrap_gate"] is not None
+    finally:
+        module.rvf_bootstrap_gate.reconcile_bootstrap_gate = original_reconcile
+        module.rvf_bootstrap_gate.replay_prepare_for_gate = original_replay
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root

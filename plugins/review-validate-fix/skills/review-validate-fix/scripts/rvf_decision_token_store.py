@@ -29,15 +29,17 @@
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import re
 import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1010,181 @@ def attach_run_anchor(
     payload["run_anchor_dir"] = run_dir
     _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
+
+
+def attach_bootstrap_gate(
+    token: str,
+    *,
+    gate: Mapping[str, Any] | None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+    ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
+) -> DecisionTokenRecord:
+    """把 pre-review local-base bootstrap 的等待 gate 挂到 token 上（``gate=None`` 即摘除）。
+
+    形状照抄 ``attach_run_anchor``：状态不变、只落盘一枚子记录，仅活跃非终态可挂。gate 让
+    ``start`` 撞上 bootstrap 时不再表现为「一次泛化失败」——token 保持 acknowledged、可
+    ``--retry``，恢复时先按 gate 重验证 base/receipt 身份，验证通过才重放**同一** run 的 prepare。
+    gate 本身由 ``rvf_bootstrap_gate.build_bootstrap_gate`` 按白名单构造，本函数不做二次加工。
+    """
+    now_dt = _coerce_now(now)
+    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+    if record.state not in ACTIVE_NONTERMINAL_STATES:
+        raise DecisionTokenStateError(
+            f"只能在活跃非终态挂载 bootstrap gate，当前={record.state}（token={record.token}）"
+        )
+    payload = dict(record.payload)
+    if gate is None:
+        payload.pop("bootstrap_gate", None)
+    else:
+        payload["bootstrap_gate"] = dict(gate)
+    _atomic_write_json(record.path, payload)
+    return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
+
+
+# ---------------------------------------------------------------------------
+# bootstrap 恢复重放的**进程外原子占位**（入口 A 的 claim 对偶）
+# ---------------------------------------------------------------------------
+#
+# 入口 B（kanban follow-up）已经把「起 prepare 重放之前先原子 claim」认定为真缺陷并加了
+# sidecar + ``O_EXCL`` 抢占（`kanban_followup_lock.claim_bootstrap_replay_in_flight`）。入口 A 是
+# 同一条 contract 的另一半：两个并发的 ``rvf-agent start --retry`` 会各自 reconcile 出
+# ``receipt_valid``，然后各自带**同一个** ``resume_run_id``/``resume_run_dir`` 调
+# ``start_run(run_id=X, run_dir=X)`` —— 同一个 run 目录被并发写，并可能分配出第二条 tracker
+# lease，违反「恢复不得产生重复 lease / reviewer」。
+#
+# 占位刻意**不写进 token payload**：payload 的每个写侧（``attach_bootstrap_gate`` /
+# ``attach_run_anchor`` / ``record_start_failure``）都是「读-改-写整份 payload」，两个并发进程各
+# 持一份陈旧副本时后写的一次会把刚盖上的在途字段整份抹掉——占位于是失去原子性。改用 token 文件
+# 旁的独立 sidecar + ``O_EXCL``（内核级互斥）。文件名以 ``.`` 开头且不以 ``.json`` 结尾，故
+# ``sweep_stale_decision_tokens`` 的 ``*.json`` 扫描与测试里的 token 计数都看不见它。
+BOOTSTRAP_REPLAY_CLAIM_SUFFIX = ".bootstrap-replay-claim"
+# 默认占位寿命上界：正常路径由 ``release_bootstrap_replay_in_flight`` 在 prepare 收尾后立刻释放，
+# 这个窗口只覆盖「持有者被硬杀、来不及释放」的残留，过窗即可被下一次 start 接手。
+DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS = 300.0
+
+
+def bootstrap_replay_claim_path(token: str, root: str | Path | None = None) -> Path:
+    """给定 token 的重放占位 sidecar 路径。"""
+    path = decision_token_path(token, root)
+    return path.with_name(f".{path.name}{BOOTSTRAP_REPLAY_CLAIM_SUFFIX}")
+
+
+def _bootstrap_replay_claim_age_seconds(claim_path: Path, *, now: datetime) -> float | None:
+    """占位已持有多久（秒）。文件不在 / 内容坏了一律 None = 「没有可信的在途占位」。"""
+    try:
+        payload = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("claimed_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        claimed_at = parse_timestamp(raw)
+    except ValueError:
+        return None
+    return max(0.0, (now - claimed_at).total_seconds())
+
+
+@contextmanager
+def _with_bootstrap_replay_takeover_lock(claim_path: Path):
+    """接手一枚过窗占位时的互斥锁（避免两个进程同时判定「已过期」而双双接手）。"""
+    lock_path = claim_path.with_name(f"{claim_path.name}.takeover.lock")
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def claim_bootstrap_replay_in_flight(
+    token: str,
+    *,
+    window_seconds: float = DEFAULT_BOOTSTRAP_REPLAY_CLAIM_WINDOW_SECONDS,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> tuple[bool, float | None]:
+    """**起 prepare 重放之前**的原子占位，返回 ``(claimed, in_flight_age_seconds)``。
+
+    ``claimed=True`` = 本进程抢到了这一轮重放，调用方可以起 prepare；``claimed=False`` = 已有
+    另一个进程在窗口内持有占位（``in_flight_age_seconds`` 是它的年龄），本轮**不得**再起第二次
+    ——否则同一个 ``resume_run_id`` / run 目录会被并发重复 prepare、并可能分配出第二条 lease。
+
+    抢占用 ``O_EXCL`` 建 sidecar（内核级互斥），**不是**「先读再写」：后者两个并发进程会同时读到
+    「无在途占位」并各自进入重放。占位超过 ``window_seconds`` 视为持有者已死，在 takeover flock
+    下重新校验后接手，一个被杀的进程不会永久堵死这枚 token。
+
+    best-effort：文件系统报错一律放行（返回 ``True``），记账永不阻断决策。
+    """
+    now_dt = _coerce_now(now)
+    claim_path = bootstrap_replay_claim_path(token, root)
+    encoded = (
+        json.dumps(
+            {"claimed_at": format_timestamp(now_dt), "claimed_by_pid": os.getpid()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    def _create_exclusive() -> None:
+        fd = os.open(str(claim_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
+        except Exception:
+            try:
+                claim_path.unlink()
+            except OSError:
+                pass
+            raise
+
+    try:
+        _ensure_parent_dir(claim_path)
+        _create_exclusive()
+        return True, None
+    except FileExistsError:
+        pass
+    except OSError:
+        return True, None
+
+    age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
+    if age is not None and age < window_seconds:
+        return False, age
+    try:
+        with _with_bootstrap_replay_takeover_lock(claim_path):
+            age = _bootstrap_replay_claim_age_seconds(claim_path, now=now_dt)
+            if age is not None and age < window_seconds:
+                return False, age
+            try:
+                claim_path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                _create_exclusive()
+            except FileExistsError:
+                return False, age
+            return True, age
+    except OSError:
+        return True, age
+
+
+def release_bootstrap_replay_in_flight(token: str, root: str | Path | None = None) -> bool:
+    """释放重放占位（prepare 已收尾 / 已确定失败，允许下一次 ``start --retry`` 立刻再试）。绝不抛。"""
+    claim_path = bootstrap_replay_claim_path(token, root)
+    try:
+        claim_path.unlink()
+    except (FileNotFoundError, OSError):
+        return False
+    return True
 
 
 def mark_dispatched(

@@ -120,6 +120,43 @@ def load_rvf_prep_file_module():
     return module
 
 
+def load_prepare_review_run_module():
+    """加载 prepare_review_run 模块（进程内直调 prepare_run_from_prep_file 等）。
+
+    与 load_rvf_agent_decision_cli_module 同构：它 top-level import 兄弟脚本
+    （rvf_prep_file / rvf_bootstrap_gate）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
+    SCRIPT_DIR 在 sys.path 上。
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location("prepare_review_run", PREPARE_REVIEW_RUN)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load prepare_review_run module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_bootstrap_gate_module():
+    """加载 rvf_bootstrap_gate 模块（pre-review local-base bootstrap 的等待状态机）。"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_bootstrap_gate", SCRIPT_DIR / "rvf_bootstrap_gate.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_bootstrap_gate module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_rvf_decision_token_store_module():
     # 与 load_rvf_prep_file_module 同构：spec 载入 + sys.modules 注册（dataclass 在 3.9 下做
     # ClassVar 检测时需要模块出现在 sys.modules，否则 _is_type 取不到模块命名空间而报错）。
@@ -6897,8 +6934,15 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
     """
     state = {"calls": 0}
 
-    def _stub(*, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0):
+    def _stub(
+        *, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0,
+        resume_run_id=None, resume_run_dir=None,
+        parent_attempt_run_id=None, parent_attempt_run_dir=None,
+    ):
         state["calls"] += 1
+        state["last_resume_run_id"] = resume_run_id
+        state["last_resume_run_dir"] = resume_run_dir
+        state["last_parent_attempt_run_id"] = parent_attempt_run_id
         if state["calls"] <= fail_first_n:
             return {"status": "failed", "error": "stub prepare 故意失败", "run_id": None, "run_dir": None, "artifacts": {}}
         run_dir = tmp / "runs" / run_name
@@ -6921,6 +6965,8 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
             "error": None,
         }
 
+    # 让调用方能断言 CLI 透传下来的 resume / parent-attempt 血缘（bootstrap 恢复路径）。
+    _stub.state = state
     return _stub
 
 
@@ -8645,6 +8691,84 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate",
+            lambda: test_prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate(
+                root / "bootstrap-gate-waiting"
+            ),
+        ),
+        (
+            "bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed",
+            lambda: test_bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed(
+                root / "bootstrap-gate-conflict-tamper"
+            ),
+        ),
+        (
+            "bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising",
+            lambda: test_bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising(
+                root / "bootstrap-gate-artifact-loss"
+            ),
+        ),
+        (
+            "bootstrap_gate_never_carries_environment_or_credential_values",
+            lambda: test_bootstrap_gate_never_carries_environment_or_credential_values(
+                root / "bootstrap-gate-no-env-leak"
+            ),
+        ),
+        (
+            "agent_cli_start_parks_on_bootstrap_then_resumes_same_run",
+            lambda: test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run(
+                root / "bootstrap-agent-cli-resume"
+            ),
+        ),
+        (
+            "ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock",
+            lambda: test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(
+                root / "bootstrap-ups-lock-stamp"
+            ),
+        ),
+        (
+            "bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end",
+            lambda: test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(
+                root / "bootstrap-replay-same-run"
+            ),
+        ),
+        (
+            "held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered",
+            lambda: test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered(
+                root / "bootstrap-gate-digest-writeback"
+            ),
+        ),
+        (
+            "bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts",
+            lambda: test_bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts(
+                root / "bootstrap-gate-g0-forgery"
+            ),
+        ),
+        (
+            "bootstrap_gate_recovers_when_local_base_advances_during_the_wait",
+            lambda: test_bootstrap_gate_recovers_when_local_base_advances_during_the_wait(
+                root / "bootstrap-gate-base-advanced"
+            ),
+        ),
+        (
+            "agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait",
+            lambda: test_agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait(
+                root / "bootstrap-agent-cli-base-advanced"
+            ),
+        ),
+        (
+            "agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once",
+            lambda: test_agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once(
+                root / "bootstrap-agent-cli-replay-claim"
+            ),
+        ),
+        (
+            "bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess",
+            lambda: test_bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess(
+                root / "bootstrap-replay-hard-deadline"
+            ),
+        ),
+        (
             "alternative_reviewer_prompt_uses_session_env_refs",
             lambda: test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env"),
         ),
@@ -9788,6 +9912,16 @@ _preprev.inject(
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
     COMMAND_LOCK=COMMAND_LOCK,
     APPLY_WORKTREE_BOOTSTRAP=APPLY_WORKTREE_BOOTSTRAP,
+    # pre-review local-base bootstrap 等待生命周期簇所需（进程内直调 prepare / gate / 入口 A CLI）。
+    load_prepare_review_run_module=load_prepare_review_run_module,
+    load_rvf_bootstrap_gate_module=load_rvf_bootstrap_gate_module,
+    load_rvf_prep_file_module=load_rvf_prep_file_module,
+    load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
+    load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,
+    load_rvf_user_prompt_submit_module=load_rvf_user_prompt_submit_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    _agent_cli_roots=_agent_cli_roots,
+    _mint_agent_decision_token=_mint_agent_decision_token,
 )
 globals().update({_n: getattr(_preprev, _n) for _n in _preprev.__all__})
 

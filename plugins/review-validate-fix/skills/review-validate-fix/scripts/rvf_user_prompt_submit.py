@@ -12,6 +12,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
+import rvf_bootstrap_gate
 import rvf_prep_file
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from session_label import text_from_message_payload
@@ -672,6 +673,59 @@ def arm_kanban_followup_lock_on_delivery(
     return marker_str
 
 
+def stamp_kanban_followup_bootstrap_gate(
+    event: dict[str, Any],
+    record: rvf_prep_file.PrepFileRecord,
+    result_state: dict[str, Any] | None,
+    *,
+    prep_root: str | Path | None = None,
+) -> str | None:
+    """prepare 判定「等 local base bootstrap」时，把 gate 就地盖进刚 arm 的 in-progress 锁。
+
+    借的是本 hook 的时序：锁在**同一个进程**里先 arm（投递确认）、prepare 才跑（见
+    ``inspect_user_prompt_submit``），所以 prepare 一返回就能把等待态写回同一把锁——不必新开
+    marker 族、也不必让 Stop 读侧去反查 prep 文件。锁的 ``state`` 同时从 ``in_progress`` 改成
+    ``waiting_bootstrap``，Stop 读侧据此改发定向指令（跑同步 skill）而不是通用「去收尾 handoff」。
+
+    best-effort：无锁 / 无 gate / 写失败一律返回 None，绝不阻断本次 prompt。
+    """
+    gate = rvf_bootstrap_gate.gate_of(result_state)
+    if gate is None:
+        return None
+    payload = record.payload
+    task_id = payload.get("target_kanban_task_id")
+    task_id = task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
+    session_id = payload.get("origin_session_id") or event.get("session_id")
+    session_id = session_id if isinstance(session_id, str) and session_id.strip() else None
+    try:
+        marker = kanban_followup_lock.read_marker(task_id=task_id, session_id=session_id)
+        if marker is None or not kanban_followup_lock.stamp_bootstrap_gate(
+            marker,
+            gate=gate,
+            state=kanban_followup_lock.STATE_WAITING_BOOTSTRAP,
+        ):
+            return None
+        marker_path = marker.get("_marker_path")
+    except Exception:  # best-effort：绝不阻断 prompt
+        return None
+    try:
+        rvf_prep_file.append_diagnostic(
+            root=prep_root,
+            token=record.token,
+            record={
+                "event": "user_prompt_submit_kanban_followup_bootstrap_gate_stamped",
+                "status": "waiting_bootstrap",
+                "kanban_task_id": task_id,
+                "marker_path": marker_path,
+                "bootstrap_phase": gate.get("phase"),
+                "required_sync_skill": gate.get("required_sync_skill"),
+            },
+        )
+    except (OSError, rvf_prep_file.PrepFileError):
+        pass
+    return marker_path if isinstance(marker_path, str) else None
+
+
 def _run_artifacts_present(payload: dict[str, Any]) -> bool:
     """best-effort：prep payload 指向的 run artifacts（``rvf_run.run_dir``）是否仍在磁盘。
 
@@ -690,6 +744,26 @@ def _run_artifacts_present(payload: dict[str, Any]) -> bool:
         return Path(run_dir).is_dir()
     except OSError:
         return False
+
+
+def _bootstrap_waiting_additional_context_text(gate: dict[str, Any]) -> str:
+    """bootstrap 等待态注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
+
+    这是入口 B 的 self-injection checkpoint：Stop 侧的 ``reengage_decision`` 要等 agent 干停
+    才能送达，而这里在 follow-up trigger 落地的**同一个 turn** 就把指引交给 agent，省掉一整轮
+    空转。步骤文案与入口 A 共用 ``rvf_bootstrap_gate.bootstrap_waiting_agent_steps``（单一来源）。
+    """
+    steps = rvf_bootstrap_gate.bootstrap_waiting_agent_steps(gate)
+    return "\n".join(
+        [
+            "=== RVF: 本轮 review 尚未开始（等 local base bootstrap）===",
+            f"local base `{gate.get('local_base_ref')}` 还没被吸收进本 task worktree，"
+            "RVF 已把本轮挂起为**可恢复的等待态**（run 与 scope 均未创建、reviewer 未派发）。",
+            *steps,
+            "④ 完成后本轮会自动接续 prepare 并进入 review——请**不要**输出 handoff、"
+            "也不要另开一轮 RVF。",
+        ]
+    )
 
 
 def _manual_decision_additional_context_text(
@@ -1263,6 +1337,23 @@ def inspect_user_prompt_submit(
 
     payload["workflow_started"] = result_state.get("status") == "completed"
     payload["shared_workflow_state"] = result_state
+    # prepare 卡在 pre-review local-base bootstrap 门：把等待 gate 写回本进程刚 arm 的
+    # in-progress 锁（state → waiting_bootstrap），使 Stop 读侧能区分「等 bootstrap」与
+    # 「正在 review」，并在锁 TTL 到期时复活本轮而不是清锁重开。
+    waiting_gate = rvf_bootstrap_gate.gate_of(result_state)
+    waiting_marker_path = stamp_kanban_followup_bootstrap_gate(
+        event, record, result_state, prep_root=prep_root
+    )
+    if waiting_marker_path:
+        payload["kanban_followup_waiting_bootstrap_marker_path"] = waiting_marker_path
+    if waiting_gate is not None:
+        # 模型可见的 self-injection checkpoint（``additionalContext``，非 user-only 的
+        # ``systemMessage``）：本轮 review 还没开始，agent 需要先跑同步 skill 把 local base
+        # 吸收进本 worktree、解决冲突、拿到 receipt，之后本轮会自动接续。
+        payload["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": _bootstrap_waiting_additional_context_text(waiting_gate),
+        }
     try:
         rvf_prep_file.append_diagnostic(
             root=prep_root,
@@ -1282,7 +1373,10 @@ def inspect_user_prompt_submit(
     # 故此处只服务 token 派发，不再产出 manual 的 additionalContext。
     _state_status = result_state.get("status") if isinstance(result_state, dict) else None
     payload["systemMessage"] = _trigger_system_message(
-        kind="success" if _state_status == "completed" else "failed",
+        kind={
+            "completed": "success",
+            rvf_bootstrap_gate.WAITING_STATUS: "waiting_local_base_bootstrap",
+        }.get(str(_state_status), "failed"),
         dispatch_origin=dispatch_origin,
         token=record.token,
         run_id=(record.payload.get("rvf_run") or {}).get("run_id"),
@@ -1348,6 +1442,15 @@ def _trigger_system_message(
         return notice(status_value=status or "completed", message="派发已就绪")
     if kind == "failed":
         return notice(status_value=status or "—", message="派发已跑但未就绪")
+    if kind == "waiting_local_base_bootstrap":
+        return notice(
+            status_value=status or rvf_bootstrap_gate.WAITING_STATUS,
+            message=(
+                "本轮 review 尚未开始：task worktree 还没吸收 local base，"
+                "已进入可恢复的 bootstrap 等待态（agent 已收到同步指引）"
+            ),
+            extra_fields=detail_fields,
+        )
     if kind == "already_completed":
         return notice(
             status_value="already_completed",
