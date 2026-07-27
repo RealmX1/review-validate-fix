@@ -6,6 +6,7 @@ import atexit
 import concurrent.futures
 import datetime
 import functools
+import inspect
 import json
 import importlib.util
 import os
@@ -1741,7 +1742,20 @@ def init_repo(path: Path) -> Path:
     return path
 
 
-def write_alternative_reviewer_config(
+# 保险丝型 idle timeout 的统一取值：调用点的 stub 秒级退出，idle timeout 只为「stub 真挂死时
+# 别把整套测试拖死」兜底，不构成被测语义。取值必须显著大于「高负载机器上 fork/exec + 解释器
+# 启动到吐出第一个字节」的最坏耗时——watchdog 只在 stdout/stderr 长度增长时刷新 liveness
+# （run_alternative_reviewer.py 的 `if stdout_len > last_stdout_len or ...` 分支），首字节之前
+# 是零活动，历史上的 5.0s 会先于被测语义开火，把 125/0/1 覆盖成 124 假红。
+#
+# 注意：2026-07-25 那次 `/rvf-local-deploy` 翻红的**主因**不在这里，而是 prompt 根本没投递完
+# （见 run_alternative_reviewer.py 的 deliver_reviewer_prompt_on_dedicated_stdin_writer_thread），
+# 那个缺陷已单独修掉。本常量兜的是剩下那一层：纯进程启动延迟。
+# 放大对正常路径零成本：stub 秒退时循环在 communicate() 返回处退出，根本不走超时分支。
+HANG_PREVENTION_IDLE_TIMEOUT_SECONDS = 60.0
+
+
+def _write_alternative_reviewer_config_payload_unclassified(
     path: Path,
     command: list[str],
     *,
@@ -1756,6 +1770,12 @@ def write_alternative_reviewer_config(
     health_command: list[str] | None = None,
     pre_run_health: bool | None = None,
 ) -> Path:
+    """底层 payload 写盘，对 idle timeout 的语义不表态。
+
+    不要直接调用：调用点必须经由下面两个 wrapper 之一显式声明 idle timeout 属于「防挂死保险丝」
+    还是「被断言的超时行为」。`test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification`
+    是这条约束的结构性守卫。
+    """
     payload = {
         "enabled": True,
         "label": "alternative-reviewer:test",
@@ -1786,6 +1806,131 @@ def write_alternative_reviewer_config(
         encoding="utf-8",
     )
     return path
+
+
+def write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+    path: Path,
+    command: list[str],
+    *,
+    activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None = None,
+    activity_probe_timeout_seconds: float | None = None,
+    activity_probe_failure_threshold: int | None = None,
+    tool_failure_threshold: int | None = None,
+    max_runtime_seconds: float | None = None,
+    output_format: str | None = "text",
+    health_command: list[str] | None = None,
+    pre_run_health: bool | None = None,
+) -> Path:
+    """给「idle timeout 不是被测语义」的调用点用：stub 秒退，超时纯粹是防挂死保险丝。
+
+    刻意**不接受** `idle_timeout_seconds` 实参——物理上杜绝调用点重新传入负载敏感的紧值。
+    需要断言超时时序的调用点改用
+    `write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior`。
+    """
+    return _write_alternative_reviewer_config_payload_unclassified(
+        path,
+        command,
+        idle_timeout_seconds=HANG_PREVENTION_IDLE_TIMEOUT_SECONDS,
+        activity_check_interval_seconds=activity_check_interval_seconds,
+        activity_probe_command=activity_probe_command,
+        activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        tool_failure_threshold=tool_failure_threshold,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+        health_command=health_command,
+        pre_run_health=pre_run_health,
+    )
+
+
+def write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
+    path: Path,
+    command: list[str],
+    *,
+    idle_timeout_seconds: float,
+    activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None = None,
+    activity_probe_timeout_seconds: float | None = None,
+    activity_probe_failure_threshold: int | None = None,
+    tool_failure_threshold: int | None = None,
+    max_runtime_seconds: float | None = None,
+    output_format: str | None = "text",
+    health_command: list[str] | None = None,
+    pre_run_health: bool | None = None,
+) -> Path:
+    """给「idle timeout 值与 stub 时序的相对关系就是被测语义」的调用点用。
+
+    这里的紧值不得放大：放大即把「超时确实开火 / 探针确实保活 / 快速失败确实没等满」这类断言
+    做成恒真的假绿。这些调用点在高负载下有残余脆弱性，是被测语义本身的代价，只能靠降低机器
+    负载（`scripts/check_skill_contracts.sh` 的并发推导）缓解，不能靠放宽断言。
+    """
+    return _write_alternative_reviewer_config_payload_unclassified(
+        path,
+        command,
+        idle_timeout_seconds=idle_timeout_seconds,
+        activity_check_interval_seconds=activity_check_interval_seconds,
+        activity_probe_command=activity_probe_command,
+        activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        tool_failure_threshold=tool_failure_threshold,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+        health_command=health_command,
+        pre_run_health=pre_run_health,
+    )
+
+
+def test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification() -> None:
+    """结构性守卫：禁止绕过「保险丝 / 被断言超时行为」的分类直接写 config payload。
+
+    没有这条守卫，未来新增的测试会重新写出 `idle_timeout_seconds=5.0` 这类紧值保险丝——
+    它们在低负载下永远绿，只在部署机负载 50+ 时集体翻红（2026-07-25 `/rvf-local-deploy`
+    卡在 `plugin_contract_check` 就是这么表现的），而翻红时看起来像是被部署的改动引入的
+    真回归。分类同时把「这个超时值到底是不是被测语义」写进函数名，避免下一个人靠猜。
+    """
+    private_payload_writer = "_write_alternative_reviewer_config_payload_unclassified"
+    aggregator_source_path = Path(__file__).resolve()
+
+    aggregator_lines = aggregator_source_path.read_text(encoding="utf-8").splitlines()
+    aggregator_reference_lines = [
+        (index + 1, line.strip())
+        for index, line in enumerate(aggregator_lines)
+        if private_payload_writer in line
+    ]
+    # 允许的三处：def 本身 + 两个 wrapper 各自的 return。docstring 里的提及不带调用括号。
+    aggregator_call_or_def_lines = [
+        (lineno, text)
+        for lineno, text in aggregator_reference_lines
+        if f"{private_payload_writer}(" in text
+    ]
+    assert len(aggregator_call_or_def_lines) == 3, aggregator_call_or_def_lines
+    assert aggregator_call_or_def_lines[0][1].startswith(f"def {private_payload_writer}("), (
+        aggregator_call_or_def_lines[0]
+    )
+    assert all(
+        text.startswith(f"return {private_payload_writer}(")
+        for _lineno, text in aggregator_call_or_def_lines[1:]
+    ), aggregator_call_or_def_lines
+
+    leaked_call_sites: list[str] = []
+    for candidate in sorted((ROOT / "tests").rglob("*.py")):
+        if candidate.resolve() == aggregator_source_path:
+            continue
+        source = candidate.read_text(encoding="utf-8")
+        if private_payload_writer in source:
+            leaked_call_sites.append(str(candidate.relative_to(ROOT)))
+    assert leaked_call_sites == [], leaked_call_sites
+
+    fuse_parameters = inspect.signature(
+        write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse
+    ).parameters
+    assert "idle_timeout_seconds" not in fuse_parameters, sorted(fuse_parameters)
+    asserted_parameters = inspect.signature(
+        write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior
+    ).parameters
+    assert "idle_timeout_seconds" in asserted_parameters, sorted(asserted_parameters)
+    assert HANG_PREVENTION_IDLE_TIMEOUT_SECONDS >= 30.0, HANG_PREVENTION_IDLE_TIMEOUT_SECONDS
 
 
 def clean_review_result_python(*, stdout: str = "artifact written") -> str:
@@ -2427,6 +2572,59 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     assert completed.returncode == 7
     assert "验证失败: failing" in completed.stderr
     assert "boom" in completed.stderr
+
+
+def test_contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight() -> None:
+    """并发度必须跟着机器走，且显式设置永远优先。
+
+    写死 8 的旧行为在开发机上恰好合适，但契约检查经常与别的 agent / 构建同时跑；机器一忙，
+    对时序敏感的那批测试就集体翻红，看起来像是被部署的改动引入的真回归。
+    """
+    skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    helper_start = skill_script.index("contract_host_cpu_count() {")
+    helper_end = skill_script.index("\ncontract_review_support_shards() {")
+    probe_body = skill_script[helper_start:helper_end]
+    assert "RVF_CONTRACT_PARALLEL_JOBS" in probe_body, "推导逻辑必须仍然读取显式覆盖"
+
+    probe = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{probe_body}\n"
+        "printf 'derived=%s\\n' \"$(unset RVF_CONTRACT_PARALLEL_JOBS; contract_parallel_jobs)\"\n"
+        "printf 'explicit=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=3 contract_parallel_jobs)\"\n"
+        "printf 'zero=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=0 contract_parallel_jobs)\"\n"
+        "printf 'nonnumeric=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=abc contract_parallel_jobs)\"\n"
+        "printf 'cpu=%s\\n' \"$(contract_host_cpu_count)\"\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        probe_path = Path(tmp_dir) / "parallel-jobs-probe.sh"
+        probe_path.write_text(probe, encoding="utf-8")
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "RVF_CONTRACT_PARALLEL_JOBS"
+        }
+        completed = subprocess.run(
+            ["bash", str(probe_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    assert completed.returncode == 0, completed.stderr
+    observed = dict(
+        line.split("=", 1) for line in completed.stdout.strip().splitlines() if "=" in line
+    )
+    host_cpu_count = int(observed["cpu"])
+    assert host_cpu_count >= 1
+
+    derived_jobs = int(observed["derived"])
+    assert derived_jobs >= 2, observed
+    # 上界：留 2 核给系统；高负载时还会再折半，所以只断言不超过这个上界。
+    assert derived_jobs <= max(2, host_cpu_count - 2), observed
+    assert observed["explicit"] == "3", observed
+    assert observed["zero"] == "1", observed
+    assert observed["nonnumeric"] == observed["derived"], observed
 
 
 def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
@@ -6037,7 +6235,7 @@ def load_harness_limit_cooldown_module():
 
 def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
     """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
-    return write_alternative_reviewer_config(
+    return write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         path,
         [
             sys.executable,
@@ -6048,7 +6246,6 @@ def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
                 f"sys.stderr.write({stderr_text!r}); sys.stderr.flush(); sys.exit(1)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6056,7 +6253,7 @@ def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
 
 def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
     """文本格式 reviewer 配置：shim 写合法 no-issues review-result 并 rc0（reroute 备援腿用）。"""
-    cfg = write_alternative_reviewer_config(
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         path,
         [
             sys.executable,
@@ -6064,7 +6261,6 @@ def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
             "-c",
             clean_review_result_python(stdout="ok"),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6229,7 +6425,7 @@ def test_run_alternative_reviewer_usage_limit_codex_json_error(tmp_path: Path) -
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6241,7 +6437,6 @@ def test_run_alternative_reviewer_usage_limit_codex_json_error(tmp_path: Path) -
                 "'You have hit your usage limit. Please try again in 4h.'}}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -6308,7 +6503,7 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_success(tmp_path
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6318,7 +6513,6 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_success(tmp_path
                 stdout="review complete: consider adding rate limit handling for HTTP 429"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6351,7 +6545,7 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(t
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6364,7 +6558,6 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(t
                 "print('model body mentions rate limit and 429')"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -8527,6 +8720,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_contract_check_parallel_test_steps_record_parallel_timing(),
         ),
         (
+            "contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight",
+            lambda: test_contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight(),
+        ),
+        (
             "contract_check_timing_report_accounts_internal_steps",
             lambda: test_contract_check_timing_report_accounts_internal_steps(),
         ),
@@ -8769,6 +8966,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification",
+            lambda: test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification(),
+        ),
+        (
             "alternative_reviewer_prompt_uses_session_env_refs",
             lambda: test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env"),
         ),
@@ -8857,6 +9058,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_idle_timeout_flag",
             lambda: test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout"),
+        ),
+        (
+            "alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups",
+            lambda: test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups(
+                root / "alternative-prompt-stdin-delivery"
+            ),
+        ),
+        (
+            "alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer",
+            lambda: test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer(
+                root / "alternative-prompt-stdin-writer-start-failure"
+            ),
         ),
         (
             "alternative_reviewer_activity_probe_keeps_silent_reviewer_alive",
@@ -9767,7 +9980,8 @@ _alt.inject(
     run=run,
     read_jsonl=read_jsonl,
     init_repo=init_repo,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     clean_review_result_python=clean_review_result_python,
     load_diff_tracker_module=load_diff_tracker_module,
     _slice_2b_repo_with_two_dirty=_slice_2b_repo_with_two_dirty,
@@ -9809,7 +10023,8 @@ _altrev.inject(
     load_alternative_reviewer_module=load_alternative_reviewer_module,
     read_jsonl=read_jsonl,
     run=run,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _cursor_tool_call_line=_cursor_tool_call_line,
 )
 globals().update({_n: getattr(_altrev, _n) for _n in _altrev.__all__})
@@ -9847,7 +10062,8 @@ _disprev.inject(
     load_dispatch_reviewers_module=load_dispatch_reviewers_module,
     load_harness_limit_cooldown_module=load_harness_limit_cooldown_module,
     write_fake_tmux_script=write_fake_tmux_script,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _dispatch_registry=_dispatch_registry,
     _make_usage_or_clean_registry=_make_usage_or_clean_registry,
     _with_cooldown_env=_with_cooldown_env,

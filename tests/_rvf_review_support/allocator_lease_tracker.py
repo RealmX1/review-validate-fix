@@ -1807,10 +1807,9 @@ def _run_reviewer_with_lease(
     packet = tmp / "packet.md"
     packet.write_text("## Review Packet\n\nlease test\n", encoding="utf-8")
     contract = _lease_contract(tmp / "scope.contract.json", repo=repo, unit_ids=unit_ids)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
         max_runtime_seconds=max_runtime_seconds,
         output_format=output_format,
@@ -1903,10 +1902,9 @@ def test_run_alternative_reviewer_shared_lease_does_not_release_on_exit(tmp: Pat
         unit_ids=unit_ids[:1],
         tracker_lease_id=acquired["lease_id"],
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", clean_review_result_python()],
-        idle_timeout_seconds=2.0,
         activity_check_interval_seconds=0.05,
     )
     env = {**os.environ, "CODEX_RVF_LOG_ROOT": str(log_root), "RVF_LEASE_HEARTBEAT_SECONDS": "0.05"}
@@ -1987,10 +1985,9 @@ def test_run_alternative_reviewer_sigterm_kills_child_before_release(tmp: Path) 
         "sys.stdin.read()\n"
         "time.sleep(30)\n"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=60,
         activity_check_interval_seconds=0.05,
         max_runtime_seconds=60,
     )

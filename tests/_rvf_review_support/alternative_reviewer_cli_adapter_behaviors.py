@@ -29,6 +29,8 @@ __all__ = [
     'test_alternative_reviewer_user_local_override_contract_rejects_invalid_configs',
     'test_alternative_reviewer_user_local_override_short_value_does_not_break_stream_json',
     'test_alternative_reviewer_idle_timeout_flag',
+    'test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups',
+    'test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer',
     'test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive',
     'test_alternative_reviewer_requires_review_result_artifact',
     'test_alternative_reviewer_records_request_as_pending_state',
@@ -130,10 +132,9 @@ def test_alternative_reviewer_subprocess_receives_session_context_alias_and_scop
         "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
         "print('artifact written')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
     )
 
@@ -181,10 +182,9 @@ def test_alternative_reviewer_pre_run_health_refreshes_before_reviewer(tmp_path:
         "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], '--audit-summary', 'audited diff; no correctness issues found'], check=True); "
         "print('artifact written')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         health_command=[sys.executable, "-c", health_code],
         pre_run_health=True,
@@ -223,10 +223,9 @@ def test_alternative_reviewer_pre_run_health_failure_skips_reviewer(tmp_path: Pa
         "sys.stdin.read(); "
         f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         health_command=[sys.executable, "-c", "import sys; print('login failed'); sys.exit(7)"],
         pre_run_health=True,
@@ -265,10 +264,9 @@ def test_alternative_reviewer_pre_run_health_timeout_skips_reviewer(tmp_path: Pa
         "sys.stdin.read(); "
         f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         health_command=[sys.executable, "-c", "import time; time.sleep(2)"],
         pre_run_health=True,
@@ -344,7 +342,7 @@ def test_alternative_reviewer_user_local_override_applies_only_to_reviewer_proce
         "'--audit-summary', 'audited metered override routing'], check=True); "
         "print('artifact written')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.claude.json",
         [sys.executable, "-c", reviewer_code],
         idle_timeout_seconds=0.25,
@@ -465,10 +463,9 @@ def test_alternative_reviewer_user_local_override_health_failure_fails_closed(
         "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
         "'--audit-summary', 'reviewer should not have run'], check=True)"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.claude.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         health_command=[sys.executable, "-c", "print('bundled health ok')"],
         pre_run_health=True,
@@ -555,10 +552,9 @@ def test_alternative_reviewer_user_local_override_contract_rejects_invalid_confi
     tmp_path: Path,
 ) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.claude.json",
         [sys.executable, "-c", "raise SystemExit('check mode must not launch reviewer')"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         health_command=[sys.executable, "-c", "print('bundled health ok')"],
         pre_run_health=True,
@@ -670,10 +666,9 @@ def test_alternative_reviewer_user_local_override_short_value_does_not_break_str
         "'debug': os.environ['RVF_TEST_SHORT_VALUE'], "
         "'debug_protocol_collision': os.environ['RVF_TEST_PROTOCOL_COLLISION_VALUE']}))"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.claude.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -749,7 +744,7 @@ def test_alternative_reviewer_idle_timeout_flag(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -779,12 +774,164 @@ def test_alternative_reviewer_idle_timeout_flag(tmp_path: Path) -> None:
     assert "RVF_EXTERNAL_REVIEWER_TIMEOUT" in completed.stderr
 
 
+def test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups(
+    tmp_path: Path,
+) -> None:
+    """回归：watchdog 的周期性 communicate() 唤醒不得吞掉没写完的 prompt。
+
+    历史缺陷：prompt 由循环里的 `communicate(input=..., timeout=...)` 投递，超时后
+    `pending_input` 被置 None，CPython 从此既不再写 stdin 也不关闭它 —— reviewer 卡在
+    `stdin.read()` 上零输出，被判成 `no_observable_activity`。macOS 每轮 selector 只写
+    512 字节，所以「prompt 越大 + 机器越忙」越容易触发，表面看是外部 reviewer 无故超时。
+    这里用远超单次 selector 写入量的 packet + 极短 check interval 强制多次唤醒。
+    """
+    repo = init_repo(tmp_path / "repo")
+    packet = tmp_path / "packet.md"
+    packet.write_text(
+        "## Review Packet\n\n" + ("prompt-delivery-filler " * 20_000) + "\n",
+        encoding="utf-8",
+    )
+    reviewer_code = (
+        "import os, subprocess, sys; "
+        "delivered = sys.stdin.read(); "
+        "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+        "'no-issues', '--out', os.environ['RVF_REVIEW_RESULT'], "
+        "'--audit-summary', 'audited diff; no correctness issues found'], check=True); "
+        "print('DELIVERED_PROMPT_CHARACTERS=' + str(len(delivered)))"
+    )
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+        tmp_path / "alternative-reviewer.json",
+        [sys.executable, "-u", "-c", reviewer_code],
+        # 极短 check interval = 每轮循环都醒来一次，最大化命中「投递被唤醒打断」的窗口。
+        activity_check_interval_seconds=0.01,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUN_ALTERNATIVE_REVIEWER),
+            "--config",
+            str(config),
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, (completed.returncode, completed.stdout, completed.stderr)
+    delivered_marker = "DELIVERED_PROMPT_CHARACTERS="
+    assert delivered_marker in completed.stdout, completed.stdout
+    delivered_characters = int(
+        completed.stdout.split(delivered_marker, 1)[1].split()[0]
+    )
+    # reviewer 必须收到完整 packet，而不是被截断的前若干个 PIPE_BUF。
+    assert delivered_characters > len(packet.read_text(encoding="utf-8")), delivered_characters
+
+
+def test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer(
+    tmp_path: Path,
+) -> None:
+    """回归：stdin writer thread 的 start() 抛错不得漏掉 reviewer 子进程的清理。
+
+    历史缺陷：prompt 投递调用落在 run_with_activity_timeout 的清理 try/except/finally **之外**，
+    而 deliver_reviewer_prompt_on_dedicated_stdin_writer_thread 先把 stdin 从 Popen 摘走
+    （process.stdin = None）再 start() writer thread。线程资源耗尽时 start() 抛 RuntimeError
+    直接穿出函数：已 Popen 的 reviewer 不被 terminate_process_group 终止而继续跑、
+    _ACTIVE_REVIEWER_PROCESS 仍指向它、被摘出的 stdin 既不被线程关闭也不被 communicate() 关闭
+    （fd 泄漏 + reviewer 永远收不到 EOF）。这里用 start() 必抛的 Thread 复现该路径。
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    module = load_alternative_reviewer_module()
+
+    spawned_reviewer_processes: list[subprocess.Popen] = []
+    detached_stdin_streams: list[object] = []
+
+    class RecordingSubprocessModule:
+        """只替换本次加载的 module 全局 `subprocess`，不污染真实 subprocess 模块。"""
+
+        def __init__(self, real_subprocess_module: object) -> None:
+            self._real_subprocess_module = real_subprocess_module
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real_subprocess_module, name)
+
+        def Popen(self, *args: object, **kwargs: object) -> subprocess.Popen:  # noqa: N802
+            process = self._real_subprocess_module.Popen(*args, **kwargs)
+            spawned_reviewer_processes.append(process)
+            detached_stdin_streams.append(process.stdin)
+            return process
+
+    class ThreadStartExhaustedModule:
+        """模拟线程资源耗尽：Thread.start() 一律抛 RuntimeError。"""
+
+        def __init__(self, real_threading_module: object) -> None:
+            self._real_threading_module = real_threading_module
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._real_threading_module, name)
+
+        def Thread(self, *args: object, **kwargs: object) -> object:  # noqa: N802
+            thread = self._real_threading_module.Thread(*args, **kwargs)
+
+            def start_always_fails() -> None:
+                raise RuntimeError("can't start new thread")
+
+            thread.start = start_always_fails
+            return thread
+
+    module.subprocess = RecordingSubprocessModule(module.subprocess)
+    module.threading = ThreadStartExhaustedModule(module.threading)
+
+    try:
+        raised: BaseException | None = None
+        try:
+            module.run_with_activity_timeout(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                input_text="prompt",
+                cwd=tmp_path,
+                reviewer_subprocess_environment=dict(os.environ),
+                activity_probe_subprocess_environment=dict(os.environ),
+                idle_timeout_seconds=5.0,
+                activity_check_interval_seconds=0.05,
+                activity_probe_command=None,
+                activity_probe_timeout_seconds=1.0,
+                activity_probe_failure_threshold=1,
+                max_runtime_seconds=10.0,
+                output_format="text",
+            )
+        except BaseException as exc:  # noqa: BLE001 — 这里就是要断言异常类型
+            raised = exc
+
+        assert isinstance(raised, RuntimeError), raised
+        assert spawned_reviewer_processes, "reviewer 子进程未被创建，复现路径没走到"
+        reviewer_process = spawned_reviewer_processes[0]
+        try:
+            reviewer_process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+        # (a) 子进程必须被终止，不能继续跑。
+        assert reviewer_process.poll() is not None, "reviewer 子进程在 start() 失败后仍在运行"
+        # (b) 全局 active 注册必须被清除。
+        assert module._ACTIVE_REVIEWER_PROCESS is None
+        # (c) 被摘出 Popen 的 stdin 必须被关掉，否则 fd 泄漏且 reviewer 收不到 EOF。
+        assert detached_stdin_streams[0].closed
+    finally:
+        for process in spawned_reviewer_processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
+
+
 def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -844,14 +991,13 @@ def test_alternative_reviewer_requires_review_result_artifact(tmp_path: Path) ->
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
             "import sys; sys.stdin.read(); print('NO_ISSUES')",
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
     )
 
@@ -896,10 +1042,9 @@ def test_alternative_reviewer_records_request_as_pending_state(tmp_path: Path) -
         "'--reason', 'needs serialized test cache'], check=True); "
         "print('request written')"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", reviewer_code],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
     )
 
@@ -948,7 +1093,7 @@ def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp_pat
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1015,7 +1160,7 @@ def test_alternative_reviewer_timeout_kills_child_process_group(tmp_path: Path) 
         f"subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
         "time.sleep(10.0)"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-c", parent_code],
         idle_timeout_seconds=0.5,
@@ -1051,7 +1196,7 @@ def test_alternative_reviewer_activity_refreshes_idle_timeout(tmp_path: Path) ->
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1093,7 +1238,7 @@ def test_alternative_reviewer_claude_bash_tool_use_suspends_idle_timeout(tmp_pat
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1143,14 +1288,13 @@ def test_alternative_reviewer_repeated_run_keeps_prior_artifacts(tmp_path: Path)
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
             "-c",
             clean_review_result_python(stdout="NO_ISSUES"),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
     )
     command = [
@@ -1287,7 +1431,7 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp_path: Path)
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1303,7 +1447,6 @@ def test_alternative_reviewer_claude_stream_json_extracts_result(tmp_path: Path)
                 "print(json.dumps({'type':'result','subtype':'success','result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -1331,7 +1474,7 @@ def test_alternative_reviewer_codex_json_extracts_agent_message(tmp_path: Path) 
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1345,7 +1488,6 @@ def test_alternative_reviewer_codex_json_extracts_agent_message(tmp_path: Path) 
                 "print(json.dumps({'type':'event_msg','payload':{'type':'agent_message','message':'NO_ISSUES'}}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1373,7 +1515,7 @@ def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(t
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1387,7 +1529,6 @@ def test_alternative_reviewer_codex_json_extracts_item_completed_agent_message(t
                 "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'NO_ISSUES'}}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1421,7 +1562,7 @@ def test_alternative_reviewer_codex_json_reports_backend_challenge_html(tmp_path
         "<body><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1\"></script>"
         "Cloudflare challenge</body></html>"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1429,7 +1570,6 @@ def test_alternative_reviewer_codex_json_reports_backend_challenge_html(tmp_path
             "-c",
             f"import sys; sys.stdin.read(); print({html!r})",
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1487,10 +1627,9 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["codex", "exec"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1550,10 +1689,9 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["codex", "--ask-for-approval", "never", "exec", "--sandbox", "workspace-write"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1628,10 +1766,9 @@ def test_alternative_reviewer_sets_codex_stop_hook_suppress_env(tmp_path: Path) 
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["codex", "exec"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -1687,10 +1824,9 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp_path: Pa
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["claude", "-p"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )
@@ -1744,10 +1880,9 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Pat
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["claude", "-p", "--output-format", "text"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )
@@ -1796,10 +1931,9 @@ def test_alternative_reviewer_non_claude_stream_json_command_is_not_patched(tmp_
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-u", str(shim), "--native-stream"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="claude_stream_json",
     )
@@ -1828,7 +1962,7 @@ def test_alternative_reviewer_cursor_stream_json_extracts_result(tmp_path: Path)
     repo = init_repo(tmp_path / "repo")
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -1844,7 +1978,6 @@ def test_alternative_reviewer_cursor_stream_json_extracts_result(tmp_path: Path)
                 "print(json.dumps({'type':'result','subtype':'success','is_error':False,'result':'NO_ISSUES'}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="cursor_stream_json",
     )
@@ -1919,7 +2052,7 @@ def test_alternative_reviewer_cursor_tool_layer_failure_fast_aborts(tmp_path: Pa
         "[ (print(json.dumps(ev), flush=True), time.sleep(0.05)) for _ in range(3) ]; "
         "time.sleep(30)"
     )
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
         tmp_path / "alternative-reviewer.json",
         [sys.executable, "-u", "-c", fake],
         idle_timeout_seconds=30.0,
@@ -1981,10 +2114,9 @@ def test_alternative_reviewer_cursor_command_not_claude_patched(tmp_path: Path) 
         encoding="utf-8",
     )
     shim.chmod(0o755)
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["cursor-agent", "-p"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="cursor_stream_json",
     )
@@ -2043,10 +2175,9 @@ def test_alternative_reviewer_cursor_autodetects_stream_json(tmp_path: Path) -> 
     )
     shim.chmod(0o755)
     # 故意不在 config 中写 output_format：依赖 is_cursor_print_command 自动判定为 cursor_stream_json。
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         ["cursor-agent", "-p"],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format=None,
     )

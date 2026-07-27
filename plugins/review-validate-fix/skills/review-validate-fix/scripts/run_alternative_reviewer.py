@@ -1274,6 +1274,64 @@ def terminate_active_reviewer_process() -> int | None:
     return signal_number
 
 
+def deliver_reviewer_prompt_on_dedicated_stdin_writer_thread(
+    process: subprocess.Popen[str], prompt_text: str
+) -> threading.Thread:
+    """在独立线程里把 prompt 写进 reviewer 的 stdin 并关闭它。
+
+    绝不能把 prompt 交给下面 watchdog 循环里的 `communicate(input=..., timeout=...)`：那次调用
+    一旦超时，CPython 会把 `_communication_started` 置位；之后循环只能传 `input=None`
+    （传别的会 ValueError），而此时 `_communicate` 既不再把 stdin 注册为可写、也不会关闭
+    stdin —— 没写完的 prompt 被永久丢弃，reviewer 阻塞在 `stdin.read()` 上一个字节都不产出，
+    最终被空闲 watchdog 判成 `no_observable_activity` 超时。macOS 每轮 selector 只写
+    `select.PIPE_BUF`（512 字节），几十 KB 的 review packet 在高负载机器上极易写不完，
+    表现就是「reviewer 无缘无故超时」的负载敏感故障。
+
+    stdin 的所有权整体移交给本线程（`process.stdin` 置 None），因此 `communicate()` 不会
+    与它抢关闭。线程是 daemon：即便 reviewer 从不读取 stdin，主流程也不会被它拖住。
+    """
+    reviewer_stdin_stream = process.stdin
+    process.stdin = None
+
+    def write_prompt_then_close_stdin() -> None:
+        try:
+            if reviewer_stdin_stream is None:
+                return
+            if prompt_text:
+                reviewer_stdin_stream.write(prompt_text)
+                reviewer_stdin_stream.flush()
+        except (OSError, ValueError):
+            # reviewer 提前退出（BrokenPipeError）或自行关掉 stdin：prompt 投递失败本身不是
+            # 判决点，交由下面的 returncode 与超时路径去定性。
+            pass
+        finally:
+            if reviewer_stdin_stream is not None:
+                try:
+                    reviewer_stdin_stream.close()
+                except OSError:
+                    pass
+
+    writer_thread = threading.Thread(
+        target=write_prompt_then_close_stdin,
+        name="rvf-reviewer-prompt-stdin-writer",
+        daemon=True,
+    )
+    try:
+        writer_thread.start()
+    except BaseException:
+        # start() 失败（线程资源耗尽 -> RuntimeError）时没有任何线程会跑 write_prompt_then_close_stdin，
+        # 而 stdin 的所有权已经从 Popen 摘走（process.stdin = None），于是既不会被线程关闭、也不会被
+        # communicate() 关闭：fd 泄漏且 reviewer 永远等不到 EOF。这里补上关闭再向上抛，交由调用方的
+        # 清理路径终止子进程并清除 active 注册。
+        if reviewer_stdin_stream is not None:
+            try:
+                reviewer_stdin_stream.close()
+            except OSError:
+                pass
+        raise
+    return writer_thread
+
+
 def run_with_activity_timeout(
     command: list[str],
     *,
@@ -1314,7 +1372,6 @@ def run_with_activity_timeout(
     next_probe_at = started_at
     consecutive_probe_failures = 0
     probe_history: list[dict[str, Any]] = []
-    pending_input: str | None = input_text
     # 两种 stream monitor 各司其职：
     #  - Claude：解析 tool_use 块，在「长静默命令」期间抑制 idle 超时（waiting_on_long_command）。
     #  - cursor：解析 tool_call(completed) 事件，统计 cursor 自身工具执行层失败；不抑制 idle，
@@ -1332,6 +1389,9 @@ def run_with_activity_timeout(
         stream_monitor = None
 
     try:
+        # 必须在 try 内投递：writer thread 的 start() 可能因线程资源耗尽抛 RuntimeError，
+        # 只有落在这里，下面的 except/finally 才能终止已经 Popen 的 reviewer 并清掉 active 注册。
+        deliver_reviewer_prompt_on_dedicated_stdin_writer_thread(process, input_text)
         while True:
             now = time.monotonic()
             if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
@@ -1374,7 +1434,7 @@ def run_with_activity_timeout(
             )
 
             try:
-                stdout, stderr = process.communicate(input=pending_input, timeout=wait_for)
+                stdout, stderr = process.communicate(timeout=wait_for)
                 return ReviewerRunResult(
                     args=command,
                     returncode=process.returncode,
@@ -1385,7 +1445,6 @@ def run_with_activity_timeout(
                     probe_history=probe_history,
                 )
             except subprocess.TimeoutExpired as exc:
-                pending_input = None
                 now = time.monotonic()
                 if max_runtime_seconds is not None and now - started_at >= max_runtime_seconds:
                     return timeout_completed(

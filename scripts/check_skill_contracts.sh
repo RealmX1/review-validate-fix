@@ -111,19 +111,87 @@ contract_parallel_tests_enabled() {
   esac
 }
 
-contract_parallel_jobs() {
-  local value="${RVF_CONTRACT_PARALLEL_JOBS:-8}"
-  case "$value" in
+contract_host_cpu_count() {
+  local detected=""
+  if command -v sysctl >/dev/null 2>&1; then
+    detected="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  if [ -z "$detected" ] && command -v nproc >/dev/null 2>&1; then
+    detected="$(nproc 2>/dev/null || true)"
+  fi
+  case "$detected" in
+    ''|*[!0-9]*|0)
+      # 探测不到核数时按保守的 4 核对待，宁可少并发也不要在小机器上超额订阅。
+      printf '4'
+      ;;
+    *)
+      printf '%s' "$detected"
+      ;;
+  esac
+}
+
+contract_host_one_minute_load_average_integer() {
+  # 输出 1 分钟 load average 的整数部分；探测不到则输出空串（调用方据此跳过负载退让）。
+  local raw=""
+  if [ -r /proc/loadavg ]; then
+    raw="$(cat /proc/loadavg 2>/dev/null || true)"
+  elif command -v sysctl >/dev/null 2>&1; then
+    # darwin: `{ 17.54 15.65 13.99 }`
+    raw="$(sysctl -n vm.loadavg 2>/dev/null || true)"
+  fi
+  raw="${raw#\{}"
+  raw="${raw# }"
+  local first_field="${raw%% *}"
+  local integer_part="${first_field%%.*}"
+  case "$integer_part" in
     ''|*[!0-9]*)
-      printf '8'
+      printf ''
+      ;;
+    *)
+      printf '%s' "$integer_part"
+      ;;
+  esac
+}
+
+# 并发度按本机核数与当前负载推导，而不是写死。写死的 8 在 10 核开发机上恰好合适，但契约检查
+# 常常跟别的 agent / 构建同时跑：2026-07-25 的 `/rvf-local-deploy` 就是在 load 50+ 时把测试
+# 里的 idle-timeout 保险丝挤爆，报成 `plugin_contract_check` 失败。并发退让只是缓解——真正
+# 让保险丝不再敏感的是测试侧的 HANG_PREVENTION_IDLE_TIMEOUT_SECONDS 分类。
+contract_parallel_jobs() {
+  local explicit_value="${RVF_CONTRACT_PARALLEL_JOBS:-}"
+  case "$explicit_value" in
+    '')
+      ;;
+    *[!0-9]*)
+      # 非数字视为未设置，落回推导（旧行为是写死 8，推导在 10 核机上同样给出 8）。
       ;;
     0)
       printf '1'
+      return
       ;;
     *)
-      printf '%s' "$value"
+      printf '%s' "$explicit_value"
+      return
       ;;
   esac
+
+  local cpu_count
+  cpu_count="$(contract_host_cpu_count)"
+  local derived_jobs=$((cpu_count - 2))
+  if [ "$derived_jobs" -lt 2 ]; then
+    derived_jobs=2
+  fi
+
+  local one_minute_load
+  one_minute_load="$(contract_host_one_minute_load_average_integer)"
+  if [ -n "$one_minute_load" ] && [ "$one_minute_load" -gt "$cpu_count" ]; then
+    derived_jobs=$((derived_jobs / 2))
+    if [ "$derived_jobs" -lt 2 ]; then
+      derived_jobs=2
+    fi
+  fi
+
+  printf '%s' "$derived_jobs"
 }
 
 contract_review_support_shards() {
@@ -186,6 +254,13 @@ run_parallel_test_steps() {
     stop_hook_shards=1
     dispatcher_shards=1
   fi
+
+  # 一行可解析的并发画像：契约失败时 `rvf_local_deploy.py` 会把它记进 deploy receipt，
+  # 省掉「事后跑 uptime 猜当时机器有多忙」的考古。
+  printf 'RVF_CONTRACT_PARALLEL_EXECUTION jobs=%s cpu=%s load1m=%s\n' \
+    "$jobs" \
+    "$(contract_host_cpu_count)" \
+    "$(contract_host_one_minute_load_average_integer)"
 
   local labels=()
   local scripts=()

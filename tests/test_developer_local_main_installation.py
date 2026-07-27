@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -286,3 +287,72 @@ print(json.dumps(payload))
         "removed_partial_first_install"
     )
     assert raised.value.result["rollback_status"] == "removed_partial_first_install"
+
+
+def test_contract_failure_receipt_records_host_load_and_failed_contract_step_labels(
+    tmp_path: Path,
+) -> None:
+    """契约检查失败时 receipt 必须留下定性所需的现场，而不是只留一个 phase 名。
+
+    这两项都是 2026-07-25 那次 `plugin_contract_check` 失败复盘时缺失的信息：
+    当时既不知道具体哪个 shard 红了，也只能靠事后 `uptime` 猜机器当时有多忙。
+    """
+    runner = _load_runner()
+    local_main_worktree = tmp_path / "review-validate-fix-local-main"
+    local_main_worktree.mkdir()
+    _git(local_main_worktree, "init", "-b", "main")
+    _git(local_main_worktree, "config", "user.name", "RVF Test")
+    _git(local_main_worktree, "config", "user.email", "rvf@example.test")
+    scripts_root = local_main_worktree / "scripts"
+    scripts_root.mkdir()
+    local_main_runner = scripts_root / "rvf_local_deploy.py"
+    local_main_runner.write_text("# local main runner\n", encoding="utf-8")
+    contract_script = scripts_root / "check_plugin_contracts.py"
+    contract_script.write_text(
+        """\
+import sys
+print("RVF_CONTRACT_PARALLEL_EXECUTION jobs=4 cpu=10 load1m=57", file=sys.stderr)
+print("验证失败: tests: review_support_scripts shard 1/4", file=sys.stderr)
+print("验证失败: tests: stop_hook shard 4/4", file=sys.stderr)
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    installer_script = scripts_root / "install_to_codex.py"
+    installer_script.write_text(
+        "raise SystemExit('installer must not run after contract failure')\n",
+        encoding="utf-8",
+    )
+    verifier_script = (
+        local_main_worktree
+        / "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py"
+    )
+    verifier_script.parent.mkdir(parents=True)
+    verifier_script.write_text("raise SystemExit('verifier must not run')\n", encoding="utf-8")
+    _git(local_main_worktree, "add", ".")
+    _git(local_main_worktree, "commit", "-m", "test: contract failure observability fixture")
+
+    with pytest.raises(runner.DeployError) as raised:
+        runner.run_local_deploy(
+            repository_hint=local_main_worktree,
+            home=tmp_path / "home",
+            expected_local_main_commit="HEAD",
+            runner_path=local_main_runner,
+        )
+
+    result = raised.value.result
+    assert result["phase"] == "plugin_contract_check"
+    assert result["failed_contract_step_labels"] == [
+        "tests: review_support_scripts shard 1/4",
+        "tests: stop_hook shard 4/4",
+    ]
+    assert result["contract_effective_parallel_jobs"] == 4
+    assert result["host_cpu_count"] == os.cpu_count()
+    assert isinstance(result["host_load_average_1m"], float)
+
+
+def test_parse_contract_check_failure_observations_ignores_unrelated_output() -> None:
+    runner = _load_runner()
+    assert runner.parse_contract_check_failure_observations(
+        "plugin 契约检查失败\nsome unrelated stderr noise\n"
+    ) == {}

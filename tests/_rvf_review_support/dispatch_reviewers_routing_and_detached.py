@@ -776,10 +776,9 @@ def test_dispatch_reviewers_probe_excludes_cooldown(tmp_path: Path) -> None:
     reg = {"schema_version": 1, "harnesses": {}}
     for hid, prio in (("alpha", 100), ("beta", 50)):
         cfg = tmp_path / f"alt-{hid}.json"
-        write_alternative_reviewer_config(
+        write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
             cfg,
             [sys.executable, "-c", "pass"],
-            idle_timeout_seconds=5.0,
             activity_check_interval_seconds=0.05,
             output_format="text",
             health_command=[sys.executable, "-c", ""],

@@ -267,7 +267,10 @@ python3 scripts/check_plugin_contracts.py
 默认启用并行测试：
 
 - `RVF_CONTRACT_PARALLEL_TESTS=1`
-- `RVF_CONTRACT_PARALLEL_JOBS=8`
+- `RVF_CONTRACT_PARALLEL_JOBS`：不设时按本机推导 —— `max(2, 核数 - 2)`，且 1 分钟 load
+  average 超过核数时再折半（下限 2）。10 核空闲机器上等于旧的写死值 8；显式设置仍然优先。
+  每次并行执行会打印一行 `RVF_CONTRACT_PARALLEL_EXECUTION jobs=… cpu=… load1m=…`，
+  契约失败时会被记进 deploy receipt。
 - `RVF_CONTRACT_REVIEW_SUPPORT_SHARDS=4`
 - `RVF_CONTRACT_STOP_HOOK_SHARDS=4`
 - `RVF_CONTRACT_DISPATCHER_SHARDS=1`

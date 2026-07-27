@@ -306,6 +306,56 @@ def _deployment_lock(home: Path) -> Iterator[Path]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def observe_deploy_host_concurrency_conditions() -> dict[str, Any]:
+    """记录部署当刻的机器负载画像。
+
+    契约检查里有一批测试对「机器有多忙」敏感（外部 reviewer 的空闲 watchdog、进程组超时等）。
+    没有这份画像时，一次 `plugin_contract_check` 失败必须靠事后跑 `uptime` 倒推当时的负载，
+    而那时负载早就变了 —— 2026-07-25 那次失败就是这么考古出来的。
+    """
+    try:
+        load_average_1m, load_average_5m, load_average_15m = os.getloadavg()
+    except (OSError, AttributeError):
+        load_average_1m = load_average_5m = load_average_15m = None
+    return {
+        "host_cpu_count": os.cpu_count(),
+        "host_load_average_1m": load_average_1m,
+        "host_load_average_5m": load_average_5m,
+        "host_load_average_15m": load_average_15m,
+    }
+
+
+def parse_contract_check_failure_observations(contract_failure_output: str) -> dict[str, Any]:
+    """从契约检查的失败输出里抽出「哪一步失败」和「当时并发度多少」。
+
+    两个标记的产出方都是 `scripts/check_skill_contracts.sh`：
+    失败步骤来自 `printf '验证失败: %s\\n'`，并发画像来自 `run_parallel_test_steps` 开头的
+    `RVF_CONTRACT_PARALLEL_EXECUTION` 行。receipt 里原本只记到 `plugin_contract_check`
+    这一级，粒度不足以分辨是哪个 shard 翻的红。
+    """
+    failed_step_marker = "验证失败: "
+    parallel_execution_marker = "RVF_CONTRACT_PARALLEL_EXECUTION "
+    failed_step_labels: list[str] = []
+    effective_parallel_jobs: int | None = None
+    for line in contract_failure_output.splitlines():
+        # 用子串而非行首匹配：`_run_phase` 会把 `<label> 失败: ` 粘在被捕获输出的第一行前面。
+        if failed_step_marker in line:
+            failed_step_labels.append(
+                line.split(failed_step_marker, 1)[1].strip()
+            )
+        elif parallel_execution_marker in line:
+            for field in line.split(parallel_execution_marker, 1)[1].split():
+                key, _, value = field.partition("=")
+                if key == "jobs" and value.isdigit():
+                    effective_parallel_jobs = int(value)
+    observations: dict[str, Any] = {}
+    if failed_step_labels:
+        observations["failed_contract_step_labels"] = failed_step_labels
+    if effective_parallel_jobs is not None:
+        observations["contract_effective_parallel_jobs"] = effective_parallel_jobs
+    return observations
+
+
 def _run_phase(
     label: str,
     argv: list[str],
@@ -413,10 +463,12 @@ def run_local_deploy(
                 "lock_path": str(lock_path),
                 "receipt_path": str(result_receipt_path),
                 "commands": commands,
+                **observe_deploy_host_concurrency_conditions(),
             }
             if error is not None:
                 result["error"] = error
                 result["remediation"] = PARTIAL_REMEDIATION
+                result.update(parse_contract_check_failure_observations(error))
             result.update(extra)
             return result
 
