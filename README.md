@@ -267,8 +267,12 @@ python3 scripts/check_plugin_contracts.py
 默认启用并行测试：
 
 - `RVF_CONTRACT_PARALLEL_TESTS=1`
-- `RVF_CONTRACT_PARALLEL_JOBS`：不设时按本机推导 —— `max(2, 核数 - 2)`，且 1 分钟 load
-  average 超过核数时再折半（下限 2）。10 核空闲机器上等于旧的写死值 8；显式设置仍然优先。
+- `RVF_CONTRACT_PARALLEL_JOBS`：不设时按本机推导 —— `max(2, 核数 / 3)`，且 1 分钟 load
+  average 超过核数时再折半（下限 2）。10 核机器上等于 3；显式设置仍然优先。
+  系数取 `/3` 而非更高，是因为并行组是滑动 FIFO 窗口（窗口满时等的是队首而非任意先完成者，
+  macOS 自带 bash 3.2 没有 `wait -n`），实测有效并发被压在 3.82：jobs=5/6/7/8 四档墙钟
+  完全相同，但峰值 CPU 从 3.39 核涨到 5.85 核。想换回原来的速度用
+  `RVF_CONTRACT_PARALLEL_JOBS=5`（墙钟与旧默认 8 一致，占用少四成）。
   每次并行执行会打印一行 `RVF_CONTRACT_PARALLEL_EXECUTION jobs=… cpu=… load1m=…`，
   契约失败时会被记进 deploy receipt。
 - `RVF_CONTRACT_REVIEW_SUPPORT_SHARDS=4`

@@ -157,13 +157,30 @@ contract_host_one_minute_load_average_integer() {
 # 常常跟别的 agent / 构建同时跑：2026-07-25 的 `/rvf-local-deploy` 就是在 load 50+ 时把测试
 # 里的 idle-timeout 保险丝挤爆，报成 `plugin_contract_check` 失败。并发退让只是缓解——真正
 # 让保险丝不再敏感的是测试侧的 HANG_PREVENTION_IDLE_TIMEOUT_SECONDS 分类。
+#
+# 系数从 `cpu-2`（10 核 → 8）降到 `cpu/3`（10 核 → 3）。依据是 2026-07-28 在隔离 worktree +
+# 隔离 HOME 里做的资源画像：本函数的消费者只有 run_parallel_test_steps，而那里是滑动 FIFO
+# 窗口——窗口满时 `wait` 的是**队首**而不是任意先完成者（macOS 自带 bash 3.2 没有 `wait -n`），
+# 队首一慢窗口就塌陷。实测名义 jobs=8 的有效并发只有 3.82，于是 jobs=5/6/7/8 四档墙钟**完全
+# 相同**（82.9s），但峰值 CPU 从 3.39 核一路涨到 5.85 核、峰值进程 32→46。高出来的那截纯属
+# 白烧，买不到任何墙钟。
+#
+#   jobs=3   墙钟 126.9s   峰值 2.48 核(25%)   24 进程
+#   jobs=5   墙钟  82.9s   峰值 3.39 核(34%)   32 进程
+#   jobs=8   墙钟  82.9s   峰值 5.85 核(59%)   46 进程   ← 旧默认
+#
+# 取 3 而非 5，是为了把机器留给开发者的其他工作：多等 44 秒换峰值占用减半。想要回原来的速度
+# 直接 `RVF_CONTRACT_PARALLEL_JOBS=5`，显式值优先级最高。
+#
+# 若哪天把队首塌陷修掉（换 Python 编排或要求 bash 4+ 的 `wait -n`），有效并发才会真正逼近
+# jobs，那时这个系数值得重新标定——在那之前，调高它只会多占资源。
 contract_parallel_jobs() {
   local explicit_value="${RVF_CONTRACT_PARALLEL_JOBS:-}"
   case "$explicit_value" in
     '')
       ;;
     *[!0-9]*)
-      # 非数字视为未设置，落回推导（旧行为是写死 8，推导在 10 核机上同样给出 8）。
+      # 非数字视为未设置，落回推导。
       ;;
     0)
       printf '1'
@@ -177,7 +194,7 @@ contract_parallel_jobs() {
 
   local cpu_count
   cpu_count="$(contract_host_cpu_count)"
-  local derived_jobs=$((cpu_count - 2))
+  local derived_jobs=$((cpu_count / 3))
   if [ "$derived_jobs" -lt 2 ]; then
     derived_jobs=2
   fi

@@ -2614,11 +2614,14 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     assert "boom" in completed.stderr
 
 
-def test_contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight() -> None:
-    """并发度必须跟着机器走，且显式设置永远优先。
+def test_contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third() -> None:
+    """并发度必须跟着机器走、不超过 cpu/3，且显式设置永远优先。
 
     写死 8 的旧行为在开发机上恰好合适，但契约检查经常与别的 agent / 构建同时跑；机器一忙，
     对时序敏感的那批测试就集体翻红，看起来像是被部署的改动引入的真回归。
+
+    系数从 cpu-2 收到 cpu/3 的依据见 `contract_parallel_jobs` 的注释：并行组的滑动 FIFO
+    窗口会因队首塌陷，把有效并发压在 3.82，再高的 jobs 只多占资源、不缩短墙钟。
     """
     skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
     helper_start = skill_script.index("contract_host_cpu_count() {")
@@ -2660,8 +2663,11 @@ def test_contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_
 
     derived_jobs = int(observed["derived"])
     assert derived_jobs >= 2, observed
-    # 上界：留 2 核给系统；高负载时还会再折半，所以只断言不超过这个上界。
-    assert derived_jobs <= max(2, host_cpu_count - 2), observed
+    # 上界 cpu/3：并行组是滑动 FIFO 窗口（窗口满时等的是队首，不是任意先完成者），实测
+    # 名义 jobs=8 的有效并发只有 3.82，jobs=5/6/7/8 四档墙钟一模一样而峰值 CPU 从 3.39
+    # 涨到 5.85 核 —— 高出去的并发买不到墙钟，只多占机器。这条上界就是防止它被调回去；
+    # 高负载时还会在此基础上再折半，所以断言的是上界而非等值。
+    assert derived_jobs <= max(2, host_cpu_count // 3), observed
     assert observed["explicit"] == "3", observed
     assert observed["zero"] == "1", observed
     assert observed["nonnumeric"] == observed["derived"], observed
@@ -8799,8 +8805,8 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_contract_check_parallel_test_steps_record_parallel_timing(),
         ),
         (
-            "contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight",
-            lambda: test_contract_check_parallel_jobs_derive_from_host_cpu_instead_of_hardcoded_eight(),
+            "contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third",
+            lambda: test_contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third(),
         ),
         (
             "contract_check_timing_report_accounts_internal_steps",
