@@ -12,6 +12,7 @@ import importlib.util
 import os
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1754,6 +1755,25 @@ def init_repo(path: Path) -> Path:
 # 放大对正常路径零成本：stub 秒退时循环在 communicate() 返回处退出，根本不走超时分支。
 HANG_PREVENTION_IDLE_TIMEOUT_SECONDS = 60.0
 
+# activity probe 的**自身**超时。同样是保险丝而非被测语义：需要探针「失败」的测试一律让探针
+# 自己非零退出（毫秒级），从不靠把这个超时调小来制造失败。调小它只会在高负载下把「探针本该
+# 成功」的测试炸掉——探针是 `python3 -c ...`，解释器冷启动在 load 35+ 时轻易超过 0.5s，
+# 连续两次即触发 `no_observable_activity_probe_failed`（2026-07-27 部署失败的 shard 2/4）。
+HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS = 30.0
+
+# command lock 争用测试的两个时长：等 holder 拿到锁、以及 holder 持锁多久。两者都只是保险丝
+# ——被测语义是「contender 超时后把 holder 元数据写进日志」。持锁时长放大的**原意**是抗高负载：
+# contender 若花 >3s 才启动，短 hold 会让 holder 提前释放，contender 就会拿到锁而不是超时。
+#
+# 「放大在墙钟上免费」这个前提**必须由 teardown 兑现**，它不是自动成立的：holder 是
+# `command_lock.py -- python3 -c sleep(...)` 两层进程，只 terminate/kill 外层的话，内层仍继承
+# 着 holder 的 stdout/stderr 管道，`communicate()` 会一直阻塞到内层自己睡完（实测本用例因此
+# 耗时 30.8s，teardown 独占约 28s）。所以 holder 必须 `start_new_session=True` 启动，并由
+# `_terminate_lock_holder_process_group_and_drain_pipes` 按**进程组**收——改动这两个常量前
+# 请确认那条路径还在。
+HANG_PREVENTION_LOCK_HOLDER_ACQUISITION_SECONDS = 30.0
+HANG_PREVENTION_LOCK_HOLDER_HOLD_SECONDS = 30.0
+
 
 def _write_alternative_reviewer_config_payload_unclassified(
     path: Path,
@@ -1931,6 +1951,26 @@ def test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_clas
     ).parameters
     assert "idle_timeout_seconds" in asserted_parameters, sorted(asserted_parameters)
     assert HANG_PREVENTION_IDLE_TIMEOUT_SECONDS >= 30.0, HANG_PREVENTION_IDLE_TIMEOUT_SECONDS
+
+    # activity probe 的自身超时同理：任何数值字面量都是负载炸弹。需要探针失败的测试让探针
+    # 自己非零退出（毫秒级），不靠压缩这个超时——压缩它只会在高负载下打死本该成功的探针。
+    probe_timeout_literal_sites: list[str] = []
+    for candidate in sorted((ROOT / "tests").rglob("*.py")):
+        for line_number, line in enumerate(
+            candidate.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            assignment = line.split("activity_probe_timeout_seconds=", 1)
+            if len(assignment) != 2:
+                continue
+            passed_value = assignment[1].strip().rstrip(",")
+            if passed_value[:1].isdigit():
+                probe_timeout_literal_sites.append(
+                    f"{candidate.relative_to(ROOT)}:{line_number} -> {passed_value}"
+                )
+    assert probe_timeout_literal_sites == [], probe_timeout_literal_sites
+    assert HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS >= 5.0, (
+        HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS
+    )
 
 
 def clean_review_result_python(*, stdout: str = "artifact written") -> str:
@@ -3149,6 +3189,30 @@ def test_command_lock_respects_env_run_dir(tmp_path: Path) -> None:
     assert [event["event"] for event in events] == ["lock_wait_started", "lock_acquired", "lock_released"]
 
 
+def _terminate_lock_holder_process_group_and_drain_pipes(
+    holder: subprocess.Popen,
+    holder_process_group_id: int,
+) -> tuple[str, str]:
+    """收掉 holder **整条进程链**并读干其 stdout/stderr。
+
+    holder 是 `command_lock.py -- python3 -c sleep(...)`：外层 command_lock 收到 SIGTERM 会直接
+    死掉（它没装 signal handler，也不转发给 subprocess.run 起的内层），但内层 python 仍继承着
+    holder 的 stdout/stderr 管道并继续睡。因此只收外层是不够的——`communicate()` 要等到**所有**
+    写端关闭，也就是一直等到内层自己睡完，把 hold 时长完全兑换成墙钟时间。
+
+    holder 用 `start_new_session=True` 启动，故其 pgid 恒等于 `holder.pid`，可以直接 killpg 整组。
+    这里不用 `os.getpgid(holder.pid)`：外层若已被 `poll()` 回收，getpgid 会 ProcessLookupError，
+    而内层仍活着。POSIX 保证进程组只要还有成员就不会被复用，用启动时记下的 pgid 是安全的。
+    """
+    try:
+        os.killpg(holder_process_group_id, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # 整组已经没了（或不可及）：退回到只收外层，communicate() 此时不会再被内层挂住。
+        if holder.poll() is None:
+            holder.kill()
+    return holder.communicate()
+
+
 def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     state = tmp_path / "state"
@@ -3190,18 +3254,32 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
             "--",
             sys.executable,
             "-c",
-            "import time; time.sleep(3)",
+            f"import time; time.sleep({HANG_PREVENTION_LOCK_HOLDER_HOLD_SECONDS})",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=holder_env,
+        # 自成 session/进程组：teardown 才能一次收掉 command_lock + 内层 sleep 两层，
+        # 否则内层会攥着管道让 communicate() 一直等到 hold 时长睡满（见常量处注释）。
+        start_new_session=True,
     )
+    # start_new_session=True 下 pgid == holder.pid；在外层被 poll() 回收前记下来。
+    holder_process_group_id = holder.pid
+    holder_pipes_already_drained = False
     try:
-        deadline = time.monotonic() + 5
+        # 被测语义是「contender 超时后把 holder 元数据写进日志」，不是「holder 多快拿到锁」。
+        # 这个 deadline 纯粹是保险丝：holder 要冷启动一个 Python 解释器、import RVF 模块、
+        # 拿锁并落 metadata，load 35+ 时超过原来的 5s 完全正常（2026-07-27 部署失败的
+        # shard 4/4 即此）。放大它不弱化任何断言——holder 真挂死时仍会红，只是晚一点。
+        deadline = time.monotonic() + HANG_PREVENTION_LOCK_HOLDER_ACQUISITION_SECONDS
         while not metadata_path.exists():
             if holder.poll() is not None:
-                stdout, stderr = holder.communicate()
+                # 外层已退出，但内层可能还攥着管道；照样按进程组收，别让失败路径挂死。
+                stdout, stderr = _terminate_lock_holder_process_group_and_drain_pipes(
+                    holder, holder_process_group_id
+                )
+                holder_pipes_already_drained = True
                 raise AssertionError(stderr.strip() or stdout.strip() or "holder exited before acquiring lock")
             if time.monotonic() >= deadline:
                 raise AssertionError("holder did not acquire lock")
@@ -3232,9 +3310,10 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
             check=False,
         )
     finally:
-        if holder.poll() is None:
-            holder.terminate()
-        holder.communicate(timeout=5)
+        # holder 是 `command_lock.py -- python3 -c sleep(...)` 两层进程；hold 时长放大后就不能
+        # 再指望「它自己睡完」兜底，必须按进程组一次收掉两层（否则 communicate() 会被内层挂住）。
+        if not holder_pipes_already_drained:
+            _terminate_lock_holder_process_group_and_drain_pipes(holder, holder_process_group_id)
 
     assert contender.returncode == 75
     assert "current holder metadata" in contender.stderr
@@ -9981,6 +10060,7 @@ _alt.inject(
     read_jsonl=read_jsonl,
     init_repo=init_repo,
     write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
     write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     clean_review_result_python=clean_review_result_python,
     load_diff_tracker_module=load_diff_tracker_module,
@@ -10024,6 +10104,7 @@ _altrev.inject(
     read_jsonl=read_jsonl,
     run=run,
     write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
     write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _cursor_tool_call_line=_cursor_tool_call_line,
 )
@@ -10063,6 +10144,7 @@ _disprev.inject(
     load_harness_limit_cooldown_module=load_harness_limit_cooldown_module,
     write_fake_tmux_script=write_fake_tmux_script,
     write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
     write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _dispatch_registry=_dispatch_registry,
     _make_usage_or_clean_registry=_make_usage_or_clean_registry,

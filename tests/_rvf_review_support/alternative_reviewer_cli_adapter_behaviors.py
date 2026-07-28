@@ -348,7 +348,7 @@ def test_alternative_reviewer_user_local_override_applies_only_to_reviewer_proce
         idle_timeout_seconds=0.25,
         activity_check_interval_seconds=0.05,
         activity_probe_command=[sys.executable, "-c", activity_probe_code],
-        activity_probe_timeout_seconds=2.0,
+        activity_probe_timeout_seconds=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
         activity_probe_failure_threshold=3,
         health_command=[sys.executable, "-c", "raise SystemExit('bundled health must be overridden')"],
         pre_run_health=True,
@@ -898,7 +898,7 @@ def test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_review
                 idle_timeout_seconds=5.0,
                 activity_check_interval_seconds=0.05,
                 activity_probe_command=None,
-                activity_probe_timeout_seconds=1.0,
+                activity_probe_timeout_seconds=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
                 activity_probe_failure_threshold=1,
                 max_runtime_seconds=10.0,
                 output_format="text",
@@ -945,7 +945,7 @@ def test_alternative_reviewer_activity_probe_keeps_silent_reviewer_alive(tmp_pat
             "-c",
             "import os; print('PROBE ' + os.environ.get('RVF_REVIEWER_PID', ''))",
         ],
-        activity_probe_timeout_seconds=0.5,
+        activity_probe_timeout_seconds=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
         activity_probe_failure_threshold=2,
     )
 
@@ -1107,7 +1107,7 @@ def test_alternative_reviewer_activity_probe_failure_threshold_times_out(tmp_pat
             "-c",
             "import sys; print('inactive'); sys.exit(2)",
         ],
-        activity_probe_timeout_seconds=0.5,
+        activity_probe_timeout_seconds=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
         activity_probe_failure_threshold=2,
     )
 
