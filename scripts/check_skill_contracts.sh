@@ -989,25 +989,70 @@ require_repo_literal "scripts/install_to_codex.py" '--cline-kanban-start-in-plan
 require_repo_literal "scripts/install_to_codex.py" '--configure-user-prompt-submit-hook'
 require_repo_literal "scripts/install_to_codex.py" 'latest-official-cli-installation.json'
 require_repo_literal "scripts/install_to_codex.py" 'review-validate-fix-local-main'
+# 打包来源是 RVF 自有的 deploy 源 worktree，不是 local main 工作树；receipt 里不得把它
+# 标成 local_main_worktree（那正是本设计要消灭的「身份撒谎」）。
+require_repo_literal "scripts/install_to_codex.py" '--deployment-source-worktree'
+require_repo_literal "scripts/install_to_codex.py" '"deployment_source_worktree"'
+forbid_repo_literal "scripts/install_to_codex.py" '"local_main_worktree"'
 # Installed skill 只持有稳定 local-main trampoline；安装与 cache 写入归宿主官方 CLI。
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '--expected-local-main-commit HEAD --json'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '降级到手写'
+# 完成证据必须交代 payload 的真实来源，以及 runner 自身是否就是被部署的那一版。
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'deployment_source_worktree_synced_to_commit'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'runner_matches_local_main_head'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'local_main_dirty_paths'
 forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'scripts/install_to_codex.py'
 forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'verify_local_deploy.py'
 require_repo_literal "scripts/rvf_local_deploy.py" '--configure-stop-hook'
 require_repo_literal "scripts/rvf_local_deploy.py" '--configure-user-prompt-submit-hook'
 require_repo_literal "scripts/rvf_local_deploy.py" 'LOCK_EX | fcntl.LOCK_NB'
-require_repo_literal "scripts/rvf_local_deploy.py" 'local main worktree 含未提交改动'
+# payload 只能来自 RVF 自有的 detached deploy 源 worktree：local main 的工作树全程只读 ref，
+# 未提交内容从结构上进不了发布件（既不靠 stash 挪走，也不靠 dirty 硬拦）。
+require_repo_literal "scripts/rvf_local_deploy.py" 'deployment-source-worktree-at-local-main-head'
+require_repo_literal "scripts/rvf_local_deploy.py" '"worktree",'
+require_repo_literal "scripts/rvf_local_deploy.py" '"--detach",'
+require_repo_literal "scripts/rvf_local_deploy.py" '"clean", "-xdff"'
+require_repo_literal "scripts/rvf_local_deploy.py" 'deployment_source_worktree_synced_to_commit'
+require_repo_literal "scripts/rvf_local_deploy.py" 'runner_matches_local_main_head'
+require_repo_literal "scripts/rvf_local_deploy.py" 'local_main_dirty_paths'
 forbid_repo_literal "scripts/rvf_local_deploy.py" '--allow-dirty'
 forbid_repo_literal "scripts/rvf_local_deploy.py" 'parser.add_argument("--repo"'
+# 不得回退到 stash 路线：它会在部署窗口内把 local main 上正在工作的人/agent 的文件抽走，
+# 且 refs/stash 是全仓共享的（20+ linked worktree 会互相顶掉栈顶）。
+forbid_repo_literal "scripts/rvf_local_deploy.py" 'stash'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'official cache 与 active plugin payload 不一致'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'RVF_USER_LOCAL_DATA_ROOT'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'deployment_source_worktree'
+forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py" 'local_main_worktree'
 require_repo_literal "tests/test_official_cli_local_deploy_verification.py" 'test_verifier_accepts_official_cli_installation_and_shared_user_state'
 require_repo_literal "tests/test_official_cli_local_deploy_verification.py" 'test_verifier_rejects_missing_official_codex_plugin'
 require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_runner_loaded_from_task_worktree'
-require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_dirty_local_main'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_reports_dirty_local_main_without_blocking'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_reports_runner_diverged_from_local_main_head'
 require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_rejects_expected_commit_mismatch'
 require_repo_literal "tests/test_developer_local_main_installation.py" 'test_public_runner_cli_has_no_repo_or_dirty_bypass'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_dirty_local_main_deploys_from_head_without_touching_worktree'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_is_reused_and_scrubbed_between_deploys'
+# 落点被占用时一律 fail-closed（绝不删）：外来仓库 worktree、本仓但挂了分支的 worktree 都要拒绝，
+# 只有「不存在」与「空目录」才放行；最后一条守住 fail-closed 没把正常首建回路一起堵死。
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_on_foreign_worktree_residue'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_on_branch_attached_own_worktree'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_is_created_into_vacant_landing_site_with_stale_registration'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_when_head_does_not_converge'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_when_residual_paths_remain'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_validate_source_pins_runner_baseline_to_frozen_deployment_commit'
+# 「同仓 + detached」这组形状任何人都手工造得出来，不构成归属证明；符号链接会让 is_dir()
+# 看到一棵合规的树而把 reset --hard + clean -xdff 落到链接目标上。销毁回路只认 RVF 亲手
+# 建树时写下的归属证据（落在该 worktree 私有 admin dir，reset/clean 抹不掉、prune 会带走）。
+require_repo_literal "scripts/rvf_local_deploy.py" 'DEPLOYMENT_SOURCE_WORKTREE_OWNERSHIP_MARKER_FILENAME'
+require_repo_literal "scripts/rvf_local_deploy.py" '_record_deployment_source_worktree_ownership'
+require_repo_literal "scripts/rvf_local_deploy.py" '_deployment_source_worktree_has_rvf_ownership_evidence'
+require_repo_literal "scripts/rvf_local_deploy.py" '--absolute-git-dir'
+require_repo_literal "scripts/rvf_local_deploy.py" 'is_symlink()'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_on_own_detached_worktree_without_ownership_evidence'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_on_symlink_landing_site'
+# 删除动作必须彻底消失：落点校验不得回退成「清理」。
+forbid_repo_literal "scripts/rvf_local_deploy.py" 'rmtree'
 require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_transaction_restores_previous_active_release_and_official_installation'
 require_repo_literal "tests/test_official_cli_installation_hooks.py" 'test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots'
 require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_never_include_an_installer'

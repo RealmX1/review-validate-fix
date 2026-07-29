@@ -160,7 +160,7 @@ def _default_command_runner(command: list[str]) -> subprocess.CompletedProcess[s
 def _run_synthetic_installed_hook_smoke(
     *,
     active_plugin_root: Path,
-    local_main_worktree: Path,
+    deployment_source_worktree: Path,
     home_directory: Path,
     user_local_data_root: Path,
 ) -> dict[str, Any]:
@@ -199,7 +199,7 @@ def _run_synthetic_installed_hook_smoke(
             stop_router,
             {
                 "hook_event_name": "Stop",
-                "cwd": str(local_main_worktree),
+                "cwd": str(deployment_source_worktree),
                 "session_id": "rvf-local-deploy-synthetic-smoke",
                 "last_user_message": "RVF local deploy synthetic hook smoke",
             },
@@ -209,7 +209,7 @@ def _run_synthetic_installed_hook_smoke(
             prompt_hook,
             {
                 "hook_event_name": "UserPromptSubmit",
-                "cwd": str(local_main_worktree),
+                "cwd": str(deployment_source_worktree),
                 "session_id": "rvf-local-deploy-synthetic-smoke",
                 "prompt": "RVF local deploy synthetic hook smoke",
             },
@@ -220,7 +220,7 @@ def _run_synthetic_installed_hook_smoke(
         completed = subprocess.run(
             [sys.executable, str(script_path)],
             input=json.dumps(event),
-            cwd=local_main_worktree,
+            cwd=deployment_source_worktree,
             env=synthetic_environment,
             capture_output=True,
             text=True,
@@ -335,8 +335,13 @@ def verify_local_deploy(
     active_marketplace_root = Path(str(receipt.get("active_marketplace_root"))).expanduser().resolve()
     release_root = Path(str(receipt.get("release_root"))).expanduser().resolve()
     user_local_data_root = Path(str(receipt.get("user_local_data_root"))).expanduser().resolve()
-    local_main_worktree = Path(str(receipt.get("local_main_worktree"))).expanduser().resolve()
-    _require(local_main_worktree.is_dir(), "installation receipt local-main worktree 不存在")
+    deployment_source_worktree = (
+        Path(str(receipt.get("deployment_source_worktree"))).expanduser().resolve()
+    )
+    _require(
+        deployment_source_worktree.is_dir(),
+        "installation receipt deploy 源 worktree 不存在",
+    )
     active_plugin_root = active_marketplace_root / f"plugins/{PLUGIN_NAME}"
     _verify_plugin_payload_root(active_plugin_root, label="active marketplace")
     _require(release_root.is_dir(), f"immutable release 不存在: {release_root}")
@@ -505,7 +510,7 @@ def verify_local_deploy(
     )
     synthetic_hook_smoke = _run_synthetic_installed_hook_smoke(
         active_plugin_root=active_plugin_root,
-        local_main_worktree=local_main_worktree,
+        deployment_source_worktree=deployment_source_worktree,
         home_directory=home_directory,
         user_local_data_root=user_local_data_root,
     )
@@ -521,7 +526,7 @@ def verify_local_deploy(
 
     return {
         "status": "ok",
-        "local_main_worktree": receipt.get("local_main_worktree"),
+        "deployment_source_worktree": receipt.get("deployment_source_worktree"),
         "local_main_commit": receipt.get("local_main_commit"),
         "generated_plugin_version": generated_plugin_version,
         "payload_digest": release_digest,

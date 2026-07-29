@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""从唯一、干净的 local main 运行 RVF 官方 CLI 本机部署。"""
+"""从唯一 local main 启动 runner，在 RVF 专用 deploy 源 worktree 的 HEAD checkout 上部署。
+
+local main 的工作树全程只被读取 ref（HEAD / refs/heads/main），从不被写入，因此开发者或
+其它 agent 手上的未提交改动既不阻塞部署，也不会被挪走。payload 一律来自 RVF 自己拥有的
+detached worktree，它是纯 tracked checkout —— 「发布件身份 == commit」因此是结构性保证，
+而不是靠「先挪走再放回」的时序约定。
+"""
 
 from __future__ import annotations
 
@@ -16,9 +22,16 @@ from typing import Any, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
+RUNNER_REPOSITORY_RELATIVE_PATH = "scripts/rvf_local_deploy.py"
+DEPLOYMENT_SOURCE_WORKTREE_DIRECTORY_NAME = (
+    "deployment-source-worktree-at-local-main-head"
+)
+DEPLOYMENT_SOURCE_WORKTREE_OWNERSHIP_MARKER_FILENAME = (
+    "rvf-deployment-source-worktree-ownership-marker.json"
+)
 PARTIAL_REMEDIATION = (
-    "修复失败原因后，从干净 local main 重新运行 runner；"
-    "不得降级到手写 plugin cache 或 installed payload。"
+    "修复失败原因后，从 local main 重新运行 runner；payload 只能来自 RVF 专用 deploy 源 "
+    "worktree 的 HEAD checkout，不得降级到手写 plugin cache 或 installed payload。"
 )
 
 
@@ -39,6 +52,8 @@ class DeployError(RuntimeError):
 class LocalMainDeploymentSource:
     worktree_path: Path
     commit: str
+    dirty_paths: tuple[str, ...]
+    runner_matches_local_main_head: bool
 
 
 @dataclass(frozen=True)
@@ -59,6 +74,33 @@ def _git(repo: Path, *args: str) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip()
         raise DeployError(f"git {' '.join(args)} 失败: {detail}", exit_code=2)
     return completed.stdout.strip()
+
+
+def _git_optional(repo: Path, *args: str) -> str | None:
+    """跑 git 但把非零退出当成「答案是没有」而不是错误。
+
+    用于那些「失败本身就是有效信号」的查询，例如 detached HEAD 下的 symbolic-ref。
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def _git_common_directory(repo: Path) -> Path | None:
+    raw_common_directory = _git_optional(repo, "rev-parse", "--git-common-dir")
+    if raw_common_directory is None:
+        return None
+    common_directory = Path(raw_common_directory)
+    if not common_directory.is_absolute():
+        # main worktree 里 git 返回相对路径（`.git`），需按查询所在目录还原。
+        common_directory = repo / common_directory
+    return common_directory.resolve()
 
 
 def _git_worktree_records(repository_hint: Path) -> list[dict[str, str]]:
@@ -84,7 +126,7 @@ def _status_paths(repo: Path) -> list[str]:
         check=False,
     )
     if completed.returncode != 0:
-        raise DeployError("无法读取 local main git status", exit_code=2)
+        raise DeployError(f"无法读取 git status: {repo}", exit_code=2)
     tokens = completed.stdout.decode("utf-8", errors="replace").split("\0")
     paths: list[str] = []
     index = 0
@@ -123,6 +165,41 @@ def _git_operation_markers(local_main_worktree: Path) -> list[Path]:
     return markers
 
 
+def _runner_matches_local_main_head(
+    *,
+    local_main_worktree: Path,
+    runner_path: Path,
+    frozen_deployment_commit: str,
+) -> bool:
+    """本次执行的 runner 自身是否就是「本次被部署的那个已冻结 commit」里的版本。
+
+    允许 local main 带 dirty 之后出现了一个新的语义缺口：runner 可能是未提交版本，却在
+    部署已冻结 commit 的 payload。这不构成失败（发布件身份依然诚实），但必须暴露 ——
+    否则「我改了编排逻辑并部署了」会被误读成「部署件里已经有这段编排逻辑」。
+
+    基线刻意绑定调用方已冻结的 `frozen_deployment_commit`（也正是 payload 的来源），
+    而不是现场再解析一次 `HEAD`：并行 agent 可能在冻结之后向 local main 提交，`HEAD`
+    会漂到一个根本没被部署的 commit，比较结果就回答不了本字段唯一要回答的问题。
+    """
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(local_main_worktree),
+            "show",
+            f"{frozen_deployment_commit}:{RUNNER_REPOSITORY_RELATIVE_PATH}",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return False
+    try:
+        return runner_path.read_bytes() == completed.stdout
+    except OSError:
+        return False
+
+
 def validate_local_main_deployment_source(
     *,
     repository_hint: Path,
@@ -142,7 +219,7 @@ def validate_local_main_deployment_source(
             exit_code=2,
         )
     local_main_worktree = Path(local_main_records[0]["worktree"]).expanduser().resolve()
-    expected_runner_path = local_main_worktree / "scripts/rvf_local_deploy.py"
+    expected_runner_path = local_main_worktree / RUNNER_REPOSITORY_RELATIVE_PATH
     if runner_path.expanduser().resolve() != expected_runner_path.resolve():
         raise DeployError(
             "deployment runner 必须来自 local main worktree: "
@@ -162,12 +239,9 @@ def validate_local_main_deployment_source(
             "local main worktree HEAD 与 refs/heads/main 不一致",
             exit_code=2,
         )
-    dirty_paths = _status_paths(local_main_worktree)
-    if dirty_paths:
-        raise DeployError(
-            f"local main worktree 含未提交改动: {sorted(dirty_paths)}",
-            exit_code=2,
-        )
+    # local main 的未提交改动只作为信息上报：payload 来自 deploy 源 worktree 的 HEAD
+    # checkout，dirty 既进不了发布件，也不需要被挪走。
+    local_main_dirty_paths = _status_paths(local_main_worktree)
     operation_markers = _git_operation_markers(local_main_worktree)
     if operation_markers:
         raise DeployError(
@@ -190,22 +264,274 @@ def validate_local_main_deployment_source(
     return LocalMainDeploymentSource(
         worktree_path=local_main_worktree,
         commit=local_main_commit,
+        dirty_paths=tuple(sorted(local_main_dirty_paths)),
+        runner_matches_local_main_head=_runner_matches_local_main_head(
+            local_main_worktree=local_main_worktree,
+            runner_path=runner_path.expanduser().resolve(),
+            frozen_deployment_commit=local_main_commit,
+        ),
     )
 
 
-def _required_paths(local_main_worktree: Path) -> dict[str, Path]:
+def deployment_source_worktree_path(home: Path) -> Path:
+    """RVF 自有 deploy 源 worktree 的落点。
+
+    与 `local-deploy.lock` 同级、由 `home` 驱动：测试传一个临时 home 即天然隔离。
+    刻意不放在 `RVF_USER_LOCAL_DATA_ROOT` 下 —— 那里被 verifier 的目录校验与契约的
+    嵌套合成部署 fixture 共用，多一棵 checkout 只会把两者耦合起来。
+    """
+    return home / ".rvf" / DEPLOYMENT_SOURCE_WORKTREE_DIRECTORY_NAME
+
+
+def _deployment_source_worktree_ownership_marker_path(
+    deployment_source_worktree: Path,
+) -> Path | None:
+    """RVF 归属证据的落盘位置：该 worktree 私有的 git admin dir 内。
+
+    刻意不写进工作树 —— 那里每轮都被 `reset --hard` + `clean -xdff` 抹平，证据活不过一次
+    部署。admin dir 由 `git worktree add` 单独为这棵树创建、随 `git worktree prune` 一起
+    消失，因此「证据在」与「这棵树是 RVF 建的、且仍然是那一棵」是同一件事。
+    """
+    absolute_git_directory = _git_optional(
+        deployment_source_worktree, "rev-parse", "--absolute-git-dir"
+    )
+    if not absolute_git_directory:
+        return None
+    return (
+        Path(absolute_git_directory)
+        / DEPLOYMENT_SOURCE_WORKTREE_OWNERSHIP_MARKER_FILENAME
+    )
+
+
+def _record_deployment_source_worktree_ownership(
+    deployment_source_worktree: Path,
+) -> None:
+    """在 RVF 亲手建出这棵树的那一刻写下归属证据；写不下就不许进入销毁回路。"""
+    marker_path = _deployment_source_worktree_ownership_marker_path(
+        deployment_source_worktree
+    )
+    if marker_path is None:
+        raise DeployError(
+            "无法为新建的 deploy 源 worktree 写入 RVF 归属证据: "
+            f"{deployment_source_worktree}",
+            exit_code=2,
+        )
+    marker_path.write_text(
+        json.dumps(
+            {
+                "owner": "review-validate-fix",
+                "purpose": DEPLOYMENT_SOURCE_WORKTREE_DIRECTORY_NAME,
+                "worktree_path": str(deployment_source_worktree.resolve()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _deployment_source_worktree_has_rvf_ownership_evidence(
+    deployment_source_worktree: Path,
+) -> bool:
+    marker_path = _deployment_source_worktree_ownership_marker_path(
+        deployment_source_worktree
+    )
+    if marker_path is None or not marker_path.is_file():
+        return False
+    marker = _read_json_object(marker_path)
+    if marker is None:
+        return False
+    # 证据与落点绑定：admin dir 若被指到别的树上，旧证据不得为新落点背书。
+    return marker.get("worktree_path") == str(deployment_source_worktree.resolve())
+
+
+def _deployment_source_worktree_is_reusable(
+    deployment_source_worktree: Path,
+    *,
+    expected_git_common_directory: Path,
+) -> bool:
+    """判断现有目录是否确实是本仓库的、RVF 自有的 deploy 源 worktree（fail-closed）。
+
+    复用分支的代价是紧接着的 `reset --hard` + `clean -xdff`，所以这里要的是「RVF 建过这棵
+    树」的**可验证证据**，而不是「形状像 RVF 的树」的推定：同仓 + detached 这组形状任何人
+    都手工造得出来，一旦据此放行，别人未提交的 tracked 改动与 untracked 文件就被不可逆抹掉。
+    """
+    # 符号链接一律不进销毁路径：`is_dir()` / `exists()` 都跟随链接，真实内容在别处，
+    # 交由 `_describe_...` 报「该路径是一个符号链接」而不是就地 reset 别人的树。
+    if deployment_source_worktree.is_symlink():
+        return False
+    if not deployment_source_worktree.is_dir():
+        return False
+    if not (deployment_source_worktree / ".git").exists():
+        return False
+    if _git_common_directory(deployment_source_worktree) != expected_git_common_directory:
+        return False
+    # detached 是 RVF 自有树的必要条件：一旦挂上分支，说明它已被当作普通开发树使用，
+    # 此时 reset --hard + clean -xdff 会毁掉别人的工作。判不可复用后由
+    # `_require_vacant_deployment_source_worktree_landing_site` 拒绝退出（不是删除重建）。
+    if (
+        _git_optional(deployment_source_worktree, "symbolic-ref", "--quiet", "HEAD")
+        is not None
+    ):
+        return False
+    return _deployment_source_worktree_has_rvf_ownership_evidence(
+        deployment_source_worktree
+    )
+
+
+def _describe_deployment_source_worktree_landing_site_occupant(
+    *,
+    local_main_worktree: Path,
+    deployment_source_worktree: Path,
+) -> str | None:
+    """描述落点上「一旦删掉就再也拿不回来」的东西；没有可丢失内容时返回 None。
+
+    返回 None 只有两种情形：路径根本不存在，或它是一个空目录。其余一切都算「有人占着」——
+    basename 等于 `DEPLOYMENT_SOURCE_WORKTREE_DIRECTORY_NAME` 只证明名字对得上，不证明
+    这棵树是 RVF 建的：那个名字任何人都写得出来，而删除是不可逆的。
+    """
+    if deployment_source_worktree.is_symlink():
+        return "该路径是一个符号链接，真实内容在别处"
+    if not deployment_source_worktree.exists():
+        return None
+    if not deployment_source_worktree.is_dir():
+        return "该路径是一个文件，不是 worktree"
+    if not any(deployment_source_worktree.iterdir()):
+        return None
+    if not (deployment_source_worktree / ".git").exists():
+        return "该路径是一个非空的普通目录，不受任何 git 仓库管理"
+    git_common_directory = _git_common_directory(deployment_source_worktree)
+    if git_common_directory != _git_common_directory(local_main_worktree):
+        return (
+            "该路径是另一个 git 仓库的 worktree"
+            f"（git common dir={git_common_directory}）"
+        )
+    attached_branch = _git_optional(
+        deployment_source_worktree, "symbolic-ref", "--quiet", "HEAD"
+    )
+    if attached_branch:
+        return (
+            f"该路径是本仓库的 worktree，但挂在分支 {attached_branch} 上，"
+            "里面可能是别人未提交的工作"
+        )
+    return (
+        "该路径是本仓库的 detached worktree，但没有 RVF 归属证据，"
+        "无法证明它是 RVF 建的（里面可能是别人未提交的工作）"
+    )
+
+
+def _require_vacant_deployment_source_worktree_landing_site(
+    *,
+    local_main_worktree: Path,
+    deployment_source_worktree: Path,
+) -> None:
+    """新建 deploy 源 worktree 之前，确认落点上没有任何会被销毁的东西（fail-closed）。
+
+    只有「路径不存在」和「空目录」两种落点能证明删除不丢东西。非空普通目录、符号链接、
+    别的仓库的 worktree、本仓但挂着分支或没有 RVF 归属证据的 worktree 一律拒绝：无法证明
+    归 RVF 所有就不动它，把处置权交回给人，而不是替他决定那些未提交改动可以丢。
+
+    稳态下根本走不到这里 —— RVF 自有的树带着 `_record_deployment_source_worktree_ownership`
+    写下的归属证据，会在 `_deployment_source_worktree_is_reusable` 处走复用分支就地 reset。
+    """
+    if deployment_source_worktree.name != DEPLOYMENT_SOURCE_WORKTREE_DIRECTORY_NAME:
+        raise DeployError(
+            "拒绝在非 RVF 命名的路径上创建 deploy 源 worktree: "
+            f"{deployment_source_worktree}",
+            exit_code=2,
+        )
+    occupant = _describe_deployment_source_worktree_landing_site_occupant(
+        local_main_worktree=local_main_worktree,
+        deployment_source_worktree=deployment_source_worktree,
+    )
+    if occupant is not None:
+        raise DeployError(
+            "deploy 源 worktree 落点已被占用，且无法证明它归 RVF 所有: "
+            f"{deployment_source_worktree}（{occupant}）。"
+            "RVF 不会删除无法证明所有权的路径。请人工确认其中没有需要保留的内容后，"
+            "自行移走或删除该路径，再重新运行部署。",
+            exit_code=2,
+        )
+    # 落点已确认为空（不存在或空目录），此时只可能残留「注册还在、树已不可用」的僵尸条目，
+    # 不清掉它 `worktree add` 会被拒。prune 只摘除失效注册，不碰任何仍然有效的 worktree。
+    _git(local_main_worktree, "worktree", "prune")
+
+
+def _ensure_deployment_source_worktree(
+    *,
+    local_main_worktree: Path,
+    deployment_source_worktree: Path,
+    commit: str,
+) -> dict[str, Any]:
+    """把 RVF 自有的 deploy 源 worktree 收敛到 local main 的 HEAD commit。"""
+    expected_git_common_directory = _git_common_directory(local_main_worktree)
+    if expected_git_common_directory is None:
+        raise DeployError(
+            f"无法解析 local main 的 git common dir: {local_main_worktree}",
+            exit_code=2,
+        )
+    created = False
+    if not _deployment_source_worktree_is_reusable(
+        deployment_source_worktree,
+        expected_git_common_directory=expected_git_common_directory,
+    ):
+        _require_vacant_deployment_source_worktree_landing_site(
+            local_main_worktree=local_main_worktree,
+            deployment_source_worktree=deployment_source_worktree,
+        )
+        deployment_source_worktree.parent.mkdir(parents=True, exist_ok=True)
+        _git(
+            local_main_worktree,
+            "worktree",
+            "add",
+            "--detach",
+            str(deployment_source_worktree),
+            commit,
+        )
+        # 归属证据必须在第一次 reset/clean 之前落盘：它是下一轮判「这棵树可以被清空」的
+        # 唯一依据，缺了它下一轮会 fail-closed 报占用，而不是误把别人的树当自己的清掉。
+        _record_deployment_source_worktree_ownership(deployment_source_worktree)
+        created = True
+    _git(deployment_source_worktree, "reset", "--hard", commit)
+    # 这棵树是 RVF 独占的，清到底是安全的；顺带清掉上一轮契约留下的
+    # `__pycache__` / `.pytest_cache` 之类 gitignored 产物。
+    _git(deployment_source_worktree, "clean", "-xdff")
+    synced_commit = _git(deployment_source_worktree, "rev-parse", "HEAD")
+    if synced_commit != commit:
+        raise DeployError(
+            "deploy 源 worktree 未收敛到 local main commit: "
+            f"expected={commit}, actual={synced_commit}",
+            exit_code=2,
+        )
+    residual_paths = _status_paths(deployment_source_worktree)
+    if residual_paths:
+        raise DeployError(
+            f"deploy 源 worktree 同步后仍不干净: {sorted(residual_paths)}",
+            exit_code=2,
+        )
+    return {
+        "deployment_source_worktree": str(deployment_source_worktree),
+        "deployment_source_worktree_created": created,
+        "deployment_source_worktree_synced_to_commit": synced_commit,
+    }
+
+
+def _required_deployment_entrypoint_paths(
+    deployment_source_worktree: Path,
+) -> dict[str, Path]:
     paths = {
-        "contract": local_main_worktree / "scripts/check_plugin_contracts.py",
-        "installer": local_main_worktree / "scripts/install_to_codex.py",
+        "contract": deployment_source_worktree / "scripts/check_plugin_contracts.py",
+        "installer": deployment_source_worktree / "scripts/install_to_codex.py",
         "verifier": (
-            local_main_worktree
+            deployment_source_worktree
             / "plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py"
         ),
     }
     missing_paths = [str(path) for path in paths.values() if not path.is_file()]
     if missing_paths:
         raise DeployError(
-            f"local main deploy 入口缺失: {missing_paths}",
+            f"deploy 源 worktree 入口缺失: {missing_paths}",
             exit_code=2,
         )
     return paths
@@ -360,12 +686,12 @@ def _run_phase(
     label: str,
     argv: list[str],
     *,
-    local_main_worktree: Path,
+    deployment_source_worktree: Path,
     environment: dict[str, str],
 ) -> str:
     completed = subprocess.run(
         argv,
-        cwd=local_main_worktree,
+        cwd=deployment_source_worktree,
         env=environment,
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -386,12 +712,13 @@ def run_local_deploy(
     runner_path: Path | None = None,
 ) -> dict[str, Any]:
     home = home.expanduser().resolve()
+    resolved_runner_path = (runner_path or Path(__file__)).expanduser().resolve()
     source = validate_local_main_deployment_source(
         repository_hint=repository_hint,
-        runner_path=runner_path or Path(__file__).resolve(),
+        runner_path=resolved_runner_path,
         expected_local_main_commit=expected_local_main_commit,
     )
-    paths = _required_paths(source.worktree_path)
+    deployment_source_worktree = deployment_source_worktree_path(home)
     environment = {**os.environ, "HOME": str(home)}
     user_local_data_root = _user_local_data_root(home, environment)
     environment["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
@@ -412,18 +739,6 @@ def run_local_deploy(
         / "deployment-receipts/previous-installation-before-latest-attempt.json"
     )
     hooks_path = home / ".codex/hooks.json"
-    contract_command = [sys.executable, str(paths["contract"])]
-    installer_command = [
-        sys.executable,
-        str(paths["installer"]),
-        "--source-local-main-worktree",
-        str(source.worktree_path),
-        "--source-local-main-commit",
-        source.commit,
-        "--configure-stop-hook",
-        "--configure-user-prompt-submit-hook",
-        "--json",
-    ]
     commands: list[list[str]] = []
 
     with _deployment_lock(home) as lock_path:
@@ -438,6 +753,11 @@ def run_local_deploy(
             )
         hooks_snapshot = _snapshot_structured_hook_configuration(hooks_path)
         installation_mutation_phase_started = False
+        deployment_source_worktree_state: dict[str, Any] = {
+            "deployment_source_worktree": str(deployment_source_worktree),
+            "deployment_source_worktree_created": None,
+            "deployment_source_worktree_synced_to_commit": None,
+        }
 
         def result_for(
             *,
@@ -451,7 +771,10 @@ def run_local_deploy(
                 "phase": phase,
                 "local_main_worktree": str(source.worktree_path),
                 "local_main_commit": source.commit,
-                "runner_path": str((runner_path or Path(__file__)).resolve()),
+                "local_main_dirty_paths": list(source.dirty_paths),
+                "runner_path": str(resolved_runner_path),
+                "runner_matches_local_main_head": source.runner_matches_local_main_head,
+                **deployment_source_worktree_state,
                 "installed_before": installed_before,
                 "installed_after": _installed_release_summary(
                     installation_receipt_path
@@ -472,6 +795,42 @@ def run_local_deploy(
             result.update(extra)
             return result
 
+        try:
+            deployment_source_worktree_state.update(
+                _ensure_deployment_source_worktree(
+                    local_main_worktree=source.worktree_path,
+                    deployment_source_worktree=deployment_source_worktree,
+                    commit=source.commit,
+                )
+            )
+            paths = _required_deployment_entrypoint_paths(deployment_source_worktree)
+        except DeployError as exc:
+            failed = result_for(
+                status="failed",
+                phase="deployment_source_worktree_preparation",
+                error=str(exc),
+                rollback_status="not_required",
+            )
+            _write_result_receipt(result_receipt_path, failed)
+            raise DeployError(
+                str(exc),
+                exit_code=exc.exit_code,
+                result=failed,
+            ) from exc
+
+        contract_command = [sys.executable, str(paths["contract"])]
+        installer_command = [
+            sys.executable,
+            str(paths["installer"]),
+            "--deployment-source-worktree",
+            str(deployment_source_worktree),
+            "--source-local-main-commit",
+            source.commit,
+            "--configure-stop-hook",
+            "--configure-user-prompt-submit-hook",
+            "--json",
+        ]
+
         commands.append(contract_command)
         _write_result_receipt(
             result_receipt_path,
@@ -481,7 +840,7 @@ def run_local_deploy(
             contract_output = _run_phase(
                 "plugin contract check",
                 contract_command,
-                local_main_worktree=source.worktree_path,
+                deployment_source_worktree=deployment_source_worktree,
                 environment=contract_environment,
             )
             commands.append(installer_command)
@@ -493,7 +852,7 @@ def run_local_deploy(
             installer_output = _run_phase(
                 "official CLI installer",
                 installer_command,
-                local_main_worktree=source.worktree_path,
+                deployment_source_worktree=deployment_source_worktree,
                 environment=environment,
             )
             try:
@@ -524,7 +883,7 @@ def run_local_deploy(
             verifier_output = _run_phase(
                 "official CLI verifier",
                 verifier_command,
-                local_main_worktree=source.worktree_path,
+                deployment_source_worktree=deployment_source_worktree,
                 environment=environment,
             )
             try:
@@ -560,7 +919,7 @@ def run_local_deploy(
                     rollback_output = _run_phase(
                         "official CLI verification rollback",
                         rollback_command,
-                        local_main_worktree=source.worktree_path,
+                        deployment_source_worktree=deployment_source_worktree,
                         environment=environment,
                     )
                     parsed_rollback_result = json.loads(rollback_output)
@@ -625,9 +984,17 @@ def _print_text(result: dict[str, Any]) -> None:
     print("RVF local-main official CLI deploy OK")
     print("local main worktree:", result["local_main_worktree"])
     print("local main commit:", str(result["local_main_commit"])[:12])
+    print("local main 未提交文件数:", len(result.get("local_main_dirty_paths") or []))
+    print("deploy 源 worktree:", result["deployment_source_worktree"])
+    print("deploy 源 worktree 本次新建:", result["deployment_source_worktree_created"])
     print("installed before:", result["installed_before"])
     print("installed after:", result["installed_after"])
     print("stale before:", result["stale_before"])
+    if not result.get("runner_matches_local_main_head", True):
+        print(
+            "注意: runner 自身含未提交改动，与本次被部署的 HEAD 版本不是同一份"
+            "（runner_matches_local_main_head=false）"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

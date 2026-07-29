@@ -106,7 +106,7 @@ def _verification_fixture(tmp_path: Path):
         {
             "schema_version": 2,
             "status": "installed",
-            "local_main_worktree": str(ROOT),
+            "deployment_source_worktree": str(ROOT),
             "local_main_commit": source_commit,
             "generated_plugin_version": release.generated_plugin_version,
             "payload_digest": release.payload_digest,

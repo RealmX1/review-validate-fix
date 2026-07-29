@@ -1316,7 +1316,7 @@ def _git_text(repository: Path, *arguments: str) -> str:
 
 def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-local-main-worktree", type=Path)
+    parser.add_argument("--deployment-source-worktree", type=Path)
     parser.add_argument("--source-local-main-commit")
     parser.add_argument(
         "--rollback-to-installation-receipt",
@@ -1352,16 +1352,16 @@ def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     ):
         parser.error("rollback mode 只能选择恢复上一 release 或移除首次安装之一")
     source_arguments_present = bool(
-        args.source_local_main_worktree or args.source_local_main_commit
+        args.deployment_source_worktree or args.source_local_main_commit
     )
     if rollback_requested and source_arguments_present:
         parser.error("rollback mode 不接受 local-main source 参数")
     if not rollback_requested and (
-        args.source_local_main_worktree is None
+        args.deployment_source_worktree is None
         or not args.source_local_main_commit
     ):
         parser.error(
-            "deployment mode 必须同时提供 --source-local-main-worktree "
+            "deployment mode 必须同时提供 --deployment-source-worktree "
             "与 --source-local-main-commit"
         )
     return args
@@ -1399,7 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
 
-        source_repository = args.source_local_main_worktree.expanduser().resolve()
+        source_repository = args.deployment_source_worktree.expanduser().resolve()
         actual_commit = _git_text(source_repository, "rev-parse", "HEAD")
         expected_commit = _git_text(
             source_repository,
@@ -1491,7 +1491,7 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": DEPLOYMENT_RECEIPT_SCHEMA_VERSION,
             "status": "installed",
             "installed_at": utc_now(),
-            "local_main_worktree": str(source_repository),
+            "deployment_source_worktree": str(source_repository),
             "local_main_commit": actual_commit,
             "source_commit_count": source_commit_count,
             "generated_plugin_version": release.generated_plugin_version,
