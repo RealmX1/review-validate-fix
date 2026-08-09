@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 # Injected by the aggregator (tests/test_review_support_scripts.py).
-__all__ = ['test_allocate_review_scope_busy_timeout_degrades', 'test_allocate_review_scope_concurrent_writers_serialize', 'test_allocate_review_scope_disable_env_short_circuits', 'test_allocate_review_scope_dry_run_does_not_create_lease', 'test_allocate_review_scope_emits_valid_tracker_scope_json', 'test_allocate_review_scope_empty_returns_no_unassigned_review_scope', 'test_allocate_review_scope_excludes_active_leased_units', 'test_allocate_review_scope_inserts_lease_and_marks_units_assigned', 'test_allocate_review_scope_output_consumed_by_prepare_run', 'test_allocate_review_scope_preserves_untracked_file_under_new_directory', 'test_allocate_review_scope_prunes_stale_leases_first', 'test_allocate_review_scope_writes_paths_and_hunks', 'test_allocator_event_appended_to_events_jsonl', 'test_complete_review_scope_does_not_complete_failed_released_lease', 'test_complete_review_scope_keeps_different_scope_active_lease', 'test_complete_review_scope_keeps_partial_edit_claim_pending', 'test_complete_review_scope_supersedes_overlapping_active_lease', 'test_complete_review_scope_unions_contract_and_lease_units', 'test_fork_first_stop_takeover_transfers_unleased_units', 'test_fork_takeover_skips_actively_leased_units', 'test_heartbeat_refreshes_tracker_lease_and_records_backend', 'test_heartbeat_treats_same_second_expiry_as_expired', 'test_invalidate_reviewed_units_for_run_reopens_and_is_idempotent', 'test_invalidate_reviewed_units_for_run_is_run_scoped', 'test_invalidate_reviewed_units_for_run_excludes_tombstoned', 'test_latest_reviewed_run_for_worktree_resolution', 'test_lease_acquire_concurrent_writers_serialize', 'test_lease_acquire_creates_lease_and_assigns_units', 'test_lease_acquire_prunes_stale_leases_first', 'test_lease_acquire_rejects_tombstoned_unit', 'test_lease_acquire_rejects_when_any_unit_already_leased', 'test_lease_participants_finish_does_not_release_shared_lease', 'test_lease_refresh_extends_expires_at', 'test_lease_refresh_returns_expired_when_past_ttl', 'test_lease_release_completed_marks_units_reviewed', 'test_lease_release_idempotent', 'test_manual_rvf_run_ensures_table_for_existing_v2_db', 'test_manual_rvf_run_find_respects_ttl', 'test_manual_rvf_run_find_returns_latest_completed_at', 'test_manual_rvf_run_inserts_row_and_emits_event', 'test_manual_rvf_run_upserts_on_pk_conflict', 'test_manual_takeover_cli_records_takeover', 'test_manual_takeover_rejects_missing_parent_session', 'test_manual_takeover_skips_actively_leased_units', 'test_manual_takeover_transfers_unleased_units', 'test_record_manual_run_cli_writes_row', 'test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge', 'test_run_alternative_reviewer_releases_lease_on_normal_exit', 'test_run_alternative_reviewer_releases_lease_on_timeout', 'test_run_alternative_reviewer_shared_lease_does_not_release_on_exit', 'test_run_alternative_reviewer_sigterm_kills_child_before_release', 'test_scope_hash_is_sha256_of_sorted_unit_ids', 'test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease', 'test_sweep_stale_no_op_when_all_active_leases_fresh', 'test_sweep_stale_releases_expired_active_leases', 'test_sweep_stale_releases_same_second_expired_lease', 'test_tracker_schema_v2_migrates_lease_participants_table', 'test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state']
+__all__ = ['test_allocate_review_scope_busy_timeout_degrades', 'test_allocate_review_scope_concurrent_writers_serialize', 'test_allocate_review_scope_disable_env_short_circuits', 'test_allocate_review_scope_dry_run_does_not_create_lease', 'test_allocate_review_scope_emits_valid_tracker_scope_json', 'test_allocate_review_scope_empty_returns_no_unassigned_review_scope', 'test_allocate_review_scope_excludes_active_leased_units', 'test_allocate_review_scope_inserts_lease_and_marks_units_assigned', 'test_allocate_review_scope_output_consumed_by_prepare_run', 'test_allocate_review_scope_preserves_untracked_file_under_new_directory', 'test_allocate_review_scope_prunes_stale_leases_first', 'test_allocate_review_scope_writes_paths_and_hunks', 'test_allocator_event_appended_to_events_jsonl', 'test_complete_review_scope_does_not_complete_failed_released_lease', 'test_complete_review_scope_keeps_different_scope_active_lease', 'test_complete_review_scope_keeps_partial_edit_claim_pending', 'test_complete_review_scope_supersedes_overlapping_active_lease', 'test_complete_review_scope_unions_contract_and_lease_units', 'test_fork_first_stop_takeover_transfers_unleased_units', 'test_fork_takeover_skips_actively_leased_units', 'test_heartbeat_refreshes_tracker_lease_and_records_backend', 'test_heartbeat_treats_same_second_expiry_as_expired', 'test_invalidate_reviewed_units_for_run_reopens_and_is_idempotent', 'test_invalidate_reviewed_units_for_run_is_run_scoped', 'test_invalidate_reviewed_units_for_run_excludes_tombstoned', 'test_latest_reviewed_run_for_worktree_resolution', 'test_lease_acquire_concurrent_writers_serialize', 'test_lease_acquire_creates_lease_and_assigns_units', 'test_lease_acquire_prunes_stale_leases_first', 'test_lease_acquire_rejects_tombstoned_unit', 'test_lease_acquire_rejects_when_any_unit_already_leased', 'test_lease_participants_finish_does_not_release_shared_lease', 'test_lease_refresh_extends_expires_at', 'test_lease_refresh_returns_expired_when_past_ttl', 'test_lease_release_completed_marks_units_reviewed', 'test_lease_release_idempotent', 'test_manual_rvf_run_ensures_table_for_existing_v2_db', 'test_manual_rvf_run_find_respects_ttl', 'test_manual_rvf_run_find_returns_latest_completed_at', 'test_manual_rvf_run_inserts_row_and_emits_event', 'test_manual_rvf_run_upserts_on_pk_conflict', 'test_manual_takeover_cli_records_takeover', 'test_manual_takeover_rejects_missing_parent_session', 'test_manual_takeover_skips_actively_leased_units', 'test_manual_takeover_transfers_unleased_units', 'test_record_manual_run_cli_writes_row', 'test_run_alternative_reviewer_releases_lease_on_codex_backend_challenge', 'test_run_alternative_reviewer_releases_lease_on_normal_exit', 'test_run_alternative_reviewer_releases_lease_on_timeout', 'test_run_alternative_reviewer_shared_lease_does_not_release_on_exit', 'test_run_alternative_reviewer_sigterm_kills_child_before_release', 'test_scope_hash_is_sha256_of_sorted_unit_ids', 'test_stale_prune_does_not_release_unit_reacquired_by_fresh_lease', 'test_sweep_stale_no_op_when_all_active_leases_fresh', 'test_sweep_stale_releases_expired_active_leases', 'test_sweep_stale_releases_same_second_expired_lease', 'test_tracker_schema_v2_migrates_lease_participants_table', 'test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state', 'test_declare_units_review_not_required_survives_tracker_refresh', 'test_declare_units_review_not_required_is_not_inherited_by_changed_hunk', 'test_allocate_review_scope_unions_prior_scope_after_lease_expiry', 'test_invalidate_reviewed_units_for_run_excludes_review_not_required_declarations', 'test_allocate_review_scope_union_list_excludes_units_held_by_active_lease', 'test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail']
 
 
 def inject(**deps: object) -> None:
@@ -2224,3 +2224,530 @@ def test_latest_reviewed_run_for_worktree_resolution(tmp: Path) -> None:
     empty = module.latest_reviewed_run_for_worktree(repo=repo, log_root_override=log_root)
     assert empty["status"] == "not_found", empty
     assert empty["run_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# 「声明不需审核」豁免（diff/hunk 级）+ lease 过期后的并集全审
+# ---------------------------------------------------------------------------
+
+def _unit_row_by_path(log_root: Path, repo_key: str, path: str):
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT unit_id, review_state, review_not_required_declared_at, "
+                "review_not_required_declared_reason, review_not_required_declared_by_run_id "
+                "FROM units WHERE path=? AND is_tombstoned=0",
+                (path,),
+            )
+        )
+    finally:
+        conn.close()
+    return rows
+
+
+def test_declare_units_review_not_required_survives_tracker_refresh(tmp: Path) -> None:
+    """豁免必须跨 tracker refresh 存活——这条直接钉死 ``_upsert_unit`` 的 ON CONFLICT 陷阱。
+
+    隔壁的 tombstone 三列在 ON CONFLICT 里被**无条件重置**，而每次 Stop 都会跑一次 refresh；
+    豁免若挂在 tombstone 一侧会被静默抹掉。故豁免挂在 ``review_state`` 一侧 + 三列审计侧车，
+    三者都不在那份 SET 列表里。
+    """
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+
+    first = module.allocate_review_scope(
+        repo=repo, session_id="sess-waiver", run_id="run-waiver-1",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    assert first["status"] == "dry_run", first
+    repo_key = first["repo_key"]
+    rows = _unit_row_by_path(log_root, repo_key, "tracked2.txt")
+    assert rows, "fixture 应该有 tracked2.txt 的 dirty unit"
+    waived_unit_id = rows[0][0]
+    assert waived_unit_id in first["unit_ids"]
+
+    declared = module.declare_units_review_not_required(
+        repo=repo, reason="agent_declined", unit_ids=[waived_unit_id],
+        declared_by_run_id="run-waiver-1", log_root_override=log_root,
+    )
+    assert declared["status"] == "declared"
+    assert declared["declared_unit_ids"] == [waived_unit_id]
+
+    # 再跑一次 allocate = 一次完整的 refresh（重新观察 + upsert 同一批 unit）。
+    second = module.allocate_review_scope(
+        repo=repo, session_id="sess-waiver", run_id="run-waiver-2",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    assert waived_unit_id not in second["unit_ids"], second  # 已被排除出审核范围
+    row = _unit_row_by_path(log_root, repo_key, "tracked2.txt")[0]
+    assert row[1] == "reviewed"                      # 豁免仍在（未被 ON CONFLICT 抹掉）
+    assert row[2] and row[2].endswith("Z")           # declared_at
+    assert row[3] == "agent_declined"                # declared_reason
+    assert row[4] == "run-waiver-1"                  # declared_by_run_id
+    # 事件落盘可审计。
+    events = [
+        json.loads(line)
+        for line in _alloc_events_path(log_root, repo_key).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("event") == "units_declared_review_not_required" for e in events), events
+
+
+def test_declare_units_review_not_required_is_not_inherited_by_changed_hunk(tmp: Path) -> None:
+    """粒度是 diff 级而非 file 级：被豁免的 hunk 内容一改，就是新 unit、不继承豁免。"""
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+
+    first = module.allocate_review_scope(
+        repo=repo, session_id="sess-waiver-diff", run_id="run-wd-1",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    repo_key = first["repo_key"]
+    waived_unit_id = _unit_row_by_path(log_root, repo_key, "tracked2.txt")[0][0]
+    module.declare_units_review_not_required(
+        repo=repo, reason="agent_declined", unit_ids=[waived_unit_id],
+        declared_by_run_id="run-wd-1", log_root_override=log_root,
+    )
+
+    # 改动同一个文件的同一段内容 → 内容派生的 unit_id 变了。
+    # 用新 session 观察：老 session 已有 session_units，allocator 的 auto-claim 只在「该 session
+    # 尚无任何归属」时兜底认领（正常路径的归属来自 manifest/register_claims），沿用老 session 会
+    # 让新 unit 因无归属而落不进候选集——那是归属机制，不是本测试要验的豁免继承性。
+    (repo / "tracked2.txt").write_text("base2\nchange2-edited-after-waiver\n", encoding="utf-8")
+    second = module.allocate_review_scope(
+        repo=repo, session_id="sess-waiver-diff-after-edit", run_id="run-wd-2",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    assert waived_unit_id not in second["unit_ids"]           # 老 unit 仍被豁免
+    assert "tracked2.txt" in second["paths"], second          # 但新内容重新进入审核范围
+
+
+def test_allocate_review_scope_unions_prior_scope_after_lease_expiry(tmp: Path) -> None:
+    """lease 过期后重新分配：不带并集会把原本圈定的 committed round 整个换掉；带上就恢复。
+
+    复现 run rvf-20260808T090747Z-stop-hook-ea36796d 的第四条结论——scope 的**口径**（而不只是
+    大小）在中断 + rewind 后被从 committed-round 悄悄换成了纯 dirty。
+    """
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+    baseline = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    (repo / "committed_in_round.txt").write_text("committed round content\n", encoding="utf-8")
+    run(["git", "add", "committed_in_round.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "committed round"], cwd=repo)
+
+    # 归属登记：committed-round 的 unit 不走 allocator 的 dirty auto-claim 兜底，正常路径由
+    # manifest → register_claims 归属（Stop hook 的 refresh 就是这么做的）。
+    registered = module.register_claims(
+        repo=repo, session_id="sess-union-1", run_id="run-union-1",
+        worktree=repo, branch=None,
+        owned_paths=["committed_in_round.txt"],
+        apply_patch_paths={"committed_in_round.txt"},
+        exec_only_paths=set(),
+        committed_paths={"committed_in_round.txt"},
+        committed_baseline=baseline,
+        log_root_override=log_root,
+    )
+    assert registered.status == "ok", registered
+
+    first = module.allocate_review_scope(
+        repo=repo, session_id="sess-union-1", run_id="run-union-1",
+        reviewer_id="reviewer-union", committed_baseline=baseline,
+        log_root_override=log_root,
+    )
+    assert first["status"] == "allocated", first
+    assert "committed_in_round.txt" in first["scope"]["paths"], first["scope"]["paths"]
+    # 口径写进了 scope artifact，供下一次重新分配继承。
+    assert first["scope"]["committed_baseline"] == baseline
+    repo_key = first["repo_key"]
+    prior_unit_ids = list(first["scope"]["unit_ids"])
+    committed_unit_id = _unit_row_by_path(log_root, repo_key, "committed_in_round.txt")[0][0]
+    assert committed_unit_id in prior_unit_ids
+
+    # lease 过期（agent 被中断 / 会话走远后回来）。
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute("UPDATE leases SET expires_at='1970-01-01T00:00:00Z'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # ① 不带并集、换了 session：committed round 被整个漏掉（这正是事故行为）。
+    without_union = module.allocate_review_scope(
+        repo=repo, session_id="sess-union-2", run_id="run-union-2",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    assert committed_unit_id not in without_union["unit_ids"], without_union
+
+    # ② 带并集：原 scope 里仍可审的 unit 全部并回。
+    # 并集必须**连口径一起**继承：只并 unit_id 而不带回 committed_baseline，committed 那批会在
+    # 观察阶段被判为「已不在场」而 superseded，并集查询自然找不到它们。CLI 的
+    # --union-with-prior-scope 会从上一轮 scope artifact 自动继承 baseline，这里显式传等价值。
+    with_union = module.allocate_review_scope(
+        repo=repo, session_id="sess-union-2", run_id="run-union-3",
+        reviewer_id="reviewer-union-2",
+        committed_baseline=first["scope"]["committed_baseline"],
+        union_with_prior_scope_unit_ids=prior_unit_ids,
+        log_root_override=log_root,
+    )
+    assert with_union["status"] == "allocated", with_union
+    union_unit_ids = with_union["scope"]["unit_ids"]
+    assert committed_unit_id in union_unit_ids, with_union
+    assert set(prior_unit_ids) <= set(union_unit_ids)               # 新 scope ⊇ 原 scope
+    assert committed_unit_id in with_union["unioned_prior_scope_unit_ids"]
+    events = [
+        json.loads(line)
+        for line in _alloc_events_path(log_root, repo_key).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    reallocated = [e for e in events if e.get("event") == "scope_reallocated_after_lease_expiry"]
+    assert len(reallocated) == 1, events
+    assert reallocated[0]["unioned_prior_scope_unit_count"] >= 1
+
+
+def test_invalidate_reviewed_units_for_run_excludes_review_not_required_declarations(
+    tmp: Path,
+) -> None:
+    """失败再入的重开不得撤销「不需审核」声明：那条 reviewed 不是「审过了」而是「决定不审」。"""
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+
+    allocated = module.allocate_review_scope(
+        repo=repo, session_id="sess-reopen-waiver", run_id="run-reopen-waiver",
+        reviewer_id="reviewer-reopen-waiver", log_root_override=log_root,
+    )
+    assert allocated["status"] == "allocated", allocated
+    scoped = list(allocated["scope"]["unit_ids"])
+    assert len(scoped) >= 2, scoped
+    waived_unit_id, genuinely_reviewed_unit_id = scoped[0], scoped[1]
+
+    # 一半走真实审完（lease 完成 → reviewed），一半走豁免声明。
+    module.complete_review_scope(
+        repo=repo, lease_id=allocated["lease_id"], log_root_override=log_root
+    )
+    module.declare_units_review_not_required(
+        repo=repo, reason="agent_declined", unit_ids=[waived_unit_id],
+        declared_by_run_id="run-reopen-waiver", log_root_override=log_root,
+    )
+
+    reopened = module.invalidate_reviewed_units_for_run(
+        repo=repo, run_id="run-reopen-waiver", log_root_override=log_root,
+    )
+    assert genuinely_reviewed_unit_id in reopened["reopened_unit_ids"], reopened
+    assert waived_unit_id not in reopened["reopened_unit_ids"], reopened
+
+
+def test_allocate_review_scope_union_list_excludes_units_held_by_active_lease(
+    tmp: Path,
+) -> None:
+    """「承接自上一轮」的清单必须与实际进入本轮 scope 的集合一致。
+
+    并集（Step 4b）刻意排在 active-lease 反连接（Step 5）**之前**，好让并回来的 unit 与本轮
+    新观察到的走同一道排他检查。代价是：被别的活跃租约占住的 prior unit 会在 Step 5 掉队。
+    若对外报告的仍是反连接**之前**的那份清单，就会出现两个后果——packet 的「承接自上一轮」
+    列出 reviewer 根本没拿到的 unit；事件里 ``newly_observed_unit_count``（本轮 scope 大小减
+    并集大小）算成负数，审计读到的是假的。
+
+    构造手法与既有的 ``test_allocate_review_scope_excludes_active_leased_units`` 相同：手工把
+    被租住的 unit 翻回 ``available``、租约原样留着——那正是 Step 5 反连接存在的理由，也是并集
+    清单唯一会与实际 scope 分叉的入口。
+    """
+    module = load_diff_tracker_module()
+    repo = _slice_2b_repo_with_two_dirty(tmp)
+    log_root = tmp / "logs"
+
+    # dry_run 只观察 + 登记归属，不建租约：拿到「上一轮 scope」的 unit 清单。
+    seeded = module.allocate_review_scope(
+        repo=repo, session_id="sess-union-lease-seed", run_id="run-union-lease-seed",
+        reviewer_id=None, dry_run=True, log_root_override=log_root,
+    )
+    assert seeded["status"] == "dry_run", seeded
+    repo_key = seeded["repo_key"]
+    prior_scope_unit_ids = list(seeded["unit_ids"])
+    assert len(prior_scope_unit_ids) >= 2, prior_scope_unit_ids
+    unit_held_by_other_active_lease = prior_scope_unit_ids[0]
+    units_still_reviewable_this_round = prior_scope_unit_ids[1:]
+
+    held = module.lease_acquire(
+        repo=repo, session_id="sess-union-lease-holder", run_id="run-union-lease-holder",
+        reviewer_id="reviewer-union-lease-holder",
+        unit_ids=[unit_held_by_other_active_lease],
+        log_root_override=log_root,
+    )
+    assert held["acquired"] is True, held
+    conn = _alloc_open_db(log_root, repo_key)
+    try:
+        conn.execute(
+            "UPDATE units SET review_state='available' WHERE unit_id=?",
+            (unit_held_by_other_active_lease,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reallocated = module.allocate_review_scope(
+        repo=repo, session_id="sess-union-lease-reallocated",
+        run_id="run-union-lease-reallocated",
+        reviewer_id="reviewer-union-lease-reallocated",
+        # 新 session 没有任何归属登记；关掉「dirty 兜底认领」好让候选集**只**来自并集，
+        # 于是「并集清单 vs 实际 scope」这一处差异被单独暴露出来，不被新观察的 unit 掩盖。
+        auto_claim_observed=False,
+        union_with_prior_scope_unit_ids=prior_scope_unit_ids,
+        log_root_override=log_root,
+    )
+    assert reallocated["status"] == "allocated", reallocated
+    assert reallocated["leased_excluded_count"] == 1, reallocated
+    assert reallocated["scope"]["unit_ids"] == units_still_reviewable_this_round, reallocated["scope"]
+    # 承接清单只能包含真正进了本轮 scope 的那部分：被活跃租约占住的那个必须掉出去。
+    assert reallocated["unioned_prior_scope_unit_ids"] == units_still_reviewable_this_round, reallocated
+    assert (
+        reallocated["scope"]["unioned_prior_scope_unit_ids"]
+        == units_still_reviewable_this_round
+    ), reallocated["scope"]
+    assert unit_held_by_other_active_lease not in reallocated["unioned_prior_scope_unit_ids"]
+
+    events = [
+        json.loads(line)
+        for line in _alloc_events_path(log_root, repo_key).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    reallocation_events = [
+        event for event in events if event.get("event") == "scope_reallocated_after_lease_expiry"
+    ]
+    assert len(reallocation_events) == 1, events
+    reallocation_event = reallocation_events[0]
+    assert reallocation_event["unioned_prior_scope_unit_ids"] == units_still_reviewable_this_round
+    assert reallocation_event["unioned_prior_scope_unit_count"] == len(
+        units_still_reviewable_this_round
+    )
+    # 本轮一个新 unit 都没观察到，所以是 0；用反连接**之前**的清单去减则是
+    # len(scope) - len(prior) = -1，负数会直接把审计读者带偏。
+    assert reallocation_event["newly_observed_unit_count"] == 0, reallocation_event
+
+
+# ---------------------------------------------------------------------------
+# kanban-followup trigger 在场判定：transcript 扫描的上界必须是**读取**层面的上界
+#
+# 该被测模块（plugins/.../scripts/kanban_followup_trigger_transcript_presence.py）同属
+# review-support scripts，故其测试登记在本 aggregator（tests/test_review_support_scripts.py）。
+# ---------------------------------------------------------------------------
+
+def _load_kanban_followup_trigger_transcript_presence_module():
+    """加载 transcript 在场判定模块。纯 stdlib 依赖，无需把 SCRIPT_DIR 放进 sys.path。"""
+    module_path = Path(SCRIPT_DIR) / "kanban_followup_trigger_transcript_presence.py"
+    cached = sys.modules.get("kanban_followup_trigger_transcript_presence_under_test")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "kanban_followup_trigger_transcript_presence_under_test", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError(
+            f"failed to load kanban_followup_trigger_transcript_presence module at {module_path}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+class _ByteCountingBinaryReadProxy:
+    """包住一个二进制文件句柄，记下每次 ``read`` 实际拿到多少字节。
+
+    刻意只实现被测代码用到的那几个方法（上下文管理 / ``seek`` / ``tell`` / ``read``）：多实现
+    一个通用文件方法，就多一分「被测代码换了读法而这条测试悄悄失去意义」的风险。
+    """
+
+    def __init__(self, handle, read_byte_sizes: list) -> None:
+        self._handle = handle
+        self._read_byte_sizes = read_byte_sizes
+
+    def __enter__(self):
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._handle.__exit__(*exc_info)
+
+    def seek(self, *args, **kwargs):
+        return self._handle.seek(*args, **kwargs)
+
+    def tell(self):
+        return self._handle.tell()
+
+    def read(self, *args, **kwargs):
+        data = self._handle.read(*args, **kwargs)
+        self._read_byte_sizes.append(len(data))
+        return data
+
+
+class _TranscriptPathWithByteCountingOpen:
+    """替身 ``Path``，只为量出被测模块**真的**从 transcript 读了多少字节。
+
+    刻意不去 monkeypatch ``pathlib.Path.open`` 本身：那会波及测试进程里所有文件访问。这里只
+    替换被测模块自己的 ``Path`` 名字，作用域收敛到那一个模块。
+    """
+
+    def __init__(self, target, read_byte_sizes: list) -> None:
+        self._target = Path(target)
+        self._read_byte_sizes = read_byte_sizes
+
+    def expanduser(self):
+        return self
+
+    def open(self, *args, **kwargs):
+        return _ByteCountingBinaryReadProxy(
+            self._target.open(*args, **kwargs), self._read_byte_sizes
+        )
+
+    def __str__(self) -> str:
+        return str(self._target)
+
+
+def _write_transcript_with_uuid_chain(
+    path: Path,
+    *,
+    entry_count: int,
+    token_literal_at_entry_index: int | None,
+    dispatch_token_literal: str,
+    padding_width: int,
+    trailing_newline: bool = True,
+) -> None:
+    """写一份 ``parentUuid`` 首尾相连的 transcript，``padding_width`` 用来把文件撑大。"""
+    lines = []
+    for index in range(entry_count):
+        text = "x" * padding_width
+        if token_literal_at_entry_index == index:
+            text = f"{text}\n{dispatch_token_literal}"
+        lines.append(
+            json.dumps(
+                {
+                    "uuid": f"entry-{index}",
+                    "parentUuid": None if index == 0 else f"entry-{index - 1}",
+                    "type": "user" if index % 2 == 0 else "assistant",
+                    "timestamp": "2026-08-08T00:00:00.000Z",
+                    "message": {"role": "user", "content": text},
+                },
+                ensure_ascii=False,
+            )
+        )
+    body = "\n".join(lines)
+    if trailing_newline and lines:
+        body += "\n"
+    path.write_text(body, encoding="utf-8")
+
+
+def test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail(tmp: Path) -> None:
+    """``DEFAULT_MAX_SCANNED_LINES`` 声明的是**读取**上界，不只是返回值上界。
+
+    原实现是 ``readlines()`` 整份读进内存再切最后 N 行——注释写着「Stop hook 的热路径，必须
+    有界」，实际每次 Stop 都按完整会话历史耗时并占内存（长会话 jsonl 几万行、几十 MB），而
+    Stop 侧锁对账与 UPS 侧陈旧 prep 否决都会同步走这条路。
+
+    这条测试同时钉住三件事：只读尾部若干块（**不是**整份文件）、尾部条目的顺序与内容不因分块
+    读取而变形、以及原有的「坏行跳过 / 不可读不抛」语义没被改动带走。
+    """
+    presence = _load_kanban_followup_trigger_transcript_presence_module()
+    dispatch_token = "0123456789abcdef"
+    literal = presence.dispatch_token_literal(dispatch_token)
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    # 文件要显著大于若干个读块，否则「没读整份」这个断言可能被块大小偶然满足。
+    long_transcript = tmp / "long-session.jsonl"
+    _write_transcript_with_uuid_chain(
+        long_transcript,
+        entry_count=4000,
+        token_literal_at_entry_index=3,  # 远在尾部窗口之外
+        dispatch_token_literal=literal,
+        padding_width=400,
+    )
+    transcript_size_bytes = long_transcript.stat().st_size
+    assert transcript_size_bytes > presence.TAIL_SCAN_CHUNK_BYTES * 3, transcript_size_bytes
+
+    read_byte_sizes: list = []
+    original_path_symbol = presence.Path
+    presence.Path = lambda target: _TranscriptPathWithByteCountingOpen(target, read_byte_sizes)
+    try:
+        classified = presence.classify_dispatch_trigger_presence(
+            transcript_path=long_transcript,
+            dispatch_token=dispatch_token,
+            max_scanned_lines=10,
+        )
+    finally:
+        presence.Path = original_path_symbol
+
+    # 只读了尾部：总读入字节数远小于整份文件，且只随块大小走、不随会话长度走。
+    total_read_bytes = sum(read_byte_sizes)
+    assert total_read_bytes > 0, read_byte_sizes
+    assert total_read_bytes < transcript_size_bytes, (total_read_bytes, transcript_size_bytes)
+    assert total_read_bytes <= presence.TAIL_SCAN_CHUNK_BYTES * 2, read_byte_sizes
+    # 尾部窗口之外的 token 不算「在场」——与原实现一致（截断丢掉的是更早的历史）。
+    assert classified.presence == presence.TRIGGER_PRESENCE_ABSENT_FROM_TRANSCRIPT, classified
+    assert classified.truncated is True, classified
+    assert classified.scanned_entry_count == 10, classified
+    assert classified.leaf_entry_uuid == "entry-3999", classified
+
+    # 尾部条目本身必须完好：token 落在最后一条时，祖先链回溯照样认得出来。
+    tail_token_transcript = tmp / "tail-token-session.jsonl"
+    _write_transcript_with_uuid_chain(
+        tail_token_transcript,
+        entry_count=4000,
+        token_literal_at_entry_index=3999,
+        dispatch_token_literal=literal,
+        padding_width=400,
+    )
+    on_chain = presence.classify_dispatch_trigger_presence(
+        transcript_path=tail_token_transcript,
+        dispatch_token=dispatch_token,
+        max_scanned_lines=10,
+    )
+    assert on_chain.presence == presence.TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN, on_chain
+    assert on_chain.trigger_entry_uuid == "entry-3999", on_chain
+    assert on_chain.truncated is True, on_chain
+
+    # 短文件（不足上限、且不以换行结尾）：整份都在，truncated 为假；坏行照旧跳过。
+    short_transcript = tmp / "short-session.jsonl"
+    _write_transcript_with_uuid_chain(
+        short_transcript,
+        entry_count=3,
+        token_literal_at_entry_index=2,
+        dispatch_token_literal=literal,
+        padding_width=8,
+        trailing_newline=False,
+    )
+    short_transcript.write_text(
+        short_transcript.read_text(encoding="utf-8") + "\n{ not json at all\n\n",
+        encoding="utf-8",
+    )
+    short = presence.classify_dispatch_trigger_presence(
+        transcript_path=short_transcript,
+        dispatch_token=dispatch_token,
+        max_scanned_lines=10,
+    )
+    assert short.presence == presence.TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN, short
+    assert short.truncated is False, short
+    assert short.scanned_entry_count == 3, short  # 坏行与空行被跳过，没被算成条目
+
+    # 不可读：返回 unknown + error，绝不抛。
+    unreadable = presence.classify_dispatch_trigger_presence(
+        transcript_path=tmp / "does-not-exist.jsonl",
+        dispatch_token=dispatch_token,
+        max_scanned_lines=10,
+    )
+    assert unreadable.presence == presence.TRIGGER_PRESENCE_UNKNOWN_TRANSCRIPT_UNREADABLE, unreadable
+    assert unreadable.error, unreadable
+    # 复用同一个 _scan 的 has_explicit_human_prompt_after 也不许抛。
+    found, error = presence.has_explicit_human_prompt_after(
+        transcript_path=tmp / "does-not-exist.jsonl",
+        after_epoch_seconds=0.0,
+        max_scanned_lines=10,
+    )
+    assert found is False and error, (found, error)

@@ -40,6 +40,24 @@ STATUS_INVALID = "invalid"
 STATE_IN_PROGRESS = "in_progress"
 STATE_WAITING_BOOTSTRAP = "waiting_bootstrap"
 
+# 上述缺陷族的**第二个实例**：UPS 在「prompt 被提交」那一刻 arm 锁，但提交 ≠ 落地成回合 ≠
+# agent 接手。注入的 follow-up trigger 可能被同回合的中断冲掉（enqueue→dequeue，从未成为
+# transcript 条目），或落地后被用户 rewind 掉；而锁一旦是 in_progress，读侧就会对一个**从未
+# 看到过这条 prompt** 的 agent 发「继续收尾这一轮、输出 handoff」的 re-engage nudge，把它拽去
+# 跑一次它从未接受的 RVF（实测 run rvf-20260808T090747Z-stop-hook-ea36796d）。
+#
+# 故投递落地时先落**这一态**：它仍满足互斥去重（marker 在场 → 不 mint 新 run），但读侧
+# **不发** re-engage nudge；只有确认 trigger 真的在当前 transcript 祖先链上（= agent 这一轮真
+# 收到了它）才 promote 成 in_progress。该态另用一条**更短**的独立 TTL（默认 600s）：到期即清
+# 锁交回常规 gate 按**当时**工作树重新决策，绝不复活一条早已被会话走远抛下的旧派发。
+STATE_DELIVERED_AWAITING_AGENT_DECISION = "delivered_awaiting_agent_decision"
+
+# awaiting 态专属 TTL。刻意短于 in-progress 的 1h：这段窗口只覆盖「trigger 已投递 → agent 在
+# 下一回合看到它」的正常延迟（秒~分钟级），不覆盖「agent 跑完一轮 review」。留长了就退化成
+# 今天的缺陷——一把无人认领的锁把后续 Stop 静默挡住。
+DEFAULT_AWAITING_AGENT_DECISION_TTL_SECONDS = 600
+AWAITING_AGENT_DECISION_TTL_ENV = "RVF_KANBAN_FOLLOWUP_AWAITING_DECISION_TTL_SECONDS"
+
 # bootstrap receipt 校验通过后那次 prepare 重放的**持久占位**。它是入口 B 专属的进程外去重
 # 记账，不属于 gate 的白名单身份字段，故不落进 gate；也**刻意不落进 marker payload**：marker
 # 的每一个写侧（``stamp_bootstrap_gate`` / ``bump_*`` / ``revive_marker``）都是「读-改-写整份
@@ -99,6 +117,35 @@ def ttl_seconds() -> float:
     except ValueError:
         return float(DEFAULT_TTL_SECONDS)
     return max(0.0, value)
+
+
+def awaiting_agent_decision_ttl_seconds() -> float:
+    """``delivered_awaiting_agent_decision`` 态专属 TTL（秒）。坏值一律回落默认。"""
+    raw = os.environ.get(AWAITING_AGENT_DECISION_TTL_ENV)
+    if raw is None or not raw.strip():
+        return float(DEFAULT_AWAITING_AGENT_DECISION_TTL_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_AWAITING_AGENT_DECISION_TTL_SECONDS)
+    return max(0.0, value)
+
+
+def ttl_seconds_for_state(state: str | None) -> float:
+    """按 marker ``state`` 选 TTL——awaiting 态短、其余沿用 in-progress 的长 TTL。"""
+    if state == STATE_DELIVERED_AWAITING_AGENT_DECISION:
+        return awaiting_agent_decision_ttl_seconds()
+    return ttl_seconds()
+
+
+def marker_state(marker: dict[str, Any] | None) -> str:
+    """读出这把锁的 ``state``（缺省 / 坏值一律按 ``in_progress``，即历史语义）。"""
+    if not isinstance(marker, dict):
+        return STATE_IN_PROGRESS
+    state = marker.get("state")
+    if isinstance(state, str) and state.strip():
+        return state.strip()
+    return STATE_IN_PROGRESS
 
 
 def _parse_iso_ts(value: Any) -> float | None:
@@ -175,10 +222,13 @@ def marker_payload(
     message_id: str | None = None,
     turn_id: str | None = None,
     prompt_path: str | None = None,
+    dispatch_token: str | None = None,
+    delivered_session_id: str | None = None,
+    delivered_transcript_path: str | None = None,
     state: str = STATE_IN_PROGRESS,
     bootstrap_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    ttl = ttl_seconds()
+    ttl = ttl_seconds_for_state(state)
     return {
         "marker_version": MARKER_VERSION,
         "state": state,
@@ -196,6 +246,15 @@ def marker_payload(
         "message_id": message_id,
         "turn_id": turn_id,
         "prompt_path": prompt_path,
+        # 派发这一轮 follow-up 的 dispatch token（注入 prompt 里字面出现为
+        # ``RVF_DISPATCH=token=<16 hex>``）。读侧据它在 transcript 里定位「这条 trigger 究竟
+        # 有没有成为一个真实回合、又是否仍在当前祖先链上」——即 promote / rewind 对账的锚点。
+        # 历史 payload 三个 id 字段全是 None，锁自己都不知道自己对应哪个回合。
+        "dispatch_token": dispatch_token,
+        # trigger 实际落地到哪个会话 / 哪份 transcript（UPS 那一刻的权威身份）。读侧优先按
+        # 这份 transcript 做祖先链对账；缺失时才退回「本次 Stop 的 transcript，且仅当会话相同」。
+        "delivered_session_id": delivered_session_id,
+        "delivered_transcript_path": delivered_transcript_path,
     }
 
 
@@ -211,6 +270,10 @@ def write_marker(
     message_id: str | None = None,
     turn_id: str | None = None,
     prompt_path: str | None = None,
+    dispatch_token: str | None = None,
+    delivered_session_id: str | None = None,
+    delivered_transcript_path: str | None = None,
+    state: str = STATE_IN_PROGRESS,
     root: Path | None = None,
 ) -> Path | None:
     paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
@@ -227,6 +290,10 @@ def write_marker(
         message_id=message_id,
         turn_id=turn_id,
         prompt_path=prompt_path,
+        dispatch_token=dispatch_token,
+        delivered_session_id=delivered_session_id,
+        delivered_transcript_path=delivered_transcript_path,
+        state=state,
     )
     target = paths[0]
     # Option A（兑现 nudge 预算的 loop-break 契约）：本函数是 in-progress 锁唯一的 arm 入口
@@ -456,7 +523,7 @@ def revive_marker(marker: dict[str, Any]) -> bool:
     raw_path = marker.get("_marker_path")
     if not isinstance(raw_path, str) or not raw_path:
         return False
-    ttl = ttl_seconds()
+    ttl = ttl_seconds_for_state(marker_state(marker))
     payload = {key: value for key, value in marker.items() if key != "_marker_path"}
     payload["expires_at"] = _iso_after(ttl)
     payload["ttl_seconds"] = ttl
@@ -468,6 +535,47 @@ def revive_marker(marker: dict[str, Any]) -> bool:
         return False
     marker.update(payload)
     return True
+
+
+def promote_marker_out_of_awaiting_agent_decision(
+    marker: dict[str, Any], *, reason: str
+) -> str | None:
+    """把一把 ``delivered_awaiting_agent_decision`` 锁升格为「agent 已接手」态，返回新 state。
+
+    目标态取决于这把锁上有没有 bootstrap gate：有 gate → ``waiting_bootstrap``（这一轮还卡在
+    pre-review 的 local base 吸收门前），无 gate → ``in_progress``。这样 UPS 侧的
+    ``stamp_bootstrap_gate`` 就不必在 awaiting 期间强行改写 state（改写会让「agent 到底收没收到
+    这条 trigger」的信息丢失，正是本次要根治的那类混淆）。
+
+    升格同时把 TTL 从 awaiting 的短窗（默认 600s）换成长窗（默认 1h）并**从此刻重新计时**
+    ——agent 是在这一刻才接手的，不该继承投递时刻的剩余寿命。``armed_at`` /
+    ``reengage_nudge_count`` / ``bootstrap_gate`` 原样保留（同一轮，不是新一轮）。
+
+    形状同 ``revive_marker`` / ``bump_bootstrap_reengage_count``：直接写 ``_marker_path``、
+    **同时写回传入的 ``marker`` 字典**（同一次 Stop 里紧随其后的整份重写不会把升格抹掉）、
+    best-effort 绝不抛。非 awaiting 态 / 无 ``_marker_path`` / 写失败一律返回 None。
+    """
+    if marker_state(marker) != STATE_DELIVERED_AWAITING_AGENT_DECISION:
+        return None
+    raw_path = marker.get("_marker_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    target_state = (
+        STATE_WAITING_BOOTSTRAP if marker.get("bootstrap_gate") else STATE_IN_PROGRESS
+    )
+    ttl = ttl_seconds()
+    payload = {key: value for key, value in marker.items() if key != "_marker_path"}
+    payload["state"] = target_state
+    payload["expires_at"] = _iso_after(ttl)
+    payload["ttl_seconds"] = ttl
+    payload["promoted_out_of_awaiting_agent_decision_at"] = _iso_now()
+    payload["promoted_out_of_awaiting_agent_decision_reason"] = reason
+    try:
+        _atomic_write(Path(raw_path), payload)
+    except OSError:
+        return None
+    marker.update(payload)
+    return target_state
 
 
 def acquire_marker(
@@ -592,7 +700,13 @@ def marker_status(
     armed_ts = _parse_iso_ts(marker.get("armed_at"))
     if armed_ts is None:
         return STATUS_INVALID
-    return STATUS_ACTIVE if current_ts - armed_ts <= ttl_seconds() else STATUS_STALE
+    # 缺 ``expires_at`` 的回退路径也必须按 state 取 TTL：awaiting 态若在这里误用 1h 长窗，
+    # 就退回了「无人认领的锁长期挡停」的原缺陷。
+    return (
+        STATUS_ACTIVE
+        if current_ts - armed_ts <= ttl_seconds_for_state(marker_state(marker))
+        else STATUS_STALE
+    )
 
 
 def reengage_nudge_count(marker: dict[str, Any] | None) -> int:

@@ -7518,6 +7518,275 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     assert again.status == "error" and again.exit_code == cli.EXIT_TOKEN_STATE
 
 
+def test_agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives(tmp: Path) -> None:
+    """decline-dispatched-review：给「Kanban 内自动 RVF」补上历史上根本不存在的谢绝出口。
+
+    收的是 **dispatch token**（注入 prompt 里的 RVF_DISPATCH=token=…），不是 S3 决策 token
+    ——Kanban task 内的自动 RVF 走延续后端，结构上不经过 S3 决策点。断言四件事：
+    ① 默认（不带豁免）= 清锁 + 清 pending + 理由落盘，scope 退回可审池；
+    ② 带 --mark-declined-scope-units-review-not-required = 额外把本轮 scope 声明为不需审核；
+    ③ **锁身份对账**：磁盘上的锁/pending 若属于**另一轮** dispatch（token 对不上），一律原样
+       保留、不清——否则一条重试的旧命令会把新一轮的互斥与续跑状态删掉（RVF-003）；
+    ④ **不谎报成功**：请求了豁免却一个 unit 都没声明成时，status 不得为 ok、message 不得
+       宣称已豁免（RVF-004）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    prep = load_rvf_prep_file_module()
+    tracker = load_diff_tracker_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    lock_root = tmp / "locks"
+    allocated = tracker.allocate_review_scope(
+        repo=repo, session_id="sess-decline", run_id="run-decline",
+        reviewer_id="reviewer-decline", log_root_override=log_root,
+    )
+    assert allocated["status"] == "allocated", allocated
+    scoped_unit_ids = list(allocated["scope"]["unit_ids"])
+
+    prep_root = tmp / "prep"
+    record = prep.write_prep_file(
+        {
+            "origin_session_id": "sess-decline",
+            "origin_repo": str(repo),
+            "origin_cwd": str(repo),
+            "target_flow": "flow-1-self-rising",
+            "target_worktree": str(repo),
+            "target_kanban_task_id": "task-decline",
+            "rvf_run": {
+                "run_id": "run-decline",
+                "run_dir": str(tmp / "run"),
+                "tracker_lease_id": allocated["lease_id"],
+            },
+        },
+        root=prep_root,
+        token="dddddddddddddddd",
+    )
+    lock_module = load_kanban_followup_lock_module()
+    lock_module.write_marker(
+        task_id="task-decline", session_id="sess-decline",
+        run_id="run-decline", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+        dispatch_token=record.token,
+        state=lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION,
+        root=lock_root,
+    )
+    # pending（dispatched_unconfirmed）也一并摆上：正常投递时 UPS 会按 token 清掉它，但谢绝
+    # 发生在「投递已落地、UPS 尚未清 / 已清」两种时序都可能，故这条路径必须自带 token guard。
+    lock_module.write_pending_marker(
+        task_id="task-decline", session_id="sess-decline",
+        run_id="run-decline", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+        token=record.token, delivery_channel="test", root=lock_root,
+    )
+    lock_marker_path = lock_root / "kanban-followup-in-progress" / "task-task-decline.json"
+    pending_marker_path = lock_root / "kanban-followup-dispatched" / "task-task-decline.json"
+    prev_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(log_root)
+    try:
+        # ① 默认谢绝：清锁 + 释放 lease，unit 退回 available（后续 Stop 仍可重新提议）。
+        result = cli.run_decline_dispatched_review(
+            token=record.token, reason="用户已让我改做别的工作",
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert result.status == "ok" and result.exit_code == cli.EXIT_OK, result
+        assert result.detail["failed_steps"] == [], result.detail
+        assert result.detail["removed_lock_paths"], result.detail
+        assert result.detail["lock_outcome"] == cli.KANBAN_FOLLOWUP_MARKER_CLEARED, result.detail
+        assert result.detail["pending_outcome"] == cli.KANBAN_FOLLOWUP_MARKER_CLEARED, result.detail
+        assert not lock_marker_path.exists()
+        assert not pending_marker_path.exists()  # token 匹配 → pending 也确实被清掉
+        assert result.detail["lease_release"]["released"] is True
+        assert result.detail["lease_release_outcome"] == "released", result.detail
+        rows = read_jsonl(Path(result.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record.token
+            and r.get("token_kind") == "dispatch"
+            and r.get("review_not_required_waiver_requested") is False
+            and r.get("review_not_required_waiver_declared") is False
+            and r.get("failed_steps") == []
+            for r in rows
+        ), rows
+        conn = sqlite3.connect(
+            str(log_root / "diff-tracker" / "repos" / allocated["repo_key"] / "tracker.sqlite3")
+        )
+        try:
+            states = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT review_state FROM units WHERE unit_id IN ({})".format(
+                        ",".join("?" for _ in scoped_unit_ids)
+                    ),
+                    tuple(scoped_unit_ids),
+                )
+            }
+        finally:
+            conn.close()
+        assert states == {"available"}, states  # 未豁免 → 退回可审池
+
+        # ② 带豁免：本轮 scope 被声明为不需审核（diff/hunk 级）。
+        second = tracker.allocate_review_scope(
+            repo=repo, session_id="sess-decline", run_id="run-decline-2",
+            reviewer_id="reviewer-decline-2", log_root_override=log_root,
+        )
+        record2 = prep.write_prep_file(
+            {
+                "origin_session_id": "sess-decline",
+                "origin_repo": str(repo),
+                "origin_cwd": str(repo),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(repo),
+                "target_kanban_task_id": "task-decline",
+                "rvf_run": {
+                    "run_id": "run-decline-2",
+                    "run_dir": str(tmp / "run"),
+                    "tracker_lease_id": second["lease_id"],
+                },
+            },
+            root=prep_root,
+            token="eeeeeeeeeeeeeeee",
+        )
+        waived = cli.run_decline_dispatched_review(
+            token=record2.token, reason="这批 diff 是生成物，无需审核",
+            mark_declined_scope_units_review_not_required=True,
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert waived.status == "ok", waived
+        assert waived.detail["review_not_required"]["status"] == "declared", waived.detail
+        assert waived.detail["review_not_required_declared"] is True, waived.detail
+        assert waived.detail["failed_steps"] == [], waived.detail
+        waived_rows = read_jsonl(Path(waived.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record2.token
+            and r.get("review_not_required_waiver_requested") is True
+            and r.get("review_not_required_waiver_declared") is True
+            for r in waived_rows
+        ), waived_rows
+        conn = sqlite3.connect(
+            str(log_root / "diff-tracker" / "repos" / allocated["repo_key"] / "tracker.sqlite3")
+        )
+        try:
+            rows2 = list(
+                conn.execute(
+                    "SELECT review_state, review_not_required_declared_reason FROM units "
+                    "WHERE unit_id IN ({})".format(",".join("?" for _ in scoped_unit_ids)),
+                    tuple(scoped_unit_ids),
+                )
+            )
+        finally:
+            conn.close()
+        assert {r[0] for r in rows2} == {"reviewed"}, rows2
+        assert all("这批 diff 是生成物" in (r[1] or "") for r in rows2), rows2
+        # 豁免生效：再分配一次已无可审 scope。
+        third = tracker.allocate_review_scope(
+            repo=repo, session_id="sess-decline", run_id="run-decline-3",
+            reviewer_id=None, dry_run=True, log_root_override=log_root,
+        )
+        assert third["status"] == "empty", third
+
+        # ③ RVF-003：不带豁免的谢绝之后同一 scope 可能立刻派发下一轮。此时重放**旧** token 的
+        #    谢绝命令，绝不能把新一轮的锁与 pending 删掉（否则当前 RVF 失去互斥与续跑状态）。
+        lock_module.write_marker(
+            task_id="task-decline", session_id="sess-decline",
+            run_id="run-decline-next", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+            dispatch_token="ffffffffffffffff",
+            state=lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION,
+            root=lock_root,
+        )
+        lock_module.write_pending_marker(
+            task_id="task-decline", session_id="sess-decline",
+            run_id="run-decline-next", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+            token="ffffffffffffffff", delivery_channel="test", root=lock_root,
+        )
+        replayed = cli.run_decline_dispatched_review(
+            token=record.token, reason="重试一条旧命令（或旧 token 的调用迟到）",
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert replayed.status == "decline_incomplete", replayed
+        assert replayed.exit_code == cli.EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE, replayed
+        assert (
+            replayed.detail["lock_outcome"]
+            == cli.KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+        ), replayed.detail
+        assert (
+            replayed.detail["pending_outcome"]
+            == cli.KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+        ), replayed.detail
+        assert replayed.detail["removed_lock_paths"] == [], replayed.detail
+        assert replayed.detail["preserved_lock_paths"], replayed.detail
+        # 新一轮的锁与 pending 都还在，且内容未被动过。
+        assert lock_marker_path.exists() and pending_marker_path.exists()
+        assert json.loads(lock_marker_path.read_text(encoding="utf-8"))["dispatch_token"] == (
+            "ffffffffffffffff"
+        )
+        assert json.loads(pending_marker_path.read_text(encoding="utf-8"))["token"] == (
+            "ffffffffffffffff"
+        )
+        assert any(
+            step["step"] == "kanban_followup_lock_clear" for step in replayed.detail["failed_steps"]
+        ), replayed.detail
+        # 部署滞后期间由老版 UPS arm 的锁没有 dispatch_token：必须回退按 run_id 对账，否则
+        # 部署完成前每一次谢绝都会退化成空操作；两者皆无时才允许「无从对账、照清」。
+        classify = cli.classify_kanban_followup_lock_identity_against_dispatch
+        assert classify(
+            {"run_id": "run-decline"}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_MATCHES_THIS_DISPATCH
+        assert classify(
+            {"run_id": "run-other"}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH
+        assert classify(
+            {}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER
+
+        # ④ RVF-004：请求了豁免但一个 unit 都没声明成（这里用一把不存在的 lease 触发 noop，
+        #    与 DB 写失败对用户是同一件事：**没有豁免**）。不得报 ok，更不得宣称已豁免。
+        record_noop = prep.write_prep_file(
+            {
+                "origin_session_id": "sess-decline",
+                "origin_repo": str(repo),
+                "origin_cwd": str(repo),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(repo),
+                "target_kanban_task_id": "task-decline-noop",
+                "rvf_run": {
+                    "run_id": "run-decline-noop",
+                    "run_dir": str(tmp / "run"),
+                    "tracker_lease_id": "lse-does-not-exist",
+                },
+            },
+            root=prep_root,
+            token="cccccccccccccccc",
+        )
+        unwaived = cli.run_decline_dispatched_review(
+            token=record_noop.token, reason="想豁免但目标 lease 已不存在",
+            mark_declined_scope_units_review_not_required=True,
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert unwaived.status == "decline_incomplete", unwaived
+        assert unwaived.exit_code == cli.EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE, unwaived
+        assert unwaived.detail["review_not_required_declared"] is False, unwaived.detail
+        assert any(
+            step["step"] == "review_not_required_waiver"
+            for step in unwaived.detail["failed_steps"]
+        ), unwaived.detail
+        # message 必须如实：不出现成功路径那句「已把 scope 声明为不需审核」，且明说没豁免。
+        assert "并把本轮 scope 的 diff 声明为「不需审核」" not in unwaived.message, unwaived.message
+        assert "没有" in unwaived.message and "不需审核" in unwaived.message, unwaived.message
+        assert unwaived.next_steps, unwaived
+        noop_rows = read_jsonl(Path(unwaived.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record_noop.token
+            and r.get("review_not_required_waiver_requested") is True
+            and r.get("review_not_required_waiver_declared") is False
+            for r in noop_rows
+        ), noop_rows
+    finally:
+        if prev_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = prev_log_root
+
+
 def test_agent_cli_error_paths_missing_and_terminal_tokens(tmp: Path) -> None:
     """错误路径：不存在的 token 在 start / dispatch / scope 上都归 EXIT_TOKEN_STATE；dispatched 终态
     token 上 scope / dispatch 亦被拒。"""
@@ -8549,6 +8818,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist",
             lambda: test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
                 root / "prompt-submit-revive"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_declines_reviving_stale_prep",
+            lambda: test_rvf_user_prompt_submit_declines_reviving_stale_prep(
+                root / "prompt-submit-stale-revive"
             ),
         ),
         (
@@ -9637,6 +9912,42 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state(root / "lease-T0b"),
         ),
         (
+            "declare_units_review_not_required_survives_tracker_refresh",
+            lambda: test_declare_units_review_not_required_survives_tracker_refresh(
+                root / "waiver-T1"
+            ),
+        ),
+        (
+            "declare_units_review_not_required_is_not_inherited_by_changed_hunk",
+            lambda: test_declare_units_review_not_required_is_not_inherited_by_changed_hunk(
+                root / "waiver-T2"
+            ),
+        ),
+        (
+            "allocate_review_scope_unions_prior_scope_after_lease_expiry",
+            lambda: test_allocate_review_scope_unions_prior_scope_after_lease_expiry(
+                root / "union-T1"
+            ),
+        ),
+        (
+            "invalidate_reviewed_units_for_run_excludes_review_not_required_declarations",
+            lambda: test_invalidate_reviewed_units_for_run_excludes_review_not_required_declarations(
+                root / "waiver-T3"
+            ),
+        ),
+        (
+            "allocate_review_scope_union_list_excludes_units_held_by_active_lease",
+            lambda: test_allocate_review_scope_union_list_excludes_units_held_by_active_lease(
+                root / "union-T2"
+            ),
+        ),
+        (
+            "kanban_followup_trigger_transcript_scan_reads_only_bounded_tail",
+            lambda: test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail(
+                root / "trigger-presence-scan-T1"
+            ),
+        ),
+        (
             "lease_acquire_creates_lease_and_assigns_units",
             lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
         ),
@@ -9902,6 +10213,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "agent_cli_decline_persists_reason_and_cooldown",
             lambda: test_agent_cli_decline_persists_reason_and_cooldown(root / "agent-cli-decline"),
+        ),
+        (
+            "agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives",
+            lambda: test_agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives(
+                root / "agent-cli-decline-dispatched"
+            ),
         ),
         (
             "agent_cli_error_paths_missing_and_terminal_tokens",
