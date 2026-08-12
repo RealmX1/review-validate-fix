@@ -447,6 +447,8 @@ def invoke_result(
     env["HOME"] = str(state / "home")
     env["CODEX_RVF_INSTALLED_STOP_HOOK"] = str(hook)
     env["CODEX_RVF_LOG_ROOT"] = str(state)
+    # 见上：session-hook 只认 CODEX_RVF_STATE_DIR，与真实安装一致地两个都设。
+    env["CODEX_RVF_STATE_DIR"] = str(state)
     if extra_env:
         env.update(extra_env)
     # 默认假 tmux：避免触发 handoff→advisory 的测试在后台真的拉起 analyze agent。
@@ -505,6 +507,11 @@ def invoke_router(
     if dev_hook is not None:
         env["CODEX_RVF_DEV_STOP_HOOK"] = str(dev_hook)
     env["CODEX_RVF_LOG_ROOT"] = str(state)
+    # session-hook 状态目录只认 CODEX_RVF_STATE_DIR，**不会**回落到 LOG_ROOT
+    # （回落会让 reviewer 子进程 source 过 review-env.sh 之后把会话状态写进
+    # 某个 run 的日志目录）。真实安装（install_to_codex.py）两个都设，这里同理；
+    # 本进程不改 HOME，漏设会让 router 写到真实的 ~/.rvf 下去。
+    env["CODEX_RVF_STATE_DIR"] = str(state)
     if extra_env:
         env.update(extra_env)
     env.setdefault("RVF_TMUX_BIN", str(_DEFAULT_FAKE_TMUX))

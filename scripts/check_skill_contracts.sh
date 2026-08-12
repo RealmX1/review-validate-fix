@@ -548,6 +548,7 @@ repo_required_files=(
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
   "scripts/rvf_local_deploy.py"
+  "scripts/merge_rvf_state_roots.py"
   "tests/test_stop_hook_dispatcher.py"
   "tests/test_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
@@ -615,6 +616,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
   "$repo_root/scripts/rvf_local_deploy.py" \
+  "$repo_root/scripts/merge_rvf_state_roots.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
   "$skill_dir/scripts/write_review_result.py" \

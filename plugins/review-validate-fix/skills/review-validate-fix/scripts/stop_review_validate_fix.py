@@ -47,7 +47,10 @@ from core.run_ledger.run_ledger import (
     skill_deploy_metadata,
     start_run,
 )
-from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
+from core.rvf_user_local_data_paths import (
+    resolved_rvf_session_hook_state_dir,
+    resolved_rvf_user_local_data_paths,
+)
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
     CLINE_KANBAN_TASK_MARKER,
     CLINE_KANBAN_WORKTREE_MODES,
@@ -234,7 +237,6 @@ RVF_USER_LOCAL_DATA_PATHS = resolved_rvf_user_local_data_paths()
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_STATE_DIR = RVF_USER_LOCAL_DATA_PATHS.runtime_state_root
-DEFAULT_SESSION_HOOK_STATE_DIR = DEFAULT_STATE_DIR / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
@@ -377,15 +379,9 @@ def read_kanban_task_suppression(task_id: str) -> dict[str, Any] | None:
 
 
 def session_hook_state_dir() -> Path:
-    explicit = os.environ.get("CODEX_RVF_SESSION_HOOK_STATE_DIR")
-    if explicit and explicit.strip():
-        return Path(explicit).expanduser()
-
-    state_root = os.environ.get("CODEX_RVF_STATE_DIR")
-    if state_root and state_root.strip():
-        return Path(state_root).expanduser() / "session-hook"
-
-    return DEFAULT_SESSION_HOOK_STATE_DIR
+    # 单一裁决点见 core.rvf_user_local_data_paths；本函数语义即该裁决点的语义
+    # （explicit → CODEX_RVF_STATE_DIR → runtime_state_root，刻意不回落 LOG_ROOT）。
+    return resolved_rvf_session_hook_state_dir()
 
 
 def read_event() -> dict[str, Any] | None:
