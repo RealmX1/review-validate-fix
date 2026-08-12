@@ -32,6 +32,12 @@ __all__ = [
     'test_dispatch_reviewers_execute_backfills_review_env',
     'test_dispatch_reviewers_reroutes_on_usage_limit',
     'test_dispatch_reviewers_reroute_id_collision',
+    'test_dispatch_reviewers_reroutes_on_leg_without_review_result',
+    'test_dispatch_reviewers_failclose_when_leg_without_review_result_unfilled',
+    'test_dispatch_reviewers_rc_zero_without_review_result_is_not_effective',
+    'test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted',
+    'test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure',
+    'test_dispatch_reviewers_wait_status_surfaces_plan_outcome',
     'test_dispatch_reviewers_probe_excludes_cooldown',
     'test_dispatch_reviewers_failclose_when_main_exhausted',
 ]
@@ -764,6 +770,289 @@ def test_dispatch_reviewers_reroute_id_collision(tmp_path: Path) -> None:
         assert Path(r["review_result_path"]).exists(), r
         seen.add(r["review_result_path"])
     assert len(seen) == 2, seen
+
+
+def test_dispatch_reviewers_reroutes_on_leg_without_review_result(tmp_path: Path) -> None:
+    """alpha 认证失败(rc1、无 review-result) → 轮内 reroute 到 gamma；不写 cooldown。
+
+    回归 rvf-20260811T170157Z：cursor 登录过期那腿 rc=1、目录里没有 review-result.json，
+    原实现只对额度耗尽(125)做 reroute，于是既不补位也不报错，plan 记 partial 就收工。
+    """
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("auth", 100), "beta": ("clean", 90), "gamma": ("clean", 80)}
+    )
+    # 同 usage-limit 测试：钉死 seed=4 让伪随机选出 alpha+beta，剧本确定可复现。
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg, selection_seed=4)
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="no-result-reroute-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta", "gamma"],
+        )
+    assert plan["status"] == "completed", plan
+    assert plan["effective_reviewer_count"] == 2, plan
+    # 认证失败不是额度问题：绝不能把 alpha 禁到后续 run 去。
+    assert plan["cooldown_recorded"] == [], plan["cooldown_recorded"]
+    assert not (cooldown_root / "harness-alpha.json").exists(), list(cooldown_root.glob("*"))
+    assert len(plan["fallbacks"]) == 1, plan["fallbacks"]
+    fb = plan["fallbacks"][0]
+    assert (fb["from"], fb["to"], fb["reason"]) == ("alpha", "gamma", "no_review_result"), fb
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"beta", "gamma"}
+    for r in plan["reviewers"]:
+        assert Path(r["review_result_path"]).exists(), r
+
+
+def test_dispatch_reviewers_failclose_when_leg_without_review_result_unfilled(
+    tmp_path: Path,
+) -> None:
+    """认证失败腿补不上（池里只有两个 harness）→ status=failed + 专属 reason，不留 partial。"""
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(tmp_path, {"alpha": ("auth", 100), "beta": ("clean", 90)})
+    plan = d.route("codex", ["alpha", "beta"], reg)
+    assert plan["routing_rule"] == "R1", plan
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="no-result-failclose-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta"],
+        )
+    # 一腿有效、一腿彻底没结论 ⇒ 不是 double-review，必须 fail-close 而不是停在 partial。
+    assert plan["status"] == "failed", plan
+    assert plan["reason"] == "reviewer_leg_produced_no_review_result", plan
+    assert plan["effective_reviewer_count"] == 1, plan
+    codes = [w["code"] for w in plan["warnings"]]
+    assert "reviewer_leg_produced_no_review_result" in codes, plan["warnings"]
+    assert plan["cooldown_recorded"] == [], plan["cooldown_recorded"]
+
+
+def test_dispatch_reviewers_rc_zero_without_review_result_is_not_effective(tmp_path: Path) -> None:
+    """腿 rc=0 却没写 review-result 也不算数：仍触发 reroute，effective 只数真有结论的腿。"""
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path,
+        {"alpha": ("rc0_no_result", 100), "beta": ("clean", 90), "gamma": ("clean", 80)},
+    )
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg, selection_seed=4)
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="rc0-no-result-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta", "gamma"],
+        )
+    assert plan["status"] == "completed", plan
+    assert plan["effective_reviewer_count"] == 2, plan
+    assert len(plan["fallbacks"]) == 1, plan["fallbacks"]
+    assert plan["fallbacks"][0]["from"] == "alpha", plan["fallbacks"]
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"beta", "gamma"}
+
+
+def test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted(tmp_path: Path) -> None:
+    """alpha 返回合法 kind: request(rc0) → 不换腿、不算失败腿，plan 冒 blocked_on_reviewer_request。
+
+    request 是 review 协议的待处理终态：主会话要按 Contract Gate 满足/驳回后让**同一** reviewer
+    重试。若按 `no_review_result` 换腿，替换腿一成功 plan 就变 completed，request 被静默丢弃。
+    """
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path,
+        {"alpha": ("review_request", 100), "beta": ("clean", 90), "gamma": ("clean", 80)},
+    )
+    # 同族测试：钉死 seed=4 让伪随机选出 alpha+beta（gamma 留作「本不该被用上」的替换候选）。
+    plan = d.route("codex", ["alpha", "beta", "gamma"], reg, selection_seed=4)
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="review-request-pending-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta", "gamma"],
+        )
+    # 关键回归：request 腿原样留在 plan 里，没有被 gamma 顶掉。
+    assert plan["fallbacks"] == [], plan["fallbacks"]
+    assert {r["harness_id"] for r in plan["reviewers"]} == {"alpha", "beta"}, plan["reviewers"]
+    assert plan["status"] == "blocked_on_reviewer_request", plan
+    assert plan["reason"] == "reviewer_review_request_pending", plan
+    assert plan["effective_reviewer_count"] == 1, plan
+    pending_ids = plan["review_request_pending_reviewer_ids"]
+    assert pending_ids == ["alpha-cli"], pending_ids
+    codes = [w["code"] for w in plan["warnings"]]
+    assert "reviewer_review_request_pending" in codes, plan["warnings"]
+    assert "reviewer_leg_produced_no_review_result" not in codes, plan["warnings"]
+    # request 不是环境故障，更不是额度问题：不写 cooldown。
+    assert plan["cooldown_recorded"] == [], plan["cooldown_recorded"]
+
+
+def test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure(tmp_path: Path) -> None:
+    """一腿额度耗尽 + 一腿认证失败且都补不上 → 混合 reason，不得谎称「全部额度耗尽」。
+
+    旧实现只要有额度腿且有效腿数为 0 就发 `all_reviewers_usage_limit_exhausted`，主会话据此
+    去等配额恢复，同时需要修的认证故障被整条藏住（连 warning 都不发）。
+    """
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(tmp_path, {"alpha": ("usage", 100), "beta": ("auth", 90)})
+    plan = d.route("codex", ["alpha", "beta"], reg)
+    assert plan["routing_rule"] == "R1", plan
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="mixed-failure-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta"],
+        )
+    assert plan["status"] == "failed", plan
+    assert plan["effective_reviewer_count"] == 0, plan
+    assert plan["reason"] == "reviewer_legs_failed_mixed_usage_limit_and_no_review_result", plan
+    codes = [w["code"] for w in plan["warnings"]]
+    # 两类故障各自的 warning 都要在，非额度腿不得被额度结论盖住。
+    assert "reviewer_leg_produced_no_review_result" in codes, plan["warnings"]
+    assert any(code.endswith("usage_limit_unfilled") for code in codes), plan["warnings"]
+    assert "all_reviewers_usage_limit_exhausted" not in codes, plan["warnings"]
+    # 只有额度腿写 cooldown；认证失败腿绝不能被禁到后续 run。
+    assert plan["cooldown_recorded"] == ["alpha"], plan["cooldown_recorded"]
+    assert not (cooldown_root / "harness-beta.json").exists(), list(cooldown_root.glob("*"))
+
+
+def test_dispatch_reviewers_wait_status_surfaces_plan_outcome(root: Path) -> None:
+    """--wait-status 必须把 plan 的聚合结果一起冒出来，而不只是派发进程的 returncode。
+
+    回归 rvf-20260811T170157Z：派发进程 exit 0、plan 却是 partial(一腿无结论)，轮询只打印
+    returncode=0，照 SKILL.md 协议轮询的主会话据此当作「派发成功」。
+    """
+    d = load_dispatch_reviewers_module()
+    root.mkdir(parents=True, exist_ok=True)
+    status_path = root / ".dispatch-thread.status.json"
+    plan_path = root / "reviewer-plan.json"
+    status_path.write_text(
+        json.dumps({"launch_status": "launched", "finished_at": "t1", "returncode": 0}),
+        encoding="utf-8",
+    )
+
+    # 派发进程 rc=0，但 plan 只有一腿有结论 → 必须报出 partial，绝不能只显示 returncode=0。
+    plan_path.write_text(
+        json.dumps(
+            {
+                "status": "partial",
+                "reviewers": [{"reviewer_id": "a"}, {"reviewer_id": "b"}],
+                "effective_reviewer_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    done = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert done["state"] == "done" and done["returncode"] == 0, done
+    assert done["plan_status"] == "partial", done
+    assert done["effective_reviewer_count"] == 1 and done["reviewer_count"] == 2, done
+
+    # fail-close 的 reason 也要带出来供排障。
+    plan_path.write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "reason": "reviewer_leg_produced_no_review_result",
+                "reviewers": [{"reviewer_id": "a"}, {"reviewer_id": "b"}],
+                "effective_reviewer_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert failed["plan_status"] == "failed", failed
+    assert failed["plan_reason"] == "reviewer_leg_produced_no_review_result", failed
+
+    # 两腿都有结论才是 completed。
+    plan_path.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "reviewers": [{"reviewer_id": "a"}, {"reviewer_id": "b"}],
+                "effective_reviewer_count": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert ok["plan_status"] == "completed" and ok["effective_reviewer_count"] == 2, ok
+
+    # plan 还没写出来 → unknown（不是乐观值）。
+    plan_path.unlink()
+    unknown = d.wait_for_dispatch_status(status_path, max_wait=0.0)
+    assert unknown["plan_status"] == "unknown", unknown
 
 
 def test_dispatch_reviewers_probe_excludes_cooldown(tmp_path: Path) -> None:

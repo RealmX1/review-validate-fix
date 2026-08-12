@@ -18,14 +18,29 @@ reviewer 使用 `references/review-standards/reviewer.md` 作为 RVF 定制审�
 
 只有当 `dispatch_reviewers.py` 报告 0 个 external reviewer 可用（plan `routing_rule: R3`、`needs_last_resort_fallback: true`）时，才退到 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 描述的 in-harness mimic 兜底（两路 `codex-mimic-reviewer-a` / `codex-mimic-reviewer-b`，仍是 double review，不要由主会话单独 review 后伪装成两路结果）。只有用户在本轮明确要求必须使用外部 reviewer、且不接受兜底时（`dispatch_reviewers.py --require-external`），才因无可用 external reviewer 而 fail-close。
 
-### 额度耗尽检测 + 自动回退（cooldown / `fallbacks`）
+### Probe 判据必须与真实评审入口同源
 
-reviewer 背后的 agentic/coding 订阅额度耗尽（usage limit / quota exhausted）与 auth 失败不同：`--preflight`（`codex login status` 等）只查 auth，额度耗尽时仍返回 0。因此 dispatcher 改为**仅失败签名检测 + 双层回退**：
+harness 的 `health_command` **必须走与 `command` 相同的入口**（同一子命令、同一组 flag，只把 prompt 换成一句最小指令），不能用旁路的 auth 查询命令代替。2026-08-11 的 run `rvf-20260811T170157Z` 上，cursor 的 probe 是 `cursor-agent status`（exit 0，文本里却写着 `unable to fetch user details`），真实评审入口 `cursor-agent -p …` 则报 `Authentication required` 退出 1——路由层据此把一个跑不起来的 harness 选进两腿，那腿派出去后不产出任何 review-result。**旁路命令的退出码不是真实可用性的充分判据。**
+
+同理，探针**不得精简 flag**：曾试过省掉 cursor 的 `--force --trust --sandbox disabled`，立刻撞上 `⚠ Workspace Trust Required` —— 探针在任何未 trust 的目录都会非零退出，把**健康**的 harness 误判为不可用（RVF 每个 worktree 都是新目录）。少一个 flag 就换一道门，也就不再是同一条路径。
+
+探针成本的量级要求：故障时应当**瞬时**失败（auth/trust 在启动即拒、不进模型），健康时只多烧一次极短会话。`health_timeout_seconds` 必须小于 `dispatch_reviewers.py --probe-timeout`（默认 60s），否则外层先超时、把健康 harness 判死。
+
+注意 probe 覆盖的是 auth/启动层，**不**覆盖工具执行层——工具层坏掉的 build 仍能通过 probe，由评审过程中的 `CursorStreamActivityMonitor` 实时 fail-over 兜底（见 `scripts/cursor_stream_tool_layer_health.py`）。
+
+### 腿失败检测 + 自动回退（reroute / cooldown / `fallbacks`）
+
+**一条腿是否算数，只看它有没有产出合法 review-result**（`reviewer.summary.json` 的 `review_result_complete`，即 review-result 的 `kind` ∈ {`no_issues`, `issues`}），而不是看进程退出码——退出码只说进程怎么退出，不说有没有可用结论。plan 的 `effective_reviewer_count` 是这个判据的汇总；**缺一条合法腿即非法 double-review**，无论失败原因是什么。
+
+失败分两类，处置不同。额度耗尽（usage limit / quota exhausted）与其它失败的区别在于：它跨 run 持续存在，而 auth 失效、启动失败、崩溃、超时之类只在本轮成立。因此 dispatcher 做**失败签名检测 + 双层回退**：
 
 - **检测**：`run_alternative_reviewer.py` 仅在「无合法 review-result 的失败输出」上识别额度签名（codex_json 走 `error`/`turn.failed`/`thread.error` 事件；其它格式扫 stderr/stdout，绝不扫模型评审正文），命中则以专用退出码 **125 + `RVF_EXTERNAL_REVIEWER_USAGE_LIMIT`** flag 收尾，并在 `reviewer.summary.json` 记 `output_error_reason: usage_limit_exhausted`。
-- **轮内 reroute**：`dispatch_reviewers.py --execute` 对「125 且 flag/summary 佐证」的每路，对 `A' = 可用集 − 已冷却 − 已失败` 重调 `route()` 取替换 harness，**in-place 替换失败 slot、保持恰好两路**，并保留失败 leg 的 artifact 目录。替换 leg 的 `reviewer_id` 以 `-fb<slot>` 后缀防碰撞。每次替换记入 plan 的 `fallbacks`（每项 `{slot, from, from_reviewer_id, to, to_reviewer_id, round}`）。
-- **跨轮 cooldown**：撞额度的 harness 在 `~/.rvf/harness-limit-cooldown/` 记一条带 TTL 的冷却标记（默认 1h，能从错误文本解析到 provider 重置提示则以它为准；env `RVF_HARNESS_LIMIT_COOLDOWN_TTL_SECONDS` 覆盖默认）。后续轮的真实 probe 会跳过仍在冷却期的 harness 并发 `harness_limit_cooldown_active` warning（`--assume-available` 仅测试用、不应用 cooldown）。
-- **fail-close（不伪装 R3）**：若 external 补不上且主/兜底 harness 自身也在冷却/刚撞额度，plan 直接 `status: failed` 并发 `main_harness_usage_limit_exhausted` / `all_reviewers_usage_limit_exhausted`（probe 阶段全被 cooldown 清空则发 `all_harnesses_usage_limited`），**绝不**静默置 `needs_last_resort_fallback` 伪装成 0-external 的正常 R3 in-harness mimic。`fallbacks` 非空只说明发生过额度回退；canonical outcome 仍以 `reviewer-plan.json` 的 `status` 与每路 `review-result.json` 为准。
+- **轮内 reroute（对任何失败腿，不只额度）**：`dispatch_reviewers.py --execute` 对**每条没产出合法 review-result 的腿**，在 `A' = 可用集 − 已冷却 − 本轮已失败` 上重调 `route()` 取替换 harness，**in-place 替换失败 slot、保持恰好两路**，并保留失败 leg 的 artifact 目录。替换 leg 的 `reviewer_id` 以 `-fb<slot>` 后缀防碰撞。每次替换记入 plan 的 `fallbacks`（每项 `{slot, from, from_reviewer_id, to, to_reviewer_id, round, reason}`，`reason` ∈ {`usage_limit_exhausted`, `no_review_result`}）。「本轮已失败」与「已冷却」是两个独立排除集——前者只在本轮成立，后者跨 run 持久；两者都必须排除，否则刚失败的 harness 会被立刻重选、reroute 空转。烧满 idle timeout 的悬挂腿（rc=124）同样走这条路自动补位，代价是最坏墙钟变长（仍在 `--total-timeout` backstop 内）。
+- **跨轮 cooldown（仅额度类）**：撞额度的 harness 在 `~/.rvf/harness-limit-cooldown/` 记一条带 TTL 的冷却标记（默认 1h，能从错误文本解析到 provider 重置提示则以它为准；env `RVF_HARNESS_LIMIT_COOLDOWN_TTL_SECONDS` 覆盖默认）。后续轮的真实 probe 会跳过仍在冷却期的 harness 并发 `harness_limit_cooldown_active` warning（`--assume-available` 仅测试用、不应用 cooldown）。**非额度类失败不写 cooldown**——本轮的环境故障不该把 harness 禁到后续 run。
+- **fail-close（不伪装 R3）**：补不上时 plan 一律 `status: failed` + 响亮 warning，**绝不**静默置 `needs_last_resort_fallback` 伪装成 0-external 的正常 R3 in-harness mimic，也绝不停在 `partial` 让主会话拿单路结论当双评审用。reason 码按失败类别：额度类发 `main_harness_usage_limit_exhausted` / `all_reviewers_usage_limit_exhausted`（probe 阶段全被 cooldown 清空则发 `all_harnesses_usage_limited`）；其它类发 `reviewer_leg_produced_no_review_result`（warning 里列出失败 harness 与退出码，指向对应 `reviewer.stderr*.txt`）。`fallbacks` 非空只说明发生过回退；canonical outcome 仍以 `reviewer-plan.json` 的 `status` / `effective_reviewer_count` 与每路 `review-result.json` 为准。
+- **混合失败必须自报混合**：`all_reviewers_usage_limit_exhausted` 只在**所有**失败腿都是额度类时才发。一腿撞额度、另一腿认证失败/崩溃/无 artifact 时，reason 发 `reviewer_legs_failed_mixed_usage_limit_and_no_review_result`，且两类 warning（`*_usage_limit_*` 与 `reviewer_leg_produced_no_review_result`）都会出现——否则主会话只会去等配额恢复，同时需要修的非额度故障被整条藏住。
+- **合法 `kind: request` 腿不是失败腿**：runner 对它以 rc=0 收尾并在 `reviewer.summary.json` 记 `review_request_pending: true`。dispatcher **不**换腿、**不**排除该 harness、**不**写 cooldown，而是把它作为待处理终态冒泡：plan 记 `review_request_pending_reviewer_ids`，无任何真失败腿时 `status: blocked_on_reviewer_request` + `reason: reviewer_review_request_pending`。若按 `no_review_result` 换腿，替换腿一成功 plan 就会变 `completed`，request 被静默丢弃、主会话再也不会按下面的 Contract Gate / Request Handling 处理它。
+- **轮询侧不得只看 `returncode`**：`--wait-status` 打印的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `effective_reviewers=k/n` 才是判据（详见 SKILL.md 的轮询协议）。
 
 ## Contract Gate
 
@@ -56,7 +71,7 @@ reviewer 背后的 agentic/coding 订阅额度耗尽（usage limit / quota exhau
 
 ## Request Handling
 
-`kind: request` 是非完成态协议，不是 finding。主会话处理 request 时应：
+`kind: request` 是非完成态协议，不是 finding。dispatcher 侧的对应信号是 plan 的 `status: blocked_on_reviewer_request` / `reason: reviewer_review_request_pending` 与 `review_request_pending_reviewer_ids`（该腿不会被自动换掉）。主会话处理 request 时应：
 
 1. 校验 request artifact 没有和完成态输出混写。
 2. 判断 request 是否仍在 session scope 内。
