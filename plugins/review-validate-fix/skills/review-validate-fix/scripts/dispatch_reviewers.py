@@ -81,6 +81,18 @@ DEFAULT_REGISTRY = resolved_rvf_reviewer_registry_path(
 RUN_ALTERNATIVE_REVIEWER = Path(__file__).resolve().parent / "run_alternative_reviewer.py"
 PLAN_SCHEMA_VERSION = 1
 
+# 本轮 double-review 的**非完成态终态**：有腿返回合法 ``kind: request``（review 协议规定的
+# 待处理终态，既不是故障也不是完成态 review）。给名字而不是散落字面量，便于消费方对齐。
+PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
+# 该终态的**专用退出码**。既不能是 failed 的 1（那会把「无人出故障、只是等主会话处置」
+# 谎报成故障），更不能是 0——0 表示「被包命令干净完成」，会让 detached 幂等锁被
+# ``rvf_detached_thread._detached_run_finished_clean`` 判为「已完成的 run」而永久保留，
+# 后续按协议重派只能拿到 ``already_running``，本 run 再也产不出完成态 review（见 main()）。
+DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE = 3
+# 真失败腿与待处理 request **并存**时，追加到失败类 reason 末尾的后缀。plan 的 ``reason``
+# 只有一个槽位，混合情形必须自报混合（与 usage_limit × no_review_result 的混合 reason 同源）。
+REVIEW_REQUEST_PENDING_REASON_SUFFIX = "_with_review_request_pending"
+
 # Detached 派发线程（--detached / --wait-status）：把「agent 前台 Bash 调用 ↔ 整轮
 # 派发 wall-clock」解耦，突破 Bash 工具 600s 硬上限。status/log/lock 落在
 # <artifacts>/reviewers/ 下，与 reviewer-plan.json / 各 reviewer artifact 同处。
@@ -509,6 +521,63 @@ def _leg_usage_limit(reviewer: dict[str, Any], artifacts_dir: Path) -> tuple[boo
     return False, None
 
 
+def _leg_produced_review_result(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
+    """这条腿是否真的产出了合法评审结论——double-review 契约的唯一真判据。
+
+    比 ``returncode == 0`` 严格：退出码只说进程怎么退出，不说有没有可用结论。2026-08-11 的
+    run rvf-20260811T170157Z 上，cursor 腿 rc=1、目录里根本没有 review-result.json，plan 却
+    只按 rc 计成 ``partial`` 就收工——主会话拿一份结论当双评审用（详见 ``execute_plan``）。
+
+    判据优先取 ``reviewer.summary.json`` 的 ``review_result_complete``（跨 harness 通用，由
+    run_alternative_reviewer.py 按 review-result 的 ``kind`` ∈ {no_issues, issues} 写入）；
+    summary 缺失/不可解析时回退到直接读 review-result.json 自身的 kind，避免因 artifact
+    形态变化而误判成「有结论」。
+    """
+    reviewer_dir = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+    summary = _read_reviewer_summary(reviewer_dir)
+    if isinstance(summary, dict) and "review_result_complete" in summary:
+        return summary["review_result_complete"] is True
+    result_path = reviewer.get("review_result_path")
+    path = Path(result_path) if result_path else reviewer_dir / "review-result.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("kind") in {"no_issues", "issues"}
+
+
+def _leg_is_effective(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
+    """腿有效 = 干净退出 **且** 产出了合法评审结论（两者缺一不可）。"""
+    return reviewer.get("returncode") == 0 and _leg_produced_review_result(reviewer, artifacts_dir)
+
+
+def _leg_review_request_pending(reviewer: dict[str, Any], artifacts_dir: Path) -> bool:
+    """这条腿是否写出了合法的 ``kind: request``（非完成态、但也**不是**失败）。
+
+    request 是 review 协议的合法待处理终态：reviewer 要标准子集/命令锁/测量结果/上下文，
+    主会话应按 ``references/review-merge-policy.md`` 的 Contract Gate + Request Handling
+    满足、驳回或 spawn 子任务后**让原 reviewer 重试**。runner 对它以 rc=0 收尾，并在
+    ``reviewer.summary.json`` 写 ``review_request_pending: true``。
+
+    必须与「没产出结论的失败腿」分开判：否则 request 会被当成 ``no_review_result`` 换腿，
+    替换 leg 一成功 plan 就变 ``completed``，那条 request 再也不会被主会话按 Contract Gate
+    处理——reviewer 明确说「我还没审完、缺东西」却被静默丢弃。
+    """
+    if reviewer.get("returncode") != 0:
+        return False
+    reviewer_dir = artifacts_dir / "reviewers" / reviewer["reviewer_id"]
+    summary = _read_reviewer_summary(reviewer_dir)
+    if isinstance(summary, dict) and "review_request_pending" in summary:
+        return summary["review_request_pending"] is True
+    result_path = reviewer.get("review_result_path")
+    path = Path(result_path) if result_path else reviewer_dir / "review-result.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("kind") == "request"
+
+
 def _dedupe_reviewer_id(reviewer_id: str, used_ids: set[str]) -> str:
     """bounded 去重：替换 leg id 与已占用 id 碰撞时追加序号（多轮 reroute 也不撞）。"""
     if reviewer_id not in used_ids:
@@ -527,15 +596,25 @@ def _reroute_candidates(
     registry: dict[str, Any],
     *,
     now_utc: datetime | None = None,
+    already_failed: set[str] | None = None,
 ) -> list[str]:
-    """对 ``A' = available − cooled`` 重调 ``route()`` 取替换候选 harness 顺序（R-c 单源）。
+    """对 ``A' = available − cooled − already_failed`` 重调 ``route()`` 取替换候选顺序（R-c 单源）。
 
     候选 = route 在 A' 上的两腿选择（已含 R0–R3 的池内无偏序选二 / main-as-external /
     R2 双实例语义；选择池 >2 时该两腿为伪随机），再按 priority 补齐 A' 其余，保证
     「需补两腿但 route 只给两腿」时仍有后备。当前 reroute 只消费 sub-plan 的 harness
     顺序，未持久化其 reviewer_selection/seed；池扩到 >2 后若要求逐次复现，须先补该遥测。
+
+    ``already_failed`` 是本轮内已经失败过的 harness。它与 ``cooled`` 分开传是有意的：
+    cooldown 是**跨 run 持久化**的额度信号，只该由额度耗尽写入；而 auth 失效之类的失败
+    只在本轮成立，不配把 harness 禁到后续 run 去。但两者都必须排除出本轮的替换候选——
+    否则刚失败的 harness 会被立刻重新选中，reroute 空转。
     """
-    a_prime = [h for h in available if h not in cooled]
+    a_prime = [
+        h
+        for h in available
+        if h not in cooled and h not in (already_failed or set())
+    ]
     candidates: list[str] = []
     if main_harness is not None and a_prime:
         sub_plan = route(main_harness, a_prime, registry, now_utc=now_utc)
@@ -566,14 +645,43 @@ def execute_plan(
 ) -> dict[str, Any]:
     """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
 
-    撞额度耗尽（returncode 125 + 佐证）时，做**轮内 reroute**：记 cooldown → 对
-    ``A' = available − cooled`` 重调 ``route()`` 取替换 → in-place 替换失败 slot（保持恰好两腿、
-    保留成功 leg 的 artifact）→ 派发替换 leg；替换也 125 则 bounded 再来一轮。补不上则
-    fail-close（F1/F2/R-e）。``registry``/``main_harness``/``available`` 缺省（None）时退化为
-    「无 reroute」，仅按 returncode 计 status（兼容旧调用方）。
+    **任何**没产出合法评审结论的腿都触发**轮内 reroute**：对
+    ``A' = available − cooled − 本轮已失败`` 重调 ``route()`` 取替换 → in-place 替换失败 slot
+    （保持恰好两腿、保留成功 leg 的 artifact）→ 派发替换 leg；替换也失败则 bounded 再来一轮。
+    补不上则 fail-close（F1/F2/R-e）。``registry``/``main_harness``/``available`` 缺省（None）
+    时退化为「无 reroute」，仅按有效腿数计 status（兼容旧调用方）。
+
+    失败分两类，处置不同：
+
+    - **额度耗尽**（returncode 125 + 佐证）：额外记 cooldown（跨 run 持久化的额度信号），
+      fail-close 时沿用既有 ``*_usage_limit_*`` reason 码。
+    - **其它任何未产出结论**（auth 失效、启动失败、崩溃、写不出 review-result …）：只在本轮
+      排除该 harness，**不**写 cooldown——本轮的环境故障不该把 harness 禁到后续 run。
+
+    第二类原先完全没有处置：2026-08-11 的 run rvf-20260811T170157Z 上 cursor 登录过期，那腿
+    rc=1、无 review-result，plan 只按 rc 计成 ``partial`` 就收工，既不补位也不报错，主会话最终
+    拿单路结论当双评审用。缺一条合法腿即非法 double-review，与额度耗尽同等对待。
+
+    两类失败可以**同时**发生，因此 fail-close 分支不是互斥的：各自 warning 都会冒出来，
+    ``reason`` 在混合时用 ``reviewer_legs_failed_mixed_usage_limit_and_no_review_result``；
+    ``all_reviewers_usage_limit_exhausted`` 只在所有失败腿都是额度类时才发（否则主会话会
+    照「等配额恢复」处置，把同时需要修的 auth/崩溃故障藏住）。
+
+    **合法 ``kind: request`` 不是失败腿**：runner 以 rc=0 收尾并记 ``review_request_pending``。
+    它既不换腿也不排除 harness，而是作为待处理终态冒泡——无真失败腿时 plan 记
+    ``status: blocked_on_reviewer_request`` + ``reason: reviewer_review_request_pending``，
+    并在 ``review_request_pending_reviewer_ids`` 列出腿。否则替换 leg 一成功 plan 就变
+    ``completed``，主会话再也不会按 Contract Gate 满足/驳回该 request。
+
+    request 腿同样**不算**「额度失败腿」：``all_reviewers_usage_limit_exhausted`` 的「全部」
+    要求所有腿都撞额度，夹着一条 request 时该断言为假。真失败腿与 request 并存时 fail-close
+    仍优先（``status: failed``），但 reason 追加 ``_with_review_request_pending`` 后缀自报混合，
+    否则主会话只会去等配额/修 auth，那条 request 从头到尾没进过 Contract Gate。
     """
     reviewers = plan.get("reviewers", [])
     cooled: set[str] = set()
+    # 本轮内失败过的 harness（含额度与非额度）——只用于排除替换候选，不落 cooldown。
+    failed_harnesses: set[str] = set()
     cooldown_recorded: list[str] = []
     used_ids: set[str] = {r["reviewer_id"] for r in reviewers}
     available = available or []
@@ -620,19 +728,30 @@ def execute_plan(
     # 初派全部两腿。
     _dispatch_indices(list(range(len(reviewers))))
 
-    # 反应式 reroute：bounded 轮次，每轮替换本轮新撞额度的 slot。
+    # 反应式 reroute：bounded 轮次，每轮替换本轮新失败（额度 or 未产出结论）的 slot。
     can_reroute = registry is not None and main_harness is not None
     for _round in range(max_fallback_rounds):
         failed_slots: list[tuple[int, str | None]] = []
+        usage_limited_slots: list[tuple[int, str | None]] = []
         for index, reviewer in enumerate(reviewers):
             hit, err = _leg_usage_limit(reviewer, artifacts_dir)
             if hit:
                 failed_slots.append((index, err))
+                usage_limited_slots.append((index, err))
+            elif _leg_review_request_pending(reviewer, artifacts_dir):
+                # 合法 request：非完成态但也非失败 → 既不换腿也不排除该 harness，
+                # 原样保留待主会话按 Contract Gate 处理后让**同一** reviewer 重试。
+                continue
+            elif not _leg_is_effective(reviewer, artifacts_dir):
+                failed_slots.append((index, None))
         if not failed_slots:
             break
 
-        # 记 cooldown（无论能否 reroute 都记——跨轮 cooldown 是第二层防线）。
-        for index, err in failed_slots:
+        # 本轮失败的 harness 一律排除出后续候选；但只有额度类才写跨 run 的 cooldown
+        # （无论能否 reroute 都记——跨轮 cooldown 是第二层防线）。
+        for index, _err in failed_slots:
+            failed_harnesses.add(reviewers[index]["harness_id"])
+        for index, err in usage_limited_slots:
             harness_id = reviewers[index]["harness_id"]
             if harness_id not in cooled:
                 reset_hint = harness_limit_cooldown.parse_reset_hint(err)
@@ -648,12 +767,19 @@ def execute_plan(
         if not can_reroute:
             break
 
-        candidates = _reroute_candidates(main_harness, available, cooled, registry)
+        candidates = _reroute_candidates(
+            main_harness,
+            available,
+            cooled,
+            registry,
+            already_failed=failed_harnesses,
+        )
         surviving = {
             reviewers[i]["harness_id"]
             for i in range(len(reviewers))
             if i not in {idx for idx, _ in failed_slots}
         }
+        usage_limited_indices = {idx for idx, _ in usage_limited_slots}
         used_replacement: set[str] = set()
         new_indices: list[int] = []
         any_assigned = False
@@ -690,6 +816,12 @@ def execute_plan(
                     "to": pick,
                     "to_reviewer_id": spec["reviewer_id"],
                     "round": _round + 1,
+                    # additive 字段：额度耗尽 vs 其它「没产出评审结论」，事后分诊用。
+                    "reason": (
+                        "usage_limit_exhausted"
+                        if index in usage_limited_indices
+                        else "no_review_result"
+                    ),
                 }
             )
             reviewers[index] = spec
@@ -703,13 +835,33 @@ def execute_plan(
         _dispatch_indices(new_indices)
 
     # 统计 + status + fail-close（F1/F2/R-e）。
-    ok = sum(1 for reviewer in reviewers if reviewer.get("returncode") == 0)
+    # ok 用「有效腿」而非裸 returncode：rc==0 但没写出 review-result 的腿不算数。
+    ok = sum(1 for reviewer in reviewers if _leg_is_effective(reviewer, artifacts_dir))
+    # 合法 request 腿：非完成态、但也不是失败，既不计入 unfilled_* 也不该被换腿。
+    pending_request_slots = [
+        index
+        for index, reviewer in enumerate(reviewers)
+        if _leg_review_request_pending(reviewer, artifacts_dir)
+    ]
     unfilled_usage = [
         index
         for index, reviewer in enumerate(reviewers)
         if _leg_usage_limit(reviewer, artifacts_dir)[0]
     ]
+    unfilled_without_review_result = [
+        index
+        for index, reviewer in enumerate(reviewers)
+        if index not in unfilled_usage
+        and index not in pending_request_slots
+        and not _leg_is_effective(reviewer, artifacts_dir)
+    ]
     plan["cooldown_recorded"] = cooldown_recorded
+    # 让消费者不必自己重算「到底有几条腿真的有结论」（additive，schema_version 仍为 1）。
+    plan["effective_reviewer_count"] = ok
+    # additive：哪几路停在 kind: request，待主会话按 Contract Gate / Request Handling 处置后重试。
+    plan["review_request_pending_reviewer_ids"] = [
+        reviewers[index]["reviewer_id"] for index in pending_request_slots
+    ]
 
     if ok == len(reviewers) and reviewers:
         plan["status"] = "completed"
@@ -723,7 +875,15 @@ def execute_plan(
         # 整体 fail-close 判 failed + 响亮信号，绝不静默置伪 R3 last-resort。
         plan["status"] = "failed"
         main_exhausted = bool(main_harness) and main_harness in cooled
-        if ok == 0:
+        if (
+            ok == 0
+            and not unfilled_without_review_result
+            and not pending_request_slots
+        ):
+            # 「全部」只在**所有**腿都是额度失败时才成立。混着 auth/崩溃见下方混合分支；
+            # 混着合法 kind: request 腿时同样不成立——那条腿没失败、更不是额度问题，把它算进
+            # 「全部额度耗尽」会让主会话照「等配额恢复」处置，漏掉必须走 Contract Gate 的 request
+            #（此处仅排除该谎报，混合事实由下方 pending 分支的 reason 后缀自报）。
             reason = "all_reviewers_usage_limit_exhausted"
             message = "全部 reviewer 腿均因额度/配额耗尽失败，且无可用 harness 可回退；本轮 external double-review 无法完成。"
         elif main_exhausted:
@@ -734,6 +894,59 @@ def execute_plan(
             message = "部分 reviewer 腿因额度耗尽失败且无可用 harness 回退补位。"
         plan["reason"] = reason
         plan["warnings"].append(_warn(reason, "error", message))
+
+    if unfilled_without_review_result:
+        # 非额度类的腿失败（auth 失效、启动失败、崩溃、写不出 review-result …）且补位不足。
+        # 与额度路径同等 fail-close：缺一条合法 leg 就不是 double-review，绝不让主会话
+        # 拿单路结论当两路用（rvf-20260811T170157Z 正是这样静默滑过去的）。
+        # 这里刻意**不是** elif：两类失败可以同时发生，各自的 warning 都必须冒出来——
+        # 否则「一腿额度耗尽 + 一腿认证失败」只报额度，主会话会去等配额恢复，认证故障被藏住。
+        plan["status"] = "failed"
+        failed_labels = ", ".join(
+            f"{reviewers[index]['harness_id']}(rc={reviewers[index].get('returncode')})"
+            for index in unfilled_without_review_result
+        )
+        plan["warnings"].append(
+            _warn(
+                "reviewer_leg_produced_no_review_result",
+                "error",
+                f"以下 reviewer 腿没有产出合法 review-result 且无可用 harness 回退补位：{failed_labels}。"
+                f"本轮只有 {ok} 条有效腿，不构成 double-review；请查看对应 reviewer 目录下的 "
+                "reviewer.stderr*.txt 排障（常见原因：该 harness 登录过期/额度以外的认证失败）。",
+            )
+        )
+        # reason 只有一个槽位：混合失败必须自报混合，不能被上面的额度 reason 独占。
+        plan["reason"] = (
+            "reviewer_legs_failed_mixed_usage_limit_and_no_review_result"
+            if unfilled_usage
+            else "reviewer_leg_produced_no_review_result"
+        )
+
+    if pending_request_slots:
+        pending_labels = ", ".join(
+            f"{reviewers[index]['harness_id']}({reviewers[index]['reviewer_id']})"
+            for index in pending_request_slots
+        )
+        plan["warnings"].append(
+            _warn(
+                "reviewer_review_request_pending",
+                "error",
+                f"以下 reviewer 腿返回 kind: request，属于待处理终态而非完成态 review：{pending_labels}。"
+                "按 references/review-merge-policy.md 的 Contract Gate / Request Handling 满足、"
+                "驳回或 spawn 子任务后，让**同一** reviewer 用同一 review packet 重试；"
+                "request 不得进入 merge table，也不会被自动换腿。",
+            )
+        )
+        if not unfilled_usage and not unfilled_without_review_result:
+            # 没有任何真失败腿时，本轮的 canonical 终态就是「被 request 阻塞」——
+            # 既不是 completed（reviewer 没审完），也不是失败（无人出故障）。
+            plan["status"] = PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST
+            plan["reason"] = "reviewer_review_request_pending"
+        elif plan.get("reason"):
+            # 与真失败腿并存：fail-close 优先，status 保持 failed；但 reason 只有一个槽位，
+            # 必须自报「还夹着一条待处理 request」——否则主会话照失败类 reason 处置完
+            #（等配额 / 修 auth）就重跑，那条 request 从头到尾没被 Contract Gate 处理过。
+            plan["reason"] = f"{plan['reason']}{REVIEW_REQUEST_PENDING_REASON_SUFFIX}"
 
     return plan
 
@@ -746,12 +959,50 @@ def _read_dispatch_status(status_path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _dispatch_status_summary(payload: dict[str, Any]) -> dict[str, Any]:
+DISPATCH_PLAN_STATUS_UNKNOWN = "unknown"
+
+
+def _dispatch_plan_outcome(plan_path: Path | None) -> dict[str, Any]:
+    """从 ``reviewer-plan.json`` 读本轮 double-review 的**实际结果**，供轮询输出使用。
+
+    为什么不能只报 ``returncode``：那是 detached 派发进程本身的退出码，与「两腿是否都产出
+    了评审结论」是两回事。2026-08-11 的 run rvf-20260811T170157Z 上，cursor 腿 rc=1、没有
+    review-result，plan 记的是 ``status: partial``，而派发进程照样 exit 0 —— 轮询只打印
+    ``returncode=0``，严格照 SKILL.md 协议轮询的主会话据此认为「派发成功」，然后拿一份结论
+    当双评审用。plan 才是本轮结果的 canonical 事实源，必须一起冒到轮询输出。
+
+    plan 缺失/不可解析时报 ``unknown``（而非乐观值）——派发尚未写出 plan 也属于「不知道」。
+    """
+    if plan_path is None:
+        return {"plan_status": DISPATCH_PLAN_STATUS_UNKNOWN}
+    try:
+        payload = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"plan_status": DISPATCH_PLAN_STATUS_UNKNOWN}
+    if not isinstance(payload, dict):
+        return {"plan_status": DISPATCH_PLAN_STATUS_UNKNOWN}
+    reviewers = payload.get("reviewers")
+    reviewer_count = len(reviewers) if isinstance(reviewers, list) else 0
+    effective = payload.get("effective_reviewer_count")
+    return {
+        "plan_status": payload.get("status") or DISPATCH_PLAN_STATUS_UNKNOWN,
+        "plan_reason": payload.get("reason"),
+        "reviewer_count": reviewer_count,
+        "effective_reviewer_count": effective if isinstance(effective, int) else None,
+    }
+
+
+def _dispatch_status_summary(
+    payload: dict[str, Any],
+    *,
+    plan_path: Path | None = None,
+) -> dict[str, Any]:
     return {
         "launch_status": payload.get("launch_status"),
         "returncode": payload.get("returncode"),
         "finished_at": payload.get("finished_at"),
         "error": payload.get("error"),
+        **_dispatch_plan_outcome(plan_path),
     }
 
 
@@ -771,11 +1022,17 @@ def wait_for_dispatch_status(
     """有界轮询 detached 派发的 ``status.json``，直到终态或 ``max_wait`` 耗尽。
 
     返回 ``{"state": "done"|"running", "launch_status", "returncode", "finished_at",
-    "error"}``。单次调用 ≤ ``max_wait`` 秒（默认 480 < Bash 工具 600s 上限），agent
-    循环调用直到 ``state == "done"``——每次都在上限内、永不被砍断。
+    "error", "plan_status", "plan_reason", "reviewer_count", "effective_reviewer_count"}``。
+    单次调用 ≤ ``max_wait`` 秒（默认 480 < Bash 工具 600s 上限），agent 循环调用直到
+    ``state == "done"``——每次都在上限内、永不被砍断。
+
+    ``plan_*`` 取自 ``status_path`` 同目录的 ``reviewer-plan.json``：``returncode`` 只说
+    派发进程怎么退出，``plan_status`` 才说两腿到底有没有产出评审结论（见
+    :func:`_dispatch_plan_outcome`）。判「本轮 double-review 是否成立」一律看后者。
     """
     import time
 
+    plan_path = Path(status_path).parent / "reviewer-plan.json"
     deadline = time.monotonic() + max(0.0, max_wait)
     latest: dict[str, Any] = {}
     while True:
@@ -783,10 +1040,10 @@ def wait_for_dispatch_status(
         if payload is not None:
             latest = payload
             if _dispatch_status_is_terminal(payload):
-                return {"state": "done", **_dispatch_status_summary(payload)}
+                return {"state": "done", **_dispatch_status_summary(payload, plan_path=plan_path)}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"state": "running", **_dispatch_status_summary(latest)}
+            return {"state": "running", **_dispatch_status_summary(latest, plan_path=plan_path)}
         time.sleep(min(poll_interval, remaining))
 
 
@@ -860,6 +1117,9 @@ def launch_detached_dispatch(
     ``--wait-status`` 有界轮询 ``status.json`` 直到终态。施加一个比任何单 reviewer 都宽
     的总 backstop（``--total-timeout``，默认 2700s）保证 ``status.json`` 终会落终态。
     幂等：同一 run 重复 ``--execute --detached`` 命中 O_EXCL 锁 → ``already_running``。
+    该幂等只对**干净完成**（被包命令 rc=0）的 run 成立：非完成态终态以非 0 收尾
+    （failed→1、``blocked_on_reviewer_request``→``DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE``），
+    线程已死时锁会被判陈旧并重夺，主会话处置完 reviewer request 后能经同一入口重派。
     """
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
@@ -1026,11 +1286,18 @@ def main() -> int:
             max_wait=args.max_wait,
         )
         if result["state"] == "done":
+            # plan_status / effective_reviewer_count 与 returncode 并列打印：后者只说派发
+            # 进程怎么退出，前两者才说本轮 double-review 是否真的成立（见 SKILL.md 轮询协议）。
             print(
                 f"RVF_DISPATCH_STATE=done "
                 f"launch_status={result.get('launch_status')} "
-                f"returncode={result.get('returncode')}"
+                f"returncode={result.get('returncode')} "
+                f"plan_status={result.get('plan_status')} "
+                f"effective_reviewers={result.get('effective_reviewer_count')}"
+                f"/{result.get('reviewer_count')}"
             )
+            if result.get("plan_reason"):
+                print(f"RVF_DISPATCH_PLAN_REASON={result.get('plan_reason')}", file=sys.stderr)
         else:
             print(
                 f"RVF_DISPATCH_STATE=running "
@@ -1210,6 +1477,14 @@ def main() -> int:
 
     if plan["status"] == "failed":
         return 1
+    if plan["status"] == PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST:
+        # 非完成态终态**不得**以 0 收尾。0 的含义是「被包命令干净完成」：detached 幂等锁的
+        # staleness 判定（``rvf_detached_thread._detached_run_finished_clean``）据此认定该 run
+        # 已完成、拒绝重夺锁，于是主会话按 SKILL.md 处置完 request 后再跑
+        # ``--execute --detached`` 只会拿到 ``already_running``——本 run 永远产不出
+        # ``status: completed`` 的 reviewed-candidate 证据，只能绕过单一入口或手改协议 artifact。
+        # 专用码 3 让锁可被重夺（可正常重派），又与真故障的 1 区分开。
+        return DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE
     return 0
 
 
