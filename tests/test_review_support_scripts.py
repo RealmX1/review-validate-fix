@@ -6318,8 +6318,12 @@ def load_harness_limit_cooldown_module():
     return module
 
 
-def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
-    """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
+def _failing_text_reviewer_config_without_review_result(path: Path, *, stderr_text: str) -> Path:
+    """文本格式 reviewer 配置：shim 往 stderr 吐给定错误并非零退出、不写 review-result。
+
+    stderr 文本是否带额度签名决定 dispatch 的分支：带签名走「记跨 run cooldown 的额度路径」，
+    不带则走「只在本轮排除该 harness 的通用失败路径」（auth 失效/崩溃等）。
+    """
     return write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         path,
         [
@@ -6334,6 +6338,65 @@ def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
+
+
+def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
+    """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
+    return _failing_text_reviewer_config_without_review_result(path, stderr_text=stderr_text)
+
+
+def _rc_zero_but_no_review_result_reviewer_config(path: Path, *, label: str) -> Path:
+    """文本格式 reviewer 配置：shim 干净退出(rc0)却**不**写 review-result。
+
+    专测「腿有效」判据不能只看 returncode：进程怎么退出与有没有产出评审结论是两回事。
+    """
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import sys; sys.stdin.read(); sys.stdout.write('done, but wrote nothing\\n')",
+        ],
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["label"] = label
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return cfg
+
+
+def _review_request_pending_text_reviewer_config(path: Path, *, label: str) -> Path:
+    """文本格式 reviewer 配置：shim 写合法 ``kind: request`` review-result 并 rc0。
+
+    这是 review 协议的合法待处理终态（reviewer 缺上下文/要标准子集），**不是**失败腿：
+    dispatch 不得把它当 ``no_review_result`` 换腿，否则替换腿一成功 plan 就变 completed，
+    request 被静默丢弃、主会话再也不会按 Contract Gate 处理它。
+    """
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, subprocess, sys; "
+                "sys.stdin.read(); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'context-request', '--out', os.environ['RVF_REVIEW_RESULT'], "
+                "'--need', 'file', '--reason', "
+                "'review packet 缺少被改函数的调用方文件，无法判断影响面'], check=True); "
+                "print('request written')"
+            ),
+        ],
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["label"] = label
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return cfg
 
 
 def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
@@ -6703,13 +6766,37 @@ def test_harness_limit_cooldown_record_active_sweep(tmp_path: Path) -> None:
 
 
 def _make_usage_or_clean_registry(tmp_path: Path, specs: dict[str, tuple[str, int]]) -> dict:
-    """specs: {harness_id: (kind, priority)}，kind ∈ {'usage','clean'}。返回内存 registry。"""
+    """specs: {harness_id: (kind, priority)}，返回内存 registry。
+
+    kind：
+      - ``'usage'``      额度耗尽（rc125 + stderr 额度签名）→ 走记 cooldown 的额度路径
+      - ``'auth'``       认证失败（rc1、无额度签名、不写 review-result）→ 走通用失败路径
+      - ``'rc0_no_result'`` 干净退出但不写 review-result → 验「腿有效」不能只看 returncode
+      - ``'review_request'`` 干净退出 + 合法 ``kind: request`` → 合法待处理终态，不是失败腿
+      - 其它（``'clean'``）合法 no-issues 结论 + rc0
+    """
     reg: dict = {"schema_version": 1, "harnesses": {}}
     for hid, (kind, prio) in specs.items():
         cfg_path = tmp_path / f"alt-{hid}.json"
         if kind == "usage":
             _usage_limit_text_reviewer_config(
                 cfg_path, stderr_text=f"fatal: usage limit reached for {hid} plan\n"
+            )
+        elif kind == "auth":
+            _failing_text_reviewer_config_without_review_result(
+                cfg_path,
+                stderr_text=(
+                    "Error: Authentication required. Please run 'agent login' first, "
+                    f"or set {hid.upper()}_API_KEY environment variable.\n"
+                ),
+            )
+        elif kind == "rc0_no_result":
+            _rc_zero_but_no_review_result_reviewer_config(
+                cfg_path, label=f"alternative-reviewer:{hid}-cli"
+            )
+        elif kind == "review_request":
+            _review_request_pending_text_reviewer_config(
+                cfg_path, label=f"alternative-reviewer:{hid}-cli"
             )
         else:
             _clean_text_reviewer_config(cfg_path, label=f"alternative-reviewer:{hid}-cli")
@@ -8594,6 +8681,54 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "dispatch_reviewers_reroutes_on_leg_without_review_result",
+            lambda: test_dispatch_reviewers_reroutes_on_leg_without_review_result(
+                root / "dispatch-reroute-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_failclose_when_leg_without_review_result_unfilled",
+            lambda: test_dispatch_reviewers_failclose_when_leg_without_review_result_unfilled(
+                root / "dispatch-failclose-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_rc_zero_without_review_result_is_not_effective",
+            lambda: test_dispatch_reviewers_rc_zero_without_review_result_is_not_effective(
+                root / "dispatch-rc0-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_review_request_leg_is_pending_not_rerouted",
+            lambda: test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted(
+                root / "dispatch-review-request-pending"
+            ),
+        ),
+        (
+            "dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit",
+            lambda: test_dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit(
+                root / "dispatch-usage-plus-request"
+            ),
+        ),
+        (
+            "dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock",
+            lambda: test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock(
+                root / "dispatch-blocked-request-exit-code"
+            ),
+        ),
+        (
+            "dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure",
+            lambda: test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure(
+                root / "dispatch-failclose-mixed"
+            ),
+        ),
+        (
+            "dispatch_reviewers_wait_status_surfaces_plan_outcome",
+            lambda: test_dispatch_reviewers_wait_status_surfaces_plan_outcome(
+                root / "dispatch-wait-plan-outcome"
+            ),
+        ),
+        (
             "diff_tracker_observes_committed_round_units",
             lambda: test_diff_tracker_observes_committed_round_units(root / "committed-observe"),
         ),
@@ -10474,6 +10609,11 @@ _disprev.inject(
     _with_cooldown_env=_with_cooldown_env,
     init_repo=init_repo,
     SCRIPT_DIR=SCRIPT_DIR,
+    # detached 幂等锁的 staleness 现场构造器：dispatch 侧「非完成态终态退出码 ⇒ 锁可重夺」
+    # 的闭合断言要用（退出码语义归 dispatch_reviewers.py 所有，故断言留在本簇）。
+    load_rvf_detached_thread_module=load_rvf_detached_thread_module,
+    _seed_detached_stale_lock=_seed_detached_stale_lock,
+    _launch_detached_with_staleness_env=_launch_detached_with_staleness_env,
 )
 globals().update({_n: getattr(_disprev, _n) for _n in _disprev.__all__})
 
