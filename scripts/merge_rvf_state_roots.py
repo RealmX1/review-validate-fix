@@ -491,6 +491,22 @@ def utc_now_text() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def parse_iso_timestamp_text(value: Any) -> float | None:
+    """ISO-8601 文本 → epoch 秒；解析不了返回 ``None``。
+
+    **直接委派给运行时自己的解析器**，不在这里复制一份。本工具写出的 marker 正是
+    ``round_baseline_status()`` 要读的，两边对「什么算过期」必须逐字节同口径——而这个文件
+    通篇的规矩就是绝不另立第二份实现（marker 命名派生自 ``marker_paths``、schema 迁移调用
+    tracker 自己的 ``_ensure_schema``，都是同一条理由）。抄一份即使当下逐字相同，也只是又
+    造了一个会漂移的副本。
+
+    委派一个带下划线的名字是刻意的取舍：运行时若改了解析口径，这里**跟着变**；若把它改名
+    或删掉，导入期就会炸——响亮地失败，而不是静默地跟真相源分叉。
+    """
+
+    return round_baseline_marker._parse_iso_ts(value)
+
+
 def read_json_document(path: Path) -> dict[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1381,6 +1397,172 @@ def choose_round_baseline(
     )
 
 
+def _marker_repository_directory(marker_document: Mapping[str, Any] | None) -> Path | None:
+    """marker 正文里那个仓此刻是否还在磁盘上；不在就返回 None（祖先关系判不了）。"""
+
+    repository = (marker_document or {}).get("repo")
+    if not isinstance(repository, str) or not repository:
+        return None
+    candidate = Path(repository)
+    return candidate if candidate.is_dir() else None
+
+
+@dataclass(frozen=True)
+class MarkerCandidateForOneRuntimeFileName:
+    """重键之后落到同一个运行时文件名上的一份候选 marker。
+
+    ``source_marker_name`` 是**重键前**的源 key（旧格式是 ``task-<id>``，新格式还含
+    仓身份 / harness 段），``chosen_head`` 是它自己那条 legacy↔canonical 裁决已经选定
+    的 commit。
+    """
+
+    source_marker_name: str
+    chosen_head: str
+    payload: Mapping[str, Any]
+    repository_directory: Path | None
+
+
+def choose_conservative_oldest_marker_colliding_on_one_runtime_file_name(
+    *,
+    runtime_file_stem: str,
+    candidates: Sequence[MarkerCandidateForOneRuntimeFileName],
+) -> tuple[MarkerCandidateForOneRuntimeFileName | None, dict[str, Any]]:
+    """在「多个源 key 重键到同一个文件名」时裁决，并把这次撞车整条落账。
+
+    **为什么会撞车、且必然撞车**：F1.2 的硬顺序是「先部署新代码、再迁移数据」，所以
+    跑迁移那一刻两根里必然同时存在旧格式 ``task-<id>`` 与新格式
+    ``task-<id>--repo-<仓>[--harness-<h>]`` 两份 marker。它们指的是同一个逻辑标识，
+    重键后自然落到同一个目标文件名上。而 legacy↔canonical 那层裁决是**按源 key 逐个**
+    做的，天生看不见这条跨 key 的冲突。
+
+    不修的后果不是「少一个文件」这么轻：源 key 排序里 ``task-X`` 恒在
+    ``task-X--repo-…`` 之前，于是**永远是新格式那份最后写、把先写的覆盖掉**，两条却都
+    被记成 written；更隐蔽的是落盘 marker 的 ``merged_from_state_roots`` 只剩赢家那条
+    裁决，磁盘上的审计记录会**声称另一侧根本不存在**。
+
+    **裁决方向刻意取「可证明更旧」，两种 marker 都如此**——这不与 owner 关于 highwater
+    的 ``advance-to-descendant`` 裁决冲突：那条裁决针对的是 legacy↔canonical 之间积了
+    数月、牵涉上百个单元的分歧；这里是**迁移自己造出来的、只有部署到迁移之间那几分钟宽**
+    的新冲突类，owner 从未对它拍过板。取更旧的一侧至多让那几分钟内的工作多审一轮，且
+    **不产生任何 write-off**（无单元被推出窗口 ⇒ 无不可逆损失），符合本工具「冲突时一律
+    保守重审、禁止静默决胜」的总原则。
+
+    祖先关系判不出来（发散 / 仓不可用 / commit 不在仓里）一律 **refuse 该文件名**，
+    而不是挑一个：这类撞车在真实数据里不该出现，出现了就是需要人看一眼的信号，而静默期
+    本来就有人在场。
+    """
+
+    record: dict[str, Any] = {
+        "runtime_file_stem": runtime_file_stem,
+        "contributing_marker_names": [candidate.source_marker_name for candidate in candidates],
+        "contributing_marker_heads": {
+            candidate.source_marker_name: candidate.chosen_head for candidate in candidates
+        },
+        "chosen_marker_name": None,
+        "chosen_head": None,
+        "conflict_classes": [],
+    }
+    chosen = candidates[0]
+    for challenger in candidates[1:]:
+        repository_directory = chosen.repository_directory or challenger.repository_directory
+        relation = ancestry_relation_between(
+            repository_directory, chosen.chosen_head, challenger.chosen_head
+        )
+        if relation in {"identical", "left_is_ancestor_of_right"}:
+            continue
+        if relation == "right_is_ancestor_of_left":
+            chosen = challenger
+            continue
+        record["conflict_classes"].append(
+            f"{relation}_between_{chosen.source_marker_name}_and_{challenger.source_marker_name}"
+        )
+        record["conflict_classes"].append(
+            "runtime_file_name_collision_without_provable_ancestry_refusing_to_choose"
+        )
+        return None, record
+    record["chosen_marker_name"] = chosen.source_marker_name
+    record["chosen_head"] = chosen.chosen_head
+    return chosen, record
+
+
+ROUND_BASELINE_TIME_TO_LIVE_FIELD_NAMES = ("captured_at", "expires_at", "ttl_seconds")
+
+
+def round_baseline_marker_expiry_timestamp(
+    marker_document: Mapping[str, Any],
+) -> float | None:
+    """按运行时 ``round_baseline_status`` 的口径复算这份 marker 的到期时刻。
+
+    优先 ``expires_at``；缺失时退回 ``captured_at`` + marker **自己记的** ``ttl_seconds``。
+    刻意不读 ``RVF_ROUND_BASELINE_TTL_SECONDS``：迁移工具跑在哪个 shell 里与这些 marker
+    当初被写出时的 TTL 无关，拿迁移进程的环境去重算别人的到期时刻只会引入第三种口径。
+    两者都算不出来返回 ``None``（该 marker 不参与新鲜度排序）。
+    """
+
+    expires_at = parse_iso_timestamp_text(marker_document.get("expires_at"))
+    if expires_at is not None:
+        return expires_at
+    captured_at = parse_iso_timestamp_text(marker_document.get("captured_at"))
+    if captured_at is None:
+        return None
+    recorded_ttl = marker_document.get("ttl_seconds")
+    if not isinstance(recorded_ttl, (int, float)) or isinstance(recorded_ttl, bool):
+        return None
+    return captured_at + float(recorded_ttl)
+
+
+def adopt_freshest_time_to_live_across_markers_merged_into_one_round_baseline_file(
+    *,
+    payload: dict[str, Any],
+    contributing_marker_documents: Sequence[tuple[str, Mapping[str, Any]]],
+) -> dict[str, Any] | None:
+    """把落盘 payload 的 TTL 元数据换成所有贡献者里**最新**的那份。就地改 ``payload``。
+
+    **为什么必须拆开 head 与 TTL 这两个方向**：round-baseline 的裁决一律取「可证明更旧」
+    的 ``baseline_head``（窗口下界更低 ⇒ 多审，不产生 write-off）。但 ``captured_at`` /
+    ``expires_at`` 跟着同一份候选走的话，方向会当场翻转——F1.2 的硬顺序是「先部署新代码、
+    再迁移数据」，撞车里那份旧格式 marker 必然是部署**之前**写的，只要部署到迁移之间隔了
+    超过一个 TTL（默认 6h）它就已经 expired。于是「保守取更旧」系统性地选中已过期的那份，
+    落盘 marker 被 ``round_baseline_status`` 判成 ``stale``、``resolve_round_baseline_head()``
+    返回 ``None``，committed-round 的 bootstrap 下界**整个消失**：从「多审几个 commit」
+    变成「一个都不审」。合并结果比任何一侧的输入都差，正是本工具最不该产出的东西。
+
+    **界限刻意划在「不得比最新鲜的那份输入更旧」，而不是「一律续期」**：两侧都已过期时结果
+    保持 ``stale``。TTL 表达的是「『上一条 prompt 时的 HEAD』这个下界还有没有意义」；两侧
+    都过期说明它本来就该失效，运行时按设计降级成「无 committed 观测」。迁移工具无权替运行时
+    把它改判成有效——那等于拿一个几天前的 HEAD 当本轮窗口下界，反过来变成大面积过触发。
+    所以这里既不凭空生成 TTL、也不延长任何一份输入的寿命，只是不让合并把仍然有效的那份丢掉。
+
+    TTL 三个字段**整组替换**（缺的就删掉），不逐字段挑：混着一份的 ``expires_at`` 和另一份
+    的 ``captured_at``，落盘 marker 就会自相矛盾，取证时无从分辨哪个才是真的。
+
+    ``reviewed_head`` 那边**不需要同款处理**：``review_highwater_marker`` 是 durable 的、
+    刻意没有 TTL 概念（见该模块头「无 TTL 过期」），根本不存在这条失效路径。
+    """
+
+    ranked: list[tuple[float, str, Mapping[str, Any]]] = []
+    for source_label, document in contributing_marker_documents:
+        expiry = round_baseline_marker_expiry_timestamp(document)
+        if expiry is not None:
+            ranked.append((expiry, source_label, document))
+    if not ranked:
+        return None
+    freshest_expiry, freshest_label, freshest_document = max(ranked, key=lambda item: item[0])
+    current_expiry = round_baseline_marker_expiry_timestamp(payload)
+    if current_expiry is not None and current_expiry >= freshest_expiry:
+        return None
+    replaced_expires_at = payload.get("expires_at")
+    for field_name in ROUND_BASELINE_TIME_TO_LIVE_FIELD_NAMES:
+        payload.pop(field_name, None)
+        if field_name in freshest_document:
+            payload[field_name] = freshest_document[field_name]
+    return {
+        "adopted_from_marker": freshest_label,
+        "replaced_expires_at": replaced_expires_at,
+        "adopted_expires_at": payload.get("expires_at"),
+    }
+
+
 def git_common_directory_of(worktree_path: Path) -> str | None:
     if not worktree_path.is_dir():
         return None
@@ -1969,6 +2151,24 @@ def render_migration_command_result_text(payload: Mapping[str, Any]) -> str:
                 f"（多为已删的 task worktree），跳过不迁——运行时同样算不出它们的仓身份，"
                 f"迁过去也永远不会被查到"
             )
+        # 重键撞车（部署到迁移之间新旧两种文件名并存造成）同样必须报数：它是「两个源 key
+        # 落到同一个目标文件」，静默处理就退化成后写覆盖先写。
+        for section_label, section in (
+            ("highwater", highwater),
+            ("round-baseline", round_baseline),
+        ):
+            for collision in section.get("runtime_file_name_collisions") or []:
+                chosen = collision.get("chosen_marker_name")
+                lines.append(
+                    f"  {'·' if chosen else '⛔'} {section_label} 重键撞车 "
+                    f"{collision.get('runtime_file_stem')}：源 key "
+                    f"{collision.get('contributing_marker_names')} → "
+                    + (
+                        f"取可证明更旧的 {chosen}（{(collision.get('chosen_head') or '-')[:8]}）"
+                        if chosen
+                        else f"祖先关系判不出，整个文件名拒绝迁移 {collision.get('conflict_classes')}"
+                    )
+                )
         written_off = [
             item
             for item in (payload.get("reconciliation_report") or {}).get("review_highwater", [])
@@ -3186,6 +3386,11 @@ def stage_review_highwater_markers(
     新 key 还含仓身份）；本工具绝不另立一套命名。``tests/test_merge_rvf_state_roots.py``
     有一条结构性守卫钉死两者一致——运行时再改 key，那条测试会先红，而不是迁移悄悄写出
     一堆读不到的文件。派生不出目标名（仓已不在磁盘上等）一律记进 ``refused``。
+
+    重键会让**多个源 key 落到同一个目标文件名**（部署到迁移之间新旧两种名字并存），因此
+    落盘分两趟：先把每个源 key 的目标名与裁决算出来分组，再对每个目标名裁决一次
+    （``choose_conservative_oldest_marker_colliding_on_one_runtime_file_name``）。直接
+    边算边写会变成后写覆盖先写，而两条都记成 written。
     """
 
     legacy_scan = collect_marker_documents(legacy_root, REVIEW_HIGHWATER_SUBDIRECTORY)
@@ -3197,6 +3402,9 @@ def stage_review_highwater_markers(
     written_runtime_file_stems: list[str] = []
     refused: list[str] = []
     skipped_because_repository_is_gone: list[str] = []
+    candidates_by_runtime_file_name: dict[
+        str, list[tuple[MarkerCandidateForOneRuntimeFileName, Mapping[str, Any]]]
+    ] = {}
     for row in highwater_report_rows:
         marker_name = str(row["task_marker"])
         chosen_head = row.get("chosen_reviewed_head")
@@ -3228,19 +3436,52 @@ def stage_review_highwater_markers(
             else:
                 refused.append(marker_name)
             continue
-        payload = dict(base_payload)
-        payload["reviewed_head"] = chosen_head
+        candidates_by_runtime_file_name.setdefault(runtime_file_name, []).append(
+            (
+                MarkerCandidateForOneRuntimeFileName(
+                    source_marker_name=marker_name,
+                    chosen_head=chosen_head,
+                    payload=base_payload,
+                    repository_directory=_marker_repository_directory(base_payload),
+                ),
+                row,
+            )
+        )
+    collisions: list[dict[str, Any]] = []
+    for runtime_file_name, entries in sorted(candidates_by_runtime_file_name.items()):
+        if len(entries) == 1:
+            candidate, row = entries[0]
+            collision_record: dict[str, Any] | None = None
+        else:
+            chosen_candidate, collision_record = (
+                choose_conservative_oldest_marker_colliding_on_one_runtime_file_name(
+                    runtime_file_stem=Path(runtime_file_name).stem,
+                    candidates=[candidate for candidate, _ in entries],
+                )
+            )
+            collisions.append(collision_record)
+            if chosen_candidate is None:
+                refused.extend(candidate.source_marker_name for candidate, _ in entries)
+                continue
+            candidate, row = next(
+                entry
+                for entry in entries
+                if entry[0].source_marker_name == chosen_candidate.source_marker_name
+            )
+        payload = dict(candidate.payload)
+        payload["reviewed_head"] = candidate.chosen_head
         payload["merged_from_state_roots"] = {
             "legacy_reviewed_head": row.get("legacy_reviewed_head"),
             "canonical_reviewed_head": row.get("canonical_reviewed_head"),
             "ancestry_relation": row.get("ancestry_relation"),
-            "chosen_side": chosen_side,
+            "chosen_side": str(row.get("chosen_side") or ""),
             "conflict_classes": list(row.get("conflict_classes") or []),
             "written_off_unit_ids": list(row.get("written_off_unit_ids") or []),
             "merged_at": utc_now_text(),
+            "runtime_file_name_collision": collision_record,
         }
         _write_marker_document(destination / runtime_file_name, payload)
-        written.append(marker_name)
+        written.append(candidate.source_marker_name)
         written_runtime_file_stems.append(Path(runtime_file_name).stem)
     return {
         "written_marker_names": sorted(written),
@@ -3249,6 +3490,7 @@ def stage_review_highwater_markers(
         "skipped_marker_names_whose_repository_is_gone": sorted(
             skipped_because_repository_is_gone
         ),
+        "runtime_file_name_collisions": collisions,
     }
 
 
@@ -3272,6 +3514,9 @@ def stage_round_baseline_markers(
     written_runtime_file_stems: list[str] = []
     refused: list[str] = []
     skipped_because_repository_is_gone: list[str] = []
+    candidates_by_runtime_file_name: dict[
+        str, list[tuple[MarkerCandidateForOneRuntimeFileName, RoundBaselineReconciliation]]
+    ] = {}
     for marker_name in sorted(
         set(legacy_scan.parsed_documents_by_marker_name)
         | set(canonical_scan.parsed_documents_by_marker_name)
@@ -3327,8 +3572,64 @@ def stage_round_baseline_markers(
             else:
                 refused.append(marker_name)
             continue
-        payload = dict(base_payload)
-        payload["baseline_head"] = reconciliation.chosen_baseline_head
+        candidates_by_runtime_file_name.setdefault(runtime_file_name, []).append(
+            (
+                MarkerCandidateForOneRuntimeFileName(
+                    source_marker_name=marker_name,
+                    chosen_head=reconciliation.chosen_baseline_head,
+                    payload=base_payload,
+                    repository_directory=_marker_repository_directory(base_payload),
+                ),
+                reconciliation,
+            )
+        )
+    collisions: list[dict[str, Any]] = []
+    for runtime_file_name, entries in sorted(candidates_by_runtime_file_name.items()):
+        if len(entries) == 1:
+            candidate, reconciliation = entries[0]
+            collision_record: dict[str, Any] | None = None
+        else:
+            chosen_candidate, collision_record = (
+                choose_conservative_oldest_marker_colliding_on_one_runtime_file_name(
+                    runtime_file_stem=Path(runtime_file_name).stem,
+                    candidates=[candidate for candidate, _ in entries],
+                )
+            )
+            collisions.append(collision_record)
+            if chosen_candidate is None:
+                refused.extend(candidate.source_marker_name for candidate, _ in entries)
+                continue
+            candidate, reconciliation = next(
+                entry
+                for entry in entries
+                if entry[0].source_marker_name == chosen_candidate.source_marker_name
+            )
+        payload = dict(candidate.payload)
+        payload["baseline_head"] = candidate.chosen_head
+        # head 取「可证明更旧」，TTL 取「所有贡献者里最新鲜」——两个方向都得保守，否则
+        # 取更旧的一侧会连它已经过期的 expires_at 一起继承，落盘 marker 变 stale ⇒
+        # resolve_round_baseline_head() 返回 None ⇒ bootstrap 下界整个消失（比不合并还差）。
+        # 贡献者要连 legacy↔canonical 两侧一起数：那层裁决按 chosen_side 取 base_payload，
+        # 同一条失效路径不撞车也能走到。
+        contributing_marker_documents: list[tuple[str, Mapping[str, Any]]] = []
+        for entry_candidate, _entry_reconciliation in entries:
+            for side_label, side_scan in (
+                ("legacy", legacy_scan),
+                ("canonical", canonical_scan),
+            ):
+                document = side_scan.parsed_documents_by_marker_name.get(
+                    entry_candidate.source_marker_name
+                )
+                if document is not None:
+                    contributing_marker_documents.append(
+                        (f"{side_label}:{entry_candidate.source_marker_name}", document)
+                    )
+        time_to_live_adoption = (
+            adopt_freshest_time_to_live_across_markers_merged_into_one_round_baseline_file(
+                payload=payload,
+                contributing_marker_documents=contributing_marker_documents,
+            )
+        )
         payload["merged_from_state_roots"] = {
             "legacy_baseline_head": reconciliation.legacy_baseline_head,
             "canonical_baseline_head": reconciliation.canonical_baseline_head,
@@ -3336,9 +3637,11 @@ def stage_round_baseline_markers(
             "chosen_side": reconciliation.chosen_side,
             "conflict_classes": reconciliation.conflict_classes,
             "merged_at": utc_now_text(),
+            "runtime_file_name_collision": collision_record,
+            "time_to_live_adoption": time_to_live_adoption,
         }
         _write_marker_document(destination / runtime_file_name, payload)
-        written.append(marker_name)
+        written.append(candidate.source_marker_name)
         written_runtime_file_stems.append(Path(runtime_file_name).stem)
     return {
         "reconciliations": reconciliations,
@@ -3348,6 +3651,7 @@ def stage_round_baseline_markers(
         "skipped_marker_names_whose_repository_is_gone": sorted(
             skipped_because_repository_is_gone
         ),
+        "runtime_file_name_collisions": collisions,
     }
 
 
