@@ -27,6 +27,22 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
+### 谢绝一轮**已派发**的自动 RVF
+
+Kanban task 内的自动 RVF（flow-1-self-rising / kanban-followup）走延续后端，结构上不经过 S3 决策点，注入的是一条祈使句。若你判断这一轮不该审（本轮改动与你正在做的事无关、用户已明确让你转做别的工作），**不要硬跑、也不要干停**，走谢绝出口：
+
+```
+rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话理由>
+```
+
+`<dispatch-token>` 取注入消息里 `RVF_DISPATCH=token=` 后面那串（**dispatch token，不是 S3 决策 token**；后者用的是 `rvf-agent decline`）。它清掉 kanban-followup 锁、释放本轮 lease、把理由写进 rewind 抹不掉的磁盘 ledger。默认语义是「这一轮不审」：scope 退回可审池，后续 Stop 仍可能重新提议同一批改动。
+
+确定这批 diff **根本不需要审核**时再加 `--mark-declined-scope-units-review-not-required`：后续 RVF 不再纳入范围。该标记是 **diff（hunk）级而非文件级**——被豁免的 diff 内容一旦被改动，会作为新改动重新进入审核范围。默认不加。
+
+**退出码必须看**：`0` 才表示谢绝完全生效。非 0（`7 = decline_incomplete`）表示副作用只做成了一部分——例如锁属于**另一轮** dispatch 而被保留、lease 未释放、或请求了豁免却没声明成。此时**不要当作已谢绝**：读输出里的 `failed_steps` 与 `next_steps` 按提示补救，或如实告诉开发者哪一步没成。尤其是带豁免时，只要 exit 非 0，那批 diff 就**没有**被声明为「不需审核」，下一轮仍会被纳入范围。
+
+> 锁的三态与你是否真的收到 trigger 有关：UPS 投递落地只落 `delivered_awaiting_agent_decision`（只做互斥去重、**不催收尾**），Stop 侧确认这条 trigger 仍在当前 transcript 祖先链上才升格为 `in_progress`；用户 rewind 掉那一段则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
+
 ### Opt-in 仓库的预审 base 同步
 
 - `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
@@ -81,6 +97,15 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
   - `plan_status=partial` / `unknown` → 同样不成立，按上一条排障。
   - `returncode` 非 0 或 `launch_status=launch_failed` → 读 status.json 的 `error` 与同目录 `.dispatch-thread.log`。唯一例外是 `returncode=3`：它是 `blocked_on_reviewer_request` 的专用码（非故障、也非完成），按上一条处置即可。
 - 轮询到 `done` 后，照常读取 `artifacts/reviewers/reviewer-plan.json` 与各路 reviewer artifact；**核对每一路都存在合法 `review-result.json`**（plan 的 `effective_reviewer_count` 是同一事实的汇总）。只在该 plan 报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
+- **lease 过期后重新分配必须走并集，不得静默换口径。** 若 reviewer 报 `lease_not_found` / lease 已过期（典型成因：这一轮被中断、隔了很久才回来），**不要**直接按当时工作树重新 allocate 一次了事——那会把原本圈定的那批改动整个踢出 packet，口径从 committed-round 悄悄翻成纯 dirty，最终审的可能 100% 是另一批东西。正确做法是把上一轮的 `tracker-scope.json` 传回去：
+
+  ```
+  python3 core/session_scope_allocation/reviewable_unit_diff_tracker.py allocate-review-scope \
+      --repo "$RVF_REPO" --session-id <sid> --run-id <run> --reviewer-id <rid> \
+      --union-with-prior-scope <上一轮 tracker-scope.json> --output-scope <新 scope 路径> --print-result
+  ```
+
+  它把上一轮 scope 里仍可审的 unit 并回本轮（已被真正审掉的不会复活），并从该 artifact 继承 `committed_baseline` / `committed_base_ref` 以恢复口径。结果里 `unioned_prior_scope_unit_ids` 与 events 里的 `scope_reallocated_after_lease_expiry` 是这次并集的证据；packet 的 `## Tracker Scope` 会标出承接自上一轮的那一段，reviewer 据此分辨两段的成熟度。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
 - scope contract v3 的 `review_kind=implementation` 仍审实现整体；`review_kind=base_drift_integration` 只审 `interaction_primary_paths` 所描述的 base/task 交互面，`base_delta_paths` 与 `task_change_paths` 是上下文事实，`candidate_evidence_path` / digest 是必须保持的父证据绑定。v1/v2 contract 继续按既有实现审查读取。
 - `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。

@@ -21,6 +21,7 @@ from pathlib import Path
 __all__ = [
     'test_rvf_user_prompt_submit_dispatches_shared_workflow',
     'test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist',
+    'test_rvf_user_prompt_submit_declines_reviving_stale_prep',
     'test_rvf_user_prompt_submit_reports_no_prep_when_expired_and_run_dir_missing',
     'test_rvf_user_prompt_submit_marker_without_token',
     'test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery',
@@ -388,10 +389,15 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
         assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
         assert marker_path.exists()
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        assert marker["state"] == "in_progress"
+        # 投递落地只落 awaiting 态：提交 ≠ agent 接手。升格成 in_progress 由 Stop 读侧在确认
+        # trigger 仍在 transcript 祖先链上时做（见 stop hook 侧 promote/rewind 对账测试）。
+        assert marker["state"] == "delivered_awaiting_agent_decision"
         assert marker["kanban_task_id"] == "task-fu"
         assert marker["run_id"] == "rvf-fu-delivered"
         assert marker["expires_at"] > marker["armed_at"]
+        # 对账锚点必须落盘：历史 payload 三个 id 字段全 None，锁自己都不知道对应哪个回合。
+        assert marker["dispatch_token"] == "bbbbbbbbbbbbbbbb"
+        assert marker["delivered_session_id"] == "session-fu"
 
         # 负例：带 token 但**非** kanban-followup（无 RVF_KANBAN_FOLLOWUP_TRIGGER，这里是 fork）
         # → 不 arm followup 锁。
@@ -1503,3 +1509,72 @@ def test_rvf_user_prompt_submit_captures_round_baseline(tmp: Path) -> None:
     marker = rbm.read_round_baseline_marker(task_id=None, session_id="sess-capture", root=state_root)
     assert marker is not None, "expected a round-baseline marker to be written"
     assert marker["baseline_head"] == head, (marker.get("baseline_head"), head)
+
+
+def test_rvf_user_prompt_submit_declines_reviving_stale_prep(tmp_path: Path) -> None:
+    """过期 prep 的复活有时效上界：会话早已走远的旧派发不得被原地唤醒。
+
+    复现动机：09:08 创建的 prep 在 49 分钟后（用户已中断、已 rewind、已改做别的事）被无条件
+    复活并上锁，于是一次从未被 agent 看到的 RVF 被强制续跑。超界即不复活，改记
+    ``dispatch_prep_stale_not_revived``、走既有 ``dispatch_no_prep`` 早返回。
+    """
+    prep = load_rvf_prep_file_module()
+    submit = load_rvf_user_prompt_submit_module()
+    root = tmp_path / "prep-root"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
+    try:
+        t0 = prep.parse_timestamp("2026-05-07T00:00:00Z")
+        prep.write_prep_file(
+            {
+                "origin_session_id": "session-stale",
+                "origin_repo": str(tmp_path),
+                "origin_cwd": str(tmp_path),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(tmp_path),
+                "rvf_run": {"run_id": "rvf-stale", "run_dir": str(run_dir)},
+            },
+            root=root,
+            token="cccccccccccccccc",
+            now=t0,
+            ttl_seconds=300,
+        )
+        # 距创建 49 分钟（> 默认 15min 上界）：run_dir 仍在，但不再复活。
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "run RVF_DISPATCH=token=cccccccccccccccc",
+                "cwd": str(tmp_path),
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+            now="2026-05-07T00:49:00Z",
+        )
+        assert payload["status"] == "expired", payload
+        assert payload.get("prep_revived") is not True
+        veto = payload.get("prep_revive_declined")
+        assert veto and veto["reason"] == "prep_older_than_revive_max_age", payload
+        assert payload["workflow_started"] is False
+        diagnostics = read_jsonl(root / "diagnostics" / "cccccccccccccccc.jsonl")
+        assert any(
+            d.get("event") == "dispatch_prep_stale_not_revived" for d in diagnostics
+        ), diagnostics
+        # prep 未被续期：之后读仍是 expired（没有被偷偷刷新 TTL）。
+        again = prep.read_prep_file(
+            "cccccccccccccccc", root=root, now=prep.parse_timestamp("2026-05-07T00:50:00Z")
+        )
+        assert again.status == "expired", again
+
+        # 对照：同一份 prep 在上界之内（10 分钟）仍照常复活——闸门只切「会话已走远」的那一段。
+        payload_in_window = submit.inspect_user_prompt_submit(
+            {
+                "prompt": "run RVF_DISPATCH=token=cccccccccccccccc",
+                "cwd": str(tmp_path),
+                "hook_event_name": "UserPromptSubmit",
+            },
+            prep_root=root,
+            now="2026-05-07T00:10:00Z",
+        )
+        assert payload_in_window.get("prep_revived") is True, payload_in_window
+    finally:
+        os.environ.pop("CODEX_RVF_PREP_ROOT", None)

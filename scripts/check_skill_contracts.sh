@@ -548,6 +548,7 @@ repo_required_files=(
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
   "scripts/rvf_local_deploy.py"
+  "scripts/merge_rvf_state_roots.py"
   "tests/test_stop_hook_dispatcher.py"
   "tests/test_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
@@ -558,6 +559,7 @@ repo_required_files=(
   "tests/test_official_cli_installation_hooks.py"
   "tests/test_official_cli_local_deploy_verification.py"
   "tests/test_rvf_user_local_data_paths.py"
+  "tests/test_merge_rvf_state_roots.py"
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
@@ -615,6 +617,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_plugin_contracts.py" \
   "$repo_root/scripts/install_to_codex.py" \
   "$repo_root/scripts/rvf_local_deploy.py" \
+  "$repo_root/scripts/merge_rvf_state_roots.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
   "$skill_dir/scripts/write_review_result.py" \
@@ -659,6 +662,7 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_official_cli_installation_hooks.py" \
   "$tests_dir/test_official_cli_local_deploy_verification.py" \
   "$tests_dir/test_rvf_user_local_data_paths.py" \
+  "$tests_dir/test_merge_rvf_state_roots.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py"
@@ -668,6 +672,9 @@ run_step "tests: rvf_local_deploy" \
   python3 -m pytest -q \
     "$tests_dir/test_developer_local_main_installation.py" \
     "$tests_dir/test_official_cli_local_deploy_verification.py"
+run_step "tests: merge_rvf_state_roots" \
+  python3 -m pytest -q \
+    "$tests_dir/test_merge_rvf_state_roots.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"

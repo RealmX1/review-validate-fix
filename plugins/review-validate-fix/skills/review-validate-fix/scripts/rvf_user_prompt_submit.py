@@ -15,6 +15,11 @@ import kanban_followup_lock
 import rvf_bootstrap_gate
 import rvf_prep_file
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from kanban_followup_trigger_transcript_presence import has_explicit_human_prompt_after
+from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # noqa: E402
+    DISPATCH_PREP_REVIVE_MAX_AGE_ENV,
+    DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS,
+)
 from session_label import text_from_message_payload
 
 try:
@@ -596,14 +601,27 @@ def arm_kanban_followup_lock_on_delivery(
     *,
     prep_root: str | Path | None = None,
 ) -> str | None:
-    """投递确认时才 arm kanban-followup in-progress 锁（delivery-confirmed arm）。
+    """投递确认时才 arm kanban-followup 锁，且**只落到 awaiting 态**（delivery-confirmed arm）。
 
     这是把锁的 arm 从 Stop hook（dispatch 时乐观预 arm）移到这里的核心。本 hook 只有在
     Cline Kanban 注入的 follow-up trigger **真正成为一个 prompt**（投递落地）时才会 fire，
-    所以在此 arm 才能保证锁只为「agent 真的接手了的那一轮 follow-up」存在。若投递静默失败
-    （例如 /compact 在注入 turn 落地前重置了会话），本 hook 不 fire → 不 arm → 不会留下纯
-    TTL 锁空转、挡住后续自动 dispatch（治本 squat）。锁的读侧（Stop 的
-    ``kanban_followup_in_progress_decision``）与 handoff 清锁保持不变。
+    所以在此 arm 才能保证锁不为「投递静默失败」的那一轮存在。若投递静默失败（例如 /compact 在
+    注入 turn 落地前重置了会话），本 hook 不 fire → 不 arm → 不会留下纯 TTL 锁空转、挡住后续
+    自动 dispatch（治本 squat）。
+
+    但**「prompt 被提交」仍不等于「agent 接手」**：本 hook 在提交那一刻 fire，严格早于模型产出
+    任何 token；提交后这条 prompt 还可能被同回合的中断冲掉（enqueue→dequeue，从未成为
+    transcript 条目），或落地后被用户 rewind 撤销。历史实现在此直接写 ``in_progress``，于是
+    Stop 读侧会对一个从未看到过这条 prompt 的 agent 发「继续收尾这一轮」的 re-engage nudge
+    （实测 run ``rvf-20260808T090747Z-stop-hook-ea36796d``）。故这里只落
+    ``delivered_awaiting_agent_decision``：仍满足互斥去重，但读侧不发 nudge；升格成
+    ``in_progress`` 由 Stop 读侧按「trigger 是否仍在当前 transcript 祖先链上」判定。
+
+    锁主键是 task_id（task-path），故 ``target_kanban_task_id`` 的一致性是关键——它取自 prep
+    payload（权威，与 Stop hook 旧 arm 用的同一来源）。run/repo/cwd 同样取自 prep。
+    best-effort：缺 task_id 则不 arm；任何异常都不阻断本次 prompt（只记 diagnostic）。
+    锁根路径走 ``kanban_followup_lock`` 的默认解析（``RVF_KANBAN_FOLLOWUP_LOCK_ROOT``
+    env 或 ``~/.rvf``），与 Stop hook 读/清侧一致。
 
     锁主键是 task_id（task-path），故 ``target_kanban_task_id`` 的一致性是关键——它取自 prep
     payload（权威，与 Stop hook 旧 arm 用的同一来源）。run/repo/cwd 同样取自 prep。
@@ -621,6 +639,10 @@ def arm_kanban_followup_lock_on_delivery(
     session_id = payload.get("origin_session_id") or event.get("session_id")
     repo = payload.get("origin_repo")
     cwd = payload.get("origin_cwd") or event.get("cwd")
+    # 投递落地的会话身份 + transcript 路径：读侧要用它们判定「本次 Stop 与这把锁是不是同一个
+    # 会话」，不同会话则不做祖先链对账（保守）。历史 payload 这三个字段全是 None。
+    delivered_session_id = event.get("session_id")
+    delivered_transcript_path = event.get("transcript_path")
     try:
         marker_path = kanban_followup_lock.write_marker(
             task_id=task_id,
@@ -629,6 +651,18 @@ def arm_kanban_followup_lock_on_delivery(
             run_dir=str(rvf_run.get("run_dir") or ""),
             repo=repo if isinstance(repo, str) else None,
             cwd=cwd if isinstance(cwd, str) else None,
+            delivered_session_id=(
+                delivered_session_id
+                if isinstance(delivered_session_id, str) and delivered_session_id.strip()
+                else None
+            ),
+            delivered_transcript_path=(
+                delivered_transcript_path
+                if isinstance(delivered_transcript_path, str) and delivered_transcript_path.strip()
+                else None
+            ),
+            dispatch_token=record.token,
+            state=kanban_followup_lock.STATE_DELIVERED_AWAITING_AGENT_DECISION,
         )
     except Exception as exc:  # best-effort：绝不阻断 prompt
         try:
@@ -665,6 +699,7 @@ def arm_kanban_followup_lock_on_delivery(
                 "kanban_task_id": task_id,
                 "run_id": rvf_run.get("run_id"),
                 "marker_path": marker_str,
+                "marker_state": kanban_followup_lock.STATE_DELIVERED_AWAITING_AGENT_DECISION,
                 "removed_pending_marker_paths": removed_pending,
             },
         )
@@ -699,10 +734,21 @@ def stamp_kanban_followup_bootstrap_gate(
     session_id = session_id if isinstance(session_id, str) and session_id.strip() else None
     try:
         marker = kanban_followup_lock.read_marker(task_id=task_id, session_id=session_id)
-        if marker is None or not kanban_followup_lock.stamp_bootstrap_gate(
+        if marker is None:
+            return None
+        # 锁刚在同一进程 arm 成 ``delivered_awaiting_agent_decision``（agent 还没被确认收到这条
+        # trigger）。此时**只盖 gate、不改 state**：改成 waiting_bootstrap 会把「收没收到」这一
+        # 维信息抹掉，读侧于是又会对一个从未看到 prompt 的 agent 发定向 re-engage。真正的升格由
+        # Stop 读侧在确认 trigger 仍在 transcript 祖先链上时做（届时按有无 gate 落到
+        # waiting_bootstrap / in_progress）。
+        keep_awaiting = (
+            kanban_followup_lock.marker_state(marker)
+            == kanban_followup_lock.STATE_DELIVERED_AWAITING_AGENT_DECISION
+        )
+        if not kanban_followup_lock.stamp_bootstrap_gate(
             marker,
             gate=gate,
-            state=kanban_followup_lock.STATE_WAITING_BOOTSTRAP,
+            state=None if keep_awaiting else kanban_followup_lock.STATE_WAITING_BOOTSTRAP,
         ):
             return None
         marker_path = marker.get("_marker_path")
@@ -714,7 +760,7 @@ def stamp_kanban_followup_bootstrap_gate(
             token=record.token,
             record={
                 "event": "user_prompt_submit_kanban_followup_bootstrap_gate_stamped",
-                "status": "waiting_bootstrap",
+                "status": kanban_followup_lock.marker_state(marker),
                 "kanban_task_id": task_id,
                 "marker_path": marker_path,
                 "bootstrap_phase": gate.get("phase"),
@@ -744,6 +790,76 @@ def _run_artifacts_present(payload: dict[str, Any]) -> bool:
         return Path(run_dir).is_dir()
     except OSError:
         return False
+
+
+def _dispatch_prep_revive_max_age_seconds() -> float:
+    raw = os.environ.get(DISPATCH_PREP_REVIVE_MAX_AGE_ENV)
+    if raw is None or not raw.strip():
+        return float(DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS)
+    return max(0.0, value)
+
+
+def _dispatch_prep_revive_staleness_veto(
+    payload: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """该过期 prep 是否**老到不该复活**？返回否决理由 dict，或 None（可以复活）。
+
+    两条判据满足其一即否决：
+
+    1. 距**首次**派发（``originally_created_at``，缺则 ``created_at``）超过上界（默认 15min）；
+    2. 派发之后这份 transcript 里出现过显式的人类 prompt——会话已经走远，那条 trigger 属于
+       上一个语境。
+
+    判据 2 只认显式信号（``promptSource: typed`` / ``origin.kind: human``），拿不到就当作
+    「没有否决证据」，靠判据 1 兜底。任何异常一律不否决（best-effort，宁可保持既有行为）。
+    """
+    created_raw = payload.get("originally_created_at")
+    if not isinstance(created_raw, str) or not created_raw.strip():
+        created_raw = payload.get("created_at")
+    if not isinstance(created_raw, str) or not created_raw.strip():
+        return None
+    try:
+        created_at = rvf_prep_file.parse_timestamp(created_raw)
+    except Exception:
+        return None
+    created_epoch = created_at.astimezone(timezone.utc).timestamp()
+    reference_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age_seconds = max(0.0, reference_now.timestamp() - created_epoch)
+    max_age = _dispatch_prep_revive_max_age_seconds()
+    if max_age > 0 and age_seconds > max_age:
+        return {
+            "reason": "prep_older_than_revive_max_age",
+            "prep_age_seconds": round(age_seconds, 3),
+            "revive_max_age_seconds": max_age,
+            "originally_created_at": created_raw,
+        }
+
+    transcript_path = event.get("transcript_path")
+    try:
+        # 探测拿不到结论（无路径 / 不可读 / 该 harness 没有显式人类输入标记）时返回 False，
+        # 即「没有否决证据」——判据 1 的年龄上界仍在兜底。
+        found_human, _probe_error = has_explicit_human_prompt_after(
+            transcript_path=transcript_path,
+            after_epoch_seconds=created_epoch,
+        )
+    except Exception:  # best-effort：探测失败绝不否决
+        return None
+    if found_human:
+        return {
+            "reason": "human_prompt_after_dispatch",
+            "prep_age_seconds": round(age_seconds, 3),
+            "revive_max_age_seconds": max_age,
+            "originally_created_at": created_raw,
+            "transcript_path": transcript_path if isinstance(transcript_path, str) else None,
+        }
+    return None
 
 
 def _bootstrap_waiting_additional_context_text(gate: dict[str, Any]) -> str:
@@ -1156,6 +1272,33 @@ def inspect_user_prompt_submit(
             # FU-1（方案 B）：prep 已过 TTL，但其 run artifacts 仍在 → 就地续期、记一条
             # revived 诊断、沿用既有 valid 派发路径，而非静默丢整轮 followup。run_dir 不在
             # （run 已清理 / 真过期）则不复活，继续走下面的 dispatch_no_prep 早返回。
+            #
+            # 但复活必须有时效上界：一条**会话早已走远**的旧派发被原地唤醒，等于把一次从未被
+            # agent 看到、且用户已 rewind 掉的 RVF 重新塞回来。两条否决判据满足其一即不复活。
+            stale_veto = _dispatch_prep_revive_staleness_veto(
+                lookup.payload, event, now=lookup_now
+            )
+            if stale_veto is not None:
+                payload["prep_revive_declined"] = stale_veto
+                try:
+                    rvf_prep_file.append_diagnostic(
+                        root=prep_root,
+                        token=token,
+                        record={
+                            "event": "dispatch_prep_stale_not_revived",
+                            "status": "declined",
+                            "workflow_started": False,
+                            "prep_file_path": str(lookup.path),
+                            "prompt_source": prompt_source,
+                            **stale_veto,
+                        },
+                    )
+                except (OSError, rvf_prep_file.PrepFileError):
+                    pass
+                payload["systemMessage"] = _trigger_system_message(
+                    kind="dispatch_no_prep", token=token, status="expired_too_stale_to_revive"
+                )
+                return payload
             try:
                 revived = rvf_prep_file.revive_prep_file(lookup, root=prep_root, now=lookup_now)
             except (OSError, rvf_prep_file.PrepFileError):

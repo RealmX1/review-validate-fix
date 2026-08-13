@@ -47,7 +47,10 @@ from core.run_ledger.run_ledger import (
     skill_deploy_metadata,
     start_run,
 )
-from core.rvf_user_local_data_paths import resolved_rvf_user_local_data_paths
+from core.rvf_user_local_data_paths import (
+    resolved_rvf_session_hook_state_dir,
+    resolved_rvf_user_local_data_paths,
+)
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (
     CLINE_KANBAN_TASK_MARKER,
     CLINE_KANBAN_WORKTREE_MODES,
@@ -98,10 +101,19 @@ try:
 except Exception:  # pragma: no cover - structured read is best-effort
     codex_invoked_skill = None
 import rvf_bootstrap_gate
+from kanban_followup_trigger_transcript_presence import (
+    TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND,
+    TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN,
+    TriggerPresence,
+    classify_dispatch_trigger_presence,
+)
 from kanban_followup_lock import (
+    STATE_DELIVERED_AWAITING_AGENT_DECISION as KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
     STATE_IN_PROGRESS as KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS,
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
     STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
+    marker_state as kanban_followup_lock_state,
+    promote_marker_out_of_awaiting_agent_decision as promote_kanban_followup_lock_out_of_awaiting,
     clear_marker as clear_kanban_followup_lock,
     revive_marker as revive_kanban_followup_lock,
     revive_count as kanban_followup_lock_revive_count,
@@ -225,7 +237,6 @@ RVF_USER_LOCAL_DATA_PATHS = resolved_rvf_user_local_data_paths()
 DEFAULT_GATE = SKILL_DIR / "scripts" / "review_validate_fix_gate.sh"
 DEFAULT_CONFIG = Path.home() / ".codex" / "config.toml"
 DEFAULT_STATE_DIR = RVF_USER_LOCAL_DATA_PATHS.runtime_state_root
-DEFAULT_SESSION_HOOK_STATE_DIR = DEFAULT_STATE_DIR / "session-hook"
 DEFAULT_CLINE_KANBAN_CLIENT = SKILL_DIR / "scripts" / "cline_kanban_client.py"
 DEFAULT_CLINE_KANBAN_STATE_DIR = Path.home() / ".cline" / "kanban"
 DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
@@ -368,15 +379,9 @@ def read_kanban_task_suppression(task_id: str) -> dict[str, Any] | None:
 
 
 def session_hook_state_dir() -> Path:
-    explicit = os.environ.get("CODEX_RVF_SESSION_HOOK_STATE_DIR")
-    if explicit and explicit.strip():
-        return Path(explicit).expanduser()
-
-    state_root = os.environ.get("CODEX_RVF_STATE_DIR")
-    if state_root and state_root.strip():
-        return Path(state_root).expanduser() / "session-hook"
-
-    return DEFAULT_SESSION_HOOK_STATE_DIR
+    # 单一裁决点见 core.rvf_user_local_data_paths；本函数语义即该裁决点的语义
+    # （explicit → CODEX_RVF_STATE_DIR → runtime_state_root，刻意不回落 LOG_ROOT）。
+    return resolved_rvf_session_hook_state_dir()
 
 
 def read_event() -> dict[str, Any] | None:
@@ -1270,8 +1275,15 @@ def dispatch_prep_prompt_block(record: rvf_prep_file.PrepFileRecord) -> str:
     )
 
 
+# 幂等守卫必须匹配**带实际 token 的那一行**，不能只匹配裸标记名 `RVF_DISPATCH=token=`：
+# 正文里合法地提到这个标记名（例如告诉 agent「token 取自本条消息里 `RVF_DISPATCH=token=`
+# 后面那串」）会让裸子串守卫误判「已经加过了」，于是真正的 token 行永远不被追加，整条派发
+# 在 UPS 侧就成了无 token 的空注入。形状与 UPS 的 ``DISPATCH_TOKEN_RE`` 一致。
+DISPATCH_TOKEN_LINE_RE = re.compile(r"\bRVF_DISPATCH=token=[0-9A-Fa-f]{16}\b")
+
+
 def add_dispatch_prep_to_prompt(prompt: str, record: rvf_prep_file.PrepFileRecord) -> str:
-    if "RVF_DISPATCH=token=" in prompt:
+    if DISPATCH_TOKEN_LINE_RE.search(prompt):
         return prompt
     return f"{prompt.rstrip()}\n\n{dispatch_prep_prompt_block(record)}"
 
@@ -1452,6 +1464,38 @@ def cline_kanban_workspace_path(*payloads: dict[str, Any]) -> str | None:
     return None
 
 
+def kanban_followup_decline_prompt_block() -> str:
+    """注入 prompt 里的**谢绝出口**。
+
+    Kanban task 内的自动 RVF 走延续后端，结构上不经过 S3 决策点，历史上因此没有任何谢绝出口
+    ——注入的是一条纯祈使句，agent 只能照跑。这段把出口显式写出来：默认仍是照跑（不谢绝就
+    正常执行，行为不变），但 agent 判断这一轮确实不该审时有一条正当路径，而不是硬跑或干停。
+
+    ``<dispatch-token>`` 就是本条 prompt 里 ``RVF_DISPATCH=token=`` 后面那串。
+    """
+    return (
+        "如果你判断这一轮**不该审**（例如本轮改动与你正在做的事无关、或用户已明确让你转做别的"
+        "工作），不要硬跑、也不要干停，改用谢绝出口：\n"
+        "```\n"
+        "rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话理由>\n"
+        "```\n"
+        "`<dispatch-token>` 取本条消息里 `RVF_DISPATCH=token=` 后面那串。默认语义是「这一轮"
+        "不审」——本轮 scope 退回可审池，后续 Stop 仍可能重新提议同一批改动。\n"
+        "若你确定这批 diff **根本不需要审核**，再加 "
+        "`--mark-declined-scope-units-review-not-required`：后续 RVF 不再把它们纳入范围。"
+        "该标记是 diff（hunk）级而非文件级——这些 diff 内容一旦被改动，会作为新的改动重新"
+        "进入审核范围。默认不加此标记。\n"
+        # 退出码语义必须写进注入正文：该命令的副作用（豁免 / 释放 lease / 清锁）是分步的，
+        # 任一步没成都会以非 0 退出并列出 failed_steps。agent 若只看「命令跑完了」就当作已谢绝，
+        # 会在锁其实还在、或豁免其实没生效的情况下继续往下走——那正是本轮要根治的「声称做了 A、
+        # 实际做了 B」那一类。
+        "**看退出码**：`0` 才表示谢绝完全生效。非 0（`7 = decline_incomplete`）表示副作用只做成"
+        "了一部分——例如锁属于**另一轮** dispatch 而被保留、lease 未释放、或请求了豁免却没声明成。"
+        "此时不要当作已谢绝：按输出里的 `failed_steps` / `next_steps` 补救，或如实告诉开发者哪一步"
+        "没成。尤其带豁免时，只要退出码非 0，那批 diff 就**没有**被声明为「不需审核」。\n\n"
+    )
+
+
 def kanban_followup_review_validate_fix_prompt(
     *,
     task_id: str,
@@ -1494,6 +1538,7 @@ def kanban_followup_review_validate_fix_prompt(
         "请在当前 task worktree 中运行完整 review-validate-fix。目标仓库为上面的 "
         "`RVF_TARGET_REPO`；如果当前 task worktree 的 repo root 与该路径不同，以当前 task "
         "worktree 为执行位置，并在 handoff 中记录这一点。\n\n"
+        f"{kanban_followup_decline_prompt_block()}"
         "从准备阶段开始创建并持续维护 run artifact `handoff.md`。完成后最终回复"
         "第一行输出 `RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
         f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}，也不要在正文里重复 "
@@ -2894,6 +2939,262 @@ def _kanban_followup_bootstrap_gate_decision(
     )
 
 
+# ── 清 kanban-followup 锁时的 tracker lease 回收 ────────────────────────────────────
+# 清锁只写掉「别再催这一轮」这一件事，这一轮 RVF 在 tracker 里占着的 scope lease 不会因此消失。
+# kanban-followup 的 lease 默认 1h（DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS），而 awaiting
+# 短窗只有 10min：不连带释放的话，清锁之后原 scope 的 unit 仍是 ``assigned``，而常规 gate 的
+# 候选查询只收 ``review_state='available'`` → 把它们整批排除。于是「交回常规 gate 按当时工作树
+# 重新决策」在剩下的 ~50min 里根本兑现不了；等 lease 自己过期时会话早已走远，当时的口径
+# （committed baseline 等）也可能已经丢了。故凡是「清锁 = 放弃这一轮」的路径都必须走这里。
+
+
+def _tracker_lease_identity_for_kanban_followup_lock(
+    marker: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """从锁记的 ``run_dir`` 回捞这一轮的 ``(lease_id, repo, 取值来源 artifact 名)``。
+
+    刻意**不**走 dispatch prep file（``marker['dispatch_token']`` → ``rvf_prep_file``，
+    ``rvf_agent_decision_cli.run_decline_dispatched_review`` 走的那条）：prep 的 TTL 只有 5min
+    且 ``rvf_prep_file.sweep_stale`` 会把过期的直接删掉，而本函数的两个调用点（awaiting 窗口
+    10min 到期 / 用户 rewind，可能发生在数小时之后）几乎必然晚于那个窗口——那条路在这里注定
+    拿不到 lease id。run dir 里的 artifact 才是长驻来源，按可信度排：
+
+      ① ``artifacts/tracker-scope.json`` —— allocate 成功那一刻直接落盘的 scope（权威）；
+      ② ``artifacts/dispatch-prep-file.json`` —— 派发时落的 prep **快照**（含同一个 lease id
+         与 ``target_worktree``），①缺失/损坏时兜底。
+
+    repo 优先用锁自己记的 ``repo``（UPS 从 prep 的 ``origin_repo`` 抄来），缺失才回落到 ②。
+    """
+    repo_raw = marker.get("repo")
+    repo = repo_raw.strip() if isinstance(repo_raw, str) and repo_raw.strip() else None
+    run_dir_raw = marker.get("run_dir")
+    if not (isinstance(run_dir_raw, str) and run_dir_raw.strip()):
+        return None, repo, None
+    artifacts_dir = Path(run_dir_raw).expanduser() / "artifacts"
+
+    def _read_json_object(path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    tracker_scope = _read_json_object(artifacts_dir / "tracker-scope.json")
+    if isinstance(tracker_scope, dict):
+        lease_id = tracker_scope.get("lease_id")
+        if isinstance(lease_id, str) and lease_id.strip():
+            return lease_id.strip(), repo, "tracker-scope.json"
+
+    dispatch_prep = _read_json_object(artifacts_dir / "dispatch-prep-file.json")
+    if isinstance(dispatch_prep, dict):
+        payload = dispatch_prep.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        rvf_run = payload.get("rvf_run")
+        rvf_run = rvf_run if isinstance(rvf_run, dict) else {}
+        lease_id = rvf_run.get("tracker_lease_id")
+        if repo is None:
+            for key in ("target_worktree", "origin_repo"):
+                candidate = payload.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    repo = candidate.strip()
+                    break
+        if isinstance(lease_id, str) and lease_id.strip():
+            return lease_id.strip(), repo, "dispatch-prep-file.json"
+
+    return None, repo, None
+
+
+def release_tracker_lease_for_reconciled_kanban_followup_lock(
+    marker: dict[str, Any],
+    *,
+    reason: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """清锁时连带释放该轮 RVF 的 tracker lease，让 scope unit 退回 ``available``。
+
+    返回 ``(lease_id, 诊断字典)``，诊断**恒为可落 ledger 的 dict**：拿不到 lease id、拿不到
+    repo、释放抛异常都如实写进去，绝不静默跳过——这条路径出问题的表征是「后续 Stop 再也不
+    提议这批改动」，是一种沉默的漏审，没有落盘证据根本无从溯源。
+
+    Stop hook 是 best-effort 路径：tracker 侧任何异常一律吞掉转成诊断，绝不阻断 Stop 主流程
+    （形状照抄本文件 ``patch_ownership_incomplete_skip_payload`` 的 lease 释放写法）。
+    """
+    lease_id, repo, source = _tracker_lease_identity_for_kanban_followup_lock(marker)
+    if not lease_id:
+        return None, {
+            "status": "unresolved",
+            "released": False,
+            "reason": "tracker_lease_id_not_found_in_run_dir_artifacts",
+            "run_dir": marker.get("run_dir"),
+            "repo": repo,
+        }
+    if not repo:
+        return lease_id, {
+            "status": "unresolved",
+            "released": False,
+            "reason": "tracker_repo_not_found_for_lease",
+            "lease_id": lease_id,
+            "lease_id_source": source,
+            "run_dir": marker.get("run_dir"),
+        }
+    try:
+        release_result = lease_release(repo=repo, lease_id=lease_id, reason=reason)
+    except Exception as exc:
+        return lease_id, {
+            "status": "error",
+            "released": False,
+            "lease_id": lease_id,
+            "lease_id_source": source,
+            "repo": repo,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    result = dict(release_result) if isinstance(release_result, dict) else {"result": release_result}
+    result["lease_id_source"] = source
+    result["repo"] = repo
+    return lease_id, result
+
+
+def _kanban_followup_awaiting_agent_decision_decision(
+    ledger: RunLedger,
+    *,
+    marker: dict[str, Any],
+    presence: TriggerPresence,
+    status: str,
+    task_id: str | None,
+    session_id: str | None,
+    cwd: str | None,
+) -> tuple[bool, StopDecision | None]:
+    """处理 ``delivered_awaiting_agent_decision`` 态，返回 ``(handled, decision)``。
+
+    - trigger 确在祖先链上 → **升格**（按有无 bootstrap gate 落到 waiting_bootstrap /
+      in_progress），``handled=False`` 让调用方落回常规分支（nudge 预算等一切照旧）。
+    - 尚未确认落地且锁仍在 awaiting 短窗内 → ``skip_decision``：**只做互斥去重，不发 nudge**。
+      这正是本次要根治的那一格——历史实现在这里会催 agent「收尾这一轮」。
+    - awaiting 短窗已过仍未确认 → 清锁 + **释放本轮 lease** 交回常规 gate，按**当时**工作树重新
+      决策。绝不复活一条早已被会话走远抛下的旧派发（原地复活正是 09:08 派发被 49 分钟后原样
+      唤醒的那条路径）。
+    """
+    marker_path = marker.get("_marker_path")
+    blocking_run_id = marker.get("run_id")
+    if presence.presence == TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN:
+        promoted_state = promote_kanban_followup_lock_out_of_awaiting(
+            marker, reason="trigger_on_transcript_ancestor_chain"
+        )
+        ledger.event(
+            phase="gate",
+            event="kanban_followup_lock_promoted_after_agent_received_trigger",
+            status="completed" if promoted_state else "warning",
+            reason_code=(
+                "kanban_followup_trigger_on_ancestor_chain"
+                if promoted_state
+                else "kanban_followup_lock_promotion_write_failed_kept_awaiting"
+            ),
+            level="info" if promoted_state else "warn",
+            cwd=cwd,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker_path=marker_path,
+            kanban_followup_lock_state=promoted_state,
+            kanban_followup_lock_promotion_failed_kept_awaiting=not promoted_state,
+            active_rvf_run_id=blocking_run_id,
+            **presence.as_ledger_fields(),
+        )
+        if promoted_state:
+            return False, None
+        # 升格写盘失败（``promote_...`` 只在 OSError 时返回 None）→ **磁盘上这把锁仍是 awaiting**。
+        # 此处绝不能 ``return False, None`` 把它交给下面的常规 in_progress / bootstrap 分支：那条
+        # 路会对一把「磁盘态仍是未确认接手」的锁发 re-engage nudge——正是本轮要根治的那个行为
+        # （ledger 记了 warning 但控制流照走，等于没 fail-closed）。故 fail-closed：往下继续按
+        # awaiting 处理（窗口内只互斥去重、不 nudge；窗口已过则回收 + 释放 lease），下一次 Stop
+        # 会重试升格。刻意**不**改成「无条件 skip」：marker 若永久不可写，无条件 skip 会让这把锁
+        # squat 到天荒地老；awaiting 短窗给的是确定的兜底上界，且回收方向是「重新决策」而不是
+        # 「强制续跑」，最坏代价是一次重复提议，不是漏审。
+
+    if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+        return True, skip_decision(
+            "上一条 Cline Kanban RVF follow-up trigger 已投递、但尚未确认被 agent 接手"
+            f"（run_id={blocking_run_id or '<unknown>'}，"
+            f"armed_at={marker.get('armed_at') or '<unknown>'}，"
+            f"trigger_presence={presence.presence}）；"
+            "本次 Stop 只做互斥去重、不催收尾——agent 尚未看到这条 trigger 时催它「继续收尾"
+            "这一轮」会逼它跑一次从未接受的 review。等待窗超时后将按当时工作树重新决策。",
+            ledger,
+            "kanban_followup_delivered_awaiting_agent_decision",
+            cwd=cwd,
+            backend="kanban-followup",
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker=marker,
+            kanban_followup_in_progress_marker_path=marker_path,
+            kanban_followup_lock_state=KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
+            active_rvf_run_id=blocking_run_id,
+            active_rvf_run_dir=marker.get("run_dir"),
+            active_rvf_armed_at=marker.get("armed_at"),
+            **presence.as_ledger_fields(),
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_delivered_awaiting_agent_decision",
+            ),
+        )
+
+    # 释放 lease 必须与清锁同时发生：只清锁不放 lease，那批 unit 会一直卡在 ``assigned``、被
+    # 常规 gate 的候选查询排除，「交回常规 gate 按当时工作树重新决策」就只是一句空话。
+    released_lease_id, lease_release_result = release_tracker_lease_for_reconciled_kanban_followup_lock(
+        marker, reason="kanban_followup_awaiting_agent_decision_expired"
+    )
+    removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    removed_pending = clear_kanban_followup_pending(task_id=task_id)
+    ledger.event(
+        phase="gate",
+        event="kanban_followup_awaiting_agent_decision_window_expired",
+        status="completed",
+        reason_code="kanban_followup_awaiting_agent_decision_expired",
+        cwd=cwd,
+        cline_kanban_task_id=task_id,
+        session_id=session_id,
+        kanban_followup_in_progress_marker=marker,
+        kanban_followup_in_progress_marker_path=marker_path,
+        kanban_followup_lock_state=KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
+        reconciled_blocking_run_id=blocking_run_id,
+        removed_kanban_followup_in_progress_marker_paths=removed_lock,
+        removed_kanban_followup_pending_marker_paths=removed_pending,
+        tracker_lease_id=released_lease_id,
+        lease_release_result=lease_release_result,
+        **presence.as_ledger_fields(),
+    )
+    return True, None
+
+
+def kanban_followup_trigger_presence_for_lock(
+    event: dict[str, Any],
+    marker: dict[str, Any],
+) -> TriggerPresence:
+    """判定这把锁对应的 follow-up trigger 是否仍在**投递会话**的 transcript 祖先链上。
+
+    优先用锁自己记下的 ``delivered_transcript_path``（UPS 投递那一刻的权威路径，跨会话仍有效）；
+    老 marker 没有该字段时，仅当本次 Stop 与投递是同一会话才退回用本次 Stop 的 transcript
+    ——读错文件得出的「不在链上」会误清一把真在跑的锁。
+    """
+    transcript_path = marker.get("delivered_transcript_path")
+    if not (isinstance(transcript_path, str) and transcript_path.strip()):
+        delivered_session_id = marker.get("delivered_session_id")
+        current_session_id = event.get("session_id")
+        if (
+            isinstance(delivered_session_id, str)
+            and delivered_session_id
+            and delivered_session_id == current_session_id
+        ):
+            fallback = first_readable_session_path(event)
+            transcript_path = str(fallback) if fallback is not None else None
+        else:
+            transcript_path = None
+    return classify_dispatch_trigger_presence(
+        transcript_path=transcript_path,
+        dispatch_token=marker.get("dispatch_token"),
+    )
+
+
 def kanban_followup_in_progress_decision(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2912,6 +3213,62 @@ def kanban_followup_in_progress_decision(
 
     status = kanban_followup_lock_status(marker)
     marker_path = marker.get("_marker_path")
+    lock_state = kanban_followup_lock_state(marker)
+
+    # ── 锁卫生（先于一切 nudge/skip）：这条 trigger 现在还在主链上吗？ ────────────────
+    # 「UPS 上过锁」只证明 prompt 被**提交**过，不证明 agent 收到、更不证明它现在还算数。
+    # 用户 rewind 会把落地过的那一段整体移出祖先链；此时继续按锁催 agent「收尾这一轮」，
+    # 就是在逼它跑一次它从未接受、且已被撤销的 RVF。
+    presence = kanban_followup_trigger_presence_for_lock(event, marker)
+    if presence.presence == TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND:
+        # 确凿证据：token 在这份 transcript 里出现过，却不在当前 leaf 的祖先链上 = 被 rewind。
+        # （若是 /compact 抹掉了历史，token 会整个消失 → ABSENT，不会走到这里，故本判据不会
+        # 因压缩而误伤。）清锁 + 清 pending + **释放本轮 lease**，交回常规 gate 按**当前**工作树
+        # 重新决策——rewind 掉的那一轮 scope 若不放 lease，会一路 assigned 到 1h TTL 到期，
+        # 期间常规 gate 看不到这批 unit（候选查询只收 available），等于把「重新决策」推迟一小时。
+        released_lease_id, lease_release_result = (
+            release_tracker_lease_for_reconciled_kanban_followup_lock(
+                marker, reason="kanban_followup_trigger_rewound_off_ancestor_chain"
+            )
+        )
+        removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+        removed_pending = clear_kanban_followup_pending(task_id=task_id)
+        ledger.event(
+            phase="gate",
+            event="kanban_followup_lock_reconciled_for_rewind",
+            status="completed",
+            reason_code="kanban_followup_trigger_rewound_off_ancestor_chain",
+            cwd=cwd,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker=marker,
+            kanban_followup_in_progress_marker_path=marker_path,
+            kanban_followup_lock_state=lock_state,
+            reconciled_blocking_run_id=marker.get("run_id"),
+            removed_kanban_followup_in_progress_marker_paths=removed_lock,
+            removed_kanban_followup_pending_marker_paths=removed_pending,
+            tracker_lease_id=released_lease_id,
+            lease_release_result=lease_release_result,
+            **presence.as_ledger_fields(),
+        )
+        return None
+
+    if lock_state == KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION:
+        handled, awaiting_decision = _kanban_followup_awaiting_agent_decision_decision(
+            ledger,
+            marker=marker,
+            presence=presence,
+            status=status,
+            task_id=task_id,
+            session_id=session_id,
+            cwd=cwd,
+        )
+        if handled:
+            return awaiting_decision
+        # 升格成功（trigger 确在祖先链上）→ 落回下面的常规 in_progress / waiting_bootstrap 分支。
+        status = kanban_followup_lock_status(marker)
+        lock_state = kanban_followup_lock_state(marker)
+
     if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
         blocking_run_id = marker.get("run_id")
         # 锁卫生：若上游 agent 经 $rvf-reopen 明确武装了 rescope marker（失败再入），

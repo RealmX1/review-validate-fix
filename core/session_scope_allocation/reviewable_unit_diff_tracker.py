@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 # 本模块迁入 core/ 后既被当作 ``core.session_scope_allocation.reviewable_unit_diff_tracker``
 # import、也作为 CLI(``__main__``) 与 ``spec_from_file_location`` 直接加载。后两种上下文里
@@ -1354,6 +1354,17 @@ CREATE TABLE IF NOT EXISTS units (
   is_tombstoned        INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstoned IN (0,1)),
   tombstoned_at        TEXT,
   tombstone_reason     TEXT,
+  -- 「agent 谢绝这一轮 RVF 时显式声明本 diff 不需审核」的可审计侧车。豁免本身**不是**靠这三
+  -- 列生效的：生效靠把 review_state 置成 'reviewed'（从而自动继承 scope 分配 / committed-round
+  -- 检测 / highwater / dedup 等全部既有过滤）。这三列只回答「这条 reviewed 究竟是真审过、还是
+  -- 被声明不需审」。
+  --
+  -- ⚠️ 三列刻意**不进** _upsert_unit 的 ON CONFLICT SET 列表——与 review_state 同等待遇。
+  -- 反例就在隔壁：is_tombstoned/tombstoned_at/tombstone_reason 在 ON CONFLICT 里被无条件重置，
+  -- 而每次 Stop 都会跑一次 tracker refresh，豁免若挂在 tombstone 一侧会被静默抹掉。
+  review_not_required_declared_at         TEXT,
+  review_not_required_declared_reason     TEXT,
+  review_not_required_declared_by_run_id  TEXT,
   FOREIGN KEY (branch_key)   REFERENCES branches(branch_key)   ON DELETE SET NULL,
   FOREIGN KEY (worktree_key) REFERENCES worktrees(worktree_key) ON DELETE CASCADE
 );
@@ -1638,6 +1649,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         return
     if version == SCHEMA_VERSION:
         _ensure_unit_tombstone_schema(conn)
+        _ensure_unit_review_not_required_waiver_schema(conn)
         _ensure_manual_rvf_runs_schema(conn)
         _ensure_lease_watermark_schema(conn)
         _ensure_lease_participants_schema(conn)
@@ -1760,6 +1772,21 @@ def _ensure_unit_tombstone_schema(conn: sqlite3.Connection) -> None:
           ON units(is_tombstoned, review_state)
         """
     )
+
+
+def _ensure_unit_review_not_required_waiver_schema(conn: sqlite3.Connection) -> None:
+    """给既有库补「声明不需审核」的可审计侧车列（纯 ADD COLUMN，无需 rebuild）。
+
+    只加列不改 CHECK 约束：豁免的生效路径是 ``review_state='reviewed'``（既有合法取值），
+    这三列纯审计。列名一律全称，别缩成 ``waived_at`` 之类脱离语境读不出含义的名字。
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(units)").fetchall()}
+    if "review_not_required_declared_at" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN review_not_required_declared_at TEXT")
+    if "review_not_required_declared_reason" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN review_not_required_declared_reason TEXT")
+    if "review_not_required_declared_by_run_id" not in columns:
+        conn.execute("ALTER TABLE units ADD COLUMN review_not_required_declared_by_run_id TEXT")
 
 
 def _rebuild_units_without_legacy_tombstoned_review_state(conn: sqlite3.Connection) -> bool:
@@ -1929,6 +1956,7 @@ def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
 
 def _migrate_schema_v4_to_v5(conn: sqlite3.Connection) -> None:
     _ensure_unit_tombstone_schema(conn)
+    _ensure_unit_review_not_required_waiver_schema(conn)
     _ensure_manual_rvf_runs_schema(conn)
     _ensure_lease_watermark_schema(conn)
     _ensure_lease_participants_schema(conn)
@@ -1938,6 +1966,7 @@ def _migrate_schema_v4_to_v5(conn: sqlite3.Connection) -> None:
 
 def _migrate_schema_v5_to_v6(conn: sqlite3.Connection) -> None:
     _ensure_unit_tombstone_schema(conn)
+    _ensure_unit_review_not_required_waiver_schema(conn)
     _ensure_manual_rvf_runs_schema(conn)
     _ensure_lease_watermark_schema(conn)
     _ensure_lease_participants_schema(conn)
@@ -4277,6 +4306,157 @@ def complete_review_scope(
             conn.close()
 
 
+def declare_units_review_not_required(
+    *,
+    repo: str | Path,
+    reason: str,
+    unit_ids: Sequence[str] | None = None,
+    lease_id: str | None = None,
+    run_id: str | None = None,
+    declared_by_run_id: str | None = None,
+    log_root_override: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """把一批 reviewable unit 声明为「不需审核」，使后续 RVF 不再把它们纳入 scope。
+
+    用途：agent **谢绝**一轮自动 RVF 时可选地带上豁免（默认不带）。不带豁免的谢绝只是「这一
+    轮不审」，下次 Stop 仍会重新提议；带豁免则该批 diff 从此不再进入审核范围。
+
+    **粒度是 diff hunk 级、不是 file 级**——这是 tracker 的原生粒度：``unit_id`` 由
+    ``canonical_patch_hash`` 等**内容**派生，所以豁免天然只绑定「这一段 diff 的这个内容」。
+    该 hunk 内容一旦被改动，就会产生一个**新的 unit_id**，不继承豁免、重新进入审核范围。
+    file 级豁免做不到这点（会把日后对该文件的一切新编辑一并吞掉）。
+
+    实现刻意挂在 ``review_state='reviewed'`` 一侧，而**不是**复用 tombstone：
+    ``_upsert_unit`` 的 ON CONFLICT 子句会无条件重置 ``is_tombstoned/tombstoned_at/
+    tombstone_reason``，而每次 Stop hook 都跑一次 tracker refresh —— 豁免若挂在 tombstone 上
+    会被静默抹掉。``review_state`` 及本函数写的三列侧车都不在那份 SET 列表里，故跨再观察持久。
+    置成 ``reviewed`` 还顺带**自动继承**既有全部过滤（scope 分配 / committed-round 检测 /
+    highwater / dedup 都已按 reviewed 排除），无需逐处改。
+
+    目标 unit 三选一（按此优先序解析，至少给一个）：``unit_ids`` 显式列表 / ``lease_id``
+    （该 lease 圈定的全部 unit）/ ``run_id``（该 run 的 ``session_units``）。
+    tombstoned unit 一律跳过（已消失的 diff 无所谓豁免）。
+    """
+    repo_resolved, key, directory, db_path, events_path, common_dir = _lease_repo_paths(
+        repo,
+        log_root_override,
+    )
+    now_iso = _tracker_now_iso(now)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(db_path)
+        with _begin_immediate(conn):
+            requested_unit_ids: list[str] = []
+            resolved_from: str
+            if unit_ids:
+                requested_unit_ids = sorted({uid for uid in unit_ids if isinstance(uid, str) and uid})
+                resolved_from = "unit_ids"
+            elif lease_id:
+                requested_unit_ids = sorted(_unit_ids_for_lease_in_txn(conn, lease_id))
+                resolved_from = "lease_id"
+            elif run_id:
+                rows = conn.execute(
+                    "SELECT DISTINCT unit_id FROM session_units WHERE run_id=?",
+                    (run_id,),
+                ).fetchall()
+                requested_unit_ids = sorted(row["unit_id"] for row in rows)
+                resolved_from = "run_id"
+            else:
+                return {
+                    "status": "noop",
+                    "reason": "no_target_units_specified",
+                    "declared_unit_ids": [],
+                    "declared_unit_count": 0,
+                    "repo_key": key,
+                    "tracker_dir": str(directory),
+                }
+
+            declared_unit_ids: list[str] = []
+            if requested_unit_ids:
+                placeholders = ",".join("?" for _ in requested_unit_ids)
+                present_rows = conn.execute(
+                    f"""
+                    SELECT unit_id FROM units
+                     WHERE is_tombstoned=0
+                       AND unit_id IN ({placeholders})
+                    """,
+                    tuple(requested_unit_ids),
+                ).fetchall()
+                declared_unit_ids = sorted(row["unit_id"] for row in present_rows)
+            if declared_unit_ids:
+                placeholders = ",".join("?" for _ in declared_unit_ids)
+                conn.execute(
+                    f"""
+                    UPDATE units
+                       SET review_state='reviewed',
+                           review_not_required_declared_at=?,
+                           review_not_required_declared_reason=?,
+                           review_not_required_declared_by_run_id=?
+                     WHERE is_tombstoned=0
+                       AND unit_id IN ({placeholders})
+                    """,
+                    (now_iso, reason, declared_by_run_id or run_id, *declared_unit_ids),
+                )
+                # 维持 complete_review_scope 的不变量（claim 为 reviewed 当且仅当其全部 unit
+                # 都 reviewed 且在场）：豁免同样让 claim 满足该条件，故一并推进，免得留下永远
+                # pending 的孤儿 claim。
+                conn.execute(
+                    f"""
+                    UPDATE edit_claims
+                       SET status='reviewed',
+                           reviewed_at=?,
+                           last_seen_at=?
+                     WHERE status='pending'
+                       AND claim_id IN (
+                           SELECT DISTINCT claim_id
+                             FROM edit_claim_units
+                            WHERE unit_id IN ({placeholders})
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM edit_claim_units ecu_all
+                             LEFT JOIN units u ON u.unit_id = ecu_all.unit_id
+                            WHERE ecu_all.claim_id = edit_claims.claim_id
+                              AND (
+                                  u.unit_id IS NULL
+                                  OR u.review_state <> 'reviewed'
+                                  OR u.is_tombstoned <> 0
+                              )
+                       )
+                    """,
+                    (now_iso, now_iso, *declared_unit_ids),
+                )
+        _ensure_meta(directory, repo_resolved, common_dir, key)
+        _emit_event(
+            events_path,
+            {
+                "event": "units_declared_review_not_required",
+                "rvf_state_phase": "review",
+                "run_id": declared_by_run_id or run_id,
+                "lease_id": lease_id,
+                "reason_code": reason,
+                "resolved_from": resolved_from,
+                "requested_unit_count": len(requested_unit_ids),
+                "declared_unit_count": len(declared_unit_ids),
+                "declared_unit_ids": declared_unit_ids,
+            },
+        )
+        return {
+            "status": "declared" if declared_unit_ids else "noop",
+            "reason": reason,
+            "resolved_from": resolved_from,
+            "requested_unit_ids": requested_unit_ids,
+            "declared_unit_ids": declared_unit_ids,
+            "declared_unit_count": len(declared_unit_ids),
+            "repo_key": key,
+            "tracker_dir": str(directory),
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def invalidate_reviewed_units_for_run(
     *,
     repo: str | Path,
@@ -4325,6 +4505,9 @@ def invalidate_reviewed_units_for_run(
                    AND u.review_state = 'reviewed'
                    AND u.is_tombstoned = 0
                    AND u.observed_state IN ('dirty','committed')
+                   -- 被显式声明「不需审核」的 unit 不参与失败再入的重开：它的 reviewed 不是
+                   -- 「审过了」而是「用户/agent 决定不审」，重开会把那个决定悄悄撤销。
+                   AND u.review_not_required_declared_at IS NULL
                 """,
                 (run_id,),
             ).fetchall()
@@ -5024,6 +5207,46 @@ def _resolve_session_assignment_in_txn(
     return {"takeover_from": takeover_from, "transferred_unit_ids": transferred}
 
 
+def _union_prior_scope_unit_ids_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    candidates: list[str],
+    prior_scope_unit_ids: Sequence[str] | None,
+) -> tuple[list[str], list[str]]:
+    """把上一轮 scope 里**仍可审**的 unit 并回候选集，返回 ``(合并后候选, 本次并回的)``。
+
+    过滤条件与 ``_collect_candidate_unit_ids_in_txn`` 完全一致（``review_state='available'``、
+    未 tombstone、``observed_state IN ('dirty','committed')``），只是不受 session 归属约束
+    ——重新分配时 session id 常常已经换了，正是那条约束把上一轮的 committed-round scope
+    整个漏掉的。已被真正审掉（``reviewed``）的不会并回。
+
+    ⚠️ 第二个返回值是**排他检查之前**的清单：active lease 的反连接由调用方的 Step 5 统一做
+    （并回的 unit 必须与本轮新观察到的走同一道检查）。因此调用方在对外报告「承接自上一轮」
+    之前，必须先把它与 Step 5 的幸存集合求交，否则会报出 reviewer 根本没拿到的 unit。
+    """
+    if not prior_scope_unit_ids:
+        return candidates, []
+    requested = sorted({uid for uid in prior_scope_unit_ids if isinstance(uid, str) and uid})
+    already = set(candidates)
+    missing = [uid for uid in requested if uid not in already]
+    if not missing:
+        return candidates, []
+    placeholders = ",".join("?" for _ in missing)
+    rows = conn.execute(
+        f"""
+        SELECT unit_id FROM units
+         WHERE review_state='available'
+           AND is_tombstoned=0
+           AND observed_state IN ('dirty','committed')
+           AND unit_id IN ({placeholders})
+         ORDER BY path, hunk_header IS NULL, hunk_header, unit_id
+        """,
+        tuple(missing),
+    ).fetchall()
+    unioned = [row["unit_id"] for row in rows]
+    return candidates + unioned, unioned
+
+
 def _collect_candidate_unit_ids_in_txn(
     conn: sqlite3.Connection,
     session_id: str,
@@ -5311,6 +5534,7 @@ def allocate_review_scope(
     transcript_max_line_number: int | None = None,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    union_with_prior_scope_unit_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Producer half of the global reviewed-diff tracker.
 
@@ -5322,6 +5546,18 @@ def allocate_review_scope(
     `dry_run=True` runs the same observation + candidate query but stops short
     of inserting a lease — used by the dispatcher to decide whether the
     installed Stop hook should fire.
+
+    ``union_with_prior_scope_unit_ids`` 是**lease 过期后重新分配**的并集入口（「并集全审」）。
+    一轮 review 的 lease 过期后，若只按当时工作树重新分配，原本圈定的那批改动会被整个踢出
+    packet——实测一次 committed-round 派发就是这样在中断+rewind 后被换成了纯 dirty 口径，最终
+    审的 100% 是另一批东西。传入上一轮 scope 的 ``unit_ids`` 后，其中**仍可审**（present、
+    未 tombstone、未被别的 active lease 持有、``review_state='available'``）的部分会并回本轮
+    候选集，使新 scope ⊇ 原 scope ∩ 仍存在者。已被真正审掉（``reviewed``）的不会复活。
+
+    ⚠️ 并集必须**连口径一起**继承：若原 scope 含 committed-round 的 unit，重新分配时还要把原来的
+    ``committed_baseline`` / ``committed_base_ref`` 一并传回，否则观察阶段会判定它们「已不在场」
+    而 superseded，并集查询自然就找不到了。CLI 的 ``--union-with-prior-scope`` 会从上一轮 scope
+    artifact 里自动继承这两个字段（它们由本函数写进 artifact），模块调用方需自行传。
     """
     repo_resolved = repo.resolve()
     if _disabled():
@@ -5442,10 +5678,36 @@ def allocate_review_scope(
 
             # Step 4: collect candidate unit_ids.
             candidates = _collect_candidate_unit_ids_in_txn(conn, session_id)
+            # Step 4b（并集全审）：把上一轮 scope 里仍可审的 unit 并回候选集。必须排在 Step 5
+            # 的 active-lease 反连接**之前**，让并回来的 unit 与本轮候选走同一道排他检查。
+            (
+                candidates,
+                unioned_prior_scope_unit_ids_before_active_lease_exclusion,
+            ) = _union_prior_scope_unit_ids_in_txn(
+                conn,
+                candidates=candidates,
+                prior_scope_unit_ids=union_with_prior_scope_unit_ids,
+            )
             candidate_unit_count = len(candidates)
 
             # Step 5: exclude active-leased units (anti-join).
             surviving, leased_excluded_count = _exclude_active_leased_in_txn(conn, candidates, now_iso)
+            # Step 5b: narrow the reported union list to what actually entered this
+            # round's scope. Step 4b deliberately runs *before* the anti-join so the
+            # unioned units face the same exclusive check as freshly observed ones —
+            # which means a prior unit still held by another active lease is dropped
+            # right here. Reporting the pre-anti-join list would (a) tell the packet
+            # and the audit event that units are being carried over when the reviewer
+            # never received them, and (b) let the event's
+            # `newly_observed_unit_count` go negative once the anti-join removes more
+            # unioned units than this round observed fresh.
+            surviving_unit_id_set = set(surviving)
+            unioned_prior_scope_unit_ids = [
+                unit_id
+                for unit_id in unioned_prior_scope_unit_ids_before_active_lease_exclusion
+                if unit_id in surviving_unit_id_set
+            ]
+            unioned_prior_scope_unit_id_set = set(unioned_prior_scope_unit_ids)
 
             if not surviving:
                 # Step 6 (empty): no lease, no scope file. Build the empty
@@ -5510,6 +5772,13 @@ def allocate_review_scope(
                     "hunks": hunks_list,
                     "source_session_id": session_id,
                     "takeover_from_session_id": takeover_from,
+                    # 本轮的 committed-round 口径。写进 scope artifact 让**下一次重新分配**能
+                    # 原样继承——只按当时工作树重分配正是「口径被悄悄换掉」的成因。
+                    "committed_baseline": committed_baseline,
+                    "committed_base_ref": committed_base_ref,
+                    # 并集全审：这批 unit 来自上一轮 scope，不是本轮新观察到的。reviewer 与
+                    # handoff 据此区分「已定稿的那一段」与「刚写的那一段」。
+                    "unioned_prior_scope_unit_ids": unioned_prior_scope_unit_ids,
                 }
                 committed_payload = {
                     "status": "allocated",
@@ -5561,12 +5830,40 @@ def allocate_review_scope(
                     "stale_freed": committed_payload["stale_freed"],
                     "takeover_from_session_id": committed_payload["takeover_from"],
                     "transcript_max_line_number": transcript_max_line_number,
+                    "unioned_prior_scope_unit_count": len(unioned_prior_scope_unit_ids),
                     "reason_code": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
                     "reason_code_legacy_alias": LEGACY_REASON_SESSION_OWNED_DIRTY,
                 },
             )
+            if unioned_prior_scope_unit_ids:
+                _emit_event(
+                    events_path,
+                    {
+                        "event": "scope_reallocated_after_lease_expiry",
+                        "rvf_state_phase": "review",
+                        "session_id": session_id,
+                        "run_id": run_id,
+                        "lease_id": committed_payload["lease_id"],
+                        "scope_hash": committed_payload["scope_hash"],
+                        "unioned_prior_scope_unit_ids": unioned_prior_scope_unit_ids,
+                        "unioned_prior_scope_unit_count": len(unioned_prior_scope_unit_ids),
+                        # Counted as a set difference rather than `len(scope) -
+                        # len(unioned)`: the subtraction is only non-negative while the
+                        # two lists stay in the containment relation Step 5b
+                        # establishes, and a silently negative audit number is worse
+                        # than a slightly slower count.
+                        "newly_observed_unit_count": sum(
+                            1
+                            for unit_id in committed_payload["unit_ids"]
+                            if unit_id not in unioned_prior_scope_unit_id_set
+                        ),
+                        "committed_baseline": committed_baseline,
+                        "reason_code": "scope_reallocated_after_lease_expiry",
+                    },
+                )
             return {
                 "status": "allocated",
+                "unioned_prior_scope_unit_ids": unioned_prior_scope_unit_ids,
                 "acquired": True,
                 "would_acquire": True,
                 "reason": REASON_UNASSIGNED_REVIEW_SCOPE_AVAILABLE,
@@ -6347,6 +6644,25 @@ def _build_argparser() -> argparse.ArgumentParser:
     alloc.add_argument("--dry-run", action="store_true")
     alloc.add_argument("--print-result", action="store_true")
     alloc.add_argument(
+        "--union-with-prior-scope",
+        default=None,
+        help=(
+            "上一轮 tracker-scope.json 的路径（lease 过期后重新分配时使用）。并集全审："
+            "其中仍可审的 unit 会并回本轮 scope，避免原本圈定的那批改动被整个换掉；"
+            "该文件里的 committed_baseline / committed_base_ref 也会在未显式指定时被继承。"
+        ),
+    )
+    alloc.add_argument(
+        "--committed-baseline",
+        default=None,
+        help="committed-round 观察基线（<baseline>..HEAD）。省略时可由 --union-with-prior-scope 继承。",
+    )
+    alloc.add_argument(
+        "--committed-base-ref",
+        default=None,
+        help="committed-round 的 base ref（排除可达 base 的提交）。省略时可由 --union-with-prior-scope 继承。",
+    )
+    alloc.add_argument(
         "--log-root",
         default=None,
         help="Override CODEX_RVF_LOG_ROOT for this invocation (test hook).",
@@ -6537,6 +6853,46 @@ def _main(argv: list[str] | None = None) -> int:
         return 2
     output_scope_path = Path(args.output_scope).expanduser().resolve() if args.output_scope else None
     repo_path = Path(args.repo).expanduser().resolve()
+    prior_scope_unit_ids: list[str] | None = None
+    committed_baseline = args.committed_baseline
+    committed_base_ref = args.committed_base_ref
+    if args.union_with_prior_scope:
+        prior_path = Path(args.union_with_prior_scope).expanduser()
+        try:
+            prior_payload = json.loads(prior_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error": f"--union-with-prior-scope 不可读: {prior_path}: {exc}",
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(prior_payload, dict):
+            print(
+                json.dumps(
+                    {"status": "error", "error": "--union-with-prior-scope 必须是 JSON 对象"},
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        raw_unit_ids = prior_payload.get("unit_ids")
+        prior_scope_unit_ids = (
+            [uid for uid in raw_unit_ids if isinstance(uid, str) and uid]
+            if isinstance(raw_unit_ids, list)
+            else []
+        )
+        # 口径继承：显式参数优先，缺省时沿用上一轮的 committed-round 基线——只按当时工作树
+        # 重分配正是「committed-round 被悄悄换成纯 dirty」的成因。
+        if not committed_baseline and isinstance(prior_payload.get("committed_baseline"), str):
+            committed_baseline = prior_payload["committed_baseline"]
+        if not committed_base_ref and isinstance(prior_payload.get("committed_base_ref"), str):
+            committed_base_ref = prior_payload["committed_base_ref"]
     result = allocate_review_scope(
         repo=repo_path,
         session_id=args.session_id,
@@ -6548,6 +6904,9 @@ def _main(argv: list[str] | None = None) -> int:
         lease_ttl_seconds=args.lease_ttl_seconds,
         dry_run=bool(args.dry_run),
         log_root_override=log_root_override,
+        committed_baseline=committed_baseline,
+        committed_base_ref=committed_base_ref,
+        union_with_prior_scope_unit_ids=prior_scope_unit_ids,
     )
     if args.print_result:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

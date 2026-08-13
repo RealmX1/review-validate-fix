@@ -118,7 +118,13 @@ def run_claude_hook(
 
     env = os.environ.copy()
     env.setdefault("CODEX_RVF_CLINE_KANBAN_AGENT_ID", "claude")
-    env.setdefault("CODEX_RVF_LOG_ROOT", str(Path.home() / ".claude" / "rvf"))
+    # 刻意不设 CODEX_RVF_LOG_ROOT：RVF 的状态根必须由 resolved_rvf_runtime_log_root()
+    # 统一裁决（默认 ~/.rvf/user-local-data/run-logs），不能由某个 host 专用 shim 钉死。
+    # 历史上这里 setdefault 成 ~/.claude/rvf，造成「走 Claude hook 的一切落根 A、
+    # 不走 hook 的一切（shell 里跑的 prepare/seal/reviewer/rvf-agent）落根 B」的双根
+    # 分裂：seal 写进的根与铸 run 读的根不同 ⇒ 已封窗的轮次被反复重新派发，
+    # 且 reviewer 会在另一个根里查不到 lease（lease_not_found）。
+    # 结构性守卫见 tests/test_rvf_user_local_data_paths.py。
     env.setdefault("CODEX_RVF_DEV_SYNC", "0")
 
     core_path = PLUGIN_ROOT.joinpath(*core_script)

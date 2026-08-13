@@ -1324,12 +1324,15 @@ def test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(tmp_path: 
         )
         event = {"session_id": "sess-bootstrap", "cwd": str(fixture["repo"])}
 
-        # ① 投递确认即 arm（既有路径，state=in_progress、无 gate）。
+        # ① 投递确认即 arm（state=delivered_awaiting_agent_decision、无 gate）。
         armed = ups.arm_kanban_followup_lock_on_delivery(
             event, record, prep_root=tmp_path / "prep"
         )
         assert armed is not None
-        assert json.loads(Path(armed).read_text(encoding="utf-8"))["state"] == "in_progress"
+        assert (
+            json.loads(Path(armed).read_text(encoding="utf-8"))["state"]
+            == lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION
+        )
 
         # ② prepare 判定等待 → 就地写回同一把锁。
         prepare = load_prepare_review_run_module()
@@ -1340,6 +1343,14 @@ def test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(tmp_path: 
         )
         assert stamped_path == armed  # 同一把锁，不是新开一把
 
+        marker = json.loads(Path(armed).read_text(encoding="utf-8"))
+        # gate 已盖上，但 state 仍是 awaiting：「收没收到这条 trigger」这一维不能被 gate 抹掉。
+        # 升格到 waiting_bootstrap 由 Stop 读侧在确认 trigger 在祖先链上时做。
+        assert marker["state"] == lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION
+        promoted_state = lock_module.promote_marker_out_of_awaiting_agent_decision(
+            {**marker, "_marker_path": armed}, reason="test_promote"
+        )
+        assert promoted_state == lock_module.STATE_WAITING_BOOTSTRAP
         marker = json.loads(Path(armed).read_text(encoding="utf-8"))
         assert marker["state"] == lock_module.STATE_WAITING_BOOTSTRAP
         assert gate_module.is_waiting_gate(marker["bootstrap_gate"])

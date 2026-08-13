@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -19,6 +20,25 @@ SKILL_DIR = SCRIPT_DIR.parent
 
 WRITE_TOOL_NAMES = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 CODEX_TOOL_NAMES = {"apply_patch", "exec_command"}
+
+# Claude host 的 hook shim 家族：入口 stop.py / user_prompt_submit.py 只是薄壳，
+# 共享骨架（含 env 准备）在 sibling ``_claude_hook_entry.py``。诊断必须扫整族，
+# 只扫入口文件会漏掉真正做 env 赋值的那一个。
+CLAUDE_HOOK_SHIM_FILE_NAMES = (
+    "stop.py",
+    "user_prompt_submit.py",
+    "post_tool_use.py",
+    "_claude_hook_entry.py",
+)
+
+# 能决定「RVF 的状态根落在哪」的全部环境变量。
+RVF_STATE_ROOT_ENVIRONMENT_VARIABLE_NAMES = (
+    "CODEX_RVF_LOG_ROOT",
+    "CODEX_RVF_STATE_DIR",
+    "CODEX_RVF_SESSION_HOOK_STATE_DIR",
+    "RVF_USER_LOCAL_DATA_ROOT",
+    "RVF_HOME",
+)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -291,8 +311,72 @@ def default_runtime_script_dirs() -> list[Path]:
     return result
 
 
+def environment_variable_assignments_in_python_source(
+    source_text: str,
+    *,
+    environment_variable_names: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """抽出 Python 源码里对指定环境变量的**真实赋值**，连同赋值表达式的源文本。
+
+    覆盖三种写法，都是本仓实际用过的：
+
+    - ``mapping.setdefault("NAME", value)``
+    - ``mapping["NAME"] = value``
+    - dict 字面量里的 ``"NAME": value``（构造 subprocess env 时最常见）
+
+    刻意用 AST 而非子串匹配。历史上这里踩过方向相反的两个坑：
+    ``sets_claude_log_root`` 曾写成
+    ``".claude" in text and "rvf" in text and "CODEX_RVF_LOG_ROOT" in text``，
+    一条解释性注释就足以把它点亮（假阳）；而当 env 赋值从 ``stop.py`` 搬进
+    sibling ``_claude_hook_entry.py`` 之后，只读 ``stop.py`` 的它又恒为 False，
+    整个双根分裂期间一次都没报过警（假阴）。子串判据两头都不可靠。
+    """
+
+    try:
+        parsed_module = ast.parse(source_text)
+    except SyntaxError:
+        return []
+
+    wanted_names = set(environment_variable_names)
+    assignments: list[dict[str, Any]] = []
+
+    def record(name_node: ast.AST, value_node: ast.AST | None, assignment_kind: str) -> None:
+        if not isinstance(name_node, ast.Constant) or name_node.value not in wanted_names:
+            return
+        value_source = (
+            ast.get_source_segment(source_text, value_node) if value_node is not None else None
+        )
+        assignments.append(
+            {
+                "environment_variable_name": name_node.value,
+                "assignment_kind": assignment_kind,
+                "value_source": value_source,
+                "line": getattr(name_node, "lineno", None),
+            }
+        )
+
+    for node in ast.walk(parsed_module):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "setdefault"
+            and node.args
+        ):
+            record(node.args[0], node.args[1] if len(node.args) > 1 else None, "setdefault")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    record(target.slice, node.value, "subscript_assignment")
+        elif isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                if key_node is not None:
+                    record(key_node, value_node, "dict_literal_entry")
+
+    return assignments
+
+
 def hook_wrapper_info() -> dict[str, Any]:
-    hook_path = (
+    hooks_directory = (
         Path.home()
         / ".claude"
         / "local-marketplaces"
@@ -300,15 +384,54 @@ def hook_wrapper_info() -> dict[str, Any]:
         / "plugins"
         / "review-validate-fix"
         / "hooks"
-        / "stop.py"
     )
-    info = file_info(hook_path)
-    if not hook_path.is_file():
+    entry_hook_path = hooks_directory / "stop.py"
+    info = file_info(entry_hook_path)
+    if not entry_hook_path.is_file():
         return info
-    text = hook_path.read_text(encoding="utf-8", errors="replace")
-    info["sets_dev_sync_zero"] = 'CODEX_RVF_DEV_SYNC", "0"' in text or "CODEX_RVF_DEV_SYNC=0" in text
-    info["sets_claude_log_root"] = ".claude" in text and "rvf" in text and "CODEX_RVF_LOG_ROOT" in text
-    info["rvf_core_expression"] = "CLAUDE_PLUGIN_ROOT" if "CLAUDE_PLUGIN_ROOT" in text else None
+
+    scanned_shim_files: list[dict[str, Any]] = []
+    state_root_assignments: list[dict[str, Any]] = []
+    sets_dev_sync_zero = False
+    resolves_core_via_claude_plugin_root = False
+
+    for shim_file_name in CLAUDE_HOOK_SHIM_FILE_NAMES:
+        shim_path = hooks_directory / shim_file_name
+        if not shim_path.is_file():
+            continue
+        shim_text = shim_path.read_text(encoding="utf-8", errors="replace")
+        if "CLAUDE_PLUGIN_ROOT" in shim_text:
+            resolves_core_via_claude_plugin_root = True
+        shim_assignments = environment_variable_assignments_in_python_source(
+            shim_text,
+            environment_variable_names=(
+                *RVF_STATE_ROOT_ENVIRONMENT_VARIABLE_NAMES,
+                "CODEX_RVF_DEV_SYNC",
+            ),
+        )
+        for assignment in shim_assignments:
+            assignment["file"] = shim_file_name
+            if assignment["environment_variable_name"] == "CODEX_RVF_DEV_SYNC":
+                if (assignment["value_source"] or "").strip("\"'") == "0":
+                    sets_dev_sync_zero = True
+                continue
+            state_root_assignments.append(assignment)
+        scanned_shim_files.append(
+            {"file": shim_file_name, "assignment_count": len(shim_assignments)}
+        )
+
+    info["scanned_shim_files"] = scanned_shim_files
+    info["sets_dev_sync_zero"] = sets_dev_sync_zero
+    info["rvf_state_root_environment_assignments"] = state_root_assignments
+    # 只有当某个**状态根**环境变量被赋成一个提到 ``.claude`` 的表达式时才算数：
+    # 这正是双根分裂的成因，也是这条诊断唯一该报的东西。
+    info["sets_claude_log_root"] = any(
+        ".claude" in (assignment.get("value_source") or "")
+        for assignment in state_root_assignments
+    )
+    info["rvf_core_expression"] = (
+        "CLAUDE_PLUGIN_ROOT" if resolves_core_via_claude_plugin_root else None
+    )
     return info
 
 

@@ -53,6 +53,13 @@ __all__ = [
     'test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets',
     'test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout',
     'test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending',
+    'test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging',
+    'test_kanban_followup_awaiting_agent_decision_window_expiry_returns_to_normal_gate',
+    'test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain',
+    'test_kanban_followup_lock_reconciled_when_trigger_rewound_off_ancestor_chain',
+    'test_kanban_followup_awaiting_window_expiry_releases_tracker_lease',
+    'test_kanban_followup_rewind_reconcile_releases_tracker_lease',
+    'test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_nudging',
 ]
 
 
@@ -2719,3 +2726,573 @@ def test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_r
             os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
         else:
             os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+
+
+# ---------------------------------------------------------------------------
+# delivered_awaiting_agent_decision 三态 + rewind 对账（治「被强制续跑一次从未接受的 RVF」）
+# ---------------------------------------------------------------------------
+
+def _write_kanban_followup_lock_marker(
+    marker_dir: Path,
+    *,
+    task_id: str,
+    state: str,
+    expires_at: str,
+    dispatch_token: str | None = None,
+    delivered_transcript_path: str | None = None,
+    delivered_session_id: str | None = None,
+    session_id: str = "session-active",
+    run_id: str = "rvf-existing",
+    run_dir: str = "/tmp/rvf-existing",
+    repo: str | None = None,
+) -> Path:
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = marker_dir / f"task-{task_id}.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": state,
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": expires_at,
+                "kanban_task_id": task_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "run_dir": run_dir,
+                # UPS arm 时从 prep 的 ``origin_repo`` 抄来；清锁释放 lease 时读侧按它定位 tracker。
+                "repo": repo,
+                "dispatch_token": dispatch_token,
+                "delivered_session_id": delivered_session_id,
+                "delivered_transcript_path": delivered_transcript_path,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker_path
+
+
+def _write_transcript_entries(path: Path, entries: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging(
+    tmp_path: Path,
+) -> None:
+    """投递已落地但 agent 未被确认接手（trigger 从未成为 transcript 条目）：只互斥去重、**不发 nudge**。
+
+    这是事故的核心格：注入的 trigger 被同回合的中断冲掉（enqueue→dequeue），agent 对这轮 RVF
+    零 token 产出，历史实现却按 in_progress 锁催它「继续收尾这一轮、输出 handoff」。
+    """
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = _write_transcript_entries(
+        tmp_path / "transcript.jsonl",
+        [
+            {"uuid": "u1", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "做点别的"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "好"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="delivered_awaiting_agent_decision",
+        expires_at="2999-01-01T00:00:00Z",
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "继续做用户要求的别的工作。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-active",
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    # skip 契约：{"continue": ...}，绝不是 force-continue 的 {"decision":"block"}。
+    assert "decision" not in payload, payload
+    latest = latest_summary(state)
+    assert latest["reason_code"] == "kanban_followup_delivered_awaiting_agent_decision"
+    events = latest_events(state)
+    assert not [e for e in events if e.get("event") == "kanban_followup_in_progress_nudged"], events
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted.get("reengage_nudge_count") is None  # 预算一次都没被消耗
+    assert persisted["state"] == "delivered_awaiting_agent_decision"  # 未被误升格
+
+
+def test_kanban_followup_awaiting_agent_decision_window_expiry_returns_to_normal_gate(
+    tmp_path: Path,
+) -> None:
+    """awaiting 短窗到期仍未确认接手：清锁、交回常规 gate 按**当时**工作树重新决策，绝不复活旧派发。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = _write_transcript_entries(
+        tmp_path / "transcript.jsonl",
+        [
+            {"uuid": "u1", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "做点别的"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="delivered_awaiting_agent_decision",
+        expires_at="2020-01-01T00:00:00Z",  # 已过期
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+    )
+
+    invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "继续做用户要求的别的工作。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "off",  # 交回常规 gate 后不真派发，只验锁被回收
+            "KANBAN_TASK_ID": "task-active",
+        },
+        state_dir=state,
+    )
+
+    events = latest_events(state)
+    expired = [
+        e for e in events
+        if e.get("event") == "kanban_followup_awaiting_agent_decision_window_expired"
+    ]
+    assert len(expired) == 1, events
+    assert expired[0].get("reason_code") == "kanban_followup_awaiting_agent_decision_expired"
+    assert not marker_path.exists()  # 锁已回收，不再挡后续 Stop
+
+
+def test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain(
+    tmp_path: Path,
+) -> None:
+    """trigger 确实成为回合、且仍在当前 leaf 的祖先链上 → 升格 in_progress，nudge 预算等一切照旧。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = _write_transcript_entries(
+        tmp_path / "transcript.jsonl",
+        [
+            {"uuid": "u1", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "RVF_DISPATCH=token=abcdef0123456789 请审"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "开始 review"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="delivered_awaiting_agent_decision",
+        expires_at="2999-01-01T00:00:00Z",
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "测试再次后台跑。等完成后 finalize handoff.md。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-active",
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "2",
+        },
+        state_dir=state,
+    )
+
+    events = latest_events(state)
+    promoted = [
+        e for e in events
+        if e.get("event") == "kanban_followup_lock_promoted_after_agent_received_trigger"
+    ]
+    assert len(promoted) == 1, events
+    assert promoted[0].get("kanban_followup_lock_state") == "in_progress"
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "in_progress"
+    # 升格后落回常规 in_progress 分支：nudge 照发。
+    payload = parse_json(stdout)
+    assert payload.get("decision") == "block", payload
+    assert latest_summary(state)["reason_code"] == "kanban_followup_in_progress_reengage"
+
+
+def test_kanban_followup_lock_reconciled_when_trigger_rewound_off_ancestor_chain(
+    tmp_path: Path,
+) -> None:
+    """trigger 落地过、但已被用户 rewind 出主链：清锁交回常规 gate，绝不再催收尾这一轮。
+
+    与「从未落地」区分开：token 在 transcript 里**出现过**却不在祖先链上，是 rewind 的确凿证据
+    （/compact 抹历史会让 token 整个消失 → 走 absent 分支，故本判据不因压缩误伤）。
+    """
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = _write_transcript_entries(
+        tmp_path / "transcript.jsonl",
+        [
+            {"uuid": "u0", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "起点"}},
+            # 被 rewind 掉的那一段：trigger 及其后续仍留在文件里，但不再挂在主链上。
+            {"uuid": "u1", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": "RVF_DISPATCH=token=abcdef0123456789 请审"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "开始 review"}},
+            # 用户重发自己的 prompt，parentUuid 指回 u0 → 主链绕开了 trigger。
+            {"uuid": "u2", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": "改做别的"}},
+            {"uuid": "a2", "parentUuid": "u2", "type": "assistant",
+             "message": {"role": "assistant", "content": "好"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="in_progress",  # 已升格过，仍应被 rewind 对账清掉
+        expires_at="2999-01-01T00:00:00Z",
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+    )
+
+    invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "继续做用户要求的别的工作。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "off",
+            "KANBAN_TASK_ID": "task-active",
+        },
+        state_dir=state,
+    )
+
+    events = latest_events(state)
+    reconciled = [
+        e for e in events if e.get("event") == "kanban_followup_lock_reconciled_for_rewind"
+    ]
+    assert len(reconciled) == 1, events
+    assert reconciled[0].get("kanban_followup_trigger_presence") == "off_ancestor_chain_rewound"
+    assert not [e for e in events if e.get("event") == "kanban_followup_in_progress_nudged"], events
+    assert not marker_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 清锁必须连带释放 tracker lease；升格写盘失败必须 fail-closed
+# ---------------------------------------------------------------------------
+
+def _tracker_lease_state(db_path: Path, lease_id: str) -> str | None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("SELECT state FROM leases WHERE lease_id=?", (lease_id,)).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+def _tracker_unit_count_by_review_state(db_path: Path, review_state: str) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM units WHERE review_state=?", (review_state,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _kanban_followup_run_with_real_tracker_lease(tmp_path: Path, state: Path) -> dict:
+    """真跑一次 tracker refresh + allocate，产出「一把 active lease + 记着它的 RVF run dir」。
+
+    刻意**不**手搓 sqlite 假 lease：手写行一旦与真实 DDL / lease 状态机漂移，缺陷仍在时测试会
+    假绿。``run_dir`` 也直接用这次 allocate 的 ledger run dir——``artifacts/tracker-scope.json``
+    是真产物，于是「读侧按哪个 artifact 名回捞 lease id」这条契约一并被钉死。
+
+    tracker 根：in-process 侧经 ``CODEX_RVF_LOG_ROOT``、子进程侧经 ``invoke`` 的
+    ``CODEX_RVF_STATE_DIR``，两者都解析到同一个 ``state``（``log_root()`` 的取值顺序），
+    故子进程 Stop 释放的正是这里分配的这把 lease。
+    """
+    module = load_hook_module()
+    repo = init_repo_with_head(tmp_path / "repo")
+    transcript = tmp_path / "allocating-session.jsonl"
+    write_apply_patch_transcript(transcript, repo, session_id="sess-lease-fixture")
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_mode = os.environ.get("CODEX_RVF_FORK_MODE")
+    try:
+        os.environ["CODEX_RVF_FORK_MODE"] = "kanban-followup"
+        ledger = _make_test_ledger(module, state)
+        event = {
+            "cwd": str(repo),
+            "transcript_path": str(transcript),
+            "task_id": "task-active",
+        }
+        context = module.resolve_stop_context(event, str(repo), ledger)
+        module.refresh_global_diff_tracker(context, ledger)
+        assert module.allocate_auto_review_scope(context, ledger, dry_run=False) is None
+    finally:
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_mode is None:
+            os.environ.pop("CODEX_RVF_FORK_MODE", None)
+        else:
+            os.environ["CODEX_RVF_FORK_MODE"] = old_mode
+
+    meta = getattr(ledger, "tracker_scope_meta", None)
+    assert isinstance(meta, dict), "fixture 没拿到 lease；后面的释放断言会变成假绿"
+    db_path = Path(meta["tracker_dir"]) / "tracker.sqlite3"
+    lease_id = meta["tracker_lease_id"]
+    # 前置钉死起点：lease 真是 active、unit 真被 assigned 走了。否则「释放后变 available」
+    # 这条断言在缺陷仍在时也会通过。
+    assert _tracker_lease_state(db_path, lease_id) == "active"
+    assert _tracker_unit_count_by_review_state(db_path, "assigned") > 0
+    return {
+        "repo": repo,
+        "lease_id": lease_id,
+        "db_path": db_path,
+        "run_dir": Path(meta["tracker_scope_path"]).parent.parent,
+    }
+
+
+def test_kanban_followup_awaiting_window_expiry_releases_tracker_lease(tmp_path: Path) -> None:
+    """awaiting 窗口过期清锁时必须**连带释放本轮 lease**，否则「交回常规 gate」只是一句空话。
+
+    lease 默认 1h 而 awaiting 短窗只有 10min：只清锁不放 lease 的话，那批 unit 还要在
+    ``assigned`` 上再挂 ~50min，而常规 gate 的候选查询只收 ``review_state='available'``
+    → 整批被排除，「按当时工作树重新决策」根本没有可决策的东西；等 lease 自己过期时，
+    会话早已走远、当时的口径也可能丢了。
+    """
+    state = tmp_path / "state"
+    fixture = _kanban_followup_run_with_real_tracker_lease(tmp_path, state)
+    transcript = _write_transcript_entries(
+        tmp_path / "delivered.jsonl",
+        [
+            {"uuid": "u1", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "做点别的"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="delivered_awaiting_agent_decision",
+        expires_at="2020-01-01T00:00:00Z",  # 短窗已过
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+        repo=str(fixture["repo"]),
+        run_dir=str(fixture["run_dir"]),
+    )
+
+    invoke(
+        {
+            "cwd": str(fixture["repo"]),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "继续做用户要求的别的工作。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "off",  # 交回常规 gate 后不真派发，只验锁与 lease 都被回收
+            "KANBAN_TASK_ID": "task-active",
+        },
+        state_dir=state,
+    )
+
+    events = latest_events(state)
+    expired = [
+        e for e in events
+        if e.get("event") == "kanban_followup_awaiting_agent_decision_window_expired"
+    ]
+    assert len(expired) == 1, events
+    assert expired[0].get("tracker_lease_id") == fixture["lease_id"], expired
+    assert (expired[0].get("lease_release_result") or {}).get("status") == "released", expired
+    assert not marker_path.exists()
+    # 真相在 tracker 里：lease 已释放、unit 退回可审池，下一次 Stop 才可能重新提议这批改动。
+    assert _tracker_lease_state(fixture["db_path"], fixture["lease_id"]) == "failed-released"
+    assert _tracker_unit_count_by_review_state(fixture["db_path"], "assigned") == 0
+    assert _tracker_unit_count_by_review_state(fixture["db_path"], "available") > 0
+
+
+def test_kanban_followup_rewind_reconcile_releases_tracker_lease(tmp_path: Path) -> None:
+    """rewind 对账清锁同样必须释放 lease——被撤销的那一轮不该继续占着 scope 到 1h TTL。"""
+    state = tmp_path / "state"
+    fixture = _kanban_followup_run_with_real_tracker_lease(tmp_path, state)
+    transcript = _write_transcript_entries(
+        tmp_path / "rewound.jsonl",
+        [
+            {"uuid": "u0", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "起点"}},
+            {"uuid": "u1", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": "RVF_DISPATCH=token=abcdef0123456789 请审"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "开始 review"}},
+            {"uuid": "u2", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": "改做别的"}},
+        ],
+    )
+    marker_path = _write_kanban_followup_lock_marker(
+        state / "kanban-followup-in-progress",
+        task_id="task-active",
+        state="in_progress",  # 已升格过，仍应被 rewind 对账连锁带 lease 一起回收
+        expires_at="2999-01-01T00:00:00Z",
+        dispatch_token="abcdef0123456789",
+        delivered_transcript_path=str(transcript),
+        delivered_session_id="session-active",
+        repo=str(fixture["repo"]),
+        run_dir=str(fixture["run_dir"]),
+    )
+
+    invoke(
+        {
+            "cwd": str(fixture["repo"]),
+            "session_id": "session-active",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "继续做用户要求的别的工作。",
+        },
+        extra_env={"CODEX_RVF_FORK_MODE": "off", "KANBAN_TASK_ID": "task-active"},
+        state_dir=state,
+    )
+
+    events = latest_events(state)
+    reconciled = [
+        e for e in events if e.get("event") == "kanban_followup_lock_reconciled_for_rewind"
+    ]
+    assert len(reconciled) == 1, events
+    assert reconciled[0].get("tracker_lease_id") == fixture["lease_id"], reconciled
+    assert (reconciled[0].get("lease_release_result") or {}).get("status") == "released", reconciled
+    assert not marker_path.exists()
+    assert _tracker_lease_state(fixture["db_path"], fixture["lease_id"]) == "failed-released"
+    assert _tracker_unit_count_by_review_state(fixture["db_path"], "assigned") == 0
+
+
+def test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_nudging(
+    tmp_path: Path,
+) -> None:
+    """升格写盘失败必须 fail-closed：磁盘上锁仍是 awaiting，就绝不能落进 nudge 路径。
+
+    ``promote_marker_out_of_awaiting_agent_decision`` 写盘失败时只返回 None（best-effort 不抛）。
+    历史实现照样 ``handled=False`` 把锁交回常规 in_progress 分支 → 对一把「磁盘态仍是未确认接手」
+    的锁发 re-engage nudge，正是本轮要根治的那个行为；ledger 里记了 warning，但控制流没被约束。
+
+    本测试带**对照臂**：同一套 fixture 在真升格下确实会 nudge，故失败臂的「不 nudge」是真差异，
+    不是因为这条路径本来就到不了 nudge（那样会假绿）。
+    """
+    module = load_hook_module()
+    repo = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    transcript = _write_transcript_entries(
+        tmp_path / "delivered.jsonl",
+        [
+            {"uuid": "u1", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "RVF_DISPATCH=token=abcdef0123456789 请审"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "开始 review"}},
+        ],
+    )
+    marker_dir = state / "kanban-followup-in-progress"
+
+    def _rearm_awaiting_marker() -> Path:
+        return _write_kanban_followup_lock_marker(
+            marker_dir,
+            task_id="task-active",
+            state="delivered_awaiting_agent_decision",
+            expires_at="2999-01-01T00:00:00Z",
+            dispatch_token="abcdef0123456789",
+            delivered_transcript_path=str(transcript),
+            delivered_session_id="session-active",
+            repo=str(repo),
+        )
+
+    event = {
+        "cwd": str(repo),
+        "session_id": "session-active",
+        "transcript_path": str(transcript),
+        "task_id": "task-active",
+        "last_user_message": "继续做用户要求的别的工作。",
+    }
+    old_log = os.environ.get("CODEX_RVF_LOG_ROOT")
+    old_lock_root = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
+    # in-process 调用没有 ``invoke`` 的子进程 env 清洗：``current_kanban_task_id`` **先读 env**，
+    # 真机上跑测试时那里坐着当前 Kanban task 的 id（实测 7ec31），锁按它的 task-path 去找就会
+    # 落空 → marker 读不到 → 整条 awaiting 判定被绕开，测试无声退化成空跑。故显式钉死三个别名。
+    task_env_names = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
+    old_task_env = {name: os.environ.get(name) for name in task_env_names}
+    original_promote = module.promote_kanban_followup_lock_out_of_awaiting
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(marker_dir)
+    os.environ["KANBAN_TASK_ID"] = "task-active"
+    for name in ("CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID"):
+        os.environ.pop(name, None)
+    try:
+        ledger = _make_test_ledger(module, state / "log")
+
+        # ① 对照臂：升格成功 → 落回常规 in_progress 分支，nudge 照发（证明本路径可达 nudge）。
+        marker_path = _rearm_awaiting_marker()
+        control = module.kanban_followup_in_progress_decision(event, ledger, cwd=str(repo))
+        assert control is not None and control.reason_code == "kanban_followup_in_progress_reengage"
+        assert json.loads(marker_path.read_text(encoding="utf-8"))["state"] == "in_progress"
+
+        # ② 失败臂：升格写盘失败（返回 None）→ 必须自己接管，按 awaiting 语义只互斥去重。
+        marker_path = _rearm_awaiting_marker()
+        module.promote_kanban_followup_lock_out_of_awaiting = lambda marker, **kwargs: None
+        decision = module.kanban_followup_in_progress_decision(event, ledger, cwd=str(repo))
+    finally:
+        module.promote_kanban_followup_lock_out_of_awaiting = original_promote
+        if old_log is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = old_log
+        if old_lock_root is None:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+        else:
+            os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = old_lock_root
+        for name, value in old_task_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert decision is not None, "fail-closed 要求这里自己接管，不能 handled=False 交回常规分支"
+    assert decision.reason_code == "kanban_followup_delivered_awaiting_agent_decision"
+    # skip 契约：{"continue": ...}，绝不是 force-continue 的 {"decision":"block"}。
+    assert "decision" not in (decision.payload or {}), decision.payload
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["state"] == "delivered_awaiting_agent_decision"  # 磁盘态未变，下次 Stop 重试升格
+    assert persisted.get("reengage_nudge_count") is None  # 预算一次都没被消耗
+    events = latest_events(state / "log")
+    warned = [
+        e for e in events
+        if e.get("event") == "kanban_followup_lock_promoted_after_agent_received_trigger"
+        and e.get("kanban_followup_lock_promotion_failed_kept_awaiting") is True
+    ]
+    assert len(warned) == 1, events
+    assert warned[0].get("status") == "warning"

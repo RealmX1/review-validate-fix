@@ -67,6 +67,11 @@ EXIT_DISPATCH_FAILED = 5  # dispatch 派发失败
 # start 撞上 pre-review local-base bootstrap 门：**不是失败**，而是一个可恢复的等待态。token 保持
 # acknowledged、gate 落盘、run 锚点挂上；agent 跑完同步 skill 后 `start --retry` 原地接续同一轮。
 EXIT_BOOTSTRAP_REQUIRED = 6
+# decline-dispatched-review 的**部分生效**：谢绝理由已落盘，但豁免 / 释放 lease / 清锁里至少一步
+# 没按预期完成。刻意与 EXIT_OK 分开：这条命令的三步副作用全是 best-effort，历史实现却固定返回
+# ok，DB/文件写失败时用户看到的是「谢绝成功」而实际 scope 与锁可能仍生效（谎报成功）。调用方按
+# 非 0 即「不要把本轮当作已谢绝」处理；detail.failed_steps 给出逐步实况。
+EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
 
 # bootstrap 恢复重放的占位窗口 = prepare 预算 + 这段余量。占位在 prepare 收尾时立刻释放，余量只
 # 覆盖「持有者被硬杀、来不及释放」的残留：过窗后下一次 `start --retry` 可接手，不会被永久堵死。
@@ -441,7 +446,10 @@ def compute_effective_primary_files(overlay: Mapping[str, Any]) -> list[str]:
 @dataclass
 class CommandResult:
     command: str
-    status: str  # ok | error | start_failed | dispatch_failed
+    # ok | error | start_failed | dispatch_failed | decline_incomplete
+    # （decline_incomplete = decline-dispatched-review 谢绝已落盘但副作用未全部生效，见
+    #  EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE）
+    status: str
     exit_code: int
     token: str | None = None
     token_state: str | None = None
@@ -1537,6 +1545,414 @@ def run_decline(
 
 
 # ---------------------------------------------------------------------------
+# decline-dispatched-review：谢绝一轮**已派发**的自动 RVF（kanban-followup / flow-1-self-rising）
+#
+# 与上面的 ``decline`` 是两种不同的 token：``decline`` 收的是 S3 决策 token（Stop hook 在决策点
+# 铸的）；本命令收的是**dispatch token**（注入 prompt 里的 ``RVF_DISPATCH=token=<16 hex>``）。
+# Kanban task 内的自动 RVF 走的是延续后端，结构上不经过 S3 决策点，历史上因此**根本没有谢绝
+# 出口**——注入的是一条纯祈使句，agent 只能照跑。本命令补上那个出口。
+# ---------------------------------------------------------------------------
+
+# 锁身份对账判定（磁盘上那把 kanban-followup 锁，是不是「本次要谢绝的这一轮」）。
+LOCK_IDENTITY_MATCHES_THIS_DISPATCH = "matches_this_dispatch"
+LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH = "belongs_to_another_dispatch"
+LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER = "unverifiable_legacy_marker"
+
+# 清锁 / 清 pending 的实际结果（in-progress 锁与 pending marker 共用同一族取值）。
+KANBAN_FOLLOWUP_MARKER_CLEARED = "cleared"
+KANBAN_FOLLOWUP_MARKER_ALREADY_ABSENT = "already_absent"
+KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH = "preserved_for_another_dispatch"
+KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED = "clear_failed"
+KANBAN_FOLLOWUP_MARKER_SKIPPED_NO_IDENTITY_IN_PREP = "skipped_no_lock_identity_in_prep"
+
+
+def classify_kanban_followup_lock_identity_against_dispatch(
+    marker: Mapping[str, Any] | None,
+    *,
+    dispatch_token: str,
+    run_id: str,
+) -> str:
+    """判定磁盘上这把 kanban-followup 锁是否就是 ``dispatch_token`` 这一轮派发的锁。
+
+    判据优先序：
+      1. marker 的 ``dispatch_token``（Fix A 起写入，是这把锁「对应哪一轮」的权威锚点）；
+      2. 缺 1 时回退 marker 的 ``run_id``（**部署滞后**期间由老版 UPS arm 的锁没有
+         ``dispatch_token``，但一直有 run_id——若这里直接判不匹配，就会在部署完成前把所有
+         谢绝都变成空操作）；
+      3. 两者都拿不到 → ``unverifiable_legacy_marker``：无从对账，沿用历史行为（照清），
+         但调用方须把这一点如实上报，不能伪装成「已核对」。
+    """
+    if not isinstance(marker, Mapping):
+        return LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER
+    marker_dispatch_token = _string_or_empty(marker.get("dispatch_token"))
+    if marker_dispatch_token:
+        return (
+            LOCK_IDENTITY_MATCHES_THIS_DISPATCH
+            if marker_dispatch_token == _string_or_empty(dispatch_token)
+            else LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH
+        )
+    marker_run_id = _string_or_empty(marker.get("run_id"))
+    if marker_run_id and _string_or_empty(run_id):
+        return (
+            LOCK_IDENTITY_MATCHES_THIS_DISPATCH
+            if marker_run_id == _string_or_empty(run_id)
+            else LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH
+        )
+    return LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER
+
+
+def _clear_kanban_followup_lock_and_pending_for_this_dispatch(
+    *,
+    task_id: str,
+    session_id: str,
+    dispatch_token: str,
+    run_id: str,
+    lock_root: Path | None,
+) -> dict[str, Any]:
+    """按 dispatch 身份**对账之后**再清锁 + 清 pending，绝不无条件按 task_id 删。
+
+    踩过的坑（本函数存在的全部理由）：原实现只凭「prep 文件可读」就按 ``task_id`` 无条件
+    ``clear_marker``，且没给本就内建 token 防误清的 ``clear_pending_marker`` 传 ``token=``。
+    不带豁免的 decline 之后同一 scope **可能立刻派发下一轮**；此时若有人重试旧命令（或旧
+    token 的调用迟到），就会把**新一轮**的锁与 pending 一并删掉，令当前 RVF 失去互斥与续跑
+    状态——正是这条命令要修复的那类「被强制续跑一次没接受的 RVF」的镜像故障。
+
+    对账逐条路径独立做（task 路径与 session 路径可能分属不同轮）：只清判定为「本轮」或
+    「无从对账」的那条，判定为别轮的一律保留并如实上报。
+    """
+    outcome: dict[str, Any] = {
+        "removed_lock_paths": [],
+        "preserved_lock_paths": [],
+        "lock_identity_verdicts": {},
+        "removed_pending_paths": [],
+    }
+    try:
+        import kanban_followup_lock  # noqa: PLC0415
+    except Exception as exc:
+        outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+        outcome["pending_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+        outcome["lock_clear_error"] = f"{type(exc).__name__}: {exc}"
+        return outcome
+
+    inspected_any_lock_marker = False
+    any_lock_marker_belongs_to_another_dispatch = False
+    try:
+        for identity_dimension, dimension_task_id, dimension_session_id in (
+            ("task", task_id or None, None),
+            ("session", None, session_id or None),
+        ):
+            if dimension_task_id is None and dimension_session_id is None:
+                continue
+            marker = kanban_followup_lock.read_marker(
+                task_id=dimension_task_id, session_id=dimension_session_id, root=lock_root
+            )
+            if marker is None:
+                continue
+            inspected_any_lock_marker = True
+            verdict = classify_kanban_followup_lock_identity_against_dispatch(
+                marker, dispatch_token=dispatch_token, run_id=run_id
+            )
+            outcome["lock_identity_verdicts"][identity_dimension] = verdict
+            if verdict == LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH:
+                any_lock_marker_belongs_to_another_dispatch = True
+                marker_path = marker.get("_marker_path")
+                if isinstance(marker_path, str) and marker_path:
+                    outcome["preserved_lock_paths"].append(marker_path)
+                continue
+            outcome["removed_lock_paths"].extend(
+                kanban_followup_lock.clear_marker(
+                    task_id=dimension_task_id, session_id=dimension_session_id, root=lock_root
+                )
+            )
+    except Exception as exc:
+        outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+        outcome["lock_clear_error"] = f"{type(exc).__name__}: {exc}"
+
+    if "lock_outcome" not in outcome:
+        if any_lock_marker_belongs_to_another_dispatch:
+            outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+        elif outcome["removed_lock_paths"]:
+            outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEARED
+        elif inspected_any_lock_marker:
+            # 读到了本轮的 marker 却一个都没删掉 = unlink 全被 OSError 吞了，不是「本就没有锁」。
+            outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+        elif not (task_id or session_id):
+            outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_SKIPPED_NO_IDENTITY_IN_PREP
+        else:
+            outcome["lock_outcome"] = KANBAN_FOLLOWUP_MARKER_ALREADY_ABSENT
+
+    # pending 侧：token 防误清 guard 一直就在 clear_pending_marker 里，历史上只是没传 token。
+    # 这里先读一次是为了**如实分辨**「本就没有 pending」与「pending 属于另一轮故未清」——
+    # 两种情况 clear_pending_marker 都返回空列表，光看返回值分不出来。
+    try:
+        pending_marker = kanban_followup_lock.read_pending_marker(
+            task_id=task_id or None, root=lock_root
+        )
+        if pending_marker is None:
+            outcome["pending_outcome"] = KANBAN_FOLLOWUP_MARKER_ALREADY_ABSENT
+        else:
+            pending_token = _string_or_empty(pending_marker.get("token"))
+            if pending_token and pending_token != _string_or_empty(dispatch_token):
+                outcome["pending_outcome"] = KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+                pending_path = pending_marker.get("_marker_path")
+                if isinstance(pending_path, str) and pending_path:
+                    outcome["preserved_pending_paths"] = [pending_path]
+            else:
+                removed_pending_paths = kanban_followup_lock.clear_pending_marker(
+                    task_id=task_id or None, token=dispatch_token or None, root=lock_root
+                )
+                outcome["removed_pending_paths"] = list(removed_pending_paths)
+                outcome["pending_outcome"] = (
+                    KANBAN_FOLLOWUP_MARKER_CLEARED
+                    if removed_pending_paths
+                    else KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+                )
+    except Exception as exc:
+        outcome["pending_outcome"] = KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED
+        outcome["pending_clear_error"] = f"{type(exc).__name__}: {exc}"
+
+    return outcome
+
+
+def run_decline_dispatched_review(
+    *,
+    token: str,
+    reason: str,
+    mark_declined_scope_units_review_not_required: bool = False,
+    prep_root: str | Path | None = None,
+    lock_root: Path | None = None,
+    roots: AgentDecisionRoots | None = None,
+    now: datetime | None = None,
+) -> CommandResult:
+    """谢绝一轮已派发的自动 RVF：清锁 + 释放 lease + 理由落盘（+ 可选 diff 级豁免）。
+
+    ``mark_declined_scope_units_review_not_required`` **默认 False**：不带它时谢绝只表示
+    「这一轮不审」，本轮 scope 的 unit 退回 ``available``，后续 Stop 仍会重新提议同一批改动。
+    带上它才把本轮 scope 声明为「不需审核」——粒度是 diff hunk 级（tracker 的原生粒度），
+    该 hunk 内容一旦改动就会产生新 unit、不继承豁免。
+
+    **返回值如实反映实际发生了什么**：豁免 / 释放 lease / 清锁三步各自都可能失败或按设计成为
+    no-op（DB 写不动、lease 早已释放、磁盘上的锁属于另一轮…）。历史实现固定返回
+    ``status="ok"``，还在带豁免时无条件宣称「已把本轮 scope 声明为不需审核」——写失败时用户
+    看到的是谢绝成功而 scope/锁其实仍生效，是**谎报成功**。现在：任一关键步骤未达成即
+    ``status="decline_incomplete"`` + ``EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE``，
+    ``detail["failed_steps"]`` 逐条说明哪步为何没成，且**请求了豁免却没豁免成功时绝不宣称已
+    豁免**。谢绝理由本身仍无条件落 ledger（那是 append-only 的事实记录，与副作用成败无关）。
+    """
+    roots = roots or AgentDecisionRoots()
+    now_dt = _coerce_now(now)
+
+    lookup = rvf_prep_file.read_prep_file(token, root=prep_root)
+    payload = lookup.payload if isinstance(lookup.payload, dict) else None
+    if payload is None:
+        return CommandResult(
+            command="decline-dispatched-review", status="error", exit_code=EXIT_TOKEN_STATE,
+            token=token, token_state=lookup.status,
+            message=f"无法谢绝：dispatch token 对应的 prep 不可读（status={lookup.status}）。",
+        )
+
+    rvf_run = payload.get("rvf_run") if isinstance(payload.get("rvf_run"), dict) else {}
+    run_id = _string_or_empty(rvf_run.get("run_id"))
+    lease_id = _string_or_empty(rvf_run.get("tracker_lease_id"))
+    repo = _string_or_empty(payload.get("target_worktree")) or _string_or_empty(
+        payload.get("origin_repo")
+    )
+    task_id = _string_or_empty(payload.get("target_kanban_task_id"))
+    session_id = _string_or_empty(payload.get("origin_session_id"))
+
+    detail: dict[str, Any] = {"run_id": run_id, "lease_id": lease_id, "repo": repo}
+    # 每一步的实况：``{"step": …, "reason": …}``。非空即「谢绝没有完全生效」，直接决定
+    # status / exit_code / message，也一并落 ledger 与遥测（磁盘上可审计，不只在 context 里）。
+    failed_steps: list[dict[str, str]] = []
+    next_steps: list[str] = []
+
+    # ① 可选豁免：必须在释放 lease **之前**做——释放会把 unit 打回 available，之后再声明就
+    #    存在一个「已 available、可被别的 Stop 抢走」的竞态窗口。
+    review_not_required_declared = False
+    if mark_declined_scope_units_review_not_required:
+        if not repo:
+            detail["review_not_required_error"] = "no_repo_in_prep_payload"
+            failed_steps.append(
+                {"step": "review_not_required_waiver", "reason": "no_repo_in_prep_payload"}
+            )
+        else:
+            try:
+                from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+                    declare_units_review_not_required,
+                )
+
+                waiver = declare_units_review_not_required(
+                    repo=repo,
+                    reason=f"agent_declined_dispatched_review: {reason}",
+                    lease_id=lease_id or None,
+                    run_id=run_id or None,
+                    declared_by_run_id=run_id or None,
+                )
+                detail["review_not_required"] = waiver
+                waiver_status = (
+                    _string_or_empty(waiver.get("status")) if isinstance(waiver, Mapping) else ""
+                )
+                # ``noop`` = 一个 unit 都没声明成（目标解析不出 / 全被 tombstone）。它和写失败
+                # 对用户是同一件事：**没有豁免**。不许它顺着 status=ok 混过去。
+                review_not_required_declared = waiver_status == "declared"
+                if not review_not_required_declared:
+                    failed_steps.append(
+                        {
+                            "step": "review_not_required_waiver",
+                            "reason": "declare_units_review_not_required_"
+                            + (waiver_status or "unexpected_result"),
+                        }
+                    )
+            except Exception as exc:  # 豁免失败不阻断谢绝本身，但绝不可被当成已豁免
+                detail["review_not_required_error"] = f"{type(exc).__name__}: {exc}"
+                failed_steps.append(
+                    {"step": "review_not_required_waiver", "reason": f"{type(exc).__name__}"}
+                )
+        if not review_not_required_declared:
+            next_steps.append(
+                "本轮 scope **未**被声明为「不需审核」：修好上面的原因后，带 "
+                "--mark-declined-scope-units-review-not-required 重跑本命令。"
+            )
+    detail["review_not_required_declared"] = review_not_required_declared
+
+    # ② 释放 lease：unit 退回 available（已豁免的那批此刻是 reviewed，release 的
+    #    ``review_state='assigned'`` 条件命不中它们，故豁免不会被 release 冲掉）。
+    if not lease_id:
+        # prep 里压根没记 lease：没有东西要释放，不算失败（不是所有派发都持 tracker lease）。
+        detail["lease_release_outcome"] = "skipped_no_lease_id_in_prep"
+    elif not repo:
+        detail["lease_release_outcome"] = "skipped_no_repo_in_prep"
+        failed_steps.append({"step": "lease_release", "reason": "no_repo_in_prep_payload"})
+    else:
+        try:
+            from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+                lease_release,
+            )
+
+            release = lease_release(
+                repo=repo, lease_id=lease_id, reason="agent_declined_dispatched_review"
+            )
+            detail["lease_release"] = release
+            released = bool(isinstance(release, Mapping) and release.get("released"))
+            # ``missing``（lease_not_found）= 这把 lease 早已释放/不存在：unit 不可能还卡在
+            # assigned，对谢绝而言无害，如实记一笔但不算失败。
+            detail["lease_release_outcome"] = "released" if released else "already_released_or_missing"
+        except Exception as exc:
+            detail["lease_release_error"] = f"{type(exc).__name__}: {exc}"
+            detail["lease_release_outcome"] = "failed"
+            failed_steps.append({"step": "lease_release", "reason": f"{type(exc).__name__}"})
+
+    # ③ 清锁 + 清 pending：不清的话 Stop 读侧会继续拿这把锁催 agent 收尾这一轮。**先按
+    #    dispatch 身份对账**，不匹配一律保留（详见被调函数的坑说明）。
+    lock_clear = _clear_kanban_followup_lock_and_pending_for_this_dispatch(
+        task_id=task_id,
+        session_id=session_id,
+        dispatch_token=token,
+        run_id=run_id,
+        lock_root=lock_root,
+    )
+    detail.update(lock_clear)
+    if lock_clear.get("lock_outcome") == KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH:
+        failed_steps.append(
+            {"step": "kanban_followup_lock_clear", "reason": "lock_belongs_to_another_dispatch"}
+        )
+        next_steps.append(
+            "磁盘上的 kanban-followup 锁属于**另一轮** dispatch（token/run 对不上），已原样保留；"
+            "若你要谢绝的是当前那一轮，请用当前注入 prompt 里的 RVF_DISPATCH token 重跑。"
+        )
+    elif lock_clear.get("lock_outcome") == KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED:
+        failed_steps.append({"step": "kanban_followup_lock_clear", "reason": "clear_failed"})
+        next_steps.append(
+            "锁未清干净：Stop 读侧仍会拿这把锁催你收尾这一轮——请人工核查 "
+            f"{detail.get('lock_clear_error') or 'kanban-followup 锁目录'}。"
+        )
+    if lock_clear.get("pending_outcome") == KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH:
+        failed_steps.append(
+            {"step": "kanban_followup_pending_clear", "reason": "pending_belongs_to_another_dispatch"}
+        )
+    elif lock_clear.get("pending_outcome") == KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED:
+        failed_steps.append({"step": "kanban_followup_pending_clear", "reason": "clear_failed"})
+
+    # ④ 理由落 append-only 磁盘 ledger（与 S3 decline 同一份），``token_kind`` 区分两种 token。
+    #    刻意分开记「请求了豁免」与「豁免真的成了」——历史实现只记前者且键名叫
+    #    ``marked_scope_units_review_not_required``，写失败时这条落盘记录本身就是假的。
+    ledger_path = _declined_reason_ledger_path(roots.declined_reason_ledger_root)
+    _append_jsonl(
+        ledger_path,
+        {
+            "token": token,
+            "token_kind": "dispatch",
+            "worktree": repo,
+            "session_id": session_id or None,
+            "kanban_task_id": task_id or None,
+            "run_id": run_id or None,
+            "reason": reason,
+            "review_not_required_waiver_requested": bool(
+                mark_declined_scope_units_review_not_required
+            ),
+            "review_not_required_waiver_declared": review_not_required_declared,
+            "failed_steps": list(failed_steps),
+            "declined_at": _format_timestamp(now_dt),
+        },
+    )
+    detail["declined_reason_ledger"] = str(ledger_path)
+    append_decision_telemetry(
+        token=token, event="dispatched_review_declined", worktree=repo,
+        session_id=session_id or None, now=now_dt, root=roots.telemetry_root,
+        detail={
+            "reason": reason,
+            "run_id": run_id or None,
+            "review_not_required_waiver_requested": bool(
+                mark_declined_scope_units_review_not_required
+            ),
+            "review_not_required_waiver_declared": review_not_required_declared,
+            "lock_outcome": detail.get("lock_outcome"),
+            "pending_outcome": detail.get("pending_outcome"),
+            "lease_release_outcome": detail.get("lease_release_outcome"),
+            "failed_steps": list(failed_steps),
+        },
+    )
+
+    detail["failed_steps"] = list(failed_steps)
+    if failed_steps:
+        failure_summary = "；".join(
+            f"{item['step']}={item['reason']}" for item in failed_steps
+        )
+        message = "本次谢绝**未完全生效**：" + failure_summary + "。"
+        if mark_declined_scope_units_review_not_required and not review_not_required_declared:
+            # RVF-004 的核心：请求了豁免却没豁免成功时，一个字都不许暗示已豁免。
+            message += "特别注意：本轮 scope 的 diff **没有**被声明为「不需审核」，请勿按已豁免行事。"
+        message += "谢绝理由与上述逐步实况均已落盘（rewind 不可抹）。"
+        return CommandResult(
+            command="decline-dispatched-review", status="decline_incomplete",
+            exit_code=EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE,
+            token=token, token_state=lookup.status, message=message,
+            next_steps=next_steps, detail=detail,
+        )
+
+    if review_not_required_declared:
+        message = (
+            "已谢绝本轮自动 RVF，并把本轮 scope 的 diff 声明为「不需审核」"
+            "（hunk 级：这些 diff 内容一旦改动会重新进入审核范围）。理由已落盘，rewind 不可抹。"
+        )
+    else:
+        message = (
+            "已谢绝本轮自动 RVF；本轮 scope 退回可审池，后续 Stop 仍可能重新提议同一批改动。"
+            "若确定这批 diff 无需审核，请改带 --mark-declined-scope-units-review-not-required。"
+            "理由已落盘，rewind 不可抹。"
+        )
+    return CommandResult(
+        command="decline-dispatched-review", status="ok", exit_code=EXIT_OK,
+        token=token, token_state=lookup.status, message=message,
+        next_steps=next_steps, detail=detail,
+    )
+
+
+def _string_or_empty(value: Any) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+# ---------------------------------------------------------------------------
 # 错误结果统一构造
 # ---------------------------------------------------------------------------
 
@@ -1600,6 +2016,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_dec.add_argument("--token", required=True)
     p_dec.add_argument("--reason", required=True, help="谢绝理由（持久化到 context 之外，rewind 不可抹）")
 
+    p_dec_dispatched = sub.add_parser(
+        "decline-dispatched-review",
+        help="谢绝一轮**已派发**的自动 RVF（收 dispatch token）：清锁 + 释放 lease + 理由持久化",
+    )
+    p_dec_dispatched.add_argument(
+        "--token", required=True, help="注入 prompt 里的 dispatch token（RVF_DISPATCH=token=…）"
+    )
+    p_dec_dispatched.add_argument(
+        "--reason", required=True, help="谢绝理由（持久化到 context 之外，rewind 不可抹）"
+    )
+    p_dec_dispatched.add_argument(
+        "--mark-declined-scope-units-review-not-required",
+        action="store_true",
+        help=(
+            "额外把本轮 scope 的 diff 声明为「不需审核」，后续 RVF 不再纳入范围"
+            "（diff hunk 级；内容改动后会重新进入范围）。**默认不声明**。"
+        ),
+    )
+
     return parser
 
 
@@ -1623,6 +2058,14 @@ def main(argv: list[str] | None = None) -> int:
         result = run_dispatch(token=args.token, strictness=args.strictness, dry_run=args.dry_run)
     elif args.command == "decline":
         result = run_decline(token=args.token, reason=args.reason)
+    elif args.command == "decline-dispatched-review":
+        result = run_decline_dispatched_review(
+            token=args.token,
+            reason=args.reason,
+            mark_declined_scope_units_review_not_required=(
+                args.mark_declined_scope_units_review_not_required
+            ),
+        )
     else:  # pragma: no cover - argparse required=True 已挡
         parser.error(f"未知子命令 {args.command!r}")
         return EXIT_USAGE
@@ -1634,7 +2077,14 @@ def main(argv: list[str] | None = None) -> int:
 
 __all__ = [
     "EXIT_OK", "EXIT_USAGE", "EXIT_TOKEN_STATE", "EXIT_START_FAILED", "EXIT_DISPATCH_FAILED",
-    "EXIT_BOOTSTRAP_REQUIRED",
+    "EXIT_BOOTSTRAP_REQUIRED", "EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE",
+    "LOCK_IDENTITY_MATCHES_THIS_DISPATCH", "LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH",
+    "LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER",
+    "KANBAN_FOLLOWUP_MARKER_CLEARED", "KANBAN_FOLLOWUP_MARKER_ALREADY_ABSENT",
+    "KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH",
+    "KANBAN_FOLLOWUP_MARKER_CLEAR_FAILED",
+    "KANBAN_FOLLOWUP_MARKER_SKIPPED_NO_IDENTITY_IN_PREP",
+    "classify_kanban_followup_lock_identity_against_dispatch",
     "AgentDecisionRoots", "CommandResult", "TokenLoadError",
     "legacy_codex_rvf_env",
     "scope_adjustment_root", "decision_telemetry_root", "scope_issue_ledger_root",
@@ -1643,6 +2093,7 @@ __all__ = [
     "compute_effective_primary_files", "load_strictness_preset", "finalize_scope_contract",
     "resolve_agent_initiation_backend", "default_launch_preflight", "default_provider_health_requirements",
     "run_start", "run_scope_annotate", "run_scope_exclude", "run_scope_include", "run_dispatch", "run_decline",
+    "run_decline_dispatched_review",
     "build_argument_parser", "main",
 ]
 
