@@ -3688,7 +3688,7 @@ def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_pat
     )
     # Precondition that reproduced the bug: round-baseline alone == HEAD → empty window.
     assert rbm.resolve_round_baseline_head(
-        task_id=None, session_id=session_id, root=state
+        task_id=None, session_id=session_id, repo=str(repo), root=state
     ) == c2
 
     # Stop hook must prefer high-water (C1) and surface the orphan C1..C2 (g.txt) in the injected

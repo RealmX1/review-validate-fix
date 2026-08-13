@@ -1506,7 +1506,9 @@ def test_rvf_user_prompt_submit_captures_round_baseline(tmp: Path) -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    marker = rbm.read_round_baseline_marker(task_id=None, session_id="sess-capture", root=state_root)
+    marker = rbm.read_round_baseline_marker(
+        task_id=None, session_id="sess-capture", repo=str(repo), root=state_root
+    )
     assert marker is not None, "expected a round-baseline marker to be written"
     assert marker["baseline_head"] == head, (marker.get("baseline_head"), head)
 

@@ -904,10 +904,10 @@ def test_migration_writes_markers_under_exactly_the_file_names_the_runtime_reads
 ) -> None:
     """本工具**绝不另立一套 marker 命名**；运行时的 ``marker_paths`` 是唯一真相源。
 
-    这条守卫存在的理由：F1 的后续切片会把「仓身份 + harness」编进 marker key（统一
-    根之后，Claude 与 Codex 在同一个 worktree 会开始互相覆盖 round-baseline）。那一刀
-    落下时，若迁移仍按老名字写，产出的就是**运行时读不到的文件**——每个 task 静默丢掉
-    自己的水位。届时这条测试会先红。
+    这条守卫存在的理由：迁移若按自己那套名字写，产出的就是**运行时读不到的文件**——每个
+    task 静默丢掉自己的水位，而对账表上一切正常。「仓身份 + harness 编进 key」那一刀落下
+    时它确实先红了（迁移那侧随之改成从 ``marker_paths`` 现场派生），这条守卫按设计生效过
+    一次；再改 key 仍会先红。
     """
 
     repository, commits = linear_git_repository
@@ -929,6 +929,13 @@ def test_migration_writes_markers_under_exactly_the_file_names_the_runtime_reads
             root=root,
         )
 
+    # 对账表的 ``task_marker`` 是**来源侧磁盘上的**文件名，而不是「task-<id>」这种手搓的
+    # 逻辑名——运行时改过 key 之后两者不再相等，写死逻辑名会让本测试自己造出一条查无此
+    # marker 的报告行、然后把「迁移拒绝了它」误读成「命名不一致」。
+    source_marker_name = review_highwater_marker.marker_paths(
+        task_id=task_identifier, session_id=None, repo=str(repository), root=canonical_root
+    )[0].stem
+
     staging_root = tmp_path / "staging"
     tool.stage_review_highwater_markers(
         legacy_root=legacy_root,
@@ -936,7 +943,7 @@ def test_migration_writes_markers_under_exactly_the_file_names_the_runtime_reads
         staging_root=staging_root,
         highwater_report_rows=[
             {
-                "task_marker": f"task-{task_identifier}",
+                "task_marker": source_marker_name,
                 "chosen_reviewed_head": commits[2],
                 "chosen_side": "canonical",
                 "legacy_reviewed_head": commits[0],
@@ -956,13 +963,153 @@ def test_migration_writes_markers_under_exactly_the_file_names_the_runtime_reads
         (review_highwater_marker, tool.REVIEW_HIGHWATER_SUBDIRECTORY),
         (round_baseline_marker, tool.ROUND_BASELINE_PENDING_SUBDIRECTORY),
     ):
-        runtime_relative = module.marker_paths(
-            task_id=task_identifier, session_id=None, root=canonical_root
-        )[0].relative_to(canonical_root)
-        assert runtime_relative.parent.name == subdirectory
-        assert (merged / runtime_relative).is_file(), (
-            f"迁移写出的 {subdirectory} marker 文件名与运行时读的不一致："
-            f"运行时期望 {runtime_relative}"
+        runtime_candidates = [
+            candidate.relative_to(canonical_root)
+            for candidate in module.marker_paths(
+                task_id=task_identifier,
+                session_id=None,
+                repo=str(repository),
+                root=canonical_root,
+            )
+        ]
+        assert runtime_candidates, "运行时连一条候选路径都给不出，key 派生已经坏了"
+        assert all(
+            candidate.parent.name == subdirectory for candidate in runtime_candidates
+        )
+        # 判据是「运行时的候选列表里**有一条**能读到」，不是「恰好等于第一候选」：
+        # round-baseline 的 key 含 harness，而迁移过来的历史 marker 里没有 harness 可恢复，
+        # 一律落在 ``--harness-unspecified`` 那条回退候选上。本测试进程自己会解析出一个真实
+        # harness（``CLAUDECODE`` 之类），所以这条断言顺带证明了那条回退确实接得住迁移产物。
+        assert any((merged / candidate).is_file() for candidate in runtime_candidates), (
+            f"迁移写出的 {subdirectory} marker 文件名运行时一条都读不到："
+            f"运行时候选 {[str(candidate) for candidate in runtime_candidates]}，"
+            f"staging 实有 {sorted(path.name for path in (merged / subdirectory).glob('*.json'))}"
+        )
+
+
+def test_marker_rekeying_is_idempotent_for_names_already_in_the_new_format(
+    linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """已经是新格式的文件名再过一遍重键，必须原样不变。
+
+    这不是洁癖：F1.2 的硬顺序是「先 land + 部署新代码，再迁移数据」，所以真正跑迁移那一刻
+    两个根里**必然新旧两种名字并存**——部署之后写出的是新名。若重键不幂等，新名会被叠成
+    ``task-x--repo-A--repo-A``，而那个名字运行时一条候选都对不上 ⇒ 该 task 的水位静默消失。
+    """
+
+    repository, _commits = linear_git_repository
+    for module, subdirectory in (
+        (review_highwater_marker, tool.REVIEW_HIGHWATER_SUBDIRECTORY),
+        (round_baseline_marker, tool.ROUND_BASELINE_PENDING_SUBDIRECTORY),
+    ):
+        document = {"repo": str(repository)}
+        from_legacy_name = tool.runtime_marker_file_name_for_migrated_marker(
+            legacy_marker_name="task-abc12",
+            marker_document=document,
+            marker_subdirectory=subdirectory,
+        )
+        assert from_legacy_name is not None
+        from_new_name = tool.runtime_marker_file_name_for_migrated_marker(
+            legacy_marker_name=Path(from_legacy_name).stem,
+            marker_document=document,
+            marker_subdirectory=subdirectory,
+        )
+        assert from_new_name == from_legacy_name, (
+            f"{subdirectory} 的重键不幂等：{from_legacy_name} → {from_new_name}"
+        )
+        assert from_legacy_name.startswith("task-abc12--repo-"), from_legacy_name
+
+    # session-keyed 那半边走同一条路径。
+    session_keyed = tool.runtime_marker_file_name_for_migrated_marker(
+        legacy_marker_name="sess-0191b2c3-dead-beef",
+        marker_document={"repo": str(repository)},
+        marker_subdirectory=tool.REVIEW_HIGHWATER_SUBDIRECTORY,
+    )
+    assert session_keyed is not None and session_keyed.startswith("sess-0191b2c3-dead-beef--repo-")
+
+
+def test_markers_whose_repository_is_gone_are_skipped_rather_than_blocking_the_migration(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """仓已被删的 marker 走「跳过并报数」，不走「拒绝并阻断」。
+
+    两者都不写出文件，但后果天差地别：``refused`` 是 ``verify`` 的 blocking，意思是「先
+    手工裁决再重跑」；而实测真实两根里 169 个无法重键的 marker **全部**是「cline-kanban
+    task worktree 已被删」。那份 marker 无论迁不迁都不会再被命中（运行时同样算不出它的仓
+    身份），把它算成阻断只会让静默期被一批早已消失的 worktree 永久卡住。
+
+    但**必须报数**——静默丢掉几百个 marker 正是这类工具最典型的假绿。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+    vanished_repository = tmp_path / "worktree-that-was-deleted"
+
+    for root in (legacy_root, canonical_root):
+        directory = root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "task-deleted.json").write_text(
+            json.dumps(
+                {
+                    "marker_version": 1,
+                    "state": "round_baseline",
+                    "baseline_head": commits[0],
+                    "repo": str(vanished_repository),
+                    "captured_at": "2026-07-01T00:00:00Z",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    staging = tool.stage_round_baseline_markers(
+        legacy_root=legacy_root, canonical_root=canonical_root, staging_root=tmp_path / "staging"
+    )
+    assert staging["skipped_marker_names_whose_repository_is_gone"] == ["task-deleted"]
+    assert staging["refused_marker_names"] == [], staging["refused_marker_names"]
+    assert staging["written_marker_names"] == []
+
+
+def test_marker_rekeying_refuses_when_the_repository_identity_cannot_be_resolved(
+    tmp_path: Path,
+) -> None:
+    """仓身份解析不出来 ⇒ 拒绝迁移该 marker，绝不退到共享占位桶。
+
+    退到占位桶等于把「不同仓撞同一个 task id」原样搬个地方——而这正是本次改 key 要消除的
+    东西。拒绝会走进 ``refused_marker_names``，``verify`` 对它是 blocking：宁可当场停下来
+    手工裁决，也不要让一份认不出归属的水位混进别人的桶里。
+    """
+
+    for subdirectory in (
+        tool.REVIEW_HIGHWATER_SUBDIRECTORY,
+        tool.ROUND_BASELINE_PENDING_SUBDIRECTORY,
+    ):
+        # 正文里没有 repo
+        assert (
+            tool.runtime_marker_file_name_for_migrated_marker(
+                legacy_marker_name="task-abc12",
+                marker_document={},
+                marker_subdirectory=subdirectory,
+            )
+            is None
+        )
+        # repo 指向一个已经不在磁盘上的路径（仓被删 / 被搬走）
+        assert (
+            tool.runtime_marker_file_name_for_migrated_marker(
+                legacy_marker_name="task-abc12",
+                marker_document={"repo": str(tmp_path / "vanished-repository")},
+                marker_subdirectory=subdirectory,
+            )
+            is None
+        )
+        # 认不出的 key 前缀
+        assert (
+            tool.runtime_marker_file_name_for_migrated_marker(
+                legacy_marker_name="mystery-abc12",
+                marker_document={"repo": str(tmp_path)},
+                marker_subdirectory=subdirectory,
+            )
+            is None
         )
 
 

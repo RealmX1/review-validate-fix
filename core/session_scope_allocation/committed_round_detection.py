@@ -101,9 +101,12 @@ def _resolve_committed_round_baseline(
         highwater = review_highwater_marker.resolve_review_highwater_head(
             task_id=task_id,
             session_id=session_id,
+            repo=repo_path,
         )
     except Exception:  # pragma: no cover - 高水位读取永不阻断
         highwater = None
     if highwater and _commit_is_ancestor_of_head(repo_path, highwater):
         return highwater
-    return resolve_round_baseline_head(task_id=task_id, session_id=session_id)
+    return resolve_round_baseline_head(
+        task_id=task_id, session_id=session_id, repo=repo_path
+    )
