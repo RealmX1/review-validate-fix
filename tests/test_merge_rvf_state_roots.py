@@ -21,6 +21,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,16 @@ def pin_every_rvf_state_root_environment_variable_into_the_temporary_directory(
     monkeypatch.setenv("CODEX_RVF_STATE_DIR", str(isolated / "runtime-state"))
     monkeypatch.setenv("RVF_USER_LOCAL_DATA_ROOT", str(isolated))
     monkeypatch.setenv("RVF_HOME", str(isolated / "rvf-home"))
+
+
+def _iso_timestamp_offset_by_seconds(offset_seconds: float) -> str:
+    """相对当前时刻偏移若干秒的 ISO-8601 ``Z`` 时间戳，与 marker 落盘格式同口径。"""
+
+    return (
+        (datetime.now(timezone.utc) + timedelta(seconds=offset_seconds))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -1172,6 +1183,464 @@ def test_round_baseline_rekeying_falls_back_to_the_harness_identity_recorded_in_
         marker_subdirectory=tool.REVIEW_HIGHWATER_SUBDIRECTORY,
     )
     assert highwater_name is not None and "--harness-" not in highwater_name, highwater_name
+
+
+def test_highwater_old_and_new_format_names_colliding_after_rekeying_take_the_older_head(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """同一 task 的旧格式与新格式 highwater marker 重键到同一文件名时，取可证明更旧的一侧。
+
+    这个组合在 F1.2 里**必然出现**且与 harness 无关：highwater 的 key 只含仓身份，所以
+    ``task-<id>``（部署前的旧代码写的）与 ``task-<id>--repo-<仓>``（部署后的新代码写的）
+    重键后落到**同一个**目标文件名上。而 legacy↔canonical 那层裁决是按源 key 逐个做的，
+    天生看不见这条跨 key 冲突。
+
+    不修的后果不是「少一个文件」：源 key 排序里 ``task-X`` 恒在 ``task-X--repo-…`` 之前，
+    于是永远是新格式那份最后写、把先写的覆盖掉——**方向系统性地偏向更新的水位**，被跳过
+    的 committed 单元既不会进 ``written_off_unit_ids`` 也不会有任何人知道（owner 拍板
+    ``advance-to-descendant`` 时明确要求「落账是唯一保留的回溯路径，不得省略」）。
+
+    取更旧不与 owner 那条裁决冲突：那条针对的是 legacy↔canonical 之间积了数月的分歧，
+    这里是迁移自己造出来的、只有「部署到迁移」之间那几分钟宽的新冲突类。取更旧至多多审
+    那几分钟内的工作，且不产生任何 write-off。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+    task_identifier = "abc12"
+
+    # legacy 侧 = 部署前的旧代码写的旧格式名，水位停在更旧的 commit。
+    legacy_directory = legacy_root / tool.REVIEW_HIGHWATER_SUBDIRECTORY
+    legacy_directory.mkdir(parents=True, exist_ok=True)
+    (legacy_directory / "task-abc12.json").write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "review_highwater",
+                "reviewed_head": commits[0],
+                "repo": str(repository),
+                "kanban_task_id": task_identifier,
+                "session_id": None,
+                "source": "stop_finalize",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # canonical 侧 = 部署后的新代码写的新格式名，水位已经前移到后代 commit。
+    new_format_path = review_highwater_marker.write_review_highwater(
+        task_id=task_identifier,
+        session_id=None,
+        reviewed_head=commits[2],
+        repo=str(repository),
+        root=canonical_root,
+    )
+    assert new_format_path is not None and "--repo-" in new_format_path.name
+
+    staging_root = tmp_path / "staging"
+    staging = tool.stage_review_highwater_markers(
+        legacy_root=legacy_root,
+        canonical_root=canonical_root,
+        staging_root=staging_root,
+        highwater_report_rows=[
+            {
+                "task_marker": "task-abc12",
+                "chosen_reviewed_head": commits[0],
+                "chosen_side": "legacy",
+                "legacy_reviewed_head": commits[0],
+                "canonical_reviewed_head": None,
+                "ancestry_relation": "single_side_only",
+                "conflict_classes": [],
+                "written_off_unit_ids": [],
+            },
+            {
+                "task_marker": new_format_path.stem,
+                "chosen_reviewed_head": commits[2],
+                "chosen_side": "canonical",
+                "legacy_reviewed_head": None,
+                "canonical_reviewed_head": commits[2],
+                "ancestry_relation": "single_side_only",
+                "conflict_classes": [],
+                "written_off_unit_ids": [],
+            },
+        ],
+    )
+
+    merged_directory = (
+        staging_root
+        / tool.STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME
+        / tool.REVIEW_HIGHWATER_SUBDIRECTORY
+    )
+    staged_paths = sorted(merged_directory.glob("*.json"))
+    assert [path.name for path in staged_paths] == [new_format_path.name]
+    staged_document = json.loads(staged_paths[0].read_text(encoding="utf-8"))
+    assert staged_document["reviewed_head"] == commits[0], (
+        "重键撞车后取了更新的水位——被跳过的 committed 单元会被静默推出观察窗口"
+    )
+
+    # 只有真正落盘的那个源 key 算 written；另一条不许也记成 written（那正是「静默丢一份」）。
+    assert staging["written_marker_names"] == ["task-abc12"], staging["written_marker_names"]
+    assert staging["refused_marker_names"] == []
+    collisions = staging["runtime_file_name_collisions"]
+    assert len(collisions) == 1, collisions
+    assert collisions[0]["contributing_marker_names"] == ["task-abc12", new_format_path.stem]
+    assert collisions[0]["chosen_marker_name"] == "task-abc12"
+    assert collisions[0]["chosen_head"] == commits[0]
+    # 落盘 marker 自己也要说出这次撞车：只看账本不够，磁盘上那份是未来取证唯一会被读的东西。
+    assert staged_document["merged_from_state_roots"]["runtime_file_name_collision"] == (
+        collisions[0]
+    )
+
+
+def test_round_baseline_old_and_new_format_names_colliding_after_rekeying_take_the_older_head(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """round-baseline 的同一条撞车（经 ``--harness-unspecified`` 会合）同样取更旧的一侧。
+
+    round-baseline 多一层 harness 段，所以旧格式（回退 ``unspecified``）只会与**同样判不出
+    harness** 的新格式撞车——判得出 harness 的那些各归各的文件。判不出 harness 是常态而非
+    异常：``resolve_parent_harness_identity`` 在拿不到任何信号时就返回 ``unspecified``。
+
+    方向在这里更要命：round-baseline 是观察窗口的**下界种子**，取新的等于把窗口下界抬高
+    ⇒ 漏审，与本切片要修的方向恰好相反。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+
+    # legacy 侧 = 旧格式名、正文没有 harness ⇒ 重键回退 --harness-unspecified，水位更旧。
+    legacy_directory = legacy_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY
+    legacy_directory.mkdir(parents=True, exist_ok=True)
+    (legacy_directory / "task-abc12.json").write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "round_baseline",
+                "baseline_head": commits[0],
+                "repo": str(repository),
+                "kanban_task_id": "abc12",
+                "session_id": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # canonical 侧 = 新格式名，但 harness 同样判不出 ⇒ 落在同一个目标文件名上；baseline 更新。
+    new_format_name = tool.runtime_marker_file_name_for_migrated_marker(
+        legacy_marker_name="task-abc12",
+        marker_document={"repo": str(repository)},
+        marker_subdirectory=tool.ROUND_BASELINE_PENDING_SUBDIRECTORY,
+    )
+    assert new_format_name is not None and new_format_name.endswith(
+        "--harness-unspecified.json"
+    )
+    canonical_directory = canonical_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY
+    canonical_directory.mkdir(parents=True, exist_ok=True)
+    (canonical_directory / new_format_name).write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "round_baseline",
+                "baseline_head": commits[2],
+                "repo": str(repository),
+                "repository_identity": new_format_name.split("--repo-")[1].split("--harness-")[0],
+                "parent_harness_identity": "unspecified",
+                "kanban_task_id": "abc12",
+                "session_id": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    staging_root = tmp_path / "staging"
+    staging = tool.stage_round_baseline_markers(
+        legacy_root=legacy_root, canonical_root=canonical_root, staging_root=staging_root
+    )
+
+    merged_directory = (
+        staging_root
+        / tool.STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME
+        / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY
+    )
+    staged_paths = sorted(merged_directory.glob("*.json"))
+    assert [path.name for path in staged_paths] == [new_format_name]
+    staged_document = json.loads(staged_paths[0].read_text(encoding="utf-8"))
+    assert staged_document["baseline_head"] == commits[0], (
+        "重键撞车后取了更新的 baseline——观察窗口下界被抬高，方向就是漏审"
+    )
+    assert staging["written_marker_names"] == ["task-abc12"], staging["written_marker_names"]
+    assert staging["refused_marker_names"] == []
+    assert len(staging["runtime_file_name_collisions"]) == 1
+
+
+def _write_round_baseline_marker_document(
+    path: Path,
+    *,
+    baseline_head: str,
+    repository: Path,
+    captured_at: str,
+    expires_at: str,
+    repository_identity: str | None = None,
+    parent_harness_identity: str | None = None,
+) -> None:
+    document: dict[str, object] = {
+        "marker_version": 1,
+        "state": "round_baseline",
+        "captured_at": captured_at,
+        "expires_at": expires_at,
+        "ttl_seconds": float(round_baseline_marker.DEFAULT_TTL_SECONDS),
+        "baseline_head": baseline_head,
+        "repo": str(repository),
+        "kanban_task_id": "abc12",
+        "session_id": None,
+    }
+    if repository_identity is not None:
+        document["repository_identity"] = repository_identity
+    if parent_harness_identity is not None:
+        document["parent_harness_identity"] = parent_harness_identity
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_round_baseline_rekeying_collision_keeps_the_time_to_live_that_was_still_valid_on_one_side(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """撞车取更旧的 ``baseline_head`` 之后，TTL 元数据不许跟着那份已过期的候选一起搬过来。
+
+    F1.2 的硬顺序是「先部署新代码、再迁移数据」，所以撞车里那份**旧格式** marker 一定是
+    部署之前写的：只要「部署 → 迁移」之间隔了超过一个 TTL（默认 6h），它就已经 expired，
+    而新格式那份是部署之后刚写的、仍然 active。
+
+    保守裁决取更旧的一侧本身是对的（窗口下界更低 ⇒ 多审）。但如果连它的
+    ``expires_at`` / ``captured_at`` 一起继承，落盘 marker 会被 ``round_baseline_status``
+    判成 ``stale``、``resolve_round_baseline_head()`` 直接返回 ``None``——committed-round
+    的 bootstrap 下界**整个消失**，方向从「多审几个 commit」翻转成「一个都不审」。
+
+    那正是本工具最不该做的事：合并的结果比**任何一侧的输入**都差（canonical 单独存在时
+    还能解析出一个可用下界，合并之后反而解析不出来了）。``choose_conservative_oldest_...``
+    的 docstring 明写「不产生任何 write-off（无单元被推出窗口 ⇒ 无不可逆损失）」——TTL
+    跟着旧候选走会让这句话变成假的。取**更旧的 head + 更新的 TTL**，两个方向才都保守。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+
+    # legacy 侧 = 部署前旧代码写的旧格式名：baseline 更旧，且 TTL 已经过期。
+    _write_round_baseline_marker_document(
+        legacy_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / "task-abc12.json",
+        baseline_head=commits[0],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-30 * 60 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(-24 * 60 * 60),
+    )
+    # canonical 侧 = 部署后新代码写的新格式名：baseline 更新，TTL 仍然有效。
+    new_format_name = tool.runtime_marker_file_name_for_migrated_marker(
+        legacy_marker_name="task-abc12",
+        marker_document={"repo": str(repository)},
+        marker_subdirectory=tool.ROUND_BASELINE_PENDING_SUBDIRECTORY,
+    )
+    assert new_format_name is not None and new_format_name.endswith(
+        "--harness-unspecified.json"
+    )
+    _write_round_baseline_marker_document(
+        canonical_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / new_format_name,
+        baseline_head=commits[2],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-5 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(6 * 60 * 60),
+        repository_identity=new_format_name.split("--repo-")[1].split("--harness-")[0],
+        parent_harness_identity="unspecified",
+    )
+
+    staging_root = tmp_path / "staging"
+    staging = tool.stage_round_baseline_markers(
+        legacy_root=legacy_root, canonical_root=canonical_root, staging_root=staging_root
+    )
+
+    merged_state_root = staging_root / tool.STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME
+    staged_path = (
+        merged_state_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / new_format_name
+    )
+    staged_document = json.loads(staged_path.read_text(encoding="utf-8"))
+
+    # 保守方向不许被这条修复破坏：head 仍然取可证明更旧的那一侧。
+    assert staged_document["baseline_head"] == commits[0]
+    assert staging["refused_marker_names"] == []
+
+    assert round_baseline_marker.round_baseline_status(staged_document) == (
+        round_baseline_marker.STATUS_ACTIVE
+    ), (
+        "撞车取了更旧的候选之后连它过期的 TTL 一起继承——落盘 marker 变 stale，"
+        "committed-round 的 bootstrap 下界整个消失（比不合并还差）"
+    )
+    # 端到端：运行时按自己的读路径去查，必须还能拿回那个保守的下界。
+    assert (
+        round_baseline_marker.resolve_round_baseline_head(
+            task_id="abc12",
+            session_id=None,
+            repo=str(repository),
+            root=merged_state_root,
+        )
+        == commits[0]
+    )
+    adoption = staged_document["merged_from_state_roots"]["time_to_live_adoption"]
+    assert adoption is not None and adoption["adopted_from_marker"].startswith("canonical:")
+
+
+def test_round_baseline_merge_does_not_expire_a_marker_that_was_still_active_on_one_side(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """同一条缺陷经 legacy↔canonical 这层（不撞车）同样可达，修复必须一并盖住。
+
+    这条路径上 ``base_payload`` 是按 ``reconciliation.chosen_side`` 取的，于是
+    「legacy 更旧 ⇒ 取 legacy」时也会把 legacy 那份过期的 TTL 一起搬走。它在本次两趟改造
+    之前就已存在，只是撞车那层把它从边角放大成了**每次迁移的常态**（保守取更旧 ⇒ 系统性
+    地选中部署前写的那份 ⇒ 系统性地选中已过期的那份）。
+
+    两条路径共用同一个落盘装配点，所以修在那里天然同时覆盖；这条用例把它钉住，免得日后
+    有人只按撞车那层理解这条约束。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+
+    # 两根上是**同一个**源 key ⇒ 不产生重键撞车，只走 legacy↔canonical 那层裁决。
+    _write_round_baseline_marker_document(
+        legacy_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / "task-abc12.json",
+        baseline_head=commits[0],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-30 * 60 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(-24 * 60 * 60),
+    )
+    _write_round_baseline_marker_document(
+        canonical_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / "task-abc12.json",
+        baseline_head=commits[2],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-5 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(6 * 60 * 60),
+    )
+
+    staging_root = tmp_path / "staging"
+    staging = tool.stage_round_baseline_markers(
+        legacy_root=legacy_root, canonical_root=canonical_root, staging_root=staging_root
+    )
+    assert staging["refused_marker_names"] == []
+    assert staging["runtime_file_name_collisions"] == []
+
+    merged_state_root = staging_root / tool.STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME
+    staged_paths = sorted(
+        (merged_state_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY).glob("*.json")
+    )
+    assert len(staged_paths) == 1, staged_paths
+    staged_document = json.loads(staged_paths[0].read_text(encoding="utf-8"))
+
+    assert staged_document["baseline_head"] == commits[0]
+    assert staged_document["merged_from_state_roots"]["chosen_side"] == (
+        "legacy_is_older_ancestor"
+    )
+    assert round_baseline_marker.round_baseline_status(staged_document) == (
+        round_baseline_marker.STATUS_ACTIVE
+    ), "取了 legacy 更旧的 baseline，却连 legacy 那份过期的 TTL 一起继承"
+    assert (
+        round_baseline_marker.resolve_round_baseline_head(
+            task_id="abc12",
+            session_id=None,
+            repo=str(repository),
+            root=merged_state_root,
+        )
+        == commits[0]
+    )
+
+
+def test_round_baseline_merge_does_not_resurrect_a_marker_that_had_expired_on_both_sides(
+    tmp_path: Path, linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """两侧都已过期时，合并结果必须**保持** stale——不许无中生有地续期。
+
+    「保留仍然有效的 TTL」与「一律重新生成 TTL」是两件事，只有前者是对的。round-baseline
+    的 TTL 表达的是「『上一条 prompt 时的 HEAD』这个下界还有没有意义」；两侧都过期说明这
+    份下界本来就已经该失效了，运行时按设计降级成「无 committed 观测」。迁移工具无权替运行
+    时把它改判成有效——那会拿一个几天前的 HEAD 去当本轮窗口下界，反过来变成大面积过触发。
+
+    所以修复的界限是「合并结果不得比**最新鲜的那份输入**更旧」，而不是「合并结果一律 active」。
+    """
+
+    repository, commits = linear_git_repository
+    legacy_root, canonical_root = _build_state_root_pair(tmp_path)
+
+    _write_round_baseline_marker_document(
+        legacy_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / "task-abc12.json",
+        baseline_head=commits[0],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-72 * 60 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(-66 * 60 * 60),
+    )
+    _write_round_baseline_marker_document(
+        canonical_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY / "task-abc12.json",
+        baseline_head=commits[2],
+        repository=repository,
+        captured_at=_iso_timestamp_offset_by_seconds(-30 * 60 * 60),
+        expires_at=_iso_timestamp_offset_by_seconds(-24 * 60 * 60),
+    )
+
+    staging_root = tmp_path / "staging"
+    tool.stage_round_baseline_markers(
+        legacy_root=legacy_root, canonical_root=canonical_root, staging_root=staging_root
+    )
+
+    merged_state_root = staging_root / tool.STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME
+    staged_paths = sorted(
+        (merged_state_root / tool.ROUND_BASELINE_PENDING_SUBDIRECTORY).glob("*.json")
+    )
+    assert len(staged_paths) == 1, staged_paths
+    staged_document = json.loads(staged_paths[0].read_text(encoding="utf-8"))
+
+    assert staged_document["baseline_head"] == commits[0]
+    assert round_baseline_marker.round_baseline_status(staged_document) == (
+        round_baseline_marker.STATUS_STALE
+    ), "两侧都过期却把合并结果续成了 active——等于替运行时改判，方向是过触发"
+    assert (
+        round_baseline_marker.resolve_round_baseline_head(
+            task_id="abc12",
+            session_id=None,
+            repo=str(repository),
+            root=merged_state_root,
+        )
+        is None
+    )
+
+
+def test_rekeying_collision_without_provable_ancestry_refuses_instead_of_picking_a_side(
+    linear_git_repository: tuple[Path, list[str]]
+) -> None:
+    """撞车两侧的祖先关系判不出来时，整个目标文件名走 refuse，不许挑一个。
+
+    这类撞车在真实数据里不该出现（同一 task、同一仓、相隔几分钟）；出现了就是需要人看
+    一眼的信号，而静默期本来就有人在场。挑一个才是最坏解——它把「无法裁决」伪装成「已裁决」。
+    """
+
+    _repository, commits = linear_git_repository
+    chosen, record = tool.choose_conservative_oldest_marker_colliding_on_one_runtime_file_name(
+        runtime_file_stem="task-abc12--repo-whatever-000000000000",
+        candidates=[
+            tool.MarkerCandidateForOneRuntimeFileName(
+                source_marker_name="task-abc12",
+                chosen_head=commits[0],
+                payload={},
+                repository_directory=None,
+            ),
+            tool.MarkerCandidateForOneRuntimeFileName(
+                source_marker_name="task-abc12--repo-whatever-000000000000",
+                chosen_head=commits[2],
+                payload={},
+                repository_directory=None,
+            ),
+        ],
+    )
+    assert chosen is None
+    assert record["chosen_marker_name"] is None
+    assert (
+        "runtime_file_name_collision_without_provable_ancestry_refusing_to_choose"
+        in record["conflict_classes"]
+    )
 
 
 def test_markers_whose_repository_is_gone_are_skipped_rather_than_blocking_the_migration(
