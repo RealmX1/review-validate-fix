@@ -85,6 +85,20 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa
     _ensure_schema as ensure_tracker_schema_is_current,
 )
 
+# marker 的目标文件名一律由**运行时**的 ``marker_paths()`` 决定（见
+# ``runtime_marker_file_name_for_migrated_marker``）。同上一条：绝不在这里另写一份命名规则。
+from core.host_adapter.parent_harness_identity import (  # noqa: E402
+    PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+    normalize_parent_harness_identity,
+)
+from core.session_scope_allocation import review_highwater_marker  # noqa: E402
+from core.session_scope_allocation import round_baseline_marker  # noqa: E402
+from core.session_scope_allocation.scope_marker_identity_key import (  # noqa: E402
+    MARKER_FILE_NAME_SEGMENT_SEPARATOR,
+    PARENT_HARNESS_IDENTITY_FILE_NAME_SEGMENT_PREFIX,
+    REPOSITORY_IDENTITY_FILE_NAME_SEGMENT_PREFIX,
+)
+
 
 LEGACY_CLAUDE_SCOPED_STATE_ROOT = Path.home() / ".claude" / "rvf"
 
@@ -1943,6 +1957,18 @@ def render_migration_command_result_text(payload: Mapping[str, Any]) -> str:
             f"round-baseline 写 {len(round_baseline.get('written_marker_names') or [])}"
             f" / 拒 {len(round_baseline.get('refused_marker_names') or [])}"
         )
+        # 「仓已不在磁盘上」单独报数，不许并进「拒」也不许省略：它不阻断（那份 marker
+        # 无论迁不迁都不会再被命中），但静默丢掉几百个 marker 是这类工具最典型的假绿。
+        markers_whose_repository_is_gone = sum(
+            len(section.get("skipped_marker_names_whose_repository_is_gone") or [])
+            for section in (highwater, round_baseline)
+        )
+        if markers_whose_repository_is_gone:
+            lines.append(
+                f"  · 另有 {markers_whose_repository_is_gone} 个 marker 的仓已不在磁盘上"
+                f"（多为已删的 task worktree），跳过不迁——运行时同样算不出它们的仓身份，"
+                f"迁过去也永远不会被查到"
+            )
         written_off = [
             item
             for item in (payload.get("reconciliation_report") or {}).get("review_highwater", [])
@@ -2962,6 +2988,185 @@ def _write_marker_document(path: Path, payload: Mapping[str, Any]) -> None:
     )
 
 
+TASK_KEYED_LEGACY_MARKER_NAME_PREFIX = "task-"
+SESSION_KEYED_LEGACY_MARKER_NAME_PREFIX = "sess-"
+
+
+def migrated_marker_repository_is_absent_from_disk(
+    marker_document: Mapping[str, Any] | None,
+) -> bool:
+    """marker 指向的仓此刻还在不在磁盘上。
+
+    区分这一类**不是**为了放宽 fail-closed，而是因为它和「无法裁决」根本不是同一件事：
+    仓已经不在了（绝大多数是被删掉的 cline-kanban task worktree），那份 marker 无论迁不迁
+    都不会再被任何一次查找命中——它的 key 里那段仓身份运行时同样算不出来。把它算成阻断，
+    静默期就会被一批早已消失的 worktree 永久卡住；而真正需要人来裁决的那些（正文没有 repo、
+    key 前缀认不出）仍然阻断。
+
+    实测：真实两根共 842 个 marker，169 个属于这一类，且**全部**是这个原因。
+    """
+    repository = (marker_document or {}).get("repo")
+    if not isinstance(repository, str) or not repository.strip():
+        return False
+    return not Path(repository.strip()).exists()
+
+
+def parent_harness_identity_recorded_in_marker_file_name(marker_file_name: str) -> str | None:
+    """从 marker 文件名里读回**已经写在名字里**的 harness 身份段；没有这一段返回 None。
+
+    返回 None 的语义是「这个名字是旧格式（根本没记过 harness）」，而不是「记过但判不出」
+    ——后者在文件名里是货真价实的 ``--harness-unspecified`` 段，会被原样读回来。两者必须
+    分得开：只有前者才允许回退到 ``unspecified``。
+
+    从**最后**一个 ``--harness-`` 处切，不是第一个：仓身份段来自 ``repo_key()``，其名字
+    部分过的是 ``safe_token``，而 ``safe_token`` 把 ``-`` 留在允许字符集里、并不折叠连续
+    的 ``-``，所以一个叫 ``foo--harness-bar`` 的仓目录能让仓身份段自己就含这个串。反过来
+    harness token 过的是 ``_sanitize_harness_identity_token``，它显式折叠 ``--``，因此
+    harness 段内部永远不含 ``--harness-`` —— 最后一个出现位置必定是真正的段边界。
+    """
+    marker_file_name_segment_prefix_for_parent_harness_identity = (
+        MARKER_FILE_NAME_SEGMENT_SEPARATOR
+        + PARENT_HARNESS_IDENTITY_FILE_NAME_SEGMENT_PREFIX
+        + "-"
+    )
+    (
+        text_before_harness_segment,
+        harness_segment_separator_was_found,
+        harness_identity_token,
+    ) = marker_file_name.rpartition(
+        marker_file_name_segment_prefix_for_parent_harness_identity
+    )
+    if not harness_segment_separator_was_found or not text_before_harness_segment:
+        return None
+    return harness_identity_token.strip() or None
+
+
+def parent_harness_identity_for_migrated_round_baseline_marker(
+    *,
+    legacy_marker_name: str,
+    marker_document: Mapping[str, Any] | None,
+) -> str:
+    """迁移一份 round-baseline marker 时，应该按哪个 harness 身份重新派生它的文件名。
+
+    优先级（**第一顺位必须是文件名**）：
+
+    1. 文件名里已有的 ``--harness-<id>`` 段。F1.2 的硬顺序是「先部署新代码、再迁移数据」，
+       所以真正跑迁移时两根里必然新旧两种名字并存，新名那批的 harness 身份是运行时**当场
+       判定并落盘过**的事实，比任何事后重判都可信。
+    2. marker 正文的 ``parent_harness_identity``。同一次写入里文件名与正文共用同一个取值
+       （见 ``round_baseline_marker.write_round_baseline_marker``），所以它只是同一事实的
+       第二个副本；留作次要来源，接住「正文健在但文件名被人手工改过」这类残缺输入。
+    3. 都没有 ⇒ ``unspecified``。这**只**适用于旧格式：旧 marker 里根本没记过 harness，
+       无从恢复，而读侧候选列表显式包含 ``--harness-unspecified`` 作回退，命中它至多让窗口
+       偏宽（多审），不会让 marker 消失。
+
+    为什么不能像最初那样对所有输入无条件写 ``unspecified``：那样一来同一个 task 下
+    ``--harness-claude-code`` 与 ``--harness-codex-cli`` 两份 marker 会被重键到**同一个**
+    目标文件、后写的覆盖先写的，而且对账表两条都记成 written（静默丢一份）。那恰好把
+    「harness 身份编进 round-baseline key」这一刀要消除的跨 harness 互相覆盖原样恢复回来。
+    """
+    identity_recorded_in_file_name = parent_harness_identity_recorded_in_marker_file_name(
+        legacy_marker_name
+    )
+    if identity_recorded_in_file_name:
+        return identity_recorded_in_file_name
+    identity_recorded_in_document = (marker_document or {}).get("parent_harness_identity")
+    normalized_identity_from_document = normalize_parent_harness_identity(
+        identity_recorded_in_document if isinstance(identity_recorded_in_document, str) else None
+    )
+    if normalized_identity_from_document:
+        return normalized_identity_from_document
+    return PARENT_HARNESS_IDENTITY_UNSPECIFIED
+
+
+def runtime_marker_file_name_for_migrated_marker(
+    *,
+    legacy_marker_name: str,
+    marker_document: Mapping[str, Any] | None,
+    marker_subdirectory: str,
+) -> str | None:
+    """旧 marker 名 → 运行时今天真正会去读的那个文件名；无法确定返回 None（拒绝迁移）。
+
+    旧 key 只有 ``task-<id>`` / ``sess-<id>``，新 key 还含仓身份（round-baseline 另含
+    harness 身份）——见 ``core.session_scope_allocation.scope_marker_identity_key``。
+    迁移必须按**新**名字落盘，否则产出的是一堆运行时读不到的文件：每个 task 静默丢掉
+    自己的水位，而对账表上一切正常。
+
+    仓身份从 marker 正文的 ``repo`` 现场解析（``git_common_dir``），因此这条路径要求
+    该仓此刻仍在磁盘上。解析不出来一律返回 None 让调用方记进 ``refused`` —— **不许**
+    退化成某个共享占位桶：那等于把「不同仓撞同一个 task id」原样搬个地方，而这正是
+    本次改 key 要消除的东西（实测反例 ``task-a877b`` 在两根分别指 cline-kanban 与
+    my-ai-setup 两个毫不相干的仓）。
+
+    harness 身份（仅 round-baseline）按
+    ``parent_harness_identity_for_migrated_round_baseline_marker`` 判定：文件名里已有的
+    ``--harness-<id>`` 段优先、正文的 ``parent_harness_identity`` 次之，两者都没有（即真正的
+    旧格式）才回退 ``unspecified``。**不许对所有输入无条件写 ``unspecified``**：那会把同一
+    task 下两个 harness 的新格式 marker 重键到同一个目标文件、互相覆盖。回退本身不是降级
+    ——读侧候选列表**显式包含** ``--harness-unspecified``，所以旧格式迁过来照样读得到；只是
+    它对「哪个 harness 写的」不作断言，命中它至多让窗口偏宽。
+
+    **必须幂等**：F1.2 的硬顺序是「先部署新代码、再迁移数据」，所以真正跑迁移时两个根里
+    必然**新旧两种文件名并存**——部署之后写出的是新名，之前的是旧名。这里先把 key token
+    从任一种格式里剥出来（切掉 ``--repo-`` 及其之后的一切）再统一重新派生，于是「已经是
+    新名」的输入产出同一个名字，而不是 ``task-x--repo-A--repo-A`` 这种叠加。幂等的判据是
+    **整个文件名**原样不变，因此 harness 段必须跟着一起还原，而不只是 key token。
+    """
+    if marker_subdirectory == REVIEW_HIGHWATER_SUBDIRECTORY:
+        marker_module: Any = review_highwater_marker
+        harness_keyword_arguments: dict[str, Any] = {}
+    elif marker_subdirectory == ROUND_BASELINE_PENDING_SUBDIRECTORY:
+        marker_module = round_baseline_marker
+        harness_keyword_arguments = {
+            "parent_harness_identity": (
+                parent_harness_identity_for_migrated_round_baseline_marker(
+                    legacy_marker_name=legacy_marker_name,
+                    marker_document=marker_document,
+                )
+            )
+        }
+    else:  # pragma: no cover - 调用点只有上面两种
+        return None
+
+    # 幂等剥壳：新名形如 ``task-<id>--repo-<identity>[--harness-<identity>]``，旧名只有
+    # ``task-<id>``。切在第一个 ``--repo-`` 上即可两种都还原出 key token。（task id 本身
+    # 含字面量 ``--repo-`` 会误切，但 cline-kanban 的 task id 是 5 位十六进制、session id
+    # 是 UUID，都产生不了这个串。）
+    key_segment = legacy_marker_name.split(
+        MARKER_FILE_NAME_SEGMENT_SEPARATOR
+        + REPOSITORY_IDENTITY_FILE_NAME_SEGMENT_PREFIX
+        + "-",
+        1,
+    )[0]
+    if key_segment.startswith(TASK_KEYED_LEGACY_MARKER_NAME_PREFIX):
+        task_identifier: str | None = key_segment[
+            len(TASK_KEYED_LEGACY_MARKER_NAME_PREFIX) :
+        ]
+        session_identifier: str | None = None
+    elif key_segment.startswith(SESSION_KEYED_LEGACY_MARKER_NAME_PREFIX):
+        task_identifier = None
+        session_identifier = key_segment[len(SESSION_KEYED_LEGACY_MARKER_NAME_PREFIX) :]
+    else:
+        return None
+    if not (task_identifier or session_identifier):
+        return None
+
+    repository = (marker_document or {}).get("repo")
+    if not isinstance(repository, str) or not repository.strip():
+        return None
+
+    candidate_paths = marker_module.marker_paths(
+        task_id=task_identifier,
+        session_id=session_identifier,
+        repo=repository.strip(),
+        root=Path("/nonexistent-staging-anchor"),
+        **harness_keyword_arguments,
+    )
+    if not candidate_paths:
+        return None
+    return candidate_paths[0].name
+
+
 def stage_review_highwater_markers(
     *,
     legacy_root: Path,
@@ -2976,10 +3181,11 @@ def stage_review_highwater_markers(
     工具在收拾的那类「同一个逻辑标识两份实现」。``verify`` 会重跑一次 report 并比对，
     这条复用关系因此是可检验的，不只是约定。
 
-    marker 的文件名**原样沿用来源侧**。目标 key 的真相源是运行时的
-    ``review_highwater_marker.marker_paths()``；本工具绝不另立一套命名，
-    ``tests/test_merge_rvf_state_roots.py`` 有一条结构性守卫钉死两者一致——运行时哪天
-    把仓身份 / harness 编进 key，那条测试会先红，而不是迁移悄悄写出读不到的文件。
+    marker 的目标文件名由 ``runtime_marker_file_name_for_migrated_marker`` 从运行时的
+    ``review_highwater_marker.marker_paths()`` 现场派生（旧 key 只有 ``task-<id>``，
+    新 key 还含仓身份）；本工具绝不另立一套命名。``tests/test_merge_rvf_state_roots.py``
+    有一条结构性守卫钉死两者一致——运行时再改 key，那条测试会先红，而不是迁移悄悄写出
+    一堆读不到的文件。派生不出目标名（仓已不在磁盘上等）一律记进 ``refused``。
     """
 
     legacy_scan = collect_marker_documents(legacy_root, REVIEW_HIGHWATER_SUBDIRECTORY)
@@ -2988,7 +3194,9 @@ def stage_review_highwater_markers(
         staging_root / STAGING_MERGED_STATE_ROOT_DIRECTORY_NAME / REVIEW_HIGHWATER_SUBDIRECTORY
     )
     written: list[str] = []
+    written_runtime_file_stems: list[str] = []
     refused: list[str] = []
+    skipped_because_repository_is_gone: list[str] = []
     for row in highwater_report_rows:
         marker_name = str(row["task_marker"])
         chosen_head = row.get("chosen_reviewed_head")
@@ -3009,6 +3217,17 @@ def stage_review_highwater_markers(
         if base_payload is None:
             refused.append(marker_name)
             continue
+        runtime_file_name = runtime_marker_file_name_for_migrated_marker(
+            legacy_marker_name=marker_name,
+            marker_document=base_payload,
+            marker_subdirectory=REVIEW_HIGHWATER_SUBDIRECTORY,
+        )
+        if runtime_file_name is None:
+            if migrated_marker_repository_is_absent_from_disk(base_payload):
+                skipped_because_repository_is_gone.append(marker_name)
+            else:
+                refused.append(marker_name)
+            continue
         payload = dict(base_payload)
         payload["reviewed_head"] = chosen_head
         payload["merged_from_state_roots"] = {
@@ -3020,11 +3239,16 @@ def stage_review_highwater_markers(
             "written_off_unit_ids": list(row.get("written_off_unit_ids") or []),
             "merged_at": utc_now_text(),
         }
-        _write_marker_document(destination / f"{marker_name}.json", payload)
+        _write_marker_document(destination / runtime_file_name, payload)
         written.append(marker_name)
+        written_runtime_file_stems.append(Path(runtime_file_name).stem)
     return {
         "written_marker_names": sorted(written),
+        "written_marker_file_stems": sorted(written_runtime_file_stems),
         "refused_marker_names": sorted(refused),
+        "skipped_marker_names_whose_repository_is_gone": sorted(
+            skipped_because_repository_is_gone
+        ),
     }
 
 
@@ -3045,7 +3269,9 @@ def stage_round_baseline_markers(
     )
     reconciliations: list[dict[str, Any]] = []
     written: list[str] = []
+    written_runtime_file_stems: list[str] = []
     refused: list[str] = []
+    skipped_because_repository_is_gone: list[str] = []
     for marker_name in sorted(
         set(legacy_scan.parsed_documents_by_marker_name)
         | set(canonical_scan.parsed_documents_by_marker_name)
@@ -3090,6 +3316,17 @@ def stage_round_baseline_markers(
         if base_payload is None:
             refused.append(marker_name)
             continue
+        runtime_file_name = runtime_marker_file_name_for_migrated_marker(
+            legacy_marker_name=marker_name,
+            marker_document=base_payload,
+            marker_subdirectory=ROUND_BASELINE_PENDING_SUBDIRECTORY,
+        )
+        if runtime_file_name is None:
+            if migrated_marker_repository_is_absent_from_disk(base_payload):
+                skipped_because_repository_is_gone.append(marker_name)
+            else:
+                refused.append(marker_name)
+            continue
         payload = dict(base_payload)
         payload["baseline_head"] = reconciliation.chosen_baseline_head
         payload["merged_from_state_roots"] = {
@@ -3100,12 +3337,17 @@ def stage_round_baseline_markers(
             "conflict_classes": reconciliation.conflict_classes,
             "merged_at": utc_now_text(),
         }
-        _write_marker_document(destination / f"{marker_name}.json", payload)
+        _write_marker_document(destination / runtime_file_name, payload)
         written.append(marker_name)
+        written_runtime_file_stems.append(Path(runtime_file_name).stem)
     return {
         "reconciliations": reconciliations,
         "written_marker_names": sorted(written),
+        "written_marker_file_stems": sorted(written_runtime_file_stems),
         "refused_marker_names": sorted(refused),
+        "skipped_marker_names_whose_repository_is_gone": sorted(
+            skipped_because_repository_is_gone
+        ),
     }
 
 
@@ -3799,6 +4041,19 @@ def run_verify_command(
         refused_marker_names = sorted(
             str(name) for name in (staging_summary.get("refused_marker_names") or [])
         )
+        markers_whose_repository_is_gone = sorted(
+            str(name)
+            for name in (
+                staging_summary.get("skipped_marker_names_whose_repository_is_gone") or []
+            )
+        )
+        if markers_whose_repository_is_gone:
+            advisory(
+                "markers_skipped_because_repository_is_gone",
+                f"{subdirectory}: {len(markers_whose_repository_is_gone)} 个 marker 的仓已不在"
+                f"磁盘上（{markers_whose_repository_is_gone[:5]}），跳过不迁。不阻断：运行时同样"
+                f"算不出这些仓的身份，迁过去也永远不会被查到；但数目记在这里，别当它不存在",
+            )
         if refused_marker_names:
             blocking(
                 "no_marker_left_unreconciled",
@@ -3806,9 +4061,19 @@ def run_verify_command(
                 f"（{refused_marker_names[:5]}）；switch 会把 legacy 根整棵归档，这些 task 的"
                 f"水位将永久取不回来。先手工裁决它们，再重跑 merge",
             )
-        recorded_written_marker_names = {
-            str(name) for name in (staging_summary.get("written_marker_names") or [])
-        }
+        # 比的是**落盘文件名**，不是账本里那个来源侧 marker 名：两者自「marker key 编入
+        # 仓身份 / harness」起不再相等（``runtime_marker_file_name_for_migrated_marker``）。
+        # 账本仍保留来源名以便与对账表逐行对上，但这条双向集合检查必须走同一个命名空间，
+        # 否则它会对**每一个** marker 恒报缺失，从一条真检查退化成一条噪声。
+        recorded_written_file_stems = staging_summary.get("written_marker_file_stems")
+        if not isinstance(recorded_written_file_stems, list):
+            blocking(
+                "marker_staging_summary_records_written_file_stems",
+                f"账本的 {staging_ledger_key} 缺 written_marker_file_stems：无法证明 "
+                f"{subdirectory} 下写出的文件与账本一致",
+            )
+            continue
+        recorded_written_marker_names = {str(name) for name in recorded_written_file_stems}
         staged_marker_names = {
             path.stem for path in (merged_state_root / subdirectory).glob("*.json")
         }

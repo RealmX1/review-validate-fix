@@ -431,6 +431,7 @@ def _classify_committed_round_window_seed_source(
     baseline: str | None,
     task_id: str | None,
     session_id: str | None,
+    repo_path: Path | str | None,
     log_root_override: Path | None,
 ) -> str:
     """标注 committed-round git 窗口下界**种子**来自 review 高水位还是 round-baseline（仅摘要透明度，
@@ -440,7 +441,7 @@ def _classify_committed_round_window_seed_source(
         return COMMITTED_ROUND_WINDOW_SEED_NONE
     try:
         highwater = review_highwater_marker.resolve_review_highwater_head(
-            task_id=task_id, session_id=session_id, root=log_root_override
+            task_id=task_id, session_id=session_id, repo=repo_path, root=log_root_override
         )
     except Exception:  # pragma: no cover - 标注读取永不阻断
         highwater = None
@@ -510,7 +511,7 @@ def build_candidate_summary(
     except Exception:  # pragma: no cover
         base_ref = None
     committed_round_window_seed_source = _classify_committed_round_window_seed_source(
-        baseline, task_id, session_id, log_root_override
+        baseline, task_id, session_id, repo_path, log_root_override
     )
 
     # ③ 枚举：committed（种子..工作树，含 committed-but-unreviewed）∪ uncommitted（dirty）。
