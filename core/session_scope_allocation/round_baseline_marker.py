@@ -85,8 +85,11 @@ def marker_paths(
     跳过写 / 读（fail-closed 的方向是窗口偏宽 ⇒ 多审，不是 marker 混住 ⇒ 漏审）。
 
     ``parent_harness_identity=None`` 表示「就地判定」（``resolve_parent_harness_identity``）。
-    每个 key 后面还跟一条 ``--harness-unspecified`` 回退候选，接住迁移写出的历史 marker
-    （旧格式没记过 harness）与「写入点比读取点少一层可用信号」时留下的那份。
+    候选列表里还有一层 ``--harness-unspecified`` 回退，接住迁移写出的历史 marker（旧格式
+    没记过 harness）与「写入点比读取点少一层可用信号」时留下的那份。**它整层排在所有精确
+    候选之后**，不是紧跟在各 key 后面——否则别的会话留下的 ``task-unspecified`` 会越过本
+    会话精确写入的 ``sess-<harness>``，读到别人的 baseline ⇒ 漏审（见
+    ``scope_marker_identity_key.scope_marker_candidate_paths`` 对两层顺序的论证）。
     """
     return scope_marker_candidate_paths(
         marker_directory=_baseline_root(root),

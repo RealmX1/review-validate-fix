@@ -62,11 +62,20 @@ KANBAN_RUNTIME_AGENT_DESCRIPTOR_ENV = "AI_AGENT"
 # 各 harness 在**自己启动的进程树**里留下的原生环境标记（不经 RVF shim 注入）。
 # ``seal_round_baseline_to_head`` 跑在 agent shell 里、拿不到 shim 注入的 agent id，
 # 只能靠这一层。实测 Claude Code 会设 ``CLAUDECODE=1`` 与 ``CLAUDE_CODE_SESSION_ID``。
+#
+# **入选门槛：必须是「当前进程正跑在该 harness 的会话里」的证据，而不是「本机装过该
+# harness」的证据。** ``CODEX_HOME`` 曾被列在这里，是错的：它是用户 shell profile 里
+# 的**常驻安装路径 override**（本仓 ``adapters/codex/subagent.py`` 正是拿它解析
+# ``$CODEX_HOME/sessions``），设过它的用户在 Cursor 会话、或在只有 ``AI_AGENT`` 可用
+# 的 kanban / seal 路径下，都会被这一层抢答成 ``codex-cli``——而本层整体排在 ``AI_AGENT``
+# 之前，误判会**压过**下游那些明确的非 Codex 信号。归一一旦在 seal 与 hook 两侧裂开，
+# 封窗就写进 Stop 读不到的 key（封窗失效 ⇒ 多派），或 UPS/Stop 不一致（⇒ 漏审）。
+# 因此只保留会话级的 ``CODEX_SESSION_ID``；判不出时回退到 ``unspecified``（读侧对它有
+# 专门的回退候选，至多窗口偏宽 ⇒ 多审）严格优于猜一个错误的具体 token。
 _HARNESS_NATIVE_ENVIRONMENT_MARKERS: tuple[tuple[str, str], ...] = (
     ("CLAUDECODE", PARENT_HARNESS_IDENTITY_CLAUDE_CODE),
     ("CLAUDE_CODE_SESSION_ID", PARENT_HARNESS_IDENTITY_CLAUDE_CODE),
     ("CODEX_SESSION_ID", PARENT_HARNESS_IDENTITY_CODEX_CLI),
-    ("CODEX_HOME", PARENT_HARNESS_IDENTITY_CODEX_CLI),
     ("CURSOR_AGENT", PARENT_HARNESS_IDENTITY_CURSOR_CLI),
 )
 

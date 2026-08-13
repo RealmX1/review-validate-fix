@@ -120,30 +120,55 @@ def scope_marker_candidate_paths(
 
     ``repository_identity is None`` ⇒ 返回空列表（fail-closed，见模块头）。
 
-    ``parent_harness_identity`` 非 None 且非 ``unspecified`` 时，每个 key 后面**追加**
-    一条 ``--harness-unspecified`` 回退候选。它接住两类 marker：迁移工具写出的历史
-    marker（旧格式里根本没有 harness 可恢复），以及某个写入点比读取点少一层可用信号时
-    留下的那份。命中回退只会让窗口偏宽——这是安全方向。
+    ``parent_harness_identity`` 非 None 且非 ``unspecified`` 时，列表里**追加**一层
+    ``--harness-unspecified`` 回退候选。它接住两类 marker：迁移工具写出的历史 marker
+    （旧格式里根本没有 harness 可恢复），以及某个写入点比读取点少一层可用信号时留下的
+    那份。命中回退只会让窗口偏宽——这是安全方向。
+
+    **候选顺序是两层，外层 harness 精度、内层 key 维度**，即
+    ``task-<exact>`` → ``sess-<exact>`` → ``task-unspecified`` → ``sess-unspecified``。
+    两层的先后不能对调，理由各自独立：
+
+    - **精度必须是外层**：``unspecified`` 只是「同一 key 维度内判不出 harness」的回退，
+      它代表的 marker 可能是迁移产物、也可能是**另一个**会话在判不出身份时留下的。让它
+      越过本会话精确写入的 ``sess-<exact>``，读到的就是别人的 baseline，窗口下界被抬高
+      ⇒ 漏审——正是本模块与 ``parent_harness_identity`` 要消除的那件事，方向还反了。
+      回退的安全性（偏宽 ⇒ 多审）只在「本会话没有更精确的 marker」时才成立。
+    - **同一精度层内仍是 task 优先于 session**：这条语义与 ``round_baseline_marker`` /
+      ``review_highwater_marker`` 的「task_id 优先、session_id 回退」写侧键选择同源，
+      不受本次分层影响。
+
+    ``[0]`` 仍是「最精确 harness + 最优先 key」那一条，故写者目标不因分层而改变。
     """
     if repository_identity is None:
         return []
 
-    harness_variants: list[str | None]
+    # 从最精确到最模糊；``None`` 表示这种 marker 根本不按 harness 分键（highwater）。
+    harness_identity_variants_from_most_to_least_precise: list[str | None]
     if parent_harness_identity is None:
-        harness_variants = [None]
+        harness_identity_variants_from_most_to_least_precise = [None]
     elif parent_harness_identity == PARENT_HARNESS_IDENTITY_UNSPECIFIED:
-        harness_variants = [PARENT_HARNESS_IDENTITY_UNSPECIFIED]
+        harness_identity_variants_from_most_to_least_precise = [
+            PARENT_HARNESS_IDENTITY_UNSPECIFIED
+        ]
     else:
-        harness_variants = [parent_harness_identity, PARENT_HARNESS_IDENTITY_UNSPECIFIED]
+        harness_identity_variants_from_most_to_least_precise = [
+            parent_harness_identity,
+            PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        ]
+
+    key_prefix_and_token_pairs_in_priority_order = [
+        (key_prefix, key_token)
+        for key_prefix, key_token in (
+            (TASK_KEYED_MARKER_FILE_NAME_PREFIX, task_id_token),
+            (SESSION_KEYED_MARKER_FILE_NAME_PREFIX, session_id_token),
+        )
+        if key_token
+    ]
 
     paths: list[Path] = []
-    for key_prefix, key_token in (
-        (TASK_KEYED_MARKER_FILE_NAME_PREFIX, task_id_token),
-        (SESSION_KEYED_MARKER_FILE_NAME_PREFIX, session_id_token),
-    ):
-        if not key_token:
-            continue
-        for harness_variant in harness_variants:
+    for harness_variant in harness_identity_variants_from_most_to_least_precise:
+        for key_prefix, key_token in key_prefix_and_token_pairs_in_priority_order:
             paths.append(
                 marker_directory
                 / scope_marker_file_name(

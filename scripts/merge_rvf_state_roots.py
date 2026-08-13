@@ -89,11 +89,13 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa
 # ``runtime_marker_file_name_for_migrated_marker``）。同上一条：绝不在这里另写一份命名规则。
 from core.host_adapter.parent_harness_identity import (  # noqa: E402
     PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+    normalize_parent_harness_identity,
 )
 from core.session_scope_allocation import review_highwater_marker  # noqa: E402
 from core.session_scope_allocation import round_baseline_marker  # noqa: E402
 from core.session_scope_allocation.scope_marker_identity_key import (  # noqa: E402
     MARKER_FILE_NAME_SEGMENT_SEPARATOR,
+    PARENT_HARNESS_IDENTITY_FILE_NAME_SEGMENT_PREFIX,
     REPOSITORY_IDENTITY_FILE_NAME_SEGMENT_PREFIX,
 )
 
@@ -3009,6 +3011,74 @@ def migrated_marker_repository_is_absent_from_disk(
     return not Path(repository.strip()).exists()
 
 
+def parent_harness_identity_recorded_in_marker_file_name(marker_file_name: str) -> str | None:
+    """从 marker 文件名里读回**已经写在名字里**的 harness 身份段；没有这一段返回 None。
+
+    返回 None 的语义是「这个名字是旧格式（根本没记过 harness）」，而不是「记过但判不出」
+    ——后者在文件名里是货真价实的 ``--harness-unspecified`` 段，会被原样读回来。两者必须
+    分得开：只有前者才允许回退到 ``unspecified``。
+
+    从**最后**一个 ``--harness-`` 处切，不是第一个：仓身份段来自 ``repo_key()``，其名字
+    部分过的是 ``safe_token``，而 ``safe_token`` 把 ``-`` 留在允许字符集里、并不折叠连续
+    的 ``-``，所以一个叫 ``foo--harness-bar`` 的仓目录能让仓身份段自己就含这个串。反过来
+    harness token 过的是 ``_sanitize_harness_identity_token``，它显式折叠 ``--``，因此
+    harness 段内部永远不含 ``--harness-`` —— 最后一个出现位置必定是真正的段边界。
+    """
+    marker_file_name_segment_prefix_for_parent_harness_identity = (
+        MARKER_FILE_NAME_SEGMENT_SEPARATOR
+        + PARENT_HARNESS_IDENTITY_FILE_NAME_SEGMENT_PREFIX
+        + "-"
+    )
+    (
+        text_before_harness_segment,
+        harness_segment_separator_was_found,
+        harness_identity_token,
+    ) = marker_file_name.rpartition(
+        marker_file_name_segment_prefix_for_parent_harness_identity
+    )
+    if not harness_segment_separator_was_found or not text_before_harness_segment:
+        return None
+    return harness_identity_token.strip() or None
+
+
+def parent_harness_identity_for_migrated_round_baseline_marker(
+    *,
+    legacy_marker_name: str,
+    marker_document: Mapping[str, Any] | None,
+) -> str:
+    """迁移一份 round-baseline marker 时，应该按哪个 harness 身份重新派生它的文件名。
+
+    优先级（**第一顺位必须是文件名**）：
+
+    1. 文件名里已有的 ``--harness-<id>`` 段。F1.2 的硬顺序是「先部署新代码、再迁移数据」，
+       所以真正跑迁移时两根里必然新旧两种名字并存，新名那批的 harness 身份是运行时**当场
+       判定并落盘过**的事实，比任何事后重判都可信。
+    2. marker 正文的 ``parent_harness_identity``。同一次写入里文件名与正文共用同一个取值
+       （见 ``round_baseline_marker.write_round_baseline_marker``），所以它只是同一事实的
+       第二个副本；留作次要来源，接住「正文健在但文件名被人手工改过」这类残缺输入。
+    3. 都没有 ⇒ ``unspecified``。这**只**适用于旧格式：旧 marker 里根本没记过 harness，
+       无从恢复，而读侧候选列表显式包含 ``--harness-unspecified`` 作回退，命中它至多让窗口
+       偏宽（多审），不会让 marker 消失。
+
+    为什么不能像最初那样对所有输入无条件写 ``unspecified``：那样一来同一个 task 下
+    ``--harness-claude-code`` 与 ``--harness-codex-cli`` 两份 marker 会被重键到**同一个**
+    目标文件、后写的覆盖先写的，而且对账表两条都记成 written（静默丢一份）。那恰好把
+    「harness 身份编进 round-baseline key」这一刀要消除的跨 harness 互相覆盖原样恢复回来。
+    """
+    identity_recorded_in_file_name = parent_harness_identity_recorded_in_marker_file_name(
+        legacy_marker_name
+    )
+    if identity_recorded_in_file_name:
+        return identity_recorded_in_file_name
+    identity_recorded_in_document = (marker_document or {}).get("parent_harness_identity")
+    normalized_identity_from_document = normalize_parent_harness_identity(
+        identity_recorded_in_document if isinstance(identity_recorded_in_document, str) else None
+    )
+    if normalized_identity_from_document:
+        return normalized_identity_from_document
+    return PARENT_HARNESS_IDENTITY_UNSPECIFIED
+
+
 def runtime_marker_file_name_for_migrated_marker(
     *,
     legacy_marker_name: str,
@@ -3028,14 +3098,19 @@ def runtime_marker_file_name_for_migrated_marker(
     本次改 key 要消除的东西（实测反例 ``task-a877b`` 在两根分别指 cline-kanban 与
     my-ai-setup 两个毫不相干的仓）。
 
-    harness 身份一律写 ``unspecified``：旧格式根本没记过它，无从恢复。这不是降级——
-    运行时读侧的候选列表**显式包含** ``--harness-unspecified`` 作回退，所以迁移过来的
-    marker 照样读得到；只是它对「哪个 harness 写的」不作断言，命中它至多让窗口偏宽。
+    harness 身份（仅 round-baseline）按
+    ``parent_harness_identity_for_migrated_round_baseline_marker`` 判定：文件名里已有的
+    ``--harness-<id>`` 段优先、正文的 ``parent_harness_identity`` 次之，两者都没有（即真正的
+    旧格式）才回退 ``unspecified``。**不许对所有输入无条件写 ``unspecified``**：那会把同一
+    task 下两个 harness 的新格式 marker 重键到同一个目标文件、互相覆盖。回退本身不是降级
+    ——读侧候选列表**显式包含** ``--harness-unspecified``，所以旧格式迁过来照样读得到；只是
+    它对「哪个 harness 写的」不作断言，命中它至多让窗口偏宽。
 
     **必须幂等**：F1.2 的硬顺序是「先部署新代码、再迁移数据」，所以真正跑迁移时两个根里
     必然**新旧两种文件名并存**——部署之后写出的是新名，之前的是旧名。这里先把 key token
     从任一种格式里剥出来（切掉 ``--repo-`` 及其之后的一切）再统一重新派生，于是「已经是
-    新名」的输入产出同一个名字，而不是 ``task-x--repo-A--repo-A`` 这种叠加。
+    新名」的输入产出同一个名字，而不是 ``task-x--repo-A--repo-A`` 这种叠加。幂等的判据是
+    **整个文件名**原样不变，因此 harness 段必须跟着一起还原，而不只是 key token。
     """
     if marker_subdirectory == REVIEW_HIGHWATER_SUBDIRECTORY:
         marker_module: Any = review_highwater_marker
@@ -3043,7 +3118,12 @@ def runtime_marker_file_name_for_migrated_marker(
     elif marker_subdirectory == ROUND_BASELINE_PENDING_SUBDIRECTORY:
         marker_module = round_baseline_marker
         harness_keyword_arguments = {
-            "parent_harness_identity": PARENT_HARNESS_IDENTITY_UNSPECIFIED
+            "parent_harness_identity": (
+                parent_harness_identity_for_migrated_round_baseline_marker(
+                    legacy_marker_name=legacy_marker_name,
+                    marker_document=marker_document,
+                )
+            )
         }
     else:  # pragma: no cover - 调用点只有上面两种
         return None

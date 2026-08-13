@@ -5296,6 +5296,38 @@ def test_parent_harness_identity_normalizes_every_signal_layer_to_one_token(tmp:
     ]
     assert set(codex_layers) == {phi.PARENT_HARNESS_IDENTITY_CODEX_CLI}, codex_layers
 
+    # ``CODEX_HOME`` 不是身份信号，是**常驻安装路径 override**（本仓 adapters/codex/
+    # subagent.py 正是拿它解析 $CODEX_HOME/sessions）。它一旦被当成「当前进程是 Codex」
+    # 的证据，就会在 harness 原生标记层抢答，而该层整体排在 ``AI_AGENT`` 之前——于是它
+    # 压过下游明确的非 Codex 信号：设过 CODEX_HOME 的用户在 Cursor 会话、或在只有
+    # AI_AGENT 可用的 kanban / seal 路径下，都会被误判成 codex-cli，seal 与 hook 两侧
+    # 归一随即裂开（封窗写进 Stop 读不到的 key ⇒ 多派；UPS/Stop 不一致 ⇒ 漏审）。
+    codex_home_environment = {"CODEX_HOME": "/Users/someone/.codex"}
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CURSOR_AGENT": "1"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CURSOR_CLI, "CODEX_HOME 压过了明确的 CURSOR_AGENT"
+    assert phi.resolve_parent_harness_identity(
+        environ={
+            **codex_home_environment,
+            phi.KANBAN_RUNTIME_AGENT_DESCRIPTOR_ENV: "claude-code_2-1-231_agent",
+        }
+    ) == phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, "CODEX_HOME 压过了明确的 AI_AGENT"
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CLAUDECODE": "1"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, "CODEX_HOME 压过了同层的 CLAUDECODE"
+    # 连一个别的信号都没有时也不许拿 CODEX_HOME 顶包：猜错一个**具体** token 会让写者与
+    # 读者落到不同的 key（marker 消失 ⇒ 漏审），而 unspecified 在读侧有专门的回退候选，
+    # 至多让窗口偏宽（多审）。判不出就老实判不出，严格更安全。
+    assert (
+        phi.resolve_parent_harness_identity(environ=dict(codex_home_environment))
+        == phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED
+    ), "CODEX_HOME 被单独当成了 Codex 会话证据"
+    # 会话级的 CODEX_SESSION_ID 才是真信号，必须继续生效（上面 codex_layers 已覆盖），
+    # 且它与常驻的 CODEX_HOME 同时存在时结论不变。
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CODEX_SESSION_ID": "x"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CODEX_CLI
+
     # 两个 harness 必须互不相等，否则整个分键是空操作。
     assert (
         phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE != phi.PARENT_HARNESS_IDENTITY_CODEX_CLI
@@ -5377,6 +5409,115 @@ def test_round_baseline_marker_is_not_shared_across_parent_harnesses(tmp: Path) 
         task_id="fallback-task", session_id=None, repo=str(repo),
         parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
     ) == fallback_head
+
+
+def test_exact_harness_scope_marker_candidates_outrank_unspecified_fallback(tmp: Path) -> None:
+    """``unspecified`` 回退不得越过更精确的候选去抢先命中。
+
+    ``unspecified`` 的设计意图是「**同一 key 维度内**判不出 harness 时的回退」。若候选顺序
+    以 key 维度为外层、harness 为内层（``task-<exact>`` → ``task-unspecified`` →
+    ``sess-<exact>`` → ``sess-unspecified``），那么本会话精确写入的 ``sess-<exact>`` 会被
+    「迁移工具或另一个判不出身份的会话留下的 ``task-unspecified``」抢先命中——读到别人的
+    baseline，窗口下界被**抬高** ⇒ 漏审。回退「至多让窗口偏宽（多审）」这条安全性论证，
+    只在本会话确实没有更精确 marker 时才成立。
+
+    故顺序必须是两层：外层 harness 精度、内层 key 维度。本用例同时钉死两条不变量——
+    精度分层（新）与同层内 task 优先于 session（既有语义，不得被本次分层改掉）。
+    """
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from core.host_adapter import parent_harness_identity as phi  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import scope_marker_identity_key as smk  # noqa: PLC0415
+
+    # ---- ① 候选顺序本身：精确 harness 的两条全部排在任何 unspecified 之前 ----
+    candidate_names = [
+        path.name
+        for path in smk.scope_marker_candidate_paths(
+            marker_directory=tmp / "candidates",
+            task_id_token="T",
+            session_id_token="S",
+            repository_identity="repoid",
+            parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        )
+    ]
+    assert candidate_names == [
+        f"task-T--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE}.json",
+        f"sess-S--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE}.json",
+        f"task-T--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED}.json",
+        f"sess-S--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED}.json",
+    ], candidate_names
+    # 写者仍取 [0]：分层不得改变写入目标（最精确 harness + 最优先 key）。
+    assert candidate_names[0].startswith("task-T--")
+    # 不按 harness 分键的 marker（highwater）完全不受分层影响，仍是 task → sess。
+    assert [
+        path.name
+        for path in smk.scope_marker_candidate_paths(
+            marker_directory=tmp / "candidates",
+            task_id_token="T",
+            session_id_token="S",
+            repository_identity="repoid",
+            parent_harness_identity=None,
+        )
+    ] == ["task-T--repo-repoid.json", "sess-S--repo-repoid.json"]
+
+    repo, _baseline = _committed_round_repo(tmp)
+    root = tmp / "state"
+    own_session_head = "a" * 40
+    foreign_unspecified_head = "b" * 40
+    own_task_head = "d" * 40
+
+    # ---- ② 端到端：sess-<exact> 与 task-unspecified 并存时，读到本会话精确写入的那份 ----
+    # 本会话 UPS 时拿不到 task_id，故精确写入 sess-<claude-code>。
+    rbm.write_round_baseline_marker(
+        task_id=None, session_id="own-session", baseline_head=own_session_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        root=root,
+    )
+    # 迁移工具 / 另一个判不出身份的会话在同一个 task 下留下的那份。
+    rbm.write_round_baseline_marker(
+        task_id="shared-task", session_id=None, baseline_head=foreign_unspecified_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == own_session_head, "别的会话的 task-unspecified 抢在本会话 sess-<exact> 之前命中 ⇒ 漏审"
+
+    # ---- ③ 既有语义：同一精度层内 task 仍优先于 session ----
+    rbm.write_round_baseline_marker(
+        task_id="shared-task", session_id=None, baseline_head=own_task_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == own_task_head, "同一精度层内 task 优先于 session 的既有语义被改掉了"
+
+    # ---- ④ 既有语义：本会话没有任何精确 marker 时，unspecified 回退仍接得住迁移产物 ----
+    migrated_head = "e" * 40
+    rbm.write_round_baseline_marker(
+        task_id="migrated-only-task", session_id=None, baseline_head=migrated_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="migrated-only-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CODEX_CLI, root=root,
+    ) == migrated_head, "unspecified 回退没接住迁移产物 ⇒ marker 消失"
+
+    # ---- ⑤ highwater 不按 harness 分键，读写路径不受本次分层影响 ----
+    highwater_head = "f" * 40
+    hwm.write_review_highwater(
+        task_id="hw-task", session_id="own-session", reviewed_head=highwater_head,
+        repo=str(repo), root=root,
+    )
+    assert hwm.resolve_review_highwater_head(
+        task_id="hw-task", session_id="own-session", repo=str(repo), root=root,
+    ) == highwater_head
 
 
 def test_scope_markers_do_not_collide_across_repositories_sharing_a_task_id(tmp: Path) -> None:
@@ -8887,6 +9028,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "round_baseline_marker_is_not_shared_across_parent_harnesses",
             lambda: test_round_baseline_marker_is_not_shared_across_parent_harnesses(
                 root / "round-baseline-per-harness"
+            ),
+        ),
+        (
+            "exact_harness_scope_marker_candidates_outrank_unspecified_fallback",
+            lambda: test_exact_harness_scope_marker_candidates_outrank_unspecified_fallback(
+                root / "marker-precision-ordering"
             ),
         ),
         (
