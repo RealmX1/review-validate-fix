@@ -36,6 +36,8 @@ __all__ = [
     'test_dispatch_reviewers_failclose_when_leg_without_review_result_unfilled',
     'test_dispatch_reviewers_rc_zero_without_review_result_is_not_effective',
     'test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted',
+    'test_dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit',
+    'test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock',
     'test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure',
     'test_dispatch_reviewers_wait_status_surfaces_plan_outcome',
     'test_dispatch_reviewers_probe_excludes_cooldown',
@@ -942,6 +944,135 @@ def test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted(tmp_path:
     assert "reviewer_leg_produced_no_review_result" not in codes, plan["warnings"]
     # request 不是环境故障，更不是额度问题：不写 cooldown。
     assert plan["cooldown_recorded"] == [], plan["cooldown_recorded"]
+
+
+def test_dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit(
+    tmp_path: Path,
+) -> None:
+    """一腿额度耗尽 + 一腿合法 kind: request 且额度腿补不上 → 不得谎称「全部额度耗尽」。
+
+    request 腿被排除出 `unfilled_without_review_result`，旧实现的
+    `ok == 0 and not unfilled_without_review_result` 因而成立，reason 落到
+    `all_reviewers_usage_limit_exhausted`：主会话据此只去等配额恢复，那条必须走
+    Contract Gate / Request Handling 的 request 被 reason 整条盖住。
+    """
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("usage", 100), "beta": ("review_request", 90)}
+    )
+    plan = d.route("codex", ["alpha", "beta"], reg)
+    assert plan["routing_rule"] == "R1", plan
+    run_dir = tmp_path / "run"
+    artifacts_dir = run_dir / "artifacts"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    with _with_cooldown_env(cooldown_root):
+        plan = d.execute_plan(
+            plan,
+            repo=str(repo),
+            review_packet=str(packet),
+            session_context=None,
+            scope_contract=None,
+            run_id="usage-plus-request-test",
+            run_dir=str(run_dir),
+            artifacts_dir=artifacts_dir,
+            registry=reg,
+            main_harness="codex",
+            available=["alpha", "beta"],
+        )
+    # 额度腿补不上 ⇒ 仍 fail-close；但「全部额度耗尽」是假的，reason 必须自报混合。
+    assert plan["status"] == "failed", plan
+    assert plan["effective_reviewer_count"] == 0, plan
+    assert plan["reason"] == (
+        "reviewer_usage_limit_unfilled" + d.REVIEW_REQUEST_PENDING_REASON_SUFFIX
+    ), plan
+    codes = [w["code"] for w in plan["warnings"]]
+    assert "all_reviewers_usage_limit_exhausted" not in codes, plan["warnings"]
+    assert "reviewer_review_request_pending" in codes, plan["warnings"]
+    # request 腿既没被换掉，也没被当成失败腿写 cooldown。
+    assert plan["fallbacks"] == [], plan["fallbacks"]
+    assert plan["review_request_pending_reviewer_ids"] == ["beta-cli"], plan
+    assert plan["cooldown_recorded"] == ["alpha"], plan["cooldown_recorded"]
+    assert not (cooldown_root / "harness-beta.json").exists(), list(cooldown_root.glob("*"))
+
+
+def test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock(
+    tmp_path: Path,
+) -> None:
+    """`blocked_on_reviewer_request` 必须以专用非 0 码收尾，否则 detached 幂等锁把 run 锁死。
+
+    旧实现下该终态与 completed 同样 rc=0：detached helper 的 staleness 判定
+    (`_detached_run_finished_clean`) 认定「run 已干净完成」→ 拒绝重夺锁 → 主会话按协议
+    处置完 request 再跑 `--execute --detached` 永远只拿到 `already_running`，本 run 再也
+    产不出 `status: completed` 的 reviewed-candidate 证据。
+    """
+    d = load_dispatch_reviewers_module()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cooldown_root = tmp_path / "cooldown"
+    reg = _make_usage_or_clean_registry(
+        tmp_path, {"alpha": ("review_request", 100), "beta": ("clean", 90)}
+    )
+    reg_path = tmp_path / "registry.json"
+    reg_path.write_text(json.dumps(reg), encoding="utf-8")
+    run_dir = tmp_path / "run"
+    packet = tmp_path / "packet.md"
+    packet.write_text("## Review Packet\n\nx\n", encoding="utf-8")
+    repo = init_repo(tmp_path / "repo")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CODEX_RVF_")}
+    env["RVF_HARNESS_LIMIT_COOLDOWN_ROOT"] = str(cooldown_root)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "dispatch_reviewers.py"),
+            "--registry",
+            str(reg_path),
+            "--main-harness",
+            "codex",
+            "--assume-available",
+            "alpha,beta",
+            "--repo",
+            str(repo),
+            "--review-packet",
+            str(packet),
+            "--rvf-run-id",
+            "blocked-exit-code-test",
+            "--rvf-run-dir",
+            str(run_dir),
+            "--execute",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    plan = json.loads(
+        (run_dir / "artifacts" / "reviewers" / "reviewer-plan.json").read_text(encoding="utf-8")
+    )
+    assert plan["status"] == "blocked_on_reviewer_request", plan
+    assert plan["status"] == d.PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST, plan
+    # 专用码：既不是 completed 的 0（会让锁永久保留），也不是 failed 的 1（无人出故障）。
+    assert completed.returncode == d.DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE, (
+        completed.returncode,
+        completed.stderr[-2000:],
+    )
+    assert d.DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE not in (0, 1)
+
+    # 端到端闭合：带该退出码的 status.json + 已死 tmux session ⇒ 锁判陈旧、重夺并重派，
+    # 而不是永远 already_running。
+    detached = load_rvf_detached_thread_module()
+    lock_root = tmp_path / "detached"
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path, status_path = _seed_detached_stale_lock(
+        lock_root, returncode=d.DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE
+    )
+    assert detached._detached_run_finished_clean(status_path) is False
+    result, recorded = _launch_detached_with_staleness_env(
+        detached, lock_root, lock_path=lock_path, status_path=status_path, has_session_rc="1"
+    )
+    assert result["launch_status"] == "launched", result
+    assert any(a[:1] == ["new-session"] for a in recorded), recorded
 
 
 def test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure(tmp_path: Path) -> None:

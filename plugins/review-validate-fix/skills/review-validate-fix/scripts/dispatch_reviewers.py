@@ -81,6 +81,18 @@ DEFAULT_REGISTRY = resolved_rvf_reviewer_registry_path(
 RUN_ALTERNATIVE_REVIEWER = Path(__file__).resolve().parent / "run_alternative_reviewer.py"
 PLAN_SCHEMA_VERSION = 1
 
+# 本轮 double-review 的**非完成态终态**：有腿返回合法 ``kind: request``（review 协议规定的
+# 待处理终态，既不是故障也不是完成态 review）。给名字而不是散落字面量，便于消费方对齐。
+PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
+# 该终态的**专用退出码**。既不能是 failed 的 1（那会把「无人出故障、只是等主会话处置」
+# 谎报成故障），更不能是 0——0 表示「被包命令干净完成」，会让 detached 幂等锁被
+# ``rvf_detached_thread._detached_run_finished_clean`` 判为「已完成的 run」而永久保留，
+# 后续按协议重派只能拿到 ``already_running``，本 run 再也产不出完成态 review（见 main()）。
+DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE = 3
+# 真失败腿与待处理 request **并存**时，追加到失败类 reason 末尾的后缀。plan 的 ``reason``
+# 只有一个槽位，混合情形必须自报混合（与 usage_limit × no_review_result 的混合 reason 同源）。
+REVIEW_REQUEST_PENDING_REASON_SUFFIX = "_with_review_request_pending"
+
 # Detached 派发线程（--detached / --wait-status）：把「agent 前台 Bash 调用 ↔ 整轮
 # 派发 wall-clock」解耦，突破 Bash 工具 600s 硬上限。status/log/lock 落在
 # <artifacts>/reviewers/ 下，与 reviewer-plan.json / 各 reviewer artifact 同处。
@@ -660,6 +672,11 @@ def execute_plan(
     ``status: blocked_on_reviewer_request`` + ``reason: reviewer_review_request_pending``，
     并在 ``review_request_pending_reviewer_ids`` 列出腿。否则替换 leg 一成功 plan 就变
     ``completed``，主会话再也不会按 Contract Gate 满足/驳回该 request。
+
+    request 腿同样**不算**「额度失败腿」：``all_reviewers_usage_limit_exhausted`` 的「全部」
+    要求所有腿都撞额度，夹着一条 request 时该断言为假。真失败腿与 request 并存时 fail-close
+    仍优先（``status: failed``），但 reason 追加 ``_with_review_request_pending`` 后缀自报混合，
+    否则主会话只会去等配额/修 auth，那条 request 从头到尾没进过 Contract Gate。
     """
     reviewers = plan.get("reviewers", [])
     cooled: set[str] = set()
@@ -858,8 +875,15 @@ def execute_plan(
         # 整体 fail-close 判 failed + 响亮信号，绝不静默置伪 R3 last-resort。
         plan["status"] = "failed"
         main_exhausted = bool(main_harness) and main_harness in cooled
-        if ok == 0 and not unfilled_without_review_result:
-            # 「全部」只在**所有**失败腿都是额度类时才成立；混着 auth/崩溃时见下方混合分支。
+        if (
+            ok == 0
+            and not unfilled_without_review_result
+            and not pending_request_slots
+        ):
+            # 「全部」只在**所有**腿都是额度失败时才成立。混着 auth/崩溃见下方混合分支；
+            # 混着合法 kind: request 腿时同样不成立——那条腿没失败、更不是额度问题，把它算进
+            # 「全部额度耗尽」会让主会话照「等配额恢复」处置，漏掉必须走 Contract Gate 的 request
+            #（此处仅排除该谎报，混合事实由下方 pending 分支的 reason 后缀自报）。
             reason = "all_reviewers_usage_limit_exhausted"
             message = "全部 reviewer 腿均因额度/配额耗尽失败，且无可用 harness 可回退；本轮 external double-review 无法完成。"
         elif main_exhausted:
@@ -916,8 +940,13 @@ def execute_plan(
         if not unfilled_usage and not unfilled_without_review_result:
             # 没有任何真失败腿时，本轮的 canonical 终态就是「被 request 阻塞」——
             # 既不是 completed（reviewer 没审完），也不是失败（无人出故障）。
-            plan["status"] = "blocked_on_reviewer_request"
+            plan["status"] = PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST
             plan["reason"] = "reviewer_review_request_pending"
+        elif plan.get("reason"):
+            # 与真失败腿并存：fail-close 优先，status 保持 failed；但 reason 只有一个槽位，
+            # 必须自报「还夹着一条待处理 request」——否则主会话照失败类 reason 处置完
+            #（等配额 / 修 auth）就重跑，那条 request 从头到尾没被 Contract Gate 处理过。
+            plan["reason"] = f"{plan['reason']}{REVIEW_REQUEST_PENDING_REASON_SUFFIX}"
 
     return plan
 
@@ -1088,6 +1117,9 @@ def launch_detached_dispatch(
     ``--wait-status`` 有界轮询 ``status.json`` 直到终态。施加一个比任何单 reviewer 都宽
     的总 backstop（``--total-timeout``，默认 2700s）保证 ``status.json`` 终会落终态。
     幂等：同一 run 重复 ``--execute --detached`` 命中 O_EXCL 锁 → ``already_running``。
+    该幂等只对**干净完成**（被包命令 rc=0）的 run 成立：非完成态终态以非 0 收尾
+    （failed→1、``blocked_on_reviewer_request``→``DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE``），
+    线程已死时锁会被判陈旧并重夺，主会话处置完 reviewer request 后能经同一入口重派。
     """
     reviewers_dir.mkdir(parents=True, exist_ok=True)
     status_path = reviewers_dir / DISPATCH_STATUS_FILENAME
@@ -1445,6 +1477,14 @@ def main() -> int:
 
     if plan["status"] == "failed":
         return 1
+    if plan["status"] == PLAN_STATUS_BLOCKED_ON_REVIEWER_REQUEST:
+        # 非完成态终态**不得**以 0 收尾。0 的含义是「被包命令干净完成」：detached 幂等锁的
+        # staleness 判定（``rvf_detached_thread._detached_run_finished_clean``）据此认定该 run
+        # 已完成、拒绝重夺锁，于是主会话按 SKILL.md 处置完 request 后再跑
+        # ``--execute --detached`` 只会拿到 ``already_running``——本 run 永远产不出
+        # ``status: completed`` 的 reviewed-candidate 证据，只能绕过单一入口或手改协议 artifact。
+        # 专用码 3 让锁可被重夺（可正常重派），又与真故障的 1 区分开。
+        return DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE
     return 0
 
 

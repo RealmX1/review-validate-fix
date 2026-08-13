@@ -8436,6 +8436,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit",
+            lambda: test_dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit(
+                root / "dispatch-usage-plus-request"
+            ),
+        ),
+        (
+            "dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock",
+            lambda: test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock(
+                root / "dispatch-blocked-request-exit-code"
+            ),
+        ),
+        (
             "dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure",
             lambda: test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure(
                 root / "dispatch-failclose-mixed"
@@ -10280,6 +10292,11 @@ _disprev.inject(
     _with_cooldown_env=_with_cooldown_env,
     init_repo=init_repo,
     SCRIPT_DIR=SCRIPT_DIR,
+    # detached 幂等锁的 staleness 现场构造器：dispatch 侧「非完成态终态退出码 ⇒ 锁可重夺」
+    # 的闭合断言要用（退出码语义归 dispatch_reviewers.py 所有，故断言留在本簇）。
+    load_rvf_detached_thread_module=load_rvf_detached_thread_module,
+    _seed_detached_stale_lock=_seed_detached_stale_lock,
+    _launch_detached_with_staleness_env=_launch_detached_with_staleness_env,
 )
 globals().update({_n: getattr(_disprev, _n) for _n in _disprev.__all__})
 

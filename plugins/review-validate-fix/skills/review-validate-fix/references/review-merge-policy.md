@@ -40,6 +40,8 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 - **fail-close（不伪装 R3）**：补不上时 plan 一律 `status: failed` + 响亮 warning，**绝不**静默置 `needs_last_resort_fallback` 伪装成 0-external 的正常 R3 in-harness mimic，也绝不停在 `partial` 让主会话拿单路结论当双评审用。reason 码按失败类别：额度类发 `main_harness_usage_limit_exhausted` / `all_reviewers_usage_limit_exhausted`（probe 阶段全被 cooldown 清空则发 `all_harnesses_usage_limited`）；其它类发 `reviewer_leg_produced_no_review_result`（warning 里列出失败 harness 与退出码，指向对应 `reviewer.stderr*.txt`）。`fallbacks` 非空只说明发生过回退；canonical outcome 仍以 `reviewer-plan.json` 的 `status` / `effective_reviewer_count` 与每路 `review-result.json` 为准。
 - **混合失败必须自报混合**：`all_reviewers_usage_limit_exhausted` 只在**所有**失败腿都是额度类时才发。一腿撞额度、另一腿认证失败/崩溃/无 artifact 时，reason 发 `reviewer_legs_failed_mixed_usage_limit_and_no_review_result`，且两类 warning（`*_usage_limit_*` 与 `reviewer_leg_produced_no_review_result`）都会出现——否则主会话只会去等配额恢复，同时需要修的非额度故障被整条藏住。
 - **合法 `kind: request` 腿不是失败腿**：runner 对它以 rc=0 收尾并在 `reviewer.summary.json` 记 `review_request_pending: true`。dispatcher **不**换腿、**不**排除该 harness、**不**写 cooldown，而是把它作为待处理终态冒泡：plan 记 `review_request_pending_reviewer_ids`，无任何真失败腿时 `status: blocked_on_reviewer_request` + `reason: reviewer_review_request_pending`。若按 `no_review_result` 换腿，替换腿一成功 plan 就会变 `completed`，request 被静默丢弃、主会话再也不会按下面的 Contract Gate / Request Handling 处理它。
+- **request 腿也不算「额度失败腿」**：`all_reviewers_usage_limit_exhausted` 的「全部」同样把 request 腿计在内——一腿撞额度、另一腿返回合法 `kind: request` 时该断言为假，不得发这个 reason。此时 fail-close 仍优先（`status: failed`、额度类 warning 照发），但 reason 在失败类基码末尾追加后缀 `_with_review_request_pending`（例如 `reviewer_usage_limit_unfilled_with_review_request_pending`、`reviewer_legs_failed_mixed_usage_limit_and_no_review_result_with_review_request_pending`），并同时发 `reviewer_review_request_pending` warning。reason 只有一个槽位，不自报混合的话主会话会照「等配额恢复」处置完就重跑，那条 request 从头到尾没进过 Contract Gate。
+- **非完成态终态不得以 rc=0 收尾**：`dispatch_reviewers.py --execute` 的退出码是 `completed`→0、`failed`→1、`blocked_on_reviewer_request`→**专用码 3**。这不是风格问题：detached 派发的每-run `O_EXCL` 幂等锁按「被包命令 rc==0 即该 run 已干净完成」判定不可重派，若 request 终态以 0 收尾，主会话按 Request Handling 处置完再跑 `--execute --detached` 只会得到 `already_running`，本 run 永远产不出 `status: completed` 的 reviewed-candidate 证据，只能绕过单一入口或手改协议 artifact。以 3 收尾则锁被判陈旧、可被重夺，重派走同一入口；要复现同一对 reviewer，重派时带上 plan `reviewer_selection.selection_seed` 的 `--selection-seed <seed>`。
 - **轮询侧不得只看 `returncode`**：`--wait-status` 打印的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `effective_reviewers=k/n` 才是判据（详见 SKILL.md 的轮询协议）。
 
 ## Contract Gate
@@ -77,7 +79,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 2. 判断 request 是否仍在 session scope 内。
 3. 按需提供 standards subset、命令锁、测量结果、上下文或由主会话 spawn 受控子任务。
 4. 把 request、决策、命令或子任务结果记录到 run ledger。
-5. 让原 reviewer 用同一 review packet 和新的 reviewer result artifact path 重试，直到返回 `kind: no_issues` 或 `kind: issues`。
+5. 让原 reviewer 用同一 review packet 和新的 reviewer result artifact path 重试，直到返回 `kind: no_issues` 或 `kind: issues`。重试仍由 `dispatch_reviewers.py` 单一入口负责：对同一 run 再跑一次 `--execute`（detached 路径同理），带 plan `reviewer_selection.selection_seed` 的 `--selection-seed <seed>` 复现同一对 reviewer；`blocked_on_reviewer_request` 以退出码 3 收尾，故 detached 幂等锁不会把本 run 锁死在 `already_running`。
 
 默认由主会话 spawn 子任务。只有平台能继承 run id、scope、manifest、packet 和 no-handoff/no-review-loop 约束时，才允许最多一层 nested subagent。
 
