@@ -73,6 +73,27 @@ for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
+# 铁律：测试绝不写真实 ``~/.rvf``（live infra ⇒ 假绿 + 污染用户状态）。上面那轮清扫把
+# ``RVF_HOME`` 家族的**专用** env（``RVF_WITHDRAWN_DISPATCH_TOMBSTONE_ROOT`` /
+# ``RVF_AGENTIC_INITIATION_GUARDIAN_ROOT`` / 决策 token store / 注入尝试 ledger /
+# kanban-followup 锁 …）连同 ``RVF_HOME`` 一起摘掉了，于是它们共同的解析链
+# 「显式参数 > 专用 env > ``$RVF_HOME`` > ``~/.rvf``」会直接落到最后一档的真实根。本文件的
+# 测试是**逐个手工 set/restore** 环境的——只要有一个新调用点落进这一族、而某个测试没跟着加
+# 隔离，就会静默写真实根（实测：``inspect_user_prompt_submit`` 见到 dispatch token 会抢
+# ``consumed`` 终态，把 tombstone 落进 ``~/.rvf/rvf-withdrawn-dispatch-tokens/``）。
+#
+# 隔离必须挂在**模块导入期**，而不是 ``main()`` 里：本文件同时也能被 bare pytest 直接收集
+# （``python3 -m pytest tests/test_review_support_scripts.py``），那条入口根本不经过
+# ``main()``，放在 ``main()`` 的隔离对它完全失效。导入期是手写 runner 与 bare pytest 两条
+# 入口唯一的公共上游。``--jobs`` 的 ``ProcessPoolExecutor`` worker 两种启动方式也都被覆盖：
+# fork 直接继承 ``os.environ``，spawn 会重新 import 本模块、各自再建一个隔离根。
+#
+# 用**强制赋值**而非 ``setdefault``：开发者 shell 里可能正带着指向真实根的 ``RVF_HOME``。
+# 个别测试仍可在自己作用域内 set/restore 覆盖本默认值，那条既有行为不受影响。
+_ISOLATED_RVF_HOME_FOR_TESTS = tempfile.mkdtemp(prefix="rvf-test-home-")
+os.environ["RVF_HOME"] = _ISOLATED_RVF_HOME_FOR_TESTS
+atexit.register(shutil.rmtree, _ISOLATED_RVF_HOME_FOR_TESTS, ignore_errors=True)
+
 
 def load_alternative_reviewer_module():
     spec = importlib.util.spec_from_file_location("rvf_run_alternative_reviewer", RUN_ALTERNATIVE_REVIEWER)
@@ -10812,6 +10833,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
+        # 注意：``RVF_HOME`` 的强制隔离**不在这里**，而在本文件模块导入期（见文件顶部
+        # ``_ISOLATED_RVF_HOME_FOR_TESTS``）。放在 ``main()`` 里只能盖住手写 runner 这一条
+        # 入口，bare pytest 直接收集本文件时不经过 ``main()`` ⇒ 隔离整个失效。别再往回搬。
         cases = selected_test_cases(
             review_support_test_cases(root),
             shard_count=args.shard_count,

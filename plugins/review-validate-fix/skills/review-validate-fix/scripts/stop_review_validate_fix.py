@@ -127,7 +127,9 @@ from kanban_followup_lock import (
     reengage_nudge_count as kanban_followup_lock_nudge_count,
     bump_reengage_nudge_count as bump_kanban_followup_lock_nudge_count,
     clear_pending_marker as clear_kanban_followup_pending,
+    dispatch_single_flight_for_task as kanban_followup_dispatch_single_flight_for_task,
     iter_pending_markers as iter_kanban_followup_pending,
+    pending_redispatch_attempt_count as kanban_followup_pending_redispatch_attempt_count,
     pending_status as kanban_followup_pending_status,
     read_pending_marker as read_kanban_followup_pending,
     stamp_pending_notified as stamp_kanban_followup_pending_notified,
@@ -178,10 +180,30 @@ from cline_kanban_client import (
     DEFAULT_START_TIMEOUT_SECONDS as DEFAULT_CLINE_KANBAN_START_TIMEOUT_SECONDS,
     DEFAULT_TASK_CMD as DEFAULT_CLINE_KANBAN_TASK_CMD,
     DEFAULT_TMUX_SESSION as DEFAULT_CLINE_KANBAN_TMUX_SESSION,
+    KanbanTerminalDeliveryInterfaceUnavailableError,
+    KanbanTerminalDeliveryRecordNotFoundError,
+    KanbanTerminalDeliveryVerdictNotYetAvailableError,
+    cancel_task_message_delivery,
+    read_task_message_terminal_delivery_status,
     task_payload_from_list,
     task_session_exit_code,
     task_session_state,
     unpark_task as cline_kanban_unpark_task,
+)
+from core.cline_kanban_terminal_delivery.cline_kanban_terminal_delivery_receipt import (  # noqa: E402 — 终端投递回执契约的唯一判读点（cline-kanban task cdea3 契约；RVF 只读）
+    REDISPATCH_DISPOSITION_ALLOWED_WITH_FRESH_IDEMPOTENCY_KEY,
+    REDISPATCH_DISPOSITION_NOT_NEEDED,
+    REDISPATCH_DISPOSITION_REQUIRES_HUMAN_CONFIRMATION,
+    REDISPATCH_DISPOSITION_WAIT_FOR_EXTERNAL_CONDITION,
+    ClineKanbanTerminalDeliveryReceipt,
+    awaiting_receipt_exceeded_contract_convergence_budget,
+    # 「取消回执」的两个判据必须在这里显式引入：它们只在 ``try/except/**else**`` 分支里被调用，
+    # 而 ``else`` 里抛的 NameError **不会**被前面的 except 捕获 —— 漏引入的表征不是 ImportError，
+    # 而是撤回在第 2 步炸掉、后面的放 lease / 清锁 / 清 pending 三步全部跳过（且 py_compile 看不见）。
+    cancel_receipt_indicates_cancellation_rather_than_another_failure,
+    cancel_receipt_indicates_message_already_reached_agent,
+    classify_cline_kanban_terminal_delivery_receipt,
+    describe_terminal_delivery_receipt_for_operator,
 )
 import rvf_post_tool_use
 from session_label import (
@@ -195,6 +217,7 @@ from session_label import (
 import core.review_dispatch.review_validate_fix_dispatch_flow as dispatch_flow
 import rvf_prep_file
 import rvf_bootstrap_confirm
+import rvf_withdrawn_dispatch_tombstone
 from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
     HOST_CLAUDE,
     HOST_CODEX,
@@ -1861,13 +1884,17 @@ def kanban_followup_lock_session_id(event: dict[str, Any]) -> str | None:
 
 
 def _kanban_followup_delivery_channel(message_id: Any) -> str:
-    """从 Cline Kanban message_id 推断投递通道（用于诚实上报）。
+    """从 Cline Kanban message_id 推断投递通道。**只作审计字段，禁止当作投递确认判据。**
 
-    ``terminal:`` 前缀来自外部 ``kanban task message`` CLI 在**无 app-server socket**时的
-    terminal fallback——它返回乐观的 ``status:started`` 回执，但消息未必成为真实 prompt turn
-    （目标 session 处于 awaiting_review / 已停止时尤甚），故视为「未确认投递」。其余形态视为经
-    app-server 的可确认投递。``terminal:`` 并非必然失败，只是 dispatch 这一刻尚不能确认落地；
-    落地的权威信号是目标 session 的 UserPromptSubmit hook（arm in-progress 锁）。
+    ⚠️ F2a 起这个函数**不再**回答「送到没有」。原因有二：
+
+    1. 新契约下 ``message_id`` 恒为 ``terminal:<taskId>:<idempotencyKey>``，前缀不再区分通道；
+    2. 更根本地，通道从来就不是投递结果——历史实现把「有 app-server socket」当成「已送达」，
+       而那个回执是在 mutate **之前**读的快照推断，与实际投递结果无关。2026-08-08 那次
+       49 分钟事故正是这条推断谎报成功造成的。
+
+    唯一的投递真相是 ``terminal_delivery_status``，判读点是
+    ``core.cline_kanban_terminal_delivery``。本函数保留下来只为把通道形态留在 ledger 里备查。
     """
     if isinstance(message_id, str) and message_id.strip().lower().startswith("terminal:"):
         return "terminal"
@@ -2027,6 +2054,378 @@ def clear_kanban_followup_lock_for_event(
     return removed
 
 
+def _query_kanban_terminal_delivery_receipt(
+    marker: dict[str, Any] | None,
+) -> tuple[ClineKanbanTerminalDeliveryReceipt | None, str | None]:
+    """对一条 pending marker 现查 cline-kanban 的**真实**投递终态。
+
+    返回 ``(receipt, degraded_reason)``：其一必为 None。``degraded_reason`` 的每一种取值都表示
+    「拿不到结论」，**没有一种表示投递失败**——这正是本函数存在的理由：历史实现只有「TTL 到了
+    还没被清 ⇒ 大概是丢了」这一种猜测，既无法区分「真丢了」与「对方还在有界收敛中」，也无法
+    区分「对方没有这个接口」。契约第 8 条明确：接口不存在是**合法运行态**，退回纯 RVF 侧语义
+    中和即可，不得阻塞派发、也不得记成一次投递失败。
+
+    整段 best-effort，永不抛。
+    """
+    if not isinstance(marker, dict):
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_MISSING_QUERY_KEYS
+    task_id = marker.get("kanban_task_id")
+    project_path = marker.get("kanban_project_path")
+    idempotency_key = marker.get("idempotency_key")
+    if not (
+        isinstance(task_id, str)
+        and task_id.strip()
+        and isinstance(project_path, str)
+        and project_path.strip()
+        and isinstance(idempotency_key, str)
+        and idempotency_key.strip()
+    ):
+        # 迁移期的历史 marker 不带 idempotency_key（F2a 之前写的），查不了 —— 退回 TTL 对账。
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_MISSING_QUERY_KEYS
+    timeout = _kanban_followup_env_float(
+        KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_SECONDS,
+    )
+    try:
+        payload = read_task_message_terminal_delivery_status(
+            task_cmd=os.environ.get(
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD
+            ),
+            repo=Path(project_path).expanduser(),
+            task_id=task_id.strip(),
+            idempotency_key=idempotency_key.strip(),
+            timeout=timeout if timeout > 0 else None,
+        )
+    except KanbanTerminalDeliveryInterfaceUnavailableError:
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_INTERFACE_UNAVAILABLE
+    except KanbanTerminalDeliveryVerdictNotYetAvailableError:
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_VERDICT_NOT_YET_AVAILABLE
+    except KanbanTerminalDeliveryRecordNotFoundError:
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_RECORD_NOT_FOUND
+    except Exception:
+        return None, TERMINAL_DELIVERY_QUERY_DEGRADED_QUERY_FAILED
+    return classify_cline_kanban_terminal_delivery_receipt(payload), None
+
+
+# 中和一条 follow-up 投递的三种结局。``withdrawn`` 这个布尔值从此**只**回答「这条投递被中和
+# 了吗」，不再兼职回答「本地状态清干净了吗」：两者在失败路径上会分叉（既没抢到 tombstone、
+# 物理取消也用不了，但 lease/锁/pending 照样清掉），把它们混成一个字段等于对调用方谎报。
+KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED = "neutralized"
+KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED = "already_consumed"
+KANBAN_FOLLOWUP_DISPATCH_NOT_NEUTRALIZED = "not_neutralized"
+
+
+def _neutralize_kanban_followup_dispatch_token(
+    marker: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """撤回的**前两步**：语义中和（token tombstone）+ 物理取消（``message-cancel``）。
+
+    刻意与「清理本地状态」（放 lease / 清锁 / 清 pending）分开，因为有两个调用方只需要中和：
+
+    - ``_withdraw_unconfirmed_kanban_followup_dispatch``：中和 **+** 清理（这一轮不再继续）；
+    - ``_maybe_redispatch_stranded_kanban_followup``：中和 **旧** token 后立刻用**新** token 重投，
+      本轮 review 仍在继续 —— 它绝不能顺手把 lease 放掉、把 pending 删掉。
+
+    返回诊断字典，``neutralization`` 取三值之一：
+
+    - ``already_consumed``：token 终态已是 ``consumed`` —— UPS 正在消费这条投递，它**不是**未投递。
+      调用方必须就此收手（撤回会拆掉一轮正在跑的 review；重投会投出第二条）。
+    - ``neutralized``：抢到了 ``withdrawn`` 终态（语义中和），或物理取消确认「消息还没进 agent」。
+    - ``not_neutralized``：两条路都没走通（tombstone 机制此刻不可用 **且** 取消失败/接口不存在）。
+      此时那条投递若迟到落地仍会执行 —— 如实上报，绝不谎报成功。
+
+    判「是不是被取消的」读 ``terminal_delivery_failure_reason``，**不读 ``cancel_result``**
+    （契约的显式警告：后者只回答「消息是否已确认进入 agent」）。整段 best-effort，绝不抛。
+    """
+    token = marker.get("token")
+    task_id = marker.get("kanban_task_id")
+    diagnostics: dict[str, Any] = {"reason": reason, "token": token}
+    semantically_neutralized = False
+
+    try:
+        claim = rvf_withdrawn_dispatch_tombstone.claim_dispatch_token_terminal_state(
+            token,
+            state=rvf_withdrawn_dispatch_tombstone.STATE_WITHDRAWN,
+            reason=reason,
+            details={
+                "kanban_task_id": task_id,
+                "run_id": marker.get("run_id"),
+                "idempotency_key": marker.get("idempotency_key"),
+            },
+        )
+    except Exception as exc:
+        diagnostics["tombstone"] = {"claimed": False, "error": f"{type(exc).__name__}: {exc}"}
+        claim = None
+    if claim is not None:
+        diagnostics["tombstone"] = {
+            "claimed": claim.won,
+            "applicable": claim.applicable,
+            "existing_state": claim.existing_state,
+            "path": str(claim.path) if claim.path else None,
+        }
+        if claim.applicable and not claim.won:
+            # 输给了 ``consumed``：这条投递其实已经落地并被 agent 接手了。撤回它会把一轮
+            # **正在进行**的 review 拆掉（放掉它的 lease、清掉它的锁），比不撤回坏得多。
+            diagnostics["neutralization"] = KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED
+            diagnostics["skipped_because"] = "dispatch_token_already_consumed"
+            return diagnostics
+        semantically_neutralized = bool(claim.applicable and claim.won)
+
+    project_path = marker.get("kanban_project_path")
+    idempotency_key = marker.get("idempotency_key")
+    if (
+        isinstance(project_path, str)
+        and project_path.strip()
+        and isinstance(task_id, str)
+        and task_id.strip()
+        and isinstance(idempotency_key, str)
+        and idempotency_key.strip()
+    ):
+        cancel_timeout = _kanban_followup_env_float(
+            KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_SECONDS,
+        )
+        try:
+            cancel_payload = cancel_task_message_delivery(
+                task_cmd=os.environ.get(
+                    "CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_CLINE_KANBAN_TASK_CMD
+                ),
+                repo=Path(project_path).expanduser(),
+                task_id=task_id.strip(),
+                idempotency_key=idempotency_key.strip(),
+                timeout=cancel_timeout if cancel_timeout > 0 else None,
+            )
+        except KanbanTerminalDeliveryInterfaceUnavailableError:
+            diagnostics["physical_cancel"] = {
+                "attempted": True,
+                "outcome": TERMINAL_DELIVERY_QUERY_DEGRADED_INTERFACE_UNAVAILABLE,
+            }
+        except KanbanTerminalDeliveryRecordNotFoundError:
+            diagnostics["physical_cancel"] = {
+                "attempted": True,
+                "outcome": TERMINAL_DELIVERY_QUERY_DEGRADED_RECORD_NOT_FOUND,
+            }
+        except Exception as exc:
+            diagnostics["physical_cancel"] = {
+                "attempted": True,
+                "outcome": TERMINAL_DELIVERY_QUERY_DEGRADED_QUERY_FAILED,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            diagnostics["physical_cancel"] = {
+                "attempted": True,
+                "outcome": "completed",
+                # 这两个判断问的是**两件不同的事**，故用两个具名函数分别问，
+                # 绝不用 ``cancel_result`` 去回答「是不是被取消的」（契约的显式警告）。
+                "message_already_reached_agent": (
+                    cancel_receipt_indicates_message_already_reached_agent(cancel_payload)
+                ),
+                "cancelled_rather_than_failed_for_another_reason": (
+                    cancel_receipt_indicates_cancellation_rather_than_another_failure(
+                        cancel_payload
+                    )
+                ),
+                "terminal_delivery_status": cancel_payload.get("terminal_delivery_status"),
+                "terminal_delivery_failure_reason": cancel_payload.get(
+                    "terminal_delivery_failure_reason"
+                ),
+            }
+    else:
+        diagnostics["physical_cancel"] = {
+            "attempted": False,
+            "outcome": TERMINAL_DELIVERY_QUERY_DEGRADED_MISSING_QUERY_KEYS,
+        }
+
+    # 物理取消只有在「取消调用真的跑完了 **且** 回执说消息还没进 agent」时才算中和成功。
+    # 「已进 agent」不是中和 —— 那条消息已经在对面了，取消只是没赶上。
+    physical_cancel = diagnostics.get("physical_cancel") or {}
+    physically_cancelled = bool(
+        physical_cancel.get("outcome") == "completed"
+        and physical_cancel.get("message_already_reached_agent") is False
+    )
+    diagnostics["semantically_neutralized"] = semantically_neutralized
+    diagnostics["physically_cancelled"] = physically_cancelled
+    diagnostics["neutralization"] = (
+        KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED
+        if (semantically_neutralized or physically_cancelled)
+        else KANBAN_FOLLOWUP_DISPATCH_NOT_NEUTRALIZED
+    )
+    return diagnostics
+
+
+def _withdraw_unconfirmed_kanban_followup_dispatch(
+    marker: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    """把一条**不再指望它落地**的 follow-up 派发正式撤回，而不只是把 pending 记录删掉。
+
+    「删掉 pending 就当没发生过」是不够的：那条投递可能**随后**才落地（实测迟到过 49 分钟），
+    落地时它完全可执行，会跑出一轮无锁、无 lease、无 scope 契约的 review。所以撤回要做四件事：
+
+    1. **抢 token 终态 ``withdrawn``**（``O_EXCL`` CAS）。抢不到且既有态是 ``consumed``，说明
+       UPS 已经在消费它——那不是「未投递」，绝不能撤回（该走 active-run cancel，见 F2b）。
+       这一步是**先决条件**：抢不到就整个放弃撤回。
+    2. **物理取消**（``kanban task message-cancel``）。接口不存在是合法运行态（契约第 8 条），
+       此时只有语义中和、没有物理取消——这正是契约边界所在，如实记录、不谎报。
+    3. **释放 tracker lease**，让被这一轮占住的 scope unit 退回 ``available``；否则那批改动
+       会以孤儿 ``assigned`` 的形态从此对候选查询不可见 —— 一种沉默的漏审。
+    4. **清 in-progress 锁与 pending 记录**，让下一次 Stop 能按**当时**的工作树重新决策。
+
+    第 1、2 步交 ``_neutralize_kanban_followup_dispatch_token``；本函数负责 3、4 与**诚实回执**。
+
+    ## 中和失败时的失败方向
+
+    tombstone 机制此刻不可用（``applicable=False``：token 形状怪 / 文件系统报错）**且**
+    ``message-cancel`` 也失败或不存在时，既没有物理取消、也没有语义中和。此时：
+
+    - 仍然做 3、4 步的清理 —— 不清理只会把这一轮**永久** park 住（lease 挂着、pending 挂着），
+      而那正是本项目反复认定为最坏结局的「沉默的漏审」；何况留着锁并不能阻止那条投递执行。
+    - 但回执里 ``withdrawn`` 置 **False** 并置 ``cleaned_up_without_neutralization=True``：
+      「清理跑完了」与「那条投递被中和了」是两件事，一个 ``withdrawn=True`` 把它们混起来就是
+      对调用方谎报。这两个字段随 withdrawal 字典整个进 ledger 事件，使「旧投递没被中和、仍
+      可能迟到落地」可取证。
+    - 这一支**不**据此拦下本轮的新 launch：清理已经做完，下一次 Stop 会在完全相同的认知下照常
+      派发，拦这一轮买不到任何东西、只是无理由推迟评审。会拦的只有 ``already_consumed``
+      （见 ``_kanban_followup_withdrawal_blocks_new_dispatch``），那一支撤回什么都没清。
+
+    整段 best-effort：每一步的成败都如实落进返回的诊断字典，绝不抛、绝不阻断 Stop。
+    """
+    task_id = marker.get("kanban_task_id")
+    marker_token = marker.get("token")
+    diagnostics = _neutralize_kanban_followup_dispatch_token(marker, reason=reason)
+    if diagnostics.get("neutralization") == KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED:
+        # lease 与 in-progress 锁**绝不动** —— 那轮 review 正在跑，这两样是它的。
+        #
+        # 但 pending 记录要清（按本 marker 的 token 走防误清 guard）：token 终态已是 ``consumed``，
+        # 这条「已派发、尚未成为 turn」的记录就此确定作废，去重责任已由 UPS arm 的 in-progress 锁
+        # 接手。留着它的代价是实打实的：此后**每一次** Stop 都会重走这条路径、每一次都被拦下，
+        # 直到 tombstone TTL（默认 6h）过期才自解 —— 一段没有任何收益的静默停摆。
+        # （投递已确认送达时也写 pending 之后，这条路径才真的会被走到：UPS 可能在 dispatch 侧
+        # 落盘 pending **之前**就已 arm 并清过一次，于是那条 pending 从诞生起就是孤儿。）
+        try:
+            diagnostics["removed_pending_marker_paths"] = clear_kanban_followup_pending(
+                task_id=task_id if isinstance(task_id, str) else None,
+                token=marker_token if isinstance(marker_token, str) else None,
+            )
+        except Exception as exc:
+            diagnostics["removed_pending_marker_paths"] = []
+            diagnostics["pending_clear_error"] = f"{type(exc).__name__}: {exc}"
+        diagnostics["withdrawn"] = False
+        return diagnostics
+
+    lease_id, lease_diagnostic = release_tracker_lease_for_reconciled_kanban_followup_lock(
+        marker, reason=f"kanban_followup_withdrawn:{reason}"
+    )
+    diagnostics["tracker_lease_id"] = lease_id
+    diagnostics["tracker_lease_release"] = lease_diagnostic
+
+    try:
+        # **只清 task 维度的锁**，不传 session_id。``clear_marker`` 会把 marker_paths 里的每一条
+        # 都删掉，而 sess-path 锁属于「没有 task_id 的那类派发」——把它一起删会误清一把与本次
+        # 撤回无关的锁。撤回的边界就是「这个 task 的这一轮」。
+        diagnostics["removed_in_progress_marker_paths"] = clear_kanban_followup_lock(
+            task_id=task_id if isinstance(task_id, str) else None,
+            session_id=None,
+        )
+    except Exception as exc:
+        diagnostics["removed_in_progress_marker_paths"] = []
+        diagnostics["in_progress_clear_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        diagnostics["removed_pending_marker_paths"] = clear_kanban_followup_pending(
+            task_id=task_id if isinstance(task_id, str) else None
+        )
+    except Exception as exc:
+        diagnostics["removed_pending_marker_paths"] = []
+        diagnostics["pending_clear_error"] = f"{type(exc).__name__}: {exc}"
+
+    neutralized = diagnostics.get("neutralization") == KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED
+    diagnostics["withdrawn"] = neutralized
+    if not neutralized:
+        # 清理跑完了，但那条投递并没有被中和 —— 回执必须把这两件事分开说。
+        diagnostics["cleaned_up_without_neutralization"] = True
+    return diagnostics
+
+
+def _kanban_followup_withdrawal_blocks_new_dispatch(withdrawal: Any) -> str | None:
+    """撤回回执是否要求「本轮别放行新的 follow-up launch」；要求则返回原因码，否则 None。
+
+    唯一要求收手的结局是 ``already_consumed``：原 review 其实已被 UPS 接手并在跑，再 launch
+    就是**第二条** follow-up。这一支不会造成漏审——撤回在这种情形下**没动 lease、也没清锁**
+    （它们属于那轮正在跑的 review），下一次 Stop 会对着 UPS arm 的 in-progress 锁重新判断。
+
+    ``not_neutralized`` 刻意**不**在此列，尽管它的 ``withdrawn`` 也是 False。理由是那道闸不成立：
+    清理已经做完（pending 没了），下一次 Stop 会在**完全相同的**认知下照常派发 —— 拦这一轮
+    买不到任何东西，只是把评审无理由地推迟一轮。它的正确归宿是**诚实上报**：
+    ``withdrawn=False`` + ``cleaned_up_without_neutralization=True`` 随 withdrawal 字典整个进
+    ledger 事件，使「那条投递没被中和、仍可能迟到落地」这件事可取证，而不是被一个
+    ``withdrawn=True`` 盖掉。
+    """
+    if not isinstance(withdrawal, dict):
+        return None
+    if withdrawal.get("withdrawn"):
+        return None
+    if withdrawal.get("neutralization") == KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED:
+        return "kanban_followup_prior_dispatch_already_consumed"
+    return None
+
+
+#: 每种「对账完了但本轮不放行新 launch」的人类可读理由（reason_code → 文案）。
+_KANBAN_FOLLOWUP_WITHHELD_DISPATCH_MESSAGES = {
+    "kanban_followup_prior_dispatch_already_consumed": (
+        "上一条 Cline Kanban RVF follow-up 其实已被目标会话接手（dispatch token 终态为 consumed）；"
+        "本次 Stop 不再投第二条 —— 那轮 review 正在跑。"
+    ),
+    "kanban_followup_redispatch_disposition_withheld": (
+        "上一条 Cline Kanban RVF follow-up 确定未送达，但该失败的契约处置是「不自动重投」"
+        "（等会话起来 / 等用户答完 / 人正在输入框里打字，或文本可能仍残留在输入框中）；"
+        "本次 Stop 不自动重投，交由人决定。"
+    ),
+}
+
+
+def _kanban_followup_withheld_dispatch_decision(
+    ledger: RunLedger,
+    *,
+    reason_code: str,
+    withdrawal: dict[str, Any],
+    pending: dict[str, Any],
+    pending_path: Any,
+    receipt_fields: dict[str, Any],
+    task_id: str | None,
+    session_id: str | None,
+    cwd: str | None,
+) -> StopDecision:
+    """pending 对账已收尾、但**本轮不放行**新的 follow-up launch 时的统一 skip 决策。
+
+    历史实现里这三条对账分支一律 ``return None``（= 放行），于是撤回回执里那句「其实已被
+    UPS 接手」「根本没中和成功」完全没人听 —— 该收手的时候照样投出第二条 follow-up。
+    """
+    return skip_decision(
+        _KANBAN_FOLLOWUP_WITHHELD_DISPATCH_MESSAGES.get(
+            reason_code, "上一条 Cline Kanban RVF follow-up 的对账结果要求本次 Stop 不重复投递。"
+        ),
+        ledger,
+        reason_code,
+        cwd=cwd,
+        backend="kanban-followup",
+        cline_kanban_task_id=task_id,
+        session_id=session_id,
+        kanban_followup_pending_marker=pending,
+        kanban_followup_pending_marker_path=pending_path,
+        kanban_followup_withdrawal=withdrawal,
+        **receipt_fields,
+        **stop_hook_rvf_state_fields(
+            phase="prepare",
+            backend="kanban-followup",
+            backend_raw="kanban-followup",
+            completion_gate=reason_code,
+        ),
+    )
+
+
 def _kanban_followup_pending_decision(
     event: dict[str, Any],
     ledger: RunLedger,
@@ -2037,11 +2436,16 @@ def _kanban_followup_pending_decision(
 ) -> StopDecision | None:
     """无 in-progress 锁时，按 dispatched-unconfirmed(pending) marker 做对账。
 
-    - pending 仍 active（在途窗口内）：上一条 follow-up 刚 dispatch、尚未确认落地，本次 Stop
-      暂不重复 dispatch 以免双注入；窗口由 pending TTL 限定（默认 15min），落地时 UPS arm 会
-      按 token 清掉它。
-    - pending 已 stale（在途窗口已过仍未确认）：上一条 follow-up 静默丢投——上报
-      ``kanban_followup_prior_dispatch_unconfirmed``、清 pending，并放行（返回 None）让正常流程重投。
+    对账**先问对方**（``kanban task message-status``），拿不到结论才退回 TTL 猜测：
+
+    - 回执说 ``delivery_failed``：这条 follow-up 确定没送到。清 pending 后**按 reason 的处置**
+      决定是否放行正常流程重投（``wait_for_external_condition`` / ``requires_human_confirmation``
+      两类一律不自动重投，见 ``redispatch_disposition_for_terminal_delivery_failure_reason``）。
+    - 回执说 ``delivered_*``：已确认进入 agent，但 UPS 还没 arm 锁（agent 尚未提交那条 prompt，
+      或提交后被中断/rewind）。保持 pending active 的语义、本轮不重投——重投会造成双注入。
+    - 回执仍是非终态 ``accepted_pending_submit_confirmation``：契约保证 ≤196.5s 内转终态，
+      故在预算内一律等待；**超出预算**才按「对方违约、结果未知」处置。
+    - 查不到结论（接口不存在 / 硬超时 / 历史 marker 无 key）：完全退回历史的 TTL 对账路径。
     - 无 pending：返回 None，照常 dispatch。
     """
     pending = read_kanban_followup_pending(task_id=task_id)
@@ -2049,12 +2453,182 @@ def _kanban_followup_pending_decision(
         return None
     status = kanban_followup_pending_status(pending)
     pending_path = pending.get("_marker_path")
+
+    receipt, degraded_reason = _query_kanban_terminal_delivery_receipt(pending)
+    if receipt is not None:
+        receipt_fields = {
+            "kanban_terminal_delivery_status": receipt.terminal_delivery_status,
+            "kanban_terminal_delivery_failure_reason": receipt.terminal_delivery_failure_reason,
+            "kanban_terminal_delivery_receipt_field_source": receipt.receipt_field_source,
+            "kanban_terminal_delivery_redispatch_disposition": receipt.redispatch_disposition,
+        }
+        if receipt.is_failed:
+            # 契约说终态**写一次即定**，故这条已判 delivery_failed 的投递理论上不会再落地、
+            # tombstone 是多余的。仍然照常撤回：多写一枚永不被命中的 tombstone 代价为零，
+            # 而少写一枚正是本切片要根治的那个缺陷——失败方向必须偏保守。
+            withdrawal = _withdraw_unconfirmed_kanban_followup_dispatch(
+                pending, reason="prior_dispatch_delivery_failed"
+            )
+            ledger.event(
+                phase="gate",
+                event="kanban_followup_prior_dispatch_delivery_failed",
+                status="completed",
+                reason_code="kanban_followup_prior_dispatch_delivery_failed",
+                cwd=cwd,
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_pending_marker=pending,
+                removed_kanban_followup_pending_marker_paths=withdrawal.get(
+                    "removed_pending_marker_paths"
+                ),
+                kanban_followup_withdrawal=withdrawal,
+                **receipt_fields,
+            )
+            blocked = _kanban_followup_withdrawal_blocks_new_dispatch(withdrawal)
+            if blocked:
+                return _kanban_followup_withheld_dispatch_decision(
+                    ledger,
+                    reason_code=blocked,
+                    withdrawal=withdrawal,
+                    pending=pending,
+                    pending_path=pending_path,
+                    receipt_fields=receipt_fields,
+                    task_id=task_id,
+                    session_id=session_id,
+                    cwd=cwd,
+                )
+            # 确定没送到，但**不是每种没送到都该自动重投**：契约给每种失败 reason 配了处置，
+            # ``wait_for_external_condition``（会话没起来 / 人正在那个输入框里打字 / agent 等
+            # 用户答完）与 ``requires_human_confirmation``（文本可能仍残留在输入框里）两类，
+            # 自动连投只会把情况变糟 —— 前者必然再失败一次，后者会把同一段文本叠成两份。
+            # 放行的只有 ``allowed_with_fresh_idempotency_key``（主派发本就每轮换新 key）与
+            # ``not_needed``（结果由另一条更晚的投递承载 / 本就是 RVF 自己取消的）。
+            if receipt.redispatch_disposition in {
+                REDISPATCH_DISPOSITION_WAIT_FOR_EXTERNAL_CONDITION,
+                REDISPATCH_DISPOSITION_REQUIRES_HUMAN_CONFIRMATION,
+            }:
+                return _kanban_followup_withheld_dispatch_decision(
+                    ledger,
+                    reason_code="kanban_followup_redispatch_disposition_withheld",
+                    withdrawal=withdrawal,
+                    pending=pending,
+                    pending_path=pending_path,
+                    receipt_fields=receipt_fields,
+                    task_id=task_id,
+                    session_id=session_id,
+                    cwd=cwd,
+                )
+            return None
+        # 「继续等」的分支**一律以 pending marker 自己的 TTL 为上界**。这条不变量是承重的：
+        # 没有它，一条「已确认送达、但 UPS 永远不会 arm」的 pending（prompt 落地后 agent 被
+        # 中断、或用户 rewind 掉了那一回合）会让每一次 Stop 都查到 delivered、每一次都 skip
+        # ——那轮 review 就此**永久静默搁浅**，且看起来一切正常。任何 wait 分支都不许没有上界。
+        pending_still_within_its_own_ttl = status == KANBAN_FOLLOWUP_LOCK_ACTIVE
+        if receipt.is_delivered and pending_still_within_its_own_ttl:
+            # 已确认进入 agent，只是还没成为一条 prompt turn（UPS 未 arm）。重投必然双注入。
+            return skip_decision(
+                "上一条 Cline Kanban RVF follow-up 已被确认送达 agent、但尚未成为 prompt turn"
+                f"（{describe_terminal_delivery_receipt_for_operator(receipt)}）；"
+                "本次 Stop 不重复 dispatch。",
+                ledger,
+                "kanban_followup_dispatch_in_flight",
+                cwd=cwd,
+                backend="kanban-followup",
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_pending_marker=pending,
+                kanban_followup_pending_marker_path=pending_path,
+                **receipt_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw="kanban-followup",
+                    completion_gate="kanban_followup_dispatch_in_flight",
+                ),
+            )
+        if (
+            receipt.is_awaiting_terminal_status
+            and pending_still_within_its_own_ttl
+            and not awaiting_receipt_exceeded_contract_convergence_budget(receipt)
+        ):
+            # 契约保证的有界收敛期内：等它，别猜。（收敛预算 196.5s 远短于 pending TTL，故这条
+            # 分支正常总是先于 TTL 到期；``pending_still_within_its_own_ttl`` 只是兜住「回执没带
+            # 状态戳、预算判据无从生效」那种退化输入，不让它变成一条无上界的等待。）
+            return skip_decision(
+                "上一条 Cline Kanban RVF follow-up 仍在 cline-kanban 承诺的有界收敛期内"
+                f"（{describe_terminal_delivery_receipt_for_operator(receipt)}）；"
+                "本次 Stop 暂不重复 dispatch。",
+                ledger,
+                "kanban_followup_dispatch_in_flight",
+                cwd=cwd,
+                backend="kanban-followup",
+                cline_kanban_task_id=task_id,
+                session_id=session_id,
+                kanban_followup_pending_marker=pending,
+                kanban_followup_pending_marker_path=pending_path,
+                **receipt_fields,
+                **stop_hook_rvf_state_fields(
+                    phase="prepare",
+                    backend="kanban-followup",
+                    backend_raw="kanban-followup",
+                    completion_gate="kanban_followup_dispatch_in_flight",
+                ),
+            )
+        # 走到这里只剩两种情形，处置相同：
+        #   ① 超出对方承诺的收敛预算仍是非终态 = 「不知道有没有送到」；
+        #   ② pending 已过自己的 TTL 而 UPS 始终没 arm —— 包括「回执说送达了，但它从未成为一个
+        #      回合」（落地后被中断，或用户 rewind 掉了那一回合）。
+        # 两者都意味着这一轮**不会再自己走完**，且那条投递仍**可能迟到落地**，故正式撤回
+        # （tombstone + 物理取消 + 放 lease + 清锁），而不是删掉记录假装没发生过。
+        # 「其实已被 agent 接手」这一种不会被误拆：撤回抢不到 token 终态（既有态 consumed）
+        # 时会自行放弃。
+        withdrawal = _withdraw_unconfirmed_kanban_followup_dispatch(
+            pending,
+            reason=(
+                "prior_dispatch_delivered_but_never_became_a_turn"
+                if receipt.is_delivered
+                else "prior_dispatch_never_converged"
+            ),
+        )
+        ledger.event(
+            phase="gate",
+            event="kanban_followup_prior_dispatch_never_converged",
+            status="completed",
+            reason_code="kanban_followup_prior_dispatch_never_converged",
+            cwd=cwd,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_pending_marker=pending,
+            removed_kanban_followup_pending_marker_paths=withdrawal.get(
+                "removed_pending_marker_paths"
+            ),
+            kanban_followup_withdrawal=withdrawal,
+            **receipt_fields,
+        )
+        blocked = _kanban_followup_withdrawal_blocks_new_dispatch(withdrawal)
+        if blocked:
+            return _kanban_followup_withheld_dispatch_decision(
+                ledger,
+                reason_code=blocked,
+                withdrawal=withdrawal,
+                pending=pending,
+                pending_path=pending_path,
+                receipt_fields=receipt_fields,
+                task_id=task_id,
+                session_id=session_id,
+                cwd=cwd,
+            )
+        return None
+
+    # 以下是**降级路径**：问不到对方的真实终态（接口不存在 / 硬超时 / 历史 marker 无 key），
+    # 退回历史的纯 TTL 猜测。`degraded_reason` 落进事件，使「今天这轮是猜的还是查的」可取证。
     if status == KANBAN_FOLLOWUP_LOCK_ACTIVE:
         return skip_decision(
             "上一条 Cline Kanban RVF follow-up 刚 dispatch、尚未确认落地"
             f"（token={pending.get('token') or '<unknown>'}，"
             f"channel={pending.get('delivery_channel') or '<unknown>'}，"
-            f"dispatched_at={pending.get('dispatched_at') or '<unknown>'}）；"
+            f"dispatched_at={pending.get('dispatched_at') or '<unknown>'}，"
+            f"终态查询降级={degraded_reason or '<unknown>'}）；"
             "本次 Stop 暂不重复 dispatch，待其落地或在途窗口超时后再处理。",
             ledger,
             "kanban_followup_dispatch_in_flight",
@@ -2064,6 +2638,7 @@ def _kanban_followup_pending_decision(
             session_id=session_id,
             kanban_followup_pending_marker=pending,
             kanban_followup_pending_marker_path=pending_path,
+            kanban_terminal_delivery_query_degraded_reason=degraded_reason,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
@@ -2071,7 +2646,11 @@ def _kanban_followup_pending_decision(
                 completion_gate="kanban_followup_dispatch_in_flight",
             ),
         )
-    removed = clear_kanban_followup_pending(task_id=task_id)
+    # 降级路径下的「在途窗口已过仍未确认」：拿不到对方的结论，故这条投递**仍可能迟到落地**，
+    # 与上面 never_converged 同一处置——正式撤回，而不是删掉记录假装没发生过。
+    withdrawal = _withdraw_unconfirmed_kanban_followup_dispatch(
+        pending, reason="prior_dispatch_unconfirmed_ttl_elapsed"
+    )
     ledger.event(
         phase="gate",
         event="kanban_followup_prior_dispatch_unconfirmed",
@@ -2081,8 +2660,27 @@ def _kanban_followup_pending_decision(
         cline_kanban_task_id=task_id,
         session_id=session_id,
         kanban_followup_pending_marker=pending,
-        removed_kanban_followup_pending_marker_paths=removed,
+        removed_kanban_followup_pending_marker_paths=withdrawal.get(
+            "removed_pending_marker_paths"
+        ),
+        kanban_followup_withdrawal=withdrawal,
+        kanban_terminal_delivery_query_degraded_reason=degraded_reason,
     )
+    blocked = _kanban_followup_withdrawal_blocks_new_dispatch(withdrawal)
+    if blocked:
+        return _kanban_followup_withheld_dispatch_decision(
+            ledger,
+            reason_code=blocked,
+            withdrawal=withdrawal,
+            pending=pending,
+            pending_path=pending_path,
+            receipt_fields={
+                "kanban_terminal_delivery_query_degraded_reason": degraded_reason,
+            },
+            task_id=task_id,
+            session_id=session_id,
+            cwd=cwd,
+        )
     return None
 
 
@@ -2101,9 +2699,39 @@ DEFAULT_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS = 3600
 DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX = 8
 KANBAN_FOLLOWUP_STRANDED_RENOTIFY_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_RENOTIFY_SECONDS"
 KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_MAX"
+# 整个 stranded sweep 的**总**挂钟预算（秒）。条数上界（SWEEP_MAX，默认 8）单独并不构成时间上界：
+# 开启自动重投后每条 pending 都要多做一次终态查询（默认 timeout 5s），仅这一项最坏就是 8×5=40s，
+# 还没算 `task list`、通知与重投子进程 —— 已经越过 Stop 链路约 30s 的总预算。故给一个显式的
+# 总预算：每条 marker 开工前检查，超预算即停止扫荡（marker 全部保留，下一次 Stop 接着扫）。
+# 0 = 关掉预算（回到纯条数上界的历史行为）。
+KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_ENV = "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_SECONDS"
+DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_SECONDS = 12.0
 KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV = "RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"
 KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV = "RVF_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS"
 DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS = 20
+# `kanban task message` 的**短等**预算（毫秒）。默认 0 = 完全不等，保持 Stop 链路既有时延；
+# 契约保证「立刻可判的失败」（如 no_active_terminal_session）不等也会当场返回终态，所以 0
+# 并不牺牲诚实性，只是把「需要收敛时间的那一类」推迟到下一次 Stop 的 message-status 对账。
+KANBAN_FOLLOWUP_MESSAGE_SHORT_WAIT_MS_ENV = "RVF_KANBAN_FOLLOWUP_MESSAGE_SHORT_WAIT_MS"
+DEFAULT_KANBAN_FOLLOWUP_MESSAGE_SHORT_WAIT_MS = 0
+# pending 对账 / 撤回取消时那一次 `kanban task message-*` 子进程的 timeout 上限（秒）。
+# 都是本机只读或幂等查询，正常亚秒级返回；上界压在 5s 是因为它跑在 Stop hook 的秒级预算里
+# （Codex 链路总预算 30s），不能让一个不可达 / 卡死的 kanban server 把整个 Stop 拖垮。
+# 超时不是投递失败——它走 `query_failed` 降级，退回历史的 TTL 对账。
+KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_ENV = (
+    "RVF_KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_SECONDS"
+)
+DEFAULT_KANBAN_FOLLOWUP_MESSAGE_STATUS_TIMEOUT_SECONDS = 5
+# 自动重投的次数上界（每次都必须换新 idempotency key，故次数只能显式记账）。
+KANBAN_FOLLOWUP_MAX_REDISPATCH_ATTEMPTS_ENV = "RVF_KANBAN_FOLLOWUP_MAX_REDISPATCH_ATTEMPTS"
+DEFAULT_KANBAN_FOLLOWUP_MAX_REDISPATCH_ATTEMPTS = 3
+
+# `_query_kanban_terminal_delivery_receipt` 查不到结论时的降级原因（全部**不是**投递失败）。
+TERMINAL_DELIVERY_QUERY_DEGRADED_INTERFACE_UNAVAILABLE = "interface_unavailable"
+TERMINAL_DELIVERY_QUERY_DEGRADED_VERDICT_NOT_YET_AVAILABLE = "verdict_not_yet_available"
+TERMINAL_DELIVERY_QUERY_DEGRADED_RECORD_NOT_FOUND = "record_not_found"
+TERMINAL_DELIVERY_QUERY_DEGRADED_MISSING_QUERY_KEYS = "missing_query_keys"
+TERMINAL_DELIVERY_QUERY_DEGRADED_QUERY_FAILED = "query_failed"
 # 搁浅判定改读 kanban session.state 时，那一次 best-effort `task list` 子进程的 timeout 上限，
 # 防在 30s Codex 链路预算内卡在不可达/慢 kanban server。见 _kanban_task_list_payload。
 KANBAN_FOLLOWUP_LIVENESS_LIST_TIMEOUT_ENV = (
@@ -2207,12 +2835,79 @@ def _maybe_redispatch_stranded_kanban_followup(
     诚实边界：即便 app-server 活着，已停 session 也未必消费 → best-effort，绝不谎报已跑。
     契约（按审查修正）：铸**新** dispatch-prep + 新 token（旧 token 的 prep 可能已被
     ``rvf_prep_file.sweep_stale`` 清，复用会让目标 UPS 判 ``dispatch_no_prep`` 不清 pending）；
-    用**稳定** idempotency key ``rvf-redispatch-<task>-<token>``（不可用每 Stop 变的 run_id，
-    否则 Kanban 侧不幂等）；子进程带 timeout；重投后据投递通道改写/清除 pending，避免与该
-    task 自己的下次 Stop 撞成双投。
+    子进程带 timeout；重投后据**真实回执**改写/清除 pending，避免与该 task 自己的下次 Stop
+    撞成双投。
+
+    **F2a 改写了幂等键策略。** 历史实现用一枚绑定旧 token 的**稳定**键
+    ``rvf-redispatch-<task>-<token>`` 来间接去重，这在新契约下是一条死路：
+
+    - 契约第 7 条「同 key + 同 prompt hash → 直接返回当前记录、**不重投**」⇒ 稳定键根本投不出去；
+    - 而每次重投都会铸新 token 并把它写进 prompt ⇒ prompt hash 变了 ⇒ 契约判**幂等冲突、退出码 1**
+      ⇒ 这条 stranded marker 从此永久重投失败。
+
+    故改为把键绑定到**本次新铸的 token**（与 prompt 内容一一对应，永不冲突），去重责任
+    移交给 ``dispatch_single_flight_for_task`` 这道 per-task 派发闸（契约第 5 条要求的正是它）。
+
+    重投前**必须先中和旧 token**（tombstone + ``message-cancel``），且中和、投递、pending 落盘
+    三件事全部在 per-task 派发闸内完成 —— 见函数体内两处注释。
     """
     if not is_truthy(os.environ.get(KANBAN_FOLLOWUP_AUTO_REDISPATCH_ENV)):
         return {"redispatched": False, "reason": "disabled"}
+    attempt_count = kanban_followup_pending_redispatch_attempt_count(marker)
+    max_attempts = _kanban_followup_env_int(
+        KANBAN_FOLLOWUP_MAX_REDISPATCH_ATTEMPTS_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_MAX_REDISPATCH_ATTEMPTS,
+    )
+    if attempt_count >= max_attempts:
+        return {
+            "redispatched": False,
+            "reason": "redispatch-budget-exhausted",
+            "redispatch_attempt_count": attempt_count,
+        }
+    # 先问对方：这条投递到底是什么下场？拿得到结论时，只有「确实没送到、且这种失败允许换新
+    # key 重投」才继续；拿不到结论（接口不存在 / 硬超时 / 老 marker 无 key）维持历史行为。
+    prior_receipt, prior_degraded_reason = _query_kanban_terminal_delivery_receipt(marker)
+    if prior_receipt is not None:
+        if prior_receipt.is_delivered:
+            return {
+                "redispatched": False,
+                "reason": "already-delivered",
+                "terminal_delivery_status": prior_receipt.terminal_delivery_status,
+            }
+        if prior_receipt.is_awaiting_terminal_status and not (
+            awaiting_receipt_exceeded_contract_convergence_budget(prior_receipt)
+        ):
+            return {
+                "redispatched": False,
+                "reason": "still-within-contract-convergence-budget",
+                "terminal_delivery_status": prior_receipt.terminal_delivery_status,
+            }
+        if (
+            prior_receipt.is_failed
+            and prior_receipt.redispatch_disposition
+            != REDISPATCH_DISPOSITION_ALLOWED_WITH_FRESH_IDEMPOTENCY_KEY
+        ):
+            # 「文本可能仍残留在输入框里」「人正在打字」「等用户答完」这几类，自动连投只会
+            # 把情况变糟。marker 仍在 + stranded 通知仍会把它浮现给用户，由人来决定。
+            #
+            # ``redispatch_not_needed`` 曾被和 ``allowed_with_fresh_idempotency_key`` **并列**
+            # 放进「继续重投」，与该常量的语义（不必重投：结果已由另一条更晚的投递承载，或本就是
+            # RVF 自己取消的）**正好相反**：于是 ``superseded_by_later_delivery`` 会被再投一次，
+            # 而那条「更晚的合法投递」可能反过来被新投的这条撞成 superseded。允许继续的只有
+            # 「换新 key 就能干净重投」这一种。
+            return {
+                "redispatched": False,
+                "reason": (
+                    "redispatch-not-needed"
+                    if prior_receipt.redispatch_disposition == REDISPATCH_DISPOSITION_NOT_NEEDED
+                    else "redispatch-disposition-withheld"
+                ),
+                "terminal_delivery_status": prior_receipt.terminal_delivery_status,
+                "terminal_delivery_failure_reason": (
+                    prior_receipt.terminal_delivery_failure_reason
+                ),
+                "redispatch_disposition": prior_receipt.redispatch_disposition,
+            }
     task_id = marker.get("kanban_task_id")
     project_path = marker.get("kanban_project_path")
     prompt_path = marker.get("prompt_path")
@@ -2254,65 +2949,132 @@ def _maybe_redispatch_stranded_kanban_followup(
     except Exception as exc:
         return {"redispatched": False, "reason": "prep-failed", "error": f"{type(exc).__name__}: {exc}"}
     new_prompt = add_dispatch_prep_to_prompt(base_prompt, fresh_prep)
-    # 幂等键必须绑定**稳定**的 stranded token（marker 当前 token），不能用每次扫荡新铸的
-    # fresh_prep.token——否则同一 stranded marker 在 renotify 窗口内被多个会话的 Stop 并发扫荡时
-    # 各生成不同 key，Kanban 无法去重 → 重复派发。token 缺失（退化 marker）才回退占位。
-    idem = f"rvf-redispatch-{safe_token(task_id)}-{token or 'no-token'}"
+    # 幂等键绑定**本次新铸的 token**：prompt 正文里字面含这个 token，故 key 与 prompt hash
+    # 一一对应，永不触发契约的幂等冲突；而「不要并发投同一个 task」由下面的 per-task 派发闸
+    # 负责，不再由 key 兼职（历史上那枚稳定键在新契约下等于「投不出去 + 之后永久冲突」）。
+    idem = f"rvf-redispatch-{safe_token(task_id)}-{fresh_prep.token}"
     redispatch_timeout = _kanban_followup_env_float(
         KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_ENV,
         DEFAULT_KANBAN_FOLLOWUP_REDISPATCH_TIMEOUT_SECONDS,
     )
-    try:
-        message_payload = start_cline_kanban_followup_message(
-            project_path=project_path,
-            task_id=task_id,
-            attempt_id=marker.get("kanban_attempt_id"),
-            prompt=new_prompt,
-            ledger=ledger,
-            idempotency_key=idem,
-            timeout=redispatch_timeout if redispatch_timeout > 0 else None,
+    # per-task 派发闸必须一路裹到「pending 已按新 token 落盘」为止。只裹住投递那一句是不够的：
+    # 闸一放开、pending 还没写，另一个 Stop 就能立刻通过「无 pending」判据进闸再投一条新 key，
+    # 于是先到的那条被判 ``superseded_by_later_delivery`` —— 正是这道闸要防的事。
+    with kanban_followup_dispatch_single_flight_for_task(task_id) as dispatch_slot_acquired:
+        if not dispatch_slot_acquired:
+            return {
+                "redispatched": False,
+                "reason": "dispatch-single-flight-busy",
+                "token": fresh_prep.token,
+            }
+        # 重投前先**中和旧 token**（tombstone + 物理取消），且只在闸内做。历史实现直接铸新 token
+        # 就投，旧那条仍可迟到落地并与新一轮并发 —— 同 task 对账路径明明会走撤回，这条路径却把
+        # 整套止血绕过去了。这里刻意**只中和、不清理**：lease / 锁 / pending 属于**同一轮**
+        # review，本次重投正是要让它继续，绝不能顺手放掉。
+        neutralization = _neutralize_kanban_followup_dispatch_token(
+            marker, reason="superseded_by_stranded_redispatch"
         )
-    except subprocess.TimeoutExpired:
-        return {"redispatched": False, "reason": "redispatch-timeout", "token": fresh_prep.token}
-    except Exception as exc:
-        return {"redispatched": False, "reason": "redispatch-failed", "error": f"{type(exc).__name__}: {exc}"}
-    new_message_id = message_payload.get("message_id")
-    new_channel = _kanban_followup_delivery_channel(new_message_id)
-    if new_channel == "app-server":
-        # 这次直接确认到 app-server → 清掉 pending（用旧 token 过 clear 的防误清 guard）。
-        clear_kanban_followup_pending(task_id=task_id, token=token)
-    else:
-        # 仍未确认 → 把 pending 改写到新 token、重置在途窗口，落地时 UPS arm 按新 token 清。
-        # 必须带上**本次重投新派发**的 prompt_path/turn_id：否则改写后的 marker 丢失 prompt_path，
-        # 下一次扫荡的 S2 重投会因 missing-prompt-path 永久无法再重投。last_notified_at 有意不保留——
-        # 改写后 marker 变 active（新 expires_at），sweep 会跳过它直到再次 stale；届时重新通知才正确。
+        if neutralization.get("neutralization") == KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED:
+            # 旧 token 已被 UPS 接手：那轮 review 正在跑，重投等于投出第二条。
+            return {
+                "redispatched": False,
+                "reason": "prior-dispatch-already-consumed",
+                "token": token,
+                "prior_dispatch_neutralization": neutralization,
+            }
         try:
-            write_kanban_followup_pending(
+            message_payload = start_cline_kanban_followup_message(
+                project_path=project_path,
                 task_id=task_id,
-                session_id=marker.get("session_id"),
-                run_id=str(ledger.run_id),
-                run_dir=str(ledger.run_dir),
-                repo=marker.get("repo"),
-                cwd=marker.get("cwd"),
-                token=fresh_prep.token,
-                delivery_channel=new_channel,
                 attempt_id=marker.get("kanban_attempt_id"),
-                message_id=new_message_id if isinstance(new_message_id, str) else None,
-                turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
-                prompt_path=message_payload.get("prompt_path"),
-                kanban_project_path=project_path,
-                kanban_task_title=marker.get("kanban_task_title"),
-                kanban_task_title_source=marker.get("kanban_task_title_source"),
-                origin_transcript_path=marker.get("origin_transcript_path"),
+                prompt=new_prompt,
+                ledger=ledger,
+                idempotency_key=idem,
+                timeout=redispatch_timeout if redispatch_timeout > 0 else None,
             )
-        except Exception:
-            pass
+        except KanbanFollowupDeliveryVerdictNotYetAvailableError as exc:
+            # CLI 硬超时（exit 124 + 空 stdout）= 「还没结论」，**不是**投递失败：这条消息可能
+            # 已被受理。绝不能当普通失败退出——那会把 pending 留在**旧** token 上，而 prompt 里
+            # 已经是新 token，UPS 落地时拿新 token 去清旧 token 的 pending 会被防误清 guard 拒绝
+            # ⇒ pending 永久锁死。故照未确认路径把 pending 改写到新 token。
+            message_payload = exc.provisional_payload()
+            verdict_pending = True
+        except subprocess.TimeoutExpired:
+            return {
+                "redispatched": False,
+                "reason": "redispatch-timeout",
+                "token": fresh_prep.token,
+                "prior_dispatch_neutralization": neutralization,
+            }
+        except Exception as exc:
+            return {
+                "redispatched": False,
+                "reason": "redispatch-failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "prior_dispatch_neutralization": neutralization,
+            }
+        else:
+            verdict_pending = False
+        new_message_id = message_payload.get("message_id")
+        new_channel = _kanban_followup_delivery_channel(new_message_id)
+        new_receipt = classify_cline_kanban_terminal_delivery_receipt(message_payload)
+        if new_receipt.is_delivered:
+            # 已确认进入 agent → 清掉 pending（用旧 token 过 clear 的防误清 guard）。
+            clear_kanban_followup_pending(task_id=task_id, token=token)
+        else:
+            # 未确认**与已确定失败走同一条路**：都把 pending 改写到**新** token。
+            #
+            # 曾想给「已确定失败」单开一条「什么都不写」的分支（理由是没必要重置在途窗口），那是
+            # 错的，两层原因：① 不写就等于 ``redispatch_attempt_count`` 永不递增 ⇒ 重投次数上界形同
+            # 虚设，同一条 stranded marker 会在每个 renotify 窗口被无限重投；② 旧 token 留在 marker 上
+            # 而 prompt 里已经是新 token，一旦那条投递后来还是被送出去（例如
+            # ``submit_confirmation_budget_exhausted`` 的残留文本被人按了回车），UPS 会拿新 token 去
+            # 清一个记着旧 token 的 pending —— 防误清 guard 直接拒绝 ⇒ pending 永久锁死。
+            #
+            # 必须带上**本次重投新派发**的 prompt_path/turn_id：否则改写后的 marker 丢失 prompt_path，
+            # 下一次扫荡的 S2 重投会因 missing-prompt-path 永久无法再重投。last_notified_at 有意不保留——
+            # 改写后 marker 变 active（新 expires_at），sweep 会跳过它直到再次 stale；届时重新通知才正确。
+            try:
+                write_kanban_followup_pending(
+                    task_id=task_id,
+                    session_id=marker.get("session_id"),
+                    run_id=str(ledger.run_id),
+                    run_dir=str(ledger.run_dir),
+                    repo=marker.get("repo"),
+                    cwd=marker.get("cwd"),
+                    token=fresh_prep.token,
+                    delivery_channel=new_channel,
+                    attempt_id=marker.get("kanban_attempt_id"),
+                    message_id=new_message_id if isinstance(new_message_id, str) else None,
+                    turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
+                    prompt_path=message_payload.get("prompt_path") or marker.get("prompt_path"),
+                    kanban_project_path=project_path,
+                    kanban_task_title=marker.get("kanban_task_title"),
+                    kanban_task_title_source=marker.get("kanban_task_title_source"),
+                    origin_transcript_path=marker.get("origin_transcript_path"),
+                    idempotency_key=message_payload.get("idempotency_key") or idem,
+                    terminal_delivery_status=new_receipt.terminal_delivery_status,
+                    terminal_delivery_failure_reason=new_receipt.terminal_delivery_failure_reason,
+                    terminal_delivery_status_updated_at=(
+                        new_receipt.terminal_delivery_status_updated_at
+                    ),
+                    # 契约第 7 条让「重投了几次」不再能从 key 反推，故必须显式累加记账。
+                    redispatch_attempt_count=attempt_count + 1,
+                )
+            except Exception:
+                pass
     return {
         "redispatched": True,
         "reason": "redispatched",
         "delivery_channel": new_channel,
         "token": fresh_prep.token,
         "idempotency_key": idem,
+        "redispatch_attempt_count": attempt_count + 1,
+        "terminal_delivery_status": new_receipt.terminal_delivery_status,
+        "terminal_delivery_failure_reason": new_receipt.terminal_delivery_failure_reason,
+        "terminal_delivery_verdict_not_yet_available": verdict_pending,
+        "prior_dispatch_neutralization": neutralization,
+        "prior_terminal_delivery_query_degraded_reason": prior_degraded_reason,
     }
 
 
@@ -2408,6 +3170,13 @@ def sweep_stranded_kanban_followup_pending(
         )
         if sweep_max <= 0:
             return
+        sweep_budget_seconds = _kanban_followup_env_float(
+            KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_ENV,
+            DEFAULT_KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_SECONDS,
+        )
+        sweep_deadline = (
+            time.monotonic() + sweep_budget_seconds if sweep_budget_seconds > 0 else None
+        )
         markers = iter_kanban_followup_pending()
         now_ts = datetime.now(timezone.utc).timestamp()
         processed = 0
@@ -2415,6 +3184,19 @@ def sweep_stranded_kanban_followup_pending(
         session_list_cache: dict[str, dict[str, Any] | None] = {}
         for marker in markers:
             if processed >= sweep_max:
+                break
+            # 总预算闸：每条 marker **开工前**检查一次。条数上界管不住时间——单条最坏要跑
+            # `task list`(10s) + 终态查询(5s) + 通知(10s) + 重投子进程(20s)，8 条足以吃穿整个
+            # Stop 预算。停下不丢事：所有 marker 都保留，下一次任意会话的 Stop 会接着扫。
+            if sweep_deadline is not None and time.monotonic() >= sweep_deadline:
+                ledger.event(
+                    phase="gate",
+                    event="kanban_followup_stranded_sweep_budget_exhausted",
+                    status="completed",
+                    reason_code="kanban_followup_stranded_sweep_budget_exhausted",
+                    kanban_followup_stranded_sweep_processed=processed,
+                    kanban_followup_stranded_sweep_budget_seconds=sweep_budget_seconds,
+                )
                 break
             if not isinstance(marker, dict):
                 continue
@@ -3002,6 +3784,54 @@ def _tracker_lease_identity_for_kanban_followup_lock(
             return lease_id.strip(), repo, "dispatch-prep-file.json"
 
     return None, repo, None
+
+
+def _release_tracker_lease_for_current_run(
+    ledger: RunLedger,
+    *,
+    repo: str | None,
+    reason: str,
+) -> dict[str, Any]:
+    """释放**本次 Stop 自己刚 allocate 出来的** tracker lease（从 ledger 的 scope meta 取 id）。
+
+    与 ``release_tracker_lease_for_reconciled_kanban_followup_lock`` 的区别只在取 lease id 的
+    来源：那一支是从**别人留下的 marker**的 run_dir artifact 回捞，本支就在本轮进程里，直接读
+    ``ledger.tracker_scope_meta``。用在「派发这一步走不下去、也不会留下任何 pending 记录」的
+    收尾路径上——不放掉，这批 scope unit 会以孤儿 ``assigned`` 挂满整个 lease TTL。
+
+    诊断恒为可落 ledger 的 dict；tracker 侧任何异常一律吞掉转成诊断，绝不阻断 Stop。
+    """
+    meta = getattr(ledger, "tracker_scope_meta", None)
+    lease_id = None
+    if isinstance(meta, dict):
+        lease_id = meta.get("tracker_lease_id") or meta.get("lease_id")
+    if not (isinstance(lease_id, str) and lease_id.strip()):
+        return {
+            "status": "unresolved",
+            "released": False,
+            "reason": "tracker_lease_id_not_found_on_ledger",
+        }
+    if not (isinstance(repo, str) and repo.strip()):
+        return {
+            "status": "unresolved",
+            "released": False,
+            "reason": "tracker_repo_not_found_for_lease",
+            "lease_id": lease_id.strip(),
+        }
+    try:
+        release_result = lease_release(repo=repo.strip(), lease_id=lease_id.strip(), reason=reason)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "released": False,
+            "lease_id": lease_id.strip(),
+            "repo": repo.strip(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    result = dict(release_result) if isinstance(release_result, dict) else {"result": release_result}
+    result.setdefault("lease_id", lease_id.strip())
+    result["repo"] = repo.strip()
+    return result
 
 
 def release_tracker_lease_for_reconciled_kanban_followup_lock(
@@ -4507,6 +5337,58 @@ def start_cline_kanban_task(
     }
 
 
+# ``cline_kanban_client.py`` 给三种降级运行态各留了专属退出码（见该文件 main()）：
+# 3=接口不存在、4=还没结论（CLI 硬超时 exit 124 + 空 stdout）、5=账本无此记录。
+# 其中 **4 绝不是投递失败**：那条消息可能已经被受理，只是 CLI 没等到结论就到点了。
+KANBAN_FOLLOWUP_CLIENT_EXIT_VERDICT_NOT_YET_AVAILABLE = 4
+
+
+class KanbanFollowupDeliveryVerdictNotYetAvailableError(RuntimeError):
+    """``kanban task message`` 没能在硬超时内给出结论（子进程退出码 4）。
+
+    **不是**投递失败：这条消息可能已被受理并随后落地。故调用方不得走「派发不可用、不写
+    pending」那条路 —— 那会让一条可能在途的消息失去 status 对账与撤回能力，并可迟到执行。
+    正确处置是照「未确认投递」写 pending：``provisional_payload()`` 给出**只含已知为真字段**的
+    最小回执（不伪造 ``message_id``/``terminal_delivery_status``；回执判读会据此落 awaiting）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        task_id: str,
+        idempotency_key: str,
+        attempt_id: str | None,
+        prompt_path: str | None,
+        command_artifact_path: str | None,
+        project_path: str,
+        task_cmd: str,
+    ) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.idempotency_key = idempotency_key
+        self.attempt_id = attempt_id
+        self.prompt_path = prompt_path
+        self.command_artifact_path = command_artifact_path
+        self.project_path = project_path
+        self.task_cmd = task_cmd
+
+    def provisional_payload(self) -> dict[str, Any]:
+        """只含**已知为真**字段的临时回执（``message_id`` 恒缺失：我们确实没拿到）。"""
+        payload: dict[str, Any] = {
+            "task_id": self.task_id,
+            "idempotency_key": self.idempotency_key,
+            "prompt_path": self.prompt_path,
+            "command_artifact_path": self.command_artifact_path,
+            "project_path": self.project_path,
+            "task_cmd": self.task_cmd,
+            "terminal_delivery_verdict_not_yet_available": True,
+        }
+        if self.attempt_id:
+            payload["attempt_id"] = self.attempt_id
+        return payload
+
+
 def start_cline_kanban_followup_message(
     *,
     project_path: str,
@@ -4524,7 +5406,10 @@ def start_cline_kanban_followup_message(
         raise RuntimeError("failed to write Cline Kanban follow-up prompt artifact")
 
     # 默认沿用每次 Stop 唯一的 ledger.run_id 作幂等键（主派发路径）；S2 重投显式传入
-    # 稳定键（rvf-redispatch-<task>-<token>），使 Kanban 侧对「同一条 stranded 重投」幂等。
+    # 一枚**绑定本次新铸 dispatch token** 的新键（见 _maybe_redispatch_stranded_kanban_followup）。
+    # 契约第 7 条：同 key + 同 prompt hash 只返回当前记录、**不重投**；同 key + 不同 prompt hash
+    # 直接报幂等冲突。故「重投」与「换 key」是同一件事，去重责任落在 per-task 派发单飞闸上。
+    resolved_idempotency_key = idempotency_key or str(ledger.run_id)
     command = [
         sys.executable,
         str(client),
@@ -4540,10 +5425,18 @@ def start_cline_kanban_followup_message(
         "--source",
         "review-validate-fix",
         "--idempotency-key",
-        idempotency_key or ledger.run_id,
+        resolved_idempotency_key,
     ]
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
+    # 契约第 4 条：短等而已（默认 0 = 完全不等，保持 Stop 链路的既有时延）。开大它并不能等满
+    # 契约的 196.5s 收敛预算——CLI 硬超时会把等待 clamp 掉；真正的终态靠 message-status 轮询。
+    wait_ms = _kanban_followup_env_int(
+        KANBAN_FOLLOWUP_MESSAGE_SHORT_WAIT_MS_ENV,
+        DEFAULT_KANBAN_FOLLOWUP_MESSAGE_SHORT_WAIT_MS,
+    )
+    if wait_ms > 0:
+        command.extend(["--wait-for-terminal-status-timeout-ms", str(wait_ms)])
 
     # timeout 默认 None=主路径行为不变（无内层超时，由 Codex 链路 30s 总预算兜底）；
     # S2 重投显式传入有界 timeout，避免在 best-effort 路径上无界阻塞吃光预算。
@@ -4564,6 +5457,20 @@ def start_cline_kanban_followup_message(
             "stderr": completed.stderr,
         },
     )
+    if completed.returncode == KANBAN_FOLLOWUP_CLIENT_EXIT_VERDICT_NOT_YET_AVAILABLE:
+        # 「还没结论」必须在 parse_json_command_output 之前拦截：那个包装器把所有非零退出码
+        # 一律当普通失败抛，会让一条**可能已被受理**的消息走「派发不可用、不写 pending」。
+        raise KanbanFollowupDeliveryVerdictNotYetAvailableError(
+            (completed.stderr or "").strip()
+            or "Cline Kanban task message did not reach a verdict before the CLI hard timeout",
+            task_id=task_id,
+            idempotency_key=resolved_idempotency_key,
+            attempt_id=attempt_id,
+            prompt_path=prompt_path,
+            command_artifact_path=command_path,
+            project_path=project_path,
+            task_cmd=task_cmd,
+        )
     payload = parse_json_command_output(completed, label="Cline Kanban task message")
     message_id = str(payload.get("message_id") or payload.get("messageId") or "").strip()
     if not message_id:
@@ -4587,6 +5494,9 @@ def start_cline_kanban_followup_message(
     payload["prompt_path"] = prompt_path
     payload["task_cmd"] = task_cmd
     payload["project_path"] = project_path
+    # 幂等键是「事后还能不能查到这条投递的真实终态」的唯一钥匙（message-status 按
+    # (task_id, idempotency_key) 定位），必须显式回传给调用方写进 pending marker。
+    payload["idempotency_key"] = payload.get("idempotency_key") or resolved_idempotency_key
     return payload
 
 
@@ -5587,16 +6497,169 @@ def launch_backend(
                 backend_raw=decision.backend,
             ),
         )
-        try:
-            message_payload = start_cline_kanban_followup_message(
-                project_path=project_path,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                prompt=prompt,
-                ledger=ledger,
-            )
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+        # 契约第 5 条：同一 task 绝不并发投递（cline-kanban 每 session 只有一个单飞槽，先到的
+        # 会被判 superseded_by_later_delivery）。拿不到闸即本轮不投——下一次 Stop 重新决策。
+        #
+        # 这道闸必须一路裹到 **pending marker 落盘为止**，并在闸内**重新校验**决策是否已过时：
+        # 「此刻没有在途 follow-up」这个判据是在本次 Stop 早得多的时候读的，两个 Stop 完全可以
+        # 都读到「无 pending」，再一前一后进闸各投一条**新 key** —— 先到的那条随即被判
+        # ``superseded_by_later_delivery``，正是这道闸要防的事。只有「闸内复检 + 闸内落盘」
+        # 才把「检查 → 投递 → 记账」变成一个原子段。
+        message_payload: dict[str, Any] | None = None
+        dispatch_error: str | None = None
+        delivery_verdict_not_yet_available = False
+        pending_marker_path: str | None = None
+        pending_task_id: Any = None
+        with kanban_followup_dispatch_single_flight_for_task(task_id) as dispatch_slot_acquired:
+            if not dispatch_slot_acquired:
+                return skip_payload(
+                    "另一个进程正在对同一个 Cline Kanban task 派发 RVF follow-up；"
+                    "本次 Stop 不并发投递（并发会让先到的那条被判 superseded_by_later_delivery）。",
+                    ledger,
+                    "kanban_followup_dispatch_single_flight_busy",
+                    repo=decision.repo,
+                    cwd=cwd,
+                    backend=decision.backend,
+                    cline_kanban_task_id=task_id,
+                    cline_kanban_project_path=project_path,
+                    **stop_hook_rvf_state_fields(
+                        phase="prepare",
+                        backend="kanban-followup",
+                        backend_raw=decision.backend,
+                    ),
+                )
+            concurrent_pending = read_kanban_followup_pending(task_id=task_id)
+            if (
+                concurrent_pending is not None
+                and kanban_followup_pending_status(concurrent_pending)
+                == KANBAN_FOLLOWUP_LOCK_ACTIVE
+            ):
+                return skip_payload(
+                    "闸外做出的「此刻没有在途 Cline Kanban RVF follow-up」判断已经过时：另一个 "
+                    "Stop 抢先投了一条并写下 active pending。本次 Stop 不再并发投递"
+                    "（并发会让先到的那条被判 superseded_by_later_delivery）。",
+                    ledger,
+                    "kanban_followup_dispatch_superseded_by_concurrent_pending",
+                    repo=decision.repo,
+                    cwd=cwd,
+                    backend=decision.backend,
+                    cline_kanban_task_id=task_id,
+                    cline_kanban_project_path=project_path,
+                    kanban_followup_pending_marker=concurrent_pending,
+                    kanban_followup_pending_marker_path=concurrent_pending.get("_marker_path"),
+                    **stop_hook_rvf_state_fields(
+                        phase="prepare",
+                        backend="kanban-followup",
+                        backend_raw=decision.backend,
+                    ),
+                )
+            try:
+                message_payload = start_cline_kanban_followup_message(
+                    project_path=project_path,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    prompt=prompt,
+                    ledger=ledger,
+                )
+            except KanbanFollowupDeliveryVerdictNotYetAvailableError as exc:
+                # CLI 硬超时（exit 124 + 空 stdout）= 「还没结论」，**不是**投递失败。走
+                # `kanban-followup-unavailable` 且不写 pending 会让一条**可能已被受理**的消息
+                # 失去 status 对账与撤回能力，并可迟到执行。故按未确认投递继续，用只含已知为真
+                # 字段的临时回执写 pending（回执判读据此落 awaiting，绝不伪造送达）。
+                message_payload = exc.provisional_payload()
+                delivery_verdict_not_yet_available = True
+            except Exception as exc:
+                message_payload = None
+                dispatch_error = f"{type(exc).__name__}: {exc}"
+
+            if message_payload is not None:
+                # 旧设计在此把 message_id/turn_id 回写进 in-progress 锁；现在 arm 由目标 session
+                # 的 UserPromptSubmit hook 在投递落地时完成，这里不再写锁。
+                message_id = message_payload.get("message_id")
+                # 投递通道只作审计（新契约下 message_id 恒为 ``terminal:<task>:<key>``，它**不再**是
+                # 「是否已确认送达」的判据）。真相唯一来自 terminal_delivery_status，见下。
+                delivery_channel = _kanban_followup_delivery_channel(message_id)
+                delivery_receipt = classify_cline_kanban_terminal_delivery_receipt(message_payload)
+                # F2a：``accepted_pending_submit_confirmation`` 不是成功；遗留 ``status`` 的
+                # started/queued 是 mutate **之前**读的快照推断、与实际投递结果无关，同样不算成功。
+                # 只有契约的两个 delivered_* 终态才算「已确认进入 agent」。
+                delivery_confirmed = delivery_receipt.is_delivered
+                if delivery_confirmed:
+                    status = "kanban-followup-started"
+                elif delivery_receipt.is_failed:
+                    status = "kanban-followup-delivery-failed"
+                else:
+                    status = "kanban-followup-dispatched-unconfirmed"
+                reason_code = status.replace("-", "_")
+                delivery_receipt_fields = {
+                    "kanban_terminal_delivery_status": delivery_receipt.terminal_delivery_status,
+                    "kanban_terminal_delivery_failure_reason": (
+                        delivery_receipt.terminal_delivery_failure_reason
+                    ),
+                    "kanban_terminal_delivery_receipt_field_source": (
+                        delivery_receipt.receipt_field_source
+                    ),
+                    "kanban_terminal_delivery_redispatch_disposition": (
+                        delivery_receipt.redispatch_disposition
+                    ),
+                    "kanban_terminal_delivery_summary": (
+                        describe_terminal_delivery_receipt_for_operator(delivery_receipt)
+                    ),
+                    "kanban_terminal_delivery_verdict_not_yet_available": (
+                        delivery_verdict_not_yet_available
+                    ),
+                }
+                # 写 pending marker，作为「dispatch 已发、这一轮尚未成为 turn」的对账依据：UPS arm
+                # 落地时按 token 清掉它；下一次 Stop 拿 idempotency_key 去查真实终态。
+                #
+                # **已确认送达的也要写。** 曾以为 delivered 就不必留记录，那是错的：
+                # ``delivered_queued_behind_active_agent_turn`` 只是排上了队，而
+                # ``delivered_and_submit_confirmed`` 之后 UPS 也可能还没 arm 就被中断 / rewind 掉。
+                # 这两种情形下既没有 in-progress 锁、也没有带 TTL 的 pending，
+                # 「delivered 但从未成为 turn ⇒ 到期撤回」那道保护就永远不会触发，那轮 review
+                # 静默搁浅且看上去一切正常。
+                #
+                # **已确定失败的仍不写** —— 此刻并没有任何东西在途，写一条 active pending 只会把
+                # 接下来 15 分钟的重新决策白白挡住；失败本身已进 ledger 并会走通知。
+                if not delivery_receipt.is_failed:
+                    pending_task_id = message_payload.get("task_id") or task_id
+                    try:
+                        pending_path = write_kanban_followup_pending(
+                            task_id=pending_task_id,
+                            session_id=source_session_id,
+                            run_id=str(ledger.run_id),
+                            run_dir=str(ledger.run_dir),
+                            repo=decision.repo,
+                            cwd=cwd,
+                            token=dispatch_prep.token,
+                            delivery_channel=delivery_channel,
+                            attempt_id=message_payload.get("attempt_id") or attempt_id,
+                            message_id=message_id if isinstance(message_id, str) else None,
+                            turn_id=(
+                                message_payload.get("turn_id") or message_payload.get("turnId")
+                            ),
+                            prompt_path=message_payload.get("prompt_path"),
+                            # S0：快照 deep-link 与可选 verify-consumed 所需字段，供 S1a/S1b 复用。
+                            kanban_project_path=project_path,
+                            kanban_task_title=source_origin.get("kanban_task_title"),
+                            kanban_task_title_source=source_origin.get("kanban_task_title_source"),
+                            origin_transcript_path=source_origin.get("transcript_path"),
+                            # F2a：没有这枚 key 就查不到真实终态，对账只能退回 TTL 猜测。
+                            idempotency_key=message_payload.get("idempotency_key"),
+                            terminal_delivery_status=delivery_receipt.terminal_delivery_status,
+                            terminal_delivery_failure_reason=(
+                                delivery_receipt.terminal_delivery_failure_reason
+                            ),
+                            terminal_delivery_status_updated_at=(
+                                delivery_receipt.terminal_delivery_status_updated_at
+                            ),
+                        )
+                        pending_marker_path = str(pending_path) if pending_path else None
+                    except Exception:  # best-effort：写 pending 失败不阻断 dispatch 上报
+                        pending_marker_path = None
+
+        if message_payload is None:
+            error = dispatch_error or "unknown dispatch error"
             # 不再在 dispatch 处 arm 锁，故注入失败时无锁可清（arm 已移交 UserPromptSubmit）。
             ledger.event(
                 phase="fork",
@@ -5643,52 +6706,9 @@ def launch_backend(
                 ),
             )
 
-        # 旧设计在此把 message_id/turn_id 回写进 in-progress 锁；现在 arm 由目标 session
-        # 的 UserPromptSubmit hook 在投递落地时完成，这里不再写锁。
-        raw_status = str(message_payload.get("status") or "").strip().lower()
-        message_id = message_payload.get("message_id")
-        delivery_channel = _kanban_followup_delivery_channel(message_id)
-        delivery_confirmed = delivery_channel == "app-server"
-        if raw_status in {"started", "running", "in_progress", "in-progress"}:
-            # app-server（可确认）→ started；terminal fallback（未确认）→ dispatched-unconfirmed，
-            # 诚实表达「已交付但未确认成为真实 turn」，不再谎报 injected。
-            status = (
-                "kanban-followup-started"
-                if delivery_confirmed
-                else "kanban-followup-dispatched-unconfirmed"
-            )
-        else:
-            status = "kanban-followup-enqueued"
-        reason_code = status.replace("-", "_")
-        # 未确认投递（terminal / 非 started 回执）写 pending marker，作为「dispatch 已发、尚未
-        # 确认落地」的对账依据：UPS arm 落地时按 token 清掉它；超时仍在 → 下次 Stop 判定上次
-        # 静默丢投并放行重投，同时 active 期间为 dispatch→delivery 在途窗口提供去重保护。
-        pending_marker_path: str | None = None
-        if not delivery_confirmed:
-            pending_task_id = message_payload.get("task_id") or task_id
-            try:
-                pending_path = write_kanban_followup_pending(
-                    task_id=pending_task_id,
-                    session_id=source_session_id,
-                    run_id=str(ledger.run_id),
-                    run_dir=str(ledger.run_dir),
-                    repo=decision.repo,
-                    cwd=cwd,
-                    token=dispatch_prep.token,
-                    delivery_channel=delivery_channel,
-                    attempt_id=message_payload.get("attempt_id") or attempt_id,
-                    message_id=message_id if isinstance(message_id, str) else None,
-                    turn_id=message_payload.get("turn_id") or message_payload.get("turnId"),
-                    prompt_path=message_payload.get("prompt_path"),
-                    # S0：快照 deep-link 与可选 verify-consumed 所需字段，供 S1a/S1b 复用。
-                    kanban_project_path=project_path,
-                    kanban_task_title=source_origin.get("kanban_task_title"),
-                    kanban_task_title_source=source_origin.get("kanban_task_title_source"),
-                    origin_transcript_path=source_origin.get("transcript_path"),
-                )
-                pending_marker_path = str(pending_path) if pending_path else None
-            except Exception:  # best-effort：写 pending 失败不阻断 dispatch 上报
-                pending_marker_path = None
+        # 通知与 lease 记账在闸外做：它们与「别并发投同一个 task」无关，压在闸内只会白白拉长
+        # 临界区（通知子进程默认 timeout 10s）。
+        if not delivery_confirmed and not delivery_receipt.is_failed:
             # S1a：首次未确认派发即发一条强可见 OS 通知（hook systemMessage 易被忽略），
             # 并盖 last_notified_at 防随后任意会话 Stop 的 stranded-sweep 立刻重复通知。
             # 整段 best-effort，永不抛——通知失败不影响 dispatch 上报。
@@ -5722,6 +6742,47 @@ def launch_backend(
                     )
                 except Exception:
                     pass
+        elif delivery_receipt.is_failed:
+            # 确定没送到：没有 pending marker 会替它浮现，故这里直接发一条 OS 通知。
+            # 整段 best-effort，永不抛。
+            try:
+                failed_task_id = message_payload.get("task_id") or task_id
+                notify_kanban_followup_stranded(
+                    task_id=failed_task_id,
+                    task_title=source_origin.get("kanban_task_title"),
+                    task_url=resolve_kanban_task_url(project_path, failed_task_id),
+                    reason=(
+                        "delivery-failed:"
+                        f"{delivery_receipt.terminal_delivery_failure_reason or 'unknown'}"
+                    ),
+                )
+            except Exception:
+                pass
+            # 这条路径刻意不留 pending，于是**没有任何东西**会在之后替这一轮释放 tracker lease：
+            # 不在这里放掉，本轮 allocate 出来的 scope unit 会在整个 lease TTL（默认约 1h）里
+            # 保持 ``assigned``，而 hook payload 却承诺「下一次该 task 的 Stop 会按当时的工作树
+            # 重新决策」—— 那次 Stop 根本拿不到这批单元，承诺是空头的。best-effort，永不抛。
+            failed_lease_release = _release_tracker_lease_for_current_run(
+                ledger,
+                repo=decision.repo,
+                reason=(
+                    "kanban_followup_delivery_failed:"
+                    f"{delivery_receipt.terminal_delivery_failure_reason or 'unknown'}"
+                ),
+            )
+            ledger.event(
+                phase="fork",
+                event="kanban_followup_delivery_failed_lease_released",
+                status=status,
+                reason_code="kanban_followup_delivery_failed_lease_released",
+                repo=decision.repo,
+                cwd=cwd,
+                mode="kanban-followup",
+                cline_kanban_task_id=task_id,
+                tracker_lease_id=failed_lease_release.get("lease_id"),
+                tracker_lease_release=failed_lease_release,
+                **delivery_receipt_fields,
+            )
         paths = {
             key: value
             for key, value in {
@@ -5754,25 +6815,36 @@ def launch_backend(
             kanban_followup_delivery_channel=delivery_channel,
             kanban_followup_delivery_confirmed=delivery_confirmed,
             kanban_followup_pending_marker_path=pending_marker_path,
+            cline_kanban_idempotency_key=message_payload.get("idempotency_key"),
+            **delivery_receipt_fields,
             **stop_hook_rvf_state_fields(
                 phase="prepare",
                 backend="kanban-followup",
                 backend_raw=decision.backend,
             ),
         )
+        if delivery_confirmed:
+            followup_delivery_message = (
+                "Cline Kanban follow-up user message was injected "
+                f"（{describe_terminal_delivery_receipt_for_operator(delivery_receipt)}）。"
+            )
+        elif delivery_receipt.is_failed:
+            followup_delivery_message = (
+                "Cline Kanban follow-up **未送达**："
+                f"{describe_terminal_delivery_receipt_for_operator(delivery_receipt)}"
+                " 本轮不留在途记录；下一次该 task 的 Stop 会按当时的工作树重新决策。"
+            )
+        else:
+            followup_delivery_message = (
+                "Cline Kanban follow-up 已被 Kanban 受理，但**尚未确认**成为真实 turn"
+                f"（{describe_terminal_delivery_receipt_for_operator(delivery_receipt)}）；"
+                "请打开或恢复该 task，让排队中的 $review-validate-fix 被消费。"
+                "下一次该 task 的 Stop 会按 idempotency key 查它的真实终态再决定是否重投。"
+            )
         success_payload = ledger.hook_payload(
             status=status,
             reason_code=reason_code,
-            message=(
-                "Cline Kanban follow-up user message was injected."
-                if delivery_confirmed
-                else (
-                    "Cline Kanban follow-up 已经 terminal fallback 交给 Kanban，但未确认成为真实 "
-                    "turn（dispatch 时无 app-server socket / 目标 session 可能已停止）；"
-                    "请打开或恢复该 task，让排队中的 $review-validate-fix 被消费。"
-                    "若未落地，下一次该 task 的 Stop 会判定丢投并自动重投。"
-                )
-            ),
+            message=followup_delivery_message,
             repo=decision.repo,
             cwd=cwd,
             backend=decision.backend,
@@ -5792,6 +6864,8 @@ def launch_backend(
             kanban_followup_delivery_channel=delivery_channel,
             kanban_followup_delivery_confirmed=delivery_confirmed,
             kanban_followup_pending_marker_path=pending_marker_path,
+            cline_kanban_idempotency_key=message_payload.get("idempotency_key"),
+            **delivery_receipt_fields,
             **source_origin_fields,
             **dispatch_prep_fields,
             **stop_hook_rvf_state_fields(
@@ -5807,7 +6881,10 @@ def launch_backend(
         )
         # 仅本「成功派发 self-rising followup」路径置位：resume 在路上 → main 据此保留 park（不 unpark）。
         # hook_payload 顶层无 status 键，故必须用这个显式内部信号；main 在 emit 前 pop 掉、不泄漏给 Claude。
-        success_payload[_RVF_KEEP_SELF_PARK_FLAG] = True
+        # F2a：**投递已确定失败时不置位** —— 没有任何 resume 在路上，继续 park 会把卡片永久压在
+        # in_progress 上等一个不会到来的 follow-up（正是「乐观回执」那类缺陷的卡片侧同构形态）。
+        if not delivery_receipt.is_failed:
+            success_payload[_RVF_KEEP_SELF_PARK_FLAG] = True
         return success_payload
     if not decision.parent_thread_id:
         return skip_payload(
