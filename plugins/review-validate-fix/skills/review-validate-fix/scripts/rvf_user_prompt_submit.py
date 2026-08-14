@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import kanban_followup_lock
 import rvf_bootstrap_gate
 import rvf_prep_file
+import rvf_withdrawn_dispatch_tombstone
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from kanban_followup_trigger_transcript_presence import has_explicit_human_prompt_after
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # noqa: E402
@@ -1170,6 +1171,125 @@ def _confirm_manual_decision_delivery(
         pass
 
 
+def _withdrawn_dispatch_additional_context_text(
+    token: str, tombstone: dict[str, Any]
+) -> str:
+    """被撤回的投递落地时，喂给模型的**权威**禁令正文（model-facing）。"""
+    reason = tombstone.get("reason") or "unspecified"
+    claimed_at = tombstone.get("claimed_at") or "<unknown>"
+    return (
+        "[RVF] 这条 `$review-validate-fix` 触发**已被 RVF 撤回，不要执行它。**\n"
+        f"- dispatch token：`{token}`\n"
+        f"- 撤回时间：{claimed_at}\n"
+        f"- 撤回原因：{reason}\n"
+        "\n"
+        "它是一条**迟到落地**的旧派发：RVF 在它落地之前就判定该轮投递未送达并已收尾"
+        "（释放了 tracker lease、清了锁）。现在执行它会跑出一轮无锁、无 lease、无 scope 契约的 "
+        "review，并可能与已经重新发起的那一轮并发撞车。\n"
+        "\n"
+        "正确做法：**忽略这条触发**，继续你原本的工作。若确实需要 review，等下一次 Stop "
+        "由 RVF 重新发起，或由用户显式触发。"
+    )
+
+
+def _apply_withdrawn_dispatch_hard_neutralization(
+    token: str, payload: dict[str, Any], tombstone: dict[str, Any]
+) -> dict[str, Any]:
+    """把 payload 就地改写成「硬中和」的 hook 结果并返回它（**唯一**的中和出口）。
+
+    三管齐下而不是只写一句提示：``decision=block``（host 支持时直接挡掉这次提交）、
+    ``additionalContext``（模型可见的权威禁令，挡不住时至少让模型看到）、``systemMessage``
+    （用户可见）。只靠注入正文自觉是不可靠的——本次事故本身就是「agent 被拽去跑一轮它从未
+    接受的 RVF」，同一类模型合规假设不能再用第二次。
+
+    刻意抽成公共出口：撤回可能在「查 tombstone」与「抢 consumed」之间才胜出（TOCTOU），
+    那条晚一步发现的路径必须走**同一条**硬中和，不能只记一行诊断就放行。
+    """
+    payload.update(
+        {
+            "status": "dispatch_withdrawn",
+            "token": token,
+            "workflow_started": False,
+            "dispatch_withdrawn_reason": tombstone.get("reason"),
+            "dispatch_withdrawn_at": tombstone.get("claimed_at"),
+        }
+    )
+    payload["continue"] = True
+    payload["decision"] = "block"
+    payload["reason"] = (
+        f"RVF 已撤回 dispatch token {token} 对应的那轮 review"
+        f"（原因：{tombstone.get('reason') or 'unspecified'}）；这条迟到落地的触发不应被执行。"
+    )
+    payload["hookSpecificOutput"] = {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": _withdrawn_dispatch_additional_context_text(token, tombstone),
+    }
+    payload["systemMessage"] = (
+        f"RVF: 已撤回的 review 派发迟到落地（token={token}，"
+        f"撤回原因={tombstone.get('reason') or 'unspecified'}），已中和、未启动 review。"
+    )
+    return payload
+
+
+def _withdrawn_dispatch_neutralization(
+    token: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """token 已被撤回 → 返回一份「硬中和」的 hook 结果；否则 None。
+
+    best-effort：tombstone 机制不可用（token 形状怪、文件系统报错）一律返回 None 放行。
+    """
+    try:
+        tombstone = rvf_withdrawn_dispatch_tombstone.dispatch_token_was_withdrawn(token)
+    except Exception:
+        return None
+    if tombstone is None:
+        return None
+    return _apply_withdrawn_dispatch_hard_neutralization(token, payload, tombstone)
+
+
+def _claim_dispatch_token_consumed(
+    token: str, payload: dict[str, Any], event: dict[str, Any]
+) -> dict[str, Any] | None:
+    """在消费 token **之前**抢下 ``consumed`` 终态；输给 ``withdrawn`` 则返回硬中和结果。
+
+    抢到 = 这条投递赢了这场竞态，后续任何超时逻辑都不得再把它当「未投递」撤回。
+
+    抢不到且既有态是 ``withdrawn``：撤回是在上一步「查 tombstone」之后才胜出的（TOCTOU 窗口），
+    这条投递**已经作废**。此时只把它记进诊断字段是不够的——主流程会照常消费 prep、arm
+    kanban-followup 锁、启动 workflow，正好跑出这套机制要根治的那一形态。故这里返回与
+    ``_withdrawn_dispatch_neutralization`` **同一条**硬中和出口，由调用方直接返回。
+
+    其余情况一律返回 None 放行：``applicable=False``（token 形状不合法 / 文件系统报错）说明
+    这道机制此刻用不了，应按无 tombstone 处理——它是止血机制，不是安全边界，绝不能堵死 prompt。
+    """
+    try:
+        claim = rvf_withdrawn_dispatch_tombstone.claim_dispatch_token_terminal_state(
+            token,
+            state=rvf_withdrawn_dispatch_tombstone.STATE_CONSUMED,
+            reason="user_prompt_submit_delivery_landed",
+            details={
+                "session_id": event.get("session_id"),
+                "transcript_path": event.get("transcript_path"),
+            },
+        )
+    except Exception:
+        return None
+    if not claim.applicable:
+        return None
+    payload["dispatch_token_terminal_state_claimed"] = claim.won
+    if not claim.won and claim.existing_state:
+        payload["dispatch_token_terminal_state_existing"] = claim.existing_state
+    if (
+        not claim.won
+        and claim.existing_state == rvf_withdrawn_dispatch_tombstone.STATE_WITHDRAWN
+    ):
+        tombstone = (
+            claim.existing_payload if isinstance(claim.existing_payload, dict) else {}
+        )
+        return _apply_withdrawn_dispatch_hard_neutralization(token, payload, tombstone)
+    return None
+
+
 def inspect_user_prompt_submit(
     event: dict[str, Any],
     *,
@@ -1236,6 +1356,25 @@ def inspect_user_prompt_submit(
             payload["round_baseline"] = round_baseline_debug
 
     if token is not None:
+        # ① 先问「这条投递还算数吗」，再谈消费它。
+        #
+        # 撤回竞态：RVF 可能早已判定这条投递丢了并撤回/重投，而它**随后**才落地（实测迟到过
+        # 49 分钟）。落地时它是完全可执行的——注入正文自包含，agent 会照跑一次无锁、无 lease、
+        # 无 scope 契约的 RVF，还可能与新一轮并发撞车。历史设计想靠「撤回时删 prep」止血，但
+        # 那结构上不可判定：撤回删 prep 与正常消费 prep，留下的都是「文件缺失」。
+        #
+        # 故这里读的是**正向 tombstone**，且中和是 hook 强制的，不是靠正文自觉：block 提交
+        # （host 支持时）+ 模型可见的权威 additionalContext + 用户可见 systemMessage 三管齐下。
+        withdrawal = _withdrawn_dispatch_neutralization(token, payload)
+        if withdrawal is not None:
+            return withdrawal
+        # ② 抢下 ``consumed``：此后任何超时逻辑都不得再把这条投递当「未投递」撤回。
+        #    抢不到而态是 consumed 属幂等重入；抢不到而态是 withdrawn 说明撤回是在 ① 之后才
+        #    胜出的（TOCTOU 窗口）——那一步返回硬中和结果，这里必须**直接返回**它，绝不能带
+        #    着一条已作废的投递继续去消费 prep / arm 锁 / 起 workflow。
+        withdrawal_after_claim = _claim_dispatch_token_consumed(token, payload, event)
+        if withdrawal_after_claim is not None:
+            return withdrawal_after_claim
         lookup_now = rvf_prep_file.parse_timestamp(now) if now else None
         lookup = rvf_prep_file.read_prep_file(token, root=prep_root, now=lookup_now)
         payload.update(
@@ -1684,6 +1823,15 @@ def _render_hook_payload(result: dict[str, Any]) -> dict[str, Any] | None:
         out["systemMessage"] = system_message
     if "hookSpecificOutput" in result:
         out["hookSpecificOutput"] = result["hookSpecificOutput"]
+        out.setdefault("continue", True)
+    # ``decision: block`` 只由「已撤回的投递迟到落地」这一条路径产出：host 支持时直接挡掉这次
+    # 提交，是三管齐下里最硬的那一管。不支持该键的 host 会忽略它，此时 additionalContext 的
+    # 权威禁令与 systemMessage 仍在（故这一管缺席只降级、不失效）。
+    if result.get("decision") == "block":
+        out["decision"] = "block"
+        reason = result.get("reason")
+        if isinstance(reason, str) and reason:
+            out["reason"] = reason
         out.setdefault("continue", True)
     return out or None
 

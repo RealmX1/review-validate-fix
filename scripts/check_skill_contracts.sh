@@ -544,6 +544,7 @@ repo_required_files=(
   "core/parent_conversation_context/parent_conversation_origin_freeze.py"
   "core/review_prompt_assembly/review_validate_fix_fork_prompt.py"
   "core/review_dispatch/review_validate_fix_dispatch_flow.py"
+  "core/cline_kanban_terminal_delivery/cline_kanban_terminal_delivery_receipt.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -560,6 +561,8 @@ repo_required_files=(
   "tests/test_official_cli_local_deploy_verification.py"
   "tests/test_rvf_user_local_data_paths.py"
   "tests/test_merge_rvf_state_roots.py"
+  "tests/test_cline_kanban_terminal_delivery_receipt.py"
+  "tests/test_rvf_withdrawn_dispatch_tombstone.py"
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
@@ -632,6 +635,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
+  "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
@@ -649,6 +653,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/parent_conversation_context/parent_conversation_origin_freeze.py" \
   "$repo_root/core/review_prompt_assembly/review_validate_fix_fork_prompt.py" \
   "$repo_root/core/review_dispatch/review_validate_fix_dispatch_flow.py" \
+  "$repo_root/core/cline_kanban_terminal_delivery/cline_kanban_terminal_delivery_receipt.py" \
   "$skill_dir/scripts/host_adapter_resolver.py" \
   "$skill_dir/scripts/review_reopen_marker.py" \
   "$skill_dir/scripts/rvf_rescope.py" \
@@ -663,6 +668,8 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_official_cli_local_deploy_verification.py" \
   "$tests_dir/test_rvf_user_local_data_paths.py" \
   "$tests_dir/test_merge_rvf_state_roots.py" \
+  "$tests_dir/test_cline_kanban_terminal_delivery_receipt.py" \
+  "$tests_dir/test_rvf_withdrawn_dispatch_tombstone.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py"
@@ -675,6 +682,12 @@ run_step "tests: rvf_local_deploy" \
 run_step "tests: merge_rvf_state_roots" \
   python3 -m pytest -q \
     "$tests_dir/test_merge_rvf_state_roots.py"
+run_step "tests: cline_kanban_terminal_delivery_receipt" \
+  python3 -m pytest -q \
+    "$tests_dir/test_cline_kanban_terminal_delivery_receipt.py"
+run_step "tests: rvf_withdrawn_dispatch_tombstone" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_withdrawn_dispatch_tombstone.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"

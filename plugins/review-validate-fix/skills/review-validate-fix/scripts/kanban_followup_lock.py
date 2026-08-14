@@ -805,6 +805,11 @@ def pending_marker_payload(
     kanban_task_title: str | None = None,
     kanban_task_title_source: str | None = None,
     origin_transcript_path: str | None = None,
+    idempotency_key: str | None = None,
+    terminal_delivery_status: str | None = None,
+    terminal_delivery_failure_reason: str | None = None,
+    terminal_delivery_status_updated_at: str | None = None,
+    redispatch_attempt_count: int = 0,
 ) -> dict[str, Any]:
     ttl = pending_ttl_seconds()
     return {
@@ -831,6 +836,19 @@ def pending_marker_payload(
         "kanban_task_title": kanban_task_title,
         "kanban_task_title_source": kanban_task_title_source,
         "origin_transcript_path": origin_transcript_path,
+        # 这条投递在 cline-kanban 账本里的主键之一（另一半是 kanban_task_id）。**没有它就没法
+        # 查真实终态**——`kanban task message-status` 正是按 (task_id, idempotency_key) 定位记录。
+        # 历史 pending marker 不记它，于是对账只能靠「TTL 到了还没被清 ⇒ 大概是丢了」的猜测，
+        # 那正是 F2a 要根治的东西。
+        "idempotency_key": idempotency_key,
+        # dispatch 那一刻的回执快照（可能是非终态 accepted_pending_submit_confirmation）。
+        # 只作审计与「对方是否回退到遗留字段」的取证，**不作判据**——判据一律现查 message-status。
+        "terminal_delivery_status": terminal_delivery_status,
+        "terminal_delivery_failure_reason": terminal_delivery_failure_reason,
+        "terminal_delivery_status_updated_at": terminal_delivery_status_updated_at,
+        # 这条 follow-up 已经被重投过几次。契约第 7 条要求每次重投换新 idempotency key，
+        # 于是「重投了几次」不再能从 key 反推，必须显式记账（也用于给自动重投设上界）。
+        "redispatch_attempt_count": max(0, int(redispatch_attempt_count or 0)),
     }
 
 
@@ -852,6 +870,11 @@ def write_pending_marker(
     kanban_task_title: str | None = None,
     kanban_task_title_source: str | None = None,
     origin_transcript_path: str | None = None,
+    idempotency_key: str | None = None,
+    terminal_delivery_status: str | None = None,
+    terminal_delivery_failure_reason: str | None = None,
+    terminal_delivery_status_updated_at: str | None = None,
+    redispatch_attempt_count: int = 0,
     root: Path | None = None,
 ) -> Path | None:
     if not (isinstance(task_id, str) and task_id.strip()):
@@ -873,10 +896,82 @@ def write_pending_marker(
         kanban_task_title=kanban_task_title,
         kanban_task_title_source=kanban_task_title_source,
         origin_transcript_path=origin_transcript_path,
+        idempotency_key=idempotency_key,
+        terminal_delivery_status=terminal_delivery_status,
+        terminal_delivery_failure_reason=terminal_delivery_failure_reason,
+        terminal_delivery_status_updated_at=terminal_delivery_status_updated_at,
+        redispatch_attempt_count=redispatch_attempt_count,
     )
     target = _pending_task_path(task_id, root)
     _atomic_write(target, payload)
     return target
+
+
+def pending_redispatch_attempt_count(marker: dict[str, Any] | None) -> int:
+    """这条 pending 已被重投过几次（缺省 0，坏值按 0）。"""
+    if not isinstance(marker, dict):
+        return 0
+    try:
+        return max(0, int(marker.get("redispatch_attempt_count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# per-task 派发单飞闸
+#
+# 契约第 5 条：**RVF 不得对同一 task 并发投递**——cline-kanban 每个 session 只有一个单飞槽，
+# 先到的那条会被判 ``superseded_by_later_delivery``。历史实现靠「重投用一个稳定 idempotency
+# key」来间接去重，但契约第 7 条要求每次重投换新 key（同 key 不会因上次失败就再投一次），
+# 两条要求叠加后，去重责任必须落到**派发侧的串行化**上，而不是 key 上。
+#
+# 用 flock（建议性锁，进程崩溃由内核自动释放）而不是 O_EXCL 占位文件：这里要的是「同一时刻
+# 只有一个 Stop 在对这个 task 做决定+投递」，不是跨进程的持久记账；持久记账仍由 pending
+# marker 承担。拿不到锁一律**跳过本轮投递**（而不是等），因为 Stop hook 自身有秒级预算，
+# 且下一次 Stop 会重新决策——宁可这一轮不投，也不要投出第二条把前一条撞成 superseded。
+# ---------------------------------------------------------------------------
+
+DISPATCH_SINGLE_FLIGHT_LOCK_SUFFIX = ".dispatch-single-flight.lock"
+
+
+def _pending_dispatch_single_flight_lock_path(task_id: str, root: Path | None = None) -> Path:
+    target = _pending_task_path(task_id, root)
+    return target.with_name(f".{target.name}{DISPATCH_SINGLE_FLIGHT_LOCK_SUFFIX}")
+
+
+@contextmanager
+def dispatch_single_flight_for_task(task_id: str | None, *, root: Path | None = None):
+    """``with`` 期间独占「对这个 task 的 follow-up 派发」；产出 True 表示拿到了闸。
+
+    产出 False = 另一个进程正在派发同一个 task，**本轮不得投递**。缺 task_id 或文件系统
+    报错一律产出 True（放行）：这道闸是防并发的，不是安全边界，绝不能让它把派发整个堵死。
+    """
+    if not (isinstance(task_id, str) and task_id.strip()):
+        yield True
+        return
+    try:
+        lock_path = _pending_dispatch_single_flight_lock_path(task_id, root)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield True
+        return
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    acquired = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def read_pending_marker(

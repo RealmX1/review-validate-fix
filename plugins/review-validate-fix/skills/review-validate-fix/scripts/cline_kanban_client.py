@@ -24,14 +24,40 @@ DEFAULT_WORKSPACE_RESOLVE_TIMEOUT_SECONDS = 5.0
 
 # 契约边界：这个 wrapper 只 shell 到 `kanban task create`、
 # `kanban task start`、`kanban task trash`，RVF 定制的
-# `kanban task message` follow-up 用户消息注入命令，以及
+# `kanban task message` / `kanban task message-status` / `kanban task message-cancel`
+# 这组 follow-up 用户消息注入与投递回执命令，以及
 # `kanban task park` / `kanban task unpark` / `kanban task is-parked`
 # 这组 park sidecar 命令（让卡片在主 agent 停下等注入式 followup 唤回时
 # 维持在 in_progress、不误移 review / 不误发通知）。
 
+# `kanban task message` 系列装有 CLI 硬超时（KANBAN_CLI_HARD_TIMEOUT_MS，默认 35s）：到点
+# `exit(124)` 且 **stdout 完全为空**。这个组合的语义是「还没结论」，**绝不是投递失败**——
+# 与本仓 cursor-agent 那条「空 stdout ⇒ 失败」的判据方向相反，故两处不能共用同一个包装器。
+KANBAN_CLI_HARD_TIMEOUT_EXIT_CODE = 124
+
 
 class KanbanError(RuntimeError):
     pass
+
+
+class KanbanTerminalDeliveryInterfaceUnavailableError(KanbanError):
+    """目标 `kanban` CLI 没有这个子命令。
+
+    契约第 8 条：**接口不存在是合法运行态**（对方实现尚未 land / 用户装的是旧版本）。调用方
+    应退回「纯 RVF 侧语义中和」路径，不得阻塞派发，也**不得**把它记成一次投递失败。
+    """
+
+
+class KanbanTerminalDeliveryVerdictNotYetAvailableError(KanbanError):
+    """CLI 硬超时（``exit 124`` + 空 stdout）= 「还没结论」，不是失败。调用方应稍后重查。"""
+
+
+class KanbanTerminalDeliveryRecordNotFoundError(KanbanError):
+    """账本里没有这条 ``(task_id, idempotency_key)`` 记录（``ok:false``/``unknown_idempotency_key``）。
+
+    注意它与「投递失败」是两件事：失败记录现在**保留**在账本里（契约 § 与今天行为的差异），
+    所以「查不到」只可能是从没请求过、或账本被清过。
+    """
 
 
 def split_command(value: str) -> list[str]:
@@ -148,6 +174,7 @@ def run_command(
     cwd: Path | None = None,
     check: bool = True,
     env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(
@@ -157,6 +184,7 @@ def run_command(
             text=True,
             check=False,
             env=dict(env) if env is not None else None,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise KanbanError(
@@ -815,6 +843,7 @@ def send_task_message(
     source: str,
     idempotency_key: str,
     attempt_id: str | None,
+    wait_for_terminal_status_timeout_ms: int | None = None,
 ) -> dict[str, Any]:
     if prompt is None and prompt_file is None:
         raise KanbanError("message requires --prompt or --prompt-file")
@@ -834,12 +863,166 @@ def send_task_message(
     command.extend(["--source", source, "--idempotency-key", idempotency_key])
     if attempt_id:
         command.extend(["--attempt-id", attempt_id])
-    payload = parse_json_stdout(run_command(command, cwd=repo, env=runtime_env(port)))
+    # 契约第 4 条：`--wait-for-terminal-status` 只能做**短等**，不能拿来等满契约的 196.5s
+    # 收敛预算——CLI 自己的硬超时会把等待预算 clamp 掉。真正的终态由 `message-status` 轮询
+    # （见 read_task_message_terminal_delivery_status）拿。传 None/0 即完全不等（默认）。
+    if wait_for_terminal_status_timeout_ms and wait_for_terminal_status_timeout_ms > 0:
+        command.extend(
+            [
+                "--wait-for-terminal-status",
+                "--wait-timeout-ms",
+                str(int(wait_for_terminal_status_timeout_ms)),
+            ]
+        )
+    completed = run_command(command, cwd=repo, check=False, env=runtime_env(port))
+    _raise_for_task_message_subcommand_failure(completed, subcommand="message")
+    payload = parse_json_stdout(completed)
     try:
         payload["task_id"] = normalize_task_id(payload)
     except KanbanError:
         payload["task_id"] = task_id
     payload["message_id"] = normalize_message_id(payload)
+    payload.setdefault("idempotency_key", idempotency_key)
+    return payload
+
+
+_MISSING_SUBCOMMAND_STDERR_MARKERS = (
+    "unknown command",
+    "unknown option",
+    "unknown argument",
+    "did you mean",
+)
+
+
+def _raise_for_task_message_subcommand_failure(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    subcommand: str,
+) -> None:
+    """把 `kanban task message*` 的非零退出分成三类互不相同的运行态，绝不混成一句「失败」。
+
+    ``exit 124`` + 空 stdout ⇒ 还没结论；stderr 是 commander 的 unknown-command/option ⇒ 接口
+    不存在；``ok:false`` + ``unknown_idempotency_key`` ⇒ 账本无此记录。其余保持 ``KanbanError``，
+    但**带着完整原因**抛（stderr 原文 / payload 全文），不留给 ``parse_json_stdout`` 吞掉。
+    判定顺序不可调换：硬超时那一支必须最先判，否则空 stdout 会被后面的分支误读成别的形态。
+    """
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if completed.returncode == KANBAN_CLI_HARD_TIMEOUT_EXIT_CODE and not stdout:
+        raise KanbanTerminalDeliveryVerdictNotYetAvailableError(
+            f"`kanban task {subcommand}` hit KANBAN_CLI_HARD_TIMEOUT_MS (exit 124, empty stdout); "
+            "this means no verdict yet, not a delivery failure."
+        )
+    if completed.returncode == 0:
+        return
+    if not stdout:
+        lowered = stderr.lower()
+        if any(marker in lowered for marker in _MISSING_SUBCOMMAND_STDERR_MARKERS):
+            raise KanbanTerminalDeliveryInterfaceUnavailableError(
+                f"`kanban task {subcommand}` is not implemented by the installed Kanban CLI: {stderr}"
+            )
+        # 非零退出、无 stdout、又不是上面两种可分类形态：这就是普通失败。必须在这里带着
+        # **stderr 原文**抛出——落到下面的 `parse_json_stdout` 会把它变成一句
+        # 「did not return JSON: ''」，把真正的失败原因整个吞掉（本函数引入前，`run_command`
+        # 的 `check=True` 抛的正是 stderr）。
+        raise KanbanError(
+            stderr or f"`kanban task {subcommand}` failed with exit code {completed.returncode}"
+        )
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict) or payload.get("ok") is not False:
+        return
+    if str(payload.get("error") or "").strip() == "unknown_idempotency_key":
+        raise KanbanTerminalDeliveryRecordNotFoundError(
+            f"`kanban task {subcommand}` has no ledger record for this idempotency key."
+        )
+    # 非零退出 + **其他** `{ok:false, error: ...}`。这里刻意**不**发明第四种分类：三个具名类
+    # 各对应一种「对方是健康的、只是这次拿不到结论」的运行态，而一个没见过的 error 码就是
+    # 普通失败，上层本就该按 `query_failed` 处理（`_query_kanban_terminal_delivery_receipt`
+    # 的五种降级取值只进事件、不驱动任何分支，多一种分类不会改变任何处置）。
+    # 要修的是另一半：落到下面的 `parse_json_stdout` 只会抛出**裸的 error 码**，把 payload 里
+    # 的补充说明与 stderr 原文一起吞掉——与上面「无 stdout」那一支写死的口径自相矛盾。CLI
+    # `main()` 把这段文本打给运维看（exit 2），吞掉的正是人排障时唯一能看到的东西。
+    detail = [f"payload={json.dumps(payload, ensure_ascii=False, sort_keys=True)}"]
+    if stderr:
+        detail.append(f"stderr={stderr}")
+    raise KanbanError(
+        f"`kanban task {subcommand}` failed with exit code {completed.returncode}: "
+        + "; ".join(detail)
+    )
+
+
+def read_task_message_terminal_delivery_status(
+    *,
+    task_cmd: str,
+    start_cmd: str | None = None,
+    repo: Path,
+    task_id: str,
+    idempotency_key: str,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """`kanban task message-status`：读一条已投递消息的**诚实**终态回执。
+
+    只读、幂等、无副作用。返回原始回执 payload；判读交给
+    ``core.cline_kanban_terminal_delivery``（本函数刻意不解释语义，避免两处各有一份判据）。
+    """
+    port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
+    command = task_command(
+        task_cmd,
+        "message-status",
+        "--project-path",
+        str(repo),
+        "--task-id",
+        task_id,
+        "--idempotency-key",
+        idempotency_key,
+    )
+    completed = run_command(
+        command, cwd=repo, check=False, env=runtime_env(port), timeout=timeout
+    )
+    _raise_for_task_message_subcommand_failure(completed, subcommand="message-status")
+    payload = parse_json_stdout(completed)
+    payload.setdefault("task_id", task_id)
+    payload.setdefault("idempotency_key", idempotency_key)
+    return payload
+
+
+def cancel_task_message_delivery(
+    *,
+    task_cmd: str,
+    start_cmd: str | None = None,
+    repo: Path,
+    task_id: str,
+    idempotency_key: str,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """`kanban task message-cancel`：请求取消一条尚未落定的投递。
+
+    幂等（同 key 重复调用返回相同结果、无副作用）。回执同时带 ``cancel_result`` 与
+    ``terminal_delivery_status`` / ``terminal_delivery_failure_reason``——**判「是不是被取消的」
+    必须读 reason，不能读 cancel_result**，见 ``core.cline_kanban_terminal_delivery`` 的两个具名
+    判读函数。
+    """
+    port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
+    command = task_command(
+        task_cmd,
+        "message-cancel",
+        "--project-path",
+        str(repo),
+        "--task-id",
+        task_id,
+        "--idempotency-key",
+        idempotency_key,
+    )
+    completed = run_command(
+        command, cwd=repo, check=False, env=runtime_env(port), timeout=timeout
+    )
+    _raise_for_task_message_subcommand_failure(completed, subcommand="message-cancel")
+    payload = parse_json_stdout(completed)
+    payload.setdefault("task_id", task_id)
+    payload.setdefault("idempotency_key", idempotency_key)
     return payload
 
 
@@ -847,7 +1030,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Cline Kanban CLI client for RVF.")
     parser.add_argument(
         "action",
-        choices=["ensure", "list", "create", "start", "trash", "message", "park", "unpark", "is-parked"],
+        choices=[
+            "ensure",
+            "list",
+            "create",
+            "start",
+            "trash",
+            "message",
+            "message-status",
+            "message-cancel",
+            "park",
+            "unpark",
+            "is-parked",
+        ],
     )
     parser.add_argument("--task-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_TASK_CMD", DEFAULT_TASK_CMD))
     parser.add_argument("--start-cmd", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_START_CMD", DEFAULT_START_CMD))
@@ -868,6 +1063,8 @@ def main() -> int:
     parser.add_argument("--attempt-id")
     parser.add_argument("--source", default="review-validate-fix")
     parser.add_argument("--idempotency-key")
+    # 短等而已（契约第 4 条）：真正的终态靠 message-status 轮询，不靠把这个数调大。
+    parser.add_argument("--wait-for-terminal-status-timeout-ms", type=int, default=0)
     parser.add_argument("--start-in-plan-mode", action="store_true")
     parser.add_argument("--auto-review-enabled", action="store_true")
     parser.add_argument("--auto-review-mode", default=os.environ.get("CODEX_RVF_CLINE_KANBAN_AUTO_REVIEW_MODE", "commit"))
@@ -938,6 +1135,30 @@ def main() -> int:
             if not args.task_id:
                 raise KanbanError("--task-id is required for is-parked")
             payload = is_parked_task(task_cmd=args.task_cmd, start_cmd=args.start_cmd, repo=repo, task_id=args.task_id)
+        elif args.action == "message-status":
+            if not args.task_id:
+                raise KanbanError("--task-id is required for message-status")
+            if not args.idempotency_key:
+                raise KanbanError("--idempotency-key is required for message-status")
+            payload = read_task_message_terminal_delivery_status(
+                task_cmd=args.task_cmd,
+                start_cmd=args.start_cmd,
+                repo=repo,
+                task_id=args.task_id,
+                idempotency_key=args.idempotency_key,
+            )
+        elif args.action == "message-cancel":
+            if not args.task_id:
+                raise KanbanError("--task-id is required for message-cancel")
+            if not args.idempotency_key:
+                raise KanbanError("--idempotency-key is required for message-cancel")
+            payload = cancel_task_message_delivery(
+                task_cmd=args.task_cmd,
+                start_cmd=args.start_cmd,
+                repo=repo,
+                task_id=args.task_id,
+                idempotency_key=args.idempotency_key,
+            )
         else:
             if not args.task_id:
                 raise KanbanError("--task-id is required for message")
@@ -953,7 +1174,18 @@ def main() -> int:
                 source=args.source,
                 idempotency_key=args.idempotency_key,
                 attempt_id=args.attempt_id,
+                wait_for_terminal_status_timeout_ms=args.wait_for_terminal_status_timeout_ms,
             )
+    # 三个降级运行态各有专属退出码：它们**都不是**「投递失败」，shell 调用方必须能分辨。
+    except KanbanTerminalDeliveryInterfaceUnavailableError as exc:
+        print(f"cline-kanban interface unavailable: {exc}", file=sys.stderr)
+        return 3
+    except KanbanTerminalDeliveryVerdictNotYetAvailableError as exc:
+        print(f"cline-kanban verdict not yet available: {exc}", file=sys.stderr)
+        return 4
+    except KanbanTerminalDeliveryRecordNotFoundError as exc:
+        print(f"cline-kanban record not found: {exc}", file=sys.stderr)
+        return 5
     except Exception as exc:
         print(f"cline-kanban error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

@@ -28,7 +28,8 @@ __all__ = [
     'test_kanban_followup_stranded_sweep_escalates_other_skips_current',
     'test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker',
     'test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable',
-    'test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path',
+    'test_kanban_followup_s2_redispatch_binds_idempotency_key_to_fresh_token_and_preserves_prompt_path',
+    'test_kanban_followup_pending_reconciliation_never_waits_without_an_upper_bound',
     'test_kanban_followup_title_falls_back_to_local_board_state',
     'test_kanban_followup_title_ignores_unrelated_board_with_same_task_id',
     'test_kanban_followup_title_uses_session_matched_board_state',
@@ -228,9 +229,14 @@ def test_kanban_followup_mode_injects_current_task_message(tmp_path: Path) -> No
     )
 
     payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    # F2a：这个 fake 只回遗留镜像 ``status: queued``。契约明说那是 mutate **之前**读的快照推断、
+    # 与实际投递结果无关，故 RVF 一律判「尚未确认」而不是「已入队/已送达」——历史实现在这里
+    # 报 enqueued 且**当作已确认**（不写 pending），正是 2026-08-08 事故的那条乐观推断。
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
     latest = latest_summary(state)
-    assert latest["status"] == "kanban-followup-enqueued"
+    assert latest["status"] == "kanban-followup-dispatched-unconfirmed"
+    assert latest["kanban_terminal_delivery_receipt_field_source"] == "legacy_status_mirror"
+    assert latest["kanban_followup_delivery_confirmed"] is False
     assert latest["backend"] == "kanban-followup"
     assert latest["rvf_backend"] == "kanban-followup"
     assert latest["rvf_state_phase"] == "prepare"
@@ -368,6 +374,149 @@ def test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pendin
     assert pending["token"] == prep_token
     assert pending["kanban_task_id"] == "task-77"
 
+    def _followup_dispatch_scenario(name: str, message_branch: str) -> tuple[dict, list[dict], Path]:
+        """跑一次干净的 kanban-followup 主派发，`message` 子命令行为由 message_branch 决定。"""
+        scenario_repo = init_repo_with_head(tmp_path / f"repo-{name}")
+        scenario_state = tmp_path / f"state-{name}"
+        scenario_tx = tmp_path / f"rollout-{name}.jsonl"
+        write_apply_patch_transcript(scenario_tx, scenario_repo, session_id=session_id)
+        scenario_client = tmp_path / f"fake_client_{name}.py"
+        scenario_calls = tmp_path / f"client-calls-{name}.jsonl"
+        scenario_client.write_text(
+            "import json, os, sys\n"
+            "with open(os.environ['FAKE_CLIENT_CALLS'], 'a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+            "if sys.argv[1] == 'list':\n"
+            "    plant = os.environ.get('FAKE_PLANT_PENDING_PATH')\n"
+            "    if plant:\n"
+            "        os.makedirs(os.path.dirname(plant), exist_ok=True)\n"
+            "        with open(plant, 'w', encoding='utf-8') as handle:\n"
+            "            handle.write(json.dumps({\n"
+            "                'marker_version': 1,\n"
+            "                'state': 'dispatched_unconfirmed',\n"
+            "                'dispatched_at': '2026-05-21T15:57:55Z',\n"
+            "                'expires_at': '2999-01-01T00:00:00Z',\n"
+            "                'kanban_task_id': 'task-77',\n"
+            "                'token': 'concurrenttoken0',\n"
+            "                'delivery_channel': 'terminal',\n"
+            "            }))\n"
+            f"    print(json.dumps({{'ok': True, 'tasks': [{{'id': 'task-77', 'title': 'T', 'workspacePath': {str(scenario_repo)!r}}}]}}))\n"
+            "elif sys.argv[1] == 'message':\n"
+            f"{message_branch}\n"
+            "else:\n"
+            "    raise SystemExit(f'unexpected action {sys.argv[1]}')\n",
+            encoding="utf-8",
+        )
+        env = {
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "RVF_PROVIDER_HEALTH_CHECK": "0",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(scenario_client),
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": "fake task",
+            "KANBAN_TASK_ID": "task-77",
+            "KANBAN_ATTEMPT_ID": "attempt-9",
+            "KANBAN_PROJECT_PATH": str(scenario_repo),
+            "FAKE_CLIENT_CALLS": str(scenario_calls),
+        }
+        if name == "concurrent":
+            env["FAKE_PLANT_PENDING_PATH"] = str(
+                scenario_state
+                / "kanban-followup-in-progress"
+                / "kanban-followup-dispatched"
+                / "task-task-77.json"
+            )
+        invoke(
+            {
+                "cwd": str(scenario_repo),
+                "stop_hook_active": False,
+                "session_id": session_id,
+                "transcript_path": str(scenario_tx),
+            },
+            extra_env=env,
+            state_dir=scenario_state,
+        )
+        calls = [
+            json.loads(line)
+            for line in scenario_calls.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return latest_summary(scenario_state), calls, scenario_state
+
+    # --- RVF-011：delivery_confirmed 也必须写 pending marker ---------------------------
+    # 不写就等于：prompt 提交后 UPS 尚未 arm 就被中断 / rewind 时，既没有 in-progress 锁、也没有
+    # 带 TTL 的 pending ⇒「delivered 但从未成为 turn ⇒ 到期撤回」那道保护永远不会触发，
+    # 那轮 review 静默搁浅且看上去一切正常。（``delivered_queued_behind_active_agent_turn``
+    # 本来就只是排上了队，更是如此。）
+    confirmed_latest, _confirmed_calls, _ = _followup_dispatch_scenario(
+        "confirmed",
+        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'message_id': "
+        "'terminal:task-77:rvf-run', 'terminal_delivery_status': "
+        "'delivered_and_submit_confirmed'}))",
+    )
+    assert confirmed_latest["status"] == "kanban-followup-started"
+    assert confirmed_latest["kanban_followup_delivery_confirmed"] is True
+    confirmed_pending = confirmed_latest.get("kanban_followup_pending_marker_path")
+    assert isinstance(confirmed_pending, str) and Path(confirmed_pending).exists(), (
+        "已确认送达也要留 pending：UPS arm 之前被中断 / rewind 时，它是唯一能到期收口的记录"
+    )
+    confirmed_marker = json.loads(Path(confirmed_pending).read_text(encoding="utf-8"))
+    assert confirmed_marker["token"] == dispatch_prep_payload(confirmed_latest)["token"]
+
+    # --- RVF-010：`kanban task message` 退出码 4（硬超时、空 stdout）= 「还没结论」 --------
+    # 它**不是**投递失败：那条消息可能已被受理。走 kanban-followup-unavailable 且不写 pending
+    # 会让它失去 status 对账与撤回能力，并可迟到执行。
+    verdict_latest, verdict_calls, _ = _followup_dispatch_scenario(
+        "verdict",
+        "    print('cline-kanban verdict not yet available: hard timeout', file=sys.stderr)\n"
+        "    raise SystemExit(4)",
+    )
+    assert [c["argv"][0] for c in verdict_calls][-1] == "message"
+    assert verdict_latest["status"] == "kanban-followup-dispatched-unconfirmed"
+    assert verdict_latest["kanban_terminal_delivery_verdict_not_yet_available"] is True
+    verdict_pending_path = verdict_latest.get("kanban_followup_pending_marker_path")
+    assert isinstance(verdict_pending_path, str) and Path(verdict_pending_path).exists(), (
+        "「还没结论」必须留下 pending，否则一条可能已被受理的消息再也无法对账 / 撤回"
+    )
+    verdict_marker = json.loads(Path(verdict_pending_path).read_text(encoding="utf-8"))
+    # 没有这枚 key 就查不到真实终态，对账只能退回 TTL 猜测。
+    assert verdict_marker["idempotency_key"]
+    assert verdict_marker["token"] == dispatch_prep_payload(verdict_latest)["token"]
+
+    # --- RVF-012：delivery_failed 刻意不写 pending，但必须释放本轮的 tracker lease --------
+    # 不放掉，scope unit 会在整个 lease TTL（默认约 1h）里保持 assigned，而 hook payload 却承诺
+    # 「下一次该 task 的 Stop 会按当时的工作树重新决策」—— 那次 Stop 根本拿不到这批单元。
+    failed_latest, _failed_calls, failed_state = _followup_dispatch_scenario(
+        "failed",
+        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'message_id': "
+        "'terminal:task-77:rvf-run', 'terminal_delivery_status': 'delivery_failed', "
+        "'terminal_delivery_failure_reason': 'terminal_prompt_readiness_timeout'}))",
+    )
+    assert failed_latest["status"] == "kanban-followup-delivery-failed"
+    assert failed_latest.get("kanban_followup_pending_marker_path") is None
+    released = [
+        event
+        for event in latest_events(failed_state)
+        if event.get("event") == "kanban_followup_delivery_failed_lease_released"
+    ]
+    assert len(released) == 1
+    assert released[0]["tracker_lease_id"]
+    assert released[0]["tracker_lease_release"].get("released") is True
+
+    # --- RVF-009：单飞闸必须裹到 pending 落盘，并在闸内复检决策是否已过时 -----------------
+    # 两个 Stop 可以都在闸外读到「无 pending」，再一前一后进闸各投一条新 key ⇒ 先到的那条被判
+    # superseded_by_later_delivery。这里让 fake client 在 `list`（闸前）阶段种下一条 active
+    # pending，模拟「闸外判据已过时」，断言闸内复检把本轮拦下、`message` 根本没被调用。
+    concurrent_latest, concurrent_calls, _ = _followup_dispatch_scenario(
+        "concurrent",
+        "    print(json.dumps({'ok': True, 'task_id': 'task-77', 'message_id': "
+        "'terminal:task-77:should-not-dispatch'}))",
+    )
+    assert concurrent_latest["status"] == "skipped"
+    assert (
+        concurrent_latest["reason_code"]
+        == "kanban_followup_dispatch_superseded_by_concurrent_pending"
+    )
+    assert "message" not in [c["argv"][0] for c in concurrent_calls]
+
 
 def test_kanban_followup_active_pending_skips_redispatch(tmp_path: Path) -> None:
     """active pending（dispatch→delivery 在途窗口内）→ 本次 Stop 跳过重复 dispatch，避免双注入。"""
@@ -430,6 +579,243 @@ def test_kanban_followup_active_pending_skips_redispatch(tmp_path: Path) -> None
     assert not client_calls.exists()
     # pending 仍在（未被清，等其落地或超时）。
     assert pending_path.exists()
+
+
+def _load_stop_hook_module_in_process(alias: str):
+    """把 Stop hook 脚本以独立别名 in-process 载入，供可 monkeypatch 的白盒断言使用。"""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(alias, SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _exercise_kanban_followup_withdrawal_receipt_and_reconciliation(tmp_path: Path) -> None:
+    """撤回本身的**可执行性 + 诚实性**，以及 pending 对账是否真的采纳撤回结论。
+
+    ⚠️ 本段刻意挂在一个**已注册**的测试里跑：同簇的
+    ``test_kanban_followup_pending_reconciliation_never_waits_without_an_upper_bound``
+    虽然存在，却**不在** ``tests/test_stop_review_validate_fix.py`` 的注册表里（protected 文件，
+    本包不得修改），挂上去等于静默不跑 = 假绿。
+
+    覆盖四条：
+
+    - **RVF-001**：撤回的「message-cancel 成功」路径（``try/except/**else**``）必须真的能跑完。
+      该分支里两个 ``cancel_receipt_indicates_*`` 判据曾**没被 import**，而 ``else`` 里抛的
+      NameError **不会**被前面的 except 捕获 ⇒ 释放 lease、清锁、清 pending 三步全部跳过、
+      撤回半途而废；``py_compile`` 与既有测试都看不见它。
+    - **RVF-002**：既没抢到 tombstone（机制此刻不可用）、``message-cancel`` 也失败/不存在时，
+      回执**不得**声称 ``withdrawn=True`` —— 此刻既无物理取消也无语义中和。
+    - **RVF-006**：三条 pending 对账分支都必须**读**撤回回执；撤回说「别放行」时不得 ``return None``
+      让正常 launch 过去（原 review 已被 UPS 接手时那就是第二条 follow-up）。
+    - **RVF-008①**：``delivery_failed`` 必须按契约的 ``redispatch_disposition`` 分流，
+      ``wait_for_external_condition`` / ``requires_human_confirmation`` 不得自动重投。
+    """
+    cs = _load_stop_hook_module_in_process("cs_withdrawal_under_test")
+    real_withdraw = cs._withdraw_unconfirmed_kanban_followup_dispatch
+
+    events: list[dict] = []
+
+    class _FakeLedger:
+        run_id = "run-withdrawal"
+        run_dir = str(tmp_path / "rd")
+
+        def event(self, **kwargs):
+            events.append(kwargs)
+
+        def hook_payload(self, **kwargs):
+            return {"continue": True, **kwargs}
+
+    # --- RVF-001：真撤回，走「message-cancel 成功」那条 else 分支 ------------------------
+    # 铁律：落盘根全部指向 tmp（tombstone 走 RVF_HOME，锁 / pending 走 LOCK_ROOT），绝不写真实 ~/.rvf。
+    isolated_home = tmp_path / "withdraw-rvf-home"
+    lock_root = tmp_path / "withdraw-kanban-followup-in-progress"
+    (lock_root / "kanban-followup-dispatched").mkdir(parents=True, exist_ok=True)
+    saved_env = {
+        name: os.environ.get(name)
+        for name in (
+            "RVF_HOME",
+            "RVF_WITHDRAWN_DISPATCH_TOMBSTONE_ROOT",
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT",
+        )
+    }
+    os.environ["RVF_HOME"] = str(isolated_home)
+    os.environ["RVF_WITHDRAWN_DISPATCH_TOMBSTONE_ROOT"] = str(
+        isolated_home / "rvf-withdrawn-dispatch-tokens"
+    )
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+    try:
+        cancel_calls: list[dict] = []
+
+        def _fake_cancel_success(**kw):
+            cancel_calls.append(kw)
+            # 契约：判「是不是被取消的」读 terminal_delivery_failure_reason，不读 cancel_result。
+            return {
+                "terminal_delivery_status": "delivery_failed",
+                "terminal_delivery_failure_reason": "cancelled_before_delivery",
+                "cancel_result": "cancelled_before_delivery",
+            }
+
+        cs.cancel_task_message_delivery = _fake_cancel_success
+        withdraw_marker = {
+            "kanban_task_id": "taskCancelOk",
+            "kanban_project_path": str(tmp_path),
+            "idempotency_key": "idem-cancel-ok",
+            "token": "abcdef0123456789",
+            "run_dir": str(tmp_path / "origin-run"),
+        }
+        result = real_withdraw(withdraw_marker, reason="prior_dispatch_never_converged")
+        assert cancel_calls, "cancel 成功路径必须真的调用过 message-cancel"
+        assert result["physical_cancel"]["outcome"] == "completed"
+        # 两个判据必须都被求值（漏 import 时它们根本走不到，NameError 会把整段撤回炸掉）。
+        assert result["physical_cancel"]["message_already_reached_agent"] is False
+        assert result["physical_cancel"]["cancelled_rather_than_failed_for_another_reason"] is True
+        # 撤回的后两步（放 lease、清锁、清 pending）必须真的跑到，而不是被异常跳过。
+        assert "tracker_lease_release" in result
+        assert "removed_in_progress_marker_paths" in result
+        assert "removed_pending_marker_paths" in result
+        assert result["withdrawn"] is True
+        assert result.get("cleaned_up_without_neutralization") is not True
+
+        # --- RVF-002：tombstone 不可用 + 取消也用不了 ⇒ 回执不得谎报 withdrawn -----------
+        def _fake_cancel_unavailable(**kw):
+            raise cs.KanbanTerminalDeliveryInterfaceUnavailableError("no such subcommand")
+
+        cs.cancel_task_message_delivery = _fake_cancel_unavailable
+        # token 形状非法 ⇒ tombstone_path 返回 None ⇒ claim.applicable=False（机制此刻用不了）。
+        unusable_marker = dict(withdraw_marker)
+        unusable_marker["kanban_task_id"] = "taskNoNeutralize"
+        unusable_marker["token"] = "not-a-valid-hex-token!"
+        degraded = real_withdraw(unusable_marker, reason="prior_dispatch_unconfirmed_ttl_elapsed")
+        assert degraded["tombstone"]["applicable"] is False
+        assert degraded["physical_cancel"]["outcome"] == "interface_unavailable"
+        assert degraded["neutralization"] == cs.KANBAN_FOLLOWUP_DISPATCH_NOT_NEUTRALIZED
+        assert degraded["withdrawn"] is False, "既无物理取消也无语义中和时不得声称已撤回"
+        assert degraded["cleaned_up_without_neutralization"] is True
+        # 清理仍然照做（不清理 = 这一轮永久 park，比多一轮延迟坏得多）。
+        assert "tracker_lease_release" in degraded
+        assert "removed_pending_marker_paths" in degraded
+
+        # --- token 终态已是 consumed：不动 lease / 锁，但必须清掉那条作废的 pending -------
+        # 留着它，此后每一次 Stop 都会重走这条路径并被拦下，直到 tombstone TTL（6h）过期才自解。
+        # （「已确认送达也写 pending」之后这条路径才真的会被走到：UPS 可能在 dispatch 侧落盘
+        # pending **之前**就已 arm 并清过一次，那条 pending 从诞生起就是孤儿。）
+        consumed_token = "c0ffee0123456789"
+        cs.rvf_withdrawn_dispatch_tombstone.claim_dispatch_token_terminal_state(
+            consumed_token,
+            state=cs.rvf_withdrawn_dispatch_tombstone.STATE_CONSUMED,
+            reason="test_ups_delivery_landed",
+        )
+        pending_dir = lock_root / "kanban-followup-dispatched"
+        orphan_pending = pending_dir / "task-taskConsumed.json"
+        orphan_pending.write_text(
+            json.dumps(
+                {
+                    "marker_version": 1,
+                    "state": "dispatched_unconfirmed",
+                    "kanban_task_id": "taskConsumed",
+                    "token": consumed_token,
+                    "expires_at": "2000-01-01T00:00:00Z",
+                }
+            ),
+            encoding="utf-8",
+        )
+        in_progress_lock = lock_root / "task-taskConsumed.json"
+        in_progress_lock.write_text(json.dumps({"state": "in_progress"}), encoding="utf-8")
+        consumed_marker = {
+            "kanban_task_id": "taskConsumed",
+            "kanban_project_path": str(tmp_path),
+            "idempotency_key": "idem-consumed",
+            "token": consumed_token,
+            "run_dir": str(tmp_path / "origin-run"),
+        }
+        consumed_result = real_withdraw(consumed_marker, reason="prior_dispatch_never_converged")
+        assert consumed_result["withdrawn"] is False
+        assert consumed_result["skipped_because"] == "dispatch_token_already_consumed"
+        assert not orphan_pending.exists(), "consumed 之后那条 pending 已作废，必须清掉"
+        # 正在跑的那轮 review 的锁与 lease 绝不能被动。
+        assert in_progress_lock.exists()
+        assert "tracker_lease_release" not in consumed_result
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    # --- RVF-006：撤回说「别放行」时，三条对账分支都不得 return None ---------------------
+    marker = {
+        "kanban_task_id": "taskB",
+        "kanban_project_path": str(tmp_path),
+        "idempotency_key": "idem-1",
+        "token": "tok0000000000000",
+        "run_dir": str(tmp_path / "origin-run"),
+        "_marker_path": str(tmp_path / "pending.json"),
+    }
+    cs.read_kanban_followup_pending = lambda **kw: dict(marker)
+    cs.kanban_followup_pending_status = lambda *a, **kw: "stale"
+    cs._withdraw_unconfirmed_kanban_followup_dispatch = lambda m, *, reason: {
+        "withdrawn": False,
+        "neutralization": cs.KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED,
+        "skipped_because": "dispatch_token_already_consumed",
+    }
+    delivered_receipt = cs.classify_cline_kanban_terminal_delivery_receipt(
+        {"terminal_delivery_status": "delivered_and_submit_confirmed"}
+    )
+    failed_receipt = cs.classify_cline_kanban_terminal_delivery_receipt(
+        {
+            "terminal_delivery_status": "delivery_failed",
+            "terminal_delivery_failure_reason": "terminal_prompt_readiness_timeout",
+        }
+    )
+    for label, query in (
+        ("delivery_failed", lambda m: (failed_receipt, None)),
+        ("never_converged", lambda m: (delivered_receipt, None)),
+        ("ttl_degraded", lambda m: (None, "interface_unavailable")),
+    ):
+        cs._query_kanban_terminal_delivery_receipt = query
+        decision = cs._kanban_followup_pending_decision(
+            {}, _FakeLedger(), task_id="taskB", session_id="s", cwd=str(tmp_path)
+        )
+        assert decision is not None, f"{label} 分支必须采纳撤回回执，不能放行第二条 follow-up"
+        assert decision.reason_code == "kanban_followup_prior_dispatch_already_consumed"
+
+    # --- RVF-008①：delivery_failed 按契约处置分流 --------------------------------------
+    cs._withdraw_unconfirmed_kanban_followup_dispatch = lambda m, *, reason: {
+        "withdrawn": True,
+        "neutralization": cs.KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED,
+    }
+    withheld_reasons = (
+        # wait_for_external_condition：会话没起来 / 人正在输入框打字 / agent 等用户答完。
+        "no_active_terminal_session",
+        "human_terminal_contention_timeout",
+        "agent_awaiting_user_decision_timeout",
+        # requires_human_confirmation：文本可能仍残留在输入框里。
+        "submit_confirmation_budget_exhausted",
+    )
+    for failure_reason in withheld_reasons:
+        receipt = cs.classify_cline_kanban_terminal_delivery_receipt(
+            {
+                "terminal_delivery_status": "delivery_failed",
+                "terminal_delivery_failure_reason": failure_reason,
+            }
+        )
+        cs._query_kanban_terminal_delivery_receipt = lambda m, _r=receipt: (_r, None)
+        decision = cs._kanban_followup_pending_decision(
+            {}, _FakeLedger(), task_id="taskB", session_id="s", cwd=str(tmp_path)
+        )
+        assert decision is not None, f"{failure_reason} 不得被自动重投"
+        assert decision.reason_code == "kanban_followup_redispatch_disposition_withheld"
+    # 「换新 key 就能干净重投」这一种仍然放行（主派发本就每轮换新 key）。
+    cs._query_kanban_terminal_delivery_receipt = lambda m: (failed_receipt, None)
+    assert (
+        cs._kanban_followup_pending_decision(
+            {}, _FakeLedger(), task_id="taskB", session_id="s", cwd=str(tmp_path)
+        )
+        is None
+    )
 
 
 def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) -> None:
@@ -513,6 +899,10 @@ def test_kanban_followup_stale_pending_redispatches_and_reports(tmp_path: Path) 
     refreshed = json.loads(pending_path.read_text(encoding="utf-8"))
     assert refreshed["token"] != "oldtokenold00000"
     assert refreshed["token"] == dispatch_prep_payload(latest)["token"]
+
+    # 同一条对账链路的白盒面：撤回是否真的能跑完（RVF-001）、回执是否诚实（RVF-002）、
+    # 以及三条对账分支是否真的采纳撤回结论 / 按契约处置分流（RVF-006 / RVF-008①）。
+    _exercise_kanban_followup_withdrawal_receipt_and_reconciliation(tmp_path / "withdrawal")
 
 
 def test_kanban_followup_stranded_sweep_escalates_other_skips_current(tmp_path: Path) -> None:
@@ -644,6 +1034,175 @@ def test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker(tmp_pa
     assert len(calls) == 1
 
 
+def _exercise_stranded_redispatch_neutralization_and_disposition(tmp_path: Path) -> None:
+    """S2 重投的可达路径：旧 token 必须先被中和，且中和 / 投递 / 落盘全在 per-task 派发闸内。
+
+    ⚠️ 本段刻意挂在一个**已注册**的测试里跑：同簇那个 in-process 的 S2 测试
+    （``test_kanban_followup_s2_redispatch_binds_idempotency_key_to_fresh_token_and_preserves_prompt_path``）
+    在 protected 注册表里仍写着一个**早已改名、如今解析不到**的旧名字，本包不得修改该文件，
+    挂上去等于静默不跑 = 假绿。
+
+    覆盖四条：
+
+    - **RVF-007**：重投前从不为旧 token 写 withdrawn tombstone、也不调 ``message-cancel``
+      ⇒ 旧消息仍可迟到落地并与新一轮并发。同 task 对账路径明明会走撤回，这条路径把整套止血绕过。
+      旧 token 已被 UPS 接手（终态 ``consumed``）时更必须收手，否则就是第二条 follow-up。
+    - **RVF-009（重投侧）**：闸只裹住投递、放开后才写 pending ⇒ 另一个 Stop 能就地进闸再投一条
+      新 key，先到的那条被判 ``superseded_by_later_delivery``。
+    - **RVF-010（重投侧）**：``kanban task message`` 退出码 4 = 「还没结论」而非失败；当普通失败
+      退出会把 pending 留在**旧** token 上（prompt 里却已是新 token）⇒ UPS 落地时防误清 guard
+      直接拒绝 ⇒ pending 永久锁死。
+    - **RVF-008②**：``redispatch_not_needed`` 与「换新 key 可重投」并列是反语义的 ——
+      ``superseded_by_later_delivery`` / ``cancelled_before_delivery`` 会被再投，
+      还可能把后一条合法投递撞成 superseded。
+    """
+    import contextlib as _contextlib
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    cs = _load_stop_hook_module_in_process("cs_s2_neutralize_under_test")
+
+    old_prompt = tmp_path / "old-prompt.md"
+    old_prompt.write_text(
+        "$review-validate-fix\n\nRVF dispatch prep file:\nRVF_DISPATCH=token=oldoldoldoldoldo\n",
+        encoding="utf-8",
+    )
+
+    class _FakePrep:
+        token = "freshtoken000000"
+        path = tmp_path / "fresh-prep.json"
+
+    class _FakeLedger:
+        run_id = "run-redispatch-neutralize"
+        run_dir = str(tmp_path / "rd")
+
+    recorded: dict[str, dict] = {}
+    neutralized: list[dict] = []
+    inside_gate = {"open": False}
+    saw_gate: dict[str, object] = {"neutralize": None, "start": None, "pending": None}
+
+    cs.select_existing_app_server_socket_for_metadata = lambda: (tmp_path / "sock", "explicit", {})
+    cs.can_connect_app_server_socket = lambda p: True
+    cs.write_dispatch_prep_file = lambda **kw: _FakePrep()
+    cs.clear_kanban_followup_pending = lambda **kw: []
+
+    @_contextlib.contextmanager
+    def _tracking_single_flight(task_id_arg):
+        inside_gate["open"] = True
+        try:
+            yield True
+        finally:
+            inside_gate["open"] = False
+
+    cs.kanban_followup_dispatch_single_flight_for_task = _tracking_single_flight
+
+    def _fake_neutralize(marker_arg, *, reason):
+        saw_gate["neutralize"] = inside_gate["open"]
+        neutralized.append({"token": marker_arg.get("token"), "reason": reason})
+        return {"neutralization": cs.KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED}
+
+    cs._neutralize_kanban_followup_dispatch_token = _fake_neutralize
+
+    def _fake_start(**kw):
+        saw_gate["start"] = inside_gate["open"]
+        recorded["start"] = kw
+        return {"message_id": "terminal:taskX:redispatch", "prompt_path": "/new/p.md"}
+
+    cs.start_cline_kanban_followup_message = _fake_start
+
+    def _fake_write_pending(**kw):
+        saw_gate["pending"] = inside_gate["open"]
+        recorded["pending"] = kw
+        return tmp_path / "pending.json"
+
+    cs.write_kanban_followup_pending = _fake_write_pending
+
+    marker = {
+        "kanban_task_id": "taskX",
+        "kanban_project_path": "/repo",
+        "prompt_path": str(old_prompt),
+        "session_id": "sX",
+        "repo": "/repo",
+        "cwd": "/repo",
+        "run_dir": str(tmp_path / "origin-run"),
+        "kanban_attempt_id": "att",
+        "token": "oldoldoldoldoldo",
+    }
+
+    def _redispatch():
+        saved = os.environ.get("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH")
+        os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = "1"
+        try:
+            return cs._maybe_redispatch_stranded_kanban_followup(
+                marker, _FakeLedger(), token="oldoldoldoldoldo"
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH", None)
+            else:
+                os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
+
+    # --- RVF-007 + RVF-009（重投侧） --------------------------------------------------
+    result = _redispatch()
+    assert result.get("redispatched") is True
+    assert [n["token"] for n in neutralized] == ["oldoldoldoldoldo"], "旧 token 必须被中和一次"
+    assert saw_gate == {"neutralize": True, "start": True, "pending": True}
+
+    # 旧 token 已被 UPS 接手（tombstone 终态 consumed）⇒ 重投等于投出第二条，必须收手。
+    cs._neutralize_kanban_followup_dispatch_token = lambda m, *, reason: {
+        "neutralization": cs.KANBAN_FOLLOWUP_DISPATCH_ALREADY_CONSUMED
+    }
+    started_before = recorded.get("start")
+    consumed_result = _redispatch()
+    assert consumed_result.get("redispatched") is False
+    assert consumed_result.get("reason") == "prior-dispatch-already-consumed"
+    assert recorded.get("start") is started_before, "已被接手时不得再投"
+
+    # --- RVF-010（重投侧）：退出码 4 = 「还没结论」，pending 必须改写到新 token ----------
+    cs._neutralize_kanban_followup_dispatch_token = lambda m, *, reason: {
+        "neutralization": cs.KANBAN_FOLLOWUP_DISPATCH_NEUTRALIZED
+    }
+
+    def _fake_start_verdict_pending(**kw):
+        raise cs.KanbanFollowupDeliveryVerdictNotYetAvailableError(
+            "hard timeout",
+            task_id="taskX",
+            idempotency_key=kw["idempotency_key"],
+            attempt_id=kw.get("attempt_id"),
+            prompt_path="/new/p3.md",
+            command_artifact_path=None,
+            project_path="/repo",
+            task_cmd="fake task",
+        )
+
+    cs.start_cline_kanban_followup_message = _fake_start_verdict_pending
+    recorded.pop("pending", None)
+    verdict_result = _redispatch()
+    assert verdict_result.get("redispatched") is True
+    assert verdict_result.get("terminal_delivery_verdict_not_yet_available") is True
+    verdict_pending = recorded["pending"]
+    assert verdict_pending["token"] == "freshtoken000000", "pending 必须改写到新 token"
+    assert verdict_pending["idempotency_key"] == verdict_result["idempotency_key"]
+    # 没拿到结论 ⇒ 回执判读必须落 awaiting，绝不伪造送达。
+    assert verdict_pending["terminal_delivery_status"] is None
+
+    # --- RVF-008② ---------------------------------------------------------------------
+    for failure_reason, expected_reason in (
+        ("superseded_by_later_delivery", "redispatch-not-needed"),
+        ("cancelled_before_delivery", "redispatch-not-needed"),
+        ("no_active_terminal_session", "redispatch-disposition-withheld"),
+    ):
+        receipt = cs.classify_cline_kanban_terminal_delivery_receipt(
+            {
+                "terminal_delivery_status": "delivery_failed",
+                "terminal_delivery_failure_reason": failure_reason,
+            }
+        )
+        cs._query_kanban_terminal_delivery_receipt = lambda m, _r=receipt: (_r, None)
+        withheld = _redispatch()
+        assert withheld.get("redispatched") is False, f"{failure_reason} 不得自动重投"
+        assert withheld.get("reason") == expected_reason
+
+
 def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_path: Path) -> None:
     """S2（RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH=1）：app-server 不可达 → 诚实放弃重投，
     仍发通知 + 保留 marker，绝不谎报已自动跑。"""
@@ -693,15 +1252,61 @@ def test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable(tmp_p
     ]
     assert len(calls) == 1
 
+    # --- RVF-014：条数上界（默认 8）管不住时间，sweep 必须另有总预算 --------------------
+    # 开启自动重投后每条 pending 都要多做一次终态查询（默认 timeout 5s）⇒ 仅这一项最坏就是
+    # 8×5=40s，还没算 task-list（10s）、通知（10s）与重投子进程（20s），已越过 Stop 链路
+    # 约 30s 的总预算。预算用尽必须**停止扫荡**（marker 全保留，下一次 Stop 接着扫），
+    # 而不是继续往下跑。
+    budget_state = tmp_path / "state-budget"
+    budget_pending_dir = (
+        budget_state / "kanban-followup-in-progress" / "kanban-followup-dispatched"
+    )
+    budget_pending_dir.mkdir(parents=True)
+    budget_a = _write_stranded_pending(
+        budget_pending_dir, task_id="taskBudgetA", token="1111111111111111",
+        project_path=str(repo), prompt_path=str(old_prompt),
+    )
+    budget_b = _write_stranded_pending(
+        budget_pending_dir, task_id="taskBudgetB", token="2222222222222222",
+        project_path=str(repo), prompt_path=str(old_prompt),
+    )
+    invoke(
+        {"cwd": str(repo), "stop_hook_active": False},
+        extra_env={**extra, "RVF_KANBAN_FOLLOWUP_STRANDED_SWEEP_BUDGET_SECONDS": "1e-9"},
+        state_dir=budget_state,
+    )
+    budget_events = latest_events(budget_state)
+    assert any(
+        event.get("event") == "kanban_followup_stranded_sweep_budget_exhausted"
+        for event in budget_events
+    ), "sweep 必须有一道总挂钟预算闸，条数上界不构成时间上界"
+    assert not any(
+        event.get("event") == "kanban_followup_pending_stranded_escalated"
+        for event in budget_events
+    )
+    # 停止扫荡不丢事：marker 全部保留。
+    assert budget_a.exists() and budget_b.exists()
 
-def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp_path: Path) -> None:
-    """S2 重投可达路径回归（RVF-001 / RVF-002）：in-process 调用 _maybe_redispatch_*，monkeypatch
-    app-server 可达 + 假派发，断言——
-      RVF-001：idempotency_key 必须绑定**稳定** stranded token（传入的 token），不含每次新铸的
-        fresh prep token；
-      RVF-002：terminal 未确认重投改写 pending 必须带上新派发的 prompt_path/turn_id（否则下次
-        重投 missing-prompt-path）。
-    e2e 路径需 websocket-协议假 socket（过重），故此处走 in-process 单测直接锁住两个修复。"""
+    # 同一条重投链路的白盒面：旧 token 的中和、闸内落盘、退出码 4 的处置与契约处置分流
+    # （RVF-007 / RVF-009 重投侧 / RVF-010 重投侧 / RVF-008②）。
+    _exercise_stranded_redispatch_neutralization_and_disposition(tmp_path / "s2-neutralize")
+
+
+def test_kanban_followup_s2_redispatch_binds_idempotency_key_to_fresh_token_and_preserves_prompt_path(tmp_path: Path) -> None:
+    """S2 重投可达路径回归：in-process 调用 _maybe_redispatch_*，monkeypatch app-server 可达 +
+    假派发，断言——
+
+      **（F2a 改写）idempotency_key 必须绑定本次新铸的 fresh prep token。** 本测试原先断言的是
+      反面（绑定稳定的 stranded token），那条判据在 cline-kanban 的终端投递契约下已被证伪：
+        - 同 key + 同 prompt hash ⇒ 契约「直接返回当前记录、**不重投**」⇒ 稳定键根本投不出去；
+        - 每次重投都会铸新 token 并写进 prompt ⇒ prompt hash 变了 ⇒ 契约判**幂等冲突、退出码 1**
+          ⇒ 这条 stranded marker 从此**永久**重投失败。
+      稳定键当初承担的「别并发投同一个 task」责任，现由 per-task 派发单飞闸承担（契约第 5 条）。
+
+      RVF-002（仍有效）：terminal 未确认重投改写 pending 必须带上新派发的 prompt_path/turn_id
+      （否则下次重投 missing-prompt-path）。
+
+    e2e 路径需 websocket-协议假 socket（过重），故此处走 in-process 单测直接锁住这两条。"""
     tmp_path.mkdir(parents=True, exist_ok=True)
     import importlib.util
 
@@ -772,10 +1377,11 @@ def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp
             os.environ["RVF_KANBAN_FOLLOWUP_AUTO_REDISPATCH"] = saved
 
     assert result.get("redispatched") is True
-    # RVF-001：idem 绑定稳定 token，绝不含 fresh prep token。
+    # F2a：idem 绑定**本次新铸**的 token，与 prompt 正文里的 token 一一对应 ⇒ 同 key 永远配同
+    # 一份 prompt hash ⇒ 永不触发契约的幂等冲突。绑旧的 stranded token 才是那条死路。
     idem = recorded["start"]["idempotency_key"]
-    assert idem == f"rvf-redispatch-{cs.safe_token('taskX')}-stabletoken00000"
-    assert "freshtoken000000" not in idem
+    assert idem == f"rvf-redispatch-{cs.safe_token('taskX')}-freshtoken000000"
+    assert "stabletoken00000" not in idem
     # 重投子进程带 timeout（有界）。
     assert recorded["start"].get("timeout")
     # RVF-002：terminal 未确认重投改写 pending 带新 prompt_path/turn_id + 新 token。
@@ -783,6 +1389,80 @@ def test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path(tmp
     assert pending["prompt_path"] == "/new/redispatch-prompt.md"
     assert pending["turn_id"] == "7"
     assert pending["token"] == "freshtoken000000"
+    # F2a：重投次数必须显式记账——换新 key 之后，「重投了几次」再也无法从 key 反推。
+    assert pending["redispatch_attempt_count"] == 1
+    assert pending["idempotency_key"] == idem
+
+
+def test_kanban_followup_pending_reconciliation_never_waits_without_an_upper_bound(
+    tmp_path: Path,
+) -> None:
+    """pending 对账的每一条「继续等」分支都必须以 pending 自己的 TTL 为上界。
+
+    没有这条上界，一条「cline-kanban 说已送达、但 UPS 永远不会 arm」的 pending
+    （prompt 落地后 agent 被中断，或用户 rewind 掉了那一回合）会让**每一次** Stop 都查到
+    ``delivered``、每一次都 skip —— 那轮 review 就此永久静默搁浅，而且看上去一切正常。
+    这是「先查真实终态」这条改进自带的新风险，故单独钉死。
+
+    走 in-process 单测：桩掉终态查询与撤回执行，直接驱动 ``_kanban_followup_pending_decision``。
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cs_pending_bound_under_test", SCRIPT)
+    cs = importlib.util.module_from_spec(spec)
+    sys.modules["cs_pending_bound_under_test"] = cs
+    spec.loader.exec_module(cs)
+
+    class _FakeLedger:
+        run_id = "run-pending-bound"
+        run_dir = str(tmp_path / "rd")
+
+        def event(self, **kwargs):
+            events.append(kwargs)
+
+        def hook_payload(self, **kwargs):
+            return {"continue": True, **kwargs}
+
+    events: list[dict] = []
+    withdrawals: list[dict] = []
+
+    delivered_receipt = cs.classify_cline_kanban_terminal_delivery_receipt(
+        {"terminal_delivery_status": "delivered_and_submit_confirmed"}
+    )
+    cs._query_kanban_terminal_delivery_receipt = lambda marker: (delivered_receipt, None)
+    cs._withdraw_unconfirmed_kanban_followup_dispatch = lambda marker, *, reason: (
+        withdrawals.append({"reason": reason}) or {"withdrawn": True, "reason": reason}
+    )
+
+    marker = {
+        "kanban_task_id": "taskB",
+        "kanban_project_path": str(tmp_path),
+        "idempotency_key": "idem-1",
+        "token": "tok0000000000000",
+        "run_dir": str(tmp_path / "origin-run"),
+        "_marker_path": str(tmp_path / "pending.json"),
+    }
+
+    # ① pending 仍在自己的 TTL 内 → 允许等（不重投、不撤回）。
+    cs.read_kanban_followup_pending = lambda **kw: dict(marker)
+    cs.kanban_followup_pending_status = lambda *a, **kw: cs.KANBAN_FOLLOWUP_LOCK_ACTIVE
+    decision = cs._kanban_followup_pending_decision(
+        {}, _FakeLedger(), task_id="taskB", session_id="s", cwd=str(tmp_path)
+    )
+    assert decision is not None, "TTL 内应当继续等待"
+    assert withdrawals == []
+
+    # ② pending 自己的 TTL 已过、UPS 仍未 arm → 必须收口：撤回并放行重新决策，
+    #    绝不因为「回执说 delivered」而无限期等下去。
+    cs.kanban_followup_pending_status = lambda *a, **kw: "stale"
+    decision = cs._kanban_followup_pending_decision(
+        {}, _FakeLedger(), task_id="taskB", session_id="s", cwd=str(tmp_path)
+    )
+    assert decision is None, "TTL 到期后必须放行重新决策，而不是继续 skip"
+    assert [w["reason"] for w in withdrawals] == [
+        "prior_dispatch_delivered_but_never_became_a_turn"
+    ]
 
 
 def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -> None:
@@ -849,7 +1529,7 @@ def test_kanban_followup_title_falls_back_to_local_board_state(tmp_path: Path) -
     )
 
     payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
     latest = latest_summary(state)
     expected_title = 'The kanban "follow up" rvf handoff source chat title'
     assert latest["cline_kanban_task_title"] == expected_title
@@ -928,7 +1608,7 @@ def test_kanban_followup_title_ignores_unrelated_board_with_same_task_id(tmp_pat
     )
 
     payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["cline_kanban_task_title"] is None
     assert latest["cline_kanban_task_title_source"] is None
@@ -1021,7 +1701,7 @@ def test_kanban_followup_title_uses_session_matched_board_state(tmp_path: Path) 
     )
 
     payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["cline_kanban_task_title"] == "Session matched workspace title"
     assert latest["cline_kanban_task_title_source"] == "cline_kanban_board_lookup"
@@ -1078,7 +1758,7 @@ def test_kanban_followup_mode_uses_repo_root_project_path_for_subdir_cwd(tmp_pat
                 os.environ[key] = value
 
     payload = parse_json(stdout)
-    assert "reason=kanban_followup_enqueued" in payload["systemMessage"]
+    assert "reason=kanban_followup_dispatched_unconfirmed" in payload["systemMessage"]
     latest = latest_summary(state)
     assert latest["cwd"] == str(subdir.resolve())
     assert latest["cline_kanban_project_path"] == str(repo.resolve())
