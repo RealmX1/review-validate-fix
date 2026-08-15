@@ -13,8 +13,10 @@
 「继续收尾这一轮、输出 handoff」的 re-engage nudge——实测 run
 ``rvf-20260808T090747Z-stop-hook-ea36796d`` 正是如此被强制续跑的。
 
-判定锚点是 dispatch token 在 prompt 正文里的字面形态（``RVF_DISPATCH=token=<16 hex>``）：它
-唯一、且必然随注入 prompt 一起进 transcript，不依赖任何在 arm 时刻拿不到的 message uuid。
+判定锚点是那一轮的 token 在正文里的字面形态：kanban 终端投递走 ``RVF_DISPATCH=token=<16 hex>``，
+agent 在**发起决策点横幅**上显式接受的就地 run 走 ``RVF_DECISION_TOKEN=<token>``（见
+``trigger_needle_for_lock_marker``）。两者都唯一、且必然随注入正文一起进 transcript，不依赖
+任何在 arm 时刻拿不到的 message uuid。
 
 四种结论（见 ``TRIGGER_PRESENCE_*``）刻意区分「不在主链」与「整份 transcript 里都没有」：
 前者是确凿的 rewind 证据，后者可能只是我们读错了文件（会话不匹配 / 路径不可读），必须保守
@@ -28,7 +30,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # trigger 落地成回合、且该回合仍在当前 leaf 的祖先链上 → agent 这一轮真的收到了它。
 TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN = "on_ancestor_chain"
@@ -79,6 +81,43 @@ class TriggerPresence:
 def dispatch_token_literal(dispatch_token: str) -> str:
     """token 在注入 prompt 正文里的字面形态（与 UPS 的 ``DISPATCH_TOKEN_RE`` 同源）。"""
     return f"RVF_DISPATCH=token={dispatch_token}"
+
+
+def decision_token_literal(decision_token: str) -> str:
+    """S3 决策 token 在**发起决策点横幅**正文里的字面形态。
+
+    与 ``stop_review_validate_fix._render_decision_point_injection_prompt`` 里那一行
+    ``RVF_DECISION_TOKEN=<token>`` 同源，也与 ``_decision_token_transcript_trace_present``
+    的投递回执探针共用同一个 needle。
+    """
+    return f"RVF_DECISION_TOKEN={decision_token}"
+
+
+def trigger_needle_for_lock_marker(marker: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
+    """从锁 marker 推出「这一轮是被什么勾起来的」以及它在 transcript 里的 needle。
+
+    返回 ``(token, needle)``；两者同时为 ``None`` 表示这把锁没记任何可对账的锚点。
+
+    锁有两个来源，needle 形态不同，**不能只认 dispatch token**：
+
+    * ``dispatch_token``：cline-kanban 终端投递那条 trigger（``RVF_DISPATCH=token=…``）；
+    * ``decision_token``：agent 在发起决策点横幅上显式 ``rvf-agent start`` 接受的就地 run
+      （``RVF_DECISION_TOKEN=…``）。P1 之后这才是**默认**来源。
+
+    dispatch 优先：一条真的被投递过的 trigger 是更强的「agent 这一轮看到了什么」证据；
+    同时存在只可能是 legacy 混写，取前者不会误判。
+    """
+    if not isinstance(marker, Mapping):
+        return None, None
+    dispatch_token = marker.get("dispatch_token")
+    if isinstance(dispatch_token, str) and dispatch_token.strip():
+        token = dispatch_token.strip()
+        return token, dispatch_token_literal(token)
+    decision_token = marker.get("decision_token")
+    if isinstance(decision_token, str) and decision_token.strip():
+        token = decision_token.strip()
+        return token, decision_token_literal(token)
+    return None, None
 
 
 def _entry_timestamp(entry: dict[str, Any]) -> float | None:
@@ -263,9 +302,14 @@ def classify_dispatch_trigger_presence(
     *,
     transcript_path: str | Path | None,
     dispatch_token: str | None,
+    trigger_literal: str | None = None,
     max_scanned_lines: int = DEFAULT_MAX_SCANNED_LINES,
 ) -> TriggerPresence:
     """判定 ``dispatch_token`` 那条 trigger 相对当前 leaf 的位置。绝不抛。
+
+    ``trigger_literal`` 缺省 = ``dispatch_token_literal(dispatch_token)``（kanban 终端投递那条
+    trigger）。agent 在发起决策点横幅上显式接受的就地 run 用的是另一种字面形态，调用方经
+    ``trigger_needle_for_lock_marker(marker)`` 一次拿到 ``(token, needle)`` 并显式传入。
 
     祖先链 = 从**文件里最后一条带 uuid 的条目**（当前 leaf）沿 ``parentUuid`` 一路回溯得到的
     uuid 集合。rewind 之后用户重发的 prompt 会把 ``parentUuid`` 挂回更早的条目，被撤销的那段
@@ -304,7 +348,11 @@ def classify_dispatch_trigger_presence(
             error=error or "empty_transcript",
         )
 
-    literal = dispatch_token_literal(token)
+    literal = (
+        trigger_literal
+        if isinstance(trigger_literal, str) and trigger_literal.strip()
+        else dispatch_token_literal(token)
+    )
     by_uuid: dict[str, dict[str, Any]] = {}
     trigger_uuids: list[str] = []
     leaf_uuid: str | None = None

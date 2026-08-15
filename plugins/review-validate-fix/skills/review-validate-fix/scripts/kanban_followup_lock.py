@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Task/session scoped in-progress marker for Cline Kanban RVF follow-up runs."""
+"""两族 task/session 维度的 ~/.rvf marker。**名字已经名实不符，读之前先看清这一节。**
+
+本模块承载两个**语义不同**的 marker 族：
+
+1. **in-progress 锁**（``SUBDIR_NAME`` = ``kanban-followup-in-progress``，``marker_paths`` /
+   ``write_marker`` / ``read_marker`` / ``clear_marker`` / ``acquire_marker`` 那一族）——
+   P1 之后它**不再是 kanban-followup 专属**，而是「**任何**已被 agent 接受、仍在途的 RVF
+   run」的抑制凭证：既由 UPS 在 kanban 终端投递落地时 arm（``dispatch_token``），也由
+   ``rvf-agent start`` 在 agent 于发起决策点上就地接受时 arm（``decision_token``）。
+2. **pending 派发记录**（``PENDING_SUBDIR_NAME`` = ``kanban-followup-dispatched``，
+   ``*_pending_marker`` 那一族）—— 这一族仍然**确实**是 kanban 终端投递专属的
+   「已派发、未确认落地」记账。
+
+所以模块名 ``kanban_followup_lock`` 对 (1) 已经偏窄、对 (2) 仍然准确。**没有顺手整体改名**
+是刻意的：一次性把模块改成 ``accepted_review_run_in_flight_lock`` 只会让 (2) 变成新的名实不符
+——正确的收敛是先把两族拆成两个模块、再各自命名，那是独立一刀，不该混进本轮的行为改动里。
+
+磁盘目录名 ``~/.rvf/kanban-followup-in-progress`` 同理**刻意保持不变**：``marker_paths()`` 是
+它唯一的构造点，改目录名等于一次活状态迁移，收益只有「好看」，风险却是真的。
+"""
 
 from __future__ import annotations
 
@@ -18,6 +37,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import safe_token  # noqa: E402
+from core.session_scope_allocation.scope_marker_identity_key import (  # noqa: E402
+    SESSION_KEYED_MARKER_FILE_NAME_PREFIX,
+    TASK_KEYED_MARKER_FILE_NAME_PREFIX,
+    resolve_repository_identity_for_scope_marker_key,
+    scope_marker_file_name,
+)
 
 
 SUBDIR_NAME = "kanban-followup-in-progress"
@@ -86,25 +111,56 @@ def _root(root: Path | None = None) -> Path:
     return Path.home() / ".rvf" / SUBDIR_NAME
 
 
-def _task_path(task_id: str, root: Path | None = None) -> Path:
-    return _root(root) / f"task-{safe_token(task_id)}.json"
+def _task_path(task_id: str, repository_identity: str, root: Path | None = None) -> Path:
+    return _root(root) / scope_marker_file_name(
+        key_prefix=TASK_KEYED_MARKER_FILE_NAME_PREFIX,
+        key_token=safe_token(task_id),
+        repository_identity=repository_identity,
+        parent_harness_identity=None,
+    )
 
 
-def _session_path(session_id: str, root: Path | None = None) -> Path:
-    return _root(root) / f"sess-{safe_token(session_id)}.json"
+def _session_path(session_id: str, repository_identity: str, root: Path | None = None) -> Path:
+    return _root(root) / scope_marker_file_name(
+        key_prefix=SESSION_KEYED_MARKER_FILE_NAME_PREFIX,
+        key_token=safe_token(session_id),
+        repository_identity=repository_identity,
+        parent_harness_identity=None,
+    )
 
 
 def marker_paths(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> list[Path]:
+    """本把锁的候选文件名：``task-<id>--repo-<identity>`` / ``sess-<id>--repo-<identity>``。
+
+    **为什么 key 里必须有仓身份**：cline-kanban 的 task id 是短哈希前缀，不同 project 会撞
+    （实测反例见 ``core.session_scope_allocation.scope_marker_identity_key`` 模块头）。这把锁
+    自 P2 起不再只挡「kanban follow-up 投递」，而是「**任何已被 agent 接受、仍在途的 RVF
+    run**」的抑制凭证——撞键就是 A 仓的在途 run 静默压掉 B 仓的发起决策点（= 漏审）。
+
+    **刻意不按 harness 分键**（``parent_harness_identity=None``，与 round-baseline 相反）：
+    它是「这个工作树里有没有一轮 RVF 在跑」的互斥锁，两个 harness 若真共用一个工作树，本就
+    **应该**争同一把锁；按 harness 切开只会让两边各派一轮。不分键也顺带免掉
+    ``--harness-unspecified`` 那层宽回退候选——对抑制性 marker 而言，读到别人的那一份就是
+    静默漏审，方向正好是错的。
+
+    ``repo`` 解析不出仓身份 ⇒ 返回空列表（fail-closed）。对这把锁而言这是安全方向：写者
+    no-op（不落抑制凭证）、读者读不到（当作没有在途 run）⇒ 至多多征询一次，绝不静默漏审。
+    仅 ``clear_*`` 会因此变成 no-op，但那只让一把锁按 TTL 自然过期，不会误挡到下一轮。
+    """
+    repository_identity = resolve_repository_identity_for_scope_marker_key(repo)
+    if repository_identity is None:
+        return []
     paths: list[Path] = []
     if task_id:
-        paths.append(_task_path(task_id, root))
+        paths.append(_task_path(task_id, repository_identity, root))
     if session_id:
-        paths.append(_session_path(session_id, root))
+        paths.append(_session_path(session_id, repository_identity, root))
     return paths
 
 
@@ -223,6 +279,7 @@ def marker_payload(
     turn_id: str | None = None,
     prompt_path: str | None = None,
     dispatch_token: str | None = None,
+    decision_token: str | None = None,
     delivered_session_id: str | None = None,
     delivered_transcript_path: str | None = None,
     state: str = STATE_IN_PROGRESS,
@@ -251,6 +308,12 @@ def marker_payload(
         # 有没有成为一个真实回合、又是否仍在当前祖先链上」——即 promote / rewind 对账的锚点。
         # 历史 payload 三个 id 字段全是 None，锁自己都不知道自己对应哪个回合。
         "dispatch_token": dispatch_token,
+        # 「agent 在**发起决策点**上显式接受了这一轮」时由 rvf-agent CLI 落的 S3 决策 token
+        # （与 ``dispatch_token`` 互斥：前者是 agent 自己 start 出来的就地 run，后者是 kanban
+        # 终端投递那条 trigger）。读侧的祖先链对账据它在 transcript 里找横幅那条
+        # ``RVF_DECISION_TOKEN=<token>``，于是「接受被 rewind 掉」与「trigger 被 rewind 掉」
+        # 共用同一套 Fix B 对账，不必新造一套 rewind 机制。
+        "decision_token": decision_token,
         # trigger 实际落地到哪个会话 / 哪份 transcript（UPS 那一刻的权威身份）。读侧优先按
         # 这份 transcript 做祖先链对账；缺失时才退回「本次 Stop 的 transcript，且仅当会话相同」。
         "delivered_session_id": delivered_session_id,
@@ -271,12 +334,16 @@ def write_marker(
     turn_id: str | None = None,
     prompt_path: str | None = None,
     dispatch_token: str | None = None,
+    decision_token: str | None = None,
     delivered_session_id: str | None = None,
     delivered_transcript_path: str | None = None,
     state: str = STATE_IN_PROGRESS,
     root: Path | None = None,
 ) -> Path | None:
-    paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
+    # 仓身份锚点用 ``repo or cwd``：``repo`` 是 payload 的权威字段，但历史 / 手动路径上它可能
+    # 缺失而 ``cwd`` 仍在。身份由 ``git_common_dir`` 归一，两者落在同一个仓里就解析成同一个
+    # identity，故这条回退只增加可解析率、不会把 key 指向别的仓。
+    paths = marker_paths(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
     if not paths:
         return None
     payload = marker_payload(
@@ -291,6 +358,7 @@ def write_marker(
         turn_id=turn_id,
         prompt_path=prompt_path,
         dispatch_token=dispatch_token,
+        decision_token=decision_token,
         delivered_session_id=delivered_session_id,
         delivered_transcript_path=delivered_transcript_path,
         state=state,
@@ -304,7 +372,7 @@ def write_marker(
     # 0 起，re-arm 则让计数跨投递存活。best-effort：read_marker 吞读错、reengage_nudge_count
     # 坏值按 0（保守：宁可多给一次 nudge，也不因坏值误判预算耗尽而静默挡停）。
     carried_nudge_count = reengage_nudge_count(
-        read_marker(task_id=task_id, session_id=session_id, root=root)
+        read_marker(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
     )
     if carried_nudge_count:
         payload["reengage_nudge_count"] = carried_nudge_count
@@ -592,7 +660,7 @@ def acquire_marker(
     prompt_path: str | None = None,
     root: Path | None = None,
 ) -> AcquireResult:
-    paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
+    paths = marker_paths(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
     if not paths:
         return AcquireResult(acquired=True, path=None, marker=None, status=STATUS_INVALID)
     target = paths[0]
@@ -614,12 +682,12 @@ def acquire_marker(
         try:
             _open_marker_exclusive(target, encoded)
         except FileExistsError:
-            marker = read_marker(task_id=task_id, session_id=session_id, root=root)
+            marker = read_marker(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
             status = marker_status(marker)
             if status == STATUS_ACTIVE:
                 return AcquireResult(acquired=False, path=target, marker=marker, status=status)
             with _with_takeover_lock(target):
-                marker = read_marker(task_id=task_id, session_id=session_id, root=root)
+                marker = read_marker(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
                 status = marker_status(marker)
                 if status == STATUS_ACTIVE:
                     return AcquireResult(acquired=False, path=target, marker=marker, status=status)
@@ -636,7 +704,7 @@ def acquire_marker(
                 return AcquireResult(acquired=True, path=target, marker=payload, status=STATUS_ACTIVE)
             continue
         return AcquireResult(acquired=True, path=target, marker=payload, status=STATUS_ACTIVE)
-    marker = read_marker(task_id=task_id, session_id=session_id, root=root)
+    marker = read_marker(task_id=task_id, session_id=session_id, repo=repo or cwd, root=root)
     return AcquireResult(
         acquired=False,
         path=target,
@@ -649,9 +717,10 @@ def read_marker(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> dict[str, Any] | None:
-    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
+    for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -666,10 +735,11 @@ def clear_marker(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> list[str]:
     removed: list[str] = []
-    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
+    for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
         # 锁没了，这把锁的重放占位就失去意义：不一并摘掉，它会在窗口内（默认 15min）把**下一
         # 轮**的第一次重放白白挡掉。sidecar 不是锁本身，故不计入 removed。
         try:

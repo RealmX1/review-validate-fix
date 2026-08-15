@@ -8,11 +8,15 @@ prompt 里拿到、显式回传（本 CLI 不枚举、不发现 token —— R18
 
 子命令（实施计划 §四 S3 / §三 agent 侧流程）：
 
-  * ``start --token --reason [--retry]``：token → ``acknowledged`` → **backend/launch 前置校验 +
-    provider-health 门** → ``prepare_review_run`` 全套（原 UPS ``_run_shared_workflow`` 的重量级
-    准备职能退役至此，本切片**不改 UPS 本身**，只把该职能在 CLI 里实现） → **自动 scope 产出**
-    落盘（供 scope 子命令编辑）。任一步失败 → ``record_start_failure`` 回退**保持 acknowledged**，
-    支持 ``start --retry``，不吞决策。
+  * ``start --token [--transcript-path] --reason [--retry]``：token → ``acknowledged`` →
+    **backend/launch 前置校验 + provider-health 门** → **tracker review scope 分配**（
+    ``build_manifest`` 归属播种 + ``allocate_review_scope``，与 Stop hook 旧派发路径同口径；见
+    「发起侧 tracker review scope 分配」节） → ``prepare_review_run`` 全套（原 UPS
+    ``_run_shared_workflow`` 的重量级准备职能退役至此，本切片**不改 UPS 本身**，只把该职能在 CLI
+    里实现） → **自动 scope 产出** 落盘（供 scope 子命令编辑）。任一步失败 →
+    ``record_start_failure`` 回退**保持 acknowledged**，支持 ``start --retry``，不吞决策。
+    ``--transcript-path`` 省略时回退读决策 token 候选摘要里 Stop/UPS 盖的那份；两者都拿不到时
+    scope 口径**显式降级**（回执 message + ``detail.tracker_scope_allocation`` + ledger 各一份）。
   * ``scope annotate --token --entry <path>:<note> [--entry …]``（批量注释）/
     ``scope exclude|include --token <path>… --reason``：改动自动 scope + 写遥测；scope 例外
     （exclude/include）按「同源 + 同类型」幂等键计数，n≥3 自动立 issue 进本地 scope-issue ledger
@@ -53,6 +57,10 @@ import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* /
 import rvf_bootstrap_gate  # noqa: E402
 import rvf_decision_token_store as token_store  # noqa: E402
 import rvf_prep_file  # noqa: E402
+import review_reopen_marker  # noqa: E402 — 失败再入（$rvf-reopen）在 allocate 前的消费，与 Stop hook 同源
+from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # noqa: E402
+    HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +80,11 @@ EXIT_BOOTSTRAP_REQUIRED = 6
 # ok，DB/文件写失败时用户看到的是「谢绝成功」而实际 scope 与锁可能仍生效（谎报成功）。调用方按
 # 非 0 即「不要把本轮当作已谢绝」处理；detail.failed_steps 给出逐步实况。
 EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
+# dispatch 撞上「有 reviewer 返回 kind: request」：**待处理终态**，既非故障也非完成态 review。
+# 与 EXIT_DISPATCH_FAILED 分开的理由与 dispatch_reviewers 的专用码 3 完全同源：混同成失败会把
+# agent 引向「修一修再重跑 dispatch」，而正确处置是先走 Contract Gate 处理那条 request，再带
+# 同一 --selection-seed 用**同一对** reviewer 经同一入口重派。
+EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST = 8
 
 # bootstrap 恢复重放的占位窗口 = prepare 预算 + 这段余量。占位在 prepare 收尾时立刻释放，余量只
 # 覆盖「持有者被硬杀、来不及释放」的残留：过窗后下一次 `start --retry` 可接手，不会被永久堵死。
@@ -469,6 +482,32 @@ class CommandResult:
             "detail": dict(self.detail),
         }
 
+    # 人类可读行的白名单：这几个键必须**不解析 JSON 也看得到**。``execution_handoff`` 的子键
+    # 单列在下方——它承载「接受之后拿什么去执行」（INV-3），恰恰是最不该逼 agent 去 grep
+    # JSON 才能拿到的一组路径。
+    RENDERED_DETAIL_KEYS = (
+        "run_id",
+        "run_dir",
+        "scope_artifact",
+        "dispatch_plan_path",
+        "dispatch_status_path",
+        "dispatch_launch_status",
+        "declined_reason_ledger",
+    )
+    RENDERED_EXECUTION_HANDOFF_KEYS = (
+        "target_repo",
+        "prep_file",
+        "review_env",
+        "review_packet",
+        "scope_contract",
+        "scope_of_work",
+        "review_agent_context",
+        "session_manifest",
+        "worktree_bootstrap",
+        "origin_metadata",
+        "handoff_path",
+    )
+
     def render(self) -> str:
         head = f"[rvf-agent {self.command}] {self.status}"
         lines = [head]
@@ -477,10 +516,21 @@ class CommandResult:
             lines.append(f"- token: {self.token}{state}")
         if self.message:
             lines.append(f"- {self.message}")
-        for key in ("run_dir", "scope_artifact", "dispatch_plan_path", "declined_reason_ledger"):
+        for key in self.RENDERED_DETAIL_KEYS:
             value = self.detail.get(key)
             if value:
                 lines.append(f"- {key}: {value}")
+        execution_handoff = self.detail.get("execution_handoff")
+        if isinstance(execution_handoff, dict):
+            lines.append("- execution_handoff:")
+            for key in self.RENDERED_EXECUTION_HANDOFF_KEYS:
+                value = execution_handoff.get(key)
+                if value:
+                    lines.append(f"    - {key}: {value}")
+            for key in ("execution_instruction", "handoff_contract"):
+                value = execution_handoff.get(key)
+                if value:
+                    lines.append(f"    - {key}: {value}")
         for step in self.next_steps:
             lines.append(f"- next: {step}")
         lines.append("RVF_AGENT_RESULT_JSON: " + json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True))
@@ -590,6 +640,412 @@ def _default_provider_health_runner(requirement: Any, timeout_seconds: float) ->
     return run_provider_health_requirement(requirement, timeout_seconds)
 
 
+# ---------------------------------------------------------------------------
+# 发起侧 tracker review scope 分配（``start`` 与 Stop hook 旧派发路径**同口径**）
+#
+# **为什么这一步必须在这里做**：``prepare_run`` 产出的 scope contract 的口径完全由输入决定——
+#
+#   * ``origin_transcript_path`` 在场 ⇒ prepare 才会用 transcript 生成 session-manifest，contract
+#     的 ``scope_mode`` 才是 ``session-owned``；缺它就退化成 ``manual-all-uncommitted``，把**别的
+#     会话**的背景 dirty WIP 一并吞进 ``primary_files`` / ``fix_allowlist``（范围污染）。
+#   * ``rvf_run.tracker_scope_path`` 在场 ⇒ contract 才有 ``primary_units`` / ``tracker_lease_id`` /
+#     ``tracker_scope_hash``。**没有 lease，handoff 就无法把本轮 units 标成 reviewed**：清锁之后
+#     同一批未提交 diff 会被后续每一次 Stop 反复重新提议，session-scope / review-highwater
+#     那一整套「已审/未审」机制在默认发起路径上被整个绕过。
+#
+# 历史上这两件事由 Stop hook 的 ``route_reviewable_scope`` 链完成（``refresh_global_diff_tracker``
+# → ``build_manifest`` → ``allocate_auto_review_scope`` → ``freeze_cline_kanban_dispatch_artifacts``）。
+# P1 把默认发起改成「agent 在决策点就地 ``rvf-agent start``」之后那条链整条不再经过，于是本 CLI
+# 里的 prep payload 把三个 tracker 字段写死成 ``None``——旧 kanban-followup 路径产出 ``session-owned``
+# + 非空 ``primary_units`` + 真 lease，同一台机器上的 ``rvf-agent start`` 产出
+# ``manual-all-uncommitted`` + ``primary_units=0`` + ``lease=None``。本节把那条链**复用既有入口**
+# 补回来（``build_manifest`` 做 transcript 归属播种 + ``allocate_review_scope`` 做分配），刻意不另写
+# 一份分配逻辑：两处口径一旦分叉，「已审」的裁决权就有两个真相源。
+#
+# **降级方向一律保守（宁可多审，不可漏审）**：任何一环拿不到（无 session 身份 / 无可读 transcript /
+# manifest 失败 / allocator 说空或不可用），都回落到既有的无 tracker 口径（contract 退回
+# ``manual-all-uncommitted``，review packet 仍全量覆盖工作树），但**必须留下显式记录**——返回值里
+# 的 ``status`` / ``degradation_reason``、run ledger 事件、决策遥测、以及 ``start`` 回执正文各一份。
+# 静默回落正是本 issue 之所以能潜伏到「所有自动 RVF 的默认路径」的原因。
+# ---------------------------------------------------------------------------
+
+# 分配成功。
+AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED = "allocated"
+# 以下均为**降级**（无 lease、contract 退回 manual-all-uncommitted），按可诊断性分开命名。
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_NO_SESSION_IDENTITY = "degraded_no_session_identity"
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_NO_READABLE_TRANSCRIPT = "degraded_no_readable_transcript"
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_SESSION_MANIFEST_FAILED = "degraded_session_manifest_failed"
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_TRANSCRIPT_SCHEMA_DRIFT = (
+    "degraded_transcript_schema_drift_suspected"
+)
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY = "degraded_allocator_reported_empty"
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_UNAVAILABLE = "degraded_allocator_unavailable"
+AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR = "degraded_allocator_error"
+
+# 分配出的 lease 记在谁名下（Stop hook 旧路径记的是 ``stop-hook``）。就地发起换一个自解释的
+# holder 名，使 tracker events / 冲突诊断一眼看得出这一轮是「agent 在决策点接受后就地开的」。
+AGENTIC_INITIATION_TRACKER_SCOPE_REVIEWER_ID = "agentic-initiation-start"
+
+# 就地发起的一轮 RVF 由主 agent 在**当前会话**跑完 review → merge → validate/fix → handoff，墙钟
+# 远超 tracker 默认的 600s lease TTL，而本仓没有任何地方对 review 期间的 lease 做 heartbeat/refresh。
+# 沿用它所取代的那条路径（kanban-followup 终端投递，同样是「主 agent 就地接着跑」）的 1h 档：
+# lease 若在 review 中途过期，units 会被 prune 回 available，下一次 Stop 立刻把同一批改动重新
+# 提议——正是本修复要根治的那个循环。
+AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS = 60 * 60
+
+# 与 ``prepare_review_run`` 的 prep payload 键同名：本仓里「这一轮 run 源自哪份 transcript」一直
+# 叫这个名字，决策 token 的候选摘要沿用它，避免同一件事在两层各起一个名。
+CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY = "origin_transcript_path"
+
+
+TRANSCRIPT_PATH_SOURCE_EXPLICIT_FLAG = "explicit_flag"
+TRANSCRIPT_PATH_SOURCE_DECISION_TOKEN_CANDIDATE_SUMMARY = "decision_token_candidate_summary"
+TRANSCRIPT_PATH_SOURCE_UNRESOLVED = "unresolved"
+
+
+def resolve_start_transcript_path(
+    *,
+    explicit_transcript_path: str | None,
+    candidate_summary: Any,
+) -> tuple[str | None, str]:
+    """``start`` 用哪份 transcript：显式 ``--transcript-path`` > 决策 token 候选摘要里盖的那份。
+
+    返回 ``(path_or_None, 来源标签)``；来源标签进遥测，使「这一轮为什么没有 transcript」在事后
+    可判读，而不是只看到一个 None。只接受**当前确实存在的文件**：候选摘要是铸 token 那一刻写的，
+    到 ``start`` 之间会话可能已被 rewind / transcript 被轮转，指着一个不存在的路径去跑
+    ``build_manifest`` 只会换来一次没必要的失败降级。
+    """
+    if isinstance(explicit_transcript_path, str) and explicit_transcript_path.strip():
+        return explicit_transcript_path, TRANSCRIPT_PATH_SOURCE_EXPLICIT_FLAG
+    if isinstance(candidate_summary, Mapping):
+        stamped = candidate_summary.get(CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY)
+        if isinstance(stamped, str) and stamped.strip():
+            try:
+                exists = Path(stamped).expanduser().is_file()
+            except OSError:
+                exists = False
+            if exists:
+                return stamped, TRANSCRIPT_PATH_SOURCE_DECISION_TOKEN_CANDIDATE_SUMMARY
+    return None, TRANSCRIPT_PATH_SOURCE_UNRESOLVED
+
+
+def _degraded_tracker_scope_allocation(
+    status: str,
+    *,
+    reason: str,
+    error: str | None = None,
+    allocator_status: str | None = None,
+    session_manifest_has_owned_paths: bool = False,
+) -> dict[str, Any]:
+    """降级结果的统一构造器：三个 tracker 字段全 None + 一条人类可读的中文降级理由。
+
+    ``session_manifest_has_owned_paths`` 与 tracker 字段**分开**报：即使分配失败，只要 transcript
+    归属出了 owned paths，prepare 仍应吃这份 transcript（拿到 ``session-owned`` 口径），只是没有
+    lease。默认 False（保守：拿不准就别把 transcript 递下去，见调用点的硬失败注释）。
+    """
+    return {
+        "status": status,
+        "tracker_scope_path": None,
+        "tracker_lease_id": None,
+        "tracker_scope_hash": None,
+        "tracker_unit_count": 0,
+        "session_manifest_has_owned_paths": session_manifest_has_owned_paths,
+        "degradation_reason": reason,
+        "allocator_status": allocator_status,
+        "error": error,
+    }
+
+
+def _session_manifest_has_owned_paths(manifest: Any) -> bool:
+    """与 ``build_review_packet.session_owned_paths`` 逐字同源的「这份 manifest 有归属吗」判据。
+
+    必须同源：``build_review_packet.validate_session_manifest`` 在归属为空时**直接抛**
+    （``session manifest has no owned paths; refusing to build empty Session-Owned scope``）。
+    发起侧只要把一份空归属的 transcript 递给 prepare，整个 ``start`` 就从「降级但能跑」变成硬失败
+    ——本轮补 transcript 透传时实测踩到过这条（user-only transcript ⇒ prepare status=failed）。
+    """
+    if not isinstance(manifest, Mapping):
+        return False
+    for key in ("owned_paths", "owned_dirty_paths", "owned_committed_round_paths"):
+        value = manifest.get(key)
+        if isinstance(value, (list, tuple)) and any(
+            isinstance(item, str) and item for item in value
+        ):
+            return True
+    return False
+
+
+def allocate_agentic_initiation_tracker_review_scope(
+    *,
+    repo: str,
+    session_id: str | None,
+    transcript_path: str | None,
+    run_id: str,
+    output_scope_path: Path,
+    committed_baseline: str | None = None,
+    committed_base_ref: str | None = None,
+    lease_ttl_seconds: int | None = AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS,
+) -> dict[str, Any]:
+    """为「agent 就地接受的这一轮」分配 tracker review scope，复用 Stop hook 那条链的既有入口。
+
+    两步，顺序不可换：
+
+    1. ``build_manifest(repo, transcript, committed_baseline=…, committed_base_ref=…)`` ——
+       它会**透传调用** ``reviewable_unit_diff_tracker.register_claims``，把 transcript 归属出来的
+       owned paths 写成 ``session_units`` 行。这正是 Stop hook 侧 ``refresh_global_diff_tracker``
+       做的唯一一件实事。
+    2. ``allocate_review_scope(auto_claim_observed=False)`` —— 归属已由第 1 步播种，此处再
+       auto-claim 会把范围撑过 transcript 意图（Stop hook 侧逐字同款理由）。
+
+    返回归一化 dict：``{status, tracker_scope_path, tracker_lease_id, tracker_scope_hash,
+    tracker_unit_count, session_manifest_has_owned_paths, degradation_reason, allocator_status,
+    error}``。**永不抛**：任何异常都收敛成一条降级结果，让 ``start`` 继续走完（发起被一次 tracker
+    故障整个打掉，比多审一遍更糟）。
+
+    ``session_manifest_has_owned_paths`` 是给调用方的第二个开关：它决定这份 transcript 该不该
+    递给 prepare（详见 ``_session_manifest_has_owned_paths`` —— 空归属会让 packet 构建硬失败）。
+    """
+    if not (isinstance(session_id, str) and session_id.strip()):
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_NO_SESSION_IDENTITY,
+            reason=(
+                "本次 start 解析不出会话身份（session_id 为空），tracker lease 按构造无法绑定；"
+                "本轮退回无 lease 的 manual-all-uncommitted 口径。"
+            ),
+        )
+    resolved_transcript = (
+        Path(transcript_path).expanduser() if isinstance(transcript_path, str) and transcript_path.strip() else None
+    )
+    if resolved_transcript is None or not resolved_transcript.is_file():
+        # 无 transcript 不只是「少一份 manifest」：``prepare_run`` 在 tracker_scope 在场而
+        # session-manifest 缺席时会**直接抛** ValueError（tracker_scope 要 splice 进 manifest.tracker）。
+        # 故这里必须在分配之前短路，否则一次好意的分配会把整个 start 变成硬失败。
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_NO_READABLE_TRANSCRIPT,
+            reason=(
+                "拿不到可读的会话 transcript（既无 --transcript-path，决策 token 的候选摘要里也没有）；"
+                "没有 transcript 就生成不了 session-manifest，tracker scope 无处 splice。"
+                "本轮退回无 lease 的 manual-all-uncommitted 口径。"
+            ),
+        )
+
+    # 惰性 import：这两个模块（尤其 tracker）很重，早退路径不该为它们付出 import 成本。
+    from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+        allocate_review_scope,
+    )
+    from core.session_scope_allocation.session_change_manifest import build_manifest  # noqa: PLC0415
+
+    repo_path = Path(repo).expanduser().resolve()
+    try:
+        manifest = build_manifest(
+            repo_path,
+            resolved_transcript.resolve(),
+            committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
+        )
+    except Exception as exc:  # noqa: BLE001 - manifest 失败降级，不阻断已接受的一轮
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_SESSION_MANIFEST_FAILED,
+            reason=(
+                "从 transcript 构建 session-manifest 失败，本轮没有归属播种可用；"
+                "退回无 lease 的 manual-all-uncommitted 口径。"
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    if isinstance(manifest, dict) and manifest.get("schema_drift_suspected"):
+        # transcript 有具体编辑证据、工作树也 dirty，归属却为空 = 解析器与 transcript schema 失配。
+        # Stop hook 在这里是 loud-skip；本路径已被 agent 接受、不能 skip，故降级成「全量多审」并
+        # 显式点名 drift，绝不让它伪装成一次正常的空归属。
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_TRANSCRIPT_SCHEMA_DRIFT,
+            reason=(
+                "疑似 transcript schema 漂移（有编辑证据但归属为空），归属播种不可信；"
+                "退回无 lease 的 manual-all-uncommitted 口径全量多审，请人工核查解析器。"
+            ),
+        )
+
+    has_owned_paths = _session_manifest_has_owned_paths(manifest)
+    if not has_owned_paths:
+        # 归属为空（transcript 里没有本轮的编辑证据，例如纯提问会话，或解析器看不懂这份 rollout）。
+        # 既拿不到 tracker scope（候选查询按 session_units 走，必然 empty），也**不能**把这份
+        # transcript 递给 prepare —— validate_session_manifest 会因空归属直接抛。原样退回历史口径。
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY,
+            reason=(
+                "transcript 归属为空（本会话在这份 transcript 里没有可识别的文件改动证据）；"
+                "既分配不出 tracker scope，也不能据此建 session-owned packet，"
+                "本轮退回无 lease 的 manual-all-uncommitted 口径全量多审。"
+            ),
+        )
+
+    patch_ownership = manifest.get("patch_ownership") if isinstance(manifest, dict) else None
+    transcript_max_line_number = (
+        patch_ownership.get("transcript_max_line_number")
+        if isinstance(patch_ownership, dict)
+        and isinstance(patch_ownership.get("transcript_max_line_number"), int)
+        else None
+    )
+
+    try:
+        result = allocate_review_scope(
+            repo=repo_path,
+            session_id=session_id.strip(),
+            run_id=run_id,
+            reviewer_id=AGENTIC_INITIATION_TRACKER_SCOPE_REVIEWER_ID,
+            output_scope_path=output_scope_path,
+            holder_kind="reviewer",
+            dry_run=False,
+            lease_ttl_seconds=lease_ttl_seconds,
+            transcript_max_line_number=transcript_max_line_number,
+            # 归属已由上面的 build_manifest → register_claims 播种；auto-claim 会把范围撑过
+            # transcript 意图（与 Stop hook 侧同款理由，两处必须一致）。
+            auto_claim_observed=False,
+            committed_baseline=committed_baseline,
+            committed_base_ref=committed_base_ref,
+        )
+    except Exception as exc:  # noqa: BLE001 - allocator 故障降级，不阻断已接受的一轮
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR,
+            reason=(
+                "tracker allocator 抛异常，本轮拿不到 lease（但 transcript 归属可用，"
+                "packet 仍按 session-owned 口径构建）。"
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+            session_manifest_has_owned_paths=True,
+        )
+
+    status = result.get("status")
+    if status == "allocated":
+        scope_path = result.get("scope_path")
+        if not (isinstance(scope_path, str) and scope_path and Path(scope_path).is_file()):
+            # 分配成功但 artifact 没落盘：拿着 lease 却没有能喂给 prepare 的 scope 文件是最坏的
+            # 中间态（占着 units 又不进 packet）。立刻释放，按降级处理。
+            _release_agentic_initiation_tracker_lease(
+                repo=str(repo_path),
+                lease_id=result.get("lease_id"),
+                reason="agentic_initiation_scope_artifact_missing",
+            )
+            return _degraded_tracker_scope_allocation(
+                AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR,
+                reason=(
+                    "tracker allocator 报 allocated 但没落下 tracker-scope.json；已释放该 lease，"
+                    "本轮无 lease（packet 仍按 session-owned 口径构建）。"
+                ),
+                allocator_status=status,
+                session_manifest_has_owned_paths=True,
+            )
+        # unit 数只在 ``result["scope"]["unit_ids"]`` 里（allocated 分支的顶层返回**没有**
+        # ``unit_ids`` 键）——与 Stop hook 侧 `tracker_scope_allocated` ledger 事件同一读法。
+        allocated_scope = result.get("scope")
+        allocated_unit_ids = (
+            allocated_scope.get("unit_ids") if isinstance(allocated_scope, Mapping) else None
+        )
+        return {
+            "status": AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED,
+            "tracker_scope_path": scope_path,
+            "tracker_lease_id": result.get("lease_id"),
+            "tracker_scope_hash": result.get("scope_hash"),
+            "tracker_unit_count": len(allocated_unit_ids or []),
+            "session_manifest_has_owned_paths": True,
+            "degradation_reason": None,
+            "allocator_status": status,
+            "error": None,
+        }
+    if status == "empty":
+        # 走到这里说明 transcript 归属**非空**（空归属已在上面短路），故最常见的成因是这批 unit
+        # 已被另一条 active lease 持有，或已被判为 reviewed。不该让已接受的一轮空转，按「多审一遍」
+        # 降级；但降级理由必须显式，别让它看起来像正常分配。
+        return _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY,
+            reason=(
+                "tracker 报本会话名下没有未分配的可审单元"
+                f"（候选 {result.get('candidate_unit_count', 0)} 个、被在途 lease 排除 "
+                f"{result.get('leased_excluded_count', 0)} 个）；本轮无 lease，"
+                "packet 仍按 session-owned 口径构建。"
+            ),
+            allocator_status=status,
+            session_manifest_has_owned_paths=True,
+        )
+    return _degraded_tracker_scope_allocation(
+        AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_UNAVAILABLE,
+        reason=(
+            f"tracker 不可用（allocator status={status}，如 tracker 被 env 关掉或仓库形态不受支持）；"
+            "本轮无 lease，packet 仍按 session-owned 口径构建。"
+        ),
+        allocator_status=status if isinstance(status, str) else None,
+        session_manifest_has_owned_paths=True,
+    )
+
+
+def _release_agentic_initiation_tracker_lease(
+    *, repo: str, lease_id: Any, reason: str
+) -> dict[str, Any] | None:
+    """把本轮刚分配的 lease 还回去（units 从 ``assigned`` 翻回 ``available``），best-effort。
+
+    调用点只有一个语义：**这一轮没能进 review**（prepare 失败 / 超时 / 撞 bootstrap 等待 / 抛异常）。
+    不还的话那批 unit 在整个 TTL 里都是 ``assigned``，而候选查询只收 ``available`` ⇒ 下一次
+    ``start --retry`` 会开一个**新 run** 再分配一次，必然拿到 ``empty`` 而静默降级——修复反倒制造了
+    一个只在重试路径上发作的新盲区。
+    """
+    if not (isinstance(lease_id, str) and lease_id):
+        return None
+    try:
+        from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+            lease_release,
+        )
+
+        return lease_release(repo=repo, lease_id=lease_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001 - 归还失败只记录，不把失败叠加成第二次失败
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _record_tracker_lease_release_on_unfinished_prepare(
+    *,
+    worktree: str,
+    tracker_scope_allocation: dict[str, Any],
+    prepare_status: str,
+    ledger: Any,
+) -> None:
+    """prepare 没跑到 ``completed`` → 归还 lease 并就地把三个 tracker 字段抹回 None + 记 ledger。
+
+    抹回 None 是关键的第二半：返回值里的 ``tracker_scope_allocation`` 会被 ``run_start`` 当作
+    「本轮口径」报给 agent，若只还 lease 不改这份记录，回执会声称拿到了一条其实已经不存在的
+    lease（谎报成功，本仓 EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE 那条注释记的同一族毛病）。
+    """
+    lease_id = tracker_scope_allocation.get("tracker_lease_id")
+    if not (isinstance(lease_id, str) and lease_id):
+        return
+    release_result = _release_agentic_initiation_tracker_lease(
+        repo=worktree,
+        lease_id=lease_id,
+        reason=f"agentic_initiation_prepare_{prepare_status}",
+    )
+    tracker_scope_allocation["status"] = AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR
+    tracker_scope_allocation["degradation_reason"] = (
+        f"prepare 未跑到 completed（status={prepare_status}），本轮 lease {lease_id} 已归还，"
+        "units 翻回 available 供下一次 start --retry 重新分配。"
+    )
+    tracker_scope_allocation["tracker_lease_id"] = None
+    tracker_scope_allocation["tracker_scope_path"] = None
+    tracker_scope_allocation["tracker_scope_hash"] = None
+    tracker_scope_allocation["tracker_unit_count"] = 0
+    try:
+        ledger.event(
+            phase="gate",
+            event="agentic_initiation_tracker_scope_lease_released",
+            status="released",
+            level="warn",
+            reason_code="agentic_initiation_prepare_unfinished",
+            repo=worktree,
+            cwd=worktree,
+            tracker_lease_id=lease_id,
+            prepare_status=prepare_status,
+            lease_release_result=release_result,
+        )
+    except Exception:  # noqa: BLE001 - 记账失败不得掩盖本来要报的 prepare 失败
+        pass
+
+
 def default_prepare_pipeline(
     *,
     token_record: token_store.DecisionTokenRecord,
@@ -639,12 +1095,62 @@ def default_prepare_pipeline(
     artifacts_dir = ledger.artifacts_dir
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    # tracker review scope 分配：必须排在写 prep payload **之前**——三个 tracker 字段是 prep 的
+    # 输入，prepare 只是把它们透传给 scope contract。见本文件上方「发起侧 tracker review scope
+    # 分配」整节的动机说明。永不抛：拿不到就是一条显式记录在案的降级，start 照常走完。
+    tracker_scope_allocation = allocate_agentic_initiation_tracker_review_scope(
+        repo=worktree,
+        session_id=session_id,
+        transcript_path=transcript_path,
+        run_id=ledger.run_id,
+        output_scope_path=artifacts_dir / "tracker-scope.json",
+        committed_baseline=committed_baseline,
+        committed_base_ref=committed_base_ref,
+    )
+    ledger.event(
+        phase="gate",
+        event="agentic_initiation_tracker_scope_allocation",
+        status=(
+            "allocated"
+            if tracker_scope_allocation["status"] == AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED
+            else "degraded"
+        ),
+        # 降级是 warn 级：它不阻断本轮，但它意味着这一轮审完也无法把 units 标成 reviewed。
+        level=(
+            None
+            if tracker_scope_allocation["status"] == AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED
+            else "warn"
+        ),
+        reason_code=tracker_scope_allocation["status"],
+        repo=worktree,
+        cwd=worktree,
+        session_id=session_id,
+        tracker_lease_id=tracker_scope_allocation["tracker_lease_id"],
+        tracker_scope_hash=tracker_scope_allocation["tracker_scope_hash"],
+        tracker_scope_path=tracker_scope_allocation["tracker_scope_path"],
+        tracker_unit_count=tracker_scope_allocation["tracker_unit_count"],
+        allocator_status=tracker_scope_allocation["allocator_status"],
+        degradation_reason=tracker_scope_allocation["degradation_reason"],
+        session_manifest_has_owned_paths=tracker_scope_allocation[
+            "session_manifest_has_owned_paths"
+        ],
+        error=tracker_scope_allocation["error"],
+    )
+
+    # transcript 只在**归属非空**时才递给 prepare：``build_review_packet.validate_session_manifest``
+    # 对空归属的 manifest 直接抛（refusing to build empty Session-Owned scope），递下去会把一次
+    # 本可降级跑完的 start 变成硬失败。归属为空时按历史口径走（无 manifest ⇒
+    # manual-all-uncommitted，packet 仍全量覆盖工作树），降级理由已由上面的分配结果记在案。
+    prepare_transcript_path = (
+        transcript_path if tracker_scope_allocation["session_manifest_has_owned_paths"] else None
+    )
+
     target_flow = "flow-manual"
     payload: dict[str, Any] = {
         "origin_session_id": session_id,
         "origin_repo": worktree,
         "origin_cwd": worktree,
-        "origin_transcript_path": transcript_path,
+        "origin_transcript_path": prepare_transcript_path,
         "target_flow": target_flow,
         "target_worktree": worktree,
         "target_kanban_task_id": None,
@@ -655,9 +1161,9 @@ def default_prepare_pipeline(
             "run_dir": str(ledger.run_dir),
             "artifacts_dir": str(artifacts_dir),
             "scope_contract_path": str(artifacts_dir / "inputs" / "scope.contract.json"),
-            "tracker_scope_path": None,
-            "tracker_lease_id": None,
-            "tracker_scope_hash": None,
+            "tracker_scope_path": tracker_scope_allocation["tracker_scope_path"],
+            "tracker_lease_id": tracker_scope_allocation["tracker_lease_id"],
+            "tracker_scope_hash": tracker_scope_allocation["tracker_scope_hash"],
         },
         "handoff_expectations": {
             "handoff_path": str(artifacts_dir / "handoff.md"),
@@ -675,11 +1181,24 @@ def default_prepare_pipeline(
 
     rvf_prep_file.sweep_stale()
     record = rvf_prep_file.write_prep_file(payload)
-    state = prepare_review_run.prepare_run_from_prep_file(
-        record,
-        timeout_seconds=timeout_seconds,
-        transcript_override=Path(transcript_path).expanduser() if transcript_path else None,
-    )
+    try:
+        state = prepare_review_run.prepare_run_from_prep_file(
+            record,
+            timeout_seconds=timeout_seconds,
+            transcript_override=(
+                Path(prepare_transcript_path).expanduser() if prepare_transcript_path else None
+            ),
+        )
+    except BaseException:
+        # prepare 抛穿（含 KeyboardInterrupt）：本轮进不了 review，刚拿的 lease 必须还回去，
+        # 否则那批 unit 在整个 TTL 里都是 assigned，下一次 start --retry 只会拿到 empty。
+        _record_tracker_lease_release_on_unfinished_prepare(
+            worktree=worktree,
+            tracker_scope_allocation=tracker_scope_allocation,
+            prepare_status="raised",
+            ledger=ledger,
+        )
+        raise
     gate = rvf_bootstrap_gate.gate_of(state)
     if gate is not None and parent_attempt_run_id and not gate.get("parent_attempt_run_id"):
         gate = {
@@ -687,6 +1206,17 @@ def default_prepare_pipeline(
             "parent_attempt_run_id": parent_attempt_run_id,
             "parent_attempt_run_dir": parent_attempt_run_dir,
         }
+    if state.get("status") != "completed":
+        # 失败 / 超时 / bootstrap 等待都归这一支。**等待态也要还**：等待期间 agent 会去吸收
+        # local base，工作树随之改变；留着一份分配于吸收之前的 scope，恢复时审的就是另一批东西
+        # （正是 union_with_prior_scope 那条注释记录的「口径被悄悄换掉」事故）。恢复重放时重新
+        # 分配，拿到的才是当时工作树的真实口径。
+        _record_tracker_lease_release_on_unfinished_prepare(
+            worktree=worktree,
+            tracker_scope_allocation=tracker_scope_allocation,
+            prepare_status=str(state.get("status")),
+            ledger=ledger,
+        )
     return {
         "status": state.get("status"),
         "run_id": state.get("run_id"),
@@ -694,6 +1224,9 @@ def default_prepare_pipeline(
         "artifacts": state.get("artifacts") or {},
         "error": state.get("error"),
         "prep_token": record.token,
+        # prep 文件的落盘路径：``start`` 的 execution_handoff 要把它交给 agent（历史上这条信息
+        # 只经祈使句 prompt 的 ``$RVF_PREP_FILE`` 提示传递，现改为从返回值读）。
+        "prep_file": str(record.path),
         "bootstrap_gate": gate,
         # bootstrap 等待路径上 prepare_run 在 start_run **之前**就抛了，故 state 里没有
         # run_id/run_dir；发起侧 ledger 的 run 目录才是该 token 唯一可锚的在途工件。没有它，
@@ -701,7 +1234,159 @@ def default_prepare_pipeline(
         # 决策熬死（入口 A 的可恢复性硬缺口）。
         "initiation_run_id": ledger.run_id,
         "initiation_run_dir": str(ledger.run_dir),
+        # 本轮 scope 口径的实况（allocated / 各种 degraded_*）。``run_start`` 把它同时写进遥测、
+        # 回执 detail 与人类可读正文——降级必须有人看得见，不能只躺在 ledger 里。
+        "tracker_scope_allocation": tracker_scope_allocation,
     }
+
+
+def _current_kanban_task_id_from_env() -> str | None:
+    """与 ``stop_review_validate_fix.current_kanban_task_id`` 的 env 段**同源**的 task id。
+
+    CLI 没有 Stop event，只剩 env 这一路；变量名与顺序必须与 Stop 侧逐字一致，否则两边会在
+    同一台机器上算出不同的 marker key。
+    """
+    for name in ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _consume_review_reopen_marker_before_allocate(
+    *, session_id: str | None, repo: str | None
+) -> dict[str, Any]:
+    """``start`` 侧的失败再入消费（与 Stop hook 旧派发路径共用同一份实现）。绝不抛。"""
+    if not (isinstance(repo, str) and repo.strip()):
+        return {"outcome": review_reopen_marker.REVIEW_REOPEN_CONSUMPTION_NO_MARKER}
+    try:
+        return review_reopen_marker.consume_review_reopen_marker_for_run_scope(
+            task_id=_current_kanban_task_id_from_env(),
+            session_id=session_id,
+            repo=repo,
+        )
+    except Exception as exc:  # noqa: BLE001 - 失败再入记账永不阻断发起
+        return {
+            "outcome": review_reopen_marker.REVIEW_REOPEN_CONSUMPTION_NO_MARKER,
+            "consumption_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def build_execution_handoff(
+    *,
+    repo: str | None,
+    run_id: str | None,
+    run_dir: str | None,
+    prepare_artifacts: Mapping[str, Any] | None,
+    prep_file_path: str | None,
+    kanban_task_id: str | None,
+) -> dict[str, Any]:
+    """``start`` 成功回执里的「接下来怎么执行」块（INV-3 的载体）。
+
+    **它取代的是什么**：历史上 kanban task 内的自动 RVF 靠一条自注入祈使句把 ``RVF_RUN_ID`` /
+    ``RVF_TARGET_REPO`` / origin 元数据 / handoff 契约一并塞进 agent 的上下文。那条祈使句现在
+    退役了（INV-1/INV-2：唯一的自注入是发起决策点横幅），这些执行所需信息改为**在 agent 接受
+    的那一刻从本命令的返回值里读**——既不再占一条 user message，也不再依赖一条可能迟到 49
+    分钟、可被 rewind 的异步投递。
+
+    ``origin_metadata`` / ``handoff_path`` 由 ``run_dir`` 派生而不是另存一份：run 目录布局
+    （``artifacts/origin.json``、``artifacts/handoff.md``）是 prepare 侧的既有约定，这里只把
+    落点算给 agent，避免两处各记一份路径而漂移。
+    """
+    artifacts = dict(prepare_artifacts) if isinstance(prepare_artifacts, Mapping) else {}
+    run_dir_path = Path(run_dir).expanduser() if isinstance(run_dir, str) and run_dir else None
+    return {
+        "target_repo": repo,
+        "kanban_task_id": kanban_task_id,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "prep_file": prep_file_path,
+        # prepare 产出的全套输入工件（缺失的键保持 None，不静默丢字段）。
+        "review_env": artifacts.get("review_env"),
+        "review_packet": artifacts.get("review_packet"),
+        "review_packet_metadata": artifacts.get("review_packet_metadata"),
+        "review_agent_context": artifacts.get("review_agent_context"),
+        "scope_contract": artifacts.get("scope_contract"),
+        "scope_of_work": artifacts.get("scope_of_work"),
+        "session_manifest": artifacts.get("session_manifest"),
+        "worktree_bootstrap": artifacts.get("worktree_bootstrap"),
+        "origin_metadata": str(run_dir_path / "artifacts" / "origin.json") if run_dir_path else None,
+        "handoff_path": str(run_dir_path / "artifacts" / "handoff.md") if run_dir_path else None,
+        "handoff_contract": (
+            "从准备阶段开始创建并持续维护 run artifact `handoff.md`；完成后最终回复第一行输出 "
+            "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
+            f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}，也不要在正文里重复 handoff 文件内容。"
+            "Stop hook 把 `RVF_HANDOFF_FILE` marker 当作完成信号：它同时清掉本轮的在途凭证，"
+            "run 结束时发送 OS 系统通知。"
+        ),
+        "execution_instruction": (
+            "就地执行：在**当前会话、当前 worktree** 里调用 `$review-validate-fix` skill，按 "
+            "SKILL.md 走 review → merge → validate/fix → handoff。不要新建 Kanban task、"
+            "不要 fork 新会话；上面这些路径就是本轮 run 的全部输入，不需要重新 prepare。"
+        ),
+    }
+
+
+ACCEPTED_REVIEW_RUN_RECEIPT_ARMED = "armed"
+ACCEPTED_REVIEW_RUN_RECEIPT_SKIPPED_NO_SESSION_IDENTITY = "skipped_no_session_identity"
+ACCEPTED_REVIEW_RUN_RECEIPT_SKIPPED_REPOSITORY_IDENTITY_UNRESOLVED = (
+    "skipped_repository_identity_unresolved"
+)
+ACCEPTED_REVIEW_RUN_RECEIPT_ARM_FAILED = "arm_failed"
+
+
+def arm_accepted_review_run_in_flight_receipt(
+    *,
+    decision_token: str,
+    session_id: str | None,
+    repo: str | None,
+    run_id: str | None,
+    run_dir: str | None,
+    transcript_path: str | None,
+    lock_root: Path | None = None,
+) -> dict[str, Any]:
+    """``start`` 成功之后落一枚「本会话已接受、这一轮 RVF 在途」的凭证（INV-5 的载体）。
+
+    **为什么必须由 CLI 自己落**：历史上这把在途锁只由 UserPromptSubmit 在「follow-up trigger
+    投递落地」那一刻 arm。P1 之后默认路径是 agent 在发起决策点横幅上就地 ``start``——根本没有
+    UPS 事件，没人 arm。不补这一枚，接受之后的**每一次** Stop 都会把同一批改动重新征询一遍。
+
+    **刻意只写 session 维度的 key**（``task_id=None``）：读侧（Stop hook）的候选顺序是
+    ``task-…`` 优先、``sess-…`` 回退，所以 session-only 的凭证无论读侧有没有解析出 kanban
+    task id 都命中得到；反过来若这里按 task id 落、而读侧那一刻恰好没有该 env，就会漏读 ⇒
+    重复征询。凭证的语义本来就是「**这个会话**接受了这一轮」，session 维度也更贴切。
+
+    整段 best-effort：任何异常都不该让一次已经成功的 ``start`` 变成失败，故只返回诊断。
+    """
+    if not (isinstance(session_id, str) and session_id.strip()):
+        return {"status": ACCEPTED_REVIEW_RUN_RECEIPT_SKIPPED_NO_SESSION_IDENTITY}
+    try:
+        import kanban_followup_lock  # noqa: PLC0415 - 与锁模块的耦合限制在本函数内
+
+        marker_path = kanban_followup_lock.write_marker(
+            task_id=None,
+            session_id=session_id.strip(),
+            run_id=str(run_id or ""),
+            run_dir=str(run_dir or ""),
+            repo=repo,
+            cwd=repo,
+            decision_token=decision_token,
+            delivered_session_id=session_id.strip(),
+            delivered_transcript_path=(
+                transcript_path
+                if isinstance(transcript_path, str) and transcript_path.strip()
+                else None
+            ),
+            state=kanban_followup_lock.STATE_IN_PROGRESS,
+            root=lock_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - 凭证记账永不阻断已成功的 start
+        return {"status": ACCEPTED_REVIEW_RUN_RECEIPT_ARM_FAILED, "error": f"{type(exc).__name__}: {exc}"}
+    if marker_path is None:
+        # marker_paths 返回空 = 仓身份解析不出（见 kanban_followup_lock.marker_paths 的 fail-closed）。
+        # 方向是安全的：没有凭证 ⇒ 下一次 Stop 至多多征询一次，绝不静默漏审。
+        return {"status": ACCEPTED_REVIEW_RUN_RECEIPT_SKIPPED_REPOSITORY_IDENTITY_UNRESOLVED}
+    return {"status": ACCEPTED_REVIEW_RUN_RECEIPT_ARMED, "marker_path": str(marker_path)}
 
 
 def run_start(
@@ -720,9 +1405,11 @@ def run_start(
     provider_health_runner: Callable[[Any, float], dict[str, Any]] | None = None,
     provider_health_timeout_seconds: float = 12.0,
     prepare_timeout_seconds: float = 60.0,
+    lock_root: Path | None = None,
 ) -> CommandResult:
     """``start`` 子命令：token→acknowledged → 前置校验 + provider-health 门 → prepare 全套 →
-    自动 scope 产出。任一步失败 → record_start_failure 回退保持 acknowledged，可 --retry。"""
+    自动 scope 产出 → arm 在途凭证。任一步失败 → record_start_failure 回退保持 acknowledged，
+    可 --retry。"""
     roots = roots or AgentDecisionRoots()
     now_dt = _coerce_now(now)
     prepare_pipeline = prepare_pipeline or default_prepare_pipeline
@@ -763,10 +1450,23 @@ def run_start(
     )
     candidate_summary = record.payload.get("candidate_summary")
     repo = repo or worktree
+    # transcript 回退（本轮 scope 口径的另一半）：``--transcript-path`` 是 agent 手打的可选参数，
+    # 而 agent 通常并不知道自己的 transcript 落在哪。铸 token 的 Stop hook / UPS 那一刻是**知道**的
+    # （event 里就有），故它们把该路径盖进候选摘要，这里读回来当默认值。没有这一步，默认发起路径
+    # 上 transcript 永远是 None ⇒ prepare 生成不了 session-manifest ⇒ contract 退化成
+    # manual-all-uncommitted，并且 tracker scope 连分配的前提都不具备。
+    transcript_path, transcript_path_source = resolve_start_transcript_path(
+        explicit_transcript_path=transcript_path, candidate_summary=candidate_summary
+    )
     append_decision_telemetry(
         token=token, event="start_acknowledged", worktree=worktree, session_id=tok_session_id,
         now=now_dt, root=roots.telemetry_root,
-        detail={"reason": reason, "retry": retry, "start_attempt_count": record.payload.get("start_attempt_count")},
+        detail={
+            "reason": reason,
+            "retry": retry,
+            "start_attempt_count": record.payload.get("start_attempt_count"),
+            "transcript_path_source": transcript_path_source,
+        },
     )
 
     def _fail(reason_text: str, *, phase: str, extra: dict[str, Any] | None = None) -> CommandResult:
@@ -987,6 +1687,21 @@ def run_start(
         if replay_claim_held:
             token_store.release_bootstrap_replay_in_flight(token, roots.token_root)
 
+    # ④b 失败再入（``$rvf-reopen``）：必须在 prepare→allocate **之前**把上一轮实现 run 的
+    #    reviewed units 翻回 available，本轮才拿得到「实现 ∪ fix」全量。历史上这一步只在 Stop
+    #    hook 的派发路径里做；P1 把默认发起改成 agent 就地 start 之后，不在这里补一次，
+    #    ``$rvf-reopen`` 在默认路径上就整个失效了（marker 永不被消费、范围永不重开）。
+    #    刻意放在**接受之后**：谢绝一轮不该顺手把用户武装的重开意图消费掉。
+    review_reopen_consumption = _consume_review_reopen_marker_before_allocate(
+        session_id=tok_session_id, repo=repo
+    )
+    if review_reopen_consumption.get("outcome") != review_reopen_marker.REVIEW_REOPEN_CONSUMPTION_NO_MARKER:
+        append_decision_telemetry(
+            token=token, event="start_review_reopen_consumed", worktree=worktree,
+            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
+            detail=review_reopen_consumption,
+        )
+
     try:
         prepared = prepare_pipeline(
             token_record=record, repo=repo, session_id=tok_session_id,
@@ -1079,23 +1794,86 @@ def run_start(
     }
     scope_artifact_path = write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
 
+    # ⑦ 在途凭证（INV-5）：接受之后的后续 Stop 不得把同一批改动重新征询一遍。就地接受没有
+    #    UPS 事件，故必须由本命令自己 arm；``--retry`` 走同一路径，整份覆盖即幂等。
+    in_flight_receipt = arm_accepted_review_run_in_flight_receipt(
+        decision_token=token,
+        session_id=tok_session_id,
+        repo=repo,
+        run_id=run_id if isinstance(run_id, str) else None,
+        run_dir=run_dir if isinstance(run_dir, str) else None,
+        transcript_path=transcript_path,
+        lock_root=lock_root,
+    )
+
+    # 本轮 scope 口径实况。降级时 message / next_steps 也会带上，确保「这一轮审完标不了 reviewed」
+    # 这件事对 agent 和用户都是**可见**的，而不是只有事后翻 ledger 才看得出来。
+    tracker_scope_allocation = prepared.get("tracker_scope_allocation")
+    if not isinstance(tracker_scope_allocation, Mapping):
+        tracker_scope_allocation = _degraded_tracker_scope_allocation(
+            AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_UNAVAILABLE,
+            reason="prepare 流水线未回报 tracker scope 口径（自定义 prepare_pipeline？）。",
+        )
+    tracker_scope_degraded = (
+        tracker_scope_allocation.get("status") != AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED
+    )
+
     append_decision_telemetry(
         token=token, event="start_prepared", worktree=worktree, session_id=tok_session_id,
         now=now_dt, root=roots.telemetry_root,
-        detail={"run_id": run_id, "run_dir": run_dir, "auto_scope_path_count": len(auto_scope_paths)},
+        detail={
+            "run_id": run_id,
+            "run_dir": run_dir,
+            "auto_scope_path_count": len(auto_scope_paths),
+            "in_flight_receipt": in_flight_receipt,
+            "transcript_path_source": transcript_path_source,
+            "tracker_scope_allocation": dict(tracker_scope_allocation),
+        },
     )
 
+    execution_handoff = build_execution_handoff(
+        repo=repo,
+        run_id=run_id if isinstance(run_id, str) else None,
+        run_dir=run_dir if isinstance(run_dir, str) else None,
+        prepare_artifacts=artifacts,
+        prep_file_path=(
+            prepared.get("prep_file") if isinstance(prepared.get("prep_file"), str) else None
+        ),
+        kanban_task_id=_current_kanban_task_id_from_env(),
+    )
+
+    scope_mode_note = (
+        f"审查准备就绪（自动 scope {len(auto_scope_paths)} 路径；tracker scope 已分配，"
+        f"lease={tracker_scope_allocation.get('tracker_lease_id')}、"
+        f"{tracker_scope_allocation.get('tracker_unit_count')} 个可审单元）。"
+        if not tracker_scope_degraded
+        else (
+            f"审查准备就绪（自动 scope {len(auto_scope_paths)} 路径）。"
+            f"⚠ 本轮 scope 口径已降级（{tracker_scope_allocation.get('status')}）："
+            f"{tracker_scope_allocation.get('degradation_reason')}"
+            " 后果：本轮审完**无法**把这批单元标成 reviewed，同一批改动可能在下一次 Stop 再被提议一次；"
+            "且范围可能含其他会话的背景改动，改文件前请以 scope contract 的 fix_allowlist 为准。"
+        )
+    )
     return CommandResult(
         command="start", status="ok", exit_code=EXIT_OK, token=token,
         token_state=token_store.STATE_ACKNOWLEDGED,
-        message=f"审查准备就绪（自动 scope {len(auto_scope_paths)} 路径）。",
+        message=scope_mode_note,
         next_steps=[
             f"rvf-agent scope annotate|exclude|include --token {token} …（可选，改动自动 scope）",
             f"rvf-agent dispatch --token {token} --strictness <light|standard|strict>",
+            "dispatch 之后：在**当前会话**调用 `$review-validate-fix` skill 就地执行"
+            "（执行所需路径全在 detail.execution_handoff，不需要重新 prepare）。",
         ],
         detail={
             "run_id": run_id, "run_dir": run_dir, "scope_artifact": str(scope_artifact_path),
             "auto_scope_paths": auto_scope_paths, "prepare_artifacts": dict(artifacts),
+            # INV-3：执行所需的一切 per-run 信息由本块承载，不再经任何注入正文携带。
+            "execution_handoff": execution_handoff,
+            "in_flight_receipt": in_flight_receipt,
+            "transcript_path": transcript_path,
+            "transcript_path_source": transcript_path_source,
+            "tracker_scope_allocation": dict(tracker_scope_allocation),
         },
     )
 
@@ -1327,6 +2105,38 @@ def finalize_scope_contract(
     }
 
 
+# ``reviewer_dispatcher`` 返回的 ``status``。刻意与「派发进程 returncode」解耦：
+#   * ``ok``                          —— 派发已（同步 dry-run / 异步 detached）就绪；
+#   * ``blocked_on_reviewer_request`` —— 有腿返回 ``kind: request``，**待处理终态**，
+#                                        既非故障也非完成，不得当失败重跑（见 SKILL.md）；
+#   * ``failed``                      —— 真故障。
+DISPATCH_OUTCOME_OK = "ok"
+DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
+DISPATCH_OUTCOME_FAILED = "failed"
+
+# detached 派发 launch 的两行 stdout 契约（``dispatch_reviewers.launch_detached_dispatch``）。
+DETACHED_DISPATCH_STATUS_PATH_STDOUT_PREFIX = "RVF_DISPATCH_STATUS="
+DETACHED_DISPATCH_LAUNCH_RESULT_STDOUT_PREFIX = "RVF_DISPATCH_LAUNCH="
+
+
+def _parse_detached_dispatch_launch_output(stdout: str) -> dict[str, Any]:
+    """按**前缀**解析 detached launch 的两行回执，而不是「取 stdout 最后一行」。
+
+    取最后一行在新输出格式下不可靠：``--execute --detached`` 打印的是
+    ``RVF_DISPATCH_STATUS=<path>`` 与 ``RVF_DISPATCH_LAUNCH=<launched|already_running|
+    launch_failed>`` 两行，最后一行是后者，把它当 plan 路径会写出一个不存在的路径。
+    """
+    status_path: str | None = None
+    launch_status: str | None = None
+    for line in stdout.splitlines():
+        text = line.strip()
+        if text.startswith(DETACHED_DISPATCH_STATUS_PATH_STDOUT_PREFIX):
+            status_path = text[len(DETACHED_DISPATCH_STATUS_PATH_STDOUT_PREFIX):].strip() or None
+        elif text.startswith(DETACHED_DISPATCH_LAUNCH_RESULT_STDOUT_PREFIX):
+            launch_status = text[len(DETACHED_DISPATCH_LAUNCH_RESULT_STDOUT_PREFIX):].strip() or None
+    return {"dispatch_status_path": status_path, "launch_status": launch_status}
+
+
 def default_reviewer_dispatcher(
     *,
     repo: str | None,
@@ -1339,11 +2149,23 @@ def default_reviewer_dispatcher(
     preset: Mapping[str, Any],
     dry_run: bool,
 ) -> dict[str, Any]:
-    """默认 reviewer 派发：以子进程调用既有 ``dispatch_reviewers.py``（S7 才模块化，本切片不重写它）。
+    """默认 reviewer 派发：以子进程调用既有 ``dispatch_reviewers.py``。
 
-    ``dry_run=True`` 走 ``--dry-run``（打印 plan、不真拉起 reviewer）；否则 ``--execute``。严格度→
-    可用池大小的 clamp / 伪随机选二 / per-phase 由 S7 落地；本切片先把 preset 的
-    ``external_reviewer_count_target`` 作为 ``--require-external`` 的意图透传（≥2 时要求真有 external）。
+    ``dry_run=True`` 走 ``--dry-run``（同步打印 plan、不真拉起 reviewer）；否则走
+    ``--execute --detached``。preset 的 ``external_reviewer_count_target`` 作为
+    ``--require-external`` 的意图透传（≥2 时要求真有 external）。
+
+    **为什么必须 ``--detached``**：``dispatch_reviewers.py`` 的模块头写明 detached 的存在理由
+    就是「整轮派发不受前台 Bash 工具 600s 上限约束」——一次彻底 review 常常 > 10 分钟。历史实现
+    用不带 ``--detached`` 的 ``--execute`` + 无超时 ``subprocess.run`` 同步等整轮跑完；P1 之后
+    本函数是**所有**发起的必经之路，那条路在 Claude 里必被砍断。改为立即返回 status.json 路径，
+    由 agent 按 SKILL.md 用 ``--wait-status`` 有界轮询。
+
+    **``returncode`` 不是判据**：它只说派发进程怎么退出。判「本轮 double-review 是否成立」一律
+    看 ``plan_status``（见 SKILL.md「Review」节）。特别地退出码 ``3`` =
+    ``blocked_on_reviewer_request``，是**待处理终态**，既非故障也非完成 —— 历史实现把它归到
+    ``failed``，agent 多半会盲目重跑 dispatch，而正确处置是先走 Contract Gate 处理那条
+    ``kind: request``、再带同一 ``--selection-seed`` 用**同一对** reviewer 重试。
     """
     dispatch_script = Path(__file__).resolve().parent / "dispatch_reviewers.py"
     argv = [sys.executable, str(dispatch_script)]
@@ -1359,22 +2181,39 @@ def default_reviewer_dispatcher(
         argv += ["--rvf-run-id", run_id]
     if run_dir:
         argv += ["--rvf-run-dir", run_dir]
-    argv += ["--dry-run"] if dry_run else ["--execute"]
+    argv += ["--dry-run"] if dry_run else ["--execute", "--detached"]
     if int(preset.get("external_reviewer_count_target") or 0) >= 2:
         argv += ["--require-external"]
     try:
         completed = subprocess.run(argv, capture_output=True, text=True, check=False)
     except (OSError, ValueError) as exc:
-        return {"status": "failed", "error": f"{type(exc).__name__}: {exc}", "argv": argv}
+        return {"status": DISPATCH_OUTCOME_FAILED, "error": f"{type(exc).__name__}: {exc}", "argv": argv}
     stdout = completed.stdout or ""
-    return {
-        "status": "ok" if completed.returncode == 0 else "failed",
+    stderr = completed.stderr or ""
+    result: dict[str, Any] = {
         "returncode": completed.returncode,
         "stdout_tail": stdout[-2000:],
-        "stderr_tail": (completed.stderr or "")[-2000:],
-        "plan_path": stdout.strip().splitlines()[-1] if stdout.strip() and not dry_run else None,
+        "stderr_tail": stderr[-2000:],
         "argv": argv,
     }
+    if dry_run:
+        # dry-run 是同步的：stdout 最后一行就是 plan 路径（与既有行为一致）。
+        result["status"] = (
+            DISPATCH_OUTCOME_OK if completed.returncode == 0 else DISPATCH_OUTCOME_FAILED
+        )
+        result["plan_path"] = stdout.strip().splitlines()[-1] if stdout.strip() else None
+        return result
+
+    import dispatch_reviewers  # noqa: PLC0415 - 重量级模块，只为读退出码常量，惰性 import
+
+    result.update(_parse_detached_dispatch_launch_output(stdout))
+    if completed.returncode == dispatch_reviewers.DISPATCH_BLOCKED_ON_REVIEWER_REQUEST_EXIT_CODE:
+        result["status"] = DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST
+    elif completed.returncode == 0:
+        result["status"] = DISPATCH_OUTCOME_OK
+    else:
+        result["status"] = DISPATCH_OUTCOME_FAILED
+    return result
 
 
 def run_dispatch(
@@ -1434,7 +2273,38 @@ def run_dispatch(
         preset=preset,
         dry_run=dry_run,
     )
-    if dispatch_result.get("status") not in ("ok", "completed"):
+    # ②a ``blocked_on_reviewer_request`` 是**待处理终态**，既不是故障也不是完成态 review。
+    #    绝不能报成 dispatch_failed —— 那会把 agent 引向「修一修再重跑 dispatch」，而正确处置
+    #    是先按 references/review-merge-policy.md 的 Contract Gate 满足/驳回那条 ``kind:
+    #    request``，再带**同一** ``--selection-seed`` 用同一对 reviewer 经同一入口重派。
+    if dispatch_result.get("status") == DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST:
+        append_decision_telemetry(
+            token=token, event="dispatch_blocked_on_reviewer_request", worktree=worktree,
+            session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
+            detail={"strictness": strictness, "dispatch_result": dispatch_result},
+        )
+        return CommandResult(
+            command="dispatch",
+            status=DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST,
+            exit_code=EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST,
+            token=token,
+            token_state=record.state,
+            message=(
+                "有 reviewer 返回 `kind: request`（待处理终态，不是故障、也不是完成态 review）。"
+                "先按 references/review-merge-policy.md 的 Contract Gate 满足或驳回该 request，"
+                "再对**同一** run 重派；request 不得进入 merge table。"
+            ),
+            next_steps=[
+                "读 artifacts/reviewers/reviewer-plan.json 的 review_request_pending_reviewer_ids "
+                "与对应 reviewer 目录，处置那条 request。",
+                "处置完带上本轮 plan 的 reviewer_selection.selection_seed 重跑 "
+                "`scripts/dispatch_reviewers.py --execute --detached --selection-seed <seed>`"
+                "（同一对 reviewer、同一 review packet）。",
+            ],
+            detail={"dispatch_result": dispatch_result, "strictness": strictness},
+        )
+
+    if dispatch_result.get("status") not in (DISPATCH_OUTCOME_OK, "completed"):
         append_decision_telemetry(
             token=token, event="dispatch_failed", worktree=worktree,
             session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
@@ -1462,17 +2332,35 @@ def run_dispatch(
         now=now_dt, root=roots.telemetry_root,
         detail={"strictness": strictness, "preset": dict(preset), "dispatch_result": dispatch_result},
     )
+    dispatch_status_path = dispatch_result.get("dispatch_status_path")
+    next_steps = (
+        [
+            # detached：整轮派发跑在 tmux 线程里、不受前台 Bash 600s 上限约束，故这里只拿到
+            # status.json 的落点，必须由 agent 有界轮询到终态。
+            f"有界轮询到终态：`python3 {Path(__file__).resolve().parent / 'dispatch_reviewers.py'} "
+            f"--wait-status --status-path {dispatch_status_path} --max-wait 480`"
+            "（打印 RVF_DISPATCH_STATE=running 就再调一次）。",
+            "**判双评审是否成立只看 `plan_status`，不看 `returncode`**："
+            "completed + effective_reviewers=2/2 才成立；failed / partial / unknown 一律不成立；"
+            "blocked_on_reviewer_request 走 Contract Gate。详见 SKILL.md「Review」节。",
+            "成立后：读 reviewer artifact → merge → validate → fix → handoff（不变）。",
+        ]
+        if dispatch_status_path
+        else ["等待 reviewer 结果 → validate → fix → handoff（不变）。"]
+    )
     return CommandResult(
         command="dispatch", status="ok", exit_code=EXIT_OK, token=token,
         token_state=dispatched.state,
         message=f"已按 {strictness} 档派发 reviewer（primary_files {len(effective_primary_files)}，"
         f"external target {preset.get('external_reviewer_count_target')}）。审查将就地进行。",
-        next_steps=["等待 reviewer 结果 → validate → fix → handoff（不变）。"],
+        next_steps=next_steps,
         detail={
             "strictness": strictness, "preset": dict(preset),
             "effective_primary_files": effective_primary_files,
             "scope_finalize": finalize,
             "dispatch_plan_path": dispatch_result.get("plan_path"),
+            "dispatch_status_path": dispatch_status_path,
+            "dispatch_launch_status": dispatch_result.get("launch_status"),
             "dispatch_result": dispatch_result,
         },
     )
@@ -1605,6 +2493,7 @@ def _clear_kanban_followup_lock_and_pending_for_this_dispatch(
     *,
     task_id: str,
     session_id: str,
+    repo: str,
     dispatch_token: str,
     run_id: str,
     lock_root: Path | None,
@@ -1644,7 +2533,10 @@ def _clear_kanban_followup_lock_and_pending_for_this_dispatch(
             if dimension_task_id is None and dimension_session_id is None:
                 continue
             marker = kanban_followup_lock.read_marker(
-                task_id=dimension_task_id, session_id=dimension_session_id, root=lock_root
+                task_id=dimension_task_id,
+                session_id=dimension_session_id,
+                repo=repo or None,
+                root=lock_root,
             )
             if marker is None:
                 continue
@@ -1661,7 +2553,10 @@ def _clear_kanban_followup_lock_and_pending_for_this_dispatch(
                 continue
             outcome["removed_lock_paths"].extend(
                 kanban_followup_lock.clear_marker(
-                    task_id=dimension_task_id, session_id=dimension_session_id, root=lock_root
+                    task_id=dimension_task_id,
+                    session_id=dimension_session_id,
+                    repo=repo or None,
+                    root=lock_root,
                 )
             )
     except Exception as exc:
@@ -1847,6 +2742,7 @@ def run_decline_dispatched_review(
     lock_clear = _clear_kanban_followup_lock_and_pending_for_this_dispatch(
         task_id=task_id,
         session_id=session_id,
+        repo=repo,
         dispatch_token=token,
         run_id=run_id,
         lock_root=lock_root,
@@ -1989,7 +2885,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--reason", required=True, help="简析后开启审查的理由")
     p_start.add_argument("--repo", default=None, help="目标 worktree（默认取 token 记录的 worktree）")
     p_start.add_argument("--session-id", default=None, help="覆盖 session id（默认取 token 记录）")
-    p_start.add_argument("--transcript-path", default=None, help="主 agent transcript（可选，改善 manifest）")
+    p_start.add_argument(
+        "--transcript-path",
+        default=None,
+        help=(
+            "主 agent transcript（可选；省略时回退读决策 token 候选摘要里 Stop/UPS 盖的那份）。"
+            "它决定本轮 scope 口径：拿得到 ⇒ session-owned + tracker lease + primary_units；"
+            "拿不到 ⇒ 退回 manual-all-uncommitted 且审完标不了 reviewed"
+        ),
+    )
     p_start.add_argument("--retry", action="store_true", help="prepare 失败后重试（token 仍在 acknowledged）")
 
     p_scope = sub.add_parser("scope", help="改动自动 scope（annotate / exclude / include），仅 acknowledged 态")

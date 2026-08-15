@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
+
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
     'test_rvf_user_prompt_submit_dispatches_shared_workflow',
@@ -342,6 +344,8 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
     submit = load_rvf_user_prompt_submit_module()
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
+    # 锁 key 含仓身份 → origin_repo 必须是**真实** git 仓，否则 marker_paths 空、根本不落锁。
+    repo = init_repo(tmp_path / "repo")  # noqa: F821 — inject() 注入
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
     prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
@@ -385,7 +389,9 @@ def test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(tmp_path: 
             now="2026-06-04T00:01:00Z",
         )
         assert payload["status"] == "valid"
-        marker_path = lock_root / "task-task-fu.json"
+        marker_path = lock_root / in_progress_lock_marker_name(
+            load_kanban_followup_lock_module(), repo=repo, task_id="task-fu"
+        )
         assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
         assert marker_path.exists()
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -453,6 +459,8 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
     k = load_kanban_followup_lock_module()
     root = tmp_path / "prep-root"
     lock_root = tmp_path / "followup-lock"
+    # 锁 key 含仓身份 → origin_repo 必须是**真实** git 仓，否则 marker_paths 空、根本不落锁。
+    repo = init_repo(tmp_path / "repo")  # noqa: F821 — inject() 注入
     prev_prep = os.environ.get("CODEX_RVF_PREP_ROOT")
     prev_lock = os.environ.get("RVF_KANBAN_FOLLOWUP_LOCK_ROOT")
     os.environ["CODEX_RVF_PREP_ROOT"] = str(root)
@@ -507,7 +515,9 @@ def test_rvf_user_prompt_submit_clears_pending_on_delivery(tmp_path: Path) -> No
         )
         assert payload["status"] == "valid"
         # in-progress 锁已 arm（投递落地的权威信号）。
-        marker_path = lock_root / "task-task-fu.json"
+        marker_path = lock_root / in_progress_lock_marker_name(
+            load_kanban_followup_lock_module(), repo=repo, task_id="task-fu"
+        )
         assert payload.get("kanban_followup_in_progress_marker_path") == str(marker_path)
         assert marker_path.exists()
         # 同 token 的 pending 已被清。

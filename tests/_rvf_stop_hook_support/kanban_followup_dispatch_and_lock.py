@@ -17,6 +17,8 @@ import sys
 import threading
 from pathlib import Path
 
+from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
+
 # 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
     'test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl',
@@ -54,6 +56,8 @@ __all__ = [
     'test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets',
     'test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout',
     'test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending',
+    'test_accepted_review_run_receipt_suppresses_repeated_decision_point_injection',
+    'test_rewound_acceptance_reconciles_receipt_via_decision_token_needle',
     'test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging',
     'test_kanban_followup_awaiting_agent_decision_window_expiry_returns_to_normal_gate',
     'test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain',
@@ -67,6 +71,16 @@ __all__ = [
 def inject(**deps: object) -> None:
     """把 aggregator 的共享 helper/常量绑定进本模块 globals，让被搬来的测试在调用时解析到它们。"""
     globals().update(deps)
+
+
+def _in_progress_marker_name(repo: Path | str, *, task_id: str | None = None, session_id: str | None = None) -> str:
+    """in-progress 锁 marker 的文件名——**现算，不硬编码**（key 含仓身份，见共享助手模块头）。"""
+    return in_progress_lock_marker_name(
+        load_kanban_followup_lock_module(),  # noqa: F821 — inject() 注入
+        repo=repo,
+        task_id=task_id,
+        session_id=session_id,
+    )
 
 
 def _write_fake_kanban_empty_list_client(path: Path) -> str:
@@ -1890,7 +1904,7 @@ def test_kanban_followup_in_progress_marker_skips_new_followup(tmp_path: Path) -
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
+    marker_path = marker_dir / _in_progress_marker_name(dirty, task_id="task-active")
     marker_path.write_text(
         json.dumps(
             {
@@ -1967,7 +1981,7 @@ def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
+    marker_path = marker_dir / _in_progress_marker_name(dirty, task_id="task-active")
     marker_path.write_text(
         json.dumps(
             {
@@ -2035,7 +2049,7 @@ def test_kanban_followup_in_progress_lock_skips_after_reengage_budget_exhausted(
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
+    marker_path = marker_dir / _in_progress_marker_name(dirty, task_id="task-active")
     marker_path.write_text(
         json.dumps(
             {
@@ -2092,28 +2106,27 @@ def test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rea
     """
     module = load_kanban_followup_lock_module()
     root = tmp_path / "locks"
+    # 锁 key 含仓身份，故 arm/read 都要给一个**真实** git 仓做锚点（否则 marker_paths 空 → 不落锁）。
+    repo = init_repo(tmp_path / "repo", dirty=True)
     arm_kwargs = dict(
         task_id="task-rearm",
         session_id="session-rearm",
-        repo=None,
+        repo=str(repo),
         cwd=None,
         root=root,
     )
+    read_kwargs = dict(task_id="task-rearm", session_id="session-rearm", repo=str(repo), root=root)
 
     # 首次 arm：无既有 marker → 计数缺省 0（不应被 carry 逻辑误置）。
     first = module.write_marker(run_id="rvf-1", run_dir=str(tmp_path / "run-1"), **arm_kwargs)
     assert first is not None
-    marker_after_first = module.read_marker(
-        task_id="task-rearm", session_id="session-rearm", root=root
-    )
+    marker_after_first = module.read_marker(**read_kwargs)
     assert module.reengage_nudge_count(marker_after_first) == 0
 
     # 模拟 Stop 读侧的 nudge 记账：bump 两次 → 计数 2，写在实际命中文件上。
     assert module.bump_reengage_nudge_count(marker_after_first) == 1
     assert (
-        module.bump_reengage_nudge_count(
-            module.read_marker(task_id="task-rearm", session_id="session-rearm", root=root)
-        )
+        module.bump_reengage_nudge_count(module.read_marker(**read_kwargs))
         == 2
     )
 
@@ -2121,9 +2134,7 @@ def test_kanban_followup_lock_write_marker_preserves_reengage_nudge_count_on_rea
     # 且 reengage_nudge_count 必须保留为 2（Option A 的核心：计数跨 re-arm 存活）。
     second = module.write_marker(run_id="rvf-2", run_dir=str(tmp_path / "run-2"), **arm_kwargs)
     assert second is not None
-    marker_after_rearm = module.read_marker(
-        task_id="task-rearm", session_id="session-rearm", root=root
-    )
+    marker_after_rearm = module.read_marker(**read_kwargs)
     assert marker_after_rearm.get("run_id") == "rvf-2"
     assert module.reengage_nudge_count(marker_after_rearm) == 2
 
@@ -2142,7 +2153,7 @@ def test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigg
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
+    marker_path = marker_dir / _in_progress_marker_name(dirty, task_id="task-active")
     marker_path.write_text(
         json.dumps(
             {
@@ -2199,7 +2210,11 @@ def test_kanban_followup_in_progress_lock_does_not_consume_nudge_budget_on_trigg
 def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: Path) -> None:
     module = load_kanban_followup_lock_module()
     root = tmp_path / "locks"
-    marker_path = module.marker_paths(task_id="task-race", session_id=None, root=root)[0]
+    # 锁 key 含仓身份 → 锚点必须是真实 git 仓；后面 acquire_marker 也用同一个仓，两侧同 key。
+    repo = init_repo(tmp_path / "repo", dirty=True)
+    marker_path = module.marker_paths(
+        task_id="task-race", session_id=None, repo=str(repo), root=root
+    )[0]
     marker_path.parent.mkdir(parents=True)
     stale_marker = {
         "marker_version": 1,
@@ -2226,9 +2241,13 @@ def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: 
     original_read_marker = module.read_marker
     swapped_to_active = False
 
-    def racing_read_marker(*, task_id: str | None, session_id: str | None, root: Path | None = None):
+    def racing_read_marker(
+        *, task_id: str | None, session_id: str | None, repo=None, root: Path | None = None
+    ):
         nonlocal swapped_to_active
-        marker = original_read_marker(task_id=task_id, session_id=session_id, root=root)
+        marker = original_read_marker(
+            task_id=task_id, session_id=session_id, repo=repo, root=root
+        )
         if not swapped_to_active and isinstance(marker, dict) and marker.get("run_id") == "rvf-stale":
             swapped_to_active = True
             marker_path.write_text(
@@ -2244,8 +2263,8 @@ def test_kanban_followup_stale_takeover_rechecks_marker_before_unlink(tmp_path: 
             session_id=None,
             run_id="rvf-new",
             run_dir=str(tmp_path / "new-run"),
-            repo=str(tmp_path / "repo"),
-            cwd=str(tmp_path / "repo"),
+            repo=str(repo),
+            cwd=str(repo),
             root=root,
         )
     finally:
@@ -2273,8 +2292,8 @@ def test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state
     shared_lock_root = tmp_path / "shared-followup-lock"
     shared_lock_root.mkdir(parents=True)
     # 直接写一份 marker，等价于 UPS 在投递确认时 arm 的结果（env 模式：marker 直接落在
-    # RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id）。
-    marker_path = shared_lock_root / "task-task-shared.json"
+    # RVF_KANBAN_FOLLOWUP_LOCK_ROOT 下，文件名按 task_id + 仓身份）。
+    marker_path = shared_lock_root / _in_progress_marker_name(repo, task_id="task-shared")
     marker_path.write_text(
         json.dumps(
             {
@@ -2485,7 +2504,7 @@ def _waiting_bootstrap_marker(
     )
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True, exist_ok=True)
-    marker_path = marker_dir / f"task-{task_id}.json"
+    marker_path = marker_dir / _in_progress_marker_name(repo, task_id=task_id)
     marker_path.write_text(
         json.dumps(
             {
@@ -2617,7 +2636,7 @@ def test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopeni
     assert waiting[0].get("bootstrap_phase") == "bootstrap_interrupted_retryable"
     # 锁根下只该有这**一把**锁：恢复不得产生第二把 / 第二轮。
     assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
-        "task-task-bootstrap.json"
+        _in_progress_marker_name(fixture["repo"], task_id="task-bootstrap")
     ]
 
 
@@ -3002,7 +3021,7 @@ def test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock(
         assert handled_next is False and decision_next is None
         assert marker_path.exists()
         assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
-            "task-task-bootstrap.json"
+            _in_progress_marker_name(fixture["repo"], task_id="task-bootstrap")
         ]
         resolved = [
             e
@@ -3159,7 +3178,7 @@ def test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stop
         )
         # 恢复不得产生第二把锁 / 第二轮。
         assert sorted(p.name for p in (state / "kanban-followup-in-progress").glob("*.json")) == [
-            "task-task-bootstrap.json"
+            _in_progress_marker_name(fixture["repo"], task_id="task-bootstrap")
         ]
     finally:
         second_finished.set()
@@ -3183,6 +3202,9 @@ def test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumpt
     state = tmp_path / "state"
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
+    # 这把锁**不经 key 解析**：本用例直接把 marker dict 喂给 _kanban_followup_bootstrap_gate_decision
+    # 并断言 handled is False，marker_paths 根本没被调用，故文件名保持字面量即可（tmp_path 也不是
+    # git 仓，现算文件名反而会失败）。
     marker_path = marker_dir / "task-legacy.json"
     marker_path.write_text(
         json.dumps(
@@ -3418,6 +3440,7 @@ def _write_kanban_followup_lock_marker(
     task_id: str,
     state: str,
     expires_at: str,
+    repository_identity_anchor: Path | str,
     dispatch_token: str | None = None,
     delivered_transcript_path: str | None = None,
     delivered_session_id: str | None = None,
@@ -3426,8 +3449,13 @@ def _write_kanban_followup_lock_marker(
     run_dir: str = "/tmp/rvf-existing",
     repo: str | None = None,
 ) -> Path:
+    # ``repository_identity_anchor`` 只决定**文件名**（key 含仓身份），与 payload 的 ``repo``
+    # 字段刻意分开：后者是「读侧据它定位 tracker」的语义字段，部分用例故意留 None 来验
+    # 「无 repo 时不误放 lease」，不能被文件名需求顺手改掉。
     marker_dir.mkdir(parents=True, exist_ok=True)
-    marker_path = marker_dir / f"task-{task_id}.json"
+    marker_path = marker_dir / _in_progress_marker_name(
+        repository_identity_anchor, task_id=task_id
+    )
     marker_path.write_text(
         json.dumps(
             {
@@ -3463,6 +3491,119 @@ def _write_transcript_entries(path: Path, entries: list[dict]) -> Path:
     return path
 
 
+def test_accepted_review_run_receipt_suppresses_repeated_decision_point_injection(
+    tmp_path: Path,
+) -> None:
+    """INV-5：agent 已在发起决策点上接受并起了一轮 run，后续 Stop 不得把同一批改动重新征询。
+
+    就地接受没有 UPS 事件，凭证由 ``rvf-agent start`` 自己 arm（session-keyed、带
+    ``decision_token``）。这里直接把那枚凭证摆上，验证下一次 Stop 走在途 skip 而不是再注入一次
+    横幅——不然接受之后每一次 Stop 都会把同一批改动再问一遍。
+    """
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    lock_module = load_kanban_followup_lock_module()
+    marker_path = lock_module.write_marker(
+        task_id=None,
+        session_id="session-accepted",
+        run_id="rvf-accepted-in-flight",
+        run_dir=str(tmp_path / "accepted-run"),
+        repo=str(dirty),
+        cwd=str(dirty),
+        decision_token="a1b2c3d4e5f60718",
+        delivered_session_id="session-accepted",
+        state=lock_module.STATE_IN_PROGRESS,
+        # ``_root(root)`` 会自己拼上 SUBDIR_NAME，故这里给 state 本身；子进程那边由
+        # ``invoke`` 的 RVF_KANBAN_FOLLOWUP_LOCK_ROOT 指到同一层。
+        root=state,
+    )
+    assert marker_path is not None and marker_path.exists()
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-accepted",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这一轮 RVF。",
+        },
+        # 默认 fork mode（auto）：没有这枚凭证的话本轮**必然**注入一次决策点横幅。
+        extra_env={"CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "0"},
+        state_dir=state,
+    )
+
+    payload = parse_json(stdout)
+    assert "RVF_DECISION_TOKEN=" not in str(payload.get("reason") or ""), payload
+    latest = latest_summary(state)
+    assert latest["reason_code"] == "kanban_followup_in_progress", latest
+    assert latest["active_rvf_run_id"] == "rvf-accepted-in-flight", latest
+    assert marker_path.exists(), "在途凭证不该被这一次 Stop 清掉"
+
+
+def test_rewound_acceptance_reconciles_receipt_via_decision_token_needle(
+    tmp_path: Path,
+) -> None:
+    """接受被 rewind 掉：凭证按**决策 token 的 needle**（``RVF_DECISION_TOKEN=``）对账清除。
+
+    Fix B 的祖先链对账历史上只认 ``RVF_DISPATCH=token=``。就地接受的凭证根本没有 dispatch
+    token，若不从 marker 现推 needle，这类凭证会永远判成「无 token → unknown」，rewind 之后
+    一路挡到 1h TTL——正是「锁 squat」那一族缺陷。
+    """
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    state = tmp_path / "state"
+    decision_token = "0f1e2d3c4b5a6978"
+    transcript = _write_transcript_entries(
+        tmp_path / "transcript.jsonl",
+        [
+            {"uuid": "u0", "parentUuid": None, "type": "user",
+             "message": {"role": "user", "content": "起点"}},
+            # 横幅落地成一个回合（正文含 needle）……
+            {"uuid": "u1", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": f"RVF_DECISION_TOKEN={decision_token} 决策点"}},
+            {"uuid": "a1", "parentUuid": "u1", "type": "assistant",
+             "message": {"role": "assistant", "content": "已 start"}},
+            # ……随后用户 rewind：新 prompt 的 parentUuid 挂回 u0，那一段离开祖先链。
+            {"uuid": "u2", "parentUuid": "u0", "type": "user",
+             "message": {"role": "user", "content": "改做别的"}},
+        ],
+    )
+    lock_module = load_kanban_followup_lock_module()
+    marker_path = lock_module.write_marker(
+        task_id=None,
+        session_id="session-rewound",
+        run_id="rvf-rewound",
+        run_dir=str(tmp_path / "rewound-run"),
+        repo=str(dirty),
+        cwd=str(dirty),
+        decision_token=decision_token,
+        delivered_session_id="session-rewound",
+        delivered_transcript_path=str(transcript),
+        state=lock_module.STATE_IN_PROGRESS,
+        # ``_root(root)`` 会自己拼上 SUBDIR_NAME，故这里给 state 本身；子进程那边由
+        # ``invoke`` 的 RVF_KANBAN_FOLLOWUP_LOCK_ROOT 指到同一层。
+        root=state,
+    )
+    assert marker_path is not None and marker_path.exists()
+
+    invoke(
+        {
+            "cwd": str(dirty),
+            "session_id": "session-rewound",
+            "transcript_path": str(transcript),
+            "stop_hook_active": False,
+            "last_user_message": "改做别的",
+        },
+        state_dir=state,
+    )
+
+    assert not marker_path.exists(), "rewind 掉的接受，其在途凭证必须被对账清除"
+    events = latest_events(state)
+    reconciled = [
+        e for e in events if e.get("event") == "kanban_followup_lock_reconciled_for_rewind"
+    ]
+    assert reconciled, [e.get("event") for e in events]
+    assert reconciled[-1].get("kanban_followup_trigger_dispatch_token") == decision_token
+
+
 def test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging(
     tmp_path: Path,
 ) -> None:
@@ -3487,6 +3628,7 @@ def test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging(
         task_id="task-active",
         state="delivered_awaiting_agent_decision",
         expires_at="2999-01-01T00:00:00Z",
+        repository_identity_anchor=dirty,
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3538,6 +3680,7 @@ def test_kanban_followup_awaiting_agent_decision_window_expiry_returns_to_normal
         task_id="task-active",
         state="delivered_awaiting_agent_decision",
         expires_at="2020-01-01T00:00:00Z",  # 已过期
+        repository_identity_anchor=dirty,
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3588,6 +3731,7 @@ def test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain(
         task_id="task-active",
         state="delivered_awaiting_agent_decision",
         expires_at="2999-01-01T00:00:00Z",
+        repository_identity_anchor=dirty,
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3656,6 +3800,7 @@ def test_kanban_followup_lock_reconciled_when_trigger_rewound_off_ancestor_chain
         task_id="task-active",
         state="in_progress",  # 已升格过，仍应被 rewind 对账清掉
         expires_at="2999-01-01T00:00:00Z",
+        repository_identity_anchor=dirty,
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3785,6 +3930,7 @@ def test_kanban_followup_awaiting_window_expiry_releases_tracker_lease(tmp_path:
         task_id="task-active",
         state="delivered_awaiting_agent_decision",
         expires_at="2020-01-01T00:00:00Z",  # 短窗已过
+        repository_identity_anchor=fixture["repo"],
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3844,6 +3990,7 @@ def test_kanban_followup_rewind_reconcile_releases_tracker_lease(tmp_path: Path)
         task_id="task-active",
         state="in_progress",  # 已升格过，仍应被 rewind 对账连锁带 lease 一起回收
         expires_at="2999-01-01T00:00:00Z",
+        repository_identity_anchor=fixture["repo"],
         dispatch_token="abcdef0123456789",
         delivered_transcript_path=str(transcript),
         delivered_session_id="session-active",
@@ -3907,6 +4054,7 @@ def test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_n
             task_id="task-active",
             state="delivered_awaiting_agent_decision",
             expires_at="2999-01-01T00:00:00Z",
+            repository_identity_anchor=repo,
             dispatch_token="abcdef0123456789",
             delivered_transcript_path=str(transcript),
             delivered_session_id="session-active",

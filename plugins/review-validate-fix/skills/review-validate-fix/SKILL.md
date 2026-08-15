@@ -27,9 +27,29 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
+### 统一发起协议：唯一的自注入是**发起决策点横幅**
+
+自动 RVF 的发起**一律**先给你一条决策点横幅，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，都走同一条路。
+
+接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf-agent start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有。完整流程：
+
+```
+rvf-agent start --token <decision-token> [--transcript-path <session.jsonl>] --reason "<一句话理由>"
+rvf-agent scope exclude|include|annotate --token <decision-token> …     # 可选
+rvf-agent dispatch --token <decision-token> --strictness <light|standard|strict>
+```
+
+`--transcript-path` 直接照抄横幅里 `start` 那一行给出的值即可（横幅只在能解析出该路径时才渲染它）；你不需要自己去找 transcript 落在哪。省略也可以——铸 token 那一刻的路径已随候选摘要存进 token，CLI 会自行回退读回来。它决定本轮 scope 的口径：拿得到 ⇒ `scope_mode=session-owned` + 真 tracker lease + `primary_units`；拿不到 ⇒ 退回 `manual-all-uncommitted`（会把别的会话的背景 dirty 一并纳入，且**审完无法把这批单元标成 reviewed**，同一批改动可能被下一次 Stop 再提议一次）。`start` 回执的 `message` 与 `detail.tracker_scope_allocation` 会明说本轮是哪一种；看到降级就以 scope contract 的 `fix_allowlist` 为准，别按候选路径全量改。
+
+`dispatch` 之后由**你自己**在当前会话调用 `$review-validate-fix` skill，按本文件就地走 review → merge → validate/fix → handoff。不要新建 Kanban task，也不要 fork 新会话；上面那些路径就是本轮 run 的全部输入，**不需要重新 prepare**。
+
+`dispatch` 的退出码：`0` = 已派发（detached，接着按下面「Review」节轮询）；`8` = `blocked_on_reviewer_request`，有腿返回 `kind: request`，是待处理终态而非故障，按「Review」节走 Contract Gate 后重派；`5` = 真派发失败，token 仍在 `acknowledged`，可修复后重试。
+
+> 例外只有一个：操作者显式设置 `CODEX_RVF_FORK_MODE=kanban-followup` 时，Stop hook 仍走旧的终端投递（注入一条 `$review-validate-fix` 开头的祈使句）。那是保留的逃生口/兼容入口，不是默认路径。
+
 ### 谢绝一轮**已派发**的自动 RVF
 
-Kanban task 内的自动 RVF（flow-1-self-rising / kanban-followup）走延续后端，结构上不经过 S3 决策点，注入的是一条祈使句。若你判断这一轮不该审（本轮改动与你正在做的事无关、用户已明确让你转做别的工作），**不要硬跑、也不要干停**，走谢绝出口：
+上面那条逃生口投递下来的祈使句（正文带 `RVF_DISPATCH=token=`）若你判断这一轮不该审（本轮改动与你正在做的事无关、用户已明确让你转做别的工作），**不要硬跑、也不要干停**，走谢绝出口：
 
 ```
 rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话理由>
@@ -41,7 +61,12 @@ rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话
 
 **退出码必须看**：`0` 才表示谢绝完全生效。非 0（`7 = decline_incomplete`）表示副作用只做成了一部分——例如锁属于**另一轮** dispatch 而被保留、lease 未释放、或请求了豁免却没声明成。此时**不要当作已谢绝**：读输出里的 `failed_steps` 与 `next_steps` 按提示补救，或如实告诉开发者哪一步没成。尤其是带豁免时，只要 exit 非 0，那批 diff 就**没有**被声明为「不需审核」，下一轮仍会被纳入范围。
 
-> 锁的三态与你是否真的收到 trigger 有关：UPS 投递落地只落 `delivered_awaiting_agent_decision`（只做互斥去重、**不催收尾**），Stop 侧确认这条 trigger 仍在当前 transcript 祖先链上才升格为 `in_progress`；用户 rewind 掉那一段则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
+> 在途锁的状态与你是否真的接受过这一轮有关，两条入口不同：
+>
+> - **逃生口投递**：UPS 投递落地只落 `delivered_awaiting_agent_decision`（只做互斥去重、**不催收尾**），Stop 侧确认这条 trigger 仍在当前 transcript 祖先链上才升格为 `in_progress`。
+> - **默认路径（你自己 `rvf-agent start` 接受）**：直接落 `in_progress` —— 你显式表过态了，不存在「收没收到」这一维。
+>
+> 两条都受同一套 rewind 对账保护：用户 rewind 掉那一段（trigger 或横幅离开祖先链）则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
 
 ### Opt-in 仓库的预审 base 同步
 

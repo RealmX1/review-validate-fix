@@ -566,6 +566,7 @@ repo_required_files=(
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
+  "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -672,7 +673,8 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_rvf_withdrawn_dispatch_tombstone.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
-  "$tests_dir/test_rvf_handoff_intake.py"
+  "$tests_dir/test_rvf_handoff_intake.py" \
+  "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py"
 
 run_parallel_test_steps
 run_step "tests: rvf_local_deploy" \
@@ -688,6 +690,11 @@ run_step "tests: cline_kanban_terminal_delivery_receipt" \
 run_step "tests: rvf_withdrawn_dispatch_tombstone" \
   python3 -m pytest -q \
     "$tests_dir/test_rvf_withdrawn_dispatch_tombstone.py"
+# 结构性 gate：投给当前活会话的自注入有且只有发起决策点横幅（INV-1 / INV-2）。行为断言，不是
+# grep —— `$review-validate-fix` 这个字面量在仓里到处都是，要钉的是默认发起路径**吐出**的正文。
+run_step "tests: review_initiation_decision_point_is_sole_self_injection" \
+  python3 -m pytest -q \
+    "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"

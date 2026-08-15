@@ -734,7 +734,13 @@ def stamp_kanban_followup_bootstrap_gate(
     session_id = payload.get("origin_session_id") or event.get("session_id")
     session_id = session_id if isinstance(session_id, str) and session_id.strip() else None
     try:
-        marker = kanban_followup_lock.read_marker(task_id=task_id, session_id=session_id)
+        marker = kanban_followup_lock.read_marker(
+            task_id=task_id,
+            session_id=session_id,
+            # 锁 key 含仓身份（``kanban_followup_lock.marker_paths``）：锚点取 prep payload 的
+            # origin_repo / origin_cwd，与同进程刚 arm 那次写侧同源，故必然解析到同一 identity。
+            repo=payload.get("origin_repo") or payload.get("origin_cwd") or event.get("cwd"),
+        )
         if marker is None:
             return None
         # 锁刚在同一进程 arm 成 ``delivered_awaiting_agent_decision``（agent 还没被确认收到这条
@@ -988,6 +994,16 @@ def _handle_manual_decision_point(
                 kind="manual_summary_failed", dispatch_origin="post_user_prompt_manual"
             ),
         }
+
+    # transcript 路径随摘要进 token payload：manual 触发同样会走 `rvf-agent start`，而 start 的
+    # scope 口径（session-owned + tracker lease vs 退化的 manual-all-uncommitted）取决于它拿不拿得到
+    # transcript。与 Stop hook 用**同一个** stamper，避免两条发起入口各盖各的名字。
+    try:
+        import stop_review_validate_fix as stop_hook  # noqa: PLC0415 - 惰性、仅 manual 触发
+
+        stop_hook.stamp_origin_transcript_path_on_candidate_summary(summary, event)
+    except Exception:  # noqa: BLE001 - 加料失败退化成「无 transcript」，由 start 侧显式降级承接
+        pass
 
     worktree = str(summary.get("repo") or repo)
     candidate_count = int(summary.get("candidate_path_count") or 0)

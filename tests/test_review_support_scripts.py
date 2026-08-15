@@ -21,6 +21,7 @@ import time
 import traceback
 from pathlib import Path
 
+from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
     assert_every_defined_test_is_registered,
     registered_names_from_case_tuples,
@@ -7625,6 +7626,23 @@ def load_rvf_agent_decision_cli_module():
     return module
 
 
+def _load_sibling_script_module(name: str):
+    """按模块名加载 skill ``scripts/`` 下的兄弟脚本（与 load_* 家族同一套 path/spec 约定）。"""
+    if name in sys.modules:
+        return sys.modules[name]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"failed to load {name} module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _agent_cli_roots(cli, tmp: Path):
     """一组 tmp 隔离的 AgentDecisionRoots（token / 冷却 / scope 产出 / 遥测 / issue / 谢绝理由）。"""
     return cli.AgentDecisionRoots(
@@ -7682,9 +7700,19 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
         )
         packet = run_dir / "artifacts" / "review-packet.md"; packet.write_text("stub packet", encoding="utf-8")
         sow = run_dir / "artifacts" / "scope-of-work.md"; sow.write_text("stub scope of work", encoding="utf-8")
+        prep_file = tmp / "prep" / f"{run_name}.json"
+        prep_file.parent.mkdir(parents=True, exist_ok=True)
+        prep_file.write_text("{}", encoding="utf-8")
+        review_env = run_dir / "artifacts" / "review-env.sh"
+        review_env.write_text("# stub review env\n", encoding="utf-8")
         return {
             "status": "completed", "run_id": run_name, "run_dir": str(run_dir),
-            "artifacts": {"scope_contract": str(scope_contract), "review_packet": str(packet), "scope_of_work": str(sow)},
+            "artifacts": {
+                "scope_contract": str(scope_contract), "review_packet": str(packet),
+                "scope_of_work": str(sow), "review_env": str(review_env),
+            },
+            # execution_handoff 要把 prep 文件落点交给 agent（真实 pipeline 也返回该键）。
+            "prep_file": str(prep_file),
             "error": None,
         }
 
@@ -7931,6 +7959,244 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
     assert contract["scope_hash"] != "stub-old-hash"
 
 
+def test_agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff(tmp: Path) -> None:
+    """P2/P3：``start`` 成功后 ① arm 一枚在途凭证（INV-5 的载体），② 回执带全套
+    ``execution_handoff``（INV-3：执行信息改从返回值读，不再经任何注入正文携带）。
+
+    凭证刻意只写 **session** 维度的 key，且 key 含仓身份 —— 故这里必须用**真实** git 仓做
+    worktree（假 .git 目录解析不出仓身份，凭证会被安全跳过而不是落盘）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    lock_module = load_kanban_followup_lock_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    lock_root = tmp / "locks"
+    tok = _mint_agent_decision_token(
+        dts, roots, worktree=str(repo), session_id="sess-in-flight", now=t0
+    )
+
+    result = cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp),
+        lock_root=lock_root,
+    )
+    assert result.status == "ok", result.message
+
+    # ① 在途凭证已 arm，且是 session-keyed（读侧 task 维度解析不出时也命中得到）。
+    receipt = result.detail["in_flight_receipt"]
+    assert receipt["status"] == cli.ACCEPTED_REVIEW_RUN_RECEIPT_ARMED, receipt
+    marker = lock_module.read_marker(
+        task_id=None, session_id="sess-in-flight", repo=str(repo), root=lock_root
+    )
+    assert marker is not None, "session-keyed 凭证应可被同一仓身份读回"
+    assert marker["decision_token"] == tok
+    assert marker["state"] == lock_module.STATE_IN_PROGRESS
+    assert marker["delivered_session_id"] == "sess-in-flight"
+    # rewind 对账的 needle 从 marker 现推：凭证走 RVF_DECISION_TOKEN= 而不是 RVF_DISPATCH=。
+    presence = _load_sibling_script_module("kanban_followup_trigger_transcript_presence")
+    needle_token, needle = presence.trigger_needle_for_lock_marker(marker)
+    assert needle_token == tok and needle == f"RVF_DECISION_TOKEN={tok}", (needle_token, needle)
+
+    # ② execution_handoff 字段齐全，且人类可读行也看得到（不必解析 JSON）。
+    handoff = result.detail["execution_handoff"]
+    for key in (
+        "target_repo", "run_id", "run_dir", "prep_file", "review_env", "review_packet",
+        "scope_contract", "scope_of_work", "origin_metadata", "handoff_path",
+        "handoff_contract", "execution_instruction",
+    ):
+        assert handoff.get(key), f"execution_handoff 缺 {key}: {handoff}"
+    assert handoff["origin_metadata"].endswith("artifacts/origin.json")
+    assert handoff["handoff_path"].endswith("artifacts/handoff.md")
+    rendered = result.render()
+    assert "execution_handoff:" in rendered
+    assert "review_packet:" in rendered and "scope_contract:" in rendered
+    # INV-2：回执正文里那条 `$review-validate-fix` 只能作为「由你自己调用」的指引出现，
+    # 绝不是某条注入正文的第一行。
+    assert not rendered.strip().startswith("$review-validate-fix")
+
+
+def test_agent_cli_start_consumes_review_reopen_marker_before_allocate(tmp: Path) -> None:
+    """P1 落地后的必然连带：``$rvf-reopen`` 的消费点必须也在 ``start`` 这条**默认**发起入口上。
+
+    历史上只有 Stop hook 的派发路径消费 rescope marker；默认发起改成「横幅 → agent 显式 start」
+    之后不补这一刀，``$rvf-reopen`` 在默认路径上就整个失效（marker 永不消费、范围永不重开）。
+    这里只验「marker 被消费」这一可观测事实（真实 tracker 重开在 stop hook 套件里覆盖）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    rrm = _load_sibling_script_module("review_reopen_marker")
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    reopen_root = tmp / "reopen-root"
+    prev_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(reopen_root)
+    try:
+        marker_path = rrm.write_review_reopen_marker(
+            task_id=None,
+            session_id="sess-reopen-start",
+            target_run_id="rvf-earlier-impl",
+            repo=str(repo),
+        )
+        assert marker_path is not None and Path(marker_path).exists()
+
+        tok = _mint_agent_decision_token(
+            dts, roots, worktree=str(repo), session_id="sess-reopen-start", now=t0
+        )
+        result = cli.run_start(
+            token=tok, reason="开审", roots=roots, now=t0,
+            prepare_pipeline=_agent_cli_stub_prepare(tmp),
+            lock_root=tmp / "locks",
+        )
+        assert result.status == "ok", result.message
+        assert not Path(marker_path).exists(), "start 必须在 allocate 之前消费掉 rescope marker"
+        tele = read_jsonl(roots.telemetry_root / f"{tok}.jsonl")
+        assert "start_review_reopen_consumed" in [r["event"] for r in tele], tele
+    finally:
+        if prev_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = prev_log_root
+
+
+def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(tmp: Path) -> None:
+    """P3b：``blocked_on_reviewer_request`` 是**待处理终态**，不得报成 dispatch_failed。
+
+    混同的后果不是「文案不好看」：agent 会把它当可修复故障去盲目重跑 dispatch，而正确处置是
+    先走 Contract Gate 处理那条 ``kind: request``、再带同一 selection-seed 用同一对 reviewer 重派。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    tok = _mint_agent_decision_token(dts, roots, worktree=str(repo), now=t0)
+    cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp), lock_root=tmp / "locks",
+    )
+
+    def _request_dispatcher(**kw):
+        return {
+            "status": cli.DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST,
+            "returncode": 3,
+            "dispatch_status_path": str(tmp / "status.json"),
+            "launch_status": "launched",
+        }
+
+    blocked = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_request_dispatcher,
+    )
+    assert blocked.status == cli.DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST, blocked
+    assert blocked.exit_code == cli.EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST
+    assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED
+    assert "Contract Gate" in blocked.message
+    assert any("selection_seed" in step for step in blocked.next_steps), blocked.next_steps
+    # token 不进终态：处置完 request 之后要能经同一入口重派。
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # 成功路径把 detached 的 status.json 落点与轮询指引冒到 next_steps。
+    def _detached_ok_dispatcher(**kw):
+        return {
+            "status": cli.DISPATCH_OUTCOME_OK,
+            "returncode": 0,
+            "dispatch_status_path": str(tmp / "reviewers" / ".dispatch-thread.status.json"),
+            "launch_status": "launched",
+        }
+
+    ok = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_detached_ok_dispatcher,
+    )
+    assert ok.status == "ok", ok
+    assert ok.detail["dispatch_status_path"].endswith(".dispatch-thread.status.json")
+    assert any("--wait-status" in step for step in ok.next_steps), ok.next_steps
+    assert any("plan_status" in step for step in ok.next_steps), ok.next_steps
+
+
+def test_default_reviewer_dispatcher_speaks_detached_execute_contract(tmp: Path) -> None:
+    """P3b：``--execute`` 必须带 ``--detached``，且 plan 路径按 ``RVF_DISPATCH_STATUS=`` 前缀解析。
+
+    不带 detached 的同步调用会被前台 Bash 工具的 600s 上限砍断（一次彻底 review 常常 >10min），
+    而「取 stdout 最后一行」在 detached 的两行回执下会把 ``RVF_DISPATCH_LAUNCH=launched`` 当成
+    plan 路径。两条都靠替换 subprocess.run 的真实 argv / stdout 钉死。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    seen = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = (
+            "RVF_DISPATCH_STATUS=/tmp/run/artifacts/reviewers/.dispatch-thread.status.json\n"
+            "RVF_DISPATCH_LAUNCH=launched\n"
+        )
+        stderr = ""
+
+    def _fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        return _Completed()
+
+    original_run = cli.subprocess.run
+    cli.subprocess.run = _fake_run
+    try:
+        result = cli.default_reviewer_dispatcher(
+            repo=str(tmp), review_packet=None, scope_contract=None, session_context=None,
+            run_id="rvf-x", run_dir=str(tmp / "run"), strictness="standard",
+            preset={"external_reviewer_count_target": 2}, dry_run=False,
+        )
+    finally:
+        cli.subprocess.run = original_run
+
+    assert "--execute" in seen["argv"] and "--detached" in seen["argv"], seen["argv"]
+    assert result["status"] == cli.DISPATCH_OUTCOME_OK
+    assert result["dispatch_status_path"].endswith(".dispatch-thread.status.json")
+    assert result["launch_status"] == "launched"
+    # 明确钉死「不是取最后一行」：最后一行是 LAUNCH 那行。
+    assert "RVF_DISPATCH_LAUNCH" not in str(result["dispatch_status_path"])
+
+
+def test_kanban_followup_lock_key_separates_colliding_task_ids_across_repositories(tmp: Path) -> None:
+    """P2a：cline-kanban 的 task id 是短哈希前缀，不同 project 会撞。
+
+    这把锁自 P2 起是「任何已接受 RVF run 的在途凭证」，撞键 = A 仓的在途 run 静默压掉 B 仓的
+    发起决策点（漏审）。key 编入仓身份之后，同一个 task id 在两个仓里必须是两把互不相干的锁。
+    """
+    lock_module = load_kanban_followup_lock_module()
+    repo_a = init_repo(tmp / "repo-a")
+    repo_b = init_repo(tmp / "repo-b")
+    root = tmp / "locks"
+
+    path_a = lock_module.write_marker(
+        task_id="a877b", session_id=None, run_id="rvf-a", run_dir=str(tmp / "run-a"),
+        repo=str(repo_a), cwd=str(repo_a), root=root,
+    )
+    path_b = lock_module.write_marker(
+        task_id="a877b", session_id=None, run_id="rvf-b", run_dir=str(tmp / "run-b"),
+        repo=str(repo_b), cwd=str(repo_b), root=root,
+    )
+    assert path_a is not None and path_b is not None
+    assert path_a != path_b, "同一 task id 在两个仓里必须落到不同的 marker 文件"
+
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root)["run_id"] == "rvf-a"
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_b), root=root)["run_id"] == "rvf-b"
+
+    # 清 A 仓那把不得波及 B 仓。
+    removed = lock_module.clear_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root)
+    assert removed == [str(path_a)]
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root) is None
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_b), root=root) is not None
+
+    # 仓身份解析不出（不是 git 仓）→ 候选为空：写者 no-op、读者读不到。fail 方向必须是
+    # 「至多多征询一次」，绝不是「静默读到别人的凭证」。
+    not_a_repo = tmp / "plain-dir"
+    not_a_repo.mkdir()
+    assert lock_module.marker_paths(task_id="a877b", session_id=None, repo=str(not_a_repo)) == []
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(not_a_repo), root=root) is None
+
+
 def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     """decline：token 终态 declined、理由落 append-only 磁盘 ledger（rewind 不可抹）、指纹入冷却表；
     再次 decline 已终态 → 错误。"""
@@ -8024,7 +8290,9 @@ def test_agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives(t
         run_id="run-decline", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
         token=record.token, delivery_channel="test", root=lock_root,
     )
-    lock_marker_path = lock_root / "kanban-followup-in-progress" / "task-task-decline.json"
+    lock_marker_path = lock_root / "kanban-followup-in-progress" / in_progress_lock_marker_name(
+        lock_module, repo=repo, task_id="task-decline"
+    )
     pending_marker_path = lock_root / "kanban-followup-dispatched" / "task-task-decline.json"
     prev_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
     os.environ["CODEX_RVF_LOG_ROOT"] = str(log_root)
@@ -10728,6 +10996,36 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_agent_cli_dispatch_finalizes_scope_and_records_strictness(root / "agent-cli-dispatch"),
         ),
         (
+            "agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff",
+            lambda: test_agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff(
+                root / "agent-cli-start-receipt"
+            ),
+        ),
+        (
+            "agent_cli_start_consumes_review_reopen_marker_before_allocate",
+            lambda: test_agent_cli_start_consumes_review_reopen_marker_before_allocate(
+                root / "agent-cli-start-reopen"
+            ),
+        ),
+        (
+            "agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure",
+            lambda: test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(
+                root / "agent-cli-dispatch-request"
+            ),
+        ),
+        (
+            "default_reviewer_dispatcher_speaks_detached_execute_contract",
+            lambda: test_default_reviewer_dispatcher_speaks_detached_execute_contract(
+                root / "agent-cli-dispatcher-detached"
+            ),
+        ),
+        (
+            "kanban_followup_lock_key_separates_colliding_task_ids_across_repositories",
+            lambda: test_kanban_followup_lock_key_separates_colliding_task_ids_across_repositories(
+                root / "followup-lock-repo-key"
+            ),
+        ),
+        (
             "agent_cli_decline_persists_reason_and_cooldown",
             lambda: test_agent_cli_decline_persists_reason_and_cooldown(root / "agent-cli-decline"),
         ),
@@ -10925,6 +11223,7 @@ from _rvf_review_support import rvf_user_prompt_submit_hook as _ups
 _ups.inject(
     run=run,
     read_jsonl=read_jsonl,
+    init_repo=init_repo,
     load_rvf_user_prompt_submit_module=load_rvf_user_prompt_submit_module,
     load_rvf_prep_file_module=load_rvf_prep_file_module,
     load_kanban_followup_lock_module=load_kanban_followup_lock_module,

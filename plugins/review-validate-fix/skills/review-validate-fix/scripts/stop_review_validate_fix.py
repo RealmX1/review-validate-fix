@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex  # 决策点横幅里渲染 --transcript-path 命令样例（路径可能含空格）
 import socket
 import subprocess
 import sys
@@ -106,6 +107,7 @@ from kanban_followup_trigger_transcript_presence import (
     TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN,
     TriggerPresence,
     classify_dispatch_trigger_presence,
+    trigger_needle_for_lock_marker,
 )
 from kanban_followup_lock import (
     STATE_DELIVERED_AWAITING_AGENT_DECISION as KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
@@ -151,14 +153,15 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (
     _manual_suppression_scope_probe,
     allocate_review_scope,
     find_manual_rvf_run_for_scope_hash,
-    invalidate_reviewed_units_for_run,
     lease_release,
     select_committed_paths_reviewed_by_session,
     sweep_stale,
 )
 from review_reopen_marker import (
+    REVIEW_REOPEN_CONSUMPTION_DISCARDED_NOT_ACTIVE,
+    REVIEW_REOPEN_CONSUMPTION_NO_MARKER,
     STATUS_ACTIVE as REVIEW_REOPEN_ACTIVE,
-    clear_review_reopen_marker,
+    consume_review_reopen_marker_for_run_scope,
     read_review_reopen_marker,
     review_reopen_status,
 )
@@ -1488,13 +1491,15 @@ def cline_kanban_workspace_path(*payloads: dict[str, Any]) -> str | None:
 
 
 def kanban_followup_decline_prompt_block() -> str:
-    """注入 prompt 里的**谢绝出口**。
+    """终端投递 prompt 里的**谢绝出口**。
 
-    Kanban task 内的自动 RVF 走延续后端，结构上不经过 S3 决策点，历史上因此没有任何谢绝出口
-    ——注入的是一条纯祈使句，agent 只能照跑。这段把出口显式写出来：默认仍是照跑（不谢绝就
-    正常执行，行为不变），但 agent 判断这一轮确实不该审时有一条正当路径，而不是硬跑或干停。
+    P1 之后自动 RVF 的发起一律先经**发起决策点横幅**，谢绝已前移到那里（``rvf-agent decline``），
+    所以这段不再是「agent 唯一能说不的地方」。它保留下来只服务一条路径：操作者显式设置
+    ``CODEX_RVF_FORK_MODE=kanban-followup`` 时仍走的终端投递逃生口——那条祈使句依旧落地即执行，
+    没有事前决策点，故仍需要一条事后的正当退出路径，而不是硬跑或干停。
 
-    ``<dispatch-token>`` 就是本条 prompt 里 ``RVF_DISPATCH=token=`` 后面那串。
+    ``<dispatch-token>`` 就是本条 prompt 里 ``RVF_DISPATCH=token=`` 后面那串（**dispatch token，
+    不是横幅上那枚 S3 决策 token**；后者用 ``rvf-agent decline``）。
     """
     return (
         "如果你判断这一轮**不该审**（例如本轮改动与你正在做的事无关、或用户已明确让你转做别的"
@@ -1529,6 +1534,16 @@ def kanban_followup_review_validate_fix_prompt(
     source_origin: dict[str, Any],
     origin_path: str | None,
 ) -> str:
+    """终端投递给**当前会话**的 follow-up trigger 正文。
+
+    ⚠️ 这是整个 RVF 里唯一一条「投给已在跑的那个 agent、且落地即执行」的祈使句。P1 之后它
+    **不再是默认发起路径**：默认路径是发起决策点横幅（``_render_decision_point_injection_prompt``），
+    由 agent 显式 ``rvf-agent start`` / ``decline``。本函数只在操作者显式设置
+    ``CODEX_RVF_FORK_MODE=kanban-followup`` 时可达，属保留的逃生口/兼容入口。
+
+    新增自注入正文时请注意区分收件人：``fork_review_validate_fix_prompt`` 与 cline-kanban 新
+    task prompt 的收件人是**新会话**，祈使句形态是正确的；只有本函数是自注入。
+    """
     attempt_line = f"RVF_CURRENT_ATTEMPT_ID: {attempt_id}\n" if attempt_id else ""
     cwd_line = cwd or "<unknown cwd>"
     origin_block = parent_origin_prompt_block(
@@ -1558,6 +1573,9 @@ def kanban_followup_review_validate_fix_prompt(
         "这是由 Cline Kanban host 在当前 task 的 coding agent chat session 中注入的"
         "真实用户消息，用于在同一 task/session 内触发 review-validate-fix。"
         "不要创建新的 Kanban task，不要 fork 新会话，也不要把这条消息当作 hook system context。\n\n"
+        "为什么你收到的是这条而不是发起决策点横幅：本轮被**显式**配置成了 "
+        "`CODEX_RVF_FORK_MODE=kanban-followup`（保留的终端投递逃生口）。默认路径是横幅 + "
+        "`rvf-agent start`/`decline`，由你决定发不发起；这条投递没有事前决策点，故谢绝出口在下方。\n\n"
         "请在当前 task worktree 中运行完整 review-validate-fix。目标仓库为上面的 "
         "`RVF_TARGET_REPO`；如果当前 task worktree 的 repo root 与该路径不同，以当前 task "
         "worktree 为执行位置，并在 handoff 中记录这一点。\n\n"
@@ -1883,6 +1901,34 @@ def kanban_followup_lock_session_id(event: dict[str, Any]) -> str | None:
     return session_hook_id_from_event(event) or session_id_from_event(event) or parent_thread_id_from_event(event)
 
 
+def kanban_followup_lock_repository_anchor(
+    event: dict[str, Any] | None = None,
+    *,
+    cwd: str | None = None,
+    marker: dict[str, Any] | None = None,
+) -> str | None:
+    """in-progress 锁 key 里那一段仓身份的**解析锚点**（见 ``kanban_followup_lock.marker_paths``）。
+
+    返回的只是「仓里的某个路径」，不是身份本身：身份由
+    ``resolve_repository_identity_for_scope_marker_key`` 经 ``git_common_dir`` 归一，所以
+    工作树内**任意**路径都解析到同一个仓身份——写侧（UPS arm）与读侧（Stop / rvf-agent CLI）
+    只要各自给出一个仓内路径就天然一致，不需要彼此约定同一个字符串。
+
+    取值优先级：显式 ``cwd`` → marker 自己记的 ``repo`` / ``cwd`` → Stop event 的 ``cwd``。
+    marker 优先于 event 是刻意的：撤回 / 对账路径处理的是**那把锁**，锚点该跟着锁走。
+    全部缺失返回 ``None`` ⇒ ``marker_paths`` 返回空候选（fail-closed，至多多征询一次）。
+    """
+    for candidate in (
+        cwd,
+        (marker or {}).get("repo"),
+        (marker or {}).get("cwd"),
+        (event or {}).get("cwd"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return None
+
+
 def _kanban_followup_delivery_channel(message_id: Any) -> str:
     """从 Cline Kanban message_id 推断投递通道。**只作审计字段，禁止当作投递确认判据。**
 
@@ -1923,6 +1969,11 @@ _KANBAN_FOLLOWUP_RESUME_PENDING_REASONS = frozenset(
         # re-engage force-continue：现有 RVF run 仍在进行、agent 被续跑令其收尾该轮，
         # resume 在路上 → 必须保留 park，否则 handoff 落地前卡片抑制会被误解除。
         "kanban_followup_in_progress_reengage",
+        # P1 的兜底分支（``classify_review_initiation_lifecycle`` 判出
+        # ``accepted_run_in_flight``）：语义与上面的 ``kanban_followup_in_progress`` 完全同类
+        # ——一轮已被 agent 接受的 RVF 仍在途，handoff 尚未落地。集合名沿用历史的
+        # ``KANBAN_FOLLOWUP_`` 前缀，但它承载的判据早已不限于 kanban-followup 那条 transport。
+        "review_initiation_accepted_run_in_flight",
     }
 )
 
@@ -2027,7 +2078,11 @@ def clear_kanban_followup_lock_for_event(
 ) -> list[str]:
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
-    removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    removed = clear_kanban_followup_lock(
+        task_id=task_id,
+        session_id=session_id,
+        repo=kanban_followup_lock_repository_anchor(event, cwd=cwd),
+    )
     # handoff 完成顺带清掉残留 pending（对称卫生）：正常路径投递落地时 UPS arm 已清，
     # 这里兜底处理「同 token pending 因故未被清」的尾巴。
     removed_pending = clear_kanban_followup_pending(task_id=task_id)
@@ -2329,6 +2384,7 @@ def _withdraw_unconfirmed_kanban_followup_dispatch(
         diagnostics["removed_in_progress_marker_paths"] = clear_kanban_followup_lock(
             task_id=task_id if isinstance(task_id, str) else None,
             session_id=None,
+            repo=kanban_followup_lock_repository_anchor(marker=marker),
         )
     except Exception as exc:
         diagnostics["removed_in_progress_marker_paths"] = []
@@ -3471,7 +3527,11 @@ def _kanban_followup_bootstrap_gate_decision(
     def _artifacts_lost(event_name: str) -> tuple[bool, StopDecision | None]:
         # 等待期工件已消失 → 这一轮无从恢复（也无在途工作可撞）。清锁回 fresh 是安全的，
         # 并把丢失原因显式落账，避免它表现成一次无声的「锁自己没了」。
-        removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+        removed = clear_kanban_followup_lock(
+            task_id=task_id,
+            session_id=session_id,
+            repo=kanban_followup_lock_repository_anchor(cwd=cwd, marker=marker),
+        )
         _event(event_name, consumed_kanban_followup_in_progress_marker_paths=removed)
         return True, None
 
@@ -3973,7 +4033,11 @@ def _kanban_followup_awaiting_agent_decision_decision(
     released_lease_id, lease_release_result = release_tracker_lease_for_reconciled_kanban_followup_lock(
         marker, reason="kanban_followup_awaiting_agent_decision_expired"
     )
-    removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    removed_lock = clear_kanban_followup_lock(
+        task_id=task_id,
+        session_id=session_id,
+        repo=kanban_followup_lock_repository_anchor(cwd=cwd, marker=marker),
+    )
     removed_pending = clear_kanban_followup_pending(task_id=task_id)
     ledger.event(
         phase="gate",
@@ -4005,6 +4069,11 @@ def kanban_followup_trigger_presence_for_lock(
     优先用锁自己记下的 ``delivered_transcript_path``（UPS 投递那一刻的权威路径，跨会话仍有效）；
     老 marker 没有该字段时，仅当本次 Stop 与投递是同一会话才退回用本次 Stop 的 transcript
     ——读错文件得出的「不在链上」会误清一把真在跑的锁。
+
+    needle **从 marker 现推**（``trigger_needle_for_lock_marker``）而不是写死 dispatch token：
+    P1 之后这把锁的默认来源是「agent 在发起决策点横幅上显式 start 的就地 run」，锚点是横幅
+    正文里的 ``RVF_DECISION_TOKEN=<token>``。写死 dispatch token 会让这类锁**永远**判成
+    「无 token → unknown」，rewind 对账整条失效。
     """
     transcript_path = marker.get("delivered_transcript_path")
     if not (isinstance(transcript_path, str) and transcript_path.strip()):
@@ -4019,9 +4088,11 @@ def kanban_followup_trigger_presence_for_lock(
             transcript_path = str(fallback) if fallback is not None else None
         else:
             transcript_path = None
+    trigger_token, trigger_literal = trigger_needle_for_lock_marker(marker)
     return classify_dispatch_trigger_presence(
         transcript_path=transcript_path,
-        dispatch_token=marker.get("dispatch_token"),
+        dispatch_token=trigger_token,
+        trigger_literal=trigger_literal,
     )
 
 
@@ -4033,7 +4104,10 @@ def kanban_followup_in_progress_decision(
 ) -> StopDecision | None:
     task_id = current_kanban_task_id(event)
     session_id = kanban_followup_lock_session_id(event)
-    marker = read_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    repository_anchor = kanban_followup_lock_repository_anchor(event, cwd=cwd)
+    marker = read_kanban_followup_lock(
+        task_id=task_id, session_id=session_id, repo=repository_anchor
+    )
     if marker is None:
         # 无 in-progress 锁（从未落地或已 handoff 清掉）→ 转交 pending 对账：判断上一条
         # dispatch 是否在途（去重）或已静默丢投（重投）。
@@ -4061,7 +4135,9 @@ def kanban_followup_in_progress_decision(
                 marker, reason="kanban_followup_trigger_rewound_off_ancestor_chain"
             )
         )
-        removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+        removed_lock = clear_kanban_followup_lock(
+            task_id=task_id, session_id=session_id, repo=repository_anchor
+        )
         removed_pending = clear_kanban_followup_pending(task_id=task_id)
         ledger.event(
             phase="gate",
@@ -4118,7 +4194,9 @@ def kanban_followup_in_progress_decision(
             and review_reopen_status(reopen_marker) == REVIEW_REOPEN_ACTIVE
             and blocking_run_id != reopen_target_run_id
         ):
-            removed_lock = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+            removed_lock = clear_kanban_followup_lock(
+                task_id=task_id, session_id=session_id, repo=repository_anchor
+            )
             ledger.event(
                 phase="gate",
                 event="kanban_followup_lock_reconciled_for_reopen",
@@ -4261,7 +4339,9 @@ def kanban_followup_in_progress_decision(
     if handled:
         return bootstrap_decision
 
-    removed = clear_kanban_followup_lock(task_id=task_id, session_id=session_id)
+    removed = clear_kanban_followup_lock(
+        task_id=task_id, session_id=session_id, repo=repository_anchor
+    )
     ledger.event(
         phase="gate",
         event="kanban_followup_in_progress_marker_consumed_incomplete",
@@ -4283,30 +4363,36 @@ def consume_review_reopen_marker(
     *,
     cwd: str | None,
 ) -> dict[str, Any] | None:
-    """失败再入：在 dirty-route 即将 dispatch / allocate 前消费 rescope marker。
+    """失败再入：在即将 dispatch / allocate 前消费 rescope marker，并把结果落 ledger。
 
-    若 marker active → 按 ``target_run_id`` 把「最近一次刚经过 RVF 的实现 run」
-    仍存在的 ``reviewed`` units 翻回 ``available``（run-scoped，**绝不广播**到其它 run
-    或全 worktree），使紧接着的 allocate（本进程或 kanban-followup 后台 run 的 refresh+
-    allocate）自然得到「该实现 units ∪ 本次 fix delta」全量重审；随后 consume marker。
-    ``stale`` / ``invalid`` 也消费但不重开。best-effort：tracker 异常不阻断 Stop 主流程。
+    真正的读-重开-consume 三步住在 ``review_reopen_marker.consume_review_reopen_marker_for_run_scope``
+    ——**两条发起入口共用同一份实现**：本函数（Stop hook 旧派发路径）与 ``rvf-agent start``
+    （P1 之后的默认就地路径）。本函数只负责 Stop 侧的 ledger 记账。
+
+    语义不变：``active`` → 按 ``target_run_id`` 把该实现 run 仍存在的 ``reviewed`` units 翻回
+    ``available``（run-scoped，**绝不广播**），使紧接着的 allocate 自然得到「该实现 units ∪
+    本次 fix delta」全量重审；``stale`` / ``invalid`` 也消费但不重开。best-effort：tracker
+    异常不阻断 Stop 主流程。
     """
     task_id = current_kanban_task_id(event)
     session_id = session_hook_id_from_event(event)
-    marker = read_review_reopen_marker(task_id=task_id, session_id=session_id)
-    if marker is None:
+    consumption = consume_review_reopen_marker_for_run_scope(
+        task_id=task_id, session_id=session_id, repo=repo
+    )
+    outcome = consumption.get("outcome")
+    if outcome == REVIEW_REOPEN_CONSUMPTION_NO_MARKER:
         return None
 
-    status = review_reopen_status(marker)
-    target_run_id = marker.get("target_run_id")
+    marker = consumption.get("marker") or {}
+    target_run_id = consumption.get("target_run_id")
+    removed = consumption.get("consumed_marker_paths") or []
 
-    if status != REVIEW_REOPEN_ACTIVE:
-        removed = clear_review_reopen_marker(task_id=task_id, session_id=session_id)
+    if outcome == REVIEW_REOPEN_CONSUMPTION_DISCARDED_NOT_ACTIVE:
         ledger.event(
             phase="gate",
             event="review_reopen_marker_discarded",
             status="completed",
-            reason_code=f"review_reopen_{status}",
+            reason_code=f"review_reopen_{consumption.get('status')}",
             cwd=cwd,
             repo=repo,
             cline_kanban_task_id=task_id,
@@ -4317,19 +4403,8 @@ def consume_review_reopen_marker(
         )
         return None
 
-    reopen_result: dict[str, Any] | None = None
-    reopen_error: dict[str, str] | None = None
-    if target_run_id:
-        try:
-            reopen_result = invalidate_reviewed_units_for_run(
-                repo=repo,
-                run_id=target_run_id,
-                reason="failed_impl_reentry",
-            )
-        except Exception as exc:  # best-effort：绝不因 tracker 异常打断 Stop 主流程
-            reopen_error = {"kind": type(exc).__name__, "message": str(exc)}
-
-    removed = clear_review_reopen_marker(task_id=task_id, session_id=session_id)
+    reopen_result = consumption.get("reopen_result")
+    reopen_error = consumption.get("reopen_error")
     ledger.event(
         phase="gate",
         event="review_scope_reopened_for_failed_impl",
@@ -8534,8 +8609,93 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
 # 经 _skip_decision_should_unpark 保留 park）；其余静默停用普通 reason_code → 照常 unpark。
 # ---------------------------------------------------------------------------
 
-# 延续/特殊后端集合（保留原派发语义，不替换为注入）。
-_RVF_CONTINUATION_OR_SPECIAL_BACKENDS = frozenset({"kanban-followup", "report-only", "off"})
+# ---------------------------------------------------------------------------
+# 发起生命周期分类（P1：取代历史的「延续/特殊后端集合」判据）
+#
+# 历史实现按 ``backend in {"kanban-followup", "report-only", "off"}`` 决定「这次 Stop 要不要
+# 走发起决策点」。那个判据把两件互不相干的事糊在一个字段上：
+#
+#   * **transport**（这一轮如果要审，消息/进程怎么送达：kanban 新 task / kanban 终端投递 /
+#     GUI / dry-run…）；
+#   * **lifecycle**（这一次 Stop 到底是「一次全新的发起」，还是「一轮已被接受的 run 的延续」，
+#     还是「发起被模式整个关掉了」）。
+#
+# 糊在一起的直接后果就是本轮要根治的缺陷：``normalize_backend_from_env`` 在
+# ``fork_mode=auto`` 时**只按「在不在 kanban task 内」**把 backend 定成 ``kanban-followup``，
+# 于是 task 内的自动 RVF 被当成「延续」，结构上到不了决策点——注入给刚停下来的那个 agent 的
+# 是一条落地即执行的祈使句，它从来没有机会说「不」。2026-08-08 的
+# ``rvf-20260808T090747Z`` 事故（agent 从未接受过那一轮）与其后多次重复派发都由此而来。
+#
+# 拆开之后：``backend`` 只描述 transport，**不再**参与「新发起 / 延续」分类（INV-4）。
+# ---------------------------------------------------------------------------
+
+# 全新发起：本次 Stop 应该注入**发起决策点横幅**，由主 agent 显式 start / decline。
+REVIEW_INITIATION_LIFECYCLE_FRESH_INITIATION = "fresh_initiation"
+# 已接受且在途：agent 早前已经 start 过一轮，凭证仍 active。不得重新征询（INV-5）。
+REVIEW_INITIATION_LIFECYCLE_ACCEPTED_RUN_IN_FLIGHT = "accepted_run_in_flight"
+# 模式把发起整个关掉了（``CODEX_RVF_MODE=off`` / ``report-only``）：维持既有早退语义。
+REVIEW_INITIATION_LIFECYCLE_DISABLED_BY_MODE = "initiation_disabled_by_mode"
+# 操作者**显式**点名了 kanban 终端投递这条延续 transport（``CODEX_RVF_FORK_MODE=kanban-followup``）：
+# 这是一条保留的逃生口/兼容入口，仍走原 route_reviewable_scope→投递语义。
+REVIEW_INITIATION_LIFECYCLE_EXPLICIT_CONTINUATION_TRANSPORT_OVERRIDE = (
+    "explicit_continuation_transport_override"
+)
+
+# 发起被模式关掉的两个 backend 值（``route_reviewable_scope`` 内部对它们各有一条早退分支）。
+_RVF_INITIATION_DISABLED_BACKENDS = frozenset({"report-only", "off"})
+
+
+def classify_review_initiation_lifecycle(
+    event: dict[str, Any],
+    ledger: RunLedger,
+    *,
+    backend: str,
+    backend_selection_mode: str,
+    cwd: str | None,
+) -> str:
+    """本次 Stop 在「发起」这件事上处于哪个生命周期阶段。见上方模块注释。
+
+    判定顺序即优先级：
+
+    1. ``off`` / ``report-only`` → 发起被模式关掉，照旧走 ``route_reviewable_scope`` 早退。
+    2. **显式**点名 ``CODEX_RVF_FORK_MODE=kanban-followup`` → 保留的延续 transport 逃生口。
+       注意判据是 ``backend_selection_mode == "explicit"`` 而不是 backend 值本身：``auto``
+       在 task 内也会推出 ``kanban-followup``，而那**正是**要改成走决策点的那条路径。
+    3. 读到一枚仍 active 的在途凭证 → ``accepted_run_in_flight``。
+    4. 其余 → ``fresh_initiation``。
+
+    第 3 条是**兜底**而非主机制：真正的延续在 ``evaluate_stop_event`` 更早处就被
+    ``awaiting_dispatched_agent_decision`` / ``kanban_followup_in_progress_decision`` 接走了
+    （两者覆盖 in_progress / waiting_bootstrap / awaiting-decision / pending-in-flight）。走到
+    这里还能读到活凭证属于不该发生的状态，故写一条 ``warn`` 级 ledger 让它可观测。
+    """
+    if backend in _RVF_INITIATION_DISABLED_BACKENDS:
+        return REVIEW_INITIATION_LIFECYCLE_DISABLED_BY_MODE
+    if backend == "kanban-followup" and backend_selection_mode == "explicit":
+        return REVIEW_INITIATION_LIFECYCLE_EXPLICIT_CONTINUATION_TRANSPORT_OVERRIDE
+
+    marker = read_kanban_followup_lock(
+        task_id=current_kanban_task_id(event),
+        session_id=kanban_followup_lock_session_id(event),
+        repo=kanban_followup_lock_repository_anchor(event, cwd=cwd),
+    )
+    # 只有 **active** 凭证才算在途：stale 凭证按 TTL 自然失效，绝不能让一把忘了清的锁把发起
+    # 决策点永久静默掉（87e9338「锁 squat」那一族缺陷的对偶）。
+    if marker is not None and kanban_followup_lock_status(marker) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+        ledger.event(
+            phase="gate",
+            event="review_initiation_accepted_run_still_in_flight_at_dirty_gate",
+            status="warning",
+            level="warn",
+            reason_code="review_initiation_accepted_run_in_flight",
+            cwd=cwd,
+            backend=backend,
+            active_rvf_run_id=marker.get("run_id"),
+            kanban_followup_in_progress_marker_path=marker.get("_marker_path"),
+            kanban_followup_lock_state=kanban_followup_lock_state(marker),
+        )
+        return REVIEW_INITIATION_LIFECYCLE_ACCEPTED_RUN_IN_FLIGHT
+    return REVIEW_INITIATION_LIFECYCLE_FRESH_INITIATION
 
 # 决策点注入的 reason_code（模型可见 block）。
 REASON_DECISION_POINT_INJECTED = "decision_point_injected"
@@ -8559,6 +8719,37 @@ def _rvf_agent_cli_path() -> Path:
     """rvf-agent 决策 CLI（S3）的落盘路径——与本 Stop hook 同目录的兄弟脚本，注入提示里渲染成
     可复制粘贴的命令样例。"""
     return Path(__file__).resolve().with_name("rvf_agent_decision_cli.py")
+
+
+# 候选摘要里承载「这一轮源自哪份会话 transcript」的键。名字与 ``prepare_review_run`` 的 prep
+# payload 键逐字相同（本仓一直用这个名字指同一件事），``rvf_agent_decision_cli`` 侧以同名常量
+# ``CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY`` 读回；两侧刻意不互相 import（Stop hook 与
+# CLI 各自都是重量级入口，互引会把两条冷启动路径绑死）。
+CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY = "origin_transcript_path"
+
+
+def stamp_origin_transcript_path_on_candidate_summary(
+    summary: dict[str, Any], event: dict[str, Any]
+) -> dict[str, Any]:
+    """把本次事件的 transcript 路径盖进候选摘要，随 token 一起交给 ``rvf-agent start``。
+
+    **为什么非它不可**：``start`` 的 ``--transcript-path`` 是 agent 手打的可选参数，而 agent 通常
+    并不知道自己的 transcript 落在哪；铸 token 的这一刻（Stop / UPS 事件在手）是全链路上唯一确定
+    知道该路径的地方。不盖这一份，默认发起路径上 transcript 恒为 None：prepare 生成不了
+    session-manifest ⇒ scope contract 从 ``session-owned`` 退化成 ``manual-all-uncommitted``
+    （吞进别的会话的背景 dirty），且 tracker scope 连分配的前提都不具备（scope 要 splice 进
+    manifest）⇒ 无 lease ⇒ 审完标不了 reviewed ⇒ 同一批改动被后续每次 Stop 反复提议。
+
+    best-effort：解析不出可读 transcript 就写 None（下游据此走显式降级），绝不抛。
+    """
+    try:
+        transcript = first_readable_session_path(event)
+    except Exception:  # noqa: BLE001 - 摘要加料永不阻断决策点
+        transcript = None
+    summary[CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY] = (
+        str(transcript) if transcript is not None else None
+    )
+    return summary
 
 
 def _render_decision_point_injection_prompt(
@@ -8634,7 +8825,19 @@ def _render_decision_point_injection_prompt(
         )
     lines.append("")
     lines.append("— 决策命令（token 已在上方 RVF_DECISION_TOKEN=；把它显式回传）—")
-    lines.append(f"  发起（简析后开审）: python3 {cli} start --token {token} --reason \"<一句话理由>\"")
+    # ``--transcript-path`` 只在解析得出时才渲染。它决定本轮 scope 口径（session-owned + tracker
+    # lease vs 退化的 manual-all-uncommitted），故必须出现在样例里；同一路径也已随候选摘要进了
+    # token payload，agent 忘了带这个参数时 CLI 会自行回退读回来——两条路互为兜底。
+    origin_transcript_path = summary.get(CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY)
+    transcript_flag = (
+        f" --transcript-path {shlex.quote(str(origin_transcript_path))}"
+        if isinstance(origin_transcript_path, str) and origin_transcript_path
+        else ""
+    )
+    lines.append(
+        f"  发起（简析后开审）: python3 {cli} start --token {token}{transcript_flag} "
+        f"--reason \"<一句话理由>\""
+    )
     lines.append(
         f"  自动 scope 微调（可选，仅 start 后 acknowledged 态）: "
         f"python3 {cli} scope exclude --token {token} <path>... --reason \"<理由>\""
@@ -8644,6 +8847,19 @@ def _render_decision_point_injection_prompt(
         f"python3 {cli} dispatch --token {token} --strictness {suggested_tier}"
     )
     lines.append(f"  谢绝（不发起）: python3 {cli} decline --token {token} --reason \"<一句话理由>\"")
+    lines.append("")
+    lines.append("— 接受之后怎么进入执行（**不会再有第二条注入消息**）—")
+    lines.append(
+        "  `start` 的回执里带一整块 `execution_handoff`（人类可读行 + `RVF_AGENT_RESULT_JSON:` "
+        "两种形态都有）：target_repo / prep_file / review_env / review_packet / scope_contract / "
+        "scope_of_work / origin_metadata / handoff_path 全在里面。**执行所需的一切都从这份回执读**，"
+        "不要等一条 `$review-validate-fix` 开头的消息送上门——那条自注入已经退役。"
+    )
+    lines.append(
+        "  流程：`start` →（可选 `scope` 微调）→ `dispatch` → 由**你自己**在当前会话调用 "
+        "`$review-validate-fix` skill，按 SKILL.md 就地走 review → merge → validate/fix → handoff。"
+        "不要新建 Kanban task，也不要 fork 新会话。"
+    )
     lines.append("")
     lines.append(
         "指引：**简析后立刻 start 或 decline，不要搁置**——决策 token 有 TTL，超时无任一信号会被标"
@@ -8824,14 +9040,32 @@ def decision_point_injection_decision(
             cwd=cwd,
         )
 
+    # 本次事件的 transcript 路径随摘要一起进 token payload：``rvf-agent start`` 靠它把 scope 口径
+    # 对齐到 session-owned + 真 lease（见 stamp_origin_transcript_path_on_candidate_summary）。
+    stamp_origin_transcript_path_on_candidate_summary(summary, event)
+
     session_id = summary.get("session_id") or session_hook_id_from_event(event)
     candidate_count = int(summary.get("candidate_path_count") or 0)
     fingerprint = str(summary.get("candidate_fingerprint") or "")
     has_committed = bool(summary.get("has_committed_but_unreviewed"))
     worktree = str(summary.get("repo") or repo)
 
-    # 无候选（含 workspace 守卫短路的空摘要）→ 静默停，不写 injection ledger（保持 canary 分母干净：
-    # 只有「候选非空」才是发起层该表态的分母）。
+    # workspace 守卫命中（cwd/git root 与本 kanban task 的执行 worktree 不一致）：这**不是**
+    # 「没有候选」，而是「候选在另一个仓、不该由这一轮 RVF 审」。原样返回守卫自己的 skip
+    # payload，保住 ``kanban_task_workspace_mismatch`` 这个可诊断的 reason_code —— 降级成通用
+    # 的 no_candidates 会让用户看到一句与事实相反的「本 worktree 没有可审改动」。
+    if summary.get("workspace_guard_blocked"):
+        guard_payload = summary.get("workspace_guard_payload")
+        if isinstance(guard_payload, dict) and guard_payload:
+            return payload_decision(
+                guard_payload,
+                reason_code="kanban_task_workspace_mismatch",
+                repo=repo,
+                cwd=cwd,
+            )
+
+    # 无候选 → 静默停，不写 injection ledger（保持 canary 分母干净：只有「候选非空」才是发起层
+    # 该表态的分母）。
     if candidate_count <= 0:
         ledger.event(
             phase="gate",
@@ -9251,17 +9485,42 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             cwd=cwd,
             gate_output_path=ledger.artifact("gate-output.txt", cwd_result.output) if cwd_result.output else None,
         )
-        # S4 手术边界：区分「初始发起决策点」与「延续/特殊后端」。
-        #   * fresh-initiation（kanban / gui / dry-run / manual / 默认）：拆掉 auto-fork，改为
-        #     轻量候选摘要 → mint → 注入决策点给主 agent（无论 DIRTY / CLEAN，候选摘要都统一枚举
-        #     dirty ∪ committed-but-unreviewed）。
-        #   * 延续/特殊后端（kanban-followup=flow-1-self-rising 自升延续 / report-only / off）不是
-        #     「是否发起 RVF」的决策点，保留原 route_reviewable_scope→launch 语义（忠实于计划
-        #     「移除 …→run_review_validate_fix_child_fork 的初始 auto-fork 链」，两函数本体亦保留）。
+        # P1 手术边界：按**发起生命周期**分流，不再按 backend 集合（见
+        # classify_review_initiation_lifecycle 上方的模块注释）。
+        #   * fresh_initiation（默认，含 kanban task 内的自动 RVF）：轻量候选摘要 → mint →
+        #     注入**发起决策点横幅**给主 agent，由它显式 start / decline（无论 DIRTY / CLEAN，
+        #     候选摘要都统一枚举 dirty ∪ committed-but-unreviewed）。
+        #   * accepted_run_in_flight：静默停（见下方分支的理由），不派发也不重新征询。
+        #   * 模式关闭 / 显式延续 transport：保留原 route_reviewable_scope→launch 语义，
+        #     两函数本体亦保留。
         backend_for_initiation = normalize_backend_from_env(event)
-        is_continuation_backend = backend_for_initiation in _RVF_CONTINUATION_OR_SPECIAL_BACKENDS
+        initiation_lifecycle = classify_review_initiation_lifecycle(
+            event,
+            ledger,
+            backend=backend_for_initiation,
+            backend_selection_mode=fork_mode_selection_from_env(),
+            cwd=cwd,
+        )
+        if initiation_lifecycle == REVIEW_INITIATION_LIFECYCLE_ACCEPTED_RUN_IN_FLIGHT:
+            # 计划原文说这一支「保留旧派发路径」。**刻意不照做**：这一支的 backend 通常是
+            # ``kanban`` / ``gui``，而 route_reviewable_scope 在那里的语义是「新建一个 RVF
+            # task / fork」——在一轮已被接受、仍在途的 run 之上再开一轮，正是本次 overhaul 要
+            # 根治的重复派发。静默停是唯一安全的处置；可观测性由分类器刚写的那条 warn 级
+            # ledger 承担（``review_initiation_accepted_run_still_in_flight_at_dirty_gate``），
+            # 不是无声吞掉。该状态按构造不可达（更早的 in-progress / awaiting 判定会先接走）。
+            return skip_decision(
+                "已有一轮被 agent 接受且仍在途的 RVF run；本次 Stop 不重新征询、也不另起一轮。",
+                ledger,
+                "review_initiation_accepted_run_in_flight",
+                repo=cwd_result.repo or cwd,
+                cwd=cwd,
+                backend=backend_for_initiation,
+            )
+        routes_to_legacy_dispatch = (
+            initiation_lifecycle != REVIEW_INITIATION_LIFECYCLE_FRESH_INITIATION
+        )
         if cwd_result.status == "DIRTY" and cwd_result.repo:
-            if is_continuation_backend:
+            if routes_to_legacy_dispatch:
                 return route_reviewable_scope(
                     event,
                     cwd_result.repo,
@@ -9280,9 +9539,9 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 fork_context=fork_context,
             )
         if cwd_result.status == "CLEAN":
-            if is_continuation_backend:
-                # 延续后端：工作区 clean 时仍查「本轮已提交但未审」改动（commit 9127824 的下游
-                # committed 检测），有则照常延续路由，没有才 clean skip。
+            if routes_to_legacy_dispatch:
+                # 非 fresh 发起：工作区 clean 时仍查「本轮已提交但未审」改动（commit 9127824 的
+                # 下游 committed 检测），有则照常按旧语义路由，没有才 clean skip。
                 committed_decision = maybe_route_committed_round_scope(
                     event,
                     cwd_result.repo or cwd,

@@ -247,3 +247,73 @@ def review_reopen_status(
     if armed_ts is None:
         return STATUS_INVALID
     return STATUS_ACTIVE if current_ts - armed_ts <= ttl_seconds() else STATUS_STALE
+
+
+# 消费结果（``consume_review_reopen_marker_for_run_scope`` 的 ``outcome``）。
+REVIEW_REOPEN_CONSUMPTION_NO_MARKER = "no_marker"
+REVIEW_REOPEN_CONSUMPTION_REOPENED = "reopened"
+REVIEW_REOPEN_CONSUMPTION_DISCARDED_NOT_ACTIVE = "discarded_not_active"
+
+
+def consume_review_reopen_marker_for_run_scope(
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    repo: str,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """读 marker → active 就按 ``target_run_id`` run-scoped 重开 → 无论如何都 consume。
+
+    **为什么这段要住在 marker 模块里、而不是 Stop hook 里**：P1 之后「决定发起一轮 RVF」的
+    入口有两个——Stop hook 的旧派发路径（显式延续 transport / 模式关闭时仍走）与 agent 在
+    发起决策点上显式 ``rvf-agent start`` 的就地路径（**默认**）。重开必须发生在 allocate
+    之前，两条入口都要做；留在 Stop hook 里就等于让默认入口悄悄丢掉 ``$rvf-reopen`` 的语义。
+
+    返回可直接摊平进 ledger / 遥测的诊断 dict：
+    ``{outcome, marker, status, target_run_id, reopen_result, reopen_error,
+    consumed_marker_paths}``。整段 best-effort：tracker 异常只落 ``reopen_error``，绝不抛。
+    """
+    marker = read_review_reopen_marker(task_id=task_id, session_id=session_id, root=root)
+    if marker is None:
+        return {"outcome": REVIEW_REOPEN_CONSUMPTION_NO_MARKER}
+
+    status = review_reopen_status(marker)
+    target_run_id = marker.get("target_run_id")
+    if status != STATUS_ACTIVE:
+        removed = clear_review_reopen_marker(
+            task_id=task_id, session_id=session_id, root=root
+        )
+        return {
+            "outcome": REVIEW_REOPEN_CONSUMPTION_DISCARDED_NOT_ACTIVE,
+            "marker": marker,
+            "status": status,
+            "target_run_id": target_run_id,
+            "consumed_marker_paths": removed,
+        }
+
+    reopen_result: dict[str, Any] | None = None
+    reopen_error: dict[str, str] | None = None
+    if target_run_id:
+        try:
+            from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+                invalidate_reviewed_units_for_run,
+            )
+
+            reopen_result = invalidate_reviewed_units_for_run(
+                repo=repo,
+                run_id=target_run_id,
+                reason="failed_impl_reentry",
+            )
+        except Exception as exc:  # noqa: BLE001 - tracker 异常绝不打断发起主流程
+            reopen_error = {"kind": type(exc).__name__, "message": str(exc)}
+
+    removed = clear_review_reopen_marker(task_id=task_id, session_id=session_id, root=root)
+    return {
+        "outcome": REVIEW_REOPEN_CONSUMPTION_REOPENED,
+        "marker": marker,
+        "status": status,
+        "target_run_id": target_run_id,
+        "reopen_result": reopen_result,
+        "reopen_error": reopen_error,
+        "consumed_marker_paths": removed,
+    }
