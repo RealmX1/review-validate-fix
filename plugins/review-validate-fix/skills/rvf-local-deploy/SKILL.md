@@ -12,6 +12,14 @@ worktree 中的 runner；installed plugin、官方 cache、task worktree 都不�
 
 仅在用户明确要求本机部署，且工作已经完成 `rvf-land` 与 `base-branch-sync` handback 后：
 
+0. **只读记录 OLD**：读 official installation receipt
+   `~/.rvf/user-local-data/deployment-receipts/latest-official-cli-installation.json`
+   的 `local_main_commit`，记为 OLD —— 它是「上次装进去的是哪个源 commit」的唯一事实源
+   （设了 `RVF_USER_LOCAL_DATA_ROOT` 就读该根下的同一相对路径）。
+   文件不存在或该字段缺失就如实记「无基线」，不要猜。**禁止用当前 HEAD 冒充 OLD**：HEAD 是本次
+   要装的 NEW，拿它当 OLD 会让每次部署都报成「没有变化」；`generated_plugin_version` 只是版本串，
+   同样反推不出 commit。这一步只读，**不得新增第二套部署标记，不得手写或改写任何 receipt**
+   —— receipt 只由官方 CLI 安装路径写。
 1. 用 `git worktree list --porcelain` 找到唯一 `branch refs/heads/main` 的 worktree。
 2. 从该 worktree 运行：
 
@@ -52,7 +60,21 @@ deploy 源 worktree 的落点是 fail-closed 的：runner 只在该树带着自�
 - 双官方 cache digest 与 active release 一致；
 - Stop/UserPromptSubmit hook 与 `RVF_USER_LOCAL_DATA_ROOT` 验证；
 - 真实 reviewer routing smoke 及 fail-closed 结果（任务要求时）。
+- `source_commit_delta`：**逐条转述 commit 级 delta**。只报 version 字符串、不给 commit 列表
+  视为未完成。措辞直接引用 runner 写好的 `boundary_explanation`，锚在「已安装 plugin 现在反映
+  这些源 commit」，不得写成「源码集成了这些 commit」。五个 `kind` 各自的汇报形态：
+  - `forward`：逐条列出 `forward_commits` 的 `sha` 与 `subject`，一条不省。
+  - `unchanged`：明说本次没有让已安装 plugin 反映任何新的源 commit。
+  - `no_baseline`：明说没有上一次安装基线、本次不做区间比较，并给出 `new_commit`。
+  - `rollback_or_diverged`：**必须同时给两个方向**（`reverse_commits` = 不再被反映、
+    `forward_commits` = 新被反映），并显式标注这是回退或分叉；只报单向视为错报。
+  - `unknown_revision`：只给 `old_commit` / `new_commit` 两端 SHA，明说不做区间，不要编区间。
 
-失败时报告 `phase`、`installed_before/after`、`error` 和 receipt path；修复后重新从 local
-main 运行。本 skill 不自动执行 `rvf-land`、`base-branch-sync`、fetch、push 或 Cline
-Kanban listener restart。
+  跑完 runner 后，若 `source_commit_delta.old_commit` 与 Phase Zero 第 0 步记下的 OLD 不一致，
+  说明部署窗口内发生了并发部署：如实报告两个值，不要挑一个顺眼的讲。
+
+失败时报告 `phase`、`installed_before/after`、`error`、receipt path，以及归档的上一份安装回执
+`~/.rvf/user-local-data/deployment-receipts/previous-installation-before-latest-attempt.json`
+（runner 在每次尝试前写它）；失败结果**不含** `source_commit_delta`，不要凭 `installed_before`
+自行编一份「已投入使用」的 commit 列表。修复后重新从 local main 运行。本 skill 不自动执行
+`rvf-land`、`base-branch-sync`、fetch、push 或 Cline Kanban listener restart。

@@ -1119,6 +1119,27 @@ require_repo_literal "tests/test_developer_local_main_installation.py" 'test_dep
 require_repo_literal "tests/test_developer_local_main_installation.py" 'test_deployment_source_worktree_fails_closed_on_symlink_landing_site'
 # 删除动作必须彻底消失：落点校验不得回退成「清理」。
 forbid_repo_literal "scripts/rvf_local_deploy.py" 'rmtree'
+# 成功部署必须回答「已安装 plugin 现在反映了哪些源 commit」，而不只给一个版本串。OLD 的唯一
+# 事实源是部署开始时读到的 official installation receipt：用当前 HEAD 冒充 OLD 会让每次部署
+# 都塌成 unchanged。回退/分叉与基线不可解析这两种边界必须有名字，才不会被含糊成「前进」。
+require_repo_literal "scripts/rvf_local_deploy.py" 'source_commit_delta'
+require_repo_literal "scripts/rvf_local_deploy.py" '禁止用当前 HEAD 冒充 OLD'
+require_repo_literal "scripts/rvf_local_deploy.py" 'rollback_or_diverged'
+require_repo_literal "scripts/rvf_local_deploy.py" 'unknown_revision'
+require_repo_literal "scripts/rvf_local_deploy.py" 'boundary_explanation'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'source_commit_delta'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" '禁止用当前 HEAD 冒充 OLD'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'latest-official-cli-installation.json'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'previous-installation-before-latest-attempt.json'
+# 唯一部署标记仍是 official installation receipt：不得新增第二套标记文件，也不得手写 receipt。
+forbid_repo_literal "scripts/rvf_local_deploy.py" 'last-deployed-source-commit'
+forbid_repo_literal "plugins/review-validate-fix/skills/rvf-local-deploy/SKILL.md" 'last-deployed-source-commit'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_source_commit_delta_reports_no_baseline_when_no_prior_installation_receipt'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_source_commit_delta_lists_forward_commits_since_previously_installed_commit'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_source_commit_delta_reports_unchanged_when_previously_installed_commit_matches'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_source_commit_delta_reports_rollback_or_diverged_with_both_directions'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_source_commit_delta_reports_unknown_revision_when_previous_commit_absent_from_repository'
+require_repo_literal "tests/test_developer_local_main_installation.py" 'test_run_local_deploy_success_result_carries_source_commit_delta_from_installation_receipt'
 require_repo_literal "tests/test_official_cli_developer_plugin_installation.py" 'test_transaction_restores_previous_active_release_and_official_installation'
 require_repo_literal "tests/test_official_cli_installation_hooks.py" 'test_configure_hooks_deduplicates_rvf_entries_and_injects_user_local_roots'
 require_repo_literal "tests/test_stop_hook_dispatcher.py" 'test_dev_sync_step_specs_never_include_an_installer'

@@ -239,21 +239,12 @@ def test_public_runner_cli_has_no_repo_or_dirty_bypass() -> None:
     assert "--allow-dirty" not in completed.stdout
 
 
-def test_run_local_deploy_records_local_main_and_official_cli_verification(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _load_runner()
-    configured_user_local_data_root = tmp_path / "configured-user-local-data"
-    monkeypatch.setenv(
-        "RVF_USER_LOCAL_DATA_ROOT",
-        str(configured_user_local_data_root),
-    )
-    local_main_worktree = tmp_path / "review-validate-fix-local-main"
-    local_main_worktree.mkdir()
-    _git(local_main_worktree, "init", "-b", "main")
-    _git(local_main_worktree, "config", "user.name", "RVF Test")
-    _git(local_main_worktree, "config", "user.email", "rvf@example.test")
+def _seed_succeeding_official_cli_deploy_fixture(local_main_worktree: Path) -> Path:
+    """写入「全部成功」的假 contract / installer / verifier 三件套，返回 local main runner 路径。
+
+    假 installer 与真安装器同构地把 official installation receipt 写到
+    `RVF_USER_LOCAL_DATA_ROOT` 下 —— commit-delta 的 OLD 正是从这份 receipt 读的。
+    """
     scripts_root = local_main_worktree / "scripts"
     scripts_root.mkdir()
     local_main_runner = scripts_root / "rvf_local_deploy.py"
@@ -299,6 +290,25 @@ print(json.dumps(payload))
         "import json\nprint(json.dumps({'status': 'ok', 'cache_payloads_match_active_release': True}))\n",
         encoding="utf-8",
     )
+    return local_main_runner
+
+
+def test_run_local_deploy_records_local_main_and_official_cli_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _load_runner()
+    configured_user_local_data_root = tmp_path / "configured-user-local-data"
+    monkeypatch.setenv(
+        "RVF_USER_LOCAL_DATA_ROOT",
+        str(configured_user_local_data_root),
+    )
+    local_main_worktree = tmp_path / "review-validate-fix-local-main"
+    local_main_worktree.mkdir()
+    _git(local_main_worktree, "init", "-b", "main")
+    _git(local_main_worktree, "config", "user.name", "RVF Test")
+    _git(local_main_worktree, "config", "user.email", "rvf@example.test")
+    local_main_runner = _seed_succeeding_official_cli_deploy_fixture(local_main_worktree)
     _git(local_main_worktree, "add", ".")
     _git(local_main_worktree, "commit", "-m", "test: seed deploy fixture")
     home_directory = tmp_path / "home"
@@ -387,6 +397,8 @@ print(json.dumps(payload))
         "removed_partial_first_install"
     )
     assert raised.value.result["rollback_status"] == "removed_partial_first_install"
+    # 失败/回滚结果一个 forward 列表都不给：没装成的东西不能被读成「已投入使用」。
+    assert "source_commit_delta" not in raised.value.result
 
 
 def test_contract_failure_receipt_records_host_load_and_failed_contract_step_labels(
@@ -931,3 +943,197 @@ def test_parse_contract_check_failure_observations_ignores_unrelated_output() ->
     assert runner.parse_contract_check_failure_observations(
         "plugin 契约检查失败\nsome unrelated stderr noise\n"
     ) == {}
+
+
+def _commit_source_change(repository: Path, filename: str, subject: str) -> str:
+    (repository / filename).write_text(f"{subject}\n", encoding="utf-8")
+    _git(repository, "add", filename)
+    _git(repository, "commit", "-m", subject)
+    return _git(repository, "rev-parse", "HEAD")
+
+
+def _linear_source_history(tmp_path: Path) -> tuple[Path, str, str]:
+    """建一段线性源码史，返回 (repo, 较早的 commit, HEAD)。"""
+    repository = tmp_path / "source-history"
+    repository.mkdir()
+    _git(repository, "init", "-b", "main")
+    _git(repository, "config", "user.name", "RVF Test")
+    _git(repository, "config", "user.email", "rvf@example.test")
+    earlier_commit = _commit_source_change(repository, "a.txt", "feat: 第一段工作")
+    _commit_source_change(repository, "b.txt", "feat: 第二段工作")
+    head_commit = _commit_source_change(repository, "c.txt", "fix: 第三段工作")
+    return repository, earlier_commit, head_commit
+
+
+def test_source_commit_delta_reports_no_baseline_when_no_prior_installation_receipt(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    repository, _, head_commit = _linear_source_history(tmp_path)
+
+    delta = runner.describe_source_commit_delta_since_last_installation(
+        repository=repository,
+        previously_installed_commit=None,
+        newly_installed_commit=head_commit,
+    )
+
+    assert delta["kind"] == "no_baseline"
+    assert delta["old_commit"] is None
+    assert delta["new_commit"] == head_commit
+    assert [commit["sha"] for commit in delta["forward_commits"]] == [head_commit]
+    assert delta["reverse_commits"] == []
+    assert "没有可用的上一次安装基线" in delta["boundary_explanation"]
+
+
+def test_source_commit_delta_lists_forward_commits_since_previously_installed_commit(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    repository, earlier_commit, head_commit = _linear_source_history(tmp_path)
+
+    delta = runner.describe_source_commit_delta_since_last_installation(
+        repository=repository,
+        previously_installed_commit=earlier_commit,
+        newly_installed_commit=head_commit,
+    )
+
+    assert delta["kind"] == "forward"
+    assert delta["old_commit"] == earlier_commit
+    assert delta["reverse_commits"] == []
+    # git log 是从新到旧，且区间不含 OLD 自己。
+    assert [commit["subject"] for commit in delta["forward_commits"]] == [
+        "fix: 第三段工作",
+        "feat: 第二段工作",
+    ]
+    assert delta["forward_commits"][0]["sha"] == head_commit
+
+
+def test_source_commit_delta_reports_unchanged_when_previously_installed_commit_matches(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    repository, _, head_commit = _linear_source_history(tmp_path)
+
+    delta = runner.describe_source_commit_delta_since_last_installation(
+        repository=repository,
+        previously_installed_commit=head_commit,
+        newly_installed_commit=head_commit,
+    )
+
+    assert delta["kind"] == "unchanged"
+    assert delta["forward_commits"] == []
+    assert delta["reverse_commits"] == []
+
+
+def test_source_commit_delta_reports_rollback_or_diverged_with_both_directions(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    repository, shared_ancestor, previously_installed_commit = _linear_source_history(
+        tmp_path
+    )
+    _git(repository, "checkout", "-b", "other", shared_ancestor)
+    newly_installed_commit = _commit_source_change(
+        repository, "d.txt", "feat: 另一条线上的工作"
+    )
+
+    delta = runner.describe_source_commit_delta_since_last_installation(
+        repository=repository,
+        previously_installed_commit=previously_installed_commit,
+        newly_installed_commit=newly_installed_commit,
+    )
+
+    assert delta["kind"] == "rollback_or_diverged"
+    assert [commit["subject"] for commit in delta["forward_commits"]] == [
+        "feat: 另一条线上的工作"
+    ]
+    assert [commit["subject"] for commit in delta["reverse_commits"]] == [
+        "fix: 第三段工作",
+        "feat: 第二段工作",
+    ]
+    assert "回退或分叉" in delta["boundary_explanation"]
+
+
+def test_source_commit_delta_reports_unknown_revision_when_previous_commit_absent_from_repository(
+    tmp_path: Path,
+) -> None:
+    runner = _load_runner()
+    repository, _, head_commit = _linear_source_history(tmp_path)
+
+    delta = runner.describe_source_commit_delta_since_last_installation(
+        repository=repository,
+        previously_installed_commit="0" * 40,
+        newly_installed_commit=head_commit,
+    )
+
+    assert delta["kind"] == "unknown_revision"
+    assert delta["old_commit"] == "0" * 40
+    assert delta["new_commit"] == head_commit
+    assert delta["forward_commits"] == []
+    assert delta["reverse_commits"] == []
+
+
+def test_run_local_deploy_success_result_carries_source_commit_delta_from_installation_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功部署必须带上 commit 级 delta，且 OLD 来自 official receipt 而不是当前 HEAD。
+
+    这同时是**反 HEAD 冒充 OLD** 的回归测试：一旦有人把 OLD 换成 `rev-parse HEAD`，
+    `old_commit` 会等于 `new_commit`、`kind` 塌成 `unchanged`，这条立刻红。
+    """
+    runner = _load_runner()
+    configured_user_local_data_root = tmp_path / "configured-user-local-data"
+    monkeypatch.setenv(
+        "RVF_USER_LOCAL_DATA_ROOT",
+        str(configured_user_local_data_root),
+    )
+    local_main_worktree = tmp_path / "review-validate-fix-local-main"
+    local_main_worktree.mkdir()
+    _git(local_main_worktree, "init", "-b", "main")
+    _git(local_main_worktree, "config", "user.name", "RVF Test")
+    _git(local_main_worktree, "config", "user.email", "rvf@example.test")
+    local_main_runner = _seed_succeeding_official_cli_deploy_fixture(local_main_worktree)
+    _git(local_main_worktree, "add", ".")
+    _git(local_main_worktree, "commit", "-m", "test: seed deploy fixture")
+    previously_installed_commit = _git(local_main_worktree, "rev-parse", "HEAD")
+    head_commit = _commit_source_change(
+        local_main_worktree, "shipped.txt", "feat: 本次要投入使用的工作"
+    )
+
+    # 预置「上一次安装」的 official receipt —— OLD 的唯一事实源。
+    installation_receipt = (
+        configured_user_local_data_root
+        / "deployment-receipts/latest-official-cli-installation.json"
+    )
+    installation_receipt.parent.mkdir(parents=True, exist_ok=True)
+    installation_receipt.write_text(
+        json.dumps(
+            {
+                "status": "installed",
+                "local_main_commit": previously_installed_commit,
+                "generated_plugin_version": "0.1.0-dev.1+g"
+                + previously_installed_commit[:12],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.run_local_deploy(
+        repository_hint=local_main_worktree,
+        home=tmp_path / "home",
+        expected_local_main_commit="HEAD",
+        runner_path=local_main_runner,
+    )
+
+    assert result["status"] == "ok"
+    delta = result["source_commit_delta"]
+    assert delta["kind"] == "forward"
+    assert delta["old_commit"] == previously_installed_commit
+    assert delta["new_commit"] == head_commit
+    assert [commit["sha"] for commit in delta["forward_commits"]] == [head_commit]
+    assert [commit["subject"] for commit in delta["forward_commits"]] == [
+        "feat: 本次要投入使用的工作"
+    ]
+    assert delta["reverse_commits"] == []
