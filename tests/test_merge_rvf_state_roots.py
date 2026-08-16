@@ -356,6 +356,52 @@ def test_coherent_backup_captures_wal_content_that_a_plain_file_copy_would_lose(
     assert not coherent.with_name(coherent.name + "-wal").exists()
 
 
+def test_sqlite_fingerprint_treats_missing_and_empty_wal_as_the_same_no_frames_state(
+    tmp_path: Path,
+) -> None:
+    """SQLite 3.50 的 backup 会把缺席的 ``-wal`` 建成空文件；两态都必须是「无 frame」。"""
+
+    database = tmp_path / "tracker.sqlite3"
+    connection = sqlite3.connect(str(database))
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("CREATE TABLE sample (value TEXT)")
+    connection.execute("INSERT INTO sample VALUES ('committed')")
+    connection.commit()
+    connection.close()
+
+    wal = database.with_name(database.name + "-wal")
+    if wal.exists():
+        wal.unlink()
+    missing = tool.sha256_of_sqlite_database_including_write_ahead_log(database)
+    wal.write_bytes(b"")
+    empty = tool.sha256_of_sqlite_database_including_write_ahead_log(database)
+    assert missing == empty
+
+
+def test_snapshot_fingerprint_stays_stable_when_backup_creates_an_empty_wal(
+    tmp_path: Path,
+) -> None:
+    """关闭 WAL 连接后磁盘上可能没有 ``-wal``；backup 建出空 sidecar 不得让快照闸红。"""
+
+    database = tmp_path / "tracker.sqlite3"
+    snapshot = tmp_path / "snapshot.sqlite3"
+    connection = sqlite3.connect(str(database))
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("CREATE TABLE sample (value TEXT)")
+    connection.execute("INSERT INTO sample VALUES ('committed')")
+    connection.commit()
+    connection.close()
+    wal = database.with_name(database.name + "-wal")
+    if wal.exists():
+        wal.unlink()
+
+    fingerprint = tool.snapshot_source_database_with_verified_fingerprint(
+        database, snapshot
+    )
+    assert fingerprint is not None
+    assert snapshot.is_file()
+
+
 @pytest.mark.parametrize(
     ("value", "expected", "changed"),
     [

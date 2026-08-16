@@ -2277,13 +2277,21 @@ def sha256_of_sqlite_database_including_write_ahead_log(database_path: Path) -> 
     tracker 跑 WAL：一次提交先落 ``-wal``，主文件要等 checkpoint 才变。只对主文件取
     sha256，一次「merge 之后又写了一批事务」的违规就会完全看不见——主文件字节没动，
     闸照样绿，而 ``switch`` 会把那批事务整体丢掉。这正是这道闸要挡的事情本身。
+
+    ``-wal`` 缺席与 0 字节是同一种「无未 checkpoint frame」状态。新 SQLite 的
+    ``Connection.backup()`` 会把缺席 sidecar 建成空文件；把两态算成不同指纹，会在
+    零应用层写入下误报并发写。
     """
 
     digest = hashlib.sha256()
     for suffix in ("", "-wal"):
         sidecar = database_path.with_name(database_path.name + suffix)
         digest.update(suffix.encode("ascii"))
-        if not sidecar.is_file():
+        # 缺席的 ``-wal`` 与 0 字节 ``-wal`` 都表示「没有任何未 checkpoint 的 WAL
+        # frame」。SQLite 3.50 在 ``Connection.backup()`` 打开只读源库时会把本来不
+        # 存在的 ``-wal`` 建成空文件；若把两态算成不同指纹，快照闸会在零应用层写入
+        # 下误报并发写。真事务要么让 ``-wal`` 变成非空，要么 checkpoint 后改主文件。
+        if not sidecar.is_file() or sidecar.stat().st_size == 0:
             digest.update(b"\x00absent")
             continue
         with sidecar.open("rb") as handle:
