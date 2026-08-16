@@ -37,6 +37,9 @@ TARGET_FLOW_BACKEND = {
     "flow-1-self-rising": "kanban-followup",
     "flow-3-inplace": "manual",
     "flow-manual": "manual",
+    # agent 经 Stop hook 决策点显式 start：就地跑，无 fork / 无 kanban task，故 backend=manual。
+    # 它与 flow-manual 的差别不在 backend 而在**来源**——后者是用户敲的手动入口。
+    "flow-agentic-initiation": "manual",
 }
 
 
@@ -651,6 +654,122 @@ def load_tracker_scope(path: Path) -> dict[str, Any]:
     payload["scope_hash"] = scope_hash
     payload["paths"] = paths
     return payload
+
+
+REVIEW_PACKET_BUILD_COMMAND_FILENAME = "review-packet.build-command.json"
+SCOPE_OF_WORK_RERENDER_ROUNDS_DIRNAME = "scope-of-work-rerender-rounds"
+
+
+def write_review_packet_build_command(inputs_dir: Path, packet_cmd: list[str]) -> Path:
+    """把这次 packet 渲染的确切参数冻在 ``inputs/`` 里，供后续重渲复用同一个 renderer。
+
+    只存**脚本之后**的参数：解释器路径与 ``build_review_packet.py`` 的绝对路径在重放时按当时的
+    环境重算，避免把一台机器的 ``sys.executable`` 钉死进工件。
+    """
+    path = inputs_dir / REVIEW_PACKET_BUILD_COMMAND_FILENAME
+    path.write_text(
+        json.dumps(
+            {
+                "renderer": "build_review_packet.py",
+                "args": list(packet_cmd[2:]),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def rerender_scope_of_work_into_review_packet(artifact_dir: Path) -> dict[str, Any]:
+    """把**盘上现有的** ``scope-of-work.md`` 重新渲进 review packet（绕过 prepare 的 completed 幂等）。
+
+    存在的理由（2026-08-15 run 实测的死结）：``start`` 在 agent 还没写实质 scope-of-work 时就把
+    stub **内联冻结**进了 review packet，而 ``prepare_run_from_prep_file`` 在 completed 态是幂等
+    直接返回的——agent 照指引把真 scope-of-work 写好也进不了 packet，reviewer 读到的仍是 stub。
+
+    做法：复用 ``inputs/review-packet.build-command.json`` 里冻结的**同一条** renderer 命令重跑，
+    不新造渲染逻辑（新造必然与 prepare 漂移）。重渲前把旧 packet / metadata / scope-of-work 整组
+    归档到 ``scope-of-work-rerender-rounds/round-<N>/``——「冻结输入可审计」不能因为重渲而破功。
+
+    fail-closed：冻结命令缺失、不是本 artifact_dir 的、或 ``--output`` 指向别处，一律抛而不是
+    猜一条命令重跑（猜错会把另一轮的 packet 覆盖掉）。
+    """
+    artifact_dir = artifact_dir.expanduser().resolve()
+    inputs_dir = artifact_dir / "inputs"
+    command_path = inputs_dir / REVIEW_PACKET_BUILD_COMMAND_FILENAME
+    if not command_path.is_file():
+        raise ValueError(
+            f"缺少冻结的 packet 渲染命令 {command_path}——该 run 是在本能力落地前铸的，"
+            "无法安全重渲（不猜命令：猜错会覆盖掉别轮的 packet）。"
+        )
+    try:
+        recorded = json.loads(command_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"冻结的 packet 渲染命令不可读：{command_path}: {exc}") from exc
+    args = recorded.get("args")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ValueError(f"冻结的 packet 渲染命令格式非法：{command_path}")
+
+    packet_path = artifact_dir / "review-packet.md"
+    metadata_path = artifact_dir / "review-packet.metadata.json"
+    scope_of_work_path = artifact_dir / "scope-of-work.md"
+    # 比对 **resolve 之后** 的路径：冻结命令里记的是当时的字面路径，而 artifact_dir 这边已经
+    # resolve 过（macOS 上 /var → /private/var 这类 symlink 会让字符串比对无谓地假红）。
+    recorded_output = (
+        Path(args[args.index("--output") + 1]).expanduser().resolve()
+        if "--output" in args and args.index("--output") + 1 < len(args)
+        else None
+    )
+    if recorded_output != packet_path:
+        raise ValueError(
+            f"冻结命令的 --output（{recorded_output}）不指向本 artifact_dir 的 review-packet.md"
+            f"（{packet_path}）；拒绝重渲，避免写到别轮的工件上。"
+        )
+    if not scope_of_work_path.is_file():
+        raise ValueError(f"没有可重渲的 scope-of-work：{scope_of_work_path}")
+
+    rounds_dir = artifact_dir / SCOPE_OF_WORK_RERENDER_ROUNDS_DIRNAME
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    round_index = 1 + sum(1 for child in rounds_dir.iterdir() if child.is_dir())
+    round_dir = rounds_dir / f"round-{round_index:02d}"
+    round_dir.mkdir(parents=True, exist_ok=False)
+    archived: list[str] = []
+    for source in (
+        packet_path,
+        metadata_path,
+        inputs_dir / "review-packet.md",
+        inputs_dir / "review-packet.metadata.json",
+        inputs_dir / "scope-of-work.md",
+    ):
+        if source.is_file():
+            relative = source.relative_to(artifact_dir)
+            destination = round_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+            archived.append(relative.as_posix())
+
+    run([sys.executable, str(BUILD_PACKET), *args])
+
+    for source, destination in (
+        (packet_path, inputs_dir / "review-packet.md"),
+        (metadata_path, inputs_dir / "review-packet.metadata.json"),
+        (scope_of_work_path, inputs_dir / "scope-of-work.md"),
+    ):
+        if source.is_file():
+            shutil.copyfile(source, destination)
+
+    return {
+        "status": "rerendered",
+        "artifact_dir": str(artifact_dir),
+        "round": round_index,
+        "archive_dir": str(round_dir),
+        "archived": archived,
+        "review_packet": str(packet_path),
+        "scope_of_work": str(scope_of_work_path),
+    }
 
 
 def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -1307,6 +1426,10 @@ def prepare_run(
     for prefix in exclude_path_prefixes:
         packet_cmd.extend(["--exclude-path-prefix", prefix])
     run(packet_cmd)
+    # 冻结这次 packet 渲染的**确切**参数，供 scope-of-work 重渲复用同一个 renderer。
+    # 没有它，「agent 写完真 scope-of-work 之后怎么让它进 packet」就只能靠另造一份渲染逻辑
+    # （必然与这里漂移），或者重跑整个 prepare（被 completed 态幂等直接短路，改了也没用）。
+    write_review_packet_build_command(inputs_dir, packet_cmd)
 
     run(
         [
@@ -1632,6 +1755,9 @@ def _resolve_prep_target_repo(payload: dict[str, Any]) -> Path:
 
 def _shared_workflow_artifacts(result: dict[str, Any]) -> dict[str, str | None]:
     return {
+        # scope-of-work 重渲需要 artifact 根（冻结的 renderer 命令住在它的 inputs/ 下）。
+        # 让消费者显式拿到它，而不是从 review_packet 的父目录反推。
+        "artifacts_dir": result.get("artifacts_dir"),
         "scope_contract": result.get("scope_contract"),
         "review_packet": result.get("review_packet"),
         "review_packet_metadata": result.get("review_packet_metadata"),
@@ -1772,6 +1898,11 @@ def prepare_run_from_prep_file(
     rvf_run = payload.get("rvf_run") if isinstance(payload.get("rvf_run"), dict) else {}
     existing_state = rvf_run.get("shared_workflow_state") if isinstance(rvf_run, dict) else None
     if isinstance(existing_state, dict) and existing_state.get("status") == "completed":
+        # ⚠️ 这条幂等短路是「agent 写了真 scope-of-work 却进不了 packet」的结构性成因：packet 在
+        # 首次 prepare 时就把 stub 内联冻结了，重跑 prepare 到这里直接返回、什么都不会重渲。
+        # 要把新正文渲进 packet，走 ``rerender_scope_of_work_into_review_packet``（显式、带归档），
+        # **不要**在这里加「检测到 scope-of-work 变了就重跑整轮」——那会顺带重算 scope/manifest/
+        # tracker lease，把一次纯文档修订变成换了口径的另一轮。
         return dict(existing_state)
 
     target_flow = str(payload.get("target_flow") or "")
@@ -1823,6 +1954,13 @@ def prepare_run_from_prep_file(
             run_id=str(rvf_run_id or ""),
             run_dir=rvf_run_dir,
             user_prompt_excerpt=user_prompt_excerpt,
+            # agentic 发起路径把决策点候选摘要的路径当骨架写进 stub，让 agent 逐条填而不是对着
+            # 空白页现编（决策点已经算过这批路径，不重算）。
+            candidate_paths=[
+                str(path)
+                for path in (payload.get("scope_of_work_candidate_paths") or [])
+                if isinstance(path, str) and path.strip()
+            ],
         )
         candidate = artifacts_dir / "startup-scope-of-work.md"
         candidate.write_text(scope_text, encoding="utf-8")

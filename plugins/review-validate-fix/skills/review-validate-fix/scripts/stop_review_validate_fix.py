@@ -228,6 +228,12 @@ from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 �
 )
 import rvf_parent_context
 from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
+from core.stop_hook_output_audience import (  # noqa: E402 — Stop 出口受众分级契约（core 声明受众，adapter 决定线材）
+    STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+    STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY,
+    AgentDirectiveStopHookOutput,
+    render_stop_hook_payload,
+)
 from core.parent_conversation_context.parent_conversation_origin_freeze import (  # noqa: E402 — 父会话来源冻结中性核（S10e 迁 core）
     freeze_parent_conversation_origin,
     parent_origin_summary_fields,
@@ -300,6 +306,19 @@ class GateResult:
 
 @dataclass(frozen=True)
 class StopDecision:
+    """一次 Stop 事件的裁决结果。
+
+    出口受众由**构造决策的调用点显式声明**（``audience``），不靠 ``reason_code``
+    白名单反查——``reengage_decision`` 的 ``reason_code`` 既有默认值也有
+    ``f"kanban_followup_bootstrap_{…}"`` 这样动态生成的取值，任何静态清单都必漏。
+
+    - ``audience == STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY``：正文在 ``payload``
+      （``{"continue": True, "systemMessage": …}`` 形状，或 ``None`` = 静默停）。
+    - ``audience == STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW``：正文在
+      ``agent_directive``，``payload`` 必须为 ``None``；线上形状由 host adapter 在
+      emit 时翻译（见 ``core.stop_hook_output_audience``）。
+    """
+
     action: str
     reason_code: str
     repo: str | None = None
@@ -311,6 +330,8 @@ class StopDecision:
     summary_fields: dict[str, Any] | None = None
     payload: dict[str, Any] | None = None
     status: str = "skipped"
+    audience: str = STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY
+    agent_directive: AgentDirectiveStopHookOutput | None = None
 
 
 def emit(payload: dict[str, Any]) -> None:
@@ -8128,9 +8149,13 @@ def reengage_decision(
     9f9fb78 的 nudge 用「return None → 常规 gate 重派新 run」唤醒、无法区分 agent 真卡住 vs
     合法等待异步 reviewer 的设计缺陷）。
 
-    Claude Stop hook 的 force-continue 契约 = ``{"decision": "block", "reason": <text>}``：
-    ``decision=block`` 阻止本次 stop，``reason`` 作为续跑提示喂回 model（与 skip_payload 的
-    ``{"continue": True, ...}`` 不同——后者放任 agent 干停）。
+    这是受众 ``agent_must_act_now`` 的第二类消息（(b) 未完成 RVF 的续跑提示）：它**必须**
+    驱动 agent 再跑一回合，与 ``skip_payload`` 的 ``{"continue": True, ...}`` 相反（后者放任
+    agent 干停）。具体线材（Claude 的非错误 ``additionalContext`` vs Codex 的
+    ``decision:block``）由 host adapter 在 emit 时决定，本函数只声明受众。
+
+    ``developer_visible_notice`` 不是可选装饰：历史上 90/92 条阻塞注入不带 systemMessage，
+    开发者终端里它们与「hook 真崩了」完全无法区分。
     """
     payload_fields = dict(summary_fields)
     if repo is not None:
@@ -8153,8 +8178,16 @@ def reengage_decision(
         backend=backend,
         message=reason,
         summary_fields=payload_fields,
-        payload={"decision": "block", "reason": reason},
+        payload=None,
         status="reengaged",
+        audience=STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+        agent_directive=AgentDirectiveStopHookOutput(
+            agent_directive_body=reason,
+            developer_visible_notice=(
+                "review-validate-fix: 已向 agent 注入进行中 RVF 的续跑提示"
+                f"（reason={reason_code}）——这是刻意注入，不是 hook 失败。"
+            ),
+        ),
     )
 
 
@@ -8578,8 +8611,9 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
 # 两函数本体保留作 fallback/观察期，仅其在 evaluate_stop_event 的初始发起调用被替换），而是
 #   ① 生成一份**轻量**候选摘要（S2 stop_decision_candidate_summary）+ 指纹；
 #   ② 铸一枚决策 token（S1 rvf_decision_token_store，去重/declined 冷却/铸造熔断三闸内建于 mint）；
-#   ③ 以 Claude Stop hook 的模型可见通道 {"decision":"block","reason":<注入提示>} 把 token + 摘要
-#      + CLI 命令样例注入给主 agent；主 agent 简析后经 rvf-agent CLI 显式 start / decline。
+#   ③ 以受众 agent_must_act_now 的出口把 token + 摘要 + CLI 命令样例注入给主 agent
+#      （线材由 host adapter 决定：Claude 走非错误的 hookSpecificOutput.additionalContext，
+#      Codex 走 decision:block）；主 agent 简析后经 rvf-agent CLI 显式 start / decline。
 # systemMessage 仅通知用户（agent 不可见）。
 #
 # ## 边界：只拆**初始发起**，不动延续/特殊后端（忠实于「→run_review_validate_fix_child_fork」措辞）
@@ -8998,7 +9032,7 @@ def decision_point_injection_decision(
     * 候选摘要经 S2 build_candidate_summary（纯 git+tracker 缓存，含 committed-but-unreviewed，先过
       workspace 守卫）；无候选 → 静默停（不写 injection ledger，避免污染 canary 分母）。
     * 候选非空 → 先 reconcile 上一枚 token 的投递回执（lost 告警并入 systemMessage）→ mint：
-        - minted：mark_injected + 以 {"decision":"block","reason":<注入提示>} 返回（模型可见）；
+        - minted：mark_injected + 以受众 agent_must_act_now 返回（模型可见；线材由 host adapter 决定）；
         - deduplicated：同键活跃 token 已在等待 → 不重注入（R25 幂等），静默停并提醒用户；
         - declined_cooldown / circuit_breaker_tripped：静默停（后者附熔断告警 systemMessage）。
     * **无论哪种候选非空结局都写 injection-attempt ledger**（负路径不变量：候选非空 ⇒ 有记录）。
@@ -9188,8 +9222,14 @@ def decision_point_injection_decision(
             repo=repo,
             cwd=cwd,
             message=reason_text,
-            payload={"decision": "block", "reason": reason_text, "systemMessage": user_notice},
+            payload=None,
             status="decision-point-injected",
+            # 受众 (a)：是否发起 RVF 的决策点——两类够格驱动 agent 的消息之一。
+            audience=STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+            agent_directive=AgentDirectiveStopHookOutput(
+                agent_directive_body=reason_text,
+                developer_visible_notice=user_notice,
+            ),
         )
 
     if outcome == decision_token_store.MINT_OUTCOME_DEDUPLICATED and mint.token:
@@ -9325,12 +9365,15 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
     if event.get("stop_hook_active") is True:
+        # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
+        # 开发者看的诊断，报错主体必须是当前这个 host）。
+        host_label = resolve_current_session_host_adapter(event).host_display_name()
         return skip_decision(
             "检测到 stop_hook_active=true，为避免递归已跳过。",
             ledger,
             "stop_hook_active",
             cwd=cwd,
-            detail="Codex 已在执行 Stop hook，RVF 跳过以避免递归",
+            detail=f"{host_label} 已在执行 Stop hook，RVF 跳过以避免递归",
         )
 
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
@@ -9668,11 +9711,194 @@ def _apply_guardian_liveness_alarm(payload: dict[str, Any] | None) -> dict[str, 
     return payload
 
 
+CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL = "/.codex/sessions/"
+"""Codex rollout **默认**根 ``~/.codex/sessions/`` 的路径字面量。
+
+单独命名是为了钉住它**不是**判定 Codex 的充分条件：``CODEX_HOME`` 一改，真实 rollout
+路径里根本不含这个字面量（见 ``codex_rollout_session_path_markers``）。
+"""
+
+
+def codex_rollout_session_path_markers() -> tuple[str, ...]:
+    """能判定「这是一条 Codex rollout 文件路径」的路径证据集合（正向证据，保守）。
+
+    除默认根 ``~/.codex/sessions/`` 外，还认 ``$CODEX_HOME/sessions/``——Codex CLI 自己
+    就用 ``CODEX_HOME`` override 安装根（本仓 ``adapters.codex.subagent.codex_sessions_root``
+    正是这么解析的），自定义过它的用户，其 rollout 路径里根本不含默认字面量。
+
+    ``CODEX_HOME`` 在这里**只**用来回答「sessions 目录在哪」，绝不当成「当前会话是 Codex」
+    的身份信号——后者是 ``core/host_adapter/parent_harness_identity`` 明令禁止的误用（它是
+    常驻安装路径 override，本机装过 Codex 的用户在任何 host 下都设着它）。
+    """
+    markers = [CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL]
+    codex_home = os.environ.get("CODEX_HOME")
+    if isinstance(codex_home, str) and codex_home.strip():
+        try:
+            root = os.path.normpath(str(Path(codex_home).expanduser() / "sessions"))
+        except (OSError, ValueError, RuntimeError):  # 解析失败按「无此证据」处理
+            root = ""
+        if root:
+            markers.append(root.rstrip(os.sep) + os.sep)
+    return tuple(markers)
+
+
+def event_session_path_is_codex_rollout(event: dict[str, Any]) -> bool:
+    """event 的任一会话路径键落在 Codex rollout 根下 ⇒ 确诊 Codex（正向证据）。
+
+    覆盖**全部** ``SESSION_PATH_KEYS``（含 ``log_path``），而不是其中一个子集：漏掉的键
+    正是「真 Codex 会话溜过守卫」的入口。
+
+    与 ``_claude_hook_entry.is_foreign_invocation`` **同判据**；那个模块刻意 stdlib-only、
+    不 import 本仓 ``core``（hook 是最该 fail-open 的安全面），故那边自带一份等价副本——
+    两处改动必须同步。
+    """
+    markers = codex_rollout_session_path_markers()
+    for path in event_session_paths(event):
+        raw = str(path)
+        try:
+            normalized = os.path.normpath(str(Path(raw).expanduser()))
+        except (OSError, ValueError, RuntimeError):  # 规范化失败退回原串
+            normalized = raw
+        for marker in markers:
+            if marker == CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL:
+                if marker in normalized or marker in raw:
+                    return True
+            elif normalized.startswith(marker):
+                return True
+    return False
+
+
+def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
+    """装配**当前这次 Stop 事件所属会话**的 HostAdapter（≠ 父会话 host）。
+
+    出口线材必须按「谁在读这次 hook 输出」决定，而既有的
+    ``resolve_host_adapter(parent_origin["host_kind"])`` 问的是父会话——两者在
+    Kanban task / fork 场景下会不同，用错会把 ``hookSpecificOutput`` 发给 Codex
+    （其 ``stop.command.output`` 是 ``additionalProperties:false``，整条 Failed）。
+
+    **判据顺序刻意「先否定 Claude、后采信 stamp」**，因为两个方向的误判代价不对称：
+
+    - Claude 被误判成 Codex：只是少了个非错误通道（降级到 ``decision: block``），仍能工作。
+    - Codex 被误判成 Claude：出口里会出现 ``hookSpecificOutput.additionalContext``，而
+      Codex 的 ``stop.command.output`` 是 ``additionalProperties: false`` ⇒ **整条 hook
+      输出被判 Failed**，RVF 在 Codex 上静默停摆（``codex exec`` 下零警告）。
+
+    而 ``source.provider`` stamp 并不可信到可以压过路径/内容证据：它是
+    ``hooks/_claude_hook_entry.py`` 在**它自己那道 foreign check 之后** ``setdefault``
+    上去的。那道 check 一旦漏判（自定义 ``CODEX_HOME``、或事件只带它没查的路径键），一个
+    真实的 Codex 会话就会带着 ``claude-code`` stamp 走到这里。所以顺序是：
+
+    1. 任一会话路径落在 Codex rollout 根下（默认 ``~/.codex/sessions/`` 或
+       ``$CODEX_HOME/sessions/``）→ Codex。**否定 Claude 的证据排在 stamp 之前。**
+    2. ``detect_transcript_format`` 嗅出当前会话 transcript 是 Codex rollout schema →
+       Codex。这条不依赖任何 env / 路径约定，是路径约定被改掉时的真相源。
+    3. ``event["source"]["provider"] == "claude-code"``——Claude plugin 入口亲手打的标；
+       在没有任何 Codex 反证时它仍是最强的正向 Claude 证据（也是 transcript 不可读 /
+       schema 不认识时唯一的 Claude 线索）。
+    4. 探测结果本身（``HOST_CLAUDE`` → Claude；``None`` → resolver 兜底 Codex + 阻塞通道），
+       沿用「无法识别退回 Codex」口径：兜底到最保守的通道，绝不赌未知 host 认识
+       ``hookSpecificOutput``。
+    """
+    if event_session_path_is_codex_rollout(event):
+        return resolve_host_adapter(HOST_CODEX)
+    session_path = first_readable_session_path(event)
+    detected = None
+    if session_path is not None:
+        try:
+            detected = detect_transcript_format(session_path)
+        except Exception:  # noqa: BLE001 - 探测失败按未知处理，走兜底
+            detected = None
+    if detected == HOST_CODEX:
+        return resolve_host_adapter(HOST_CODEX)
+    source = event.get("source")
+    if isinstance(source, dict) and source.get("provider") == "claude-code":
+        return resolve_host_adapter(HOST_CLAUDE)
+    return resolve_host_adapter(detected)
+
+
+def emit_stop_hook_payload(
+    *,
+    audience: str,
+    agent_directive: AgentDirectiveStopHookOutput | None,
+    developer_only_payload: dict[str, Any] | None,
+    host_adapter: Any,
+    ledger: RunLedger | None,
+    reason_code: str,
+) -> None:
+    """Stop hook 的**唯一**出口：受众翻译 → guardian 告警并入 → 留痕 → stdout。
+
+    顺序是刻意的：guardian 告警会在构造**之后**改写 payload（往 ``systemMessage``
+    追加），所以留痕必须排在它后面，否则 ledger 记的不是真正发出去的那份。
+
+    翻译失败（受众契约被违反）不得让 hook 失声——Stop hook 必须 fail open。此时
+    降级成一条 developer-only 的诊断，并在 ledger 里如实记下违反原因。
+    """
+    channel = host_adapter.stop_hook_agent_directive_channel()
+    try:
+        payload = render_stop_hook_payload(
+            audience=audience,
+            agent_directive=agent_directive,
+            developer_only_payload=developer_only_payload,
+            agent_directive_channel=channel,
+        )
+    except Exception as exc:  # noqa: BLE001 - hook 必须 fail open
+        payload = {
+            "continue": True,
+            "systemMessage": (
+                "review-validate-fix: Stop hook 出口受众契约被违反，已降级为诊断"
+                f"（reason={reason_code}）：{type(exc).__name__}: {exc}"
+            ),
+        }
+        audience = STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY
+
+    payload = _apply_guardian_liveness_alarm(payload)
+
+    if ledger is not None:
+        try:
+            ledger.event(
+                phase="gate",
+                event="stop_hook_payload_emitted",
+                status="completed",
+                reason_code=reason_code,
+                stop_hook_output_audience=audience,
+                stop_hook_agent_directive_channel=(
+                    channel if audience == STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW else None
+                ),
+                # 宿主留痕能力差异极大（只有 Claude 能从 transcript 事后取证；Codex rollout
+                # 完全不承载 hook 记录），故最终正文以 RVF 自己的 ledger 为真相源。
+                emitted_payload=payload,
+            )
+        except Exception:  # noqa: BLE001 - 留痕永不阻断出口
+            pass
+
+    if payload is not None:
+        emit(payload)
+
+
+def emit_developer_only_stop_hook_payload(
+    payload: dict[str, Any] | None,
+    *,
+    host_adapter: Any,
+    ledger: RunLedger | None,
+    reason_code: str,
+) -> None:
+    """``developer_only`` 受众的便捷出口（失败 / 降级 / skip / 诊断一律走这条）。"""
+    emit_stop_hook_payload(
+        audience=STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY,
+        agent_directive=None,
+        developer_only_payload=payload,
+        host_adapter=host_adapter,
+        ledger=ledger,
+        reason_code=reason_code,
+    )
+
+
 def main() -> int:
     event = read_event()
     if event is None:
         return 0
 
+    host_adapter = resolve_current_session_host_adapter(event)
     latest_user = latest_user_message_from_event(event)
     ledger = start_stop_hook_ledger(event)
     # S1b：与 backend 无关的跨 task stranded-pending 扫荡，必须早于 suppress/launch 分支——
@@ -9685,6 +9911,8 @@ def main() -> int:
         # 因此既不计 liveness 分母，也不向无用户受众的子会话回灌 guardian 告警。
         decision = suppressed_decision(event, ledger)
         unpark_self_parked_card(event, ledger, reason="suppressed")
+        # 刻意不并入 guardian 告警：detached RVF/analyze/guardian 子会话按设计永不产生发起
+        # 注入，既不计 liveness 分母、也没有用户受众可以看告警。故直接 emit，不走收口。
         if decision.payload is not None:
             emit(decision.payload)
         return 0
@@ -9698,7 +9926,14 @@ def main() -> int:
         provider_health_decision = provider_health_guard_decision(decision, event, ledger)
         if provider_health_decision is not None and provider_health_decision.payload is not None:
             unpark_self_parked_card(event, ledger, reason="provider_health_block")
-            emit(_apply_guardian_liveness_alarm(provider_health_decision.payload))
+            emit_stop_hook_payload(
+                audience=provider_health_decision.audience,
+                agent_directive=provider_health_decision.agent_directive,
+                developer_only_payload=provider_health_decision.payload,
+                host_adapter=host_adapter,
+                ledger=ledger,
+                reason_code=provider_health_decision.reason_code,
+            )
             return 0
         workspace_guard_payload = kanban_task_workspace_guard_payload(
             event=event,
@@ -9707,7 +9942,12 @@ def main() -> int:
         )
         if workspace_guard_payload is not None:
             unpark_self_parked_card(event, ledger, reason="workspace_guard_block")
-            emit(_apply_guardian_liveness_alarm(workspace_guard_payload))
+            emit_developer_only_stop_hook_payload(
+                workspace_guard_payload,
+                host_adapter=host_adapter,
+                ledger=ledger,
+                reason_code="kanban_task_workspace_guard",
+            )
             return 0
         result = launch_backend(decision, event, ledger)
         # park 泄漏安全阀：仅当本次 Stop 成功派发了 self-rising followup（resume 在路上）才保留
@@ -9719,17 +9959,27 @@ def main() -> int:
             result.pop(_RVF_KEEP_SELF_PARK_FLAG, None)
         if not keep_park:
             unpark_self_parked_card(event, ledger, reason="no_followup_dispatch")
-        result = _apply_guardian_liveness_alarm(result)
-        emit(result)
+        emit_developer_only_stop_hook_payload(
+            result,
+            host_adapter=host_adapter,
+            ledger=ledger,
+            reason_code=decision.reason_code,
+        )
         return 0
     # skip / 不 launch（含 handoff 完成）= 一般无 resume → unpark；但 followup 仍活跃 / dispatch
     # 仍在途的 skip（resume 在路上）必须保留 park，否则会在 followup 落地前误解除卡片抑制。
     if _skip_decision_should_unpark(decision):
         unpark_self_parked_card(event, ledger, reason="stop_no_launch")
-    # S8·R23:发起层静默死亡告警并入出口(告警在场时静默停升格为 systemMessage)。
-    skip_payload = _apply_guardian_liveness_alarm(decision.payload)
-    if skip_payload is not None:
-        emit(skip_payload)
+    # 受众翻译 + S8·R23 发起层静默死亡告警并入出口(告警在场时静默停升格为 systemMessage)，
+    # 全部收在 emit_stop_hook_payload 内。
+    emit_stop_hook_payload(
+        audience=decision.audience,
+        agent_directive=decision.agent_directive,
+        developer_only_payload=decision.payload,
+        host_adapter=host_adapter,
+        ledger=ledger,
+        reason_code=decision.reason_code,
+    )
     return 0
 
 

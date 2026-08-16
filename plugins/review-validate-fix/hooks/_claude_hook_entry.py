@@ -50,20 +50,80 @@ def emit(payload: dict[str, object]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
+CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL = "/.codex/sessions/"
+
+# 与 ``core.rvf_shared_runtime_constants.SESSION_PATH_KEYS`` /
+# ``stop_review_validate_fix.event_session_paths`` 对齐的会话路径键全集。本模块刻意
+# stdlib-only、不 import ``core``（hook 是最该 fail-open 的安全面），故自带一份副本，
+# **两处必须同步**。
+#
+# 历史缺口：这里原本只列了 4 个键、漏了 ``log_path``，于是只带 ``log_path`` 的 Codex
+# 事件会溜过本守卫，被下面的 ``setdefault`` 打上 ``claude-code`` stamp——而核心侧当时
+# 又把那枚 stamp 排在路径证据之前，于是一个真实 Codex 会话被判成 Claude、出口里带上
+# ``hookSpecificOutput``，被 Codex 的 ``additionalProperties:false`` schema 整条判 Failed
+# （``codex exec`` 下零警告的静默停摆）。
+_SESSION_PATH_KEYS = (
+    "transcript_path",
+    "session_path",
+    "conversation_path",
+    "log_path",
+    "session_file",
+)
+
+
+def codex_rollout_session_path_markers() -> tuple[str, ...]:
+    """能判定「这是一条 Codex rollout 文件路径」的路径证据集合。
+
+    默认根 ``~/.codex/sessions/`` 之外还认 ``$CODEX_HOME/sessions/``——Codex CLI 自己就
+    用 ``CODEX_HOME`` override 安装根，自定义过它的用户其 rollout 路径里根本不含默认字面量。
+
+    ``CODEX_HOME`` 在这里**只**用来回答「sessions 目录在哪」，绝不当成「当前会话是 Codex」
+    的身份信号：它是常驻安装路径 override，本机装过 Codex 的用户在任何 host 下都设着它，
+    拿它当身份会让 Claude 会话被本守卫判成 foreign 而**整条 RVF 失声**。
+    """
+    markers = [CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL]
+    codex_home = os.environ.get("CODEX_HOME")
+    if isinstance(codex_home, str) and codex_home.strip():
+        try:
+            root = os.path.normpath(
+                os.path.join(os.path.expanduser(codex_home), "sessions")
+            )
+        except (OSError, ValueError):  # 解析失败按「无此证据」处理
+            root = ""
+        if root:
+            markers.append(root.rstrip(os.sep) + os.sep)
+    return tuple(markers)
+
+
 def is_foreign_invocation(event: dict[str, object]) -> bool:
     """判断本次 hook 是否被非 Claude（Codex）host 旁路触发（应当 no-op）。
 
-    检测策略（保守，仅在正向证据时返回 True）：
-    1. 事件里任一会话路径键（``transcript_path`` / ``conversation_path`` /
-       ``session_path`` / ``session_file``）落在 ``/.codex/sessions/`` 下
-       → Codex 转写文件路径，确诊 Codex。
-    2. 兜底：未匹配则返回 False（按 Claude 跑，杜绝把 Claude 误判成 Codex
-       而失声）。
+    检测策略（**保守，仅在正向证据时返回 True**）：
+    1. 事件里任一会话路径键（``_SESSION_PATH_KEYS`` 全集）落在 Codex rollout 根下——
+       默认 ``~/.codex/sessions/`` 或 ``$CODEX_HOME/sessions/`` → 确诊 Codex。
+    2. 兜底：未匹配则返回 False（按 Claude 跑，杜绝把 Claude 误判成 Codex 而失声）。
+
+    **这里的误判代价与核心侧恰好相反**，故判据只许按「路径证据」扩宽、不许引入 env 身份
+    猜测：本函数返回 True 会让 Claude 入口整体静默 no-op，一旦对 Claude 假阳性，RVF 在
+    Claude 上就彻底不触发（无任何报错）。核心侧
+    ``stop_review_validate_fix.resolve_current_session_host_adapter`` 用的是同一套路径判据，
+    但它在此之上还叠了 transcript schema 探测——因为那边的假阴性才是致命的那一侧。
     """
-    for key in ("transcript_path", "conversation_path", "session_path", "session_file"):
+    markers = codex_rollout_session_path_markers()
+    for key in _SESSION_PATH_KEYS:
         value = event.get(key)
-        if isinstance(value, str) and "/.codex/sessions/" in value:
-            return True
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            normalized = os.path.normpath(os.path.expanduser(value))
+        except (OSError, ValueError):  # 规范化失败退回原串
+            normalized = value
+        for marker in markers:
+            if marker == CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL:
+                if marker in normalized or marker in value:
+                    return True
+            elif normalized.startswith(marker):
+                return True
     return False
 
 

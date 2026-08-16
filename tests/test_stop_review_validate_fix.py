@@ -835,7 +835,25 @@ def test_stop_hook_active_skips(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
     payload = assert_skip_reason(stdout, "stop_hook_active=true")
+    # host 未标明 → 兜底 Codex。
     assert "detail=Codex 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
+
+
+def test_stop_hook_active_skip_names_the_current_host_not_a_hardcoded_one(
+    tmp_path: Path,
+) -> None:
+    """同一条诊断在 Claude 会话里必须说 "Claude Code"——写死 host 名会指错报错主体。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": True,
+            "source": {"provider": "claude-code", "plugin": "review-validate-fix"},
+        }
+    )
+    payload = assert_skip_reason(stdout, "stop_hook_active=true")
+    assert "detail=Claude Code 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
+    assert "Codex 已在执行" not in payload["systemMessage"], payload["systemMessage"]
 
 
 def test_codex_goal_mode_skips_direct_stop_hook(tmp_path: Path) -> None:
@@ -5238,6 +5256,30 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
             dispatched_calls.append(dict(kwargs))
             return {"status": "ok", "returncode": 0, "plan_path": None}
 
+        # contract gate:此刻 scope-of-work 还是 start 写的 stub ⇒ 必须**拒派**且不碰 reviewer。
+        # 派了也白派——reviewer 侧的 contract gate 会当场把这一轮退回成 kind: request。
+        blocked = cli.run_dispatch(
+            token=token,
+            strictness="standard",
+            dry_run=True,
+            reviewer_dispatcher=fake_reviewer_dispatcher,
+        )
+        assert blocked.status == "scope_of_work_still_stub", (blocked.status, blocked.message)
+        assert dispatched_calls == [], dispatched_calls
+
+        # agent 按指引写真实 scope-of-work,再经**受支持的重渲入口**把它渲进已冻结的 packet。
+        # 只改盘上的文件不够:packet 在 start 时就把 stub 内联冻结了。
+        scope_of_work_path = Path(prepare_artifacts["scope_of_work"])
+        scope_of_work_path.write_text(
+            "# Scope of Work\n\nE2E dogfood:本轮唯一实质改动是 changed.txt,审查请盯它。\n",
+            encoding="utf-8",
+        )
+        rerender = cli.run_scope_rerender_scope_of_work(token=token)
+        assert rerender.status == "ok", (rerender.status, rerender.message)
+        assert (
+            "E2E dogfood" in Path(prepare_artifacts["review_packet"]).read_text(encoding="utf-8")
+        ), "重渲之后 packet 里必须是真 scope-of-work,不再是 stub"
+
         dispatch = cli.run_dispatch(
             token=token,
             strictness="standard",
@@ -5742,6 +5784,7 @@ def main() -> int:
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
         test_diagnose_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
+        test_stop_hook_active_skip_names_the_current_host_not_a_hardcoded_one,
         test_codex_goal_mode_skips_direct_stop_hook,
         test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook,
         test_codex_completed_goal_does_not_skip_direct_stop_hook,

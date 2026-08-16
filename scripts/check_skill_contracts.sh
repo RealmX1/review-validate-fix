@@ -545,6 +545,7 @@ repo_required_files=(
   "core/review_prompt_assembly/review_validate_fix_fork_prompt.py"
   "core/review_dispatch/review_validate_fix_dispatch_flow.py"
   "core/cline_kanban_terminal_delivery/cline_kanban_terminal_delivery_receipt.py"
+  "core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -567,6 +568,12 @@ repo_required_files=(
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
+  "tests/test_stop_hook_output_audience_contract.py"
+  "tests/test_agentic_initiation_scope_of_work_contract.py"
+  "tests/test_reviewer_result_artifact_lifecycle.py"
+  "tests/test_codex_hook_trust_fingerprint.py"
+  "scripts/codex_hook_trust_fingerprint.py"
+  "tests/test_current_session_host_adapter_resolution.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -634,6 +641,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/run_ledger/run_ledger.py" \
   "$repo_root/core/rvf_user_local_data_paths.py" \
   "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
+  "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
@@ -695,6 +703,37 @@ run_step "tests: rvf_withdrawn_dispatch_tombstone" \
 run_step "tests: review_initiation_decision_point_is_sole_self_injection" \
   python3 -m pytest -q \
     "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py"
+# 结构性 + 行为 gate：Stop 出口的受众分级。驱动 agent 的线上键（decision / hookSpecificOutput）
+# 只能在 core/stop_hook_output_audience 的翻译层里构造（AST 判定，不是字面量扫描）；且同一条
+# 决策在 Claude 下必须落非错误的 additionalContext、在 Codex 下必须落 decision:block。
+run_step "tests: stop_hook_output_audience_contract" \
+  python3 -m pytest -q \
+    "$tests_dir/test_stop_hook_output_audience_contract.py"
+# agentic 发起路径的 scope-of-work 契约：stub 不得自称手动入口；stub 标记机器可判（dispatch
+# contract gate 据它拒派）；改好的 scope-of-work 有受支持的重渲入口把它渲进已冻结的 packet。
+run_step "tests: agentic_initiation_scope_of_work_contract" \
+  python3 -m pytest -q \
+    "$tests_dir/test_agentic_initiation_scope_of_work_contract.py"
+# reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
+# request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
+run_step "tests: reviewer_result_artifact_lifecycle" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_result_artifact_lifecycle.py"
+# Codex hook 信任指纹：改了 hook 命令不重新信任 ⇒ Codex 静默跳过该 hook（exec 下零警告），
+# deploy 却报告成功。核对只观测、不改 live config。
+run_step "tests: codex_hook_trust_fingerprint" \
+  python3 -m pytest -q \
+    "$tests_dir/test_codex_hook_trust_fingerprint.py"
+run_step "codex hook trust fingerprint self-check" \
+  python3 "$repo_root/scripts/codex_hook_trust_fingerprint.py"
+# 当前会话 host 解析：判据顺序必须「先否定 Claude、后采信 claude-code stamp」。把 Codex 误判成
+# Claude 会让它收到 hookSpecificOutput（stop.command.output 是 additionalProperties:false）⇒
+# 整条 hook 输出 Failed = RVF 在 Codex 上静默停摆；反向误判只是降级，代价不对称。
+run_step "tests: current_session_host_adapter_resolution" \
+  python3 -m pytest -q \
+    "$tests_dir/test_current_session_host_adapter_resolution.py"
+run_step "stop hook output audience contract self-check" \
+  python3 "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"

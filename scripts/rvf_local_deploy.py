@@ -975,9 +975,130 @@ def run_local_deploy(
             contract_output=contract_output,
             installer=installer_receipt,
             verification=verification,
+            codex_hook_trust=_observe_codex_hook_trust(
+                home, installer_receipt=installer_receipt
+            ),
         )
         _write_result_receipt(result_receipt_path, completed)
         return completed
+
+
+def _deployed_plugin_payload_root_from_installer_receipt(
+    installer_receipt: dict[str, Any] | None,
+) -> tuple[Path | None, str | None, str | None]:
+    """从安装器回执取**真实**的 plugin payload 根与 plugin selector。
+
+    绝不硬拼 `$HOME/plugins/<plugin>`：本安装器把 payload 装进
+    `$HOME/.rvf/developer-plugin-marketplaces/<marketplace>/plugins/<plugin>`。
+    `$HOME/plugins/` 在本机上是一个早已停更的历史目录——照着它核对，核到的是一份陈旧快照
+    （或者干脆什么都核不到），而真正被 Codex 加载的那份一次都没被核对，结果还报「全部一致」。
+
+    返回 ``(payload_root, plugin_selector, 无法定位时的说明)``。定位不到就如实返回 ``None``
+    并带上说明，**不**退回猜路径——猜错的路径正是这条缺陷本身。
+    """
+    if not isinstance(installer_receipt, dict):
+        return (
+            None,
+            None,
+            "安装器回执不可用 ⇒ 无法定位已部署 plugin payload 根，bundled hook 源未进核对。",
+        )
+    raw_selector = installer_receipt.get("plugin_selector")
+    selector = raw_selector if isinstance(raw_selector, str) and raw_selector else None
+    raw_marketplace_root = installer_receipt.get("active_marketplace_root")
+    if not isinstance(raw_marketplace_root, str) or not raw_marketplace_root:
+        return (
+            None,
+            selector,
+            "安装器回执缺 active_marketplace_root ⇒ bundled hook 源未进核对。",
+        )
+    plugin_name = selector.split("@", 1)[0] if selector else ""
+    if not plugin_name:
+        return (
+            None,
+            selector,
+            "安装器回执缺 plugin_selector ⇒ 无法确定 payload 目录名，bundled hook 源未进核对。",
+        )
+    payload_root = (
+        Path(raw_marketplace_root).expanduser() / "plugins" / plugin_name
+    )
+    if not payload_root.is_dir():
+        return (
+            payload_root,
+            selector,
+            f"回执给出的 plugin payload 根不存在: {payload_root}",
+        )
+    return payload_root, selector, None
+
+
+def _observe_codex_hook_trust(
+    home: Path, *, installer_receipt: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """部署收尾核对 Codex 的 hook 信任指纹（**只观测、不改 live config**）。
+
+    为什么必须有这一步：Codex 对每条 command hook 记信任指纹，改了命令而不重新信任 ⇒ 该 hook 被
+    判 Modified 并**跳过**，而 `codex exec` 下这件事完全静默（实测 0.147.0：stdout+stderr 里
+    `hook`/`trust`/`/hooks` 命中全为 0）。于是 deploy 会报告一切成功，而 RVF 在 Codex 上从此
+    一次都不执行。
+
+    刻意**不**自动改 `~/.codex/config.toml`：重新信任是一个信任决定，必须由人做。
+    也刻意**不**让它使 deploy 失败：它是观测项，而这台机器上 Codex 未必是被使用的 host。
+
+    ⚠️ 已知盲区：deploy verifier 的 synthetic smoke 是**直接执行脚本**，绕过 Codex 自己的 hook
+    发现与信任层——所以只补普通 smoke 仍然会假绿，真正的端到端校验必须走 Codex 的发现路径。
+    本观测是那条缝的**指纹侧**补丁，不是它的替代。
+
+    bundled hook 源的位置一律从 ``installer_receipt`` 里取（``active_marketplace_root`` +
+    ``plugin_selector``），**不**按 `$HOME/plugins/<plugin>` 硬拼——那个路径本安装器根本不写。
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_hook_trust_fingerprint as trust  # noqa: PLC0415
+
+        codex_home = Path(home) / ".codex"
+        table = trust.read_codex_hook_trust_table(codex_home)
+        (
+            payload_root,
+            plugin_selector,
+            payload_root_resolution_note,
+        ) = _deployed_plugin_payload_root_from_installer_receipt(installer_receipt)
+        sources = trust.rvf_codex_hook_sources(
+            codex_home=codex_home,
+            deployed_plugin_root=payload_root,
+            trust_table=table,
+            deployed_plugin_selector=plugin_selector,
+        )
+        observation = trust.verify_codex_hook_trust(
+            codex_home=codex_home, hook_sources=sources
+        )
+        observation["deployed_plugin_payload_root"] = (
+            str(payload_root) if payload_root is not None else None
+        )
+        observation["deployed_plugin_selector"] = plugin_selector
+        if payload_root_resolution_note:
+            # 定位不到 payload 根 = bundled hook 源一条都没进核对；这必须压到非 trusted，
+            # 否则又回到「核到 0 条却报全部一致」。已经是非 trusted 的更严重结论不覆盖。
+            if observation.get("status") == trust.TRUST_STATUS_TRUSTED:
+                observation["status"] = trust.TRUST_STATUS_CHECK_COVERAGE_INCOMPLETE
+            observation["coverage_incomplete"] = True
+            observation["note"] = " ".join(
+                part
+                for part in (observation.get("note"), payload_root_resolution_note)
+                if part
+            )
+            observation.setdefault(
+                "remediation", trust.INCOMPLETE_COVERAGE_REMEDIATION
+            )
+        return observation
+    except Exception as exc:  # noqa: BLE001 - 观测项永不阻断 deploy
+        return {
+            "status": "unavailable",
+            "checked": 0,
+            "untrusted": [],
+            "missing_sources": [],
+            "sources_without_any_trust_entry": [],
+            "coverage_incomplete": True,
+            "note": f"Codex hook 信任核对本身失败：{type(exc).__name__}: {exc}",
+        }
 
 
 def _print_text(result: dict[str, Any]) -> None:
@@ -995,6 +1116,54 @@ def _print_text(result: dict[str, Any]) -> None:
             "注意: runner 自身含未提交改动，与本次被部署的 HEAD 版本不是同一份"
             "（runner_matches_local_main_head=false）"
         )
+    _print_codex_hook_trust_observation(result.get("codex_hook_trust") or {})
+
+
+def _print_codex_hook_trust_observation(trust: dict[str, Any]) -> None:
+    """把 hook 信任观测印成人能读的结论。
+
+    唯一的硬约束：**只有 `trusted` 一种状态可以读成「一切正常」**。核不到、核不全、源从没被
+    信任过——每一种都要长得像告警，因为它们在后果上与「未受信」等价（Codex 静默不执行）。
+    """
+    status = trust.get("status")
+    if not status:
+        return
+    checked = trust.get("checked")
+    untrusted = trust.get("untrusted") or []
+    missing_sources = trust.get("missing_sources") or []
+    never_trusted_sources = trust.get("sources_without_any_trust_entry") or []
+    if status == "trusted":
+        print(f"Codex hook 信任指纹: 全部一致（核对 {checked} 条，所有 hook 源均已登记）")
+    elif status in {"untrusted_entries", "trust_table_absent"}:
+        print(
+            f"⚠️ Codex hook 信任指纹: {len(untrusted)}/{checked} 条**未受信**"
+            "——它们会被 Codex 静默跳过（exec 下无任何警告），RVF 在 Codex 侧等于停摆。"
+        )
+        for entry in untrusted:
+            print(f"   - {entry['key']}  ({entry['reason']})")
+            print(f"     current_fingerprint: {entry['current_fingerprint']}")
+    elif status == "check_coverage_incomplete":
+        print(
+            f"⚠️ Codex hook 信任指纹: 核对**覆盖不完整**（只核到 {checked} 条）"
+            "——本次结果**不能**当作「一切正常」读：没被核到的 hook 与「未受信」后果相同。"
+        )
+    else:
+        print(f"⚠️ Codex hook 信任指纹: 未能核对（{status}）——这**不是**「一切正常」。")
+    if status != "trusted":
+        payload_root = trust.get("deployed_plugin_payload_root")
+        if payload_root:
+            print(f"   已部署 plugin payload 根: {payload_root}")
+        for entry in never_trusted_sources:
+            print(
+                f"   - 从未被信任过的 hook 源（信任表里一个键都没有）: "
+                f"{entry['source']} -> {entry['path']}"
+            )
+        for item in missing_sources:
+            print(f"   - 缺失 / 不可读的 hook 源: {item}")
+        if trust.get("note"):
+            print(f"   注: {trust['note']}")
+        if trust.get("remediation"):
+            print(f"   处置: {trust['remediation']}")
 
 
 def main(argv: list[str] | None = None) -> int:

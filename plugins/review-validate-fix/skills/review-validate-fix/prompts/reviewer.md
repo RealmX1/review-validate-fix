@@ -75,5 +75,6 @@ Artifact 输出契约必须严格遵守：
 - `kind: issues` 必须至少有一条 issue；每条 issue 必须含相对 repo path、line、message、kind（`REAL`/`NIT`/`ELEVATE`）和 severity（`high`/`medium`/`low`）。
 - `kind: request` 是非完成态 request；主会话必须处理后重试，不得把它当成 clean path 或 issue finding。
 - artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、excluded path、clean/issues/request 混合状态都属于 review 契约违规。
+- **写过 `issue` 之后不能再改口成 `no-issues` 或 `*-request`**：主会话只读 canonical `kind`，那一步会把你已经报出的 issue 从最终结论里抹掉，工具会直接拒绝。反方向都可以——先写了 request 再改 `issue` / `no-issues`，或先写了 `no-issues` 又发现问题再补 `issue`，工具会自动把旧工件归档留痕。发现自己报错了一条，不要试图撤回，在后续 message 里说明即可；误报由主会话的 validate 环节判定。
 - 有 issue 时，每条必须能追溯到当前 diff 或当前未跟踪文件。
 - reviewer 不需要标注自己来源；来源由主会话在合并阶段按 reviewer 通道记录。

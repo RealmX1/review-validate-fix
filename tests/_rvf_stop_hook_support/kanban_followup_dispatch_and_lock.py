@@ -18,6 +18,10 @@ import threading
 from pathlib import Path
 
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
+from _rvf_test_support.stop_decision_agent_directive import (
+    agent_directive_body,
+    emitted_agent_directive_body,
+)
 
 # 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
@@ -2018,10 +2022,14 @@ def test_kanban_followup_in_progress_lock_reengage_nudges_within_budget(
     )
 
     payload = parse_json(stdout)
-    # force-continue 契约：恰好 {"decision":"block","reason":...}——既非 skip 的 {"continue":...}，
-    # 也非 launch 的 fork payload（证明没经常规 gate 重派新 run）。
-    assert set(payload.keys()) == {"decision", "reason"}, payload
+    # force-continue 契约：受众 agent_must_act_now，在**未标明 host** 的事件上兜底 Codex 通道
+    # ⇒ 恰好 {"decision":"block","reason":…} + 一条 developer-only 的 systemMessage——既非 skip 的
+    # {"continue":…}，也非 launch 的 fork payload（证明没经常规 gate 重派新 run）。
+    # systemMessage 是**必需项**而非装饰：没有它，开发者终端里这条刻意注入与「hook 真崩了」
+    # 完全无法区分（历史上 90/92 条阻塞注入正是这样）。
+    assert set(payload.keys()) == {"decision", "reason", "systemMessage"}, payload
     assert payload["decision"] == "block"
+    assert "刻意注入" in payload["systemMessage"], payload["systemMessage"]
     assert "rvf-existing" in payload["reason"]  # reason 带阻塞 run_id，指明续跑哪一轮
     assert "RVF_HANDOFF_FILE" in payload["reason"]  # 指引 agent 用 handoff 收尾、而非新开 review
     latest = latest_summary(state)
@@ -2560,8 +2568,11 @@ def test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff(
     )
 
     payload = parse_json(stdout)
-    assert set(payload.keys()) == {"decision", "reason"}, payload
+    # 受众 agent_must_act_now + 未标明 host ⇒ 兜底阻塞通道；systemMessage 是必需的
+    # developer-only 旁注（把刻意注入与 hook 崩溃区分开）。
+    assert set(payload.keys()) == {"decision", "reason", "systemMessage"}, payload
     assert payload["decision"] == "block"
+    assert "刻意注入" in payload["systemMessage"], payload["systemMessage"]
     reason = payload["reason"]
     assert "sync-local-base-into-task-worktree-only" in reason
     assert "BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF" in reason
@@ -2611,8 +2622,9 @@ def test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopeni
     )
 
     payload = parse_json(stdout)
-    assert set(payload.keys()) == {"decision", "reason"}, payload
+    assert set(payload.keys()) == {"decision", "reason", "systemMessage"}, payload
     assert payload["decision"] == "block"
+    assert "刻意注入" in payload["systemMessage"], payload["systemMessage"]
     assert "sync-local-base-into-task-worktree-only" in payload["reason"]
 
     assert marker_path.exists(), "stale 的 bootstrap 等待锁被清掉了（32cad 回归）"
@@ -2695,9 +2707,9 @@ def test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clea
             store_expired=False,
         )
         assert handled is True
-        assert decision is not None and decision.payload.get("decision") == "block"
-        assert "rvf-bootstrap" in decision.payload["reason"]
-        assert "不要**新开 review" in decision.payload["reason"]
+        body = agent_directive_body(decision)
+        assert "rvf-bootstrap" in body
+        assert "不要**新开 review" in body
         assert marker_path.exists(), "bootstrap 收尾时不得清锁（否则常规 gate 会重开一轮）"
         resolved = json.loads(marker_path.read_text(encoding="utf-8"))
         assert resolved["bootstrap_gate"] is None
@@ -2721,7 +2733,7 @@ def test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clea
             store_expired=False,
         )
         assert handled is True
-        assert decision is not None and decision.payload.get("decision") == "block"
+        agent_directive_body(decision)
         assert marker_path.exists()
         assert json.loads(marker_path.read_text(encoding="utf-8"))["bootstrap_gate"] is not None
 
@@ -2831,9 +2843,8 @@ def test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_a
             session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
         )
         assert handled is True
-        assert decision is not None and decision.payload.get("decision") == "block"
         # 已经吸收完、receipt 也验过了：定向指令必须**反过来**要求别再跑同步 skill、别动 receipt。
-        assert "**不要**再跑一次同步 skill" in decision.payload["reason"]
+        assert "**不要**再跑一次同步 skill" in agent_directive_body(decision)
         persisted = json.loads(marker_path.read_text(encoding="utf-8"))
         assert persisted["bootstrap_gate"] is not None
         assert persisted["bootstrap_gate"]["bootstrap_receipt_digest"] == "a" * 64
@@ -2856,7 +2867,7 @@ def test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_a
             session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
         )
         assert handled is True
-        assert decision is not None and decision.payload.get("decision") == "block"
+        agent_directive_body(decision)
         assert replay_calls == ["timeout", "timeout"], "超时后的下一次 Stop 没能立刻重试重放"
         pending = [
             e
@@ -2996,7 +3007,7 @@ def test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock(
             store_expired=True,
         )
         assert handled is True
-        assert decision is not None and decision.payload.get("decision") == "block"
+        agent_directive_body(decision)
         assert marker_path.exists(), "bootstrap 收尾时不得清锁（否则常规 gate 会重开一轮）"
         persisted = json.loads(marker_path.read_text(encoding="utf-8"))
         assert persisted["bootstrap_gate"] is None
@@ -3162,9 +3173,7 @@ def test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stop
         )
         handled_second, decision_second = results["second"]
         assert handled_second is True
-        assert decision_second is not None
-        assert decision_second.payload.get("decision") == "block"
-        assert "正在跑本轮 prepare 重放" in decision_second.payload["reason"]
+        assert "正在跑本轮 prepare 重放" in agent_directive_body(decision_second)
         handled_first, decision_first = results["first"]
         assert handled_first is True
         assert decision_first is not None
@@ -3285,7 +3294,7 @@ def test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_bud
             session_id="session-bootstrap", cwd=str(fixture["repo"]), store_expired=False,
         )
         assert handled is True
-        assert decision.payload.get("decision") == "block"
+        agent_directive_body(decision)
         persisted = json.loads(marker_path.read_text(encoding="utf-8"))
         assert persisted["bootstrap_reengage_count"] == 1
         assert "reengage_nudge_count" not in persisted  # 不吃 review 收尾那把预算
@@ -3764,7 +3773,9 @@ def test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain(
     assert persisted["state"] == "in_progress"
     # 升格后落回常规 in_progress 分支：nudge 照发。
     payload = parse_json(stdout)
-    assert payload.get("decision") == "block", payload
+    # 本 fixture 写的是 Claude 形状 transcript ⇒ host 探测判 Claude ⇒ 走非错误的
+    # additionalContext 通道；断言只关心「确实驱动了 agent + 正文对」，不钉线材。
+    emitted_agent_directive_body(payload)
     assert latest_summary(state)["reason_code"] == "kanban_followup_in_progress_reengage"
 
 

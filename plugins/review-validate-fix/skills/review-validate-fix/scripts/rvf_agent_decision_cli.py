@@ -57,6 +57,7 @@ import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* /
 import rvf_bootstrap_gate  # noqa: E402
 import rvf_decision_token_store as token_store  # noqa: E402
 import rvf_prep_file  # noqa: E402
+import rvf_dispatch_prompts  # noqa: E402 — scope-of-work stub 模板与 stub 标记（与 prepare 同源）
 import review_reopen_marker  # noqa: E402 — 失败再入（$rvf-reopen）在 allocate 前的消费，与 Stop hook 同源
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # noqa: E402
     HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION,
@@ -82,9 +83,15 @@ EXIT_BOOTSTRAP_REQUIRED = 6
 EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
 # dispatch 撞上「有 reviewer 返回 kind: request」：**待处理终态**，既非故障也非完成态 review。
 # 与 EXIT_DISPATCH_FAILED 分开的理由与 dispatch_reviewers 的专用码 3 完全同源：混同成失败会把
-# agent 引向「修一修再重跑 dispatch」，而正确处置是先走 Contract Gate 处理那条 request，再带
-# 同一 --selection-seed 用**同一对** reviewer 经同一入口重派。
+# agent 引向「修一修再重跑 dispatch」，而正确处置是先走 Contract Gate 处理那条 request，再用
+# `--redispatch-review-request-legs-only` 经同一入口**只重派那条 request 腿**
+#（见 REVIEW_REQUEST_REDISPATCH_FLAG）。
 EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST = 8
+# dispatch 的 contract gate：scope-of-work 仍是 hook 生成的 stub（未被 agent 覆盖）。**不是故障**，
+# 而是「还差一步没做」。与 EXIT_DISPATCH_FAILED 分开的理由：派了也白派——reviewer 的 contract
+# gate 会当场把这一轮退回成 `kind: request`，而那是个同轮内转不回 issues 的死结（实测废掉整轮
+# codex 评审、白跑约 13 分钟）。在派发**之前**拦住，比派完再退回便宜一个数量级。
+EXIT_SCOPE_OF_WORK_STILL_STUB = 9
 
 # bootstrap 恢复重放的占位窗口 = prepare 预算 + 这段余量。占位在 prepare 收尾时立刻释放，余量只
 # 覆盖「持有者被硬杀、来不及释放」的残留：过窗后下一次 `start --retry` 可接手，不会被永久堵死。
@@ -1145,7 +1152,10 @@ def default_prepare_pipeline(
         transcript_path if tracker_scope_allocation["session_manifest_has_owned_paths"] else None
     )
 
-    target_flow = "flow-manual"
+    # 本路径的来源是 Stop hook 发起决策点 + agent 显式 start，**不是**用户敲的手动入口。
+    # 历史上这里硬写 flow-manual，于是 stub 自称「用户显式触发 /review-validate-fix」，与同一份
+    # payload 里的 dispatch_origin=agentic_initiation_start 直接矛盾——reviewer 读到假来源。
+    target_flow = rvf_dispatch_prompts.AGENTIC_INITIATION_FLOW
     payload: dict[str, Any] = {
         "origin_session_id": session_id,
         "origin_repo": worktree,
@@ -1156,6 +1166,9 @@ def default_prepare_pipeline(
         "target_kanban_task_id": None,
         "target_session_id": session_id,
         "dispatch_origin": "agentic_initiation_start",
+        # 决策点已经算好的候选路径：prepare 拿它当 scope-of-work 骨架，让 agent 逐条填实质
+        # reasoning，而不是对着空白页现编（也不必再算一遍 git 状态）。
+        "scope_of_work_candidate_paths": _initial_auto_scope_paths(candidate_summary, None),
         "rvf_run": {
             "run_id": ledger.run_id,
             "run_dir": str(ledger.run_dir),
@@ -1994,6 +2007,82 @@ def _run_scope_exception(
     )
 
 
+def run_scope_rerender_scope_of_work(
+    *,
+    token: str,
+    roots: AgentDecisionRoots | None = None,
+    now: datetime | None = None,
+) -> CommandResult:
+    """``scope rerender-scope-of-work``：把 agent 改好的 scope-of-work 重渲进已冻结的 review packet。
+
+    存在的理由：``start`` 在 agent 还没写实质内容时就把 stub **内联冻结**进了 packet，而
+    ``prepare_run_from_prep_file`` 在 completed 态幂等直接返回——不提供这条显式入口，agent 就
+    只剩「手改冻结的 packet」这一条歪路（2026-08-15 run 实测走的正是那条）。
+    """
+    roots = roots or AgentDecisionRoots()
+    now_dt = _coerce_now(now)
+    try:
+        record, overlay = _load_overlay_for_scope(token, roots=roots, now=now_dt)
+    except TokenLoadError as exc:
+        return _token_error_result("scope rerender-scope-of-work", token, exc)
+
+    artifacts = overlay.get("prepare_artifacts") if isinstance(overlay.get("prepare_artifacts"), Mapping) else {}
+    artifacts_dir_raw = artifacts.get("artifacts_dir")
+    if not (isinstance(artifacts_dir_raw, str) and artifacts_dir_raw.strip()):
+        # 老 run（本能力落地前铸的）没有这个字段：从 review_packet 的父目录反推。
+        packet_raw = artifacts.get("review_packet")
+        artifacts_dir_raw = str(Path(packet_raw).parent) if isinstance(packet_raw, str) and packet_raw else ""
+    if not artifacts_dir_raw:
+        return CommandResult(
+            command="scope rerender-scope-of-work", status="error", exit_code=EXIT_TOKEN_STATE,
+            token=token, token_state=record.state,
+            message="本轮 overlay 里没有 prepare 工件目录，无法重渲（run 可能还没 prepare 成功）。",
+        )
+
+    import prepare_review_run  # noqa: PLC0415 - 重量级，惰性 import
+
+    try:
+        result = prepare_review_run.rerender_scope_of_work_into_review_packet(Path(artifacts_dir_raw))
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        return CommandResult(
+            command="scope rerender-scope-of-work", status="error", exit_code=EXIT_DISPATCH_FAILED,
+            token=token, token_state=record.state,
+            message=f"scope-of-work 重渲失败：{exc}",
+            detail={"artifacts_dir": artifacts_dir_raw},
+        )
+
+    still_stub = _scope_of_work_stub_gate(artifacts)
+    append_decision_telemetry(
+        token=token, event="scope_of_work_rerendered",
+        worktree=str(overlay.get("worktree") or ""),
+        session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
+        detail={"round": result.get("round"), "still_stub": bool(still_stub)},
+    )
+    overlay["scope_of_work_rerender"] = result
+    overlay["updated_at"] = _format_timestamp(now_dt)
+    write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+
+    message = (
+        f"scope-of-work 已重渲进 review packet（第 {result.get('round')} 轮，"
+        f"旧工件归档在 {result.get('archive_dir')}）。"
+    )
+    next_steps = [f"rvf-agent dispatch --token {token} --strictness <…>"]
+    if still_stub:
+        message += " ⚠️ 但 dispatch 的 contract gate 仍会拒派：" + _scope_of_work_gate_message(still_stub)
+        next_steps = [
+            *_scope_of_work_gate_next_steps(still_stub, token=token),
+            f"处理完再重渲一次，然后 rvf-agent dispatch --token {token} --strictness <…>",
+        ]
+    return CommandResult(
+        command="scope rerender-scope-of-work",
+        status="still_stub" if still_stub else "ok",
+        exit_code=EXIT_SCOPE_OF_WORK_STILL_STUB if still_stub else EXIT_OK,
+        token=token, token_state=record.state,
+        message=message, next_steps=next_steps,
+        detail={"rerender": result, "still_stub": still_stub},
+    )
+
+
 def run_scope_exclude(
     *,
     token: str,
@@ -2114,6 +2203,24 @@ DISPATCH_OUTCOME_OK = "ok"
 DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST = "blocked_on_reviewer_request"
 DISPATCH_OUTCOME_FAILED = "failed"
 
+# ``blocked_on_reviewer_request`` 终态下**唯一正确**的重派形态（单一事实源：next_steps 与
+# SKILL.md / references/review-merge-policy.md 都必须与它一致，见
+# tests/test_reviewer_result_artifact_lifecycle.py 的 LIFE-6 契约测试）。
+#
+# 为什么不是「带同一 --selection-seed 整盘重跑」：那条指引在真实入口上等于没修 bug。整盘重派
+# 会把**健康且已完成**的那条腿也重跑一遍，新一轮结果原地覆写掉旧的（实测一条 cursor 腿跑了三轮
+# 2/4/3 条 issue，只留最后一轮）。``--redispatch-review-request-legs-only`` 直接复用上一轮
+# reviewer-plan.json，只重跑停在 ``kind: request`` 的腿。
+#
+# 为什么该模式下**不需要** ``--selection-seed``：seed 的用途是让 ``route()`` 复现同一对
+# reviewer；重派模式根本不调 ``route()``（plan 与 reviewer_id 直接复用），传了也不生效。
+# ``--selection-seed`` 只在整盘重派时才有意义。
+#
+# 为什么保持**显式 flag** 而不是让它在该终态下隐式生效：``dispatch_reviewers.py`` 同一入口也
+# 服务全新一轮派发，且该 flag 在没有上一轮 plan 时是 fail-closed 抛错的；隐式翻转会让「开新一轮」
+# 与「续上一轮」两种意图无法区分。
+REVIEW_REQUEST_REDISPATCH_FLAG = "--redispatch-review-request-legs-only"
+
 # detached 派发 launch 的两行 stdout 契约（``dispatch_reviewers.launch_detached_dispatch``）。
 DETACHED_DISPATCH_STATUS_PATH_STDOUT_PREFIX = "RVF_DISPATCH_STATUS="
 DETACHED_DISPATCH_LAUNCH_RESULT_STDOUT_PREFIX = "RVF_DISPATCH_LAUNCH="
@@ -2165,7 +2272,8 @@ def default_reviewer_dispatcher(
     看 ``plan_status``（见 SKILL.md「Review」节）。特别地退出码 ``3`` =
     ``blocked_on_reviewer_request``，是**待处理终态**，既非故障也非完成 —— 历史实现把它归到
     ``failed``，agent 多半会盲目重跑 dispatch，而正确处置是先走 Contract Gate 处理那条
-    ``kind: request``、再带同一 ``--selection-seed`` 用**同一对** reviewer 重试。
+    ``kind: request``、再用 ``--redispatch-review-request-legs-only`` 只重派那条腿
+    （见 ``REVIEW_REQUEST_REDISPATCH_FLAG``）。
     """
     dispatch_script = Path(__file__).resolve().parent / "dispatch_reviewers.py"
     argv = [sys.executable, str(dispatch_script)]
@@ -2216,6 +2324,154 @@ def default_reviewer_dispatcher(
     return result
 
 
+REVIEW_PACKET_SESSION_CONTEXT_HEADING = "## Session Context"
+
+SCOPE_OF_WORK_GATE_REASON_STILL_STUB = "scope_of_work_still_stub"
+SCOPE_OF_WORK_GATE_REASON_UNREADABLE = "scope_of_work_unreadable"
+SCOPE_OF_WORK_GATE_REASON_EMPTY = "scope_of_work_empty"
+SCOPE_OF_WORK_GATE_REASON_PACKET_UNREADABLE = "review_packet_unreadable"
+SCOPE_OF_WORK_GATE_REASON_PACKET_MISSING_SESSION_CONTEXT = "review_packet_missing_session_context"
+SCOPE_OF_WORK_GATE_REASON_PACKET_STALE = "review_packet_session_context_is_stale"
+
+
+def _packet_inlined_session_context_matches(packet_text: str, scope_of_work_body: str) -> bool:
+    """冻结 packet 的 ``## Session Context`` 是否**正好**是这份 scope-of-work 正文。
+
+    锚定比对而不是全文 substring：packet 里还内联着整个 diff 与全部 untracked 文件，本仓自审时
+    那些内容本身就含 stub 标记字面量，全文匹配会当场假红/假绿。
+    """
+    heading = REVIEW_PACKET_SESSION_CONTEXT_HEADING
+    for anchor in (f"\n{heading}\n\n", f"{heading}\n\n"):
+        index = packet_text.find(anchor)
+        if index < 0:
+            continue
+        return packet_text[index + len(anchor) :].startswith(scope_of_work_body)
+    return False
+
+
+def _scope_of_work_stub_gate(artifacts: Mapping[str, Any]) -> dict[str, Any] | None:
+    """本轮 scope-of-work 还不能拿去派 reviewer → 返回 gate detail；可以派 → ``None``。
+
+    判据是 **reviewer 真正会读到的那份正文**，即冻结进 review packet 的 ``## Session Context``，
+    而不是可变的盘上文件。只看盘上文件拦不住这条 gate 本来要拦的失败模式：agent 覆盖了盘上的
+    scope-of-work、删掉了 stub 标记，但**没跑 rerender** 就 dispatch —— gate 放行，reviewer 读到的
+    packet 里冻的仍是 stub，整轮空审（2026-08-15 run 实测浪费约 13 分钟）。
+
+    「路径已声明但读不到」与「压根没声明路径」分开处置：
+
+    * 没声明 → 放行。没有 scope-of-work 的合法路径（manual-all-uncommitted）本来就该派得出去，
+      这条 gate 不替 prepare 兜底「工件缺失」。
+    * 声明了却读不到 / 内容为空 → **拒派**。声明过就意味着这一轮的契约里有这份正文；此时读不到
+      只可能是它被删了或坏了，而放行等于把「删掉文件」变成绕过 gate 的最省事办法。
+    """
+    raw_path = artifacts.get("scope_of_work")
+    if not (isinstance(raw_path, str) and raw_path.strip()):
+        return None
+    path = Path(raw_path).expanduser()
+    detail: dict[str, Any] = {
+        "scope_of_work": str(path),
+        "stub_marker": rvf_dispatch_prompts.SCOPE_OF_WORK_STUB_MARKER,
+    }
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_UNREADABLE, "error": f"{type(exc).__name__}: {exc}"}
+    detail["scope_of_work_bytes"] = len(text.encode("utf-8"))
+    body = text.strip()
+    if not body:
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_EMPTY}
+    if rvf_dispatch_prompts.scope_of_work_is_untouched_stub(text):
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_STILL_STUB}
+
+    raw_packet = artifacts.get("review_packet")
+    if not (isinstance(raw_packet, str) and raw_packet.strip()):
+        # 本轮没声明 packet（本能力落地前铸的老 run）：无从核验冻结正文，不在这里假装能核验。
+        return None
+    packet_path = Path(raw_packet).expanduser()
+    detail["review_packet"] = str(packet_path)
+    try:
+        packet_text = packet_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_PACKET_UNREADABLE, "error": f"{type(exc).__name__}: {exc}"}
+    if REVIEW_PACKET_SESSION_CONTEXT_HEADING not in packet_text:
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_PACKET_MISSING_SESSION_CONTEXT}
+    if not _packet_inlined_session_context_matches(packet_text, body):
+        return {**detail, "reason": SCOPE_OF_WORK_GATE_REASON_PACKET_STALE}
+    return None
+
+
+_SCOPE_OF_WORK_GATE_WHY_IT_MATTERS = (
+    "派了也白派：reviewer 的 contract gate 会当场把这一轮退回成 `kind: request`，"
+    "而 request 在同一 run 内转不回 issues。"
+)
+
+
+def _scope_of_work_gate_message(detail: Mapping[str, Any]) -> str:
+    """把 gate 的 reason 翻成「哪一步没做」，而不是一律报「仍是 stub」。"""
+    reason = detail.get("reason")
+    scope_of_work = detail.get("scope_of_work")
+    if reason == SCOPE_OF_WORK_GATE_REASON_UNREADABLE:
+        head = (
+            f"本轮契约声明了 scope-of-work `{scope_of_work}`，但它读不到"
+            f"（{detail.get('error')}），拒绝派发。"
+        )
+    elif reason == SCOPE_OF_WORK_GATE_REASON_EMPTY:
+        head = f"scope-of-work `{scope_of_work}` 是空的，拒绝派发。"
+    elif reason == SCOPE_OF_WORK_GATE_REASON_PACKET_UNREADABLE:
+        head = (
+            f"冻结的 review packet `{detail.get('review_packet')}` 读不到"
+            f"（{detail.get('error')}），无法确认 reviewer 会读到哪份 scope-of-work，拒绝派发。"
+        )
+    elif reason == SCOPE_OF_WORK_GATE_REASON_PACKET_MISSING_SESSION_CONTEXT:
+        head = (
+            f"冻结的 review packet 里没有 `{REVIEW_PACKET_SESSION_CONTEXT_HEADING}` 段，"
+            "reviewer 拿不到本轮 scope-of-work，拒绝派发。"
+        )
+    elif reason == SCOPE_OF_WORK_GATE_REASON_PACKET_STALE:
+        head = (
+            "盘上的 scope-of-work 已经写好了，但 review packet 里冻的仍是**旧正文**"
+            "（多半是 stub —— packet 在 start 时就内联冻结了它，改盘上的文件不会进 packet），拒绝派发。"
+        )
+    else:
+        head = "scope-of-work 仍是 hook 生成的 stub（未被真实 reasoning 内容覆盖），拒绝派发。"
+    return head + _SCOPE_OF_WORK_GATE_WHY_IT_MATTERS
+
+
+def _scope_of_work_gate_next_steps(detail: Mapping[str, Any], *, token: str) -> list[str]:
+    """每个 reason 给出**它自己**的下一步；rerender 这一步几乎每条路径都要走，所以统一附在末尾。"""
+    reason = detail.get("reason")
+    scope_of_work = detail.get("scope_of_work")
+    rerender_step = (
+        f"跑 `rvf-agent scope rerender-scope-of-work --token {token}` 把新正文重渲进 "
+        "review packet——packet 在 start 时就冻结了旧正文，只改盘上的文件不会进 packet。"
+    )
+    if reason == SCOPE_OF_WORK_GATE_REASON_UNREADABLE:
+        first = (
+            f"先把 `{scope_of_work}` 恢复出来（它是本轮契约声明过的冻结输入，不能靠删掉它来放行），"
+            "再写清本轮改了什么、为什么、审的时候该盯哪里。"
+        )
+    elif reason == SCOPE_OF_WORK_GATE_REASON_EMPTY:
+        first = f"往 `{scope_of_work}` 里写清本轮改了什么、为什么、审的时候该盯哪里。"
+    elif reason == SCOPE_OF_WORK_GATE_REASON_PACKET_UNREADABLE:
+        first = (
+            f"先恢复 `{detail.get('review_packet')}`（本轮的冻结 reviewer 输入）；"
+            "确实不可恢复时重跑 prepare 而不是绕过这条 gate。"
+        )
+    elif reason in (
+        SCOPE_OF_WORK_GATE_REASON_PACKET_MISSING_SESSION_CONTEXT,
+        SCOPE_OF_WORK_GATE_REASON_PACKET_STALE,
+    ):
+        first = None  # 正文已经写好了，缺的就是重渲这一步。
+    else:
+        first = (
+            f"编辑 `{scope_of_work}`：写清本轮改了什么、为什么、审的时候该盯哪里，"
+            f"并删掉顶部单独成行的 `{rvf_dispatch_prompts.SCOPE_OF_WORK_STUB_MARKER}` 标记行。"
+        )
+    steps = [step for step in (first, rerender_step) if step]
+    steps.append("然后重跑 `rvf-agent dispatch`。")
+    return steps
+
+
 def run_dispatch(
     *,
     token: str,
@@ -2255,6 +2511,25 @@ def run_dispatch(
     artifacts = overlay.get("prepare_artifacts") if isinstance(overlay.get("prepare_artifacts"), Mapping) else {}
 
     worktree = str(overlay.get("worktree") or record.payload.get("worktree") or "")
+
+    # ①a contract gate：reviewer 会读到的那份 scope-of-work 还不能审就**拒派**。
+    stub_gate = _scope_of_work_stub_gate(artifacts)
+    if stub_gate is not None:
+        append_decision_telemetry(
+            token=token, event="dispatch_blocked_on_scope_of_work_stub", worktree=worktree,
+            session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
+            detail=stub_gate,
+        )
+        return CommandResult(
+            command="dispatch",
+            status="scope_of_work_still_stub",
+            exit_code=EXIT_SCOPE_OF_WORK_STILL_STUB,
+            token=token,
+            token_state=record.state,
+            message=_scope_of_work_gate_message(stub_gate),
+            next_steps=_scope_of_work_gate_next_steps(stub_gate, token=token),
+            detail=stub_gate,
+        )
     append_decision_telemetry(
         token=token, event="dispatch_scope_finalized", worktree=worktree,
         session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
@@ -2276,7 +2551,8 @@ def run_dispatch(
     # ②a ``blocked_on_reviewer_request`` 是**待处理终态**，既不是故障也不是完成态 review。
     #    绝不能报成 dispatch_failed —— 那会把 agent 引向「修一修再重跑 dispatch」，而正确处置
     #    是先按 references/review-merge-policy.md 的 Contract Gate 满足/驳回那条 ``kind:
-    #    request``，再带**同一** ``--selection-seed`` 用同一对 reviewer 经同一入口重派。
+    #    request``，再用 ``REVIEW_REQUEST_REDISPATCH_FLAG`` 经同一入口只重派那条 request 腿
+    #    （整盘重派会把健康腿的结果一并覆写掉）。
     if dispatch_result.get("status") == DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST:
         append_decision_telemetry(
             token=token, event="dispatch_blocked_on_reviewer_request", worktree=worktree,
@@ -2297,9 +2573,11 @@ def run_dispatch(
             next_steps=[
                 "读 artifacts/reviewers/reviewer-plan.json 的 review_request_pending_reviewer_ids "
                 "与对应 reviewer 目录，处置那条 request。",
-                "处置完带上本轮 plan 的 reviewer_selection.selection_seed 重跑 "
-                "`scripts/dispatch_reviewers.py --execute --detached --selection-seed <seed>`"
-                "（同一对 reviewer、同一 review packet）。",
+                "处置完对**同一 run** 重跑 "
+                f"`scripts/dispatch_reviewers.py --execute --detached {REVIEW_REQUEST_REDISPATCH_FLAG}`"
+                "：它复用上一轮 plan、只重派停在 `kind: request` 的腿，健康且已完成的腿保留结果、"
+                "不重跑也不被覆写。该模式不调用 route()，因此**不需要** `--selection-seed`"
+                "（reviewer 身份直接来自上一轮 plan）。",
             ],
             detail={"dispatch_result": dispatch_result, "strictness": strictness},
         )
@@ -2910,6 +3188,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_inc.add_argument("--token", required=True)
     p_inc.add_argument("paths", nargs="+", help="要追加的路径（可多个）")
     p_inc.add_argument("--reason", required=True, help="追加理由")
+    p_rerender = scope_sub.add_parser(
+        "rerender-scope-of-work",
+        help=(
+            "把改好的 scope-of-work 重渲进已冻结的 review packet"
+            "（packet 在 start 时就内联冻结了 stub，只改盘上的文件不会进 packet）"
+        ),
+    )
+    p_rerender.add_argument("--token", required=True)
 
     p_disp = sub.add_parser("dispatch", help="scope 定稿 + 严格度终选 + 派发 reviewer + 终态 dispatched")
     p_disp.add_argument("--token", required=True)
@@ -2956,6 +3242,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_scope_annotate(token=args.token, entries=list(args.entry))
         elif args.scope_action == "exclude":
             result = run_scope_exclude(token=args.token, paths=list(args.paths), reason=args.reason)
+        elif args.scope_action == "rerender-scope-of-work":
+            result = run_scope_rerender_scope_of_work(token=args.token)
         else:  # include
             result = run_scope_include(token=args.token, paths=list(args.paths), reason=args.reason)
     elif args.command == "dispatch":

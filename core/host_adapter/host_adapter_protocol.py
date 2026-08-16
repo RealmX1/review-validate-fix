@@ -28,6 +28,11 @@ host 身份词汇（守卫 `rg 'HOST_CLAUDE|HOST_CODEX|host_kind' core/ --glob '
   (engine:6586)：本 host 特有的「这次 Stop 应跳过」检测（Codex=goal-mode；
   Claude 无此概念、返回 None）。中性 suppress marker/env 仍由 ``should_suppress``
   在 core 内判定，不进注入面。
+- ``stop_hook_agent_directive_channel()``——Stop hook 上「必须驱动 agent 立刻行动」
+  这一类出口在本 host 的线材：Claude / Oh My Pi 用非错误的
+  ``hookSpecificOutput.additionalContext``，Codex / Cursor / Kimi / DeepSeek 用
+  ``decision:block``。core 只声明受众（见
+  ``core.stop_hook_output_audience``），线材是 host 行为、归注入面。
 
 ## 刻意**不**进 v1 的（避免 dead scaffolding / 提前 S10 工作）
 
@@ -50,6 +55,10 @@ callable + ``run_stop_pipeline(event, host_adapter, ledger)`` 这个真实注入
 from __future__ import annotations
 
 from typing import Any, Mapping, Protocol, runtime_checkable
+
+from core.stop_hook_output_audience import (
+    STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION,
+)
 
 
 @runtime_checkable
@@ -100,6 +109,24 @@ class HostAdapter(Protocol):
         """
         ...
 
+    def stop_hook_agent_directive_channel(self) -> str:
+        """本 host 上「必须驱动 agent 立刻行动」这类 Stop hook 出口该走哪条线材。
+
+        取值来自 ``core.stop_hook_output_audience``：
+
+        - ``STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_NON_ERROR_ADDITIONAL_CONTEXT``——
+          ``hookSpecificOutput.additionalContext``，驱动 agent 但不带错误框架
+          （Claude Code / Oh My Pi）。
+        - ``STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION``——
+          ``decision:block`` + ``reason``（Codex / Cursor / Kimi / DeepSeek；
+          Codex 的 ``stop.command.output`` 是 ``additionalProperties:false``，
+          发 ``hookSpecificOutput`` 会让整条 hook 输出 Failed）。
+
+        ``developer_only`` 受众在两个 host 上都是 ``{"continue": true,
+        "systemMessage": …}``，不需要注入面参与，故本方法只覆盖 agent-directive。
+        """
+        ...
+
 
 def _self_check() -> None:
     """runtime_checkable 一致性自检：齐方法的 stub 通过 isinstance、缺方法的不通过。
@@ -124,6 +151,9 @@ def _self_check() -> None:
         def parent_transcript_quoted_session_name(self, path: Any) -> str | None:
             return None
 
+        def stop_hook_agent_directive_channel(self) -> str:
+            return STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
+
     class _MissingSkipMode:
         def host_display_name(self) -> str:
             return "Claude Code"
@@ -138,13 +168,14 @@ def _self_check() -> None:
     partial = _MissingSkipMode()
     assert isinstance(conforming, HostAdapter), "齐方法 stub 应满足 HostAdapter Protocol"
     assert not isinstance(partial, HostAdapter), "缺 detect_host_skip_mode 的 stub 不应满足"
-    # 顺带验证 v1 注入面的方法名集合就是这 4 个，防止悄悄增删。
+    # 顺带验证注入面的方法名集合就是这 6 个，防止悄悄增删。
     expected = {
         "host_display_name",
         "session_deep_link",
         "cline_kanban_agent_id",
         "detect_host_skip_mode",
         "parent_transcript_quoted_session_name",
+        "stop_hook_agent_directive_channel",
     }
     actual = {name for name in dir(HostAdapter) if not name.startswith("_")}
     assert actual == expected, f"HostAdapter 注入面漂移：{actual} != {expected}"

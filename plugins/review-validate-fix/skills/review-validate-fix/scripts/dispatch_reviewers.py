@@ -61,6 +61,7 @@ from run_alternative_reviewer import (
     reviewer_id_from_label,
     safe_artifact_token,
 )
+from write_review_result import SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
 from core.host_adapter.host_transcript_format_detection import (
     HOST_CLAUDE,
     HOST_CODEX,
@@ -628,6 +629,85 @@ def _reroute_candidates(
     return candidates
 
 
+def _resume_plan_for_review_request_legs(
+    reviewers_dir: Path, artifacts_dir: Path
+) -> tuple[dict[str, Any], list[int]]:
+    """载入上一轮 plan，挑出停在 ``kind: request`` 的腿。**只读**：不动磁盘上任何工件。
+
+    为什么不重新 ``route()``：重派必须用**同一对** reviewer（同 selection_seed、同 reviewer_id），
+    否则「处置完 request 让原 reviewer 重试」就变成了换人重审，merge policy 的双腿身份对不上。
+
+    为什么这里**不**做工件轮转（2026-08-15 RVF-008）：本函数在 ``--dry-run`` 短路**之前**被调用，
+    ``--dry-run`` 自己的契约是 “Print plan JSON to stdout; do not write or execute”。曾经在这里
+    ``os.replace`` 掉 canonical ``review-result.json``，于是一次纯预演就把当前结果搬走了——
+    ``--plan-only`` 同理。轮转推迟到真正 execute 的那一步（``_rotate_review_request_leg_artifacts``）。
+
+    fail-closed：plan 缺失 / 不可读 / 无 reviewers 一律抛，绝不退回「整盘重派」——那正是要修的
+    行为，静默降级回去等于没修。
+    """
+    plan_path = reviewers_dir / "reviewer-plan.json"
+    if not plan_path.is_file():
+        raise ValueError(
+            f"--redispatch-review-request-legs-only 需要上一轮的 {plan_path}，但它不存在。"
+        )
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"上一轮 reviewer-plan.json 不可读：{exc}") from exc
+    if not isinstance(plan, dict) or not isinstance(plan.get("reviewers"), list) or not plan["reviewers"]:
+        raise ValueError(f"上一轮 reviewer-plan.json 里没有 reviewers：{plan_path}")
+
+    indices = [
+        index
+        for index, reviewer in enumerate(plan["reviewers"])
+        if _leg_review_request_pending(reviewer, artifacts_dir)
+    ]
+
+    plan.setdefault("warnings", [])
+    plan["warnings"].append(
+        _warn(
+            "redispatching_review_request_legs_only",
+            "warning",
+            "只重派停在 kind: request 的腿（"
+            + ", ".join(plan["reviewers"][i]["reviewer_id"] for i in indices)
+            + "）；健康且已完成的腿保留上一轮结果，不重跑、不覆写。",
+        )
+    )
+    # 上一轮的终态标记必须清掉，否则本轮无论结果如何都还挂着 blocked/failed。
+    plan["status"] = "planned"
+    plan.pop("reason", None)
+    return plan, indices
+
+
+def _rotate_review_request_leg_artifacts(
+    plan: dict[str, Any], indices: list[int], artifacts_dir: Path
+) -> list[str]:
+    """把待重派的 request 腿的 canonical ``review-result.json`` 轮转进归档目录。
+
+    **只在真正 execute 前调用**（RVF-008）：这是本流程唯一有破坏性的一步，``--dry-run`` /
+    ``--plan-only`` 都不得触发它。
+
+    为什么重派前必须轮转：不轮转的话，重跑那条 request 腿会把新的 request 追加在旧的后面
+    （writer 对同 kind 是原地追加），跨轮累积成一份越滚越大的 request 列表；而换成 issues 时
+    ``write_review_result.ensure_supersession_allowed`` 只放行 ``request → issues``、
+    ``issues`` 一旦落盘就是终态。轮转 = 每轮从**没有 canonical 文件**的干净起点开始，
+    上一轮内容仍可在归档里查。
+    """
+    rotated: list[str] = []
+    for index in indices:
+        reviewer_id = plan["reviewers"][index]["reviewer_id"]
+        result_path = artifacts_dir / "reviewers" / reviewer_id / "review-result.json"
+        if not result_path.is_file():
+            continue
+        archive_dir = result_path.parent / SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        sequence = 1 + sum(1 for _ in archive_dir.glob("review-result.*.json"))
+        archive_path = archive_dir / f"review-result.{sequence:02d}.request.json"
+        os.replace(result_path, archive_path)
+        rotated.append(str(archive_path))
+    return rotated
+
+
 def execute_plan(
     plan: dict[str, Any],
     *,
@@ -642,6 +722,7 @@ def execute_plan(
     main_harness: str | None = None,
     available: list[str] | None = None,
     max_fallback_rounds: int = 2,
+    initial_dispatch_indices: list[int] | None = None,
 ) -> dict[str, Any]:
     """派发 plan 的两路 external reviewer，回填 returncode / result path / status。
 
@@ -725,8 +806,14 @@ def execute_plan(
                 artifacts_dir / "reviewers" / reviewer["reviewer_id"] / "review-result.json"
             )
 
-    # 初派全部两腿。
-    _dispatch_indices(list(range(len(reviewers))))
+    # 初派：默认全部两腿；``initial_dispatch_indices`` 在场时只派指定的那几腿。
+    # 后者是「只重派 kind: request 的腿」用的——整盘重派会把健康且已完成的那腿也重跑一遍，
+    # 它的结果被新一轮覆写丢弃（实测一条 cursor 腿跑了三轮 2/4/3 条 issue，只留最后一轮）。
+    _dispatch_indices(
+        list(range(len(reviewers)))
+        if initial_dispatch_indices is None
+        else list(initial_dispatch_indices)
+    )
 
     # 反应式 reroute：bounded 轮次，每轮替换本轮新失败（额度 or 未产出结论）的 slot。
     can_reroute = registry is not None and main_harness is not None
@@ -1097,6 +1184,10 @@ def _build_detached_child_argv(
     selection_seed = getattr(args, "selection_seed", None)
     if selection_seed is not None:
         argv += ["--selection-seed", str(selection_seed)]
+    # 必须透传：不传的话 detached child 会退回整盘重派，把「只重派 request 腿」在真正跑活的那条
+    # 路径（--execute --detached 是主会话的标准用法）上悄悄作废。
+    if getattr(args, "redispatch_review_request_legs_only", False):
+        argv.append("--redispatch-review-request-legs-only")
     return argv
 
 
@@ -1244,6 +1335,15 @@ def main() -> int:
         help="Override pseudo-random reviewer selection seed (reproduce a recorded "
         "reviewer_selection.selection_seed; default: freshly generated and recorded).",
     )
+    parser.add_argument(
+        "--redispatch-review-request-legs-only",
+        action="store_true",
+        help="With --execute: reuse the previous reviewer-plan.json and re-run ONLY the legs "
+        "that ended in `kind: request`. Healthy completed legs keep their results untouched "
+        "(a whole-board re-dispatch re-runs them and their findings get overwritten by the "
+        "new round). Each re-dispatched leg's old artifact is rotated into "
+        "superseded-review-result-artifacts/ first.",
+    )
     parser.add_argument("--plan-only", action="store_true", help="Plan + write reviewer-plan.json; do not execute.")
     parser.add_argument("--execute", action="store_true", help="Plan then execute reviewers in parallel.")
     parser.add_argument("--dry-run", action="store_true", help="Print plan JSON to stdout; do not write or execute.")
@@ -1382,13 +1482,30 @@ def main() -> int:
         cooldown_active=set(cooled_markers),
     )
 
-    plan = route(
-        main_harness,
-        available,
-        registry,
-        require_external_only=args.require_external,
-        selection_seed=args.selection_seed,
-    )
+    redispatch_indices: list[int] | None = None
+    if args.redispatch_review_request_legs_only:
+        try:
+            plan, redispatch_indices = _resume_plan_for_review_request_legs(
+                reviewers_dir, artifacts_dir
+            )
+        except ValueError as exc:
+            print(f"[dispatch_reviewers] error: {exc}", file=sys.stderr)
+            return 1
+        if not redispatch_indices:
+            print(
+                "[dispatch_reviewers] 上一轮 plan 里没有 kind: request 的腿，无需重派。",
+                file=sys.stderr,
+            )
+            print(str(reviewers_dir / "reviewer-plan.json"))
+            return 0
+    else:
+        plan = route(
+            main_harness,
+            available,
+            registry,
+            require_external_only=args.require_external,
+            selection_seed=args.selection_seed,
+        )
 
     # 被 cooldown 排除的 enabled harness：逐一发可观测 warning（O2 契约 code）。
     enabled_ids = set(_enabled_harnesses(registry))
@@ -1438,6 +1555,12 @@ def main() -> int:
 
     if args.execute and plan["status"] != "failed" and plan["reviewers"]:
         pre_execute_warning_count = len(plan["warnings"])
+        if redispatch_indices:
+            # 破坏性的一步，只能在这里发生：--dry-run / --plan-only 已在上面短路/落空，
+            # 它们看到的仍是上一轮完整的 canonical review-result.json（RVF-008）。
+            plan["rotated_review_request_artifacts"] = _rotate_review_request_leg_artifacts(
+                plan, redispatch_indices, artifacts_dir
+            )
         plan = execute_plan(
             plan,
             repo=repo,
@@ -1450,6 +1573,7 @@ def main() -> int:
             registry=registry,
             main_harness=main_harness,
             available=available,
+            initial_dispatch_indices=redispatch_indices,
         )
         # reroute / fail-close 在 execute_plan 内可能追加 warning，只打印增量部分（避免重复已打印的）。
         for warning in plan["warnings"][pre_execute_warning_count:]:

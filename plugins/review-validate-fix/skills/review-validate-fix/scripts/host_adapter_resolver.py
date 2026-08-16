@@ -75,6 +75,25 @@ def _self_check() -> None:
     # （真实摘录行为由 parent_conversation_origin 端到端测试覆盖）。
     assert claude.parent_transcript_quoted_session_name(None) is None
     assert codex.parent_transcript_quoted_session_name(None) is None
+    # stop_hook_agent_directive_channel：Claude 走非错误的 additionalContext，Codex 走 decision:block
+    # （Codex stop.command.output 是 additionalProperties:false，多发一个键整条 Failed）。
+    from core.stop_hook_output_audience import (
+        STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION,
+        STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_NON_ERROR_ADDITIONAL_CONTEXT,
+    )
+
+    assert (
+        claude.stop_hook_agent_directive_channel()
+        == STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_NON_ERROR_ADDITIONAL_CONTEXT
+    )
+    assert (
+        codex.stop_hook_agent_directive_channel()
+        == STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
+    )
+    assert (
+        fallback.stop_hook_agent_directive_channel()
+        == STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
+    ), "host 未知兜底 Codex ⇒ 必须用最保守的阻塞通道，不得赌 host 认识 hookSpecificOutput"
     print("host_adapter_resolver self-check OK")
 
 

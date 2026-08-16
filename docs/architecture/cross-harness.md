@@ -45,6 +45,7 @@
 - **Claude Code 的 hook 是 trigger-only**：`hooks/stop.py` / `hooks/user_prompt_submit.py` 是薄 shim，读 stdin → normalize → 转发到 Codex core 脚本（`stop_review_validate_fix.py` / `rvf_user_prompt_submit.py`）。Claude Code **不重写** review 业务逻辑，只做触发器——这就是「bridged to Codex core」的含义。两入口共享单一 host-ownership 契约 `hooks/_claude_hook_entry.py`（S3，见 §3）。
 - **Codex 的 hook 标 Installer-registered 而非 Native**：Codex runtime 只扫 `~/.codex/hooks.json`、不自动加载 plugin 根的 `hooks.json`（反模式 ③ / 上游 `openai/codex#16430`）。`scripts/install_to_codex.py --configure-stop-hook` 负责把 router 绝对路径写入 `~/.codex/hooks.json`。
 - **OpenCode / Cursor / Hermes / OpenClaw 保持 Reference-only**：只发布 `agentskills.io` 兼容的 skill 文档，不接线 hook / subagent。要升级到 Adapter-backed，按 6 维契约新增一个 `adapters/<host>/`，不动 core。
+- **hook 的「输出」维度另有专文**：Stop hook 有三条出口且各 host 支持面不同（Codex 的 `stop.command.output` 是 `additionalProperties:false`，多发一个 `hookSpecificOutput` 会让整条输出 Failed）。受众分级、线材分流、防死循环保险丝见 [`stop-hook-output-audience-contract.md`](stop-hook-output-audience-contract.md)。
 
 ---
 

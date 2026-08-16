@@ -7668,6 +7668,21 @@ def _mint_agent_decision_token(
     ).token
 
 
+def _write_stub_review_packet(packet: Path, scope_of_work_text: str) -> None:
+    """按 ``build_review_packet`` 的真实排版把 scope-of-work 内联进 packet。
+
+    渲染器写的是 ``## Session Context`` + 空行 + ``.strip()`` 后的正文；gate 就锚在这个排版上，
+    所以这里必须照抄，而不是随手拼一段像 packet 的文本。
+    """
+    packet.parent.mkdir(parents=True, exist_ok=True)
+    packet.write_text(
+        "# Review Packet\n\nstub packet\n\n## Session Context\n\n"
+        + scope_of_work_text.strip()
+        + "\n\n## Git status\n\n(stub)\n",
+        encoding="utf-8",
+    )
+
+
 def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files=None, fail_first_n: int = 0):
     """构造一个 stub prepare pipeline：写出假的 run_dir + scope.contract.json，返回归一化 dict。
 
@@ -7698,8 +7713,12 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
             }),
             encoding="utf-8",
         )
-        packet = run_dir / "artifacts" / "review-packet.md"; packet.write_text("stub packet", encoding="utf-8")
         sow = run_dir / "artifacts" / "scope-of-work.md"; sow.write_text("stub scope of work", encoding="utf-8")
+        # packet 必须**内联冻结**当时的 scope-of-work：真实 prepare 就是这么干的，而 dispatch 的
+        # contract gate 校验的正是「reviewer 会读到的那一份」。写一个不含 Session Context 的假
+        # packet 会让这条 gate 在所有用例里恒真，等于把它测没了。
+        packet = run_dir / "artifacts" / "review-packet.md"
+        _write_stub_review_packet(packet, sow.read_text(encoding="utf-8"))
         prep_file = tmp / "prep" / f"{run_name}.json"
         prep_file.parent.mkdir(parents=True, exist_ok=True)
         prep_file.write_text("{}", encoding="utf-8")
@@ -8061,6 +8080,88 @@ def test_agent_cli_start_consumes_review_reopen_marker_before_allocate(tmp: Path
             os.environ["CODEX_RVF_LOG_ROOT"] = prev_log_root
 
 
+def test_agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub(
+    tmp: Path,
+) -> None:
+    """contract gate：scope-of-work 仍是 stub 就拒派，且**没有**真的调 reviewer dispatcher。
+
+    派了也白派——reviewer 侧的 contract gate 会当场把这一轮退回成 ``kind: request``，而 request
+    在同一 run 内转不回 issues（2026-08-15 run 实测：整轮 codex 评审白跑约 13 分钟）。在派发
+    **之前**拦住比派完再退回便宜一个数量级，所以这条 gate 排在 reviewer_dispatcher 之前。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    import rvf_dispatch_prompts  # noqa: PLC0415
+
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    tok = _mint_agent_decision_token(dts, roots, worktree=str(repo), now=t0)
+    cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp), lock_root=tmp / "locks",
+    )
+    scope_of_work = tmp / "runs" / "run-1" / "artifacts" / "scope-of-work.md"
+    stub_text = rvf_dispatch_prompts.dispatch_scope_of_work_text(
+        target_flow=rvf_dispatch_prompts.AGENTIC_INITIATION_FLOW,
+        cwd=str(repo), parent_session_id="s1", parent_thread_path=None, prompt_path=None,
+        run_id="run-1", run_dir=tmp / "runs" / "run-1", candidate_paths=["a.py"],
+    )
+    scope_of_work.write_text(stub_text, encoding="utf-8")
+
+    dispatcher_calls: list[dict] = []
+
+    def _recording_dispatcher(**kw):
+        dispatcher_calls.append(kw)
+        return {"status": cli.DISPATCH_OUTCOME_OK, "returncode": 0}
+
+    blocked = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert blocked.status == "scope_of_work_still_stub", blocked
+    assert blocked.exit_code == cli.EXIT_SCOPE_OF_WORK_STILL_STUB
+    assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED, "不是故障，是「还差一步没做」"
+    assert dispatcher_calls == [], "gate 必须排在 reviewer 派发之前，否则白跑一轮"
+    assert any("rerender-scope-of-work" in step for step in blocked.next_steps), blocked.next_steps
+    # token 不进终态：agent 补完 scope-of-work 后要能经同一入口重派。
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # agent 写了真实内容并删掉标记，但**没重渲** → 仍须拒派。
+    # 这是这条 gate 本来要拦的那件事：packet 在 start 时就把 stub 内联冻结了，只改盘上的文件
+    # 不会进 packet。只看盘上文件的 gate 会在这里放行，而 reviewer 读到的仍是 stub ⇒ 整轮空审。
+    written = "# Scope of Work\n\n本轮改了 a.py，审查请盯错误处理。\n"
+    scope_of_work.write_text(written, encoding="utf-8")
+    stale = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert stale.status == "scope_of_work_still_stub", stale
+    assert stale.detail["reason"] == cli.SCOPE_OF_WORK_GATE_REASON_PACKET_STALE, stale.detail
+    assert dispatcher_calls == [], "packet 里冻的还是 stub，这一轮派出去就是空审"
+
+    # 声明过的 scope-of-work 读不到 ⇒ 拒派，不能跟「压根没声明」共用放行分支：
+    # 否则「把文件删了」就是绕过这条 gate 最省事的办法。
+    scope_of_work.unlink()
+    missing = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert missing.status == "scope_of_work_still_stub", missing
+    assert missing.detail["reason"] == cli.SCOPE_OF_WORK_GATE_REASON_UNREADABLE, missing.detail
+    assert dispatcher_calls == []
+    scope_of_work.write_text(written, encoding="utf-8")
+
+    # 经重渲把新正文冻进 packet → 放行。
+    _write_stub_review_packet(tmp / "runs" / "run-1" / "artifacts" / "review-packet.md", written)
+    ok = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert ok.status == "ok", ok
+    assert len(dispatcher_calls) == 1
+
+
 def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(tmp: Path) -> None:
     """P3b：``blocked_on_reviewer_request`` 是**待处理终态**，不得报成 dispatch_failed。
 
@@ -8094,7 +8195,11 @@ def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(t
     assert blocked.exit_code == cli.EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST
     assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED
     assert "Contract Gate" in blocked.message
-    assert any("selection_seed" in step for step in blocked.next_steps), blocked.next_steps
+    # 指引必须给出**只重派 request 腿**的形态：整盘重跑会把健康且已完成的那条腿一并覆写，
+    # 这条修复只在 flag 上生效、在标准操作流程上不生效（RVF-004）。
+    assert any(
+        cli.REVIEW_REQUEST_REDISPATCH_FLAG in step for step in blocked.next_steps
+    ), blocked.next_steps
     # token 不进终态：处置完 request 之后要能经同一入口重派。
     assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
 
@@ -11005,6 +11110,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "agent_cli_start_consumes_review_reopen_marker_before_allocate",
             lambda: test_agent_cli_start_consumes_review_reopen_marker_before_allocate(
                 root / "agent-cli-start-reopen"
+            ),
+        ),
+        (
+            "agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub",
+            lambda: test_agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub(
+                root / "agent-cli-dispatch-stub-gate"
             ),
         ),
         (
