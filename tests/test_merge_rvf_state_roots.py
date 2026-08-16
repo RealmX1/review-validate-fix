@@ -400,6 +400,48 @@ def test_snapshot_fingerprint_stays_stable_when_backup_creates_an_empty_wal(
     )
     assert fingerprint is not None
     assert snapshot.is_file()
+    probe = sqlite3.connect(str(snapshot))
+    try:
+        assert probe.execute("SELECT COUNT(*) FROM sample").fetchone()[0] == 1
+    finally:
+        probe.close()
+
+
+def test_coherent_backup_does_not_checkpoint_orphaned_wal_frames(tmp_path: Path) -> None:
+    """静默源库仍可能留着非空 ``-wal``；backup 不得 rw 打开再 close 把 frame checkpoint 掉。"""
+
+    live = tmp_path / "live.sqlite3"
+    connection = sqlite3.connect(str(live))
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA wal_autocheckpoint = 0")
+    connection.execute("CREATE TABLE sample (value TEXT)")
+    connection.execute("INSERT INTO sample VALUES ('uncheckpointed')")
+    connection.commit()
+
+    orphan = tmp_path / "orphan.sqlite3"
+    for suffix in ("", "-wal", "-shm"):
+        sidecar = live.with_name(live.name + suffix)
+        if sidecar.exists():
+            orphan.with_name(orphan.name + suffix).write_bytes(sidecar.read_bytes())
+    connection.close()
+
+    wal = orphan.with_name(orphan.name + "-wal")
+    wal_size_before = wal.stat().st_size
+    assert wal_size_before > 0, "夹具没留下非空 WAL，这条测试就没在测东西"
+    fingerprint_before = tool.sha256_of_sqlite_database_including_write_ahead_log(orphan)
+
+    coherent = tmp_path / "coherent.sqlite3"
+    tool.create_sqlite_coherent_backup(orphan, coherent)
+
+    assert wal.stat().st_size == wal_size_before
+    assert (
+        tool.sha256_of_sqlite_database_including_write_ahead_log(orphan) == fingerprint_before
+    )
+    probe = sqlite3.connect(str(coherent))
+    try:
+        assert probe.execute("SELECT COUNT(*) FROM sample").fetchone()[0] == 1
+    finally:
+        probe.close()
 
 
 @pytest.mark.parametrize(
