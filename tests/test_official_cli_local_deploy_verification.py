@@ -235,3 +235,139 @@ def test_verifier_rejects_missing_official_codex_plugin(tmp_path: Path) -> None:
             home_directory=fixture["home_directory"],
             official_cli_state=fixture["official_cli_state"],
         )
+
+
+def test_verifier_rejects_second_codex_rvf_plugin_registration(tmp_path: Path) -> None:
+    """canonical 在场也不够：第二份 RVF 注册必须让 verifier 判红。
+
+    这正是本机长期同时装着两套 RVF 的形状——旧的 `review-validate-fix@local-codex-plugins`
+    从 2026-07-21 起一直活着，而只做存在性断言的 verifier 一路绿灯。
+    """
+    verifier = _load_module("verifier_for_duplicate_codex_test", VERIFIER_PATH)
+    fixture = _verification_fixture(tmp_path)
+    fixture["official_cli_state"]["codex_plugins"]["installed"].append(
+        {
+            "pluginId": "review-validate-fix@local-codex-plugins",
+            "version": "0.1.0-dev.290+gdeadbeef1234",
+            "installed": True,
+            "enabled": True,
+        }
+    )
+
+    with pytest.raises(
+        verifier.RegistrationUniquenessError,
+        match="Codex 存在多份 RVF 插件注册",
+    ) as raised:
+        verifier.verify_local_deploy(
+            installation_receipt_path=fixture["receipt_path"],
+            hooks_path=fixture["hooks_path"],
+            home_directory=fixture["home_directory"],
+            official_cli_state=fixture["official_cli_state"],
+        )
+    # 失败信息必须自带可执行清理命令，否则又退化成「写在文档里的人工待办」。
+    assert (
+        "codex plugin remove review-validate-fix@local-codex-plugins --json"
+        in str(raised.value)
+    )
+
+
+def test_verifier_rejects_second_claude_rvf_plugin_registration(tmp_path: Path) -> None:
+    verifier = _load_module("verifier_for_duplicate_claude_test", VERIFIER_PATH)
+    fixture = _verification_fixture(tmp_path)
+    fixture["official_cli_state"]["claude_plugins"].append(
+        {
+            "id": "review-validate-fix@review-validate-fix-local",
+            "version": "0.1.0-dev.290+gdeadbeef1234",
+            "scope": "user",
+            "enabled": True,
+            "installPath": str(tmp_path / "stale-claude-cache"),
+        }
+    )
+
+    with pytest.raises(
+        verifier.RegistrationUniquenessError,
+        match="Claude 存在多份 RVF 插件注册",
+    ) as raised:
+        verifier.verify_local_deploy(
+            installation_receipt_path=fixture["receipt_path"],
+            hooks_path=fixture["hooks_path"],
+            home_directory=fixture["home_directory"],
+            official_cli_state=fixture["official_cli_state"],
+        )
+    assert (
+        "claude plugin uninstall review-validate-fix@review-validate-fix-local"
+        " --scope user"
+    ) in str(raised.value)
+
+
+def test_verifier_rejects_second_codex_plugin_cache_payload_tree(
+    tmp_path: Path,
+) -> None:
+    """注册清干净了、cache 树还在磁盘上，同样必须判红。
+
+    旧会话 rollout 会把 skill 根与 hook 命令的**绝对路径**固化下来；只要那棵树还在，它就还会
+    被加载。而 `codex plugin remove` 是否连带删 cache 并不确定，所以必须独立断言。
+    """
+    verifier = _load_module("verifier_for_duplicate_cache_test", VERIFIER_PATH)
+    fixture = _verification_fixture(tmp_path)
+    stale_cache_root = (
+        fixture["home_directory"]
+        / ".codex/plugins/cache/local-codex-plugins/review-validate-fix/0.1.0"
+    )
+    stale_cache_root.mkdir(parents=True)
+
+    with pytest.raises(
+        verifier.RegistrationUniquenessError,
+        match="Codex plugin cache 里存在多份 RVF payload 树",
+    ):
+        verifier.verify_local_deploy(
+            installation_receipt_path=fixture["receipt_path"],
+            hooks_path=fixture["hooks_path"],
+            home_directory=fixture["home_directory"],
+            official_cli_state=fixture["official_cli_state"],
+        )
+
+
+def test_registration_uniqueness_failure_exits_with_dedicated_code_not_generic_verification_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """注册唯一性失败必须用**专属退出码**，与其余验证失败分开。
+
+    调用方（`scripts/rvf_local_deploy.py`）是以子进程方式跑 verifier 的，只看得见退出码；两类
+    失败的处置正好相反——其余失败要回滚，这一类**绝不能**回滚（回滚会移除刚装好的 canonical，
+    只留下残留那份）。退出码是这个区别唯一过得了进程边界的载体。
+    """
+    verifier = _load_module("verifier_for_uniqueness_exit_code_test", VERIFIER_PATH)
+    receipt_argv = ["--installation-receipt", str(tmp_path / "receipt.json")]
+
+    def _raise_registration_uniqueness_failure(**_kwargs: object):
+        raise verifier.RegistrationUniquenessError("Codex 存在多份 RVF 插件注册: [...]")
+
+    def _raise_generic_verification_failure(**_kwargs: object):
+        raise verifier.VerificationError("Codex plugin version 不匹配")
+
+    monkeypatch.setattr(
+        verifier, "verify_local_deploy", _raise_registration_uniqueness_failure
+    )
+    assert verifier.main(receipt_argv) == verifier.REGISTRATION_UNIQUENESS_EXIT_CODE
+
+    monkeypatch.setattr(
+        verifier, "verify_local_deploy", _raise_generic_verification_failure
+    )
+    assert verifier.main(receipt_argv) == 2
+    assert verifier.REGISTRATION_UNIQUENESS_EXIT_CODE != 2
+
+
+def test_verifier_registration_uniqueness_exit_code_matches_deploy_runner_routing_constant() -> None:
+    """两个文件各写一份退出码常量，漂移了就没人会发现——这条断言就是那个防漂移锚。"""
+    verifier = _load_module("verifier_for_exit_code_parity_test", VERIFIER_PATH)
+    deploy_runner = _load_module(
+        "deploy_runner_for_exit_code_parity_test",
+        ROOT / "scripts/rvf_local_deploy.py",
+    )
+
+    assert (
+        deploy_runner.OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE
+        == verifier.REGISTRATION_UNIQUENESS_EXIT_CODE
+    )

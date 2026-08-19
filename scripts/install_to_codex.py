@@ -16,7 +16,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -92,6 +92,8 @@ class OfficialCliInstallationResult:
     claude_marketplace_preexisting: bool
     claude_plugin_preinstalled: bool
     commands: tuple[tuple[str, ...], ...]
+    removed_noncanonical_codex_plugin_selectors: tuple[str, ...]
+    removed_noncanonical_claude_plugin_selectors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -568,6 +570,45 @@ def _marketplace_entry_path(entry: Mapping[str, Any]) -> Path | None:
     return None
 
 
+def noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+    installed_plugin_entries: Iterable[Any],
+    *,
+    plugin_selector_field_name: str,
+) -> tuple[str, ...]:
+    """列出「插件名是 RVF、但 selector 不是 canonical」的已安装条目。
+
+    为什么必须**枚举**而不是等值匹配 canonical selector：安装器过去只认
+    ``review-validate-fix@review-validate-fix-local-main`` 一个字符串，于是任何经**别的**
+    marketplace 注册的同名插件（本机实测的 ``review-validate-fix@local-codex-plugins``）对它
+    结构性不可见——每次部署都只刷新 canonical 那份，旧那份原封不动地活下来，两套 RVF 代码在同
+    一台机器上并行执行、各写各的 state 根。
+
+    ``review-validate-fix@*`` 这整个 selector 命名空间属于 RVF 自己，不存在「用户有意保留的第
+    二份 RVF 安装」这种合法情形，所以枚举到的非 canonical 条目一律该被清掉。
+
+    **刻意只针对 plugin，不连带删 marketplace**：marketplace 名（如 ``local-codex-plugins``）
+    是通用容器名，可能同时托管别的插件，删掉会误伤第三方；而真正造成重复 skill 与重复 hook 的
+    是**已安装的 plugin 注册**，不是「某个 marketplace 提供了 RVF」。
+    """
+    canonical_marketplace_prefix = f"{PLUGIN_NAME}@"
+    selectors: list[str] = []
+    for entry in installed_plugin_entries:
+        if not isinstance(entry, dict):
+            continue
+        selector = entry.get(plugin_selector_field_name)
+        if not isinstance(selector, str) or not selector.startswith(
+            canonical_marketplace_prefix
+        ):
+            continue
+        if selector == DEVELOPER_PLUGIN_SELECTOR:
+            continue
+        if entry.get("installed") is False:
+            continue
+        if selector not in selectors:
+            selectors.append(selector)
+    return tuple(sorted(selectors))
+
+
 def install_developer_marketplace_with_official_clis(
     *,
     active_marketplace_root: Path,
@@ -617,6 +658,39 @@ def install_developer_marketplace_with_official_clis(
     claude_installed_plugins = (
         claude_plugin_payload if isinstance(claude_plugin_payload, list) else []
     )
+
+    # 先把非 canonical 的 RVF 注册清掉，再动 canonical：否则本次部署又只刷新一份、留下另一份。
+    removed_noncanonical_codex_plugin_selectors = (
+        noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+            codex_installed_plugins,
+            plugin_selector_field_name="pluginId",
+        )
+    )
+    for stale_selector in removed_noncanonical_codex_plugin_selectors:
+        _run_official_cli_command(
+            [codex_executable_text, "plugin", "remove", stale_selector, "--json"],
+            command_runner=command_runner,
+            recorded_commands=recorded_commands,
+        )
+    removed_noncanonical_claude_plugin_selectors = (
+        noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+            claude_installed_plugins,
+            plugin_selector_field_name="id",
+        )
+    )
+    for stale_selector in removed_noncanonical_claude_plugin_selectors:
+        _run_official_cli_command(
+            [
+                claude_executable_text,
+                "plugin",
+                "uninstall",
+                stale_selector,
+                "--scope",
+                "user",
+            ],
+            command_runner=command_runner,
+            recorded_commands=recorded_commands,
+        )
 
     codex_marketplace_entry = next(
         (
@@ -771,6 +845,12 @@ def install_developer_marketplace_with_official_clis(
         claude_marketplace_preexisting=claude_marketplace_entry is not None,
         claude_plugin_preinstalled=claude_plugin_entry is not None,
         commands=tuple(recorded_commands),
+        removed_noncanonical_codex_plugin_selectors=(
+            removed_noncanonical_codex_plugin_selectors
+        ),
+        removed_noncanonical_claude_plugin_selectors=(
+            removed_noncanonical_claude_plugin_selectors
+        ),
     )
 
 
@@ -1506,6 +1586,14 @@ def main(argv: list[str] | None = None) -> int:
             "official_cli_commands": [
                 list(command) for command in official_cli_result.commands
             ],
+            "removed_noncanonical_plugin_selectors": {
+                "codex": list(
+                    official_cli_result.removed_noncanonical_codex_plugin_selectors
+                ),
+                "claude": list(
+                    official_cli_result.removed_noncanonical_claude_plugin_selectors
+                ),
+            },
             "hooks_path": str(hooks_path) if hooks_path else None,
             "user_local_data_root": str(user_local_data_paths.user_local_data_root),
             "rollback_status": deployment_transaction.rollback_status,

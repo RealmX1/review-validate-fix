@@ -36,6 +36,28 @@ class VerificationError(RuntimeError):
     pass
 
 
+class RegistrationUniquenessError(VerificationError):
+    """宿主里存在**第二份** RVF 注册或第二棵 RVF payload 树。
+
+    刻意与其余验证失败分成两类，因为**失败处置不同**：其余失败该回滚（部署没做成，回到部署前
+    最干净），而这一类**绝不能回滚**——回滚会移除刚装好的 canonical，把机器留在「只剩残留那份」
+    的更差状态。正确的 severity 是「部署做完但拒绝认证」，由人去清理残留。
+
+    这个区别必须过得了进程边界：runner 是以子进程方式跑本脚本的，只看得见退出码与输出。所以
+    `main()` 用 `REGISTRATION_UNIQUENESS_EXIT_CODE` 单独编码这一类，`rvf_local_deploy` 据此
+    绕开回滚分支。子类化 `VerificationError` 是为了让「独立跑 verifier」的调用方无需改动。
+    """
+
+
+REGISTRATION_UNIQUENESS_EXIT_CODE = 3
+"""`RegistrationUniquenessError` 的专属退出码（其余验证失败仍是 2）。
+
+必须与 `scripts/rvf_local_deploy.py` 的
+``OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE`` 逐字一致——两边同源于一个
+commit，且 `tests/test_official_cli_local_deploy_verification.py` 里有一条等值断言守着漂移。
+"""
+
+
 OfficialCliCommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 
@@ -146,6 +168,65 @@ def _marketplace_entry_path(entry: Mapping[str, Any]) -> Path | None:
         if isinstance(source, str) and source.strip():
             return Path(source).expanduser().resolve()
     return None
+
+
+def _review_validate_fix_plugin_selectors(
+    installed_plugin_entries: Any,
+    *,
+    plugin_selector_field_name: str,
+) -> list[str]:
+    """列出宿主 CLI 里所有已安装的 ``review-validate-fix@*`` selector。"""
+    if not isinstance(installed_plugin_entries, list):
+        return []
+    selectors: list[str] = []
+    for entry in installed_plugin_entries:
+        if not isinstance(entry, dict):
+            continue
+        selector = entry.get(plugin_selector_field_name)
+        if not isinstance(selector, str) or not selector.startswith(f"{PLUGIN_NAME}@"):
+            continue
+        if entry.get("installed") is False:
+            continue
+        if selector not in selectors:
+            selectors.append(selector)
+    return sorted(selectors)
+
+
+def _require_sole_review_validate_fix_registration(
+    installed_plugin_entries: Any,
+    *,
+    plugin_selector_field_name: str,
+    host_label: str,
+    cleanup_command_template: str,
+) -> None:
+    """断言宿主里**只有一个** RVF 插件注册，且它就是 canonical selector。
+
+    为什么必须是唯一性而不是存在性：既有断言全是 ``next(...)`` / ``any(...)`` 形态——只要
+    canonical 那份在，第二份对它完全不可见。本机因此长期同时注册着两套 RVF：会话 skill 清单里
+    6 个 skill 各出现两遍，两棵不同 commit 的插件树各自跑 hook、各写各的 ``review-highwater``
+    高水位，把 committed-round 漏审那类盲区重新打开。存在性断言对这一切一路绿灯。
+
+    抛 `RegistrationUniquenessError` 而不是 `VerificationError`：这一类失败**不得触发部署回滚**
+    （见该异常的 docstring）。
+    """
+    selectors = _review_validate_fix_plugin_selectors(
+        installed_plugin_entries,
+        plugin_selector_field_name=plugin_selector_field_name,
+    )
+    extra_selectors = [
+        selector for selector in selectors if selector != PLUGIN_SELECTOR
+    ]
+    if not extra_selectors:
+        return
+    cleanup_commands = " && ".join(
+        cleanup_command_template.format(selector=selector)
+        for selector in extra_selectors
+    )
+    raise RegistrationUniquenessError(
+        f"{host_label} 存在多份 RVF 插件注册: {selectors}；"
+        f"canonical 只应是 {PLUGIN_SELECTOR}。"
+        f"清理命令: {cleanup_commands}"
+    )
 
 
 def _default_command_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -454,6 +535,12 @@ def verify_local_deploy(
     _require(codex_plugin is not None, "Codex 缺少目标 plugin selector")
     _require(codex_plugin.get("version") == generated_plugin_version, "Codex plugin version 不匹配")
     _require(codex_plugin.get("enabled") is True, "Codex plugin 未启用")
+    _require_sole_review_validate_fix_registration(
+        codex_plugins,
+        plugin_selector_field_name="pluginId",
+        host_label="Codex",
+        cleanup_command_template="codex plugin remove {selector} --json",
+    )
 
     claude_marketplaces = state.get("claude_marketplaces")
     claude_marketplace = next(
@@ -485,6 +572,12 @@ def verify_local_deploy(
     _require(claude_plugin is not None, "Claude 缺少目标 plugin selector")
     _require(claude_plugin.get("version") == generated_plugin_version, "Claude plugin version 不匹配")
     _require(claude_plugin.get("enabled") is True, "Claude plugin 未启用")
+    _require_sole_review_validate_fix_registration(
+        claude_plugins,
+        plugin_selector_field_name="id",
+        host_label="Claude",
+        cleanup_command_template="claude plugin uninstall {selector} --scope user",
+    )
 
     codex_cache_root = (
         home_directory
@@ -499,6 +592,22 @@ def verify_local_deploy(
     claude_cache_root = Path(claude_install_path).expanduser().resolve()
     _verify_plugin_payload_root(codex_cache_root, label="Codex official cache")
     _verify_plugin_payload_root(claude_cache_root, label="Claude official cache")
+    # 注册被清掉、cache 树还留着 = 第二套代码仍在磁盘上；旧会话 rollout 固化的 skill 根与 hook
+    # 绝对路径会继续指向它。CLI 的 remove 是否连带删 cache 并不确定，所以这里独立断言一次。
+    # 刻意排在 canonical cache 的存在性断言之后：cache 整体缺失时，那条报错比这条清楚得多。
+    codex_plugin_cache_roots = sorted(
+        path
+        for path in (home_directory / ".codex/plugins/cache").glob(f"*/{PLUGIN_NAME}")
+        if path.is_dir()
+    )
+    if codex_plugin_cache_roots != [codex_cache_root.parent]:
+        # 与上面两条注册唯一性断言同一类失败（多出来的第二套代码），因此同样**不得回滚**。
+        raise RegistrationUniquenessError(
+            "Codex plugin cache 里存在多份 RVF payload 树: "
+            f"{[str(path) for path in codex_plugin_cache_roots]}；"
+            f"canonical 只应是 {codex_cache_root.parent}。"
+            "请在解除对应 plugin 注册后删除多余目录。"
+        )
     active_plugin_digest = _directory_digest(active_plugin_root)
     _require(
         _directory_digest(codex_cache_root) == active_plugin_digest,
@@ -570,6 +679,14 @@ def main(argv: list[str] | None = None) -> int:
             hooks_path=args.hooks_path,
             home_directory=args.home,
         )
+    except RegistrationUniquenessError as exc:
+        # 必须排在通用 VerificationError 之前：调用方按退出码决定「回滚」还是「保留部署、拒绝认证」。
+        print(
+            "RVF official CLI local deploy verification FAILED (registration uniqueness): "
+            f"{exc}",
+            file=sys.stderr,
+        )
+        return REGISTRATION_UNIQUENESS_EXIT_CODE
     except VerificationError as exc:
         print(f"RVF official CLI local deploy verification FAILED: {exc}", file=sys.stderr)
         return 2

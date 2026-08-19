@@ -337,6 +337,110 @@ def test_official_cli_update_uses_codex_remove_add_and_claude_update(
     assert ["plugin", "update", plugin_selector, "--scope", "user"] in command_tails
 
 
+def test_official_cli_install_removes_noncanonical_rvf_plugin_registrations(
+    tmp_path: Path,
+) -> None:
+    """安装器必须枚举 `review-validate-fix@*` 并清掉非 canonical 的那些。
+
+    复现本机的真实形状：canonical 与旧的 `review-validate-fix@local-codex-plugins` 同时在册。
+    等值匹配单一 selector 的旧实现对旧那份结构性失明，于是每次部署只刷新 canonical、旧那份原封
+    不动地活下来。
+    """
+    installer = _load_installer()
+    active_marketplace_root = tmp_path / "active-marketplace"
+    canonical_selector = "review-validate-fix@review-validate-fix-local-main"
+    stale_codex_selector = "review-validate-fix@local-codex-plugins"
+    stale_claude_selector = "review-validate-fix@review-validate-fix-local"
+    runner = RecordingOfficialCliRunner(
+        codex_marketplaces=[
+            {
+                "name": "review-validate-fix-local-main",
+                "root": str(active_marketplace_root),
+            }
+        ],
+        codex_installed_plugins=[
+            {"pluginId": canonical_selector, "installed": True},
+            {"pluginId": stale_codex_selector, "installed": True},
+        ],
+        claude_marketplaces=[
+            {
+                "name": "review-validate-fix-local-main",
+                "path": str(active_marketplace_root),
+            }
+        ],
+        claude_installed_plugins=[
+            {"id": canonical_selector, "enabled": True},
+            {"id": stale_claude_selector, "enabled": True},
+        ],
+    )
+
+    result = installer.install_developer_marketplace_with_official_clis(
+        active_marketplace_root=active_marketplace_root,
+        codex_executable=Path("/opt/test/bin/codex"),
+        claude_executable=Path("/opt/test/bin/claude"),
+        command_runner=runner,
+    )
+
+    command_tails = [command[1:] for command in runner.commands]
+    assert ["plugin", "remove", stale_codex_selector, "--json"] in command_tails
+    assert [
+        "plugin",
+        "uninstall",
+        stale_claude_selector,
+        "--scope",
+        "user",
+    ] in command_tails
+    assert result.removed_noncanonical_codex_plugin_selectors == (
+        stale_codex_selector,
+    )
+    assert result.removed_noncanonical_claude_plugin_selectors == (
+        stale_claude_selector,
+    )
+    # canonical 仍走正常的 remove→add / update 路径，没有被误当成残留。
+    assert ["plugin", "add", canonical_selector, "--json"] in command_tails
+    assert [
+        "plugin",
+        "update",
+        canonical_selector,
+        "--scope",
+        "user",
+    ] in command_tails
+
+
+def test_official_cli_install_keeps_non_rvf_plugins_and_reports_no_removals(
+    tmp_path: Path,
+) -> None:
+    """枚举必须严格限定在 `review-validate-fix@` 命名空间内，不得误伤别的插件。"""
+    installer = _load_installer()
+    active_marketplace_root = tmp_path / "active-marketplace"
+    runner = RecordingOfficialCliRunner(
+        codex_marketplaces=[],
+        codex_installed_plugins=[
+            {"pluginId": "ponytail@local-codex-plugins", "installed": True},
+            # 同一个 marketplace 下的别家插件；名字前缀相近但不是 RVF。
+            {"pluginId": "review-validate-fix-dashboard@x", "installed": True},
+        ],
+        claude_marketplaces=[],
+        claude_installed_plugins=[{"id": "ponytail@somewhere", "enabled": True}],
+    )
+
+    result = installer.install_developer_marketplace_with_official_clis(
+        active_marketplace_root=active_marketplace_root,
+        codex_executable=Path("/opt/test/bin/codex"),
+        claude_executable=Path("/opt/test/bin/claude"),
+        command_runner=runner,
+    )
+
+    assert result.removed_noncanonical_codex_plugin_selectors == ()
+    assert result.removed_noncanonical_claude_plugin_selectors == ()
+    removed_selectors = [
+        command[3]
+        for command in runner.commands
+        if command[1:3] in (["plugin", "remove"], ["plugin", "uninstall"])
+    ]
+    assert removed_selectors == []
+
+
 def test_transaction_restores_previous_active_release_and_official_installation(
     tmp_path: Path,
 ) -> None:

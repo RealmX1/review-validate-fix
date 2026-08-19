@@ -119,8 +119,8 @@ def hook_trust_fingerprint(
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def read_codex_hook_trust_table(codex_home: Path) -> dict[str, Any] | None:
-    """读 `config.toml` 的 `[hooks.state]`；读不到 / 无 tomllib / 无该表时返回 ``None``。"""
+def read_codex_config_document(codex_home: Path) -> dict[str, Any] | None:
+    """读 `~/.codex/config.toml` 全文；读不到 / 无 tomllib / 解析失败时返回 ``None``。"""
     config_path = Path(codex_home) / "config.toml"
     if not config_path.is_file():
         return None
@@ -129,11 +129,76 @@ def read_codex_hook_trust_table(codex_home: Path) -> dict[str, Any] | None:
     except ImportError:
         return None
     try:
-        parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return None
+
+
+def read_codex_hook_trust_table(codex_home: Path) -> dict[str, Any] | None:
+    """读 `config.toml` 的 `[hooks.state]`；读不到 / 无 tomllib / 无该表时返回 ``None``。"""
+    parsed = read_codex_config_document(codex_home)
+    if parsed is None:
         return None
     state = (parsed.get("hooks") or {}).get("state")
     return state if isinstance(state, dict) else None
+
+
+CODEX_CONFIG_PLUGIN_REGISTRATION_TABLE = "plugins"
+"""``[plugins."<selector>"]``——插件注册本身，重复 skill 清单与重复 hook 的直接来源。"""
+
+CODEX_CONFIG_HOOK_TRUST_TABLE = "hooks.state"
+"""``[hooks.state."<selector>:<相对路径>:<event>:<gi>:<hi>"]``——bundled hook 的信任条目。
+
+**实测（codex-cli 0.147.0）：`codex plugin remove <selector>` 不清理这张表**——它会删掉
+plugin cache 树与 ``[plugins."<selector>"]``，却把该 selector 的信任条目原样留下。所以「只在
+这张表里出现」的 selector 必须给出**手工删除**的指引，而不是又建议跑一遍 remove。
+"""
+
+
+def rvf_plugin_selector_registration_sources_in_codex_config(
+    config_document: Mapping[str, Any] | None,
+) -> dict[str, tuple[str, ...]]:
+    """`config.toml` 里每个 ``review-validate-fix@<marketplace>`` selector 出现在哪几张表。
+
+    两张表都要扫，且必须分辨来源——因为两者的清理手段不同（见
+    ``CODEX_CONFIG_HOOK_TRUST_TABLE``）。只做识别，不做判断：调用方决定「多于一个 selector」
+    该是告警还是阻断。
+    """
+    if not isinstance(config_document, Mapping):
+        return {}
+    selector_prefix = f"{RVF_PLUGIN_NAME}@"
+    sources: dict[str, list[str]] = {}
+
+    def record(selector: str, table_name: str) -> None:
+        tables = sources.setdefault(selector, [])
+        if table_name not in tables:
+            tables.append(table_name)
+
+    plugins_table = config_document.get(CODEX_CONFIG_PLUGIN_REGISTRATION_TABLE)
+    if isinstance(plugins_table, Mapping):
+        for key in plugins_table:
+            if isinstance(key, str) and key.startswith(selector_prefix):
+                record(key, CODEX_CONFIG_PLUGIN_REGISTRATION_TABLE)
+    hooks_table = config_document.get("hooks")
+    trust_table = hooks_table.get("state") if isinstance(hooks_table, Mapping) else None
+    if isinstance(trust_table, Mapping):
+        for key in trust_table:
+            if not isinstance(key, str) or not key.startswith(selector_prefix):
+                continue
+            # key = "<plugin>@<marketplace>:<相对路径>:<event>:<gi>:<hi>"
+            record(key.split(":", 1)[0], CODEX_CONFIG_HOOK_TRUST_TABLE)
+    return {
+        selector: tuple(sources[selector]) for selector in sorted(sources)
+    }
+
+
+def rvf_plugin_selectors_in_codex_config(
+    config_document: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    """`config.toml` 里出现过的所有 ``review-validate-fix@<marketplace>`` selector（去重排序）。"""
+    return tuple(
+        rvf_plugin_selector_registration_sources_in_codex_config(config_document)
+    )
 
 
 def verify_codex_hook_trust(
