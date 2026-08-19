@@ -42,6 +42,11 @@ except Exception:  # pragma: no cover - stay resilient if the vendor is absent
 
 
 DISPATCH_TOKEN_RE = re.compile(r"\bRVF_DISPATCH=token=([0-9A-Fa-f]{16})\b")
+# 发起决策点横幅的 needle。横幅经 cline-kanban 终端投递成为一条**真实 user message** 时，本
+# hook 会 fire 并在 prompt 正文里读到它——**这就是 INV-A 的达成信号**：一条真实 user prompt
+# 必然触发 UPS，所以 RVF 自己就能观测到「横幅确实成了 user message」，比查任何外部 ref 都可靠。
+# 与 ``kanban_followup_trigger_transcript_presence.decision_token_literal`` 同源。
+DECISION_POINT_TOKEN_RE = re.compile(r"\bRVF_DECISION_TOKEN=([0-9A-Fa-f]{16})\b")
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
@@ -151,6 +156,16 @@ def dispatch_token_from_text(text: str | None) -> str | None:
     if not text:
         return None
     match = DISPATCH_TOKEN_RE.search(text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def decision_point_token_from_text(text: str | None) -> str | None:
+    """从 prompt 正文里取出发起决策点横幅的 token（没有则 None）。"""
+    if not text:
+        return None
+    match = DECISION_POINT_TOKEN_RE.search(text)
     if match is None:
         return None
     return match.group(1).lower()
@@ -1187,6 +1202,112 @@ def _confirm_manual_decision_delivery(
         pass
 
 
+def _observe_delivered_decision_point_banner(
+    event: dict[str, Any],
+    decision_token: str,
+    *,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """带外投递的横幅**确实成了一条 user message**——INV-A 达成，在此结算。
+
+    它只做三件事：
+
+    1. 把 token 推进 ``injected``（``mark_injected`` 的新语义 = 「agent 确实拿到了这份正文」；
+       同步自注入由 Stop hook 当场推进，带外的推进点就是**这里**）；
+    2. 清掉那份带外投递意图（它的使命——覆盖「送出去了没有」的崩溃窗口——到此结束）；
+    3. 落一条诊断 + 一条 user-facing ``systemMessage``。
+
+    **三条出口的文案必须互不借用**（每一步都可能不成立，出口断言只能说到那一步真做成的事）：
+
+    * token 已达终态（withdrawn / dispatched / declined）⇒ 不推进、不清意图，如实报一句；
+    * ``mark_injected`` 抛 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒
+      **未推进**，同样不清意图，走专用文案并保留异常类型；
+    * 只有真的推进成功，才允许输出「推进为 injected」这句断言。
+
+    **它绝不 arm 在途锁。** in-progress marker 里 ``decision_token`` 的语义是「agent 已在决策点上
+    **显式接受**」，而 awaiting 锁一旦在祖先链上发现 needle 就会把状态升格 ``in_progress`` ⇒ 会对
+    一个**从未接受**的 agent 发出「继续收尾这一轮」的 nudge。``rvf-agent start`` 仍然是 arm 接受
+    凭证的**唯一**入口。
+
+    整段 best-effort：任何异常都收敛成结构化字段，绝不阻断这条 prompt——横幅已经在 agent 眼前了，
+    因为记账失败而 block 它是纯粹的自伤。
+    """
+    result: dict[str, Any] = {
+        **payload,
+        "status": "decision_point_banner_delivered",
+        "decision_token": decision_token,
+        "dispatch_origin": "cline_kanban_decision_point_banner",
+    }
+    try:
+        import rvf_decision_token_store as decision_token_store  # noqa: PLC0415
+
+        lookup = decision_token_store.read_decision_token(decision_token)
+        result["decision_token_status"] = lookup.status
+        result["decision_token_state_before_observation"] = lookup.state
+        payload_data = lookup.payload if isinstance(lookup.payload, dict) else {}
+        # 已被撤回 / 已决策的 token 落地了：**不推进、不清意图**，只如实报一句。撤回的权威是
+        # token store 自身，``rvf-agent start`` 读到终态会硬失败，这里不需要（也不该）再管束。
+        if lookup.state in (
+            decision_token_store.STATE_WITHDRAWN,
+            decision_token_store.STATE_DISPATCHED,
+            decision_token_store.STATE_DECLINED,
+        ):
+            result["decision_token_terminal_on_arrival"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_terminal_on_arrival",
+                token=decision_token,
+                status=str(lookup.state),
+            )
+            return result
+        try:
+            advanced = decision_token_store.mark_injected(decision_token)
+            result["decision_token_state"] = advanced.state
+            result["decision_token_advanced_to_injected"] = True
+        except decision_token_store.DecisionTokenError as exc:
+            # 没能推进（TTL 已过 ⇒ ``DecisionTokenExpiredError``、token 文件缺失 ⇒
+            # ``DecisionTokenNotFoundError``、状态机拒绝 ⇒ ``DecisionTokenStateError``）。
+            #
+            # 历史实现把异常记进 ``decision_token_error`` 就继续往下走，出口仍是那条逐字写着
+            # 「决策 token 推进为 injected」的 systemMessage ⇒ 磁盘 state 其实还停在 minted、
+            # ``rvf-agent start`` 实际会硬失败，开发者却被告知已经推进了。构造上完全可达：
+            # 带外横幅异步到达，回执 ``delivered_queued_behind_active_agent_turn`` 排在一个长回合
+            # 之后就能越过 1200s TTL。
+            #
+            # 故这里**提前返回**，走一条如实说明「未推进」的出口，并且**不清投递意图**：意图是
+            # 后续对账（stranded 撤回 / 重新征询）唯一的抓手，token 没能推进时清掉它等于把善后
+            # 线索也一起删了。
+            result["decision_token_error"] = f"{type(exc).__name__}: {exc}"
+            result["decision_token_advanced_to_injected"] = False
+            result["decision_point_delivery_intent_left_for_reconciliation"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_arrived_but_token_not_advanced",
+                token=decision_token,
+                status=str(lookup.status),
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            return result
+
+        detail = payload_data.get("out_of_band_delivery_detail")
+        task_id = detail.get("kanban_task_id") if isinstance(detail, dict) else None
+        if not (isinstance(task_id, str) and task_id):
+            from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+            task_id = current_kanban_task_id(event)
+        if isinstance(task_id, str) and task_id:
+            cleared = kanban_followup_lock.clear_decision_point_delivery_intent(
+                task_id=task_id, decision_token=decision_token
+            )
+            result["cleared_decision_point_delivery_intent_paths"] = cleared
+        result["systemMessage"] = _trigger_system_message(
+            kind="decision_point_banner_delivered",
+            token=decision_token,
+            detail="横幅已作为一条真实 user message 到达（可 rewind）",
+        )
+    except Exception as exc:  # noqa: BLE001 - 记账永不阻断这条 prompt
+        result["decision_token_observation_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
 def _withdrawn_dispatch_additional_context_text(
     token: str, tombstone: dict[str, Any]
 ) -> str:
@@ -1327,9 +1448,17 @@ def inspect_user_prompt_submit(
 
     token = dispatch_token_from_text(prompt)
     origin_marker = detect_origin_marker(prompt) if token is None else None
+    # 发起决策点横幅经带外投递落地成的那条 user message。它与 dispatch token / origin marker
+    # 一样是 **RVF 自己产生的机器正文**，不是用户的工作轮边界——故它同样要抑制 manual 触发判定、
+    # 轮 baseline 前移与 PostToolUse park 资格（见下）。
+    decision_point_token = (
+        decision_point_token_from_text(prompt)
+        if token is None and origin_marker is None
+        else None
+    )
     manual_decision = (
         _classify_manual_trigger(event, prompt)
-        if token is None and origin_marker is None
+        if token is None and origin_marker is None and decision_point_token is None
         else "none"
     )
     is_manual = manual_decision == "manual"
@@ -1352,7 +1481,12 @@ def inspect_user_prompt_submit(
 
             rvf_post_tool_use.mark_park_eligibility(
                 park_session_id.strip(),
-                eligible=(token is None and origin_marker is None and not is_manual),
+                eligible=(
+                    token is None
+                    and origin_marker is None
+                    and decision_point_token is None
+                    and not is_manual
+                ),
             )
     except Exception:
         pass
@@ -1366,10 +1500,17 @@ def inspect_user_prompt_submit(
     # 仅对「真正的用户 prompt」记录本轮 baseline（dispatch token / origin marker 是
     # RVF 自注入的机器 prompt，不是用户轮边界，不得前移 baseline）。纯副作用 +
     # best-effort：失败即降级为今日 dirty-only 行为。
-    if token is None and origin_marker is None:
+    if token is None and origin_marker is None and decision_point_token is None:
         round_baseline_debug = _capture_round_baseline(event, prompt)
         if round_baseline_debug:
             payload["round_baseline"] = round_baseline_debug
+
+    if decision_point_token is not None:
+        # 带外投递的发起横幅落地了 —— INV-A 达成。只推进 token + 清投递意图，**绝不 arm 在途锁**
+        # （arm 的唯一入口仍是 `rvf-agent start`，即 agent 显式接受之后）。
+        return _observe_delivered_decision_point_banner(
+            event, decision_point_token, payload=payload
+        )
 
     if token is not None:
         # ① 先问「这条投递还算数吗」，再谈消费它。
@@ -1717,6 +1858,14 @@ def _trigger_system_message(
     - ``manual_decision_declined_cooldown``：候选指纹处于 declined 冷却，未铸（尊重 agent 早前谢绝）。
     - ``manual_decision_circuit_breaker``：决策 token 铸造频率熔断，疑似递归发起，未铸。
     - ``manual_summary_failed`` / ``manual_mint_anomaly``：manual 决策点摘要构造 / 铸造异常兜底。
+    - ``decision_point_banner_delivered``：带外投递的发起横幅**已成为一条真实 user message**
+      （INV-A 达成，token 推进 injected）。
+    - ``decision_point_banner_terminal_on_arrival``：一份已达终态（withdrawn / dispatched /
+      declined）的横幅迟到落地，未推进任何状态。
+    - ``decision_point_banner_arrived_but_token_not_advanced``：横幅落地了但 ``mark_injected``
+      抛了 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒ **未推进**。与上一条
+      刻意分开：那条是「本来就不该推进」，这条是「本该推进但没推成」，善后不同（后者保留投递
+      意图交给对账）。两者都**绝不**能借用 ``decision_point_banner_delivered`` 那句断言性文案。
     """
     run_ref = run_id or "—"
     origin = dispatch_origin or "—"
@@ -1817,6 +1966,35 @@ def _trigger_system_message(
         return notice(
             status_value="manual_decision_mint_anomaly",
             message="手动触发但决策 token 铸造异常，未注入（best-effort，不阻断）",
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_delivered":
+        return notice(
+            status_value="decision_point_banner_delivered",
+            message=(
+                "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，"
+                "决策 token 推进为 injected（等待 agent 显式 start / decline）"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_terminal_on_arrival":
+        return notice(
+            status_value=status or "terminal",
+            message=(
+                "一份**已作废**的 RVF 发起决策点横幅迟到落地（token 已达终态），"
+                "未推进任何状态；rvf-agent start 会硬失败"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_arrived_but_token_not_advanced":
+        return notice(
+            status_value=status or "not_advanced",
+            message=(
+                "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，但"
+                "**决策 token 未能推进**（TTL 已过 / token 文件缺失 / 状态机拒绝，详见 detail）；"
+                "token 仍停在原状态，rvf-agent start 会硬失败。投递意图**未清除**，"
+                "留给后续对账处置（到期撤回并重新征询）"
+            ),
             extra_fields=detail_fields,
         )
     return notice(status_value=kind, message=kind)

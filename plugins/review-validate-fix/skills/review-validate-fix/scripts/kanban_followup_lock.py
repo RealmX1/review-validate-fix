@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""两族 task/session 维度的 ~/.rvf marker。**名字已经名实不符，读之前先看清这一节。**
+"""三族 task/session 维度的 ~/.rvf marker。**名字已经名实不符，读之前先看清这一节。**
 
-本模块承载两个**语义不同**的 marker 族：
+本模块承载三个**语义不同**的 marker 族：
 
 1. **in-progress 锁**（``SUBDIR_NAME`` = ``kanban-followup-in-progress``，``marker_paths`` /
    ``write_marker`` / ``read_marker`` / ``clear_marker`` / ``acquire_marker`` 那一族）——
@@ -11,8 +11,13 @@
 2. **pending 派发记录**（``PENDING_SUBDIR_NAME`` = ``kanban-followup-dispatched``，
    ``*_pending_marker`` 那一族）—— 这一族仍然**确实**是 kanban 终端投递专属的
    「已派发、未确认落地」记账。
+3. **决策点横幅的带外投递意图**（``DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME`` =
+   ``kanban-decision-point-delivery-intent``，``*_decision_point_delivery_intent`` 那一族）——
+   记的是「一次**尚未被接受**的发起征询已经交给 cline-kanban 终端投递」。与 (2) 的分别是本质的：
+   (2) 背后有 run / lease / prep 要善后，(3) 背后**只有一枚 decision token**（见计划 D0），
+   两者的撤回动作完全不同，合用一个文件只会让「撤回」语义分叉。
 
-所以模块名 ``kanban_followup_lock`` 对 (1) 已经偏窄、对 (2) 仍然准确。**没有顺手整体改名**
+所以模块名 ``kanban_followup_lock`` 对 (1) 已经偏窄、对 (2)(3) 仍然准确。**没有顺手整体改名**
 是刻意的：一次性把模块改成 ``accepted_review_run_in_flight_lock`` 只会让 (2) 变成新的名实不符
 ——正确的收敛是先把两族拆成两个模块、再各自命名，那是独立一刀，不该混进本轮的行为改动里。
 
@@ -1168,3 +1173,220 @@ def stamp_pending_notified(
     except OSError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# 决策点横幅「带外投递意图」marker family
+#
+# 与 in-progress 锁、dispatched-unconfirmed pending **三族并列、物理隔离**（各自子目录，
+# 避免同名 ``task-*.json`` 互相覆盖）。
+#
+# 它解决的是「同步 → 异步」转换独有的那个崩溃窗口：Stop hook 把横幅交给 cline-kanban 终端投递
+# 之后、拿到回执之前若进程被杀，本进程的返回值就永远拿不到了。**外部副作用之前先持久化意图**，
+# 下一次 Stop 就能从 intent 对账，而不必靠「本进程有没有返回」去猜。
+#
+# 与 pending marker 的分工：pending 记的是**一条已派发的 review follow-up**（有 run、有 lease、
+# 有 prep）；intent 记的是**一次尚未被接受的发起征询**（decision token 之外什么都还没有，见 D0）。
+# 两者的善后完全不同，合用一个文件只会让「撤回」这个动作语义分叉。
+# ---------------------------------------------------------------------------
+
+DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME = "kanban-decision-point-delivery-intent"
+#: 已落盘意图、尚未（或不知有没有）把消息交出去。进程在此崩溃 ⇒ 下一次 Stop 从这里对账。
+DECISION_POINT_DELIVERY_INTENT_STATE_RECORDED_BEFORE_SEND = "recorded_before_send"
+#: 消息已交给 cline-kanban 且回执不是「确定失败」，但 agent 还没接到（等 UPS 观测 needle）。
+DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT = "sent_awaiting_agent_receipt"
+#: intent 的 TTL 必须**严格小于**决策 token 的带外 TTL（1200s），否则 token 先死、撤回接手时
+#: 已无 token 可对账。默认 900s。
+DEFAULT_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS = 15 * 60
+DECISION_POINT_DELIVERY_INTENT_TTL_ENV = "RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS"
+
+
+def _decision_point_delivery_intent_root(root: Path | None = None) -> Path:
+    if root is not None:
+        return root.expanduser() / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
+    raw = os.environ.get(LOCK_ROOT_ENV)
+    if raw and raw.strip():
+        return Path(raw).expanduser() / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
+    return Path.home() / ".rvf" / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
+
+
+def _decision_point_delivery_intent_path(task_id: str, root: Path | None = None) -> Path:
+    return _decision_point_delivery_intent_root(root) / f"task-{safe_token(task_id)}.json"
+
+
+def decision_point_delivery_intent_ttl_seconds() -> float:
+    raw = os.environ.get(DECISION_POINT_DELIVERY_INTENT_TTL_ENV)
+    if raw is None or not raw.strip():
+        return float(DEFAULT_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(DEFAULT_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS)
+    return max(0.0, value)
+
+
+def decision_point_delivery_intent_payload(
+    *,
+    task_id: str,
+    session_id: str | None,
+    worktree: str | None,
+    cwd: str | None,
+    decision_token: str,
+    candidate_fingerprint: str | None,
+    kanban_project_path: str | None,
+    kanban_attempt_id: str | None = None,
+    origin_transcript_path: str | None = None,
+    state: str = DECISION_POINT_DELIVERY_INTENT_STATE_RECORDED_BEFORE_SEND,
+    idempotency_key: str | None = None,
+    prompt_path: str | None = None,
+    out_of_band_delivery_status: str | None = None,
+    out_of_band_delivery_failure_reason: str | None = None,
+) -> dict[str, Any]:
+    ttl = decision_point_delivery_intent_ttl_seconds()
+    return {
+        "marker_version": MARKER_VERSION,
+        "state": state,
+        "recorded_at": _iso_now(),
+        "expires_at": _iso_after(ttl),
+        "ttl_seconds": ttl,
+        "kanban_task_id": task_id,
+        "kanban_attempt_id": kanban_attempt_id,
+        "kanban_project_path": kanban_project_path,
+        "session_id": session_id,
+        "worktree": worktree,
+        "cwd": cwd,
+        # 这枚 decision token 是 intent 与 token store 之间的唯一连接键，也是 clear/update 的
+        # 防误清 guard（对偶于 pending marker 的 ``token``）。
+        "decision_token": decision_token,
+        "candidate_fingerprint": candidate_fingerprint,
+        "origin_transcript_path": origin_transcript_path,
+        # 没有这枚 key 就查不到 cline-kanban 侧的真实终态，也取消不掉这条投递。
+        "idempotency_key": idempotency_key,
+        "prompt_path": prompt_path,
+        "out_of_band_delivery_status": out_of_band_delivery_status,
+        "out_of_band_delivery_failure_reason": out_of_band_delivery_failure_reason,
+    }
+
+
+def write_decision_point_delivery_intent(
+    *,
+    task_id: str | None,
+    root: Path | None = None,
+    **fields: Any,
+) -> Path | None:
+    """落盘一份投递意图（**必须在把消息交给 cline-kanban 之前调用**）。"""
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return None
+    payload = decision_point_delivery_intent_payload(task_id=task_id, **fields)
+    target = _decision_point_delivery_intent_path(task_id, root)
+    _atomic_write(target, payload)
+    return target
+
+
+def read_decision_point_delivery_intent(
+    *,
+    task_id: str | None,
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return None
+    path = _decision_point_delivery_intent_path(task_id, root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict):
+        payload.setdefault("_marker_path", str(path))
+        return payload
+    return None
+
+
+def update_decision_point_delivery_intent(
+    *,
+    task_id: str | None,
+    decision_token: str | None = None,
+    updates: dict[str, Any],
+    root: Path | None = None,
+) -> bool:
+    """read-merge-write 一份既有意图（``decision_token`` 作防误改 guard）。
+
+    与 ``stamp_pending_notified`` 同款：直接读原始文件、合并后整体写回，绝不经
+    ``read_decision_point_delivery_intent``（它会注入 ``_marker_path``）。
+    """
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return False
+    path = _decision_point_delivery_intent_path(task_id, root)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if decision_token is not None:
+        stored = payload.get("decision_token")
+        if isinstance(stored, str) and stored and stored != decision_token:
+            return False
+    payload.pop("_marker_path", None)
+    payload.update(updates)
+    payload["updated_at"] = _iso_now()
+    try:
+        _atomic_write(path, payload)
+    except OSError:
+        return False
+    return True
+
+
+def clear_decision_point_delivery_intent(
+    *,
+    task_id: str | None,
+    decision_token: str | None = None,
+    root: Path | None = None,
+) -> list[str]:
+    """清掉某 task 的投递意图（``decision_token`` 不匹配时**不清**，避免误删更新的一份）。"""
+    if not (isinstance(task_id, str) and task_id.strip()):
+        return []
+    if decision_token is not None:
+        existing = read_decision_point_delivery_intent(task_id=task_id, root=root)
+        if isinstance(existing, dict):
+            stored = existing.get("decision_token")
+            if isinstance(stored, str) and stored and stored != decision_token:
+                return []
+    path = _decision_point_delivery_intent_path(task_id, root)
+    try:
+        path.unlink()
+    except (FileNotFoundError, OSError):
+        return []
+    return [str(path)]
+
+
+def decision_point_delivery_intent_status(
+    marker: dict[str, Any] | None,
+    *,
+    now_ts: float | None = None,
+) -> str:
+    """intent payload 始终带 ``expires_at``，故直接复用 ``marker_status`` 的过期判定。"""
+    return marker_status(marker, now_ts=now_ts)
+
+
+def iter_decision_point_delivery_intents(
+    *,
+    root: Path | None = None,
+) -> list[dict[str, Any]]:
+    """枚举全部投递意图（跨 task），形状仿 ``iter_pending_markers``：坏文件跳过，永不抛。"""
+    base = _decision_point_delivery_intent_root(root)
+    if not base.is_dir():
+        return []
+    markers: list[dict[str, Any]] = []
+    try:
+        paths = sorted(base.glob("task-*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("_marker_path", str(path))
+            markers.append(payload)
+    return markers

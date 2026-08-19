@@ -35,6 +35,7 @@ import json
 import os
 import re
 import secrets
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -48,12 +49,34 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = 1
 DEFAULT_DECISION_TOKEN_TTL_SECONDS = 900  # 15 分钟：足够主 agent 在同一 turn 内简析后 start/decline
+
+# 带外投递（横幅经 cline-kanban 终端投递成为一条真实 user message）专用 TTL。
+#
+# **为什么不能沿用 900s**：同步自注入的 900s 是按「同一个 turn 内决策」定的；带外投递的横幅要先
+# 等 cline-kanban 把它投成 user message，对方契约承诺的收敛预算就有 196.5s
+# （``core.cline_kanban_terminal_delivery`` 的
+# ``TERMINAL_DELIVERY_STATUS_CONVERGENCE_CONTRACT_BUDGET_SECONDS``），落地后还要再给 agent 一个
+# 回合去简析。下界由两条契约共同决定：
+#   * **> 200s**——覆盖对方的投递状态收敛预算；
+#   * **> 900s**——严格大于 ``kanban_followup_lock`` 的 pending marker TTL
+#     （``DEFAULT_PENDING_TTL_SECONDS`` = 15 分钟）。token 若先于投递意图死掉，撤回逻辑接手时
+#     已经没有 token 可对账，那正是 D6 要根治的「撤回对横幅是空的」。
+# 取 1200s（20 分钟）同时满足两者，并留出一个 agent 回合的余量。
+DECISION_TOKEN_TTL_SECONDS_FOR_OUT_OF_BAND_DELIVERY = 1200
 DEFAULT_TOKEN_ALLOCATION_ATTEMPTS = 8
 TOKEN_RE = re.compile(r"^[0-9a-f]{16}$")
 
 # 铸造侧频率熔断参数（R24 裁决 b）：同 session 3600 秒窗口内第 ≥3 次铸造请求拒铸。
 DEFAULT_MINT_CIRCUIT_BREAKER_WINDOW_SECONDS = 3600
 DEFAULT_MINT_CIRCUIT_BREAKER_MAX_REQUESTS = 3
+
+# mint-request ledger 的两个字段名（append-only 记账 + 追加式冲销）。
+#   * ``mint_request_record_id``：每一次铸造请求的稳定 id，同时写进 ledger 行与 token payload，
+#     使「哪一枚 token 占用了哪一份熔断额度」可对账；
+#   * ``reverses_mint_request_record_id``：一条**冲销**记录，声明上面那份额度已被撤回释放。
+# 冲销刻意做成追加行而不是回改/删除既有行——ledger 的可审计性要求它 append-only。
+MINT_REQUEST_LEDGER_RECORD_ID_FIELD = "mint_request_record_id"
+MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD = "reverses_mint_request_record_id"
 
 # 落盘根：显式参数 > 专用环境变量 > ``$RVF_HOME`` 或 ``~/.rvf`` 下的固定子目录。
 ENV_RVF_HOME = "RVF_HOME"
@@ -80,25 +103,46 @@ STATE_DISPATCHED = "dispatched"
 STATE_DECLINED = "declined"
 STATE_EXPIRED = "expired"
 STATE_LOST = "lost"
+# 用户把这次征询本身 rewind / 撤回掉了（INV-C）。**不是**决策，也不是 TTL 死亡：它表示
+# 「这枚 token 承载的那次征询已经不在会话历史里了」。进入即移出去重索引，使下一次 Stop 能且
+# 只能重新征询一次；且**不计 declined 冷却、不计铸造熔断**——用户刚刻意回退掉的征询，不该反过来
+# 把接下来的 TTL 窗口堵死。
+STATE_WITHDRAWN = "withdrawn"
 
 # 非终态且仍在决策进行中的活跃状态（去重、复活只认这三种）。
 ACTIVE_NONTERMINAL_STATES = frozenset({STATE_MINTED, STATE_INJECTED, STATE_ACKNOWLEDGED})
 # 决策已定的终态（dispatched=已派发，declined=已谢绝）。
 TERMINAL_STATES = frozenset({STATE_DISPATCHED, STATE_DECLINED})
-# 旁路终态（TTL 死亡 / 投递回执丢失）。
-BYPASS_STATES = frozenset({STATE_EXPIRED, STATE_LOST})
+# 旁路终态（TTL 死亡 / 投递回执丢失 / 用户 rewind 撤回）。三者都不是「agent 做出的决策」。
+BYPASS_STATES = frozenset({STATE_EXPIRED, STATE_LOST, STATE_WITHDRAWN})
 
 # 合法迁移邻接表：key=当前状态，value=允许迁入的目标状态集合。
 # acknowledged 自环 = start --retry 幂等重入（回退失败后再 start）。TTL 复活不是一次迁移
 # （状态不变、只续期），故不出现在本表中，由 revive_decision_token 单独处理。
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
-    STATE_MINTED: frozenset({STATE_INJECTED, STATE_ACKNOWLEDGED, STATE_DECLINED, STATE_EXPIRED, STATE_LOST}),
-    STATE_INJECTED: frozenset({STATE_ACKNOWLEDGED, STATE_DECLINED, STATE_EXPIRED, STATE_LOST}),
-    STATE_ACKNOWLEDGED: frozenset({STATE_ACKNOWLEDGED, STATE_DISPATCHED, STATE_DECLINED, STATE_EXPIRED, STATE_LOST}),
+    STATE_MINTED: frozenset(
+        {STATE_INJECTED, STATE_ACKNOWLEDGED, STATE_DECLINED, STATE_EXPIRED, STATE_LOST, STATE_WITHDRAWN}
+    ),
+    STATE_INJECTED: frozenset(
+        {STATE_ACKNOWLEDGED, STATE_DECLINED, STATE_EXPIRED, STATE_LOST, STATE_WITHDRAWN}
+    ),
+    # acknowledged → withdrawn 同样合法：用户可以在 agent 已经 ``start`` 之后才 rewind 掉横幅
+    # （D7 明确要求「start 前 rewind」与「start 后 rewind」两种都覆盖）。
+    STATE_ACKNOWLEDGED: frozenset(
+        {
+            STATE_ACKNOWLEDGED,
+            STATE_DISPATCHED,
+            STATE_DECLINED,
+            STATE_EXPIRED,
+            STATE_LOST,
+            STATE_WITHDRAWN,
+        }
+    ),
     STATE_DISPATCHED: frozenset(),
     STATE_DECLINED: frozenset(),
     STATE_EXPIRED: frozenset(),
     STATE_LOST: frozenset(),
+    STATE_WITHDRAWN: frozenset(),
 }
 
 # 每个目标状态对应的落盘时间戳字段名（进入该状态时打戳）。
@@ -109,7 +153,31 @@ _STATE_TIMESTAMP_FIELD: dict[str, str] = {
     STATE_DECLINED: "declined_at",
     STATE_EXPIRED: "expired_at",
     STATE_LOST: "lost_at",
+    STATE_WITHDRAWN: "withdrawn_at",
 }
+
+# 决策点横幅的两条投递通道（transport，**不是** lifecycle）。两侧共享同一份取值：Stop hook 用它
+# 决定往哪投、token payload 用它记「这枚 token 当初是怎么投出去的」、TTL 也按它选。
+DECISION_POINT_DELIVERY_TRANSPORT_STOP_HOOK_SELF_INJECTION = "stop_hook_self_injection"
+DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION = "cline_kanban_task_chat_session"
+DECISION_POINT_DELIVERY_TRANSPORTS = frozenset(
+    {
+        DECISION_POINT_DELIVERY_TRANSPORT_STOP_HOOK_SELF_INJECTION,
+        DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION,
+    }
+)
+
+
+def decision_token_ttl_seconds_for_delivery_transport(transport: str | None) -> int:
+    """按 transport 选 TTL：带外投递用 1200s，其余（含 None=同步自注入）沿用 900s。
+
+    同步路径的 900s **逐字不动**——那个值对「同一个 turn 内决策」是对的，改它会连带影响手动触发
+    与所有既有用例。
+    """
+    if transport == DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION:
+        return DECISION_TOKEN_TTL_SECONDS_FOR_OUT_OF_BAND_DELIVERY
+    return DEFAULT_DECISION_TOKEN_TTL_SECONDS
+
 
 # mint 结果的四种结局。
 MINT_OUTCOME_MINTED = "minted"
@@ -184,6 +252,9 @@ class CircuitBreakerStatus:
     max_requests: int
     session_id: str
     ledger_path: Path | None = None
+    # 本次铸造请求写进 mint-request ledger 的那一行的稳定 id。它同时落进 token payload，
+    # 使「撤回这枚 token」能追加一条冲销记录、把这份熔断额度还回去（INV-C）。
+    mint_request_record_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -393,6 +464,132 @@ def _digest(*parts: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 每 token 的 payload 读-改-写排他锁（整份覆盖之间的互斥）
+# ---------------------------------------------------------------------------
+#
+# **为什么必须有**：本模块所有写侧都是「读整份 payload → 改 dict 副本 → ``_atomic_write_json``
+# 整份覆盖」。两个持有各自陈旧副本的写侧交错时，后写的那次会把先写的那次**整份抹掉**——这不是
+# 纸上推演的竞态，两条真实链路本就并发：
+#
+#   * Stop hook 侧：``start_cline_kanban_followup_message`` 返回后调
+#     ``record_out_of_band_delivery_status`` 落投递回执；
+#   * 目标会话 UserPromptSubmit hook 侧：横幅一旦落成 user message 就调 ``mark_injected``
+#     把 ``minted → injected``。
+#
+# 回执为 ``delivered_and_submit_confirmed`` 时这个交错**几乎必然发生**——该回执的语义就是
+# 「消息已确认进入 agent」，也就是 UPS 那一侧正在跑。回执线程若后写，``state`` 被旧快照回滚成
+# ``minted``、``injected_at`` 与 history 条目一并丢失；随后投递意图对账
+# （``reconcile_stranded_decision_point_delivery_intents``）把一份**确实送达且已被 agent 看到**
+# 的横幅判成搁浅并 ``mark_withdrawn``，``rvf-agent start`` 硬失败。**直接破坏 INV-A。**
+#
+# 互斥用 token 文件旁的独立 flock 锁文件（形状照抄 ``_with_bootstrap_replay_takeover_lock``）。
+# 锁文件名以 ``.`` 开头且以 ``.lock`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
+# 扫描与测试里的 token 计数都看不见它。铁律：**读与写必须在同一把锁内**——只调换语句顺序不构成
+# 互斥，只锁住写入同样不构成互斥（陈旧副本仍会被整份写回去）。
+DECISION_TOKEN_PAYLOAD_MUTATION_LOCK_SUFFIX = ".payload-mutation.lock"
+
+# flock 以「打开文件描述」为单位：同一进程用第二个 fd 再 flock 同一文件会把自己锁死。故按线程
+# 记持有深度，实现**同线程可重入**——外层公开函数持锁后，内层 ``_apply_lifecycle_transition``
+# 再进同一把锁时只加深度、不再 open。不同线程各自 open 自己的描述，flock 仍然互斥。
+_decision_token_payload_mutation_lock_state_per_thread = threading.local()
+
+
+def decision_token_payload_mutation_lock_path(token_path: Path) -> Path:
+    """给定 token 文件路径，返回其 payload 读-改-写锁文件路径。"""
+    return token_path.with_name(
+        f".{token_path.name}{DECISION_TOKEN_PAYLOAD_MUTATION_LOCK_SUFFIX}"
+    )
+
+
+def _decision_token_path_for_payload_mutation_lock(
+    token: str, root: str | Path | None
+) -> Path | None:
+    """算出待加锁的 token 文件路径；token 非法则返回 None。
+
+    刻意**不**在这里抛异常：非法 token 的既有语义由随后的读取（``_read_record_any`` /
+    ``_load_active_record`` 抛 ``DecisionTokenNotFoundError``）负责，加锁这一步不该抢先改变
+    调用方看到的异常类型。
+    """
+    try:
+        return decision_token_path(token, root)
+    except DecisionTokenError:
+        return None
+
+
+@contextmanager
+def _with_decision_token_payload_mutation_lock(token_path: Path | None):
+    """持有某枚 token 的 payload 读-改-写排他锁；``token_path=None`` 或文件系统报错即降级为无锁。
+
+    降级是刻意的 best-effort：拿不到锁文件不该把决策链路整条堵死（与本模块「记账永不阻断决策」
+    一致），降级后的行为与加锁前逐字相同（即退回到原来的竞态窗口，而不是新的失败模式）。
+    """
+    if token_path is None:
+        yield
+        return
+    lock_path = decision_token_payload_mutation_lock_path(token_path)
+    lock_key = str(lock_path)
+    depth_per_lock_key = getattr(
+        _decision_token_payload_mutation_lock_state_per_thread, "depth_per_lock_key", None
+    )
+    if depth_per_lock_key is None:
+        depth_per_lock_key = {}
+        _decision_token_payload_mutation_lock_state_per_thread.depth_per_lock_key = (
+            depth_per_lock_key
+        )
+    if depth_per_lock_key.get(lock_key, 0) > 0:
+        # 同线程重入：外层已经持有这把锁，只加深度。
+        depth_per_lock_key[lock_key] += 1
+        try:
+            yield
+        finally:
+            depth_per_lock_key[lock_key] -= 1
+        return
+    try:
+        _ensure_parent_dir(lock_path)
+        fd = os.open(lock_key, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    acquired_flock = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired_flock = True
+        except OSError:
+            acquired_flock = False
+        depth_per_lock_key[lock_key] = 1
+        try:
+            yield
+        finally:
+            depth_per_lock_key.pop(lock_key, None)
+    finally:
+        if acquired_flock:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _reload_token_payload_from_disk_or_keep(record: DecisionTokenRecord) -> dict[str, Any]:
+    """锁内重读 token 文件拿最新整份 payload；读不到 / 结构不符即沿用传入副本。
+
+    这是「读+写同锁」的最后一道保险：即便某个调用方在锁**之外**读出了 record，落盘那一刻用的
+    也是锁内重读的最新整份 payload，不会把别人刚写进去的 ``state`` / ``history`` 抹掉。
+    """
+    try:
+        reloaded = json.loads(record.path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return dict(record.payload)
+    if not isinstance(reloaded, dict):
+        return dict(record.payload)
+    if reloaded.get("token") != record.payload.get("token"):
+        return dict(record.payload)
+    return reloaded
+
+
+# ---------------------------------------------------------------------------
 # run_dir 复活锚点（参照 rvf_user_prompt_submit._run_artifacts_present / FU-1 方案 B）
 # ---------------------------------------------------------------------------
 
@@ -508,6 +705,22 @@ def _load_active_record(
 # 状态迁移引擎
 # ---------------------------------------------------------------------------
 
+def _ensure_lifecycle_transition_is_legal(
+    current_state: str, target_state: str, *, token: str
+) -> None:
+    """按 ``LEGAL_TRANSITIONS`` 邻接表前验一次迁移是否合法，非法抛 ``DecisionTokenStateError``。
+
+    单独拆出来是为了让「有副作用的迁移」（如 ``mark_withdrawn`` 要先删去重索引、先冲销熔断额度）
+    能在**动任何东西之前**先把合法性验掉：非法迁移必须什么都不改。
+    """
+    allowed = LEGAL_TRANSITIONS.get(current_state, frozenset())
+    if target_state not in allowed:
+        raise DecisionTokenStateError(
+            f"非法状态迁移: {current_state} → {target_state}（token={token}；"
+            f"当前状态允许迁往 {sorted(allowed) or '无（终态）'}）"
+        )
+
+
 def _apply_lifecycle_transition(
     record: DecisionTokenRecord,
     target_state: str,
@@ -518,25 +731,27 @@ def _apply_lifecycle_transition(
     """校验并落盘一次生命周期状态迁移；非法迁移抛 ``DecisionTokenStateError``。
 
     合法性以 ``LEGAL_TRANSITIONS`` 邻接表为准。落盘时打对应状态时间戳、追加一条 history。
+
+    整段（重读 + 校验 + 整份覆盖）都在该 token 的
+    ``_with_decision_token_payload_mutation_lock`` 内完成，与 ``record_out_of_band_delivery_status``
+    这类正交字段写入**互斥**。锁可重入，故公开入口先持锁再读 record 也不会自锁死；而锁内那次
+    ``_reload_token_payload_from_disk_or_keep`` 保证即便 record 是锁外读出的陈旧副本，写回去的
+    也是最新整份 payload。
     """
-    current = str(record.payload.get("state"))
-    allowed = LEGAL_TRANSITIONS.get(current, frozenset())
-    if target_state not in allowed:
-        raise DecisionTokenStateError(
-            f"非法状态迁移: {current} → {target_state}（token={record.token}；"
-            f"当前状态允许迁往 {sorted(allowed) or '无（终态）'}）"
-        )
-    payload = dict(record.payload)
-    payload["state"] = target_state
-    stamp_field = _STATE_TIMESTAMP_FIELD.get(target_state)
-    if stamp_field:
-        payload[stamp_field] = format_timestamp(now)
-    history = list(payload.get("history") or [])
-    history.append({"from": current, "to": target_state, "at": format_timestamp(now)})
-    payload["history"] = history
-    if extra_updates:
-        payload.update(extra_updates)
-    _atomic_write_json(record.path, payload)
+    with _with_decision_token_payload_mutation_lock(record.path):
+        payload = _reload_token_payload_from_disk_or_keep(record)
+        current = str(payload.get("state"))
+        _ensure_lifecycle_transition_is_legal(current, target_state, token=record.token)
+        payload["state"] = target_state
+        stamp_field = _STATE_TIMESTAMP_FIELD.get(target_state)
+        if stamp_field:
+            payload[stamp_field] = format_timestamp(now)
+        history = list(payload.get("history") or [])
+        history.append({"from": current, "to": target_state, "at": format_timestamp(now)})
+        payload["history"] = history
+        if extra_updates:
+            payload.update(extra_updates)
+        _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
@@ -561,6 +776,42 @@ def _read_dedup_index(path: Path) -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _clear_dedup_index_for_token_payload(
+    payload: dict[str, Any] | None, *, root: str | Path | None
+) -> Path | None:
+    """把某枚 token 对应的去重索引条目移除（返回被删路径；无索引/删不掉一律 None）。
+
+    仅在 ``withdrawn`` 这一支使用：用户 rewind 掉征询后，去重索引若还活着，下一次 Stop 会
+    命中 ``deduplicated`` 而静默停——**用户刚刚刻意回退掉的征询会把整个 TTL 窗口堵死**。
+    删索引前先核对它确实指向本 token，避免误删一枚更新的 token 的索引。
+
+    **残留（如实记录，本轮判定可接受）**：这个「先读索引确认指向本 token、再 unlink」不是原子
+    CAS。每 token 的 ``_with_decision_token_payload_mutation_lock`` 锁的是**本 token 的文件**，
+    而去重索引文件是按 ``(worktree, session_id, candidate_fingerprint)`` 哈希命名、由同键的
+    **任意** token 共享的，故本锁覆盖不到它；刻意**不**为它引入第二把跨文件锁。最坏情况是多删
+    或少删一个索引条目：多删 → 下一次 Stop 重新征询一次（``mint`` 会重建索引）；少删 → 索引指向
+    的 token 已是 withdrawn 终态，``_dedup_active_lookup`` 判它非活跃、走 ``index_is_stale``
+    覆盖分支。两个方向都会被下一轮 mint 收敛，不会永久卡死。
+    """
+    if not isinstance(payload, dict):
+        return None
+    worktree = payload.get("worktree")
+    session_id = payload.get("session_id")
+    fingerprint = payload.get("candidate_fingerprint")
+    token = payload.get("token")
+    if not (isinstance(worktree, str) and isinstance(fingerprint, str) and isinstance(token, str)):
+        return None
+    index_path = _dedup_index_path(worktree, str(session_id or ""), fingerprint, root)
+    existing = _read_dedup_index(index_path)
+    if existing is None or existing.get("token") != token:
+        return None
+    try:
+        index_path.unlink()
+    except OSError:
+        return None
+    return index_path
 
 
 def _dedup_active_lookup(
@@ -605,11 +856,34 @@ def count_recent_mint_requests(
     window_seconds: int = DEFAULT_MINT_CIRCUIT_BREAKER_WINDOW_SECONDS,
     root: str | Path | None = None,
 ) -> int:
-    """统计给定 session 在 ``[now - window, now]`` 滚动窗口内已记录的铸造请求条数（纯计数）。"""
+    """统计给定 session 在 ``[now - window, now]`` 滚动窗口内**仍占用熔断额度**的铸造请求条数。
+
+    纯计数，零语义判断，但要扣掉两类行：
+
+      * **冲销记录本身**（带 ``reverses_mint_request_record_id``）不是一次铸造请求；
+      * **已被冲销的铸造请求**——token 进 ``withdrawn`` 时会向同一 ledger 追加一条冲销记录。
+        INV-C 要求撤回「不计冷却也不计熔断」：用户刚刻意 rewind 掉的那次征询，不该反过来把接
+        下来一整个窗口（默认 3600s）堵死。冲销刻意做成**追加行**而不是删既有行，ledger 保持
+        append-only 的可审计性。
+    """
     ledger = _mint_request_ledger_path(session_id, root)
+    ledger_records = _read_jsonl(ledger)
+    reversed_mint_request_record_ids = {
+        record[MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD]
+        for record in ledger_records
+        if isinstance(record.get(MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD), str)
+    }
     horizon = _coerce_now(now) - timedelta(seconds=window_seconds)
     count = 0
-    for record in _read_jsonl(ledger):
+    for record in ledger_records:
+        if isinstance(record.get(MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD), str):
+            continue
+        mint_request_record_id = record.get(MINT_REQUEST_LEDGER_RECORD_ID_FIELD)
+        if (
+            isinstance(mint_request_record_id, str)
+            and mint_request_record_id in reversed_mint_request_record_ids
+        ):
+            continue
         raw = record.get("at")
         if not isinstance(raw, str):
             continue
@@ -620,6 +894,43 @@ def count_recent_mint_requests(
         if at >= horizon:
             count += 1
     return count
+
+
+def _reverse_mint_request_charge_for_withdrawn_token(
+    payload: dict[str, Any],
+    *,
+    reason: str,
+    now: datetime,
+    circuit_breaker_root_dir: str | Path | None,
+) -> str | None:
+    """向 mint-request ledger **追加**一条冲销记录，把这枚 token 铸造时占用的熔断额度还回去。
+
+    只在 ``mark_withdrawn`` 这一支调用（INV-C：撤回不计冷却、也**不计熔断**）。返回被冲销的
+    ``mint_request_record_id``；没有可冲销的额度占用（去重命中返回的既有 token、或本字段落地
+    之前铸出的老 token）即返回 None，不留噪声记录。
+
+    追加而非回改/删行：ledger 是 append-only 的可审计记录，删行会毁掉「这个 session 到底请求过
+    几次铸造」的证据。扣减发生在 ``count_recent_mint_requests`` 的统计侧。
+    """
+    mint_request_record_id = payload.get(MINT_REQUEST_LEDGER_RECORD_ID_FIELD)
+    session_id = payload.get("session_id")
+    if not isinstance(mint_request_record_id, str) or not mint_request_record_id:
+        return None
+    if not isinstance(session_id, str):
+        return None
+    try:
+        _append_jsonl(
+            _mint_request_ledger_path(session_id, circuit_breaker_root_dir),
+            {
+                MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD: mint_request_record_id,
+                "at": format_timestamp(now),
+                "reversed_because": reason,
+                "token": payload.get("token"),
+            },
+        )
+    except OSError:
+        return None
+    return mint_request_record_id
 
 
 def _register_mint_request_and_check_breaker(
@@ -636,11 +947,17 @@ def _register_mint_request_and_check_breaker(
 
     先向 mint-request ledger 追加本次请求（含当前请求本身参与计数），再统计窗口内条数；
     达到 ``max_requests`` 即熔断，向 circuit-breaker-tripped ledger 追加一条并返回 tripped 状态。
+
+    追加的那一行带一个稳定的 ``mint_request_record_id`` 并随 ``CircuitBreakerStatus`` 带回；
+    调用方把它写进 token payload，使这枚 token 被 ``mark_withdrawn`` 撤回时能追加一条冲销记录
+    把额度还回去（INV-C）。
     """
+    mint_request_record_id = f"mint-request-{secrets.token_hex(8)}"
     ledger = _mint_request_ledger_path(session_id, root)
     _append_jsonl(
         ledger,
         {
+            MINT_REQUEST_LEDGER_RECORD_ID_FIELD: mint_request_record_id,
             "at": format_timestamp(now),
             "worktree": worktree,
             "candidate_fingerprint": candidate_fingerprint,
@@ -668,6 +985,7 @@ def _register_mint_request_and_check_breaker(
             max_requests=max_requests,
             session_id=session_id,
             ledger_path=tripped_ledger,
+            mint_request_record_id=mint_request_record_id,
         )
     return CircuitBreakerStatus(
         tripped=False,
@@ -676,6 +994,7 @@ def _register_mint_request_and_check_breaker(
         max_requests=max_requests,
         session_id=session_id,
         ledger_path=None,
+        mint_request_record_id=mint_request_record_id,
     )
 
 
@@ -770,7 +1089,8 @@ def mint_decision_token(
     session_id: str,
     candidate_fingerprint: str,
     candidate_summary: dict[str, Any] | None = None,
-    ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
+    delivery_transport: str | None = None,
+    ttl_seconds: int | None = None,
     now: datetime | None = None,
     root: str | Path | None = None,
     cooldown_root: str | Path | None = None,
@@ -788,7 +1108,14 @@ def mint_decision_token(
 
     三闸皆过则新铸 token（``outcome=minted``），落盘 + 建/覆盖去重索引。``candidate_fingerprint`` 对
     本模块不透明。
+
+    ``delivery_transport`` 只描述「这枚 token 的横幅打算怎么送出去」（见
+    :data:`DECISION_POINT_DELIVERY_TRANSPORTS`），既落进 payload 供后续对账，也在
+    ``ttl_seconds`` 缺省时决定 TTL（带外投递 1200s / 其余 900s）。显式传 ``ttl_seconds``
+    时以显式值为准。
     """
+    if ttl_seconds is None:
+        ttl_seconds = decision_token_ttl_seconds_for_delivery_transport(delivery_transport)
     if ttl_seconds <= 0:
         raise DecisionTokenError("ttl_seconds 必须为正")
     now_dt = _coerce_now(now)
@@ -833,12 +1160,15 @@ def mint_decision_token(
             ),
         )
 
-    # 三闸皆过：新铸 token。
+    # 三闸皆过：新铸 token。把本次铸造请求在 ledger 里的 id 一并写进 payload——撤回时凭它
+    # 追加冲销记录，把这份熔断额度还回去（INV-C：withdrawn 不计冷却、也不计熔断）。
     record = _create_token_record(
         worktree=worktree,
         session_id=session_id,
         candidate_fingerprint=candidate_fingerprint,
         candidate_summary=candidate_summary,
+        delivery_transport=delivery_transport,
+        mint_request_record_id=breaker.mint_request_record_id,
         ttl_seconds=ttl_seconds,
         now=now_dt,
         root=root,
@@ -879,6 +1209,8 @@ def _create_token_record(
     session_id: str,
     candidate_fingerprint: str,
     candidate_summary: dict[str, Any] | None,
+    delivery_transport: str | None = None,
+    mint_request_record_id: str | None = None,
     ttl_seconds: int,
     now: datetime,
     root: str | Path | None,
@@ -895,6 +1227,13 @@ def _create_token_record(
             "session_id": session_id,
             "candidate_fingerprint": candidate_fingerprint,
             "candidate_summary": candidate_summary,
+            # 这枚 token 的横幅打算走哪条 transport（None = 同步 stdout 自注入的历史形状）。
+            "decision_point_delivery_transport": delivery_transport,
+            # 带外投递回执（cline-kanban 终端投递契约的四态之一；对本模块不透明）。与 ``state``
+            # **正交**：它只说「消息送到没送到」，绝不参与 lifecycle 判定。
+            "out_of_band_delivery_status": None,
+            # 本次铸造请求在 mint-request ledger 里那一行的 id：撤回时凭它追加冲销记录。
+            MINT_REQUEST_LEDGER_RECORD_ID_FIELD: mint_request_record_id,
             "created_at": format_timestamp(now),
             "minted_at": format_timestamp(now),
             "expires_at": format_timestamp(expires_at),
@@ -931,15 +1270,194 @@ def mark_injected(
     now: datetime | None = None,
     ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
 ) -> DecisionTokenRecord:
-    """``minted → injected``（Stop hook 在**确认投递注入后**调用）。已是 injected 则幂等返回。
+    """``minted → injected`` = 「**agent 确实拿到了这份正文**」。已是 injected 则幂等返回。
 
-    遵循 87e9338「确认落地才 arm」教训：仅在真正投递注入后推进，不做乐观预 arm。
+    这条语义对**两条 transport 通吃**，推进权一律由「观测到 agent 拿到了」驱动：
+
+    * **同步自注入**：``main()`` 在决策函数返回后**同步**把正文写进 stdout，故 Stop hook 侧当场推进
+      （行为与本轮改动前逐字一致）。
+    * **带外投递**（横幅经 cline-kanban 投成一条真实 user message）：Stop 这一刻 agent 什么也没拿到，
+      **绝不**在此推进；真正的推进点是目标会话的 UserPromptSubmit hook 观测到
+      ``RVF_DECISION_TOKEN=<token>`` 落进 prompt 的那一刻。
+
+    统一之后 TTL 对账的判据自然正确：到期仍 ``minted`` = 投出去了没人接 ⇒ ``lost`` 并告警；
+    到期已 ``injected`` 但未 acknowledge = agent 看到了没决定 ⇒ 按既有语义静默 ``expired``。
+
+    遵循 87e9338「确认落地才 arm」教训：仅在真正确认交付后推进，不做乐观预 arm。
+
+    读 + 写整段在每 token 排他锁内：这条推进与 Stop hook 侧的
+    ``record_out_of_band_delivery_status`` 天然并发，无互斥时后写的一方会把先写的一方整份抹掉。
     """
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    if record.state == STATE_INJECTED:
-        return record
-    return _apply_lifecycle_transition(record, STATE_INJECTED, now=now_dt)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        if record.state == STATE_INJECTED:
+            return record
+        return _apply_lifecycle_transition(record, STATE_INJECTED, now=now_dt)
+
+
+def record_out_of_band_delivery_status(
+    token: str,
+    *,
+    status: str | None,
+    detail: Mapping[str, Any] | None = None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> DecisionTokenRecord:
+    """把带外投递的回执落到 token 上（**正交字段，不动 ``state``**）。
+
+    ``status`` 是 cline-kanban 终端投递契约的取值（``delivered_and_submit_confirmed`` /
+    ``delivered_queued_behind_active_agent_turn`` / ``accepted_pending_submit_confirmation`` /
+    ``delivery_failed``），对本模块不透明；``None`` 即清除。
+
+    **为什么不做成新的 lifecycle 状态**：``acknowledge_decision_token`` 只接受
+    minted/injected/acknowledged，任何插在中间的新状态都会让随后的 ``rvf-agent start`` 报非法迁移。
+    投递状态与决策状态本就是两个维度，硬塞进一条状态机只会同时毁掉两者。
+
+    作用于 TTL 已过期的 token 也合法（``_read_record_any``）：回执迟到时我们仍要如实记账。
+
+    **读 + 写整段必须在每 token 排他锁内**：本函数与目标会话 UPS hook 的 ``mark_injected``
+    真实并发（``delivered_and_submit_confirmed`` 的语义就是「消息已确认进入 agent」）。若本函数
+    在锁外读快照、随后整份覆盖，``state`` 会被回滚成 ``minted``、``injected_at`` 与 history
+    条目一并丢失，随后搁浅对账会作废一份**确实送达并已被 agent 看到**的横幅（破坏 INV-A）。
+    """
+    now_dt = _coerce_now(now)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _read_record_any(token, root=root, now=now_dt)
+        payload = dict(record.payload)
+        payload["out_of_band_delivery_status"] = status
+        payload["out_of_band_delivery_status_updated_at"] = format_timestamp(now_dt)
+        if detail is not None:
+            payload["out_of_band_delivery_detail"] = dict(detail)
+        _atomic_write_json(record.path, payload)
+    return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
+
+
+def mark_withdrawn(
+    token: str,
+    *,
+    reason: str,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+    circuit_breaker_root_dir: str | Path | None = None,
+) -> DecisionTokenRecord:
+    """旁路终态 ``… → withdrawn``：这次征询已被用户 rewind / 被 RVF 主动撤回（INV-C）。
+
+    进入终态的同时做两件对账，二者都是「能 rewind」这个功能的另一半：
+
+      * **移除去重索引条目**，使下一次 Stop 能且只能重新征询一次；
+      * **冲销这枚 token 铸造时占用的那一份熔断额度**——向 mint-request ledger 追加一条冲销
+        记录（``_reverse_mint_request_charge_for_withdrawn_token``）。没有它，连续 rewind 两次
+        之后第三次征询会直接撞上 ``circuit_breaker_tripped``，会话被静默一整个窗口（默认
+        3600s）；而 INV-C 明确写着 withdrawn「不计冷却也不计熔断」。
+
+    刻意**不**写 declined 冷却表：撤回不是 agent 做出的谢绝决策。
+
+    整段（读 → 前验合法性 → 删索引 → 冲销 → **单次**落盘）都在该 token 的排他锁内：
+    合法性必须在动索引/动 ledger **之前**验掉（非法迁移要什么都不改），而落盘只写一次——
+    「迁移写一次、补字段再写一次」是同族的「无互斥整份 read-modify-write」形状，即便有锁也不该
+    留着。
+
+    作用于可能已 TTL 过期的 token（``_read_record_any``）：撤回对账多半发生在 TTL 边缘。
+    """
+    now_dt = _coerce_now(now)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _read_record_any(token, root=root, now=now_dt)
+        _ensure_lifecycle_transition_is_legal(
+            str(record.payload.get("state")), STATE_WITHDRAWN, token=record.token
+        )
+        extra_updates: dict[str, Any] = {"withdrawn_reason": reason}
+        removed_index = _clear_dedup_index_for_token_payload(record.payload, root=root)
+        if removed_index is not None:
+            extra_updates["withdrawn_dedup_index_path"] = str(removed_index)
+        reversed_mint_request_record_id = _reverse_mint_request_charge_for_withdrawn_token(
+            record.payload,
+            reason=reason,
+            now=now_dt,
+            circuit_breaker_root_dir=circuit_breaker_root_dir,
+        )
+        if reversed_mint_request_record_id is not None:
+            extra_updates["withdrawn_mint_request_charge_reversal_of_record_id"] = (
+                reversed_mint_request_record_id
+            )
+        return _apply_lifecycle_transition(
+            record, STATE_WITHDRAWN, now=now_dt, extra_updates=extra_updates
+        )
+
+
+def iter_decision_tokens_for_session(
+    *,
+    worktree: str,
+    session_id: str | None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> list[DecisionTokenLookup]:
+    """枚举 ``(worktree, session_id)`` 名下的全部 token（best-effort，坏文件跳过，永不抛）。
+
+    单一真相源：Stop hook 的投递回执对账、带外在途查询、rewind 对账三处共用它，避免各写一份
+    glob+过滤而在字段名上分叉。
+    """
+    results: list[DecisionTokenLookup] = []
+    if not session_id:
+        return results
+    try:
+        base = decision_token_root(root)
+        if not base.is_dir():
+            return results
+        token_files = sorted(base.glob("*.json"))
+    except OSError:
+        return results
+    for path in token_files:
+        try:
+            lookup = read_decision_token(path.stem, root=root, now=now)
+        except DecisionTokenError:
+            continue
+        payload = lookup.payload
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("worktree") != worktree or payload.get("session_id") != session_id:
+            continue
+        results.append(lookup)
+    return results
+
+
+def find_decision_token_awaiting_out_of_band_delivery(
+    *,
+    worktree: str,
+    session_id: str | None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> DecisionTokenLookup | None:
+    """本 (worktree, session) 是否已有一枚**带外投出去、尚未被 agent 接到**的横幅。
+
+    判据 = ``transport 是带外`` **且** ``TTL 未过期`` **且** ``state 仍是 minted``。
+    ``injected`` 不算在途：那说明 UPS 已经观测到它落地了，决策权已经在 agent 手上（走的是
+    「已接到、还没决定」那条既有路径）。
+
+    D2 第 2 步用它挡住迟到窗口内的重复铸币——**它在 mint 之前生效，故不写 mint-request ledger、
+    不计熔断**。闸挡住不是「重复铸币」，不该烧熔断额度。
+    """
+    for lookup in iter_decision_tokens_for_session(
+        worktree=worktree, session_id=session_id, root=root, now=now
+    ):
+        payload = lookup.payload or {}
+        if (
+            payload.get("decision_point_delivery_transport")
+            != DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
+        ):
+            continue
+        if lookup.status != "valid":
+            continue
+        if lookup.state != STATE_MINTED:
+            continue
+        return lookup
+    return None
 
 
 def acknowledge_decision_token(
@@ -955,15 +1473,18 @@ def acknowledge_decision_token(
     重量级准备失败后回退到 acknowledged、再次 start 即再走一轮 acknowledge。
     """
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    if record.state not in (STATE_MINTED, STATE_INJECTED, STATE_ACKNOWLEDGED):
-        raise DecisionTokenStateError(
-            f"非法状态迁移: {record.state} → {STATE_ACKNOWLEDGED}（token={record.token}；已达终态不可再 start）"
-        )
-    extra: dict[str, Any] = {"start_attempt_count": int(record.payload.get("start_attempt_count") or 0) + 1}
-    if "acknowledged_at" not in record.payload:
-        extra["acknowledged_at"] = format_timestamp(now_dt)
-    return _apply_lifecycle_transition(record, STATE_ACKNOWLEDGED, now=now_dt, extra_updates=extra)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        if record.state not in (STATE_MINTED, STATE_INJECTED, STATE_ACKNOWLEDGED):
+            raise DecisionTokenStateError(
+                f"非法状态迁移: {record.state} → {STATE_ACKNOWLEDGED}（token={record.token}；已达终态不可再 start）"
+            )
+        extra: dict[str, Any] = {"start_attempt_count": int(record.payload.get("start_attempt_count") or 0) + 1}
+        if "acknowledged_at" not in record.payload:
+            extra["acknowledged_at"] = format_timestamp(now_dt)
+        return _apply_lifecycle_transition(record, STATE_ACKNOWLEDGED, now=now_dt, extra_updates=extra)
 
 
 def record_start_failure(
@@ -980,14 +1501,17 @@ def record_start_failure(
     以坐实「dispatched 前才可从失败回退到 acknowledged」的边界。状态不变，仅落盘失败诊断。
     """
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    if record.state != STATE_ACKNOWLEDGED:
-        raise DecisionTokenStateError(
-            f"只能在 acknowledged 状态记录 start 失败回退，当前={record.state}（token={record.token}）"
-        )
-    payload = dict(record.payload)
-    payload["last_start_failure"] = {"reason": reason, "at": format_timestamp(now_dt)}
-    _atomic_write_json(record.path, payload)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        if record.state != STATE_ACKNOWLEDGED:
+            raise DecisionTokenStateError(
+                f"只能在 acknowledged 状态记录 start 失败回退，当前={record.state}（token={record.token}）"
+            )
+        payload = dict(record.payload)
+        payload["last_start_failure"] = {"reason": reason, "at": format_timestamp(now_dt)}
+        _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
@@ -1001,14 +1525,17 @@ def attach_run_anchor(
 ) -> DecisionTokenRecord:
     """把在途 ``run_dir`` 锚点写入 token（``start``/prepare 建好 run 后由 CLI 调用），供 TTL 复活判据。"""
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    if record.state not in ACTIVE_NONTERMINAL_STATES:
-        raise DecisionTokenStateError(
-            f"只能在活跃非终态挂载 run 锚点，当前={record.state}（token={record.token}）"
-        )
-    payload = dict(record.payload)
-    payload["run_anchor_dir"] = run_dir
-    _atomic_write_json(record.path, payload)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        if record.state not in ACTIVE_NONTERMINAL_STATES:
+            raise DecisionTokenStateError(
+                f"只能在活跃非终态挂载 run 锚点，当前={record.state}（token={record.token}）"
+            )
+        payload = dict(record.payload)
+        payload["run_anchor_dir"] = run_dir
+        _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
@@ -1028,17 +1555,20 @@ def attach_bootstrap_gate(
     gate 本身由 ``rvf_bootstrap_gate.build_bootstrap_gate`` 按白名单构造，本函数不做二次加工。
     """
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    if record.state not in ACTIVE_NONTERMINAL_STATES:
-        raise DecisionTokenStateError(
-            f"只能在活跃非终态挂载 bootstrap gate，当前={record.state}（token={record.token}）"
-        )
-    payload = dict(record.payload)
-    if gate is None:
-        payload.pop("bootstrap_gate", None)
-    else:
-        payload["bootstrap_gate"] = dict(gate)
-    _atomic_write_json(record.path, payload)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        if record.state not in ACTIVE_NONTERMINAL_STATES:
+            raise DecisionTokenStateError(
+                f"只能在活跃非终态挂载 bootstrap gate，当前={record.state}（token={record.token}）"
+            )
+        payload = dict(record.payload)
+        if gate is None:
+            payload.pop("bootstrap_gate", None)
+        else:
+            payload["bootstrap_gate"] = dict(gate)
+        _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 
 
@@ -1054,10 +1584,13 @@ def attach_bootstrap_gate(
 # lease，违反「恢复不得产生重复 lease / reviewer」。
 #
 # 占位刻意**不写进 token payload**：payload 的每个写侧（``attach_bootstrap_gate`` /
-# ``attach_run_anchor`` / ``record_start_failure``）都是「读-改-写整份 payload」，两个并发进程各
-# 持一份陈旧副本时后写的一次会把刚盖上的在途字段整份抹掉——占位于是失去原子性。改用 token 文件
-# 旁的独立 sidecar + ``O_EXCL``（内核级互斥）。文件名以 ``.`` 开头且不以 ``.json`` 结尾，故
-# ``sweep_stale_decision_tokens`` 的 ``*.json`` 扫描与测试里的 token 计数都看不见它。
+# ``attach_run_anchor`` / ``record_start_failure``）都是「读-改-写整份 payload」。这些写侧现在
+# 已由 ``_with_decision_token_payload_mutation_lock`` 串行化（不再互相抹掉），但**占位本身仍然
+# 必须是 O_EXCL 创建**：占位要回答的是「谁抢到了这一轮重放」，那是一个 test-and-set，不是一次
+# 字段更新——用「先拿锁再读 payload 判断」实现它，等于把内核级的原子抢占降级成一段可被锁降级
+# （best-effort 无锁回退）影响的临界区。故继续用 token 文件旁的独立 sidecar + ``O_EXCL``。
+# 文件名以 ``.`` 开头且不以 ``.json`` 结尾，故 ``sweep_stale_decision_tokens`` 的 ``*.json``
+# 扫描与测试里的 token 计数都看不见它。
 BOOTSTRAP_REPLAY_CLAIM_SUFFIX = ".bootstrap-replay-claim"
 # 默认占位寿命上界：正常路径由 ``release_bootstrap_replay_in_flight`` 在 prepare 收尾后立刻释放，
 # 这个窗口只覆盖「持有者被硬杀、来不及释放」的残留，过窗即可被下一次 start 接手。
@@ -1197,11 +1730,14 @@ def mark_dispatched(
 ) -> DecisionTokenRecord:
     """``acknowledged → dispatched``（rvf-agent ``dispatch``，终态）。minted/injected 直接 dispatch 为非法。"""
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    extra: dict[str, Any] = {}
-    if strictness is not None:
-        extra["dispatched_strictness"] = strictness
-    return _apply_lifecycle_transition(record, STATE_DISPATCHED, now=now_dt, extra_updates=extra)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        extra: dict[str, Any] = {}
+        if strictness is not None:
+            extra["dispatched_strictness"] = strictness
+        return _apply_lifecycle_transition(record, STATE_DISPATCHED, now=now_dt, extra_updates=extra)
 
 
 def mark_declined(
@@ -1218,8 +1754,13 @@ def mark_declined(
     同时把 ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表——指纹未变即不再注入。
     """
     now_dt = _coerce_now(now)
-    record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-    updated = _apply_lifecycle_transition(record, STATE_DECLINED, now=now_dt, extra_updates={"decline_reason": reason})
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        updated = _apply_lifecycle_transition(
+            record, STATE_DECLINED, now=now_dt, extra_updates={"decline_reason": reason}
+        )
     record_declined_fingerprint(
         worktree=str(updated.payload.get("worktree")),
         candidate_fingerprint=str(updated.payload.get("candidate_fingerprint")),
@@ -1240,11 +1781,14 @@ def mark_lost(
 ) -> DecisionTokenRecord:
     """旁路终态 ``… → lost``（S4 投递回执 TTL 超时无任一信号；作用于可能已 TTL 过期的 token）。"""
     now_dt = _coerce_now(now)
-    record = _read_record_any(token, root=root, now=now_dt)
-    extra: dict[str, Any] = {}
-    if reason is not None:
-        extra["lost_reason"] = reason
-    return _apply_lifecycle_transition(record, STATE_LOST, now=now_dt, extra_updates=extra)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _read_record_any(token, root=root, now=now_dt)
+        extra: dict[str, Any] = {}
+        if reason is not None:
+            extra["lost_reason"] = reason
+        return _apply_lifecycle_transition(record, STATE_LOST, now=now_dt, extra_updates=extra)
 
 
 def mark_expired(
@@ -1256,11 +1800,14 @@ def mark_expired(
 ) -> DecisionTokenRecord:
     """旁路终态 ``… → expired``（显式把一枚 TTL 死亡且不复活的 token 终局化；作用于已过期 token）。"""
     now_dt = _coerce_now(now)
-    record = _read_record_any(token, root=root, now=now_dt)
-    extra: dict[str, Any] = {}
-    if reason is not None:
-        extra["expired_reason"] = reason
-    return _apply_lifecycle_transition(record, STATE_EXPIRED, now=now_dt, extra_updates=extra)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _read_record_any(token, root=root, now=now_dt)
+        extra: dict[str, Any] = {}
+        if reason is not None:
+            extra["expired_reason"] = reason
+        return _apply_lifecycle_transition(record, STATE_EXPIRED, now=now_dt, extra_updates=extra)
 
 
 def revive_decision_token(
@@ -1290,11 +1837,16 @@ def revive_decision_token(
         raise DecisionTokenError(f"仅可复活活跃非终态 token，当前 state={lookup.state}")
     if not _run_anchor_present(lookup.payload):
         raise DecisionTokenExpiredError("token 已过 TTL 且无在途 run 锚点，不复活")
-    payload = dict(lookup.payload)
-    payload["created_at"] = format_timestamp(now_dt)
-    payload["expires_at"] = format_timestamp(now_dt + timedelta(seconds=ttl_seconds))
-    payload["revived_count"] = int(payload.get("revived_count") or 0) + 1
-    _atomic_write_json(lookup.path, payload)
+    # 续期同样是「读整份 → 改 → 整份覆盖」，一样要在每 token 排他锁内落盘，并以**锁内重读**
+    # 的最新 payload 为写入基底（lookup 多半是锁外读出来的）。
+    with _with_decision_token_payload_mutation_lock(lookup.path):
+        payload = _reload_token_payload_from_disk_or_keep(
+            DecisionTokenRecord(token=lookup.token, path=lookup.path, payload=lookup.payload)
+        )
+        payload["created_at"] = format_timestamp(now_dt)
+        payload["expires_at"] = format_timestamp(now_dt + timedelta(seconds=ttl_seconds))
+        payload["revived_count"] = int(payload.get("revived_count") or 0) + 1
+        _atomic_write_json(lookup.path, payload)
     return DecisionTokenRecord(token=lookup.token, path=lookup.path, payload=payload)
 
 
@@ -1325,5 +1877,12 @@ def sweep_stale_decision_tokens(
             path.unlink()
         except OSError:
             continue
+        # 连同它的 payload 读-改-写锁文件一并清掉，否则每枚 token 都会在根目录留一个空锁文件
+        # 永久堆积。此刻该 token 已是终态/真过期，不再会有新的 payload 变更需要互斥；极端情况下
+        # 若真有并发持有者，最坏也只是那一瞬失去互斥（回到加锁前的行为），不会损坏数据。
+        try:
+            decision_token_payload_mutation_lock_path(path).unlink()
+        except OSError:
+            pass
         removed.append(path)
     return removed

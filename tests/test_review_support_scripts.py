@@ -9671,6 +9671,37 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_captures_round_baseline",
             lambda: test_rvf_user_prompt_submit_captures_round_baseline(root / "round-baseline-capture"),
         ),
+        # --- 带外投递的发起横幅落地（INV-A 达成信号 / 不 arm 锁 / 检测器互斥 / 撤回中和） ---
+        (
+            "rvf_user_prompt_submit_observes_delivered_decision_point_banner",
+            lambda: test_rvf_user_prompt_submit_observes_delivered_decision_point_banner(
+                root / "banner-observed"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock(
+                root / "banner-no-arm"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector(
+                root / "banner-detectors"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing",
+            lambda: test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing(
+                root / "banner-withdrawn"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced",
+            lambda: test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
+                root / "banner-expired-not-advanced"
+            ),
+        ),
         (
             "allocate_review_scope_includes_committed_round",
             lambda: test_allocate_review_scope_includes_committed_round(root / "committed-allocate-e2e"),

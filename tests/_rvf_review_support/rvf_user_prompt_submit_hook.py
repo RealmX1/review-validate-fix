@@ -46,6 +46,11 @@ __all__ = [
     'test_rvf_user_prompt_submit_dispatch_no_prep_emits_user_visible_systemMessage',
     'test_rvf_user_prompt_submit_render_hook_payload_merges_channels',
     'test_rvf_user_prompt_submit_captures_round_baseline',
+    'test_rvf_user_prompt_submit_observes_delivered_decision_point_banner',
+    'test_rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock',
+    'test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector',
+    'test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing',
+    'test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced',
 ]
 
 
@@ -1590,3 +1595,299 @@ def test_rvf_user_prompt_submit_declines_reviving_stale_prep(tmp_path: Path) -> 
         assert payload_in_window.get("prep_revived") is True, payload_in_window
     finally:
         os.environ.pop("CODEX_RVF_PREP_ROOT", None)
+
+
+# --- 带外投递的发起横幅落地：INV-A 的达成信号 --------------------------------------
+
+def _delivered_decision_point_banner_prompt(stop_hook, summary: dict, token: str) -> str:
+    """用**生产渲染函数**造出这条 user message 的正文，绝不在测试里手抄横幅。
+
+    手抄等于给自己发一份永远不会漂移的假正文——而 D9 恰恰要改这段文案，
+    「改文案会不会让横幅把自己判成手动触发」正是这几条用例要守的东西。
+    """
+    return stop_hook._render_decision_point_injection_prompt(
+        summary=summary,
+        token=token,
+        fork_context=None,
+        delivery_transport="cline_kanban_task_chat_session",
+    )
+
+
+def _mint_out_of_band_decision_token(dts, stop_hook, repo: Path, session_id: str):
+    """铸一枚带外 transport 的 token 并返回 ``(token, banner)``。"""
+    import stop_decision_candidate_summary  # noqa: PLC0415
+
+    summary = stop_decision_candidate_summary.build_candidate_summary(
+        event={"cwd": str(repo), "session_id": session_id},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+    )
+    mint = dts.mint_decision_token(
+        worktree=str(repo.resolve()),
+        session_id=session_id,
+        candidate_fingerprint=str(summary.get("candidate_fingerprint") or ""),
+        candidate_summary=summary,
+        delivery_transport=dts.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION,
+    )
+    assert mint.outcome == dts.MINT_OUTCOME_MINTED, mint
+    return mint.token, _delivered_decision_point_banner_prompt(stop_hook, summary, mint.token)
+
+
+def _load_stop_hook_module_for_ups_tests():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import stop_review_validate_fix as _stop  # noqa: PLC0415
+
+    return _stop
+
+
+def test_rvf_user_prompt_submit_observes_delivered_decision_point_banner(
+    tmp_path: Path,
+) -> None:
+    """INV-A 的达成信号：横幅作为一条真实 user prompt 到达 ⇒ UPS 观测到 needle ⇒ token 推进
+    ``injected``，投递意图被清。
+
+    这条 needle 的价值就在这里——**一条真实 user prompt 必然触发 UPS**，所以 RVF 自己就能观测到
+    「横幅确实成了 user message」，比查任何外部 ref 都可靠。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        try:
+            token, banner = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-sess"
+            )
+            import kanban_followup_lock as kfl  # noqa: PLC0415
+
+            intent_path = kfl.write_decision_point_delivery_intent(
+                task_id="task-banner",
+                session_id="banner-sess",
+                worktree=str(repo.resolve()),
+                cwd=str(repo),
+                decision_token=token,
+                candidate_fingerprint="fp",
+                kanban_project_path=str(repo),
+                idempotency_key=f"rvf-decision-point-{token}",
+                state=kfl.DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT,
+            )
+            assert intent_path is not None and Path(intent_path).is_file()
+
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": banner,
+                    "cwd": str(repo),
+                    "session_id": "banner-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                    "kanban_task_id": "task-banner",
+                }
+            )
+            assert payload["status"] == "decision_point_banner_delivered", payload
+            assert payload["decision_token"] == token, payload
+            assert payload["decision_token_state"] == dts.STATE_INJECTED, payload
+            assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+            assert not Path(intent_path).exists(), "投递意图应在观测后被清掉"
+            assert "真实 user message" in str(payload.get("systemMessage") or "")
+            # 横幅是 RVF 自己的机器正文，不是用户的工作轮边界 ⇒ 不得前移 round baseline。
+            assert "round_baseline" not in payload, payload
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock(
+    tmp_path: Path,
+) -> None:
+    """横幅落地**绝不** arm 在途锁。
+
+    锁里 ``decision_token`` 的语义是「agent 已在决策点上**显式接受**」，而 awaiting 锁一旦在祖先链上
+    发现 needle 就会升格 ``in_progress`` ⇒ 会对一个**从未接受**的 agent 发「继续收尾这一轮」的 nudge。
+    ``rvf-agent start`` 仍是 arm 接受凭证的唯一入口。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    lock_root = tmp_path / "locks"
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(lock_root)
+        try:
+            token, banner = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-noarm-sess"
+            )
+            submit.inspect_user_prompt_submit(
+                {
+                    "prompt": banner,
+                    "cwd": str(repo),
+                    "session_id": "banner-noarm-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                    "kanban_task_id": "task-banner-noarm",
+                }
+            )
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+    armed = sorted(lock_root.glob("*.json")) if lock_root.is_dir() else []
+    assert armed == [], armed
+
+
+def test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector(
+    tmp_path: Path,
+) -> None:
+    """横幅正文必须**只**命中决策点检测器，其余全 miss。
+
+    今天正文里两处 ``$review-validate-fix`` 只因被反引号包着才没命中手动触发正则（它要求前面是
+    行首或空白）——而 D9 正要改这段文案。没有这条 gate，一次无心的换行就会让横幅把自己判成手动
+    触发、再铸一枚 token 再注入一遍。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        token, banner = _mint_out_of_band_decision_token(
+            dts, stop_hook, repo, "banner-detector-sess"
+        )
+    event = {
+        "prompt": banner,
+        "cwd": str(repo),
+        "session_id": "banner-detector-sess",
+        "hook_event_name": "UserPromptSubmit",
+    }
+    assert submit.decision_point_token_from_text(banner) == token
+    assert submit.dispatch_token_from_text(banner) is None
+    assert submit.detect_origin_marker(banner) is None
+    assert submit.detect_manual_trigger(banner) is False
+    assert submit._classify_manual_trigger(event, banner) == "none"
+    for name, pattern in submit.DISPATCH_ORIGIN_MARKERS:
+        assert pattern.search(banner) is None, name
+    # 自注入变体（transport=None）同样不得命中——两条 transport 用的是同一份正文。
+    with _manual_decision_env(tmp_path):
+        import stop_decision_candidate_summary  # noqa: PLC0415
+
+        summary = stop_decision_candidate_summary.build_candidate_summary(
+            event={"cwd": str(repo), "session_id": "banner-detector-sess"},
+            cwd=str(repo),
+            repo=str(repo),
+            ledger=None,
+        )
+    self_injected = stop_hook._render_decision_point_injection_prompt(
+        summary=summary, token=token, fork_context=None, delivery_transport=None
+    )
+    assert submit.detect_manual_trigger(self_injected) is False
+    assert submit.dispatch_token_from_text(self_injected) is None
+
+
+def test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing(
+    tmp_path: Path,
+) -> None:
+    """一份**已撤回**的横幅迟到落地：不推进、不清意图，只如实报一句。
+
+    这正是 D6 要的效果——撤回的权威是 token store 自身，``rvf-agent start`` 读到终态会硬失败。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        token, banner = _mint_out_of_band_decision_token(
+            dts, stop_hook, repo, "banner-withdrawn-sess"
+        )
+        dts.mark_withdrawn(token, reason="test-withdrawal")
+        payload = submit.inspect_user_prompt_submit(
+            {
+                "prompt": banner,
+                "cwd": str(repo),
+                "session_id": "banner-withdrawn-sess",
+                "hook_event_name": "UserPromptSubmit",
+            }
+        )
+        assert payload["decision_token_terminal_on_arrival"] is True, payload
+        assert dts.read_decision_token(token).state == dts.STATE_WITHDRAWN
+        # 撤回后 start 必须硬失败（既有非法迁移路径）。
+        try:
+            dts.acknowledge_decision_token(token)
+        except dts.DecisionTokenStateError:
+            pass
+        else:  # pragma: no cover - 失败即回归
+            raise AssertionError("撤回后的 token 不得还能 acknowledge")
+
+
+def test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
+    tmp_path: Path,
+) -> None:
+    """TTL 已过的横幅落地：``mark_injected`` 抛异常 ⇒ **绝不**输出「推进为 injected」那句断言。
+
+    构造上完全可达：带外横幅异步到达，回执 ``delivered_queued_behind_active_agent_turn`` 排在一个
+    长回合之后就能越过 1200s TTL。历史实现只对 ``withdrawn/dispatched/declined`` 做了早返回，其余
+    一律往下走——``DecisionTokenExpiredError`` / ``DecisionTokenNotFoundError`` 被吞进
+    ``decision_token_error``，出口却仍是那条逐字写着「决策 token 推进为 injected（等待 agent 显式
+    start / decline）」的 systemMessage。于是磁盘 ``state`` 还停在 ``minted``、``rvf-agent start``
+    实际会硬失败，**开发者却被告知已经推进了**。
+
+    顺带钉住善后：token 没能推进时**不清投递意图**——意图是后续对账（到期撤回 + 重新征询）唯一的
+    抓手，清掉它等于把善后线索一起删了。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        try:
+            token, banner = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-expired-sess"
+            )
+            import kanban_followup_lock as kfl  # noqa: PLC0415
+
+            intent_path = kfl.write_decision_point_delivery_intent(
+                task_id="task-banner-expired",
+                session_id="banner-expired-sess",
+                worktree=str(repo.resolve()),
+                cwd=str(repo),
+                decision_token=token,
+                candidate_fingerprint="fp",
+                kanban_project_path=str(repo),
+                idempotency_key=f"rvf-decision-point-{token}",
+                state=kfl.DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT,
+            )
+            assert intent_path is not None and Path(intent_path).is_file()
+
+            # 把 TTL 推到过去 = 横幅排在一个长回合之后才落地。
+            token_path = dts.decision_token_path(token)
+            on_disk = json.loads(Path(token_path).read_text(encoding="utf-8"))
+            on_disk["expires_at"] = "2000-01-01T00:00:00+00:00"
+            Path(token_path).write_text(
+                json.dumps(on_disk, ensure_ascii=False), encoding="utf-8"
+            )
+
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": banner,
+                    "cwd": str(repo),
+                    "session_id": "banner-expired-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                    "kanban_task_id": "task-banner-expired",
+                }
+            )
+
+            # ① 出口文案不得断言「已推进」。
+            system_message = str(payload.get("systemMessage") or "")
+            assert "推进为 injected" not in system_message, system_message
+            assert "未能推进" in system_message, system_message
+            assert "DecisionTokenExpiredError" in system_message, system_message
+            # ② 结构化字段如实：没推进就是没推进，且保留具体异常类型。
+            assert payload.get("decision_token_advanced_to_injected") is False, payload
+            assert payload.get("decision_token_state") is None, payload
+            assert str(payload.get("decision_token_error") or "").startswith(
+                "DecisionTokenExpiredError"
+            ), payload
+            assert payload.get("decision_token_status") == "expired", payload
+            # ③ 磁盘 state 仍是 minted —— 这正是那句断言性文案与事实相悖之处。
+            assert dts.read_decision_token(token).state == dts.STATE_MINTED
+            # ④ 投递意图未被误清，留给后续对账。
+            assert Path(intent_path).is_file(), "未推进时不得清掉投递意图"
+            assert payload.get("cleared_decision_point_delivery_intent_paths") is None, payload
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)

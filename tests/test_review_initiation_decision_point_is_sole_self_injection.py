@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""结构性 gate：**投给当前活会话**的自注入，有且只有发起决策点横幅。
+"""结构性 gate：**一次 Stop 投给 agent 的发起消息**，有且只有发起决策点横幅。
 
 护的不变量（计划 §二）：
 
-* **INV-1** —— 一次 Stop 至多产生一种自注入：发起决策点横幅。
+* **INV-1** —— 一次 Stop 至多产生**一条**面向 agent 的发起正文，**无论它走哪条 transport**
+  （stdout 自注入 / cline-kanban 带外投递）。文件名里的 ``sole_self_injection`` 是上一轮留下的
+  历史口径——那时只有自注入一条路；口径已扩，文件名待独立一刀改，不混进本轮行为改动。
 * **INV-2** —— ``$review-validate-fix`` 只能由 agent 在接受之后自己发出，不得是任何注入正文
   的第一行。
 
@@ -23,6 +25,12 @@ fork prompt、新 task prompt、文档、测试）。真正要钉死的不是「
 **恒为假绿**——而实测它们占全部阻塞注入的 90/92。第 4 组把在途锁摆出来，逼 Stop 走 reengage，
 并在**两个 host** 下各验一次不变量（Claude 走非错误的 additionalContext，兜底走 decision:block）。
 
+**第 5/6 组：带外投递（本轮新增）**。横幅改经 cline-kanban 终端投递成为一条真实 user message
+之后，正文**根本不进 stdout payload**——只看 payload 的 INV-1 断言对新 transport 恒为真（第二代
+假绿）。故这两组分别验：投递成功时 stdout **不驱动 agent**（只有 systemMessage）且带外投递恰好
+一条；投递**确定失败**时当场回落自注入（INV-B）且带外投递为零。两组合起来才让
+``len(stdout 正文) + len(带外投递) <= 1`` 这条口径在两条 transport 上都非 vacuous。
+
 ⚠️ 自扫型 checker 假绿前例（见 dev 记录）：本文件被 ``scripts/check_skill_contracts.sh`` 的
 ``repo_required_files`` 清单要求存在 + 一条 ``run_step`` pytest 条目执行。新增此类 gate 时务必在
 **tracked** 状态下先验一次真红，否则 untracked 期的自扫会给出假绿。
@@ -41,7 +49,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _rvf_test_support.sole_self_injection_invariants import (  # noqa: E402
-    assert_self_injection_invariants,
+    assert_agent_facing_initiation_message_invariants,
+    out_of_band_decision_point_deliveries,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,39 +114,55 @@ def _invoke_stop_hook(
     return json.loads(completed.stdout or "{}")
 
 
-def _assert_no_imperative_self_injection(payload: dict[str, object]) -> str | None:
-    """INV-1 + INV-2：至多一条投给模型的正文，且其首行不得是那条祈使句。
+def _assert_sole_initiation_message(
+    payload: dict[str, object], state_dir: Path
+) -> str | None:
+    """INV-1 + INV-2：stdout 正文 + 带外投递合计至多一条，且 stdout 正文首行不是那条祈使句。
 
-    ⚠️ 本函数曾只在 payload **顶层**找 ``reason`` / ``additionalContext``。Stop 的
-    ``additionalContext`` 实际嵌在 ``hookSpecificOutput`` 里，于是 Claude 通道上这条断言恒不
-    命中——假绿。现在统一走 ``_rvf_test_support.sole_self_injection_invariants``。
+    ⚠️ 两代假绿都收在 ``_rvf_test_support.sole_self_injection_invariants`` 里治了：第一代是只看
+    payload **顶层**（Stop 的 ``additionalContext`` 嵌在 ``hookSpecificOutput`` 里）；第二代是只看
+    payload（带外投递的正文根本不进 payload）。故 ``run_log_root`` 是必填参数。
     """
-    return assert_self_injection_invariants(payload)
+    return assert_agent_facing_initiation_message_invariants(
+        payload, run_log_root=state_dir
+    )
 
 
 def test_in_kanban_task_dirty_stop_injects_decision_point_banner(tmp_path: Path) -> None:
+    """task 内 + 显式钉住自注入 transport：仍必须是横幅，不是落地即执行的祈使句。
+
+    ⚠️ 本轮之后 task 内的**默认** transport 已改为带外投递（见
+    ``test_in_kanban_task_dirty_stop_delivers_banner_out_of_band``）。这条用例钉的是「P1 那道
+    lifecycle 判据没有回退」——即便强制走自注入通道，出口也仍是横幅而非祈使句。故显式设置逃生口
+    env，让它与 transport 的默认值解耦（否则它测的就变成另一件事了）。
+    """
     repo = _init_dirty_repo(tmp_path / "dirty")
+    state = tmp_path / "state"
     payload = _invoke_stop_hook(
         repo=repo,
-        state_dir=tmp_path / "state",
+        state_dir=state,
         # 默认 fork mode（auto）+ 在 task 内：历史上这一组合推出 backend=kanban-followup，
         # 被当成「延续」而绕过决策点。P1 之后必须走横幅。
-        extra_env={"KANBAN_TASK_ID": "task-sole-injection"},
+        extra_env={
+            "KANBAN_TASK_ID": "task-sole-injection",
+            "RVF_DECISION_POINT_DELIVERY_TRANSPORT": "stop_hook_self_injection",
+        },
     )
     assert payload.get("decision") == "block", payload
     reason = str(payload.get("reason") or "")
     assert reason.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE, reason[:400]
     assert "RVF_DECISION_TOKEN=" in reason, reason[:400]
-    _assert_no_imperative_self_injection(payload)
+    _assert_sole_initiation_message(payload, state)
 
 
 def test_outside_kanban_task_dirty_stop_injects_decision_point_banner(tmp_path: Path) -> None:
     repo = _init_dirty_repo(tmp_path / "dirty")
-    payload = _invoke_stop_hook(repo=repo, state_dir=tmp_path / "state")
+    state = tmp_path / "state"
+    payload = _invoke_stop_hook(repo=repo, state_dir=state)
     assert payload.get("decision") == "block", payload
     reason = str(payload.get("reason") or "")
     assert reason.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE, reason[:400]
-    _assert_no_imperative_self_injection(payload)
+    _assert_sole_initiation_message(payload, state)
 
 
 def test_explicit_kanban_followup_transport_override_stays_reachable(tmp_path: Path) -> None:
@@ -251,7 +276,7 @@ def test_in_flight_run_reengage_branch_keeps_self_injection_invariants(
         event_overrides=dict(host_marker),
     )
 
-    body = assert_self_injection_invariants(payload)
+    body = _assert_sole_initiation_message(payload, state)
     assert body is not None, payload
     # 走的确实是 reengage，不是发起决策点——否则这条用例又退回去测第一支了。
     assert DECISION_POINT_BANNER_FIRST_LINE not in body, body[:400]
@@ -259,6 +284,172 @@ def test_in_flight_run_reengage_branch_keeps_self_injection_invariants(
     assert channel in payload, payload
     # AUD-4：每条 agent-directive 都要带 developer-only 旁注，否则终端里与真崩溃不可分辨。
     assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"], payload
+
+
+# --- 第 5/6 组：带外投递（横幅成为一条真实 user message） ----------------------------
+
+_STUB_CLINE_KANBAN_CLIENT = '''#!/usr/bin/env python3
+"""测试替身：冒充 ``cline_kanban_client.py message``，回一份可控的终端投递回执。
+
+它同时把收到的 ``--prompt-file`` 正文原样另存一份，供用例断言「投出去的确实是横幅原文」。
+"""
+import argparse
+import json
+import os
+import sys
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("subcommand")
+    parser.add_argument("--repo")
+    parser.add_argument("--task-cmd")
+    parser.add_argument("--task-id")
+    parser.add_argument("--prompt-file")
+    parser.add_argument("--source")
+    parser.add_argument("--idempotency-key")
+    parser.add_argument("--attempt-id")
+    parser.add_argument("--wait-for-terminal-status-timeout-ms")
+    args, _unknown = parser.parse_known_args()
+    capture = os.environ["RVF_TEST_DELIVERED_PROMPT_CAPTURE_PATH"]
+    if args.prompt_file:
+        with open(args.prompt_file, encoding="utf-8") as handle:
+            body = handle.read()
+        with open(capture, "w", encoding="utf-8") as handle:
+            handle.write(body)
+    receipt = {
+        "message_id": f"terminal:{args.task_id}:{args.idempotency_key}",
+        "task_id": args.task_id,
+        "idempotency_key": args.idempotency_key,
+        "terminal_delivery_status": os.environ["RVF_TEST_TERMINAL_DELIVERY_STATUS"],
+    }
+    failure_reason = os.environ.get("RVF_TEST_TERMINAL_DELIVERY_FAILURE_REASON")
+    if failure_reason:
+        receipt["terminal_delivery_failure_reason"] = failure_reason
+    sys.stdout.write(json.dumps(receipt))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _write_stub_cline_kanban_client(path: Path) -> Path:
+    path.write_text(_STUB_CLINE_KANBAN_CLIENT, encoding="utf-8")
+    return path
+
+
+def test_in_kanban_task_dirty_stop_delivers_banner_out_of_band(tmp_path: Path) -> None:
+    """本轮存在的理由：task 内的默认 transport 是**带外投递**，横幅成为一条真实 user message。
+
+    断言三件事：
+    1. 当前会话的 stdout **不驱动 agent**（既无 ``decision`` 也无 ``hookSpecificOutput``，
+       只有给开发者看的 ``systemMessage``）——D3 的「走 developer_only，不加第三个 audience」；
+    2. 带外投递恰好一条（INV-1 在两条 transport 上合计 ≤ 1）；
+    3. 投出去的确实是横幅原文，且带 kanban 变体那两行（来源声明 + 时效说明）。
+    """
+    repo = _init_dirty_repo(tmp_path / "dirty")
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    capture = state / "delivered-prompt.md"
+    client = _write_stub_cline_kanban_client(state / "stub-cline-kanban-client.py")
+
+    payload = _invoke_stop_hook(
+        repo=repo,
+        state_dir=state,
+        extra_env={
+            "KANBAN_TASK_ID": "task-out-of-band",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(client),
+            "RVF_TEST_DELIVERED_PROMPT_CAPTURE_PATH": str(capture),
+            # 默认回执：契约唯一的**非终态**，且因为短等默认 0ms，它是最常见的返回。
+            "RVF_TEST_TERMINAL_DELIVERY_STATUS": "accepted_pending_submit_confirmation",
+        },
+    )
+
+    assert "decision" not in payload, payload
+    assert "hookSpecificOutput" not in payload, payload
+    assert isinstance(payload.get("systemMessage"), str) and payload["systemMessage"], payload
+    assert "cline-kanban" in str(payload["systemMessage"]), payload["systemMessage"]
+
+    deliveries = out_of_band_decision_point_deliveries(state)
+    assert len(deliveries) == 1, deliveries
+    token = deliveries[0].get("decision_token")
+    assert isinstance(token, str) and token, deliveries[0]
+
+    delivered_body = capture.read_text(encoding="utf-8")
+    assert delivered_body.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE
+    assert f"RVF_DECISION_TOKEN={token}" in delivered_body
+    assert "来源：这条消息**不是开发者打的**" in delivered_body
+    assert "时效：这枚 token 有 TTL" in delivered_body
+
+    # token 停在 minted：推进权交给 UPS（观测到 needle 才是「agent 确实拿到了」）。
+    token_path = state / "rvf-home" / "agentic-initiation-decision-tokens" / f"{token}.json"
+    token_payload = json.loads(token_path.read_text(encoding="utf-8"))
+    assert token_payload["state"] == "minted", token_payload
+    assert (
+        token_payload["decision_point_delivery_transport"] == "cline_kanban_task_chat_session"
+    ), token_payload
+    assert (
+        token_payload["out_of_band_delivery_status"] == "accepted_pending_submit_confirmation"
+    ), token_payload
+
+    # 投递意图已落盘并标成「送出去了、等 agent 接到」。
+    intents = sorted(
+        (state / "kanban-followup-in-progress" / "kanban-decision-point-delivery-intent").glob(
+            "task-*.json"
+        )
+    )
+    assert len(intents) == 1, intents
+    intent = json.loads(intents[0].read_text(encoding="utf-8"))
+    assert intent["decision_token"] == token, intent
+    assert intent["state"] == "sent_awaiting_agent_receipt", intent
+
+    _assert_sole_initiation_message(payload, state)
+
+
+def test_out_of_band_delivery_definite_failure_falls_back_to_self_injection(
+    tmp_path: Path,
+) -> None:
+    """INV-B 的「确定失败」那一半：``delivery_failed`` ⇒ 当场回落自注入，且带外投递计数为 0。
+
+    没有这一条，上一条用例就可能因为「带外是唯一出口」而 vacuous——也看不出 INV-1 在
+    「投出去了又自注入一次」这个具体失败场景上是否真的成立。
+    """
+    repo = _init_dirty_repo(tmp_path / "dirty")
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    capture = state / "delivered-prompt.md"
+    client = _write_stub_cline_kanban_client(state / "stub-cline-kanban-client.py")
+
+    payload = _invoke_stop_hook(
+        repo=repo,
+        state_dir=state,
+        extra_env={
+            "KANBAN_TASK_ID": "task-out-of-band-failed",
+            "CODEX_RVF_CLINE_KANBAN_CLIENT": str(client),
+            "RVF_TEST_DELIVERED_PROMPT_CAPTURE_PATH": str(capture),
+            "RVF_TEST_TERMINAL_DELIVERY_STATUS": "delivery_failed",
+            "RVF_TEST_TERMINAL_DELIVERY_FAILURE_REASON": "no_active_terminal_session",
+        },
+    )
+
+    assert payload.get("decision") == "block", payload
+    reason = str(payload.get("reason") or "")
+    assert reason.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE, reason[:400]
+    # 回落的是**自注入变体**：kanban 变体那两行不该出现在当前会话的注入正文里。
+    assert "来源：这条消息**不是开发者打的**" not in reason, reason[:600]
+    # 降级必须响亮：开发者旁注要说清「这一条不会成为可 rewind 的 user message」。
+    assert "回落" in str(payload.get("systemMessage") or ""), payload.get("systemMessage")
+
+    assert out_of_band_decision_point_deliveries(state) == []
+    # 确定失败即清意图：留一份 active 意图只会把接下来 15 分钟的重新决策白白挡住。
+    intent_dir = (
+        state / "kanban-followup-in-progress" / "kanban-decision-point-delivery-intent"
+    )
+    assert sorted(intent_dir.glob("task-*.json")) == []
+
+    _assert_sole_initiation_message(payload, state)
 
 
 if __name__ == "__main__":  # pragma: no cover - 与仓内其它 pytest 文件一致的直跑入口

@@ -27,9 +27,25 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
-### 统一发起协议：唯一的自注入是**发起决策点横幅**
+### 统一发起协议：唯一的发起消息是**发起决策点横幅**
 
-自动 RVF 的发起**一律**先给你一条决策点横幅，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，都走同一条路。
+自动 RVF 的发起**一律**先给你一条决策点横幅，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
+
+变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
+
+| 在哪 | transport | 你看到的形态 |
+| --- | --- | --- |
+| **cline-kanban task 内**（默认） | 经 cline-kanban 终端投递成为一条**真实 user message** | 隔几秒到达并开启一个新回合；因为它是真实 user 条目，所以在会话历史里是一个**可回退的边界**（Claude Code 双 ESC 的 rewind 列表里能看到它），用户随时可以回到它之前 |
+| task 外 / 非 kanban backend / 逃生口 | Stop hook 自注入 | 与 Stop 同一刻直接出现在上下文里 |
+
+带外投递那条路上，横幅多两行「来源声明 + 时效说明」，其余逐字相同。四件必须知道的事：
+
+- **Stop 那一刻你什么也看不到是正常的。** 默认短等为 0ms，横幅数秒后才作为 user message 到达。这不是降级——正因为它开启新回合，才有 rewind 边界。
+- **只有确定失败才回落自注入。** 投递结论未知时本轮静默停、不回落，由投递意图在后续 Stop 对账（宁可晚问一轮，也不要两条通道各问一次）。回落发生时开发者旁注会明说「本轮已回落为 Stop hook 自注入」。
+- **投出去却始终没成为 turn 的横幅会被撤回。** 那枚 token 进 `withdrawn` 终态，即便消息迟到落地，`rvf-agent start` 也会硬失败——不要试图绕过它去手动开一轮。
+- 逃生口：`RVF_DECISION_POINT_DELIVERY_TRANSPORT=stop_hook_self_injection|cline_kanban_task_chat_session` 可强制指定通道。
+
+**用户 rewind 掉横幅之后**：那枚 token 当轮作废（移出去重索引、**不计** decline 冷却与铸造熔断），下一次 Stop 会重新征询一次。所以看到「同一批改动又被问了一遍」且中间发生过 rewind，那是设计行为，不是重复派发。
 
 接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf-agent start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有。完整流程：
 

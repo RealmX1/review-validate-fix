@@ -4929,6 +4929,34 @@ globals().update({_n: getattr(_kbfu, _n) for _n in _kbfu.__all__})
 
 # 有界拆分：cline-kanban stop-hook 派发 测试簇（9 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
 # 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+# 有界拆分：发起决策点横幅的**带外投递** 测试簇（8 个，本轮新增）移入子模块；模块级 inject 共享依赖后重绑测试名，
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
+from _rvf_stop_hook_support import decision_point_out_of_band_delivery as _f2oob
+_f2oob.inject(
+    assert_decision_point_injection=assert_decision_point_injection,
+    decision_token_records=decision_token_records,
+    init_repo=init_repo,
+    injection_attempt_records=injection_attempt_records,
+    invoke=invoke,
+    latest_events=latest_events,
+    latest_summary=latest_summary,
+    load_hook_module=load_hook_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    parse_json=parse_json,
+    rvf_home_dir=rvf_home_dir,
+)
+globals().update({_n: getattr(_f2oob, _n) for _n in _f2oob.__all__})
+
+
+# 有界拆分：决策 token store 的**并发互斥**与**熔断额度记账** 测试簇（6 个，本轮新增）移入子模块；
+# 模块级 inject 共享依赖后重绑测试名，让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
+from _rvf_stop_hook_support import (
+    decision_point_token_store_concurrency_and_breaker as _f2tokenstore,
+)
+_f2tokenstore.inject(SCRIPT=SCRIPT)
+globals().update({_n: getattr(_f2tokenstore, _n) for _n in _f2tokenstore.__all__})
+
+
 from _rvf_stop_hook_support import cline_kanban_stop_hook_dispatch as _f2clkb
 _f2clkb.inject(
     assert_decision_point_injection=assert_decision_point_injection,
@@ -5967,6 +5995,29 @@ def main() -> int:
         test_preserved_guards_short_circuit_before_decision_point_injection,
         # S5：bootstrap 独立确认闸废除（Stop 侧闸中和；UPS 侧 resume 闸退役见 UPS 套件）。
         test_bootstrap_size_confirmation_gate_abolished_never_blocks,
+        # 本轮：横幅带外投递（四态处置 / 次序 / TTL / 崩溃窗口 / 两条撤回路径）。
+        test_decision_point_out_of_band_delivered_receipts_keep_token_minted,
+        test_decision_point_out_of_band_uses_longer_ttl_than_self_injection,
+        test_decision_point_out_of_band_delivery_never_started_falls_back_to_self_injection,
+        # 「拿不到可解析回执」= 结论未知 ≠ 确定失败：不回落、保留意图、由后续对账处置。
+        test_decision_point_out_of_band_unparseable_receipt_after_delivery_never_self_injects,
+        test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered,
+        test_decision_point_transport_override_without_task_id_falls_back_honestly,
+        test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker,
+        test_decision_point_out_of_band_single_flight_busy_does_not_mint,
+        test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once,
+        test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
+        # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
+        test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,
+        test_decision_point_crash_between_send_and_receipt_is_reconciled_from_intent,
+        test_decision_point_declined_fingerprint_is_not_delivered_out_of_band_again,
+        # 本轮：决策 token store 的写侧互斥（回执 vs lifecycle）与撤回的熔断额度冲销（INV-C）。
+        test_decision_token_stale_receipt_snapshot_cannot_roll_back_injected_lifecycle_state,
+        test_decision_token_receipt_write_and_lifecycle_transition_are_mutually_exclusive_under_threads,
+        test_decision_token_withdrawal_writes_payload_exactly_once_with_dedup_index_field,
+        test_two_consecutive_rewind_withdrawals_do_not_trip_circuit_breaker_on_third_ask,
+        test_decision_token_withdrawal_reversal_is_append_only_and_scoped_to_its_own_mint_request,
+        test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched,
     ]
     assert_every_defined_test_is_registered(
         globals(),

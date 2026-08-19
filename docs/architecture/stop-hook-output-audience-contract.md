@@ -16,6 +16,19 @@
 agent 指令，**一条真失败也没有**。一个 100% 假阳性的告警通道会训练人忽略它，真故障随之被
 一并忽略。腾出 `decision:block` 专供真失败，这个信号才重新有意义。
 
+### 0.1 一个**不是**错误、却也走 `developer_only` 的出口（读到它别以为是违规）
+
+决策点横幅在 cline-kanban task 内改走**带外投递**（经终端投递成为一条真实 user message）之后，
+那次 Stop 的 stdout 走的是 `developer_only` + `systemMessage`——尽管它既不是失败也不是降级。
+
+这不是给铁律开的口子，而是铁律的正确应用：**这一刻 stdout 上确实没有任何要驱动 agent 的东西**。
+正文根本不在 stdout 里，它几秒后作为一条 user message 到达并自己开一个新回合。若给它安一个
+「携带 agent_directive 但不渲染进 stdout」的第三受众，契约就会声称「本次出口驱动了 agent」，
+而实际可能根本没送达——那是把契约变成谎言。
+
+带外路径上契约不是权威。权威是三样东西：投递意图 marker（`kanban_followup_lock` 的第三族）、
+decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECISION_TOKEN=<token>` 的那一刻。
+
 ---
 
 ## 1. Claude Code 的 Stop hook 有**三**条出口
