@@ -7464,6 +7464,131 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
 
 
+def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True``（用户手动触发）对闸二不适用：命中 declined 冷却
+    时不再拒铸，而是**清掉**冷却记录后照常铸，并如实回报
+    explicit_user_request_overrode_agent_declined_cooldown（命中即真）与
+    declined_cooldown_record_still_blocks_automatic_path（清除成功 ⇒ False）；
+    清除而非仅本次绕过，故随后的自动路径（默认 False）也不再被这条陈旧 decline 挡住。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpU", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+    # 对照：默认（自动路径）仍被冷却挡住。
+    auto = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+    assert auto.explicit_user_request_overrode_agent_declined_cooldown is False
+
+    manual = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    assert manual.token and manual.record is not None
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is False
+    # 冷却记录已被物理清除 ⇒ 自动路径也解锁。
+    assert not dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpU", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto_after.outcome == dts.MINT_OUTCOME_MINTED
+
+    # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
+    fresh = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpV", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert fresh.outcome == dts.MINT_OUTCOME_MINTED
+    assert fresh.explicit_user_request_overrode_agent_declined_cooldown is False
+    assert fresh.declined_cooldown_record_still_blocks_automatic_path is False
+
+
+def test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+    tmp: Path,
+) -> None:
+    """闸二豁免下的两个事实必须解耦（RVF-001 回归）：冷却记录 unlink 因 I/O 失败（被
+    ``clear_declined_fingerprint`` 吞成 False）时，「用户显式推翻了 agent 早前的谢绝」这一**告知类**
+    事实仍由命中证成、必须为 True；unlink 失败只体现在
+    ``declined_cooldown_record_still_blocks_automatic_path=True``——即后续自动路径仍被这条陈旧
+    decline 挡着。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpW", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+
+    # 只让「冷却表目录下的文件」删除失败，其余 unlink（token 落盘等）照常，避免误伤别处。
+    blocked_dir = dts.declined_fingerprint_root(cd_root).resolve()
+    original_unlink = Path.unlink
+
+    def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
+        if self.resolve().parent == blocked_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_unlink(self, *args, **kwargs)
+
+    Path.unlink = unlink_failing_only_inside_declined_cooldown_dir
+    try:
+        manual = dts.mint_decision_token(
+            worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+    finally:
+        Path.unlink = original_unlink
+
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    # 告知类事实：命中即真，绝不因 unlink 失败被静默吞掉。
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    # 磁盘事实：记录仍在，自动路径依旧被挡。
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is True
+    assert dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpW", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(
+        worktree="/wt", session_id="sa", candidate_fingerprint="fpW", now=t0, **roots
+    )
+    assert auto_after.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+
+
+def test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True`` 对闸三整段跳过：既不注册铸造请求、也不判定，
+    远超阈值地连铸仍次次 minted、mint-request ledger 零新增、token payload 不带 record id；
+    且不污染同 session 后续自动路径的计数（自动路径仍从 0 起算、到阈值照常熔断）。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cb_root = roots["circuit_breaker_root_dir"]
+    t0 = _fixed_utc(0)
+
+    for index in range(5):  # 远超默认阈值 3
+        result = dts.mint_decision_token(
+            worktree="/wt", session_id="sm", candidate_fingerprint=f"fpM{index}", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+        assert result.outcome == dts.MINT_OUTCOME_MINTED, (index, result)
+        assert result.circuit_breaker is None
+        payload = json.loads(result.record.path.read_text(encoding="utf-8"))
+        assert payload[dts.MINT_REQUEST_LEDGER_RECORD_ID_FIELD] is None
+
+    assert dts.count_recent_mint_requests("sm", now=t0, root=cb_root) == 0, "手动铸造不该占熔断额度"
+
+    # 同 session 的自动路径不受污染：从 0 起算，第 3 次才熔断。
+    a1 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA1", now=t0, **roots)
+    a2 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA2", now=t0, **roots)
+    a3 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA3", now=t0, **roots)
+    assert a1.outcome == dts.MINT_OUTCOME_MINTED and a2.outcome == dts.MINT_OUTCOME_MINTED
+    assert a3.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
+    assert a3.circuit_breaker.request_count == 3
+
+
 def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
     """铸造频率熔断（R24 裁决 b）：同 session 3600s 窗口内第 ≥3 次铸造请求拒铸，写 tripped ledger；
     纯计数、零语义；请求滑出窗口后计数重置。"""
@@ -9867,9 +9992,21 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject",
-            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+            "rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
                 root / "prompt-submit-manual-cooldown"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure(
+                root / "prompt-submit-manual-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker",
+            lambda: test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker(
+                root / "prompt-submit-manual-breaker-exempt"
             ),
         ),
         (
@@ -11112,6 +11249,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "decision_token_declined_fingerprint_cooldown_write_query",
             lambda: test_decision_token_declined_fingerprint_cooldown_write_query(root / "dts-cooldown"),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_clears_declined_cooldown",
+            lambda: test_decision_token_mint_explicit_user_request_clears_declined_cooldown(
+                root / "dts-user-clears-cooldown"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails",
+            lambda: test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+                root / "dts-user-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker",
+            lambda: test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(
+                root / "dts-user-breaker-exempt"
+            ),
         ),
         (
             "decision_token_mint_circuit_breaker_window",

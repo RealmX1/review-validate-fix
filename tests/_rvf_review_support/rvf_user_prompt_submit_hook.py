@@ -34,7 +34,9 @@ __all__ = [
     'test_rvf_user_prompt_submit_hook_stdout_confirms_manual_delivery',
     'test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injection',
     'test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger',
-    'test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject',
+    'test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user',
+    'test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure',
+    'test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker',
     'test_rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed',
     'test_rvf_user_prompt_submit_bootstrap_confirm_gate_abolished',
     'test_rvf_user_prompt_submit_manual_substring_does_not_falsely_trigger',
@@ -854,11 +856,12 @@ def test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledg
         assert il.read_injection_attempts(worktree=str(repo.resolve())) == []
 
 
-def test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+def test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
     tmp_path: Path,
 ) -> None:
-    """候选指纹处于 declined 冷却（agent 早前谢绝、改动未变）→ manual 触发只出 systemMessage、
-    不重铸 token、不再注入 additionalContext（尊重三闸，指纹未变不 nag），但仍写 ledger（候选非空）。"""
+    """用户手动触发**推翻** agent 早前的谢绝：候选指纹虽处于 declined 冷却（改动未变），manual
+    路径仍照常铸 token 并注入 additionalContext；冷却记录被就地清除，且 additionalContext 明确
+    告知 agent「你上次的 decline 已被用户推翻」——否则它会照上次判断再谢绝一次。"""
     submit = load_rvf_user_prompt_submit_module()
     dts, il, summary_mod = _load_manual_decision_modules()
     repo = _manual_candidate_repo(tmp_path)
@@ -873,6 +876,9 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
             candidate_fingerprint=fingerprint,
             reason="agent declined earlier",
         )
+        assert dts.is_fingerprint_in_declined_cooldown(
+            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+        )
         payload = submit.inspect_user_prompt_submit(
             {
                 "prompt": "/review-validate-fix",
@@ -883,15 +889,126 @@ def test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
             prep_root=str(tmp_path / "prep-root"),
             now="2026-07-11T00:00:00Z",
         )
-        assert payload["status"] == "manual_decision_declined_cooldown", payload
-        assert "hookSpecificOutput" not in payload  # 不再注入
-        assert "declined 冷却" in payload["systemMessage"]
-        # ledger 记一条 declined_cooldown（候选非空 ⇒ 有记录），未新铸 token。
+        assert payload["status"] == "manual_decision_injected", payload
+        token = payload["token"]
+        assert dts.TOKEN_RE.fullmatch(token), token
+
+        # 冷却记录被清除：后续自动 Stop 路径也不再被这条陈旧 decline 挡住。
+        assert not dts.is_fingerprint_in_declined_cooldown(
+            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+        )
+
+        # additionalContext 必须告知 agent 用户推翻了它早前的谢绝。
+        additional_context = payload["hookSpecificOutput"]["additionalContext"]
+        assert "推翻" in additional_context, additional_context
+        assert "不要以" in additional_context
+        # user-facing systemMessage 也如实说明推翻 + 冷却记录已被清除。
+        assert "已推翻" in payload["systemMessage"], payload["systemMessage"]
+        assert "已清除对应的谢绝冷却记录" in payload["systemMessage"], payload["systemMessage"]
+
+        # 投递回执落地后，ledger 记的是 injected（而非 declined_cooldown）。
+        submit._confirm_manual_decision_delivery(payload, now="2026-07-11T00:00:01Z")
         records = il.read_injection_attempts(worktree=str(repo.resolve()))
         assert len(records) == 1, records
-        assert records[0]["mint_outcome"] == il.INJECTION_OUTCOME_DECLINED_COOLDOWN
-        assert records[0]["injected"] is False
-        assert not list(dts.decision_token_root().glob("*.json"))
+        assert records[0]["mint_outcome"] == il.INJECTION_OUTCOME_INJECTED
+        assert records[0]["injected"] is True
+
+
+def test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure(
+    tmp_path: Path,
+) -> None:
+    """RVF-001 回归：冷却记录 unlink 因 I/O 失败（被 ``clear_declined_fingerprint`` 吞成 False）时，
+    「用户显式推翻了 agent 早前的谢绝」这条**告知**仍必须照发——additionalContext 里的推翻提示、
+    systemMessage 里的说明都不许被 I/O 失败静默吞掉；同时 systemMessage 不得谎称「已清除冷却」，
+    而要如实说明记录清除失败、后续自动 Stop 仍可能被它挡住。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        summ = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo)}, cwd=str(repo), repo=str(repo), ledger=None
+        )
+        fingerprint = summ["candidate_fingerprint"]
+        dts.record_declined_fingerprint(
+            worktree=str(repo.resolve()),
+            candidate_fingerprint=fingerprint,
+            reason="agent declined earlier",
+        )
+
+        # 只让「冷却表目录下的文件」删除失败，其余 unlink 照常，避免误伤 hook 其它落盘。
+        blocked_dir = dts.declined_fingerprint_root().resolve()
+        original_unlink = Path.unlink
+
+        def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
+            if self.resolve().parent == blocked_dir:
+                raise PermissionError(13, "Permission denied", str(self))
+            return original_unlink(self, *args, **kwargs)
+
+        Path.unlink = unlink_failing_only_inside_declined_cooldown_dir
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "/review-validate-fix",
+                    "cwd": str(repo),
+                    "session_id": "cooldown-clear-fail-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=str(tmp_path / "prep-root"),
+                now="2026-07-11T00:00:00Z",
+            )
+        finally:
+            Path.unlink = original_unlink
+
+        assert payload["status"] == "manual_decision_injected", payload
+        # 冷却记录确实没删掉（复现了 unlink 失败），自动路径仍被挡。
+        assert dts.is_fingerprint_in_declined_cooldown(
+            worktree=str(repo.resolve()), candidate_fingerprint=fingerprint
+        )
+        # 关键回归：告知 agent 的那段不得因清除失败而消失。
+        additional_context = payload["hookSpecificOutput"]["additionalContext"]
+        assert "推翻" in additional_context, additional_context
+        assert "不要以" in additional_context
+        # 用户可见文案：如实说明推翻 + 清除失败，绝不谎称已清除。
+        system_message = payload["systemMessage"]
+        assert "已推翻" in system_message, system_message
+        assert "谢绝冷却记录清除失败" in system_message, system_message
+        assert "已清除对应的谢绝冷却记录" not in system_message, system_message
+
+
+def test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker(
+    tmp_path: Path,
+) -> None:
+    """铸造频率熔断（R24）防的是 agent 递归自发起，对用户显式手动触发不适用：同一 session 连打
+    远超阈值的次数，每次都要铸得出 token，且一行 mint-request ledger 都不该写（不占自动路径配额）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    assert dts.DEFAULT_MINT_CIRCUIT_BREAKER_MAX_REQUESTS < 5
+    with _manual_decision_env(tmp_path):
+        for index in range(5):
+            # 每轮换一次候选内容 ⇒ 指纹变化，绕开闸一去重，逼真地逐次请求铸造。
+            (repo / "f.txt").write_text(f"base\nmanual round {index}\n", encoding="utf-8")
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": "/review-validate-fix",
+                    "cwd": str(repo),
+                    "session_id": "breaker-exempt-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                },
+                prep_root=str(tmp_path / "prep-root"),
+                now="2026-07-11T00:00:00Z",
+            )
+            assert payload["status"] == "manual_decision_injected", (index, payload)
+            assert payload.get("token")
+        # 手动路径不注册铸造请求 ⇒ mint-request ledger 一行都没有。
+        assert (
+            dts.count_recent_mint_requests(
+                "breaker-exempt-sess",
+                now=dts.parse_timestamp("2026-07-11T00:00:00Z"),
+                window_seconds=dts.DEFAULT_MINT_CIRCUIT_BREAKER_WINDOW_SECONDS,
+            )
+            == 0
+        )
 
 
 def test_rvf_user_prompt_submit_manual_retired_packet_prep_functions_removed(

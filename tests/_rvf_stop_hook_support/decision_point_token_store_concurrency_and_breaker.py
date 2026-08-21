@@ -36,6 +36,7 @@ __all__ = [
     'test_two_consecutive_rewind_withdrawals_do_not_trip_circuit_breaker_on_third_ask',
     'test_decision_token_withdrawal_reversal_is_append_only_and_scoped_to_its_own_mint_request',
     'test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched',
+    'test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token',
 ]
 
 
@@ -421,3 +422,157 @@ def test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched(tmp: Pat
         raised = exc
     assert raised is not None, "withdrawn 是终态，重复撤回必须抛 DecisionTokenStateError"
     assert _mint_request_ledger_lines(store, roots, session_id) == lines_after_first_withdrawal
+
+
+# ---------------------------------------------------------------------------
+# issue #3：陈旧去重索引的「覆盖」必须与首建同样互斥（同一 dedup key 至多一枚活跃 token）
+# ---------------------------------------------------------------------------
+
+def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token(
+    tmp: Path,
+) -> None:
+    """同键并发撞上**陈旧**去重索引时，至多一方 ``minted``，另一方必须幂等返回胜者的同一枚 token。
+
+    修复前 ``mint_decision_token`` 的写索引阶段是不对称的：首建走 ``_atomic_create_json`` 的
+    ``O_EXCL``（内核级互斥 + 竞态裁决），而「索引指向的 token 已终态 / 真过期」这一支是**无条件
+    整份覆盖**，既没有 ``O_EXCL`` 也没有任何 CAS。闸一那次读索引发生在铸造之前、且不在任何锁内，
+    于是同键的两个请求会双双读到「索引陈旧」、各自铸出**不同**的 token、各自把索引覆盖成自己，
+    双双返回 ``minted``——一个 dedup key 两枚活跃 token，同一批改动被重复注入 / 重复发起 RVF，
+    R25 的注入幂等硬保证当场失效。
+
+    两条到达方式都要钉住，因为它们是两条独立的真实链路：
+
+      * ``automatic_stop_hook_path``：token 自然 TTL 过期且无 run anchor 不可复活 ⇒ 索引陈旧。
+        Stop hook 侧不需要任何前置条件就能走到这里。
+      * ``explicit_user_request_path``：agent ``decline`` 让 token 进终态 ⇒ 索引同样陈旧。这条
+        路径在「手动触发豁免 declined 冷却」落地之前不可达（闸二会先 ``declined_cooldown`` 早退），
+        正是那次豁免把它打开的。
+
+    每轮用 ``Barrier`` 把两个线程对齐到同一瞬间。修复前实测两条路径各 20/20 轮双双 ``minted``；
+    修复后必须 0 轮违约，且败者刚铸的 token 文件要被 ``_discard_token_record`` 真正删掉，不留孤儿。
+    """
+    store = _load_decision_token_store_module()
+    minted_at = "2026-08-21T00:00:00Z"
+    # 铸造频率熔断（默认阈值 3）与本用例无关，抬高上限免得多轮铸造把它撞停。
+    circuit_breaker_max_requests_disabled = 10_000
+
+    def run_race_rounds(*, path_name: str, initiated_by_explicit_user_request: bool) -> None:
+        roots = _isolated_decision_token_store_roots(tmp / path_name)
+        rounds_with_more_than_one_active_token: list[dict] = []
+        rounds_with_orphaned_token_file: list[dict] = []
+
+        for round_index in range(20):
+            session_id = f"{path_name}-sess-{round_index}"
+            candidate_fingerprint = f"{path_name}-fingerprint-{round_index}"
+
+            def mint_for_this_round(**overrides: object):
+                return _mint_out_of_band_decision_token(
+                    store,
+                    roots,
+                    session_id=session_id,
+                    candidate_fingerprint=candidate_fingerprint,
+                    circuit_breaker_max_requests=circuit_breaker_max_requests_disabled,
+                    **overrides,
+                )
+
+            predecessor = mint_for_this_round(now=store.parse_timestamp(minted_at))
+            assert predecessor.outcome == store.MINT_OUTCOME_MINTED, predecessor
+
+            if initiated_by_explicit_user_request:
+                # agent 谢绝 ⇒ 前任进终态（并写下 declined 冷却，由手动路径自己清掉）。
+                store.mark_declined(
+                    predecessor.token,
+                    reason="agent_declined_for_stale_index_race_test",
+                    root=roots["decision_token_root_dir"],
+                    cooldown_root=roots["declined_fingerprint_root_dir"],
+                    now=store.parse_timestamp(minted_at),
+                )
+                raced_at = store.parse_timestamp(minted_at)
+            else:
+                # 前任自然过期且无 run anchor ⇒ 不可复活，索引同样陈旧。
+                raced_at = store.parse_timestamp("2026-08-21T01:00:00Z")
+
+            start_barrier = threading.Barrier(2)
+            mint_results: list = []
+            thread_failures: list[BaseException] = []
+            results_lock = threading.Lock()
+
+            def mint_concurrently_on_the_same_dedup_key() -> None:
+                try:
+                    start_barrier.wait()
+                    result = mint_for_this_round(
+                        now=raced_at,
+                        initiated_by_explicit_user_request=initiated_by_explicit_user_request,
+                    )
+                    with results_lock:
+                        mint_results.append(result)
+                except BaseException as exc:  # noqa: BLE001 - 线程内异常要带回主线程断言
+                    thread_failures.append(exc)
+
+            threads = [
+                threading.Thread(target=mint_concurrently_on_the_same_dedup_key) for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+                assert not thread.is_alive(), "占坑互斥不得把任一线程永久堵死（疑似自锁死）"
+            assert thread_failures == [], thread_failures
+            assert len(mint_results) == 2, mint_results
+
+            outcomes = sorted(result.outcome for result in mint_results)
+            tokens = {result.token for result in mint_results}
+            if outcomes != sorted(
+                [store.MINT_OUTCOME_MINTED, store.MINT_OUTCOME_DEDUPLICATED]
+            ) or len(tokens) != 1:
+                rounds_with_more_than_one_active_token.append(
+                    {"round": round_index, "outcomes": outcomes, "tokens": sorted(tokens)}
+                )
+                continue
+
+            # 去重索引必须指向那枚唯一的胜者，且胜者仍然活跃。
+            winner_token = next(iter(tokens))
+            index_path = store._dedup_index_path(
+                "/wt", session_id, candidate_fingerprint, roots["decision_token_root_dir"]
+            )
+            index_payload = store._read_dedup_index(index_path)
+            assert index_payload is not None and index_payload["token"] == winner_token, (
+                index_payload,
+                winner_token,
+            )
+            assert (
+                store.read_decision_token(
+                    winner_token, root=roots["decision_token_root_dir"], now=raced_at
+                ).state
+                in store.ACTIVE_NONTERMINAL_STATES
+            )
+
+            # 败者刚铸的那枚 token 必须已被丢弃：本轮磁盘上只该留下「前任 + 胜者」两个 token 文件。
+            token_files_for_this_round = {
+                path.stem
+                for path in store.decision_token_root(roots["decision_token_root_dir"]).glob(
+                    "*.json"
+                )
+            }
+            expected_tokens_still_on_disk = {predecessor.token, winner_token}
+            orphans = token_files_for_this_round - expected_tokens_still_on_disk
+            if orphans:
+                rounds_with_orphaned_token_file.append(
+                    {"round": round_index, "orphaned_tokens": sorted(orphans)}
+                )
+            # 逐轮清干净，让「孤儿」判定只反映本轮。
+            for path in store.decision_token_root(roots["decision_token_root_dir"]).glob("*.json"):
+                path.unlink()
+
+        assert rounds_with_more_than_one_active_token == [], (
+            path_name,
+            rounds_with_more_than_one_active_token,
+        )
+        assert rounds_with_orphaned_token_file == [], (path_name, rounds_with_orphaned_token_file)
+
+    run_race_rounds(
+        path_name="automatic_stop_hook_path", initiated_by_explicit_user_request=False
+    )
+    run_race_rounds(
+        path_name="explicit_user_request_path", initiated_by_explicit_user_request=True
+    )
