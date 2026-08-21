@@ -574,6 +574,11 @@ repo_required_files=(
   "tests/test_codex_hook_trust_fingerprint.py"
   "scripts/codex_hook_trust_fingerprint.py"
   "tests/test_current_session_host_adapter_resolution.py"
+  "tests/test_reviewer_prompt_delivery_contract.py"
+  "tests/test_reviewer_structured_output_extraction.py"
+  "tests/test_reviewer_health_probe_parity.py"
+  "tests/test_reviewer_registry_additive_merge.py"
+  "tests/test_reviewer_quota_pool_exclusive_selection.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -682,7 +687,12 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py" \
-  "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py"
+  "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py" \
+  "$tests_dir/test_reviewer_prompt_delivery_contract.py" \
+  "$tests_dir/test_reviewer_structured_output_extraction.py" \
+  "$tests_dir/test_reviewer_health_probe_parity.py" \
+  "$tests_dir/test_reviewer_registry_additive_merge.py" \
+  "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py"
 
 run_parallel_test_steps
 run_step "tests: rvf_local_deploy" \
@@ -734,6 +744,39 @@ run_step "tests: current_session_host_adapter_resolution" \
     "$tests_dir/test_current_session_host_adapter_resolution.py"
 run_step "stop hook output audience contract self-check" \
   python3 "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
+# 备选评审腿的 prompt 投递契约：kimi 的 `-p` 是带值 flag 且从不读 stdin，而整份 review packet
+# 远超 ARG_MAX ⇒ 必须走「argv 只带短指针、正文留在磁盘」。同时钉住 `--dry-run` 打印的是终结后的
+# 真实 argv，且仍停在 pre_run_health 之前（否则零成本预演变成每次烧一次真实 probe）。
+run_step "tests: reviewer_prompt_delivery_contract" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_prompt_delivery_contract.py"
+# kimi / omp 结构化 stdout：kimi 无 result 信封（否则整份 JSONL 被当评审正文）；「重试」不等于
+# 「失败」（在首次 429 判死会把可恢复重试变成硬失败腿）；omp 用 --mode json 时报错也退 0，
+# 额度错误必须 typed 识别；omp 的 isError 不是 cursor spawnError 的对偶，刻意不据它 fail-over。
+run_step "tests: reviewer_structured_output_extraction" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_structured_output_extraction.py"
+# 健康探针必须与派发命令走同一条后端路径。这条纪律原本只以 cursor 模板里的一段注释存在，
+# claude/codex 两份则原样带着 `auth status` / `login status` —— 同一失效形状，只是还没发作。
+# run rvf-20260811T170157Z：cursor 登录过期时 status 退 0 而 -p 退 1，RVF 因此把死腿选进两腿，
+# 该轮实际只剩单路评审结论却全程自认为做了双评审。
+run_step "tests: reviewer_health_probe_parity" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_health_probe_parity.py"
+# reviewer registry 是 additive merge 而非首次 seed：已部署过的机器上 user-local registry
+# 早就存在，若沿用「不存在才 copy」，后续新增的评审腿（kimi_code / oh_my_pi 是第一批）永远
+# 进不去那台机器，而部署照常报成功、派发照常从旧的 3 条腿里选 2 条 —— 无人报错的假绿。
+# 反向也要钉住：merge 不得覆盖用户改过的条目（关掉的腿不能被一次部署重新打开）。
+run_step "tests: reviewer_registry_additive_merge" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_registry_additive_merge.py"
+# 同额度池互斥：omp 腿被 pin 到 Codex 订阅，与 codex 腿同模型同账号 ⇒ 抽到这一对时双评审
+# 退化成同一模型评两遍（实测 200 seed 下 16.5%），且该订阅额度耗尽会同时打掉两腿，而
+# fail-over 假设各腿独立。指纹取「额度池」而非模型名：五条腿里只有 omp pin 了模型，
+# 其余四条跟随各自 CLI 的默认模型、随时会变，写模型名第二天就会撒谎。
+run_step "tests: reviewer_quota_pool_exclusive_selection" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"
@@ -801,6 +844,42 @@ require_literal "SKILL.md" 'scope.contract.json'
 require_literal "SKILL.md" 'scripts/check_review_result.py'
 require_literal "references/review-merge-policy.md" 'alternative-reviewer:<harness-id>'
 require_literal "references/review-merge-policy.md" 'scripts/dispatch_reviewers.py --execute --repo <repo> --review-packet <packet> --session-context <file>'
+# 健康探针必须与派发命令走同一条后端路径（run rvf-20260811T170157Z 的教训）。
+# health_probe_parity_exemption 只给测试夹具用（夹具的 reviewer 是 `python3 -c "<脚本>"`，
+# 两边 -c 载荷本来就必须不同、不存在可比对的 CLI 入口）。它一旦出现在出厂模板里，
+# 就等于把这条 gate 在生产路径上关掉——因此这里逐份禁死。
+for reviewer_template in \
+  "config/alternative-reviewer.cursor.json" \
+  "config/alternative-reviewer.claude.json" \
+  "config/alternative-reviewer.codex.json" \
+  "config/alternative-reviewer.kimi.json" \
+  "config/alternative-reviewer.oh-my-pi.json"; do
+  forbid_literal "$reviewer_template" 'health_probe_parity_exemption'
+  require_literal "$reviewer_template" '"pre_run_health": true'
+  require_literal "$reviewer_template" '"health_command"'
+done
+# 三份既有模板曾经带着旁路查询当健康探针：cursor 已在 2026-08-11 实盘发作，claude/codex 是
+# 同一失效形状的未爆版本。禁死这三条字面量，防止「顺手改回去」。
+forbid_literal "config/alternative-reviewer.claude.json" '"auth",'
+forbid_literal "config/alternative-reviewer.codex.json" '"login",'
+forbid_literal "config/alternative-reviewer.cursor.json" '"status"'
+require_literal "config/alternative-reviewer.kimi.json" 'argv_prompt_flag_with_prompt_file_pointer'
+require_literal "config/alternative-reviewer.kimi.json" 'alternative-reviewer:kimi-code'
+require_literal "config/alternative-reviewer.kimi.json" 'kimi_stream_json'
+forbid_literal "config/alternative-reviewer.kimi.json" '"--yolo"'
+forbid_literal "config/alternative-reviewer.kimi.json" '"--auto"'
+require_literal "config/alternative-reviewer.oh-my-pi.json" 'alternative-reviewer:oh-my-pi'
+require_literal "config/alternative-reviewer.oh-my-pi.json" 'oh_my_pi_json'
+require_literal "config/alternative-reviewer.oh-my-pi.json" 'openai-codex/gpt-5.6-sol'
+require_literal "config/alternative-reviewer.oh-my-pi.json" '"xhigh"'
+# ⚠️ 上面这些 require_literal 是**整文件** grep，给不出「这个字面量在哪个字段」的保证——
+# 同一个串出现在 health_command 或注释里就会绿。字段级的强保证在
+# tests/test_reviewer_prompt_delivery_contract.py 的出厂模板结构断言里（已登记进 run_step）。
+# 这里保留它们只作粗粒度绊线：整份文件里彻底消失时仍会当场红。
+require_literal "scripts/run_alternative_reviewer.py" 'assert_health_command_shares_dispatch_flag_set'
+require_literal "scripts/run_alternative_reviewer.py" 'finalize_reviewer_command_for_prompt_delivery'
+require_literal "scripts/run_alternative_reviewer.py" 'STRUCTURED_JSON_LINES_OUTPUT_FORMATS'
+
 # Claude harness 模板（曾是被 0ba4a1d 覆盖掉的 active 默认，现为 registry 中的 claude_code 模板）
 require_literal "config/alternative-reviewer.claude.json" 'alternative-reviewer:claude-code'
 require_literal "config/alternative-reviewer.claude.json" 'ANTHROPIC_API_KEY'
@@ -836,6 +915,15 @@ require_literal "config/reviewer-registry.json" 'priority_default'
 require_literal "config/reviewer-registry.json" 'alternative-reviewer:cursor-cli'
 require_literal "config/reviewer-registry.json" 'alternative-reviewer:claude-code'
 require_literal "config/reviewer-registry.json" 'alternative-reviewer:codex-cli'
+require_literal "config/reviewer-registry.json" 'alternative-reviewer:kimi-code'
+require_literal "config/reviewer-registry.json" 'alternative-reviewer:oh-my-pi'
+# 同额度池互斥的声明字段（选腿层据它避开「同一模型 + 同一订阅」的两腿组合）。
+require_literal "config/reviewer-registry.json" 'underlying_provider_account_quota_pool_identity'
+# ⚠️ 上面这些 require_literal 是整文件 grep，只挡「整条 harness 或整个字段消失」这类粗差错；
+# 它证明不了「每条 harness 都声明了指纹」「registry 与磁盘上的 config 文件一一对应」这类
+# 字段级事实——同一个串出现在 description 或某条注释里就会绿。字段级保证在
+# tests/test_reviewer_quota_pool_exclusive_selection.py（QP-1/QP-2/QP-3）与
+# tests/test_reviewer_registry_additive_merge.py，两者都已登记进下面的 run_step。
 # dispatch_reviewers.py：路由 + 派发单一入口
 require_literal "scripts/dispatch_reviewers.py" 'def route'
 require_literal "scripts/dispatch_reviewers.py" 'reviewer-plan.json'

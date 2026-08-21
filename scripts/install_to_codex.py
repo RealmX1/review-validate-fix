@@ -1152,19 +1152,137 @@ def initialize_rvf_user_local_data(
         paths.deployment_receipts_root,
     ):
         directory.mkdir(parents=True, exist_ok=True)
-    if not paths.reviewer_registry_path.exists():
-        bundled_registry = (
+    merge_bundled_reviewer_harnesses_into_user_local_registry(
+        bundled_registry_path=(
             source_repository
             / f"plugins/{PLUGIN_NAME}"
             / PLUGIN_SKILL_RELATIVE_PATH
             / "config/reviewer-registry.json"
-        )
-        if not bundled_registry.is_file():
-            raise OfficialCliInstallationError(
-                f"缺少 bundled reviewer registry: {bundled_registry}"
-            )
-        shutil.copy2(bundled_registry, paths.reviewer_registry_path)
+        ),
+        user_local_registry_path=paths.reviewer_registry_path,
+    )
     return paths
+
+
+def merge_bundled_reviewer_harnesses_into_user_local_registry(
+    *,
+    bundled_registry_path: Path,
+    user_local_registry_path: Path,
+) -> list[str]:
+    """把 bundled registry 里 user-local 尚缺的 harness 增量并入，返回新增的 harness id。
+
+    真相源是 **user-local** 那份 registry：bundled 那份构建时会被移出 payload
+    (`_remove_path_if_present`)，verifier 还断言它不得存在于 payload 里。
+    所以这里的方向是单向的——bundled 只当 seed 用。
+
+    **只补不覆盖**：user-local 的条目是用户资产（关掉某条腿、调 priority、
+    加自己的 harness），一次部署不得把它们改回出厂值。
+
+    **补到字段一级**：只在条目一级 additive 是不够的——它挡住了「新腿进不来」，
+    却挡不住「新字段进不来」。见
+    :func:`backfill_bundled_fields_missing_from_existing_user_local_harness_entries`。
+
+    **不静默跳过**：并入前先比对 schema_version。版本对不上时宁可让部署响亮地
+    失败，也不能跳过——跳过的后果是新评审腿永远进不来，而部署照常报成功，
+    没有任何一处会察觉（本仓反复栽过的假绿形状）。
+    """
+    if not bundled_registry_path.is_file():
+        raise OfficialCliInstallationError(
+            f"缺少 bundled reviewer registry: {bundled_registry_path}"
+        )
+    bundled_registry = read_json_object(bundled_registry_path)
+    bundled_harnesses = bundled_registry.get("harnesses")
+    if not isinstance(bundled_harnesses, dict):
+        raise OfficialCliInstallationError(
+            f"bundled reviewer registry 缺少 harnesses object: {bundled_registry_path}"
+        )
+
+    if not user_local_registry_path.exists():
+        user_local_registry_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_registry_path, user_local_registry_path)
+        return sorted(bundled_harnesses)
+
+    user_local_registry = read_json_object(user_local_registry_path)
+    user_local_harnesses = user_local_registry.get("harnesses")
+    if not isinstance(user_local_harnesses, dict):
+        raise OfficialCliInstallationError(
+            "user-local reviewer registry 缺少 harnesses object: "
+            f"{user_local_registry_path}"
+        )
+    if user_local_registry.get("schema_version") != bundled_registry.get(
+        "schema_version"
+    ):
+        raise OfficialCliInstallationError(
+            "reviewer registry schema_version 不一致，拒绝并入新 harness："
+            f"user-local={user_local_registry.get('schema_version')!r} "
+            f"bundled={bundled_registry.get('schema_version')!r} "
+            f"({user_local_registry_path})。请先人工迁移该文件再重跑部署。"
+        )
+
+    newly_added_harness_ids = sorted(
+        harness_id
+        for harness_id in bundled_harnesses
+        if harness_id not in user_local_harnesses
+    )
+    for harness_id in newly_added_harness_ids:
+        user_local_harnesses[harness_id] = bundled_harnesses[harness_id]
+    backfilled_field_names_by_harness_id = (
+        backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+            bundled_harnesses=bundled_harnesses,
+            user_local_harnesses=user_local_harnesses,
+            harness_ids_added_by_this_merge=frozenset(newly_added_harness_ids),
+        )
+    )
+    if not newly_added_harness_ids and not backfilled_field_names_by_harness_id:
+        return []
+    user_local_registry["harnesses"] = user_local_harnesses
+    write_json_atomic(user_local_registry_path, user_local_registry)
+    return newly_added_harness_ids
+
+
+def backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+    *,
+    bundled_harnesses: Mapping[str, Any],
+    user_local_harnesses: dict[str, Any],
+    harness_ids_added_by_this_merge: frozenset[str] = frozenset(),
+) -> dict[str, list[str]]:
+    """给**已存在**的 harness 条目补上「出厂后来新增、user-local 从未有过」的字段。
+
+    就地改写 ``user_local_harnesses``，返回 ``{harness_id: [被补上的字段名]}``。
+
+    **为什么条目级 additive 不够**：它只挡住「新腿进不来」，挡不住「新字段进不来」。
+    一台已部署过的机器，其 cursor / claude_code / codex 三条腿是首次部署那天的形状；
+    之后往出厂条目里加的字段（第一例是
+    ``underlying_provider_account_quota_pool_identity``）对它们永远不可见，
+    于是依赖该字段的选腿约束（同额度池互斥）在生产路径上**静默失效**——
+    部署照常成功、双评审照常跑两条腿，没有任何一处会察觉。这与当初「新腿永远
+    进不来」是同一个假绿形状，只是降了一级粒度。
+
+    **判据是「键在不在」而不是「值等不等于出厂值」**：键不存在 ⇒ 用户从未对它表达过
+    意见（那天这个字段还不存在），补进去不算改用户的值；键存在 ⇒ 用户资产，值一律
+    原样保留，包括显式改过的值、显式置空的值、以及恰好等于出厂值的值。
+
+    **只补顶层键**：出厂条目全是标量字段。递归合并会引入「用户改过的嵌套结构被部分
+    覆盖」这种更难解释的语义，等真出现嵌套字段时再单独设计。
+    """
+    backfilled_field_names_by_harness_id: dict[str, list[str]] = {}
+    for harness_id, bundled_spec in bundled_harnesses.items():
+        if harness_id in harness_ids_added_by_this_merge:
+            continue
+        user_local_spec = user_local_harnesses.get(harness_id)
+        if not isinstance(bundled_spec, dict) or not isinstance(user_local_spec, dict):
+            continue
+        backfilled_field_names = sorted(
+            field_name
+            for field_name in bundled_spec
+            if field_name not in user_local_spec
+        )
+        if not backfilled_field_names:
+            continue
+        for field_name in backfilled_field_names:
+            user_local_spec[field_name] = bundled_spec[field_name]
+        backfilled_field_names_by_harness_id[harness_id] = backfilled_field_names
+    return backfilled_field_names_by_harness_id
 
 
 def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str | None:

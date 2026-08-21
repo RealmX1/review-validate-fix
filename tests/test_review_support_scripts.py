@@ -1841,6 +1841,13 @@ def _write_alternative_reviewer_config_payload_unclassified(
         payload["output_format"] = output_format
     if health_command is not None:
         payload["health_command"] = health_command
+        # 夹具的 "reviewer" 是 `python3 -c "<脚本>"`：两边 `-c` 的载荷本来就必须不同
+        # （健康脚本验环境、评审脚本写工件），根本不存在可比对的 CLI 入口，因此显式声明豁免
+        # health probe parity gate。这个字面量自证其为夹具，且 contract gate 会禁止它出现在
+        # 任何出厂 config/alternative-reviewer.*.json 里。
+        payload["health_probe_parity_exemption"] = (
+            "inline_script_fixture_has_no_shared_cli_entrypoint"
+        )
     if pre_run_health is not None:
         payload["pre_run_health"] = pre_run_health
     path.write_text(
@@ -6778,7 +6785,15 @@ def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
 
 
 def _dispatch_registry() -> dict:
-    """In-memory registry mirroring config/reviewer-registry.json (real harness ids)."""
+    """路由算法的冻结 fixture：三条真实 harness id，【刻意不随出厂 registry 增长】。
+
+    这里测的是 route() 这个纯函数的选路行为，不是出厂 registry 装了几条腿。把 fixture
+    绑到出厂那份，等于每加一条评审腿就要重写一批与选路无关的断言，而且 available 集
+    的大小本身就是 routing_rule / selection_mode 的判据（len(available)>=3、
+    len(selection_pool)==2）——跟着涨会让这些断言测的东西悄悄换掉。
+    出厂 registry 与各腿 config 是否一一对应，由
+    tests/test_reviewer_registry_additive_merge.py 单独钉住。
+    """
     return {
         "schema_version": 1,
         "harnesses": {
@@ -8844,12 +8859,20 @@ def test_review_strictness_presets_schema(tmp: Path) -> None:
     assert standard["per_phase_model_selection_enabled"] is False
     assert light["per_phase_model_selection_enabled"] is False
 
-    # Tier-1 池全集 = {claude_code, codex, cursor}（R15/R20 补集 − 主 harness 在 S7 落地）。
-    assert set(data["reviewer_harness_pool_tier1_full_membership"]) == {
-        "claude_code",
-        "codex",
-        "cursor",
-    }
+    # Tier-1 池全集必须与出厂 reviewer-registry.json 逐字同源（R15/R20 补集 − 主 harness
+    # 在 S7 落地）。这里刻意**不再抄一份字面量**：两处各写一份 harness 名单，迟早会漂——
+    # 加 kimi_code / oh_my_pi 时就正好撞上，preset 里还写着三条而 registry 已是五条，
+    # 而这个断言当时是绿的（它只在验证自己抄得对不对）。
+    registry_harnesses = set(
+        json.loads(
+            (SCRIPT_DIR.parent / "config" / "reviewer-registry.json").read_text(
+                encoding="utf-8"
+            )
+        )["harnesses"]
+    )
+    assert (
+        set(data["reviewer_harness_pool_tier1_full_membership"]) == registry_harnesses
+    ), (data["reviewer_harness_pool_tier1_full_membership"], sorted(registry_harnesses))
 
 
 def test_candidate_summary_includes_committed_but_unreviewed(tmp: Path) -> None:

@@ -30,12 +30,14 @@
 
 ## 仓库已自带的 alternative reviewer 模板
 
-仓库已带三份 per-harness 模板和 bundled registry 模板；首次部署会把 registry 初始化到 user-local 路径并由其统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 user-local registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
+仓库已带五份 per-harness 模板和 bundled registry 模板；首次部署会把 registry 初始化到 user-local 路径、后续部署对它做幂等 additive merge（只补本机缺的 harness，绝不覆盖你改过的条目），并由其统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 user-local registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
 
 - `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，默认路由的首选一腿；`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。`run_alternative_reviewer.py` 无 `--config` 时的默认即指向它。
 - `config/alternative-reviewer.claude.json` — Claude Code CLI 模板。
 - `config/alternative-reviewer.codex.json` — Codex CLI 模板。
-- `~/.rvf/user-local-data/reviewer-configuration/reviewer-registry.json` — 上述三者的本机注册表，是「本机启用哪些 external reviewer」的唯一事实源；官方 CLI 重装 plugin cache 时不会覆盖。
+- `config/alternative-reviewer.kimi.json` — Kimi Code CLI 模板。**五条腿里唯一不经 stdin 拿 prompt 的一条**：`kimi` 的 `-p/--prompt` 是带值 flag、从不读 stdin，而整份 review packet 塞进 argv 必然 E2BIG（实盘最大 1,522,602 字节 vs `ARG_MAX` 1,048,576）⇒ 走 `prompt_delivery: argv_prompt_flag_with_prompt_file_pointer`，正文照常落盘、argv 只带一段指针指令。
+- `config/alternative-reviewer.oh-my-pi.json` — oh-my-pi（`omp`）模板。**五份里唯一 pin 模型的一份**（`openai-codex/gpt-5.6-sol` + `--thinking xhigh`）：omp 是多 provider 的壳，不 pin 时可能落到与其他腿相同的底层模型，而 SANTA 的价值全部来自模型分歧。代价是它与 codex 腿共用同一 Codex 订阅额度池，选腿层据 `underlying_provider_account_quota_pool_identity` 对这一对做互斥。
+- `~/.rvf/user-local-data/reviewer-configuration/reviewer-registry.json` — 上述五者的本机注册表，是「本机启用哪些 external reviewer」的唯一事实源；官方 CLI 重装 plugin cache 时不会覆盖。
 
 Cursor 模板的命令为 `cursor-agent -p --output-format stream-json --force --trust --sandbox disabled`，几个 flag 的理由：
 
