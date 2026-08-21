@@ -910,6 +910,7 @@ def _manual_decision_additional_context_text(
     token: str,
     newly_minted: bool,
     inline_scope: list[str] | None = None,
+    overrode_agent_declined_cooldown: bool = False,
 ) -> str:
     """manual 决策点注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
 
@@ -917,6 +918,11 @@ def _manual_decision_additional_context_text(
     ``RVF_DECISION_TOKEN`` + rvf-agent ``start/scope/dispatch/decline`` 样例命令 + 「简析后立刻
     start/decline」指引 + R24 递归护栏文案；仅在前面加一行 manual 触发前缀，末尾附用户内联 ``scope:``
     提示。Stop 引擎 import 失败时降级为精简自包含提示（token + 关键命令），绝不阻断。
+
+    ``overrode_agent_declined_cooldown=True`` 时额外插一句：本次手动触发**推翻了你早前对同一批改动
+    的谢绝**。这句不能省——否则 agent 拿到 token 后极可能照上次判断再谢绝一次，用户白打一遍。该参数
+    只反映「是否命中并推翻了 agent 的谢绝」，与冷却记录能否被物理清除无关（清除失败只影响后续自动
+    路径，对本轮 agent 无意义），故这段文案不提「冷却已清除」，恒为真话。
     """
     lines: list[str] = []
     if newly_minted:
@@ -924,6 +930,11 @@ def _manual_decision_additional_context_text(
     else:
         lines.append(
             "你手动触发了 /review-validate-fix；本候选指纹已有一枚活跃决策 token 在等待（幂等复用）；"
+        )
+    if overrode_agent_declined_cooldown:
+        lines.append(
+            "⚠️ 注意：你早前对**同一批改动**谢绝过一次 RVF，用户这次的显式触发已推翻该谢绝。"
+            "请不要以「上次已判断过不必审」为由再次 decline——除非你有本次新出现的理由。"
         )
     lines.append("请简要评估后用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。")
     lines.append("")
@@ -962,12 +973,17 @@ def _handle_manual_decision_point(
 ) -> dict[str, Any]:
     """manual ``/review-validate-fix`` 触发 → 铸决策 token → ``additionalContext`` 注入决策点（S5·R22）。
 
-    与 Stop hook 的 ``decision_point_injection_decision`` 对偶（同 S2 候选摘要 + S1 三闸铸造 + S4
-    注入尝试 ledger），差别仅在交付通道：UPS 用**合法专属**的
+    与 Stop hook 的 ``decision_point_injection_decision`` 对偶（同 S2 候选摘要 + S1 铸造 + S4
+    注入尝试 ledger），差别在交付通道与生效闸数：UPS 用**合法专属**的
     ``hookSpecificOutput.additionalContext`` 把决策提示喂进主 agent 上下文（Stop 只能用
     decision/block）。manual 是用户显式意图：候选非空时 minted / deduplicated 均 surface
-    additionalContext（附 token + rvf-agent CLI 样例命令）；declined 冷却 / 铸造熔断只出 user-facing
-    systemMessage（尊重三闸，指纹未变不 nag）。
+    additionalContext（附 token + rvf-agent CLI 样例命令）。
+
+    **闸二/闸三对本路径不适用**：铸造时传 ``initiated_by_explicit_user_request=True``——命中 declined
+    冷却即视为「用户推翻 agent 早前的谢绝」并照常铸（该告知与冷却记录能否清除无关；清除成功还会把
+    这批改动整体放回可审状态，清除失败则仅剩后续自动路径仍被挡，文案如实分叉），铸造
+    频率熔断整段跳过（它防的是 agent 递归自发起，手动触发按定义来自用户）。因此本函数不再有
+    ``declined_cooldown`` / ``circuit_breaker_tripped`` 分支；除已知 outcome 外一律走 mint anomaly 兜底。
 
     负路径不变量（计划 §五.3）：候选非空的每种结局都写 injection-attempt ledger；成功投递路径
     由 :func:`_confirm_manual_decision_delivery` 在 stdout flush 后写回执，避免尚未 emit 就把 token /
@@ -1040,7 +1056,9 @@ def _handle_manual_decision_point(
             ),
         }
 
-    # ③ 铸 token（S1 三闸内建：去重幂等 / declined 冷却 / 铸造频率熔断）。异常兜底写 ledger。
+    # ③ 铸 token。`initiated_by_explicit_user_request=True` ⇒ 只剩闸一（去重幂等）生效：
+    # declined 冷却命中即清除后继续铸，铸造频率熔断整段跳过（两者都是自动路径的保护闸，
+    # 对用户显式意图是误伤）。异常兜底写 ledger。
     try:
         mint = decision_token_store.mint_decision_token(
             worktree=worktree,
@@ -1048,6 +1066,7 @@ def _handle_manual_decision_point(
             candidate_fingerprint=fingerprint,
             candidate_summary=summary,
             now=now_dt,
+            initiated_by_explicit_user_request=True,
         )
     except Exception as exc:  # pragma: no cover - 铸造异常兜底
         injection_attempt_ledger.record_injection_attempt(
@@ -1082,9 +1101,28 @@ def _handle_manual_decision_point(
     ):
         token = mint.token
         newly_minted = outcome == decision_token_store.MINT_OUTCOME_MINTED
-        additional_context = _manual_decision_additional_context_text(
-            summary=summary, token=token, newly_minted=newly_minted, inline_scope=inline_scope
+        # 「用户推翻了 agent 的谢绝」由**命中**冷却即证成，与 unlink 成败解耦：清除失败只让后续
+        # 自动路径仍被挡，绝不能吞掉这次必发的告知（否则 agent 会照上次判断再 decline 一次）。
+        overrode_cooldown = mint.explicit_user_request_overrode_agent_declined_cooldown
+        cooldown_record_still_blocks_automatic_path = (
+            mint.declined_cooldown_record_still_blocks_automatic_path
         )
+        additional_context = _manual_decision_additional_context_text(
+            summary=summary,
+            token=token,
+            newly_minted=newly_minted,
+            inline_scope=inline_scope,
+            overrode_agent_declined_cooldown=overrode_cooldown,
+        )
+        detail = f"候选 {candidate_count} 文件"
+        if overrode_cooldown:
+            # 两支都必须与磁盘事实一致：清不掉时绝不谎称「已清除」，并把「自动路径仍被挡」说明白。
+            detail += "；已推翻 agent 早前对同一批改动的谢绝"
+            detail += (
+                "，但谢绝冷却记录清除失败，后续自动 Stop 可能仍被它挡住"
+                if cooldown_record_still_blocks_automatic_path
+                else "，并已清除对应的谢绝冷却记录"
+            )
         manual_payload.update(
             {
                 "status": "manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
@@ -1100,7 +1138,7 @@ def _handle_manual_decision_point(
                     kind="manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
                     dispatch_origin="post_user_prompt_manual",
                     token=token,
-                    detail=f"候选 {candidate_count} 文件",
+                    detail=detail,
                 ),
                 _RVF_PENDING_MANUAL_INJECTION_RECEIPT: {
                     "token": token,
@@ -1121,46 +1159,26 @@ def _handle_manual_decision_point(
             manual_payload["manual_scope_files"] = inline_scope
         return manual_payload
 
-    # ⑤ declined 冷却：写 ledger + 只出 systemMessage（尊重 agent 早前的谢绝，指纹未变不 nag）。
-    if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
-        injection_attempt_ledger.record_injection_attempt(
-            worktree=worktree,
-            session_id=summary_session_id,
-            candidate_fingerprint=fingerprint,
-            candidate_path_count=candidate_count,
-            has_committed_but_unreviewed=has_committed,
-            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DECLINED_COOLDOWN,
-            injected=False,
-        )
-        return {
-            **manual_payload,
-            "status": "manual_decision_declined_cooldown",
-            "candidate_path_count": candidate_count,
-            "systemMessage": _trigger_system_message(
-                kind="manual_decision_declined_cooldown",
-                dispatch_origin="post_user_prompt_manual",
-            ),
-        }
-
-    # ⑥ circuit_breaker_tripped（或其它未识别 outcome）：写 ledger + 熔断告警 systemMessage。
+    # ⑤ 走到这里说明 outcome 既非 minted/deduplicated、也拿不到 token。闸二被清除、闸三被跳过后
+    # 这条路径已无正常来源，只可能是 store 侧新增了未知 outcome —— 按铸造异常兜底（写 ledger +
+    # developer-facing systemMessage），保住「候选非空的每种结局都写 injection ledger」的负路径不变量。
     injection_attempt_ledger.record_injection_attempt(
         worktree=worktree,
         session_id=summary_session_id,
         candidate_fingerprint=fingerprint,
         candidate_path_count=candidate_count,
         has_committed_but_unreviewed=has_committed,
-        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_MINT_ANOMALY,
         injected=False,
-        note=mint.message,
+        note=mint.message or f"未识别的铸造 outcome: {outcome}",
     )
     return {
         **manual_payload,
-        "status": "manual_decision_circuit_breaker",
+        "status": "manual_decision_mint_anomaly",
         "candidate_path_count": candidate_count,
-        "systemMessage": mint.message
-        or _trigger_system_message(
-            kind="manual_decision_circuit_breaker",
-            dispatch_origin="post_user_prompt_manual",
+        "error": f"未识别的铸造 outcome: {outcome}",
+        "systemMessage": _trigger_system_message(
+            kind="manual_mint_anomaly", dispatch_origin="post_user_prompt_manual"
         ),
     }
 
@@ -1679,7 +1697,7 @@ def inspect_user_prompt_submit(
     elif is_manual:
         # S5（R22）：manual 触发不再预置 packet/prepare（旧 `_create_manual_prep_file` +
         # shared-workflow 预置逻辑已退役至 rvf-agent CLI `start`）。改为与 Stop hook 决策点
-        # `decision_point_injection_decision` 对偶——铸决策 token（S1 三闸内建）并经 UPS 专属的
+        # `decision_point_injection_decision` 对偶——铸决策 token（S1；用户显式触发只受闸一去重约束）并经 UPS 专属的
         # `additionalContext` 交付「候选摘要（S2）+ token + rvf-agent start/scope/dispatch/decline
         # 样例命令 + 简析后立刻 start/decline 指引」，由主 agent 显式发起或谢绝。此分支自成终局，
         # 提前返回，不再落入下方 token 派发的 shared-workflow 块。
@@ -1855,9 +1873,9 @@ def _trigger_system_message(
     - ``manual_decision_injected``：manual 触发**已铸决策 token，等待 agent 决策**（区分旧「审查已开始」）。
     - ``manual_decision_deduplicated``：manual 触发命中同键活跃决策 token（幂等复用），未重铸。
     - ``manual_decision_no_candidates``：manual 触发但本 worktree 自上次 review 以来无可审候选。
-    - ``manual_decision_declined_cooldown``：候选指纹处于 declined 冷却，未铸（尊重 agent 早前谢绝）。
-    - ``manual_decision_circuit_breaker``：决策 token 铸造频率熔断，疑似递归发起，未铸。
     - ``manual_summary_failed`` / ``manual_mint_anomaly``：manual 决策点摘要构造 / 铸造异常兜底。
+      （declined 冷却 / 铸造熔断对 manual 路径不适用，故无对应 kind——见
+      :func:`_handle_manual_decision_point`。）
     - ``decision_point_banner_delivered``：带外投递的发起横幅**已成为一条真实 user message**
       （INV-A 达成，token 推进 injected）。
     - ``decision_point_banner_terminal_on_arrival``：一份已达终态（withdrawn / dispatched /
@@ -1939,21 +1957,6 @@ def _trigger_system_message(
         return notice(
             status_value="manual_decision_no_candidates",
             message="手动触发但本 worktree 自上次 review 以来无可审候选改动，未铸 token",
-            extra_fields=detail_fields,
-        )
-    if kind == "manual_decision_declined_cooldown":
-        return notice(
-            status_value="manual_decision_declined_cooldown",
-            message=(
-                "候选指纹处于 declined 冷却（agent 早前已谢绝且改动未变），未铸 token；"
-                "如仍需审查，请改动候选或让 agent 清冷却后重试"
-            ),
-            extra_fields=detail_fields,
-        )
-    if kind == "manual_decision_circuit_breaker":
-        return notice(
-            status_value="manual_decision_circuit_breaker",
-            message="决策 token 铸造频率熔断，疑似递归发起，未铸 token",
             extra_fields=detail_fields,
         )
     if kind == "manual_summary_failed":
