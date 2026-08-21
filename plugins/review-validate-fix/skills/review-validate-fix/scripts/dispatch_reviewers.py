@@ -39,9 +39,11 @@ from datetime import datetime, timezone
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,7 @@ from run_alternative_reviewer import (
     EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG,
     reviewer_id_from_label,
     safe_artifact_token,
+    user_local_alternative_reviewer_config_override_path,
 )
 from write_review_result import SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
 from core.host_adapter.host_transcript_format_detection import (
@@ -70,6 +73,14 @@ from core.host_adapter.host_transcript_format_detection import (
 from core.reviewer_harness_selection import (
     SELECTION_MODE_SAME_HARNESS_DOUBLE,
     compute_reviewer_harness_selection,
+)
+from core.reviewer_harness_probe_result_cache import (
+    PROBE_OUTCOME_AVAILABLE,
+    PROBE_OUTCOME_UNAVAILABLE,
+    compute_probe_identity_digest,
+    invalidate_cached_probe_outcome,
+    read_cached_probe_outcome,
+    write_probe_outcome,
 )
 from core.temporary_disable_window import TemporaryDisableWindow
 from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
@@ -448,6 +459,34 @@ def probe_available(
             continue
         spec = registry["harnesses"][harness_id]
         config_path = SKILL_DIR / spec["config_path"]
+
+        # 第一道：零成本否定。可执行文件都不在 PATH 上，真跑 probe 必然失败，没必要为
+        # 一个注定的结论付一次模型调用。**这个方向是安全的**——「不在 PATH」只能证否、
+        # 不能用来证真，所以它不构成 health parity gate 要防的那种廉价替代判据。
+        executable_path, override_path = _resolved_probe_execution_inputs(config_path)
+        if executable_path is None:
+            continue
+
+        # 第二道：复用一次**真实** probe 的结论。摘要绑 config 内容 + 可执行文件身份 +
+        # probe 模式，任一变化即视为未命中。
+        probe_identity_digest = compute_probe_identity_digest(
+            config_path=config_path,
+            user_local_config_override_path=override_path,
+            executable_path=executable_path,
+            probe_mode=probe_mode,
+        )
+        now_epoch_seconds = time.time()
+        cached_outcome = read_cached_probe_outcome(
+            harness_id,
+            probe_identity_digest=probe_identity_digest,
+            now_epoch_seconds=now_epoch_seconds,
+        )
+        if cached_outcome == PROBE_OUTCOME_AVAILABLE:
+            available.append(harness_id)
+            continue
+        if cached_outcome == PROBE_OUTCOME_UNAVAILABLE:
+            continue
+
         cmd = [
             sys.executable,
             str(RUN_ALTERNATIVE_REVIEWER),
@@ -462,11 +501,86 @@ def probe_available(
                 stderr=subprocess.DEVNULL,
                 timeout=timeout,
             )
-            if completed.returncode == 0:
-                available.append(harness_id)
         except (subprocess.TimeoutExpired, OSError):
+            # 这里兜的**只是外层 probe 进程**级的失败，不要把它读成「health 超时不写缓存」。
+            # 两种超时归属不同，处理也必须不同：
+            #
+            # - 腿**自己**的 health 超时（config 的 health_timeout_seconds）根本走不到这个
+            #   except。各腿的预算一律小于 --probe-timeout（30/45/45/50 < 60，config 注释里
+            #   写死了这条约束），所以慢腿——omp 这种 thinking xhigh 冷启动——的主超时路径是
+            #   内层先触发：run_health 捕获 TimeoutExpired 后经 fail() 返回非 0，从这里看就是
+            #   一个普通的 returncode != 0，随后被写成 unavailable。**这是刻意的**：一条腿在
+            #   它自己声明的预算内没响应，本身就是关于这条腿的信息，够格记下来；至于它多半是
+            #   瞬时的，由 unavailable 那条短 TTL（默认 300s，只有 available 的六分之一）兜住，
+            #   下一轮很快就会重新真跑。
+            # - 走到这个 except 的只剩两种：连内层的超时预算都没兑现（进程卡在更外层），以及
+            #   进程压根没起来。那是 probe 机制本身失效，**不构成关于这条腿的任何信息**——
+            #   记 available 会把死腿判活（health probe parity 事故的形状），记 unavailable
+            #   会让好腿凭空缺席，所以两侧都不记，下一轮老实重跑。
             continue
+        probe_outcome = (
+            PROBE_OUTCOME_AVAILABLE
+            if completed.returncode == 0
+            else PROBE_OUTCOME_UNAVAILABLE
+        )
+        write_probe_outcome(
+            harness_id,
+            probe_outcome,
+            probe_identity_digest=probe_identity_digest,
+            now_epoch_seconds=now_epoch_seconds,
+        )
+        if probe_outcome == PROBE_OUTCOME_AVAILABLE:
+            available.append(harness_id)
     return available
+
+
+def _resolved_probe_execution_inputs(
+    config_path: Path,
+) -> tuple[Path | None, Path | None]:
+    """解析这一轮 probe 真正依赖的两个外部输入：可执行文件，以及 user-local override 文件。
+
+    返回 ``(executable_path, user_local_config_override_path)``。
+
+    ``executable_path`` 解析不出（config 读不动 / 没有 command / 命令不在 PATH）即代表这条腿
+    不可用——这是**证否**用途，绝不用它来判「可用」。
+
+    ``user_local_config_override_path`` 是**摘要输入**，不是可用性判据：``--preflight`` 跑的是
+    bundled config 叠加 override 之后的有效配置，而 override 能改掉 ``health_command`` 等
+    真正被执行的字段。它指向的文件多数机器上并不存在，此处仍如实返回路径，由摘要把「当前
+    有没有 override、内容是什么」一并纳入——否则新建或改动 override 不会让缓存失效。
+    解析不出 label（因而推不出 override 路径）时返回 None，摘要会用固定占位表示这一状态。
+    """
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    command = payload.get("command")
+    if not isinstance(command, list) or not command:
+        return None, None
+    executable_name = str(command[0]).strip()
+    if not executable_name:
+        return None, None
+    resolved = shutil.which(executable_name)
+    if not resolved:
+        return None, None
+
+    override_path: Path | None = None
+    reviewer_label = payload.get("label")
+    if isinstance(reviewer_label, str) and reviewer_label.startswith("alternative-reviewer:"):
+        try:
+            override_path = user_local_alternative_reviewer_config_override_path(reviewer_label)
+        except (OSError, ValueError):
+            override_path = None
+    return Path(resolved), override_path
+
+
+def invalidate_probe_result_cache_for_failed_dispatch(harness_id: str) -> bool:
+    """派发阶段这条腿真挂了 ⇒ 立刻废掉它的缓存结论。
+
+    不做这一步的话，一条「可用」缓存会在整个 TTL 内把死腿一次次喂回选腿层，而每一轮都
+    因为命中缓存而不再真实 probe——错误会自我延续，正好是缓存最危险的失效形状。
+    """
+    return invalidate_cached_probe_outcome(harness_id)
 
 
 def _build_reviewer_command(
@@ -868,7 +982,12 @@ def execute_plan(
         # 本轮失败的 harness 一律排除出后续候选；但只有额度类才写跨 run 的 cooldown
         # （无论能否 reroute 都记——跨轮 cooldown 是第二层防线）。
         for index, _err in failed_slots:
-            failed_harnesses.add(reviewers[index]["harness_id"])
+            failed_harness_id = reviewers[index]["harness_id"]
+            failed_harnesses.add(failed_harness_id)
+            # 派发实证这条腿本轮没能产出评审结论 ⇒ 它此前那条「可用」probe 缓存已被现实
+            # 推翻，立刻废掉。不废的话，整个 TTL 内每一轮都会命中缓存、不再真实 probe，
+            # 于是同一条死腿被反复选进两腿——缓存把一次性的失败变成自我延续的错误。
+            invalidate_probe_result_cache_for_failed_dispatch(failed_harness_id)
         for index, err in usage_limited_slots:
             harness_id = reviewers[index]["harness_id"]
             if harness_id not in cooled:
