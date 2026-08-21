@@ -240,6 +240,25 @@ def _warn(code: str, severity: str, message: str) -> dict[str, str]:
     return {"code": code, "severity": severity, "message": message}
 
 
+def _quota_pool_identity_by_harness(registry: dict[str, Any]) -> dict[str, str]:
+    """registry → {harness_id: 额度池标识}，未声明者不入 mapping（视为各自独立）。
+
+    出厂 registry 每条都必须声明，漏填由 check_skill_contracts 的契约测试抓；
+    这里对缺失保持宽松，是为了不让一条刚加进来的腿把选腿逼进降级。
+    """
+    harnesses = registry.get("harnesses", {})
+    identities: dict[str, str] = {}
+    for harness_id, spec in harnesses.items():
+        if not isinstance(spec, dict):
+            continue
+        declared = str(
+            spec.get("underlying_provider_account_quota_pool_identity", "")
+        ).strip()
+        if declared:
+            identities[harness_id] = declared
+    return identities
+
+
 def route(
     main_harness: str,
     available: list[str],
@@ -311,11 +330,23 @@ def route(
     selection = compute_reviewer_harness_selection(
         main_harness=main_harness,
         available_harnesses=A,
+        quota_pool_identity_by_harness=_quota_pool_identity_by_harness(registry),
         selection_seed=selection_seed,
     )
     plan["routing_rule"] = selection.routing_rule
     # 选材遥测块（seed 落此处，可复现；schema additive，既有消费者忽略未知 key）。
     plan["reviewer_selection"] = selection.telemetry_payload()
+    if selection.shared_quota_pool_collision_accepted:
+        warnings.append(
+            _warn(
+                "reviewer_legs_share_quota_pool",
+                "warning",
+                "本轮两腿共用同一额度池（同一底层模型 + 同一订阅账号）："
+                f"{', '.join(selection.selected_harnesses)}。"
+                "双评审的模型分歧因此消失，且该订阅额度耗尽会同时打掉两腿。"
+                "这是可用集里已无异池组合时的降级——减少腿数会更糟，故仍照常派发。",
+            )
+        )
 
     # R3 — 零可用
     if not selection.selected_harnesses:
