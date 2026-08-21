@@ -173,7 +173,51 @@ ledger，不是宿主 transcript。
 
 ---
 
-## 6. 已知残留
+## 6. 宿主侧缺口：hook **根本没跑起来**时，契约在下游
+
+本文前五节管的都是「RVF 的 core 跑起来了，往哪个出口写什么」。有一整族失败**在这之前**：
+hook 命令起不来。此时 RVF 的一切自我保护——受众翻译层、`is_foreign_invocation`、
+nudge 预算——**全部在失败的下游，一行都跑不到**。
+
+### 危险条件精确到一种
+
+| 失败形态 | Codex 0.147.0 | Claude Code 2.1.235 |
+| --- | --- | --- |
+| **退出码 2 + stderr 非空** | ✅ **驱动 agent**：stderr 逐字成为 `<hook_prompt>` 续跑提示 | ✅ **驱动 agent**：`Exit code 2 - show stderr to model and continue conversation` |
+| 退出码 2 + stderr 为空 | ❌ 落到错误模板 | ❌ |
+| 其它非零退出码（含 `python3` 缺失的 127） | ❌ | ❌ `Other exit codes - show stderr to user only` |
+| 超时 / 非法 JSON / 退出码 0 带 stderr | ❌ | ❌ |
+
+而 `python3 <不存在的脚本>` 的退出码**正好是 2**，stderr 正好是
+`[Errno 2] No such file or directory` ⇒ 命中唯一那格。
+
+`<hook_prompt>` 不是「失败通道」，它就是 **Stop 的续跑通道本身**——RVF 正常的决策点横幅
+走的也是它。投递到模型侧后两者不可区分。
+
+**没有任何上界。** 实测 286 次注入、同一个 `turn_id`、持续 2h37m，最后由人工 kill；
+Codex 二进制里不存在任何失败计数器标识符，也**没有**把 hook 失败降级为 developer-only 的
+配置开关（`[hooks.state]` 只有 `enabled` 与 `trusted_hash` 两个键）。
+
+### 所以守卫只能活在命令串里
+
+命令串是宿主在**会话启动时**快照的一部分，磁盘被掏空也照样存在。
+`core/hook_command_spawn_guard_against_missing_target_script.py` 把每条 hook 命令包成
+「目标脚本不在就静默 `exit 0` + 往 `~/.rvf/user-local-data/rvf-hook-target-missing.log`
+留一行 developer-only 面包屑」。这不是新契约，是把 §0 的铁律贯彻到 core 够不着的那一段。
+
+隔离 `CODEX_HOME` 真实会话对照（同一份 payload、同一条悬空路径）：
+
+| 命令形态 | `<hook_prompt>` 次数 | 收尾 |
+| --- | --- | --- |
+| `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/stop.py"`（改造前） | **32 次 / 100 秒**，不自停 | 被硬超时 kill |
+| spawn 守卫（改造后） | **0** | 14.2 秒 exit 0，面包屑 1 行 |
+
+**改任何写 hook 命令串的代码时（`hooks/hooks.json`、`install_to_codex.py` 的烘焙点），
+都必须经由该守卫**——`tests/test_hook_command_spawn_guard.py` 有结构性 gate。
+
+---
+
+## 7. 已知残留
 
 - Codex 上 agent-directive 仍走 `decision:block`，harness 照旧把它渲染成错误。这是 Codex 侧
   `additionalProperties:false` 的硬约束，不是 RVF 的选择。

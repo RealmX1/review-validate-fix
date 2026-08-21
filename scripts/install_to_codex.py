@@ -22,6 +22,18 @@ from typing import Any, Callable, Iterable, Mapping
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from core.hook_command_spawn_guard_against_missing_target_script import (  # noqa: E402
+    hook_command_guarded_against_missing_target_script,
+)
+from core.codex_bundled_plugin_hook_suppression import (  # noqa: E402
+    BUNDLED_HOOKS_JSON_RELATIVE_PATH,
+    disable_bundled_plugin_hooks_in_codex_config,
+)
+from core.live_codex_sessions_holding_plugin_cache_paths import (  # noqa: E402
+    live_codex_session_warning_lines,
+    live_codex_sessions_holding_plugin_cache_paths,
+    plugin_cache_path_prefixes_for_selectors,
+)
 from core.rvf_user_local_data_paths import (  # noqa: E402
     RvfUserLocalDataPaths,
     resolved_rvf_user_local_data_paths,
@@ -94,6 +106,20 @@ class OfficialCliInstallationResult:
     commands: tuple[tuple[str, ...], ...]
     removed_noncanonical_codex_plugin_selectors: tuple[str, ...]
     removed_noncanonical_claude_plugin_selectors: tuple[str, ...]
+    codex_bundled_plugin_hook_suppression: dict[str, Any] | None = None
+    """把 Codex 侧 bundled ``hooks/hooks.json`` 注册置为 ``enabled = false`` 的结果。
+
+    bundled 那份在 Codex 上恒定 no-op，却是唯一指向版本化 plugin cache 目录的注册。
+    """
+    live_codex_sessions_holding_plugin_cache_paths_to_be_removed: tuple[
+        dict[str, Any], ...
+    ] = ()
+    """部署前检测到的、可能仍在运行且持有即将被删 plugin cache 路径的 Codex 会话。
+
+    **只告警、不阻断**：判据本身有已知假阴性（liveness 用 rollout mtime 近似），而硬闸也
+    不可行——Kanban 会在 codex 进程死亡后立刻重启新会话，「等所有 codex 退出」不可达。
+    空列表意味着「未发现」，不等于「已确认安全」。
+    """
 
 
 @dataclass(frozen=True)
@@ -609,6 +635,24 @@ def noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
     return tuple(sorted(selectors))
 
 
+def _bundled_plugin_hooks_document(active_marketplace_root: Path) -> dict[str, Any]:
+    """读 active marketplace 里 plugin bundled 的 ``hooks/hooks.json``。
+
+    读不到就返回空文档：抑制写入本身是**加固**，不该因为读不到而让整次部署失败。
+    """
+    path = (
+        Path(active_marketplace_root)
+        / "plugins"
+        / PLUGIN_NAME
+        / BUNDLED_HOOKS_JSON_RELATIVE_PATH
+    )
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
 def install_developer_marketplace_with_official_clis(
     *,
     active_marketplace_root: Path,
@@ -666,6 +710,23 @@ def install_developer_marketplace_with_official_clis(
             plugin_selector_field_name="pluginId",
         )
     )
+    # 动任何 plugin cache 之前先看有没有 live 会话持有它。``codex plugin remove`` 会连带
+    # 删掉整棵 payload 树，而已在运行的会话持有的是**启动时的注册快照**——2026-08-18 的
+    # 286 次无上界续跑就是这么来的。只告警不阻断，理由见结果字段的 docstring。
+    live_codex_sessions_holding_removed_paths = live_codex_sessions_holding_plugin_cache_paths(
+        codex_home=Path.home() / ".codex",
+        plugin_cache_path_prefixes=plugin_cache_path_prefixes_for_selectors(
+            codex_home=Path.home() / ".codex",
+            plugin_selectors=(
+                *removed_noncanonical_codex_plugin_selectors,
+                DEVELOPER_PLUGIN_SELECTOR,
+            ),
+        ),
+    )
+    for warning_line in live_codex_session_warning_lines(
+        live_codex_sessions_holding_removed_paths
+    ):
+        print(warning_line, file=sys.stderr)
     for stale_selector in removed_noncanonical_codex_plugin_selectors:
         _run_official_cli_command(
             [codex_executable_text, "plugin", "remove", stale_selector, "--json"],
@@ -763,6 +824,14 @@ def install_developer_marketplace_with_official_clis(
         command_runner=command_runner,
         recorded_commands=recorded_commands,
     )
+    # 装完立刻把 bundled hook 注册停掉：它在 Codex 上恒定 no-op（`is_foreign_invocation`
+    # 只服务 Claude），却是唯一指向**版本化 plugin cache 目录**的注册，也就是每次部署换
+    # 版本目录后会悬空的那一条。理由与实测见该模块 docstring。
+    codex_bundled_plugin_hook_suppression = disable_bundled_plugin_hooks_in_codex_config(
+        codex_home=Path.home() / ".codex",
+        plugin_selector=DEVELOPER_PLUGIN_SELECTOR,
+        bundled_hooks_document=_bundled_plugin_hooks_document(active_marketplace_root),
+    )
 
     claude_marketplace_entry = next(
         (
@@ -850,6 +919,31 @@ def install_developer_marketplace_with_official_clis(
         ),
         removed_noncanonical_claude_plugin_selectors=(
             removed_noncanonical_claude_plugin_selectors
+        ),
+        codex_bundled_plugin_hook_suppression={
+            "config_path": str(codex_bundled_plugin_hook_suppression.config_path),
+            "disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.disabled_hook_state_keys
+            ),
+            "already_disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.already_disabled_hook_state_keys
+            ),
+            "created_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.created_hook_state_keys
+            ),
+            "config_written": codex_bundled_plugin_hook_suppression.config_written,
+            # 抑制失败不阻断部署（它是加固，不是部署的必要条件），所以只能靠回执被看见。
+            "config_write_failure_reason": (
+                codex_bundled_plugin_hook_suppression.config_write_failure_reason
+            ),
+        },
+        live_codex_sessions_holding_plugin_cache_paths_to_be_removed=tuple(
+            {
+                "session_id": finding.session_id,
+                "rollout_path": str(finding.rollout_path),
+                "held_plugin_cache_paths": list(finding.held_plugin_cache_paths),
+            }
+            for finding in live_codex_sessions_holding_removed_paths
         ),
     )
 
@@ -1270,12 +1364,20 @@ def configure_stop_hook(
             "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
             "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
             f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
-            f"python3 {shlex.quote(str(router))}",
         ]
     )
     entry = {
         "type": "command",
-        "command": " ".join(env_parts),
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(router)),
+            hook_event_name="Stop",
+            environment_assignment_prefix=" ".join(env_parts),
+            # env 前缀只作用于 python3 那一条命令，面包屑分支读不到它烘焙的
+            # RVF_USER_LOCAL_DATA_ROOT，故把已解析的根显式传进守卫。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
+        ),
         "timeout": 300,
         "statusMessage": "Review-Validate-Fix：选择通道并运行停止检查",
     }
@@ -1335,14 +1437,21 @@ def configure_user_prompt_submit_hook(
     detector = plugin_skill_dir / "scripts/rvf_user_prompt_submit.py"
     entry = {
         "type": "command",
-        "command": " ".join(
-            [
-                f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
-                f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
-                f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
-                f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
-                f"python3 {shlex.quote(str(detector))}",
-            ]
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(detector)),
+            hook_event_name="UserPromptSubmit",
+            environment_assignment_prefix=" ".join(
+                [
+                    f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
+                    f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
+                    f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
+                    f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
+                ]
+            ),
+            # 同 configure_stop_hook：面包屑根必须显式传，不能指望 ambient 环境变量。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
         ),
         "timeout": 5,
     }
@@ -1594,6 +1703,16 @@ def main(argv: list[str] | None = None) -> int:
                     official_cli_result.removed_noncanonical_claude_plugin_selectors
                 ),
             },
+            "codex_bundled_plugin_hook_suppression": (
+                official_cli_result.codex_bundled_plugin_hook_suppression
+            ),
+            "live_codex_sessions_holding_plugin_cache_paths_to_be_removed": [
+                dict(finding)
+                for finding in (
+                    official_cli_result
+                    .live_codex_sessions_holding_plugin_cache_paths_to_be_removed
+                )
+            ],
             "hooks_path": str(hooks_path) if hooks_path else None,
             "user_local_data_root": str(user_local_data_paths.user_local_data_root),
             "rollback_status": deployment_transaction.rollback_status,
