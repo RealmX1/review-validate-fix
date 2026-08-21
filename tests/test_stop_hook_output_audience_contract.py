@@ -102,7 +102,10 @@ def _registered_hook_shims() -> dict[Path, str]:
                 command = hook["command"]
                 marker = "${CLAUDE_PLUGIN_ROOT}/"
                 assert marker in command, command
-                relative = command.split(marker, 1)[1].strip().strip('"')
+                # 命令串不再是裸 `python3 "<marker><rel>"`：spawn 守卫把路径搬进了 shell
+                # 变量赋值（`rvf_hook_target_script="<marker><rel>"; if [ -f … ]`），marker
+                # 之后还跟着整条守卫逻辑。所以切到**第一个收尾双引号**为止，两种形态通吃。
+                relative = command.split(marker, 1)[1].split('"', 1)[0]
                 path = PLUGIN_ROOT / relative
                 declared = _declared_event_name(path)
                 assert declared == registered_event, (

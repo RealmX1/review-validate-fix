@@ -20,7 +20,8 @@ Claude Code adapter（路径 C：trigger-only，转发到 Codex core）。
 
 - **问题**：Codex plugin loader 把 plugin-packaged `hooks/hooks.json` 也当 hooks 源加载（`~/.codex/config.toml` `[hooks.state.review-validate-fix@local-codex-plugins:hooks/hooks.json:...]`），与 `~/.codex/hooks.json` 里 installer 注册的 RVF entry 平行执行 → 同一 Codex 事件触发两次 RVF。
 - **S3 已做（守卫单源化）**：`hooks/_claude_hook_entry.py` 的 `is_foreign_invocation` 是**唯一** host-ownership 守卫——本 Claude 入口只拥有 Claude 调用，正向证据判定 Codex 时静默 no-op，由 Codex 端 entry 独自处理 → 每 host 恰好处理一次。原 `stop.py` / `user_prompt_submit.py` 各持一份逐字复制的 `_is_codex_invocation` 已被消除，收敛为本契约一处（`run_claude_hook` 同样收纳共享的 stdin→normalize→subprocess→fail-open 骨架）。该模块**刻意 stdlib-only、不依赖 `core`/`adapters`**：hook 是最该 fail-open 的安全面，不给它加 vendored import 失败模式；两入口经 same-dir `sys.path` 自举 import 该 sibling。
-- **deferred（非维度 1 完美形态，受 Risk #14 约束）**：彻底删运行期守卫的「config 级单次注册」——让 Codex plugin loader **不注册** bundled `hooks.json`，使守卫可整体删除、`rg is_foreign_invocation hooks/` 命中 0、core 在注册层而非脚本层结构性不重复——需先在 live `~/.codex` 实测 Codex plugin-loader 是否支持抑制 bundled 双源（plan Risk #14「先实测确认抑制、再删守卫」），且受「勿污染真实 ~/.codex」约束。故本切片只做守卫单源化，零守卫的结构性消除留作后续；双触发回归测试（`claude_plugin_{shim,stop_shim}_codex_invocation_noop`）保留作安全网。
+- **原 deferred 的实测部分已完成（2026-08-20），守卫刻意保留**：Risk #14 要求的「先实测确认能否抑制 bundled 双源」已在隔离 `CODEX_HOME` + 真实 codex 0.147.0 会话下做完——bundled `hooks/hooks.json` 确实被 plugin loader 按约定加载并执行；`[hooks.state."<selector>:hooks/hooks.json:<event>:<g>:<h>"].enabled = false` **能抑制它**（同会话里 `~/.codex/hooks.json` 的 hook 照常执行）；该值跨 `codex plugin add`/`remove`/再 `add` 原样存活。抑制已由 `install_to_codex.py` 在每次部署时写入（`core/codex_bundled_plugin_hook_suppression.py`）。
+  **但 `is_foreign_invocation` 不删**：抑制是「部署时写进某台机器 config 的状态」，只覆盖已部署且未被改回的机器；守卫是「随 payload 走的代码」，覆盖任何拿到该 payload 的 Codex（含手工安装、旧 config、被还原的 config）。因此 `rg is_foreign_invocation hooks/` 命中 0 这条**验收判据作废**，不再是待办；双触发回归测试（`claude_plugin_{shim,stop_shim}_codex_invocation_noop`）继续作安全网。
 
 ## 6 维契约现状
 
