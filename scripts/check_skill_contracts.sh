@@ -579,6 +579,7 @@ repo_required_files=(
   "tests/test_reviewer_health_probe_parity.py"
   "tests/test_reviewer_registry_additive_merge.py"
   "tests/test_reviewer_quota_pool_exclusive_selection.py"
+  "tests/test_reviewer_harness_probe_result_cache.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -692,7 +693,8 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_reviewer_structured_output_extraction.py" \
   "$tests_dir/test_reviewer_health_probe_parity.py" \
   "$tests_dir/test_reviewer_registry_additive_merge.py" \
-  "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py"
+  "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py" \
+  "$tests_dir/test_reviewer_harness_probe_result_cache.py"
 
 run_parallel_test_steps
 run_step "tests: rvf_local_deploy" \
@@ -777,6 +779,14 @@ run_step "tests: reviewer_registry_additive_merge" \
 run_step "tests: reviewer_quota_pool_exclusive_selection" \
   python3 -m pytest -q \
     "$tests_dir/test_reviewer_quota_pool_exclusive_selection.py"
+# probe 结果缓存：probe_available 每轮对每条 enabled harness 真跑一次 --preflight，那是真实
+# 模型调用（omp 单次实测 input 39,499 tokens），5 条腿后每轮稳态代价可观。缓存只复用一次
+# **真实** probe 的结论，绝不用廉价信号替代它——那正是 health parity gate 要防的形状。
+# 三条方向性不变量必须钉死：读侧任何异常退化成 miss 而非「可用」；成功/失败 TTL 不对称；
+# 派发失败当场作废缓存（否则一条「可用」缓存会在整个 TTL 内自我延续地把死腿喂回选腿层）。
+run_step "tests: reviewer_harness_probe_result_cache" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewer_harness_probe_result_cache.py"
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"

@@ -30,7 +30,7 @@
 
 ## 仓库已自带的 alternative reviewer 模板
 
-仓库已带五份 per-harness 模板和 bundled registry 模板；首次部署会把 registry 初始化到 user-local 路径、后续部署对它做幂等 additive merge（只补本机缺的 harness，绝不覆盖你改过的条目），并由其统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 user-local registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe；也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
+仓库已带五份 per-harness 模板和 bundled registry 模板；首次部署会把 registry 初始化到 user-local 路径、后续部署对它做幂等 additive merge（只补本机缺的 harness，绝不覆盖你改过的条目），并由其统一注册（`harness_id → config_path / enabled / priority_default`）。`dispatch_reviewers.py` 据 user-local registry 对每个 enabled harness 跑 `run_alternative_reviewer.py --config <path> --preflight` probe。该 probe 是真实模型调用，所以结论会被带 TTL 复用（默认可用 30 分钟 / 不可用 5 分钟），且命令不在 PATH 时直接判不可用、不付这次调用；改了 config 或升级了 CLI 会自动失效，`RVF_REVIEWER_HARNESS_PROBE_RESULT_CACHE_DISABLED=1` 可强制重探。也可单独把某个模板传给 `run_alternative_reviewer.py --config <path>`：
 
 - `config/alternative-reviewer.cursor.json` — Cursor CLI（`cursor-agent`）模板，默认路由的首选一腿；`cursor-agent` 已在 `scripts/discover_santa_alternative_agents.sh` 的候选列表中。`run_alternative_reviewer.py` 无 `--config` 时的默认即指向它。
 - `config/alternative-reviewer.claude.json` — Claude Code CLI 模板。
