@@ -22,6 +22,18 @@ from typing import Any, Callable, Iterable, Mapping
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from core.hook_command_spawn_guard_against_missing_target_script import (  # noqa: E402
+    hook_command_guarded_against_missing_target_script,
+)
+from core.codex_bundled_plugin_hook_suppression import (  # noqa: E402
+    BUNDLED_HOOKS_JSON_RELATIVE_PATH,
+    disable_bundled_plugin_hooks_in_codex_config,
+)
+from core.live_codex_sessions_holding_plugin_cache_paths import (  # noqa: E402
+    live_codex_session_warning_lines,
+    live_codex_sessions_holding_plugin_cache_paths,
+    plugin_cache_path_prefixes_for_selectors,
+)
 from core.rvf_user_local_data_paths import (  # noqa: E402
     RvfUserLocalDataPaths,
     resolved_rvf_user_local_data_paths,
@@ -94,6 +106,20 @@ class OfficialCliInstallationResult:
     commands: tuple[tuple[str, ...], ...]
     removed_noncanonical_codex_plugin_selectors: tuple[str, ...]
     removed_noncanonical_claude_plugin_selectors: tuple[str, ...]
+    codex_bundled_plugin_hook_suppression: dict[str, Any] | None = None
+    """把 Codex 侧 bundled ``hooks/hooks.json`` 注册置为 ``enabled = false`` 的结果。
+
+    bundled 那份在 Codex 上恒定 no-op，却是唯一指向版本化 plugin cache 目录的注册。
+    """
+    live_codex_sessions_holding_plugin_cache_paths_to_be_removed: tuple[
+        dict[str, Any], ...
+    ] = ()
+    """部署前检测到的、可能仍在运行且持有即将被删 plugin cache 路径的 Codex 会话。
+
+    **只告警、不阻断**：判据本身有已知假阴性（liveness 用 rollout mtime 近似），而硬闸也
+    不可行——Kanban 会在 codex 进程死亡后立刻重启新会话，「等所有 codex 退出」不可达。
+    空列表意味着「未发现」，不等于「已确认安全」。
+    """
 
 
 @dataclass(frozen=True)
@@ -609,6 +635,24 @@ def noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
     return tuple(sorted(selectors))
 
 
+def _bundled_plugin_hooks_document(active_marketplace_root: Path) -> dict[str, Any]:
+    """读 active marketplace 里 plugin bundled 的 ``hooks/hooks.json``。
+
+    读不到就返回空文档：抑制写入本身是**加固**，不该因为读不到而让整次部署失败。
+    """
+    path = (
+        Path(active_marketplace_root)
+        / "plugins"
+        / PLUGIN_NAME
+        / BUNDLED_HOOKS_JSON_RELATIVE_PATH
+    )
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
 def install_developer_marketplace_with_official_clis(
     *,
     active_marketplace_root: Path,
@@ -666,6 +710,23 @@ def install_developer_marketplace_with_official_clis(
             plugin_selector_field_name="pluginId",
         )
     )
+    # 动任何 plugin cache 之前先看有没有 live 会话持有它。``codex plugin remove`` 会连带
+    # 删掉整棵 payload 树，而已在运行的会话持有的是**启动时的注册快照**——2026-08-18 的
+    # 286 次无上界续跑就是这么来的。只告警不阻断，理由见结果字段的 docstring。
+    live_codex_sessions_holding_removed_paths = live_codex_sessions_holding_plugin_cache_paths(
+        codex_home=Path.home() / ".codex",
+        plugin_cache_path_prefixes=plugin_cache_path_prefixes_for_selectors(
+            codex_home=Path.home() / ".codex",
+            plugin_selectors=(
+                *removed_noncanonical_codex_plugin_selectors,
+                DEVELOPER_PLUGIN_SELECTOR,
+            ),
+        ),
+    )
+    for warning_line in live_codex_session_warning_lines(
+        live_codex_sessions_holding_removed_paths
+    ):
+        print(warning_line, file=sys.stderr)
     for stale_selector in removed_noncanonical_codex_plugin_selectors:
         _run_official_cli_command(
             [codex_executable_text, "plugin", "remove", stale_selector, "--json"],
@@ -763,6 +824,14 @@ def install_developer_marketplace_with_official_clis(
         command_runner=command_runner,
         recorded_commands=recorded_commands,
     )
+    # 装完立刻把 bundled hook 注册停掉：它在 Codex 上恒定 no-op（`is_foreign_invocation`
+    # 只服务 Claude），却是唯一指向**版本化 plugin cache 目录**的注册，也就是每次部署换
+    # 版本目录后会悬空的那一条。理由与实测见该模块 docstring。
+    codex_bundled_plugin_hook_suppression = disable_bundled_plugin_hooks_in_codex_config(
+        codex_home=Path.home() / ".codex",
+        plugin_selector=DEVELOPER_PLUGIN_SELECTOR,
+        bundled_hooks_document=_bundled_plugin_hooks_document(active_marketplace_root),
+    )
 
     claude_marketplace_entry = next(
         (
@@ -850,6 +919,31 @@ def install_developer_marketplace_with_official_clis(
         ),
         removed_noncanonical_claude_plugin_selectors=(
             removed_noncanonical_claude_plugin_selectors
+        ),
+        codex_bundled_plugin_hook_suppression={
+            "config_path": str(codex_bundled_plugin_hook_suppression.config_path),
+            "disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.disabled_hook_state_keys
+            ),
+            "already_disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.already_disabled_hook_state_keys
+            ),
+            "created_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.created_hook_state_keys
+            ),
+            "config_written": codex_bundled_plugin_hook_suppression.config_written,
+            # 抑制失败不阻断部署（它是加固，不是部署的必要条件），所以只能靠回执被看见。
+            "config_write_failure_reason": (
+                codex_bundled_plugin_hook_suppression.config_write_failure_reason
+            ),
+        },
+        live_codex_sessions_holding_plugin_cache_paths_to_be_removed=tuple(
+            {
+                "session_id": finding.session_id,
+                "rollout_path": str(finding.rollout_path),
+                "held_plugin_cache_paths": list(finding.held_plugin_cache_paths),
+            }
+            for finding in live_codex_sessions_holding_removed_paths
         ),
     )
 
@@ -1152,19 +1246,137 @@ def initialize_rvf_user_local_data(
         paths.deployment_receipts_root,
     ):
         directory.mkdir(parents=True, exist_ok=True)
-    if not paths.reviewer_registry_path.exists():
-        bundled_registry = (
+    merge_bundled_reviewer_harnesses_into_user_local_registry(
+        bundled_registry_path=(
             source_repository
             / f"plugins/{PLUGIN_NAME}"
             / PLUGIN_SKILL_RELATIVE_PATH
             / "config/reviewer-registry.json"
-        )
-        if not bundled_registry.is_file():
-            raise OfficialCliInstallationError(
-                f"缺少 bundled reviewer registry: {bundled_registry}"
-            )
-        shutil.copy2(bundled_registry, paths.reviewer_registry_path)
+        ),
+        user_local_registry_path=paths.reviewer_registry_path,
+    )
     return paths
+
+
+def merge_bundled_reviewer_harnesses_into_user_local_registry(
+    *,
+    bundled_registry_path: Path,
+    user_local_registry_path: Path,
+) -> list[str]:
+    """把 bundled registry 里 user-local 尚缺的 harness 增量并入，返回新增的 harness id。
+
+    真相源是 **user-local** 那份 registry：bundled 那份构建时会被移出 payload
+    (`_remove_path_if_present`)，verifier 还断言它不得存在于 payload 里。
+    所以这里的方向是单向的——bundled 只当 seed 用。
+
+    **只补不覆盖**：user-local 的条目是用户资产（关掉某条腿、调 priority、
+    加自己的 harness），一次部署不得把它们改回出厂值。
+
+    **补到字段一级**：只在条目一级 additive 是不够的——它挡住了「新腿进不来」，
+    却挡不住「新字段进不来」。见
+    :func:`backfill_bundled_fields_missing_from_existing_user_local_harness_entries`。
+
+    **不静默跳过**：并入前先比对 schema_version。版本对不上时宁可让部署响亮地
+    失败，也不能跳过——跳过的后果是新评审腿永远进不来，而部署照常报成功，
+    没有任何一处会察觉（本仓反复栽过的假绿形状）。
+    """
+    if not bundled_registry_path.is_file():
+        raise OfficialCliInstallationError(
+            f"缺少 bundled reviewer registry: {bundled_registry_path}"
+        )
+    bundled_registry = read_json_object(bundled_registry_path)
+    bundled_harnesses = bundled_registry.get("harnesses")
+    if not isinstance(bundled_harnesses, dict):
+        raise OfficialCliInstallationError(
+            f"bundled reviewer registry 缺少 harnesses object: {bundled_registry_path}"
+        )
+
+    if not user_local_registry_path.exists():
+        user_local_registry_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_registry_path, user_local_registry_path)
+        return sorted(bundled_harnesses)
+
+    user_local_registry = read_json_object(user_local_registry_path)
+    user_local_harnesses = user_local_registry.get("harnesses")
+    if not isinstance(user_local_harnesses, dict):
+        raise OfficialCliInstallationError(
+            "user-local reviewer registry 缺少 harnesses object: "
+            f"{user_local_registry_path}"
+        )
+    if user_local_registry.get("schema_version") != bundled_registry.get(
+        "schema_version"
+    ):
+        raise OfficialCliInstallationError(
+            "reviewer registry schema_version 不一致，拒绝并入新 harness："
+            f"user-local={user_local_registry.get('schema_version')!r} "
+            f"bundled={bundled_registry.get('schema_version')!r} "
+            f"({user_local_registry_path})。请先人工迁移该文件再重跑部署。"
+        )
+
+    newly_added_harness_ids = sorted(
+        harness_id
+        for harness_id in bundled_harnesses
+        if harness_id not in user_local_harnesses
+    )
+    for harness_id in newly_added_harness_ids:
+        user_local_harnesses[harness_id] = bundled_harnesses[harness_id]
+    backfilled_field_names_by_harness_id = (
+        backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+            bundled_harnesses=bundled_harnesses,
+            user_local_harnesses=user_local_harnesses,
+            harness_ids_added_by_this_merge=frozenset(newly_added_harness_ids),
+        )
+    )
+    if not newly_added_harness_ids and not backfilled_field_names_by_harness_id:
+        return []
+    user_local_registry["harnesses"] = user_local_harnesses
+    write_json_atomic(user_local_registry_path, user_local_registry)
+    return newly_added_harness_ids
+
+
+def backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+    *,
+    bundled_harnesses: Mapping[str, Any],
+    user_local_harnesses: dict[str, Any],
+    harness_ids_added_by_this_merge: frozenset[str] = frozenset(),
+) -> dict[str, list[str]]:
+    """给**已存在**的 harness 条目补上「出厂后来新增、user-local 从未有过」的字段。
+
+    就地改写 ``user_local_harnesses``，返回 ``{harness_id: [被补上的字段名]}``。
+
+    **为什么条目级 additive 不够**：它只挡住「新腿进不来」，挡不住「新字段进不来」。
+    一台已部署过的机器，其 cursor / claude_code / codex 三条腿是首次部署那天的形状；
+    之后往出厂条目里加的字段（第一例是
+    ``underlying_provider_account_quota_pool_identity``）对它们永远不可见，
+    于是依赖该字段的选腿约束（同额度池互斥）在生产路径上**静默失效**——
+    部署照常成功、双评审照常跑两条腿，没有任何一处会察觉。这与当初「新腿永远
+    进不来」是同一个假绿形状，只是降了一级粒度。
+
+    **判据是「键在不在」而不是「值等不等于出厂值」**：键不存在 ⇒ 用户从未对它表达过
+    意见（那天这个字段还不存在），补进去不算改用户的值；键存在 ⇒ 用户资产，值一律
+    原样保留，包括显式改过的值、显式置空的值、以及恰好等于出厂值的值。
+
+    **只补顶层键**：出厂条目全是标量字段。递归合并会引入「用户改过的嵌套结构被部分
+    覆盖」这种更难解释的语义，等真出现嵌套字段时再单独设计。
+    """
+    backfilled_field_names_by_harness_id: dict[str, list[str]] = {}
+    for harness_id, bundled_spec in bundled_harnesses.items():
+        if harness_id in harness_ids_added_by_this_merge:
+            continue
+        user_local_spec = user_local_harnesses.get(harness_id)
+        if not isinstance(bundled_spec, dict) or not isinstance(user_local_spec, dict):
+            continue
+        backfilled_field_names = sorted(
+            field_name
+            for field_name in bundled_spec
+            if field_name not in user_local_spec
+        )
+        if not backfilled_field_names:
+            continue
+        for field_name in backfilled_field_names:
+            user_local_spec[field_name] = bundled_spec[field_name]
+        backfilled_field_names_by_harness_id[harness_id] = backfilled_field_names
+    return backfilled_field_names_by_harness_id
 
 
 def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str | None:
@@ -1270,12 +1482,20 @@ def configure_stop_hook(
             "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
             "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
             f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
-            f"python3 {shlex.quote(str(router))}",
         ]
     )
     entry = {
         "type": "command",
-        "command": " ".join(env_parts),
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(router)),
+            hook_event_name="Stop",
+            environment_assignment_prefix=" ".join(env_parts),
+            # env 前缀只作用于 python3 那一条命令，面包屑分支读不到它烘焙的
+            # RVF_USER_LOCAL_DATA_ROOT，故把已解析的根显式传进守卫。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
+        ),
         "timeout": 300,
         "statusMessage": "Review-Validate-Fix：选择通道并运行停止检查",
     }
@@ -1335,14 +1555,21 @@ def configure_user_prompt_submit_hook(
     detector = plugin_skill_dir / "scripts/rvf_user_prompt_submit.py"
     entry = {
         "type": "command",
-        "command": " ".join(
-            [
-                f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
-                f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
-                f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
-                f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
-                f"python3 {shlex.quote(str(detector))}",
-            ]
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(detector)),
+            hook_event_name="UserPromptSubmit",
+            environment_assignment_prefix=" ".join(
+                [
+                    f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
+                    f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
+                    f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
+                    f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
+                ]
+            ),
+            # 同 configure_stop_hook：面包屑根必须显式传，不能指望 ambient 环境变量。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
         ),
         "timeout": 5,
     }
@@ -1594,6 +1821,16 @@ def main(argv: list[str] | None = None) -> int:
                     official_cli_result.removed_noncanonical_claude_plugin_selectors
                 ),
             },
+            "codex_bundled_plugin_hook_suppression": (
+                official_cli_result.codex_bundled_plugin_hook_suppression
+            ),
+            "live_codex_sessions_holding_plugin_cache_paths_to_be_removed": [
+                dict(finding)
+                for finding in (
+                    official_cli_result
+                    .live_codex_sessions_holding_plugin_cache_paths_to_be_removed
+                )
+            ],
             "hooks_path": str(hooks_path) if hooks_path else None,
             "user_local_data_root": str(user_local_data_paths.user_local_data_root),
             "rollback_status": deployment_transaction.rollback_status,

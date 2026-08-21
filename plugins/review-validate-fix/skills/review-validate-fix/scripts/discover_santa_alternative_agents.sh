@@ -14,6 +14,8 @@ candidate_commands=(
   cursor-agent
   qwen
   qwen-code
+  kimi
+  omp
 )
 
 printf '# Santa-method alternative reviewer discovery\n\n'

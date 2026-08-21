@@ -118,19 +118,47 @@ def _hook_commands_for_event(payload: Any, event_name: str) -> list[str]:
     return commands
 
 
-def _command_targets_script(command: str, expected_script_path: Path) -> bool:
-    expected = str(expected_script_path.resolve())
+HOOK_TARGET_SCRIPT_SHELL_VARIABLE_NAME = "rvf_hook_target_script"
+"""守卫命令串里承载目标脚本路径的 shell 变量名。
+
+真相源是 ``core/hook_command_spawn_guard_against_missing_target_script.py`` 的同名常量。
+本脚本刻意 stdlib-only、不 import ``core``（它要能在**任何**已部署 payload 上独立跑），
+故自带一份副本，**两处必须同步**——``tests/test_hook_command_spawn_guard.py`` 有 gate。
+"""
+
+
+def _command_path_candidates(command: str) -> list[str]:
+    """从 hook 命令串里取出所有**可能是脚本路径**的 token。
+
+    ``python3 <path>`` 的裸 token 之外还要认 ``rvf_hook_target_script=<path>;`` 这种
+    赋值形态：spawn 守卫把路径搬进了 shell 变量，裸 token 不再出现。刻意只剥这一个变量名
+    的前缀，不泛化到任意 ``NAME=value``——否则 ``CODEX_RVF_*`` 那些 env 值也会被当成
+    候选路径，把「精确指向」削弱成「出现过就算」。
+    """
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return False
+        return []
+    assignment_prefix = f"{HOOK_TARGET_SCRIPT_SHELL_VARIABLE_NAME}="
+    candidates: list[str] = []
+    for token in tokens:
+        candidate = token.rstrip(";")
+        if candidate.startswith(assignment_prefix):
+            candidate = candidate[len(assignment_prefix) :]
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _command_targets_script(command: str, expected_script_path: Path) -> bool:
+    expected = str(expected_script_path.resolve())
     return any(
-        token == expected
+        candidate == expected
         or (
-            token.startswith("/")
-            and Path(token).expanduser().resolve() == expected_script_path.resolve()
+            candidate.startswith("/")
+            and Path(candidate).expanduser().resolve() == expected_script_path.resolve()
         )
-        for token in tokens
+        for candidate in _command_path_candidates(command)
     )
 
 
