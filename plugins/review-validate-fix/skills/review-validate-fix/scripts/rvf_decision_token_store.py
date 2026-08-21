@@ -272,6 +272,15 @@ class MintResult:
     record: DecisionTokenRecord | None = None
     circuit_breaker: CircuitBreakerStatus | None = None
     message: str | None = None
+    # 事实一（告知类）：「用户显式推翻了 agent 早前的谢绝」。仅在
+    # ``initiated_by_explicit_user_request=True`` 且本次铸造确实**命中**了一条既有 declined 冷却
+    # 记录时为 True——命中即已证成，与冷却记录能否被物理删除**无关**。调用方据此把该事实如实告知
+    # 用户与 agent；不告知的话，agent 拿到 token 后极可能照上次判断再谢绝一次，用户白打一遍。
+    explicit_user_request_overrode_agent_declined_cooldown: bool = False
+    # 事实二（磁盘状态）：上面那次推翻之后冷却记录**仍留在盘上**（unlink 因 I/O 原因失败），
+    # 于是后续**自动**路径依旧会被这条陈旧 decline 挡住。它只影响自动路径与面向用户的措辞，
+    # 绝不参与「是否告知推翻」的判定。未发生推翻时恒为 False（无记录可挡）。
+    declined_cooldown_record_still_blocks_automatic_path: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -790,10 +799,16 @@ def _clear_dedup_index_for_token_payload(
     **残留（如实记录，本轮判定可接受）**：这个「先读索引确认指向本 token、再 unlink」不是原子
     CAS。每 token 的 ``_with_decision_token_payload_mutation_lock`` 锁的是**本 token 的文件**，
     而去重索引文件是按 ``(worktree, session_id, candidate_fingerprint)`` 哈希命名、由同键的
-    **任意** token 共享的，故本锁覆盖不到它；刻意**不**为它引入第二把跨文件锁。最坏情况是多删
-    或少删一个索引条目：多删 → 下一次 Stop 重新征询一次（``mint`` 会重建索引）；少删 → 索引指向
-    的 token 已是 withdrawn 终态，``_dedup_active_lookup`` 判它非活跃、走 ``index_is_stale``
-    覆盖分支。两个方向都会被下一轮 mint 收敛，不会永久卡死。
+    **任意** token 共享的，故本锁覆盖不到它。最坏情况是多删或少删一个索引条目：多删 → 下一次
+    Stop 重新征询一次（``mint`` 会重建索引）；少删 → 索引指向的 token 已是 withdrawn 终态，
+    ``_dedup_active_lookup`` 判它非活跃，下一轮 mint 会在占坑锁内把它顶掉。两个方向都会被下一轮
+    mint 收敛，不会永久卡死。
+
+    **这里刻意不加 :func:`_with_dedup_index_mint_claim_exclusive_lock`**（哪怕它正好锁的就是这个
+    索引文件）：本函数是在 ``mark_withdrawn`` 的**每 token payload 锁内**被调用的，在此再取占坑锁
+    会形成「payload 锁 → 占坑锁」的持有顺序，而铸造侧是「占坑锁 → payload 锁」（锁内
+    ``_dedup_active_lookup`` 可能触发 :func:`revive_decision_token`）——两者相反即构成经典死锁环。
+    上面那点收敛得掉的多删/少删，比死锁便宜得多。
     """
     if not isinstance(payload, dict):
         return None
@@ -835,6 +850,70 @@ def _dedup_active_lookup(
     if lookup.status == "expired" and lookup.revivable:
         return revive_decision_token(lookup, root=root, now=now, ttl_seconds=ttl_seconds)
     return None
+
+
+# ---------------------------------------------------------------------------
+# 同键去重索引的「铸造占坑」排他锁（同一 dedup key 至多一枚活跃 token）
+# ---------------------------------------------------------------------------
+#
+# **为什么必须有**：铸造侧对去重索引做的是「读索引 → 判它指向的 token 还活不活跃 → 写索引」这样
+# 一段读-改-写，而闸一那次读发生在铸造**之前**、且不在任何锁内。同键的两个请求完全可能双双读到
+# 「索引陈旧」（指向的 token 已终态 / 真过期不可复活），于是各自 ``_create_token_record`` 铸出
+# **不同**的 token，再各自把索引整份覆盖成自己，双双返回 ``minted``——两枚活跃 token 指向同一个
+# dedup key，同一批改动被重复注入 / 重复发起 RVF，直接违反 R25 的注入幂等硬保证。
+#
+# 这条竞态在自动路径（Stop hook，token 自然过期后）与手动路径（UPS 清掉 declined 冷却后继续下铸）
+# 上都可达。修复前首建路径靠 ``_atomic_create_json`` 的 O_EXCL 有内核级互斥，覆盖陈旧索引的路径
+# 却是**无条件覆盖**、什么互斥都没有，两条路径不对称。这把锁把「重读索引 → 判活跃 → 写索引」整段
+# 圈成一个临界区，让首建与覆盖走**同一条**互斥路径：至多一方写成索引并返回 ``minted``，其余方丢弃
+# 自己刚铸的 token 并幂等返回胜者（``deduplicated``）。
+#
+# 锁文件与索引文件同目录（落盘根随 ``root`` 参数 / ``$RVF_HOME``，测试靠显式根隔离，绝不写真实
+# ``~/.rvf``），名字以 ``.`` 开头并以 ``.lock`` 结尾，因此进不了本模块任何 ``*.json`` 扫描。
+#
+# **陈旧回收：不需要，且这是刻意选型。** 互斥由 ``flock`` 提供，锁的所有权绑在「打开文件描述」上
+# ——持有者中途崩溃 / 被硬杀 / 进程退出时内核自动释放，不存在「崩溃后残留把同键铸造永久堵死」的
+# 形态，故既不需要 TTL 窗口也不需要接管逻辑（与 ``claim_bootstrap_replay_in_flight`` 那种 O_EXCL
+# 占位 sidecar 相反：那种占位靠文件**存在性**互斥，才必须自带过窗接管）。磁盘上留下的只是一个空
+# 锁文件，下一次同键铸造直接复用同一个 inode。
+DEDUP_INDEX_MINT_CLAIM_LOCK_SUFFIX = ".dedup-index-mint-claim.lock"
+
+
+def dedup_index_mint_claim_lock_path(index_path: Path) -> Path:
+    """给定去重索引文件路径，返回其「铸造占坑」锁文件路径。"""
+    return index_path.with_name(f".{index_path.name}{DEDUP_INDEX_MINT_CLAIM_LOCK_SUFFIX}")
+
+
+@contextmanager
+def _with_dedup_index_mint_claim_exclusive_lock(index_path: Path):
+    """持有某个 dedup key 的铸造占坑排他锁；文件系统报错即降级为无锁（best-effort）。
+
+    降级与 :func:`_with_decision_token_payload_mutation_lock` 同款且同理由：拿不到锁文件不该把
+    决策链路整条堵死，降级后的行为**逐字退回**到加锁前的竞态窗口，而不是变成一种新的失败模式。
+    """
+    lock_path = dedup_index_mint_claim_lock_path(index_path)
+    try:
+        _ensure_parent_dir(lock_path)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    acquired_flock = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired_flock = True
+        except OSError:
+            acquired_flock = False
+        yield
+    finally:
+        if acquired_flock:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1176,7 @@ def mint_decision_token(
     circuit_breaker_root_dir: str | Path | None = None,
     circuit_breaker_window_seconds: int = DEFAULT_MINT_CIRCUIT_BREAKER_WINDOW_SECONDS,
     circuit_breaker_max_requests: int = DEFAULT_MINT_CIRCUIT_BREAKER_MAX_REQUESTS,
+    initiated_by_explicit_user_request: bool = False,
 ) -> MintResult:
     """铸造一枚决策 token（Stop hook 侧唯一入口），依次经三道闸：
 
@@ -1109,10 +1189,34 @@ def mint_decision_token(
     三闸皆过则新铸 token（``outcome=minted``），落盘 + 建/覆盖去重索引。``candidate_fingerprint`` 对
     本模块不透明。
 
+    「同一 dedup key 至多一枚活跃 token」是**硬保证**，对**首建索引与顶掉陈旧索引一视同仁**：占坑
+    全程持 :func:`_with_dedup_index_mint_claim_exclusive_lock`，锁内重读索引裁决，同键并发中至多
+    一方返回 ``minted``，其余方丢弃自己刚铸的 token 并幂等返回胜者（``deduplicated``）。
+
     ``delivery_transport`` 只描述「这枚 token 的横幅打算怎么送出去」（见
     :data:`DECISION_POINT_DELIVERY_TRANSPORTS`），既落进 payload 供后续对账，也在
     ``ttl_seconds`` 缺省时决定 TTL（带外投递 1200s / 其余 900s）。显式传 ``ttl_seconds``
     时以显式值为准。
+
+    ``initiated_by_explicit_user_request=True`` 表示这次铸造源自**用户当场显式打出的手动触发**
+    （UPS 的 manual 分支），此时闸二、闸三**均不适用**——它们保护的都是自动路径，对用户显式意图
+    则是误伤：
+
+    * 闸二不适用：declined 冷却的语义是「agent 谢绝过就别再骚扰 agent」，而用户显式触发本身就是
+      *推翻 agent 的谢绝*。命中冷却时不再拒铸，而是调 :func:`clear_declined_fingerprint`
+      **清掉**那条记录再往下铸。清除而非仅本次绕过：用户既已推翻谢绝，这批改动就该整体重回可审
+      状态，否则会出现「手动审得了、后续自动 Stop 仍被同一条陈旧 decline 挡着」的语义割裂。
+      **命中与清除是两件事**，分别由两个字段回报：``explicit_user_request_overrode_agent_
+      declined_cooldown``（命中即 True，供调用方告知用户与 agent）与
+      ``declined_cooldown_record_still_blocks_automatic_path``（unlink 失败时 True，只说明这条
+      陈旧冷却仍会挡住后续自动路径）。清不掉绝不能吞掉推翻告知。
+    * 闸三不适用：熔断（R24）防的是 agent 对自己的 RVF 结果递归自发起；手动触发按定义来自用户
+      而非自注入（manual 判定路径已把带 token/marker 的自注入 prompt 全部短路掉），因此**整段跳过**
+      ——既不注册铸造请求、也不判定，不占用自动路径的窗口配额，``mint_request_record_id`` 留 None
+      （下游 :func:`_reverse_mint_request_charge_for_withdrawn_token` 对 None 直接放行，不会去冲销
+      一份从未占用的额度）。
+
+    默认 ``False`` ⇒ 自动路径（Stop hook）行为完全不变。
     """
     if ttl_seconds is None:
         ttl_seconds = decision_token_ttl_seconds_for_delivery_transport(delivery_transport)
@@ -1123,59 +1227,81 @@ def mint_decision_token(
     # 闸一：去重。存在活跃同键 token → 幂等返回。
     index_path = _dedup_index_path(worktree, session_id, candidate_fingerprint, root)
     existing_index = _read_dedup_index(index_path)
-    index_is_stale = False
     if existing_index is not None:
         active = _dedup_active_lookup(existing_index, root=root, now=now_dt, ttl_seconds=ttl_seconds)
         if active is not None:
             return MintResult(outcome=MINT_OUTCOME_DEDUPLICATED, token=active.token, record=active)
-        index_is_stale = True  # 索引指向的 token 已终态/真过期，可覆盖
+        # 索引指向的 token 已终态 / 真过期 ⇒ 索引陈旧、可被本次铸造顶掉。这里**不**记下「陈旧」
+        # 结论去指导后面怎么写：本次读在锁外、且铸造还没发生，结论到写索引那一刻早已可能过时。
+        # 占坑与否一律由下方锁内的那次重读裁决。
 
-    # 闸二：declined 冷却（指纹未变不再注入）。
+    # 闸二：declined 冷却（指纹未变不再注入）。用户显式触发不适用——那正是在推翻 agent 的谢绝，
+    # 此时把冷却记录清掉再往下铸，让这批改动整体重回可审状态。
+    # 这里有**两个互不相干的事实**，必须分开记：**命中**冷却即已证成「用户推翻了 agent 的谢绝」
+    # （告知用户与 agent 的唯一依据），而 unlink 成败只决定「这条陈旧冷却是否还会挡住后续自动
+    # 路径」。若压成同一个布尔，一次 I/O 失败就会静默吞掉本该必发的推翻告知。
+    overrode_agent_declined_cooldown = False
+    declined_cooldown_record_still_blocks_automatic_path = False
     if is_fingerprint_in_declined_cooldown(
         worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
     ):
-        return MintResult(
-            outcome=MINT_OUTCOME_DECLINED_COOLDOWN,
-            message="候选指纹处于 declined 冷却中，跳过铸造（指纹未变不再注入）。",
+        if not initiated_by_explicit_user_request:
+            return MintResult(
+                outcome=MINT_OUTCOME_DECLINED_COOLDOWN,
+                message="候选指纹处于 declined 冷却中，跳过铸造（指纹未变不再注入）。",
+            )
+        overrode_agent_declined_cooldown = True
+        # clear 吞掉 OSError 返回 False；删不掉只意味着自动路径仍被挡，不改变「已被推翻」这一事实。
+        declined_cooldown_record_still_blocks_automatic_path = not clear_declined_fingerprint(
+            worktree=worktree, candidate_fingerprint=candidate_fingerprint, cooldown_root=cooldown_root
         )
 
-    # 闸三：铸造频率熔断（纯计数）。
-    breaker = _register_mint_request_and_check_breaker(
-        session_id=session_id,
-        worktree=worktree,
-        candidate_fingerprint=candidate_fingerprint,
-        now=now_dt,
-        window_seconds=circuit_breaker_window_seconds,
-        max_requests=circuit_breaker_max_requests,
-        root=circuit_breaker_root_dir,
-    )
-    if breaker.tripped:
-        return MintResult(
-            outcome=MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
-            circuit_breaker=breaker,
-            message=(
-                f"铸造频率熔断：session {session_id} 在 {breaker.window_seconds}s 窗口内已第 "
-                f"{breaker.request_count} 次请求铸造决策 token（阈值 {breaker.max_requests}）。"
-                "疑似递归发起，已拒铸——请检查是否在对自己的 RVF 结果再次发起 RVF。"
-            ),
+    # 闸三：铸造频率熔断（纯计数）。用户显式触发整段跳过——不注册请求、不判定、不占配额。
+    breaker: CircuitBreakerStatus | None = None
+    if not initiated_by_explicit_user_request:
+        breaker = _register_mint_request_and_check_breaker(
+            session_id=session_id,
+            worktree=worktree,
+            candidate_fingerprint=candidate_fingerprint,
+            now=now_dt,
+            window_seconds=circuit_breaker_window_seconds,
+            max_requests=circuit_breaker_max_requests,
+            root=circuit_breaker_root_dir,
         )
+        if breaker.tripped:
+            return MintResult(
+                outcome=MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+                circuit_breaker=breaker,
+                message=(
+                    f"铸造频率熔断：session {session_id} 在 {breaker.window_seconds}s 窗口内已第 "
+                    f"{breaker.request_count} 次请求铸造决策 token（阈值 {breaker.max_requests}）。"
+                    "疑似递归发起，已拒铸——请检查是否在对自己的 RVF 结果再次发起 RVF。"
+                ),
+            )
 
     # 三闸皆过：新铸 token。把本次铸造请求在 ledger 里的 id 一并写进 payload——撤回时凭它
     # 追加冲销记录，把这份熔断额度还回去（INV-C：withdrawn 不计冷却、也不计熔断）。
+    # 用户显式触发跳过了闸三，压根没占额度，故 id 为 None、撤回时也无从冲销。
     record = _create_token_record(
         worktree=worktree,
         session_id=session_id,
         candidate_fingerprint=candidate_fingerprint,
         candidate_summary=candidate_summary,
         delivery_transport=delivery_transport,
-        mint_request_record_id=breaker.mint_request_record_id,
+        mint_request_record_id=breaker.mint_request_record_id if breaker is not None else None,
         ttl_seconds=ttl_seconds,
         now=now_dt,
         root=root,
     )
 
-    # 建/覆盖去重索引。首次创建用 O_EXCL 防并发双铸竞态：若竞态者已抢先建索引且其 token 活跃，
-    # 丢弃本次刚铸 token、返回竞态者的 token（幂等）。
+    # 为这个 dedup key 占坑。**首建与「顶掉陈旧索引」是同一件事**（都是占同一个坑，只差坑里有没有
+    # 前任），因此必须走同一条互斥路径：全程持有同键铸造占坑排他锁，锁内**重读**索引裁决——
+    #
+    #   * 索引已被竞态者占走且其 token 活跃 ⇒ 丢弃本次刚铸的 token，幂等返回竞态者的 token；
+    #   * 否则（无索引 / 索引确认陈旧）⇒ 本方占坑成功，整份写入索引并返回 ``minted``。
+    #
+    # 锁内重读是这段互斥的**全部**要害：闸一那次读在锁外、且发生在铸造之前，只凭它就写索引，
+    # 同键并发会各自铸出不同 token 并双双返回 ``minted``（一个 dedup key 两枚活跃 token）。
     index_payload = {
         "schema_version": SCHEMA_VERSION,
         "token": record.token,
@@ -1184,23 +1310,35 @@ def mint_decision_token(
         "candidate_fingerprint": candidate_fingerprint,
         "created_at": format_timestamp(now_dt),
     }
-    if index_is_stale:
-        _atomic_write_json(index_path, index_payload)
-        return MintResult(outcome=MINT_OUTCOME_MINTED, token=record.token, record=record)
-    try:
-        _atomic_create_json(index_path, index_payload)
-    except FileExistsError:
-        winner = _read_dedup_index(index_path)
-        winner_active = (
-            _dedup_active_lookup(winner, root=root, now=now_dt, ttl_seconds=ttl_seconds)
-            if winner is not None
+    with _with_dedup_index_mint_claim_exclusive_lock(index_path):
+        index_claim_holder = _read_dedup_index(index_path)
+        index_claim_holder_active = (
+            _dedup_active_lookup(index_claim_holder, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+            if index_claim_holder is not None
             else None
         )
-        if winner_active is not None:
+        if index_claim_holder_active is not None:
             _discard_token_record(record)
-            return MintResult(outcome=MINT_OUTCOME_DEDUPLICATED, token=winner_active.token, record=winner_active)
+            return MintResult(
+                outcome=MINT_OUTCOME_DEDUPLICATED,
+                token=index_claim_holder_active.token,
+                record=index_claim_holder_active,
+                # 本次虽被竞态者顶掉，「用户推翻了 agent 的谢绝」这件事确实发生了，如实上报。
+                explicit_user_request_overrode_agent_declined_cooldown=overrode_agent_declined_cooldown,
+                declined_cooldown_record_still_blocks_automatic_path=(
+                    declined_cooldown_record_still_blocks_automatic_path
+                ),
+            )
         _atomic_write_json(index_path, index_payload)
-    return MintResult(outcome=MINT_OUTCOME_MINTED, token=record.token, record=record)
+    return MintResult(
+        outcome=MINT_OUTCOME_MINTED,
+        token=record.token,
+        record=record,
+        explicit_user_request_overrode_agent_declined_cooldown=overrode_agent_declined_cooldown,
+        declined_cooldown_record_still_blocks_automatic_path=(
+            declined_cooldown_record_still_blocks_automatic_path
+        ),
+    )
 
 
 def _create_token_record(

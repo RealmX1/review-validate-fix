@@ -4948,7 +4948,7 @@ _f2oob.inject(
 globals().update({_n: getattr(_f2oob, _n) for _n in _f2oob.__all__})
 
 
-# 有界拆分：决策 token store 的**并发互斥**与**熔断额度记账** 测试簇（6 个，本轮新增）移入子模块；
+# 有界拆分：决策 token store 的**并发互斥**与**熔断额度记账** 测试簇（7 个）移入子模块；
 # 模块级 inject 共享依赖后重绑测试名，让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
 from _rvf_stop_hook_support import (
     decision_point_token_store_concurrency_and_breaker as _f2tokenstore,
@@ -6018,6 +6018,8 @@ def main() -> int:
         test_two_consecutive_rewind_withdrawals_do_not_trip_circuit_breaker_on_third_ask,
         test_decision_token_withdrawal_reversal_is_append_only_and_scoped_to_its_own_mint_request,
         test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched,
+        # 同键并发撞陈旧去重索引：覆盖必须与首建同样互斥（一个 dedup key 至多一枚活跃 token）。
+        test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token,
     ]
     assert_every_defined_test_is_registered(
         globals(),
