@@ -37,6 +37,9 @@ __all__ = [
     'test_decision_token_withdrawal_reversal_is_append_only_and_scoped_to_its_own_mint_request',
     'test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched',
     'test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token',
+    'test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stranding_backs_off',
+    'test_unknown_withdrawal_cause_fails_closed_to_retaining_mint_request_charge',
+    'test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_charge',
 ]
 
 
@@ -576,3 +579,182 @@ def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_mint
     run_race_rounds(
         path_name="explicit_user_request_path", initiated_by_explicit_user_request=True
     )
+
+
+# ---------------------------------------------------------------------------
+# C-②：``withdrawn`` 的两种成因对熔断额度的处置必须相反
+# ---------------------------------------------------------------------------
+
+def test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stranding_backs_off(
+    tmp: Path,
+) -> None:
+    """带外投递从未落地而撤回 ⇒ **不**冲销熔断额度，于是连续空转会如实退避。
+
+    与 ``test_two_consecutive_rewind_withdrawals_do_not_trip_circuit_breaker_on_third_ask``
+    是**同一函数、相反期望**的一对，两条必须同时绿——这正是「按成因分叉」的意义所在：
+
+      * 用户 rewind：他还想被问，冲销额度让第三次征询仍能铸（INV-C 原义，那条用例钉住）；
+      * 投递空转：他**根本没看到过**横幅，且通道坏着时重铸多少次都会照样空转。此时烧掉额度、
+        让熔断如实跳闸，正是所需的退避。
+
+    实测（2026-08-21）在冲销行为下出现过一个 session 内 ``minted → withdrawn`` 连铸三枚、全程
+    从未经过 ``injected`` 的空转环——那正是这条用例要钉死的形态。
+    """
+    store = _load_decision_token_store_module()
+    roots = _isolated_decision_token_store_roots(tmp / "stranded-retains-charge")
+    session_id = "stranded-backoff-sess"
+
+    outcomes: list[str] = []
+    for ask_index in range(1, 4):
+        result = _mint_out_of_band_decision_token(
+            store,
+            roots,
+            session_id=session_id,
+            candidate_fingerprint=f"fingerprint-after-edit-{ask_index}",
+        )
+        outcomes.append(result.outcome)
+        if result.outcome != store.MINT_OUTCOME_MINTED:
+            break
+        store.mark_withdrawn(
+            result.token,
+            reason="decision_point_delivery_never_became_a_turn",
+            withdrawal_cause=(
+                store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
+            ),
+            root=roots["decision_token_root_dir"],
+            circuit_breaker_root_dir=roots["circuit_breaker_root_dir"],
+        )
+
+    # 三次铸造请求的额度**全部**留在账上（阈值 3 ⇒ 第三次即跳闸）。
+    assert (
+        store.count_recent_mint_requests(
+            session_id, root=roots["circuit_breaker_root_dir"]
+        )
+        == 3
+    ), _mint_request_ledger_lines(store, roots, session_id)
+    # 一条冲销行都不该有。
+    reversal_lines = [
+        line
+        for line in _mint_request_ledger_lines(store, roots, session_id)
+        if store.MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD in line
+    ]
+    assert reversal_lines == [], reversal_lines
+    # 第三次铸造把窗口内计数推到阈值 ⇒ 熔断跳闸，第四次不再铸。
+    assert outcomes[-1] in (
+        store.MINT_OUTCOME_MINTED,
+        store.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+    ), outcomes
+    fourth = _mint_out_of_band_decision_token(
+        store,
+        roots,
+        session_id=session_id,
+        candidate_fingerprint="fingerprint-after-edit-4",
+    )
+    assert fourth.outcome == store.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED, (
+        fourth.outcome,
+        fourth.message,
+    )
+    # 撤回同样不写冷却表（这一半两种成因共享）。
+    assert sorted(roots["declined_fingerprint_root_dir"].glob("*.json")) == []
+
+
+def test_unknown_withdrawal_cause_fails_closed_to_retaining_mint_request_charge(
+    tmp: Path,
+) -> None:
+    """未知成因 ⇒ **不冲销**（fail closed），且不抛。
+
+    冲销与否是白名单判定：将来新增一个成因而忘了想清楚它该不该退额度时，默认落到「不冲销」
+    这一侧——多退避一次只是延后一次征询，而错误地无限冲销会让熔断整个失效（漏审方向）。
+    同时它不能抛：撤回对账是 best-effort 链路的一环，为一个拼错的成因串打断 Stop 决策更危险。
+    """
+    store = _load_decision_token_store_module()
+    roots = _isolated_decision_token_store_roots(tmp / "unknown-cause")
+    session_id = "unknown-cause-sess"
+
+    mint = _mint_out_of_band_decision_token(store, roots, session_id=session_id)
+    assert mint.outcome == store.MINT_OUTCOME_MINTED, mint
+    record = store.mark_withdrawn(
+        mint.token,
+        reason="some-future-cause-nobody-classified",
+        withdrawal_cause="a-cause-that-does-not-exist-yet",
+        root=roots["decision_token_root_dir"],
+        circuit_breaker_root_dir=roots["circuit_breaker_root_dir"],
+    )
+    assert record.payload["state"] == store.STATE_WITHDRAWN, record.payload
+    assert record.payload["withdrawn_mint_request_charge_retained"] is True, record.payload
+    assert (
+        store.count_recent_mint_requests(
+            session_id, root=roots["circuit_breaker_root_dir"]
+        )
+        == 1
+    )
+    # 去重索引仍必须被清掉——那一半与成因无关（少清 = 下一次 Stop 静默停 = 漏审方向）。
+    assert "withdrawn_dedup_index_path" in record.payload, record.payload
+
+
+def test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_charge(
+    tmp: Path,
+) -> None:
+    """横幅**确实成为过一条 turn**、只是记账没跟上 ⇒ 冲销额度，连续三次也不该把熔断打跳。
+
+    与 ``test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stranding_backs_off``
+    是同一函数、相反期望的一对：那条钉「通道坏着要退避」，这条钉「通道是通的就不许退避」。
+    两条同时绿才说明分叉判据落在**成因**上，而不是落在「凡是搁浅撤回一律计费」这个过粗的规则上。
+
+    可达路径：``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在
+    ``mark_injected`` 抛 ``DecisionTokenExpiredError``（横幅排在长回合之后越过 1200s TTL）时提前
+    返回、**刻意不清投递意图**，而 ``read_decision_token`` 对过期 token 仍返回 ``state=minted``。
+    若这一族按空转计费，连续 3 次记账失败就会把铸造熔断打跳，整个 session 的自动发起被静默封禁
+    一个窗口（默认 3600s）——那是**漏审**方向，比多问一次严重得多。
+    """
+    store = _load_decision_token_store_module()
+    roots = _isolated_decision_token_store_roots(tmp / "became-a-turn-reverses-charge")
+    session_id = "became-a-turn-sess"
+
+    for ask_index in range(1, 5):
+        result = _mint_out_of_band_decision_token(
+            store,
+            roots,
+            session_id=session_id,
+            candidate_fingerprint=f"fingerprint-after-edit-{ask_index}",
+        )
+        # 每一轮都必须铸得出来：额度被逐轮冲销掉了，熔断永远够不到阈值。
+        assert result.outcome == store.MINT_OUTCOME_MINTED, (
+            ask_index,
+            result.outcome,
+            _mint_request_ledger_lines(store, roots, session_id),
+        )
+        record = store.mark_withdrawn(
+            result.token,
+            reason="decision_point_delivery_stranded:out_of_band_delivery_became_a_turn_but_token_advance_failed",
+            withdrawal_cause=(
+                store
+                .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED
+            ),
+            root=roots["decision_token_root_dir"],
+            circuit_breaker_root_dir=roots["circuit_breaker_root_dir"],
+        )
+        # 如实记账的**反面**：这一支不得留下「额度被保留」的标记，且必须点名它冲销了哪一次铸造。
+        assert "withdrawn_mint_request_charge_retained" not in record.payload, record.payload
+        assert (
+            "withdrawn_mint_request_charge_reversal_of_record_id" in record.payload
+        ), record.payload
+
+    assert (
+        store.count_recent_mint_requests(
+            session_id, root=roots["circuit_breaker_root_dir"]
+        )
+        == 0
+    ), _mint_request_ledger_lines(store, roots, session_id)
+    # 白名单是这条行为的唯一真相源：成因写在白名单里，才有上面的冲销。
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED
+        in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    # 空转那一支必须**留在白名单外**——否则退避就没了，实测过的连铸空转环会立刻回来。
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
+        not in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    # 撤回同样不写冷却表（这一半三种成因共享）。
+    assert sorted(roots["declined_fingerprint_root_dir"].glob("*.json")) == []

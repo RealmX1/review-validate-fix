@@ -113,6 +113,7 @@ from kanban_followup_trigger_transcript_presence import (
 from kanban_followup_lock import (
     STATE_DELIVERED_AWAITING_AGENT_DECISION as KANBAN_FOLLOWUP_LOCK_STATE_AWAITING_DECISION,
     STATE_IN_PROGRESS as KANBAN_FOLLOWUP_LOCK_STATE_IN_PROGRESS,
+    STATE_WAITING_BOOTSTRAP as KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP,
     STATUS_ACTIVE as KANBAN_FOLLOWUP_LOCK_ACTIVE,
     STATUS_STALE as KANBAN_FOLLOWUP_LOCK_STALE,
     marker_state as kanban_followup_lock_state,
@@ -120,6 +121,10 @@ from kanban_followup_lock import (
     clear_marker as clear_kanban_followup_lock,
     revive_marker as revive_kanban_followup_lock,
     revive_count as kanban_followup_lock_revive_count,
+    in_flight_run_shows_recent_activity as in_flight_rvf_run_shows_recent_activity,
+    seconds_since_last_run_activity as seconds_since_last_in_flight_rvf_run_activity,
+    marker_exceeds_revival_absolute_cap as kanban_followup_lock_exceeds_revival_absolute_cap,
+    seconds_since_marker_armed as seconds_since_kanban_followup_lock_armed,
     stamp_bootstrap_gate as stamp_kanban_followup_bootstrap_gate,
     bootstrap_reengage_count as kanban_followup_bootstrap_reengage_count,
     bump_bootstrap_reengage_count as bump_kanban_followup_bootstrap_reengage_count,
@@ -284,7 +289,13 @@ DEFAULT_PREPARE_REVIEW_RUN = SKILL_DIR / "scripts" / "prepare_review_run.py"
 KANBAN_TASK_SUPPRESSIONS_DIRNAME = "kanban-task-suppressions"
 # 以下为引擎簇私有常量（仅单簇引用），随其所属簇在 S10e–S10j 一并迁出；
 # 被 ≥2 簇引用的共享常量已上提到 core/rvf_shared_runtime_constants（S10d，见顶部 import）。
-DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 60 * 60
+# 与 ``kanban_followup_lock.DEFAULT_TTL_SECONDS`` /
+# ``rvf_agent_decision_cli.AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS`` **同档**：
+# 三者保护的是同一个事件（这一轮 RVF 还在跑），只是分别挡 Stop 重铸、挡 units 被 prune（就地
+# 发起路径）、挡 units 被 prune（kanban-followup 路径）。任一方先到期，另两方就形同虚设——
+# lease 一过期 units 回 available，下一次 Stop 立刻把同一批改动重新提议。
+# 本轮实测一轮 RVF p50 = 84.3min、53% 超 60min，三者一并 1h → 2h（理由与分布见那把锁的注释）。
+DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS = 2 * 60 * 60
 KANBAN_FOLLOWUP_LEASE_TTL_ENV = "RVF_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS"
 DEFAULT_RVF_MODE = "fork"
 DEFAULT_FORK_LAUNCH_MODE = "auto"
@@ -3813,11 +3824,12 @@ def _kanban_followup_bootstrap_gate_decision(
 
 # ── 清 kanban-followup 锁时的 tracker lease 回收 ────────────────────────────────────
 # 清锁只写掉「别再催这一轮」这一件事，这一轮 RVF 在 tracker 里占着的 scope lease 不会因此消失。
-# kanban-followup 的 lease 默认 1h（DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS），而 awaiting
+# kanban-followup 的 lease 默认 2h（DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS），而 awaiting
 # 短窗只有 10min：不连带释放的话，清锁之后原 scope 的 unit 仍是 ``assigned``，而常规 gate 的
 # 候选查询只收 ``review_state='available'`` → 把它们整批排除。于是「交回常规 gate 按当时工作树
-# 重新决策」在剩下的 ~50min 里根本兑现不了；等 lease 自己过期时会话早已走远，当时的口径
+# 重新决策」在剩下的近两小时里根本兑现不了；等 lease 自己过期时会话早已走远，当时的口径
 # （committed baseline 等）也可能已经丢了。故凡是「清锁 = 放弃这一轮」的路径都必须走这里。
+# （lease TTL 上调后这个缺口只会更宽，连带释放因此更不能省。）
 
 
 def _tracker_lease_identity_for_kanban_followup_lock(
@@ -4368,6 +4380,95 @@ def kanban_followup_in_progress_decision(
     )
     if handled:
         return bootstrap_decision
+
+    # 心跳续期（B）：清锁之前再问一句「这一轮其实还在跑吗？」
+    #
+    # 原本这里是无条件清锁 —— 而 TTL 被证实短于它要保护的事件（实测 p50 = 84.3min、53% 超过
+    # 原先的 1h TTL），于是一轮**正常**的长 review 会在中途丢掉自己的抑制凭证，此后每一次 Stop
+    # 都落回 fresh-initiation、对**这一轮自己尚未 handoff 的产物**重新征询。近 4 天落盘的 7 次
+    # stale 清锁后面全都紧跟一次重铸+decline。
+    #
+    # 存活证据 = run 目录的**阶段锚点**近期仍有写入。注意别把它读成「ledger 每个阶段都在写、
+    # 所以 run 目录 mtime 是条覆盖整轮的心跳」——那句话实测是错的：只扫 run 根 + 直接子项时，
+    # 215 个真实长 run 里 51.6% 至少有一个时刻会被判「已死」、46.2% 的在途时长是盲的，即本条
+    # 续期分支基本等于掷硬币。观察面与窗口宽度的实测标定见 kanban_followup_lock 里
+    # ``RUN_ACTIVITY_LIVENESS_WINDOW_SECONDS`` 上方那段；此处只需记住它仍有一类**探不到**的
+    # 盲窗：主 agent 在仓库工作树里改代码/跑测试的那几十分钟，run 目录一个字节都不动。
+    # 拿不到证据（run_dir 缺失 / 不可读 / 久无活动）一律**不**续期：抑制性凭证的失败方向必须是
+    # 「多问一次」而不是「静默续命」。
+    #
+    # 绝对硬顶（F2a：任何 wait 分支都要有与被等对象无关的上界）由**本调用点**负责，不塞进
+    # ``revive_marker`` 的默认行为——bootstrap 等待那条路径有它自己的上界形态（复活次数预算），
+    # 且其中「收尾时把锁续回 active」那一处必须成功，在共享路径上塞墙钟硬顶会把 32cad 回归放
+    # 回来。硬顶自 ``armed_at`` 起算、不随续期前移；越过之后无论 run 写得多勤都不再续——「它还
+    # 在写日志」恰恰是活锁最典型的样子。
+    #
+    # 硬顶要真的是硬顶，需要**两道**判定，缺一道就只是个建议值：
+    #   ① 续期之前判「还能不能续」（``..._exceeds_revival_absolute_cap``）；
+    #   ② 续期之时判「最多能续到哪」（``truncate_expiry_to_revival_absolute_cap=True``）。
+    # 只有 ① 时，一把在 ``cap - 1min`` 处续上的锁会被推到 ``now + TTL`` —— 而下一次 Stop 读到它
+    # 是 ACTIVE，ACTIVE 分支不复查硬顶，于是它一路 active 到 ``armed + cap + TTL``（实测 armed
+    # 5h59m 的锁被续到 armed + 7.98h，6h 硬顶被整整绕过一个 TTL）。② 之后上界闭合在 armed + cap：
+    # 硬顶那一刻锁必然转 stale，回到这里就只剩 ① 那条「不再续、清锁交回常规 gate」的出口。
+    #
+    # 第一个合取项是 RVF-003：心跳只对**真的在跑 review** 的锁生效，绝不覆盖 bootstrap 侧刚刚
+    # 作出的放弃决定。上面那次 gate 判定返回 ``handled=False`` 有两种成因，处置**相反**：
+    #   * 这把锁与 bootstrap 无关（没有等待 gate）→ 正是心跳要保护的长 review；
+    #   * 等待 gate 还在、但复活预算已耗尽 → bootstrap 已**明确放弃本轮**，把 stale 语义交还给
+    #     下面的清锁。此时再按 run 活动续期，等于把「3 次复活」的等待上界偷换成「6h 硬顶」。
+    # 判据取 marker 的 ``state`` 而不是 gate 形状，因为真正的理由在证据的语义上：心跳的存活证据
+    # 是「run 目录近期有写入」，而等待态的 run 目录是被 **prepare 重放**写的，不代表 review 在
+    # 推进——receipt 已验证却重放反复失败时，重放本身就刚写过 run 目录，恰好把这条证据变成永动机。
+    if (
+        kanban_followup_lock_state(marker)
+        != KANBAN_FOLLOWUP_LOCK_STATE_WAITING_BOOTSTRAP
+        and in_flight_rvf_run_shows_recent_activity(marker)
+        and not kanban_followup_lock_exceeds_revival_absolute_cap(marker)
+        and revive_kanban_followup_lock(
+            marker, truncate_expiry_to_revival_absolute_cap=True
+        )
+    ):
+        ledger.event(
+            phase="gate",
+            event="kanban_followup_in_progress_marker_revived_on_run_activity",
+            status="completed",
+            reason_code="kanban_followup_in_progress_revived_on_run_activity",
+            cwd=cwd,
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker_path=marker.get("_marker_path"),
+            active_rvf_run_id=marker.get("run_id"),
+            active_rvf_run_dir=marker.get("run_dir"),
+            active_rvf_armed_at=marker.get("armed_at"),
+            seconds_since_last_run_activity=seconds_since_last_in_flight_rvf_run_activity(marker),
+            seconds_since_marker_armed=seconds_since_kanban_followup_lock_armed(marker),
+            kanban_followup_lock_revive_count=kanban_followup_lock_revive_count(marker),
+        )
+        return skip_decision(
+            "已有 RVF run 仍在进行（run 目录近期仍有写入），锁虽已过 TTL 但已就地续期；"
+            f"本次 Stop 跳过自动 RVF dispatch。run_id={marker.get('run_id') or '<unknown>'}，"
+            f"armed_at={marker.get('armed_at') or '<unknown>'}，"
+            f"续期次数={kanban_followup_lock_revive_count(marker)}，"
+            f"续到 expires_at={marker.get('expires_at') or '<unknown>'}。"
+            "续期有绝对硬顶（自 armed_at 起算，本次续期已按它截断），"
+            "到点即按 TTL 判死、清锁交回常规 gate。",
+            ledger,
+            "kanban_followup_in_progress_revived_on_run_activity",
+            cwd=cwd,
+            backend="kanban-followup",
+            cline_kanban_task_id=task_id,
+            session_id=session_id,
+            kanban_followup_in_progress_marker=marker,
+            active_rvf_run_id=marker.get("run_id"),
+            active_rvf_run_dir=marker.get("run_dir"),
+            active_rvf_armed_at=marker.get("armed_at"),
+            **stop_hook_rvf_state_fields(
+                phase="complete",
+                backend="kanban-followup",
+                backend_raw="kanban-followup",
+                completion_gate="kanban_followup_in_progress_revived_on_run_activity",
+            ),
+        )
 
     removed = clear_kanban_followup_lock(
         task_id=task_id, session_id=session_id, repo=repository_anchor
@@ -8821,6 +8922,10 @@ REASON_DECISION_POINT_DEDUPLICATED_PENDING = "decision_point_deduplicated_pendin
 REASON_DECISION_POINT_DECLINED_COOLDOWN = "decision_point_declined_cooldown"
 REASON_DECISION_POINT_CIRCUIT_BREAKER = "decision_point_circuit_breaker_tripped"
 REASON_DECISION_POINT_NO_CANDIDATES = "decision_point_no_candidates"
+# 本次 Stop 刚撤掉一枚搁浅横幅 ⇒ 当次就地结束，不在同一次 Stop 里重铸（C-①）。
+REASON_DECISION_POINT_STRANDED_DELIVERY_WITHDRAWN_THIS_STOP = (
+    "decision_point_stranded_delivery_withdrawn_this_stop"
+)
 REASON_DECISION_POINT_MINT_ANOMALY = "decision_point_mint_anomaly"
 # 带外投递（横幅经 cline-kanban 终端投递成为一条真实 user message）新增的三种结局。
 REASON_DECISION_POINT_DELIVERED_OUT_OF_BAND = "decision_point_delivered_out_of_band"
@@ -9247,7 +9352,11 @@ def reconcile_rewound_decision_point_deliveries(
         payload = lookup.payload or {}
         try:
             decision_token_store.mark_withdrawn(
-                lookup.token, reason="user_rewound_decision_point_banner"
+                lookup.token,
+                reason="user_rewound_decision_point_banner",
+                withdrawal_cause=(
+                    decision_token_store.DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER
+                ),
             )
         except decision_token_store.DecisionTokenError:
             continue
@@ -9283,12 +9392,157 @@ def reconcile_rewound_decision_point_deliveries(
     return notices
 
 
+@dataclass(frozen=True)
+class StrandedDecisionPointDeliveryReconciliationOutcome:
+    """一次「搁浅横幅」对账的结果：给开发者的旁注，以及**本次真的撤回了哪些 token**。
+
+    之所以不再只返回 notices：调用方需要能区分「本轮什么都没撤」与「本轮刚撤掉一枚」——
+    后者必须让**当次 Stop 就地结束**，否则控制流会立刻落回铸造路径，在同一次 Stop 里重铸一枚
+    新 token（实测间隔 6~7 秒）。notices 是给人看的文本，拿文本非空当控制流判据是脆的。
+
+    撤回清单**按投递通道归属分成两份**，因为对账的枚举面（跨 task 全局）比早退的判据面
+    （本轮这条投递通道）大得多：
+
+    * ``withdrawn_decision_tokens_on_this_stop_delivery_channel`` —— 意图的 worktree/cwd/
+      kanban task 与本轮 Stop 对得上。**只有这一份**够格触发早退：早退的立论是「刚撤掉一枚 =
+      这条投递通道此刻不通」，而这句话只对**同一条通道**成立。
+    * ``withdrawn_decision_tokens_garbage_collected_from_other_delivery_channels`` —— 别的
+      task/worktree 遗留的搁浅意图。清理它们本来就是这个函数该做的垃圾回收（少清 = 一份迟到
+      落地的横幅照样能跑出一轮无 lease 的 review），但它们**与本轮该不该征询无关**：拿它们
+      早退等于让 task A 的一枚残留意图把 repo B 的脏改动整轮压掉（漏审方向）。
+    """
+
+    developer_visible_notices: list[str]
+    withdrawn_decision_tokens_on_this_stop_delivery_channel: list[str]
+    withdrawn_decision_tokens_garbage_collected_from_other_delivery_channels: list[str]
+
+    @property
+    def withdrew_any_stranded_delivery_on_this_stop_delivery_channel(self) -> bool:
+        return bool(self.withdrawn_decision_tokens_on_this_stop_delivery_channel)
+
+
+def _normalized_path_for_delivery_channel_identity(value: Any) -> str | None:
+    """把一个路径串归一到可比较形态（``~`` 展开 + symlink 解析）。不可解析时退回原串。
+
+    投递意图里的 ``worktree`` 写的是候选摘要算出来的 repo 路径（已 resolve），而 Stop 侧手里的
+    ``repo``/``cwd`` 未必经过同一道解析（macOS 上 ``/tmp`` 与 ``/private/tmp`` 就是典型差异）。
+    不归一就会把「同一个 worktree」判成两个，早退判据随之失效。
+    """
+    if not (isinstance(value, str) and value.strip()):
+        return None
+    try:
+        return str(Path(value).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return value.strip()
+
+
+def stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel(
+    marker: dict[str, Any],
+    *,
+    stop_worktree: str | None,
+    stop_cwd: str | None,
+    stop_kanban_task_id: str | None,
+) -> bool:
+    """这条搁浅投递意图，是不是**本轮 Stop 自己那条投递通道**上的？
+
+    ``iter_decision_point_delivery_intents`` 是**跨 task 全局枚举**（它的 docstring 逐字写着
+    「枚举全部投递意图（跨 task）」），而投递通道是按 kanban task 的 chat session 分的、
+    候选集是按 worktree 分的。两者都不是全局的，所以「刚撤掉一枚」这个早退判据必须先收敛到
+    本轮这条通道上。
+
+    判据是**正向证据**（拿不到证据即判「不属于本轮」）：
+
+    * 路径证据：意图记的 ``worktree``/``cwd`` 与本轮的 repo/cwd 有任一项归一后相等 ⇒ 同一个
+      worktree ⇒ 本轮要重算的候选集与那枚搁浅 token 当初承载的是同一批改动。
+    * 通道证据：意图记的 ``kanban_task_id`` 与本轮 Stop 所处的 kanban task 相同 ⇒ 同一条
+      chat session ⇒ 「这条通道此刻不通」直接成立。
+
+    方向选择：拿不到证据时判「不属于」（=**不**早退）。误判成属于是漏审（本轮候选被整轮压掉、
+    连候选摘要都不算）；误判成不属于最多是同一次 Stop 里多铸一枚——那一支还有铸造熔断兜着。
+    """
+    marker_paths = {
+        _normalized_path_for_delivery_channel_identity(marker.get("worktree")),
+        _normalized_path_for_delivery_channel_identity(marker.get("cwd")),
+    } - {None}
+    stop_paths = {
+        _normalized_path_for_delivery_channel_identity(stop_worktree),
+        _normalized_path_for_delivery_channel_identity(stop_cwd),
+    } - {None}
+    if marker_paths & stop_paths:
+        return True
+    marker_task_id = marker.get("kanban_task_id")
+    return bool(
+        isinstance(marker_task_id, str)
+        and marker_task_id.strip()
+        and isinstance(stop_kanban_task_id, str)
+        and stop_kanban_task_id.strip()
+        and marker_task_id.strip() == stop_kanban_task_id.strip()
+    )
+
+
+def classify_stranded_decision_point_delivery_withdrawal_cause(
+    *,
+    transcript_path: Path | None,
+    decision_token: str,
+) -> tuple[str, TriggerPresence]:
+    """一枚搁浅 token 该按哪个**成因**撤回（决定它烧不烧熔断额度）。返回 ``(成因, 证据)``。
+
+    ``state`` 仍停在 ``minted`` **不足以**断言「从未成为 turn」：
+    ``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在 ``mark_injected``
+    抛 ``DecisionTokenExpiredError``（横幅确实落地了、但排在一个长回合之后越过了 1200s TTL）时
+    **提前返回且刻意不清投递意图**，而 ``read_decision_token`` 对已过 TTL 的 token 照样返回
+    ``state=minted``。于是「agent 看到过横幅」与「横幅从未落地」在对账侧形状完全一致。
+
+    唯一能把这两者分开的现成证据是 transcript：带外横幅是以一条**真实 user message** 进
+    transcript 的（这正是 ``reconcile_rewound_decision_point_deliveries`` 的立论），所以
+    ``RVF_DECISION_TOKEN=<token>`` 这枚 needle 出现与否就是「它有没有成为一条 turn」的直答。
+
+    三分：
+
+    * 在祖先链上 ⇒ 横幅**确实**成为了 turn，只是记账没跟上 ⇒ 通道健康，冲销额度（不然连续 3 次
+      记账失败就把熔断打跳、整个 session 静默封禁一个窗口 = 漏审方向）；
+    * 不在祖先链上但出现过 ⇒ 横幅成为过 turn 且被用户 rewind 掉了 ⇒ 复用 ``rewound_by_user``
+      （与 ``reconcile_rewound_decision_point_deliveries`` 同一事实、同一处置，不另造成因）；
+    * 整份 transcript 里找不到 / transcript 不可读（含调用方判定「这条意图不属于本轮这条通道」
+      因而显式传 ``None``）⇒ 维持 ``never_became_a_turn``（保留额度）。
+      不可读这一支刻意**不**走「安全方向」：保留额度是 C-② 引入的**唯一**退避手段，把无证据的
+      那一支也改成冲销等于把退避整个删掉，实测过的空转环（一个 session 连铸三枚、全程
+      ``minted → withdrawn``）会立刻回来。残留缺口记在下面。
+
+    ⚠️ **已知残留**：拿不到 transcript 的 host 上，「横幅落地过但记账失败」仍会被按空转计费。
+    彻底修法是让 UPS 在那条失败分支上把事实写进投递意图 marker（``rvf_user_prompt_submit.py``
+    不在本轮改动面内），使对账侧无需 transcript 也能区分。
+    """
+    presence = classify_dispatch_trigger_presence(
+        transcript_path=transcript_path,
+        dispatch_token=decision_token,
+        trigger_literal=decision_token_literal(decision_token),
+    )
+    if presence.presence == TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN:
+        return (
+            decision_token_store
+            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+            presence,
+        )
+    if presence.presence == TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND:
+        return (
+            decision_token_store.DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
+            presence,
+        )
+    return (
+        decision_token_store
+        .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
+        presence,
+    )
+
+
 def reconcile_stranded_decision_point_delivery_intents(
     event: dict[str, Any],
     *,
     ledger: RunLedger,
     cwd: str | None,
-) -> list[str]:
+    worktree: str | None,
+) -> StrandedDecisionPointDeliveryReconciliationOutcome:
     """D6：一份**投出去却始终没成为 turn** 的横幅意图到期后，必须真的把它中和掉。
 
     F2a 的安全撤回抢的是 **dispatch token** 的 tombstone，而消费侧只在命中
@@ -9301,12 +9555,39 @@ def reconcile_stranded_decision_point_delivery_intents(
 
     只处理 **stale**（TTL 已过）的意图。意图 TTL（900s）严格小于带外 token TTL（1200s），
     所以走到这里时 token 一定还读得出来——这正是两个 TTL 那样取值的原因。
+
+    **枚举面 ≠ 早退面。** ``iter_decision_point_delivery_intents`` 是跨 task 全局枚举，垃圾回收
+    本来就该跨 task 做；但返回的撤回清单按 ``worktree``/``cwd``/kanban task 归属拆成两份，
+    只有本轮这条投递通道上的那份够格触发调用方的当次早退——判据与理由见
+    ``stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel``。
+
+    撤回**成因**按 transcript 证据三分（见
+    ``classify_stranded_decision_point_delivery_withdrawal_cause``）：``state`` 停在 ``minted``
+    并不蕴含「从未成为 turn」，UPS 的 ``mark_injected`` 失败分支会留下形状完全相同的一枚。
     """
     notices: list[str] = []
+    withdrawn_tokens_on_this_stop_delivery_channel: list[str] = []
+    withdrawn_tokens_from_other_delivery_channels: list[str] = []
+
+    def _outcome() -> StrandedDecisionPointDeliveryReconciliationOutcome:
+        return StrandedDecisionPointDeliveryReconciliationOutcome(
+            developer_visible_notices=notices,
+            withdrawn_decision_tokens_on_this_stop_delivery_channel=(
+                withdrawn_tokens_on_this_stop_delivery_channel
+            ),
+            withdrawn_decision_tokens_garbage_collected_from_other_delivery_channels=(
+                withdrawn_tokens_from_other_delivery_channels
+            ),
+        )
+
+    stop_kanban_task_id = current_kanban_task_id(event)
+    # 成因判定要用的 transcript：本轮 Stop 事件自带的那份（拿不到即 ``None``，成因分类器会据此
+    # 落到「无结论」那一支）。只解析一次，避免每条意图各扫一遍长 jsonl。
+    stop_transcript_path = first_readable_session_path(event)
     try:
         markers = iter_decision_point_delivery_intents()
     except Exception:  # pragma: no cover - 枚举永不阻断
-        return notices
+        return _outcome()
     for marker in markers:
         if decision_point_delivery_intent_status(marker) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
             continue
@@ -9330,12 +9611,43 @@ def reconcile_stranded_decision_point_delivery_intents(
                 pass
             continue
 
+        belongs_to_this_stop_delivery_channel = (
+            stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel(
+                marker,
+                stop_worktree=worktree,
+                stop_cwd=cwd,
+                stop_kanban_task_id=stop_kanban_task_id,
+            )
+        )
+        # 成因判定只对**本轮这条通道**的意图使用本轮的 transcript：别的 worktree/task 那枚
+        # token 的横幅从来就不该出现在这份 transcript 里，拿它扫出来的 ``absent_from_transcript``
+        # 是「扫错了文件」而不是「那份横幅没落地」。故对跨通道的那些显式传 ``None``（=无结论），
+        # 让它们落到与改动前逐字相同的 ``never_became_a_turn`` 上。
+        withdrawal_cause, banner_presence = (
+            classify_stranded_decision_point_delivery_withdrawal_cause(
+                transcript_path=(
+                    stop_transcript_path if belongs_to_this_stop_delivery_channel else None
+                ),
+                decision_token=token,
+            )
+        )
+        banner_became_a_turn = (
+            withdrawal_cause
+            != decision_token_store
+            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
+        )
         cancel_diagnostics = _cancel_stranded_decision_point_delivery(marker)
         try:
             decision_token_store.mark_withdrawn(
-                token, reason="decision_point_delivery_never_became_a_turn"
+                token,
+                reason=f"decision_point_delivery_stranded:{withdrawal_cause}",
+                withdrawal_cause=withdrawal_cause,
             )
             withdrawn = True
+            if belongs_to_this_stop_delivery_channel:
+                withdrawn_tokens_on_this_stop_delivery_channel.append(token)
+            else:
+                withdrawn_tokens_from_other_delivery_channels.append(token)
         except decision_token_store.DecisionTokenError as exc:
             withdrawn = False
             cancel_diagnostics["mark_withdrawn_error"] = f"{type(exc).__name__}: {exc}"
@@ -9355,14 +9667,49 @@ def reconcile_stranded_decision_point_delivery_intents(
             decision_point_delivery_intent_path=marker.get("_marker_path"),
             decision_point_delivery_intent_state=marker.get("state"),
             decision_token_withdrawn=withdrawn,
+            decision_point_delivery_intent_worktree=marker.get("worktree"),
+            stranded_delivery_intent_belongs_to_this_stop_delivery_channel=(
+                belongs_to_this_stop_delivery_channel
+            ),
+            decision_point_stranded_withdrawal_cause=withdrawal_cause,
+            **banner_presence.as_ledger_fields(),
             **cancel_diagnostics,
         )
-        notices.append(
-            f"发起横幅（token={token}）投出去后在有效期内始终没成为一条真实 user message，"
-            "已撤回该 token（即便消息迟到落地，rvf-agent start 也会硬失败）。"
-            "**不会自动重投**；下一轮真实改动后会重新征询。"
-        )
-    return notices
+        # 文案按三件事分叉：撤回成没成、横幅到底有没有成为过 turn、这条意图是不是本轮这条通道的。
+        # 撤回失败时 token 仍活着、去重索引还在，下面的 mint 会命中 dedup 静默停（不会空转），
+        # 所以既不早退、也不能宣称「已撤回」。
+        if not withdrawn:
+            notices.append(
+                f"发起横幅（token={token}）投出去后始终没成为一条真实 user message，"
+                "但把它推进 withdrawn 终态**失败**了（详见 ledger 的 mark_withdrawn_error）。"
+                "该 token 仍处活跃态、去重索引仍在，故本次 Stop 不会重铸；"
+                "它会由 TTL 对账（mark_lost）兜底。"
+            )
+            continue
+        if not belongs_to_this_stop_delivery_channel:
+            notices.append(
+                f"顺带清理了**另一条投递通道**遗留的搁浅横幅（token={token}，"
+                f"task={task_id}，worktree={marker.get('worktree')}）：已撤回该 token 并清掉意图。"
+                "它与本 worktree 本轮该不该征询无关，**不影响本次 Stop 的发起决策**。"
+            )
+            continue
+        if banner_became_a_turn:
+            notices.append(
+                f"发起横幅（token={token}）**确实**作为一条真实 user message 落地过"
+                f"（transcript 证据：{banner_presence.presence}），但决策 token 没能推进到 injected"
+                "（多半是横幅排在长回合之后越过了 TTL）。已撤回该 token；"
+                f"撤回成因记为 {withdrawal_cause}，**冲销**这次铸造占用的熔断额度——通道是通的，"
+                "不该按空转退避。**本次 Stop 不再重铸**，重新征询最早发生在下一次 Stop。"
+            )
+        else:
+            notices.append(
+                f"发起横幅（token={token}）投出去后在有效期内始终没成为一条真实 user message"
+                f"（transcript 证据：{banner_presence.presence}），"
+                "已撤回该 token（即便消息迟到落地，rvf-agent start 也会硬失败）。"
+                "**本次 Stop 不再重铸**——重新征询最早发生在下一次 Stop，且这次空转会如实计入"
+                "铸造熔断（通道持续坏着时自动退避；手动 /review-validate-fix 不受影响）。"
+            )
+    return _outcome()
 
 
 def _cancel_stranded_decision_point_delivery(marker: dict[str, Any]) -> dict[str, Any]:
@@ -9469,9 +9816,47 @@ def decision_point_injection_decision(
     # 每次 Stop 都先做一次「搁浅横幅」对账（D6）。**必须早于候选摘要**：一份投出去却从未成为
     # turn 的横幅，其危害与本轮有没有新候选无关——不撤回它，它 20 分钟后落地照样能跑出一轮
     # 无 lease、无 scope 契约的 review。
-    stranded_notices = reconcile_stranded_decision_point_delivery_intents(
-        event, ledger=ledger, cwd=cwd
+    stranded_reconciliation = reconcile_stranded_decision_point_delivery_intents(
+        event, ledger=ledger, cwd=cwd, worktree=repo
     )
+    stranded_notices = stranded_reconciliation.developer_visible_notices
+
+    # C-①：本次 Stop 刚把**本轮这条投递通道上**的一枚搁浅横幅推进 ``withdrawn`` ⇒ **当次就地结束**。
+    #
+    # 撤回与重铸原本挨在同一条控制流上：对账只返回 notices、不返回决策，于是撤回后控制流直接
+    # 落回下面的候选摘要 → mint 三闸，在**同一次 Stop** 里铸出一枚新 token（实测间隔 6~7 秒，
+    # 一个 session 内连出三枚，全程 ``minted → withdrawn``、从未 ``injected``）。
+    #
+    # 「刚撤掉一枚」本身就是「这条投递通道此刻不通」的直接证据，此刻重铸的那枚多半照样空转。
+    # 隔到下一次 Stop 再征询，成本只是延后一个 Stop 周期；候选不会因此丢失——review-highwater
+    # 与候选摘要都是按「自上次 review 以来」重算的，下一次 Stop 会把同一批改动原样再算出来。
+    #
+    # ⚠️ 判据必须收敛到**本轮这条通道**：对账的枚举面是跨 task 全局的，拿「撤回了任意一枚」早退
+    # 会让 task A 遗留的一枚残留意图把 repo B 的脏改动整轮压掉（连候选摘要都不算）——那是漏审
+    # 方向，而上面那句立论只对同一条通道成立。跨通道的那些只做垃圾回收，不参与本轮决策。
+    #
+    # 受众是 developer_only（``skip_decision`` ⇒ ``status="skipped"``）：这是一次降级诊断，
+    # **不得**驱动 agent 再跑一回合。
+    if stranded_reconciliation.withdrew_any_stranded_delivery_on_this_stop_delivery_channel:
+        return skip_decision(
+            " ".join(
+                [
+                    "本次 Stop 撤回了搁浅的发起横幅，按约当次就地结束，不在同一次 Stop 内重铸。",
+                    *stranded_notices,
+                ]
+            ),
+            ledger,
+            REASON_DECISION_POINT_STRANDED_DELIVERY_WITHDRAWN_THIS_STOP,
+            repo=repo,
+            cwd=cwd,
+            withdrawn_stranded_decision_tokens_on_this_stop_delivery_channel=(
+                stranded_reconciliation.withdrawn_decision_tokens_on_this_stop_delivery_channel
+            ),
+            withdrawn_stranded_decision_tokens_garbage_collected_from_other_delivery_channels=(
+                stranded_reconciliation
+                .withdrawn_decision_tokens_garbage_collected_from_other_delivery_channels
+            ),
+        )
 
     try:
         summary = stop_decision_candidate_summary.build_candidate_summary(
