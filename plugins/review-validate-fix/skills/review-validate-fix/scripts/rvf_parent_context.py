@@ -38,7 +38,7 @@ Host-aware
 ----------
 复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 判定父 transcript 格式：
 ``HOST_CODEX`` 走 Codex rollout schema，``HOST_CLAUDE`` 走 Claude transcript
-schema，``HOST_KIMI_CODE_CLI`` 走 Kimi 的 per-agent wire schema；探测失败（空文件/
+schema，``HOST_KIMI_CODE`` 走 Kimi 的 per-agent wire schema；探测失败（空文件/
 异常 schema）fallback 到 Codex 解析，与既有 Codex-only 用例保持一致。
 
 ⚠️ **漏接一个 host 在这里是静默的**：Codex 的渲染器读别家的 record 只会逐条返回 ``None``，
@@ -60,7 +60,7 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 
@@ -370,7 +370,7 @@ def _host_record_renderer(host: str | None):
     """
     if host == HOST_CLAUDE:
         return _render_claude_record
-    if host == HOST_KIMI_CODE_CLI:
+    if host == HOST_KIMI_CODE:
         return _render_kimi_record
     return _render_codex_record
 

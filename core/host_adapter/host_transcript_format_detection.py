@@ -7,7 +7,7 @@
 ``detect_transcript_format`` 仅按 transcript 文件首条 record 的 ``type`` 字符串
 比对 per-host 签名集合，**不 import 任何 host adapter / 不 spawn 任何 host 二进制**，
 故保持 ``core/`` 的 host-中性不变量：业务逻辑模块经注入拿 host 行为，而 host 身份
-词汇（``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE_CLI``）与探测原语集中住本
+词汇（``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE``）与探测原语集中住本
 ``core/host_adapter/`` 注入契约包内（core host-free 退出门须对 ``core/host_adapter/**`` 开 carve-out）。
 """
 
@@ -24,7 +24,7 @@ HOST_CLAUDE = "claude_code"
 """Claude Code transcript NDJSON schema (``user`` / ``assistant`` / ``summary``
 record types，无 ``payload`` 包裹)。由 ``adapters.claude_code.transcript`` 解析。"""
 
-HOST_KIMI_CODE_CLI = "kimi_code_cli"
+HOST_KIMI_CODE = "kimi_code"
 """Kimi Code CLI 的 per-agent wire JSONL schema（``metadata`` + 19 种带点命名空间的
 事件 type）。由 ``adapters.kimi.transcript`` 解析。
 
@@ -67,7 +67,7 @@ _KIMI_CODE_CLI_RECORD_TYPES = frozenset(
 **42/42 份文件的首行 type 都是 ``metadata``** ⇒ 首行探测稳定，不必依赖后续行。
 """
 
-KNOWN_HOST_IDENTITIES = frozenset({HOST_CODEX, HOST_CLAUDE, HOST_KIMI_CODE_CLI})
+KNOWN_HOST_IDENTITIES = frozenset({HOST_CODEX, HOST_CLAUDE, HOST_KIMI_CODE})
 """本探测器能正向识别的全部 host 身份。
 
 公开出来是给**装配层**（``host_adapter_resolver``）做完备性断言用的：每多一个 host 身份，
@@ -78,7 +78,7 @@ resolver 就必须多一条装配分支，否则该 host 会静默落进「未�
 _HOST_RECORD_TYPE_SIGNATURES: dict[str, frozenset[str]] = {
     HOST_CODEX: _CODEX_RECORD_TYPES,
     HOST_CLAUDE: _CLAUDE_RECORD_TYPES,
-    HOST_KIMI_CODE_CLI: _KIMI_CODE_CLI_RECORD_TYPES,
+    HOST_KIMI_CODE: _KIMI_CODE_CLI_RECORD_TYPES,
 }
 """签名总表：**只**供 ``_self_check`` 做不相交与防漂移断言，不参与探测。
 
@@ -89,7 +89,7 @@ _HOST_RECORD_TYPE_SIGNATURES: dict[str, frozenset[str]] = {
 
 
 def detect_transcript_format(path: Path) -> str | None:
-    """探测 transcript 的 schema host：``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE_CLI`` / None。
+    """探测 transcript 的 schema host：``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE`` / None。
 
     读首 ``_FORMAT_DETECT_MAX_LINES`` 行非空 JSON-decodable record，按 record 的顶层
     ``type`` 字符串比对三套签名集合，首命中即返回。三套集合**两两不相交**（由
@@ -128,7 +128,7 @@ def detect_transcript_format(path: Path) -> str | None:
                 if rtype in _CLAUDE_RECORD_TYPES:
                     return HOST_CLAUDE
                 if rtype in _KIMI_CODE_CLI_RECORD_TYPES:
-                    return HOST_KIMI_CODE_CLI
+                    return HOST_KIMI_CODE
     except OSError:
         return None
     return None
@@ -195,7 +195,7 @@ def _self_check() -> None:
             + "\n",
             encoding="utf-8",
         )
-        assert detect_transcript_format(probe) == HOST_KIMI_CODE_CLI
+        assert detect_transcript_format(probe) == HOST_KIMI_CODE
 
     print("host_transcript_format_detection self-check OK")
 

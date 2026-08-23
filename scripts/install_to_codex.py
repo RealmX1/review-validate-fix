@@ -1539,6 +1539,247 @@ def configure_stop_hook(
     return hooks_path
 
 
+KIMI_CODE_HOME_ENVIRONMENT_VARIABLE = "KIMI_CODE_HOME"
+KIMI_DEFAULT_HOME_RELATIVE_TO_USER_HOME = ".kimi-code"
+
+
+def resolve_kimi_code_home(
+    *,
+    environment: Mapping[str, str] | None = None,
+    home_directory: Path | None = None,
+) -> Path:
+    environment = os.environ if environment is None else environment
+    override = environment.get(KIMI_CODE_HOME_ENVIRONMENT_VARIABLE)
+    if override:
+        return Path(override).expanduser()
+    base = home_directory if home_directory is not None else Path.home()
+    return Path(base) / KIMI_DEFAULT_HOME_RELATIVE_TO_USER_HOME
+
+
+def verify_kimi_plugin_registry_after_write(
+    registry_path: Path,
+    *,
+    expected_plugin_record: Mapping[str, Any],
+    expected_other_plugin_ids: Iterable[Any],
+) -> dict[str, Any]:
+    """读回刚写的 ``installed.json``，确认落盘的确实是我们写的那份。
+
+    存在的理由见 ``configure_kimi_plugin_registration`` 的「丢更新竞争」段：这条写入无锁无 CAS，
+    运行中的 Kimi 会用它内存里的旧 registry 全量重写。复验抓的是**写入时点**的三类真实故障：
+    没落盘、我们自己的 merge 写错、以及在 ``replace`` 与复验之间发生的覆盖。
+
+    返回的 ``registry_sha256`` 是给事后对账的锚：``kimi_plugin_manifest_activation_state_check.py``
+    在任意后续时刻再算一次，对不上就说明注册在部署之后被覆盖掉了。它**不**证明注册此刻还在——
+    无锁写入给不出那种保证。
+    """
+    registry_bytes = registry_path.read_bytes()
+    try:
+        verified_document = json.loads(registry_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：读回的内容不是合法 JSON（{exc}）"
+        ) from exc
+    verified_records = verified_document.get("plugins")
+    if not isinstance(verified_records, list):
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：读回的文档里没有 plugins 列表"
+        )
+    verified_plugin_ids = [
+        record.get("id") for record in verified_records if isinstance(record, dict)
+    ]
+    landed_record = next(
+        (
+            record
+            for record in verified_records
+            if isinstance(record, dict)
+            and record.get("id") == expected_plugin_record["id"]
+        ),
+        None,
+    )
+    if landed_record != dict(expected_plugin_record):
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：我们写入的 {expected_plugin_record['id']} 记录"
+            f"不在读回内容里（读到 {landed_record!r}）。最可能的成因是运行中的 Kimi 用内存里的"
+            "旧 registry 全量重写了它——请退出 Kimi 后重试部署，或重试后执行 /plugins reload"
+        )
+    missing_other_plugin_ids = sorted(
+        str(plugin_id)
+        for plugin_id in set(expected_other_plugin_ids) - set(verified_plugin_ids)
+    )
+    if missing_other_plugin_ids:
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：用户原有插件被掀掉了 {missing_other_plugin_ids}"
+        )
+    return {
+        "registry_sha256": hashlib.sha256(registry_bytes).hexdigest(),
+        "plugin_ids": sorted(str(plugin_id) for plugin_id in verified_plugin_ids),
+    }
+
+
+def configure_kimi_plugin_registration(
+    active_marketplace_root: Path,
+    *,
+    kimi_code_home: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """把 RVF 注册进 Kimi 的 ``plugins/installed.json``（幂等 additive merge）。
+
+    **为什么是「写文件」而不是调 CLI**：Kimi 的插件注册在四条跨进程通道上全部不可达——
+    `kimi --help` 无 `plugin` 子命令、`kimi web` 的 REST 路由表与 WebSocket frame 全集里
+    没有任何 plugin 操作、`AcpServer` 的 28 个方法含 plugin 的为 0。`installPlugin` 只是
+    TUI 与 kernel 之间的进程内 RPC。手改 `installed.json` + `/plugins reload` 是 Kimi
+    **官方认可**的路径（它自己的错误文案逐字这么写）。
+
+    **两条必须守住的约束**：
+
+    1. **幂等 additive merge。** 全量重写会掀掉用户装的其它插件。这里只替换/插入
+       ``id == review-validate-fix`` 那一条。
+    2. **``state`` 写不进去。** ``persist()`` 只落 9 个字段，``state`` / ``manifest`` /
+       ``diagnostics`` 都是加载时派生的内存值。所以本函数**不写** state，调用方也**不得**
+       靠读它来确认生效——生效与否由 ``kimi_plugin_manifest_activation_state_check.py``
+       独立复算（「安装器写完了」永远不等于「注册生效了」）。
+
+    ⚠️ **丢更新竞争**：Kimi 在内存里持有完整 registry，并以固定 ``installed.json.tmp``
+    **全量重写**，没有跨进程锁也没有 CAS ⇒ 运行中的 TUI/web 会覆盖掉我们刚写的内容。
+
+    本函数**刻意不做进程探测**：「有没有 Kimi 在跑」两个方向都判不准——误判成「在运行」会让
+    部署无谓失败，判成「没在跑」也拦不住下一秒才启动的实例；那种信号进了 receipt 也不构成
+    可对账的凭据。实际兜底是三层，全部可验证：
+
+    1. **写后复验**（本函数实现）：``replace`` 之后立刻读回，比对我们那条记录是否逐字落盘、
+       别人插件的 id 集合是否原样保留；不符即 fail closed。复验结果连同读回内容的 sha256
+       进 receipt 的 ``post_write_verification``。
+    2. ``requires_manual_reload_command``：让用户显式 ``/plugins reload`` 收敛内存态。
+    3. ``kimi_plugin_manifest_activation_state_check.py`` 事后**独立复算**生效状态；把当时
+       文件的 sha256 与 1 记下的那个一比，就能看出注册有没有被运行中的 Kimi 覆盖掉。
+
+    复验是**时点观测**，不是「注册一定还在」的保证——无锁写入本来就给不出那种保证，这一点
+    必须照直写，否则读者会把 receipt 当成比它更强的证据。
+
+    ⚠️ **状态根只能用默认值**：Kimi 的 ``enabledHooks()`` 只注入 ``KIMI_CODE_HOME`` 与
+    ``KIMI_PLUGIN_ROOT`` 两个变量，而 hook 命令写在**进 payload 的静态** manifest 里、
+    不能带本机绝对路径 ⇒ Kimi 侧的 hook 子进程拿不到 Codex 侧那串显式 ``RVF_*`` env 前缀，
+    只能落到 ``~/.rvf/user-local-data`` 默认根。单机部署下这就是正确值；但如果将来要支持
+    非默认状态根，得改 manifest 的生成方式（而不是在这里塞 env）。
+    """
+    kimi_home = kimi_code_home or resolve_kimi_code_home()
+    plugin_root = active_marketplace_root / f"plugins/{PLUGIN_NAME}"
+    registry_path = kimi_home / "plugins" / "installed.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_document: dict[str, Any] = {}
+    if registry_path.is_file():
+        try:
+            loaded = json.loads(registry_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing_document = loaded
+        except json.JSONDecodeError as exc:
+            # Kimi 对非法 JSON 是抛错（整个 plugin store 加载失败），不是当空 registry。
+            # 直接覆盖会掩盖用户那边的问题，所以 fail closed。
+            raise OfficialCliInstallationError(
+                f"{registry_path} 不是合法 JSON（{exc}）；请先修复它再重试部署"
+            ) from exc
+
+    existing_records = existing_document.get("plugins")
+    if not isinstance(existing_records, list):
+        existing_records = []
+
+    timestamp = now or utc_now()
+    previous = next(
+        (
+            record
+            for record in existing_records
+            if isinstance(record, dict) and record.get("id") == PLUGIN_NAME
+        ),
+        None,
+    )
+    record = {
+        "id": PLUGIN_NAME,
+        "root": str(plugin_root),
+        "source": str(plugin_root),
+        "enabled": True,
+        # 首次注册才记 installedAt；重复部署保留原值，让「装了多久」这个事实不被刷掉。
+        "installedAt": (previous or {}).get("installedAt") or timestamp,
+        "updatedAt": timestamp,
+        "originalSource": str(plugin_root),
+        "capabilities": [],
+        "github": None,
+    }
+    merged_records = [
+        existing
+        for existing in existing_records
+        if not (isinstance(existing, dict) and existing.get("id") == PLUGIN_NAME)
+    ]
+    merged_records.append(record)
+    existing_document["plugins"] = merged_records
+
+    temporary_path = registry_path.with_suffix(".json.rvf-tmp")
+    temporary_path.write_text(
+        json.dumps(existing_document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(registry_path)
+
+    post_write_verification = verify_kimi_plugin_registry_after_write(
+        registry_path,
+        expected_plugin_record=record,
+        expected_other_plugin_ids=[
+            existing.get("id")
+            for existing in merged_records
+            if isinstance(existing, dict) and existing.get("id") != PLUGIN_NAME
+        ],
+    )
+
+    return {
+        "kimi_code_home": str(kimi_home),
+        "installed_registry_path": str(registry_path),
+        "plugin_root": str(plugin_root),
+        "was_already_registered": previous is not None,
+        "preserved_other_plugin_count": len(merged_records) - 1,
+        "requires_manual_reload_command": "/plugins reload",
+        "post_write_verification": post_write_verification,
+    }
+
+
+def kimi_plugin_registration_outcome_for_deployment_receipt(
+    active_marketplace_root: Path,
+    *,
+    enabled: bool,
+    register_kimi_plugin: Callable[[Path], dict[str, Any]] = (
+        configure_kimi_plugin_registration
+    ),
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """跑 Kimi 注册，把结果**降级成回执字段**；返回 ``(注册回执, 失败回执)``，本函数永不抛。
+
+    Kimi 注册是部署链的最后一环：调用它的时候，Codex/Claude 的 marketplace 事务、两个官方
+    CLI 的安装、以及 Stop hook 配置都已经不可回滚地完成了，只差写部署回执。而它对损坏的
+    ``installed.json`` 是显式 raise（另有 mkdir/write 的 OSError 面），``main()`` 的 except
+    只打印并 ``return 2``——既不回滚已提交的部署，也**不写回执**。
+
+    于是一个第三方产品的坏文件（甚至根本没装 Kimi 的用户手里一份损坏的
+    ``~/.kimi-code/plugins/installed.json``）就能让「Claude/Codex 实际已部署新版、回执仍停在
+    旧版」。回执是本仓判 deploy-lag 的**唯一凭据**，停在旧版比 Kimi 没注册上危险得多：前者
+    让整套「先核验部署版本再断言因果」的纪律读到假事实，后者只是第三个 host 少一个 hook。
+
+    所以这一环非致命：失败写进回执里**独立的** ``kimi_plugin_registration_failure`` 字段
+    （不是把成功字段填成空，那样区分不了「没启用」和「失败了」），并打到 stderr。
+    """
+    if not enabled:
+        return None, None
+    try:
+        return register_kimi_plugin(active_marketplace_root), None
+    except Exception as kimi_registration_error:  # noqa: BLE001 — 见 docstring：这一环必须非致命
+        failure = {
+            "error_type": type(kimi_registration_error).__name__,
+            "message": str(kimi_registration_error),
+        }
+        print(
+            "RVF Kimi plugin registration FAILED（非致命；Codex/Claude 部署与部署回执不受影响）: "
+            f"{kimi_registration_error}",
+            file=sys.stderr,
+        )
+        return None, failure
+
+
 def configure_user_prompt_submit_hook(
     plugin_skill_dir: Path,
     *,
@@ -1637,6 +1878,15 @@ def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--configure-stop-hook", action="store_true")
     parser.add_argument("--configure-user-prompt-submit-hook", action="store_true")
+    parser.add_argument(
+        "--configure-kimi-plugin-registration",
+        action="store_true",
+        help=(
+            "把 RVF 注册进 Kimi 的 plugins/installed.json（幂等 additive merge）。"
+            "Kimi 没有任何可自动化的 plugin CLI/RPC 入口，手改该文件 + /plugins reload "
+            "是官方认可路径；写完仍须由 kimi_plugin_manifest_activation_state_check.py 独立复验。"
+        ),
+    )
     parser.add_argument("--fork-mode", default="auto")
     parser.add_argument("--cline-kanban-start-cmd")
     parser.add_argument("--cline-kanban-task-cmd")
@@ -1794,6 +2044,13 @@ def main(argv: list[str] | None = None) -> int:
                 plugin_skill_dir,
                 user_local_data_paths=user_local_data_paths,
             )
+        (
+            kimi_plugin_registration,
+            kimi_plugin_registration_failure,
+        ) = kimi_plugin_registration_outcome_for_deployment_receipt(
+            active_marketplace_root,
+            enabled=args.configure_kimi_plugin_registration,
+        )
         receipt = {
             "schema_version": DEPLOYMENT_RECEIPT_SCHEMA_VERSION,
             "status": "installed",
@@ -1806,6 +2063,10 @@ def main(argv: list[str] | None = None) -> int:
             "release_root": str(release.release_root),
             "active_marketplace_root": str(active_marketplace_root),
             "marketplace_identifier": DEVELOPER_MARKETPLACE_NAME,
+            # 只记「写了什么」，绝不记「生效了」——Kimi 的 state 不落盘，生效与否必须由
+            # kimi_plugin_manifest_activation_state_check.py 独立复算。
+            "kimi_plugin_registration": kimi_plugin_registration,
+            "kimi_plugin_registration_failure": kimi_plugin_registration_failure,
             "plugin_selector": DEVELOPER_PLUGIN_SELECTOR,
             "codex_executable": str(codex_executable),
             "claude_executable": str(claude_executable),
@@ -1852,6 +2113,13 @@ def main(argv: list[str] | None = None) -> int:
             "RVF official CLI installation OK: "
             f"{receipt['generated_plugin_version']} @ {actual_commit[:12]}"
         )
+        # 非致命≠可以静默：Kimi 这一环失败时，人类摘要里必须看得见，否则「降级」就变成了隐瞒。
+        if receipt.get("kimi_plugin_registration_failure"):
+            print(
+                "  ⚠️ Kimi 插件注册未完成（非致命，Codex/Claude 已部署且回执已写）: "
+                f"{receipt['kimi_plugin_registration_failure']['message']}",
+                file=sys.stderr,
+            )
     return 0
 
 

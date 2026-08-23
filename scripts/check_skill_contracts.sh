@@ -555,6 +555,14 @@ repo_required_files=(
   "plugins/review-validate-fix/.kimi-plugin/plugin.json"
   "tests/test_kimi_hook_entry_normalization.py"
   "adapters/kimi/transcript.py"
+  "core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
+  "core/stop_hook_reentry_budget/__init__.py"
+  "scripts/kimi_plugin_manifest_activation_state_check.py"
+  "tests/test_stop_hook_reentry_budget.py"
+  "tests/test_kimi_plugin_activation_state_check.py"
+  "tests/test_kimi_plugin_registration_installer.py"
+  "scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
+  "tests/test_host_identity_reviewer_registry_vocabulary_gate.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -665,6 +673,9 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/plugins/review-validate-fix/hooks/kimi_stop.py" \
   "$repo_root/plugins/review-validate-fix/hooks/kimi_user_prompt_submit.py" \
   "$repo_root/adapters/kimi/transcript.py" \
+  "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py" \
+  "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py" \
+  "$repo_root/scripts/kimi_plugin_manifest_activation_state_check.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
@@ -783,6 +794,50 @@ require_repo_literal "docs/architecture/stop-hook-output-audience-contract.md" \
 # 正向识别的 host 都必须有自己的装配分支（缺分支不会报错，只会静默落进 Codex 兜底）。
 run_step "host transcript format detection self-check" \
   python3 "$repo_root/core/host_adapter/host_transcript_format_detection.py"
+# P-5 词表一致性：host 身份词表与 reviewer-registry 的 harness id 是两套独立演化的词表，
+# 前两项（codex / claude_code）历史上恰好同名纯属巧合。Kimi 接入时巧合断裂——host 身份取
+# ``kimi_code_cli`` 而 registry 是 ``kimi_code`` ⇒ 主 harness 排不出 alternative reviewer 池，
+# 200-seed 实测 44% 的 Kimi 会话被 Kimi 自己评审，**全程零报错**（双评审的价值全在异构性上）。
+# 判据是结构性的（遍历 KNOWN_HOST_IDENTITIES），所以加第四个 host 时同样当场炸。
+run_step "host identity / reviewer registry vocabulary consistency" \
+  python3 "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
+# 上面那条 gate 的第二条断言只有在 VALID_MAIN_HARNESSES 真的派生自 registry 时才有检测力：
+# 一旦被改回手写清单，它就退化成「清单碰巧写全了」的假绿。故把派生实现本身钉死。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/prepare_review_run.py" \
+  'VALID_MAIN_HARNESSES = _resolve_valid_main_harnesses()'
+# 同一条断言的另一半：它必须按**仓库内 seed** registry 求值。曾经的实现裸 import
+# prepare_review_run，而那个常量优先读运行时 user-local registry ⇒ 仓库完全正确、只是本机
+# registry 落后一个 host，提交前 gate 就红，并造出「必须先部署才能让 gate 转绿」的循环依赖。
+# 两个方向（不读运行时状态 / 手写清单仍当场红）都由这份测试钉住。
+run_step "tests: host_identity_reviewer_registry_vocabulary_gate" \
+  python3 -m pytest -q \
+    "$tests_dir/test_host_identity_reviewer_registry_vocabulary_gate.py"
+# S-B6 跨 turn 再入预算：宿主的保险丝对 Kimi 完全无效（`stop_hook_active` 恒 false，引擎的
+# 续跑标记每 turn 复位）⇒「driven 一回合 → agent 停下 → 再 driven 一回合」在宿主侧没有上界。
+# 本仓已实测过一次 286 次无上界续跑，所以这道闸必须由 RVF 自带。
+run_step "stop hook reentry budget self-check" \
+  python3 "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
+run_step "tests: stop_hook_reentry_budget" \
+  python3 -m pytest -q \
+    "$tests_dir/test_stop_hook_reentry_budget.py"
+# 预算的三条复位路径里，「digest 变化」最容易退化成恒真——驱动正文每次都带新铸的
+# RVF_DECISION_TOKEN，拿正文做 digest 等于关掉这道闸。故把「用 reason_code 而非正文」钉死。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+  'stable_agent_directive_scope_digest_source=reason_code'
+# Kimi 激活态核对：installed.json 磁盘上**没有** state 字段（persist 只落 9 个），所以判定必须
+# 自己复算；且单条 hook 不过 schema 时 Kimi 只 warn + 丢弃该条、plugin 仍报 ok ⇒「看起来健康、
+# 实际 Stop hook 不存在」是零报错状态。核对脚本本身读 live infra，故只在 fixture 测试里跑。
+run_step "tests: kimi_plugin_activation_state_check" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_plugin_activation_state_check.py"
+# Kimi 注册安装器：注册在四条跨进程通道上全部不可达 ⇒ 只能写 installed.json。两条风险各钉一根钉：
+# 全量重写会掀掉用户装的其它插件（必须幂等 additive merge）；state 写不进去（persist 只落 9 个
+# 字段）⇒「安装器写完了」不等于「注册生效了」，闭环由独立复算的核对器给。
+run_step "tests: kimi_plugin_registration_installer" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_plugin_registration_installer.py"
+require_repo_literal "scripts/rvf_local_deploy.py" \
+  '"--configure-kimi-plugin-registration",'
 run_step "kimi session layout self-check" \
   python3 "$repo_root/adapters/kimi/session_layout.py"
 # Kimi wire 蒸馏 + adapter 行为。三条最容易静默出错的地方：origin.kind 区分真实输入与系统
@@ -821,13 +876,13 @@ require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scr
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py" \
   'renderer = _host_record_renderer(host)'
 require_repo_literal "core/host_adapter/parent_harness_identity.py" \
-  'PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI = "kimi-code-cli"'
+  'PARENT_HARNESS_IDENTITY_KIMI_CODE = "kimi-code"'
 require_repo_literal "core/host_adapter/parent_harness_identity.py" \
-  '("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI),'
+  '("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE),'
 # kimi-code stamp 是 HOST-2 的 Kimi 对偶：transcript 合成落空时它是唯一的 Kimi 线索，没有它
 # 整条链路兜底 Codex ⇒ 发 decision:block ⇒ Kimi 静默 allow（零报错）。
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
-  '"kimi-code": HOST_KIMI_CODE_CLI,'
+  '"kimi-code": HOST_KIMI_CODE,'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
   'HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP.get(source.get("provider"))'
 # Kimi hook 入口：事件只有四个字段、**没有 transcript_path**，shim 必须合成它——否则 host 判成
@@ -841,7 +896,7 @@ require_repo_literal "plugins/review-validate-fix/hooks/_kimi_hook_entry.py" 'de
 require_repo_literal "plugins/review-validate-fix/hooks/_kimi_hook_entry.py" 'def owns_invocation'
 
 require_repo_literal "core/host_adapter/host_transcript_format_detection.py" \
-  'HOST_KIMI_CODE_CLI = "kimi_code_cli"'
+  'HOST_KIMI_CODE = "kimi_code"'
 require_repo_literal "adapters/kimi/kimi_code_cli_host_adapter.py" \
   'class KimiCodeCliHostAdapter'
 require_repo_literal "adapters/kimi/kimi_code_cli_host_adapter.py" \

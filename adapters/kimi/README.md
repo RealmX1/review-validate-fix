@@ -18,7 +18,7 @@ Kimi Code CLI 作为 RVF 第三个 host 的 adapter bundle。
 
 ```
 wire.jsonl 首行 metadata
-  → detect_transcript_format() → HOST_KIMI_CODE_CLI
+  → detect_transcript_format() → HOST_KIMI_CODE
   → resolve_current_session_host_adapter() （schema 判据排在 source.provider stamp 之前）
   → resolve_host_adapter() → KimiCodeCliHostAdapter
   → stop_hook_agent_directive_channel() → hook_specific_output_permission_decision_deny
@@ -117,15 +117,44 @@ reason 取 stderr），**其他任意码都让 stdout 被完全丢弃并 allow �
 ## 已知留白（**不留占位代码**，按切片补）
 
 - **`build_analyze_command`（调用侧）** —— 观测侧已实装；构造 headless analyze 调用向量尚未做。
-- **防死循环预算**（S-B6）—— Kimi 的 `stop_hook_active` **恒 false**，引擎的
-  `stopHookContinuationUsed` 每 turn 复位 ⇒ **跨 turn 没有保险丝**，RVF 必须自带。
-- **`parent_harness_identity` 词表**（S-B7）、**分发**（S-B8）。
+- ~~**防死循环预算**（S-B6）~~ ✅ **已做**（2026-08-24）——`core/stop_hook_reentry_budget/`，
+  挂在 `emit_stop_hook_payload` 的受众翻译之前。Kimi 的 `stop_hook_active` **恒 false**、引擎的
+  `stopHookContinuationUsed` 每 turn 复位 ⇒ 跨 turn 没有保险丝，所以这道闸只能由 RVF 自带。
+- ~~**`parent_harness_identity` 词表**（S-B7）~~ ✅ **已做**——三个信号层收敛到 `kimi-code`。
+- **分发**（S-B8）—— ⚠️ **代码已齐、尚未部署**。安装链路三件都已补上：
+  `install_to_codex.py` 的 `configure_kimi_plugin_registration()` +
+  `--configure-kimi-plugin-registration`、`rvf_local_deploy.py` 的 `installer_command`
+  已带该 flag、`sync-manifest.sh` 已四路化（含「Kimi hook 事件必须同时有 Stop 与
+  UserPromptSubmit」的正向断言）；激活态核对早已有
+  （`scripts/kimi_plugin_manifest_activation_state_check.py`）。
+  但 **`/rvf-local-deploy` 还没跑过 ⇒ Kimi host 依然未上线**——成因已不再是「安装器缺失」，
+  而是「未部署」，两者别混为一谈。判据：部署根
+  `~/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/`
+  下既无 `.kimi-plugin/`，`hooks/` 里也没有 `kimi_stop.py` / `kimi_user_prompt_submit.py`。
 - **注册只能半自动**（P-1 已实测定案）：`installPlugin` 在 CLI / REST / WebSocket / ACP
   四条跨进程通道上**全部不可达**，只能由安装器写 `installed.json` + 提示 `/plugins reload`。
   且 `installed.json` **不持久化 `state`**（`persist()` 只写 9 个字段）⇒ 部署校验必须自己复算，
   不能读该字段。
 - **Stop 上的 developer-only 出口在 Kimi 上完全不可见**：Kimi 丢弃 Stop 的 allow-stdout，
   也没有 `systemMessage` 等价物 ⇒ **RVF 自己的 ledger 是 Kimi 上唯一的开发者可见面**。
+
+## 身份词表：`kimi_code` 与 `kimi_code_cli` 的分工（别改错）
+
+RVF 里与 Kimi 有关的名字有**三套**，取值刻意不同，各有各的消费者：
+
+| 用途 | 取值 | 谁消费 |
+|---|---|---|
+| **host 身份** | `kimi_code`（`HOST_KIMI_CODE`） | `detect_transcript_format` → `resolve_host_adapter`；**同时被 `prepare_review_run` 当作 `main_harness` 拿去和 reviewer-registry 比对** |
+| **marker token** | `kimi-code`（`PARENT_HARNESS_IDENTITY_KIMI_CODE`） | round-baseline / review-highwater marker 的文件名 bucket |
+| **模块与类名** | `kimi_code_cli_host_adapter.py` / `KimiCodeCliHostAdapter` | 只是产品「Kimi Code CLI」的名字，**不参与任何词表匹配** |
+
+**host 身份那一行必须与 `config/reviewer-registry.json` 的 harness id 逐字相同。** 它曾经是
+`kimi_code_cli`，与 registry 的 `kimi_code` 对不上 ⇒ 主 harness 排不出 alternative reviewer 池
+⇒ 200-seed 实测 **44%** 的 Kimi 会话被 Kimi 自己评审，**全程零报错**（双评审的价值全在异构性上）。
+`codex` / `claude_code` 两家历史上恰好同名纯属巧合，所以这条缺陷一直没暴露。
+
+现在有 `scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py`
+钉住它，判据是遍历 `KNOWN_HOST_IDENTITIES` 的结构性断言 ⇒ 加第四个 host 时同样当场炸。
 
 ## 6 维契约现状
 

@@ -48,7 +48,7 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     KNOWN_HOST_IDENTITIES,
 )
 from trajectory_distill import (  # noqa: E402
@@ -95,7 +95,7 @@ def _host_distill(host_kind: str):
     """按 host 选 distiller（公共边界仍返回 ``(list[dict], index)``）。"""
     if host_kind == HOST_CLAUDE:
         return distill_claude_jsonl
-    if host_kind == HOST_KIMI_CODE_CLI:
+    if host_kind == HOST_KIMI_CODE:
         return distill_kimi_wire_jsonl
     return distill_codex_jsonl
 
@@ -103,7 +103,7 @@ def _host_distill(host_kind: str):
 def _host_originator(host_kind: str, src: Path) -> str | None:
     if host_kind == HOST_CLAUDE:
         return read_claude_originator(src)
-    if host_kind == HOST_KIMI_CODE_CLI:
+    if host_kind == HOST_KIMI_CODE:
         return read_kimi_originator(src)
     return read_codex_originator(src)
 
@@ -121,7 +121,7 @@ def _resolve_subagents(
             original_transcript=original_transcript,
             sessions_root=sessions_root,
         )
-    if host_kind == HOST_KIMI_CODE_CLI:
+    if host_kind == HOST_KIMI_CODE:
         return _kimi_resolve_subagents(
             main_rollout_path=main_rollout_path,
             original_transcript=original_transcript,

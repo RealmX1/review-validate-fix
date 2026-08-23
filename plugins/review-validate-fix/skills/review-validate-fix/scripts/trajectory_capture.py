@@ -73,7 +73,7 @@ from subagent_capture import capture_all_subagents  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 from trajectory_distill import (  # noqa: E402
@@ -440,7 +440,7 @@ def _host_distill(host_kind: str | None):
     """
     if host_kind == HOST_CLAUDE:
         return distill_claude_jsonl
-    if host_kind == HOST_KIMI_CODE_CLI:
+    if host_kind == HOST_KIMI_CODE:
         return distill_kimi_wire_jsonl
     return distill_codex_jsonl
 
@@ -449,7 +449,7 @@ def _host_find_rvf_start(host_kind: str | None):
     """按 host 选 RVF-起点 cut finder。漏接一个 host ⇒ 该 host 恒 ``no_marker_found``。"""
     if host_kind == HOST_CLAUDE:
         return find_rvf_start_in_claude_jsonl
-    if host_kind == HOST_KIMI_CODE_CLI:
+    if host_kind == HOST_KIMI_CODE:
         return find_rvf_start_in_kimi_wire_jsonl
     return find_rvf_start_in_jsonl
 

@@ -139,7 +139,7 @@ def _text_from_input_parts(parts: Any) -> str | None:
 
 MESSAGE_ORIGIN_KIND_USER = "user"
 
-KIMI_TRANSCRIPT_SOURCE = "kimi_code_cli"
+KIMI_TRANSCRIPT_SOURCE = "kimi_code"
 
 
 def _origin_kind(container: Any) -> str | None:

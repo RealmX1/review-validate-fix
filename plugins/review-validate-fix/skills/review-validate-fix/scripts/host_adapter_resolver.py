@@ -11,7 +11,7 @@ RVF 中**唯一**同时认识 Codex / Claude / Kimi 三个 concrete bundle 的�
 host 兜底一致）：
 
 - ``HOST_CLAUDE`` → ``ClaudeCodeHostAdapter``。
-- ``HOST_KIMI_CODE_CLI`` → ``KimiCodeCliHostAdapter``。
+- ``HOST_KIMI_CODE`` → ``KimiCodeCliHostAdapter``。
 - ``HOST_CODEX`` / host 未知（``None``，探测失败或未识别格式）→ ``CodexHostAdapter``，
   沿用历史「无法识别 → 退回 Codex」口径，保证既有 Codex-only 用例零回归。
 
@@ -33,7 +33,7 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 
 from core.host_adapter import (  # noqa: E402
     HOST_CLAUDE,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     KNOWN_HOST_IDENTITIES,
     HostAdapter,
 )
@@ -49,13 +49,13 @@ from adapters.kimi.kimi_code_cli_host_adapter import (  # noqa: E402
 def resolve_host_adapter(host: str | None) -> HostAdapter:
     """按 ``detect_transcript_format`` 的 host 字符串装配并返回具体 ``HostAdapter``。
 
-    ``host`` 取 ``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE_CLI`` / ``None``
+    ``host`` 取 ``HOST_CODEX`` / ``HOST_CLAUDE`` / ``HOST_KIMI_CODE`` / ``None``
     （探测失败或未识别）。Claude → ``ClaudeCodeHostAdapter``；Kimi →
     ``KimiCodeCliHostAdapter``；其余（Codex 及 host 未知兜底）→ ``CodexHostAdapter``。
     """
     if host == HOST_CLAUDE:
         return ClaudeCodeHostAdapter()
-    if host == HOST_KIMI_CODE_CLI:
+    if host == HOST_KIMI_CODE:
         return KimiCodeCliHostAdapter()
     return CodexHostAdapter()
 
@@ -113,7 +113,7 @@ def _self_check() -> None:
         == STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
     ), "host 未知兜底 Codex ⇒ 必须用最保守的阻塞通道，不得赌 host 认识 hookSpecificOutput"
 
-    kimi = resolve_host_adapter(HOST_KIMI_CODE_CLI)
+    kimi = resolve_host_adapter(HOST_KIMI_CODE)
     assert isinstance(kimi, HostAdapter), "KimiCodeCliHostAdapter 应满足 HostAdapter Protocol"
     assert isinstance(kimi, KimiCodeCliHostAdapter), (
         "Kimi 未被正向装配就会落进 Codex 兜底 ⇒ 收到 decision:block ⇒ Kimi 静默 allow ⇒ 完全失声"

@@ -41,14 +41,14 @@ from pathlib import Path
 from core.host_adapter.host_transcript_format_detection import (
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 
 PARENT_HARNESS_IDENTITY_CLAUDE_CODE = "claude-code"
 PARENT_HARNESS_IDENTITY_CODEX_CLI = "codex-cli"
 PARENT_HARNESS_IDENTITY_CURSOR_CLI = "cursor-cli"
-PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI = "kimi-code-cli"
+PARENT_HARNESS_IDENTITY_KIMI_CODE = "kimi-code"
 PARENT_HARNESS_IDENTITY_UNSPECIFIED = "unspecified"
 """无法判定父 harness 时的取值。
 
@@ -89,9 +89,9 @@ _HARNESS_IDENTITY_ALIAS_PREFIXES: tuple[tuple[str, str], ...] = (
     ("cursor", PARENT_HARNESS_IDENTITY_CURSOR_CLI),
     # Kimi 的 hook shim 注入 agent id ``kimi``（``CLINE_KANBAN_AGENT_IDENTIFIER``），kanban
     # runtime 写的是 ``AI_AGENT=kimi_<version>_agent``。没有这条前缀时前者折成 ``kimi``、
-    # 后者折成 ``kimi-<version>-agent``，与 host 探测值折出的 ``kimi-code-cli`` 三分天下 ——
+    # 后者折成 ``kimi-<version>-agent``，与 host 探测值折出的 ``kimi-code`` 三分天下 ——
     # 写者写 A、读者读 B，marker 凭空消失（⇒ 漏审），且没有任何报错。
-    ("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI),
+    ("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE),
 )
 
 _HARNESS_IDENTITY_MAX_TOKEN_CHARS = 32
@@ -123,8 +123,8 @@ def normalize_parent_harness_identity(raw_signal: str | None) -> str | None:
         return None
     if text == PARENT_HARNESS_IDENTITY_UNSPECIFIED:
         return PARENT_HARNESS_IDENTITY_UNSPECIFIED
-    # ``HOST_CLAUDE``/``HOST_CODEX``/``HOST_KIMI_CODE_CLI`` 是 transcript-format 探测的取值，
-    # 与 agent id 拼写不同（``claude_code`` vs ``claude``、``kimi_code_cli`` vs ``kimi``）；
+    # ``HOST_CLAUDE``/``HOST_CODEX``/``HOST_KIMI_CODE`` 是 transcript-format 探测的取值，
+    # 与 agent id 拼写不同（``claude_code`` vs ``claude``、``kimi_code`` vs ``kimi``）；
     # 前缀表把两套一并收进同一 token。**每多一个可被正向识别的 host，这里就必须多一条**——
     # 漏一条只会让它落进 ``_sanitize_harness_identity_token`` 的自造 bucket，于是同一个
     # harness 在不同信号层归一成不同串（正是本模块 docstring 要消除的那件事），静默无报错。
@@ -132,8 +132,8 @@ def normalize_parent_harness_identity(raw_signal: str | None) -> str | None:
         return PARENT_HARNESS_IDENTITY_CLAUDE_CODE
     if text == HOST_CODEX:
         return PARENT_HARNESS_IDENTITY_CODEX_CLI
-    if text == HOST_KIMI_CODE_CLI:
-        return PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI
+    if text == HOST_KIMI_CODE:
+        return PARENT_HARNESS_IDENTITY_KIMI_CODE
     for prefix, identity in _HARNESS_IDENTITY_ALIAS_PREFIXES:
         if text.startswith(prefix):
             return identity

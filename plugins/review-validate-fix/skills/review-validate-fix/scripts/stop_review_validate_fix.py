@@ -233,11 +233,14 @@ import rvf_withdrawn_dispatch_tombstone
 from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 import rvf_parent_context
 from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
+from core.stop_hook_reentry_budget import (  # noqa: E402 — Stop 驱动 agent 的跨 turn 再入预算（host-中性）
+    consume_stop_hook_reentry_budget,
+)
 from core.stop_hook_output_audience import (  # noqa: E402 — Stop 出口受众分级契约（core 声明受众，adapter 决定线材）
     STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
     STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY,
@@ -768,7 +771,7 @@ def session_index_thread_name(session_id: str | None) -> str | None:
 SESSION_REFERENCE_LABEL_PREFIX_BY_HOST: dict[str, str] = {
     HOST_CODEX: "Codex",
     HOST_CLAUDE: "Claude",
-    HOST_KIMI_CODE_CLI: "Kimi",
+    HOST_KIMI_CODE: "Kimi",
 }
 """来源标签兜底级用的 host 短前缀（``<prefix> <session-ref>``）。
 
@@ -8849,6 +8852,12 @@ REASON_DECISION_POINT_OUT_OF_BAND_DELIVERY_SINGLE_FLIGHT_BUSY = (
 REASON_DECISION_POINT_OUT_OF_BAND_DELIVERY_OUTCOME_UNKNOWN = (
     "decision_point_out_of_band_delivery_outcome_unknown"
 )
+# 跨 turn 再入预算已耗尽 ⇒ 本轮自注入横幅**不发**，已铸的 token 当场撤回。它不是投递失败，
+# 也不是 agent 的决策：是 RVF 自己在「宣称 agent 已收到」之前就决定不问这一次。
+REASON_DECISION_POINT_REENTRY_BUDGET_EXHAUSTED = "decision_point_reentry_budget_exhausted"
+
+# 撤回理由（写进 token payload 的 ``withdrawn_reason``，供 $rvf-analyze 与人工对账区分撤回成因）。
+DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED = "stop-hook-reentry-budget-exhausted"
 
 # 注入尝试 ledger（canary）里表示「本轮铸了 token、把横幅交出去了，但拿不到可解析回执」的取值。
 # 刻意不复用 ``INJECTION_OUTCOME_DELIVERED_OUT_OF_BAND``：那个取值断言「已交给终端投递并拿到
@@ -8858,6 +8867,11 @@ REASON_DECISION_POINT_OUT_OF_BAND_DELIVERY_OUTCOME_UNKNOWN = (
 INJECTION_ATTEMPT_OUTCOME_OUT_OF_BAND_DELIVERY_OUTCOME_UNKNOWN = (
     "out_of_band_delivery_outcome_unknown"
 )
+
+# 注入尝试 ledger 里表示「候选非空、token 也铸了，但因再入预算耗尽而根本没发出去」的取值。
+# 必须单列且 ``injected=False``：记成 ``injected``（哪怕 True/False）都会把 canary 的分子
+# 与「确实发过一次横幅」混为一谈，而这一支的全部意思正是**没发**。
+INJECTION_ATTEMPT_OUTCOME_REENTRY_BUDGET_EXHAUSTED = "reentry_budget_exhausted"
 
 # park 保留集：这些 skip/emit 决策代表「决策点仍在途」（token minted/injected/acknowledged），
 # resume 尚未落定，必须保留 self-park（对偶于 kanban-followup 的 resume-pending 语义）。
@@ -9648,6 +9662,7 @@ def decision_point_injection_decision(
             has_committed=has_committed,
             gate_status=gate_status,
             lost_warnings=lost_warnings,
+            event=event,
         )
 
     return _decision_point_non_minted_outcome_decision(
@@ -9660,6 +9675,109 @@ def decision_point_injection_decision(
         fingerprint=fingerprint,
         candidate_count=candidate_count,
         has_committed=has_committed,
+        lost_warnings=lost_warnings,
+    )
+
+
+def _decision_point_reentry_budget_exhausted_decision(
+    budget_decision: Any,
+    *,
+    token: str,
+    ledger: RunLedger,
+    repo: str,
+    cwd: str | None,
+    worktree: str,
+    session_id: str | None,
+    fingerprint: str,
+    candidate_count: int,
+    has_committed: bool,
+    lost_warnings: list[str],
+) -> StopDecision:
+    """再入预算耗尽 ⇒ 本轮不自注入，并把已铸的 token **当场撤回**后静默停。
+
+    撤回不是可选的礼节，是这条路径的正确性本身。横幅没发出去，而 token 若留在活跃非终态上，
+    三件事会同时发生且**全都没有信号**：
+
+    * 去重索引仍被这枚 token 占着 ⇒ 后续同指纹 Stop 一律 ``deduplicated`` 走静默路径，
+      整个 TTL 窗口内用户等不到横幅；
+    * 铸造熔断额度被一次从未发生的征询占掉；
+    * ``$rvf-analyze`` 与人工对账看到的是「有一枚征询在等 agent 决策」，而根本没人被问过。
+
+    ``mark_withdrawn`` 恰好一次做完这三件对账（移出去重索引 + 冲销熔断额度 + 落终态），
+    且按 INV-C 明确「不计 declined 冷却、不计熔断」——正是本支需要的语义：这次没问成，
+    下一次（预算复位后）应当能且只能重新问一次。
+
+    注入尝试 ledger 记 ``injected=False``：candidate 非空的 Stop 都要留一条记录（canary 分母
+    不能有洞），但绝不能把「没发」记成发过。
+
+    **已知代价（刻意接受）**：预算持续耗尽期间，每个 Stop 都会走一遍「铸一枚 → 当场撤回」。
+    换来的是每一次都有一条开发者可见的诊断，且预算一复位（用户提交新 prompt / digest 变化 /
+    TTL 到期）下一个 Stop 就能立刻正常征询。反面（把 token 留在活跃态省掉这次 churn）买到的
+    是整个 TTL 窗口的静默——那正是本函数存在的理由。churn 不会失控：撤回同时冲销熔断额度，
+    而预算本身始终拒绝驱动 agent，所以不存在续跑循环。
+    """
+    withdraw_failure: str | None = None
+    try:
+        decision_token_store.mark_withdrawn(
+            token, reason=DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED
+        )
+    except decision_token_store.DecisionTokenError as exc:
+        # 撤回失败不得让 Stop 失声，但**必须**响亮：撤不掉就意味着上面那三条后果仍然成立，
+        # 开发者需要看到它，否则又变成一次静默搁浅。
+        withdraw_failure = f"{type(exc).__name__}: {exc}"
+    injection_attempt_ledger.record_injection_attempt(
+        worktree=worktree,
+        session_id=session_id,
+        candidate_fingerprint=fingerprint,
+        candidate_path_count=candidate_count,
+        has_committed_but_unreviewed=has_committed,
+        mint_outcome=INJECTION_ATTEMPT_OUTCOME_REENTRY_BUDGET_EXHAUSTED,
+        decision_token=token,
+        injected=False,
+        note=withdraw_failure,
+    )
+    ledger.event(
+        phase="gate",
+        event="decision_point_reentry_budget_exhausted",
+        status="warning",
+        level="warn",
+        reason_code=REASON_DECISION_POINT_REENTRY_BUDGET_EXHAUSTED,
+        repo=repo,
+        cwd=cwd,
+        session_id=session_id,
+        decision_token=token,
+        candidate_path_count=candidate_count,
+        candidate_fingerprint=fingerprint,
+        stop_hook_reentry_budget_consecutive_count=(
+            budget_decision.consecutive_agent_directive_count
+        ),
+        stop_hook_reentry_budget_maximum=budget_decision.budget_maximum,
+        decision_point_withdrawn_reason=(
+            DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED
+            if withdraw_failure is None
+            else None
+        ),
+        error=withdraw_failure,
+    )
+    message = (
+        budget_decision.exhaustion_diagnostic
+        or "review-validate-fix: Stop hook 再入预算已耗尽，本次不注入发起决策点。"
+    )
+    message += (
+        f" 本轮已铸的决策 token {token} 已撤回"
+        "（移出去重索引 + 冲销熔断额度），预算复位后的下一次 Stop 会重新征询一次。"
+    )
+    if withdraw_failure is not None:
+        message += (
+            f" ⚠ 撤回失败（{withdraw_failure}）：该 token 仍占着去重索引，"
+            "在它 TTL 到期前同指纹的 Stop 会被静默去重。"
+        )
+    return _decision_point_silent_stop(
+        ledger,
+        reason_code=REASON_DECISION_POINT_REENTRY_BUDGET_EXHAUSTED,
+        message=message,
+        repo=repo,
+        cwd=cwd,
         lost_warnings=lost_warnings,
     )
 
@@ -9679,6 +9797,7 @@ def _decision_point_self_injection_decision(
     has_committed: bool,
     gate_status: str,
     lost_warnings: list[str],
+    event: dict[str, Any] | None,
     fell_back_from_out_of_band_delivery: dict[str, Any] | None = None,
 ) -> StopDecision:
     """同步自注入出口：渲染横幅 → 推进 token → 记账 → 以 ``agent_must_act_now`` 返回。
@@ -9686,7 +9805,32 @@ def _decision_point_self_injection_decision(
     两个调用方：默认的自注入路径，以及带外投递**确定失败**后的当场回落（INV-B：只在确定失败时
     回落；结论未知一律静默停）。回落时 ``fell_back_from_out_of_band_delivery`` 带着失败诊断，
     进 ledger 与开发者旁注——降级必须响亮。
+
+    **跨 turn 再入预算必须在这里判，不能只留给出口层 ``emit_stop_hook_payload``。** 出口层那道
+    闸是所有驱动型出口的通用兜底，但对本函数来说它来得太晚：下面的 ``mark_injected`` /
+    INJECTED 记账 / 去重索引占位三件副作用**全都预设了「正文确实会被投出去」**（``mark_injected``
+    的 docstring 逐字写着这个前提）。出口层一旦丢掉 ``agent_directive``，前提变假而副作用已经
+    落盘 ⇒ token 停在活跃非终态、去重索引被占、canary 分子被一次从未送达的注入撑高，且全程
+    零信号。判定必须早于第一件副作用；两层查的是同一次消费（见
+    ``_STOP_HOOK_REENTRY_BUDGET_DECISIONS_ALREADY_CONSUMED_IN_THIS_PROCESS``），不会重复计数。
     """
+    reentry_budget_decision = _consume_stop_hook_reentry_budget_for_event(
+        event, REASON_DECISION_POINT_INJECTED, hand_off_to_the_exit_layer=True
+    )
+    if reentry_budget_decision is not None and not reentry_budget_decision.agent_directive_permitted:
+        return _decision_point_reentry_budget_exhausted_decision(
+            reentry_budget_decision,
+            token=token,
+            ledger=ledger,
+            repo=repo,
+            cwd=cwd,
+            worktree=worktree,
+            session_id=session_id,
+            fingerprint=fingerprint,
+            candidate_count=candidate_count,
+            has_committed=has_committed,
+            lost_warnings=lost_warnings,
+        )
     reason_text = _render_decision_point_injection_prompt(
         summary=summary,
         token=token,
@@ -10042,6 +10186,7 @@ def _decision_point_out_of_band_delivery_decision(
             gate_status=gate_status,
             lost_warnings=lost_warnings,
             fallback_diagnostics={"summary": "kanban task id 在 transport 解析后消失"},
+            event=event,
         )
 
     project_path = current_kanban_project_path(event, worktree)
@@ -10306,6 +10451,7 @@ def _decision_point_out_of_band_delivery_decision(
                 has_committed=has_committed,
                 gate_status=gate_status,
                 lost_warnings=lost_warnings,
+                event=event,
                 fell_back_from_out_of_band_delivery={
                     "summary": failure_summary,
                     "terminal_delivery_status": (
@@ -10556,6 +10702,7 @@ def _decision_point_fall_back_to_self_injection(
     gate_status: str,
     lost_warnings: list[str],
     fallback_diagnostics: dict[str, Any],
+    event: dict[str, Any] | None,
 ) -> StopDecision:
     """带外 transport 在**铸币之前**就不可用时的回落：照常 mint（自注入 TTL）再自注入。"""
     try:
@@ -10608,6 +10755,7 @@ def _decision_point_fall_back_to_self_injection(
         has_committed=has_committed,
         gate_status=gate_status,
         lost_warnings=lost_warnings,
+        event=event,
         fell_back_from_out_of_band_delivery=fallback_diagnostics,
     )
 
@@ -11086,7 +11234,7 @@ def event_session_path_is_codex_rollout(event: dict[str, Any]) -> bool:
 
 HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP: dict[str, str] = {
     "claude-code": HOST_CLAUDE,
-    "kimi-code": HOST_KIMI_CODE_CLI,
+    "kimi-code": HOST_KIMI_CODE,
 }
 """``event["source"]["provider"]`` → host 身份。键是各 host 的 plugin 入口 ``setdefault``
 上去的那个字面量（``hooks/_claude_hook_entry.py`` / ``hooks/_kimi_hook_entry.py``）。
@@ -11164,8 +11312,8 @@ def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
             detected = None
     if detected == HOST_CODEX:
         return resolve_host_adapter(HOST_CODEX)
-    if detected == HOST_KIMI_CODE_CLI:
-        return resolve_host_adapter(HOST_KIMI_CODE_CLI)
+    if detected == HOST_KIMI_CODE:
+        return resolve_host_adapter(HOST_KIMI_CODE)
     if detected == HOST_CLAUDE:
         # 第 3.5 条：**所有** schema 证据都排在**所有** stamp 之前。对既有行为是恒等的
         # ——探测出 Claude 时，旧代码要么走 claude-code stamp 分支、要么落到末尾的
@@ -11180,6 +11328,83 @@ def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
     return resolve_host_adapter(detected)
 
 
+_STOP_HOOK_REENTRY_BUDGET_DECISION_HANDED_OFF_TO_THE_EXIT_LAYER: dict[tuple[str, str], Any] = {}
+"""决策层已为**同一次出口**消费好、等着出口层取走的预算判定，key = ``(session_id, reason_code)``。
+
+同一次 Stop 出口现在有两个提问方：决策层（必须在提交 ``mark_injected`` 这类「宣称 agent 已收到」
+的副作用**之前**问）与出口层 ``emit_stop_hook_payload``（所有驱动型出口的通用兜底）。两方各真
+消费一次的话，每个 Stop 会把连续计数 +2，预算实际只剩一半——一条看起来在保护、实际提前一倍
+触发的闸。
+
+刻意是**取走即清**的一次性交接，不是长驻缓存：交接只覆盖「决策层刚刚为之消费、随后就要发出去」
+的那一次出口。做成常驻 memo 会让「本进程内同一 reason_code 的后续出口一律免费」，那才是真正
+危险的方向（预算恒不生效）。跨 turn 的累积一律由预算模块自己的落盘状态负责。
+"""
+
+
+def _consume_stop_hook_reentry_budget_for_event(
+    event: dict[str, Any] | None,
+    reason_code: str,
+    *,
+    hand_off_to_the_exit_layer: bool = False,
+) -> Any | None:
+    """为一次「将要驱动 agent」的出口消费跨 turn 再入预算；判不出会话身份时返回 ``None``。
+
+    digest source 取 ``reason_code`` 而**不是**驱动正文：正文里带着每次新铸的
+    ``RVF_DECISION_TOKEN``，拿它做 digest 会让「digest 变化」这条复位路径**每次都命中**，
+    预算永不生效——一条看起来在保护、实际恒真的假保险丝。``reason_code`` 是「这次驱动属于
+    哪一类事」的稳定标识，同一类事被反复催才是要抓的形状。
+
+    ``hand_off_to_the_exit_layer=True`` 由**决策层**使用：它在提交任何「宣称 agent 已收到」的
+    副作用之前先问预算，随后出口层还会为同一次出口再问一次，故把本次判定挂进交接槽，让出口层
+    取走而不是重复消费。默认 ``False``——出口层自己的兜底消费**绝不**回填交接槽，否则下一次
+    出口就会白捡这一份，交接退化成「同 reason_code 免费通行」的常驻 memo。
+
+    整段 best-effort：预算模块自身出任何问题都不得让 Stop hook 失声（fail open），
+    代价只是这一次不设防。
+    """
+    if event is None:
+        return None
+    try:
+        session_identifier = session_id_from_event(event)
+        if not session_identifier:
+            return None
+        decision = consume_stop_hook_reentry_budget(
+            session_identifier=session_identifier,
+            stable_agent_directive_scope_digest_source=reason_code,
+            state_directory=session_hook_state_dir(),
+        )
+        if hand_off_to_the_exit_layer:
+            _STOP_HOOK_REENTRY_BUDGET_DECISION_HANDED_OFF_TO_THE_EXIT_LAYER[
+                (session_identifier, reason_code)
+            ] = decision
+        return decision
+    except Exception:  # noqa: BLE001 - 预算故障绝不阻断 Stop 出口
+        return None
+
+
+def _take_stop_hook_reentry_budget_decision_for_stop_hook_exit(
+    event: dict[str, Any] | None, reason_code: str
+) -> Any | None:
+    """出口层取本次出口的预算判定：优先取走决策层刚交接的那一份，没有则自己真消费一次。
+
+    「取走即清」：交接项只能被兑现一次，之后的出口一律回到真消费，这样本函数对**没有**决策层
+    前置判定的驱动型出口（如 ``reengage_decision``）行为逐字不变。
+    """
+    if event is not None:
+        try:
+            session_identifier = session_id_from_event(event)
+        except Exception:  # noqa: BLE001 - 身份解析失败退回真消费路径
+            session_identifier = None
+        if session_identifier:
+            handed_off = _STOP_HOOK_REENTRY_BUDGET_DECISION_HANDED_OFF_TO_THE_EXIT_LAYER.pop(
+                (session_identifier, reason_code), None
+            )
+            if handed_off is not None:
+                return handed_off
+    return _consume_stop_hook_reentry_budget_for_event(event, reason_code)
+
+
 def emit_stop_hook_payload(
     *,
     audience: str,
@@ -11188,6 +11413,7 @@ def emit_stop_hook_payload(
     host_adapter: Any,
     ledger: RunLedger | None,
     reason_code: str,
+    event: dict[str, Any] | None = None,
 ) -> None:
     """Stop hook 的**唯一**出口：受众翻译 → guardian 告警并入 → 留痕 → stdout。
 
@@ -11198,6 +11424,24 @@ def emit_stop_hook_payload(
     降级成一条 developer-only 的诊断，并在 ledger 里如实记下违反原因。
     """
     channel = host_adapter.stop_hook_agent_directive_channel()
+
+    # 跨 turn 再入预算：只对**会驱动 agent 再跑一回合**的出口计数。宿主自己的保险丝不够用——
+    # Kimi 的 `stop_hook_active` 恒 false 且引擎的续跑标记每 turn 复位 ⇒ 「driven 一回合 → agent
+    # 停下 → 再 driven 一回合」在宿主侧完全没有上界。超预算时降级成 developer_only 诊断，
+    # 而不是静默丢弃（开发者会失去唯一线索），也不是照旧驱动（那样这道闸就白加了）。
+    reentry_budget_decision = None
+    if audience == STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW and agent_directive is not None:
+        reentry_budget_decision = _take_stop_hook_reentry_budget_decision_for_stop_hook_exit(
+            event, reason_code
+        )
+        if reentry_budget_decision is not None and not reentry_budget_decision.agent_directive_permitted:
+            developer_only_payload = {
+                "continue": True,
+                "systemMessage": reentry_budget_decision.exhaustion_diagnostic,
+            }
+            agent_directive = None
+            audience = STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY
+
     try:
         payload = render_stop_hook_payload(
             audience=audience,
@@ -11231,6 +11475,16 @@ def emit_stop_hook_payload(
                 # 宿主留痕能力差异极大（只有 Claude 能从 transcript 事后取证；Codex rollout
                 # 完全不承载 hook 记录），故最终正文以 RVF 自己的 ledger 为真相源。
                 emitted_payload=payload,
+                stop_hook_reentry_budget_consecutive_count=(
+                    reentry_budget_decision.consecutive_agent_directive_count
+                    if reentry_budget_decision is not None
+                    else None
+                ),
+                stop_hook_reentry_budget_exhausted=(
+                    (not reentry_budget_decision.agent_directive_permitted)
+                    if reentry_budget_decision is not None
+                    else None
+                ),
             )
         except Exception:  # noqa: BLE001 - 留痕永不阻断出口
             pass
@@ -11297,6 +11551,7 @@ def main() -> int:
                 host_adapter=host_adapter,
                 ledger=ledger,
                 reason_code=provider_health_decision.reason_code,
+                event=event,
             )
             return 0
         workspace_guard_payload = kanban_task_workspace_guard_payload(
@@ -11343,6 +11598,7 @@ def main() -> int:
         host_adapter=host_adapter,
         ledger=ledger,
         reason_code=decision.reason_code,
+        event=event,
     )
     return 0
 

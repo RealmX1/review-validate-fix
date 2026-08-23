@@ -1509,6 +1509,35 @@ def inspect_user_prompt_submit(
     except Exception:
         pass
 
+    # Stop 侧「跨 turn 再入预算」的复位路径 ②：出现了真实的人类回合 ⇒ 连续驱动 agent 的
+    # 链条已被打破。判据与上面的 park 资格、下面的 baseline 前移**同源**——dispatch token /
+    # origin marker / decision-point token 三者都是 RVF 自己产生的机器正文，不是用户轮边界；
+    # 拿它们复位等于让 RVF 自己的注入把自己的保险丝按掉，那道闸就白加了。
+    #
+    # ⚠️ 会话身份的解析口径与 Stop 侧不完全相同：Stop 用 `session_id_from_event()`（event 缺
+    # `session_id` 时回退到 transcript 路径推导），这里只取 `event["session_id"]`。不一致的后果
+    # 一律是**少复位或复位错 bucket ⇒ 预算偏严**，不会造成假放行，故刻意不为此把那个巨型模块
+    # import 进 UPS 的热路径。
+    #
+    # best-effort、纯副作用：复位失败只让预算偏严，永不阻断这条 prompt。
+    if token is None and origin_marker is None and decision_point_token is None:
+        try:
+            from core.rvf_user_local_data_paths import (  # noqa: PLC0415
+                resolved_rvf_session_hook_state_dir,
+            )
+            from core.stop_hook_reentry_budget import (  # noqa: PLC0415
+                reset_stop_hook_reentry_budget_on_user_prompt_submit,
+            )
+
+            reentry_budget_session_id = event.get("session_id")
+            if isinstance(reentry_budget_session_id, str) and reentry_budget_session_id.strip():
+                reset_stop_hook_reentry_budget_on_user_prompt_submit(
+                    session_identifier=reentry_budget_session_id.strip(),
+                    state_directory=resolved_rvf_session_hook_state_dir(),
+                )
+        except Exception:
+            pass
+
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
     record: rvf_prep_file.PrepFileRecord | None = None

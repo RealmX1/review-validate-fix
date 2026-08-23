@@ -11,7 +11,7 @@ from core.host_adapter.host_adapter_protocol import HostAdapter
 from core.host_adapter.host_transcript_format_detection import (
     HOST_CLAUDE,
     HOST_CODEX,
-    HOST_KIMI_CODE_CLI,
+    HOST_KIMI_CODE,
     KNOWN_HOST_IDENTITIES,
     detect_transcript_format,
 )
@@ -19,7 +19,7 @@ from core.host_adapter.host_transcript_format_detection import (
 __all__ = [
     "HOST_CLAUDE",
     "HOST_CODEX",
-    "HOST_KIMI_CODE_CLI",
+    "HOST_KIMI_CODE",
     "KNOWN_HOST_IDENTITIES",
     "HostAdapter",
     "detect_transcript_format",

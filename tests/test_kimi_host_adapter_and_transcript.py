@@ -613,18 +613,18 @@ def test_subagent_capture_dispatches_all_three_seams_to_kimi() -> None:
     """漏接任一处都会静默退回 Codex 的实现去解析 Kimi 的数据。"""
     result = _run_in_repo_context(
         "import subagent_capture as sc\n"
-        "from core.host_adapter import HOST_CLAUDE, HOST_CODEX, HOST_KIMI_CODE_CLI\n"
+        "from core.host_adapter import HOST_CLAUDE, HOST_CODEX, HOST_KIMI_CODE\n"
         "from pathlib import Path\n"
         "print(json.dumps({\n"
         "  'distill': {str(h): sc._host_distill(h).__name__\n"
-        "              for h in (HOST_CODEX, HOST_CLAUDE, HOST_KIMI_CODE_CLI, None)},\n"
-        "  'originator_kimi': sc._host_originator(HOST_KIMI_CODE_CLI, Path('/nonexistent')),\n"
-        "  'subagents_kimi': sc._resolve_subagents(HOST_KIMI_CODE_CLI,\n"
+        "              for h in (HOST_CODEX, HOST_CLAUDE, HOST_KIMI_CODE, None)},\n"
+        "  'originator_kimi': sc._host_originator(HOST_KIMI_CODE, Path('/nonexistent')),\n"
+        "  'subagents_kimi': sc._resolve_subagents(HOST_KIMI_CODE,\n"
         "      main_rollout_path=Path('/nonexistent/agents/main/wire.jsonl'),\n"
         "      original_transcript=None, sessions_root=None),\n"
         "}))\n"
     )
-    assert result["distill"]["kimi_code_cli"] == "distill_kimi_wire_jsonl", result["distill"]
+    assert result["distill"]["kimi_code"] == "distill_kimi_wire_jsonl", result["distill"]
     assert result["distill"]["codex"] == "distill_codex_jsonl", result["distill"]
     assert result["distill"]["claude_code"] == "distill_claude_jsonl", result["distill"]
     assert result["distill"]["None"] == "distill_codex_jsonl", "host 未知仍兜底 Codex"
@@ -728,11 +728,11 @@ def test_kimi_main_trajectory_is_distilled_by_the_kimi_distiller(tmp_path: Path)
         ],
     )
     result = _capture_run(run_dir=tmp_path / "rvf-run", transcript=wire)
-    assert result["post_manifest"]["host"] == "kimi_code_cli", result["post_manifest"]
+    assert result["post_manifest"]["host"] == "kimi_code", result["post_manifest"]
     assert result["trajectory_record_count"] > 0, (
         "Kimi 会话的主 trajectory 被蒸成 0 条 —— 正是本切片要杜绝的静默失声"
     )
-    assert result["trajectory_sources"] == ["kimi_code_cli"], result["trajectory_sources"]
+    assert result["trajectory_sources"] == ["kimi_code"], result["trajectory_sources"]
 
 
 def test_kimi_rvf_start_marker_is_found_in_a_wire_transcript(tmp_path: Path) -> None:
@@ -800,8 +800,8 @@ def test_every_known_host_identity_has_its_own_main_trajectory_dispatch() -> Non
     )
     assert len(set(result["distill"].values())) == len(result["distill"]), result["distill"]
     assert len(set(result["find_start"].values())) == len(result["find_start"]), result["find_start"]
-    assert result["distill"]["kimi_code_cli"] == "distill_kimi_wire_jsonl", result["distill"]
-    assert result["find_start"]["kimi_code_cli"] == "find_rvf_start_in_kimi_wire_jsonl", (
+    assert result["distill"]["kimi_code"] == "distill_kimi_wire_jsonl", result["distill"]
+    assert result["find_start"]["kimi_code"] == "find_rvf_start_in_kimi_wire_jsonl", (
         result["find_start"]
     )
     assert result["distill_unknown"] == "distill_codex_jsonl", "host 未知仍兜底 Codex"
@@ -876,7 +876,7 @@ def test_every_known_host_identity_has_its_own_parent_context_renderer() -> None
         "}))\n"
     )
     assert len(set(result["renderer"].values())) == len(result["renderer"]), result["renderer"]
-    assert result["renderer"]["kimi_code_cli"] == "_render_kimi_record", result["renderer"]
+    assert result["renderer"]["kimi_code"] == "_render_kimi_record", result["renderer"]
     assert result["unknown"] == "_render_codex_record", "host 未知仍兜底 Codex"
 
 
@@ -887,16 +887,16 @@ def test_kimi_harness_identity_token_converges_across_every_signal_layer() -> No
     """``round_baseline_marker`` 的 key 里带 harness token；两层归一成不同串 = marker 消失。
 
     Claude 的三种写法（``claude_code`` / ``claude`` / ``claude-code_2-1-231_agent``）都折进
-    ``claude-code``。Kimi 曾经没有这条：host 探测值 ``kimi_code_cli`` 折成 ``kimi-code-cli``、
+    ``claude-code``。Kimi 曾经没有这条：host 探测值 ``kimi_code`` 折成 ``kimi-code``、
     hook shim 注入的 agent id ``kimi`` 折成 ``kimi``、kanban 的 ``AI_AGENT=kimi_…_agent`` 又折成
     第三个串 —— 写者写 A、读者读 B，窗口下界凭空消失（⇒ 漏审），且**没有任何报错**。
     """
     result = _run_in_repo_context(
         "from core.host_adapter.parent_harness_identity import (\n"
-        "  normalize_parent_harness_identity as n, PARENT_HARNESS_IDENTITY_KIMI_CODE_CLI as K)\n"
+        "  normalize_parent_harness_identity as n, PARENT_HARNESS_IDENTITY_KIMI_CODE as K)\n"
         "print(json.dumps({\n"
         "  'constant': K,\n"
-        "  'from_host_kind': n('kimi_code_cli'),\n"
+        "  'from_host_kind': n('kimi_code'),\n"
         "  'from_kanban_agent_id': n('kimi'),\n"
         "  'from_ai_agent_descriptor': n('kimi_1-0-0_agent'),\n"
         "  'claude_unchanged': [n('claude_code'), n('claude'), n('claude-code_2-1-231_agent')],\n"
@@ -904,7 +904,7 @@ def test_kimi_harness_identity_token_converges_across_every_signal_layer() -> No
         "  'cursor_unchanged': n('cursor-agent'),\n"
         "}))\n"
     )
-    assert result["constant"] == "kimi-code-cli", result
+    assert result["constant"] == "kimi-code", result
     assert (
         result["from_host_kind"]
         == result["from_kanban_agent_id"]
@@ -943,7 +943,7 @@ def test_session_reference_label_prefix_is_not_two_host_binary() -> None:
         "}))\n"
     )
     assert result["missing_hosts"] == [], result
-    assert result["table"]["kimi_code_cli"] == "Kimi", result["table"]
+    assert result["table"]["kimi_code"] == "Kimi", result["table"]
     assert len(set(result["table"].values())) == len(result["table"]), result["table"]
     assert result["unknown_fallback"] == "Codex", "host 未知仍兜底 Codex"
 
@@ -968,7 +968,7 @@ def test_subagent_capture_cli_accepts_every_known_host_identity(tmp_path: Path) 
         "from core.host_adapter import KNOWN_HOST_IDENTITIES\n"
         "print(json.dumps(sorted(KNOWN_HOST_IDENTITIES)))\n"
     )
-    assert "kimi_code_cli" in known_hosts, known_hosts
+    assert "kimi_code" in known_hosts, known_hosts
 
     for host in known_hosts:
         completed = subprocess.run(
