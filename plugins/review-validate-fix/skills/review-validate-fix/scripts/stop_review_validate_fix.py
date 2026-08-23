@@ -10104,7 +10104,14 @@ def _decision_point_reentry_budget_exhausted_decision(
     withdraw_failure: str | None = None
     try:
         decision_token_store.mark_withdrawn(
-            token, reason=DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED
+            token,
+            reason=DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED,
+            # base 在 0a9a915 给 mark_withdrawn 加了 withdrawal_cause **枚举**（它决定是否冲销
+            # 熔断额度），默认值是 rewound_by_user。不显式传就会把「预算耗尽」记成「用户 rewind」：
+            # 冲销行为碰巧一致，但成因分类是错的，对账与统计会把两件事混为一谈。
+            withdrawal_cause=(
+                decision_token_store.DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED
+            ),
         )
     except decision_token_store.DecisionTokenError as exc:
         # 撤回失败不得让 Stop 失声，但**必须**响亮：撤不掉就意味着上面那三条后果仍然成立，
