@@ -233,6 +233,7 @@ import rvf_withdrawn_dispatch_tombstone
 from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 — HOST_CODEX 经 module.X 给 parent-context 簇测试 re-export，随 S10e 簇迁移
     HOST_CLAUDE,
     HOST_CODEX,
+    HOST_KIMI_CODE_CLI,
     detect_transcript_format,
 )
 import rvf_parent_context
@@ -764,6 +765,19 @@ def session_index_thread_name(session_id: str | None) -> str | None:
     return match
 
 
+SESSION_REFERENCE_LABEL_PREFIX_BY_HOST: dict[str, str] = {
+    HOST_CODEX: "Codex",
+    HOST_CLAUDE: "Claude",
+    HOST_KIMI_CODE_CLI: "Kimi",
+}
+"""来源标签兜底级用的 host 短前缀（``<prefix> <session-ref>``）。
+
+刻意与 ``HostAdapter.host_display_name()``（"Claude Code" / "Kimi Code CLI"）分开：这里要的
+是能和 session ref 拼成一行的短名。未登记的 host 取 ``"Codex"``，与整条链路「未知兜底
+Codex」的口径一致——这一层只影响人类可读标签，不选线材。
+"""
+
+
 def parent_conversation_origin(
     *,
     parent_session_id: str | None,
@@ -795,7 +809,7 @@ def parent_conversation_origin(
         host_adapter=resolve_host_adapter(host_kind),
         session_id=session_id,
         thread_name_from_index=session_index_thread_name(session_id),
-        session_ref_prefix="Claude" if host_kind == HOST_CLAUDE else "Codex",
+        session_ref_prefix=SESSION_REFERENCE_LABEL_PREFIX_BY_HOST.get(host_kind, "Codex"),
         parent_thread_name=parent_thread_name,
         name_lookup=name_lookup,
     )
@@ -11070,6 +11084,22 @@ def event_session_path_is_codex_rollout(event: dict[str, Any]) -> bool:
     return False
 
 
+HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP: dict[str, str] = {
+    "claude-code": HOST_CLAUDE,
+    "kimi-code": HOST_KIMI_CODE_CLI,
+}
+"""``event["source"]["provider"]`` → host 身份。键是各 host 的 plugin 入口 ``setdefault``
+上去的那个字面量（``hooks/_claude_hook_entry.py`` / ``hooks/_kimi_hook_entry.py``）。
+
+**每多一个自带 hook 入口的 host，这里就必须多一条**：漏一条时该 host 的 stamp 会被无视，
+在 transcript 探测落空的场合直接掉进「未知 → Codex」兜底。Codex 兜底对 Codex 自己是安全的
+（发错键会**响亮**地整条 Failed），对 Kimi 则是**静默 allow**，RVF 完全失声、零报错。
+
+Codex 不在表里，也不需要在：它没有自己的 stamp，而它的两条正向证据（会话路径、rollout
+schema）排在本表之前。
+"""
+
+
 def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
     """装配**当前这次 Stop 事件所属会话**的 HostAdapter（≠ 父会话 host）。
 
@@ -11094,12 +11124,34 @@ def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
        ``$CODEX_HOME/sessions/``）→ Codex。**否定 Claude 的证据排在 stamp 之前。**
     2. ``detect_transcript_format`` 嗅出当前会话 transcript 是 Codex rollout schema →
        Codex。这条不依赖任何 env / 路径约定，是路径约定被改掉时的真相源。
-    3. ``event["source"]["provider"] == "claude-code"``——Claude plugin 入口亲手打的标；
-       在没有任何 Codex 反证时它仍是最强的正向 Claude 证据（也是 transcript 不可读 /
-       schema 不认识时唯一的 Claude 线索）。
-    4. 探测结果本身（``HOST_CLAUDE`` → Claude；``None`` → resolver 兜底 Codex + 阻塞通道），
+    3. ``detect_transcript_format`` 嗅出当前会话是 **Kimi** wire schema → Kimi；嗅出
+       Claude transcript schema → Claude。理由与第 2 条一致：schema 是文件内容的事实，
+       stamp 只是入口自己 ``setdefault`` 的，所以**整层** schema 证据排在**整层** stamp 之前。
+       Kimi 方向的代价更高：它若被误判成 Claude 会收到 ``hookSpecificOutput.additionalContext``，
+       而 Kimi 的 hook 输出 schema 是 ``looseObject`` 且只读 ``permissionDecision`` ⇒
+       **静默 allow、零报错**，RVF 完全失声。实测（2026-08-23）：不加 Kimi schema 这条时，
+       一个带 ``claude-code`` stamp 的 Kimi 会话确实被判成 Claude —— 这不是假想，Kimi 的 shim
+       要做大量事件归一，复用或误配 Claude 入口逻辑就会打上那个 stamp。
+    4. ``event["source"]["provider"]`` stamp——各 host 的 plugin 入口亲手打的标
+       （``claude-code`` → Claude，``kimi-code`` → Kimi）。在没有任何 schema / 路径反证时
+       它是最强的正向 host 证据，也是 **transcript 不可读 / 尚未落盘时唯一的线索**。
+       Kimi 尤其依赖这一层：它的 Stop 事件原本**没有** ``transcript_path``，那个键由
+       ``hooks/_kimi_hook_entry.py`` 合成（会话目录 → ``agents/main/wire.jsonl``），而合成
+       有两条正常的落空路径——会话目录还没进 ``session_index.jsonl`` 且扫桶没命中，以及
+       ``wire.jsonl`` 尚未落盘（``resolve_agent_wire_transcript_path`` 要求 ``is_file()``）。
+       落空即探测为 ``None`` ⇒ 兜底 Codex ⇒ 发 ``decision:block`` ⇒ Kimi 静默 allow。
+       这是 HOST-2（「Claude 在 transcript 不可读时仍采信 stamp」）的 Kimi 对偶。
+    5. 探测结果本身（``HOST_CLAUDE`` → Claude；``None`` → resolver 兜底 Codex + 阻塞通道），
        沿用「无法识别退回 Codex」口径：兜底到最保守的通道，绝不赌未知 host 认识
        ``hookSpecificOutput``。
+
+    **stamp 之间不排序，因为 ``provider`` 只有一个值**；而 stamp 整体仍排在第 1–3 条
+    schema / 路径证据之后，所以即使某个入口的归属判据漏判、把 stamp 打到了别家的会话上，
+    正向的 Codex 证据依旧最先命中——Codex 方向的既有不对称性一个字符都没被放松。
+
+    ⚠️ **兜底的不对称性只覆盖 Codex 方向。** 「未知 → Codex + 阻塞通道」之所以安全，是因为
+    Codex 收到不认识的键会**响亮**地整条 Failed。Kimi 方向没有这层保护：任何把 Kimi 判成
+    别家的路径都是静默失效，所以 Kimi 只能靠**正向识别**，兜底救不了它。
     """
     if event_session_path_is_codex_rollout(event):
         return resolve_host_adapter(HOST_CODEX)
@@ -11112,9 +11164,19 @@ def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
             detected = None
     if detected == HOST_CODEX:
         return resolve_host_adapter(HOST_CODEX)
-    source = event.get("source")
-    if isinstance(source, dict) and source.get("provider") == "claude-code":
+    if detected == HOST_KIMI_CODE_CLI:
+        return resolve_host_adapter(HOST_KIMI_CODE_CLI)
+    if detected == HOST_CLAUDE:
+        # 第 3.5 条：**所有** schema 证据都排在**所有** stamp 之前。对既有行为是恒等的
+        # ——探测出 Claude 时，旧代码要么走 claude-code stamp 分支、要么落到末尾的
+        # ``resolve_host_adapter(detected)``，两条路都返回 Claude。它存在是为了让新增的
+        # 第二枚 stamp（kimi-code）无法抢走一个内容上明确是 Claude 的会话。
         return resolve_host_adapter(HOST_CLAUDE)
+    source = event.get("source")
+    if isinstance(source, dict):
+        stamped_host = HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP.get(source.get("provider"))
+        if stamped_host is not None:
+            return resolve_host_adapter(stamped_host)
     return resolve_host_adapter(detected)
 
 
