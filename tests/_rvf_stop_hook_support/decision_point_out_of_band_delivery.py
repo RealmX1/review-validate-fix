@@ -14,6 +14,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +29,8 @@ __all__ = [
     'test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker',
     'test_decision_point_out_of_band_single_flight_busy_does_not_mint',
     'test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once',
+    'test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point',
+    'test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off',
     'test_decision_point_rewound_banner_is_withdrawn_and_reasked_once',
     'test_decision_point_self_injected_token_is_not_withdrawn_as_rewound',
     'test_decision_point_crash_between_send_and_receipt_is_reconciled_from_intent',
@@ -455,7 +458,8 @@ def test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered(
     tokens = decision_token_records(state)
     assert len(tokens) == 1 and tokens[0]["token"] == token_before, tokens
 
-    # ② 把意图 TTL 推到过去 = 横幅始终没成为 turn ⇒ 搁浅对账撤回它，下一次 Stop 重新征询一次。
+    # ② 把意图 TTL 推到过去 = 横幅始终没成为 turn ⇒ 搁浅对账撤回它。
+    #    撤回那一次 Stop **就地结束**（C-①），再下一次 Stop 才重新征询一次。
     lock_module = load_kanban_followup_lock_module()
     intents_dir = (
         state / "kanban-followup-in-progress" / "kanban-decision-point-delivery-intent"
@@ -471,7 +475,18 @@ def test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered(
     assert "decision_point_out_of_band_delivery_stranded_withdrawn" in names, names
     after = {record["token"]: record for record in decision_token_records(state)}
     assert after[token_before]["state"] == "withdrawn", after[token_before]
-    assert len(after) == 2, after
+    # C-①：撤回的那一次 Stop 不重铸——「刚撤掉一枚」正是「这条通道此刻不通」的证据。
+    assert list(after) == [token_before], after
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_stranded_delivery_withdrawn_this_stop"
+    ), latest_summary(state)
+
+    # ③ 再下一次 Stop：这时才重新征询，且恰好一枚。
+    invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    reasked = {record["token"]: record for record in decision_token_records(state)}
+    assert len(reasked) == 2, reasked
+    fresh = [token for token in reasked if token != token_before]
+    assert len(fresh) == 1 and reasked[fresh[0]]["state"] == "minted", reasked
 
 
 def test_decision_point_transport_override_without_task_id_falls_back_honestly(
@@ -561,10 +576,15 @@ def test_decision_point_out_of_band_single_flight_busy_does_not_mint(tmp: Path) 
 def test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once(
     tmp: Path,
 ) -> None:
-    """D6：投出去却始终没成为 turn 的横幅，到期后必须真的被撤回，然后**重新征询恰好一次**。
+    """D6 + C-①：搁浅横幅到期后必须真的被撤回，且**当次 Stop 不重铸**，下一次 Stop 才重新征询。
 
-    没有这一条，一轮被判「已撤回」的横幅 20 分钟后落地照样能跑出一轮无 lease、无 scope 契约的
+    没有 D6 那一半，一轮被判「已撤回」的横幅 20 分钟后落地照样能跑出一轮无 lease、无 scope 契约的
     review——F2a 的 tombstone 对横幅是空的（横幅不带 ``RVF_DISPATCH=token=`` needle）。
+
+    C-① 收紧了后一半：撤回与重铸原本挨在同一条控制流上（对账只返回 notices、不返回决策），于是
+    撤回后当次就落回铸造路径，在**同一次 Stop** 里再铸一枚。实测（2026-08-21）由此出现一个
+    session 内连铸三枚、间隔 6~7 秒、全程 ``minted → withdrawn`` 从未 ``injected`` 的空转环。
+    「刚撤掉一枚」本身就是「这条通道此刻不通」的证据，当次重铸的那枚多半照样空转。
     """
     case = tmp / "stranded"
     repo = init_repo(case / "repo", dirty=True)
@@ -583,18 +603,300 @@ def test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once(
     assert len(first) == 1 and first[0]["state"] == "minted", first
     stranded_token = first[0]["token"]
 
+    # ---- 第二次 Stop：撤回，且**当次不重铸**（C-①）----
     stdout, _stderr = invoke(_stop_event(repo), state_dir=state, extra_env=env)
     names = [event.get("event") for event in latest_events(state)]
     assert "decision_point_out_of_band_delivery_stranded_withdrawn" in names, names
 
     records = {record["token"]: record for record in decision_token_records(state)}
     assert records[stranded_token]["state"] == "withdrawn", records[stranded_token]
-    # 撤回后**重新征询恰好一次**：新铸一枚、再投一次，绝不多投。
+    assert records[stranded_token]["withdrawal_cause"] == (
+        "out_of_band_delivery_never_became_a_turn"
+    ), records[stranded_token]
+    # 当次 Stop 就地结束：token 总数没涨，且**这一次 run 里一次投递都没有**。
+    # （``_delivery_events`` 读的是 ``latest_events`` = 当次 run，不是跨 run 累计。）
+    assert list(records) == [stranded_token], records
+    assert _delivery_events(state) == [], latest_events(state)
+    withdrawal_stop_summary = latest_summary(state)
+    assert withdrawal_stop_summary["reason_code"] == (
+        "decision_point_stranded_delivery_withdrawn_this_stop"
+    ), withdrawal_stop_summary
+    # 受众纪律：这是降级诊断，**不得**驱动 agent 再跑一回合。
+    withdrawal_stop_payload = parse_json(stdout)
+    assert withdrawal_stop_payload is not None
+    assert "decision" not in withdrawal_stop_payload, withdrawal_stop_payload
+    assert "hookSpecificOutput" not in withdrawal_stop_payload, withdrawal_stop_payload
+
+    # ---- 第三次 Stop：这时才重新征询，且**恰好一次** ----
+    stdout, _stderr = invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    records = {record["token"]: record for record in decision_token_records(state)}
     fresh = [token for token in records if token != stranded_token]
     assert len(fresh) == 1, records
     assert records[fresh[0]]["state"] == "minted", records[fresh[0]]
+    # 这一次 run 里恰好投递一次（不是累计计数，见上）。
     assert len(_delivery_events(state)) == 1, latest_events(state)
     assert parse_json(stdout) is not None
+
+
+def test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point(
+    tmp: Path,
+) -> None:
+    """另一个 worktree/task 遗留的搁浅意图，**不得**让本 worktree 这一轮的发起被整轮压掉。
+
+    ``iter_decision_point_delivery_intents`` 是**跨 task 全局枚举**（其 docstring 逐字写着
+    「枚举全部投递意图（跨 task）」），而投递意图落在全局唯一的 ``$RVF_HOME`` 根下——两个仓的
+    Stop 天然共用同一份意图目录，所以本用例让两个 worktree 共用同一个 ``state_dir``。
+
+    C-① 把「本次撤回了任意一枚」变成当次早退判据之后，这个枚举面就成了漏审源：task A 留下的
+    一枚 stale intent 会让 repo B 的 Stop 直接返回
+    ``decision_point_stranded_delivery_withdrawn_this_stop``，B 的脏改动**连候选摘要都不算**。
+    早退的立论「刚撤掉一枚 = 这条投递通道此刻不通」只对**同一条通道**成立。
+
+    两个变体都钉：B 走带外投递、B 走内联自注入（后者根本不经投递意图这条通道，被挡尤其荒谬）。
+    跨 task 垃圾回收**必须保留**——它本来就该做，少清一份迟到落地的横幅照样能跑出一轮无 lease 的
+    review。
+    """
+    for variant, this_stop_task_id, expected_reason_code in (
+        ("out-of-band", "task-B-out-of-band", "decision_point_delivered_out_of_band"),
+        ("inline-self-injection", None, "decision_point_injected"),
+    ):
+        case = tmp / variant
+        state = case / "state"
+        stub = _write_stub_client(case / "stub-client.py")
+
+        # ---- 另一个 worktree（task A）：投一枚横幅，意图 TTL=0 ⇒ 写下来就是 stale ----
+        other_worktree = init_repo(case / "repo-other-worktree", dirty=True)
+        other_env = _out_of_band_env(
+            stub_client=stub,
+            task_id="task-A-other-worktree",
+            RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS="0",
+        )
+        invoke(
+            _stop_event(other_worktree, session_id="sess-other-worktree"),
+            state_dir=state,
+            extra_env=other_env,
+        )
+        stranded = decision_token_records(state)
+        assert len(stranded) == 1 and stranded[0]["state"] == "minted", stranded
+        stranded_token = stranded[0]["token"]
+        assert len(_delivery_intents(state)) == 1, _delivery_intents(state)
+
+        # ---- 本轮这个 worktree：不同的仓 / session / task，有自己的脏改动 ----
+        this_worktree = init_repo(case / "repo-this-worktree", dirty=True)
+        if this_stop_task_id is None:
+            # 内联自注入：不进 kanban task（没有 KANBAN_TASK_ID 就没有带外通道）。
+            this_env = {
+                "CODEX_RVF_CLINE_KANBAN_TASK_CMD": str(stub.parent / "no-such-kanban-cli"),
+                "RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS": "0",
+            }
+        else:
+            this_env = _out_of_band_env(
+                stub_client=stub,
+                task_id=this_stop_task_id,
+                RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS="0",
+            )
+        stdout, _stderr = invoke(
+            _stop_event(this_worktree, session_id="sess-this-worktree"),
+            state_dir=state,
+            extra_env=this_env,
+        )
+
+        summary = latest_summary(state)
+        assert summary["reason_code"] != (
+            "decision_point_stranded_delivery_withdrawn_this_stop"
+        ), (variant, summary)
+        assert summary["reason_code"] == expected_reason_code, (variant, summary)
+
+        records = {record["token"]: record for record in decision_token_records(state)}
+        fresh = [token for token in records if token != stranded_token]
+        assert len(fresh) == 1, (variant, records)
+        assert records[fresh[0]]["state"] in ("minted", "injected"), (
+            variant,
+            records[fresh[0]],
+        )
+
+        # 跨 task 垃圾回收仍然做了：另一个 worktree 那枚被撤回、它的意图被清掉。
+        assert records[stranded_token]["state"] == "withdrawn", (
+            variant,
+            records[stranded_token],
+        )
+        names = [event.get("event") for event in latest_events(state)]
+        assert "decision_point_out_of_band_delivery_stranded_withdrawn" in names, (
+            variant,
+            names,
+        )
+        garbage_collected = [
+            event
+            for event in latest_events(state)
+            if event.get("event") == "decision_point_out_of_band_delivery_stranded_withdrawn"
+        ]
+        assert len(garbage_collected) == 1, (variant, garbage_collected)
+        # ledger 必须如实记下「这条不是本轮这条通道的」——它正是早退判据的取数口径。
+        assert garbage_collected[0][
+            "stranded_delivery_intent_belongs_to_this_stop_delivery_channel"
+        ] is False, (variant, garbage_collected[0])
+        remaining_intent_task_ids = sorted(
+            str(intent.get("kanban_task_id")) for intent in _delivery_intents(state)
+        )
+        assert "task-A-other-worktree" not in remaining_intent_task_ids, (
+            variant,
+            remaining_intent_task_ids,
+        )
+        if this_stop_task_id is not None:
+            assert remaining_intent_task_ids == [this_stop_task_id], (
+                variant,
+                remaining_intent_task_ids,
+            )
+            assert parse_json(stdout) is not None
+        else:
+            # 内联路径根本不写投递意图。
+            assert remaining_intent_task_ids == [], (variant, remaining_intent_task_ids)
+            assert parse_json(stdout).get("decision") == "block", (variant, stdout)
+
+
+def _invoke_user_prompt_submit_hook(
+    event: dict[str, object], *, state_dir: Path, extra_env: dict[str, str] | None = None
+) -> dict[str, object]:
+    """跑**真实**的 UserPromptSubmit hook，落盘根与 ``invoke()`` 指向同一个隔离 state。
+
+    刻意驱动真 hook 而不是手工摆 token 状态：本用例的前提（「横幅落地了但 ``mark_injected``
+    失败、且**刻意不清**投递意图」）是 UPS 自己的一条分支，摆状态就摆掉了它是否仍然可达这件事。
+    """
+    env = os.environ.copy()
+    for name in tuple(env):
+        if name.startswith(("CODEX_RVF_", "RVF_", "KANBAN_", "CLINE_KANBAN_")):
+            env.pop(name, None)
+    env.pop("CODEX_THREAD_ID", None)
+    env["CODEX_RVF_STATE_DIR"] = str(state_dir)
+    env["RVF_HOME"] = str(state_dir / "rvf-home")
+    env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state_dir / "kanban-followup-in-progress")
+    if extra_env:
+        env.update(extra_env)
+    completed = subprocess.run(
+        [sys.executable, str(Path(SCRIPT).with_name("rvf_user_prompt_submit.py"))],  # noqa: F821
+        input=json.dumps(event),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    return json.loads(completed.stdout) if completed.stdout.strip() else {}
+
+
+def test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off(
+    tmp: Path,
+) -> None:
+    """横幅**确实落地成一条 turn**、只是 ``mark_injected`` 撞 TTL 失败 ⇒ 撤回时**冲销**熔断额度。
+
+    ``state`` 仍停在 ``minted`` 并不蕴含「从未成为 turn」：
+    ``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在 ``mark_injected`` 抛
+    ``DecisionTokenExpiredError``（横幅排在一个长回合之后，越过了 1200s 带外 TTL）时**提前返回
+    且刻意不清投递意图**（逐字：留给后续对账），而 ``read_decision_token`` 对已过 TTL 的 token
+    照样返回 ``state=minted``。于是「agent 已经看到过横幅」与「横幅从未落地」在对账侧形状全同。
+
+    若这一族按空转如实计费，连续 3 次就把铸造熔断打跳，整个 session 的自动发起被静默封禁一个
+    窗口（默认 3600s）——**漏审**方向。C-② 的退避前提（用户根本没看到过横幅、通道坏着）在这里
+    不成立，故必须按成因分开：transcript 里那条 ``RVF_DECISION_TOKEN=`` 就是「它成为过 turn」的
+    直答证据。
+    """
+    case = tmp / "became-a-turn"
+    repo = init_repo(case / "repo", dirty=True)
+    state = case / "state"
+    stub = _write_stub_client(case / "stub-client.py")
+    env = _out_of_band_env(
+        stub_client=stub,
+        task_id="task-became-a-turn",
+        RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS="0",
+    )
+
+    # ---- ① Stop：铸 token + 带外投出横幅 ----
+    invoke(_stop_event(repo, session_id="sess-became-a-turn"), state_dir=state, extra_env=env)
+    minted = decision_token_records(state)
+    assert len(minted) == 1 and minted[0]["state"] == "minted", minted
+    token = minted[0]["token"]
+    assert len(_effective_mint_request_charges(state)) == 1, _mint_request_records(state)
+
+    # ---- ② 横幅排在一个长回合之后才落地：带外 TTL 在排队期间烧完 ----
+    token_path = next(
+        (rvf_home_dir(state) / "agentic-initiation-decision-tokens").glob("*.json")
+    )
+    expired_payload = json.loads(token_path.read_text(encoding="utf-8"))
+    expired_payload["expires_at"] = "1970-01-01T00:00:00Z"
+    token_path.write_text(json.dumps(expired_payload), encoding="utf-8")
+
+    # ---- ③ UPS：横幅**确实**作为一条真实 user message 到达，但 token 推不动了 ----
+    banner_body = (
+        "=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===\n"
+        f"RVF_DECISION_TOKEN={token}\n"
+    )
+    ups_payload = _invoke_user_prompt_submit_hook(
+        {
+            "cwd": str(repo),
+            "session_id": "sess-became-a-turn",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": banner_body,
+        },
+        state_dir=state,
+        extra_env={"KANBAN_TASK_ID": "task-became-a-turn"},
+    )
+    # UPS 必须**如实**说「未推进」，绝不能借用那句断言性的「已推进为 injected」文案。
+    assert "决策 token 未能推进" in str(ups_payload.get("systemMessage", "")), ups_payload
+    after_ups = {record["token"]: record for record in decision_token_records(state)}
+    assert after_ups[token]["state"] == "minted", after_ups[token]
+    # 前提的另一半：意图**没有**被清掉（UPS 把它留给了对账）。
+    assert len(_delivery_intents(state)) == 1, _delivery_intents(state)
+
+    # ---- ④ 下一次 Stop：横幅那条 user message 就在 transcript 的祖先链上 ----
+    transcript = case / "session.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(entry, ensure_ascii=False)
+            for entry in [
+                {
+                    "uuid": "entry-root",
+                    "parentUuid": None,
+                    "type": "user",
+                    "message": {"role": "user", "content": "开始干活"},
+                },
+                {
+                    "uuid": "entry-banner",
+                    "parentUuid": "entry-root",
+                    "type": "user",
+                    "message": {"role": "user", "content": banner_body},
+                },
+                {
+                    "uuid": "entry-after-banner",
+                    "parentUuid": "entry-banner",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": "先把手头的事做完"},
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    invoke(
+        _stop_event(
+            repo, session_id="sess-became-a-turn", transcript_path=str(transcript)
+        ),
+        state_dir=state,
+        extra_env=env,
+    )
+
+    reconciled = {record["token"]: record for record in decision_token_records(state)}
+    assert reconciled[token]["state"] == "withdrawn", reconciled[token]
+    assert reconciled[token]["withdrawal_cause"] == (
+        "out_of_band_delivery_became_a_turn_but_token_advance_failed"
+    ), reconciled[token]
+    # 记账方向：额度被**冲销**，不得留下「保留」标记。
+    assert "withdrawn_mint_request_charge_retained" not in reconciled[token], (
+        reconciled[token]
+    )
+    assert _effective_mint_request_charges(state) == [], _mint_request_records(state)
+    # 撤回本身仍在本轮这条通道上 ⇒ 当次 Stop 仍就地结束（C-① 不因成因不同而改变）。
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_stranded_delivery_withdrawn_this_stop"
+    ), latest_summary(state)
 
 
 def _write_rewound_transcript(path: Path, token: str, banner_excerpt: str) -> Path:

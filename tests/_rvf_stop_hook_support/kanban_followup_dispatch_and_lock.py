@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
@@ -25,7 +26,7 @@ from _rvf_test_support.stop_decision_agent_directive import (
 
 # 由 aggregator（tests/test_stop_review_validate_fix.py）在 main() 前 inject 注入共享依赖。
 __all__ = [
-    'test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl',
+    'test_kanban_followup_auto_review_scope_lease_ttl_matches_in_flight_lock_ttl',
     'test_kanban_followup_without_task_id_does_not_allocate_review_scope',
     'test_kanban_followup_mode_injects_current_task_message',
     'test_kanban_followup_terminal_fallback_reports_unconfirmed_and_writes_pending',
@@ -69,6 +70,16 @@ __all__ = [
     'test_kanban_followup_awaiting_window_expiry_releases_tracker_lease',
     'test_kanban_followup_rewind_reconcile_releases_tracker_lease',
     'test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_nudging',
+    'test_stale_in_progress_lock_with_recent_run_activity_is_revived_not_cleared',
+    'test_stale_in_progress_lock_without_recent_run_activity_is_cleared_as_before',
+    'test_stale_in_progress_lock_past_revival_absolute_cap_is_cleared_despite_activity',
+    'test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap',
+    'test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat',
+    'test_run_activity_probe_sees_reviewer_stream_writes_below_artifacts_root',
+    'test_run_activity_probe_sees_fix_attempt_result_writes_below_artifacts_root',
+    'test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree',
+    'test_run_activity_probe_anchor_enumeration_stays_within_stat_budget',
+    'test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived',
 ]
 
 
@@ -104,7 +115,7 @@ def _write_fake_kanban_empty_list_client(path: Path) -> str:
     return str(path)
 
 
-def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) -> None:
+def test_kanban_followup_auto_review_scope_lease_ttl_matches_in_flight_lock_ttl(tmp: Path) -> None:
     module = load_hook_module()
     repo = init_repo_with_head(tmp / "dirty")
     transcript = tmp / "session.jsonl"
@@ -142,7 +153,14 @@ def test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl(tmp: Path) ->
     finally:
         conn.close()
     assert row is not None
-    assert row[0] == 3600
+    # **不硬编码秒数**：这条断言的意思是「lease 与在途锁同档」，不是「恰好一小时」。
+    # 历史上它写死 3600，于是锁 TTL 一改，这里就变成一条与真相无关却仍然绿的断言。
+    assert row[0] == module.DEFAULT_KANBAN_FOLLOWUP_LEASE_TTL_SECONDS
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821 — inject() 注入
+    assert row[0] == lock_module.DEFAULT_TTL_SECONDS, (
+        row[0],
+        lock_module.DEFAULT_TTL_SECONDS,
+    )
 
 
 def test_kanban_followup_without_task_id_does_not_allocate_review_scope(tmp: Path) -> None:
@@ -4135,3 +4153,506 @@ def test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_n
     ]
     assert len(warned) == 1, events
     assert warned[0].get("status") == "warning"
+
+
+# ---------------------------------------------------------------------------
+# B：in-progress 锁的心跳续期 + 绝对硬顶
+# ---------------------------------------------------------------------------
+
+def _iso_minutes_ago(minutes: float) -> str:
+    """``minutes`` 分钟之前的 UTC ISO 时刻（marker 的 ``armed_at`` 格式）。"""
+    moment = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _stale_in_progress_marker_with_run_dir(
+    *,
+    state: Path,
+    repo: Path,
+    run_dir: Path,
+    armed_at: str,
+    task_id: str = "task-heartbeat",
+    session_id: str = "session-heartbeat",
+    run_id: str = "rvf-heartbeat",
+) -> Path:
+    """种一把**已过 TTL** 的 ``state=in_progress`` 锁，并让它指向一个真实存在的 run 目录。"""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker_path = marker_dir / _in_progress_marker_name(repo, task_id=task_id)
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": armed_at,
+                "expires_at": "2000-01-01T00:00:00Z",  # 已过 TTL → STALE
+                "kanban_task_id": task_id,
+                "session_id": session_id,
+                "run_id": run_id,
+                "run_dir": str(run_dir),
+                "repo": str(repo),
+                "cwd": str(repo),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return marker_path
+
+
+def _invoke_stop_against_stale_lock(repo: Path, state: Path, *, task_id: str = "task-heartbeat"):
+    return invoke(  # noqa: F821 — inject() 注入
+        {
+            "cwd": str(repo),
+            "session_id": "session-heartbeat",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这轮任务。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": task_id,
+        },
+        state_dir=state,
+    )
+
+
+def test_stale_in_progress_lock_with_recent_run_activity_is_revived_not_cleared(
+    tmp_path: Path,
+) -> None:
+    """一轮**仍在跑**的 RVF：锁虽已过 TTL，但 run 目录近期有写入 ⇒ 就地续期，绝不清锁。
+
+    这是本轮主因的守卫。TTL 原按「一轮 follow-up，实测最长约 47min」标定为 1h，而 ``0aac3ba``
+    把这把锁泛化成「任何在途 RVF run」的通用凭证后没跟着改；实测一轮 RVF p50 = 84.3min、
+    **53% 超过 60min**。于是一轮正常的长 review 会在中途丢掉自己的抑制凭证，此后每一次 Stop
+    都落回 fresh-initiation、对**这一轮自己尚未 handoff 的产物**重新征询——近 4 天落盘的 7 次
+    stale 清锁后面全都紧跟一次重铸 + decline，而同期这把锁成功抑制只有 6 次。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=tmp_path / "live-run",
+        # 刚 arm 不久 ⇒ 远未触及绝对硬顶；run 目录是刚写的 ⇒ 存活证据成立。
+        armed_at=_iso_minutes_ago(90),
+    )
+
+    _invoke_stop_against_stale_lock(repo, state)
+
+    assert marker_path.exists(), "在途 run 仍活着，锁却被清掉了"
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["revived_count"] == 1, persisted
+    assert persisted["state"] == "in_progress", persisted
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    assert lock_module.marker_status(persisted) == lock_module.STATUS_ACTIVE
+    events = latest_events(state)  # noqa: F821
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_consumed_incomplete"
+    ], events
+    revived = [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ]
+    assert len(revived) == 1, events
+    summary = latest_summary(state)  # noqa: F821
+    assert summary["reason_code"] == "kanban_followup_in_progress_revived_on_run_activity", summary
+    # 受众纪律：在途抑制是 developer_only，绝不驱动 agent 再跑一回合。
+    assert summary["status"] == "skipped", summary
+
+
+def test_stale_in_progress_lock_without_recent_run_activity_is_cleared_as_before(
+    tmp_path: Path,
+) -> None:
+    """run 目录久无写入 ⇒ 判它已死，清锁交回常规 gate（旧行为原样保留）。
+
+    抑制性凭证的失败方向必须是「多问一次」，不是「静默续命」：拿不到存活证据就**不**续期。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=tmp_path / "dead-run",
+        armed_at=_iso_minutes_ago(90),
+    )
+    # 把 run 目录的活动窗口收到 0 秒 ⇒ 任何 mtime 都算「久无活动」（不必真的等）。
+    stdout, _ = invoke(  # noqa: F821
+        {
+            "cwd": str(repo),
+            "session_id": "session-heartbeat",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这轮任务。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-heartbeat",
+            "RVF_IN_FLIGHT_RUN_ACTIVITY_LIVENESS_WINDOW_SECONDS": "0",
+        },
+        state_dir=state,
+    )
+    assert stdout is not None
+
+    assert not marker_path.exists(), "无存活证据却把锁续了命（漏审方向）"
+    events = latest_events(state)  # noqa: F821
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_consumed_incomplete"
+    ], events
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], events
+
+
+def test_stale_in_progress_lock_past_revival_absolute_cap_is_cleared_despite_activity(
+    tmp_path: Path,
+) -> None:
+    """越过绝对硬顶 ⇒ 即便 run 目录还在写，也不再续期。
+
+    F2a 判据：任何 wait 分支都必须有一个**与被等对象无关**的上界。没有它，一个持续写日志却永远
+    不收尾的 run（活锁、卡在重试循环、reviewer 一直吐输出）会把锁无限续下去——「它还在写日志」
+    恰恰是活锁最典型的样子。那会把「TTL 太短导致多问」换成远更危险的「永久漏审」。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=tmp_path / "livelock-run",  # 目录刚写过 ⇒ 存活证据成立
+        armed_at=_iso_minutes_ago(60 * 24),  # 24h 前 arm，远超 6h 硬顶
+    )
+
+    _invoke_stop_against_stale_lock(repo, state)
+
+    assert not marker_path.exists(), "越过绝对硬顶仍在续期（永久漏审风险）"
+    events = latest_events(state)  # noqa: F821
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_consumed_incomplete"
+    ], events
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], events
+
+
+def _marker_iso_to_timestamp(value: str) -> float:
+    """把 marker 里的 ISO 时刻（``...Z``）读成 epoch 秒，供上界断言做真实算术。"""
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap(
+    tmp_path: Path,
+) -> None:
+    """续期不得把 ``expires_at`` 推到绝对硬顶之外——否则硬顶能被整整绕过一个 TTL。
+
+    硬顶原本只在**续期之前**判一次（``armed age < cap``），而续期把 ``expires_at`` 无条件推到
+    ``now + TTL``；in-progress 闸的 ACTIVE 分支又不复查硬顶。于是一把在 ``cap - 1min`` 处续上的
+    锁会一路 active 到 ``armed + cap + TTL``——6h 的硬顶实际护到 8h，正是硬顶要防的那个形态
+    （持续写日志却永不收尾）。
+
+    判据刻意写成不变式而不是字面量：**任何一次续期之后，``expires_at`` 都必须 ≤
+    ``armed_at + cap``**。这样 TTL / cap 常量日后再调，这条守卫依旧成立。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    # 取常量而非 ``revival_absolute_cap_seconds()``：invoke() 会把子进程的 RVF_* env 清空，
+    # 子进程读到的必然是默认值；测进程侧若受环境影响就会与被测进程口径不一致。
+    cap_seconds = float(lock_module.REVIVAL_ABSOLUTE_CAP_SECONDS)
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=tmp_path / "long-lived-run",  # 目录刚写过 ⇒ 存活证据成立
+        armed_at=_iso_minutes_ago(cap_seconds / 60.0 - 1.0),  # 距硬顶只剩 1min
+    )
+
+    _invoke_stop_against_stale_lock(repo, state)
+
+    # 硬顶尚未越过，这一次续期本身是对的——本守卫只管它能把锁续到**多远**。
+    assert marker_path.exists(), "硬顶尚未越过，锁不该被清（本守卫只约束上界，不改续期条件）"
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["revived_count"] == 1, persisted
+    assert lock_module.marker_status(persisted) == lock_module.STATUS_ACTIVE, persisted
+    armed_ts = _marker_iso_to_timestamp(persisted["armed_at"])
+    expires_ts = _marker_iso_to_timestamp(persisted["expires_at"])
+    # +1s 容差只吸收 hook 进程与断言之间的墙钟漂移，不放宽上界本身。
+    assert expires_ts <= armed_ts + cap_seconds + 1.0, (
+        "续期把锁推过了绝对硬顶："
+        f"expires_at 超出 armed_at + cap {expires_ts - (armed_ts + cap_seconds):.0f}s"
+    )
+
+
+def test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """bootstrap 明确放弃本轮之后，心跳不得把它救回来（否则等待上界被整体偷换）。
+
+    ``_kanban_followup_bootstrap_gate_decision`` 的复活预算耗尽路径是一次**刻意的放弃**：
+    ``return False, None`` = 把 stale 语义交还给下面的清锁。而心跳分支正好坐在这条 fall-through
+    上，只看「run 目录近期有写入」——于是 ledger 会先记 ``..._revive_budget_exhausted``、紧接着
+    记 ``..._revived_on_run_activity``，marker 存活、``revived_count`` 继续涨、state 仍是
+    ``waiting_bootstrap``。等待的上界就从「3 次复活」被换成「6h 硬顶」。
+
+    这条**走调用方**（真 Stop hook 进程），不像
+    ``test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets``
+    那样直接调内层函数——后者对本缺陷结构性失明（内层确实返回了 handled=False，假绿）。
+
+    场景取 receipt 已验证但 prepare 重放反复失败：重放本身就刚写过 run 目录，恰好让
+    「run 活动」这条存活证据变成永动机。
+    """
+    fixture = _bootstrap_opt_in_task_repo(tmp_path / "task-repo")
+    state = tmp_path / "state"
+    marker_path = _waiting_bootstrap_marker(
+        state=state,
+        fixture=fixture,
+        run_dir=tmp_path / "existing-run",  # 目录刚写过 ⇒ 心跳的存活证据成立
+        expires_at="2000-01-01T00:00:00Z",  # 已过 TTL → STALE，才会走到放弃/心跳这一段
+    )
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    # armed 才 3h ⇒ 远未触及 6h 绝对硬顶：本守卫要证的是「bootstrap 的放弃优先于心跳」，
+    # 而不是「硬顶兜住了」——后者会让守卫在 cap 之外的成因上假绿。
+    payload["armed_at"] = _iso_minutes_ago(180)
+    payload["revived_count"] = 3  # = DEFAULT_KANBAN_FOLLOWUP_BOOTSTRAP_REVIVE_BUDGET
+    marker_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+    invoke(  # noqa: F821
+        {
+            "cwd": str(fixture["repo"]),
+            "session_id": "session-bootstrap",
+            "stop_hook_active": False,
+            "last_user_message": "继续推进这轮任务。",
+        },
+        extra_env={
+            "CODEX_RVF_FORK_MODE": "kanban-followup",
+            "KANBAN_TASK_ID": "task-bootstrap",
+        },
+        state_dir=state,
+    )
+
+    events = latest_events(state)  # noqa: F821
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_bootstrap_gate_revive_budget_exhausted"
+    ], events
+    assert not [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], "bootstrap 已明确放弃本轮，心跳却把锁救了回来"
+    assert not marker_path.exists(), "放弃本轮之后锁仍在（等待上界被偷换成 6h 硬顶）"
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_consumed_incomplete"
+    ], events
+
+
+def _seconds_since_shallow_run_root_observation_surface(run_dir: Path) -> float:
+    """本轮之前那个观察面（run 根 + 直接子项）距今多久没看到写入。
+
+    守卫用它证明「旧实现在这里确实是瞎的」——不然「新实现判活着」可能只是因为浅层也新鲜。
+    """
+    newest = max(
+        entry.stat().st_mtime for entry in [run_dir, *run_dir.iterdir()]
+    )
+    return datetime.now(timezone.utc).timestamp() - newest
+
+
+def _age_whole_run_tree_then_freshen_one_path(
+    run_dir: Path,
+    *,
+    freshly_written_relative_path: str,
+    other_paths_aged_minutes: float = 240.0,
+) -> Path:
+    """造一个「除了某一条指定路径之外，整棵 run 树都很久没动」的 run 目录，返回那条新鲜路径。
+
+    这是下面几条守卫的取证手法：run 根、``events.jsonl``、``artifacts/`` 全部被人为做旧，于是
+    「只扫 run 根 + 直接子项」那个旧观察面**必然**判它已死；探针若仍判它活着，就只可能是因为
+    真的看到了那条深层路径——而不是碰巧被某个浅层 mtime 蒙对。
+
+    做旧放在最后一步，且用 ``os.utime`` 单点改新鲜路径的时间戳：``utime`` 只动目标 inode，不会
+    像 ``write_text`` 那样把父目录的 mtime 一并顶起来，故不会污染刚做旧的浅层观察面。
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    freshly_written_path = run_dir / freshly_written_relative_path
+    freshly_written_path.parent.mkdir(parents=True, exist_ok=True)
+    freshly_written_path.write_text("x\n", encoding="utf-8")
+
+    aged_epoch = datetime.now(timezone.utc).timestamp() - other_paths_aged_minutes * 60.0
+    for path in sorted(run_dir.rglob("*"), reverse=True):
+        os.utime(path, (aged_epoch, aged_epoch))
+    os.utime(run_dir, (aged_epoch, aged_epoch))
+
+    fresh_epoch = datetime.now(timezone.utc).timestamp()
+    os.utime(freshly_written_path, (fresh_epoch, fresh_epoch))
+    return freshly_written_path
+
+
+def test_run_activity_probe_sees_reviewer_stream_writes_below_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    """external reviewer 段只写 ``artifacts/reviewers/<id>/`` 深层文件 ⇒ 探针必须仍判它活着。
+
+    目录的 mtime 只被**直接子项**的创建/rename 顶起，所以一个 reviewer 一边跑一边往
+    ``reviewer.stdout.txt`` 追加输出时，``artifacts/`` 与 run 根的 mtime 都纹丝不动——旧的
+    「run 根 + 直接子项」观察面在这一段上是全瞎的。
+    """
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    run_dir = tmp_path / "reviewer-wait-run"
+    _age_whole_run_tree_then_freshen_one_path(
+        run_dir,
+        freshly_written_relative_path="artifacts/reviewers/claude-code-fb1/reviewer.stdout.txt",
+    )
+
+    assert _seconds_since_shallow_run_root_observation_surface(run_dir) > 3600, (
+        "取证前提不成立：浅层观察面本身就是新鲜的，这条守卫证明不了任何事"
+    )
+    marker = {"run_dir": str(run_dir)}
+    idle_seconds = lock_module.seconds_since_last_run_activity(marker)
+    assert idle_seconds is not None and idle_seconds < 60, idle_seconds
+    assert lock_module.in_flight_run_shows_recent_activity(marker)
+
+
+def test_run_activity_probe_sees_fix_attempt_result_writes_below_artifacts_root(
+    tmp_path: Path,
+) -> None:
+    """validate/fix 段只写 ``artifacts/fix-attempts/<attempt>/`` ⇒ 探针必须仍判它活着。
+
+    实测这一段是最长的一类浅扫盲窗（真实 run 上量到 18.0 / 23.4 / 24.8min 的整段失明）。
+    """
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    run_dir = tmp_path / "fix-phase-run"
+    _age_whole_run_tree_then_freshen_one_path(
+        run_dir,
+        freshly_written_relative_path=(
+            "artifacts/fix-attempts/rvf-attempt-run-RVF-001-abc12345/result.json"
+        ),
+    )
+
+    assert _seconds_since_shallow_run_root_observation_surface(run_dir) > 3600
+    marker = {"run_dir": str(run_dir)}
+    assert lock_module.in_flight_run_shows_recent_activity(marker)
+
+
+def test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree(
+    tmp_path: Path,
+) -> None:
+    """attempt 里那棵 git worktree **刻意**不看——这是「代价恒定」的硬边界，不是疏漏。
+
+    Stop hook 每回合都要跑这一段，而单个 run 树实测可达 6 万+ 路径（几乎全部来自 attempt 的
+    worktree）。故观察面止步于 ``fix-attempts/<attempt>/worktree`` 这个**目录本身**：目录被
+    stat（能看见「worktree 刚建好 / 顶层条目被增删」），但里面的深层编辑一律看不见。
+
+    这条守卫钉住的是**代价**而非**灵敏度**：漏掉的这类活动由
+    ``RUN_ACTIVITY_LIVENESS_WINDOW_SECONDS`` 的窗口宽度吸收。谁要是哪天顺手把它改成 rglob，
+    这条会红。
+    """
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    run_dir = tmp_path / "worktree-edit-run"
+    _age_whole_run_tree_then_freshen_one_path(
+        run_dir,
+        freshly_written_relative_path=(
+            "artifacts/fix-attempts/rvf-attempt-run-RVF-001-abc12345"
+            "/worktree/src/deep/nested/module.py"
+        ),
+    )
+
+    marker = {"run_dir": str(run_dir)}
+    assert not lock_module.in_flight_run_shows_recent_activity(marker), (
+        "探针钻进了 attempt worktree —— 代价不再恒定"
+    )
+    anchor_paths = lock_module.run_activity_probe_anchor_paths(run_dir)
+    assert not [path for path in anchor_paths if "worktree" in path.parts[:-1]], anchor_paths
+
+
+def test_run_activity_probe_anchor_enumeration_stays_within_stat_budget(
+    tmp_path: Path,
+) -> None:
+    """锚点枚举有**结构性**上界，且预算打满时优先保住浅层（平滑退化，不是随机漏一个阶段）。
+
+    「实测下来不大」不是上界。issue 数没有硬上限，故必须有 ``RUN_ACTIVITY_PROBE_ANCHOR_STAT_BUDGET``
+    兜底；截断时先砍最深一层，于是探针退回更浅的观察面 = 更容易判「已死」= 失败方向仍是
+    「多问一次」，而不是静默续命。
+    """
+    lock_module = load_kanban_followup_lock_module()  # noqa: F821
+    run_dir = tmp_path / "huge-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    artifacts = run_dir / "artifacts"
+    (artifacts / "reviewers" / "codex-cli").mkdir(parents=True, exist_ok=True)
+    (artifacts / "reviewers" / "codex-cli" / "reviewer.stdout.txt").write_text(
+        "x\n", encoding="utf-8"
+    )
+    attempt_dir = artifacts / "fix-attempts" / "rvf-attempt-run-RVF-001-abc12345"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    (attempt_dir / "result.json").write_text("{}\n", encoding="utf-8")
+    fix_issues = artifacts / "fix-issues"
+    fix_issues.mkdir(parents=True, exist_ok=True)
+    for index in range(2 * lock_module.RUN_ACTIVITY_PROBE_ANCHOR_STAT_BUDGET):
+        (fix_issues / f"RVF-{index:05d}.json").write_text("{}\n", encoding="utf-8")
+
+    anchor_paths = lock_module.run_activity_probe_anchor_paths(run_dir)
+    assert len(anchor_paths) == lock_module.RUN_ACTIVITY_PROBE_ANCHOR_STAT_BUDGET, len(anchor_paths)
+    anchor_path_strings = {str(path) for path in anchor_paths}
+    # 浅层与前两个阶段锚点必须都还在（预算是从最深一层开始砍的）。
+    assert str(run_dir / "events.jsonl") in anchor_path_strings
+    assert str(artifacts / "reviewers" / "codex-cli") in anchor_path_strings
+    assert str(attempt_dir) in anchor_path_strings
+
+
+def test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived(
+    tmp_path: Path,
+) -> None:
+    """端到端：一轮 RVF 只在 ``artifacts/`` 深层写字时，过 TTL 的锁仍必须被就地续期。
+
+    这是 RVF-004 的回归守卫。心跳续期（B）本身是对的，但它当初挂在一个只扫「run 根 + 直接子项」
+    的存活判据上——实测（215 个真实已完成 long run 重放）**51.6% 的长 run** 至少有一个时刻会被
+    该判据判「已死」、**46.2% 的在途时长是盲的**，也就是说主因修复在目标场景里基本等于掷硬币。
+    盲窗成因不是当初以为的 external reviewer 等待段（那一段反而被 ledger 的 lock_* 事件盖得很
+    好），而是「深处有写、浅扫看不见」的 reviewer / validate-fix 两段。
+    """
+    repo = init_repo(tmp_path / "repo", dirty=True)  # noqa: F821
+    state = tmp_path / "state"
+    run_dir = tmp_path / "deep-write-only-run"
+    marker_path = _stale_in_progress_marker_with_run_dir(
+        state=state,
+        repo=repo,
+        run_dir=run_dir,
+        armed_at=_iso_minutes_ago(90),
+    )
+    # marker 落好之后再做旧：``_stale_in_progress_marker_with_run_dir`` 自己会写 events.jsonl，
+    # 顺序反了就会把浅层观察面重新顶新鲜，守卫也就白设了。
+    _age_whole_run_tree_then_freshen_one_path(
+        run_dir,
+        freshly_written_relative_path="artifacts/reviewers/claude-code-fb1/reviewer.stdout.txt",
+    )
+    assert _seconds_since_shallow_run_root_observation_surface(run_dir) > 3600
+
+    _invoke_stop_against_stale_lock(repo, state)
+
+    assert marker_path.exists(), "reviewer 仍在写输出，锁却被清掉了（RVF-004 回归）"
+    persisted = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["revived_count"] == 1, persisted
+    events = latest_events(state)  # noqa: F821
+    assert [
+        e
+        for e in events
+        if e.get("event") == "kanban_followup_in_progress_marker_revived_on_run_activity"
+    ], events

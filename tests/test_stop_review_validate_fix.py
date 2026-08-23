@@ -4933,6 +4933,7 @@ globals().update({_n: getattr(_kbfu, _n) for _n in _kbfu.__all__})
 # 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
 from _rvf_stop_hook_support import decision_point_out_of_band_delivery as _f2oob
 _f2oob.inject(
+    SCRIPT=SCRIPT,
     assert_decision_point_injection=assert_decision_point_injection,
     decision_token_records=decision_token_records,
     init_repo=init_repo,
@@ -5828,7 +5829,7 @@ def main() -> int:
         test_allocate_auto_review_scope_writes_artifact_when_scope_present,
         test_patch_ownership_incomplete_detects_partial_tracker_scope,
         test_patch_ownership_incomplete_skip_payload_does_not_duplicate_reason_code,
-        test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl,
+        test_kanban_followup_auto_review_scope_lease_ttl_matches_in_flight_lock_ttl,
         test_kanban_followup_without_task_id_does_not_allocate_review_scope,
         test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
         test_manual_scope_suppression_sweeps_expired_lease_before_probe,
@@ -6006,6 +6007,10 @@ def main() -> int:
         test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker,
         test_decision_point_out_of_band_single_flight_busy_does_not_mint,
         test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once,
+        # 搁浅对账的枚举面是跨 task 全局的，早退判据必须先收敛到本轮这条投递通道。
+        test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point,
+        # `state=minted` ≠「从未成为 turn」：UPS 的 mark_injected 失败分支留下的形状完全相同。
+        test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off,
         test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
         # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
         test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,
@@ -6020,6 +6025,28 @@ def main() -> int:
         test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched,
         # 同键并发撞陈旧去重索引：覆盖必须与首建同样互斥（一个 dedup key 至多一枚活跃 token）。
         test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token,
+        # withdrawn 的两种成因对熔断额度处置相反：空转保留额度（退避）、rewind 冲销（INV-C）。
+        test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stranding_backs_off,
+        test_unknown_withdrawal_cause_fails_closed_to_retaining_mint_request_charge,
+        # 第三种成因：横幅成为过 turn、只是记账没跟上 ⇒ 通道健康，冲销额度（不许按空转退避）。
+        test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_charge,
+        # in-progress 锁的心跳续期与绝对硬顶：活着就续、久无活动即清、越过硬顶一律清。
+        test_stale_in_progress_lock_with_recent_run_activity_is_revived_not_cleared,
+        test_stale_in_progress_lock_without_recent_run_activity_is_cleared_as_before,
+        test_stale_in_progress_lock_past_revival_absolute_cap_is_cleared_despite_activity,
+        # RVF-004：存活证据探针必须看得见 artifacts/ 下两层的 reviewer / fix-attempt 写入，
+        # 且枚举代价有结构性上界（不得退化成整树 rglob）。
+        test_run_activity_probe_sees_reviewer_stream_writes_below_artifacts_root,
+        test_run_activity_probe_sees_fix_attempt_result_writes_below_artifacts_root,
+        test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree,
+        test_run_activity_probe_anchor_enumeration_stays_within_stat_budget,
+        test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived,
+        # 硬顶的**上界**本身也要有守卫：续期只判「续之前有没有越界」，不截断续期后的 expires_at，
+        # 硬顶就能被整整绕过一个 TTL。
+        test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap,
+        # 心跳坐在 bootstrap「复活预算耗尽 ⇒ 放弃本轮」的 fall-through 上，必须尊重那个放弃。
+        # 走调用方，因为只调内层函数的既有守卫对这条缝结构性失明（假绿）。
+        test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat,
     ]
     assert_every_defined_test_is_registered(
         globals(),
