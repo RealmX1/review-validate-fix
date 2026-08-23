@@ -101,4 +101,4 @@
 
 **通用判据**：任一 host 维度若仍需在 `core/` 内写 `if host == "codex"` 式分支，即视为该维度归一未闭合（`rg 'host\s*==\s*["'\'']codex' core/` 应命中 0）。
 
-`scripts/sync-manifest.sh` 是这套形态在 manifest 层的 fail-fast 守护：校验三份 manifest 的 `name`（三处一致）、`version`（两份 plugin.json 一致）、`source` 指向、description 非空；**有意不校验 description 内容相等**（跨 host 文案是设计，不是漂移）。`scripts/check_skill_contracts.sh` 会在本地契约检查中运行它。
+`scripts/sync-manifest.sh` 是这套形态在 manifest 层的 fail-fast 守护：校验**四份** manifest（Claude / Codex / Kimi 三份 nested plugin.json + 源仓库 marketplace）的 `name`（四处一致）、`version`（Claude 与 Codex 两份 plugin.json 一致；marketplace 与 Kimi manifest 都不带 version，跳过）、`source` 指向、description 非空，以及 **Kimi manifest 的 hook 事件集合恰为 `Stop,UserPromptSubmit`**（Kimi 对单条不合格 hook 只 warn + 静默丢弃该条、plugin 仍报 healthy ⇒「看起来装好了、hook 根本不存在」是零报错状态，只能靠这条正向断言抓）；**有意不校验 description 内容相等**（跨 host 文案是设计，不是漂移）。`scripts/check_skill_contracts.sh` 会在本地契约检查中运行它。

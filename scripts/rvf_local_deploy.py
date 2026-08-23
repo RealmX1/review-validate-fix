@@ -876,6 +876,7 @@ def run_local_deploy(
             source.commit,
             "--configure-stop-hook",
             "--configure-user-prompt-submit-hook",
+            "--configure-kimi-plugin-registration",
             "--json",
         ]
 

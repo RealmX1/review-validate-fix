@@ -153,11 +153,29 @@ DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADV
 证据本身就说明这不是一次空转。
 """
 
+DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED = (
+    "stop_hook_reentry_budget_exhausted"
+)
+"""跨 turn 再入预算耗尽，RVF **主动决定不注入**这一枚横幅。冲销熔断额度。
+
+与上面两个带外成因的关键区别：那两支是「发出去了、但（可能）没到」，这一支是**根本没发**——
+判定发生在 ``_decision_point_self_injection_decision`` 入口，早于任何投递动作。
+
+为什么它进冲销白名单（这条要论证，因为白名单的默认方向是「不冲销」）：熔断存在的意义是
+**通道坏着时退避**。这一支里通道是健康的，重铸也不会空转——下一次 Stop 只要预算复位
+（驱动正文换了一类事 / 用户提交了新 prompt / TTL 过期），横幅立刻就能正常发出。把它按空转计费，
+连续 3 次就会把铸造熔断打跳、整个 session 的自动发起被静默封禁，那是**漏审**方向。
+
+而且再入预算**本身就是一层退避**，且比熔断更精确（它按 reason_code 分类、有三条复位路径）。
+在它之上再叠一层 session 级熔断，是对同一件事退避两次。
+"""
+
 DECISION_POINT_WITHDRAWAL_CAUSES = frozenset(
     {
         DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+        DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
     }
 )
 
@@ -170,6 +188,8 @@ DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE = frozenset(
     {
         DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+        # 「根本没发出去」这一支：通道健康、重铸不会空转 ⇒ 退避前提不成立。理由见该常量 docstring。
+        DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
     }
 )
 

@@ -24,11 +24,41 @@ from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
 from core.session_scope_allocation import reviewable_unit_diff_tracker
 from core.host_adapter.host_transcript_format_detection import HOST_CODEX, detect_transcript_format
+from core.rvf_user_local_data_paths import resolved_rvf_reviewer_registry_path
 
 
-# 合法的主 dispatch harness（与 dispatch_reviewers / reviewer-registry 对齐）。
-# cursor 仅经显式 RVF_MAIN_HARNESS=cursor 覆盖可达，transcript 探测永不返回 cursor。
-VALID_MAIN_HARNESSES = {"cursor", "claude_code", "codex"}
+def _resolve_valid_main_harnesses() -> frozenset[str]:
+    """合法的主 dispatch harness 集合 = reviewer-registry 的 harness id 全集。
+
+    **不要在这里手写清单。** RVF 里同一套 harness 名字有三个消费者：host 身份探测
+    （``core/host_adapter``）、reviewer-registry（选腿池）、以及本集合（显式
+    ``RVF_MAIN_HARNESS`` 覆盖的白名单）。三份曾各自演化，代价是 Kimi 的 host 身份取了
+    ``kimi_code_cli`` 而 registry 是 ``kimi_code`` —— 主 harness 排不出池，200-seed 实测
+    44% 的 Kimi 会话被 Kimi 自己评审，且全程零报错（计划 §14 / P-5）。手写第三份清单是
+    同一缺陷的第三个入口：漏登记一个 host，它的显式 env 覆盖就被**静默丢弃**。
+
+    ``scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py``
+    是这条不变量的 gate。刻意**不**对 ``KNOWN_HOST_IDENTITIES`` 做并集兜底：并上去会让
+    gate 那条断言结构性恒真，把「派生错了」变成查不出来的假绿。
+
+    registry 不可读时返回空集（fail-safe 方向：显式覆盖失效、回落到 transcript 探测值），
+    而不是猜一个清单出来。
+
+    ⚠️ ``cursor`` 在 registry 里但**不是** host —— 它只经显式 ``RVF_MAIN_HARNESS=cursor``
+    覆盖可达，transcript 探测永不返回它。这是词表方向单向的原因。
+    """
+    bundled_reviewer_registry_path = (
+        Path(__file__).resolve().parent.parent / "config" / "reviewer-registry.json"
+    )
+    try:
+        registry_path = resolved_rvf_reviewer_registry_path(bundled_reviewer_registry_path)
+        registry_document = json.loads(registry_path.read_text(encoding="utf-8"))
+        return frozenset(registry_document["harnesses"])
+    except Exception:
+        return frozenset()
+
+
+VALID_MAIN_HARNESSES = _resolve_valid_main_harnesses()
 
 SHARED_WORKFLOW_DEFAULT_TIMEOUT_SECONDS = 60.0
 TARGET_FLOW_BACKEND = {
