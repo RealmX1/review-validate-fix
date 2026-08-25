@@ -5517,6 +5517,339 @@ def select_committed_paths_reviewed_by_session(
     }
 
 
+# ``DirtyPathReviewedChangeObservation.unit_kind`` 的哨兵值：该路径在 tracker 里压根没有「本
+# session 名下的 dirty+reviewed 单元」，因此**刻意跳过了昂贵的工作树 git 观测**（见
+# ``select_dirty_path_reviewed_change_by_session`` 的「先按 DB 收窄」一节）。语义上等价于「一行
+# 已审都扣不掉」，与真做了观测却查不到已审单元的路径落在同一个未审桶里；``unit_kind`` 用独立取值
+# 而不是伪造 ``path_only``，是为了让诊断读者一眼分清「观测过、没已审」与「按 DB 判定无需观测」。
+DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER = (
+    "skipped_no_reviewed_units_in_tracker"
+)
+
+
+@dataclass(frozen=True)
+class DirtyPathReviewedChangeObservation:
+    """单个候选路径上「已被本 session 审过」的那部分**未提交**改动的只读观测。
+
+    ``reviewed_added_lines`` / ``reviewed_deleted_lines`` 是已审 hunk 体内的裸增删行文本（已去掉
+    前导 ``+``/``-``），供调用方对全量 diff 做**多重集减法**估算「本轮尚未审的规模」。刻意返回行
+    文本而非行数：行数减法无法分辨「同一批行」与「恰好同样多的新行」，多重集减法减不掉就自然计入
+    未审，天生偏保守。
+
+    ``unit_kind`` / ``observed_unit_count`` 是纯诊断字段。当 ``unit_kind`` 是
+    ``DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER`` 时，本路径没有
+    做工作树 git 观测（DB 已证明这里没有可扣的已审单元），``observed_unit_count`` 恒为 0，不代表
+    「工作树上没有改动」。
+    """
+
+    path: str
+    unit_kind: str
+    observed_unit_count: int
+    reviewed_unit_count: int
+    whole_path_identity_reviewed: bool
+    reviewed_added_lines: tuple[str, ...]
+    reviewed_deleted_lines: tuple[str, ...]
+    last_observed_at: str | None
+
+
+def _reviewed_lines_from_hunk_body(lines: Iterable[str]) -> tuple[list[str], list[str]]:
+    """把一个 hunk 体（context + ``+``/``-`` 行，无 ``@@`` 头）拆成裸增行 / 裸删行。
+
+    与 ``stop_decision_candidate_summary._parse_unified_diff_added_deleted`` 的分类口径对齐：
+    ``+++``/``---`` 文件头在 hunk 体里不会出现，``\\ No newline`` 以反斜杠开头故不会被误判。
+    """
+    added: list[str] = []
+    deleted: list[str] = []
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith("-"):
+            deleted.append(line[1:])
+    return added, deleted
+
+
+def select_dirty_path_reviewed_change_by_session(
+    *,
+    repo: Path,
+    session_id: str | None,
+    candidate_paths: Iterable[str],
+    log_root_override: Path | None = None,
+) -> dict[str, DirtyPathReviewedChangeObservation]:
+    """dirty 侧的「已审」只读观测器 —— ``select_committed_paths_reviewed_by_session`` 的对偶。
+
+    committed 侧那位回答「这条路径能不能整条从候选里剔掉」；本函数**不做任何剔除裁决**，只回答
+    「这条路径上哪些行是上一轮 review 已经审过的」，供 Stop 决策点横幅把规模数字拆成「已审 / 未审」
+    两桶。候选集永远不因本函数的返回值缩小——dirty 侧没有 commit 那种不可变锚点，剔除就是凭空开
+    漏审面。
+
+    ## 身份对齐：内容寻址，而不是 hunk header 匹配
+
+    用 ``_classify_path`` + ``_specs_from_observation``（**与 tracker 写侧同一对函数**）从当前工
+    作树重新推导 unit_id，再拿 unit_id 对上 ``review_state``。这样：
+
+      * 行号漂移不影响判定——``_canonical_hash_tracked_hunk`` 只哈希 (path, change_type, hunk 体)，
+        刻意不含 ``@@`` 头；
+      * 工作树在上一轮 review 之后又改过 → 新内容推导出的是**新** unit_id，tracker 里查不到 →
+        自动落入「未审」。查不到即未审，是这套设计的 fail-safe 方向，不是缺陷。
+
+    判据（与 committed 侧同口径）：``observed_state='dirty'``、未 tombstone、``review_state
+    ='reviewed'``、且经 ``session_units``（``assignment_kind IN ('owned','takeover')``）归属本
+    session。任一不满足 → 该 unit 计未审。
+
+    ## 顺序：先按 DB 收窄，再做 git 观测（纯性能，语义不变）
+
+    ``_classify_path`` 每条路径要起多个 git 子进程，而本观测在**每一次 Stop** 的轻量候选摘要里都跑。
+    所以先用一条只读 SQL 问出「哪些候选路径名下真有本 session 的 dirty+reviewed 单元」，只对这个通常
+    小得多的子集做工作树观测。因 unit_id 由 ``_canonical_hash_*`` 把 ``path`` 一并哈希（单射），按
+    path 先筛与按 unit_id 后筛结果完全一致；被跳过的路径仍会带一条 ``reviewed_unit_count=0`` 的观测
+    出现在返回值里（``unit_kind`` 为
+    ``DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER``），落进与「观测过但
+    查不到已审单元」相同的未审桶。**候选集本身永远不因本函数收窄**。
+
+    best-effort：tracker 禁用 / DB 不存在 / 任何 sqlite 或 git 异常 → 返回空 dict（调用方退化为
+    「全量都算未审」，即今日行为）。只读，不 refresh、不写。
+    """
+    paths = [p for p in candidate_paths if p]
+    if not paths or not session_id:
+        return {}
+    if _disabled():
+        return {}
+    common_dir = git_common_dir(repo)
+    if common_dir is None:
+        return {}
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    db_path = tracker_dir(base, key) / SQLITE_FILENAME
+    if not db_path.exists():
+        return {}
+
+    repo_resolved = repo.resolve()
+    worktree = _worktree_key(str(repo_resolved))
+
+    # ① 先按 DB 把「需要做 git 观测的路径」收窄到真有已审单元的那些。
+    #
+    # 这一步纯属性能，不改语义：每一个 unit_id 都由 ``_canonical_hash_*`` 把 ``path`` 连同内容一起
+    # 哈希（六个函数各带独立域标签），所以「unit_id → path」是单射；一条候选路径 P 推导出的 unit_id
+    # 不可能命中另一条路径 Q 名下的行（除非 sha256 碰撞）。因此「P 名下没有 dirty+reviewed+owned
+    # 行」⟺「P 的任何 spec 都不会出现在 ② 的结果里」，先按 path 过滤与后按 unit_id 过滤等价。
+    #
+    # 值得这么做的原因：``_classify_path`` 每条路径要起 ``git status`` / ``git diff --numstat`` /
+    # ``git diff -U3`` 等多个子进程，而本观测在**每一次 Stop** 的轻量候选摘要里都会跑（
+    # ``stop_decision_candidate_summary`` 的模块铁律是「只用 git + tracker sqlite，绝不重量级解析」）。
+    # 绝大多数 Stop 下「本 session 名下已审的 dirty 单元」远少于候选集，收窄后开销与已审路径数成正比，
+    # 而不再与候选集大小成正比。
+    reviewed_owned_by_path: dict[str, dict[str, str | None]] = {}
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        # SQLite 的 bound-parameter 上限在旧版本是 999；分批而不是一次性展开，避免大候选集触顶。
+        chunk_size = 400
+        for start in range(0, len(paths), chunk_size):
+            chunk = paths[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT u.path AS path,
+                       u.unit_id AS unit_id,
+                       u.last_observed_at AS last_observed_at
+                  FROM units u
+                 WHERE u.worktree_key = ?
+                   AND u.is_tombstoned = 0
+                   AND u.observed_state = 'dirty'
+                   AND u.review_state = 'reviewed'
+                   AND u.path IN ({placeholders})
+                   AND EXISTS (
+                       SELECT 1
+                         FROM session_units su
+                        WHERE su.unit_id = u.unit_id
+                          AND su.session_id = ?
+                          AND su.assignment_kind IN ('owned', 'takeover')
+                   )
+                """,
+                (worktree, *chunk, session_id),
+            ).fetchall()
+            for row in rows:
+                reviewed_owned_by_path.setdefault(row["path"], {})[row["unit_id"]] = row[
+                    "last_observed_at"
+                ]
+    except sqlite3.Error:
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+
+    # ② 只对收窄后的路径从当前工作树重新观测，推导出与写侧同源的 unit_id。
+    # 被跳过的路径**不从结果里消失**：它们照旧带一条 reviewed_unit_count=0 的观测返回，让调用方
+    # 落进和「观测过但查不到已审单元」完全相同的未审桶（扣不掉即未审）。
+    observed_paths = list(dict.fromkeys(path for path in paths if path in reviewed_owned_by_path))
+    observations: dict[str, _PathObservation | None] = {}
+    specs_by_path: dict[str, list[_UnitSpec]] = {}
+    try:
+        for path in observed_paths:
+            observation = _classify_path(repo_resolved, path)
+            observations[path] = observation
+            specs_by_path[path] = _specs_from_observation(observation, path)
+    except Exception:  # pragma: no cover - 观测永不阻断调用方
+        return {}
+
+    # ③ 把「已审」折回每条路径的行文本。
+    result: dict[str, DirtyPathReviewedChangeObservation] = {}
+    for path in paths:
+        specs = specs_by_path.get(path) or []
+        if not specs:
+            # DB 已经证明这条路径没有可扣的已审单元 —— 不付 git 观测的代价，直接记为全未审。
+            result[path] = DirtyPathReviewedChangeObservation(
+                path=path,
+                unit_kind=DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER,
+                observed_unit_count=0,
+                reviewed_unit_count=0,
+                whole_path_identity_reviewed=False,
+                reviewed_added_lines=(),
+                reviewed_deleted_lines=(),
+                last_observed_at=None,
+            )
+            continue
+        reviewed_owned = reviewed_owned_by_path.get(path) or {}
+        observation = observations.get(path)
+        reviewed_added: list[str] = []
+        reviewed_deleted: list[str] = []
+        whole_path_reviewed = False
+        reviewed_count = 0
+        last_observed_at: str | None = None
+        for unit_id in (spec.unit_id for spec in specs):
+            if unit_id in reviewed_owned:
+                reviewed_count += 1
+                observed_at = reviewed_owned[unit_id]
+                if observed_at and (last_observed_at is None or observed_at > last_observed_at):
+                    last_observed_at = observed_at
+        is_per_hunk = (
+            observation is not None
+            and observation.kind == "tracked_hunk"
+            and observation.change_type != "add"
+            and bool(observation.hunks)
+        )
+        if is_per_hunk:
+            assert observation is not None  # narrowed by is_per_hunk
+            for hunk in observation.hunks:
+                if hunk.canonical_hash not in reviewed_owned:
+                    continue
+                hunk_added, hunk_deleted = _reviewed_lines_from_hunk_body(hunk.lines)
+                reviewed_added.extend(hunk_added)
+                reviewed_deleted.extend(hunk_deleted)
+        else:
+            # 整路径身份单元（untracked / 追踪态新增 / 删除 / 二进制 / path_only）：没有 hunk 锚点，
+            # 只能整条判定，不做行级折算。
+            whole_path_reviewed = reviewed_count > 0
+        result[path] = DirtyPathReviewedChangeObservation(
+            path=path,
+            unit_kind=(observation.kind if observation is not None else "path_only"),
+            observed_unit_count=len(specs),
+            reviewed_unit_count=reviewed_count,
+            whole_path_identity_reviewed=whole_path_reviewed,
+            reviewed_added_lines=tuple(reviewed_added),
+            reviewed_deleted_lines=tuple(reviewed_deleted),
+            last_observed_at=last_observed_at,
+        )
+    return result
+
+
+def summarize_session_unit_review_states(
+    *,
+    repo: Path,
+    session_id: str | None,
+    tracker_dir_override: Path | None = None,
+    log_root_override: Path | None = None,
+) -> dict[str, int]:
+    """本 session 名下可审单元按 ``review_state`` 的计数：
+    ``{available, assigned, reviewed, total, path_only_reviewed}``。
+
+    存在的理由很具体：``allocate_review_scope`` 报 ``status='empty'`` 时，调用方分不清成因。
+    ``_collect_candidate_unit_ids_in_txn`` 只收 ``review_state='available'``，被在途 lease 持有的
+    单元是 ``assigned``，**在候选查询阶段就被滤掉了**，根本走不到 Step 5 的 anti-join —— 所以
+    ``leased_excluded_count`` 在正常流程下恒为 0，拿它当「是不是并发」的判据永远为假。判断成因必须
+    直接看 review_state 分布：
+
+      * ``assigned > 0``      → 另一条 lease 正持有这批单元（并发），多审一遍是安全的；
+      * ``reviewed > 0`` 且 ``available == 0`` → 确实全审过了；
+      * 全 0                  → 本 session 名下压根没有登记单元（tracker 刚建 / 归属播种失败），
+                                此时**不能**声称「已全部审过」，调用方应保守回退。
+
+    ``path_only_reviewed`` 是给上一条「确实全审过了」加的**可信度旁证**，不属于 review_state 分布：
+    ``path_only`` 是「看不见改了什么」时的兜底身份（``_canonical_hash_path_only`` 只哈希路径，不含
+    mode、不含 change 方向），所以它的 ``reviewed`` 标记只能证明「这个路径被审过一次」，**证明不了
+    「当前这次改动被审过」**。典型反例是 chmod 往返：``100644→100755`` 审掉并提交后，相反方向的
+    ``100755→100644`` 会推导出同一个 unit_id、命中同一行 reviewed，于是新的可执行位回退被当成旧工作。
+    调用方据此判「全已审」而跳过 review 时，必须先看这个计数是不是 0。
+
+    WHERE 条件与 ``_collect_candidate_unit_ids_in_txn`` 逐条同源（含 pending edit_claim 那一支），
+    只是把「取 available」换成「按 (review_state, kind) 分组计数」。best-effort：任何异常 → 全 0。
+    """
+    empty = {"available": 0, "assigned": 0, "reviewed": 0, "total": 0, "path_only_reviewed": 0}
+    if not session_id:
+        return dict(empty)
+    if _disabled():
+        return dict(empty)
+    if tracker_dir_override is not None:
+        db_path = Path(tracker_dir_override) / SQLITE_FILENAME
+    else:
+        common_dir = git_common_dir(repo)
+        if common_dir is None:
+            return dict(empty)
+        base = log_root_override if log_root_override is not None else log_root()
+        db_path = tracker_dir(base, repo_key(common_dir)) / SQLITE_FILENAME
+    if not db_path.exists():
+        return dict(empty)
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT u.review_state AS review_state, u.kind AS kind, COUNT(*) AS n
+              FROM units u
+             WHERE (
+                   EXISTS (
+                       SELECT 1
+                         FROM session_units su
+                        WHERE su.unit_id = u.unit_id
+                          AND su.session_id=?
+                          AND su.assignment_kind IN ('owned','takeover')
+                   )
+                   OR EXISTS (
+                       SELECT 1
+                         FROM edit_claim_units ecu
+                         JOIN edit_claims ec ON ec.claim_id = ecu.claim_id
+                        WHERE ecu.unit_id = u.unit_id
+                          AND ec.session_id=?
+                          AND ec.status='pending'
+                   )
+               )
+               AND u.is_tombstoned=0
+               AND u.observed_state IN ('dirty','committed')
+             GROUP BY u.review_state, u.kind
+            """,
+            (session_id, session_id),
+        ).fetchall()
+    except sqlite3.Error:
+        return dict(empty)
+    finally:
+        if conn is not None:
+            conn.close()
+    counts = dict(empty)
+    for row in rows:
+        state = row["review_state"]
+        n = int(row["n"] or 0)
+        if state in ("available", "assigned", "reviewed"):
+            counts[state] += n
+            if state == "reviewed" and row["kind"] == "path_only":
+                counts["path_only_reviewed"] += n
+    counts["total"] = counts["available"] + counts["assigned"] + counts["reviewed"]
+    return counts
+
+
 def allocate_review_scope(
     *,
     repo: Path,

@@ -9083,6 +9083,87 @@ def stamp_origin_transcript_path_on_candidate_summary(
     return summary
 
 
+def _render_decision_point_unreviewed_estimate_lines(
+    *,
+    unreviewed_estimate: dict[str, Any],
+    unreviewed_strictness: dict[str, Any],
+    bootstrap: dict[str, Any],
+) -> list[str]:
+    """把候选摘要的「已审 / 未审」行数估算渲染成横幅里规模行下方的那一小段。
+
+    这一段存在的理由：发起闸只看工作树脏不脏，规模行报的是候选文件的**全量** delta，两者都不回答
+    「上一轮 RVF 审完之后，究竟还剩多少真没审的工作」。没有这一段时，一次刚审完、修复尚未提交的
+    背靠背征询看起来和一千多行的全新工作一模一样。
+
+    ``estimate_basis`` 不在「扣减确实生效」的集合里 → 渲染一行诚实说明，而不是省略这一段：
+    省略会被读成「没有已审的部分」，把失效的扣减冒充成成功的扣减。"""
+    basis = str(unreviewed_estimate.get("estimate_basis") or "")
+    effective = (
+        stop_decision_candidate_summary.ESTIMATE_BASES_WITH_EFFECTIVE_DEDUCTION
+    )
+    if basis not in effective:
+        if basis == stop_decision_candidate_summary.ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION:
+            return [
+                "    └ 已审/未审估算不可用：tracker 记录的已审改动与当前工作树对不上（工作树在上一轮"
+                " review 之后又变过）。上面的规模是**全量**，未做任何已审扣除。"
+            ]
+        if basis == stop_decision_candidate_summary.ESTIMATE_BASIS_NO_REVIEWED_UNITS:
+            return [
+                "    └ 本会话名下没有已审单元，上面的规模即未审规模（无可扣除的部分）。"
+            ]
+        if basis == (
+            stop_decision_candidate_summary
+            .ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+        ):
+            return [
+                "    └ 已审/未审估算不可用：有文件的已审证据只覆盖未提交那一半，而上面的规模跨到了"
+                "**本轮已提交但未审**的内容。上面的规模是**全量**，未做任何已审扣除——这里的已提交"
+                "工作很可能确实没审过。"
+            ]
+        return [
+            "    └ 已审/未审估算不可用：本轮拿不到 tracker 观测。上面的规模是**全量**，未做任何已审扣除。"
+        ]
+
+    total_added = int(bootstrap.get("total_nonblank_added_lines", 0) or 0)
+    total_deleted = int(bootstrap.get("total_nonblank_deleted_lines", 0) or 0)
+    unreviewed_added = int(unreviewed_estimate.get("nonblank_added_lines", 0) or 0)
+    unreviewed_deleted = int(unreviewed_estimate.get("nonblank_deleted_lines", 0) or 0)
+    reviewed_added = max(0, total_added - unreviewed_added)
+    reviewed_deleted = max(0, total_deleted - unreviewed_deleted)
+
+    rendered = [
+        "    └ 其中约 新增 {ra} 行 / 删除 {rd} 行 已在此前的 review 中审过（tracker 观测，"
+        "best-effort）；**本轮未审 ≈ 新增 {ua} 行 / 删除 {ud} 行**".format(
+            ra=reviewed_added, rd=reviewed_deleted, ua=unreviewed_added, ud=unreviewed_deleted
+        )
+    ]
+    unreviewed_totals = unreviewed_strictness.get("totals") or {}
+    rendered.append(
+        "      未审口径参考档: {tier}；加权有效行={weighted}；非测试非生成改动行={core}".format(
+            tier=unreviewed_strictness.get("suggested_strictness_tier") or "standard",
+            weighted=unreviewed_totals.get("weighted_effective_lines", 0),
+            core=unreviewed_totals.get(
+                "nonblank_change_lines_excluding_tests_and_generated", 0
+            ),
+        )
+    )
+    stale_paths = int(unreviewed_estimate.get("stale_observation_path_count", 0) or 0)
+    if basis == stop_decision_candidate_summary.ESTIMATE_BASIS_PARTIAL_HUNK_FILTERED:
+        rendered.append(
+            "      （部分文件在 review 之后又改过，只扣掉了对得上的那部分——未审量偏保守报大。）"
+        )
+    if stale_paths:
+        rendered.append(
+            f"      （其中 {stale_paths} 个文件的 tracker 观测已陈旧，按全量计入未审。）"
+        )
+    if unreviewed_added == 0 and unreviewed_deleted == 0:
+        rendered.append(
+            "      ⚠ 未审量为 0 —— 这批改动很可能就是上一轮 RVF 的产物。除非你确知有 tracker 看不见的"
+            "新工作（例如经 shell heredoc 写入的文件），否则这一轮通常应当 decline。"
+        )
+    return rendered
+
+
 def _render_decision_point_injection_prompt(
     *,
     summary: dict[str, Any],
@@ -9113,6 +9194,8 @@ def _render_decision_point_injection_prompt(
     suggested_tier = strictness.get("suggested_strictness_tier") or "standard"
     oversized = bool(strictness.get("oversized_change_elevate_recommended"))
     totals = strictness.get("totals") or {}
+    unreviewed_estimate = summary.get("unreviewed_line_estimate") or {}
+    unreviewed_strictness = summary.get("strictness_reference_unreviewed_estimate") or {}
     candidates = [
         c
         for c in (summary.get("candidates") or [])
@@ -9122,7 +9205,9 @@ def _render_decision_point_injection_prompt(
     lines: list[str] = []
     lines.append("=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===")
     lines.append(
-        "本轮工作停下时检测到**本 worktree 自上次 review 以来**存在可审改动。是否发起 RVF 由你"
+        "本轮工作停下时检测到本 worktree **存在未提交（或本轮已提交但未审）的改动**——发起闸看的是"
+        "工作树是否干净，**不是**「有没有新工作」；上一轮 RVF 刚审完、你把修复落盘还没提交，这里照样"
+        "会再问一次。规模行下方的「已审 / 未审」估算才是判断「还剩多少真没审」的依据。是否发起 RVF 由你"
         "（主 agent）决定：简要评估后，用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。"
     )
     lines.append(f"RVF_DECISION_TOKEN={token}")
@@ -9154,8 +9239,18 @@ def _render_decision_point_injection_prompt(
             bytes=bootstrap.get("total_working_tree_bytes", 0),
         )
     )
+    # 规模行只报全量；「其中多少已审」由下面这一段单独说 —— 让人一眼看出全量与未审是两个量，
+    # 而不是把一个估算值悄悄替换进原来的数字里。估算不可信时如实说明，不静默省略（省略会让读者
+    # 以为「没写就是没有已审的」，那是把一次失效的扣减冒充成一次成功的扣减）。
+    lines.extend(
+        _render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=unreviewed_estimate,
+            unreviewed_strictness=unreviewed_strictness,
+            bootstrap=bootstrap,
+        )
+    )
     lines.append(
-        "  严格度参考档（仅参考，最终你选）: {tier}；加权有效行={weighted}；"
+        "  严格度参考档（仅参考，最终你选；**全量口径**）: {tier}；加权有效行={weighted}；"
         "非测试非生成改动行={core}{elevate}".format(
             tier=suggested_tier,
             weighted=totals.get("weighted_effective_lines", 0),
