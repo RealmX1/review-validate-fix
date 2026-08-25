@@ -22,12 +22,22 @@ stdin→normalize→subprocess→fail-open 骨架。本模块把它们收敛为�
 same-dir ``sys.path`` 自举 import（与 ``subagent_capture`` / ``rvf_analyze_thread``
 的自举同款思路，但这里只 import 同目录文件、不触 ``_rvf_pyroot``）。
 
-**未做（deferred，非本切片范围）**：彻底删运行期守卫的「config 级单次注册」
-（让 Codex plugin loader 不注册 bundled ``hooks.json``，使本守卫可整体删除、
-``rg is_foreign_invocation hooks/`` 命中 0）需在 live ``~/.codex`` 实测
-plugin-loader 行为（plan Risk #14「先实测确认抑制 bundled 双源、再删守卫」），
-且受「勿污染真实 ~/.codex」约束。故本切片只做守卫**单源化**（去掉两份复制），
-零守卫的结构性消除留作后续。
+**原 deferred 的实测部分已完成（2026-08-20），但守卫刻意保留**：那条 deferred 要求先在
+live ``~/.codex`` 实测「能否让 Codex plugin loader 不注册 bundled ``hooks.json``」，再据此
+删掉本守卫。隔离 ``CODEX_HOME`` + 真实 codex 0.147.0 会话实测结论：
+
+- bundled ``hooks/hooks.json`` 确实被 plugin loader 按约定加载并执行；
+- ``[hooks.state."<selector>:hooks/hooks.json:<event>:<g>:<h>"].enabled = false``
+  **能抑制它**，同会话里 ``~/.codex/hooks.json`` 的 hook 照常执行；
+- 该值跨 ``codex plugin add`` / ``remove`` / 再 ``add`` 原样存活。
+
+抑制因此已由 ``install_to_codex.py`` 在每次部署时写入（见
+``core/codex_bundled_plugin_hook_suppression.py``）。**但本守卫不删**，理由是覆盖面不同：
+抑制是**部署时写进某台机器 config 的状态**，只覆盖已部署且未被人改回的机器；本守卫是
+**随 payload 走的代码**，覆盖任何拿到这份 payload 的 Codex（含手工安装、旧 config、
+被还原的 config）。删掉它会把「同一 Codex 事件触发两次 RVF」的防线从两层降到一层，
+换来的只是少几十行代码。故 ``rg is_foreign_invocation hooks/`` 命中 0 这条**验收判据作废**，
+不再是待办。
 """
 from __future__ import annotations
 

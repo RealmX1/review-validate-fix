@@ -383,5 +383,262 @@ def test_only_trusted_status_is_printed_as_everything_is_fine(capsys) -> None:
     assert "⚠️" not in printed
 
 
+def _write_config_text(codex_home: Path, text: str) -> None:
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(text, encoding="utf-8")
+
+
+def test_rvf_selectors_are_collected_from_both_plugins_and_hooks_state(
+    tmp_path: Path,
+) -> None:
+    """两张表都要扫：`[plugins.*]` 是注册本身，`[hooks.state.*]` 会留下解除注册后的残迹。"""
+    codex_home = tmp_path / "codex-home"
+    _write_config_text(
+        codex_home,
+        '\n'.join(
+            [
+                '[plugins."review-validate-fix@review-validate-fix-local-main"]',
+                "enabled = true",
+                '[plugins."ponytail@local-codex-plugins"]',
+                "enabled = true",
+                '[hooks.state."review-validate-fix@local-codex-plugins'
+                ':hooks/hooks.json:stop:0:0"]',
+                'trusted_hash = "sha256:deadbeef"',
+                "",
+            ]
+        ),
+    )
+
+    document = trust.read_codex_config_document(codex_home)
+    selectors = trust.rvf_plugin_selectors_in_codex_config(document)
+
+    assert selectors == (
+        "review-validate-fix@local-codex-plugins",
+        "review-validate-fix@review-validate-fix-local-main",
+    )
+
+
+def test_rvf_selector_scan_ignores_similarly_named_plugins(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    _write_config_text(
+        codex_home,
+        '[plugins."review-validate-fix-dashboard@somewhere"]\nenabled = true\n',
+    )
+
+    document = trust.read_codex_config_document(codex_home)
+
+    assert trust.rvf_plugin_selectors_in_codex_config(document) == ()
+
+
+def test_second_rvf_registration_in_codex_config_blocks_rather_than_observes(
+    tmp_path: Path,
+) -> None:
+    """config.toml 里的第二份注册必须判成阻断态，而不是又一条 advisory 观测。
+
+    既有的 `_observe_codex_hook_trust` 是刻意非阻断的（重新信任是人的决定）；沿用那个语义正是
+    本机双份 RVF 烂了三周的原因。
+    """
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '\n'.join(
+            [
+                '[plugins."review-validate-fix@review-validate-fix-local-main"]',
+                "enabled = true",
+                '[plugins."review-validate-fix@local-codex-plugins"]',
+                "enabled = true",
+                "",
+            ]
+        ),
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == "multiple_registrations"
+    assert uniqueness["extra_selectors"] == ["review-validate-fix@local-codex-plugins"]
+    assert (
+        "codex plugin remove review-validate-fix@local-codex-plugins --json"
+        in uniqueness["remediation"]
+    )
+
+
+def test_hook_trust_only_residue_is_flagged_with_manual_cleanup_not_plugin_remove(
+    tmp_path: Path,
+) -> None:
+    """只剩 `[hooks.state]` 残留时，指引必须是手删，不能是 `codex plugin remove`。
+
+    实测（codex-cli 0.147.0，隔离 HOME）：``codex plugin remove <selector>`` 会删掉 plugin
+    cache 树与 ``[plugins."<selector>"]``，却把该 selector 的 ``[hooks.state.*]`` 条目原样留
+    下。对这种残留建议跑 remove，等于给了一条已被证明无效的命令。
+    """
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '\n'.join(
+            [
+                '[plugins."review-validate-fix@review-validate-fix-local-main"]',
+                "enabled = true",
+                '[hooks.state."review-validate-fix@local-codex-plugins'
+                ':hooks/hooks.json:stop:0:0"]',
+                'trusted_hash = "sha256:deadbeef"',
+                "",
+            ]
+        ),
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == "multiple_registrations"
+    assert uniqueness["registration_sources"][
+        "review-validate-fix@local-codex-plugins"
+    ] == [trust.CODEX_CONFIG_HOOK_TRUST_TABLE]
+    assert "手工删除" in uniqueness["remediation"]
+    # 不得给出「跑一遍 remove」这条已被证明无效的指令（说明性提及该命令名是可以的）。
+    assert (
+        "codex plugin remove review-validate-fix@local-codex-plugins --json"
+        not in uniqueness["remediation"]
+    )
+
+
+def test_sole_rvf_registration_in_codex_config_is_accepted(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '[plugins."review-validate-fix@review-validate-fix-local-main"]\nenabled = true\n',
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == "sole_registration"
+
+
+def test_unreadable_codex_config_is_never_reported_as_sole_registration(
+    tmp_path: Path,
+) -> None:
+    """核不到 ≠ 唯一。这条守的是与 hook 信任观测同一个失败模式。"""
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        tmp_path / "home-without-codex",
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == "unavailable"
+    assert uniqueness["status"] != "sole_registration"
+
+
+def test_missing_installer_receipt_selector_never_reports_sole_registration(
+    tmp_path: Path,
+) -> None:
+    """canonical selector 一律取自回执；取不到就如实说核不了，不得硬拼 marketplace 名。"""
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '[plugins."review-validate-fix@local-codex-plugins"]\nenabled = true\n',
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={},
+    )
+
+    assert uniqueness["status"] == "unavailable"
+
+
+def test_codex_config_without_canonical_registration_is_not_reported_as_sole_registration(
+    tmp_path: Path,
+) -> None:
+    """一个 RVF selector 都没有 ⇒ 「没有第二份」，但 canonical 也不在册。
+
+    旧实现只排除已识别的多注册状态，于是这种 config 会落到 `sole_registration`，把「canonical
+    根本没注册」谎报成「唯一」。认证要的是**正向证明**：canonical 确实出现在插件注册表里。
+    """
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '[plugins."ponytail@local-codex-plugins"]\nenabled = true\n',
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == (
+        rvf_local_deploy.CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS
+    )
+    assert uniqueness["status"] != rvf_local_deploy.CODEX_SOLE_REGISTRATION_STATUS
+    assert "review-validate-fix@review-validate-fix-local-main" in uniqueness["note"]
+
+
+def test_canonical_selector_only_in_hook_trust_table_is_not_reported_as_sole_registration(
+    tmp_path: Path,
+) -> None:
+    """canonical 只剩 `[hooks.state]` 残迹 ⇒ 插件没注册，只是信任条目还在，同样不算在册。"""
+    home = tmp_path / "home"
+    _write_config_text(
+        home / ".codex",
+        '[hooks.state."review-validate-fix@review-validate-fix-local-main'
+        ':hooks/hooks.json:stop:0:0"]\ntrusted_hash = "sha256:deadbeef"\n',
+    )
+
+    uniqueness = rvf_local_deploy._sole_review_validate_fix_registration_in_codex_config(
+        home,
+        installer_receipt={
+            "plugin_selector": "review-validate-fix@review-validate-fix-local-main"
+        },
+    )
+
+    assert uniqueness["status"] == (
+        rvf_local_deploy.CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS
+    )
+
+
+def test_only_sole_registration_is_printed_as_fine(capsys) -> None:
+    for status in (
+        "multiple_registrations",
+        "unavailable",
+        rvf_local_deploy.CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS,
+    ):
+        rvf_local_deploy._print_codex_registration_uniqueness(
+            {
+                "status": status,
+                "selectors": ["review-validate-fix@a", "review-validate-fix@b"],
+                "remediation": "codex plugin remove review-validate-fix@b --json",
+                "note": "n",
+            }
+        )
+        printed = capsys.readouterr().out
+        assert "⚠️" in printed, (status, printed)
+        assert "唯一" not in printed.replace("唯一性", ""), (status, printed)
+
+    rvf_local_deploy._print_codex_registration_uniqueness(
+        {
+            "status": "sole_registration",
+            "selectors": ["review-validate-fix@review-validate-fix-local-main"],
+        }
+    )
+    printed = capsys.readouterr().out
+    assert "唯一" in printed
+    assert "⚠️" not in printed
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

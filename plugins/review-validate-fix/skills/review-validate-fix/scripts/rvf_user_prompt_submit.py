@@ -42,6 +42,11 @@ except Exception:  # pragma: no cover - stay resilient if the vendor is absent
 
 
 DISPATCH_TOKEN_RE = re.compile(r"\bRVF_DISPATCH=token=([0-9A-Fa-f]{16})\b")
+# 发起决策点横幅的 needle。横幅经 cline-kanban 终端投递成为一条**真实 user message** 时，本
+# hook 会 fire 并在 prompt 正文里读到它——**这就是 INV-A 的达成信号**：一条真实 user prompt
+# 必然触发 UPS，所以 RVF 自己就能观测到「横幅确实成了 user message」，比查任何外部 ref 都可靠。
+# 与 ``kanban_followup_trigger_transcript_presence.decision_token_literal`` 同源。
+DECISION_POINT_TOKEN_RE = re.compile(r"\bRVF_DECISION_TOKEN=([0-9A-Fa-f]{16})\b")
 RVF_FORK_MARKER = "RVF_FORKED_REVIEW_VALIDATE_FIX"
 CLINE_KANBAN_TASK_MARKER = "RVF_CLINE_KANBAN_TASK"
 KANBAN_FOLLOWUP_MARKER = "RVF_KANBAN_FOLLOWUP_TRIGGER"
@@ -151,6 +156,16 @@ def dispatch_token_from_text(text: str | None) -> str | None:
     if not text:
         return None
     match = DISPATCH_TOKEN_RE.search(text)
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
+def decision_point_token_from_text(text: str | None) -> str | None:
+    """从 prompt 正文里取出发起决策点横幅的 token（没有则 None）。"""
+    if not text:
+        return None
+    match = DECISION_POINT_TOKEN_RE.search(text)
     if match is None:
         return None
     return match.group(1).lower()
@@ -895,6 +910,7 @@ def _manual_decision_additional_context_text(
     token: str,
     newly_minted: bool,
     inline_scope: list[str] | None = None,
+    overrode_agent_declined_cooldown: bool = False,
 ) -> str:
     """manual 决策点注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
 
@@ -902,6 +918,11 @@ def _manual_decision_additional_context_text(
     ``RVF_DECISION_TOKEN`` + rvf-agent ``start/scope/dispatch/decline`` 样例命令 + 「简析后立刻
     start/decline」指引 + R24 递归护栏文案；仅在前面加一行 manual 触发前缀，末尾附用户内联 ``scope:``
     提示。Stop 引擎 import 失败时降级为精简自包含提示（token + 关键命令），绝不阻断。
+
+    ``overrode_agent_declined_cooldown=True`` 时额外插一句：本次手动触发**推翻了你早前对同一批改动
+    的谢绝**。这句不能省——否则 agent 拿到 token 后极可能照上次判断再谢绝一次，用户白打一遍。该参数
+    只反映「是否命中并推翻了 agent 的谢绝」，与冷却记录能否被物理清除无关（清除失败只影响后续自动
+    路径，对本轮 agent 无意义），故这段文案不提「冷却已清除」，恒为真话。
     """
     lines: list[str] = []
     if newly_minted:
@@ -909,6 +930,11 @@ def _manual_decision_additional_context_text(
     else:
         lines.append(
             "你手动触发了 /review-validate-fix；本候选指纹已有一枚活跃决策 token 在等待（幂等复用）；"
+        )
+    if overrode_agent_declined_cooldown:
+        lines.append(
+            "⚠️ 注意：你早前对**同一批改动**谢绝过一次 RVF，用户这次的显式触发已推翻该谢绝。"
+            "请不要以「上次已判断过不必审」为由再次 decline——除非你有本次新出现的理由。"
         )
     lines.append("请简要评估后用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。")
     lines.append("")
@@ -947,12 +973,17 @@ def _handle_manual_decision_point(
 ) -> dict[str, Any]:
     """manual ``/review-validate-fix`` 触发 → 铸决策 token → ``additionalContext`` 注入决策点（S5·R22）。
 
-    与 Stop hook 的 ``decision_point_injection_decision`` 对偶（同 S2 候选摘要 + S1 三闸铸造 + S4
-    注入尝试 ledger），差别仅在交付通道：UPS 用**合法专属**的
+    与 Stop hook 的 ``decision_point_injection_decision`` 对偶（同 S2 候选摘要 + S1 铸造 + S4
+    注入尝试 ledger），差别在交付通道与生效闸数：UPS 用**合法专属**的
     ``hookSpecificOutput.additionalContext`` 把决策提示喂进主 agent 上下文（Stop 只能用
     decision/block）。manual 是用户显式意图：候选非空时 minted / deduplicated 均 surface
-    additionalContext（附 token + rvf-agent CLI 样例命令）；declined 冷却 / 铸造熔断只出 user-facing
-    systemMessage（尊重三闸，指纹未变不 nag）。
+    additionalContext（附 token + rvf-agent CLI 样例命令）。
+
+    **闸二/闸三对本路径不适用**：铸造时传 ``initiated_by_explicit_user_request=True``——命中 declined
+    冷却即视为「用户推翻 agent 早前的谢绝」并照常铸（该告知与冷却记录能否清除无关；清除成功还会把
+    这批改动整体放回可审状态，清除失败则仅剩后续自动路径仍被挡，文案如实分叉），铸造
+    频率熔断整段跳过（它防的是 agent 递归自发起，手动触发按定义来自用户）。因此本函数不再有
+    ``declined_cooldown`` / ``circuit_breaker_tripped`` 分支；除已知 outcome 外一律走 mint anomaly 兜底。
 
     负路径不变量（计划 §五.3）：候选非空的每种结局都写 injection-attempt ledger；成功投递路径
     由 :func:`_confirm_manual_decision_delivery` 在 stdout flush 后写回执，避免尚未 emit 就把 token /
@@ -1025,7 +1056,9 @@ def _handle_manual_decision_point(
             ),
         }
 
-    # ③ 铸 token（S1 三闸内建：去重幂等 / declined 冷却 / 铸造频率熔断）。异常兜底写 ledger。
+    # ③ 铸 token。`initiated_by_explicit_user_request=True` ⇒ 只剩闸一（去重幂等）生效：
+    # declined 冷却命中即清除后继续铸，铸造频率熔断整段跳过（两者都是自动路径的保护闸，
+    # 对用户显式意图是误伤）。异常兜底写 ledger。
     try:
         mint = decision_token_store.mint_decision_token(
             worktree=worktree,
@@ -1033,6 +1066,7 @@ def _handle_manual_decision_point(
             candidate_fingerprint=fingerprint,
             candidate_summary=summary,
             now=now_dt,
+            initiated_by_explicit_user_request=True,
         )
     except Exception as exc:  # pragma: no cover - 铸造异常兜底
         injection_attempt_ledger.record_injection_attempt(
@@ -1067,9 +1101,28 @@ def _handle_manual_decision_point(
     ):
         token = mint.token
         newly_minted = outcome == decision_token_store.MINT_OUTCOME_MINTED
-        additional_context = _manual_decision_additional_context_text(
-            summary=summary, token=token, newly_minted=newly_minted, inline_scope=inline_scope
+        # 「用户推翻了 agent 的谢绝」由**命中**冷却即证成，与 unlink 成败解耦：清除失败只让后续
+        # 自动路径仍被挡，绝不能吞掉这次必发的告知（否则 agent 会照上次判断再 decline 一次）。
+        overrode_cooldown = mint.explicit_user_request_overrode_agent_declined_cooldown
+        cooldown_record_still_blocks_automatic_path = (
+            mint.declined_cooldown_record_still_blocks_automatic_path
         )
+        additional_context = _manual_decision_additional_context_text(
+            summary=summary,
+            token=token,
+            newly_minted=newly_minted,
+            inline_scope=inline_scope,
+            overrode_agent_declined_cooldown=overrode_cooldown,
+        )
+        detail = f"候选 {candidate_count} 文件"
+        if overrode_cooldown:
+            # 两支都必须与磁盘事实一致：清不掉时绝不谎称「已清除」，并把「自动路径仍被挡」说明白。
+            detail += "；已推翻 agent 早前对同一批改动的谢绝"
+            detail += (
+                "，但谢绝冷却记录清除失败，后续自动 Stop 可能仍被它挡住"
+                if cooldown_record_still_blocks_automatic_path
+                else "，并已清除对应的谢绝冷却记录"
+            )
         manual_payload.update(
             {
                 "status": "manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
@@ -1085,7 +1138,7 @@ def _handle_manual_decision_point(
                     kind="manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
                     dispatch_origin="post_user_prompt_manual",
                     token=token,
-                    detail=f"候选 {candidate_count} 文件",
+                    detail=detail,
                 ),
                 _RVF_PENDING_MANUAL_INJECTION_RECEIPT: {
                     "token": token,
@@ -1106,46 +1159,26 @@ def _handle_manual_decision_point(
             manual_payload["manual_scope_files"] = inline_scope
         return manual_payload
 
-    # ⑤ declined 冷却：写 ledger + 只出 systemMessage（尊重 agent 早前的谢绝，指纹未变不 nag）。
-    if outcome == decision_token_store.MINT_OUTCOME_DECLINED_COOLDOWN:
-        injection_attempt_ledger.record_injection_attempt(
-            worktree=worktree,
-            session_id=summary_session_id,
-            candidate_fingerprint=fingerprint,
-            candidate_path_count=candidate_count,
-            has_committed_but_unreviewed=has_committed,
-            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DECLINED_COOLDOWN,
-            injected=False,
-        )
-        return {
-            **manual_payload,
-            "status": "manual_decision_declined_cooldown",
-            "candidate_path_count": candidate_count,
-            "systemMessage": _trigger_system_message(
-                kind="manual_decision_declined_cooldown",
-                dispatch_origin="post_user_prompt_manual",
-            ),
-        }
-
-    # ⑥ circuit_breaker_tripped（或其它未识别 outcome）：写 ledger + 熔断告警 systemMessage。
+    # ⑤ 走到这里说明 outcome 既非 minted/deduplicated、也拿不到 token。闸二被清除、闸三被跳过后
+    # 这条路径已无正常来源，只可能是 store 侧新增了未知 outcome —— 按铸造异常兜底（写 ledger +
+    # developer-facing systemMessage），保住「候选非空的每种结局都写 injection ledger」的负路径不变量。
     injection_attempt_ledger.record_injection_attempt(
         worktree=worktree,
         session_id=summary_session_id,
         candidate_fingerprint=fingerprint,
         candidate_path_count=candidate_count,
         has_committed_but_unreviewed=has_committed,
-        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+        mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_MINT_ANOMALY,
         injected=False,
-        note=mint.message,
+        note=mint.message or f"未识别的铸造 outcome: {outcome}",
     )
     return {
         **manual_payload,
-        "status": "manual_decision_circuit_breaker",
+        "status": "manual_decision_mint_anomaly",
         "candidate_path_count": candidate_count,
-        "systemMessage": mint.message
-        or _trigger_system_message(
-            kind="manual_decision_circuit_breaker",
-            dispatch_origin="post_user_prompt_manual",
+        "error": f"未识别的铸造 outcome: {outcome}",
+        "systemMessage": _trigger_system_message(
+            kind="manual_mint_anomaly", dispatch_origin="post_user_prompt_manual"
         ),
     }
 
@@ -1185,6 +1218,112 @@ def _confirm_manual_decision_delivery(
         )
     except Exception:  # noqa: BLE001 - 投递后的可观测性回执永不反向拖红 UPS
         pass
+
+
+def _observe_delivered_decision_point_banner(
+    event: dict[str, Any],
+    decision_token: str,
+    *,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """带外投递的横幅**确实成了一条 user message**——INV-A 达成，在此结算。
+
+    它只做三件事：
+
+    1. 把 token 推进 ``injected``（``mark_injected`` 的新语义 = 「agent 确实拿到了这份正文」；
+       同步自注入由 Stop hook 当场推进，带外的推进点就是**这里**）；
+    2. 清掉那份带外投递意图（它的使命——覆盖「送出去了没有」的崩溃窗口——到此结束）；
+    3. 落一条诊断 + 一条 user-facing ``systemMessage``。
+
+    **三条出口的文案必须互不借用**（每一步都可能不成立，出口断言只能说到那一步真做成的事）：
+
+    * token 已达终态（withdrawn / dispatched / declined）⇒ 不推进、不清意图，如实报一句；
+    * ``mark_injected`` 抛 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒
+      **未推进**，同样不清意图，走专用文案并保留异常类型；
+    * 只有真的推进成功，才允许输出「推进为 injected」这句断言。
+
+    **它绝不 arm 在途锁。** in-progress marker 里 ``decision_token`` 的语义是「agent 已在决策点上
+    **显式接受**」，而 awaiting 锁一旦在祖先链上发现 needle 就会把状态升格 ``in_progress`` ⇒ 会对
+    一个**从未接受**的 agent 发出「继续收尾这一轮」的 nudge。``rvf-agent start`` 仍然是 arm 接受
+    凭证的**唯一**入口。
+
+    整段 best-effort：任何异常都收敛成结构化字段，绝不阻断这条 prompt——横幅已经在 agent 眼前了，
+    因为记账失败而 block 它是纯粹的自伤。
+    """
+    result: dict[str, Any] = {
+        **payload,
+        "status": "decision_point_banner_delivered",
+        "decision_token": decision_token,
+        "dispatch_origin": "cline_kanban_decision_point_banner",
+    }
+    try:
+        import rvf_decision_token_store as decision_token_store  # noqa: PLC0415
+
+        lookup = decision_token_store.read_decision_token(decision_token)
+        result["decision_token_status"] = lookup.status
+        result["decision_token_state_before_observation"] = lookup.state
+        payload_data = lookup.payload if isinstance(lookup.payload, dict) else {}
+        # 已被撤回 / 已决策的 token 落地了：**不推进、不清意图**，只如实报一句。撤回的权威是
+        # token store 自身，``rvf-agent start`` 读到终态会硬失败，这里不需要（也不该）再管束。
+        if lookup.state in (
+            decision_token_store.STATE_WITHDRAWN,
+            decision_token_store.STATE_DISPATCHED,
+            decision_token_store.STATE_DECLINED,
+        ):
+            result["decision_token_terminal_on_arrival"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_terminal_on_arrival",
+                token=decision_token,
+                status=str(lookup.state),
+            )
+            return result
+        try:
+            advanced = decision_token_store.mark_injected(decision_token)
+            result["decision_token_state"] = advanced.state
+            result["decision_token_advanced_to_injected"] = True
+        except decision_token_store.DecisionTokenError as exc:
+            # 没能推进（TTL 已过 ⇒ ``DecisionTokenExpiredError``、token 文件缺失 ⇒
+            # ``DecisionTokenNotFoundError``、状态机拒绝 ⇒ ``DecisionTokenStateError``）。
+            #
+            # 历史实现把异常记进 ``decision_token_error`` 就继续往下走，出口仍是那条逐字写着
+            # 「决策 token 推进为 injected」的 systemMessage ⇒ 磁盘 state 其实还停在 minted、
+            # ``rvf-agent start`` 实际会硬失败，开发者却被告知已经推进了。构造上完全可达：
+            # 带外横幅异步到达，回执 ``delivered_queued_behind_active_agent_turn`` 排在一个长回合
+            # 之后就能越过 1200s TTL。
+            #
+            # 故这里**提前返回**，走一条如实说明「未推进」的出口，并且**不清投递意图**：意图是
+            # 后续对账（stranded 撤回 / 重新征询）唯一的抓手，token 没能推进时清掉它等于把善后
+            # 线索也一起删了。
+            result["decision_token_error"] = f"{type(exc).__name__}: {exc}"
+            result["decision_token_advanced_to_injected"] = False
+            result["decision_point_delivery_intent_left_for_reconciliation"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_arrived_but_token_not_advanced",
+                token=decision_token,
+                status=str(lookup.status),
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            return result
+
+        detail = payload_data.get("out_of_band_delivery_detail")
+        task_id = detail.get("kanban_task_id") if isinstance(detail, dict) else None
+        if not (isinstance(task_id, str) and task_id):
+            from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+            task_id = current_kanban_task_id(event)
+        if isinstance(task_id, str) and task_id:
+            cleared = kanban_followup_lock.clear_decision_point_delivery_intent(
+                task_id=task_id, decision_token=decision_token
+            )
+            result["cleared_decision_point_delivery_intent_paths"] = cleared
+        result["systemMessage"] = _trigger_system_message(
+            kind="decision_point_banner_delivered",
+            token=decision_token,
+            detail="横幅已作为一条真实 user message 到达（可 rewind）",
+        )
+    except Exception as exc:  # noqa: BLE001 - 记账永不阻断这条 prompt
+        result["decision_token_observation_error"] = f"{type(exc).__name__}: {exc}"
+    return result
 
 
 def _withdrawn_dispatch_additional_context_text(
@@ -1327,9 +1466,17 @@ def inspect_user_prompt_submit(
 
     token = dispatch_token_from_text(prompt)
     origin_marker = detect_origin_marker(prompt) if token is None else None
+    # 发起决策点横幅经带外投递落地成的那条 user message。它与 dispatch token / origin marker
+    # 一样是 **RVF 自己产生的机器正文**，不是用户的工作轮边界——故它同样要抑制 manual 触发判定、
+    # 轮 baseline 前移与 PostToolUse park 资格（见下）。
+    decision_point_token = (
+        decision_point_token_from_text(prompt)
+        if token is None and origin_marker is None
+        else None
+    )
     manual_decision = (
         _classify_manual_trigger(event, prompt)
-        if token is None and origin_marker is None
+        if token is None and origin_marker is None and decision_point_token is None
         else "none"
     )
     is_manual = manual_decision == "manual"
@@ -1352,10 +1499,44 @@ def inspect_user_prompt_submit(
 
             rvf_post_tool_use.mark_park_eligibility(
                 park_session_id.strip(),
-                eligible=(token is None and origin_marker is None and not is_manual),
+                eligible=(
+                    token is None
+                    and origin_marker is None
+                    and decision_point_token is None
+                    and not is_manual
+                ),
             )
     except Exception:
         pass
+
+    # Stop 侧「跨 turn 再入预算」的复位路径 ②：出现了真实的人类回合 ⇒ 连续驱动 agent 的
+    # 链条已被打破。判据与上面的 park 资格、下面的 baseline 前移**同源**——dispatch token /
+    # origin marker / decision-point token 三者都是 RVF 自己产生的机器正文，不是用户轮边界；
+    # 拿它们复位等于让 RVF 自己的注入把自己的保险丝按掉，那道闸就白加了。
+    #
+    # ⚠️ 会话身份的解析口径与 Stop 侧不完全相同：Stop 用 `session_id_from_event()`（event 缺
+    # `session_id` 时回退到 transcript 路径推导），这里只取 `event["session_id"]`。不一致的后果
+    # 一律是**少复位或复位错 bucket ⇒ 预算偏严**，不会造成假放行，故刻意不为此把那个巨型模块
+    # import 进 UPS 的热路径。
+    #
+    # best-effort、纯副作用：复位失败只让预算偏严，永不阻断这条 prompt。
+    if token is None and origin_marker is None and decision_point_token is None:
+        try:
+            from core.rvf_user_local_data_paths import (  # noqa: PLC0415
+                resolved_rvf_session_hook_state_dir,
+            )
+            from core.stop_hook_reentry_budget import (  # noqa: PLC0415
+                reset_stop_hook_reentry_budget_on_user_prompt_submit,
+            )
+
+            reentry_budget_session_id = event.get("session_id")
+            if isinstance(reentry_budget_session_id, str) and reentry_budget_session_id.strip():
+                reset_stop_hook_reentry_budget_on_user_prompt_submit(
+                    session_identifier=reentry_budget_session_id.strip(),
+                    state_directory=resolved_rvf_session_hook_state_dir(),
+                )
+        except Exception:
+            pass
 
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
@@ -1366,10 +1547,17 @@ def inspect_user_prompt_submit(
     # 仅对「真正的用户 prompt」记录本轮 baseline（dispatch token / origin marker 是
     # RVF 自注入的机器 prompt，不是用户轮边界，不得前移 baseline）。纯副作用 +
     # best-effort：失败即降级为今日 dirty-only 行为。
-    if token is None and origin_marker is None:
+    if token is None and origin_marker is None and decision_point_token is None:
         round_baseline_debug = _capture_round_baseline(event, prompt)
         if round_baseline_debug:
             payload["round_baseline"] = round_baseline_debug
+
+    if decision_point_token is not None:
+        # 带外投递的发起横幅落地了 —— INV-A 达成。只推进 token + 清投递意图，**绝不 arm 在途锁**
+        # （arm 的唯一入口仍是 `rvf-agent start`，即 agent 显式接受之后）。
+        return _observe_delivered_decision_point_banner(
+            event, decision_point_token, payload=payload
+        )
 
     if token is not None:
         # ① 先问「这条投递还算数吗」，再谈消费它。
@@ -1538,7 +1726,7 @@ def inspect_user_prompt_submit(
     elif is_manual:
         # S5（R22）：manual 触发不再预置 packet/prepare（旧 `_create_manual_prep_file` +
         # shared-workflow 预置逻辑已退役至 rvf-agent CLI `start`）。改为与 Stop hook 决策点
-        # `decision_point_injection_decision` 对偶——铸决策 token（S1 三闸内建）并经 UPS 专属的
+        # `decision_point_injection_decision` 对偶——铸决策 token（S1；用户显式触发只受闸一去重约束）并经 UPS 专属的
         # `additionalContext` 交付「候选摘要（S2）+ token + rvf-agent start/scope/dispatch/decline
         # 样例命令 + 简析后立刻 start/decline 指引」，由主 agent 显式发起或谢绝。此分支自成终局，
         # 提前返回，不再落入下方 token 派发的 shared-workflow 块。
@@ -1714,9 +1902,17 @@ def _trigger_system_message(
     - ``manual_decision_injected``：manual 触发**已铸决策 token，等待 agent 决策**（区分旧「审查已开始」）。
     - ``manual_decision_deduplicated``：manual 触发命中同键活跃决策 token（幂等复用），未重铸。
     - ``manual_decision_no_candidates``：manual 触发但本 worktree 自上次 review 以来无可审候选。
-    - ``manual_decision_declined_cooldown``：候选指纹处于 declined 冷却，未铸（尊重 agent 早前谢绝）。
-    - ``manual_decision_circuit_breaker``：决策 token 铸造频率熔断，疑似递归发起，未铸。
     - ``manual_summary_failed`` / ``manual_mint_anomaly``：manual 决策点摘要构造 / 铸造异常兜底。
+      （declined 冷却 / 铸造熔断对 manual 路径不适用，故无对应 kind——见
+      :func:`_handle_manual_decision_point`。）
+    - ``decision_point_banner_delivered``：带外投递的发起横幅**已成为一条真实 user message**
+      （INV-A 达成，token 推进 injected）。
+    - ``decision_point_banner_terminal_on_arrival``：一份已达终态（withdrawn / dispatched /
+      declined）的横幅迟到落地，未推进任何状态。
+    - ``decision_point_banner_arrived_but_token_not_advanced``：横幅落地了但 ``mark_injected``
+      抛了 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒ **未推进**。与上一条
+      刻意分开：那条是「本来就不该推进」，这条是「本该推进但没推成」，善后不同（后者保留投递
+      意图交给对账）。两者都**绝不**能借用 ``decision_point_banner_delivered`` 那句断言性文案。
     """
     run_ref = run_id or "—"
     origin = dispatch_origin or "—"
@@ -1792,21 +1988,6 @@ def _trigger_system_message(
             message="手动触发但本 worktree 自上次 review 以来无可审候选改动，未铸 token",
             extra_fields=detail_fields,
         )
-    if kind == "manual_decision_declined_cooldown":
-        return notice(
-            status_value="manual_decision_declined_cooldown",
-            message=(
-                "候选指纹处于 declined 冷却（agent 早前已谢绝且改动未变），未铸 token；"
-                "如仍需审查，请改动候选或让 agent 清冷却后重试"
-            ),
-            extra_fields=detail_fields,
-        )
-    if kind == "manual_decision_circuit_breaker":
-        return notice(
-            status_value="manual_decision_circuit_breaker",
-            message="决策 token 铸造频率熔断，疑似递归发起，未铸 token",
-            extra_fields=detail_fields,
-        )
     if kind == "manual_summary_failed":
         return notice(
             status_value="manual_decision_summary_failed",
@@ -1817,6 +1998,35 @@ def _trigger_system_message(
         return notice(
             status_value="manual_decision_mint_anomaly",
             message="手动触发但决策 token 铸造异常，未注入（best-effort，不阻断）",
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_delivered":
+        return notice(
+            status_value="decision_point_banner_delivered",
+            message=(
+                "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，"
+                "决策 token 推进为 injected（等待 agent 显式 start / decline）"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_terminal_on_arrival":
+        return notice(
+            status_value=status or "terminal",
+            message=(
+                "一份**已作废**的 RVF 发起决策点横幅迟到落地（token 已达终态），"
+                "未推进任何状态；rvf-agent start 会硬失败"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_arrived_but_token_not_advanced":
+        return notice(
+            status_value=status or "not_advanced",
+            message=(
+                "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，但"
+                "**决策 token 未能推进**（TTL 已过 / token 文件缺失 / 状态机拒绝，详见 detail）；"
+                "token 仍停在原状态，rvf-agent start 会硬失败。投递意图**未清除**，"
+                "留给后续对账处置（到期撤回并重新征询）"
+            ),
             extra_fields=detail_fields,
         )
     return notice(status_value=kind, message=kind)

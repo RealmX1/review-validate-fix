@@ -1841,6 +1841,13 @@ def _write_alternative_reviewer_config_payload_unclassified(
         payload["output_format"] = output_format
     if health_command is not None:
         payload["health_command"] = health_command
+        # 夹具的 "reviewer" 是 `python3 -c "<脚本>"`：两边 `-c` 的载荷本来就必须不同
+        # （健康脚本验环境、评审脚本写工件），根本不存在可比对的 CLI 入口，因此显式声明豁免
+        # health probe parity gate。这个字面量自证其为夹具，且 contract gate 会禁止它出现在
+        # 任何出厂 config/alternative-reviewer.*.json 里。
+        payload["health_probe_parity_exemption"] = (
+            "inline_script_fixture_has_no_shared_cli_entrypoint"
+        )
     if pre_run_health is not None:
         payload["pre_run_health"] = pre_run_health
     path.write_text(
@@ -6778,7 +6785,15 @@ def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
 
 
 def _dispatch_registry() -> dict:
-    """In-memory registry mirroring config/reviewer-registry.json (real harness ids)."""
+    """路由算法的冻结 fixture：三条真实 harness id，【刻意不随出厂 registry 增长】。
+
+    这里测的是 route() 这个纯函数的选路行为，不是出厂 registry 装了几条腿。把 fixture
+    绑到出厂那份，等于每加一条评审腿就要重写一批与选路无关的断言，而且 available 集
+    的大小本身就是 routing_rule / selection_mode 的判据（len(available)>=3、
+    len(selection_pool)==2）——跟着涨会让这些断言测的东西悄悄换掉。
+    出厂 registry 与各腿 config 是否一一对应，由
+    tests/test_reviewer_registry_additive_merge.py 单独钉住。
+    """
     return {
         "schema_version": 1,
         "harnesses": {
@@ -7447,6 +7462,131 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     assert dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
     assert not dts.clear_declined_fingerprint(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
     assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
+
+
+def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True``（用户手动触发）对闸二不适用：命中 declined 冷却
+    时不再拒铸，而是**清掉**冷却记录后照常铸，并如实回报
+    explicit_user_request_overrode_agent_declined_cooldown（命中即真）与
+    declined_cooldown_record_still_blocks_automatic_path（清除成功 ⇒ False）；
+    清除而非仅本次绕过，故随后的自动路径（默认 False）也不再被这条陈旧 decline 挡住。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpU", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+    # 对照：默认（自动路径）仍被冷却挡住。
+    auto = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+    assert auto.explicit_user_request_overrode_agent_declined_cooldown is False
+
+    manual = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    assert manual.token and manual.record is not None
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is False
+    # 冷却记录已被物理清除 ⇒ 自动路径也解锁。
+    assert not dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpU", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto_after.outcome == dts.MINT_OUTCOME_MINTED
+
+    # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
+    fresh = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpV", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert fresh.outcome == dts.MINT_OUTCOME_MINTED
+    assert fresh.explicit_user_request_overrode_agent_declined_cooldown is False
+    assert fresh.declined_cooldown_record_still_blocks_automatic_path is False
+
+
+def test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+    tmp: Path,
+) -> None:
+    """闸二豁免下的两个事实必须解耦（RVF-001 回归）：冷却记录 unlink 因 I/O 失败（被
+    ``clear_declined_fingerprint`` 吞成 False）时，「用户显式推翻了 agent 早前的谢绝」这一**告知类**
+    事实仍由命中证成、必须为 True；unlink 失败只体现在
+    ``declined_cooldown_record_still_blocks_automatic_path=True``——即后续自动路径仍被这条陈旧
+    decline 挡着。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpW", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+
+    # 只让「冷却表目录下的文件」删除失败，其余 unlink（token 落盘等）照常，避免误伤别处。
+    blocked_dir = dts.declined_fingerprint_root(cd_root).resolve()
+    original_unlink = Path.unlink
+
+    def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
+        if self.resolve().parent == blocked_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_unlink(self, *args, **kwargs)
+
+    Path.unlink = unlink_failing_only_inside_declined_cooldown_dir
+    try:
+        manual = dts.mint_decision_token(
+            worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+    finally:
+        Path.unlink = original_unlink
+
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    # 告知类事实：命中即真，绝不因 unlink 失败被静默吞掉。
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    # 磁盘事实：记录仍在，自动路径依旧被挡。
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is True
+    assert dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpW", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(
+        worktree="/wt", session_id="sa", candidate_fingerprint="fpW", now=t0, **roots
+    )
+    assert auto_after.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+
+
+def test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True`` 对闸三整段跳过：既不注册铸造请求、也不判定，
+    远超阈值地连铸仍次次 minted、mint-request ledger 零新增、token payload 不带 record id；
+    且不污染同 session 后续自动路径的计数（自动路径仍从 0 起算、到阈值照常熔断）。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cb_root = roots["circuit_breaker_root_dir"]
+    t0 = _fixed_utc(0)
+
+    for index in range(5):  # 远超默认阈值 3
+        result = dts.mint_decision_token(
+            worktree="/wt", session_id="sm", candidate_fingerprint=f"fpM{index}", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+        assert result.outcome == dts.MINT_OUTCOME_MINTED, (index, result)
+        assert result.circuit_breaker is None
+        payload = json.loads(result.record.path.read_text(encoding="utf-8"))
+        assert payload[dts.MINT_REQUEST_LEDGER_RECORD_ID_FIELD] is None
+
+    assert dts.count_recent_mint_requests("sm", now=t0, root=cb_root) == 0, "手动铸造不该占熔断额度"
+
+    # 同 session 的自动路径不受污染：从 0 起算，第 3 次才熔断。
+    a1 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA1", now=t0, **roots)
+    a2 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA2", now=t0, **roots)
+    a3 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA3", now=t0, **roots)
+    assert a1.outcome == dts.MINT_OUTCOME_MINTED and a2.outcome == dts.MINT_OUTCOME_MINTED
+    assert a3.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
+    assert a3.circuit_breaker.request_count == 3
 
 
 def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
@@ -8844,12 +8984,20 @@ def test_review_strictness_presets_schema(tmp: Path) -> None:
     assert standard["per_phase_model_selection_enabled"] is False
     assert light["per_phase_model_selection_enabled"] is False
 
-    # Tier-1 池全集 = {claude_code, codex, cursor}（R15/R20 补集 − 主 harness 在 S7 落地）。
-    assert set(data["reviewer_harness_pool_tier1_full_membership"]) == {
-        "claude_code",
-        "codex",
-        "cursor",
-    }
+    # Tier-1 池全集必须与出厂 reviewer-registry.json 逐字同源（R15/R20 补集 − 主 harness
+    # 在 S7 落地）。这里刻意**不再抄一份字面量**：两处各写一份 harness 名单，迟早会漂——
+    # 加 kimi_code / oh_my_pi 时就正好撞上，preset 里还写着三条而 registry 已是五条，
+    # 而这个断言当时是绿的（它只在验证自己抄得对不对）。
+    registry_harnesses = set(
+        json.loads(
+            (SCRIPT_DIR.parent / "config" / "reviewer-registry.json").read_text(
+                encoding="utf-8"
+            )
+        )["harnesses"]
+    )
+    assert (
+        set(data["reviewer_harness_pool_tier1_full_membership"]) == registry_harnesses
+    ), (data["reviewer_harness_pool_tier1_full_membership"], sorted(registry_harnesses))
 
 
 def test_candidate_summary_includes_committed_but_unreviewed(tmp: Path) -> None:
@@ -9203,6 +9351,574 @@ def test_candidate_summary_excludes_reviewed_committed_keeps_dirty(tmp: Path) ->
     )
 
 
+# ---------------------------------------------------------------------------
+# 「背靠背再问一轮」与「规模数字虚高」修复：dirty 侧已审观测 + 未审行数估算 + start 语义
+# ---------------------------------------------------------------------------
+
+def _dirty_reviewed_repo(tmp: Path):
+    """建一个 repo：``f.txt`` 已提交 base；会话 s1 把它改脏（**不提交**）并完整走过一轮 review。
+
+    终态 = 一个 ``observed_state='dirty'`` 且 ``review_state='reviewed'`` 的单元，归属 s1。
+    这正是「上一轮 RVF 刚审完、修复落盘还没提交」的现场——也就是背靠背再问一轮的那个现场。
+    """
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty，刻意不 commit
+    # 归属用 allocator 的 auto-claim 播种：工作树观测到的 dirty 单元直接记到 s1 名下。比走
+    # transcript + build_manifest 更贴近本用例要断言的东西（tracker 里有一个 dirty+reviewed+owned
+    # 的单元），也不必依赖 apply_patch hunk 锚点在 dirty 侧对得上。
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    return dt, sm, repo, logs, baseline, alloc
+
+
+def _candidate_summary_for(summary_mod, repo: Path, logs: Path, **overrides):
+    kwargs = dict(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        log_root_override=logs,
+        workspace_guard=lambda **_k: None,
+        task_id_resolver=lambda _e: None,
+        session_id_resolver=lambda _e: "s1",
+        committed_baseline_resolver=lambda _rp, _t, _s: None,
+        committed_base_ref_resolver=lambda _rp: None,
+    )
+    kwargs.update(overrides)
+    return summary_mod.build_candidate_summary(**kwargs)
+
+
+def test_dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks(tmp: Path) -> None:
+    """背靠背场景的核心用例：上一轮审过的 dirty 行从**规模估算**里扣掉，但**候选集一个都不少**。
+
+    这是本次修复的形状：横幅原先只报文件级全量 delta，一次「刚审完、修复没提交」的再征询看起来
+    和一千多行全新工作一模一样。扣减只动数字，不动候选集——dirty 侧没有 commit 那种不可变锚点，
+    按 tracker 剔除路径就是凭空开漏审面。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+
+    # ① tracker 侧只读观测：dirty 单元已 reviewed，且能还原出被审过的行文本。
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["f.txt"], log_root_override=logs
+    )
+    assert "f.txt" in obs, obs
+    assert obs["f.txt"].reviewed_unit_count >= 1, obs["f.txt"]
+    assert "changed" in obs["f.txt"].reviewed_added_lines, obs["f.txt"]
+    assert "base" in obs["f.txt"].reviewed_deleted_lines, obs["f.txt"]
+    # 他 session / 无 session_id 视角一律拿不到已审证据（与 committed 侧同口径的保守方向）。
+    assert dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="sess-OTHER", candidate_paths=["f.txt"], log_root_override=logs
+    ).get("f.txt").reviewed_unit_count == 0
+    assert dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id=None, candidate_paths=["f.txt"], log_root_override=logs
+    ) == {}
+
+    # ② 候选摘要：候选集不缩小，但未审估算归零。
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert "f.txt" in by_path, summ["candidates"]
+    assert summ["candidate_path_count"] == 1
+    # 全量口径原样保留（下游既有断言不受影响）。
+    assert by_path["f.txt"]["nonblank_added_lines"] == 1
+    assert by_path["f.txt"]["nonblank_deleted_lines"] == 1
+    assert summ["bootstrap_size"]["total_nonblank_added_lines"] == 1
+    assert summ["bootstrap_size"]["total_nonblank_deleted_lines"] == 1
+    # 未审口径：已审那一行被扣掉。
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["f.txt"]["unreviewed_nonblank_deleted_lines"] == 0
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == 0 and est["nonblank_deleted_lines"] == 0, est
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_HUNK_FILTERED, est
+    assert est["hunk_filtered_path_count"] == 1 and est["fallback_path_count"] == 0, est
+    assert summ["strictness_reference_unreviewed_estimate"]["totals"]["nonblank_added_lines"] == 0
+
+    # ③ 横幅：把「已审 / 未审」两桶如实渲染出来，并对「未审为 0」给出 decline 建议。
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    assert "已在此前的 review 中审过" in rendered, rendered
+    assert "未审量为 0" in rendered and "decline" in rendered, rendered
+
+
+def test_dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review(
+    tmp: Path,
+) -> None:
+    """review 之后工作树**又改过** → 新内容推导出新 unit_id，tracker 里查不到 → 整份按未审计。
+
+    这是本估算唯一的失败方向，也是它敢做扣减的前提：身份是内容寻址的（canonical hash 不含 ``@@``
+    头），对不上就是新工作。若这里退化成「还是按上一轮扣」，修复本身就成了漏审源。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+
+    # 审完之后又写了新工作（同一个文件，内容变了）。
+    (repo / "f.txt").write_text("changed\nbrand-new-unreviewed-work\n", encoding="utf-8")
+
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["f.txt"], log_root_override=logs
+    )
+    assert obs["f.txt"].reviewed_unit_count == 0, obs["f.txt"]
+
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    # 全量 = 未审：一行都没扣。
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == by_path["f.txt"]["nonblank_added_lines"]
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == summ["bootstrap_size"]["total_nonblank_added_lines"] > 0, est
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_NO_REVIEWED_UNITS, est
+
+
+def test_dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match(tmp: Path) -> None:
+    """tracker 声称审过某些行、却一行都对不上 → 报 ``stale``、整份回退全量，横幅改口说实话。
+
+    自校验分支的专用用例（真实 git 状态下这一支很罕见，但它正是防「第二代假绿」的那道闸：一个
+    失效的扣减绝不能渲染成一次成功的扣减）。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    _dt2, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "g.py").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    class _StaleObservation:
+        whole_path_identity_reviewed = False
+        reviewed_added_lines = ("a-line-that-is-not-in-the-diff",)
+        reviewed_deleted_lines = ()
+
+    summ = _candidate_summary_for(
+        summary_mod, repo, logs,
+        dirty_reviewed_change_resolver=lambda *_a: {"g.py": _StaleObservation()},
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION
+    )
+    est = summ["unreviewed_line_estimate"]
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION, est
+    assert est["nonblank_added_lines"] == summ["bootstrap_size"]["total_nonblank_added_lines"] == 2
+    assert est["stale_observation_path_count"] == 1 and est["fallback_path_count"] == 1, est
+
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    # 诚实告警，而不是静默省略这一段（省略会被读成「没有已审的部分」）。
+    assert "估算不可用" in rendered and "全量" in rendered, rendered
+
+
+def test_dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity(tmp: Path) -> None:
+    """新增文件没有 hunk 锚点（``_canonical_hash_added`` 是整文件身份）→ 整条判定，不做行级折算。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    (repo / "n.py").write_text("one\ntwo\n", encoding="utf-8")  # untracked 新文件
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["n.py"], log_root_override=logs
+    )
+    assert obs["n.py"].unit_kind == "untracked_file", obs["n.py"]
+    assert obs["n.py"].whole_path_identity_reviewed is True, obs["n.py"]
+    assert obs["n.py"].reviewed_added_lines == (), obs["n.py"]  # 整条判定，不返回行
+
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert "n.py" in by_path  # 候选集仍不缩小
+    assert by_path["n.py"]["nonblank_added_lines"] == 2
+    assert by_path["n.py"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["n.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED
+    )
+
+
+def test_whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed(
+    tmp: Path,
+) -> None:
+    """整路径已审扣减**只覆盖 dirty 一半**，被扣的却是 baseline→工作树的合并 delta → 必须整份回退。
+
+    现场：同一路径上既有「本轮已提交但未审」的内容改动，又有「已审的 dirty chmod」（path_only 单元，
+    没有 hunk 锚点 → ``whole_path_identity_reviewed=True``）。修复前 ``_estimate_unreviewed_lines_for_path``
+    直接 ``return [], []``，把未审的已提交内容一并算成已审，横幅渲染出「⚠ 未审量为 0 …… 通常应当
+    decline」——把没审过的已提交工作说成审过了，是实打实的漏审诱导。
+
+    锁住的行为：未审量回到全量、basis 落在如实标注的回退取值、横幅改口说实话且不再建议 decline。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # ① 本轮提交、且从未被审的内容改动。
+    (repo / "g.py").write_text("committed-unreviewed-1\ncommitted-unreviewed-2\n", encoding="utf-8")
+    run(["git", "add", "g.py"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "committed round work"], cwd=repo)
+    head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    # ② 同一路径上的 dirty chmod：没有 hunk 锚点 → path_only 整路径身份单元。
+    os.chmod(repo / "g.py", 0o755)
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["g.py"], log_root_override=logs
+    )
+    # 前提锚点：tracker 侧确实给出整路径已审观测（否则本用例会退化成空转的假绿）。
+    assert obs["g.py"].unit_kind == "path_only", obs["g.py"]
+    assert obs["g.py"].whole_path_identity_reviewed is True, obs["g.py"]
+
+    summ = _candidate_summary_for(
+        summary_mod, repo, logs,
+        committed_baseline_resolver=lambda _rp, _t, _s: baseline,
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["g.py"]["change_state"] == summary_mod.CHANGE_STATE_COMMITTED_AND_UNCOMMITTED
+    # 未审量 == 全量：一行都没扣（未审的已提交内容不再被冒充成已审）。
+    assert by_path["g.py"]["nonblank_added_lines"] == 2
+    assert by_path["g.py"]["unreviewed_nonblank_added_lines"] == 2
+    assert by_path["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+    )
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == 2, est
+    assert est["estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+    ), est
+    # 回退必须计进 fallback 桶、且不得计进「扣减确实生效」桶——否则失效的扣减看起来仍像成功的扣减。
+    assert est["fallback_path_count"] == 1 and est["hunk_filtered_path_count"] == 0, est
+    assert (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+        not in summary_mod.ESTIMATE_BASES_WITH_EFFECTIVE_DEDUCTION
+    )
+
+    # ③ 横幅：如实说明估算不可用，且不再渲染那句诱导 decline 的「未审量为 0」。
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    assert "估算不可用" in rendered and "全量" in rendered, rendered
+    assert "已提交但未审" in rendered, rendered
+    assert "未审量为 0" not in rendered, rendered
+    # 也不能反过来谎称「拿不到 tracker 观测」——观测是有的，只是覆盖面窄于被扣的 delta。
+    assert "拿不到 tracker 观测" not in rendered, rendered
+
+    # ④ 反向锚点：同一现场、下界取到 HEAD（本轮无已提交层）→ delta 就是纯 dirty，扣减照常生效。
+    # 少了这一条，上面的修复可能是把所有整路径扣减一刀砍掉，而不是只砍跨层的那一支。
+    summ_head_baseline = _candidate_summary_for(
+        summary_mod, repo, logs,
+        committed_baseline_resolver=lambda _rp, _t, _s: head,
+    )
+    by_path_head = {c["path"]: c for c in summ_head_baseline["candidates"]}
+    assert by_path_head["g.py"]["change_state"] == summary_mod.CHANGE_STATE_UNCOMMITTED
+    assert by_path_head["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED
+    )
+
+
+def test_dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units(
+    tmp: Path,
+) -> None:
+    """性能回归锁：dirty 已审观测只对「tracker 里真有本 session 已审单元」的候选路径付 git 代价。
+
+    这条观测在**每一次 Stop** 的轻量候选摘要里都跑，而 ``_classify_path`` 每条路径要起
+    ``git status`` / ``git diff --numstat`` / ``git diff -U3`` 等多个子进程。逐候选观测会让
+    ``stop_decision_candidate_summary`` 的「轻量」铁律随候选数线性破产（120 个 dirty 文件实测
+    ~7s 墙钟、其中不到 1s 是 CPU，其余全是子进程开销）。
+
+    断言用 ``_classify_path`` 的**调用集合**而不是墙钟：墙钟在负载下必 flake，调用集合是结构性的
+    —— 一旦有人改回逐候选观测，它立刻从 1 条涨到 12 条即红。
+
+    同时锁住这次提速**不许**换来的语义损失：返回值里一条候选路径都不能少（候选集永不因 tracker
+    数据缩小），且扣不掉的一律算未审。
+    """
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # 11 条「本 session 从没审过」的陪跑路径，先随 base 一起提交（此刻全是干净的）。
+    noise_paths = [f"noise_{i:02d}.txt" for i in range(11)]
+    for noise in noise_paths:
+        (repo / noise).write_text("base\n", encoding="utf-8")
+    run(["git", "add", *noise_paths], cwd=repo)
+    run(["git", "commit", "-q", "-m", "noise base"], cwd=repo)
+
+    # 只有 f.txt 被改脏并完整走过一轮 review → 它是唯一一条 tracker 里有 dirty+reviewed+owned 单元的路径。
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+
+    # review 之后陪跑路径才变脏 —— 它们在 tracker 里连单元都没有，更谈不上已审。
+    for noise in noise_paths:
+        (repo / noise).write_text("brand-new-unreviewed-work\n", encoding="utf-8")
+
+    candidate_paths = ["f.txt", *noise_paths]
+    classified_paths: list[str] = []
+    original_classify_path = dt._classify_path
+
+    def _counting_classify_path(repo_arg, path_arg):
+        classified_paths.append(path_arg)
+        return original_classify_path(repo_arg, path_arg)
+
+    dt._classify_path = _counting_classify_path
+    try:
+        obs = dt.select_dirty_path_reviewed_change_by_session(
+            repo=repo, session_id="s1", candidate_paths=candidate_paths, log_root_override=logs
+        )
+    finally:
+        dt._classify_path = original_classify_path
+
+    # ① 性能形状：只对唯一那条有已审单元的路径起 git 子进程。
+    assert classified_paths == ["f.txt"], classified_paths
+
+    # ② 语义不变：12 条候选一条不少，未审的照旧是未审。
+    assert set(obs) == set(candidate_paths), sorted(obs)
+    assert obs["f.txt"].reviewed_unit_count >= 1, obs["f.txt"]
+    assert "changed" in obs["f.txt"].reviewed_added_lines, obs["f.txt"]
+    for noise in noise_paths:
+        skipped = obs[noise]
+        assert skipped.reviewed_unit_count == 0, skipped
+        assert skipped.whole_path_identity_reviewed is False, skipped
+        assert skipped.reviewed_added_lines == () and skipped.reviewed_deleted_lines == (), skipped
+        # 跳过观测用独立 unit_kind 自陈，而不是伪装成一次真观测。
+        assert skipped.unit_kind == (
+            dt.DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER
+        ), skipped
+
+    # ③ 下游摘要：候选集完整，只有已审那条被扣减，陪跑路径全额计入未审。
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert set(by_path) == set(candidate_paths), sorted(by_path)
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["f.txt"]["reviewed_line_estimate_basis"] == summary_mod.ESTIMATE_BASIS_HUNK_FILTERED
+    for noise in noise_paths:
+        assert by_path[noise]["unreviewed_nonblank_added_lines"] == (
+            by_path[noise]["nonblank_added_lines"]
+        ) > 0, by_path[noise]
+        assert by_path[noise]["reviewed_line_estimate_basis"] == (
+            summary_mod.ESTIMATE_BASIS_NO_REVIEWED_UNITS
+        ), by_path[noise]
+
+
+def _agentic_initiation_allocation_for(tmp: Path, repo: Path, logs: Path, transcript: Path, **kwargs):
+    """在隔离 log root 下调一次发起侧 tracker scope 分配（真实 allocator，不打桩）。"""
+    cli = load_rvf_agent_decision_cli_module()
+    original = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    try:
+        return cli, cli.allocate_agentic_initiation_tracker_review_scope(
+            repo=str(repo),
+            session_id="s1",
+            transcript_path=str(transcript),
+            run_id=kwargs.pop("run_id", "r-alloc"),
+            output_scope_path=tmp / "tracker-scope.json",
+            **kwargs,
+        )
+    finally:
+        if original is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original
+
+
+def test_start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything(
+    tmp: Path,
+) -> None:
+    """全已审的一批 diff 再 start → 报 ``no_unreviewed_scope``，**不**静默扩成无 lease 的全量重审。
+
+    这一条掐断的是背靠背闭环的发动机：旧行为下 allocator 报 empty 就降级成 manual-all-uncommitted，
+    而无 lease 的一轮审完标不了 reviewed，同一批 diff 于是在之后每一次 Stop 又被提议一遍。"""
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE, allocation
+    assert allocation["tracker_lease_id"] is None, allocation  # 无 lease 泄漏
+    assert allocation["tracker_scope_path"] is None, allocation
+    assert allocation["allocator_status"] == "empty", allocation
+    assert "已全部审过" in (allocation["degradation_reason"] or ""), allocation
+
+    # 显式 --force-full-rescope → 回到历史降级口径（知情后重审的出口仍在）。
+    _cli2, forced = _agentic_initiation_allocation_for(
+        tmp, repo, logs, transcript, run_id="r-alloc-forced", force_full_rescope=True
+    )
+    assert forced["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, forced
+    assert forced["session_manifest_has_owned_paths"] is True, forced
+    assert "--force-full-rescope" in (forced["degradation_reason"] or ""), forced
+
+
+def test_start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease(
+    tmp: Path,
+) -> None:
+    """empty 的另一半成因（被在途 lease 持有）必须保持旧的「多审一遍」降级——并发下多审是安全的。
+
+    与上一条成对：修复只拆掉「全已审」那一支，绝不能顺手把并发路径也改掉。"""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    held = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert held["status"] == "allocated", held  # lease 在途，**不** complete
+
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, allocation
+    assert allocation["session_manifest_has_owned_paths"] is True, allocation
+    # 成因判据看的是 review_state 分布，不是 allocator 的 leased_excluded_count（那个恒为 0，
+    # 因为 assigned 单元在候选查询阶段就被滤掉、走不到 anti-join）。
+    assert "assigned=1" in (allocation["degradation_reason"] or ""), allocation
+    assert "已全部审过" not in (allocation["degradation_reason"] or ""), allocation
+
+
+def test_start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units(
+    tmp: Path,
+) -> None:
+    """``path_only`` 已审单元在场 → **不**走「全已审」早退，保守回到旧的全量多审降级。
+
+    ``_canonical_hash_path_only`` 只哈希路径（不含 mode、不含 change 方向），所以 ``path_only``
+    的 ``reviewed`` 只证明「这个路径被审过一次」，证明不了「当前这次改动被审过」。本用例走一遍
+    chmod 往返来钉死这一点：``100644→100755`` 审掉并提交后，相反方向的 ``100755→100644`` 复用
+    同一个 unit_id、allocator 照样报 empty、计数照样是 ``reviewed=1``——早退分支若只看 review_state
+    分布，就会把一次真的没审过的可执行位回退静默跳掉。多审一遍只是浪费，跳过是漏审。"""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # ① 第一次 mode 改动（100644 → 100755）：只有 mode 变，无内容 diff ⇒ tracker 兜底成 path_only。
+    os.chmod(repo / "f.txt", 0o755)
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    tracker_dir = alloc["tracker_dir"]
+    first_units = _units_full_by_path(tracker_dir, "f.txt")
+    assert len(first_units) == 1, first_units
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    run(["git", "add", "-A"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "chmod +x"], cwd=repo)
+
+    # ② 相反方向的 mode 改动（100755 → 100644）：这是**没审过**的新工作。
+    os.chmod(repo / "f.txt", 0o644)
+
+    counts = dt.summarize_session_unit_review_states(
+        repo=repo, session_id="s1", log_root_override=logs
+    )
+    # 身份塌缩如实呈现：没有新单元，reviewed 那一行就是上一次 chmod 留下的 path_only。
+    assert _units_full_by_path(tracker_dir, "f.txt").keys() == first_units.keys()
+    assert counts["available"] == 0 and counts["assigned"] == 0, counts
+    assert counts["reviewed"] == 1, counts
+    assert counts["path_only_reviewed"] == 1, counts
+
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="base"
+    )
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    # 关键断言：**不是** no_unreviewed_scope（那会让这次 mode 回退永远不被审）。
+    assert allocation["status"] != cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE, allocation
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, allocation
+    assert allocation["allocator_status"] == "empty", allocation
+    assert allocation["session_manifest_has_owned_paths"] is True, allocation
+    # 降级理由必须点名 path_only，否则读者只看到 reviewed=1/available=0 会以为早退分支坏了。
+    assert "path_only" in (allocation["degradation_reason"] or ""), allocation
+    assert "已全部审过" not in (allocation["degradation_reason"] or ""), allocation
+
+
+def test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag(
+    tmp: Path,
+) -> None:
+    """``run_start`` 拿到「无未审单元」→ 专用回执（非 start_failed），token 停在 acknowledged。
+
+    刻意不复用 ``_fail``：那会把一个正常结论渲染成故障，并诱导 agent 去 ``--retry`` 一个重试多少
+    次都一样的状态。回执必须同时给出 decline 与 ``--force-full-rescope`` 两条出路。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, now=t0)
+
+    def _pipeline_no_unreviewed(**_kwargs):
+        return {
+            "status": cli.PREPARE_STATUS_NO_UNREVIEWED_SCOPE,
+            "run_id": "run-nus", "run_dir": str(tmp / "runs" / "run-nus"),
+            "artifacts": {}, "error": None, "prep_token": None, "bootstrap_gate": None,
+            "initiation_run_id": "run-nus", "initiation_run_dir": str(tmp / "runs" / "run-nus"),
+            "tracker_scope_allocation": {
+                "status": cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
+                "tracker_scope_path": None, "tracker_lease_id": None, "tracker_scope_hash": None,
+                "tracker_unit_count": 0, "session_manifest_has_owned_paths": True,
+                "degradation_reason": "tracker 报本会话名下**没有任何未审单元**", "allocator_status": "empty",
+                "error": None,
+            },
+        }
+
+    result = cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_pipeline_no_unreviewed,
+    )
+    assert result.status == "no_unreviewed_scope", result
+    assert result.exit_code == cli.EXIT_NO_UNREVIEWED_SCOPE, result
+    assert result.token_state == dts.STATE_ACKNOWLEDGED, result
+    assert "已全部审过" in result.message, result.message
+    steps = "\n".join(result.next_steps or [])
+    assert "decline" in steps and "--force-full-rescope" in steps, steps
+    # token 仍是非终态：decline 这条出路必须真的还走得通。
+    declined = cli.run_decline(token=tok, reason="上一轮 RVF 产物，无未审单元", roots=roots, now=t0)
+    assert declined.exit_code == cli.EXIT_OK, declined
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         # --- S2：候选摘要 + 严格度参考档 ---
@@ -9269,6 +9985,67 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "candidate_summary_excludes_reviewed_committed_keeps_dirty",
             lambda: test_candidate_summary_excludes_reviewed_committed_keeps_dirty(
                 root / "s6-summary-excludes-reviewed-committed"
+            ),
+        ),
+        # --- 背靠背再问一轮 / 规模数字虚高：dirty 已审观测 + 未审估算 + start 语义 ---
+        (
+            "dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks",
+            lambda: test_dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks(
+                root / "dirty-reviewed-deducted"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review",
+            lambda: test_dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review(
+                root / "dirty-unreviewed-worktree-changed"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match",
+            lambda: test_dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match(
+                root / "dirty-unreviewed-stale"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity",
+            lambda: test_dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity(
+                root / "dirty-unreviewed-new-file"
+            ),
+        ),
+        (
+            "whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed",
+            lambda: test_whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed(
+                root / "whole-path-reviewed-spans-committed"
+            ),
+        ),
+        (
+            "dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units",
+            lambda: test_dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units(
+                root / "dirty-reviewed-observation-narrowed-git"
+            ),
+        ),
+        (
+            "start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything",
+            lambda: test_start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything(
+                root / "start-no-unreviewed-scope"
+            ),
+        ),
+        (
+            "start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease",
+            lambda: test_start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease(
+                root / "start-leased-excluded-degradation"
+            ),
+        ),
+        (
+            "start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units",
+            lambda: test_start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units(
+                root / "start-path-only-chmod-roundtrip"
+            ),
+        ),
+        (
+            "run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag",
+            lambda: test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag(
+                root / "run-start-no-unreviewed-scope"
             ),
         ),
         (
@@ -9671,6 +10448,37 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_captures_round_baseline",
             lambda: test_rvf_user_prompt_submit_captures_round_baseline(root / "round-baseline-capture"),
         ),
+        # --- 带外投递的发起横幅落地（INV-A 达成信号 / 不 arm 锁 / 检测器互斥 / 撤回中和） ---
+        (
+            "rvf_user_prompt_submit_observes_delivered_decision_point_banner",
+            lambda: test_rvf_user_prompt_submit_observes_delivered_decision_point_banner(
+                root / "banner-observed"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock(
+                root / "banner-no-arm"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector(
+                root / "banner-detectors"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing",
+            lambda: test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing(
+                root / "banner-withdrawn"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced",
+            lambda: test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
+                root / "banner-expired-not-advanced"
+            ),
+        ),
         (
             "allocate_review_scope_includes_committed_round",
             lambda: test_allocate_review_scope_includes_committed_round(root / "committed-allocate-e2e"),
@@ -9813,9 +10621,21 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject",
-            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+            "rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
                 root / "prompt-submit-manual-cooldown"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure(
+                root / "prompt-submit-manual-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker",
+            lambda: test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker(
+                root / "prompt-submit-manual-breaker-exempt"
             ),
         ),
         (
@@ -11058,6 +11878,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "decision_token_declined_fingerprint_cooldown_write_query",
             lambda: test_decision_token_declined_fingerprint_cooldown_write_query(root / "dts-cooldown"),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_clears_declined_cooldown",
+            lambda: test_decision_token_mint_explicit_user_request_clears_declined_cooldown(
+                root / "dts-user-clears-cooldown"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails",
+            lambda: test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+                root / "dts-user-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker",
+            lambda: test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(
+                root / "dts-user-breaker-exempt"
+            ),
         ),
         (
             "decision_token_mint_circuit_breaker_window",

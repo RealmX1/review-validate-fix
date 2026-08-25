@@ -518,6 +518,7 @@ def test_dispatch_reviewers_plan_artifact_schema(root: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        env=dict(os.environ, RVF_USER_LOCAL_DATA_ROOT=str(root / "user-local-state")),
     )
     assert completed.returncode == 0, completed.stderr
     plan_path = run_dir / "artifacts" / "reviewers" / "reviewer-plan.json"
@@ -655,6 +656,9 @@ def test_dispatch_reviewers_execute_backfills_review_env(root: Path) -> None:
     # is identical for repo/packet/scope.)
     env["RVF_REVIEW_PACKET"] = str(packet)
     env["RVF_SCOPE_OF_WORK"] = str(sow)
+    # probe 结果缓存落在 $RVF_USER_LOCAL_DATA_ROOT 下；不隔离的话这些用例会读写**真实**
+    # 状态根，并且互相删对方写进去的条目（--execute 那些用例在 reroute 时会 invalidate）。
+    env["RVF_USER_LOCAL_DATA_ROOT"] = str(root / "user-local-state")
     completed = subprocess.run(
         [
             sys.executable,
@@ -1023,6 +1027,9 @@ def test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached
     repo = init_repo(tmp_path / "repo")
     env = {k: v for k, v in os.environ.items() if not k.startswith("CODEX_RVF_")}
     env["RVF_HARNESS_LIMIT_COOLDOWN_ROOT"] = str(cooldown_root)
+    # probe 结果缓存落在 $RVF_USER_LOCAL_DATA_ROOT 下；不隔离的话这些用例会读写**真实**
+    # 状态根，并且互相删对方写进去的条目（--execute 那些用例在 reroute 时会 invalidate）。
+    env["RVF_USER_LOCAL_DATA_ROOT"] = str(tmp_path / "user-local-state")
     completed = subprocess.run(
         [
             sys.executable,
@@ -1230,7 +1237,12 @@ def test_dispatch_reviewers_probe_excludes_cooldown(tmp_path: Path) -> None:
             ],
             capture_output=True,
             text=True,
-            env=dict(os.environ),
+            # 本用例是四处里唯一真的跑真实 probe 的：不隔离状态根就会把 alpha/beta 的
+            # 探针结论写进真实 cache 目录。
+            env=dict(
+                os.environ,
+                RVF_USER_LOCAL_DATA_ROOT=str(tmp_path / "user-local-state"),
+            ),
             check=False,
         )
     assert "harness_limit_cooldown_active" in completed.stderr, completed.stderr

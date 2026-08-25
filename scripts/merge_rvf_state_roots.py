@@ -2277,13 +2277,21 @@ def sha256_of_sqlite_database_including_write_ahead_log(database_path: Path) -> 
     tracker 跑 WAL：一次提交先落 ``-wal``，主文件要等 checkpoint 才变。只对主文件取
     sha256，一次「merge 之后又写了一批事务」的违规就会完全看不见——主文件字节没动，
     闸照样绿，而 ``switch`` 会把那批事务整体丢掉。这正是这道闸要挡的事情本身。
+
+    ``-wal`` 缺席与 0 字节是同一种「无未 checkpoint frame」状态。新 SQLite 的
+    ``Connection.backup()`` 会把缺席 sidecar 建成空文件；把两态算成不同指纹，会在
+    零应用层写入下误报并发写。
     """
 
     digest = hashlib.sha256()
     for suffix in ("", "-wal"):
         sidecar = database_path.with_name(database_path.name + suffix)
         digest.update(suffix.encode("ascii"))
-        if not sidecar.is_file():
+        # 缺席的 ``-wal`` 与 0 字节 ``-wal`` 都表示「没有任何未 checkpoint 的 WAL
+        # frame」。SQLite 3.50 在 ``Connection.backup()`` 打开只读源库时会把本来不
+        # 存在的 ``-wal`` 建成空文件；若把两态算成不同指纹，快照闸会在零应用层写入
+        # 下误报并发写。真事务要么让 ``-wal`` 变成非空，要么 checkpoint 后改主文件。
+        if not sidecar.is_file() or sidecar.stat().st_size == 0:
             digest.update(b"\x00absent")
             continue
         with sidecar.open("rb") as handle:
@@ -2350,6 +2358,30 @@ def fingerprint_non_tracker_merge_sources(root: Path) -> dict[str, str]:
     return fingerprints
 
 
+def _remove_sqlite_database_and_sidecars(database: Path) -> None:
+    for sidecar_suffix in ("", "-wal", "-shm"):
+        stale = database.with_name(database.name + sidecar_suffix)
+        if stale.exists():
+            stale.unlink()
+
+
+def _write_ahead_log_has_uncheckpointed_frames(database: Path) -> bool:
+    wal = database.with_name(database.name + "-wal")
+    return wal.is_file() and wal.stat().st_size > 0
+
+
+def _backup_sqlite_connection_into(
+    source: sqlite3.Connection, destination_database: Path
+) -> None:
+    destination = sqlite3.connect(str(destination_database))
+    try:
+        source.backup(destination)
+        destination.execute("PRAGMA journal_mode = DELETE")
+        destination.commit()
+    finally:
+        destination.close()
+
+
 def create_sqlite_coherent_backup(source_database: Path, destination_database: Path) -> None:
     """用 SQLite 的 backup API 做一致性快照，**不是** ``cp``。
 
@@ -2359,22 +2391,35 @@ def create_sqlite_coherent_backup(source_database: Path, destination_database: P
     错误，因为它不报错。``Connection.backup`` 走的是页级复制且会读 WAL，产出的是自洽
     的单文件库；随后显式把目标切回 DELETE 日志模式，让 staging 里不留 sidecar，
     ``switch`` 的目录整体换入才不会把新库配上旧 ``-wal``。
+
+    源库默认 ``mode=ro``：最后一个读写连接关闭时 SQLite 会把 WAL checkpoint 进主文件，
+    快照前后指纹闸会把一次合法备份判成并发写。部分构建（系统 Python 3.9 所带
+    SQLite 3.51.0）在已静默、磁盘上没有 ``-wal`` 的 WAL 库上，不肯为只读连接创建
+    ``-shm``，``backup`` 报 ``unable to open database file``——包括 3.50 关连接后不留
+    sidecar、再拿到 3.51 上快照的生产路径。只在确认没有未 checkpoint 的 frame 时才
+    回退读写打开：缺席与空 ``-wal`` 都是无 frame，关连接不会改主文件指纹。有 frame
+    时绝不能回退。禁止 ``immutable=1``：它会跳过 WAL。
     """
 
     destination_database.parent.mkdir(parents=True, exist_ok=True)
-    for sidecar_suffix in ("", "-wal", "-shm"):
-        stale = destination_database.with_name(destination_database.name + sidecar_suffix)
-        if stale.exists():
-            stale.unlink()
+    _remove_sqlite_database_and_sidecars(destination_database)
     source = sqlite3.connect(f"file:{source_database}?mode=ro", uri=True)
     try:
-        destination = sqlite3.connect(str(destination_database))
-        try:
-            source.backup(destination)
-            destination.execute("PRAGMA journal_mode = DELETE")
-            destination.commit()
-        finally:
-            destination.close()
+        _backup_sqlite_connection_into(source, destination_database)
+        return
+    except sqlite3.OperationalError as error:
+        if (
+            _write_ahead_log_has_uncheckpointed_frames(source_database)
+            or "unable to open database file" not in str(error)
+        ):
+            raise
+    finally:
+        source.close()
+
+    _remove_sqlite_database_and_sidecars(destination_database)
+    source = sqlite3.connect(str(source_database))
+    try:
+        _backup_sqlite_connection_into(source, destination_database)
     finally:
         source.close()
 

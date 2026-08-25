@@ -16,12 +16,24 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from core.hook_command_spawn_guard_against_missing_target_script import (  # noqa: E402
+    hook_command_guarded_against_missing_target_script,
+)
+from core.codex_bundled_plugin_hook_suppression import (  # noqa: E402
+    BUNDLED_HOOKS_JSON_RELATIVE_PATH,
+    disable_bundled_plugin_hooks_in_codex_config,
+)
+from core.live_codex_sessions_holding_plugin_cache_paths import (  # noqa: E402
+    live_codex_session_warning_lines,
+    live_codex_sessions_holding_plugin_cache_paths,
+    plugin_cache_path_prefixes_for_selectors,
+)
 from core.rvf_user_local_data_paths import (  # noqa: E402
     RvfUserLocalDataPaths,
     resolved_rvf_user_local_data_paths,
@@ -92,6 +104,22 @@ class OfficialCliInstallationResult:
     claude_marketplace_preexisting: bool
     claude_plugin_preinstalled: bool
     commands: tuple[tuple[str, ...], ...]
+    removed_noncanonical_codex_plugin_selectors: tuple[str, ...]
+    removed_noncanonical_claude_plugin_selectors: tuple[str, ...]
+    codex_bundled_plugin_hook_suppression: dict[str, Any] | None = None
+    """把 Codex 侧 bundled ``hooks/hooks.json`` 注册置为 ``enabled = false`` 的结果。
+
+    bundled 那份在 Codex 上恒定 no-op，却是唯一指向版本化 plugin cache 目录的注册。
+    """
+    live_codex_sessions_holding_plugin_cache_paths_to_be_removed: tuple[
+        dict[str, Any], ...
+    ] = ()
+    """部署前检测到的、可能仍在运行且持有即将被删 plugin cache 路径的 Codex 会话。
+
+    **只告警、不阻断**：判据本身有已知假阴性（liveness 用 rollout mtime 近似），而硬闸也
+    不可行——Kanban 会在 codex 进程死亡后立刻重启新会话，「等所有 codex 退出」不可达。
+    空列表意味着「未发现」，不等于「已确认安全」。
+    """
 
 
 @dataclass(frozen=True)
@@ -568,6 +596,63 @@ def _marketplace_entry_path(entry: Mapping[str, Any]) -> Path | None:
     return None
 
 
+def noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+    installed_plugin_entries: Iterable[Any],
+    *,
+    plugin_selector_field_name: str,
+) -> tuple[str, ...]:
+    """列出「插件名是 RVF、但 selector 不是 canonical」的已安装条目。
+
+    为什么必须**枚举**而不是等值匹配 canonical selector：安装器过去只认
+    ``review-validate-fix@review-validate-fix-local-main`` 一个字符串，于是任何经**别的**
+    marketplace 注册的同名插件（本机实测的 ``review-validate-fix@local-codex-plugins``）对它
+    结构性不可见——每次部署都只刷新 canonical 那份，旧那份原封不动地活下来，两套 RVF 代码在同
+    一台机器上并行执行、各写各的 state 根。
+
+    ``review-validate-fix@*`` 这整个 selector 命名空间属于 RVF 自己，不存在「用户有意保留的第
+    二份 RVF 安装」这种合法情形，所以枚举到的非 canonical 条目一律该被清掉。
+
+    **刻意只针对 plugin，不连带删 marketplace**：marketplace 名（如 ``local-codex-plugins``）
+    是通用容器名，可能同时托管别的插件，删掉会误伤第三方；而真正造成重复 skill 与重复 hook 的
+    是**已安装的 plugin 注册**，不是「某个 marketplace 提供了 RVF」。
+    """
+    canonical_marketplace_prefix = f"{PLUGIN_NAME}@"
+    selectors: list[str] = []
+    for entry in installed_plugin_entries:
+        if not isinstance(entry, dict):
+            continue
+        selector = entry.get(plugin_selector_field_name)
+        if not isinstance(selector, str) or not selector.startswith(
+            canonical_marketplace_prefix
+        ):
+            continue
+        if selector == DEVELOPER_PLUGIN_SELECTOR:
+            continue
+        if entry.get("installed") is False:
+            continue
+        if selector not in selectors:
+            selectors.append(selector)
+    return tuple(sorted(selectors))
+
+
+def _bundled_plugin_hooks_document(active_marketplace_root: Path) -> dict[str, Any]:
+    """读 active marketplace 里 plugin bundled 的 ``hooks/hooks.json``。
+
+    读不到就返回空文档：抑制写入本身是**加固**，不该因为读不到而让整次部署失败。
+    """
+    path = (
+        Path(active_marketplace_root)
+        / "plugins"
+        / PLUGIN_NAME
+        / BUNDLED_HOOKS_JSON_RELATIVE_PATH
+    )
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
 def install_developer_marketplace_with_official_clis(
     *,
     active_marketplace_root: Path,
@@ -617,6 +702,56 @@ def install_developer_marketplace_with_official_clis(
     claude_installed_plugins = (
         claude_plugin_payload if isinstance(claude_plugin_payload, list) else []
     )
+
+    # 先把非 canonical 的 RVF 注册清掉，再动 canonical：否则本次部署又只刷新一份、留下另一份。
+    removed_noncanonical_codex_plugin_selectors = (
+        noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+            codex_installed_plugins,
+            plugin_selector_field_name="pluginId",
+        )
+    )
+    # 动任何 plugin cache 之前先看有没有 live 会话持有它。``codex plugin remove`` 会连带
+    # 删掉整棵 payload 树，而已在运行的会话持有的是**启动时的注册快照**——2026-08-18 的
+    # 286 次无上界续跑就是这么来的。只告警不阻断，理由见结果字段的 docstring。
+    live_codex_sessions_holding_removed_paths = live_codex_sessions_holding_plugin_cache_paths(
+        codex_home=Path.home() / ".codex",
+        plugin_cache_path_prefixes=plugin_cache_path_prefixes_for_selectors(
+            codex_home=Path.home() / ".codex",
+            plugin_selectors=(
+                *removed_noncanonical_codex_plugin_selectors,
+                DEVELOPER_PLUGIN_SELECTOR,
+            ),
+        ),
+    )
+    for warning_line in live_codex_session_warning_lines(
+        live_codex_sessions_holding_removed_paths
+    ):
+        print(warning_line, file=sys.stderr)
+    for stale_selector in removed_noncanonical_codex_plugin_selectors:
+        _run_official_cli_command(
+            [codex_executable_text, "plugin", "remove", stale_selector, "--json"],
+            command_runner=command_runner,
+            recorded_commands=recorded_commands,
+        )
+    removed_noncanonical_claude_plugin_selectors = (
+        noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
+            claude_installed_plugins,
+            plugin_selector_field_name="id",
+        )
+    )
+    for stale_selector in removed_noncanonical_claude_plugin_selectors:
+        _run_official_cli_command(
+            [
+                claude_executable_text,
+                "plugin",
+                "uninstall",
+                stale_selector,
+                "--scope",
+                "user",
+            ],
+            command_runner=command_runner,
+            recorded_commands=recorded_commands,
+        )
 
     codex_marketplace_entry = next(
         (
@@ -688,6 +823,14 @@ def install_developer_marketplace_with_official_clis(
         ],
         command_runner=command_runner,
         recorded_commands=recorded_commands,
+    )
+    # 装完立刻把 bundled hook 注册停掉：它在 Codex 上恒定 no-op（`is_foreign_invocation`
+    # 只服务 Claude），却是唯一指向**版本化 plugin cache 目录**的注册，也就是每次部署换
+    # 版本目录后会悬空的那一条。理由与实测见该模块 docstring。
+    codex_bundled_plugin_hook_suppression = disable_bundled_plugin_hooks_in_codex_config(
+        codex_home=Path.home() / ".codex",
+        plugin_selector=DEVELOPER_PLUGIN_SELECTOR,
+        bundled_hooks_document=_bundled_plugin_hooks_document(active_marketplace_root),
     )
 
     claude_marketplace_entry = next(
@@ -771,6 +914,37 @@ def install_developer_marketplace_with_official_clis(
         claude_marketplace_preexisting=claude_marketplace_entry is not None,
         claude_plugin_preinstalled=claude_plugin_entry is not None,
         commands=tuple(recorded_commands),
+        removed_noncanonical_codex_plugin_selectors=(
+            removed_noncanonical_codex_plugin_selectors
+        ),
+        removed_noncanonical_claude_plugin_selectors=(
+            removed_noncanonical_claude_plugin_selectors
+        ),
+        codex_bundled_plugin_hook_suppression={
+            "config_path": str(codex_bundled_plugin_hook_suppression.config_path),
+            "disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.disabled_hook_state_keys
+            ),
+            "already_disabled_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.already_disabled_hook_state_keys
+            ),
+            "created_hook_state_keys": list(
+                codex_bundled_plugin_hook_suppression.created_hook_state_keys
+            ),
+            "config_written": codex_bundled_plugin_hook_suppression.config_written,
+            # 抑制失败不阻断部署（它是加固，不是部署的必要条件），所以只能靠回执被看见。
+            "config_write_failure_reason": (
+                codex_bundled_plugin_hook_suppression.config_write_failure_reason
+            ),
+        },
+        live_codex_sessions_holding_plugin_cache_paths_to_be_removed=tuple(
+            {
+                "session_id": finding.session_id,
+                "rollout_path": str(finding.rollout_path),
+                "held_plugin_cache_paths": list(finding.held_plugin_cache_paths),
+            }
+            for finding in live_codex_sessions_holding_removed_paths
+        ),
     )
 
 
@@ -1072,19 +1246,137 @@ def initialize_rvf_user_local_data(
         paths.deployment_receipts_root,
     ):
         directory.mkdir(parents=True, exist_ok=True)
-    if not paths.reviewer_registry_path.exists():
-        bundled_registry = (
+    merge_bundled_reviewer_harnesses_into_user_local_registry(
+        bundled_registry_path=(
             source_repository
             / f"plugins/{PLUGIN_NAME}"
             / PLUGIN_SKILL_RELATIVE_PATH
             / "config/reviewer-registry.json"
-        )
-        if not bundled_registry.is_file():
-            raise OfficialCliInstallationError(
-                f"缺少 bundled reviewer registry: {bundled_registry}"
-            )
-        shutil.copy2(bundled_registry, paths.reviewer_registry_path)
+        ),
+        user_local_registry_path=paths.reviewer_registry_path,
+    )
     return paths
+
+
+def merge_bundled_reviewer_harnesses_into_user_local_registry(
+    *,
+    bundled_registry_path: Path,
+    user_local_registry_path: Path,
+) -> list[str]:
+    """把 bundled registry 里 user-local 尚缺的 harness 增量并入，返回新增的 harness id。
+
+    真相源是 **user-local** 那份 registry：bundled 那份构建时会被移出 payload
+    (`_remove_path_if_present`)，verifier 还断言它不得存在于 payload 里。
+    所以这里的方向是单向的——bundled 只当 seed 用。
+
+    **只补不覆盖**：user-local 的条目是用户资产（关掉某条腿、调 priority、
+    加自己的 harness），一次部署不得把它们改回出厂值。
+
+    **补到字段一级**：只在条目一级 additive 是不够的——它挡住了「新腿进不来」，
+    却挡不住「新字段进不来」。见
+    :func:`backfill_bundled_fields_missing_from_existing_user_local_harness_entries`。
+
+    **不静默跳过**：并入前先比对 schema_version。版本对不上时宁可让部署响亮地
+    失败，也不能跳过——跳过的后果是新评审腿永远进不来，而部署照常报成功，
+    没有任何一处会察觉（本仓反复栽过的假绿形状）。
+    """
+    if not bundled_registry_path.is_file():
+        raise OfficialCliInstallationError(
+            f"缺少 bundled reviewer registry: {bundled_registry_path}"
+        )
+    bundled_registry = read_json_object(bundled_registry_path)
+    bundled_harnesses = bundled_registry.get("harnesses")
+    if not isinstance(bundled_harnesses, dict):
+        raise OfficialCliInstallationError(
+            f"bundled reviewer registry 缺少 harnesses object: {bundled_registry_path}"
+        )
+
+    if not user_local_registry_path.exists():
+        user_local_registry_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_registry_path, user_local_registry_path)
+        return sorted(bundled_harnesses)
+
+    user_local_registry = read_json_object(user_local_registry_path)
+    user_local_harnesses = user_local_registry.get("harnesses")
+    if not isinstance(user_local_harnesses, dict):
+        raise OfficialCliInstallationError(
+            "user-local reviewer registry 缺少 harnesses object: "
+            f"{user_local_registry_path}"
+        )
+    if user_local_registry.get("schema_version") != bundled_registry.get(
+        "schema_version"
+    ):
+        raise OfficialCliInstallationError(
+            "reviewer registry schema_version 不一致，拒绝并入新 harness："
+            f"user-local={user_local_registry.get('schema_version')!r} "
+            f"bundled={bundled_registry.get('schema_version')!r} "
+            f"({user_local_registry_path})。请先人工迁移该文件再重跑部署。"
+        )
+
+    newly_added_harness_ids = sorted(
+        harness_id
+        for harness_id in bundled_harnesses
+        if harness_id not in user_local_harnesses
+    )
+    for harness_id in newly_added_harness_ids:
+        user_local_harnesses[harness_id] = bundled_harnesses[harness_id]
+    backfilled_field_names_by_harness_id = (
+        backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+            bundled_harnesses=bundled_harnesses,
+            user_local_harnesses=user_local_harnesses,
+            harness_ids_added_by_this_merge=frozenset(newly_added_harness_ids),
+        )
+    )
+    if not newly_added_harness_ids and not backfilled_field_names_by_harness_id:
+        return []
+    user_local_registry["harnesses"] = user_local_harnesses
+    write_json_atomic(user_local_registry_path, user_local_registry)
+    return newly_added_harness_ids
+
+
+def backfill_bundled_fields_missing_from_existing_user_local_harness_entries(
+    *,
+    bundled_harnesses: Mapping[str, Any],
+    user_local_harnesses: dict[str, Any],
+    harness_ids_added_by_this_merge: frozenset[str] = frozenset(),
+) -> dict[str, list[str]]:
+    """给**已存在**的 harness 条目补上「出厂后来新增、user-local 从未有过」的字段。
+
+    就地改写 ``user_local_harnesses``，返回 ``{harness_id: [被补上的字段名]}``。
+
+    **为什么条目级 additive 不够**：它只挡住「新腿进不来」，挡不住「新字段进不来」。
+    一台已部署过的机器，其 cursor / claude_code / codex 三条腿是首次部署那天的形状；
+    之后往出厂条目里加的字段（第一例是
+    ``underlying_provider_account_quota_pool_identity``）对它们永远不可见，
+    于是依赖该字段的选腿约束（同额度池互斥）在生产路径上**静默失效**——
+    部署照常成功、双评审照常跑两条腿，没有任何一处会察觉。这与当初「新腿永远
+    进不来」是同一个假绿形状，只是降了一级粒度。
+
+    **判据是「键在不在」而不是「值等不等于出厂值」**：键不存在 ⇒ 用户从未对它表达过
+    意见（那天这个字段还不存在），补进去不算改用户的值；键存在 ⇒ 用户资产，值一律
+    原样保留，包括显式改过的值、显式置空的值、以及恰好等于出厂值的值。
+
+    **只补顶层键**：出厂条目全是标量字段。递归合并会引入「用户改过的嵌套结构被部分
+    覆盖」这种更难解释的语义，等真出现嵌套字段时再单独设计。
+    """
+    backfilled_field_names_by_harness_id: dict[str, list[str]] = {}
+    for harness_id, bundled_spec in bundled_harnesses.items():
+        if harness_id in harness_ids_added_by_this_merge:
+            continue
+        user_local_spec = user_local_harnesses.get(harness_id)
+        if not isinstance(bundled_spec, dict) or not isinstance(user_local_spec, dict):
+            continue
+        backfilled_field_names = sorted(
+            field_name
+            for field_name in bundled_spec
+            if field_name not in user_local_spec
+        )
+        if not backfilled_field_names:
+            continue
+        for field_name in backfilled_field_names:
+            user_local_spec[field_name] = bundled_spec[field_name]
+        backfilled_field_names_by_harness_id[harness_id] = backfilled_field_names
+    return backfilled_field_names_by_harness_id
 
 
 def legacy_default_cline_kanban_env_value(name: str, value: str | None) -> str | None:
@@ -1190,12 +1482,20 @@ def configure_stop_hook(
             "CODEX_RVF_DEV_SYNC_COMMAND_TIMEOUT=180",
             "CODEX_RVF_STOP_HOOK_CHAIN_TIMEOUT=60",
             f"CODEX_RVF_DEV_REPO={shlex.quote(str(ROOT))}",
-            f"python3 {shlex.quote(str(router))}",
         ]
     )
     entry = {
         "type": "command",
-        "command": " ".join(env_parts),
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(router)),
+            hook_event_name="Stop",
+            environment_assignment_prefix=" ".join(env_parts),
+            # env 前缀只作用于 python3 那一条命令，面包屑分支读不到它烘焙的
+            # RVF_USER_LOCAL_DATA_ROOT，故把已解析的根显式传进守卫。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
+        ),
         "timeout": 300,
         "statusMessage": "Review-Validate-Fix：选择通道并运行停止检查",
     }
@@ -1239,6 +1539,247 @@ def configure_stop_hook(
     return hooks_path
 
 
+KIMI_CODE_HOME_ENVIRONMENT_VARIABLE = "KIMI_CODE_HOME"
+KIMI_DEFAULT_HOME_RELATIVE_TO_USER_HOME = ".kimi-code"
+
+
+def resolve_kimi_code_home(
+    *,
+    environment: Mapping[str, str] | None = None,
+    home_directory: Path | None = None,
+) -> Path:
+    environment = os.environ if environment is None else environment
+    override = environment.get(KIMI_CODE_HOME_ENVIRONMENT_VARIABLE)
+    if override:
+        return Path(override).expanduser()
+    base = home_directory if home_directory is not None else Path.home()
+    return Path(base) / KIMI_DEFAULT_HOME_RELATIVE_TO_USER_HOME
+
+
+def verify_kimi_plugin_registry_after_write(
+    registry_path: Path,
+    *,
+    expected_plugin_record: Mapping[str, Any],
+    expected_other_plugin_ids: Iterable[Any],
+) -> dict[str, Any]:
+    """读回刚写的 ``installed.json``，确认落盘的确实是我们写的那份。
+
+    存在的理由见 ``configure_kimi_plugin_registration`` 的「丢更新竞争」段：这条写入无锁无 CAS，
+    运行中的 Kimi 会用它内存里的旧 registry 全量重写。复验抓的是**写入时点**的三类真实故障：
+    没落盘、我们自己的 merge 写错、以及在 ``replace`` 与复验之间发生的覆盖。
+
+    返回的 ``registry_sha256`` 是给事后对账的锚：``kimi_plugin_manifest_activation_state_check.py``
+    在任意后续时刻再算一次，对不上就说明注册在部署之后被覆盖掉了。它**不**证明注册此刻还在——
+    无锁写入给不出那种保证。
+    """
+    registry_bytes = registry_path.read_bytes()
+    try:
+        verified_document = json.loads(registry_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：读回的内容不是合法 JSON（{exc}）"
+        ) from exc
+    verified_records = verified_document.get("plugins")
+    if not isinstance(verified_records, list):
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：读回的文档里没有 plugins 列表"
+        )
+    verified_plugin_ids = [
+        record.get("id") for record in verified_records if isinstance(record, dict)
+    ]
+    landed_record = next(
+        (
+            record
+            for record in verified_records
+            if isinstance(record, dict)
+            and record.get("id") == expected_plugin_record["id"]
+        ),
+        None,
+    )
+    if landed_record != dict(expected_plugin_record):
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：我们写入的 {expected_plugin_record['id']} 记录"
+            f"不在读回内容里（读到 {landed_record!r}）。最可能的成因是运行中的 Kimi 用内存里的"
+            "旧 registry 全量重写了它——请退出 Kimi 后重试部署，或重试后执行 /plugins reload"
+        )
+    missing_other_plugin_ids = sorted(
+        str(plugin_id)
+        for plugin_id in set(expected_other_plugin_ids) - set(verified_plugin_ids)
+    )
+    if missing_other_plugin_ids:
+        raise OfficialCliInstallationError(
+            f"{registry_path} 写后复验失败：用户原有插件被掀掉了 {missing_other_plugin_ids}"
+        )
+    return {
+        "registry_sha256": hashlib.sha256(registry_bytes).hexdigest(),
+        "plugin_ids": sorted(str(plugin_id) for plugin_id in verified_plugin_ids),
+    }
+
+
+def configure_kimi_plugin_registration(
+    active_marketplace_root: Path,
+    *,
+    kimi_code_home: Path | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """把 RVF 注册进 Kimi 的 ``plugins/installed.json``（幂等 additive merge）。
+
+    **为什么是「写文件」而不是调 CLI**：Kimi 的插件注册在四条跨进程通道上全部不可达——
+    `kimi --help` 无 `plugin` 子命令、`kimi web` 的 REST 路由表与 WebSocket frame 全集里
+    没有任何 plugin 操作、`AcpServer` 的 28 个方法含 plugin 的为 0。`installPlugin` 只是
+    TUI 与 kernel 之间的进程内 RPC。手改 `installed.json` + `/plugins reload` 是 Kimi
+    **官方认可**的路径（它自己的错误文案逐字这么写）。
+
+    **两条必须守住的约束**：
+
+    1. **幂等 additive merge。** 全量重写会掀掉用户装的其它插件。这里只替换/插入
+       ``id == review-validate-fix`` 那一条。
+    2. **``state`` 写不进去。** ``persist()`` 只落 9 个字段，``state`` / ``manifest`` /
+       ``diagnostics`` 都是加载时派生的内存值。所以本函数**不写** state，调用方也**不得**
+       靠读它来确认生效——生效与否由 ``kimi_plugin_manifest_activation_state_check.py``
+       独立复算（「安装器写完了」永远不等于「注册生效了」）。
+
+    ⚠️ **丢更新竞争**：Kimi 在内存里持有完整 registry，并以固定 ``installed.json.tmp``
+    **全量重写**，没有跨进程锁也没有 CAS ⇒ 运行中的 TUI/web 会覆盖掉我们刚写的内容。
+
+    本函数**刻意不做进程探测**：「有没有 Kimi 在跑」两个方向都判不准——误判成「在运行」会让
+    部署无谓失败，判成「没在跑」也拦不住下一秒才启动的实例；那种信号进了 receipt 也不构成
+    可对账的凭据。实际兜底是三层，全部可验证：
+
+    1. **写后复验**（本函数实现）：``replace`` 之后立刻读回，比对我们那条记录是否逐字落盘、
+       别人插件的 id 集合是否原样保留；不符即 fail closed。复验结果连同读回内容的 sha256
+       进 receipt 的 ``post_write_verification``。
+    2. ``requires_manual_reload_command``：让用户显式 ``/plugins reload`` 收敛内存态。
+    3. ``kimi_plugin_manifest_activation_state_check.py`` 事后**独立复算**生效状态；把当时
+       文件的 sha256 与 1 记下的那个一比，就能看出注册有没有被运行中的 Kimi 覆盖掉。
+
+    复验是**时点观测**，不是「注册一定还在」的保证——无锁写入本来就给不出那种保证，这一点
+    必须照直写，否则读者会把 receipt 当成比它更强的证据。
+
+    ⚠️ **状态根只能用默认值**：Kimi 的 ``enabledHooks()`` 只注入 ``KIMI_CODE_HOME`` 与
+    ``KIMI_PLUGIN_ROOT`` 两个变量，而 hook 命令写在**进 payload 的静态** manifest 里、
+    不能带本机绝对路径 ⇒ Kimi 侧的 hook 子进程拿不到 Codex 侧那串显式 ``RVF_*`` env 前缀，
+    只能落到 ``~/.rvf/user-local-data`` 默认根。单机部署下这就是正确值；但如果将来要支持
+    非默认状态根，得改 manifest 的生成方式（而不是在这里塞 env）。
+    """
+    kimi_home = kimi_code_home or resolve_kimi_code_home()
+    plugin_root = active_marketplace_root / f"plugins/{PLUGIN_NAME}"
+    registry_path = kimi_home / "plugins" / "installed.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_document: dict[str, Any] = {}
+    if registry_path.is_file():
+        try:
+            loaded = json.loads(registry_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing_document = loaded
+        except json.JSONDecodeError as exc:
+            # Kimi 对非法 JSON 是抛错（整个 plugin store 加载失败），不是当空 registry。
+            # 直接覆盖会掩盖用户那边的问题，所以 fail closed。
+            raise OfficialCliInstallationError(
+                f"{registry_path} 不是合法 JSON（{exc}）；请先修复它再重试部署"
+            ) from exc
+
+    existing_records = existing_document.get("plugins")
+    if not isinstance(existing_records, list):
+        existing_records = []
+
+    timestamp = now or utc_now()
+    previous = next(
+        (
+            record
+            for record in existing_records
+            if isinstance(record, dict) and record.get("id") == PLUGIN_NAME
+        ),
+        None,
+    )
+    record = {
+        "id": PLUGIN_NAME,
+        "root": str(plugin_root),
+        "source": str(plugin_root),
+        "enabled": True,
+        # 首次注册才记 installedAt；重复部署保留原值，让「装了多久」这个事实不被刷掉。
+        "installedAt": (previous or {}).get("installedAt") or timestamp,
+        "updatedAt": timestamp,
+        "originalSource": str(plugin_root),
+        "capabilities": [],
+        "github": None,
+    }
+    merged_records = [
+        existing
+        for existing in existing_records
+        if not (isinstance(existing, dict) and existing.get("id") == PLUGIN_NAME)
+    ]
+    merged_records.append(record)
+    existing_document["plugins"] = merged_records
+
+    temporary_path = registry_path.with_suffix(".json.rvf-tmp")
+    temporary_path.write_text(
+        json.dumps(existing_document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(registry_path)
+
+    post_write_verification = verify_kimi_plugin_registry_after_write(
+        registry_path,
+        expected_plugin_record=record,
+        expected_other_plugin_ids=[
+            existing.get("id")
+            for existing in merged_records
+            if isinstance(existing, dict) and existing.get("id") != PLUGIN_NAME
+        ],
+    )
+
+    return {
+        "kimi_code_home": str(kimi_home),
+        "installed_registry_path": str(registry_path),
+        "plugin_root": str(plugin_root),
+        "was_already_registered": previous is not None,
+        "preserved_other_plugin_count": len(merged_records) - 1,
+        "requires_manual_reload_command": "/plugins reload",
+        "post_write_verification": post_write_verification,
+    }
+
+
+def kimi_plugin_registration_outcome_for_deployment_receipt(
+    active_marketplace_root: Path,
+    *,
+    enabled: bool,
+    register_kimi_plugin: Callable[[Path], dict[str, Any]] = (
+        configure_kimi_plugin_registration
+    ),
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """跑 Kimi 注册，把结果**降级成回执字段**；返回 ``(注册回执, 失败回执)``，本函数永不抛。
+
+    Kimi 注册是部署链的最后一环：调用它的时候，Codex/Claude 的 marketplace 事务、两个官方
+    CLI 的安装、以及 Stop hook 配置都已经不可回滚地完成了，只差写部署回执。而它对损坏的
+    ``installed.json`` 是显式 raise（另有 mkdir/write 的 OSError 面），``main()`` 的 except
+    只打印并 ``return 2``——既不回滚已提交的部署，也**不写回执**。
+
+    于是一个第三方产品的坏文件（甚至根本没装 Kimi 的用户手里一份损坏的
+    ``~/.kimi-code/plugins/installed.json``）就能让「Claude/Codex 实际已部署新版、回执仍停在
+    旧版」。回执是本仓判 deploy-lag 的**唯一凭据**，停在旧版比 Kimi 没注册上危险得多：前者
+    让整套「先核验部署版本再断言因果」的纪律读到假事实，后者只是第三个 host 少一个 hook。
+
+    所以这一环非致命：失败写进回执里**独立的** ``kimi_plugin_registration_failure`` 字段
+    （不是把成功字段填成空，那样区分不了「没启用」和「失败了」），并打到 stderr。
+    """
+    if not enabled:
+        return None, None
+    try:
+        return register_kimi_plugin(active_marketplace_root), None
+    except Exception as kimi_registration_error:  # noqa: BLE001 — 见 docstring：这一环必须非致命
+        failure = {
+            "error_type": type(kimi_registration_error).__name__,
+            "message": str(kimi_registration_error),
+        }
+        print(
+            "RVF Kimi plugin registration FAILED（非致命；Codex/Claude 部署与部署回执不受影响）: "
+            f"{kimi_registration_error}",
+            file=sys.stderr,
+        )
+        return None, failure
+
+
 def configure_user_prompt_submit_hook(
     plugin_skill_dir: Path,
     *,
@@ -1255,14 +1796,21 @@ def configure_user_prompt_submit_hook(
     detector = plugin_skill_dir / "scripts/rvf_user_prompt_submit.py"
     entry = {
         "type": "command",
-        "command": " ".join(
-            [
-                f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
-                f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
-                f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
-                f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
-                f"python3 {shlex.quote(str(detector))}",
-            ]
+        "command": hook_command_guarded_against_missing_target_script(
+            target_script_shell_literal=shlex.quote(str(detector)),
+            hook_event_name="UserPromptSubmit",
+            environment_assignment_prefix=" ".join(
+                [
+                    f"RVF_USER_LOCAL_DATA_ROOT={shlex.quote(str(paths.user_local_data_root))}",
+                    f"CODEX_RVF_LOG_ROOT={shlex.quote(str(paths.run_logs_root))}",
+                    f"CODEX_RVF_STATE_DIR={shlex.quote(str(paths.runtime_state_root))}",
+                    f"CODEX_RVF_INSTALLED_SKILL_DIR={shlex.quote(str(plugin_skill_dir))}",
+                ]
+            ),
+            # 同 configure_stop_hook：面包屑根必须显式传，不能指望 ambient 环境变量。
+            hook_target_missing_breadcrumb_directory_shell_literal=shlex.quote(
+                str(paths.user_local_data_root)
+            ),
         ),
         "timeout": 5,
     }
@@ -1330,6 +1878,15 @@ def _parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--configure-stop-hook", action="store_true")
     parser.add_argument("--configure-user-prompt-submit-hook", action="store_true")
+    parser.add_argument(
+        "--configure-kimi-plugin-registration",
+        action="store_true",
+        help=(
+            "把 RVF 注册进 Kimi 的 plugins/installed.json（幂等 additive merge）。"
+            "Kimi 没有任何可自动化的 plugin CLI/RPC 入口，手改该文件 + /plugins reload "
+            "是官方认可路径；写完仍须由 kimi_plugin_manifest_activation_state_check.py 独立复验。"
+        ),
+    )
     parser.add_argument("--fork-mode", default="auto")
     parser.add_argument("--cline-kanban-start-cmd")
     parser.add_argument("--cline-kanban-task-cmd")
@@ -1487,6 +2044,13 @@ def main(argv: list[str] | None = None) -> int:
                 plugin_skill_dir,
                 user_local_data_paths=user_local_data_paths,
             )
+        (
+            kimi_plugin_registration,
+            kimi_plugin_registration_failure,
+        ) = kimi_plugin_registration_outcome_for_deployment_receipt(
+            active_marketplace_root,
+            enabled=args.configure_kimi_plugin_registration,
+        )
         receipt = {
             "schema_version": DEPLOYMENT_RECEIPT_SCHEMA_VERSION,
             "status": "installed",
@@ -1499,12 +2063,34 @@ def main(argv: list[str] | None = None) -> int:
             "release_root": str(release.release_root),
             "active_marketplace_root": str(active_marketplace_root),
             "marketplace_identifier": DEVELOPER_MARKETPLACE_NAME,
+            # 只记「写了什么」，绝不记「生效了」——Kimi 的 state 不落盘，生效与否必须由
+            # kimi_plugin_manifest_activation_state_check.py 独立复算。
+            "kimi_plugin_registration": kimi_plugin_registration,
+            "kimi_plugin_registration_failure": kimi_plugin_registration_failure,
             "plugin_selector": DEVELOPER_PLUGIN_SELECTOR,
             "codex_executable": str(codex_executable),
             "claude_executable": str(claude_executable),
             "official_cli_versions": official_cli_versions,
             "official_cli_commands": [
                 list(command) for command in official_cli_result.commands
+            ],
+            "removed_noncanonical_plugin_selectors": {
+                "codex": list(
+                    official_cli_result.removed_noncanonical_codex_plugin_selectors
+                ),
+                "claude": list(
+                    official_cli_result.removed_noncanonical_claude_plugin_selectors
+                ),
+            },
+            "codex_bundled_plugin_hook_suppression": (
+                official_cli_result.codex_bundled_plugin_hook_suppression
+            ),
+            "live_codex_sessions_holding_plugin_cache_paths_to_be_removed": [
+                dict(finding)
+                for finding in (
+                    official_cli_result
+                    .live_codex_sessions_holding_plugin_cache_paths_to_be_removed
+                )
             ],
             "hooks_path": str(hooks_path) if hooks_path else None,
             "user_local_data_root": str(user_local_data_paths.user_local_data_root),
@@ -1527,6 +2113,13 @@ def main(argv: list[str] | None = None) -> int:
             "RVF official CLI installation OK: "
             f"{receipt['generated_plugin_version']} @ {actual_commit[:12]}"
         )
+        # 非致命≠可以静默：Kimi 这一环失败时，人类摘要里必须看得见，否则「降级」就变成了隐瞒。
+        if receipt.get("kimi_plugin_registration_failure"):
+            print(
+                "  ⚠️ Kimi 插件注册未完成（非致命，Codex/Claude 已部署且回执已写）: "
+                f"{receipt['kimi_plugin_registration_failure']['message']}",
+                file=sys.stderr,
+            )
     return 0
 
 

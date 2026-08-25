@@ -16,6 +16,19 @@
 agent 指令，**一条真失败也没有**。一个 100% 假阳性的告警通道会训练人忽略它，真故障随之被
 一并忽略。腾出 `decision:block` 专供真失败，这个信号才重新有意义。
 
+### 0.1 一个**不是**错误、却也走 `developer_only` 的出口（读到它别以为是违规）
+
+决策点横幅在 cline-kanban task 内改走**带外投递**（经终端投递成为一条真实 user message）之后，
+那次 Stop 的 stdout 走的是 `developer_only` + `systemMessage`——尽管它既不是失败也不是降级。
+
+这不是给铁律开的口子，而是铁律的正确应用：**这一刻 stdout 上确实没有任何要驱动 agent 的东西**。
+正文根本不在 stdout 里，它几秒后作为一条 user message 到达并自己开一个新回合。若给它安一个
+「携带 agent_directive 但不渲染进 stdout」的第三受众，契约就会声称「本次出口驱动了 agent」，
+而实际可能根本没送达——那是把契约变成谎言。
+
+带外路径上契约不是权威。权威是三样东西：投递意图 marker（`kanban_followup_lock` 的第三族）、
+decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECISION_TOKEN=<token>` 的那一刻。
+
 ---
 
 ## 1. Claude Code 的 Stop hook 有**三**条出口
@@ -58,9 +71,10 @@ agent 指令，**一条真失败也没有**。一个 100% 假阳性的告警通�
 
 | 能力 | Claude | Codex | Cursor | Kimi | Oh My Pi | DeepSeek |
 | --- | --- | --- | --- | --- | --- | --- |
-| `decision:block` | ✅ | ✅ | ✅ 仅交互 | ✅ | ✅ | ✅ |
+| `decision:block` | ✅ | ✅ | ✅ 仅交互 | ❌ **见下方纠错** | ✅ | ✅ |
 | **Stop 上 `additionalContext`** | ✅ | ❌ `additionalProperties:false`（发过去整条 hook 输出 Failed） | ❌ | ❌ | ✅ | ❌ |
-| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ | ✅ | ❌ |
+| **Stop 上 `hookSpecificOutput.permissionDecision:"deny"`** | ❌ | ❌ | ❌ | ✅ **唯一可用通道** | ❌ | ❌ |
+| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ 静默丢弃（无害） | ✅ | ❌ |
 | **UPS 上 `additionalContext`** | ✅ | ✅ | ✅ | ⚠️ exit-0 stdout | ✅ | ✅ |
 
 **跨宿主适配负担集中在 Stop**，UPS 侧 additionalContext 基本全家都支持。
@@ -68,6 +82,43 @@ agent 指令，**一条真失败也没有**。一个 100% 假阳性的告警通�
 **Codex 的 `additionalProperties:false` 是硬约束**：给 Codex 发 `hookSpecificOutput` 会让整条
 hook 输出被判 Failed = RVF 在 Codex 上静默停摆。所以 host 未知时**必须**兜底到最保守的
 `decision:block`，绝不赌未知 host 认识 `hookSpecificOutput`。
+
+### ⛔ 纠错（2026-08-23 取证）：Kimi **不**认 `decision:block`
+
+本表此前把 Kimi 的 `decision:block` 记为 ✅。**那是错的**，且这条错误会诱导出一个危险的设计
+判断——「Kimi 被误判成 Codex 只是降级，仍能工作」。实际是**完全失声**。
+
+kimi 0.29.1 二进制内嵌源码逐字：
+
+```js
+HookJsonOutputSchema = looseObject({
+    message: OptionalStringSchema,
+    hookSpecificOutput: HookSpecificOutputSchema,   // { message, permissionDecision, permissionDecisionReason }
+});
+// …
+const { message, hookSpecificOutput } = output.data;
+if (hookSpecificOutput?.permissionDecision !== "deny") return result;   // ← 唯一的 block 判据
+```
+
+schema 只**命名** `message` 与 `hookSpecificOutput` 两个键。`looseObject` 会让顶层
+`decision:"block"` 通过校验（不报错），但解构处**从不读它** ⇒ 结果是 `allow`。
+
+⇒ 三条后果，实现时都要按最坏情况处理：
+
+1. **Kimi 上发错线材 = 静默 allow + 零报错。** 与 Codex 的「整条 Failed」相反，这里没有任何
+   可观测的失败信号，只有「RVF 好像没反应」。
+2. `permissionDecision` 的 zod 类型是 `unknown().optional()`，判据是 JS 全等 `!== "deny"`
+   ⇒ 必须是**字面量** `"deny"`，大小写错、拼接得到的同值字符串以外的任何偏差都静默降级。
+   本仓把它单列为常量 `STOP_HOOK_PERMISSION_DECISION_DENY` 并由 gate AUD-5 钉住。
+3. `systemMessage` 在 Kimi 上落在 `looseObject` 的未命名区 ⇒ 被保留但从不读取。翻译层
+   **仍然照附**（三通道一律附），因为 `_apply_guardian_liveness_alarm` 本就会写它、
+   且 ledger 的 `emitted_payload` 是跨 host 复盘的唯一真相源。代价为零，去掉反而自相矛盾。
+
+顺带取证到的两条实现约束：hook 子进程的 `DEFAULT_TIMEOUT_SECONDS = 30`（manifest 应显式声明
+timeout，别吃默认值）；`HookSpecificOutputSchema` 内层只命名三个键，故翻译层的 Kimi 分支
+**不发** `hookEventName`（那是 Claude 专属的事件校验键）。
+
+完整取证见 `kimi-code-cli-plugin-and-hook-runtime-forensics.md`。
 
 ---
 
@@ -101,6 +152,11 @@ return StopDecision(
 
 - `ClaudeCodeHostAdapter` → `non_error_additional_context`
 - `CodexHostAdapter`（含 host 未知兜底）→ `blocking_decision`
+- `KimiCodeCliHostAdapter` → `hook_specific_output_permission_decision_deny`
+
+通道分派是**穷举 + 末尾 `raise`**，没有 `else` 兜底：新增通道却漏加渲染分支时必须当场炸，
+而不是悄悄退化成某个 host 的形状。`_self_check` 另有一条完备性断言，要求每条已登记通道都
+渲染出**两两可辨**的线上形状。
 
 当前会话的 host 由 `resolve_current_session_host_adapter(event)` 判定，判据从强到弱：
 `event["source"]["provider"] == "claude-code"`（Claude 入口亲手打的标）→ 会话路径落在
@@ -160,7 +216,51 @@ ledger，不是宿主 transcript。
 
 ---
 
-## 6. 已知残留
+## 6. 宿主侧缺口：hook **根本没跑起来**时，契约在下游
+
+本文前五节管的都是「RVF 的 core 跑起来了，往哪个出口写什么」。有一整族失败**在这之前**：
+hook 命令起不来。此时 RVF 的一切自我保护——受众翻译层、`is_foreign_invocation`、
+nudge 预算——**全部在失败的下游，一行都跑不到**。
+
+### 危险条件精确到一种
+
+| 失败形态 | Codex 0.147.0 | Claude Code 2.1.235 |
+| --- | --- | --- |
+| **退出码 2 + stderr 非空** | ✅ **驱动 agent**：stderr 逐字成为 `<hook_prompt>` 续跑提示 | ✅ **驱动 agent**：`Exit code 2 - show stderr to model and continue conversation` |
+| 退出码 2 + stderr 为空 | ❌ 落到错误模板 | ❌ |
+| 其它非零退出码（含 `python3` 缺失的 127） | ❌ | ❌ `Other exit codes - show stderr to user only` |
+| 超时 / 非法 JSON / 退出码 0 带 stderr | ❌ | ❌ |
+
+而 `python3 <不存在的脚本>` 的退出码**正好是 2**，stderr 正好是
+`[Errno 2] No such file or directory` ⇒ 命中唯一那格。
+
+`<hook_prompt>` 不是「失败通道」，它就是 **Stop 的续跑通道本身**——RVF 正常的决策点横幅
+走的也是它。投递到模型侧后两者不可区分。
+
+**没有任何上界。** 实测 286 次注入、同一个 `turn_id`、持续 2h37m，最后由人工 kill；
+Codex 二进制里不存在任何失败计数器标识符，也**没有**把 hook 失败降级为 developer-only 的
+配置开关（`[hooks.state]` 只有 `enabled` 与 `trusted_hash` 两个键）。
+
+### 所以守卫只能活在命令串里
+
+命令串是宿主在**会话启动时**快照的一部分，磁盘被掏空也照样存在。
+`core/hook_command_spawn_guard_against_missing_target_script.py` 把每条 hook 命令包成
+「目标脚本不在就静默 `exit 0` + 往 `~/.rvf/user-local-data/rvf-hook-target-missing.log`
+留一行 developer-only 面包屑」。这不是新契约，是把 §0 的铁律贯彻到 core 够不着的那一段。
+
+隔离 `CODEX_HOME` 真实会话对照（同一份 payload、同一条悬空路径）：
+
+| 命令形态 | `<hook_prompt>` 次数 | 收尾 |
+| --- | --- | --- |
+| `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/stop.py"`（改造前） | **32 次 / 100 秒**，不自停 | 被硬超时 kill |
+| spawn 守卫（改造后） | **0** | 14.2 秒 exit 0，面包屑 1 行 |
+
+**改任何写 hook 命令串的代码时（`hooks/hooks.json`、`install_to_codex.py` 的烘焙点），
+都必须经由该守卫**——`tests/test_hook_command_spawn_guard.py` 有结构性 gate。
+
+---
+
+## 7. 已知残留
 
 - Codex 上 agent-directive 仍走 `decision:block`，harness 照旧把它渲染成错误。这是 Codex 侧
   `additionalProperties:false` 的硬约束，不是 RVF 的选择。

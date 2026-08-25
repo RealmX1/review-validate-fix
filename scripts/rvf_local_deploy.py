@@ -35,6 +35,36 @@ PARTIAL_REMEDIATION = (
     "修复失败原因后，从 local main 重新运行 runner；payload 只能来自 RVF 专用 deploy 源 "
     "worktree 的 HEAD checkout，不得降级到手写 plugin cache 或 installed payload。"
 )
+OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE = 3
+"""verifier 判定「宿主里存在第二份 RVF 注册 / payload 树」时的专属退出码。
+
+必须与 `plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py`
+的 ``REGISTRATION_UNIQUENESS_EXIT_CODE`` 逐字一致（两边同源于一个 commit，
+`tests/test_official_cli_local_deploy_verification.py` 里有等值断言守着漂移）。
+
+这个退出码是「不回滚」的唯一判据：注册唯一性失败必须**保留刚装好的 canonical**、只拒绝认证；
+把它并进通用失败分支就会回滚掉 canonical，把机器留在「只剩残留那份」的更差状态。
+
+注意它**只**是 verifier 子进程的退出码，不透传成 runner 自己的退出码——runner 的 3 早已是
+「已有 RVF local deploy 正在运行」（见 `_deployment_lock`）。
+"""
+CODEX_SOLE_REGISTRATION_STATUS = "sole_registration"
+"""`_sole_review_validate_fix_registration_in_codex_config` 唯一够格认证部署的状态。
+
+门禁按「是否等于这个状态」判定，而不是「是否等于某个已识别的坏状态」：后者会把
+`unavailable`（根本没核到）与 `canonical_selector_not_registered`（canonical 根本没注册）
+当成好状态放行。
+"""
+CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS = "canonical_selector_not_registered"
+"""config.toml 可读、但 canonical selector 根本不在 `[plugins.*]` 注册表里。
+
+不能读成「唯一」：没有第二份，不等于 canonical 那一份在。
+"""
+REGISTRATION_UNIQUENESS_REMEDIATION = (
+    "先按上面的清理命令清掉非 canonical 的 RVF 注册/残留，再重新运行 runner 重新认证；"
+    "canonical 安装本身已就位，**不要**用回滚去「修」这个失败——回滚只会移除 canonical、"
+    "把机器留在只剩残留那份的更差状态。"
+)
 
 
 class DeployError(RuntimeError):
@@ -898,7 +928,15 @@ def _run_phase(
     *,
     deployment_source_worktree: Path,
     environment: dict[str, str],
+    child_exit_codes_preserved_on_failure: frozenset[int] = frozenset(),
 ) -> str:
+    """跑一个部署阶段；非零退出一律抛 `DeployError`。
+
+    ``child_exit_codes_preserved_on_failure`` 里的退出码会被原样带进
+    ``DeployError.exit_code``，让调用方分辨**这一类**失败该走哪条处置路径（当前用途：verifier
+    的注册唯一性失败不得回滚）。其余退出码一律折叠成 1，避免子进程的退出码约定悄悄变成 runner
+    自己的对外契约。
+    """
     completed = subprocess.run(
         argv,
         cwd=deployment_source_worktree,
@@ -910,7 +948,14 @@ def _run_phase(
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        raise DeployError(f"{label} 失败: {detail}")
+        raise DeployError(
+            f"{label} 失败: {detail}",
+            exit_code=(
+                completed.returncode
+                if completed.returncode in child_exit_codes_preserved_on_failure
+                else 1
+            ),
+        )
     return completed.stdout.strip()
 
 
@@ -1028,6 +1073,9 @@ def run_local_deploy(
                 result=failed,
             ) from exc
 
+        # 失败 receipt 也要能带上「失败前已经拿到的现场」，所以先绑定，避免异常处置分支撞上未绑定名。
+        contract_output: str | None = None
+        installer_receipt: dict[str, Any] | None = None
         contract_command = [sys.executable, str(paths["contract"])]
         installer_command = [
             sys.executable,
@@ -1038,6 +1086,7 @@ def run_local_deploy(
             source.commit,
             "--configure-stop-hook",
             "--configure-user-prompt-submit-hook",
+            "--configure-kimi-plugin-registration",
             "--json",
         ]
 
@@ -1095,6 +1144,10 @@ def run_local_deploy(
                 verifier_command,
                 deployment_source_worktree=deployment_source_worktree,
                 environment=environment,
+                # verifier 的注册唯一性失败必须能与其余验证失败分开处置（不回滚）。
+                child_exit_codes_preserved_on_failure=frozenset(
+                    {OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE}
+                ),
             )
             try:
                 verification = json.loads(verifier_output)
@@ -1108,6 +1161,33 @@ def run_local_deploy(
                     "部署后 official installation receipt 未收敛到 local main commit"
                 )
         except DeployError as exc:
+            if exc.exit_code == OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE:
+                # verifier 判定宿主里存在第二份 RVF 注册 / payload 树。**刻意不回滚**：canonical
+                # 刚装好，回滚会把它一并移除，只留下残留那份——正是这条门禁要消灭的局面。正确的
+                # severity 是「部署做完但拒绝认证」。
+                #
+                # 这个判断必须写在这里（通用 except 的最前面）而不是下游的 config.toml 门禁里：
+                # verifier 先抛，先被这个通用 except 接住，写在下游根本轮不到执行。
+                registration_uniqueness_not_certified = result_for(
+                    status="failed",
+                    phase="official_cli_plugin_registration_uniqueness",
+                    error=str(exc),
+                    rollback_status="not_required",
+                    remediation=REGISTRATION_UNIQUENESS_REMEDIATION,
+                    contract_output=contract_output,
+                    installer=installer_receipt,
+                )
+                _write_result_receipt(
+                    result_receipt_path, registration_uniqueness_not_certified
+                )
+                raise DeployError(
+                    f"{exc}；{REGISTRATION_UNIQUENESS_REMEDIATION}",
+                    # 刻意**不**把 verifier 的退出码原样透传给 runner 自己的 CLI：runner 的 3
+                    # 早已是「已有 RVF local deploy 正在运行」。这里与下游 config.toml 门禁
+                    # 统一用 2（部署失败/拒绝认证）。
+                    exit_code=2,
+                    result=registration_uniqueness_not_certified,
+                ) from exc
             rollback_result: dict[str, Any] | None = None
             rollback_error: str | None = None
             if installation_mutation_phase_started:
@@ -1179,6 +1259,41 @@ def run_local_deploy(
                 result=failed,
             ) from exc
 
+        codex_registration_uniqueness = (
+            _sole_review_validate_fix_registration_in_codex_config(
+                home, installer_receipt=installer_receipt
+            )
+        )
+        codex_hook_trust = _observe_codex_hook_trust(
+            home, installer_receipt=installer_receipt
+        )
+        if codex_registration_uniqueness.get("status") != CODEX_SOLE_REGISTRATION_STATUS:
+            # 认证要的是**正向证明**：canonical 确实在册、且只有它一份。任何别的状态都不够格——
+            # `multiple_registrations` 是已识别的多注册，`canonical_selector_not_registered`
+            # 是 canonical 根本没注册，`unavailable` 是根本没核到（「核不到」不是「核过了」）。
+            # 只排除已识别的坏状态，会把后两类当成好状态放行。
+            #
+            # 刻意不走上面的 rollback 分支：回滚会移除刚装好的 canonical，只留下残留那份，更差。
+            registration_not_certified = result_for(
+                status="failed",
+                phase="codex_registration_uniqueness",
+                error=codex_registration_uniqueness["note"],
+                rollback_status="not_required",
+                remediation=REGISTRATION_UNIQUENESS_REMEDIATION,
+                contract_output=contract_output,
+                installer=installer_receipt,
+                verification=verification,
+                codex_hook_trust=codex_hook_trust,
+                codex_registration_uniqueness=codex_registration_uniqueness,
+            )
+            _write_result_receipt(result_receipt_path, registration_not_certified)
+            cleanup_commands = codex_registration_uniqueness.get("remediation")
+            raise DeployError(
+                codex_registration_uniqueness["note"]
+                + (f" 清理命令: {cleanup_commands}" if cleanup_commands else ""),
+                exit_code=2,
+                result=registration_not_certified,
+            )
         # `source_commit_delta` 只挂在**成功**结果上，且必须走 `result_for(**extra)`：
         # `result_for` 同时服务 status=running / failed，把它塞进函数本体等于给失败与回滚
         # 结果也发一份「已投入使用」的 forward 列表。位置也必须在上面那个 except 之外——
@@ -1196,9 +1311,8 @@ def run_local_deploy(
                 ),
                 newly_installed_commit=source.commit,
             ),
-            codex_hook_trust=_observe_codex_hook_trust(
-                home, installer_receipt=installer_receipt
-            ),
+            codex_hook_trust=codex_hook_trust,
+            codex_registration_uniqueness=codex_registration_uniqueness,
         )
         _write_result_receipt(result_receipt_path, completed)
         return completed
@@ -1249,6 +1363,136 @@ def _deployed_plugin_payload_root_from_installer_receipt(
             f"回执给出的 plugin payload 根不存在: {payload_root}",
         )
     return payload_root, selector, None
+
+
+def _sole_review_validate_fix_registration_in_codex_config(
+    home: Path, *, installer_receipt: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """核对 `~/.codex/config.toml` 里 **canonical selector 在册、且只有它一份**。**阻断 deploy。**
+
+    与同文件的 `_observe_codex_hook_trust` 刻意分成两件事：那一项是观测（重新信任是人的决定，
+    且本机未必用 Codex），这一项是硬约束。本机的双份 RVF 注册正是「只观测、只写文档、从不阻断」
+    烂了三周的产物——两棵不同 commit 的插件树并行执行、各写各的 `review-highwater` 高水位。
+
+    刻意**不触发部署回滚**：回滚会移除刚装好的 canonical、把机器留在「只剩旧那份」的更差状态。
+    正确的 severity 是「部署做完但拒绝认证」，让人去清理残留。
+
+    canonical selector 一律取自安装器回执的 ``plugin_selector``，不在这里硬拼 marketplace 名。
+
+    返回的 ``status`` 只有 `CODEX_SOLE_REGISTRATION_STATUS` 一种够格放行，其余三类都必须阻断：
+
+    - ``multiple_registrations``：已识别的多注册；
+    - `CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS`：config 可读但 canonical 不在
+      ``[plugins.*]`` 里——「没有第二份」不等于「canonical 在册」，把它读成唯一等于谎报；
+    - ``unavailable``：根本没核到（回执缺 selector / config 读不到 / 扫描抛异常）——「核不到」
+      不是「核过了、没问题」，这正是 hook 信任观测那条同款失败模式。
+    """
+    canonical_selector = (
+        installer_receipt.get("plugin_selector")
+        if isinstance(installer_receipt, dict)
+        else None
+    )
+    if not isinstance(canonical_selector, str) or not canonical_selector.strip():
+        return {
+            "status": "unavailable",
+            "selectors": [],
+            "note": (
+                "安装器回执缺 plugin_selector ⇒ 无从判断哪个 selector 是 canonical，"
+                "本次未核对 Codex 侧是否存在多份 RVF 注册。"
+            ),
+        }
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_hook_trust_fingerprint as trust  # noqa: PLC0415
+
+        codex_home = Path(home) / ".codex"
+        document = trust.read_codex_config_document(codex_home)
+        if document is None:
+            return {
+                "status": "unavailable",
+                "selectors": [],
+                "note": (
+                    f"读不到 {codex_home / 'config.toml'}（文件缺失 / 无 tomllib / 解析失败）；"
+                    "本次无法判断 Codex 侧是否存在多份 RVF 注册。"
+                ),
+            }
+        registration_sources = (
+            trust.rvf_plugin_selector_registration_sources_in_codex_config(document)
+        )
+        plugin_registration_table = trust.CODEX_CONFIG_PLUGIN_REGISTRATION_TABLE
+        hook_trust_table = trust.CODEX_CONFIG_HOOK_TRUST_TABLE
+    except Exception as exc:  # noqa: BLE001 - 核对本身失败不得伪装成「唯一」
+        return {
+            "status": "unavailable",
+            "selectors": [],
+            "note": f"Codex config 里的 RVF 注册核对失败：{type(exc).__name__}: {exc}",
+        }
+    selectors = list(registration_sources)
+    extra_selectors = [
+        selector for selector in selectors if selector != canonical_selector
+    ]
+    if extra_selectors:
+        # 两类残留的清理手段不同，实测：`codex plugin remove` 删 cache 与 [plugins.*]，
+        # 但**不**清 [hooks.state.*]。对只剩信任条目的 selector 建议跑 remove 等于给了
+        # 一条证明无效的命令——那正是这条检查要终结的那种「看起来有指引」。
+        remediation_steps: list[str] = []
+        for selector in extra_selectors:
+            tables = registration_sources.get(selector, ())
+            if plugin_registration_table in tables:
+                remediation_steps.append(f"codex plugin remove {selector} --json")
+            if hook_trust_table in tables:
+                remediation_steps.append(
+                    f'手工删除 ~/.codex/config.toml 里所有 [hooks.state."{selector}:…"] 块'
+                    "（codex plugin remove 不清这张表）"
+                )
+        return {
+            "status": "multiple_registrations",
+            "selectors": selectors,
+            "extra_selectors": extra_selectors,
+            "registration_sources": {
+                selector: list(tables)
+                for selector, tables in registration_sources.items()
+            },
+            "canonical_selector": canonical_selector,
+            "note": (
+                f"{Path(home) / '.codex/config.toml'} 里存在多份 RVF 注册: {selectors}；"
+                f"canonical 只应是 {canonical_selector}。"
+            ),
+            "remediation": "；".join(remediation_steps),
+        }
+    if plugin_registration_table not in registration_sources.get(
+        canonical_selector, ()
+    ):
+        # 「一个 RVF selector 都没有」和「canonical 只剩 [hooks.state] 残迹」在旧实现里都会落到
+        # sole_registration，把「canonical 根本没注册」谎报成「唯一」。认证要的是正向证明。
+        return {
+            "status": CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS,
+            "selectors": selectors,
+            "registration_sources": {
+                selector: list(tables)
+                for selector, tables in registration_sources.items()
+            },
+            "canonical_selector": canonical_selector,
+            "note": (
+                f"{Path(home) / '.codex/config.toml'} 的 [{plugin_registration_table}] 表里"
+                f"没有 canonical RVF 注册 {canonical_selector}"
+                f"（本次扫到的 RVF selector: {selectors or '无'}）；"
+                "「没有第二份」不等于「canonical 在册」，本次部署不予认证。"
+            ),
+            "remediation": (
+                f"确认 `codex plugin list` 里有 {canonical_selector}；"
+                "若没有，说明官方 CLI 的安装没有落到 config.toml，"
+                "查完安装器输出后从 local main 重新运行 runner。"
+            ),
+        }
+    return {
+        "status": CODEX_SOLE_REGISTRATION_STATUS,
+        "selectors": selectors,
+        "registration_sources": {
+            selector: list(tables) for selector, tables in registration_sources.items()
+        },
+        "canonical_selector": canonical_selector,
+    }
 
 
 def _observe_codex_hook_trust(
@@ -1338,6 +1582,9 @@ def _print_text(result: dict[str, Any]) -> None:
             "注意: runner 自身含未提交改动，与本次被部署的 HEAD 版本不是同一份"
             "（runner_matches_local_main_head=false）"
         )
+    _print_codex_registration_uniqueness(
+        result.get("codex_registration_uniqueness") or {}
+    )
     _print_codex_hook_trust_observation(result.get("codex_hook_trust") or {})
 
 
@@ -1406,6 +1653,27 @@ def _print_source_commit_delta(delta: dict[str, Any]) -> None:
     elif kind == "unknown_revision":
         print("   ⚠️ 上次: ", neutralize(delta.get("old_commit")))
         print("   ⚠️ 现在: ", neutralize(delta.get("new_commit")))
+
+def _print_codex_registration_uniqueness(uniqueness: dict[str, Any]) -> None:
+    """印 RVF 注册唯一性结论；只有 `sole_registration` 可以读成正常。
+
+    `unavailable`（没核到）与 `canonical_selector_not_registered`（canonical 不在册）都必须
+    长得像告警——它们在后果上与「存在多份」同级：都不构成「canonical 唯一」的证明。
+    """
+    status = uniqueness.get("status")
+    if not status:
+        return
+    selectors = uniqueness.get("selectors") or []
+    if status == CODEX_SOLE_REGISTRATION_STATUS:
+        print(f"Codex RVF 注册: 唯一（{selectors[0] if selectors else '无条目'}）")
+    elif status == "multiple_registrations":
+        print(f"⚠️ Codex RVF 注册: 存在多份 {selectors}")
+        print("   清理:", uniqueness.get("remediation"))
+    elif status == CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS:
+        print(f"⚠️ Codex RVF 注册: canonical 未在册（{uniqueness.get('note')}）")
+        print("   处置:", uniqueness.get("remediation"))
+    else:
+        print(f"⚠️ Codex RVF 注册唯一性: 未能核对（{uniqueness.get('note')}）")
 
 
 def _print_codex_hook_trust_observation(trust: dict[str, Any]) -> None:

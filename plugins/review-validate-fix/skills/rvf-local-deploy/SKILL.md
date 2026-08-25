@@ -57,6 +57,12 @@ deploy 源 worktree 的落点是 fail-closed 的：runner 只在该树带着自�
 - `runner_matches_local_main_head`；为 `false` 时必须显式说明「本次执行的 runner 是未提交
   版本，被部署的是 HEAD 版本」，不得把它当成部署件里已含该改动；
 - Codex/Claude marketplace 和 plugin selector；
+- `removed_noncanonical_plugin_selectors`：本次自动清掉的非 canonical RVF 注册（正常应为空；
+  非空说明机器上本来存在第二份 RVF，必须在报告里点名，不能当噪声略过）；
+- `codex_registration_uniqueness.status`：**只有 `sole_registration` 可读成正常**，其余三态
+  一律让 runner 非零退出——`multiple_registrations`（存在多份）、
+  `canonical_selector_not_registered`（config 可读但 canonical 根本不在册，「没有第二份」
+  不等于「canonical 在册」）、`unavailable`（根本没核到，不是「核过了、没问题」）；
 - 双官方 cache digest 与 active release 一致；
 - Stop/UserPromptSubmit hook 与 `RVF_USER_LOCAL_DATA_ROOT` 验证；
 - 真实 reviewer routing smoke 及 fail-closed 结果（任务要求时）。
@@ -75,6 +81,12 @@ deploy 源 worktree 的落点是 fail-closed 的：runner 只在该树带着自�
 
   跑完 runner 后，若 `source_commit_delta.old_commit` 与 Phase Zero 第 0 步记下的 OLD 不一致，
   说明部署窗口内发生了并发部署：如实报告两个值，不要挑一个顺眼的讲。
+
+注册唯一性这一类失败（`phase` 为 `official_cli_plugin_registration_uniqueness`——verifier 在
+宿主插件清单或 `~/.codex/plugins/cache` 里看见第二份；或 `codex_registration_uniqueness`——
+runner 收尾核对 `~/.codex/config.toml`）**刻意不回滚**：canonical 已经装好，回滚只会把它也移除、
+留下残留那份，更差。这类失败的正确读法是「部署做完但拒绝认证」——按 `remediation` 清理残留后
+重跑 runner 重新认证，`rollback_status` 会是 `not_required`。
 
 失败时报告 `phase`、`installed_before/after`、`error`、receipt path，以及归档的上一份安装回执
 `~/.rvf/user-local-data/deployment-receipts/previous-installation-before-latest-attempt.json`
