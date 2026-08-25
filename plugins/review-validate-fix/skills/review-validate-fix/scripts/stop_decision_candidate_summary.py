@@ -67,9 +67,10 @@ import json
 import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* import
@@ -89,6 +90,7 @@ from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa
     git_common_dir,
     repo_key,
     select_committed_paths_reviewed_by_session,
+    select_dirty_path_reviewed_change_by_session,
     tracker_dir,
 )
 from core.run_ledger.run_ledger import log_root  # noqa: E402
@@ -122,6 +124,43 @@ LOWER_BOUND_SOURCE_NONE = "none"
 COMMITTED_ROUND_WINDOW_SEED_REVIEW_HIGHWATER = "review_highwater"
 COMMITTED_ROUND_WINDOW_SEED_ROUND_BASELINE = "round_baseline"
 COMMITTED_ROUND_WINDOW_SEED_NONE = "none"
+
+# ``unreviewed_line_estimate.estimate_basis``：「已审行扣除」这一步的**可信度自陈**。横幅按它决定
+# 是渲染「其中约 N 行已审」还是诚实地说「本轮拿不到可信的已审估算，下列规模为全量」。
+#
+# ⚠️ 这里没有、也不该有一个「静默归零」的取值：扣不掉就是扣不掉，宁可把规模报大（多审一次），
+# 也不能让一个失效的扣减看起来像成功扣减——那正是第二代假绿的长相。
+ESTIMATE_BASIS_HUNK_FILTERED = "hunk_filtered"                    # 已审行全部对上并扣除
+ESTIMATE_BASIS_PARTIAL_HUNK_FILTERED = "partial_hunk_filtered"    # 部分对上（工作树在 review 后又动过）
+ESTIMATE_BASIS_NO_REVIEWED_UNITS = "no_reviewed_units"            # tracker 有观测，但本会话名下无已审单元
+ESTIMATE_BASIS_NO_TRACKER_OBSERVATION = "no_tracker_observation"  # tracker 无观测（禁用 / 无 DB / 异常）
+ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION = "stale_tracker_observation"  # 声称有已审行，却一行都对不上
+ESTIMATE_BASIS_WHOLE_PATH_REVIEWED = "whole_path_reviewed"        # 整路径身份单元已审（新增/删除/二进制）
+# 整路径身份单元已审，**但**本路径的 delta 跨过了 committed 层 → 扣减覆盖面（仅 dirty）窄于被扣对象
+# （baseline→工作树的 committed+dirty 合并 delta），整份回退全量。详见 ``_estimate_unreviewed_lines_for_path``。
+ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED = (
+    "whole_path_reviewed_spans_unreviewed_committed_delta"
+)
+
+# 聚合优先级：越靠前越「值得报警」。任一路径 stale → 整份摘要报 stale（诚实告警优先于好看的数字）。
+_ESTIMATE_BASIS_AGGREGATION_ORDER = (
+    ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION,
+    ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED,
+    ESTIMATE_BASIS_PARTIAL_HUNK_FILTERED,
+    ESTIMATE_BASIS_HUNK_FILTERED,
+    ESTIMATE_BASIS_WHOLE_PATH_REVIEWED,
+    ESTIMATE_BASIS_NO_REVIEWED_UNITS,
+    ESTIMATE_BASIS_NO_TRACKER_OBSERVATION,
+)
+
+# 判定「已审扣减是否真的生效」的 basis 集合——横幅只在命中这些时才渲染「其中约 N 行已审」。
+ESTIMATE_BASES_WITH_EFFECTIVE_DEDUCTION = frozenset(
+    {
+        ESTIMATE_BASIS_HUNK_FILTERED,
+        ESTIMATE_BASIS_PARTIAL_HUNK_FILTERED,
+        ESTIMATE_BASIS_WHOLE_PATH_REVIEWED,
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +227,28 @@ def _default_reviewed_committed_paths_resolver(
         return set()
 
 
+def _default_dirty_reviewed_change_resolver(
+    repo_path: Path,
+    session_id: str | None,
+    candidate_paths: Sequence[str],
+    log_root_override: Path | None,
+) -> Mapping[str, Any]:
+    """委托给 tracker 的 dirty 侧「已审」只读观测器（committed 侧过滤器的对偶）。
+
+    与 committed 侧的关键区别：committed 侧那位**裁决剔除**，本 resolver 只提供「哪些行已审」的
+    观测，**绝不影响候选集**。dirty 没有 commit 那种不可变锚点，按它剔除路径就是凭空开漏审面。
+    best-effort：任何异常退化为空 mapping（调用方按「全量都算未审」渲染，即今日行为）。"""
+    try:
+        return select_dirty_path_reviewed_change_by_session(
+            repo=repo_path,
+            session_id=session_id,
+            candidate_paths=candidate_paths,
+            log_root_override=log_root_override,
+        )
+    except Exception:  # pragma: no cover - 观测器永不阻断摘要
+        return {}
+
+
 def _default_workspace_guard(
     *, event: Mapping[str, Any], cwd: str | None, ledger: Any
 ) -> dict[str, Any] | None:
@@ -216,6 +277,11 @@ class CandidateFileChange:
     content_sha256: str
     added_lines: tuple[str, ...] = field(default=())
     deleted_lines: tuple[str, ...] = field(default=())
+    # 「扣掉上一轮 review 已审那部分」之后剩下的行。默认与全量相同 —— 没有可信的 tracker 观测
+    # 时，全量即未审，这是本估算的 fail-open 方向（宁可报大，不可报小）。
+    unreviewed_added_lines: tuple[str, ...] = field(default=())
+    unreviewed_deleted_lines: tuple[str, ...] = field(default=())
+    reviewed_line_estimate_basis: str = ESTIMATE_BASIS_NO_TRACKER_OBSERVATION
 
     def to_public_dict(self) -> dict[str, Any]:
         # 注入 prompt 只需要清单元数据，不需要逐行原文（避免注入体积爆炸）；行文本仅供内部
@@ -228,6 +294,13 @@ class CandidateFileChange:
             "content_sha256": self.content_sha256,
             "nonblank_added_lines": strictness_calculator.count_nonblank_lines(self.added_lines)[0],
             "nonblank_deleted_lines": strictness_calculator.count_nonblank_lines(self.deleted_lines)[0],
+            "unreviewed_nonblank_added_lines": strictness_calculator.count_nonblank_lines(
+                self.unreviewed_added_lines
+            )[0],
+            "unreviewed_nonblank_deleted_lines": strictness_calculator.count_nonblank_lines(
+                self.unreviewed_deleted_lines
+            )[0],
+            "reviewed_line_estimate_basis": self.reviewed_line_estimate_basis,
         }
 
 
@@ -316,6 +389,123 @@ def _added_deleted_for_path(
     if diff_text is None:
         return [], []
     return _parse_unified_diff_added_deleted(diff_text)
+
+
+def _path_delta_spans_committed_layer(
+    repo_path: Path, diff_base: str | None, path: str
+) -> bool:
+    """本路径的 ``diff_base``→工作树 delta 是否**跨过了 committed 层**（即 base..HEAD 之间该路径有改动）。
+
+    存在的理由：``_added_deleted_for_path`` 在有 committed-round 下界时用 ``diff_base`` 而不是 ``HEAD``，
+    拿到的是 committed + dirty 的**合并** delta；而 dirty 侧的整路径已审观测
+    （``select_dirty_path_reviewed_change_by_session``，``observed_state='dirty'``）只覆盖 dirty 那一半。
+    两者覆盖面不等时，整路径扣减会把未审的已提交内容一并算成已审。
+
+    ``diff_base`` 为空（无 committed 窗口，delta 就是纯 dirty）→ False，行为与既往完全一致；
+    ``diff_base`` 等于 HEAD（本轮没提交过东西）→ git diff 为空 → False，同样不受影响。
+    git 读取失败（返回 None）→ **无法核验即判为跨层**，回退全量，与本模块「扣不掉即算未审」同向。
+    """
+    if not diff_base:
+        return False
+    out = _run_git(
+        repo_path, ["diff", "--name-only", "--no-renames", diff_base, "HEAD", "--", path]
+    )
+    if out is None:
+        return True
+    return bool(out.strip())
+
+
+def _subtract_line_multiset(
+    total_lines: Sequence[str], reviewed_lines: Sequence[str]
+) -> tuple[list[str], int]:
+    """从 ``total_lines`` 里按**多重集**减去 ``reviewed_lines``，返回 (剩余行, 实际扣掉的条数)。
+
+    为什么是多重集减法而不是「总数 - 已审数」：后者分不清「同一批行」与「恰好一样多的新行」，
+    工作树在 review 之后再改一次就会把新工作也减没。多重集减法只减真正逐字相同的行，减不掉的行
+    自动留在未审桶里——**扣不掉即未审**，是本估算唯一的失败方向。
+
+    返回的扣除条数是调用方做陈旧性自校验的依据：声称有已审行、却一条都扣不掉，说明 tracker 观测
+    与当前工作树已经对不上，此时必须整份回退全量而不是接受一个失效的扣减。"""
+    if not reviewed_lines:
+        return list(total_lines), 0
+    remaining = Counter(reviewed_lines)
+    kept: list[str] = []
+    removed = 0
+    for line in total_lines:
+        if remaining.get(line, 0) > 0:
+            remaining[line] -= 1
+            removed += 1
+            continue
+        kept.append(line)
+    return kept, removed
+
+
+def _estimate_unreviewed_lines_for_path(
+    added: Sequence[str],
+    deleted: Sequence[str],
+    observation: Any,
+    *,
+    delta_spans_committed_layer: bool = False,
+) -> tuple[list[str], list[str], str]:
+    """单路径的「未审行」估算：(未审增行, 未审删行, estimate_basis)。
+
+    ``observation`` 是 tracker 的 ``DirtyPathReviewedChangeObservation``（或 None=无观测）。
+    整路径身份单元（新增 / 删除 / 二进制 / path_only）没有 hunk 锚点，只能整条判定；tracked_hunk
+    才做行级多重集扣减。任何拿不准的情形一律回退全量。
+
+    ``delta_spans_committed_layer``：传进来的 ``added``/``deleted`` 是否是 baseline→工作树的
+    **committed + dirty 合并** delta（见 ``_path_delta_spans_committed_layer``）。整路径扣减的证据只
+    来自 dirty 侧观测（``observed_state='dirty'``），覆盖面窄于合并 delta——此时若照旧整份归零，未审
+    的已提交内容会被算成已审，横幅进而渲染出「未审量为 0 …… 通常应当 decline」，这是实打实的漏审诱导。
+    故跨层时整份回退全量，并换一个如实标注的 basis（与 ``stale_tracker_observation`` 同一保守方向）。
+
+    刻意**不**做「按层拆分后分别扣减」：整路径身份单元（chmod/path_only、删除、二进制）的 dirty 那
+    一半本来就没有可扣的行文本，分层的实际收益是 0，却要为每条路径多付一次 git diff，并引入「两层
+    之和 ≠ 合并 delta」（commit 里加、dirty 里删的行会在合并 delta 抵消、分层却各算一次）的语义债。
+    """
+    if observation is None:
+        return list(added), list(deleted), ESTIMATE_BASIS_NO_TRACKER_OBSERVATION
+    if getattr(observation, "whole_path_identity_reviewed", False):
+        if delta_spans_committed_layer:
+            return (
+                list(added),
+                list(deleted),
+                ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED,
+            )
+        return [], [], ESTIMATE_BASIS_WHOLE_PATH_REVIEWED
+    reviewed_added = list(getattr(observation, "reviewed_added_lines", ()) or ())
+    reviewed_deleted = list(getattr(observation, "reviewed_deleted_lines", ()) or ())
+    claimed = len(reviewed_added) + len(reviewed_deleted)
+    if claimed == 0:
+        return list(added), list(deleted), ESTIMATE_BASIS_NO_REVIEWED_UNITS
+    kept_added, removed_added = _subtract_line_multiset(added, reviewed_added)
+    kept_deleted, removed_deleted = _subtract_line_multiset(deleted, reviewed_deleted)
+    removed = removed_added + removed_deleted
+    if removed == 0:
+        # 声称审过、却一行都对不上 —— tracker 观测已陈旧（或口径漂移）。整份回退全量并如实标注，
+        # 绝不把一个失效的扣减渲染成「已审 0 行」那种看起来正常的数字。
+        return list(added), list(deleted), ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION
+    basis = (
+        ESTIMATE_BASIS_HUNK_FILTERED
+        if removed >= claimed
+        else ESTIMATE_BASIS_PARTIAL_HUNK_FILTERED
+    )
+    return kept_added, kept_deleted, basis
+
+
+def _aggregate_estimate_basis(per_path_bases: Sequence[str]) -> str:
+    """把逐路径的 basis 合成整份摘要的一个自陈值。
+
+    优先级见 ``_ESTIMATE_BASIS_AGGREGATION_ORDER``：**越值得报警的越优先**。任一路径 stale，整份
+    就报 stale——横幅据此改口说「本轮拿不到可信的已审估算」。反过来做（让多数派或最乐观值胜出）会
+    把一份含失效扣减的估算包装成正常数字，正是要避免的那种假绿。空候选集 → 无观测。"""
+    if not per_path_bases:
+        return ESTIMATE_BASIS_NO_TRACKER_OBSERVATION
+    present = set(per_path_bases)
+    for basis in _ESTIMATE_BASIS_AGGREGATION_ORDER:
+        if basis in present:
+            return basis
+    return ESTIMATE_BASIS_NO_TRACKER_OBSERVATION
 
 
 def _content_sha256(repo_path: Path, path: str) -> str:
@@ -467,6 +657,7 @@ def build_candidate_summary(
     committed_baseline_resolver: Callable[[Path, str | None, str | None], str | None] | None = None,
     committed_base_ref_resolver: Callable[[Path], str | None] | None = None,
     reviewed_committed_paths_resolver: Callable[[Path, str | None, set[str], Path | None], set[str]] | None = None,
+    dirty_reviewed_change_resolver: Callable[[Path, str | None, Sequence[str], Path | None], Mapping[str, Any]] | None = None,
     strictness_rule_parameters: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构造 Stop hook 注入用的候选摘要（结构见返回 dict / 模块 docstring）。
@@ -482,6 +673,9 @@ def build_candidate_summary(
     committed_base_ref_resolver = committed_base_ref_resolver or _default_committed_base_ref_resolver
     reviewed_committed_paths_resolver = (
         reviewed_committed_paths_resolver or _default_reviewed_committed_paths_resolver
+    )
+    dirty_reviewed_change_resolver = (
+        dirty_reviewed_change_resolver or _default_dirty_reviewed_change_resolver
     )
 
     # ① 先过 workspace 守卫（Kanban task worktree 一致性）。命中 → 短路，空候选。
@@ -549,6 +743,16 @@ def build_candidate_summary(
     ownership_labels = _read_tracker_ownership(repo_path, session_id, log_root_override)
     diff_base = baseline if baseline else None
 
+    # ③.6 dirty 侧「已审」只读观测（committed 侧 ③.5 的对偶，但**只影响规模数字，不影响候选集**）。
+    # 只喂未提交路径：纯 committed 路径的已审剔除已在 ③.5 按路径做完，剩下的 committed 工作按定义
+    # 就是未审，整份计入未审桶即可。
+    try:
+        dirty_reviewed_observations = dirty_reviewed_change_resolver(
+            repo_path, session_id, sorted(uncommitted_set), log_root_override
+        )
+    except Exception:  # pragma: no cover - 观测永不阻断摘要
+        dirty_reviewed_observations = {}
+
     candidates: list[CandidateFileChange] = []
     for path in all_paths:
         in_committed = path in committed_set
@@ -566,6 +770,21 @@ def build_candidate_summary(
         added, deleted = _added_deleted_for_path(
             repo_path, diff_base, path, path in untracked
         )
+        path_observation = dirty_reviewed_observations.get(path)
+        # 整路径扣减即将生效时，先核验被扣的 delta 是不是纯 dirty：有 committed-round 下界时
+        # ``_added_deleted_for_path`` 给的是 baseline→工作树的合并 delta，而整路径已审证据只覆盖
+        # dirty 一半。仅在「真要扣」时才多付这一次 git diff（罕见），其余路径零开销。
+        delta_spans_committed_layer = bool(
+            path_observation is not None
+            and getattr(path_observation, "whole_path_identity_reviewed", False)
+            and _path_delta_spans_committed_layer(repo_path, diff_base, path)
+        )
+        unreviewed_added, unreviewed_deleted, estimate_basis = _estimate_unreviewed_lines_for_path(
+            added,
+            deleted,
+            path_observation,
+            delta_spans_committed_layer=delta_spans_committed_layer,
+        )
         candidates.append(
             CandidateFileChange(
                 path=path,
@@ -575,6 +794,9 @@ def build_candidate_summary(
                 content_sha256=_content_sha256(repo_path, path),
                 added_lines=tuple(added),
                 deleted_lines=tuple(deleted),
+                unreviewed_added_lines=tuple(unreviewed_added),
+                unreviewed_deleted_lines=tuple(unreviewed_deleted),
+                reviewed_line_estimate_basis=estimate_basis,
             )
         )
 
@@ -609,6 +831,52 @@ def build_candidate_summary(
         "total_working_tree_bytes": total_working_tree_bytes,
     }
 
+    # ⑤.5 未审口径的规模与严格度参考档（复用同一个计算器，只是喂「扣掉已审之后」的行）。
+    # 既有 bootstrap_size / strictness_reference 原样保留 —— 它们是**全量**口径，下游断言不动。
+    strictness_reference_unreviewed_estimate = strictness_calculator.compute_strictness_reference(
+        [
+            strictness_calculator.FileLineChange(
+                path=c.path,
+                added_lines=c.unreviewed_added_lines,
+                deleted_lines=c.unreviewed_deleted_lines,
+            )
+            for c in included_candidates
+        ],
+        rule_parameters=strictness_rule_parameters,
+    )
+    aggregated_estimate_basis = _aggregate_estimate_basis(
+        [c.reviewed_line_estimate_basis for c in included_candidates]
+    )
+    unreviewed_line_estimate = {
+        "nonblank_added_lines": strictness_reference_unreviewed_estimate["totals"][
+            "nonblank_added_lines"
+        ],
+        "nonblank_deleted_lines": strictness_reference_unreviewed_estimate["totals"][
+            "nonblank_deleted_lines"
+        ],
+        "estimate_basis": aggregated_estimate_basis,
+        "hunk_filtered_path_count": sum(
+            1
+            for c in included_candidates
+            if c.reviewed_line_estimate_basis in ESTIMATE_BASES_WITH_EFFECTIVE_DEDUCTION
+        ),
+        "fallback_path_count": sum(
+            1
+            for c in included_candidates
+            if c.reviewed_line_estimate_basis
+            in (
+                ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION,
+                ESTIMATE_BASIS_NO_TRACKER_OBSERVATION,
+                ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED,
+            )
+        ),
+        "stale_observation_path_count": sum(
+            1
+            for c in included_candidates
+            if c.reviewed_line_estimate_basis == ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION
+        ),
+    }
+
     # ⑥ 指纹（本模块唯一权威）：纳入候选集的 (path, content_sha256)。
     fingerprint = compute_candidate_fingerprint(
         [(c.path, c.content_sha256) for c in included_candidates]
@@ -636,9 +904,11 @@ def build_candidate_summary(
         "filtered_out_other_session_path_count": filtered_out_count,
         "has_committed_but_unreviewed": has_committed_but_unreviewed,
         "bootstrap_size": bootstrap_size,
+        "unreviewed_line_estimate": unreviewed_line_estimate,
         "candidate_fingerprint": fingerprint,
         "candidate_fingerprint_algorithm_version": CANDIDATE_FINGERPRINT_ALGORITHM_VERSION,
         "strictness_reference": strictness_reference,
+        "strictness_reference_unreviewed_estimate": strictness_reference_unreviewed_estimate,
     }
 
 
@@ -672,9 +942,20 @@ def _empty_summary(
             "total_nonblank_deleted_lines": 0,
             "total_working_tree_bytes": 0,
         },
+        "unreviewed_line_estimate": {
+            "nonblank_added_lines": 0,
+            "nonblank_deleted_lines": 0,
+            "estimate_basis": ESTIMATE_BASIS_NO_TRACKER_OBSERVATION,
+            "hunk_filtered_path_count": 0,
+            "fallback_path_count": 0,
+            "stale_observation_path_count": 0,
+        },
         "candidate_fingerprint": compute_candidate_fingerprint([]),
         "candidate_fingerprint_algorithm_version": CANDIDATE_FINGERPRINT_ALGORITHM_VERSION,
         "strictness_reference": strictness_calculator.compute_strictness_reference([]),
+        "strictness_reference_unreviewed_estimate": (
+            strictness_calculator.compute_strictness_reference([])
+        ),
     }
 
 
