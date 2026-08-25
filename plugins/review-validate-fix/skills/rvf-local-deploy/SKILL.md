@@ -70,6 +70,9 @@ deploy 源 worktree 的落点是 fail-closed 的：runner 只在该树带着自�
     `forward_commits` = 新被反映），并显式标注这是回退或分叉；只报单向视为错报。
   - `unknown_revision`：只给 `old_commit` / `new_commit` 两端 SHA，明说不做区间，不要编区间。
 
+  `subject` 里出现替换字符（`�`）说明该条提交信息不是 UTF-8，runner 已容错解码。原样转述并
+  说明这是解码降级，**不要**把它猜回或「修」成通顺的文字——猜出来的 subject 看着可信却是伪造的。
+
   跑完 runner 后，若 `source_commit_delta.old_commit` 与 Phase Zero 第 0 步记下的 OLD 不一致，
   说明部署窗口内发生了并发部署：如实报告两个值，不要挑一个顺眼的讲。
 
