@@ -92,6 +92,14 @@ EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST = 8
 # gate 会当场把这一轮退回成 `kind: request`，而那是个同轮内转不回 issues 的死结（实测废掉整轮
 # codex 评审、白跑约 13 分钟）。在派发**之前**拦住，比派完再退回便宜一个数量级。
 EXIT_SCOPE_OF_WORK_STILL_STUB = 9
+# start 探到「本会话名下一个未审单元都没有」：这批 diff 就是上一轮 review 的产物。**不是失败**，
+# 也不是成功——是一次「没东西可审」的诚实回执。token 保持 acknowledged，agent 可以 decline，也可以
+# `--force-full-rescope` 显式要求重审一遍。
+EXIT_NO_UNREVIEWED_SCOPE = 10
+
+# ``default_prepare_pipeline`` 在「无未审单元」时的提前返回状态。刻意不复用 ``failed``：
+# 这一轮什么都没坏，只是没东西可审；混进 failed 会让 `--retry` 看起来像修复手段。
+PREPARE_STATUS_NO_UNREVIEWED_SCOPE = "no_unreviewed_scope"
 
 # bootstrap 恢复重放的占位窗口 = prepare 预算 + 这段余量。占位在 prepare 收尾时立刻释放，余量只
 # 覆盖「持有者被硬杀、来不及释放」的残留：过窗后下一次 `start --retry` 可接手，不会被永久堵死。
@@ -686,6 +694,10 @@ AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_TRANSCRIPT_SCHEMA_DRIFT = (
     "degraded_transcript_schema_drift_suspected"
 )
 AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY = "degraded_allocator_reported_empty"
+# allocator 报 empty 且**候选单元数为 0**（不是被在途 lease 挡住）：本会话名下所有可审单元都已
+# reviewed。历史上这一支与「被 lease 排除」压成同一个降级、静默扩成全量重审，而无 lease 的一轮审完
+# 又标不了 reviewed —— 于是同一批 diff 在之后每一次 Stop 都被重新提议。这个状态把它拆出来。
+AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE = "no_unreviewed_scope_all_units_already_reviewed"
 AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_UNAVAILABLE = "degraded_allocator_unavailable"
 AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR = "degraded_allocator_error"
 
@@ -789,6 +801,36 @@ def _session_manifest_has_owned_paths(manifest: Any) -> bool:
     return False
 
 
+def _session_unit_review_state_counts(
+    repo_path: Path, session_id: str, tracker_dir: Any
+) -> dict[str, int]:
+    """本 session 名下可审单元的 ``review_state`` 分布，用于给 allocator 的 ``empty`` 定成因。
+
+    优先用 allocator 结果里回报的 ``tracker_dir``：它是**这次分配实际用的**那个 DB，比在这里重新
+    解析一遍 log root 更不容易出现两侧不一致。best-effort：拿不到就全 0，调用方按保守分支处理。
+    """
+    from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+        summarize_session_unit_review_states,
+    )
+
+    try:
+        return summarize_session_unit_review_states(
+            repo=repo_path,
+            session_id=session_id,
+            tracker_dir_override=(
+                Path(tracker_dir) if isinstance(tracker_dir, str) and tracker_dir else None
+            ),
+        )
+    except Exception:  # noqa: BLE001 - 成因判定永不阻断降级路径
+        return {
+            "available": 0,
+            "assigned": 0,
+            "reviewed": 0,
+            "total": 0,
+            "path_only_reviewed": 0,
+        }
+
+
 def allocate_agentic_initiation_tracker_review_scope(
     *,
     repo: str,
@@ -799,6 +841,7 @@ def allocate_agentic_initiation_tracker_review_scope(
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
     lease_ttl_seconds: int | None = AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS,
+    force_full_rescope: bool = False,
 ) -> dict[str, Any]:
     """为「agent 就地接受的这一轮」分配 tracker review scope，复用 Stop hook 那条链的既有入口。
 
@@ -966,16 +1009,71 @@ def allocate_agentic_initiation_tracker_review_scope(
             "error": None,
         }
     if status == "empty":
-        # 走到这里说明 transcript 归属**非空**（空归属已在上面短路），故最常见的成因是这批 unit
-        # 已被另一条 active lease 持有，或已被判为 reviewed。不该让已接受的一轮空转，按「多审一遍」
-        # 降级；但降级理由必须显式，别让它看起来像正常分配。
+        # 走到这里说明 transcript 归属**非空**（空归属已在上面短路）。``empty`` 有两个成因，后果
+        # 完全不同，必须分开处理——历史上它们被压成同一个降级，正是「RVF 紧跟着 RVF」的发动机：
+        #
+        #   * 被在途 lease 排除（并发：另一条 reviewer 正拿着这批 unit）→ 多审一遍是**安全**的，
+        #     保持既有降级。
+        #   * 候选单元数为 0（这批 unit 全部 review_state='reviewed'）→ 这就是上一轮 review 的
+        #     产物。旧行为在此静默扩成无 lease 的全量重审；而无 lease ⇒ handoff 标不了 reviewed
+        #     ⇒ 同一批 diff 在之后每一次 Stop 又被重新提议，闭环自锁。改为**不进 prepare**，
+        #     把「没东西可审」如实回给 agent 去表态。
+        candidate_unit_count = result.get("candidate_unit_count", 0) or 0
+        leased_excluded_count = result.get("leased_excluded_count", 0) or 0
+        # ⚠️ 成因判据**不能**看 ``leased_excluded_count``：候选查询只收
+        # ``review_state='available'``，被在途 lease 持有的单元是 ``assigned``，在候选阶段就被滤
+        # 掉了、走不到 anti-join，所以那个计数在正常流程下恒为 0。必须直接看本 session 名下单元的
+        # review_state 分布。（这条是本次修复自己引入、被并发用例逮住的缺陷，别再改回去。）
+        review_state_counts = _session_unit_review_state_counts(
+            repo_path, session_id.strip(), result.get("tracker_dir")
+        )
+        # ⚠️ 第二个必要条件：本 session 名下**不能有已审的 ``path_only`` 单元**。
+        # ``path_only`` 是 tracker 在「看不出改了什么」时的兜底身份，``_canonical_hash_path_only``
+        # 只哈希路径——不含 mode、不含 change 方向。于是它的 ``reviewed`` 只证明「这个路径被审过
+        # 一次」，证明不了「当前这次改动被审过」。实测反例：``100644→100755`` 审掉并提交后，相反
+        # 方向的 ``100755→100644`` 推导出同一个 unit_id、命中同一行 reviewed，allocator 照样报
+        # empty、计数照样是 reviewed=1——本分支于是把一次**真的没审过**的可执行位回退直接跳掉。
+        # 旧的 ``degraded_allocator_reported_empty`` 降级（无 lease 全量多审）在这种形状下反而是对的：
+        # 多审一遍只是浪费，跳过则是静默漏审。所以这里只对「身份可信」的单元族启用早退。
+        #
+        # 刻意**不**改 ``_canonical_hash_path_only`` 去把 mode 编进身份：那会 churn 既有 unit_id、
+        # 波及全局去重与 path_only↔同路径他 kind 的 cross-match，而且只补上 mode 这一个可观测维度，
+        # 「hunk 锚点消失」「无可观测变更」两支照样看不见内容——治不了「身份自认看不见内容」这个根。
+        session_has_reviewed_path_only_units = review_state_counts.get("path_only_reviewed", 0) > 0
+        all_units_already_reviewed = (
+            review_state_counts["assigned"] == 0
+            and review_state_counts["available"] == 0
+            and review_state_counts["reviewed"] > 0
+            and not session_has_reviewed_path_only_units
+        )
+        if all_units_already_reviewed and not force_full_rescope:
+            return _degraded_tracker_scope_allocation(
+                AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
+                reason=(
+                    "tracker 报本会话名下**没有任何未审单元**"
+                    f"（已审 {review_state_counts['reviewed']} 个、未审 0 个、被在途 lease 持有 0 个）"
+                    "——这批改动的可审单元在此前的 review 中已全部审过。本轮不自动扩成全量重审："
+                    "无 lease 的一轮审完也标不了 reviewed，只会让同一批 diff 在下一次 Stop 再被提议一遍。"
+                ),
+                allocator_status=status,
+                session_manifest_has_owned_paths=True,
+            )
         return _degraded_tracker_scope_allocation(
             AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY,
             reason=(
                 "tracker 报本会话名下没有未分配的可审单元"
-                f"（候选 {result.get('candidate_unit_count', 0)} 个、被在途 lease 排除 "
-                f"{result.get('leased_excluded_count', 0)} 个）；本轮无 lease，"
-                "packet 仍按 session-owned 口径构建。"
+                f"（候选 {candidate_unit_count} 个、anti-join 排除 {leased_excluded_count} 个；"
+                f"review_state 分布 available={review_state_counts['available']} "
+                f"assigned={review_state_counts['assigned']} reviewed={review_state_counts['reviewed']}）"
+                + (
+                    f"；其中 {review_state_counts['path_only_reviewed']} 个已审单元是 path_only "
+                    "（身份只含路径、不含 mode 与 change 方向），据此判「全已审」不可信"
+                    "——例如 chmod 往返会复用同一个 unit_id，故保守按多审一遍处理"
+                    if session_has_reviewed_path_only_units
+                    else ""
+                )
+                + ("；已按 --force-full-rescope 显式要求继续" if force_full_rescope else "")
+                + "；本轮无 lease，packet 仍按 session-owned 口径构建。"
             ),
             allocator_status=status,
             session_manifest_has_owned_paths=True,
@@ -1072,6 +1170,7 @@ def default_prepare_pipeline(
     resume_run_dir: str | None = None,
     parent_attempt_run_id: str | None = None,
     parent_attempt_run_dir: str | None = None,
+    force_full_rescope: bool = False,
 ) -> dict[str, Any]:
     """默认重量级准备流水线：分配 run + 写 dispatch prep + 跑 ``prepare_run_from_prep_file`` 全套。
 
@@ -1120,6 +1219,7 @@ def default_prepare_pipeline(
         output_scope_path=artifacts_dir / "tracker-scope.json",
         committed_baseline=committed_baseline,
         committed_base_ref=committed_base_ref,
+        force_full_rescope=force_full_rescope,
     )
     ledger.event(
         phase="gate",
@@ -1150,6 +1250,34 @@ def default_prepare_pipeline(
         ],
         error=tracker_scope_allocation["error"],
     )
+
+    # 「本会话名下没有任何未审单元」→ 到此为止，**不进 prepare**。
+    # 继续走下去会派出一次审自己上一轮产物的 review：无 lease、审完标不了 reviewed、下一次 Stop
+    # 再提议同一批 diff。run 已经开了（allocator 需要 run_id），就让它作为这次「没东西可审」的
+    # 审计记录停在这里；token 由 run_start 保持 acknowledged，agent 可 decline 或 --force-full-rescope。
+    if tracker_scope_allocation["status"] == AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE:
+        ledger.event(
+            phase="gate",
+            event="agentic_initiation_no_unreviewed_scope",
+            status="skipped",
+            reason_code=AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
+            repo=worktree,
+            cwd=worktree,
+            session_id=session_id,
+            degradation_reason=tracker_scope_allocation["degradation_reason"],
+        )
+        return {
+            "status": PREPARE_STATUS_NO_UNREVIEWED_SCOPE,
+            "run_id": ledger.run_id,
+            "run_dir": str(ledger.run_dir),
+            "artifacts": {},
+            "error": None,
+            "prep_token": None,
+            "bootstrap_gate": None,
+            "initiation_run_id": ledger.run_id,
+            "initiation_run_dir": str(ledger.run_dir),
+            "tracker_scope_allocation": tracker_scope_allocation,
+        }
 
     # transcript 只在**归属非空**时才递给 prepare：``build_review_packet.validate_session_manifest``
     # 对空归属的 manifest 直接抛（refusing to build empty Session-Owned scope），递下去会把一次
@@ -1426,10 +1554,15 @@ def run_start(
     provider_health_timeout_seconds: float = 12.0,
     prepare_timeout_seconds: float = 60.0,
     lock_root: Path | None = None,
+    force_full_rescope: bool = False,
 ) -> CommandResult:
     """``start`` 子命令：token→acknowledged → 前置校验 + provider-health 门 → prepare 全套 →
     自动 scope 产出 → arm 在途凭证。任一步失败 → record_start_failure 回退保持 acknowledged，
-    可 --retry。"""
+    可 --retry。
+
+    ``force_full_rescope``：显式覆盖「本会话名下没有未审单元就不开审」这道闸，按历史行为把整份
+    未提交 diff 当作本轮范围重审一遍。给的是**知情后仍要重审**的出口（例如工作是经 shell heredoc
+    写入的、tracker 归属看不见），不是默认路径。"""
     roots = roots or AgentDecisionRoots()
     now_dt = _coerce_now(now)
     prepare_pipeline = prepare_pipeline or default_prepare_pipeline
@@ -1722,6 +1855,10 @@ def run_start(
             detail=review_reopen_consumption,
         )
 
+    # 只在**显式**要求重审时才把这个 kwarg 递下去：``prepare_pipeline`` 是可注入的，测试与
+    # bootstrap 夹具里的 stub 都写死了参数列表。默认路径一个字节都不变，就不会因为多一个关键字
+    # 参数把一堆既有注入点变成 TypeError。
+    forced_rescope_kwargs = {"force_full_rescope": True} if force_full_rescope else {}
     try:
         prepared = prepare_pipeline(
             token_record=record, repo=repo, session_id=tok_session_id,
@@ -1729,6 +1866,7 @@ def run_start(
             resume_run_id=resume_run_id, resume_run_dir=resume_run_dir,
             parent_attempt_run_id=parent_attempt_run_id,
             parent_attempt_run_dir=parent_attempt_run_dir,
+            **forced_rescope_kwargs,
         )
     except Exception as exc:  # prepare 抛异常 → 回退可 retry，不吞决策
         _release_replay_claim()
@@ -1752,6 +1890,51 @@ def run_start(
                 if isinstance(prepared.get("initiation_run_dir"), str)
                 else None
             ),
+        )
+
+    # 「本会话名下没有未审单元」：不是失败，是「没东西可审」。必须排在下面的泛化 != completed
+    # 分支**之前**，否则会被 _fail 当成一次 prepare 失败——那会把一个正常结论渲染成故障，还会诱导
+    # agent 去 --retry 一个重试多少次都一样的状态。
+    if prepared.get("status") == PREPARE_STATUS_NO_UNREVIEWED_SCOPE:
+        _release_replay_claim()
+        allocation = prepared.get("tracker_scope_allocation")
+        degradation_reason = (
+            allocation.get("degradation_reason") if isinstance(allocation, Mapping) else None
+        )
+        append_decision_telemetry(
+            token=token, event="start_no_unreviewed_scope", worktree=worktree,
+            session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
+            detail={
+                "retry": retry,
+                "run_id": prepared.get("run_id"),
+                "degradation_reason": degradation_reason,
+            },
+        )
+        return CommandResult(
+            command="start",
+            status="no_unreviewed_scope",
+            exit_code=EXIT_NO_UNREVIEWED_SCOPE,
+            token=token,
+            token_state=token_store.STATE_ACKNOWLEDGED,
+            message=(
+                "这批改动的可审单元在此前的 review 中已全部审过（tracker 候选 0 个，且不是被在途 "
+                "lease 挡住）。本轮**没有**自动为你扩成全量重审——那样审完也标不了 reviewed，"
+                "只会让同一批 diff 在下一次 Stop 再被提议一遍。"
+            ),
+            next_steps=[
+                f'① 通常应当谢绝本轮：rvf-agent decline --token {token} --reason "上一轮 RVF 产物，无未审单元"',
+                f"② 确知有 tracker 看不见的新工作（例如经 shell heredoc 写入的文件）而要重审："
+                f"rvf-agent start --token {token} --retry --force-full-rescope --reason <重审理由>",
+            ],
+            detail={
+                "phase": "tracker_scope_allocation",
+                "prepare_status": prepared.get("status"),
+                "run_id": prepared.get("run_id"),
+                "run_dir": prepared.get("run_dir"),
+                "tracker_scope_allocation": (
+                    dict(allocation) if isinstance(allocation, Mapping) else None
+                ),
+            },
         )
 
     if prepared.get("status") != "completed":
@@ -3180,6 +3363,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     p_start.add_argument("--retry", action="store_true", help="prepare 失败后重试（token 仍在 acknowledged）")
+    p_start.add_argument(
+        "--force-full-rescope",
+        action="store_true",
+        help=(
+            "本会话名下没有未审单元时仍强行开审（把整份未提交 diff 当本轮范围重审一遍）。"
+            "默认不这么做：那一轮拿不到 lease，审完标不了 reviewed，同一批 diff 下次 Stop 会再被提议。"
+            "只在确知有 tracker 归属看不见的新工作（例如经 shell heredoc 写入的文件）时用"
+        ),
+    )
 
     p_scope = sub.add_parser("scope", help="改动自动 scope（annotate / exclude / include），仅 acknowledged 态")
     scope_sub = p_scope.add_subparsers(dest="scope_action", required=True)
@@ -3243,6 +3435,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_start(
             token=args.token, reason=args.reason, repo=args.repo,
             session_id=args.session_id, transcript_path=args.transcript_path, retry=args.retry,
+            force_full_rescope=args.force_full_rescope,
         )
     elif args.command == "scope":
         if args.scope_action == "annotate":
