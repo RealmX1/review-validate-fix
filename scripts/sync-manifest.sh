@@ -16,12 +16,17 @@
 #     零报错状态，只能靠这里的正向断言抓。
 #   - marketplace.plugins[0].source 必须指向 ./plugins/review-validate-fix。
 #   - 四处 description 均非空。
+#   - Claude / Codex / Kimi 三份 nested manifest 都必须声明 skills，且归一化后取值一致：
+#     host 发现 plugin skill 的唯一入口就是 manifest 的 skills 字段（不会回退去扫 skills/
+#     目录），漏声明的那份是「plugin 装上了、hook 照常触发、里面一个 skill 都没有」的零报错
+#     状态，只能靠这里的正向断言抓（不变量 6）。
 #
 # 有意不强校验（host-specific 设计，不是漂移）：
 #   - description **内容**跨 host 故意不同（Claude 文案提 Cline Kanban、Codex 提 Codex
 #     workspaces、marketplace 面向 Claude Code 安装）——只校验非空，不校验相等。
-#   - skills / commands 字段形态（Claude 用数组、Codex 用字符串）属各 host resolver 约定的
-#     格式差异，不在本脚本同步范围。
+#   - commands 字段形态（Claude 用数组、Codex 用字符串）属各 host resolver 约定的格式差异，
+#     不在本脚本同步范围。skills 的同类形态差异同样容忍（本脚本先归一化成数组再比），但它的
+#     **取值集合**由不变量 6 强校验，不属于「不校验」。
 #
 # 用法：
 #   bash scripts/sync-manifest.sh            # 静默校验，通过则打印简短成功信息
@@ -70,6 +75,11 @@ kimi_name="$(jq -r '.name // ""' "$kimi_manifest")"
 kimi_desc="$(jq -r '.description // ""' "$kimi_manifest")"
 kimi_hook_events="$(jq -r '[.hooks[]?.event] | sort | join(",")' "$kimi_manifest")"
 
+# 三份 host manifest 各自声明的 skills 目录。`skills` 允许 string 或 string[]，统一成数组再比。
+claude_skills="$(jq -r '[.skills] | flatten | map(select(. != null)) | sort | join(",")' "$claude_manifest")"
+codex_skills="$(jq -r '[.skills] | flatten | map(select(. != null)) | sort | join(",")' "$codex_manifest")"
+kimi_skills="$(jq -r '[.skills] | flatten | map(select(. != null)) | sort | join(",")' "$kimi_manifest")"
+
 claude_version="$(jq -r '.version // ""' "$claude_manifest")"
 codex_version="$(jq -r '.version // ""' "$codex_manifest")"
 
@@ -114,6 +124,24 @@ if [ "$kimi_hook_events" != "Stop,UserPromptSubmit" ]; then
   fail "Kimi manifest 的 hook 事件集合为 '$kimi_hook_events'，期望 'Stop,UserPromptSubmit'"
 fi
 
+# 不变量 6：三份 host manifest 都必须声明 skills，且声明一致。
+#
+# 实盘教训（2026-08-26）：Kimi 那份**漏了** `skills`，于是 RVF 的 6 个 skill 在 Kimi 上全部不存在。
+# 它是零报错的：Kimi 发现 plugin skill 的唯一入口就是 manifest 的 `skills` 字段
+# （`countDiscoveredPluginSkills()` 在 `roots.length === 0` 时直接 return 0，**不会**去扫
+# `skills/` 目录——对照 `agents` 缺省时会自动收 `agents/`，skills 没有这个待遇），
+# 而 plugin 的 state 仍是 ok、hook 也照常触发 ⇒「装上了、看得见、里面是空的」。
+#
+# 本 gate 的意义正是「N 份 manifest 里少写一份」这个形状：漏的那份自己不会喊。
+for skills_pair in "claude:$claude_skills" "codex:$codex_skills" "kimi:$kimi_skills"; do
+  skills_host="${skills_pair%%:*}"
+  skills_value="${skills_pair#*:}"
+  [ -n "$skills_value" ] || fail "$skills_host manifest 没有声明 skills（该 host 上 RVF 将没有任何入口）"
+done
+if [ "$claude_skills" != "$kimi_skills" ] || [ "$claude_skills" != "$codex_skills" ]; then
+  fail "skills 声明漂移：Claude='$claude_skills' / Codex='$codex_skills' / Kimi='$kimi_skills'"
+fi
+
 if [ "$verbose" -eq 1 ]; then
   printf 'name      : %s（四处一致）\n' "$claude_name"
   printf 'version   : %s（两份 plugin.json 一致；marketplace 不带 version）\n' "$claude_version"
@@ -123,7 +151,8 @@ if [ "$verbose" -eq 1 ]; then
   printf 'desc.marketplace: %s\n' "$mkt_desc"
   printf 'desc.kimi      : %s\n' "$kimi_desc"
   printf 'kimi.hooks     : %s\n' "$kimi_hook_events"
+  printf 'skills（三处一致）: %s\n' "$claude_skills"
   printf '（description 内容有意 host-specific，仅校验非空）\n'
 fi
 
-printf 'manifest 同步检查通过：四份 manifest 的 name/version/source 一致，description 均非空，Kimi hook 事件齐备\n'
+printf 'manifest 同步检查通过：四份 manifest 的 name/version/source 一致，description 均非空，Kimi hook 事件齐备，三份 host manifest 的 skills 声明一致\n'

@@ -1,6 +1,12 @@
 {
   "name": "review-validate-fix",
   "description": "Review-Validate-Fix: 在 Stop 时刻征询是否发起双路外部评审，并在 UserPromptSubmit 时刻承接派发。",
+  "skills": [
+    "./skills/"
+  ],
+  "commands": [
+    "./commands/"
+  ],
   "hooks": [
     {
       "event": "Stop",

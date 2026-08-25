@@ -121,18 +121,23 @@ reason 取 stderr），**其他任意码都让 stdout 被完全丢弃并 allow �
   挂在 `emit_stop_hook_payload` 的受众翻译之前。Kimi 的 `stop_hook_active` **恒 false**、引擎的
   `stopHookContinuationUsed` 每 turn 复位 ⇒ 跨 turn 没有保险丝，所以这道闸只能由 RVF 自带。
 - ~~**`parent_harness_identity` 词表**（S-B7）~~ ✅ **已做**——三个信号层收敛到 `kimi-code`。
-- **分发**（S-B8）—— ⚠️ **代码已齐、尚未部署**。安装链路三件都已补上：
+- **分发**（S-B8）—— ✅ **已部署**（2026-08-24）。安装链路三件都已补上：
   `install_to_codex.py` 的 `configure_kimi_plugin_registration()` +
   `--configure-kimi-plugin-registration`、`rvf_local_deploy.py` 的 `installer_command`
   已带该 flag、`sync-manifest.sh` 已四路化（含「Kimi hook 事件必须同时有 Stop 与
   UserPromptSubmit」的正向断言）；激活态核对早已有
   （`scripts/kimi_plugin_manifest_activation_state_check.py`）。
-  但 **`/rvf-local-deploy` 还没跑过 ⇒ Kimi host 依然未上线**——成因已不再是「安装器缺失」，
-  而是「未部署」，两者别混为一谈。判据：部署根
-  `~/.rvf/developer-plugin-marketplaces/review-validate-fix-local-main/plugins/review-validate-fix/`
-  下既无 `.kimi-plugin/`，`hooks/` 里也没有 `kimi_stop.py` / `kimi_user_prompt_submit.py`。
-- **注册只能半自动**（P-1 已实测定案）：`installPlugin` 在 CLI / REST / WebSocket / ACP
-  四条跨进程通道上**全部不可达**，只能由安装器写 `installed.json` + 提示 `/plugins reload`。
+  部署实据：`installed.json` 落盘、hook 到位。首次真机使用暴露了三条缺陷，已于 2026-08-26
+  修复，但该批修复**尚未 land、尚未重新部署**，见下方「首次真机使用暴露的三条缺陷」。
+- **注册只能半自动**（P-1 定案，2026-08-26 按 Kimi **0.38.0** 修订）：`installPlugin` 在
+  CLI / WebSocket / ACP 三条跨进程通道上**仍不可达**（0.38.0 `kimi --help` 的 Commands 里
+  确实没有 `plugin`）；**REST 自 0.38.0 起可达**——`packages/kap-server/src/routes/plugins.ts`
+  注册了 `GET/POST /plugins`（`installPluginRequestSchema = object({source: string().min(1)})`）
+  以及 enable / disable / remove action。但它要求先起 `kimi web` 服务器、再从 stdout 抓 bearer
+  token，对非交互部署器比直接写 `installed.json` 更脆 ⇒ **它的价值在「终验」而不是「注册」**：
+  注册仍是安装器写 `installed.json`、再由用户跑激活命令；终验才走
+  `GET /api/v1/plugins`（本轮端到端终验用的正是它）。取证与实测命令见
+  `docs/architecture/kimi-code-cli-plugin-and-hook-runtime-forensics.md` §11.4-bis。
   且 `installed.json` **不持久化 `state`**（`persist()` 只写 9 个字段）⇒ 部署校验必须自己复算，
   不能读该字段。
 - **Stop 上的 developer-only 出口在 Kimi 上完全不可见**：Kimi 丢弃 Stop 的 allow-stdout，
@@ -165,4 +170,64 @@ RVF 里与 Kimi 有关的名字有**三套**，取值刻意不同，各有各的
 | transcript | ✅ 完整蒸馏已实装（42/42 份真实 wire 验证，0 失败） |
 | permission | `-p` 隐含 `forceAuto`；**不得**再加 `-y/--yolo`（与 `-p` 互斥报错） |
 | config | ✅ `.kimi-plugin/plugin.json` |
-| discovery | ⚠️ 半自动：`$KIMI_CODE_HOME/plugins/installed.json` + `/plugins reload`（无目录扫描、无 CLI 入口） |
+| discovery | ⚠️ 半自动：`$KIMI_CODE_HOME/plugins/installed.json` + `/plugins reload` **再** `/reload`（无目录扫描、无 CLI 入口；两条命令缺一不可，见下节） |
+
+## 首次真机使用暴露的三条缺陷（2026-08-26 修复；取证自 Kimi 0.38.0 二进制）
+
+⚠️ **本目录早期的取证文档锚在 Kimi 0.29.1，本机已是 0.38.0。** 三条里有一条正是 0.38.0 新增的
+出站校验才让它显形——所以「当时能用」不代表现在能用，版本变更后要重跑激活态核对。
+
+### 1. `installed.json` 的 `source` 是**枚举**，不是路径
+
+`resolveInstallSource()` 返回 `{kind: "local-path"|"zip-url"|"github", path}`，`recordFrom()` 落的是
+那个 **kind**（`source: input.source ?? "local-path"`），路径归 `originalSource`。安装器原先把绝对
+路径写进了 `source`，又显式写了 `"github": null`（zod 的 `.optional()` 接受**缺省**、不接受 null）。
+
+0.38.0 起 `pluginService.listPlugins` 有**出站** schema 校验
+（`source: enum([...])` / `github: <object>.optional()`）⇒ `/plugins` 面板整个报
+`output validation failed` 打不开。
+
+**这条故障是偏斜的**：hook 派发走 `enabledHooks()` → `materialize()` → `recordFrom()`，那条路径对
+`source` 不做任何枚举校验（原样透传）⇒ **Stop / UserPromptSubmit 仍在正常触发，只有 UI 全挂**。
+按「插件没装上」去排查会全程走错方向。
+
+### 2. Kimi **只**从 `manifest.skills` 发现 skill，不扫 `skills/`
+
+`countDiscoveredPluginSkills()` 逐字是 `(manifest?.skills ?? []).map(...)`，`roots.length === 0`
+时直接 `return 0`。`.kimi-plugin/plugin.json` 原先只声明了 `hooks` ⇒ **6 个 RVF skill 在 Kimi 上
+全部不存在**，而 plugin `state` 仍是 `ok`、hook 照常触发、面板显示 `Skills (0)`。
+
+对照差异值得记住：**`agents` 在字段缺省时会自动收 `agents/` 目录，`skills` 没有这个待遇**；
+skills 的唯一 fallback 是 plugin 根上放一份 `SKILL.md`（`rootSkillFallback`），RVF 没有。
+
+⚠️ 声明写错比不写更危险：`resolveDirListField` 对「不以 `./` 开头」「解析到插件之外」的处置是
+`severity:"error"` ⇒ 整条 record 的 `state` 翻成 `error` ⇒ **连 hook 一起停摆**。
+
+### 3. 激活需要**两条**命令，`/plugins reload` 一条不够
+
+两条收敛的是两层不同的缓存：
+
+| 命令 | 收敛什么 |
+|---|---|
+| `/plugins reload` | 把 `installed.json` 重新 materialize 进**进程级** `PluginManager` |
+| `/reload` 或 `/new` | 重建**会话**——skill 是会话级的，`this.skillsReady = this.loadSkills()` 只在 session 构造时跑一次，已有会话不会重扫 |
+
+Kimi 自己的 TUI 常量逐字就是这个意思：
+`PLUGIN_RELOAD_HINT = "Run /new or /reload to apply plugin changes."`
+只提示前者，用户会看到「插件在册、Skills 却是空的」而无从下手。
+
+> 另：`/plugins` 面板的 **Custom 页不是「已装列表」**，而是「装自定义插件」的输入框。
+> 手写进 `installed.json` 的本地插件只会出现在 **Installed** 页。
+
+### 这三条为什么能一起活下来（结构性教训）
+
+`kimi_plugin_manifest_activation_state_check.py` 当时对这个坏掉的注册判的是
+**`sole_registration` / exit 0**——一个完整的假绿。成因是它只复算了「hook 条目级」这一层，
+而三条缺陷分别落在**注册记录层**（1）、**manifest 声明层**（2）、**会话生命周期层**（3）。
+
+同样地，闭环测试 `test_installer_output_is_independently_verifiable_as_actually_active` 用的是
+**手抄的 manifest fixture**，而不是仓库里真实发布的那份 ⇒ 发布物漏声明 `skills`，fixture 也漏，
+测试对着「与发布物不同的东西」判了绿。现已改为直接读发布物。
+
+三条修复对应三道新闸：核对器的 `registry_record_rejected_by_host_schema` 新态与 skills 复算、
+`sync-manifest.sh` 的「三份 host manifest 都必须声明 skills 且一致」、以及 fixture 改读发布物。

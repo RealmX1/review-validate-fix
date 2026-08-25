@@ -30,31 +30,35 @@ ACTIVATION_STATE_CHECKER = (
 )
 
 
+SHIPPED_KIMI_PLUGIN_MANIFEST = (
+    REPOSITORY_ROOT / "plugins/review-validate-fix/.kimi-plugin/plugin.json"
+)
+
+
 def _build_marketplace_root(root: Path) -> Path:
-    """造一个最小的 active marketplace root，含 RVF 的 Kimi manifest。"""
+    """造一个最小的 active marketplace root，**复用仓库里真实发布的那份 Kimi manifest**。
+
+    ⚠️ 这里刻意**不**手写一份 manifest。手写副本正是 S-B8 那个缺陷能活下来的原因：真实
+    manifest 漏声明 ``skills``（⇒ Kimi 侧 6 个 skill 全部不存在，且零报错），而 fixture 里那份
+    手抄件同样漏了，于是闭环测试对着一份「与发布物不同的东西」判了绿。读真文件之后，
+    发布物一旦少声明什么，下面那条 independently-verifiable 测试就会当场红。
+    """
     plugin_root = root / "plugins" / "review-validate-fix"
     (plugin_root / ".kimi-plugin").mkdir(parents=True)
-    (plugin_root / ".kimi-plugin" / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "review-validate-fix",
-                "description": "d",
-                "hooks": [
-                    {
-                        "event": "Stop",
-                        "command": 'python3 "$KIMI_PLUGIN_ROOT/hooks/kimi_stop.py"',
-                        "timeout": 115,
-                    },
-                    {
-                        "event": "UserPromptSubmit",
-                        "command": 'python3 "$KIMI_PLUGIN_ROOT/hooks/kimi_user_prompt_submit.py"',
-                        "timeout": 85,
-                    },
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    manifest_text = SHIPPED_KIMI_PLUGIN_MANIFEST.read_text(encoding="utf-8")
+    (plugin_root / ".kimi-plugin" / "plugin.json").write_text(manifest_text, encoding="utf-8")
+
+    # manifest 声明的目录必须在 plugin root 内真实存在，否则 Kimi 判 severity=error/warn。
+    # 只复制目录骨架与 SKILL.md，避免把整棵 skills/ 树拷进 tmp。
+    manifest = json.loads(manifest_text)
+    for declared in manifest.get("skills", []):
+        source_directory = SHIPPED_KIMI_PLUGIN_MANIFEST.parent.parent / declared
+        for shipped_skill in sorted(source_directory.glob("*/SKILL.md")):
+            mirrored = plugin_root / declared / shipped_skill.parent.name / "SKILL.md"
+            mirrored.parent.mkdir(parents=True, exist_ok=True)
+            mirrored.write_text(shipped_skill.read_text(encoding="utf-8"), encoding="utf-8")
+    for declared in manifest.get("commands", []):
+        (plugin_root / declared).mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -62,7 +66,7 @@ def _read_registry(kimi_home: Path) -> dict:
     return json.loads((kimi_home / "plugins" / "installed.json").read_text(encoding="utf-8"))
 
 
-def test_first_registration_creates_the_registry_with_all_nine_persisted_fields(
+def test_first_registration_writes_exactly_the_shape_kimi_itself_persists(
     tmp_path: Path,
 ) -> None:
     marketplace_root = _build_marketplace_root(tmp_path / "marketplace")
@@ -73,15 +77,77 @@ def test_first_registration_creates_the_registry_with_all_nine_persisted_fields(
     )
 
     assert receipt["was_already_registered"] is False, receipt
-    assert receipt["requires_manual_reload_command"] == "/plugins reload", receipt
+    # 两条命令缺一不可：前者刷进程级注册表，后者重建会话（skill 只在会话构造时加载）。
+    assert receipt["requires_manual_activation_commands_in_order"] == [
+        "/plugins reload",
+        "/reload",
+    ], receipt
     records = _read_registry(kimi_home)["plugins"]
     assert len(records) == 1, records
+    # 全新注册应当与 Kimi 自己 install 本地插件时写下的形状**逐字一致**：`capabilities` 与
+    # `github` 在它那边都是 undefined ⇒ 键根本不落盘。写 `null` 会被 0.38.0 的
+    # listPlugins 出站 schema 拒收，`/plugins` 面板整个打不开。
     assert set(records[0]) == {
         "id", "root", "source", "enabled", "installedAt",
-        "updatedAt", "originalSource", "capabilities", "github",
-    }, "字段集合必须与 Kimi 的 persist() 完全一致，多写的字段下次会被它自己抹掉"
+        "updatedAt", "originalSource",
+    }, "字段集合必须与 Kimi 的 persist() 对本地路径安装写出的形状一致"
+    assert records[0]["source"] == "local-path", (
+        "source 是**来源种类枚举**不是路径；写路径会让 /plugins 报 output validation failed"
+    )
+    assert records[0]["originalSource"].endswith("plugins/review-validate-fix"), records
     assert records[0]["enabled"] is True, records
     assert "state" not in records[0], "state 是内存派生值，写进去是自欺"
+
+
+def test_first_registration_writes_the_document_envelope_kimi_itself_persists(
+    tmp_path: Path,
+) -> None:
+    """上一条测试只盖 **record**；这条盖**承载它的 document**。
+
+    Kimi 的 ``persist()`` 落的信封逐字是 ``{version: 1, plugins: [...]}``，它的空 registry
+    常量同样是 ``{version: 1, plugins: []}``。当前 ``readInstalled()`` 只校验
+    ``Array.isArray(parsed.plugins)`` ⇒ 缺 ``version`` 今天不报错——但这正是
+    `source`/`github` 那两条真缺陷的同款形状：**旧版容忍、新版加校验就变硬失败**。
+    所以信封也要与宿主逐字一致，而不是只对齐 record。
+    """
+    marketplace_root = _build_marketplace_root(tmp_path / "marketplace")
+    kimi_home = tmp_path / "kimi-home"
+
+    install_to_codex.configure_kimi_plugin_registration(
+        marketplace_root, kimi_code_home=kimi_home, now="2026-08-24T00:00:00Z"
+    )
+
+    document = _read_registry(kimi_home)
+    assert set(document) == {"version", "plugins"}, (
+        f"全新 registry 的顶层键集必须与 Kimi 的 writeInstalled() 一致：{document}"
+    )
+    assert document["version"] == 1, document
+
+
+def test_existing_document_version_is_preserved_instead_of_being_forced_back_down(
+    tmp_path: Path,
+) -> None:
+    """已存在的 document 保留它自己的 ``version``，不被我们降级。
+
+    补 ``version`` 是为了对齐宿主，不是为了夺走这个字段的所有权：如果用户或未来版本的 Kimi
+    已经把 registry 升到更高的 schema 版本，我们这条 additive merge 把它写回 ``1``，就等于
+    用一个「兼容性修复」制造出一个真正的降级故障。
+    """
+    marketplace_root = _build_marketplace_root(tmp_path / "marketplace")
+    kimi_home = tmp_path / "kimi-home"
+    (kimi_home / "plugins").mkdir(parents=True)
+    (kimi_home / "plugins" / "installed.json").write_text(
+        json.dumps({"version": 2, "plugins": []}), encoding="utf-8"
+    )
+
+    install_to_codex.configure_kimi_plugin_registration(
+        marketplace_root, kimi_code_home=kimi_home, now="2026-08-24T00:00:00Z"
+    )
+
+    document = _read_registry(kimi_home)
+    assert document["version"] == 2, (
+        f"已存在的 document version 被覆写了，这是降级不是兼容：{document}"
+    )
 
 
 def test_reinstall_is_idempotent_and_preserves_other_plugins(tmp_path: Path) -> None:
@@ -155,6 +221,9 @@ def test_installer_output_is_independently_verifiable_as_actually_active(tmp_pat
     assert report["activation_state"] == "sole_registration", report
     assert completed.returncode == 0, report
     assert sorted(report["live_hook_event_names"]) == ["Stop", "UserPromptSubmit"], report
+    # hook 活着还不够：Kimi 只从 manifest.skills 发现 skill，漏声明就是「插件健康、入口全无」
+    # 的零报错状态。这条断言是那个形状的闸。
+    assert "review-validate-fix" in report["discovered_skill_directory_names"], report
 
 
 def test_kimi_home_override_is_honoured(tmp_path: Path) -> None:
@@ -292,3 +361,49 @@ def test_main_routes_kimi_registration_through_the_non_fatal_outcome_helper() ->
         "main() 又在直接调用会抛的注册函数了 ⇒ 它一失败，部署回执就写不出来"
     )
     assert '"kimi_plugin_registration_failure": kimi_plugin_registration_failure' in main_source
+
+
+def test_shipped_kimi_manifest_declares_the_skill_directory(tmp_path: Path) -> None:
+    """发布物必须自己声明 skills——Kimi 不会去扫 ``skills/``。
+
+    ``countDiscoveredPluginSkills()`` 逐字是 ``(manifest?.skills ?? []).map(...)``，
+    ``roots.length === 0`` 时直接 ``return 0``。对照：``agents`` 在字段缺省时会自动收
+    ``agents/`` 目录，``skills`` **没有**这个待遇；唯一 fallback 是 plugin 根上的 ``SKILL.md``，
+    RVF 没有。⇒ 漏声明 = 6 个 skill 全部不存在，而 plugin ``state`` 仍是 ``ok``。
+    """
+    manifest = json.loads(SHIPPED_KIMI_PLUGIN_MANIFEST.read_text(encoding="utf-8"))
+    declared = manifest.get("skills")
+    assert declared, "Kimi manifest 必须声明 skills，否则 RVF 在 Kimi 上没有任何入口"
+    assert all(entry.startswith("./") for entry in declared), (
+        'skills 条目必须以 "./" 开头，否则 Kimi 判 severity=error ⇒ 连 hook 一起停摆'
+    )
+    payload_root = SHIPPED_KIMI_PLUGIN_MANIFEST.parent.parent
+    for entry in declared:
+        assert (payload_root / entry).is_dir(), f"{entry} 在发布物里不是目录"
+        assert list((payload_root / entry).glob("*/SKILL.md")), f"{entry} 下没有任何 SKILL.md"
+
+
+def test_reinstall_preserves_previously_recorded_capabilities(tmp_path: Path) -> None:
+    """``capabilities`` 是用户态（per-plugin 的 MCP 开关），重装不得把它抹掉。
+
+    Kimi 自己 install 时写的是 ``existing?.capabilities``；我们必须照抄那个语义——
+    有就原样保留（否则用户关掉的 MCP server 会被重装重新打开），没有就**不写这个键**。
+    """
+    marketplace_root = _build_marketplace_root(tmp_path / "marketplace")
+    kimi_home = tmp_path / "kimi-home"
+    install_to_codex.configure_kimi_plugin_registration(
+        marketplace_root, kimi_code_home=kimi_home
+    )
+
+    registry_path = kimi_home / "plugins" / "installed.json"
+    document = json.loads(registry_path.read_text(encoding="utf-8"))
+    user_capabilities = {"mcpServers": {"some-server": {"enabled": False}}}
+    document["plugins"][0]["capabilities"] = user_capabilities
+    registry_path.write_text(json.dumps(document), encoding="utf-8")
+
+    install_to_codex.configure_kimi_plugin_registration(
+        marketplace_root, kimi_code_home=kimi_home
+    )
+
+    records = _read_registry(kimi_home)["plugins"]
+    assert records[0]["capabilities"] == user_capabilities, records
