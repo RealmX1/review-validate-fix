@@ -13,6 +13,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import string
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -120,6 +122,34 @@ def _git_optional(repo: Path, *args: str) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
+
+
+def _git_optional_narration_text(repo: Path, *args: str) -> str | None:
+    """`_git_optional` 的容错解码版：专供「输出只拿去讲给人看」的 git 查询。
+
+    与 `_git_optional` 的差别只有一处：不做严格解码。git 输出的字节序列并不保证是 UTF-8
+    —— 仓库可以设 `i18n.logOutputEncoding=ISO-8859-1`，历史里也可能本就存在非 UTF-8 的提交
+    信息 —— 此时 `text=True` 的严格解码会抛 `UnicodeDecodeError`。而 commit subject 这类
+    查询是**事后统计**：一次已经安装并验证通过、receipt 也已收敛的部署，绝不能因为讲述用的
+    字节不好解码而以异常收场。所以这里退化标准与非零退出对齐（返回 `None`，交调用方降级），
+    能拿到字节就用 `errors="replace"` 容错解码。
+
+    刻意**不**把这个宽容度并进 `_git_optional`：那个 helper 的其它调用点读的是路径、ref 名、
+    `rev-parse --verify` 解析结果这类**结构性**值，用 U+FFFD 顶替坏字节只会把一次硬失败换成
+    一个看着正常、实则错误的路径/ref 继续往下走。容错解码只在「输出纯属人读叙述」时才是对的。
+
+    错误处理器必须是 `replace` 而不是 `surrogateescape`：这段文本最终会进 result receipt 的
+    JSON，`surrogateescape` 留下的孤立代理字符会让 `json.dumps` 当场抛错——那等于把解码期的
+    异常挪到序列化期，一次已收敛的部署照样以异常收场。
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
 def _git_common_directory(repo: Path) -> Path | None:
@@ -600,6 +630,186 @@ def _installed_release_summary(installation_receipt_path: Path) -> dict[str, Any
         "generated_plugin_version": receipt.get("generated_plugin_version"),
         "status": receipt.get("status"),
     }
+
+
+_SOURCE_COMMIT_LOG_FIELD_SEPARATOR = "\x1f"
+
+
+def _looks_like_commit_sha(revision: str) -> bool:
+    """只放行纯十六进制的 commit 名。
+
+    双重作用：既是「这串东西还像不像一个 commit」的廉价证伪，也堵死把 receipt 里的任意
+    字符串直接当 git revision 参数递进去（`-` 开头会被当 flag 解析）的路径。
+    """
+    return len(revision) >= 7 and all(character in string.hexdigits for character in revision)
+
+
+def _read_source_commit_log(
+    repository: Path, *revision_arguments: str
+) -> list[dict[str, str]] | None:
+    """读一段 commit 列表；git 查询失败返回 None（交给调用方降级，不抛错）。
+
+    走 `_git_optional_narration_text` 而不是 `_git_optional`：subject 是纯人读叙述，且不保证
+    是 UTF-8，严格解码抛出的 `UnicodeDecodeError` 会绕过调用方的降级分支直接逃逸。
+    """
+    output = _git_optional_narration_text(
+        repository,
+        "log",
+        "--no-decorate",
+        f"--format=%H{_SOURCE_COMMIT_LOG_FIELD_SEPARATOR}%s",
+        *revision_arguments,
+    )
+    if output is None:
+        return None
+    commits: list[dict[str, str]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        sha, _, subject = line.partition(_SOURCE_COMMIT_LOG_FIELD_SEPARATOR)
+        commits.append({"sha": sha, "subject": subject})
+    return commits
+
+
+def describe_source_commit_delta_since_last_installation(
+    *,
+    repository: Path,
+    previously_installed_commit: str | None,
+    newly_installed_commit: str,
+) -> dict[str, Any]:
+    """回答「已安装 plugin 现在反映了哪些源 commit」。
+
+    OLD 的唯一事实源是**部署开始时读到的 official installation receipt**
+    （`latest-official-cli-installation.json` 的 `local_main_commit`）。
+    **禁止用当前 HEAD 冒充 OLD**：HEAD 是本次要装的 NEW，拿它当 OLD 会让每一次部署都塌成
+    `unchanged`；`generated_plugin_version` 只是版本串，也反推不出 commit。
+
+    分类先证伪再归类，顺序固定：无基线 → 基线不可解析（`unknown_revision`）→ 未变 →
+    前进（`forward`）→ 回退或分叉（`rollback_or_diverged`）。函数内一律走 `_git_optional`，
+    任何 git 查询失败都降级成 `unknown_revision` 而不是抛 `DeployError` —— 一次已经成功并
+    收敛的部署，不该因为事后统计失败被判成失败。
+
+    `boundary_explanation` 是措辞的唯一事实源：人读输出与 skill 汇报都直接引用它，措辞一律
+    锚在 runtime 语义（「已安装 plugin 现在反映…」），不写成「源码集成了这些 commit」。
+    """
+    # OLD 直接来自磁盘上的 receipt JSON，字段类型不受本进程控制：非字符串一律按「没有基线」
+    # 处理，绝不让一次已经收敛的部署栽在类型上。
+    old_commit = (
+        previously_installed_commit.strip() or None
+        if isinstance(previously_installed_commit, str)
+        else None
+    )
+    new_commit = (
+        newly_installed_commit.strip() if isinstance(newly_installed_commit, str) else ""
+    )
+    new_commit_is_addressable = _looks_like_commit_sha(new_commit)
+
+    def delta(
+        kind: str,
+        *,
+        forward_commits: list[dict[str, str]],
+        reverse_commits: list[dict[str, str]],
+        boundary_explanation: str,
+    ) -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "old_commit": old_commit,
+            "new_commit": new_commit or None,
+            "forward_commits": forward_commits,
+            "reverse_commits": reverse_commits,
+            "boundary_explanation": boundary_explanation,
+        }
+
+    def unknown_revision(reason: str) -> dict[str, Any]:
+        return delta(
+            "unknown_revision",
+            forward_commits=[],
+            reverse_commits=[],
+            boundary_explanation=(
+                f"{reason}，无法计算区间；只能给出两端：上次安装反映 "
+                f"{old_commit or '（无记录）'}，现在反映 {new_commit or '（无记录）'}。"
+            ),
+        )
+
+    if old_commit is None:
+        newly_installed = (
+            _read_source_commit_log(repository, "-n", "1", new_commit)
+            if new_commit_is_addressable
+            else None
+        )
+        return delta(
+            "no_baseline",
+            forward_commits=newly_installed or [],
+            reverse_commits=[],
+            boundary_explanation=(
+                "没有可用的上一次安装基线（official installation receipt 不存在或未记录 "
+                f"local main commit），不做区间比较；已安装 plugin 现在反映到源 commit "
+                f"{new_commit[:12] or '（无记录）'}。"
+            ),
+        )
+
+    if not _looks_like_commit_sha(old_commit) or not new_commit_is_addressable:
+        return unknown_revision("上次安装记录的源 commit 不是一个可寻址的 commit 名")
+    # 存在性检查与「归一成同一个 commit object id」是同一件事：receipt 里的 OLD 可能是 NEW 的
+    # 合法缩写（≥7 位十六进制）或大小写异体，字符串比较会把「同一个 commit」误判成两端不同，
+    # 进而落到 `forward` 却带着空区间，说出「前进了 0 个源 commit」这种自相矛盾的话。先各自
+    # 解析成完整 object id，再拿解析结果做后续比较与区间查询。解析失败（不在对象库里、缩写
+    # 歧义）沿用既有约定降级成 `unknown_revision`，不抛错。
+    resolved_commits: list[str] = []
+    for revision in (old_commit, new_commit):
+        resolved_commit = _git_optional(
+            repository, "rev-parse", "--verify", f"{revision}^{{commit}}"
+        )
+        if not resolved_commit:
+            return unknown_revision(f"源 commit {revision[:12]} 不在本仓对象库里")
+        resolved_commits.append(resolved_commit)
+    resolved_old_commit, resolved_new_commit = resolved_commits
+
+    if resolved_old_commit == resolved_new_commit:
+        return delta(
+            "unchanged",
+            forward_commits=[],
+            reverse_commits=[],
+            boundary_explanation=(
+                f"已安装 plugin 反映的源 commit 没有变化（仍是 {resolved_new_commit[:12]}），"
+                "本次部署没有让它反映任何新的源 commit。"
+            ),
+        )
+
+    forward_commits = _read_source_commit_log(
+        repository, f"{resolved_old_commit}..{resolved_new_commit}"
+    )
+    if forward_commits is None:
+        return unknown_revision("读取源 commit 区间失败")
+
+    if _git_optional(
+        repository, "merge-base", "--is-ancestor", resolved_old_commit, resolved_new_commit
+    ) is not None:
+        return delta(
+            "forward",
+            forward_commits=forward_commits,
+            reverse_commits=[],
+            boundary_explanation=(
+                f"已安装 plugin 现在反映到源 commit {resolved_new_commit[:12]}，"
+                f"比上次安装反映的 {resolved_old_commit[:12]} 前进了 "
+                f"{len(forward_commits)} 个源 commit。"
+            ),
+        )
+
+    reverse_commits = _read_source_commit_log(
+        repository, f"{resolved_new_commit}..{resolved_old_commit}"
+    )
+    if reverse_commits is None:
+        return unknown_revision("读取反向源 commit 区间失败")
+    return delta(
+        "rollback_or_diverged",
+        forward_commits=forward_commits,
+        reverse_commits=reverse_commits,
+        boundary_explanation=(
+            f"已安装 plugin 现在反映的源 commit {resolved_new_commit[:12]} 并不在上次安装的 "
+            f"{resolved_old_commit[:12]} 之后（回退或分叉）：{len(reverse_commits)} 个源 commit "
+            f"不再被反映，{len(forward_commits)} 个源 commit 新被反映。"
+        ),
+    )
 
 
 def _snapshot_structured_hook_configuration(
@@ -1084,12 +1294,23 @@ def run_local_deploy(
                 exit_code=2,
                 result=registration_not_certified,
             )
+        # `source_commit_delta` 只挂在**成功**结果上，且必须走 `result_for(**extra)`：
+        # `result_for` 同时服务 status=running / failed，把它塞进函数本体等于给失败与回滚
+        # 结果也发一份「已投入使用」的 forward 列表。位置也必须在上面那个 except 之外——
+        # 部署已经收敛了，一次事后统计的异常不该把它拖回回滚分支。
         completed = result_for(
             status="ok",
             phase="completed",
             contract_output=contract_output,
             installer=installer_receipt,
             verification=verification,
+            source_commit_delta=describe_source_commit_delta_since_last_installation(
+                repository=source.worktree_path,
+                previously_installed_commit=(installed_before or {}).get(
+                    "local_main_commit"
+                ),
+                newly_installed_commit=source.commit,
+            ),
             codex_hook_trust=codex_hook_trust,
             codex_registration_uniqueness=codex_registration_uniqueness,
         )
@@ -1355,6 +1576,7 @@ def _print_text(result: dict[str, Any]) -> None:
     print("installed before:", result["installed_before"])
     print("installed after:", result["installed_after"])
     print("stale before:", result["stale_before"])
+    _print_source_commit_delta(result.get("source_commit_delta") or {})
     if not result.get("runner_matches_local_main_head", True):
         print(
             "注意: runner 自身含未提交改动，与本次被部署的 HEAD 版本不是同一份"
@@ -1365,6 +1587,72 @@ def _print_text(result: dict[str, Any]) -> None:
     )
     _print_codex_hook_trust_observation(result.get("codex_hook_trust") or {})
 
+
+# C0（含 ESC / BEL / 换行 / 制表）、DEL 与 C1：终端会把它们当命令而不是字符看待。
+# U+FFFD（`errors="replace"` 容错解码留下的 `�`）刻意不在此列：它是一个普通可打印
+# 字符，讲述坏字节这件事本身要如实呈现，不该被当成控制序列吃掉。
+_TERMINAL_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _neutralize_terminal_control_sequences_for_human_readable_output(
+    value: object,
+) -> str:
+    """把外部可控字符串里的终端控制字符转成可见转义，**只用于人读打印路径**。
+
+    这些串的内容都不受本进程控制：commit `subject` 来自提交信息（任何能往本仓写提交的人
+    都能构造），`old_commit` / `new_commit` 来自磁盘上的 official installation receipt。
+    原样 `print` 会让 ESC/OSC 等序列直达终端，可以伪造输出行、清屏盖掉前面的真实结论，或
+    触发终端功能——而人读输出恰恰是开发者用来判断「到底装了什么」的那一路，伪造的代价正好
+    落在它上面。
+
+    处理只发生在打印侧：`--json` 回执与 receipt 落盘必须继续携带原始值，转义不得回灌进
+    结构化结果。换行 / 回车 / 制表符一并转义——它们同样能凭空造出一整行看着像真结论的输出。
+    """
+    return _TERMINAL_CONTROL_CHARACTER_PATTERN.sub(
+        lambda match: f"\\x{ord(match.group()):02x}",
+        "" if value is None else str(value),
+    )
+
+
+def _print_source_commit_delta(delta: dict[str, Any]) -> None:
+    """把 commit 级 delta 印成人能读的结论。
+
+    措辞不在这里另起炉灶：一律先印 runner 自己写的 `boundary_explanation`，再按 kind 决定
+    要不要展开列表。只报版本串、不给 commit 列表，等于没有汇报。
+
+    这一路上的每个外部可控串（commit `subject`、`old_commit` / `new_commit`，以及内插了
+    它们的 `boundary_explanation`）在打印前都过
+    `_neutralize_terminal_control_sequences_for_human_readable_output`：转义只发生在人读
+    打印侧，`--json` 回执与 receipt 里的原始值保持原样。
+    """
+    kind = delta.get("kind")
+    if not kind:
+        return
+    neutralize = _neutralize_terminal_control_sequences_for_human_readable_output
+    print("已安装 plugin 现在反映的源 commit:", kind)
+    print("  ", neutralize(delta.get("boundary_explanation", "")))
+
+    def print_commits(caption: str, commits: list[dict[str, str]]) -> None:
+        if not commits:
+            return
+        print(f"   {caption}（{len(commits)} 个）:")
+        for commit in commits:
+            sha = neutralize(commit.get("sha", ""))[:12]
+            print(f"     - {sha} {neutralize(commit.get('subject', ''))}")
+
+    forward_commits = delta.get("forward_commits") or []
+    reverse_commits = delta.get("reverse_commits") or []
+    if kind == "forward":
+        print_commits("本次新投入使用的源 commit", forward_commits)
+    elif kind == "no_baseline":
+        print_commits("本次安装所在的源 commit", forward_commits)
+    elif kind == "rollback_or_diverged":
+        print("   ⚠️ 相对上次安装是回退或分叉，两个方向都必须一起看：")
+        print_commits("不再被已安装 plugin 反映的源 commit", reverse_commits)
+        print_commits("新被已安装 plugin 反映的源 commit", forward_commits)
+    elif kind == "unknown_revision":
+        print("   ⚠️ 上次: ", neutralize(delta.get("old_commit")))
+        print("   ⚠️ 现在: ", neutralize(delta.get("new_commit")))
 
 def _print_codex_registration_uniqueness(uniqueness: dict[str, Any]) -> None:
     """印 RVF 注册唯一性结论；只有 `sole_registration` 可以读成正常。
