@@ -1736,6 +1736,18 @@ require_repo_file "docs/architecture/cross-harness.md"
 require_repo_literal "scripts/sync-manifest.sh" '.plugins[0].source // ""'
 require_repo_literal "scripts/sync-manifest.sh" 'plugin id 漂移'
 require_repo_literal "scripts/sync-manifest.sh" 'version 漂移'
+
+# Kimi manifest 漏声明 skills 是零报错状态（plugin state 仍是 ok、hook 照常触发、6 个 skill
+# 全部不存在）。Kimi 只从 manifest.skills 发现 skill，不扫 skills/ 目录——对照 agents 有目录
+# 兜底、skills 没有。2026-08-26 实盘命中过一次，故把「三份 host manifest 都声明且一致」钉死。
+require_repo_literal "scripts/sync-manifest.sh" 'skills 声明漂移'
+require_repo_literal "plugins/review-validate-fix/.kimi-plugin/plugin.json" '"./skills/"'
+# 注册记录写错 source/github 会让 Kimi 0.38.0 的 /plugins 面板整个打不开，而 hook 仍在跑
+# （enabledHooks 不过那道出站校验）⇒ 必须是独立一态，不能折进 not_registered。
+require_repo_literal "scripts/kimi_plugin_manifest_activation_state_check.py" \
+  'registry_record_rejected_by_host_schema'
+require_repo_literal "scripts/install_to_codex.py" \
+  'KIMI_PLUGIN_REGISTRY_INSTALL_SOURCE_KIND_LOCAL_PATH = "local-path"'
 require_repo_literal "docs/architecture/cross-harness.md" 'Adapter-backed'
 require_repo_literal "docs/architecture/cross-harness.md" '(M+N)'
 # README 与指南 06 须链入 as-built 矩阵、并对齐脱离反模式 ② 的现状。

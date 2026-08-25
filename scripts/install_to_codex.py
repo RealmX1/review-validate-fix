@@ -1542,6 +1542,23 @@ def configure_stop_hook(
 KIMI_CODE_HOME_ENVIRONMENT_VARIABLE = "KIMI_CODE_HOME"
 KIMI_DEFAULT_HOME_RELATIVE_TO_USER_HOME = ".kimi-code"
 
+# Kimi 的 `installed.json` 里 `source` 是**安装来源种类的枚举**，不是路径——路径归
+# `originalSource`。取证：`resolveInstallSource()` 返回 `{kind: "local-path"|"zip-url"|"github", path}`，
+# `recordFrom()` 落的是 `source: input.source ?? "local-path"`（即那个 kind），`persist()` 原样写盘。
+# 写错的代价在 0.38.0 起是**响亮**的：`pluginService.listPlugins` 的出站 zod 校验里
+# `source: enum([...])` / `github: pluginGithubMetadataSchema.optional()`，一条不合规就让整个
+# `/plugins` 面板报 "output validation failed" 打不开（hook 派发走 enabledHooks()、不过这道校验，
+# 所以这是一个「hook 还在跑、UI 全挂」的偏斜故障，别按「插件没装上」去排查）。
+KIMI_PLUGIN_REGISTRY_INSTALL_SOURCE_KIND_LOCAL_PATH = "local-path"
+
+# 承载 record 的 **document 信封**同样有形状：Kimi 的 `persist()` 逐字写
+# `writeInstalled(home, {version: 1, plugins: [...]})`，它的空 registry 常量也是
+# `{version: 1, plugins: []}`（0.38.0 里 agent-core 与 agent-core-v2 两份实现一致）。
+# 今天 `readInstalled()` 只校验 `Array.isArray(parsed.plugins)` ⇒ 缺 `version` **不报错**；
+# 但那正是 `source` / `github` 那两条真缺陷的同款形状——旧版容忍、新版加一道校验就变硬失败。
+# 所以全新 registry 补齐它；**已存在的 document 保留原有 version**，见下面写入处的注释。
+KIMI_PLUGIN_REGISTRY_DOCUMENT_SCHEMA_VERSION = 1
+
 
 def resolve_kimi_code_home(
     *,
@@ -1649,7 +1666,14 @@ def configure_kimi_plugin_registration(
     1. **写后复验**（本函数实现）：``replace`` 之后立刻读回，比对我们那条记录是否逐字落盘、
        别人插件的 id 集合是否原样保留；不符即 fail closed。复验结果连同读回内容的 sha256
        进 receipt 的 ``post_write_verification``。
-    2. ``requires_manual_reload_command``：让用户显式 ``/plugins reload`` 收敛内存态。
+    2. ``requires_manual_activation_commands_in_order``：让用户显式收敛内存态。**必须两条、
+       且顺序固定**，因为它们收敛的是两层不同的缓存（取证自 0.38.0 二进制）：
+       ``/plugins reload`` 只把 ``installed.json`` 重新 materialize 进**进程级**
+       ``PluginManager``；而 skill 是**会话级**的——``loadSkills()`` 只在 session 构造时跑一次
+       （``this.skillsReady = this.loadSkills()``），已有会话不会重扫。所以还要 ``/reload``
+       （或 ``/new``）重建会话，新的 skill 才进得去。Kimi 自己的 TUI 常量逐字就是这个意思：
+       ``PLUGIN_RELOAD_HINT = "Run /new or /reload to apply plugin changes."``
+       ⚠️ 只提示 ``/plugins reload`` 会让用户看到「插件在册、Skills 却是空的」而无从下手。
     3. ``kimi_plugin_manifest_activation_state_check.py`` 事后**独立复算**生效状态；把当时
        文件的 sha256 与 1 记下的那个一比，就能看出注册有没有被运行中的 Kimi 覆盖掉。
 
@@ -1696,21 +1720,36 @@ def configure_kimi_plugin_registration(
     record = {
         "id": PLUGIN_NAME,
         "root": str(plugin_root),
-        "source": str(plugin_root),
+        # 枚举，不是路径——见 KIMI_PLUGIN_REGISTRY_INSTALL_SOURCE_KIND_LOCAL_PATH 的取证注释。
+        "source": KIMI_PLUGIN_REGISTRY_INSTALL_SOURCE_KIND_LOCAL_PATH,
         "enabled": True,
         # 首次注册才记 installedAt；重复部署保留原值，让「装了多久」这个事实不被刷掉。
         "installedAt": (previous or {}).get("installedAt") or timestamp,
         "updatedAt": timestamp,
         "originalSource": str(plugin_root),
-        "capabilities": [],
-        "github": None,
     }
+    # `capabilities`（per-plugin 的 MCP 开关等）是**用户态**：Kimi 自己 install 时写的是
+    # `existing?.capabilities`，全新安装即 undefined ⇒ 键不落盘。这里照抄那个语义——有就原样保留
+    # （否则重装会把用户关掉的 MCP server 又打开），没有就**不写这个键**，而不是写 `[]`。
+    previous_capabilities = (previous or {}).get("capabilities")
+    if previous_capabilities is not None:
+        record["capabilities"] = previous_capabilities
+    # `github` 刻意**不写**：它只对 kind=="github" 的安装有值，本地路径安装在 Kimi 那边是
+    # undefined ⇒ JSON 里根本没这个键。写 `null` 会被 `.optional()` 拒收（zod 接受「缺省」，
+    # 不接受 null），正是 0.38.0 下 `/plugins` 报错的另一半。
     merged_records = [
         existing
         for existing in existing_records
         if not (isinstance(existing, dict) and existing.get("id") == PLUGIN_NAME)
     ]
     merged_records.append(record)
+    # 用 `setdefault` 而不是直接赋值：全新 registry 从空 dict 出发 ⇒ 补上宿主那个顶层
+    # `version`（否则落盘信封只有 `plugins`，与 writeInstalled() 写的形状对不上）；而**已存在**
+    # 的 document 原样保留它自己的值。后者是刻意的：如果用户或未来版本的 Kimi 已经把 registry
+    # 升到更高的 schema 版本，这条 additive merge 把它压回 1 就是拿「兼容性修复」制造真降级。
+    existing_document.setdefault(
+        "version", KIMI_PLUGIN_REGISTRY_DOCUMENT_SCHEMA_VERSION
+    )
     existing_document["plugins"] = merged_records
 
     temporary_path = registry_path.with_suffix(".json.rvf-tmp")
@@ -1735,7 +1774,11 @@ def configure_kimi_plugin_registration(
         "plugin_root": str(plugin_root),
         "was_already_registered": previous is not None,
         "preserved_other_plugin_count": len(merged_records) - 1,
-        "requires_manual_reload_command": "/plugins reload",
+        # 两条命令**都要跑，且缺一不可**——它们收敛的是两个不同的东西：
+        "requires_manual_activation_commands_in_order": [
+            "/plugins reload",
+            "/reload",
+        ],
         "post_write_verification": post_write_verification,
     }
 

@@ -1,5 +1,9 @@
 # Kimi Code CLI 插件注册与 hook 运行时取证（S-B0）
 
+> ⚠️ **版本已漂移：本文正文锚在 0.29.1，本机现为 0.38.0。** 差异与新增取证见文末
+> **§11「0.38.0 补充取证」**——其中一条（`listPlugins` 出站校验）是 0.38.0 才有的，
+> 它让一条早已存在的写入缺陷在此时才显形。**正文与 §11 冲突时以 §11 为准。**
+>
 > 取证对象：`~/.kimi-code/bin/kimi`，**0.29.1**，Mach-O arm64 单体（158 MB，内嵌 JS bundle）。
 > 全程只读：未写入 `~/.kimi-code` 任何文件，未起 `kimi web`，未注册任何插件。
 > 取证方式：二进制内嵌源码字面量抽取 + `kanban` CLI 的只读 `--preview`。
@@ -330,3 +334,148 @@ $KIMI_CODE_HOME/sessions/
 - ~~**wire.jsonl 的 record 结构与蒸馏映射**~~ → ✅ **已取证并落地**（§7b）。
   `distill_kimi_wire_jsonl` 已实装，42/42 份真实 wire 验证 0 失败，未抽取记录逐项对账闭合
   （903 = `step.begin` 404 + `step.end` 398 + 空正文 `content.part` 101）。
+
+---
+
+## 11. 0.38.0 补充取证（2026-08-26，首次真机使用后）
+
+> 取证对象：`~/.kimi-code/bin/kimi`，**0.38.0**，179 MB。全程只读。
+> 触发原因：RVF 于 2026-08-24 部署到 Kimi 后，`/plugin` 报
+> `output validation failed for pluginService.listPlugins`，且面板显示 `Skills (0)`。
+
+### 11.1 `installed.json` 的 record 形状（推翻正文的隐含假设）
+
+`persist()` 写的 9 个字段正文已记对，但**没记 `source` 的值域**。实测：
+
+```js
+// packages/agent-core/src/plugin/source.ts
+function resolveInstallSource(source) {
+  const github = parseGithubUrl(trimmed);
+  if (github !== undefined) return github;                       // {kind:"github", owner, repo, ref}
+  if (trimmed.startsWith("http")) return {kind:"zip-url", path:trimmed};
+  if (!path.isAbsolute(trimmed)) throw …;
+  return {kind:"local-path", path:trimmed};
+}
+// packages/agent-core/src/plugin/manager.ts
+async function recordFrom(input) {
+  return { …, source: input.source ?? "local-path", …, github: input.github, … };
+}
+```
+
+⇒ **`source` 是安装来源的种类枚举，不是路径**；路径归 `originalSource`。
+`github` 只对 `kind === "github"` 有值，本地路径安装下是 `undefined` ⇒ **键不落盘**。
+
+### 11.2 0.38.0 新增：`listPlugins` 的出站 zod 校验
+
+```js
+// packages/kap-server/src/protocol/rest-plugin.ts
+pluginSummarySchema = object({
+  …,
+  source: _enum(["local-path", "zip-url", "github"]),
+  originalSource: string().optional(),
+  github: pluginGithubMetadataSchema.optional(),
+});
+listPluginsResponseSchema = object({ plugins: array(pluginSummarySchema) });
+```
+
+`.optional()` 接受**缺省**，**不**接受 `null`。⇒ 把路径写进 `source`、或把 `github` 写成 `null`，
+`/plugins` 面板整个打不开。
+
+**关键的偏斜性**：hook 派发走的是 `enabledHooks()` → `materialize()` → `recordFrom()`，
+那条路径对 `source` 不做枚举校验（`input.source ?? "local-path"` 原样透传）
+⇒ **record 写坏时 hook 照常触发，只有 UI 挂掉**。故障表象与真实影响面不一致。
+
+### 11.3 skill 发现只认 `manifest.skills`，且与 `agents` 不对称
+
+```js
+async function countDiscoveredPluginSkills(pluginId, manifest) {
+  const roots = (manifest?.skills ?? []).map(…);
+  if (roots.length === 0) return 0;                 // ← 不扫 skills/ 目录
+  return (await discoverSkills({ roots })).length;
+}
+```
+
+而 `parseManifest` 里两者的兜底待遇**不同**：
+
+```js
+let skills = await resolveDirListField(pluginRoot, "skills", raw["skills"], diagnostics);
+let rootSkillFallback;
+if (raw["skills"] === undefined) {
+  if (await isFile(join(pluginRoot, "SKILL.md"))) { skills = [pluginRoot]; rootSkillFallback = true; }
+}
+let agents = await resolveDirListField(pluginRoot, "agents", raw["agents"], diagnostics);
+if (raw["agents"] === undefined) {
+  const agentsDir = join(pluginRoot, "agents");
+  if (await isDir(agentsDir)) agents = [agentsDir];   // ← agents 有目录兜底，skills 没有
+}
+```
+
+⇒ 漏声明 `skills` 是**零报错**状态：`state: ok`、hook 正常、所有 skill 不存在。
+
+`resolveDirListField` 的失败等级要分清：
+
+| 情形 | severity | 后果 |
+|---|---|---|
+| 不是 string / string[] | `error` | record `state` → `error` ⇒ **hook 一起停摆** |
+| 条目不以 `./` 开头 | `error` | 同上 |
+| 条目解析到 plugin root 之外 | `error` | 同上 |
+| 条目不是目录 | `warn` | 只丢弃该条 |
+
+⇒ **声明写错比不声明更严重。**
+
+`discoverSkills` 对一个 root 的顶层行为：该目录下每个含 `SKILL.md` 的子目录算一个 skill，
+目录自身的 `SKILL.md` 也算一个 ⇒ `"skills": ["./skills/"]` 能收全 `skills/<name>/SKILL.md`。
+
+### 11.4 skill 是**会话级**的，`/plugins reload` 收敛不到
+
+```js
+this.skillsReady = this.loadSkills();      // 只在 session 构造时跑一次
+async loadSkills() {
+  const roots = await resolveSkillRoots({ …, pluginSkillRoots: this.options.skills?.pluginSkillRoots, … });
+  await this.skills.loadRoots(roots);
+}
+```
+
+`/plugins reload` 只把 `installed.json` 重新 materialize 进**进程级** `PluginManager`。
+Kimi 自己的 TUI 常量把这件事说得很明白：
+
+```js
+PLUGIN_RELOAD_HINT = "Run /new or /reload to apply plugin changes.";
+function pluginInlineChangeHint() { return "run /reload or /new to apply"; }
+```
+
+⇒ 激活序列是 **`/plugins reload` 然后 `/reload`（或 `/new`）**，两条缺一不可。
+
+### 11.4-bis ⚠️ 部分推翻 §1：0.38.0 的 `kimi web` **有** plugin REST 路由
+
+§1 断言「四条跨进程通道全部不可达」，其中「`kimi web` 的 `/api/v1/*` 无 plugin 路由」这一条
+**在 0.38.0 已不成立**。二进制里有 `packages/kap-server/src/protocol/rest-plugin.ts`
+（`listPluginsResponseSchema` / `installPluginRequestSchema` / `pluginIdParamSchema`）与
+`packages/kap-server/src/routes/plugins.ts`（`enablePluginAction` / `disablePluginAction` 等）。
+
+**已实测**（2026-08-26，本次修复的独立验证手段）：
+
+```bash
+kimi web --port <port> --log-level error      # 默认只绑 127.0.0.1，启动时打印 bearer token
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/v1/plugins
+# → {"code":0,"msg":"success","data":{"plugins":[{…,"state":"ok","skillCount":6,
+#     "hookCount":2,"commandCount":1,"hasErrors":false,"source":"local-path"}]}}
+```
+
+**这条路径的价值主要是「验证」而不是「注册」**：它要求先把服务器跑起来、再从 stdout 抓 token，
+对一个非交互部署器来说比直接写 `installed.json` 更脆；但它是**唯一能让 Kimi 自己的代码给出结论**的
+非交互手段——`skillCount` / `state` / `hasErrors` 都是它现算的，比任何复刻脚本都硬。
+
+⇒ **修 Kimi 侧注册问题后，用这条路径做终验**，别只信复刻式核对器（复刻器与自己一致说明不了什么）。
+§1 的其余三条（CLI 无 `plugin` 子命令、WebSocket 控制帧、ACP 方法表）在 0.38.0 仍成立
+——`kimi --help` 的 Commands 里确实没有 `plugin`。
+
+### 11.5 顺带确认（与正文一致，未变）
+
+- manifest 双路径与遮蔽关系不变：`kimi.plugin.json`（root）**优先于** `.kimi-plugin/plugin.json`（dir）。
+- `enabledHooks()` 过滤条件不变：`record.enabled && record.state === "ok" && record.manifest !== undefined`；
+  注入 env 仍恰为 `KIMI_CODE_HOME` 与 `KIMI_PLUGIN_ROOT`。
+- hook 事件枚举含 `Stop` 与 `UserPromptSubmit`，`timeout` 仍是 `int().min(1).max(600).optional()`。
+- `UNSUPPORTED_RUNTIME_FIELDS = ["tools","apps","inject","configFile","config_file","bootstrap"]`
+  ——命中只记 `severity:"info"`，无害。
+- `commands` 与 `skills` 一样需显式声明（`./` 前缀），支持目录递归收 `.md`。
