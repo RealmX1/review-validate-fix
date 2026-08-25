@@ -21,6 +21,8 @@ Host 归一（S2 / handoff A2）
   ``rollout-*-<agent_id>.jsonl`` glob（``adapters/codex/subagent.py``）。
 - **Claude Code**：父会话同名目录 ``<uuid>/subagents/agent-*.jsonl``
   （``adapters/claude_code/subagent.py``）。
+- **Kimi Code CLI**：会话 ``state.json`` 里的 ``agents`` 名册（既不是 spawn 事件也不是
+  glob；``adapters/kimi/subagent.py``）。
 
 本 facade 只保留 host 中性的 copy / distill / manifest 骨架，按 host_kind 选取
 discovery、distill 与 originator 提取函数。``SpawnRecord`` /
@@ -46,10 +48,13 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
+    HOST_KIMI_CODE,
+    KNOWN_HOST_IDENTITIES,
 )
 from trajectory_distill import (  # noqa: E402
     distill_claude_jsonl,
     distill_codex_jsonl,
+    distill_kimi_wire_jsonl,
     read_codex_originator,
     write_jsonl,
 )
@@ -63,6 +68,10 @@ from adapters.codex.subagent import (  # noqa: E402
 from adapters.claude_code.subagent import (  # noqa: E402
     read_claude_originator,
     resolve_subagents as _claude_resolve_subagents,
+)
+from adapters.kimi.subagent import (  # noqa: E402
+    read_kimi_originator,
+    resolve_subagents as _kimi_resolve_subagents,
 )
 
 SCHEMA_VERSION = 1
@@ -86,12 +95,16 @@ def _host_distill(host_kind: str):
     """按 host 选 distiller（公共边界仍返回 ``(list[dict], index)``）。"""
     if host_kind == HOST_CLAUDE:
         return distill_claude_jsonl
+    if host_kind == HOST_KIMI_CODE:
+        return distill_kimi_wire_jsonl
     return distill_codex_jsonl
 
 
 def _host_originator(host_kind: str, src: Path) -> str | None:
     if host_kind == HOST_CLAUDE:
         return read_claude_originator(src)
+    if host_kind == HOST_KIMI_CODE:
+        return read_kimi_originator(src)
     return read_codex_originator(src)
 
 
@@ -104,6 +117,12 @@ def _resolve_subagents(
 ) -> list[tuple[SpawnRecord, Path | None]]:
     if host_kind == HOST_CLAUDE:
         return _claude_resolve_subagents(
+            main_rollout_path=main_rollout_path,
+            original_transcript=original_transcript,
+            sessions_root=sessions_root,
+        )
+    if host_kind == HOST_KIMI_CODE:
+        return _kimi_resolve_subagents(
             main_rollout_path=main_rollout_path,
             original_transcript=original_transcript,
             sessions_root=sessions_root,
@@ -302,7 +321,9 @@ def main() -> int:
     parser.add_argument("--repo", help="Optional repo root to normalize patch paths.")
     parser.add_argument(
         "--host",
-        choices=[HOST_CODEX, HOST_CLAUDE],
+        # 取自 detect_transcript_format 能正向识别的全集：写死两家会让新 host 连 CLI 都进不来
+        # （argparse 直接拒绝），而库侧三处派发明明已经认识它。
+        choices=sorted(KNOWN_HOST_IDENTITIES),
         default=HOST_CODEX,
         help="Host kind for discovery dispatch (default: codex).",
     )

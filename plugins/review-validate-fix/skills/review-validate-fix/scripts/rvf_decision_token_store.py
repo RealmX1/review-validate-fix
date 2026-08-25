@@ -109,6 +109,90 @@ STATE_LOST = "lost"
 # 把接下来的 TTL 窗口堵死。
 STATE_WITHDRAWN = "withdrawn"
 
+# ``withdrawn`` 的**成因**：同一个终态，两种完全不同的起因，对熔断额度的处置必须相反。
+#
+# INV-C（「withdrawn 不计冷却也不计熔断」）当初是为**用户 rewind** 这一支立的，理由正当：用户
+# 刚把征询回退掉，说明他还想被问，若让这次撤回烧掉一份熔断额度，连续 rewind 两次之后第三次征询
+# 就会撞上 ``circuit_breaker_tripped``，会话被静默一整个窗口（默认 3600s）。
+#
+# 但 ``mark_withdrawn`` 历史上把**带外投递从未落地**这一支也按同样处置，于是产生了一个空转环：
+# 横幅铸出 → 投递从未成为 turn → 判搁浅撤回 → 冲销额度 → 下一次 Stop 无成本地再铸一枚 → 再空转。
+# 实测（2026-08-21）一个 session 内出现 ``minted → withdrawn`` 连铸三枚、全程从未经过 ``injected``。
+# 这一支里用户**根本没看到过**横幅，「他还想被问」的前提不成立；而投递通道坏着时重铸多少次都会
+# 空转，此时烧掉额度、让熔断如实跳闸，正是所需的退避。
+#
+# 故按成因分叉，而不是取消 INV-C：``rewound_by_user`` 一支行为逐字不变，只有空转这一支不冲销。
+# 自动路径退避期间用户仍可手动发起——手动触发已由 ``initiated_by_explicit_user_request`` 豁免熔断。
+DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER = "rewound_by_user"
+"""用户把承载这次征询的那条消息 rewind 掉了。冲销熔断额度（INV-C 原义）。"""
+
+DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN = (
+    "out_of_band_delivery_never_became_a_turn"
+)
+"""带外横幅投出去后在有效期内从未成为一条真实 user message。**不**冲销熔断额度。
+
+⚠️ 这个成因是一句**关于事实的断言**，只有在拿到「这枚 token 的横幅从未出现在 transcript 里」
+这样的确凿证据时才能用。把「无法确证」也塞进来会撞上下面那个成因描述的可达路径。
+"""
+
+DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED = (
+    "out_of_band_delivery_became_a_turn_but_token_advance_failed"
+)
+"""带外横幅**确实**成为了一条真实 user message，但 ``minted → injected`` 那一步没能落上。
+冲销熔断额度。
+
+可达路径（本仓已记录）：``rvf_user_prompt_submit._observe_delivered_decision_point_banner``
+在 ``mark_injected`` 抛 ``DecisionTokenExpiredError`` 时**提前返回且刻意不清投递意图**（留给
+后续对账），而 ``read_decision_token`` 对已过 TTL 的 token 仍原样返回 ``state=minted``。于是
+一枚「agent 已经看到过横幅」的 token 在对账侧与「从未成为 turn」的那一族形状完全一致。
+
+为什么它必须**冲销**（即进白名单）：这一支里横幅其实送达了、通道是**健康**的，退避的前提
+（「通道坏着，重铸多少次都会空转」）根本不成立。按空转计费的话，连续 3 次这种记账失败就会把
+铸造熔断打跳（默认窗口 3600s），整个 session 的自动发起被静默封禁——那是**漏审**方向，比多问
+一次严重得多。冲销并不会让熔断失效：它只在拿到「横幅确实落地过」的正向证据时才成立，而那份
+证据本身就说明这不是一次空转。
+"""
+
+DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED = (
+    "stop_hook_reentry_budget_exhausted"
+)
+"""跨 turn 再入预算耗尽，RVF **主动决定不注入**这一枚横幅。冲销熔断额度。
+
+与上面两个带外成因的关键区别：那两支是「发出去了、但（可能）没到」，这一支是**根本没发**——
+判定发生在 ``_decision_point_self_injection_decision`` 入口，早于任何投递动作。
+
+为什么它进冲销白名单（这条要论证，因为白名单的默认方向是「不冲销」）：熔断存在的意义是
+**通道坏着时退避**。这一支里通道是健康的，重铸也不会空转——下一次 Stop 只要预算复位
+（驱动正文换了一类事 / 用户提交了新 prompt / TTL 过期），横幅立刻就能正常发出。把它按空转计费，
+连续 3 次就会把铸造熔断打跳、整个 session 的自动发起被静默封禁，那是**漏审**方向。
+
+而且再入预算**本身就是一层退避**，且比熔断更精确（它按 reason_code 分类、有三条复位路径）。
+在它之上再叠一层 session 级熔断，是对同一件事退避两次。
+"""
+
+DECISION_POINT_WITHDRAWAL_CAUSES = frozenset(
+    {
+        DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
+        DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
+        DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+        DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
+    }
+)
+
+# 哪些成因该把铸造时占用的那一份熔断额度还回去。**白名单而非黑名单**：将来新增成因时，
+# 默认落到「不冲销」这一侧——多退避一次只是多问一次的延迟，而错误地无限冲销会让熔断整个失效。
+#
+# 判据（两条成因共享同一条）：**有正向证据表明这次征询确实到达过 agent/用户眼前** ⇒ 冲销。
+# 「通道坏着要退避」只对拿不到那份证据的那一支成立。
+DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE = frozenset(
+    {
+        DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
+        DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+        # 「根本没发出去」这一支：通道健康、重铸不会空转 ⇒ 退避前提不成立。理由见该常量 docstring。
+        DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
+    }
+)
+
 # 非终态且仍在决策进行中的活跃状态（去重、复活只认这三种）。
 ACTIVE_NONTERMINAL_STATES = frozenset({STATE_MINTED, STATE_INJECTED, STATE_ACKNOWLEDGED})
 # 决策已定的终态（dispatched=已派发，declined=已谢绝）。
@@ -1479,19 +1563,27 @@ def mark_withdrawn(
     token: str,
     *,
     reason: str,
+    withdrawal_cause: str = DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
     root: str | Path | None = None,
     now: datetime | None = None,
     circuit_breaker_root_dir: str | Path | None = None,
 ) -> DecisionTokenRecord:
-    """旁路终态 ``… → withdrawn``：这次征询已被用户 rewind / 被 RVF 主动撤回（INV-C）。
+    """旁路终态 ``… → withdrawn``：这次征询已被用户 rewind / 被 RVF 主动撤回。
 
-    进入终态的同时做两件对账，二者都是「能 rewind」这个功能的另一半：
+    进入终态的同时做两件对账：
 
-      * **移除去重索引条目**，使下一次 Stop 能且只能重新征询一次；
-      * **冲销这枚 token 铸造时占用的那一份熔断额度**——向 mint-request ledger 追加一条冲销
-        记录（``_reverse_mint_request_charge_for_withdrawn_token``）。没有它，连续 rewind 两次
-        之后第三次征询会直接撞上 ``circuit_breaker_tripped``，会话被静默一整个窗口（默认
-        3600s）；而 INV-C 明确写着 withdrawn「不计冷却也不计熔断」。
+      * **移除去重索引条目**（**两种成因都做**），使下一次 Stop 能且只能重新征询一次。少了它，
+        下一次 Stop 会命中 ``deduplicated`` 而静默停——那是漏审方向，比多问一次严重得多。
+      * **按 ``withdrawal_cause`` 决定要不要冲销这枚 token 铸造时占用的那一份熔断额度**。
+
+    ``withdrawal_cause`` 是**枚举**（``DECISION_POINT_WITHDRAWAL_CAUSES``），与自由文本的
+    ``reason`` 分开：``reason`` 是给人读的诊断串，成因判定必须落在一个封闭取值上，否则改一句
+    文案就会静默改变熔断行为。取值语义与分叉理由见 ``DECISION_POINT_WITHDRAWAL_CAUSE_*`` 常量组。
+    默认值保持 INV-C 原义（``rewound_by_user`` → 冲销），使既有调用点行为逐字不变。
+
+    未知取值 **fail closed 到不冲销**（而不是抛）：撤回对账是 best-effort 链路上的一环，为一个
+    拼错的成因串把 Stop 决策整条打断，比少还一份额度危险；而「不冲销」的最坏后果只是提前一次
+    退避，方向安全。
 
     刻意**不**写 declined 冷却表：撤回不是 agent 做出的谢绝决策。
 
@@ -1510,20 +1602,33 @@ def mark_withdrawn(
         _ensure_lifecycle_transition_is_legal(
             str(record.payload.get("state")), STATE_WITHDRAWN, token=record.token
         )
-        extra_updates: dict[str, Any] = {"withdrawn_reason": reason}
+        extra_updates: dict[str, Any] = {
+            "withdrawn_reason": reason,
+            "withdrawal_cause": withdrawal_cause,
+        }
         removed_index = _clear_dedup_index_for_token_payload(record.payload, root=root)
         if removed_index is not None:
             extra_updates["withdrawn_dedup_index_path"] = str(removed_index)
-        reversed_mint_request_record_id = _reverse_mint_request_charge_for_withdrawn_token(
-            record.payload,
-            reason=reason,
-            now=now_dt,
-            circuit_breaker_root_dir=circuit_breaker_root_dir,
-        )
-        if reversed_mint_request_record_id is not None:
-            extra_updates["withdrawn_mint_request_charge_reversal_of_record_id"] = (
-                reversed_mint_request_record_id
+        # 成因决定要不要把熔断额度还回去。白名单判定 ⇒ 未知成因落到「不冲销」。
+        if (
+            withdrawal_cause
+            in DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+        ):
+            reversed_mint_request_record_id = (
+                _reverse_mint_request_charge_for_withdrawn_token(
+                    record.payload,
+                    reason=reason,
+                    now=now_dt,
+                    circuit_breaker_root_dir=circuit_breaker_root_dir,
+                )
             )
+            if reversed_mint_request_record_id is not None:
+                extra_updates["withdrawn_mint_request_charge_reversal_of_record_id"] = (
+                    reversed_mint_request_record_id
+                )
+        else:
+            # 如实记账：这枚 token 烧掉的那份额度**没有**被还回去，熔断计数照常推进。
+            extra_updates["withdrawn_mint_request_charge_retained"] = True
         return _apply_lifecycle_transition(
             record, STATE_WITHDRAWN, now=now_dt, extra_updates=extra_updates
         )

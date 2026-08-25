@@ -14,6 +14,16 @@
   ``stop.command.output`` 是 ``additionalProperties:false``，多一个未知键整条 hook 输出 Failed）。
 * **AUD-4（可分辨）** —— 每条 agent-directive 出口都必须带 ``systemMessage``：没有它，开发者在
   终端里无法把「RVF 刻意注入」与「hook 真崩了」区分开。
+* **AUD-5（契约·Kimi）** —— 同一条决策在 Kimi 通道下必须落
+  ``hookSpecificOutput.permissionDecision == "deny"`` + 非空 ``permissionDecisionReason``，
+  **且不带顶层** ``decision``、**不带** ``additionalContext``。Kimi 的 hook 输出 schema 是
+  ``looseObject``：发错线材会被**静默吞掉并 allow**，RVF 完全失声且零报错——所以这条只能靠
+  gate 钉，不能指望运行期报错。
+* **AUD-6（结构·退出码）** —— exit code 是 payload 之外的**第二个自由度**，且 Kimi 把
+  ``exit 2`` 定义为 block（reason 取 stderr）。本仓刻意不用那条通道，故结构性封死两处：
+  **(a)** Stop 严格层禁止任何**字面量非 0** 退出码；**(b)** Stop 核心 ``main()`` 的每个
+  ``return`` 都必须是字面量 ``0``——只禁 (a) 会留下真缺口，因为 ``main`` 里一个 ``return 2``
+  同样会经 ``raise SystemExit(main())`` 变成进程退出码 2。
 
 **为什么是 AST 而不是字面量扫描**：``"decision"`` / ``"block"`` 这两个词在本仓的注释、docstring、
 常量元组（如 ``PLAN_DOC_REVIEW_NAME_MARKERS`` 里的 ``"decision"``）里到处都是——按字面量扫会
@@ -163,7 +173,16 @@ def _stop_tier_files() -> list[Path]:
     收口之外的第三个出口；把它钉在「只准发 developer-only」上，才不会有人顺手在 fail-open
     路径上加一条驱动 agent 的键。
     """
-    files: set[Path] = {AUDIENCE_CONTRACT_MODULE, HOOKS_DIR / "_claude_hook_entry.py"}
+    files: set[Path] = {
+        AUDIENCE_CONTRACT_MODULE,
+        HOOKS_DIR / "_claude_hook_entry.py",
+        # Kimi 的两个入口刻意**不**在 hooks.json 里（它们走 .kimi-plugin/plugin.json；混进
+        # hooks.json 会被 Codex 的 plugin loader 一并加载 ⇒ 三重触发）。所以从 hooks.json
+        # 出发的自动发现看不见它们，必须显式纳入——它们同样是 core 收口之外的 emit 点。
+        HOOKS_DIR / "_kimi_hook_entry.py",
+        HOOKS_DIR / "kimi_stop.py",
+        HOOKS_DIR / "kimi_user_prompt_submit.py",
+    }
     for shim, event in _registered_hook_shims().items():
         if event != STOP_EVENT_NAME:
             continue
@@ -246,6 +265,11 @@ def test_scan_set_covers_every_registered_hook_and_its_core_script() -> None:
     assert AUDIENCE_CONTRACT_MODULE in stop_tier, stop_tier
     assert HOOKS_DIR / "_claude_hook_entry.py" in stop_tier, stop_tier
     assert HOOKS_DIR / "stop.py" in stop_tier, stop_tier
+    assert HOOKS_DIR / "kimi_stop.py" in stop_tier, (
+        "Kimi 的 Stop 入口不在 hooks.json 里，自动发现看不见它——必须显式纳入严格层，"
+        "否则 AUD-1 / AUD-6 对它是盲的。"
+    )
+    assert HOOKS_DIR / "_kimi_hook_entry.py" in stop_tier, stop_tier
 
     non_stop_tier = _non_stop_tier_files()
     ups_core = (
@@ -302,6 +326,164 @@ def test_every_sanctioned_exemption_still_points_at_real_code() -> None:
         assert function in functions, (
             f"过期豁免：{relative}::{function} 已不再构造驱动 agent 的键，请删掉这条豁免。"
         )
+
+
+# ── AUD-5（契约级）：Kimi 通道的线上形状 ─────────────────────────────────────
+# 端到端那半（真实 Kimi host adapter 被选中后出口确实落 deny）依赖 adapters/kimi/ 落地，
+# 由 S-B4 的 HOST-8 覆盖；本节钉的是翻译层契约本身，不依赖任何 adapter。
+def _render_via_contract(channel: str) -> dict:
+    """在子进程里调翻译层，避免把 core 包 import 进 pytest 进程（与既有行为测试同口径）。"""
+    script = f"""
+import json, sys
+sys.path.insert(0, {str(ROOT)!r})
+from core.stop_hook_output_audience import (
+    AgentDirectiveStopHookOutput,
+    STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+    render_stop_hook_payload,
+)
+payload = render_stop_hook_payload(
+    audience=STOP_HOOK_OUTPUT_AUDIENCE_AGENT_MUST_ACT_NOW,
+    agent_directive=AgentDirectiveStopHookOutput(
+        agent_directive_body="RVF_DECISION_TOKEN=tok-aud5 继续收尾当前 RVF。",
+        developer_visible_notice="RVF: 刻意注入，非失败。",
+    ),
+    developer_only_payload=None,
+    agent_directive_channel={channel!r},
+)
+print(json.dumps(payload))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+    return json.loads(completed.stdout)
+
+
+def test_kimi_channel_lands_on_permission_decision_deny() -> None:
+    """AUD-5：Kimi 通道必须落 permissionDecision:"deny"，且不带 decision / additionalContext。"""
+    payload = _render_via_contract("hook_specific_output_permission_decision_deny")
+
+    assert "decision" not in payload, (
+        f"Kimi 通道发了顶层 decision：{payload}。Kimi 的 hook 输出 schema 是 looseObject，"
+        "它会被静默吞掉并 allow —— RVF 完全失声且零报错。"
+    )
+    inner = payload["hookSpecificOutput"]
+    assert inner["permissionDecision"] == "deny", (
+        f'Kimi 的判据逐字是 permissionDecision !== "deny" 才 allow（全等比较）：{inner}'
+    )
+    assert "additionalContext" not in inner, inner
+    reason = inner["permissionDecisionReason"]
+    assert reason.strip(), "permissionDecisionReason 不得为空——空 reason 的 block 行为未实测。"
+    assert "RVF_DECISION_TOKEN=" in reason, reason
+    assert payload["systemMessage"], "AUD-4 同样适用于 Kimi 通道。"
+
+
+def test_each_agent_directive_channel_has_a_distinguishable_wire_shape() -> None:
+    """AUD-5 的对偶：三条通道两两形状可辨——否则某个 host 的误判会变成无声降级。"""
+    shapes = {
+        channel: _render_via_contract(channel)
+        for channel in (
+            "non_error_additional_context",
+            "blocking_decision",
+            "hook_specific_output_permission_decision_deny",
+        )
+    }
+    assert "additionalContext" in shapes["non_error_additional_context"]["hookSpecificOutput"]
+    assert shapes["blocking_decision"]["decision"] == "block"
+    assert "hookSpecificOutput" not in shapes["blocking_decision"], (
+        "Codex 的 stop.command.output 是 additionalProperties:false，多一个未知键整条输出 Failed。"
+    )
+    assert (
+        shapes["hook_specific_output_permission_decision_deny"]["hookSpecificOutput"][
+            "permissionDecision"
+        ]
+        == "deny"
+    )
+    fingerprints = {
+        channel: tuple(sorted(shape.get("hookSpecificOutput", {}))) or ("decision",)
+        for channel, shape in shapes.items()
+    }
+    assert len(set(fingerprints.values())) == len(shapes), (
+        f"两条通道渲染出同一种线上形状，host 之间将不可分辨：{fingerprints}"
+    )
+
+
+# ── AUD-6：退出码这个第二自由度必须保持「未被使用」──────────────────────────
+STOP_HOOK_CORE_MAIN_FUNCTION_NAME = "main"
+
+
+def _literal_nonzero_exit_calls(path: Path) -> list[tuple[int, str]]:
+    """找 ``SystemExit(<非0字面量>)`` / ``sys.exit(<非0字面量>)`` / ``exit(<非0字面量>)``。
+
+    只认**字面量**：``SystemExit(main())`` 这种把退出码委托给函数的形态由 AUD-6b 从另一端钉住
+    （钉 ``main`` 的 return），两条合起来才封得住整条路径。
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            continue
+        if name not in ("SystemExit", "exit", "_exit"):
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, int) and first.value != 0:
+            hits.append((node.lineno, ast.unparse(node)))
+    return hits
+
+
+@pytest.mark.parametrize("path", _stop_tier_files(), ids=lambda p: p.name)
+def test_stop_tier_never_uses_a_literal_nonzero_exit_code(path: Path) -> None:
+    """AUD-6a：Stop 严格层禁止字面量非 0 退出码。
+
+    Kimi 把 ``exit 2`` 定义为 deliberate block 且 **reason 取 stderr**，而 RVF 全程把诊断写
+    stderr —— 一旦有人在 Stop 出口上写 ``sys.exit(2)``，所有杂音都会变成注入给 agent 的正文，
+    而本仓的 AUD-1 AST gate 只扫 payload 的 dict 构造，**完全看不见**这条第二出口。
+    """
+    offending = _literal_nonzero_exit_calls(path)
+    assert not offending, (
+        f"{path.relative_to(ROOT).as_posix()} 使用了字面量非 0 退出码：{offending}。\n"
+        "Stop hook 出口在所有 host 上恒 exit 0；Kimi 的 exit-2 + stderr 通道已知存在且刻意不用"
+        "（理由见 core/stop_hook_output_audience 的模块 docstring「退出码不是本契约的一部分」）。"
+    )
+
+
+def test_stop_hook_core_main_returns_only_literal_zero() -> None:
+    """AUD-6b：Stop 核心 ``main()`` 的每个 return 都必须是字面量 0。
+
+    只有 AUD-6a 是不够的：``hooks/stop.py`` 与本核心都以 ``raise SystemExit(main())`` 收尾，
+    所以 ``main`` 里任何一个 ``return 2`` 都会**绕过** AUD-6a 直接变成进程退出码 2。两条断言
+    从 payload 端与 return 端合围，才真的封死这个自由度。
+    """
+    tree = ast.parse(STOP_HOOK_CORE.read_text(encoding="utf-8"))
+    mains = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == STOP_HOOK_CORE_MAIN_FUNCTION_NAME
+    ]
+    assert len(mains) == 1, f"期望恰好一个 main()，实得 {len(mains)} 个"
+
+    returns = [node for node in ast.walk(mains[0]) if isinstance(node, ast.Return)]
+    assert returns, "main() 没有任何 return —— 本断言会变成 vacuous truth"
+    offending = [
+        (node.lineno, ast.unparse(node.value) if node.value is not None else "<bare>")
+        for node in returns
+        if not (
+            isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, int)
+            and node.value.value == 0
+        )
+    ]
+    assert not offending, (
+        f"{STOP_HOOK_CORE.relative_to(ROOT).as_posix()}::main 有非「字面量 0」的 return："
+        f"{offending}。Stop hook 出口恒 exit 0；驱动 agent 只走 payload，绝不走退出码。"
+    )
 
 
 def _init_dirty_repo(path: Path) -> Path:

@@ -71,9 +71,10 @@ decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECIS
 
 | 能力 | Claude | Codex | Cursor | Kimi | Oh My Pi | DeepSeek |
 | --- | --- | --- | --- | --- | --- | --- |
-| `decision:block` | ✅ | ✅ | ✅ 仅交互 | ✅ | ✅ | ✅ |
+| `decision:block` | ✅ | ✅ | ✅ 仅交互 | ❌ **见下方纠错** | ✅ | ✅ |
 | **Stop 上 `additionalContext`** | ✅ | ❌ `additionalProperties:false`（发过去整条 hook 输出 Failed） | ❌ | ❌ | ✅ | ❌ |
-| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ | ✅ | ❌ |
+| **Stop 上 `hookSpecificOutput.permissionDecision:"deny"`** | ❌ | ❌ | ❌ | ✅ **唯一可用通道** | ❌ | ❌ |
+| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ 静默丢弃（无害） | ✅ | ❌ |
 | **UPS 上 `additionalContext`** | ✅ | ✅ | ✅ | ⚠️ exit-0 stdout | ✅ | ✅ |
 
 **跨宿主适配负担集中在 Stop**，UPS 侧 additionalContext 基本全家都支持。
@@ -81,6 +82,43 @@ decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECIS
 **Codex 的 `additionalProperties:false` 是硬约束**：给 Codex 发 `hookSpecificOutput` 会让整条
 hook 输出被判 Failed = RVF 在 Codex 上静默停摆。所以 host 未知时**必须**兜底到最保守的
 `decision:block`，绝不赌未知 host 认识 `hookSpecificOutput`。
+
+### ⛔ 纠错（2026-08-23 取证）：Kimi **不**认 `decision:block`
+
+本表此前把 Kimi 的 `decision:block` 记为 ✅。**那是错的**，且这条错误会诱导出一个危险的设计
+判断——「Kimi 被误判成 Codex 只是降级，仍能工作」。实际是**完全失声**。
+
+kimi 0.29.1 二进制内嵌源码逐字：
+
+```js
+HookJsonOutputSchema = looseObject({
+    message: OptionalStringSchema,
+    hookSpecificOutput: HookSpecificOutputSchema,   // { message, permissionDecision, permissionDecisionReason }
+});
+// …
+const { message, hookSpecificOutput } = output.data;
+if (hookSpecificOutput?.permissionDecision !== "deny") return result;   // ← 唯一的 block 判据
+```
+
+schema 只**命名** `message` 与 `hookSpecificOutput` 两个键。`looseObject` 会让顶层
+`decision:"block"` 通过校验（不报错），但解构处**从不读它** ⇒ 结果是 `allow`。
+
+⇒ 三条后果，实现时都要按最坏情况处理：
+
+1. **Kimi 上发错线材 = 静默 allow + 零报错。** 与 Codex 的「整条 Failed」相反，这里没有任何
+   可观测的失败信号，只有「RVF 好像没反应」。
+2. `permissionDecision` 的 zod 类型是 `unknown().optional()`，判据是 JS 全等 `!== "deny"`
+   ⇒ 必须是**字面量** `"deny"`，大小写错、拼接得到的同值字符串以外的任何偏差都静默降级。
+   本仓把它单列为常量 `STOP_HOOK_PERMISSION_DECISION_DENY` 并由 gate AUD-5 钉住。
+3. `systemMessage` 在 Kimi 上落在 `looseObject` 的未命名区 ⇒ 被保留但从不读取。翻译层
+   **仍然照附**（三通道一律附），因为 `_apply_guardian_liveness_alarm` 本就会写它、
+   且 ledger 的 `emitted_payload` 是跨 host 复盘的唯一真相源。代价为零，去掉反而自相矛盾。
+
+顺带取证到的两条实现约束：hook 子进程的 `DEFAULT_TIMEOUT_SECONDS = 30`（manifest 应显式声明
+timeout，别吃默认值）；`HookSpecificOutputSchema` 内层只命名三个键，故翻译层的 Kimi 分支
+**不发** `hookEventName`（那是 Claude 专属的事件校验键）。
+
+完整取证见 `kimi-code-cli-plugin-and-hook-runtime-forensics.md`。
 
 ---
 
@@ -114,6 +152,11 @@ return StopDecision(
 
 - `ClaudeCodeHostAdapter` → `non_error_additional_context`
 - `CodexHostAdapter`（含 host 未知兜底）→ `blocking_decision`
+- `KimiCodeCliHostAdapter` → `hook_specific_output_permission_decision_deny`
+
+通道分派是**穷举 + 末尾 `raise`**，没有 `else` 兜底：新增通道却漏加渲染分支时必须当场炸，
+而不是悄悄退化成某个 host 的形状。`_self_check` 另有一条完备性断言，要求每条已登记通道都
+渲染出**两两可辨**的线上形状。
 
 当前会话的 host 由 `resolve_current_session_host_adapter(event)` 判定，判据从强到弱：
 `event["source"]["provider"] == "claude-code"`（Claude 入口亲手打的标）→ 会话路径落在

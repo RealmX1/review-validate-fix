@@ -546,6 +546,23 @@ repo_required_files=(
   "core/review_dispatch/review_validate_fix_dispatch_flow.py"
   "core/cline_kanban_terminal_delivery/cline_kanban_terminal_delivery_receipt.py"
   "core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
+  "adapters/kimi/kimi_code_cli_host_adapter.py"
+  "adapters/kimi/session_layout.py"
+  "adapters/kimi/subagent.py"
+  "plugins/review-validate-fix/hooks/_kimi_hook_entry.py"
+  "plugins/review-validate-fix/hooks/kimi_stop.py"
+  "plugins/review-validate-fix/hooks/kimi_user_prompt_submit.py"
+  "plugins/review-validate-fix/.kimi-plugin/plugin.json"
+  "tests/test_kimi_hook_entry_normalization.py"
+  "adapters/kimi/transcript.py"
+  "core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
+  "core/stop_hook_reentry_budget/__init__.py"
+  "scripts/kimi_plugin_manifest_activation_state_check.py"
+  "tests/test_stop_hook_reentry_budget.py"
+  "tests/test_kimi_plugin_activation_state_check.py"
+  "tests/test_kimi_plugin_registration_installer.py"
+  "scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
+  "tests/test_host_identity_reviewer_registry_vocabulary_gate.py"
   "scripts/check_plugin_contracts.py"
   "scripts/check_skill_contracts.sh"
   "scripts/install_to_codex.py"
@@ -569,6 +586,7 @@ repo_required_files=(
   "tests/test_rvf_handoff_intake.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
+  "tests/test_kimi_host_adapter_and_transcript.py"
   "tests/test_agentic_initiation_scope_of_work_contract.py"
   "tests/test_reviewer_result_artifact_lifecycle.py"
   "tests/test_codex_hook_trust_fingerprint.py"
@@ -648,6 +666,16 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/rvf_user_local_data_paths.py" \
   "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
   "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py" \
+  "$repo_root/adapters/kimi/kimi_code_cli_host_adapter.py" \
+  "$repo_root/adapters/kimi/session_layout.py" \
+  "$repo_root/adapters/kimi/subagent.py" \
+  "$repo_root/plugins/review-validate-fix/hooks/_kimi_hook_entry.py" \
+  "$repo_root/plugins/review-validate-fix/hooks/kimi_stop.py" \
+  "$repo_root/plugins/review-validate-fix/hooks/kimi_user_prompt_submit.py" \
+  "$repo_root/adapters/kimi/transcript.py" \
+  "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py" \
+  "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py" \
+  "$repo_root/scripts/kimi_plugin_manifest_activation_state_check.py" \
   "$skill_dir/scripts/rvf_prep_file.py" \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
@@ -746,6 +774,136 @@ run_step "tests: current_session_host_adapter_resolution" \
     "$tests_dir/test_current_session_host_adapter_resolution.py"
 run_step "stop hook output audience contract self-check" \
   python3 "$repo_root/core/stop_hook_output_audience/stop_hook_output_audience_contract.py"
+# Kimi 的第三条线材：它的 block 判据是 JS 全等 `permissionDecision !== "deny"`，而 hook 输出
+# schema 是 looseObject ⇒ 拼错字面量、或整条通道被误删，都会**静默降级成 allow 且零报错**
+# （与 Codex「整条 Failed」相反，这里没有任何可观测的失败信号）。所以三处各钉一根钉：
+require_repo_literal "core/stop_hook_output_audience/stop_hook_output_audience_contract.py" \
+  'STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_HOOK_SPECIFIC_OUTPUT_PERMISSION_DECISION_DENY'
+require_repo_literal "core/stop_hook_output_audience/stop_hook_output_audience_contract.py" \
+  'STOP_HOOK_PERMISSION_DECISION_DENY = "deny"'
+require_repo_literal "core/stop_hook_output_audience/stop_hook_output_audience_contract.py" \
+  '"permissionDecisionReason": agent_directive.agent_directive_body'
+# 文档回归护栏：`docs/architecture/stop-hook-output-audience-contract.md` 的跨宿主表此前把
+# 「Kimi 认 decision:block」记为 ✅（实为 ❌——顶层 decision 通不过解构、结果是 allow）。那条
+# 错误会诱导出「Kimi 被误判成 Codex 只是降级」的危险判断，故把纠错段钉死，防止被改回去。
+require_repo_literal "docs/architecture/stop-hook-output-audience-contract.md" \
+  'Kimi **不**认 `decision:block`'
+require_repo_literal "docs/architecture/stop-hook-output-audience-contract.md" \
+  'Stop 上 `hookSpecificOutput.permissionDecision:"deny"`'
+# Kimi host 身份与装配：三套 transcript 签名必须两两不相交（相交即静默误判），且每个可被
+# 正向识别的 host 都必须有自己的装配分支（缺分支不会报错，只会静默落进 Codex 兜底）。
+run_step "host transcript format detection self-check" \
+  python3 "$repo_root/core/host_adapter/host_transcript_format_detection.py"
+# P-5 词表一致性：host 身份词表与 reviewer-registry 的 harness id 是两套独立演化的词表，
+# 前两项（codex / claude_code）历史上恰好同名纯属巧合。Kimi 接入时巧合断裂——host 身份取
+# ``kimi_code_cli`` 而 registry 是 ``kimi_code`` ⇒ 主 harness 排不出 alternative reviewer 池，
+# 200-seed 实测 44% 的 Kimi 会话被 Kimi 自己评审，**全程零报错**（双评审的价值全在异构性上）。
+# 判据是结构性的（遍历 KNOWN_HOST_IDENTITIES），所以加第四个 host 时同样当场炸。
+run_step "host identity / reviewer registry vocabulary consistency" \
+  python3 "$repo_root/scripts/check_host_identity_and_reviewer_registry_harness_id_vocabulary_consistency.py"
+# 上面那条 gate 的第二条断言只有在 VALID_MAIN_HARNESSES 真的派生自 registry 时才有检测力：
+# 一旦被改回手写清单，它就退化成「清单碰巧写全了」的假绿。故把派生实现本身钉死。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/prepare_review_run.py" \
+  'VALID_MAIN_HARNESSES = _resolve_valid_main_harnesses()'
+# 同一条断言的另一半：它必须按**仓库内 seed** registry 求值。曾经的实现裸 import
+# prepare_review_run，而那个常量优先读运行时 user-local registry ⇒ 仓库完全正确、只是本机
+# registry 落后一个 host，提交前 gate 就红，并造出「必须先部署才能让 gate 转绿」的循环依赖。
+# 两个方向（不读运行时状态 / 手写清单仍当场红）都由这份测试钉住。
+run_step "tests: host_identity_reviewer_registry_vocabulary_gate" \
+  python3 -m pytest -q \
+    "$tests_dir/test_host_identity_reviewer_registry_vocabulary_gate.py"
+# S-B6 跨 turn 再入预算：宿主的保险丝对 Kimi 完全无效（`stop_hook_active` 恒 false，引擎的
+# 续跑标记每 turn 复位）⇒「driven 一回合 → agent 停下 → 再 driven 一回合」在宿主侧没有上界。
+# 本仓已实测过一次 286 次无上界续跑，所以这道闸必须由 RVF 自带。
+run_step "stop hook reentry budget self-check" \
+  python3 "$repo_root/core/stop_hook_reentry_budget/stop_hook_reentry_budget.py"
+run_step "tests: stop_hook_reentry_budget" \
+  python3 -m pytest -q \
+    "$tests_dir/test_stop_hook_reentry_budget.py"
+# 预算的三条复位路径里，「digest 变化」最容易退化成恒真——驱动正文每次都带新铸的
+# RVF_DECISION_TOKEN，拿正文做 digest 等于关掉这道闸。故把「用 reason_code 而非正文」钉死。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+  'stable_agent_directive_scope_digest_source=reason_code'
+# Kimi 激活态核对：installed.json 磁盘上**没有** state 字段（persist 只落 9 个），所以判定必须
+# 自己复算；且单条 hook 不过 schema 时 Kimi 只 warn + 丢弃该条、plugin 仍报 ok ⇒「看起来健康、
+# 实际 Stop hook 不存在」是零报错状态。核对脚本本身读 live infra，故只在 fixture 测试里跑。
+run_step "tests: kimi_plugin_activation_state_check" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_plugin_activation_state_check.py"
+# Kimi 注册安装器：注册在四条跨进程通道上全部不可达 ⇒ 只能写 installed.json。两条风险各钉一根钉：
+# 全量重写会掀掉用户装的其它插件（必须幂等 additive merge）；state 写不进去（persist 只落 9 个
+# 字段）⇒「安装器写完了」不等于「注册生效了」，闭环由独立复算的核对器给。
+run_step "tests: kimi_plugin_registration_installer" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_plugin_registration_installer.py"
+require_repo_literal "scripts/rvf_local_deploy.py" \
+  '"--configure-kimi-plugin-registration",'
+run_step "kimi session layout self-check" \
+  python3 "$repo_root/adapters/kimi/session_layout.py"
+# Kimi wire 蒸馏 + adapter 行为。三条最容易静默出错的地方：origin.kind 区分真实输入与系统
+# 注入（混同会污染 scope 归属）；think 的正文在 part.think 而非 part.text（取错静默变空串）；
+# 写型工具参数是 path 而非 Claude 的 file_path（照抄会让 artifact_refs 恒为空且不报错）。
+run_step "tests: kimi_host_adapter_and_transcript" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_host_adapter_and_transcript.py"
+require_repo_literal "adapters/kimi/transcript.py" \
+  '_ARTIFACT_PATH_ARGUMENT_NAME = "path"'
+require_repo_literal "adapters/kimi/transcript.py" \
+  'CONTENT_PART_TYPE_THINK: "think"'
+require_repo_literal "adapters/kimi/transcript.py" \
+  'def distill_kimi_wire_jsonl'
+# 三处 host 派发漏接任一处，都会静默退回 Codex 的实现去解析 Kimi 的数据。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/subagent_capture.py" \
+  'return distill_kimi_wire_jsonl'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/subagent_capture.py" \
+  'return read_kimi_originator(src)'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/subagent_capture.py" \
+  '_kimi_resolve_subagents('
+# 上面三处只覆盖**子代理**轨迹。主轨迹另有两处独立派发（蒸馏 / RVF-起点 cut）、父会话 context
+# 渲染一处、harness 身份归一一处 —— 同一个形状、同样静默：Codex 的解析器读 Kimi 的数据不抛，
+# 只返回 0 条 / None / 空行。行为断言在 tests/test_kimi_host_adapter_and_transcript.py
+# （KIMI-9/10/11/12，逐 KNOWN_HOST_IDENTITIES 断言分派各有其人）；这里再钉住派发点本身的存在。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_capture.py" \
+  'return distill_kimi_wire_jsonl'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_capture.py" \
+  'return find_rvf_start_in_kimi_wire_jsonl'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_capture.py" \
+  'cut = _host_find_rvf_start(post_host_kind)('
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/trajectory_capture.py" \
+  'distilled, distill_index = _host_distill(post_host_kind)('
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py" \
+  'return _render_kimi_record'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_parent_context.py" \
+  'renderer = _host_record_renderer(host)'
+require_repo_literal "core/host_adapter/parent_harness_identity.py" \
+  'PARENT_HARNESS_IDENTITY_KIMI_CODE = "kimi-code"'
+require_repo_literal "core/host_adapter/parent_harness_identity.py" \
+  '("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE),'
+# kimi-code stamp 是 HOST-2 的 Kimi 对偶：transcript 合成落空时它是唯一的 Kimi 线索，没有它
+# 整条链路兜底 Codex ⇒ 发 decision:block ⇒ Kimi 静默 allow（零报错）。
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+  '"kimi-code": HOST_KIMI_CODE,'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+  'HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP.get(source.get("provider"))'
+# Kimi hook 入口：事件只有四个字段、**没有 transcript_path**，shim 必须合成它——否则 host 判成
+# Codex ⇒ 发 decision:block ⇒ 被 Kimi 的 looseObject 静默吞掉 ⇒ RVF 完全失声且零报错。
+run_step "tests: kimi_hook_entry_normalization" \
+  python3 -m pytest -q \
+    "$tests_dir/test_kimi_hook_entry_normalization.py"
+require_repo_literal "plugins/review-validate-fix/.kimi-plugin/plugin.json" '"event": "Stop"'
+require_repo_literal "plugins/review-validate-fix/.kimi-plugin/plugin.json" '"event": "UserPromptSubmit"'
+require_repo_literal "plugins/review-validate-fix/hooks/_kimi_hook_entry.py" 'def normalize_kimi_event'
+require_repo_literal "plugins/review-validate-fix/hooks/_kimi_hook_entry.py" 'def owns_invocation'
+
+require_repo_literal "core/host_adapter/host_transcript_format_detection.py" \
+  'HOST_KIMI_CODE = "kimi_code"'
+require_repo_literal "adapters/kimi/kimi_code_cli_host_adapter.py" \
+  'class KimiCodeCliHostAdapter'
+require_repo_literal "adapters/kimi/kimi_code_cli_host_adapter.py" \
+  'def parent_transcript_quoted_session_name'
+# 结构性护栏：Kimi 条目绝不能进 Claude 的 hooks.json——Codex 的 plugin loader 会把
+# plugin-packaged hooks.json 也当 hooks 源加载，混进去就是三重触发。
+forbid_repo_literal "plugins/review-validate-fix/hooks/hooks.json" 'kimi'
 # 备选评审腿的 prompt 投递契约：kimi 的 `-p` 是带值 flag 且从不读 stdin，而整份 review packet
 # 远超 ARG_MAX ⇒ 必须走「argv 只带短指针、正文留在磁盘」。同时钉住 `--dry-run` 打印的是终结后的
 # 真实 argv，且仍停在 pre_run_health 之前（否则零成本预演变成每次烧一次真实 probe）。
@@ -1368,6 +1526,15 @@ require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def session_d
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def cline_kanban_agent_id'
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def detect_host_skip_mode'
 require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def parent_transcript_quoted_session_name'
+# 第 6 个方法此前漏钉（既有缺口）。它决定每个 host 拿哪条出口线材——漏钉意味着有人删掉它时
+# 契约 gate 不会响，而后果是某个 host 在线上静默失声。
+require_repo_literal "core/host_adapter/host_adapter_protocol.py" 'def stop_hook_agent_directive_channel'
+# 既存缺口：该模块有 _self_check()（内含钉死方法集的 assert actual == expected），但此前
+# 全仓**从不执行它**——gate 只钉字面量、测试里 0 引用、直接 `python3 <file>` 又因 core 不在
+# sys.path 上而 ModuleNotFoundError。于是「加第 7 个方法会当场触发那条断言」这层保护实际
+# 并不存在。用 env 补上 PYTHONPATH 真正跑它。
+run_step "host adapter protocol self-check" \
+  env PYTHONPATH="$repo_root" python3 "$repo_root/core/host_adapter/host_adapter_protocol.py"
 require_repo_literal "core/host_adapter/__init__.py" 'from core.host_adapter.host_adapter_protocol import HostAdapter'
 
 # S10f: provider 健康探测中性内核迁 core/provider_health；codex 登录/二进制发现下沉

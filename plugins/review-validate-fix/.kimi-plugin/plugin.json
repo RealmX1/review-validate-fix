@@ -1,0 +1,16 @@
+{
+  "name": "review-validate-fix",
+  "description": "Review-Validate-Fix: 在 Stop 时刻征询是否发起双路外部评审，并在 UserPromptSubmit 时刻承接派发。",
+  "hooks": [
+    {
+      "event": "Stop",
+      "command": "python3 \"$KIMI_PLUGIN_ROOT/hooks/kimi_stop.py\"",
+      "timeout": 115
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "python3 \"$KIMI_PLUGIN_ROOT/hooks/kimi_user_prompt_submit.py\"",
+      "timeout": 85
+    }
+  ]
+}

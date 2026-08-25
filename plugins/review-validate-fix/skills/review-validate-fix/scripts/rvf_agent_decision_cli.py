@@ -706,11 +706,18 @@ AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_ERROR = "degraded_allocator_
 AGENTIC_INITIATION_TRACKER_SCOPE_REVIEWER_ID = "agentic-initiation-start"
 
 # 就地发起的一轮 RVF 由主 agent 在**当前会话**跑完 review → merge → validate/fix → handoff，墙钟
-# 远超 tracker 默认的 600s lease TTL，而本仓没有任何地方对 review 期间的 lease 做 heartbeat/refresh。
-# 沿用它所取代的那条路径（kanban-followup 终端投递，同样是「主 agent 就地接着跑」）的 1h 档：
-# lease 若在 review 中途过期，units 会被 prune 回 available，下一次 Stop 立刻把同一批改动重新
-# 提议——正是本修复要根治的那个循环。
-AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS = 60 * 60
+# 远超 tracker 默认的 600s lease TTL。lease 若在 review 中途过期，units 会被 prune 回 available，
+# 下一次 Stop 立刻把同一批改动重新提议——正是本修复要根治的那个循环。
+#
+# 与 ``kanban_followup_lock.DEFAULT_TTL_SECONDS`` **必须同档**：两者保护的是同一个事件（这一轮
+# RVF 还在跑），只是一个挡 Stop 重铸、一个挡 units 被 prune。任一方先到期，另一方就形同虚设。
+# 该常量历史上照 1h 标定，正是沿用了那把锁的 1h；本轮实测 p50 = 84.3min、53% 超 60min，两者
+# 一并上调到 2h（理由与分布见那边的注释）。
+#
+# ⚠️ **仍是「无心跳」的一侧**：``kanban_followup_lock`` 这一轮补了心跳续期（``revive_marker``
+# + 绝对硬顶），tracker lease 没有对应的 refresh 入口，所以它这个 2h 是**硬上界**而非兜底。
+# 超过 2h 的一轮仍会丢 lease。真正对齐要给 tracker 也开一个 heartbeat 入口，属独立一刀。
+AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS = 2 * 60 * 60
 
 # 与 ``prepare_review_run`` 的 prep payload 键同名：本仓里「这一轮 run 源自哪份 transcript」一直
 # 叫这个名字，决策 token 的候选摘要沿用它，避免同一件事在两层各起一个名。
