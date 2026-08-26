@@ -42,15 +42,19 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
   --handoff <handoff.md> --repo . --format json
 ```
 
-脚本只读 handoff、run artifacts、candidate evidence、local base commit 和 git status，不修改 repo。使用输出里的 `reviewed_scope_paths`、`scoped_status_in_current_repo`、`unrelated_dirty_paths_in_current_repo`、`target_repo_same_git_common_dir_as_current`、`rvf_worktree_differs_from_current`、`candidate_evidence_status`、`validation_evidence_source`、`pre_rvf_land_base_sync_gate` 和 `intake_hints` 做后续判断；`intake_hints` 中的 protected / accepted / rejected 信息优先于手工猜测同文件内 hunk 归属。
+脚本只读 handoff、run artifacts、candidate evidence、local base commit 和 git status，不修改 repo。使用输出里的 `reviewed_scope_paths`、`scoped_status_in_current_repo`、`unrelated_dirty_paths_in_current_repo`、`target_repo_same_git_common_dir_as_current`、`rvf_worktree_differs_from_current`、`candidate_evidence_status`、`validation_evidence_source` 和 `intake_hints` 做后续判断；`intake_hints` 中的 protected / accepted / rejected 信息优先于手工猜测同文件内 hunk 归属。
 
-`rvf_handoff_intake.py` 的退出码 `3` 是不可绕过的前置门禁：状态为 `bootstrap_required_before_rvf_land` 或 `bootstrap_receipt_invalid_before_rvf_land`。此时在调用 marker 指定的严格单向同步、重新 prepare 并完成覆盖新 candidate 的 RVF 之前，**禁止运行任何 target-repo validation、stage 或 commit**。该检查从当前 local base commit 的 `AGENTS.md` 读取 marker，因此旧 handoff / 旧 worktree 也不能绕过。
+**land 前后不做任何 base intake。** 本 skill 不再检查 local base 是否已被吸收，也不再因 base 漂移而拦截。原因：那道门禁自己的第 ② 段会命令 agent 去跑一次同步，而那次同步必然重写 bootstrap receipt（digest 变、`absorbed_base_tip` 变），从而亲手打破它第 ④⑤ 段依赖的冻结值——只要 local base 在 prepare 之后前移过一次就无解。
+
+「当前 base 吸收了吗」这个问题归 **prepare 侧门禁**：`prepare_review_run.py` 在 `bootstrap_required_before_rvf` 时直接 `raise BootstrapRequiredBeforeRvf`，不建 run、不写 contract、不派 reviewer。**能走到 rvf-land 的 run，其 prepare 必然已经过闸。**
+
+残余风险已知且已接受：marker 生效**之前**产生的旧 handoff + 陈旧 worktree 这条路径失去阻拦。它按定义是历史存量，随积压 task 清空而消失；一切**新** run 仍被 prepare 侧门禁拦住。
 
 同时提取 RVF run id、origin、reviewed scope、review findings、fixes、validation commands、final state。
 
 ## Workflow
 
-1. **先通过 local-base bootstrap 门禁，再确认这是同一个 worktree。** 只有 deterministic intake 退出码为 `0` 且 `pre_rvf_land_base_sync_gate.status` 为 `ready` 或 `not_applicable` 才能继续。随后运行 `git status --short`。本命令的前提是 future-self 在「当前 worktree」跑完 RVF 并留下修复，用户只是 rewind 了会话。
+1. **先确认这是同一个 worktree。** deterministic intake 退出码为 `0` 即可继续；随后运行 `git status --short`。本命令的前提是 future-self 在「当前 worktree」跑完 RVF 并留下修复，用户只是 rewind 了会话。
    - 期望 `rvf_worktree_differs_from_current` 为 false、handoff 的 target repo 与当前 worktree 一致。
    - 如果二者明显不一致（handoff 指向 fork / 另一个 task worktree），停止并说明：这是跨 worktree 的 handoff，应改用 `$rvf-handoff-intake` / `/rvf-handoff-commit`，不要在这里强行提交。
 
@@ -63,6 +67,11 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 
 3. **必要时做最小修正。** 仅当 sanity-check 暴露出明确、范围内的小问题（例如 future-self 漏改的一处、明显笔误）时，在 reviewed scope 或其直接 fallout 内做最小修正。不要借机扩大改动、重构或引入新功能。
    - 如果发现 handoff 的 fix 无效、scope 不完整、或 worktree 状态与 handoff 严重冲突，停止并报告，不要强行 commit。
+   - **做了最小修正就必须重跑验证，否则最后一步写不出 evidence。** 最小修正的字节会进入
+     `candidate_content_manifest_sha256`（`write_reviewed_task_candidate_evidence.py` 在提交后现算），
+     而 evidence 要求**每一条** validation record 的内容摘要都等于**当前**摘要。改完不重跑，
+     手上那批 record 就全部对应旧内容，写 evidence 时才会在最后一步被拒。这是既有约束，
+     不是新增门禁；先重跑、再进第 4 步。
 
 4. **验证证据复用。** 不直接裸跑 handoff 命令。
    - 若 intake 的 `validation_evidence_source=candidate_evidence`，且其 HEAD/tree/worktree/common-dir/content 检查均有效，复用 `validation_records`，不要重跑。
@@ -111,7 +120,6 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 停止而不是 commit：
 
 - 无法证明 handoff 描述的工作就是当前 worktree 的改动（疑似跨 worktree handoff）。
-- 当前 local base 的 `AGENTS.md` 声明了 pre-review 单向同步，但 task 尚未吸收当前 base、contracted bootstrap receipt 无效，或 local base 已从 reviewed base 漂移；返回 `bootstrap_required_before_rvf_land`，不得先跑验证或提交再补同步。
 - handoff scope、当前 dirty paths 和 artifact 摘要互相矛盾。
 - 需要的修复依赖 scope 外 runtime 改动，但这些改动未被明确纳入本次提交。
 - 相关验证无法运行且风险不低。
