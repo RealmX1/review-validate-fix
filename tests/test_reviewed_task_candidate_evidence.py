@@ -986,3 +986,36 @@ def test_rename_out_of_an_unreviewed_path_is_caught_because_renames_are_disabled
     assert completed.returncode != 0
     assert "landed delta escaped the reviewed scope" in completed.stderr
     assert "outside.txt" in completed.stderr
+
+
+def test_incomplete_review_refuses_before_restamping_anything(tmp_path: Path) -> None:
+    """restamp 是本 writer 唯一的写操作，必须排在**全部只读闸之后**。
+
+    构造：contract 已 opt-in、land 提交也真的发生了（两 tip 不等，restamp 有事可做），
+    但 handoff 的 `review_status` 是 `PENDING`（双评审不成立时的正确记法）。
+    断言 writer 拒绝，且 **`scope.contract.json` 一个字节都没变、没有落下冻结副本**——
+    否则一轮未通过评审的 run 会先被改写契约再 fail-closed。
+    """
+    repo, run_dir, prepare_time_head, post_land_head = opted_in_repo_with_land_commit(tmp_path)
+    assert prepare_time_head != post_land_head  # 防恒等守卫：restamp 必须有事可做
+    rewrite_contract(
+        run_dir,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+    )
+    handoff_path = run_dir / "artifacts/handoff.md"
+    handoff_path.write_text(
+        handoff_path.read_text(encoding="utf-8").replace(
+            "- review_status: COMPLETED", "- review_status: PENDING"
+        ),
+        encoding="utf-8",
+    )
+
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    before_bytes = contract_path.read_bytes()
+
+    completed = run_writer(repo, run_dir)
+
+    assert completed.returncode != 0
+    assert contract_path.read_bytes() == before_bytes
+    assert not (run_dir / "artifacts/inputs/scope.contract.reviewed.json").exists()

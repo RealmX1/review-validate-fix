@@ -888,9 +888,23 @@ def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
     candidate_tree_oid = git(repo, "rev-parse", "HEAD^{tree}")
     contract, contract_path, contract_digest = validated_scope_contract(run_dir, repo)
     validate_scope_tips(repo, contract, candidate_head_oid)
-    # K5：land 提交之后把 `candidate_task_tip` 刷成落地后的 HEAD（三处同步 + 重算 scope_hash），
-    # 并在放开 tip 等号的同时补上落地 delta 收敛闸。**只能发生在 finalize 与 reviewer 全部完成之后**
-    # ——本函数的前置条件就是「handoff 已 COMPLETED、worktree 已 clean」，故此处即最早的合法时刻。
+    handoff_path = run_dir / "artifacts/handoff.md"
+    if handoff_path.is_symlink() or not handoff_path.is_file():
+        raise ValueError("completed handoff artifact is required")
+    handoff_text = handoff_path.read_text(encoding="utf-8")
+    issue_count, conclusion = completed_review(run_dir, handoff_text)
+    candidate_digest = candidate_content_manifest_sha256(repo)
+    validation_records = validated_validation_records(
+        run_dir, candidate_digest, common_dir
+    )
+    # K5 的 restamp 是本函数里**唯一的写操作**，因此它必须排在**全部只读闸之后**：
+    # worktree clean、scope tips、handoff 双 COMPLETED、以及每一条 validation record 都 passed
+    # 且对应当前内容。08-19 处方原文即「restamp 只能发生在 finalize 与 reviewer 全部完成之后」。
+    #
+    # 曾经把它放在 `completed_review` 之前——那样一轮**未通过评审**的 run（例如双评审不成立、
+    # handoff 仍是 PENDING）会先被改写 `scope.contract.json`、并落下一份 `scope.contract.reviewed.json`，
+    # 然后才 fail-closed。那正是「不得留下半改的 contract」这条性质要禁止的形态，只是触发它的
+    # 不是越界 delta 而是未完成的评审。
     reviewed_task_tip = restamp_scope_contract_for_landing(
         repo,
         run_dir,
@@ -904,15 +918,6 @@ def write_evidence(repo_argument: Path, run_dir: Path) -> dict[str, Any]:
     # 一份与盘上文件对不上的身份，消费侧四条等式立刻全挂。重读顺带复验 scope_hash 自洽。
     contract, contract_path, contract_digest = validated_scope_contract(run_dir, repo)
     validate_scope_tips(repo, contract, candidate_head_oid)
-    handoff_path = run_dir / "artifacts/handoff.md"
-    if handoff_path.is_symlink() or not handoff_path.is_file():
-        raise ValueError("completed handoff artifact is required")
-    handoff_text = handoff_path.read_text(encoding="utf-8")
-    issue_count, conclusion = completed_review(run_dir, handoff_text)
-    candidate_digest = candidate_content_manifest_sha256(repo)
-    validation_records = validated_validation_records(
-        run_dir, candidate_digest, common_dir
-    )
     evidence_path = git_dir / EVIDENCE_RELATIVE_PATH
     if evidence_path.parent.resolve() != (git_dir / "rvf/evidence").resolve():
         raise ValueError("candidate evidence parent escaped the task git directory")
