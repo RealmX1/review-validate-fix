@@ -97,6 +97,18 @@ SANCTIONED_AGENT_DRIVING_KEY_CONSTRUCTORS: dict[tuple[str, str], str] = {
         "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
         "inspect_user_prompt_submit",
     ): "UPS turn-riding injection：bootstrap checkpoint 上下文，同样搭用户这一条 prompt 的车。",
+    (
+        "plugins/review-validate-fix/hooks/_kimi_hook_entry.py",
+        "translate_core_payload_to_kimi_user_prompt_submit_wire",
+    ): (
+        "Kimi 的 **UPS 出口翻译层**（ENTRY-7）。该文件整体落严格层是因为它同时是 Stop 入口的"
+        "fail-open 骨架，但**本函数只处理 UserPromptSubmit**，与 Stop 受众分级无关。\n"
+        "它存在的理由与 render_stop_hook_payload 同构：UPS 核心是 host-blind 的、发 Claude 形状的 "
+        "additionalContext，而 Kimi 二进制里 additionalContext / systemMessage 各 0 次命中，"
+        "且 UPS 是唯一会把 stdout 回落成正文注入的事件 ⇒ 不翻译就等于把整份 JSON（含 "
+        "developer-only 的 systemMessage）逐字喂给模型。2026-08-25 已真实发生过一次。\n"
+        "差异刻意不上提到 core：UPS 的 additionalContext 是另外五家通吃的，Kimi 是唯一例外。"
+    ),
 }
 
 STOP_EVENT_NAME = "Stop"

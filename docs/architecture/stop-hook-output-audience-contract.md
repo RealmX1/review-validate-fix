@@ -74,10 +74,11 @@ decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECIS
 | `decision:block` | ✅ | ✅ | ✅ 仅交互 | ❌ **见下方纠错** | ✅ | ✅ |
 | **Stop 上 `additionalContext`** | ✅ | ❌ `additionalProperties:false`（发过去整条 hook 输出 Failed） | ❌ | ❌ | ✅ | ❌ |
 | **Stop 上 `hookSpecificOutput.permissionDecision:"deny"`** | ❌ | ❌ | ❌ | ✅ **唯一可用通道** | ❌ | ❌ |
-| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ 静默丢弃（无害） | ✅ | ❌ |
-| **UPS 上 `additionalContext`** | ✅ | ✅ | ✅ | ⚠️ exit-0 stdout | ✅ | ✅ |
+| `systemMessage` | ✅ | ⚠️ schema 有字段但 `codex exec` 实测不落地 | ❌ | ❌ 二进制 0 次命中；Stop 上静默丢弃（无害），**UPS 上会被回落成正文注入模型**（见下方纠错 2） | ✅ | ❌ |
+| **UPS 上 `additionalContext`** | ✅ | ✅ | ✅ | ❌ 二进制 0 次命中；只认顶层 `message`（见下方纠错 2） | ✅ | ✅ |
 
-**跨宿主适配负担集中在 Stop**，UPS 侧 additionalContext 基本全家都支持。
+**跨宿主适配负担主要在 Stop**，但 **UPS 侧 Kimi 同样是例外**（见下方纠错 2）：
+Claude / Codex / Cursor / Oh My Pi / DeepSeek 五家吃 `additionalContext`，Kimi 只认顶层 `message`。
 
 **Codex 的 `additionalProperties:false` 是硬约束**：给 Codex 发 `hookSpecificOutput` 会让整条
 hook 输出被判 Failed = RVF 在 Codex 上静默停摆。所以 host 未知时**必须**兜底到最保守的
@@ -110,15 +111,75 @@ schema 只**命名** `message` 与 `hookSpecificOutput` 两个键。`looseObject
 2. `permissionDecision` 的 zod 类型是 `unknown().optional()`，判据是 JS 全等 `!== "deny"`
    ⇒ 必须是**字面量** `"deny"`，大小写错、拼接得到的同值字符串以外的任何偏差都静默降级。
    本仓把它单列为常量 `STOP_HOOK_PERMISSION_DECISION_DENY` 并由 gate AUD-5 钉住。
-3. `systemMessage` 在 Kimi 上落在 `looseObject` 的未命名区 ⇒ 被保留但从不读取。翻译层
+3. `systemMessage` 在 Kimi 上落在 `looseObject` 的未命名区 ⇒ 被保留但从不读取。**Stop 的**翻译层
    **仍然照附**（三通道一律附），因为 `_apply_guardian_liveness_alarm` 本就会写它、
-   且 ledger 的 `emitted_payload` 是跨 host 复盘的唯一真相源。代价为零，去掉反而自相矛盾。
+   且 ledger 的 `emitted_payload` 是跨 host 复盘的唯一真相源。**在 Stop 上**代价为零，
+   去掉反而自相矛盾。
+   ⚠️ **这条「代价为零」只对 Stop 成立**：UPS 上 Kimi 会把整段 stdout 回落成正文注入模型，
+   附带的 `systemMessage` 会随之逐字进入模型上下文。见下方**纠错 2**。
 
 顺带取证到的两条实现约束：hook 子进程的 `DEFAULT_TIMEOUT_SECONDS = 30`（manifest 应显式声明
 timeout，别吃默认值）；`HookSpecificOutputSchema` 内层只命名三个键，故翻译层的 Kimi 分支
 **不发** `hookEventName`（那是 Claude 专属的事件校验键）。
 
 完整取证见 `kimi-code-cli-plugin-and-hook-runtime-forensics.md`。
+
+
+### ⛔ 纠错 2（2026-08-26 取证，kimi **0.38.0**）：UPS 上 Kimi 只认顶层 `message`
+
+本表此前把 Kimi 的「UPS 上 `additionalContext`」记为含糊的 `⚠️ exit-0 stdout`，并在正文里写着
+「UPS 侧 additionalContext 基本全家都支持」。**那是没取证过的猜测。** 实测：
+
+`strings` 全量抽取 0.38.0 二进制的 751,968 条字面量，`additionalContext` 与 `systemMessage`
+**各 0 次命中**。Kimi 在 UPS 上读的是：
+
+```js
+// packages/agent-core/src/session/hooks/runner.ts
+const { message, hookSpecificOutput } = output.data;
+const result = { message: message ?? hookSpecificOutput?.message, structuredOutput: true };
+
+// packages/agent-core/src/session/hooks/user-prompt.ts
+function userPromptHookMessage(result) {
+  if (result.timedOut === true || (result.exitCode !== void 0 && result.exitCode !== 0)) return;
+  const message = result.message?.trim();
+  if (message !== void 0 && message.length > 0) return message;   // ① 顶层 message
+  const stdout = result.stdout?.trim();
+  return stdout === void 0 || stdout.length === 0 ? void 0 : stdout;   // ② 回落：整段 stdout
+}
+function renderHookResult(event, message) {
+  return `<hook_result hook_event="${event}">\n${message}\n</hook_result>`;
+}
+```
+
+⇒ 发 `additionalContext` 等于什么都没发，命中回落 ②。而产物有**两个**去向
+（`applyUserPromptHook`，两者取的是**同一份** `hookResult`）：
+
+```js
+this.agent.context.appendUserMessage([{type:"text", text: hookResult.text}], {kind:"hook_result", event:"UserPromptSubmit"});
+this.agent.emitEvent({type:"hook.result", turnId, hookEvent, content: hookResult.message});
+```
+
+前者进模型上下文，后者经 TUI 的 `formatHookResultMarkdown` 渲染成 `*UserPromptSubmit hook*` 块。
+
+⇒ **四条后果**：
+
+1. **旧行为把整份 JSON（含 developer-only 的 `systemMessage`）逐字注入模型上下文。**
+   不是推测——2026-08-25T21:28:57.898Z 已在真实会话里发生过一次，实据与逐字 wire 记录见
+   `kimi-code-cli-plugin-and-hook-runtime-forensics.md` §12。
+2. **Kimi 上不存在「开发者可见但不喂模型」的 UPS 通道**（注入与渲染同源），
+   所以 developer-only 的唯一正确渲染是**静默**。
+3. **UPS 的 `decision:"block"` 在 Kimi 上必定失效**——顶层 `decision` 从不被读取；
+   要 block 必须发 `hookSpecificOutput.permissionDecision:"deny"`（与 Stop 同一个判据）。
+4. **Stop 与 UPS 的开发者可见性是不对称的**：Stop 的 block 正文只
+   `appendUserMessage(kind:"system_trigger", name:"stop_hook")`、**不发** `hook.result`
+   ⇒ TUI 不渲染；UPS 发 ⇒ TUI 渲染。「Stop 的 developer-only 出口在 Kimi 上完全不可见」
+   这条结论**不能推广到 UPS**。
+
+**这条差异不由 core 处理。** UPS 核心 `rvf_user_prompt_submit.py` 保持 host-blind（五家通吃
+`additionalContext`，Kimi 是唯一例外），翻译收口在 Kimi shim 的出口：
+`plugins/review-validate-fix/hooks/_kimi_hook_entry.py` 的
+`translate_core_payload_to_kimi_user_prompt_submit_wire()` 与 `emit_developer_only_notice()`，
+回归护栏见 `tests/test_kimi_hook_entry_normalization.py` 的 **ENTRY-7**。
 
 ---
 

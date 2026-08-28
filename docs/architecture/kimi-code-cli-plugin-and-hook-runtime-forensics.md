@@ -479,3 +479,127 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/v1/plugins
 - `UNSUPPORTED_RUNTIME_FIELDS = ["tools","apps","inject","configFile","config_file","bootstrap"]`
   ——命中只记 `severity:"info"`，无害。
 - `commands` 与 `skills` 一样需显式声明（`./` 前缀），支持目录递归收 `.md`。
+
+---
+
+## 12. UserPromptSubmit 出口语义取证（2026-08-26，kimi **0.38.0**）
+
+> 触发原因：开发者在 Kimi 里看不到任何 RVF 的 system message，怀疑 hook 没挂上。
+> 取证方式：`strings -n 6` 抽二进制全部 **751,968** 条字面量 + 本机 RVF 状态根与
+> 三个 Kimi home 的 transcript 实证。全程只读。
+>
+> **结论：hook 挂上了、在跑、功能正常；但出口线材是错的。** 正文 §2.3 只取证了通用
+> hook runner 的 block 判据，**没有**取证 UPS 特有的 allow-stdout 消费路径——那条路径
+> 才是本节的内容。
+
+### 12.1 字段命中数：`additionalContext` 与 `systemMessage` 各 0 次
+
+| 字段 | 命中 |
+|---|---|
+| `systemMessage` / `system_message` | **0** |
+| `additionalContext` / `additional_context` | **0** |
+| `UserPromptSubmit` | 23 |
+| `permissionDecision` | 8 |
+
+⇒ RVF 发的这两个键在 Kimi 上**不存在对应实现**，不是「被忽略」而是「从未被命名」。
+
+### 12.2 UPS 的 allow 路径有**回落**，Stop 没有
+
+```js
+// packages/agent-core/src/session/hooks/user-prompt.ts
+function userPromptHookMessage(result) {
+  if (result.timedOut === true || (result.exitCode !== void 0 && result.exitCode !== 0)) return;
+  const message = result.message?.trim();
+  if (message !== void 0 && message.length > 0) return message;   // ① 顶层 message
+  const stdout = result.stdout?.trim();
+  return stdout === void 0 || stdout.length === 0 ? void 0 : stdout;   // ② 回落：整段 stdout
+}
+function renderUserPromptHookResult(results) {
+  const messages = results?.filter((r) => r.action !== "block")?.map(userPromptHookMessage).filter(isNonEmptyString) ?? [];
+  if (messages.length === 0) return void 0;
+  return { event: "UserPromptSubmit", message: messages.join("\n\n"),
+           text: messages.map((m) => renderHookResult("UserPromptSubmit", m)).join("\n") };
+}
+function renderHookResult(event, message) {
+  return `<hook_result hook_event="${event}">\n${message}\n</hook_result>`;
+}
+```
+
+`result.message` 的来源（`runner.ts`，与 §2.3 同一段）是
+`message ?? hookSpecificOutput?.message` —— **两者 RVF 都不发** ⇒ 必然命中回落 ②。
+
+### 12.3 产物的两个去向是**同一份** `hookResult`
+
+```js
+// applyUserPromptHook
+if (origin.kind !== "user") return void 0;            // ← 只有真人 prompt 才触发
+const promptHookResults = await this.agent.hooks?.trigger("UserPromptSubmit", {
+  matcherValue: input, signal, inputData: { prompt: input } });
+// … block 分支略 …
+const hookResult = renderUserPromptHookResult(promptHookResults);
+if (hookResult === void 0) return void 0;
+this.agent.context.appendUserMessage([{type:"text", text: hookResult.text}],
+  { kind:"hook_result", event:"UserPromptSubmit" });              // → 模型上下文
+this.agent.emitEvent({ type:"hook.result", turnId, hookEvent: hookResult.event,
+  content: hookResult.message });                                 // → TUI
+```
+
+TUI 侧 `handleHookResult` 把它 append 成一条 `renderMode:"markdown"` / `hookResult:true` 的
+transcript 条目，标题由 `formatHookResultTitle` 渲染成 `*UserPromptSubmit hook*`。
+
+⇒ **没有「只给开发者看」的分支。** 想让开发者看见，就必须同时喂给模型;
+反过来，developer-only 内容的唯一正确渲染是**完全不输出**。
+
+### 12.4 🔴 已发生的事故：developer-only 诊断被逐字注入模型
+
+`~/.cline/kanban/hooks/kimi/code-home/sessions/wd_cline-kanban_b03d278244bd/
+session_871f3f2d-c3b4-496f-bcff-c28466bd1170/agents/main/wire.jsonl:1126`
+（`time=1787693337898` → **2026-08-25T21:28:57.898Z**）：
+
+```json
+{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":
+"<hook_result hook_event=\"UserPromptSubmit\">\n{\"continue\": true, \"systemMessage\": \"=== RVF USER-PROMPT HOOK ===\\nRVF UPS: 带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达…\\nstatus=decision_point_banner_delivered\\ntoken=da51d40543293ec5…\"}\n</hook_result>"}],
+"origin":{"kind":"hook_result","event":"UserPromptSubmit"}},"time":1787693337898}
+```
+
+闭环旁证：`~/.rvf/agentic-initiation-decision-telemetry/da51d40543293ec5.jsonl` 显示同一
+session 在 45 秒后 `declined`。⇒ Stop 造 token → UPS 投递 → agent 决策**整条链路是通的**，
+只有出口线材是错的。
+
+### 12.5 hook 确实在跑的正面证据（供将来复用判据）
+
+`round_baseline_marker.py` 的 docstring 逐字是「UserPromptSubmit 写、Stop 读」，
+`write_round_baseline_marker` 全仓只有两个调用点，其一是 `rvf_user_prompt_submit.py:381`
+（另一处 `seal_round_baseline_to_head.py` 的 `prompt_excerpt` 是固定文案）。⇒
+
+```
+~/.rvf/user-local-data/run-logs/round-baseline-pending/*harness-kimi-code.json
+```
+
+里任何 `prompt_excerpt` 非 seal 文案的 marker，**都是 UPS hook 亲手写的**。本机 13 条，
+时间跨度 2026-08-24 22:35 → 2026-08-26 05:52，`prompt_excerpt` 全部正确
+（`continue` / `/plugin reload` / 评审 prompt 全文）。
+
+⚠️ **别只用 transcript 里的 `hook_result` 计数判断 hook 是否触发**：RVF 的 Kimi UPS shim 是
+`silent_success=True`，绝大多数回合本来就不输出、因此不留痕。13 次触发只有 1 次留下记录。
+**「零观测 ≠ 没触发」。**
+
+⚠️ **别只查 `~/.kimi-code`**：本机有三个 Kimi home（默认 / kanban 托管
+`~/.cline/kanban/hooks/kimi/code-home` / 一次性 override），上面那条实证就不在默认 home 里。
+kanban 那个 home 靠 `plugins -> ~/.kimi-code/plugins` 软链才看得到插件（见 §6 的本机缓解）。
+
+### 12.6 修复归属
+
+差异不上提到 core（UPS 的 `additionalContext` 是 Claude/Codex/Cursor/OMP/DeepSeek **五家通吃**的，
+Kimi 是唯一例外），翻译收口在 shim 出口：
+`plugins/review-validate-fix/hooks/_kimi_hook_entry.py` 的
+`translate_core_payload_to_kimi_user_prompt_submit_wire()`（三条映射）与
+`emit_developer_only_notice()`（按事件分流），回归护栏见
+`tests/test_kimi_hook_entry_normalization.py` 的 **ENTRY-7**。
+
+### 12.7 顺带发现（不属 RVF，未改动）
+
+`~/.kimi-code/config.toml` 的 `[[hooks]]` 段被 Orca 的安装器**追加了 4 轮**，每个事件 4 条、
+去重后 3 条命令文本互不相同。Kimi 的 `matchingHooks` 只按 `(cwd, command)` 精确去重
+⇒ **每次 UserPromptSubmit 实际 fork 3 个 orca `/bin/sh` + 1 个 RVF `python3`**。
+属 Orca 侧安装器不幂等，建议单独处理。

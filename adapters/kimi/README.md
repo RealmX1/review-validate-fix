@@ -142,6 +142,42 @@ reason 取 stderr），**其他任意码都让 stdout 被完全丢弃并 allow �
   不能读该字段。
 - **Stop 上的 developer-only 出口在 Kimi 上完全不可见**：Kimi 丢弃 Stop 的 allow-stdout，
   也没有 `systemMessage` 等价物 ⇒ **RVF 自己的 ledger 是 Kimi 上唯一的开发者可见面**。
+  ⚠️ **这条不能推广到 UPS** —— 两个事件的可见性是不对称的，见下节。
+
+
+## Stop 与 UPS 的出口不对称（2026-08-26 取证，0.38.0）
+
+两个事件在 Kimi 上的 hook 输出消费路径**完全不同**，照抄另一个必错：
+
+| | Stop | UserPromptSubmit |
+|---|---|---|
+| 消费什么 | 只读 block 判据（`triggerBlock`），**allow-stdout 整段丢弃** | 读顶层 `message` ?? `hookSpecificOutput.message`，**两者皆缺则回落整段 stdout** |
+| 驱动 agent 的线材 | `hookSpecificOutput.permissionDecision:"deny"` | 同左（block）／顶层 `message`（非 block 注入） |
+| 注入形态 | `appendUserMessage(kind:"system_trigger", name:"stop_hook")` | `appendUserMessage(kind:"hook_result")` |
+| TUI 是否渲染 | **否**（不发 `hook.result` 事件） | **是**（`emitEvent type:"hook.result"` → `*UserPromptSubmit hook*` 块） |
+| developer-only 的正确渲染 | 照发 `systemMessage`（被静默丢弃，无害） | **完全不输出**（否则会随回落逐字进模型上下文） |
+
+⇒ Stop 侧 core 已由 `render_stop_hook_payload` 渲染好 Kimi 线材，shim 逐字透传即可；
+**UPS 侧 core 是 host-blind 的**（发 Claude 的 `hookSpecificOutput.additionalContext`），
+必须由 shim 在出口翻译：
+
+| core 发的 | Kimi 线材 |
+|---|---|
+| `decision:"block"` + `reason` | `hookSpecificOutput.{permissionDecision:"deny", permissionDecisionReason}` |
+| `hookSpecificOutput.additionalContext` | 顶层 `message` |
+| 只有 `systemMessage` / `continue` | **不输出** |
+
+收口在 `hooks/_kimi_hook_entry.py` 的 `translate_core_payload_to_kimi_user_prompt_submit_wire()`
+与 `emit_developer_only_notice()`；回归护栏 `tests/test_kimi_hook_entry_normalization.py` **ENTRY-7**。
+
+**为什么没上提成 `HostAdapter` 方法**：UPS 的 `additionalContext` 是 Claude / Codex / Cursor /
+Oh My Pi / DeepSeek **五家通吃**的，Kimi 是唯一例外；为一个 host 的差异去改 host-blind 的 UPS
+热路径（要在里面付 transcript 探测的开销）是过度设计。将来若出现第二个线材不同的 host，
+再把这层上提为 `HostAdapter.user_prompt_submit_hook_payload_channel()`。
+
+🔴 **旧行为已在生产里出过事**：2026-08-25T21:28:57Z 的一次真实会话里，一条 developer-only
+诊断连 JSON 引号带 `\n` 转义一起被注入模型上下文。逐字 wire 记录见取证文档 §12.4。
+
 
 ## 身份词表：`kimi_code` 与 `kimi_code_cli` 的分工（别改错）
 
