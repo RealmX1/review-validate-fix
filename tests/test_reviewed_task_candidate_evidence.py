@@ -619,3 +619,403 @@ def test_refuses_opted_in_scope_with_missing_base_identity_before_writing(
         check=True,
     )
     assert json.loads(written.stdout)["status"] == "written"
+
+
+# ===========================================================================
+# K3（bootstrap receipt 换单调祖先性）与 K5（land 后 restamp + 落地 delta 收敛）
+#
+# **这一族全部带防恒等构造守卫。** 本文件既有的 9 个用例把四个 tip 与 `subject.head_oid` 构造成
+# 同一个 HEAD、全程不新建提交，于是唯一有区分度的断言结构性不可达——15 个 contract test 全绿，
+# 证明的只是「两个恒等值相等」。下面每条都先 `assert 两值不等` 再断言行为。
+# ===========================================================================
+
+
+def advance_local_base(repo: Path) -> str:
+    """在 base ref 上造一个子提交并推进 ref（不切分支、不动工作树）。
+
+    形状与真实场景一致：别的 worktree 往本地 base 落了提交 / `base-branch-sync` 做了 fast-forward。
+    """
+    tip = git(repo, "rev-parse", "main")
+    tree = git(repo, "rev-parse", f"{tip}^{{tree}}")
+    advanced = git(repo, "commit-tree", tree, "-p", tip, "-m", "local base advances")
+    git(repo, "update-ref", "refs/heads/main", advanced)
+    return advanced
+
+
+def write_bootstrap_receipt(repo: Path, **overrides: object) -> tuple[Path, str]:
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir"))
+    common_dir = Path(
+        git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    ).resolve()
+    head = git(repo, "rev-parse", "HEAD")
+    receipt: dict[str, object] = {
+        "schema_name": "local-base-into-task-worktree-bootstrap-receipt",
+        "schema_version": 1,
+        "base_ref": "main",
+        "remote_name": "origin",
+        "absorbed_base_tip": git(repo, "rev-parse", "main"),
+        "task_tip_after_base_absorption": head,
+        "git_common_directory_realpath": str(common_dir),
+        "task_worktree_realpath": str(repo.resolve()),
+        "boundary_status": "VERIFIED",
+        "lock_status": "RELEASED",
+        "target_repository_hooks_status": "DISABLED",
+        "wip_status": "RESTORED_AND_DROPPED",
+    }
+    receipt.update(overrides)
+    path = git_dir / "base-branch-sync" / "local-base-into-task-worktree-bootstrap-receipt.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = canonical_bytes(receipt)
+    path.write_bytes(encoded)
+    digest = hashlib.sha256(encoded).hexdigest()
+    Path(f"{path}.sha256").write_text(digest + "\n", encoding="ascii")
+    return path, digest
+
+
+def rewrite_contract(run_dir: Path, **updates: object) -> dict[str, object]:
+    """改 contract 的字段并**同步**改 canonical_scope + 重算 scope_hash（生产同款三处一致）。"""
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    canonical_scope = contract["canonical_scope"]
+    for name, value in updates.items():
+        contract[name] = value
+        if name in canonical_scope:
+            canonical_scope[name] = value
+    contract["scope_hash"] = hashlib.sha256(canonical_bytes(canonical_scope)).hexdigest()
+    contract_path.write_bytes(canonical_bytes(contract))
+    return contract
+
+
+def run_writer(repo: Path, run_dir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def opted_in_repo_with_land_commit(
+    tmp_path: Path, *, extra_base_files: dict[str, str] | None = None
+) -> tuple[Path, Path, str, str]:
+    """建「prepare 冻结在 head0 → land 提交推进到 head1」的现场，返回 (repo, run_dir, head0, head1)。"""
+    repo = repository(tmp_path / "repo")
+    for name, content in (extra_base_files or {}).items():
+        (repo / name).write_text(content, encoding="utf-8")
+        git(repo, "add", name)
+    (repo / "AGENTS.md").write_text(
+        "RVF-PRE-REVIEW-BASE-SYNC-SKILL: sync-local-base-into-task-worktree-only\n",
+        encoding="utf-8",
+    )
+    git(repo, "add", "AGENTS.md")
+    git(repo, "commit", "-q", "-m", "opt in")
+    prepare_time_head = git(repo, "rev-parse", "HEAD")
+
+    (repo / "tracked.txt").write_text("landed fix\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-q", "-m", "rvf-land fix")
+    post_land_head = git(repo, "rev-parse", "HEAD")
+    # 防恒等守卫：整族测试的前提就是这两个值必须不同。
+    assert prepare_time_head != post_land_head
+
+    # validation record 必须对应**落地后**的内容，故 run 在提交之后建。
+    run_dir = create_completed_run(tmp_path, repo)
+    return repo, run_dir, prepare_time_head, post_land_head
+
+
+def test_base_drift_after_prepare_no_longer_blocks_evidence(tmp_path: Path) -> None:
+    """K3 核心回归：prepare 之后 local base 前移过一次，仍必须写得出 evidence。"""
+    repo, run_dir, prepare_time_head, _post_land_head = opted_in_repo_with_land_commit(tmp_path)
+    reviewed_base_tip = git(repo, "rev-parse", "main")
+
+    advanced_base_tip = advance_local_base(repo)
+    assert reviewed_base_tip != advanced_base_tip  # 防恒等守卫：base 必须真的动过
+
+    receipt_path, live_digest = write_bootstrap_receipt(
+        repo, absorbed_base_tip=advanced_base_tip, task_tip_after_base_absorption=prepare_time_head
+    )
+    stale_contract_digest = "0" * 64
+    assert live_digest != stale_contract_digest  # 防恒等守卫：冻结值必须真的对不上活文件
+    rewrite_contract(
+        run_dir,
+        reviewed_base_tip=reviewed_base_tip,
+        comparison_base_tip=reviewed_base_tip,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+        bootstrap_receipt_path=str(receipt_path),
+        bootstrap_receipt_digest=stale_contract_digest,
+    )
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode == 0, completed.stderr
+    evidence = json.loads(
+        Path(json.loads(completed.stdout)["candidate_evidence_path"]).read_text(encoding="utf-8")
+    )
+    # 写进 evidence 的 digest 必须是**活文件现算值**，否则下游重算对不上。
+    assert evidence["receipts"]["bootstrap_sha256"] == live_digest
+
+
+def test_reviewed_base_that_does_not_precede_the_absorbed_base_is_refused(tmp_path: Path) -> None:
+    """祖先性方向不能写反：absorbed base 必须是 reviewed base 的后代，不是反过来。"""
+    repo, run_dir, prepare_time_head, _post = opted_in_repo_with_land_commit(tmp_path)
+    older_base_tip = git(repo, "rev-parse", "main")
+    newer_base_tip = advance_local_base(repo)
+    assert older_base_tip != newer_base_tip
+
+    # 故意反向：receipt 说吸收了**旧** base，contract 说审的是**新** base。
+    receipt_path, _digest = write_bootstrap_receipt(
+        repo, absorbed_base_tip=older_base_tip, task_tip_after_base_absorption=prepare_time_head
+    )
+    rewrite_contract(
+        run_dir,
+        reviewed_base_tip=newer_base_tip,
+        comparison_base_tip=older_base_tip,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+        bootstrap_receipt_path=str(receipt_path),
+        bootstrap_receipt_digest="0" * 64,
+    )
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode != 0
+    assert "absorbed base does not descend from the reviewed base" in completed.stderr
+
+
+def test_task_rewound_behind_the_bootstrap_receipt_is_refused(tmp_path: Path) -> None:
+    repo, run_dir, prepare_time_head, post_land_head = opted_in_repo_with_land_commit(tmp_path)
+    reviewed_base_tip = git(repo, "rev-parse", "main")
+    unreachable_tip = git(
+        repo,
+        "commit-tree",
+        git(repo, "rev-parse", f"{post_land_head}^{{tree}}"),
+        "-p",
+        post_land_head,
+        "-m",
+        "a tip the task was rewound away from",
+    )
+    assert unreachable_tip != post_land_head
+
+    receipt_path, _digest = write_bootstrap_receipt(
+        repo,
+        absorbed_base_tip=reviewed_base_tip,
+        task_tip_after_base_absorption=unreachable_tip,
+    )
+    rewrite_contract(
+        run_dir,
+        reviewed_base_tip=reviewed_base_tip,
+        comparison_base_tip=reviewed_base_tip,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+        bootstrap_receipt_path=str(receipt_path),
+        bootstrap_receipt_digest="0" * 64,
+    )
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode != 0
+    assert "does not descend from the bootstrap receipt" in completed.stderr
+
+
+def test_bootstrap_receipt_bound_to_another_worktree_is_refused(tmp_path: Path) -> None:
+    """receipt 指向别的 worktree 必须拦。改内容后**必须重算 digest 并重写 sidecar**，
+
+    否则测到的是 sidecar 自洽那一层，而不是 subject binding 那一层。
+    """
+    repo, run_dir, prepare_time_head, _post = opted_in_repo_with_land_commit(tmp_path)
+    reviewed_base_tip = git(repo, "rev-parse", "main")
+    receipt_path, honest_digest = write_bootstrap_receipt(
+        repo,
+        absorbed_base_tip=reviewed_base_tip,
+        task_tip_after_base_absorption=prepare_time_head,
+        task_worktree_realpath="/somewhere/else",
+    )
+    # 防恒等守卫：sidecar 必须与被改过的内容自洽，才能确保第一层放行、第二层判罪。
+    assert Path(f"{receipt_path}.sha256").read_text().strip() == honest_digest
+    rewrite_contract(
+        run_dir,
+        reviewed_base_tip=reviewed_base_tip,
+        comparison_base_tip=reviewed_base_tip,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+        bootstrap_receipt_path=str(receipt_path),
+        bootstrap_receipt_digest=honest_digest,
+    )
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode != 0
+    assert "bootstrap receipt subject does not match the reviewed candidate" in completed.stderr
+
+
+def test_land_commit_restamps_the_contract_and_records_landing_provenance(tmp_path: Path) -> None:
+    """K5 / N7 + N7b：三重一致性 + provenance，一次断完。"""
+    repo, run_dir, prepare_time_head, post_land_head = opted_in_repo_with_land_commit(tmp_path)
+    rewrite_contract(
+        run_dir,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+    )
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    reviewed_scope_hash = json.loads(contract_path.read_text(encoding="utf-8"))["scope_hash"]
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode == 0, completed.stderr
+
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    # ① top-level 与 canonical_scope 同步推进到落地后的 HEAD
+    assert contract["candidate_task_tip"] == post_land_head
+    assert contract["canonical_scope"]["candidate_task_tip"] == post_land_head
+    # ② scope_hash 与 canonical_scope 自洽
+    assert contract["scope_hash"] == hashlib.sha256(
+        canonical_bytes(contract["canonical_scope"])
+    ).hexdigest()
+    assert contract["scope_hash"] != reviewed_scope_hash
+    # ③ provenance 保留了被评审那一版，且 landing_restamp 不进 canonical_scope
+    assert "landing_restamp" not in contract["canonical_scope"]
+    (restamp,) = contract["landing_restamp"]
+    assert restamp["reviewed_candidate_task_tip"] == prepare_time_head
+    assert restamp["landed_candidate_task_tip"] == post_land_head
+    assert restamp["reviewed_scope_hash"] == reviewed_scope_hash
+    assert restamp["landed_delta_paths"] == ["tracked.txt"]
+    # 冻结的被评审契约存在，且其 digest 就是记录里的值
+    reviewed_contract_path = Path(restamp["reviewed_contract_path"])
+    assert reviewed_contract_path.is_file()
+    assert (
+        hashlib.sha256(reviewed_contract_path.read_bytes()).hexdigest()
+        == restamp["reviewed_contract_sha256"]
+    )
+    assert json.loads(reviewed_contract_path.read_text(encoding="utf-8"))[
+        "candidate_task_tip"
+    ] == prepare_time_head
+
+    evidence = json.loads(
+        Path(json.loads(completed.stdout)["candidate_evidence_path"]).read_text(encoding="utf-8")
+    )
+    # 消费侧的四条等式在 restamp 之后同时成立
+    assert evidence["subject"]["head_oid"] == post_land_head == contract["candidate_task_tip"]
+    assert evidence["scope"]["scope_digest"] == contract["scope_hash"]
+    assert evidence["scope"]["contract_sha256"] == hashlib.sha256(
+        canonical_bytes(contract)
+    ).hexdigest()
+    # evidence 自身仍说得出「reviewer 当时看的是哪个 tip」
+    assert evidence["subject"]["reviewed_task_tip"] == prepare_time_head
+
+
+def test_restamp_is_a_no_op_when_rvf_land_committed_nothing(tmp_path: Path) -> None:
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    head = git(repo, "rev-parse", "HEAD")
+    assert json.loads(
+        (run_dir / "artifacts/inputs/scope.contract.json").read_text(encoding="utf-8")
+    )["candidate_task_tip"] == head
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode == 0, completed.stderr
+    contract = json.loads(
+        (run_dir / "artifacts/inputs/scope.contract.json").read_text(encoding="utf-8")
+    )
+    assert "landing_restamp" not in contract
+    assert not (run_dir / "artifacts/inputs/scope.contract.reviewed.json").exists()
+
+
+def test_landed_delta_outside_the_reviewed_scope_is_refused_without_half_writing(
+    tmp_path: Path,
+) -> None:
+    """放开 tip 等号的**配套闸**：land 的最小修正不得落地 reviewer 没看过的路径。"""
+    repo = repository(tmp_path / "repo")
+    prepare_time_head = git(repo, "rev-parse", "HEAD")
+    (repo / "outside.txt").write_text("never reviewed\n", encoding="utf-8")
+    git(repo, "add", "outside.txt")
+    git(repo, "commit", "-q", "-m", "land touches an unreviewed path")
+    post_land_head = git(repo, "rev-parse", "HEAD")
+    assert prepare_time_head != post_land_head
+
+    run_dir = create_completed_run(tmp_path, repo)
+    rewrite_contract(
+        run_dir,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+    )
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    before_bytes = contract_path.read_bytes()
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode != 0
+    assert "landed delta escaped the reviewed scope" in completed.stderr
+    assert "outside.txt" in completed.stderr
+    # 不得留下半改的 contract
+    assert contract_path.read_bytes() == before_bytes
+    assert not (run_dir / "artifacts/inputs/scope.contract.reviewed.json").exists()
+
+
+def test_rename_out_of_an_unreviewed_path_is_caught_because_renames_are_disabled(
+    tmp_path: Path,
+) -> None:
+    """`--no-renames` 的存在理由，用一个开启改名检测就会漏掉的构造来钉住。
+
+    构造：源路径 `outside.txt` **不在** scope，目的路径 `moved-into-scope.txt` **在** scope，
+    且该轮只有这一次纯改名、没有别的改动。
+    开启改名检测时 `--name-only` 只打印目的路径 ⇒ delta ⊆ scope ⇒ 放行（错的）。
+    关掉之后源与目的都出现 ⇒ `outside.txt` 越界 ⇒ 拦住（对的）。
+    """
+    repo = repository(tmp_path / "repo")
+    (repo / "outside.txt").write_text("x" * 400 + "\n", encoding="utf-8")
+    git(repo, "add", "outside.txt")
+    git(repo, "commit", "-q", "-m", "an unreviewed file exists at prepare time")
+    prepare_time_head = git(repo, "rev-parse", "HEAD")
+
+    git(repo, "mv", "outside.txt", "moved-into-scope.txt")
+    git(repo, "commit", "-q", "-m", "land renames an unreviewed file into scope")
+    post_land_head = git(repo, "rev-parse", "HEAD")
+    assert prepare_time_head != post_land_head
+    # 防恒等守卫：开启改名检测时该 delta **只有目的路径**，确实会被判成「全在 scope 内」。
+    # 这条断言一旦不成立，下面的用例就不再证明 `--no-renames` 有意义。
+    renames_detected = git(
+        repo, "diff", "--name-only", "--find-renames", prepare_time_head, post_land_head
+    ).split()
+    assert renames_detected == ["moved-into-scope.txt"]
+
+    run_dir = create_completed_run(tmp_path, repo)
+    rewrite_contract(
+        run_dir,
+        primary_files=["tracked.txt", "moved-into-scope.txt"],
+        fix_allowlist=["tracked.txt", "moved-into-scope.txt"],
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+    )
+
+    completed = run_writer(repo, run_dir)
+    assert completed.returncode != 0
+    assert "landed delta escaped the reviewed scope" in completed.stderr
+    assert "outside.txt" in completed.stderr
+
+
+def test_incomplete_review_refuses_before_restamping_anything(tmp_path: Path) -> None:
+    """restamp 是本 writer 唯一的写操作，必须排在**全部只读闸之后**。
+
+    构造：contract 已 opt-in、land 提交也真的发生了（两 tip 不等，restamp 有事可做），
+    但 handoff 的 `review_status` 是 `PENDING`（双评审不成立时的正确记法）。
+    断言 writer 拒绝，且 **`scope.contract.json` 一个字节都没变、没有落下冻结副本**——
+    否则一轮未通过评审的 run 会先被改写契约再 fail-closed。
+    """
+    repo, run_dir, prepare_time_head, post_land_head = opted_in_repo_with_land_commit(tmp_path)
+    assert prepare_time_head != post_land_head  # 防恒等守卫：restamp 必须有事可做
+    rewrite_contract(
+        run_dir,
+        reviewed_task_tip=prepare_time_head,
+        candidate_task_tip=prepare_time_head,
+    )
+    handoff_path = run_dir / "artifacts/handoff.md"
+    handoff_path.write_text(
+        handoff_path.read_text(encoding="utf-8").replace(
+            "- review_status: COMPLETED", "- review_status: PENDING"
+        ),
+        encoding="utf-8",
+    )
+
+    contract_path = run_dir / "artifacts/inputs/scope.contract.json"
+    before_bytes = contract_path.read_bytes()
+
+    completed = run_writer(repo, run_dir)
+
+    assert completed.returncode != 0
+    assert contract_path.read_bytes() == before_bytes
+    assert not (run_dir / "artifacts/inputs/scope.contract.reviewed.json").exists()

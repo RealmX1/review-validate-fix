@@ -20,6 +20,13 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 import concurrent.futures
 import rvf_bootstrap_gate
 import rvf_prep_file
+from base_task_intent_reconciliation_artifact import (
+    consumed_base_task_intent_reconciliation,
+    intent_context_markdown,
+    record_intent_artifact_consumption_outcome,
+    status_artifact_payload as intent_artifact_status_artifact_payload,
+    STATUS_ARTIFACT_FILENAME as INTENT_ARTIFACT_STATUS_FILENAME,
+)
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
 from core.session_scope_allocation import reviewable_unit_diff_tracker
@@ -250,6 +257,43 @@ def pre_review_base_sync_state(repo: Path, local_base_ref: str | None) -> dict[s
         "local_base_tip": local_base_tip,
         "task_head": task_head,
     }
+
+
+def refuse_explicit_local_base_ref_that_bypasses_opt_in(
+    repo: Path,
+    *,
+    explicit_local_base_ref: str | None,
+    committed_base_ref: str | None,
+    resolved_local_base_ref: str | None,
+) -> None:
+    """堵 O1：不许用一个**存在但没有 marker 的旁支**当 base ref，从而绕开本仓的 opt-in 门禁。
+
+    ``resolve_local_base_ref`` 把 ``explicit_local_base_ref`` 当最高优先级短路，而门禁读哪个 commit
+    的 ``AGENTS.md`` 完全由它决定。畸形 ref 与不存在的 ref 早已 fail-closed（``_local_base_ref_full_name``
+    与 ``git rev-parse --verify`` 各挡一层），**唯一**剩下的旁路形态是：仓库自己解析出来的 base 是
+    opt-in 的，而显式传入的那个分支恰好没有 marker ⇒ ``pre_review_base_sync_state`` 返回 ``None``、
+    整道门禁静默变成 ``not_applicable``。这与 docstring 承诺的「always read from the current local
+    base commit」直接矛盾。
+
+    因此这里独立解析一次（不带显式覆盖），只在「独立解析出的 base 是 opt-in、而显式那个不是」时拒绝。
+    显式 ref 与独立解析**不同但同样 opt-in**（或两者都非 opt-in）不受影响——那是合法用法，
+    比如默认分支不叫 main、又没有 ``origin/HEAD`` 的仓库。
+    """
+    if not explicit_local_base_ref:
+        return
+    independently_resolved = resolve_local_base_ref(
+        repo, explicit_local_base_ref=None, committed_base_ref=committed_base_ref
+    )
+    if not independently_resolved or independently_resolved == resolved_local_base_ref:
+        return
+    if pre_review_base_sync_state(repo, independently_resolved) is None:
+        return
+    if pre_review_base_sync_state(repo, resolved_local_base_ref) is not None:
+        return
+    raise ValueError(
+        "explicit local base ref bypasses the repository's opt-in pre-review base sync marker: "
+        f"{resolved_local_base_ref!r} carries no marker while {independently_resolved!r} does"
+    )
 
 
 def git_diff_path_set(repo: Path, older_tip: str, newer_tip: str) -> list[str]:
@@ -1226,9 +1270,19 @@ def prepare_run(
         explicit_local_base_ref=local_base_ref,
         committed_base_ref=committed_base_ref,
     )
+    refuse_explicit_local_base_ref_that_bypasses_opt_in(
+        root,
+        explicit_local_base_ref=local_base_ref,
+        committed_base_ref=committed_base_ref,
+        resolved_local_base_ref=resolved_local_base_ref,
+    )
     pre_review_sync_state = pre_review_base_sync_state(root, resolved_local_base_ref)
     if pre_review_sync_state is not None and pre_review_sync_state["status"] == "bootstrap_required_before_rvf":
         raise BootstrapRequiredBeforeRvf(pre_review_sync_state)
+    # N5/K4：把本轮已校验的 bootstrap receipt 与它的 digest 捕获到函数作用域，供 intent artifact
+    # 的 subject binding 使用（digest 是 anti-replay 直接锚，receipt 自身按 schema 不得内嵌它）。
+    validated_bootstrap_receipt_payload: dict[str, Any] | None = None
+    validated_bootstrap_receipt_digest: str | None = None
     effective_scope_contract_extensions = dict(
         scope_contract_extensions or scope_contract_v3_extensions()
     )
@@ -1257,6 +1311,8 @@ def prepare_run(
         if receipt_path is not None:
             receipt_payload = validated_bootstrap_receipt(root, pre_review_sync_state, receipt_path)
             receipt_value, receipt_digest = canonical_json_artifact_identity(receipt_path)
+            validated_bootstrap_receipt_payload = receipt_payload
+            validated_bootstrap_receipt_digest = receipt_digest
             configured_receipt_digest = effective_scope_contract_extensions.get(
                 "bootstrap_receipt_digest"
             )
@@ -1371,6 +1427,67 @@ def prepare_run(
     if session_context is not None:
         shutil.copyfile(session_context, scope_of_work_path)
         packet_session_context = scope_of_work_path
+
+    # ------------------------------------------------------------------ N5 / K4
+    # 消费 base-branch-sync 的 intent artifact，注入 reviewer / fixer context。
+    #
+    # **只对 opt-in 仓库做**（``pre_review_sync_state is not None`` 即 opt-in）：非 opt-in 仓库
+    # 既没有 base 单向吸收、也不会有 artifact，给它们写日志只会污染退出条件第 4 条的分母。
+    #
+    # **三种 status 一律放行**：consumed / missing / invalid 走同一条路径，绝不 raise。
+    # 两侧部署节奏天然不同步（my-ai-setup 软链即时生效、RVF 要跑 /rvf-local-deploy），
+    # 因此「artifact 不在」是常规事件而非异常——把它当异常就是再造一条 fail-closed 死路。
+    intent_artifact_outcome: dict[str, Any] | None = None
+    intent_artifact_status_path: Path | None = None
+    if pre_review_sync_state is not None:
+        intent_artifact_outcome = consumed_base_task_intent_reconciliation(
+            root,
+            validated_bootstrap_receipt_payload,
+            validated_bootstrap_receipt_digest,
+        )
+        # 机器可校验的落点①：run 工件（事后可审计）。
+        intent_artifact_status_path = artifact_dir / INTENT_ARTIFACT_STATUS_FILENAME
+        intent_artifact_status_path.write_text(
+            json.dumps(
+                intent_artifact_status_artifact_payload(
+                    intent_artifact_outcome, run_id=ledger.run_id
+                ),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # 机器可校验的落点②：跨 run 的 append-only 日志（过渡机制退出条件第 4 条要它做统计）。
+        # best-effort，永不阻断 prepare。
+        intent_log_git_common_directory = (validated_bootstrap_receipt_payload or {}).get(
+            "git_common_directory_realpath"
+        )
+        if not intent_log_git_common_directory:
+            # `run()` 见非零退出即 raise。这条路径**只是可观测性记录**，绝不允许把 prepare 拖红
+            # ——给它留一条能抛的缝，就等于在「一律放行」的契约里凿了个 fail-closed 出来。
+            try:
+                intent_log_git_common_directory = run(
+                    ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                    cwd=root,
+                ).strip()
+            except (OSError, RuntimeError):
+                intent_log_git_common_directory = str(root)
+        record_intent_artifact_consumption_outcome(
+            outcome=intent_artifact_outcome,
+            git_common_directory=intent_log_git_common_directory,
+            task_worktree=str(root),
+            rvf_run_id=ledger.run_id,
+        )
+        # 注入通道：追加到 scope-of-work 末尾。**只在已有 scope-of-work 时追加**——
+        # 若本轮压根没传 session context，凭空造一个只含 intent 段的文件会改变
+        # allow_missing_session_context 的既有语义。追加在末尾还保证 stub marker
+        # （scope_of_work_is_untouched_stub 只看前 20 行）不会被我们误判成「已填实」。
+        if packet_session_context is not None and scope_of_work_path.exists():
+            with scope_of_work_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + intent_context_markdown(intent_artifact_outcome))
+    # ---------------------------------------------------------------- end N5 / K4
 
     packet_session_manifest: Path | None = None
     source_session_manifest: str | None = None
@@ -1670,6 +1787,22 @@ def prepare_run(
         "main_harness_file": str(main_harness_path),
         "scope_contract": str(scope_contract_path),
         "scope_contract_payload": scope_contract,
+        # N5/K4：intent artifact 的消费结局。三种取值一律放行，这里只是把它做成机器事实。
+        "intent_artifact_status": (
+            intent_artifact_outcome.get("status")
+            if intent_artifact_outcome is not None
+            else None
+        ),
+        "intent_artifact_status_reason": (
+            intent_artifact_outcome.get("reason")
+            if intent_artifact_outcome is not None
+            else None
+        ),
+        "intent_artifact_status_file": (
+            str(intent_artifact_status_path)
+            if intent_artifact_status_path is not None
+            else None
+        ),
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
@@ -1796,6 +1929,7 @@ def _shared_workflow_artifacts(result: dict[str, Any]) -> dict[str, str | None]:
         "worktree_bootstrap": result.get("worktree_bootstrap"),
         "session_manifest": result.get("session_manifest_file"),
         "scope_of_work": result.get("scope_of_work_file"),
+        "intent_artifact_status_file": result.get("intent_artifact_status_file"),
     }
 
 

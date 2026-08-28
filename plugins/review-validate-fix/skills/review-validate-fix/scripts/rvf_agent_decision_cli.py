@@ -1458,6 +1458,9 @@ def build_execution_handoff(
         "scope_of_work": artifacts.get("scope_of_work"),
         "session_manifest": artifacts.get("session_manifest"),
         "worktree_bootstrap": artifacts.get("worktree_bootstrap"),
+        # N5/K4：intent artifact 的消费结局工件。agent 照抄它填 handoff `## 状态` 的
+        # `intent_artifact_status`，不要自己判断——「标注」必须是机器事实而非 agent 自觉。
+        "intent_artifact_status_file": artifacts.get("intent_artifact_status_file"),
         "origin_metadata": str(run_dir_path / "artifacts" / "origin.json") if run_dir_path else None,
         "handoff_path": str(run_dir_path / "artifacts" / "handoff.md") if run_dir_path else None,
         "handoff_contract": (
