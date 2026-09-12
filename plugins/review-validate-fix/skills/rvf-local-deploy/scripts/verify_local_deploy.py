@@ -402,6 +402,12 @@ def _verify_plugin_payload_root(plugin_root: Path, *, label: str) -> None:
         if not (plugin_root / relative_path).is_file()
     ]
     _require(not missing, f"{label} plugin payload 缺少必要文件: {missing}")
+    # 共享包内的 hooks/hooks.json 只供 Claude 使用。空数组仍可能回退默认文件。
+    codex_manifest = _read_json(plugin_root / ".codex-plugin/plugin.json")
+    _require(
+        codex_manifest.get("hooks") == {"hooks": {}},
+        f"{label} Codex manifest 必须显式声明空 hooks 文档，排除 Claude bundled hooks",
+    )
     _require(
         not (plugin_root / "skills/review-validate-fix/state").exists(),
         f"{label} plugin payload 不得包含可变 state",
@@ -685,6 +691,7 @@ def verify_local_deploy(
         },
         "cache_payloads_match_active_release": True,
         "hooks_verified": ["Stop", "UserPromptSubmit"],
+        "codex_bundled_hooks_excluded_by_manifest": True,
         "synthetic_hook_smoke": synthetic_hook_smoke,
         "official_cli_versions": dict(cli_versions),
     }

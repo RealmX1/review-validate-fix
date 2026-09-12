@@ -25,10 +25,6 @@ sys.path.insert(0, str(ROOT))
 from core.hook_command_spawn_guard_against_missing_target_script import (  # noqa: E402
     hook_command_guarded_against_missing_target_script,
 )
-from core.codex_bundled_plugin_hook_suppression import (  # noqa: E402
-    BUNDLED_HOOKS_JSON_RELATIVE_PATH,
-    disable_bundled_plugin_hooks_in_codex_config,
-)
 from core.live_codex_sessions_holding_plugin_cache_paths import (  # noqa: E402
     live_codex_session_warning_lines,
     live_codex_sessions_holding_plugin_cache_paths,
@@ -106,11 +102,6 @@ class OfficialCliInstallationResult:
     commands: tuple[tuple[str, ...], ...]
     removed_noncanonical_codex_plugin_selectors: tuple[str, ...]
     removed_noncanonical_claude_plugin_selectors: tuple[str, ...]
-    codex_bundled_plugin_hook_suppression: dict[str, Any] | None = None
-    """把 Codex 侧 bundled ``hooks/hooks.json`` 注册置为 ``enabled = false`` 的结果。
-
-    bundled 那份在 Codex 上恒定 no-op，却是唯一指向版本化 plugin cache 目录的注册。
-    """
     live_codex_sessions_holding_plugin_cache_paths_to_be_removed: tuple[
         dict[str, Any], ...
     ] = ()
@@ -635,24 +626,6 @@ def noncanonical_review_validate_fix_plugin_selectors_in_official_cli_listing(
     return tuple(sorted(selectors))
 
 
-def _bundled_plugin_hooks_document(active_marketplace_root: Path) -> dict[str, Any]:
-    """读 active marketplace 里 plugin bundled 的 ``hooks/hooks.json``。
-
-    读不到就返回空文档：抑制写入本身是**加固**，不该因为读不到而让整次部署失败。
-    """
-    path = (
-        Path(active_marketplace_root)
-        / "plugins"
-        / PLUGIN_NAME
-        / BUNDLED_HOOKS_JSON_RELATIVE_PATH
-    )
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return document if isinstance(document, dict) else {}
-
-
 def install_developer_marketplace_with_official_clis(
     *,
     active_marketplace_root: Path,
@@ -824,15 +797,6 @@ def install_developer_marketplace_with_official_clis(
         command_runner=command_runner,
         recorded_commands=recorded_commands,
     )
-    # 装完立刻把 bundled hook 注册停掉：它在 Codex 上恒定 no-op（`is_foreign_invocation`
-    # 只服务 Claude），却是唯一指向**版本化 plugin cache 目录**的注册，也就是每次部署换
-    # 版本目录后会悬空的那一条。理由与实测见该模块 docstring。
-    codex_bundled_plugin_hook_suppression = disable_bundled_plugin_hooks_in_codex_config(
-        codex_home=Path.home() / ".codex",
-        plugin_selector=DEVELOPER_PLUGIN_SELECTOR,
-        bundled_hooks_document=_bundled_plugin_hooks_document(active_marketplace_root),
-    )
-
     claude_marketplace_entry = next(
         (
             entry
@@ -920,23 +884,6 @@ def install_developer_marketplace_with_official_clis(
         removed_noncanonical_claude_plugin_selectors=(
             removed_noncanonical_claude_plugin_selectors
         ),
-        codex_bundled_plugin_hook_suppression={
-            "config_path": str(codex_bundled_plugin_hook_suppression.config_path),
-            "disabled_hook_state_keys": list(
-                codex_bundled_plugin_hook_suppression.disabled_hook_state_keys
-            ),
-            "already_disabled_hook_state_keys": list(
-                codex_bundled_plugin_hook_suppression.already_disabled_hook_state_keys
-            ),
-            "created_hook_state_keys": list(
-                codex_bundled_plugin_hook_suppression.created_hook_state_keys
-            ),
-            "config_written": codex_bundled_plugin_hook_suppression.config_written,
-            # 抑制失败不阻断部署（它是加固，不是部署的必要条件），所以只能靠回执被看见。
-            "config_write_failure_reason": (
-                codex_bundled_plugin_hook_suppression.config_write_failure_reason
-            ),
-        },
         live_codex_sessions_holding_plugin_cache_paths_to_be_removed=tuple(
             {
                 "session_id": finding.session_id,
@@ -2125,9 +2072,6 @@ def main(argv: list[str] | None = None) -> int:
                     official_cli_result.removed_noncanonical_claude_plugin_selectors
                 ),
             },
-            "codex_bundled_plugin_hook_suppression": (
-                official_cli_result.codex_bundled_plugin_hook_suppression
-            ),
             "live_codex_sessions_holding_plugin_cache_paths_to_be_removed": [
                 dict(finding)
                 for finding in (
