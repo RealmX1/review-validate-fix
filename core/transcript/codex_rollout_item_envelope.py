@@ -1,27 +1,32 @@
 """Codex rollout ``item_completed`` 信封的解包原语（host-中性、stdlib-only）。
 
-背景：三代 rollout schema 当前同时在跑
+背景：多种 rollout 记录形态当前同时在跑
 ------------------------------------------------
-Codex 的 rollout JSONL 至今出现过三代记录形态，且**同时在跑**（Codex 支持 resume /
-切换模型 / 不同前端，同一天不同会话可能是不同代，同一个会话内也可能前后段不同代）：
+Codex 的 rollout JSONL 至今出现过几种并存的记录形态，**它们不是按时间先后替换的「世代」，
+而是按前端 / 工具配置并存**（Codex 支持 resume、切换模型、不同前端，同一天不同会话可能不同
+形态，同一个会话内也可能前后段不同）：
 
-* 第一代（~2026-05 前）：``event_msg`` 的 ``exec_command_end``，工具走
-  ``function_call`` name=``exec_command``。
-* 第二代（gpt-5.6-sol，~2026-07）：工具统一成 ``custom_tool_call`` name=``exec``、
-  实际调用以 JS 文本内嵌在 ``input``；编辑真相源是 ``event_msg`` 的 ``patch_apply_end``。
-* 第三代（2026-08，``codex-tui`` 0.147.0）：原先散在 ``event_msg`` 的若干子类型被搬进
-  统一的 ``event_msg`` / ``payload.type = "item_completed"`` 信封，真正的内容在
-  ``payload.item``，由 ``item.type`` 区分（``FileChange`` / ``UserMessage`` /
-  ``AgentMessage`` / ``CommandExecution`` / …）。``response_item`` 侧未变。
+* ``function_call`` name=``exec_command``：命令以 JSON 实参投递，配套
+  ``event_msg`` 的 ``exec_command_end``（该事件 2026-05-09 起改走
+  ``response_item.function_call_output``）。
+* ``custom_tool_call`` name=``exec``：命令与 ``apply_patch`` 都以 **JS 文本**内嵌在
+  ``input``（``const r = await tools.exec_command({...})``）。
+* ``event_msg`` / ``payload.type = "item_completed"`` 信封：内容在 ``payload.item``、
+  由 ``item.type`` 区分（``FileChange`` / ``CommandExecution`` / ``UserMessage`` /
+  ``AgentMessage`` / …）。``response_item`` 侧不受影响。
 
-⚠️ 世代判定只能看 payload 结构，**绝不能看 ``cli_version`` / ``originator``**
+⚠️ 形态判定只能看 payload 结构，**绝不能看 ``cli_version`` / 日期 / ``originator``**
 -------------------------------------------------------------------------------
-全库 1699 个 rollout 的普查实证：同一个 ``cli_version`` 会走不同 schema ——
-``Codex Desktop 0.147.0-alpha.6.5`` 仍发 ``patch_apply_end``、不发新 item 类型，而
-``codex-tui 0.147.0`` 相反。另外 ``item_completed`` 信封自 2026-04-25 就存在，但当时
-**只承载 ``item.type == "Plan"``**；真正新增的是 ``CommandExecution`` / ``FileChange`` /
-``AgentMessage`` / ``UserMessage`` 这几类。因此本模块的每个函数都按 **payload / item
-结构** 判定，不引用任何版本号；调用方也必须如此。
+本机语料 1955 个 rollout 的实测（2026-09-23 复查，**推翻了此前基于较小语料的几个判断**）：
+
+* ``item_completed`` 信封承载 ``FileChange`` / ``CommandExecution`` / ``UserMessage`` /
+  ``AgentMessage`` **最早见于 2026-04-02**（``codex-tui 0.118.0``），并非某次版本升级新增；
+  含 ``FileChange`` 的文件有 705 个。按日期或版本号判形态必然误判。
+* ``patch_apply_end`` 在这 1955 个文件里**从未作为 ``payload.type`` 出现过**。裸 grep 命中的
+  102 个文件全部是该字面量出现在工具输出/消息正文里（agent 自己读 RVF 源码读进去的）。
+  legacy 分支因此在本机语料上是死路径，保留只为兼容其它 host / 更早存档。
+* 500 个文件**同时**含 ``apply_patch`` 工具调用与 ``FileChange`` item（1:1 对应同一次编辑）。
+  这正是既有「路径级去重」存在的理由：两侧都摄入会把同一次编辑登记两次。
 
 刻意不提供「整条 record 的宽归一化」
 --------------------------------------
@@ -45,22 +50,42 @@ from __future__ import annotations
 import re
 import shlex
 from typing import Any, Iterable
+from urllib.parse import unquote, urlparse
 
 CODEX_ITEM_ENVELOPE_PAYLOAD_TYPE = "item_completed"
 
-# 全库 1699 个 rollout 普查得到的 ``item.type`` 全集。用于 ``unrecognized_codex_item_types``
-# 的前向兼容告警：出现集合外的新类型时记 warning，让第四代漂移在**降级前**就被看见，
-# 而不是像本次一样先炸 fail-loud 守卫再回溯。
+# 本机语料 1955 个 rollout 普查（2026-09-23）实测出现过的全部 ``item.type``。
+# ``unrecognized_codex_item_types`` 据此做前向兼容告警：**语义是「从未见过的新类型」**，
+# 所以已普查、已判定「不携带文件编辑或 shell 命令证据、刻意不做归属」的类型也必须列在这里，
+# 否则每个正常会话都会刷警告、真正的新类型反而被淹没。
+#
+# 参与归属的：FileChange（编辑真相源）、CommandExecution（命令归属）、
+# UserMessage（显式 $skill 触发检测）。
+# 已普查但**刻意不归属**的：Reasoning / AgentMessage / Plan / ContextCompaction / Extension
+# （纯文本或标记）、WebSearch / ImageView（只读）、McpToolCall / DynamicToolCall
+# （带 namespace 的插件工具，无结构化 diff 或 argv，归属只能靠猜）、
+# SubAgentActivity / CollabAgentToolCall / FunctionCallOutput / HookPrompt（代理间消息与指针）、
+# EnteredReviewMode / ExitedReviewMode（Codex 自带 review 模式的进出标记）。
 KNOWN_CODEX_ITEM_TYPES = frozenset(
     {
         "AgentMessage",
+        "CollabAgentToolCall",
         "CommandExecution",
         "ContextCompaction",
+        "DynamicToolCall",
+        "EnteredReviewMode",
+        "ExitedReviewMode",
         "Extension",
         "FileChange",
+        "FunctionCallOutput",
+        "HookPrompt",
+        "ImageView",
+        "McpToolCall",
         "Plan",
         "Reasoning",
+        "SubAgentActivity",
         "UserMessage",
+        "WebSearch",
     }
 )
 
@@ -202,10 +227,25 @@ def agent_message_text_from_item(item: dict[str, Any]) -> str | None:
 
 
 def _strip_file_uri(value: str) -> str:
-    """第三代的 ``cwd`` 是 ``file://`` URI；下游 ``command_workdir`` 只认普通路径。"""
-    if value.startswith("file://"):
-        return value[len("file://") :] or value
-    return value
+    """把 ``cwd`` 的 ``file://`` URI 还原成普通文件系统路径。
+
+    **必须 percent-decode**：实测带空格的仓库路径会写成
+    ``file:///Users/x/Project%20Theseus``。只剥前缀不解码会同时造成两处损坏——
+
+    1. 去重键与 ``exec_command`` 工具调用侧的 ``workdir``（那边是未编码的字面路径）
+       不匹配，同一次执行被两代记录各登记一次；
+    2. ``command_workdir`` 解析不出 ``%20`` 路径 → 返回 ``None`` → 该次执行的相对路径
+       候选被整体丢弃，归属反而比不修更差。
+
+    非 ``file://`` 值、以及带非本机 host 的 URI 原样返回（不猜）。
+    """
+    if not value.startswith("file://"):
+        return value
+    parsed = urlparse(value)
+    if parsed.netloc not in ("", "localhost"):
+        return value
+    path = unquote(parsed.path)
+    return path or value
 
 
 def shell_command_and_workdir_from_command_execution_item(

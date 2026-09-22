@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 
+from core.transcript.codex_rollout_item_envelope import codex_item_of_type  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
@@ -137,6 +138,16 @@ def _render_codex_record_to_single_line(record: dict[str, Any]) -> str | None:
             return f"[{sub}]"
         if sub == "patch_apply_end":
             return f"[patch_apply success={payload.get('success')}]"
+        # 第三代 rollout（2026-08 codex-tui）把 patch_apply_end 搬进 ``item_completed``
+        # 信封的 ``FileChange`` item，该编辑成功标记在这一代会整条消失。补回后与第二代
+        # 严格 parity：两代都是「exec 调用渲染出补丁内容 + 一行成功标记」，不产生重复。
+        # 信封里的 UserMessage / AgentMessage / Reasoning / CommandExecution 刻意**不**
+        # 补分支——实测它们的 ``response_item`` 孪生记录已被下面的分支逐条渲染
+        # （message 50 覆盖 UserMessage 5 + AgentMessage 41、reasoning 105 一一对应、
+        # custom_tool_call 126 覆盖 CommandExecution 92），再补一遍就是重复渲染。
+        file_change_item = codex_item_of_type(payload, "FileChange")
+        if file_change_item is not None:
+            return f"[patch_apply success={file_change_item.get('status') == 'completed'}]"
         return None
     if rtype == "response_item":
         if sub == "message":

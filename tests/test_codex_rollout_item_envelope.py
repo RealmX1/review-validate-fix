@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -161,6 +162,64 @@ def test_command_execution_item_unwraps_shell_argv_and_file_uri_cwd() -> None:
     )
 
 
+def test_command_execution_cwd_file_uri_is_percent_decoded() -> None:
+    """``cwd`` 是 percent-encoded 的 ``file://`` URI：带空格的仓库路径写作 ``%20``。
+    只剥前缀不解码会同时造成两处损坏——去重键与 ``exec_command`` 侧（未编码字面路径）
+    不匹配导致同一次执行被两代记录各登记一次；且 ``command_workdir`` 解析不出 ``%20``
+    路径而返回 None，该次执行的相对路径候选被整体丢弃，归属反比不修更差。
+    """
+    item = {
+        "type": "CommandExecution",
+        "id": "exec-1",
+        "command": ["/bin/zsh", "-lc", "git status --short"],
+        "cwd": "file:///Users/me/Documents/Project%20Theseus",
+    }
+    assert envelope.shell_command_and_workdir_from_command_execution_item(item) == (
+        "git status --short",
+        "/Users/me/Documents/Project Theseus",
+    )
+
+
+def test_command_execution_and_exec_command_tool_call_dedupe_across_encoded_cwd() -> None:
+    """跨来源去重必须在「同一 workdir 的两种写法」之间也成立——这正是上面那条编码缺陷
+    在归属层的表现：两条记录描述同一次执行，解码后 ``(cmd, workdir)`` 必须逐字相同。"""
+    workdir = "/Users/me/Documents/Project Theseus"
+    tool_call = {
+        "payload": {
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": json.dumps({"cmd": "git status --short", "workdir": workdir}),
+        }
+    }
+    envelope_record = _envelope_record(
+        {
+            "type": "CommandExecution",
+            "id": "exec-1",
+            "command": ["/bin/zsh", "-lc", "git status --short"],
+            "cwd": "file:///Users/me/Documents/Project%20Theseus",
+        }
+    )
+    from_tool_call = manifest_module.shell_invocation_from_record(tool_call)
+    from_envelope = manifest_module.shell_invocation_from_record(envelope_record)
+    assert from_tool_call[:2] == from_envelope[:2] == ("git status --short", workdir)
+    assert from_tool_call[2] != from_envelope[2], "两条记录必须来源不同，才会被跨代去重"
+
+
+def test_surveyed_item_types_do_not_trigger_unknown_warning() -> None:
+    """前向兼容告警的语义是「从未见过的新类型」。已普查、已判定不做归属的类型
+    （WebSearch / McpToolCall / SubAgentActivity 等）必须算已知，否则每个正常会话都刷
+    警告、真正的新类型反被淹没。"""
+    surveyed_but_unattributed = [
+        "WebSearch", "McpToolCall", "SubAgentActivity", "HookPrompt", "CollabAgentToolCall",
+        "ImageView", "DynamicToolCall", "EnteredReviewMode", "ExitedReviewMode", "FunctionCallOutput",
+    ]
+    records = [_envelope_record({"type": name, "id": "x"}) for name in surveyed_but_unattributed]
+    assert envelope.unrecognized_codex_item_types(records) == []
+    assert envelope.unrecognized_codex_item_types(
+        [*records, _envelope_record({"type": "ANewThingNobodyHasSeen", "id": "y"})]
+    ) == ["ANewThingNobodyHasSeen"]
+
+
 def test_command_execution_item_without_shell_wrapper_joins_argv() -> None:
     item = {"type": "CommandExecution", "id": "exec-2", "command": ["git", "status", "--short"], "cwd": "/repo"}
     command, workdir = envelope.shell_command_and_workdir_from_command_execution_item(item)
@@ -254,6 +313,23 @@ def _init_repo(path: Path) -> Path:
     return path
 
 
+def _timestamp_after_head_commit(repo: Path, *, seconds: int = 1) -> str:
+    """产出一个**晚于该 fixture 仓库 HEAD commit** 的 ISO 时间戳。
+
+    ``ownership_baseline`` 在没有 git-commit 行号 cutoff 时退化到 ``head_commit_time``：
+    早于 HEAD commit 时刻的工具记录会被 ``should_include_tool_record`` 判为基线之前的旧
+    活动而滤掉。fixture 仓库的 commit 发生在「测试运行的此刻」，所以任何**硬编码**的
+    transcript 时间戳都是定时炸弹——写测试当天在 commit 之后、过几周就落到了 commit 之前，
+    测试从绿变红却与被测代码无关。这里改为从仓库 HEAD 派生，测试自此与挂钟无关。
+    """
+    raw = subprocess.run(
+        ["git", "show", "-s", "--format=%cI", "HEAD"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    committed_at = datetime.fromisoformat(raw)
+    return (committed_at + timedelta(seconds=seconds)).isoformat()
+
+
 def _write_jsonl(path: Path, records: list[dict]) -> Path:
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -282,20 +358,22 @@ def test_third_generation_rollout_attributes_edits_without_schema_drift(tmp_path
     必须归属出编辑路径，且 ``schema_drift_suspected`` 为 False。"""
     repo = _init_repo(tmp_path / "repo")
     (repo / "seed.txt").write_text("seed\nedited\n", encoding="utf-8")
+    after_commit = _timestamp_after_head_commit(repo)
     transcript = _write_jsonl(
         tmp_path / "rollout.jsonl",
         [
-            {"timestamp": "2026-08-12T23:00:00Z", "type": "session_meta", "payload": {"id": "S3", "originator": "codex-tui"}},
+            {"timestamp": after_commit, "type": "session_meta", "payload": {"id": "S3", "originator": "codex-tui"}},
             _envelope_record(
                 {
                     "type": "UserMessage",
                     "id": "um",
                     "content": [{"type": "text", "text": "edit seed.txt", "text_elements": []}],
-                }
+                },
+                timestamp=after_commit,
             ),
             # 编辑证据只以第二代 exec 内嵌 JS 出现（apply_patch 调用），真相源是 FileChange。
             {
-                "timestamp": "2026-08-12T23:09:00Z",
+                "timestamp": after_commit,
                 "type": "response_item",
                 "payload": {
                     "type": "custom_tool_call",
@@ -310,7 +388,8 @@ def test_third_generation_rollout_attributes_edits_without_schema_drift(tmp_path
                     type="update",
                     unified_diff="@@ -1,1 +1,2 @@\n seed\n+edited\n",
                     move_path=None,
-                )
+                ),
+                timestamp=after_commit,
             ),
         ],
     )
@@ -328,13 +407,14 @@ def test_three_generations_coexisting_attribute_without_duplication(tmp_path: Pa
     (repo / "second.txt").write_text("two\n", encoding="utf-8")
     (repo / "third.txt").write_text("three\n", encoding="utf-8")
     shared_command = "tee third.txt"
+    after_commit = _timestamp_after_head_commit(repo)
     transcript = _write_jsonl(
         tmp_path / "rollout.jsonl",
         [
-            {"timestamp": "2026-08-12T23:00:00Z", "type": "session_meta", "payload": {"id": "MIX"}},
+            {"timestamp": after_commit, "type": "session_meta", "payload": {"id": "MIX"}},
             # 第一代：apply_patch 工具调用
             {
-                "timestamp": "2026-08-12T23:01:00Z",
+                "timestamp": after_commit,
                 "type": "response_item",
                 "payload": {
                     "type": "custom_tool_call",
@@ -345,7 +425,7 @@ def test_three_generations_coexisting_attribute_without_duplication(tmp_path: Pa
             },
             # 第二代：patch_apply_end（覆盖旧式未覆盖的新路径 → 必须照常摄入）
             {
-                "timestamp": "2026-08-12T23:02:00Z",
+                "timestamp": after_commit,
                 "type": "event_msg",
                 "payload": {
                     "type": "patch_apply_end",
@@ -356,7 +436,7 @@ def test_three_generations_coexisting_attribute_without_duplication(tmp_path: Pa
             },
             # 同一次 shell 执行的两代记录：第二代调用 + 第三代结果，只能算一次。
             {
-                "timestamp": "2026-08-12T23:03:00Z",
+                "timestamp": after_commit,
                 "type": "response_item",
                 "payload": {
                     "type": "custom_tool_call",
@@ -374,7 +454,7 @@ def test_three_generations_coexisting_attribute_without_duplication(tmp_path: Pa
                     "exit_code": 0,
                     "status": "completed",
                 },
-                timestamp="2026-08-12T23:03:01Z",
+                timestamp=after_commit,
             ),
         ],
     )
@@ -452,6 +532,75 @@ def test_third_generation_user_messages_are_not_double_counted(tmp_path: Path) -
     distilled, _index = distill_codex_jsonl(rollout_path=transcript, rollout_filename="rollout.jsonl", repo=repo)
     assert [item["summary"] for item in distilled if item.get("role") == "user"] == ["do the thing"]
     assert [item["summary"] for item in distilled if item.get("role") == "assistant"] == ["on it"]
+
+
+def test_parent_context_renders_file_change_success_marker_without_duplicating_twins(tmp_path: Path) -> None:
+    """父会话 context 渲染的第四处信封缺口：``patch_apply_end`` 的编辑成功标记在第三代整条
+    消失。补回后必须与第二代严格 parity——两代都是「exec 调用渲染补丁内容 + 一行成功标记」。
+
+    同时守住「不补 UserMessage/AgentMessage/Reasoning/CommandExecution 分支」的决定：它们的
+    ``response_item`` 孪生记录已各自渲染，再补一遍就是重复渲染。
+    """
+    scripts = ROOT / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix" / "scripts"
+    sys.path.insert(0, str(scripts))
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("rvf_parent_context", scripts / "rvf_parent_context.py")
+    parent_context = importlib.util.module_from_spec(spec)
+    sys.modules["rvf_parent_context"] = parent_context
+    spec.loader.exec_module(parent_context)
+
+    exec_call = {
+        "timestamp": "2026-08-12T23:09:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_x",
+            "input": 'const r = await tools.apply_patch("*** Begin Patch\\n***");',
+        },
+    }
+    user_twin = {
+        "timestamp": "2026-08-12T23:00:01Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [{"type": "text", "text": "do it"}]},
+    }
+    third_generation = _write_jsonl(
+        tmp_path / "gen3.jsonl",
+        [
+            {"timestamp": "2026-08-12T23:00:00Z", "type": "session_meta", "payload": {"id": "PC", "cwd": "/repo"}},
+            user_twin,
+            _envelope_record(
+                {"type": "UserMessage", "id": "um", "content": [{"type": "text", "text": "do it", "text_elements": []}]}
+            ),
+            exec_call,
+            _envelope_record(
+                _file_change_item("src/foo.py", type="update", unified_diff="@@ -1,1 +1,1 @@\n-a\n+b\n")
+            ),
+        ],
+    )
+    second_generation = _write_jsonl(
+        tmp_path / "gen2.jsonl",
+        [
+            {"timestamp": "2026-08-12T23:00:00Z", "type": "session_meta", "payload": {"id": "PC", "cwd": "/repo"}},
+            user_twin,
+            exec_call,
+            {
+                "timestamp": "2026-08-12T23:09:01Z",
+                "type": "event_msg",
+                "payload": {"type": "patch_apply_end", "call_id": "exec-1", "success": True, "changes": {}},
+            },
+        ],
+    )
+    gen3_lines = parent_context.render_lines(third_generation, host="codex")
+    gen2_lines = parent_context.render_lines(second_generation, host="codex")
+    assert [line for line in gen3_lines if line.startswith("[patch_apply ")] == ["[patch_apply success=True]"]
+    assert [line for line in gen3_lines if line.startswith("[patch_apply ")] == [
+        line for line in gen2_lines if line.startswith("[patch_apply ")
+    ], "第三代的成功标记必须与第二代逐字 parity"
+    assert [line for line in gen3_lines if line.startswith("user:")] == ["user: do it"], (
+        "信封里的 UserMessage 不得与其 response_item 孪生记录重复渲染"
+    )
 
 
 def test_bridge_recovers_invoked_skill_from_envelope_and_matches_vendored_on_legacy(tmp_path: Path) -> None:
