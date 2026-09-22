@@ -631,6 +631,8 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
+  "$repo_root/core/transcript/codex_rollout_item_envelope.py" \
+  "$skill_dir/scripts/codex_invoked_skill_rollout_schema_bridge.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/stop_hook_dispatcher.py" \
   "$skill_dir/scripts/stop_review_validate_fix.py" \
@@ -661,7 +663,8 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_rvf_user_local_data_paths.py" \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
-  "$tests_dir/test_rvf_handoff_intake.py"
+  "$tests_dir/test_rvf_handoff_intake.py" \
+  "$tests_dir/test_codex_rollout_item_envelope.py"
 
 run_parallel_test_steps
 run_step "tests: rvf_local_deploy" \
@@ -671,6 +674,9 @@ run_step "tests: rvf_local_deploy" \
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"
+run_step "tests: codex_rollout_item_envelope" \
+  python3 -m pytest -q \
+    "$tests_dir/test_codex_rollout_item_envelope.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "prompts/reviewer.md" 'RVF_CHECK_REVIEW_RESULT'

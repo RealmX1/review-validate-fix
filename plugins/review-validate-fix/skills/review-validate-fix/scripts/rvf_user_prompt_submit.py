@@ -27,10 +27,13 @@ except Exception:  # pragma: no cover - handoff 识别可缺省降级
     rvf_handoff_intake = None
 
 try:
-    # Vendored single-file copy (see its header). Gives a structured "which skill
-    # did the user explicitly invoke" read from the Codex rollout — catches forms
-    # the anchored regex misses (notably the namespaced `$rvf:review-validate-fix`).
-    import codex_invoked_skill
+    # Vendored single-file copy (see its header), reached through the rollout-schema
+    # bridge. Gives a structured "which skill did the user explicitly invoke" read from
+    # the Codex rollout — catches forms the anchored regex misses (notably the
+    # namespaced `$rvf:review-validate-fix`). The bridge only re-implements the
+    # schema-coupled iteration (the vendored one is blind to the 2026-08 `item_completed`
+    # envelope); every match decision still delegates to the vendored module.
+    import codex_invoked_skill_rollout_schema_bridge as codex_invoked_skill
 except Exception:  # pragma: no cover - stay resilient if the vendor is absent
     codex_invoked_skill = None
 

@@ -89,12 +89,14 @@ from rvf_analyze_advisory import (
 )
 
 try:
-    # Vendored single-file reader (same copy rvf_user_prompt_submit uses): a
-    # structured "which skill did the user explicitly invoke this turn" read from
-    # the Codex rollout, plus an anchored text fallback. Used by the turn-scoped
-    # `$rvf-analyze` re-entrancy guard below. Optional: stay resilient on Claude /
-    # missing transcript / vendor absent.
-    import codex_invoked_skill
+    # Vendored single-file reader (same copy rvf_user_prompt_submit uses), reached
+    # through the rollout-schema bridge: a structured "which skill did the user
+    # explicitly invoke this turn" read from the Codex rollout, plus an anchored text
+    # fallback. Used by the turn-scoped `$rvf-analyze` re-entrancy guard below. The
+    # bridge adds 2026-08 `item_completed`-envelope rollouts, which the vendored
+    # iterator is blind to; match decisions still delegate to the vendored module.
+    # Optional: stay resilient on Claude / missing transcript / vendor absent.
+    import codex_invoked_skill_rollout_schema_bridge as codex_invoked_skill
 except Exception:  # pragma: no cover - structured read is best-effort
     codex_invoked_skill = None
 import rvf_bootstrap_gate

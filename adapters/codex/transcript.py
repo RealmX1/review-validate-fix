@@ -27,6 +27,10 @@ from core.transcript.io import (  # noqa: E402
     _safe_json_loads,
     _truncate,
 )
+from core.transcript.codex_rollout_item_envelope import (  # noqa: E402
+    codex_item_of_type,
+    legacy_patch_apply_end_payload_from_file_change_item,
+)
 from core.transcript.models import TranscriptRecord  # noqa: E402
 from core.transcript.patch_parsing import (  # noqa: E402
     apply_patch_hunk_line_range_for_path,
@@ -197,7 +201,22 @@ def _distill_codex_record(
                 ),
                 artifact_refs=[],
             )
-        if sub == "patch_apply_end":
+        # 第三代 rollout（2026-08 codex-tui）把 patch_apply_end 搬进 ``item_completed``
+        # 信封的 ``item.type == "FileChange"``；``changes`` 形状未变，故归一回
+        # patch_apply_end payload 形状后与第二代**共用下面同一分支**（含既有的路径级去重），
+        # 恢复 rvf-analyze 的 issue↔patch 因果链——否则该链在 codex-tui 会话里**静默**全盲。
+        # UserMessage / AgentMessage 刻意**不加**分支：它们的文本已由下方
+        # ``response_item/message`` 分支覆盖（实测每个回合两侧成对出现），再翻译一遍只会把
+        # 旧世代的双份冗余搬过来，造成 trajectory 重复切分。
+        _file_change_item = codex_item_of_type(payload, "FileChange")
+        patch_apply_end_payload = (
+            payload
+            if sub == "patch_apply_end"
+            else legacy_patch_apply_end_payload_from_file_change_item(_file_change_item)
+            if _file_change_item is not None
+            else None
+        )
+        if patch_apply_end_payload is not None:
             # 新 Codex（gpt-5.6-sol 世代）把编辑工具统一成 custom_tool_call name=``exec``、
             # apply_patch 以 JS 文本内嵌在 input，旧的 apply_patch 工具调用消失——那条
             # tool_call 分支不再产出 artifact_refs，issue↔patch 因果归属会全盲。
@@ -209,7 +228,7 @@ def _distill_codex_record(
             # 旧式调用即全局跳过」的布尔 gate：Codex resume / 切换模型的混合 session 里，后段
             # 新编辑的 patch_apply_end 覆盖的路径未被旧式覆盖，必须照常产出 artifact_refs，
             # 否则 rvf-analyze 因果链缺失（RVF-001 F1）。
-            patch_text = synthesize_apply_patch_text_from_patch_apply_end(payload)
+            patch_text = synthesize_apply_patch_text_from_patch_apply_end(patch_apply_end_payload)
             if not patch_text:
                 return None
             # 无任何旧式调用 → 照常产出（纯新格式）；否则仅当覆盖到旧式未覆盖的新路径时产出，
@@ -222,9 +241,9 @@ def _distill_codex_record(
             return _rec(
                 kind="tool_result",
                 tool="apply_patch",
-                call_id=payload.get("call_id"),
+                call_id=patch_apply_end_payload.get("call_id"),
                 summary=_truncate(
-                    f"patch_apply_end success={payload.get('success')} {n_ops} file(s)"
+                    f"patch_apply_end success={patch_apply_end_payload.get('success')} {n_ops} file(s)"
                 ),
                 artifact_refs=artifact_refs,
             )

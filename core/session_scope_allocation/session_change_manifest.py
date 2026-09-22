@@ -27,6 +27,13 @@ for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
             sys.path.insert(0, str(_pyroot_candidate))
         break
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.transcript.codex_rollout_item_envelope import (  # noqa: E402
+    codex_item_of_type,
+    embedded_exec_command_invocation_from_tool_input,
+    legacy_patch_apply_end_payload_from_file_change_item,
+    shell_command_and_workdir_from_command_execution_item,
+    unrecognized_codex_item_types,
+)
 from core.transcript.patch_parsing import (  # noqa: E402
     synthesize_apply_patch_text_from_patch_apply_end,
 )
@@ -436,6 +443,15 @@ def command_workdir(repo: Path, workdir: str | None) -> Path | None:
     return candidate
 
 
+# shell 控制操作符：写命令的参数列表在此结束。``shlex.split`` 不理解 shell 语法，会把
+# ``&&`` / ``|`` / ``;`` 原样当成普通 token；而 ``normalize_repo_path`` 会把任何不含 ``/``
+# 的裸 token 解析成 ``<repo>/<token>``，于是 ``rm -r /tmp/x && git diff …`` 里的 ``&&``
+# 被登记成一个名为 ``&&`` 的「被改动路径」。这类伪路径不在 dirty set 里、不会形成审查单元，
+# 但会让 ``owned_paths`` 非空，从而**掩盖 fail-loud 的 schema-drift 守卫**
+# （判据是「有编辑证据 + dirty + 零归属」）。故参数扫描遇到控制操作符即停。
+_SHELL_ARGUMENT_LIST_TERMINATORS = frozenset({"&&", "||", "|", "|&", ";", ";;", "&", ">", ">>", "<", "<<"})
+
+
 def command_path_candidates(repo: Path, command: str, workdir: Path | None) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     allow_relative = workdir is not None
@@ -450,6 +466,8 @@ def command_path_candidates(repo: Path, command: str, workdir: Path | None) -> l
         token = tokens[index]
         if token in {"touch", "mkdir", "rm", "mv", "cp"}:
             for arg in tokens[index + 1 :]:
+                if arg in _SHELL_ARGUMENT_LIST_TERMINATORS:
+                    break
                 if arg.startswith("-"):
                     continue
                 rel = normalize_repo_path(repo, arg, base_dir=workdir, allow_relative=allow_relative)
@@ -460,6 +478,8 @@ def command_path_candidates(repo: Path, command: str, workdir: Path | None) -> l
             break
         if token == "tee":
             for arg in tokens[index + 1 :]:
+                if arg in _SHELL_ARGUMENT_LIST_TERMINATORS:
+                    break
                 if arg.startswith("-"):
                     continue
                 rel = normalize_repo_path(repo, arg, base_dir=workdir, allow_relative=allow_relative)
@@ -565,13 +585,75 @@ def tool_name_for_record(record: dict[str, Any]) -> str | None:
 _EMBEDDED_APPLY_PATCH_CALL_RE = re.compile(r"tools\s*\.\s*apply_patch\s*\(")
 
 
-def is_patch_apply_end_record(record: dict[str, Any]) -> bool:
-    """新版 Codex（gpt-5.6-sol 世代）把 shell/编辑工具统一成 ``custom_tool_call``
-    name=``exec``，真正的 ``apply_patch`` 以 JS 文本内嵌在 input，旧的
-    ``exec_command_end`` 事件消失；唯一跨版本稳定的结构化编辑真相源是
-    ``event_msg`` 的 ``patch_apply_end``。归属解析据此识别它。"""
+def patch_apply_end_payload_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    """取出该记录的结构化编辑真相源 payload（``patch_apply_end`` 形状），跨两代 schema。
+
+    * 第二代（gpt-5.6-sol）把 shell/编辑工具统一成 ``custom_tool_call`` name=``exec``、
+      真正的 ``apply_patch`` 以 JS 文本内嵌在 input，旧的 ``exec_command_end`` 事件消失；
+      当时唯一跨版本稳定的结构化编辑真相源是 ``event_msg`` 的 ``patch_apply_end``。
+    * 第三代（2026-08 codex-tui）又把它搬进 ``item_completed`` 信封的
+      ``item.type == "FileChange"``。``changes`` 形状未变，故此处只做信封层映射，
+      下游合成/解析链一行不用改。
+
+    两代都不是 → ``None``。**判据一律是 payload/item 结构，不看 ``cli_version``**
+    （实测同一版本号会走不同 schema）。
+    """
     payload = record.get("payload")
-    return isinstance(payload, dict) and payload.get("type") == "patch_apply_end"
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") == "patch_apply_end":
+        return payload
+    file_change_item = codex_item_of_type(payload, "FileChange")
+    if file_change_item is None:
+        return None
+    return legacy_patch_apply_end_payload_from_file_change_item(file_change_item)
+
+
+def is_patch_apply_end_record(record: dict[str, Any]) -> bool:
+    """该记录是否为结构化编辑真相源（两代 schema 任一形态）。"""
+    return patch_apply_end_payload_from_record(record) is not None
+
+
+# 一次 shell 执行的三代记录形态。归属侧只关心 ``(命令文本, workdir)``，故统一还原成
+# 第一代 ``exec_command`` 参数的形状，再喂给既有的 command_path_candidates / command_workdir。
+# ``source`` 用于跨代去重：第三代 transcript 里同一条命令**同时**有第二代的 ``exec``
+# 调用记录与第三代的 ``CommandExecution`` 结果记录（实测解码后命令逐字节相同、
+# exec ⊆ CommandExecution），若两条都登记会重复计数；而同一代内的重复命令是真实的
+# 两次执行，必须各自保留。故按 (cmd, workdir) 记住首次来源，仅跳过**不同来源**的重复。
+SHELL_INVOCATION_SOURCE_EXEC_COMMAND_TOOL = "exec_command_tool_call"
+SHELL_INVOCATION_SOURCE_EMBEDDED_JS = "embedded_exec_command_js"
+SHELL_INVOCATION_SOURCE_COMMAND_EXECUTION_ITEM = "command_execution_item"
+
+
+def shell_invocation_from_record(record: dict[str, Any]) -> tuple[str, str | None, str] | None:
+    """把一条记录还原成 ``(命令文本, workdir, 来源)``；不是 shell 执行记录 → ``None``。"""
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    tool_name = payload_tool_name(payload)
+    if tool_name == "exec_command":
+        args_text = payload_tool_input(payload)
+        if not args_text:
+            return None
+        args = parse_exec_arguments(args_text)
+        cmd = args.get("cmd")
+        if not isinstance(cmd, str) or not cmd.strip():
+            return None
+        raw_workdir = args.get("workdir") if isinstance(args.get("workdir"), str) else None
+        return cmd, raw_workdir, SHELL_INVOCATION_SOURCE_EXEC_COMMAND_TOOL
+    if tool_name == "exec":
+        # 第二代：实参是 JS 对象字面量（实测仅约 17% 是严格 JSON），json.loads 恢复率为 0。
+        embedded = embedded_exec_command_invocation_from_tool_input(payload_tool_input(payload))
+        if embedded is None:
+            return None
+        return embedded[0], embedded[1], SHELL_INVOCATION_SOURCE_EMBEDDED_JS
+    command_execution_item = codex_item_of_type(payload, "CommandExecution")
+    if command_execution_item is not None:
+        resolved = shell_command_and_workdir_from_command_execution_item(command_execution_item)
+        if resolved is None:
+            return None
+        return resolved[0], resolved[1], SHELL_INVOCATION_SOURCE_COMMAND_EXECUTION_ITEM
+    return None
 
 
 def has_timestamp_comparable_tool(record: dict[str, Any]) -> bool:
@@ -1008,6 +1090,8 @@ def build_manifest(
 
     live_owned_units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     live_exec_paths: set[str] = set()
+    # (cmd, workdir) -> 首次登记该执行的记录来源；跨代去重用，见 shell_invocation_from_record。
+    shell_invocation_source_by_key: dict[tuple[str, str | None], str] = {}
     included_tool_record_count = 0
     ignored_tool_record_count = 0
     included_tool_line_numbers: list[int] = []
@@ -1090,11 +1174,13 @@ def build_manifest(
                 "message": user_message,
             }
         payload = record.get("payload")
-        # 新 Codex schema：patch_apply_end event 是结构化编辑真相源。合成为 apply_patch
-        # 补丁文本后复用同一归属路径（helper 仅对 success 记录返回非 None）。
-        if is_patch_apply_end_record(record):
-            assert isinstance(payload, dict)
-            patch_text = synthesize_apply_patch_text_from_patch_apply_end(payload)
+        # 新 Codex schema：patch_apply_end event（第二代）/ item_completed 信封里的
+        # FileChange item（第三代）是结构化编辑真相源。两代都归一到 patch_apply_end
+        # 形状后合成 apply_patch 补丁文本，复用同一归属路径（helper 仅对 success 记录
+        # 返回非 None）。
+        patch_apply_end_payload = patch_apply_end_payload_from_record(record)
+        if patch_apply_end_payload is not None:
+            patch_text = synthesize_apply_patch_text_from_patch_apply_end(patch_apply_end_payload)
             if patch_text:
                 saw_edit_evidence = True
                 # 路径级去重：无任何旧式 apply_patch 工具调用 → 照常摄入（纯新格式）；否则仅当
@@ -1105,10 +1191,11 @@ def build_manifest(
                     root, patch_text, int(record.get("_line_number", 0))
                 )
                 if not has_legacy_apply_patch_tool_call or (_pae_paths - legacy_apply_patch_paths):
+                    _call_id = patch_apply_end_payload.get("call_id")
                     _ingest_apply_patch_text(
                         patch_text,
                         record,
-                        payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
+                        _call_id if isinstance(_call_id, str) else None,
                     )
             continue
         tool_name = payload_tool_name(payload) if isinstance(payload, dict) else None
@@ -1124,20 +1211,22 @@ def build_manifest(
                 payload.get("call_id") if isinstance(payload.get("call_id"), str) else None,
             )
             continue
-        if tool_name != "exec_command":
+        if isinstance(payload, dict) and tool_name != "exec_command":
             # 新 Codex 把编辑工具统一成 custom_tool_call name=``exec``，apply_patch 以 JS
-            # 文本内嵌在 input。此处不解析该文本（编辑归属以 patch_apply_end 为权威源），
-            # 但记录「见过内嵌 apply_patch」作为编辑证据，供 fail-loud 守卫在未来 schema
-            # 再漂移（连 patch_apply_end 也变形）时仍能报警而非静默盲。
-            if isinstance(payload, dict):
-                tool_input = payload_tool_input(payload)
-                # 精确匹配实际调用形态 ``tools.apply_patch(``（新 Codex 把 apply_patch 以 JS
-                # 文本内嵌在 exec input 中，真正的调用是 ``text(await tools.apply_patch(patch))``）。
-                # 裸子串 ``apply_patch`` 会把只读命令误判为编辑证据——例如
-                # ``tools.exec_command({cmd: "rg -n apply_patch ..."})`` / ``grep apply_patch``——
-                # 与 F3 联动后会造成高频误跳过（RVF-001 F4）。
-                if isinstance(tool_input, str) and _EMBEDDED_APPLY_PATCH_CALL_RE.search(tool_input):
-                    saw_edit_evidence = True
+            # 文本内嵌在 input。此处不解析该文本（编辑归属以 patch_apply_end / FileChange
+            # 为权威源），但记录「见过内嵌 apply_patch」作为编辑证据，供 fail-loud 守卫在
+            # 未来 schema 再漂移（连这两个真相源也变形）时仍能报警而非静默盲。
+            tool_input = payload_tool_input(payload)
+            # 精确匹配实际调用形态 ``tools.apply_patch(``（新 Codex 把 apply_patch 以 JS
+            # 文本内嵌在 exec input 中，真正的调用是 ``text(await tools.apply_patch(patch))``）。
+            # 裸子串 ``apply_patch`` 会把只读命令误判为编辑证据——例如
+            # ``tools.exec_command({cmd: "rg -n apply_patch ..."})`` / ``grep apply_patch``——
+            # 与 F3 联动后会造成高频误跳过（RVF-001 F4）。
+            if isinstance(tool_input, str) and _EMBEDDED_APPLY_PATCH_CALL_RE.search(tool_input):
+                saw_edit_evidence = True
+        # 三代 shell 执行记录统一还原成 (cmd, workdir)；不是 shell 记录才走 Claude 写工具分支。
+        shell_invocation = shell_invocation_from_record(record)
+        if shell_invocation is None:
             for item in claude_tool_uses(record):
                 name = item.get("name")
                 path = claude_write_path(root, item)
@@ -1168,15 +1257,16 @@ def build_manifest(
                 else:
                     ignored_tool_record_count += 1
             continue
-        assert isinstance(payload, dict)
-        args_text = payload_tool_input(payload)
-        if not args_text:
+        cmd, raw_workdir, shell_invocation_source = shell_invocation
+        # 跨代去重：第三代 transcript 同时含第二代 ``exec`` 调用与第三代 ``CommandExecution``
+        # 结果，两条描述的是**同一次执行**（实测解码后命令逐字节相同）。只跳过来源不同的
+        # 重复；同一来源的相同命令是真实的两次执行，照常各自登记（保旧世代逐字节等价）。
+        _invocation_key = (cmd, raw_workdir)
+        _first_source = shell_invocation_source_by_key.get(_invocation_key)
+        if _first_source is not None and _first_source != shell_invocation_source:
             continue
-        args = parse_exec_arguments(args_text)
-        cmd = args.get("cmd")
-        if not isinstance(cmd, str) or not cmd.strip():
-            continue
-        raw_workdir = args.get("workdir") if isinstance(args.get("workdir"), str) else None
+        if _first_source is None:
+            shell_invocation_source_by_key[_invocation_key] = shell_invocation_source
         resolved_workdir = command_workdir(root, raw_workdir)
         event = {
             "line_number": record.get("_line_number"),
@@ -1286,6 +1376,7 @@ def build_manifest(
     # 纯读/纯测试（无编辑证据）会话不会误触发。调用方（refresh_global_diff_tracker）据此
     # 走 loud-skip 而非静默 no_codebase_changes。
     schema_drift_suspected = bool(saw_edit_evidence and dirty_set and not owned_paths)
+    unrecognized_item_types = unrecognized_codex_item_types(records)
 
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
@@ -1416,6 +1507,19 @@ def build_manifest(
                     "beyond what this parser recognizes; review manually."
                 ]
                 if schema_drift_suspected
+                else []
+            ),
+            # 前向兼容信号：第三代 rollout 把内容装进 item_completed 信封、按 item.type 分派。
+            # 出现已知集合外的新 item.type 时先在 warnings 说话，让第四代漂移在**降级/失明前**
+            # 就可见，而不是等到归属归零、fail-loud 守卫整体 skip 才被回溯发现。
+            *(
+                [
+                    "unrecognized_codex_item_types: "
+                    + ", ".join(unrecognized_item_types)
+                    + " — this transcript carries item_completed envelope types this parser does "
+                    "not map; ownership attribution for those records is skipped."
+                ]
+                if unrecognized_item_types
                 else []
             ),
             *baseline_warnings,
