@@ -38,8 +38,12 @@ Host-aware
 ----------
 复用 ``core.host_adapter.host_transcript_format_detection.detect_transcript_format`` 判定父 transcript 格式：
 ``HOST_CODEX`` 走 Codex rollout schema，``HOST_CLAUDE`` 走 Claude transcript
-schema；探测失败（空文件/异常 schema）fallback 到 Codex 解析，与既有
-Codex-only 用例保持一致。
+schema，``HOST_KIMI_CODE`` 走 Kimi 的 per-agent wire schema；探测失败（空文件/
+异常 schema）fallback 到 Codex 解析，与既有 Codex-only 用例保持一致。
+
+⚠️ **漏接一个 host 在这里是静默的**：Codex 的渲染器读别家的 record 只会逐条返回 ``None``，
+于是那个 host 的父会话 context blob 变成空白——没有异常、没有日志，child agent 只是拿不到
+背景。所以渲染器分派集中在 ``_host_record_renderer``，并由结构性 gate 逐 host 断言。
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 
@@ -109,7 +114,7 @@ def _collect_texts(node: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_codex_record(record: dict[str, Any]) -> str | None:
+def _render_codex_record_to_single_line(record: dict[str, Any]) -> str | None:
     """把一条 raw Codex rollout 记录压成一行可读 context；返回 None=丢弃。"""
     rtype = record.get("type")
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -163,6 +168,17 @@ def _render_codex_record(record: dict[str, Any]) -> str | None:
             output = _truncate_bytes(output, TOOL_RESULT_LIMIT_BYTES, _TRUNCATE_RESULT_SUFFIX)
             return f"result: {output}"
     return None
+
+
+def _render_codex_record(record: dict[str, Any]) -> list[str]:
+    """Codex 渲染器的 ``list[str]`` 外壳——三家渲染器共用一个「0..N 行」契约。
+
+    Codex 的 record 与行是一对一的（历史实现返回 ``str | None``），Claude / Kimi 的一条
+    record 可以展开成多行。分派表要能无差别地调用它们，契约就必须统一；单行逻辑原样留在
+    ``_render_codex_record_to_single_line`` 里，一个字符都没动。
+    """
+    line = _render_codex_record_to_single_line(record)
+    return [line] if line is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -234,8 +250,129 @@ def _render_claude_record(record: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Kimi Code CLI wire schema 渲染
+# ---------------------------------------------------------------------------
+
+
+def _render_kimi_record(record: dict[str, Any]) -> list[str]:
+    """把一条 Kimi wire JSONL 记录压成 0..N 行可读 context。
+
+    Kimi 与另两家的**结构性**差异（取证见 ``adapters/kimi/transcript.py``）：助手输出与
+    工具调用**都不在** ``context.append_message`` 里，而在 ``context.append_loop_event``
+    的 ``event`` 下。只读 ``context.append_message`` 会拿到一份「只有用户在说话」的假 blob。
+
+    两处静默陷阱：
+
+    - ``context.append_message`` 的 ``role`` 实测**全是** ``"user"``，真正区分来源的是
+      ``message.origin.kind``。harness 注入的系统提醒（``injection`` 等）在这里丢弃，与
+      Codex/Claude 渲染器丢 system/developer boilerplate 同口径——不丢就会把系统提醒当成
+      用户发言喂给 child。
+    - ``content.part`` 里 ``think`` 的正文在 ``part.think``，**不在** ``part.text``；按
+      ``part["text"]`` 一把抓会让所有推理内容静默变成空串。
+    """
+    rtype = record.get("type")
+
+    if rtype == "context.append_message":
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return []
+        origin = message.get("origin")
+        if not isinstance(origin, dict) or origin.get("kind") != "user":
+            # 正向判据：只有 origin.kind == "user" 才是真实用户输入。负向判据（「不等于
+            # injection」）挡不住后续新增的来源种类，那些会默认落进「用户发言」。
+            return []
+        text = _kimi_part_text(message.get("content"))
+        role = message.get("role") or "user"
+        return [f"{role}: {text}"] if text else []
+
+    if rtype != "context.append_loop_event":
+        # metadata / turn.prompt / llm.* / usage.* / config.* / tools.* / permission.* 等
+        # 不承载会话内容。turn.prompt 与 origin.kind=="user" 的 append_message 是同一条输入
+        # 的两次记录，只认后者，避免每条用户输入渲染两遍。
+        return []
+
+    event = record.get("event")
+    if not isinstance(event, dict):
+        return []
+    event_type = event.get("type")
+
+    if event_type == "content.part":
+        part = event.get("part")
+        if not isinstance(part, dict):
+            return []
+        part_type = part.get("type")
+        field = _KIMI_CONTENT_PART_TEXT_FIELD_BY_PART_TYPE.get(part_type)
+        if field is None:
+            return []
+        body = part.get(field)
+        if not isinstance(body, str) or not body.strip():
+            return []
+        if part_type == "think":
+            # Kimi 的 reasoning 与 Claude 的 thinking 一样是明文，保留全文。
+            return [f"reasoning: {body.strip()}"]
+        return [f"assistant: {body.strip()}"]
+
+    if event_type == "tool.call":
+        args = event.get("args")
+        rendered_args = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        rendered_args = _truncate_bytes(
+            rendered_args, TOOL_ARGS_LIMIT_BYTES, _TRUNCATE_ARGS_SUFFIX
+        )
+        return [f"call {event.get('name') or '<unknown>'}({rendered_args})"]
+
+    if event_type == "tool.result":
+        result = event.get("result")
+        output = result.get("output") if isinstance(result, dict) else None
+        if not isinstance(output, str):
+            output = "" if result is None else json.dumps(result, ensure_ascii=False)
+        return [f"result: {_truncate_bytes(output, TOOL_RESULT_LIMIT_BYTES, _TRUNCATE_RESULT_SUFFIX)}"]
+
+    return []
+
+
+#: ``content.part`` / ``turn.prompt.input`` 的正文字段名**随 part 类型而变**：
+#: ``{"type":"think","think":"…"}`` 的正文在 ``think`` 键下而不是 ``text`` 键下。
+_KIMI_CONTENT_PART_TEXT_FIELD_BY_PART_TYPE = {"text": "text", "think": "think"}
+
+
+def _kimi_part_text(parts: Any) -> str | None:
+    """把 part 列表（**不是**字符串）折叠成一段文本。"""
+    if isinstance(parts, str):
+        return parts.strip() or None
+    if not isinstance(parts, list):
+        return None
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        field = _KIMI_CONTENT_PART_TEXT_FIELD_BY_PART_TYPE.get(part.get("type"), "text")
+        value = part.get(field)
+        if isinstance(value, str) and value.strip():
+            chunks.append(value)
+    joined = "\n".join(chunks).strip()
+    return joined or None
+
+
+# ---------------------------------------------------------------------------
 # 总装配
 # ---------------------------------------------------------------------------
+
+
+def _host_record_renderer(host: str | None):
+    """按 host 选 record 渲染器；每个渲染器返回 ``list[str]``（0..N 行）。
+
+    未知 host 兜底 Codex，与 ``detect_transcript_format`` 的「无证据回 None、调用方兜底
+    Codex」约定一致。**漏接一个 host 不会抛**，只会让它的 context blob 静默变空，故由
+    结构性 gate 逐 host 断言这里各有其人。
+    """
+    if host == HOST_CLAUDE:
+        return _render_claude_record
+    if host == HOST_KIMI_CODE:
+        return _render_kimi_record
+    return _render_codex_record
 
 
 def _iter_records(transcript_path: Path) -> list[dict[str, Any]]:
@@ -266,16 +403,10 @@ def render_lines(transcript_path: Path, host: str | None = None) -> list[str]:
     """
     if host is None:
         host = detect_transcript_format(transcript_path) or HOST_CODEX
-    records = _iter_records(transcript_path)
+    renderer = _host_record_renderer(host)
     lines: list[str] = []
-    if host == HOST_CLAUDE:
-        for record in records:
-            lines.extend(_render_claude_record(record))
-    else:  # HOST_CODEX（含 fallback）
-        for record in records:
-            rendered = _render_codex_record(record)
-            if rendered is not None:
-                lines.append(rendered)
+    for record in _iter_records(transcript_path):
+        lines.extend(renderer(record))
     return lines
 
 

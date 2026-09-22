@@ -21,4 +21,4 @@ Codex adapter（native 实装）。
 | transcript | `RVF_USER_LOCAL_DATA_ROOT/run-logs/runs/rvf-*/artifacts/trajectory.jsonl`（Codex JSONL 格式）→ `NormalizedTranscript` |
 | permission | Codex CLI 标准（cwd/env merge，sandbox 由 codex 控制） |
 | config | nested `plugins/review-validate-fix/.codex-plugin/plugin.json`；生成的 `.agents/plugins/marketplace.json` 由官方 CLI 注册 selector `review-validate-fix@review-validate-fix-local-main` |
-| discovery | `rvf_local_deploy.py` 从干净 local `main` 生成 commit-addressed marketplace；Codex 官方 `plugin marketplace add` / `plugin add` 管理 cache 与 installed state。RVF wrapper 仅结构化维护 `~/.codex/hooks.json`。 |
+| discovery | `rvf_local_deploy.py` 在 RVF 专用 deploy 源 worktree（detached，同步到 local `main` 的 HEAD）上生成 commit-addressed marketplace；local main 工作树只被读取 ref，其未提交改动不阻塞部署也不进 payload。Codex 官方 `plugin marketplace add` / `plugin add` 管理 cache 与 installed state。RVF wrapper 仅结构化维护 `~/.codex/hooks.json`。 |

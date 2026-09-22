@@ -6,11 +6,13 @@ import atexit
 import concurrent.futures
 import datetime
 import functools
+import inspect
 import json
 import importlib.util
 import os
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import time
 import traceback
 from pathlib import Path
 
+from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
     assert_every_defined_test_is_registered,
     registered_names_from_case_tuples,
@@ -71,6 +74,27 @@ for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
 
+# 铁律：测试绝不写真实 ``~/.rvf``（live infra ⇒ 假绿 + 污染用户状态）。上面那轮清扫把
+# ``RVF_HOME`` 家族的**专用** env（``RVF_WITHDRAWN_DISPATCH_TOMBSTONE_ROOT`` /
+# ``RVF_AGENTIC_INITIATION_GUARDIAN_ROOT`` / 决策 token store / 注入尝试 ledger /
+# kanban-followup 锁 …）连同 ``RVF_HOME`` 一起摘掉了，于是它们共同的解析链
+# 「显式参数 > 专用 env > ``$RVF_HOME`` > ``~/.rvf``」会直接落到最后一档的真实根。本文件的
+# 测试是**逐个手工 set/restore** 环境的——只要有一个新调用点落进这一族、而某个测试没跟着加
+# 隔离，就会静默写真实根（实测：``inspect_user_prompt_submit`` 见到 dispatch token 会抢
+# ``consumed`` 终态，把 tombstone 落进 ``~/.rvf/rvf-withdrawn-dispatch-tokens/``）。
+#
+# 隔离必须挂在**模块导入期**，而不是 ``main()`` 里：本文件同时也能被 bare pytest 直接收集
+# （``python3 -m pytest tests/test_review_support_scripts.py``），那条入口根本不经过
+# ``main()``，放在 ``main()`` 的隔离对它完全失效。导入期是手写 runner 与 bare pytest 两条
+# 入口唯一的公共上游。``--jobs`` 的 ``ProcessPoolExecutor`` worker 两种启动方式也都被覆盖：
+# fork 直接继承 ``os.environ``，spawn 会重新 import 本模块、各自再建一个隔离根。
+#
+# 用**强制赋值**而非 ``setdefault``：开发者 shell 里可能正带着指向真实根的 ``RVF_HOME``。
+# 个别测试仍可在自己作用域内 set/restore 覆盖本默认值，那条既有行为不受影响。
+_ISOLATED_RVF_HOME_FOR_TESTS = tempfile.mkdtemp(prefix="rvf-test-home-")
+os.environ["RVF_HOME"] = _ISOLATED_RVF_HOME_FOR_TESTS
+atexit.register(shutil.rmtree, _ISOLATED_RVF_HOME_FOR_TESTS, ignore_errors=True)
+
 
 def load_alternative_reviewer_module():
     spec = importlib.util.spec_from_file_location("rvf_run_alternative_reviewer", RUN_ALTERNATIVE_REVIEWER)
@@ -114,6 +138,43 @@ def load_rvf_prep_file_module():
     spec = importlib.util.spec_from_file_location("rvf_prep_file", RVF_PREP_FILE)
     if spec is None or spec.loader is None:
         raise AssertionError("failed to load rvf_prep_file module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_prepare_review_run_module():
+    """加载 prepare_review_run 模块（进程内直调 prepare_run_from_prep_file 等）。
+
+    与 load_rvf_agent_decision_cli_module 同构：它 top-level import 兄弟脚本
+    （rvf_prep_file / rvf_bootstrap_gate）与 core.*（经 _rvf_pyroot），故先保证 ROOT +
+    SCRIPT_DIR 在 sys.path 上。
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location("prepare_review_run", PREPARE_REVIEW_RUN)
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load prepare_review_run module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_rvf_bootstrap_gate_module():
+    """加载 rvf_bootstrap_gate 模块（pre-review local-base bootstrap 的等待状态机）。"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "rvf_bootstrap_gate", SCRIPT_DIR / "rvf_bootstrap_gate.py"
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("failed to load rvf_bootstrap_gate module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -2014,7 +2075,39 @@ def init_repo(path: Path) -> Path:
     return path
 
 
-def write_alternative_reviewer_config(
+# 保险丝型 idle timeout 的统一取值：调用点的 stub 秒级退出，idle timeout 只为「stub 真挂死时
+# 别把整套测试拖死」兜底，不构成被测语义。取值必须显著大于「高负载机器上 fork/exec + 解释器
+# 启动到吐出第一个字节」的最坏耗时——watchdog 只在 stdout/stderr 长度增长时刷新 liveness
+# （run_alternative_reviewer.py 的 `if stdout_len > last_stdout_len or ...` 分支），首字节之前
+# 是零活动，历史上的 5.0s 会先于被测语义开火，把 125/0/1 覆盖成 124 假红。
+#
+# 注意：2026-07-25 那次 `/rvf-local-deploy` 翻红的**主因**不在这里，而是 prompt 根本没投递完
+# （见 run_alternative_reviewer.py 的 deliver_reviewer_prompt_on_dedicated_stdin_writer_thread），
+# 那个缺陷已单独修掉。本常量兜的是剩下那一层：纯进程启动延迟。
+# 放大对正常路径零成本：stub 秒退时循环在 communicate() 返回处退出，根本不走超时分支。
+HANG_PREVENTION_IDLE_TIMEOUT_SECONDS = 60.0
+
+# activity probe 的**自身**超时。同样是保险丝而非被测语义：需要探针「失败」的测试一律让探针
+# 自己非零退出（毫秒级），从不靠把这个超时调小来制造失败。调小它只会在高负载下把「探针本该
+# 成功」的测试炸掉——探针是 `python3 -c ...`，解释器冷启动在 load 35+ 时轻易超过 0.5s，
+# 连续两次即触发 `no_observable_activity_probe_failed`（2026-07-27 部署失败的 shard 2/4）。
+HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS = 30.0
+
+# command lock 争用测试的两个时长：等 holder 拿到锁、以及 holder 持锁多久。两者都只是保险丝
+# ——被测语义是「contender 超时后把 holder 元数据写进日志」。持锁时长放大的**原意**是抗高负载：
+# contender 若花 >3s 才启动，短 hold 会让 holder 提前释放，contender 就会拿到锁而不是超时。
+#
+# 「放大在墙钟上免费」这个前提**必须由 teardown 兑现**，它不是自动成立的：holder 是
+# `command_lock.py -- python3 -c sleep(...)` 两层进程，只 terminate/kill 外层的话，内层仍继承
+# 着 holder 的 stdout/stderr 管道，`communicate()` 会一直阻塞到内层自己睡完（实测本用例因此
+# 耗时 30.8s，teardown 独占约 28s）。所以 holder 必须 `start_new_session=True` 启动，并由
+# `_terminate_lock_holder_process_group_and_drain_pipes` 按**进程组**收——改动这两个常量前
+# 请确认那条路径还在。
+HANG_PREVENTION_LOCK_HOLDER_ACQUISITION_SECONDS = 30.0
+HANG_PREVENTION_LOCK_HOLDER_HOLD_SECONDS = 30.0
+
+
+def _write_alternative_reviewer_config_payload_unclassified(
     path: Path,
     command: list[str],
     *,
@@ -2029,6 +2122,12 @@ def write_alternative_reviewer_config(
     health_command: list[str] | None = None,
     pre_run_health: bool | None = None,
 ) -> Path:
+    """底层 payload 写盘，对 idle timeout 的语义不表态。
+
+    不要直接调用：调用点必须经由下面两个 wrapper 之一显式声明 idle timeout 属于「防挂死保险丝」
+    还是「被断言的超时行为」。`test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification`
+    是这条约束的结构性守卫。
+    """
     payload = {
         "enabled": True,
         "label": "alternative-reviewer:test",
@@ -2052,6 +2151,13 @@ def write_alternative_reviewer_config(
         payload["output_format"] = output_format
     if health_command is not None:
         payload["health_command"] = health_command
+        # 夹具的 "reviewer" 是 `python3 -c "<脚本>"`：两边 `-c` 的载荷本来就必须不同
+        # （健康脚本验环境、评审脚本写工件），根本不存在可比对的 CLI 入口，因此显式声明豁免
+        # health probe parity gate。这个字面量自证其为夹具，且 contract gate 会禁止它出现在
+        # 任何出厂 config/alternative-reviewer.*.json 里。
+        payload["health_probe_parity_exemption"] = (
+            "inline_script_fixture_has_no_shared_cli_entrypoint"
+        )
     if pre_run_health is not None:
         payload["pre_run_health"] = pre_run_health
     path.write_text(
@@ -2059,6 +2165,151 @@ def write_alternative_reviewer_config(
         encoding="utf-8",
     )
     return path
+
+
+def write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+    path: Path,
+    command: list[str],
+    *,
+    activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None = None,
+    activity_probe_timeout_seconds: float | None = None,
+    activity_probe_failure_threshold: int | None = None,
+    tool_failure_threshold: int | None = None,
+    max_runtime_seconds: float | None = None,
+    output_format: str | None = "text",
+    health_command: list[str] | None = None,
+    pre_run_health: bool | None = None,
+) -> Path:
+    """给「idle timeout 不是被测语义」的调用点用：stub 秒退，超时纯粹是防挂死保险丝。
+
+    刻意**不接受** `idle_timeout_seconds` 实参——物理上杜绝调用点重新传入负载敏感的紧值。
+    需要断言超时时序的调用点改用
+    `write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior`。
+    """
+    return _write_alternative_reviewer_config_payload_unclassified(
+        path,
+        command,
+        idle_timeout_seconds=HANG_PREVENTION_IDLE_TIMEOUT_SECONDS,
+        activity_check_interval_seconds=activity_check_interval_seconds,
+        activity_probe_command=activity_probe_command,
+        activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        tool_failure_threshold=tool_failure_threshold,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+        health_command=health_command,
+        pre_run_health=pre_run_health,
+    )
+
+
+def write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior(
+    path: Path,
+    command: list[str],
+    *,
+    idle_timeout_seconds: float,
+    activity_check_interval_seconds: float,
+    activity_probe_command: list[str] | None = None,
+    activity_probe_timeout_seconds: float | None = None,
+    activity_probe_failure_threshold: int | None = None,
+    tool_failure_threshold: int | None = None,
+    max_runtime_seconds: float | None = None,
+    output_format: str | None = "text",
+    health_command: list[str] | None = None,
+    pre_run_health: bool | None = None,
+) -> Path:
+    """给「idle timeout 值与 stub 时序的相对关系就是被测语义」的调用点用。
+
+    这里的紧值不得放大：放大即把「超时确实开火 / 探针确实保活 / 快速失败确实没等满」这类断言
+    做成恒真的假绿。这些调用点在高负载下有残余脆弱性，是被测语义本身的代价，只能靠降低机器
+    负载（`scripts/check_skill_contracts.sh` 的并发推导）缓解，不能靠放宽断言。
+    """
+    return _write_alternative_reviewer_config_payload_unclassified(
+        path,
+        command,
+        idle_timeout_seconds=idle_timeout_seconds,
+        activity_check_interval_seconds=activity_check_interval_seconds,
+        activity_probe_command=activity_probe_command,
+        activity_probe_timeout_seconds=activity_probe_timeout_seconds,
+        activity_probe_failure_threshold=activity_probe_failure_threshold,
+        tool_failure_threshold=tool_failure_threshold,
+        max_runtime_seconds=max_runtime_seconds,
+        output_format=output_format,
+        health_command=health_command,
+        pre_run_health=pre_run_health,
+    )
+
+
+def test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification() -> None:
+    """结构性守卫：禁止绕过「保险丝 / 被断言超时行为」的分类直接写 config payload。
+
+    没有这条守卫，未来新增的测试会重新写出 `idle_timeout_seconds=5.0` 这类紧值保险丝——
+    它们在低负载下永远绿，只在部署机负载 50+ 时集体翻红（2026-07-25 `/rvf-local-deploy`
+    卡在 `plugin_contract_check` 就是这么表现的），而翻红时看起来像是被部署的改动引入的
+    真回归。分类同时把「这个超时值到底是不是被测语义」写进函数名，避免下一个人靠猜。
+    """
+    private_payload_writer = "_write_alternative_reviewer_config_payload_unclassified"
+    aggregator_source_path = Path(__file__).resolve()
+
+    aggregator_lines = aggregator_source_path.read_text(encoding="utf-8").splitlines()
+    aggregator_reference_lines = [
+        (index + 1, line.strip())
+        for index, line in enumerate(aggregator_lines)
+        if private_payload_writer in line
+    ]
+    # 允许的三处：def 本身 + 两个 wrapper 各自的 return。docstring 里的提及不带调用括号。
+    aggregator_call_or_def_lines = [
+        (lineno, text)
+        for lineno, text in aggregator_reference_lines
+        if f"{private_payload_writer}(" in text
+    ]
+    assert len(aggregator_call_or_def_lines) == 3, aggregator_call_or_def_lines
+    assert aggregator_call_or_def_lines[0][1].startswith(f"def {private_payload_writer}("), (
+        aggregator_call_or_def_lines[0]
+    )
+    assert all(
+        text.startswith(f"return {private_payload_writer}(")
+        for _lineno, text in aggregator_call_or_def_lines[1:]
+    ), aggregator_call_or_def_lines
+
+    leaked_call_sites: list[str] = []
+    for candidate in sorted((ROOT / "tests").rglob("*.py")):
+        if candidate.resolve() == aggregator_source_path:
+            continue
+        source = candidate.read_text(encoding="utf-8")
+        if private_payload_writer in source:
+            leaked_call_sites.append(str(candidate.relative_to(ROOT)))
+    assert leaked_call_sites == [], leaked_call_sites
+
+    fuse_parameters = inspect.signature(
+        write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse
+    ).parameters
+    assert "idle_timeout_seconds" not in fuse_parameters, sorted(fuse_parameters)
+    asserted_parameters = inspect.signature(
+        write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior
+    ).parameters
+    assert "idle_timeout_seconds" in asserted_parameters, sorted(asserted_parameters)
+    assert HANG_PREVENTION_IDLE_TIMEOUT_SECONDS >= 30.0, HANG_PREVENTION_IDLE_TIMEOUT_SECONDS
+
+    # activity probe 的自身超时同理：任何数值字面量都是负载炸弹。需要探针失败的测试让探针
+    # 自己非零退出（毫秒级），不靠压缩这个超时——压缩它只会在高负载下打死本该成功的探针。
+    probe_timeout_literal_sites: list[str] = []
+    for candidate in sorted((ROOT / "tests").rglob("*.py")):
+        for line_number, line in enumerate(
+            candidate.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            assignment = line.split("activity_probe_timeout_seconds=", 1)
+            if len(assignment) != 2:
+                continue
+            passed_value = assignment[1].strip().rstrip(",")
+            if passed_value[:1].isdigit():
+                probe_timeout_literal_sites.append(
+                    f"{candidate.relative_to(ROOT)}:{line_number} -> {passed_value}"
+                )
+    assert probe_timeout_literal_sites == [], probe_timeout_literal_sites
+    assert HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS >= 5.0, (
+        HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS
+    )
 
 
 def clean_review_result_python(*, stdout: str = "artifact written") -> str:
@@ -2702,6 +2953,65 @@ def test_contract_check_entrypoints_default_quiet_with_verbose_flag() -> None:
     assert "boom" in completed.stderr
 
 
+def test_contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third() -> None:
+    """并发度必须跟着机器走、不超过 cpu/3，且显式设置永远优先。
+
+    写死 8 的旧行为在开发机上恰好合适，但契约检查经常与别的 agent / 构建同时跑；机器一忙，
+    对时序敏感的那批测试就集体翻红，看起来像是被部署的改动引入的真回归。
+
+    系数从 cpu-2 收到 cpu/3 的依据见 `contract_parallel_jobs` 的注释：并行组的滑动 FIFO
+    窗口会因队首塌陷，把有效并发压在 3.82，再高的 jobs 只多占资源、不缩短墙钟。
+    """
+    skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
+    helper_start = skill_script.index("contract_host_cpu_count() {")
+    helper_end = skill_script.index("\ncontract_review_support_shards() {")
+    probe_body = skill_script[helper_start:helper_end]
+    assert "RVF_CONTRACT_PARALLEL_JOBS" in probe_body, "推导逻辑必须仍然读取显式覆盖"
+
+    probe = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"{probe_body}\n"
+        "printf 'derived=%s\\n' \"$(unset RVF_CONTRACT_PARALLEL_JOBS; contract_parallel_jobs)\"\n"
+        "printf 'explicit=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=3 contract_parallel_jobs)\"\n"
+        "printf 'zero=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=0 contract_parallel_jobs)\"\n"
+        "printf 'nonnumeric=%s\\n' \"$(RVF_CONTRACT_PARALLEL_JOBS=abc contract_parallel_jobs)\"\n"
+        "printf 'cpu=%s\\n' \"$(contract_host_cpu_count)\"\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        probe_path = Path(tmp_dir) / "parallel-jobs-probe.sh"
+        probe_path.write_text(probe, encoding="utf-8")
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "RVF_CONTRACT_PARALLEL_JOBS"
+        }
+        completed = subprocess.run(
+            ["bash", str(probe_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
+    assert completed.returncode == 0, completed.stderr
+    observed = dict(
+        line.split("=", 1) for line in completed.stdout.strip().splitlines() if "=" in line
+    )
+    host_cpu_count = int(observed["cpu"])
+    assert host_cpu_count >= 1
+
+    derived_jobs = int(observed["derived"])
+    assert derived_jobs >= 2, observed
+    # 上界 cpu/3：并行组是滑动 FIFO 窗口（窗口满时等的是队首，不是任意先完成者），实测
+    # 名义 jobs=8 的有效并发只有 3.82，jobs=5/6/7/8 四档墙钟一模一样而峰值 CPU 从 3.39
+    # 涨到 5.85 核 —— 高出去的并发买不到墙钟，只多占机器。这条上界就是防止它被调回去；
+    # 高负载时还会在此基础上再折半，所以断言的是上界而非等值。
+    assert derived_jobs <= max(2, host_cpu_count // 3), observed
+    assert observed["explicit"] == "3", observed
+    assert observed["zero"] == "1", observed
+    assert observed["nonnumeric"] == observed["derived"], observed
+
+
 def test_contract_check_parallel_test_steps_record_parallel_timing() -> None:
     skill_script = CHECK_SKILL_CONTRACTS.read_text(encoding="utf-8")
     function_start = skill_script.index("timestamp_ms() {")
@@ -3224,6 +3534,30 @@ def test_command_lock_respects_env_run_dir(tmp_path: Path) -> None:
     assert [event["event"] for event in events] == ["lock_wait_started", "lock_acquired", "lock_released"]
 
 
+def _terminate_lock_holder_process_group_and_drain_pipes(
+    holder: subprocess.Popen,
+    holder_process_group_id: int,
+) -> tuple[str, str]:
+    """收掉 holder **整条进程链**并读干其 stdout/stderr。
+
+    holder 是 `command_lock.py -- python3 -c sleep(...)`：外层 command_lock 收到 SIGTERM 会直接
+    死掉（它没装 signal handler，也不转发给 subprocess.run 起的内层），但内层 python 仍继承着
+    holder 的 stdout/stderr 管道并继续睡。因此只收外层是不够的——`communicate()` 要等到**所有**
+    写端关闭，也就是一直等到内层自己睡完，把 hold 时长完全兑换成墙钟时间。
+
+    holder 用 `start_new_session=True` 启动，故其 pgid 恒等于 `holder.pid`，可以直接 killpg 整组。
+    这里不用 `os.getpgid(holder.pid)`：外层若已被 `poll()` 回收，getpgid 会 ProcessLookupError，
+    而内层仍活着。POSIX 保证进程组只要还有成员就不会被复用，用启动时记下的 pgid 是安全的。
+    """
+    try:
+        os.killpg(holder_process_group_id, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # 整组已经没了（或不可及）：退回到只收外层，communicate() 此时不会再被内层挂住。
+        if holder.poll() is None:
+            holder.kill()
+    return holder.communicate()
+
+
 def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
     repo = init_repo(tmp_path / "repo")
     state = tmp_path / "state"
@@ -3265,18 +3599,32 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
             "--",
             sys.executable,
             "-c",
-            "import time; time.sleep(3)",
+            f"import time; time.sleep({HANG_PREVENTION_LOCK_HOLDER_HOLD_SECONDS})",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=holder_env,
+        # 自成 session/进程组：teardown 才能一次收掉 command_lock + 内层 sleep 两层，
+        # 否则内层会攥着管道让 communicate() 一直等到 hold 时长睡满（见常量处注释）。
+        start_new_session=True,
     )
+    # start_new_session=True 下 pgid == holder.pid；在外层被 poll() 回收前记下来。
+    holder_process_group_id = holder.pid
+    holder_pipes_already_drained = False
     try:
-        deadline = time.monotonic() + 5
+        # 被测语义是「contender 超时后把 holder 元数据写进日志」，不是「holder 多快拿到锁」。
+        # 这个 deadline 纯粹是保险丝：holder 要冷启动一个 Python 解释器、import RVF 模块、
+        # 拿锁并落 metadata，load 35+ 时超过原来的 5s 完全正常（2026-07-27 部署失败的
+        # shard 4/4 即此）。放大它不弱化任何断言——holder 真挂死时仍会红，只是晚一点。
+        deadline = time.monotonic() + HANG_PREVENTION_LOCK_HOLDER_ACQUISITION_SECONDS
         while not metadata_path.exists():
             if holder.poll() is not None:
-                stdout, stderr = holder.communicate()
+                # 外层已退出，但内层可能还攥着管道；照样按进程组收，别让失败路径挂死。
+                stdout, stderr = _terminate_lock_holder_process_group_and_drain_pipes(
+                    holder, holder_process_group_id
+                )
+                holder_pipes_already_drained = True
                 raise AssertionError(stderr.strip() or stdout.strip() or "holder exited before acquiring lock")
             if time.monotonic() >= deadline:
                 raise AssertionError("holder did not acquire lock")
@@ -3307,9 +3655,10 @@ def test_command_lock_logs_timeout_with_holder_metadata(tmp_path: Path) -> None:
             check=False,
         )
     finally:
-        if holder.poll() is None:
-            holder.terminate()
-        holder.communicate(timeout=5)
+        # holder 是 `command_lock.py -- python3 -c sleep(...)` 两层进程；hold 时长放大后就不能
+        # 再指望「它自己睡完」兜底，必须按进程组一次收掉两层（否则 communicate() 会被内层挂住）。
+        if not holder_pipes_already_drained:
+            _terminate_lock_holder_process_group_and_drain_pipes(holder, holder_process_group_id)
 
     assert contender.returncode == 75
     assert "current holder metadata" in contender.stderr
@@ -5072,7 +5421,9 @@ def test_seal_round_baseline_to_head_advances_marker(tmp: Path) -> None:
         result = seal.seal_round_baseline_to_head(str(repo))
         assert result["sealed"] is True, result
         assert result["baseline_head"] == new_head, result
-        sealed_head = rbm.resolve_round_baseline_head(task_id="seal-task-1", session_id=None)
+        sealed_head = rbm.resolve_round_baseline_head(
+            task_id="seal-task-1", session_id=None, repo=str(repo)
+        )
         assert sealed_head == new_head, (sealed_head, new_head)
         # Window is now empty for the landed commit.
         assert dt._list_committed_round_changed_paths(repo, sealed_head) == []
@@ -5092,24 +5443,39 @@ def test_review_highwater_marker_round_trip(tmp: Path) -> None:
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
     from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
+    repo, _baseline = _committed_round_repo(tmp)
     root = tmp / "state"
     head_a = "a" * 40
     head_b = "b" * 40
-    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_a, repo="/r", root=root)
-    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) == head_a
+    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_a, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, repo=str(repo), root=root) == head_a
     # Overwrite advances (high-water only moves forward by caller contract).
-    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_b, repo="/r", root=root)
-    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) == head_b
+    hwm.write_review_highwater(task_id="t1", session_id="s1", reviewed_head=head_b, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, repo=str(repo), root=root) == head_b
     # Session-only keying when no task_id.
-    hwm.write_review_highwater(task_id=None, session_id="s9", reviewed_head=head_a, repo="/r", root=root)
-    assert hwm.resolve_review_highwater_head(task_id=None, session_id="s9", root=root) == head_a
+    hwm.write_review_highwater(task_id=None, session_id="s9", reviewed_head=head_a, repo=str(repo), root=root)
+    assert hwm.resolve_review_highwater_head(task_id=None, session_id="s9", repo=str(repo), root=root) == head_a
     # Missing / empty head / no key → None (no write).
-    assert hwm.resolve_review_highwater_head(task_id="nope", session_id=None, root=root) is None
-    assert hwm.write_review_highwater(task_id=None, session_id=None, reviewed_head=head_a, repo=None, root=root) is None
-    assert hwm.write_review_highwater(task_id="t2", session_id=None, reviewed_head="  ", repo=None, root=root) is None
-    removed = hwm.clear_review_highwater(task_id="t1", session_id="s1", root=root)
+    assert hwm.resolve_review_highwater_head(task_id="nope", session_id=None, repo=str(repo), root=root) is None
+    assert hwm.write_review_highwater(task_id=None, session_id=None, reviewed_head=head_a, repo=str(repo), root=root) is None
+    assert hwm.write_review_highwater(task_id="t2", session_id=None, reviewed_head="  ", repo=str(repo), root=root) is None
+    # 仓身份是 key 的一部分（scope_marker_identity_key）：解析不出来一律 fail-closed 不写，
+    # 而不是退到某个共享占位桶——那等于把「不同仓撞同一个 task id」原样搬个地方。
+    assert hwm.write_review_highwater(
+        task_id="t1", session_id=None, reviewed_head=head_a, repo=None, root=root
+    ) is None
+    assert hwm.write_review_highwater(
+        task_id="t1", session_id=None, reviewed_head=head_a, repo=str(tmp / "not-a-git-repo"), root=root
+    ) is None
+    # 另一个仓的同名 task 读不到本仓的水位（撞 key 的实测反例：task-a877b 在两根分别指
+    # cline-kanban 与 my-ai-setup）。
+    other_repo, _ = _committed_round_repo(tmp / "other")
+    assert hwm.resolve_review_highwater_head(
+        task_id="t1", session_id=None, repo=str(other_repo), root=root
+    ) is None
+    removed = hwm.clear_review_highwater(task_id="t1", session_id="s1", repo=str(repo), root=root)
     assert removed, removed
-    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, root=root) is None
+    assert hwm.resolve_review_highwater_head(task_id="t1", session_id=None, repo=str(repo), root=root) is None
 
 
 def test_seal_advances_review_highwater(tmp: Path) -> None:
@@ -5134,7 +5500,9 @@ def test_seal_advances_review_highwater(tmp: Path) -> None:
         result = seal.seal_round_baseline_to_head(str(repo))
         assert result["sealed"] is True, result
         assert result.get("highwater_marker_path"), result
-        assert hwm.resolve_review_highwater_head(task_id="seal-hw-task", session_id=None) == new_head
+        assert hwm.resolve_review_highwater_head(
+            task_id="seal-hw-task", session_id=None, repo=str(repo)
+        ) == new_head
     finally:
         for name, val in (("CODEX_RVF_LOG_ROOT", original_log_root), ("KANBAN_TASK_ID", original_task)):
             if val is None:
@@ -5170,7 +5538,9 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
         }
         out_noop = fin._advance_review_highwater(run_dir, repo, {}, {}, rec_noop)
         assert out_noop["status"] == "skipped", out_noop
-        assert hwm.resolve_review_highwater_head(task_id="hw-fin-task", session_id=None) is None
+        assert hwm.resolve_review_highwater_head(
+            task_id="hw-fin-task", session_id=None, repo=str(repo)
+        ) is None
 
         # Genuine review completion → high-water advanced to reviewed HEAD.
         rec_real = {
@@ -5180,7 +5550,9 @@ def test_advance_review_highwater_only_on_did_review(tmp: Path) -> None:
         out_real = fin._advance_review_highwater(run_dir, repo, {}, {}, rec_real)
         assert out_real["status"] == "advanced", out_real
         assert out_real["reviewed_head"] == head, out_real
-        assert hwm.resolve_review_highwater_head(task_id="hw-fin-task", session_id=None) == head
+        assert hwm.resolve_review_highwater_head(
+            task_id="hw-fin-task", session_id=None, repo=str(repo)
+        ) == head
     finally:
         for name, val in (("CODEX_RVF_LOG_ROOT", original_log_root), ("KANBAN_TASK_ID", original_task)):
             if val is None:
@@ -5208,19 +5580,329 @@ def test_review_highwater_write_is_monotonic_with_repo(tmp: Path) -> None:
 
     # Advance to c2 (ahead).
     hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c2, repo=str(repo), root=root)
-    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c2
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, repo=str(repo), root=root) == c2
     # Regress to c1 (strict ancestor of c2) WITH repo → refused, stays c2.
     hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c1, repo=str(repo), root=root)
-    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c2, "regress must be refused"
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, repo=str(repo), root=root) == c2, "regress must be refused"
     # Forward to c3 (descendant) → advances.
     (repo / "f.txt").write_text("base\nc1\nc2\nc3\n", encoding="utf-8")
     run(["git", "add", "f.txt"], cwd=repo); run(["git", "commit", "-q", "-m", "c3"], cwd=repo)
     c3 = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
     hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c3, repo=str(repo), root=root)
-    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c3
-    # repo=None → degrade to blind write (best-effort), regress allowed.
-    hwm.write_review_highwater(task_id="mono", session_id=None, reviewed_head=c1, repo=None, root=root)
-    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, root=root) == c1
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, repo=str(repo), root=root) == c3
+    # repo=None → key 里的仓身份解析不出来 ⇒ 整个 marker 无归属，**不写**（fail-closed）。
+    # 这条以前断言的是「退化成盲写、允许回退」；仓身份进 key 之后那条路径不再可达——
+    # 能拿到 repo 才有 key，拿得到 key 就同样拿得到 ancestry 判据。守卫里 repo 为空的
+    # 回退分支仍在，但只服务「git 调用本身失败」那一种，不再服务 repo=None。
+    assert hwm.write_review_highwater(
+        task_id="mono", session_id=None, reviewed_head=c1, repo=None, root=root
+    ) is None
+    assert hwm.resolve_review_highwater_head(task_id="mono", session_id=None, repo=str(repo), root=root) == c3
+
+
+def test_parent_harness_identity_normalizes_every_signal_layer_to_one_token(tmp: Path) -> None:
+    """同一个 harness 无论命中哪一层信号，都必须归一到**同一个 token**。
+
+    这条是承重的，不是风格问题：round-baseline 的三个读写点各自只看得见不同的层——
+    UPS / Stop 是 hook 子进程（shim 注入的 agent id）、``seal_round_baseline_to_head``
+    跑在 agent shell（只有 harness 原生环境标记 / kanban 的 ``AI_AGENT`` 描述串）。
+    三者写 / 读的是同一个 marker；任何一层归一得不一样，key 就静默裂开：封窗写进一个
+    Stop 读不到的文件（封窗失效 ⇒ 多派），或者更糟，UPS 与 Stop 不一致（marker 消失
+    ⇒ committed 窗口没了 ⇒ 漏审）。
+    """
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from core.host_adapter import parent_harness_identity as phi  # noqa: PLC0415
+
+    claude_layers = [
+        phi.resolve_parent_harness_identity(explicit_host_kind="claude_code"),
+        phi.resolve_parent_harness_identity(environ={phi.CLINE_KANBAN_AGENT_ID_ENV: "claude"}),
+        phi.resolve_parent_harness_identity(environ={"CLAUDECODE": "1"}),
+        phi.resolve_parent_harness_identity(environ={"CLAUDE_CODE_SESSION_ID": "x"}),
+        phi.resolve_parent_harness_identity(
+            environ={phi.KANBAN_RUNTIME_AGENT_DESCRIPTOR_ENV: "claude-code_2-1-231_agent"}
+        ),
+    ]
+    assert set(claude_layers) == {phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE}, claude_layers
+
+    codex_layers = [
+        phi.resolve_parent_harness_identity(explicit_host_kind="codex"),
+        phi.resolve_parent_harness_identity(environ={phi.CLINE_KANBAN_AGENT_ID_ENV: "codex"}),
+        phi.resolve_parent_harness_identity(environ={"CODEX_SESSION_ID": "x"}),
+        phi.resolve_parent_harness_identity(
+            environ={phi.KANBAN_RUNTIME_AGENT_DESCRIPTOR_ENV: "codex_0-9-1_agent"}
+        ),
+    ]
+    assert set(codex_layers) == {phi.PARENT_HARNESS_IDENTITY_CODEX_CLI}, codex_layers
+
+    # ``CODEX_HOME`` 不是身份信号，是**常驻安装路径 override**（本仓 adapters/codex/
+    # subagent.py 正是拿它解析 $CODEX_HOME/sessions）。它一旦被当成「当前进程是 Codex」
+    # 的证据，就会在 harness 原生标记层抢答，而该层整体排在 ``AI_AGENT`` 之前——于是它
+    # 压过下游明确的非 Codex 信号：设过 CODEX_HOME 的用户在 Cursor 会话、或在只有
+    # AI_AGENT 可用的 kanban / seal 路径下，都会被误判成 codex-cli，seal 与 hook 两侧
+    # 归一随即裂开（封窗写进 Stop 读不到的 key ⇒ 多派；UPS/Stop 不一致 ⇒ 漏审）。
+    codex_home_environment = {"CODEX_HOME": "/Users/someone/.codex"}
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CURSOR_AGENT": "1"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CURSOR_CLI, "CODEX_HOME 压过了明确的 CURSOR_AGENT"
+    assert phi.resolve_parent_harness_identity(
+        environ={
+            **codex_home_environment,
+            phi.KANBAN_RUNTIME_AGENT_DESCRIPTOR_ENV: "claude-code_2-1-231_agent",
+        }
+    ) == phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, "CODEX_HOME 压过了明确的 AI_AGENT"
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CLAUDECODE": "1"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, "CODEX_HOME 压过了同层的 CLAUDECODE"
+    # 连一个别的信号都没有时也不许拿 CODEX_HOME 顶包：猜错一个**具体** token 会让写者与
+    # 读者落到不同的 key（marker 消失 ⇒ 漏审），而 unspecified 在读侧有专门的回退候选，
+    # 至多让窗口偏宽（多审）。判不出就老实判不出，严格更安全。
+    assert (
+        phi.resolve_parent_harness_identity(environ=dict(codex_home_environment))
+        == phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED
+    ), "CODEX_HOME 被单独当成了 Codex 会话证据"
+    # 会话级的 CODEX_SESSION_ID 才是真信号，必须继续生效（上面 codex_layers 已覆盖），
+    # 且它与常驻的 CODEX_HOME 同时存在时结论不变。
+    assert phi.resolve_parent_harness_identity(
+        environ={**codex_home_environment, "CODEX_SESSION_ID": "x"}
+    ) == phi.PARENT_HARNESS_IDENTITY_CODEX_CLI
+
+    # 两个 harness 必须互不相等，否则整个分键是空操作。
+    assert (
+        phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE != phi.PARENT_HARNESS_IDENTITY_CODEX_CLI
+    )
+    # transcript schema 探测层（③）：实际读文件，不走字符串。
+    claude_transcript = tmp / "claude.jsonl"
+    claude_transcript.parent.mkdir(parents=True, exist_ok=True)
+    claude_transcript.write_text('{"type": "user"}\n', encoding="utf-8")
+    codex_transcript = tmp / "codex.jsonl"
+    codex_transcript.write_text('{"type": "session_meta"}\n', encoding="utf-8")
+    assert phi.resolve_parent_harness_identity(
+        parent_transcript_path=claude_transcript, environ={}
+    ) == phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE
+    assert phi.resolve_parent_harness_identity(
+        parent_transcript_path=codex_transcript, environ={}
+    ) == phi.PARENT_HARNESS_IDENTITY_CODEX_CLI
+
+    # 一层都没有 ⇒ unspecified（词表里的正常一员，读侧对它有专门的回退候选）。
+    assert (
+        phi.resolve_parent_harness_identity(environ={})
+        == phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED
+    )
+    # 未知 harness 拿自己的 bucket，而不是一律折进 unspecified——折进去等于让两个互不相干
+    # 的未知 harness 重新开始互相覆盖，正是本次改 key 要消除的东西。
+    unknown = phi.resolve_parent_harness_identity(
+        environ={phi.CLINE_KANBAN_AGENT_ID_ENV: "some-new-harness"}
+    )
+    assert unknown not in (
+        phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        phi.PARENT_HARNESS_IDENTITY_CODEX_CLI,
+    ), unknown
+
+
+def test_round_baseline_marker_is_not_shared_across_parent_harnesses(tmp: Path) -> None:
+    """同一个 worktree / 同一个 task 被两个 harness 打开时，round-baseline 不得互相覆盖。
+
+    这正是双状态根一直在偶然掩盖的分裂（Claude hook 落根 A、shell 进程落根 B）：统一根
+    之后两个 harness 的 UserPromptSubmit 会写进同一个文件，A 的 Stop 于是读到 B 上一条
+    prompt 的 HEAD，窗口下界被抬高 ⇒ 漏审。
+    """
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from core.host_adapter import parent_harness_identity as phi  # noqa: PLC0415
+
+    repo, _baseline = _committed_round_repo(tmp)
+    root = tmp / "state"
+    claude_head = "a" * 40
+    codex_head = "b" * 40
+
+    for identity, head in (
+        (phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, claude_head),
+        (phi.PARENT_HARNESS_IDENTITY_CODEX_CLI, codex_head),
+    ):
+        rbm.write_round_baseline_marker(
+            task_id="shared-task", session_id=None, baseline_head=head,
+            repo=str(repo), parent_harness_identity=identity, root=root,
+        )
+
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id=None, repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == claude_head, "Codex 的 UPS 覆盖掉了 Claude 的 round-baseline"
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id=None, repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CODEX_CLI, root=root,
+    ) == codex_head
+
+    # 判不出 harness 的写入方留下的那份，任何 harness 都读得到（读侧回退候选）——命中它
+    # 至多让窗口偏宽（多审），不会让 marker 消失（漏审）。迁移过来的历史 marker 走同一条路。
+    fallback_head = "c" * 40
+    rbm.write_round_baseline_marker(
+        task_id="fallback-task", session_id=None, baseline_head=fallback_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="fallback-task", session_id=None, repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == fallback_head
+
+
+def test_exact_harness_scope_marker_candidates_outrank_unspecified_fallback(tmp: Path) -> None:
+    """``unspecified`` 回退不得越过更精确的候选去抢先命中。
+
+    ``unspecified`` 的设计意图是「**同一 key 维度内**判不出 harness 时的回退」。若候选顺序
+    以 key 维度为外层、harness 为内层（``task-<exact>`` → ``task-unspecified`` →
+    ``sess-<exact>`` → ``sess-unspecified``），那么本会话精确写入的 ``sess-<exact>`` 会被
+    「迁移工具或另一个判不出身份的会话留下的 ``task-unspecified``」抢先命中——读到别人的
+    baseline，窗口下界被**抬高** ⇒ 漏审。回退「至多让窗口偏宽（多审）」这条安全性论证，
+    只在本会话确实没有更精确 marker 时才成立。
+
+    故顺序必须是两层：外层 harness 精度、内层 key 维度。本用例同时钉死两条不变量——
+    精度分层（新）与同层内 task 优先于 session（既有语义，不得被本次分层改掉）。
+    """
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from core.host_adapter import parent_harness_identity as phi  # noqa: PLC0415
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
+    from core.session_scope_allocation import scope_marker_identity_key as smk  # noqa: PLC0415
+
+    # ---- ① 候选顺序本身：精确 harness 的两条全部排在任何 unspecified 之前 ----
+    candidate_names = [
+        path.name
+        for path in smk.scope_marker_candidate_paths(
+            marker_directory=tmp / "candidates",
+            task_id_token="T",
+            session_id_token="S",
+            repository_identity="repoid",
+            parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        )
+    ]
+    assert candidate_names == [
+        f"task-T--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE}.json",
+        f"sess-S--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE}.json",
+        f"task-T--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED}.json",
+        f"sess-S--repo-repoid--harness-{phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED}.json",
+    ], candidate_names
+    # 写者仍取 [0]：分层不得改变写入目标（最精确 harness + 最优先 key）。
+    assert candidate_names[0].startswith("task-T--")
+    # 不按 harness 分键的 marker（highwater）完全不受分层影响，仍是 task → sess。
+    assert [
+        path.name
+        for path in smk.scope_marker_candidate_paths(
+            marker_directory=tmp / "candidates",
+            task_id_token="T",
+            session_id_token="S",
+            repository_identity="repoid",
+            parent_harness_identity=None,
+        )
+    ] == ["task-T--repo-repoid.json", "sess-S--repo-repoid.json"]
+
+    repo, _baseline = _committed_round_repo(tmp)
+    root = tmp / "state"
+    own_session_head = "a" * 40
+    foreign_unspecified_head = "b" * 40
+    own_task_head = "d" * 40
+
+    # ---- ② 端到端：sess-<exact> 与 task-unspecified 并存时，读到本会话精确写入的那份 ----
+    # 本会话 UPS 时拿不到 task_id，故精确写入 sess-<claude-code>。
+    rbm.write_round_baseline_marker(
+        task_id=None, session_id="own-session", baseline_head=own_session_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        root=root,
+    )
+    # 迁移工具 / 另一个判不出身份的会话在同一个 task 下留下的那份。
+    rbm.write_round_baseline_marker(
+        task_id="shared-task", session_id=None, baseline_head=foreign_unspecified_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == own_session_head, "别的会话的 task-unspecified 抢在本会话 sess-<exact> 之前命中 ⇒ 漏审"
+
+    # ---- ③ 既有语义：同一精度层内 task 仍优先于 session ----
+    rbm.write_round_baseline_marker(
+        task_id="shared-task", session_id=None, baseline_head=own_task_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="shared-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CLAUDE_CODE, root=root,
+    ) == own_task_head, "同一精度层内 task 优先于 session 的既有语义被改掉了"
+
+    # ---- ④ 既有语义：本会话没有任何精确 marker 时，unspecified 回退仍接得住迁移产物 ----
+    migrated_head = "e" * 40
+    rbm.write_round_baseline_marker(
+        task_id="migrated-only-task", session_id=None, baseline_head=migrated_head,
+        repo=str(repo), parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_UNSPECIFIED,
+        root=root,
+    )
+    assert rbm.resolve_round_baseline_head(
+        task_id="migrated-only-task", session_id="own-session", repo=str(repo),
+        parent_harness_identity=phi.PARENT_HARNESS_IDENTITY_CODEX_CLI, root=root,
+    ) == migrated_head, "unspecified 回退没接住迁移产物 ⇒ marker 消失"
+
+    # ---- ⑤ highwater 不按 harness 分键，读写路径不受本次分层影响 ----
+    highwater_head = "f" * 40
+    hwm.write_review_highwater(
+        task_id="hw-task", session_id="own-session", reviewed_head=highwater_head,
+        repo=str(repo), root=root,
+    )
+    assert hwm.resolve_review_highwater_head(
+        task_id="hw-task", session_id="own-session", repo=str(repo), root=root,
+    ) == highwater_head
+
+
+def test_scope_markers_do_not_collide_across_repositories_sharing_a_task_id(tmp: Path) -> None:
+    """不同仓的同名 task id 不得共用 marker。
+
+    实测反例：``round-baseline-pending/task-a877b.json`` 在一个状态根里指
+    ``.cline/worktrees/a877b/cline-kanban``、在另一个根里指 ``Documents/GitHub/my-ai-setup``。
+    cline-kanban 的 task id 是短哈希前缀，跨 project 撞车是必然而非意外。
+    """
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from core.session_scope_allocation import review_highwater_marker as hwm  # noqa: PLC0415
+
+    first_repo, _ = _committed_round_repo(tmp / "first")
+    second_repo, _ = _committed_round_repo(tmp / "second")
+    root = tmp / "state"
+    first_head = "1" * 40
+    second_head = "2" * 40
+    colliding_task_id = "a877b"
+
+    for repo, head in ((first_repo, first_head), (second_repo, second_head)):
+        hwm.write_review_highwater(
+            task_id=colliding_task_id, session_id=None, reviewed_head=head,
+            repo=str(repo), root=root,
+        )
+        rbm.write_round_baseline_marker(
+            task_id=colliding_task_id, session_id=None, baseline_head=head,
+            repo=str(repo), root=root,
+        )
+
+    for repo, head in ((first_repo, first_head), (second_repo, second_head)):
+        assert hwm.resolve_review_highwater_head(
+            task_id=colliding_task_id, session_id=None, repo=str(repo), root=root,
+        ) == head, "另一个仓的水位覆盖了本仓的"
+        assert rbm.resolve_round_baseline_head(
+            task_id=colliding_task_id, session_id=None, repo=str(repo), root=root,
+        ) == head
+
+    # 同一个仓的不同 worktree **必须**共享身份（比的是 git_common_dir 而不是工作树路径）：
+    # 要区分的是不同的仓，不是同一个仓的不同 attempt。
+    linked_worktree = tmp / "linked-worktree"
+    run(["git", "worktree", "add", "-q", "--detach", str(linked_worktree)], cwd=first_repo)
+    assert hwm.resolve_review_highwater_head(
+        task_id=colliding_task_id, session_id=None, repo=str(linked_worktree), root=root,
+    ) == first_head
 
 
 def test_committed_observation_excludes_base_branch_sync_merge(tmp: Path) -> None:
@@ -5824,27 +6506,29 @@ def test_committed_unit_gone_after_reset_is_superseded(tmp: Path) -> None:
 def test_round_baseline_marker_round_trip(tmp: Path) -> None:
     """write/read/dual-key/overwrite/status for the round-baseline marker."""
     _dt, _sm, rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
     root = tmp / "state"
     head_a = "a" * 40
     head_b = "b" * 40
     # task-keyed write, then overwrite (multi-prompt semantics: last wins).
-    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_a, repo="/r", root=root)
-    assert rbm.read_round_baseline_marker(task_id="t1", session_id=None, root=root)["baseline_head"] == head_a
-    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_b, repo="/r", root=root)
-    marker = rbm.read_round_baseline_marker(task_id="t1", session_id=None, root=root)
+    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_a, repo=str(repo), root=root)
+    assert rbm.read_round_baseline_marker(task_id="t1", session_id=None, repo=str(repo), root=root)["baseline_head"] == head_a
+    rbm.write_round_baseline_marker(task_id="t1", session_id="s1", baseline_head=head_b, repo=str(repo), root=root)
+    marker = rbm.read_round_baseline_marker(task_id="t1", session_id=None, repo=str(repo), root=root)
     assert marker["baseline_head"] == head_b
     # session fallback when no task id.
-    rbm.write_round_baseline_marker(task_id=None, session_id="s9", baseline_head=head_a, repo="/r", root=root)
-    assert rbm.read_round_baseline_marker(task_id=None, session_id="s9", root=root)["baseline_head"] == head_a
+    rbm.write_round_baseline_marker(task_id=None, session_id="s9", baseline_head=head_a, repo=str(repo), root=root)
+    assert rbm.read_round_baseline_marker(task_id=None, session_id="s9", repo=str(repo), root=root)["baseline_head"] == head_a
     # status + resolve helper.
     assert rbm.round_baseline_status(marker) == rbm.STATUS_ACTIVE
-    assert rbm.resolve_round_baseline_head(task_id="t1", session_id=None, root=root) == head_b
+    assert rbm.resolve_round_baseline_head(task_id="t1", session_id=None, repo=str(repo), root=root) == head_b
     assert rbm.round_baseline_status(marker, now_ts=4102444800.0) == rbm.STATUS_STALE  # year 2100
     assert rbm.round_baseline_status({"baseline_head": ""}) == rbm.STATUS_INVALID
     assert rbm.round_baseline_status(None) == rbm.STATUS_INVALID
-    # No keys / empty head => no write.
-    assert rbm.write_round_baseline_marker(task_id=None, session_id=None, baseline_head=head_a, repo=None, root=root) is None
-    assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head="", repo=None, root=root) is None
+    # No keys / empty head / 仓身份解析不出 => no write（后者 fail-closed，见 scope_marker_identity_key）。
+    assert rbm.write_round_baseline_marker(task_id=None, session_id=None, baseline_head=head_a, repo=str(repo), root=root) is None
+    assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head="", repo=str(repo), root=root) is None
+    assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head=head_a, repo=None, root=root) is None
 
 
 def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
@@ -5860,7 +6544,9 @@ def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
     run(["git", "commit", "-q", "-m", "agent commit"], cwd=repo)
     # Marker written at the prior prompt (baseline = pre-commit HEAD).
     rbm.write_round_baseline_marker(task_id=None, session_id="s1", baseline_head=baseline, repo=str(repo), root=state_root)
-    resolved = rbm.resolve_round_baseline_head(task_id=None, session_id="s1", root=state_root)
+    resolved = rbm.resolve_round_baseline_head(
+        task_id=None, session_id="s1", repo=str(repo), root=state_root
+    )
     assert resolved == baseline
     sm.build_manifest(repo, transcript, tracker_run_id="r1", tracker_log_root=logs, committed_baseline=resolved)
     result = dt.allocate_review_scope(
@@ -6308,9 +6994,13 @@ def load_harness_limit_cooldown_module():
     return module
 
 
-def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
-    """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
-    return write_alternative_reviewer_config(
+def _failing_text_reviewer_config_without_review_result(path: Path, *, stderr_text: str) -> Path:
+    """文本格式 reviewer 配置：shim 往 stderr 吐给定错误并非零退出、不写 review-result。
+
+    stderr 文本是否带额度签名决定 dispatch 的分支：带签名走「记跨 run cooldown 的额度路径」，
+    不带则走「只在本轮排除该 harness 的通用失败路径」（auth 失效/崩溃等）。
+    """
+    return write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         path,
         [
             sys.executable,
@@ -6321,15 +7011,73 @@ def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
                 f"sys.stderr.write({stderr_text!r}); sys.stderr.flush(); sys.exit(1)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
 
 
+def _usage_limit_text_reviewer_config(path: Path, *, stderr_text: str) -> Path:
+    """文本格式 reviewer 配置：shim 往 stderr 吐额度签名并非零退出、不写 review-result。"""
+    return _failing_text_reviewer_config_without_review_result(path, stderr_text=stderr_text)
+
+
+def _rc_zero_but_no_review_result_reviewer_config(path: Path, *, label: str) -> Path:
+    """文本格式 reviewer 配置：shim 干净退出(rc0)却**不**写 review-result。
+
+    专测「腿有效」判据不能只看 returncode：进程怎么退出与有没有产出评审结论是两回事。
+    """
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import sys; sys.stdin.read(); sys.stdout.write('done, but wrote nothing\\n')",
+        ],
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["label"] = label
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return cfg
+
+
+def _review_request_pending_text_reviewer_config(path: Path, *, label: str) -> Path:
+    """文本格式 reviewer 配置：shim 写合法 ``kind: request`` review-result 并 rc0。
+
+    这是 review 协议的合法待处理终态（reviewer 缺上下文/要标准子集），**不是**失败腿：
+    dispatch 不得把它当 ``no_review_result`` 换腿，否则替换腿一成功 plan 就变 completed，
+    request 被静默丢弃、主会话再也不会按 Contract Gate 处理它。
+    """
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
+        path,
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, subprocess, sys; "
+                "sys.stdin.read(); "
+                "subprocess.run([sys.executable, os.environ['RVF_WRITE_REVIEW_RESULT'], "
+                "'context-request', '--out', os.environ['RVF_REVIEW_RESULT'], "
+                "'--need', 'file', '--reason', "
+                "'review packet 缺少被改函数的调用方文件，无法判断影响面'], check=True); "
+                "print('request written')"
+            ),
+        ],
+        activity_check_interval_seconds=0.05,
+        output_format="text",
+    )
+    payload = json.loads(cfg.read_text(encoding="utf-8"))
+    payload["label"] = label
+    cfg.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return cfg
+
+
 def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
     """文本格式 reviewer 配置：shim 写合法 no-issues review-result 并 rc0（reroute 备援腿用）。"""
-    cfg = write_alternative_reviewer_config(
+    cfg = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         path,
         [
             sys.executable,
@@ -6337,7 +7085,6 @@ def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
             "-c",
             clean_review_result_python(stdout="ok"),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6348,7 +7095,15 @@ def _clean_text_reviewer_config(path: Path, *, label: str) -> Path:
 
 
 def _dispatch_registry() -> dict:
-    """In-memory registry mirroring config/reviewer-registry.json (real harness ids)."""
+    """路由算法的冻结 fixture：三条真实 harness id，【刻意不随出厂 registry 增长】。
+
+    这里测的是 route() 这个纯函数的选路行为，不是出厂 registry 装了几条腿。把 fixture
+    绑到出厂那份，等于每加一条评审腿就要重写一批与选路无关的断言，而且 available 集
+    的大小本身就是 routing_rule / selection_mode 的判据（len(available)>=3、
+    len(selection_pool)==2）——跟着涨会让这些断言测的东西悄悄换掉。
+    出厂 registry 与各腿 config 是否一一对应，由
+    tests/test_reviewer_registry_additive_merge.py 单独钉住。
+    """
     return {
         "schema_version": 1,
         "harnesses": {
@@ -6502,7 +7257,7 @@ def test_run_alternative_reviewer_usage_limit_codex_json_error(tmp_path: Path) -
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6514,7 +7269,6 @@ def test_run_alternative_reviewer_usage_limit_codex_json_error(tmp_path: Path) -
                 "'You have hit your usage limit. Please try again in 4h.'}}), flush=True)"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="codex_json",
     )
@@ -6581,7 +7335,7 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_success(tmp_path
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6591,7 +7345,6 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_success(tmp_path
                 stdout="review complete: consider adding rate limit handling for HTTP 429"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6624,7 +7377,7 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(t
     packet = tmp_path / "packet.md"
     packet.write_text("## Review Packet\n\nempty\n", encoding="utf-8")
     run_dir = tmp_path / "run"
-    config = write_alternative_reviewer_config(
+    config = write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse(
         tmp_path / "alternative-reviewer.json",
         [
             sys.executable,
@@ -6637,7 +7390,6 @@ def test_run_alternative_reviewer_usage_limit_no_false_positive_invalid_result(t
                 "print('model body mentions rate limit and 429')"
             ),
         ],
-        idle_timeout_seconds=5.0,
         activity_check_interval_seconds=0.05,
         output_format="text",
     )
@@ -6698,13 +7450,37 @@ def test_harness_limit_cooldown_record_active_sweep(tmp_path: Path) -> None:
 
 
 def _make_usage_or_clean_registry(tmp_path: Path, specs: dict[str, tuple[str, int]]) -> dict:
-    """specs: {harness_id: (kind, priority)}，kind ∈ {'usage','clean'}。返回内存 registry。"""
+    """specs: {harness_id: (kind, priority)}，返回内存 registry。
+
+    kind：
+      - ``'usage'``      额度耗尽（rc125 + stderr 额度签名）→ 走记 cooldown 的额度路径
+      - ``'auth'``       认证失败（rc1、无额度签名、不写 review-result）→ 走通用失败路径
+      - ``'rc0_no_result'`` 干净退出但不写 review-result → 验「腿有效」不能只看 returncode
+      - ``'review_request'`` 干净退出 + 合法 ``kind: request`` → 合法待处理终态，不是失败腿
+      - 其它（``'clean'``）合法 no-issues 结论 + rc0
+    """
     reg: dict = {"schema_version": 1, "harnesses": {}}
     for hid, (kind, prio) in specs.items():
         cfg_path = tmp_path / f"alt-{hid}.json"
         if kind == "usage":
             _usage_limit_text_reviewer_config(
                 cfg_path, stderr_text=f"fatal: usage limit reached for {hid} plan\n"
+            )
+        elif kind == "auth":
+            _failing_text_reviewer_config_without_review_result(
+                cfg_path,
+                stderr_text=(
+                    "Error: Authentication required. Please run 'agent login' first, "
+                    f"or set {hid.upper()}_API_KEY environment variable.\n"
+                ),
+            )
+        elif kind == "rc0_no_result":
+            _rc_zero_but_no_review_result_reviewer_config(
+                cfg_path, label=f"alternative-reviewer:{hid}-cli"
+            )
+        elif kind == "review_request":
+            _review_request_pending_text_reviewer_config(
+                cfg_path, label=f"alternative-reviewer:{hid}-cli"
             )
         else:
             _clean_text_reviewer_config(cfg_path, label=f"alternative-reviewer:{hid}-cli")
@@ -6998,6 +7774,131 @@ def test_decision_token_declined_fingerprint_cooldown_write_query(tmp: Path) -> 
     assert not dts.is_fingerprint_in_declined_cooldown(worktree="/wt", candidate_fingerprint="fpX", cooldown_root=cd_root)
 
 
+def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True``（用户手动触发）对闸二不适用：命中 declined 冷却
+    时不再拒铸，而是**清掉**冷却记录后照常铸，并如实回报
+    explicit_user_request_overrode_agent_declined_cooldown（命中即真）与
+    declined_cooldown_record_still_blocks_automatic_path（清除成功 ⇒ False）；
+    清除而非仅本次绕过，故随后的自动路径（默认 False）也不再被这条陈旧 decline 挡住。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpU", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+    # 对照：默认（自动路径）仍被冷却挡住。
+    auto = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+    assert auto.explicit_user_request_overrode_agent_declined_cooldown is False
+
+    manual = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    assert manual.token and manual.record is not None
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is False
+    # 冷却记录已被物理清除 ⇒ 自动路径也解锁。
+    assert not dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpU", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(worktree="/wt", session_id="sa", candidate_fingerprint="fpU", now=t0, **roots)
+    assert auto_after.outcome == dts.MINT_OUTCOME_MINTED
+
+    # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
+    fresh = dts.mint_decision_token(
+        worktree="/wt", session_id="su", candidate_fingerprint="fpV", now=t0,
+        initiated_by_explicit_user_request=True, **roots,
+    )
+    assert fresh.outcome == dts.MINT_OUTCOME_MINTED
+    assert fresh.explicit_user_request_overrode_agent_declined_cooldown is False
+    assert fresh.declined_cooldown_record_still_blocks_automatic_path is False
+
+
+def test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+    tmp: Path,
+) -> None:
+    """闸二豁免下的两个事实必须解耦（RVF-001 回归）：冷却记录 unlink 因 I/O 失败（被
+    ``clear_declined_fingerprint`` 吞成 False）时，「用户显式推翻了 agent 早前的谢绝」这一**告知类**
+    事实仍由命中证成、必须为 True；unlink 失败只体现在
+    ``declined_cooldown_record_still_blocks_automatic_path=True``——即后续自动路径仍被这条陈旧
+    decline 挡着。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cd_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    dts.record_declined_fingerprint(
+        worktree="/wt", candidate_fingerprint="fpW", reason="agent declined earlier",
+        now=t0, cooldown_root=cd_root,
+    )
+
+    # 只让「冷却表目录下的文件」删除失败，其余 unlink（token 落盘等）照常，避免误伤别处。
+    blocked_dir = dts.declined_fingerprint_root(cd_root).resolve()
+    original_unlink = Path.unlink
+
+    def unlink_failing_only_inside_declined_cooldown_dir(self, *args, **kwargs):
+        if self.resolve().parent == blocked_dir:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_unlink(self, *args, **kwargs)
+
+    Path.unlink = unlink_failing_only_inside_declined_cooldown_dir
+    try:
+        manual = dts.mint_decision_token(
+            worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+    finally:
+        Path.unlink = original_unlink
+
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED
+    # 告知类事实：命中即真，绝不因 unlink 失败被静默吞掉。
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is True
+    # 磁盘事实：记录仍在，自动路径依旧被挡。
+    assert manual.declined_cooldown_record_still_blocks_automatic_path is True
+    assert dts.is_fingerprint_in_declined_cooldown(
+        worktree="/wt", candidate_fingerprint="fpW", cooldown_root=cd_root
+    )
+    auto_after = dts.mint_decision_token(
+        worktree="/wt", session_id="sa", candidate_fingerprint="fpW", now=t0, **roots
+    )
+    assert auto_after.outcome == dts.MINT_OUTCOME_DECLINED_COOLDOWN
+
+
+def test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(tmp: Path) -> None:
+    """``initiated_by_explicit_user_request=True`` 对闸三整段跳过：既不注册铸造请求、也不判定，
+    远超阈值地连铸仍次次 minted、mint-request ledger 零新增、token payload 不带 record id；
+    且不污染同 session 后续自动路径的计数（自动路径仍从 0 起算、到阈值照常熔断）。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cb_root = roots["circuit_breaker_root_dir"]
+    t0 = _fixed_utc(0)
+
+    for index in range(5):  # 远超默认阈值 3
+        result = dts.mint_decision_token(
+            worktree="/wt", session_id="sm", candidate_fingerprint=f"fpM{index}", now=t0,
+            initiated_by_explicit_user_request=True, **roots,
+        )
+        assert result.outcome == dts.MINT_OUTCOME_MINTED, (index, result)
+        assert result.circuit_breaker is None
+        payload = json.loads(result.record.path.read_text(encoding="utf-8"))
+        assert payload[dts.MINT_REQUEST_LEDGER_RECORD_ID_FIELD] is None
+
+    assert dts.count_recent_mint_requests("sm", now=t0, root=cb_root) == 0, "手动铸造不该占熔断额度"
+
+    # 同 session 的自动路径不受污染：从 0 起算，第 3 次才熔断。
+    a1 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA1", now=t0, **roots)
+    a2 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA2", now=t0, **roots)
+    a3 = dts.mint_decision_token(worktree="/wt", session_id="sm", candidate_fingerprint="fpA3", now=t0, **roots)
+    assert a1.outcome == dts.MINT_OUTCOME_MINTED and a2.outcome == dts.MINT_OUTCOME_MINTED
+    assert a3.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
+    assert a3.circuit_breaker.request_count == 3
+
+
 def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
     """铸造频率熔断（R24 裁决 b）：同 session 3600s 窗口内第 ≥3 次铸造请求拒铸，写 tripped ledger；
     纯计数、零语义；请求滑出窗口后计数重置。"""
@@ -7175,6 +8076,23 @@ def load_rvf_agent_decision_cli_module():
     return module
 
 
+def _load_sibling_script_module(name: str):
+    """按模块名加载 skill ``scripts/`` 下的兄弟脚本（与 load_* 家族同一套 path/spec 约定）。"""
+    if name in sys.modules:
+        return sys.modules[name]
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    spec = importlib.util.spec_from_file_location(name, SCRIPT_DIR / f"{name}.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"failed to load {name} module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _agent_cli_roots(cli, tmp: Path):
     """一组 tmp 隔离的 AgentDecisionRoots（token / 冷却 / scope 产出 / 遥测 / issue / 谢绝理由）。"""
     return cli.AgentDecisionRoots(
@@ -7200,6 +8118,21 @@ def _mint_agent_decision_token(
     ).token
 
 
+def _write_stub_review_packet(packet: Path, scope_of_work_text: str) -> None:
+    """按 ``build_review_packet`` 的真实排版把 scope-of-work 内联进 packet。
+
+    渲染器写的是 ``## Session Context`` + 空行 + ``.strip()`` 后的正文；gate 就锚在这个排版上，
+    所以这里必须照抄，而不是随手拼一段像 packet 的文本。
+    """
+    packet.parent.mkdir(parents=True, exist_ok=True)
+    packet.write_text(
+        "# Review Packet\n\nstub packet\n\n## Session Context\n\n"
+        + scope_of_work_text.strip()
+        + "\n\n## Git status\n\n(stub)\n",
+        encoding="utf-8",
+    )
+
+
 def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files=None, fail_first_n: int = 0):
     """构造一个 stub prepare pipeline：写出假的 run_dir + scope.contract.json，返回归一化 dict。
 
@@ -7207,8 +8140,15 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
     """
     state = {"calls": 0}
 
-    def _stub(*, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0):
+    def _stub(
+        *, token_record, repo, session_id, transcript_path, now, timeout_seconds=60.0,
+        resume_run_id=None, resume_run_dir=None,
+        parent_attempt_run_id=None, parent_attempt_run_dir=None,
+    ):
         state["calls"] += 1
+        state["last_resume_run_id"] = resume_run_id
+        state["last_resume_run_dir"] = resume_run_dir
+        state["last_parent_attempt_run_id"] = parent_attempt_run_id
         if state["calls"] <= fail_first_n:
             return {"status": "failed", "error": "stub prepare 故意失败", "run_id": None, "run_dir": None, "artifacts": {}}
         run_dir = tmp / "runs" / run_name
@@ -7223,14 +8163,30 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
             }),
             encoding="utf-8",
         )
-        packet = run_dir / "artifacts" / "review-packet.md"; packet.write_text("stub packet", encoding="utf-8")
         sow = run_dir / "artifacts" / "scope-of-work.md"; sow.write_text("stub scope of work", encoding="utf-8")
+        # packet 必须**内联冻结**当时的 scope-of-work：真实 prepare 就是这么干的，而 dispatch 的
+        # contract gate 校验的正是「reviewer 会读到的那一份」。写一个不含 Session Context 的假
+        # packet 会让这条 gate 在所有用例里恒真，等于把它测没了。
+        packet = run_dir / "artifacts" / "review-packet.md"
+        _write_stub_review_packet(packet, sow.read_text(encoding="utf-8"))
+        prep_file = tmp / "prep" / f"{run_name}.json"
+        prep_file.parent.mkdir(parents=True, exist_ok=True)
+        prep_file.write_text("{}", encoding="utf-8")
+        review_env = run_dir / "artifacts" / "review-env.sh"
+        review_env.write_text("# stub review env\n", encoding="utf-8")
         return {
             "status": "completed", "run_id": run_name, "run_dir": str(run_dir),
-            "artifacts": {"scope_contract": str(scope_contract), "review_packet": str(packet), "scope_of_work": str(sow)},
+            "artifacts": {
+                "scope_contract": str(scope_contract), "review_packet": str(packet),
+                "scope_of_work": str(sow), "review_env": str(review_env),
+            },
+            # execution_handoff 要把 prep 文件落点交给 agent（真实 pipeline 也返回该键）。
+            "prep_file": str(prep_file),
             "error": None,
         }
 
+    # 让调用方能断言 CLI 透传下来的 resume / parent-attempt 血缘（bootstrap 恢复路径）。
+    _stub.state = state
     return _stub
 
 
@@ -7472,6 +8428,330 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
     assert contract["scope_hash"] != "stub-old-hash"
 
 
+def test_agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff(tmp: Path) -> None:
+    """P2/P3：``start`` 成功后 ① arm 一枚在途凭证（INV-5 的载体），② 回执带全套
+    ``execution_handoff``（INV-3：执行信息改从返回值读，不再经任何注入正文携带）。
+
+    凭证刻意只写 **session** 维度的 key，且 key 含仓身份 —— 故这里必须用**真实** git 仓做
+    worktree（假 .git 目录解析不出仓身份，凭证会被安全跳过而不是落盘）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    lock_module = load_kanban_followup_lock_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    lock_root = tmp / "locks"
+    tok = _mint_agent_decision_token(
+        dts, roots, worktree=str(repo), session_id="sess-in-flight", now=t0
+    )
+
+    result = cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp),
+        lock_root=lock_root,
+    )
+    assert result.status == "ok", result.message
+
+    # ① 在途凭证已 arm，且是 session-keyed（读侧 task 维度解析不出时也命中得到）。
+    receipt = result.detail["in_flight_receipt"]
+    assert receipt["status"] == cli.ACCEPTED_REVIEW_RUN_RECEIPT_ARMED, receipt
+    marker = lock_module.read_marker(
+        task_id=None, session_id="sess-in-flight", repo=str(repo), root=lock_root
+    )
+    assert marker is not None, "session-keyed 凭证应可被同一仓身份读回"
+    assert marker["decision_token"] == tok
+    assert marker["state"] == lock_module.STATE_IN_PROGRESS
+    assert marker["delivered_session_id"] == "sess-in-flight"
+    # rewind 对账的 needle 从 marker 现推：凭证走 RVF_DECISION_TOKEN= 而不是 RVF_DISPATCH=。
+    presence = _load_sibling_script_module("kanban_followup_trigger_transcript_presence")
+    needle_token, needle = presence.trigger_needle_for_lock_marker(marker)
+    assert needle_token == tok and needle == f"RVF_DECISION_TOKEN={tok}", (needle_token, needle)
+
+    # ② execution_handoff 字段齐全，且人类可读行也看得到（不必解析 JSON）。
+    handoff = result.detail["execution_handoff"]
+    for key in (
+        "target_repo", "run_id", "run_dir", "prep_file", "review_env", "review_packet",
+        "scope_contract", "scope_of_work", "origin_metadata", "handoff_path",
+        "handoff_contract", "execution_instruction",
+    ):
+        assert handoff.get(key), f"execution_handoff 缺 {key}: {handoff}"
+    assert handoff["origin_metadata"].endswith("artifacts/origin.json")
+    assert handoff["handoff_path"].endswith("artifacts/handoff.md")
+    rendered = result.render()
+    assert "execution_handoff:" in rendered
+    assert "review_packet:" in rendered and "scope_contract:" in rendered
+    # INV-2：回执正文里那条 `$review-validate-fix` 只能作为「由你自己调用」的指引出现，
+    # 绝不是某条注入正文的第一行。
+    assert not rendered.strip().startswith("$review-validate-fix")
+
+
+def test_agent_cli_start_consumes_review_reopen_marker_before_allocate(tmp: Path) -> None:
+    """P1 落地后的必然连带：``$rvf-reopen`` 的消费点必须也在 ``start`` 这条**默认**发起入口上。
+
+    历史上只有 Stop hook 的派发路径消费 rescope marker；默认发起改成「横幅 → agent 显式 start」
+    之后不补这一刀，``$rvf-reopen`` 在默认路径上就整个失效（marker 永不消费、范围永不重开）。
+    这里只验「marker 被消费」这一可观测事实（真实 tracker 重开在 stop hook 套件里覆盖）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    rrm = _load_sibling_script_module("review_reopen_marker")
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    reopen_root = tmp / "reopen-root"
+    prev_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(reopen_root)
+    try:
+        marker_path = rrm.write_review_reopen_marker(
+            task_id=None,
+            session_id="sess-reopen-start",
+            target_run_id="rvf-earlier-impl",
+            repo=str(repo),
+        )
+        assert marker_path is not None and Path(marker_path).exists()
+
+        tok = _mint_agent_decision_token(
+            dts, roots, worktree=str(repo), session_id="sess-reopen-start", now=t0
+        )
+        result = cli.run_start(
+            token=tok, reason="开审", roots=roots, now=t0,
+            prepare_pipeline=_agent_cli_stub_prepare(tmp),
+            lock_root=tmp / "locks",
+        )
+        assert result.status == "ok", result.message
+        assert not Path(marker_path).exists(), "start 必须在 allocate 之前消费掉 rescope marker"
+        tele = read_jsonl(roots.telemetry_root / f"{tok}.jsonl")
+        assert "start_review_reopen_consumed" in [r["event"] for r in tele], tele
+    finally:
+        if prev_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = prev_log_root
+
+
+def test_agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub(
+    tmp: Path,
+) -> None:
+    """contract gate：scope-of-work 仍是 stub 就拒派，且**没有**真的调 reviewer dispatcher。
+
+    派了也白派——reviewer 侧的 contract gate 会当场把这一轮退回成 ``kind: request``，而 request
+    在同一 run 内转不回 issues（2026-08-15 run 实测：整轮 codex 评审白跑约 13 分钟）。在派发
+    **之前**拦住比派完再退回便宜一个数量级，所以这条 gate 排在 reviewer_dispatcher 之前。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    import rvf_dispatch_prompts  # noqa: PLC0415
+
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    tok = _mint_agent_decision_token(dts, roots, worktree=str(repo), now=t0)
+    cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp), lock_root=tmp / "locks",
+    )
+    scope_of_work = tmp / "runs" / "run-1" / "artifacts" / "scope-of-work.md"
+    stub_text = rvf_dispatch_prompts.dispatch_scope_of_work_text(
+        target_flow=rvf_dispatch_prompts.AGENTIC_INITIATION_FLOW,
+        cwd=str(repo), parent_session_id="s1", parent_thread_path=None, prompt_path=None,
+        run_id="run-1", run_dir=tmp / "runs" / "run-1", candidate_paths=["a.py"],
+    )
+    scope_of_work.write_text(stub_text, encoding="utf-8")
+
+    dispatcher_calls: list[dict] = []
+
+    def _recording_dispatcher(**kw):
+        dispatcher_calls.append(kw)
+        return {"status": cli.DISPATCH_OUTCOME_OK, "returncode": 0}
+
+    blocked = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert blocked.status == "scope_of_work_still_stub", blocked
+    assert blocked.exit_code == cli.EXIT_SCOPE_OF_WORK_STILL_STUB
+    assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED, "不是故障，是「还差一步没做」"
+    assert dispatcher_calls == [], "gate 必须排在 reviewer 派发之前，否则白跑一轮"
+    assert any("rerender-scope-of-work" in step for step in blocked.next_steps), blocked.next_steps
+    # token 不进终态：agent 补完 scope-of-work 后要能经同一入口重派。
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # agent 写了真实内容并删掉标记，但**没重渲** → 仍须拒派。
+    # 这是这条 gate 本来要拦的那件事：packet 在 start 时就把 stub 内联冻结了，只改盘上的文件
+    # 不会进 packet。只看盘上文件的 gate 会在这里放行，而 reviewer 读到的仍是 stub ⇒ 整轮空审。
+    written = "# Scope of Work\n\n本轮改了 a.py，审查请盯错误处理。\n"
+    scope_of_work.write_text(written, encoding="utf-8")
+    stale = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert stale.status == "scope_of_work_still_stub", stale
+    assert stale.detail["reason"] == cli.SCOPE_OF_WORK_GATE_REASON_PACKET_STALE, stale.detail
+    assert dispatcher_calls == [], "packet 里冻的还是 stub，这一轮派出去就是空审"
+
+    # 声明过的 scope-of-work 读不到 ⇒ 拒派，不能跟「压根没声明」共用放行分支：
+    # 否则「把文件删了」就是绕过这条 gate 最省事的办法。
+    scope_of_work.unlink()
+    missing = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert missing.status == "scope_of_work_still_stub", missing
+    assert missing.detail["reason"] == cli.SCOPE_OF_WORK_GATE_REASON_UNREADABLE, missing.detail
+    assert dispatcher_calls == []
+    scope_of_work.write_text(written, encoding="utf-8")
+
+    # 经重渲把新正文冻进 packet → 放行。
+    _write_stub_review_packet(tmp / "runs" / "run-1" / "artifacts" / "review-packet.md", written)
+    ok = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_recording_dispatcher,
+    )
+    assert ok.status == "ok", ok
+    assert len(dispatcher_calls) == 1
+
+
+def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(tmp: Path) -> None:
+    """P3b：``blocked_on_reviewer_request`` 是**待处理终态**，不得报成 dispatch_failed。
+
+    混同的后果不是「文案不好看」：agent 会把它当可修复故障去盲目重跑 dispatch，而正确处置是
+    先走 Contract Gate 处理那条 ``kind: request``、再带同一 selection-seed 用同一对 reviewer 重派。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    repo = init_repo(tmp / "worktree")
+    tok = _mint_agent_decision_token(dts, roots, worktree=str(repo), now=t0)
+    cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp), lock_root=tmp / "locks",
+    )
+
+    def _request_dispatcher(**kw):
+        return {
+            "status": cli.DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST,
+            "returncode": 3,
+            "dispatch_status_path": str(tmp / "status.json"),
+            "launch_status": "launched",
+        }
+
+    blocked = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_request_dispatcher,
+    )
+    assert blocked.status == cli.DISPATCH_OUTCOME_BLOCKED_ON_REVIEWER_REQUEST, blocked
+    assert blocked.exit_code == cli.EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST
+    assert blocked.exit_code != cli.EXIT_DISPATCH_FAILED
+    assert "Contract Gate" in blocked.message
+    # 指引必须给出**只重派 request 腿**的形态：整盘重跑会把健康且已完成的那条腿一并覆写，
+    # 这条修复只在 flag 上生效、在标准操作流程上不生效（RVF-004）。
+    assert any(
+        cli.REVIEW_REQUEST_REDISPATCH_FLAG in step for step in blocked.next_steps
+    ), blocked.next_steps
+    # token 不进终态：处置完 request 之后要能经同一入口重派。
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+
+    # 成功路径把 detached 的 status.json 落点与轮询指引冒到 next_steps。
+    def _detached_ok_dispatcher(**kw):
+        return {
+            "status": cli.DISPATCH_OUTCOME_OK,
+            "returncode": 0,
+            "dispatch_status_path": str(tmp / "reviewers" / ".dispatch-thread.status.json"),
+            "launch_status": "launched",
+        }
+
+    ok = cli.run_dispatch(
+        token=tok, strictness="standard", roots=roots, now=t0,
+        reviewer_dispatcher=_detached_ok_dispatcher,
+    )
+    assert ok.status == "ok", ok
+    assert ok.detail["dispatch_status_path"].endswith(".dispatch-thread.status.json")
+    assert any("--wait-status" in step for step in ok.next_steps), ok.next_steps
+    assert any("plan_status" in step for step in ok.next_steps), ok.next_steps
+
+
+def test_default_reviewer_dispatcher_speaks_detached_execute_contract(tmp: Path) -> None:
+    """P3b：``--execute`` 必须带 ``--detached``，且 plan 路径按 ``RVF_DISPATCH_STATUS=`` 前缀解析。
+
+    不带 detached 的同步调用会被前台 Bash 工具的 600s 上限砍断（一次彻底 review 常常 >10min），
+    而「取 stdout 最后一行」在 detached 的两行回执下会把 ``RVF_DISPATCH_LAUNCH=launched`` 当成
+    plan 路径。两条都靠替换 subprocess.run 的真实 argv / stdout 钉死。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    seen = {}
+
+    class _Completed:
+        returncode = 0
+        stdout = (
+            "RVF_DISPATCH_STATUS=/tmp/run/artifacts/reviewers/.dispatch-thread.status.json\n"
+            "RVF_DISPATCH_LAUNCH=launched\n"
+        )
+        stderr = ""
+
+    def _fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        return _Completed()
+
+    original_run = cli.subprocess.run
+    cli.subprocess.run = _fake_run
+    try:
+        result = cli.default_reviewer_dispatcher(
+            repo=str(tmp), review_packet=None, scope_contract=None, session_context=None,
+            run_id="rvf-x", run_dir=str(tmp / "run"), strictness="standard",
+            preset={"external_reviewer_count_target": 2}, dry_run=False,
+        )
+    finally:
+        cli.subprocess.run = original_run
+
+    assert "--execute" in seen["argv"] and "--detached" in seen["argv"], seen["argv"]
+    assert result["status"] == cli.DISPATCH_OUTCOME_OK
+    assert result["dispatch_status_path"].endswith(".dispatch-thread.status.json")
+    assert result["launch_status"] == "launched"
+    # 明确钉死「不是取最后一行」：最后一行是 LAUNCH 那行。
+    assert "RVF_DISPATCH_LAUNCH" not in str(result["dispatch_status_path"])
+
+
+def test_kanban_followup_lock_key_separates_colliding_task_ids_across_repositories(tmp: Path) -> None:
+    """P2a：cline-kanban 的 task id 是短哈希前缀，不同 project 会撞。
+
+    这把锁自 P2 起是「任何已接受 RVF run 的在途凭证」，撞键 = A 仓的在途 run 静默压掉 B 仓的
+    发起决策点（漏审）。key 编入仓身份之后，同一个 task id 在两个仓里必须是两把互不相干的锁。
+    """
+    lock_module = load_kanban_followup_lock_module()
+    repo_a = init_repo(tmp / "repo-a")
+    repo_b = init_repo(tmp / "repo-b")
+    root = tmp / "locks"
+
+    path_a = lock_module.write_marker(
+        task_id="a877b", session_id=None, run_id="rvf-a", run_dir=str(tmp / "run-a"),
+        repo=str(repo_a), cwd=str(repo_a), root=root,
+    )
+    path_b = lock_module.write_marker(
+        task_id="a877b", session_id=None, run_id="rvf-b", run_dir=str(tmp / "run-b"),
+        repo=str(repo_b), cwd=str(repo_b), root=root,
+    )
+    assert path_a is not None and path_b is not None
+    assert path_a != path_b, "同一 task id 在两个仓里必须落到不同的 marker 文件"
+
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root)["run_id"] == "rvf-a"
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_b), root=root)["run_id"] == "rvf-b"
+
+    # 清 A 仓那把不得波及 B 仓。
+    removed = lock_module.clear_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root)
+    assert removed == [str(path_a)]
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_a), root=root) is None
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(repo_b), root=root) is not None
+
+    # 仓身份解析不出（不是 git 仓）→ 候选为空：写者 no-op、读者读不到。fail 方向必须是
+    # 「至多多征询一次」，绝不是「静默读到别人的凭证」。
+    not_a_repo = tmp / "plain-dir"
+    not_a_repo.mkdir()
+    assert lock_module.marker_paths(task_id="a877b", session_id=None, repo=str(not_a_repo)) == []
+    assert lock_module.read_marker(task_id="a877b", session_id=None, repo=str(not_a_repo), root=root) is None
+
+
 def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     """decline：token 终态 declined、理由落 append-only 磁盘 ledger（rewind 不可抹）、指纹入冷却表；
     再次 decline 已终态 → 错误。"""
@@ -7502,6 +8782,277 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     # 已终态再次 decline → 错误。
     again = cli.run_decline(token=tok, reason="再次", roots=roots, now=t0)
     assert again.status == "error" and again.exit_code == cli.EXIT_TOKEN_STATE
+
+
+def test_agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives(tmp: Path) -> None:
+    """decline-dispatched-review：给「Kanban 内自动 RVF」补上历史上根本不存在的谢绝出口。
+
+    收的是 **dispatch token**（注入 prompt 里的 RVF_DISPATCH=token=…），不是 S3 决策 token
+    ——Kanban task 内的自动 RVF 走延续后端，结构上不经过 S3 决策点。断言四件事：
+    ① 默认（不带豁免）= 清锁 + 清 pending + 理由落盘，scope 退回可审池；
+    ② 带 --mark-declined-scope-units-review-not-required = 额外把本轮 scope 声明为不需审核；
+    ③ **锁身份对账**：磁盘上的锁/pending 若属于**另一轮** dispatch（token 对不上），一律原样
+       保留、不清——否则一条重试的旧命令会把新一轮的互斥与续跑状态删掉（RVF-003）；
+    ④ **不谎报成功**：请求了豁免却一个 unit 都没声明成时，status 不得为 ok、message 不得
+       宣称已豁免（RVF-004）。
+    """
+    cli = load_rvf_agent_decision_cli_module()
+    prep = load_rvf_prep_file_module()
+    tracker = load_diff_tracker_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+
+    repo = init_repo(tmp / "repo")
+    log_root = tmp / "logs"
+    lock_root = tmp / "locks"
+    allocated = tracker.allocate_review_scope(
+        repo=repo, session_id="sess-decline", run_id="run-decline",
+        reviewer_id="reviewer-decline", log_root_override=log_root,
+    )
+    assert allocated["status"] == "allocated", allocated
+    scoped_unit_ids = list(allocated["scope"]["unit_ids"])
+
+    prep_root = tmp / "prep"
+    record = prep.write_prep_file(
+        {
+            "origin_session_id": "sess-decline",
+            "origin_repo": str(repo),
+            "origin_cwd": str(repo),
+            "target_flow": "flow-1-self-rising",
+            "target_worktree": str(repo),
+            "target_kanban_task_id": "task-decline",
+            "rvf_run": {
+                "run_id": "run-decline",
+                "run_dir": str(tmp / "run"),
+                "tracker_lease_id": allocated["lease_id"],
+            },
+        },
+        root=prep_root,
+        token="dddddddddddddddd",
+    )
+    lock_module = load_kanban_followup_lock_module()
+    lock_module.write_marker(
+        task_id="task-decline", session_id="sess-decline",
+        run_id="run-decline", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+        dispatch_token=record.token,
+        state=lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION,
+        root=lock_root,
+    )
+    # pending（dispatched_unconfirmed）也一并摆上：正常投递时 UPS 会按 token 清掉它，但谢绝
+    # 发生在「投递已落地、UPS 尚未清 / 已清」两种时序都可能，故这条路径必须自带 token guard。
+    lock_module.write_pending_marker(
+        task_id="task-decline", session_id="sess-decline",
+        run_id="run-decline", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+        token=record.token, delivery_channel="test", root=lock_root,
+    )
+    lock_marker_path = lock_root / "kanban-followup-in-progress" / in_progress_lock_marker_name(
+        lock_module, repo=repo, task_id="task-decline"
+    )
+    pending_marker_path = lock_root / "kanban-followup-dispatched" / "task-task-decline.json"
+    prev_log_root = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(log_root)
+    try:
+        # ① 默认谢绝：清锁 + 释放 lease，unit 退回 available（后续 Stop 仍可重新提议）。
+        result = cli.run_decline_dispatched_review(
+            token=record.token, reason="用户已让我改做别的工作",
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert result.status == "ok" and result.exit_code == cli.EXIT_OK, result
+        assert result.detail["failed_steps"] == [], result.detail
+        assert result.detail["removed_lock_paths"], result.detail
+        assert result.detail["lock_outcome"] == cli.KANBAN_FOLLOWUP_MARKER_CLEARED, result.detail
+        assert result.detail["pending_outcome"] == cli.KANBAN_FOLLOWUP_MARKER_CLEARED, result.detail
+        assert not lock_marker_path.exists()
+        assert not pending_marker_path.exists()  # token 匹配 → pending 也确实被清掉
+        assert result.detail["lease_release"]["released"] is True
+        assert result.detail["lease_release_outcome"] == "released", result.detail
+        rows = read_jsonl(Path(result.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record.token
+            and r.get("token_kind") == "dispatch"
+            and r.get("review_not_required_waiver_requested") is False
+            and r.get("review_not_required_waiver_declared") is False
+            and r.get("failed_steps") == []
+            for r in rows
+        ), rows
+        conn = sqlite3.connect(
+            str(log_root / "diff-tracker" / "repos" / allocated["repo_key"] / "tracker.sqlite3")
+        )
+        try:
+            states = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT review_state FROM units WHERE unit_id IN ({})".format(
+                        ",".join("?" for _ in scoped_unit_ids)
+                    ),
+                    tuple(scoped_unit_ids),
+                )
+            }
+        finally:
+            conn.close()
+        assert states == {"available"}, states  # 未豁免 → 退回可审池
+
+        # ② 带豁免：本轮 scope 被声明为不需审核（diff/hunk 级）。
+        second = tracker.allocate_review_scope(
+            repo=repo, session_id="sess-decline", run_id="run-decline-2",
+            reviewer_id="reviewer-decline-2", log_root_override=log_root,
+        )
+        record2 = prep.write_prep_file(
+            {
+                "origin_session_id": "sess-decline",
+                "origin_repo": str(repo),
+                "origin_cwd": str(repo),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(repo),
+                "target_kanban_task_id": "task-decline",
+                "rvf_run": {
+                    "run_id": "run-decline-2",
+                    "run_dir": str(tmp / "run"),
+                    "tracker_lease_id": second["lease_id"],
+                },
+            },
+            root=prep_root,
+            token="eeeeeeeeeeeeeeee",
+        )
+        waived = cli.run_decline_dispatched_review(
+            token=record2.token, reason="这批 diff 是生成物，无需审核",
+            mark_declined_scope_units_review_not_required=True,
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert waived.status == "ok", waived
+        assert waived.detail["review_not_required"]["status"] == "declared", waived.detail
+        assert waived.detail["review_not_required_declared"] is True, waived.detail
+        assert waived.detail["failed_steps"] == [], waived.detail
+        waived_rows = read_jsonl(Path(waived.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record2.token
+            and r.get("review_not_required_waiver_requested") is True
+            and r.get("review_not_required_waiver_declared") is True
+            for r in waived_rows
+        ), waived_rows
+        conn = sqlite3.connect(
+            str(log_root / "diff-tracker" / "repos" / allocated["repo_key"] / "tracker.sqlite3")
+        )
+        try:
+            rows2 = list(
+                conn.execute(
+                    "SELECT review_state, review_not_required_declared_reason FROM units "
+                    "WHERE unit_id IN ({})".format(",".join("?" for _ in scoped_unit_ids)),
+                    tuple(scoped_unit_ids),
+                )
+            )
+        finally:
+            conn.close()
+        assert {r[0] for r in rows2} == {"reviewed"}, rows2
+        assert all("这批 diff 是生成物" in (r[1] or "") for r in rows2), rows2
+        # 豁免生效：再分配一次已无可审 scope。
+        third = tracker.allocate_review_scope(
+            repo=repo, session_id="sess-decline", run_id="run-decline-3",
+            reviewer_id=None, dry_run=True, log_root_override=log_root,
+        )
+        assert third["status"] == "empty", third
+
+        # ③ RVF-003：不带豁免的谢绝之后同一 scope 可能立刻派发下一轮。此时重放**旧** token 的
+        #    谢绝命令，绝不能把新一轮的锁与 pending 删掉（否则当前 RVF 失去互斥与续跑状态）。
+        lock_module.write_marker(
+            task_id="task-decline", session_id="sess-decline",
+            run_id="run-decline-next", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+            dispatch_token="ffffffffffffffff",
+            state=lock_module.STATE_DELIVERED_AWAITING_AGENT_DECISION,
+            root=lock_root,
+        )
+        lock_module.write_pending_marker(
+            task_id="task-decline", session_id="sess-decline",
+            run_id="run-decline-next", run_dir=str(tmp / "run"), repo=str(repo), cwd=str(repo),
+            token="ffffffffffffffff", delivery_channel="test", root=lock_root,
+        )
+        replayed = cli.run_decline_dispatched_review(
+            token=record.token, reason="重试一条旧命令（或旧 token 的调用迟到）",
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert replayed.status == "decline_incomplete", replayed
+        assert replayed.exit_code == cli.EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE, replayed
+        assert (
+            replayed.detail["lock_outcome"]
+            == cli.KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+        ), replayed.detail
+        assert (
+            replayed.detail["pending_outcome"]
+            == cli.KANBAN_FOLLOWUP_MARKER_PRESERVED_FOR_ANOTHER_DISPATCH
+        ), replayed.detail
+        assert replayed.detail["removed_lock_paths"] == [], replayed.detail
+        assert replayed.detail["preserved_lock_paths"], replayed.detail
+        # 新一轮的锁与 pending 都还在，且内容未被动过。
+        assert lock_marker_path.exists() and pending_marker_path.exists()
+        assert json.loads(lock_marker_path.read_text(encoding="utf-8"))["dispatch_token"] == (
+            "ffffffffffffffff"
+        )
+        assert json.loads(pending_marker_path.read_text(encoding="utf-8"))["token"] == (
+            "ffffffffffffffff"
+        )
+        assert any(
+            step["step"] == "kanban_followup_lock_clear" for step in replayed.detail["failed_steps"]
+        ), replayed.detail
+        # 部署滞后期间由老版 UPS arm 的锁没有 dispatch_token：必须回退按 run_id 对账，否则
+        # 部署完成前每一次谢绝都会退化成空操作；两者皆无时才允许「无从对账、照清」。
+        classify = cli.classify_kanban_followup_lock_identity_against_dispatch
+        assert classify(
+            {"run_id": "run-decline"}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_MATCHES_THIS_DISPATCH
+        assert classify(
+            {"run_id": "run-other"}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_BELONGS_TO_ANOTHER_DISPATCH
+        assert classify(
+            {}, dispatch_token=record.token, run_id="run-decline"
+        ) == cli.LOCK_IDENTITY_UNVERIFIABLE_LEGACY_MARKER
+
+        # ④ RVF-004：请求了豁免但一个 unit 都没声明成（这里用一把不存在的 lease 触发 noop，
+        #    与 DB 写失败对用户是同一件事：**没有豁免**）。不得报 ok，更不得宣称已豁免。
+        record_noop = prep.write_prep_file(
+            {
+                "origin_session_id": "sess-decline",
+                "origin_repo": str(repo),
+                "origin_cwd": str(repo),
+                "target_flow": "flow-1-self-rising",
+                "target_worktree": str(repo),
+                "target_kanban_task_id": "task-decline-noop",
+                "rvf_run": {
+                    "run_id": "run-decline-noop",
+                    "run_dir": str(tmp / "run"),
+                    "tracker_lease_id": "lse-does-not-exist",
+                },
+            },
+            root=prep_root,
+            token="cccccccccccccccc",
+        )
+        unwaived = cli.run_decline_dispatched_review(
+            token=record_noop.token, reason="想豁免但目标 lease 已不存在",
+            mark_declined_scope_units_review_not_required=True,
+            prep_root=prep_root, lock_root=lock_root, roots=roots, now=t0,
+        )
+        assert unwaived.status == "decline_incomplete", unwaived
+        assert unwaived.exit_code == cli.EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE, unwaived
+        assert unwaived.detail["review_not_required_declared"] is False, unwaived.detail
+        assert any(
+            step["step"] == "review_not_required_waiver"
+            for step in unwaived.detail["failed_steps"]
+        ), unwaived.detail
+        # message 必须如实：不出现成功路径那句「已把 scope 声明为不需审核」，且明说没豁免。
+        assert "并把本轮 scope 的 diff 声明为「不需审核」" not in unwaived.message, unwaived.message
+        assert "没有" in unwaived.message and "不需审核" in unwaived.message, unwaived.message
+        assert unwaived.next_steps, unwaived
+        noop_rows = read_jsonl(Path(unwaived.detail["declined_reason_ledger"]))
+        assert any(
+            r.get("token") == record_noop.token
+            and r.get("review_not_required_waiver_requested") is True
+            and r.get("review_not_required_waiver_declared") is False
+            for r in noop_rows
+        ), noop_rows
+    finally:
+        if prev_log_root is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = prev_log_root
 
 
 def test_agent_cli_error_paths_missing_and_terminal_tokens(tmp: Path) -> None:
@@ -7743,12 +9294,20 @@ def test_review_strictness_presets_schema(tmp: Path) -> None:
     assert standard["per_phase_model_selection_enabled"] is False
     assert light["per_phase_model_selection_enabled"] is False
 
-    # Tier-1 池全集 = {claude_code, codex, cursor}（R15/R20 补集 − 主 harness 在 S7 落地）。
-    assert set(data["reviewer_harness_pool_tier1_full_membership"]) == {
-        "claude_code",
-        "codex",
-        "cursor",
-    }
+    # Tier-1 池全集必须与出厂 reviewer-registry.json 逐字同源（R15/R20 补集 − 主 harness
+    # 在 S7 落地）。这里刻意**不再抄一份字面量**：两处各写一份 harness 名单，迟早会漂——
+    # 加 kimi_code / oh_my_pi 时就正好撞上，preset 里还写着三条而 registry 已是五条，
+    # 而这个断言当时是绿的（它只在验证自己抄得对不对）。
+    registry_harnesses = set(
+        json.loads(
+            (SCRIPT_DIR.parent / "config" / "reviewer-registry.json").read_text(
+                encoding="utf-8"
+            )
+        )["harnesses"]
+    )
+    assert (
+        set(data["reviewer_harness_pool_tier1_full_membership"]) == registry_harnesses
+    ), (data["reviewer_harness_pool_tier1_full_membership"], sorted(registry_harnesses))
 
 
 def test_candidate_summary_includes_committed_but_unreviewed(tmp: Path) -> None:
@@ -8102,6 +9661,574 @@ def test_candidate_summary_excludes_reviewed_committed_keeps_dirty(tmp: Path) ->
     )
 
 
+# ---------------------------------------------------------------------------
+# 「背靠背再问一轮」与「规模数字虚高」修复：dirty 侧已审观测 + 未审行数估算 + start 语义
+# ---------------------------------------------------------------------------
+
+def _dirty_reviewed_repo(tmp: Path):
+    """建一个 repo：``f.txt`` 已提交 base；会话 s1 把它改脏（**不提交**）并完整走过一轮 review。
+
+    终态 = 一个 ``observed_state='dirty'`` 且 ``review_state='reviewed'`` 的单元，归属 s1。
+    这正是「上一轮 RVF 刚审完、修复落盘还没提交」的现场——也就是背靠背再问一轮的那个现场。
+    """
+    dt, sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")  # dirty，刻意不 commit
+    # 归属用 allocator 的 auto-claim 播种：工作树观测到的 dirty 单元直接记到 s1 名下。比走
+    # transcript + build_manifest 更贴近本用例要断言的东西（tracker 里有一个 dirty+reviewed+owned
+    # 的单元），也不必依赖 apply_patch hunk 锚点在 dirty 侧对得上。
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    return dt, sm, repo, logs, baseline, alloc
+
+
+def _candidate_summary_for(summary_mod, repo: Path, logs: Path, **overrides):
+    kwargs = dict(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        log_root_override=logs,
+        workspace_guard=lambda **_k: None,
+        task_id_resolver=lambda _e: None,
+        session_id_resolver=lambda _e: "s1",
+        committed_baseline_resolver=lambda _rp, _t, _s: None,
+        committed_base_ref_resolver=lambda _rp: None,
+    )
+    kwargs.update(overrides)
+    return summary_mod.build_candidate_summary(**kwargs)
+
+
+def test_dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks(tmp: Path) -> None:
+    """背靠背场景的核心用例：上一轮审过的 dirty 行从**规模估算**里扣掉，但**候选集一个都不少**。
+
+    这是本次修复的形状：横幅原先只报文件级全量 delta，一次「刚审完、修复没提交」的再征询看起来
+    和一千多行全新工作一模一样。扣减只动数字，不动候选集——dirty 侧没有 commit 那种不可变锚点，
+    按 tracker 剔除路径就是凭空开漏审面。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+
+    # ① tracker 侧只读观测：dirty 单元已 reviewed，且能还原出被审过的行文本。
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["f.txt"], log_root_override=logs
+    )
+    assert "f.txt" in obs, obs
+    assert obs["f.txt"].reviewed_unit_count >= 1, obs["f.txt"]
+    assert "changed" in obs["f.txt"].reviewed_added_lines, obs["f.txt"]
+    assert "base" in obs["f.txt"].reviewed_deleted_lines, obs["f.txt"]
+    # 他 session / 无 session_id 视角一律拿不到已审证据（与 committed 侧同口径的保守方向）。
+    assert dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="sess-OTHER", candidate_paths=["f.txt"], log_root_override=logs
+    ).get("f.txt").reviewed_unit_count == 0
+    assert dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id=None, candidate_paths=["f.txt"], log_root_override=logs
+    ) == {}
+
+    # ② 候选摘要：候选集不缩小，但未审估算归零。
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert "f.txt" in by_path, summ["candidates"]
+    assert summ["candidate_path_count"] == 1
+    # 全量口径原样保留（下游既有断言不受影响）。
+    assert by_path["f.txt"]["nonblank_added_lines"] == 1
+    assert by_path["f.txt"]["nonblank_deleted_lines"] == 1
+    assert summ["bootstrap_size"]["total_nonblank_added_lines"] == 1
+    assert summ["bootstrap_size"]["total_nonblank_deleted_lines"] == 1
+    # 未审口径：已审那一行被扣掉。
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["f.txt"]["unreviewed_nonblank_deleted_lines"] == 0
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == 0 and est["nonblank_deleted_lines"] == 0, est
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_HUNK_FILTERED, est
+    assert est["hunk_filtered_path_count"] == 1 and est["fallback_path_count"] == 0, est
+    assert summ["strictness_reference_unreviewed_estimate"]["totals"]["nonblank_added_lines"] == 0
+
+    # ③ 横幅：把「已审 / 未审」两桶如实渲染出来，并对「未审为 0」给出 decline 建议。
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    assert "已在此前的 review 中审过" in rendered, rendered
+    assert "未审量为 0" in rendered and "decline" in rendered, rendered
+
+
+def test_dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review(
+    tmp: Path,
+) -> None:
+    """review 之后工作树**又改过** → 新内容推导出新 unit_id，tracker 里查不到 → 整份按未审计。
+
+    这是本估算唯一的失败方向，也是它敢做扣减的前提：身份是内容寻址的（canonical hash 不含 ``@@``
+    头），对不上就是新工作。若这里退化成「还是按上一轮扣」，修复本身就成了漏审源。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+
+    # 审完之后又写了新工作（同一个文件，内容变了）。
+    (repo / "f.txt").write_text("changed\nbrand-new-unreviewed-work\n", encoding="utf-8")
+
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["f.txt"], log_root_override=logs
+    )
+    assert obs["f.txt"].reviewed_unit_count == 0, obs["f.txt"]
+
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    # 全量 = 未审：一行都没扣。
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == by_path["f.txt"]["nonblank_added_lines"]
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == summ["bootstrap_size"]["total_nonblank_added_lines"] > 0, est
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_NO_REVIEWED_UNITS, est
+
+
+def test_dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match(tmp: Path) -> None:
+    """tracker 声称审过某些行、却一行都对不上 → 报 ``stale``、整份回退全量，横幅改口说实话。
+
+    自校验分支的专用用例（真实 git 状态下这一支很罕见，但它正是防「第二代假绿」的那道闸：一个
+    失效的扣减绝不能渲染成一次成功的扣减）。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    _dt2, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    (repo / "g.py").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    class _StaleObservation:
+        whole_path_identity_reviewed = False
+        reviewed_added_lines = ("a-line-that-is-not-in-the-diff",)
+        reviewed_deleted_lines = ()
+
+    summ = _candidate_summary_for(
+        summary_mod, repo, logs,
+        dirty_reviewed_change_resolver=lambda *_a: {"g.py": _StaleObservation()},
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION
+    )
+    est = summ["unreviewed_line_estimate"]
+    assert est["estimate_basis"] == summary_mod.ESTIMATE_BASIS_STALE_TRACKER_OBSERVATION, est
+    assert est["nonblank_added_lines"] == summ["bootstrap_size"]["total_nonblank_added_lines"] == 2
+    assert est["stale_observation_path_count"] == 1 and est["fallback_path_count"] == 1, est
+
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    # 诚实告警，而不是静默省略这一段（省略会被读成「没有已审的部分」）。
+    assert "估算不可用" in rendered and "全量" in rendered, rendered
+
+
+def test_dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity(tmp: Path) -> None:
+    """新增文件没有 hunk 锚点（``_canonical_hash_added`` 是整文件身份）→ 整条判定，不做行级折算。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    (repo / "n.py").write_text("one\ntwo\n", encoding="utf-8")  # untracked 新文件
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["n.py"], log_root_override=logs
+    )
+    assert obs["n.py"].unit_kind == "untracked_file", obs["n.py"]
+    assert obs["n.py"].whole_path_identity_reviewed is True, obs["n.py"]
+    assert obs["n.py"].reviewed_added_lines == (), obs["n.py"]  # 整条判定，不返回行
+
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert "n.py" in by_path  # 候选集仍不缩小
+    assert by_path["n.py"]["nonblank_added_lines"] == 2
+    assert by_path["n.py"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["n.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED
+    )
+
+
+def test_whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed(
+    tmp: Path,
+) -> None:
+    """整路径已审扣减**只覆盖 dirty 一半**，被扣的却是 baseline→工作树的合并 delta → 必须整份回退。
+
+    现场：同一路径上既有「本轮已提交但未审」的内容改动，又有「已审的 dirty chmod」（path_only 单元，
+    没有 hunk 锚点 → ``whole_path_identity_reviewed=True``）。修复前 ``_estimate_unreviewed_lines_for_path``
+    直接 ``return [], []``，把未审的已提交内容一并算成已审，横幅渲染出「⚠ 未审量为 0 …… 通常应当
+    decline」——把没审过的已提交工作说成审过了，是实打实的漏审诱导。
+
+    锁住的行为：未审量回到全量、basis 落在如实标注的回退取值、横幅改口说实话且不再建议 decline。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # ① 本轮提交、且从未被审的内容改动。
+    (repo / "g.py").write_text("committed-unreviewed-1\ncommitted-unreviewed-2\n", encoding="utf-8")
+    run(["git", "add", "g.py"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "committed round work"], cwd=repo)
+    head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    # ② 同一路径上的 dirty chmod：没有 hunk 锚点 → path_only 整路径身份单元。
+    os.chmod(repo / "g.py", 0o755)
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    obs = dt.select_dirty_path_reviewed_change_by_session(
+        repo=repo, session_id="s1", candidate_paths=["g.py"], log_root_override=logs
+    )
+    # 前提锚点：tracker 侧确实给出整路径已审观测（否则本用例会退化成空转的假绿）。
+    assert obs["g.py"].unit_kind == "path_only", obs["g.py"]
+    assert obs["g.py"].whole_path_identity_reviewed is True, obs["g.py"]
+
+    summ = _candidate_summary_for(
+        summary_mod, repo, logs,
+        committed_baseline_resolver=lambda _rp, _t, _s: baseline,
+    )
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["g.py"]["change_state"] == summary_mod.CHANGE_STATE_COMMITTED_AND_UNCOMMITTED
+    # 未审量 == 全量：一行都没扣（未审的已提交内容不再被冒充成已审）。
+    assert by_path["g.py"]["nonblank_added_lines"] == 2
+    assert by_path["g.py"]["unreviewed_nonblank_added_lines"] == 2
+    assert by_path["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+    )
+    est = summ["unreviewed_line_estimate"]
+    assert est["nonblank_added_lines"] == 2, est
+    assert est["estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+    ), est
+    # 回退必须计进 fallback 桶、且不得计进「扣减确实生效」桶——否则失效的扣减看起来仍像成功的扣减。
+    assert est["fallback_path_count"] == 1 and est["hunk_filtered_path_count"] == 0, est
+    assert (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED_SPANS_UNREVIEWED_COMMITTED
+        not in summary_mod.ESTIMATE_BASES_WITH_EFFECTIVE_DEDUCTION
+    )
+
+    # ③ 横幅：如实说明估算不可用，且不再渲染那句诱导 decline 的「未审量为 0」。
+    stop_hook = summary_mod._load_stop_hook_module()
+    rendered = "\n".join(
+        stop_hook._render_decision_point_unreviewed_estimate_lines(
+            unreviewed_estimate=est,
+            unreviewed_strictness=summ["strictness_reference_unreviewed_estimate"],
+            bootstrap=summ["bootstrap_size"],
+        )
+    )
+    assert "估算不可用" in rendered and "全量" in rendered, rendered
+    assert "已提交但未审" in rendered, rendered
+    assert "未审量为 0" not in rendered, rendered
+    # 也不能反过来谎称「拿不到 tracker 观测」——观测是有的，只是覆盖面窄于被扣的 delta。
+    assert "拿不到 tracker 观测" not in rendered, rendered
+
+    # ④ 反向锚点：同一现场、下界取到 HEAD（本轮无已提交层）→ delta 就是纯 dirty，扣减照常生效。
+    # 少了这一条，上面的修复可能是把所有整路径扣减一刀砍掉，而不是只砍跨层的那一支。
+    summ_head_baseline = _candidate_summary_for(
+        summary_mod, repo, logs,
+        committed_baseline_resolver=lambda _rp, _t, _s: head,
+    )
+    by_path_head = {c["path"]: c for c in summ_head_baseline["candidates"]}
+    assert by_path_head["g.py"]["change_state"] == summary_mod.CHANGE_STATE_UNCOMMITTED
+    assert by_path_head["g.py"]["reviewed_line_estimate_basis"] == (
+        summary_mod.ESTIMATE_BASIS_WHOLE_PATH_REVIEWED
+    )
+
+
+def test_dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units(
+    tmp: Path,
+) -> None:
+    """性能回归锁：dirty 已审观测只对「tracker 里真有本 session 已审单元」的候选路径付 git 代价。
+
+    这条观测在**每一次 Stop** 的轻量候选摘要里都跑，而 ``_classify_path`` 每条路径要起
+    ``git status`` / ``git diff --numstat`` / ``git diff -U3`` 等多个子进程。逐候选观测会让
+    ``stop_decision_candidate_summary`` 的「轻量」铁律随候选数线性破产（120 个 dirty 文件实测
+    ~7s 墙钟、其中不到 1s 是 CPU，其余全是子进程开销）。
+
+    断言用 ``_classify_path`` 的**调用集合**而不是墙钟：墙钟在负载下必 flake，调用集合是结构性的
+    —— 一旦有人改回逐候选观测，它立刻从 1 条涨到 12 条即红。
+
+    同时锁住这次提速**不许**换来的语义损失：返回值里一条候选路径都不能少（候选集永不因 tracker
+    数据缩小），且扣不掉的一律算未审。
+    """
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # 11 条「本 session 从没审过」的陪跑路径，先随 base 一起提交（此刻全是干净的）。
+    noise_paths = [f"noise_{i:02d}.txt" for i in range(11)]
+    for noise in noise_paths:
+        (repo / noise).write_text("base\n", encoding="utf-8")
+    run(["git", "add", *noise_paths], cwd=repo)
+    run(["git", "commit", "-q", "-m", "noise base"], cwd=repo)
+
+    # 只有 f.txt 被改脏并完整走过一轮 review → 它是唯一一条 tracker 里有 dirty+reviewed+owned 单元的路径。
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+
+    # review 之后陪跑路径才变脏 —— 它们在 tracker 里连单元都没有，更谈不上已审。
+    for noise in noise_paths:
+        (repo / noise).write_text("brand-new-unreviewed-work\n", encoding="utf-8")
+
+    candidate_paths = ["f.txt", *noise_paths]
+    classified_paths: list[str] = []
+    original_classify_path = dt._classify_path
+
+    def _counting_classify_path(repo_arg, path_arg):
+        classified_paths.append(path_arg)
+        return original_classify_path(repo_arg, path_arg)
+
+    dt._classify_path = _counting_classify_path
+    try:
+        obs = dt.select_dirty_path_reviewed_change_by_session(
+            repo=repo, session_id="s1", candidate_paths=candidate_paths, log_root_override=logs
+        )
+    finally:
+        dt._classify_path = original_classify_path
+
+    # ① 性能形状：只对唯一那条有已审单元的路径起 git 子进程。
+    assert classified_paths == ["f.txt"], classified_paths
+
+    # ② 语义不变：12 条候选一条不少，未审的照旧是未审。
+    assert set(obs) == set(candidate_paths), sorted(obs)
+    assert obs["f.txt"].reviewed_unit_count >= 1, obs["f.txt"]
+    assert "changed" in obs["f.txt"].reviewed_added_lines, obs["f.txt"]
+    for noise in noise_paths:
+        skipped = obs[noise]
+        assert skipped.reviewed_unit_count == 0, skipped
+        assert skipped.whole_path_identity_reviewed is False, skipped
+        assert skipped.reviewed_added_lines == () and skipped.reviewed_deleted_lines == (), skipped
+        # 跳过观测用独立 unit_kind 自陈，而不是伪装成一次真观测。
+        assert skipped.unit_kind == (
+            dt.DIRTY_REVIEWED_OBSERVATION_UNIT_KIND_SKIPPED_NO_REVIEWED_UNITS_IN_TRACKER
+        ), skipped
+
+    # ③ 下游摘要：候选集完整，只有已审那条被扣减，陪跑路径全额计入未审。
+    summ = _candidate_summary_for(summary_mod, repo, logs)
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert set(by_path) == set(candidate_paths), sorted(by_path)
+    assert by_path["f.txt"]["unreviewed_nonblank_added_lines"] == 0
+    assert by_path["f.txt"]["reviewed_line_estimate_basis"] == summary_mod.ESTIMATE_BASIS_HUNK_FILTERED
+    for noise in noise_paths:
+        assert by_path[noise]["unreviewed_nonblank_added_lines"] == (
+            by_path[noise]["nonblank_added_lines"]
+        ) > 0, by_path[noise]
+        assert by_path[noise]["reviewed_line_estimate_basis"] == (
+            summary_mod.ESTIMATE_BASIS_NO_REVIEWED_UNITS
+        ), by_path[noise]
+
+
+def _agentic_initiation_allocation_for(tmp: Path, repo: Path, logs: Path, transcript: Path, **kwargs):
+    """在隔离 log root 下调一次发起侧 tracker scope 分配（真实 allocator，不打桩）。"""
+    cli = load_rvf_agent_decision_cli_module()
+    original = os.environ.get("CODEX_RVF_LOG_ROOT")
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(logs)
+    try:
+        return cli, cli.allocate_agentic_initiation_tracker_review_scope(
+            repo=str(repo),
+            session_id="s1",
+            transcript_path=str(transcript),
+            run_id=kwargs.pop("run_id", "r-alloc"),
+            output_scope_path=tmp / "tracker-scope.json",
+            **kwargs,
+        )
+    finally:
+        if original is None:
+            os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+        else:
+            os.environ["CODEX_RVF_LOG_ROOT"] = original
+
+
+def test_start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything(
+    tmp: Path,
+) -> None:
+    """全已审的一批 diff 再 start → 报 ``no_unreviewed_scope``，**不**静默扩成无 lease 的全量重审。
+
+    这一条掐断的是背靠背闭环的发动机：旧行为下 allocator 报 empty 就降级成 manual-all-uncommitted，
+    而无 lease 的一轮审完标不了 reviewed，同一批 diff 于是在之后每一次 Stop 又被提议一遍。"""
+    dt, _sm, repo, logs, _baseline, _alloc = _dirty_reviewed_repo(tmp)
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE, allocation
+    assert allocation["tracker_lease_id"] is None, allocation  # 无 lease 泄漏
+    assert allocation["tracker_scope_path"] is None, allocation
+    assert allocation["allocator_status"] == "empty", allocation
+    assert "已全部审过" in (allocation["degradation_reason"] or ""), allocation
+
+    # 显式 --force-full-rescope → 回到历史降级口径（知情后重审的出口仍在）。
+    _cli2, forced = _agentic_initiation_allocation_for(
+        tmp, repo, logs, transcript, run_id="r-alloc-forced", force_full_rescope=True
+    )
+    assert forced["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, forced
+    assert forced["session_manifest_has_owned_paths"] is True, forced
+    assert "--force-full-rescope" in (forced["degradation_reason"] or ""), forced
+
+
+def test_start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease(
+    tmp: Path,
+) -> None:
+    """empty 的另一半成因（被在途 lease 持有）必须保持旧的「多审一遍」降级——并发下多审是安全的。
+
+    与上一条成对：修复只拆掉「全已审」那一支，绝不能顺手把并发路径也改掉。"""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="changed"
+    )
+    (repo / "f.txt").write_text("changed\n", encoding="utf-8")
+    held = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert held["status"] == "allocated", held  # lease 在途，**不** complete
+
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, allocation
+    assert allocation["session_manifest_has_owned_paths"] is True, allocation
+    # 成因判据看的是 review_state 分布，不是 allocator 的 leased_excluded_count（那个恒为 0，
+    # 因为 assigned 单元在候选查询阶段就被滤掉、走不到 anti-join）。
+    assert "assigned=1" in (allocation["degradation_reason"] or ""), allocation
+    assert "已全部审过" not in (allocation["degradation_reason"] or ""), allocation
+
+
+def test_start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units(
+    tmp: Path,
+) -> None:
+    """``path_only`` 已审单元在场 → **不**走「全已审」早退，保守回到旧的全量多审降级。
+
+    ``_canonical_hash_path_only`` 只哈希路径（不含 mode、不含 change 方向），所以 ``path_only``
+    的 ``reviewed`` 只证明「这个路径被审过一次」，证明不了「当前这次改动被审过」。本用例走一遍
+    chmod 往返来钉死这一点：``100644→100755`` 审掉并提交后，相反方向的 ``100755→100644`` 复用
+    同一个 unit_id、allocator 照样报 empty、计数照样是 ``reviewed=1``——早退分支若只看 review_state
+    分布，就会把一次真的没审过的可执行位回退静默跳掉。多审一遍只是浪费，跳过是漏审。"""
+    dt, _sm, _rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    logs = tmp / "logs"
+
+    # ① 第一次 mode 改动（100644 → 100755）：只有 mode 变，无内容 diff ⇒ tracker 兜底成 path_only。
+    os.chmod(repo / "f.txt", 0o755)
+    alloc = dt.allocate_review_scope(
+        repo=repo, session_id="s1", run_id="r1", reviewer_id="rev1",
+        log_root_override=logs, auto_claim_observed=True,
+    )
+    assert alloc["status"] == "allocated", alloc
+    tracker_dir = alloc["tracker_dir"]
+    first_units = _units_full_by_path(tracker_dir, "f.txt")
+    assert len(first_units) == 1, first_units
+    dt.complete_review_scope(
+        repo=repo, lease_id=alloc["lease_id"], scope_hash=alloc["scope_hash"], run_id="r1",
+        log_root_override=logs,
+    )
+    run(["git", "add", "-A"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "chmod +x"], cwd=repo)
+
+    # ② 相反方向的 mode 改动（100755 → 100644）：这是**没审过**的新工作。
+    os.chmod(repo / "f.txt", 0o644)
+
+    counts = dt.summarize_session_unit_review_states(
+        repo=repo, session_id="s1", log_root_override=logs
+    )
+    # 身份塌缩如实呈现：没有新单元，reviewed 那一行就是上一次 chmod 留下的 path_only。
+    assert _units_full_by_path(tracker_dir, "f.txt").keys() == first_units.keys()
+    assert counts["available"] == 0 and counts["assigned"] == 0, counts
+    assert counts["reviewed"] == 1, counts
+    assert counts["path_only_reviewed"] == 1, counts
+
+    transcript = _committed_round_transcript(
+        tmp, repo, session_id="s1", path="f.txt", old="base", new="base"
+    )
+    cli, allocation = _agentic_initiation_allocation_for(tmp, repo, logs, transcript)
+    # 关键断言：**不是** no_unreviewed_scope（那会让这次 mode 回退永远不被审）。
+    assert allocation["status"] != cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE, allocation
+    assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY, allocation
+    assert allocation["allocator_status"] == "empty", allocation
+    assert allocation["session_manifest_has_owned_paths"] is True, allocation
+    # 降级理由必须点名 path_only，否则读者只看到 reviewed=1/available=0 会以为早退分支坏了。
+    assert "path_only" in (allocation["degradation_reason"] or ""), allocation
+    assert "已全部审过" not in (allocation["degradation_reason"] or ""), allocation
+
+
+def test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag(
+    tmp: Path,
+) -> None:
+    """``run_start`` 拿到「无未审单元」→ 专用回执（非 start_failed），token 停在 acknowledged。
+
+    刻意不复用 ``_fail``：那会把一个正常结论渲染成故障，并诱导 agent 去 ``--retry`` 一个重试多少
+    次都一样的状态。回执必须同时给出 decline 与 ``--force-full-rescope`` 两条出路。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, now=t0)
+
+    def _pipeline_no_unreviewed(**_kwargs):
+        return {
+            "status": cli.PREPARE_STATUS_NO_UNREVIEWED_SCOPE,
+            "run_id": "run-nus", "run_dir": str(tmp / "runs" / "run-nus"),
+            "artifacts": {}, "error": None, "prep_token": None, "bootstrap_gate": None,
+            "initiation_run_id": "run-nus", "initiation_run_dir": str(tmp / "runs" / "run-nus"),
+            "tracker_scope_allocation": {
+                "status": cli.AGENTIC_INITIATION_TRACKER_SCOPE_NO_UNREVIEWED_SCOPE,
+                "tracker_scope_path": None, "tracker_lease_id": None, "tracker_scope_hash": None,
+                "tracker_unit_count": 0, "session_manifest_has_owned_paths": True,
+                "degradation_reason": "tracker 报本会话名下**没有任何未审单元**", "allocator_status": "empty",
+                "error": None,
+            },
+        }
+
+    result = cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_pipeline_no_unreviewed,
+    )
+    assert result.status == "no_unreviewed_scope", result
+    assert result.exit_code == cli.EXIT_NO_UNREVIEWED_SCOPE, result
+    assert result.token_state == dts.STATE_ACKNOWLEDGED, result
+    assert "已全部审过" in result.message, result.message
+    steps = "\n".join(result.next_steps or [])
+    assert "decline" in steps and "--force-full-rescope" in steps, steps
+    # token 仍是非终态：decline 这条出路必须真的还走得通。
+    declined = cli.run_decline(token=tok, reason="上一轮 RVF 产物，无未审单元", roots=roots, now=t0)
+    assert declined.exit_code == cli.EXIT_OK, declined
+
+
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
         # --- S2：候选摘要 + 严格度参考档 ---
@@ -8168,6 +10295,67 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "candidate_summary_excludes_reviewed_committed_keeps_dirty",
             lambda: test_candidate_summary_excludes_reviewed_committed_keeps_dirty(
                 root / "s6-summary-excludes-reviewed-committed"
+            ),
+        ),
+        # --- 背靠背再问一轮 / 规模数字虚高：dirty 已审观测 + 未审估算 + start 语义 ---
+        (
+            "dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks",
+            lambda: test_dirty_reviewed_lines_deducted_but_candidate_set_never_shrinks(
+                root / "dirty-reviewed-deducted"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review",
+            lambda: test_dirty_unreviewed_estimate_falls_back_to_full_when_worktree_changed_after_review(
+                root / "dirty-unreviewed-worktree-changed"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match",
+            lambda: test_dirty_unreviewed_estimate_reports_stale_when_reviewed_lines_do_not_match(
+                root / "dirty-unreviewed-stale"
+            ),
+        ),
+        (
+            "dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity",
+            lambda: test_dirty_unreviewed_estimate_treats_new_file_as_whole_path_identity(
+                root / "dirty-unreviewed-new-file"
+            ),
+        ),
+        (
+            "whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed",
+            lambda: test_whole_path_reviewed_deduction_falls_back_when_delta_spans_unreviewed_committed(
+                root / "whole-path-reviewed-spans-committed"
+            ),
+        ),
+        (
+            "dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units",
+            lambda: test_dirty_reviewed_observation_only_pays_git_for_paths_with_tracker_reviewed_units(
+                root / "dirty-reviewed-observation-narrowed-git"
+            ),
+        ),
+        (
+            "start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything",
+            lambda: test_start_reports_no_unreviewed_scope_instead_of_silently_rescoping_everything(
+                root / "start-no-unreviewed-scope"
+            ),
+        ),
+        (
+            "start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease",
+            lambda: test_start_keeps_legacy_degradation_when_units_are_held_by_an_in_flight_lease(
+                root / "start-leased-excluded-degradation"
+            ),
+        ),
+        (
+            "start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units",
+            lambda: test_start_keeps_legacy_degradation_when_session_owns_reviewed_path_only_units(
+                root / "start-path-only-chmod-roundtrip"
+            ),
+        ),
+        (
+            "run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag",
+            lambda: test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force_flag(
+                root / "run-start-no-unreviewed-scope"
             ),
         ),
         (
@@ -8311,6 +10499,54 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "dispatch_reviewers_reroutes_on_leg_without_review_result",
+            lambda: test_dispatch_reviewers_reroutes_on_leg_without_review_result(
+                root / "dispatch-reroute-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_failclose_when_leg_without_review_result_unfilled",
+            lambda: test_dispatch_reviewers_failclose_when_leg_without_review_result_unfilled(
+                root / "dispatch-failclose-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_rc_zero_without_review_result_is_not_effective",
+            lambda: test_dispatch_reviewers_rc_zero_without_review_result_is_not_effective(
+                root / "dispatch-rc0-no-result"
+            ),
+        ),
+        (
+            "dispatch_reviewers_review_request_leg_is_pending_not_rerouted",
+            lambda: test_dispatch_reviewers_review_request_leg_is_pending_not_rerouted(
+                root / "dispatch-review-request-pending"
+            ),
+        ),
+        (
+            "dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit",
+            lambda: test_dispatch_reviewers_usage_limit_with_pending_request_is_not_all_usage_limit(
+                root / "dispatch-usage-plus-request"
+            ),
+        ),
+        (
+            "dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock",
+            lambda: test_dispatch_reviewers_blocked_on_reviewer_request_exit_code_frees_detached_lock(
+                root / "dispatch-blocked-request-exit-code"
+            ),
+        ),
+        (
+            "dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure",
+            lambda: test_dispatch_reviewers_failclose_mixed_usage_limit_and_auth_failure(
+                root / "dispatch-failclose-mixed"
+            ),
+        ),
+        (
+            "dispatch_reviewers_wait_status_surfaces_plan_outcome",
+            lambda: test_dispatch_reviewers_wait_status_surfaces_plan_outcome(
+                root / "dispatch-wait-plan-outcome"
+            ),
+        ),
+        (
             "diff_tracker_observes_committed_round_units",
             lambda: test_diff_tracker_observes_committed_round_units(root / "committed-observe"),
         ),
@@ -8397,6 +10633,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "review_highwater_write_is_monotonic_with_repo",
             lambda: test_review_highwater_write_is_monotonic_with_repo(root / "highwater-monotonic"),
+        ),
+        (
+            "parent_harness_identity_normalizes_every_signal_layer_to_one_token",
+            lambda: test_parent_harness_identity_normalizes_every_signal_layer_to_one_token(
+                root / "harness-identity-layers"
+            ),
+        ),
+        (
+            "round_baseline_marker_is_not_shared_across_parent_harnesses",
+            lambda: test_round_baseline_marker_is_not_shared_across_parent_harnesses(
+                root / "round-baseline-per-harness"
+            ),
+        ),
+        (
+            "exact_harness_scope_marker_candidates_outrank_unspecified_fallback",
+            lambda: test_exact_harness_scope_marker_candidates_outrank_unspecified_fallback(
+                root / "marker-precision-ordering"
+            ),
+        ),
+        (
+            "scope_markers_do_not_collide_across_repositories_sharing_a_task_id",
+            lambda: test_scope_markers_do_not_collide_across_repositories_sharing_a_task_id(
+                root / "marker-repo-identity"
+            ),
         ),
         (
             "committed_observation_excludes_base_branch_sync_merge",
@@ -8498,6 +10758,37 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_captures_round_baseline",
             lambda: test_rvf_user_prompt_submit_captures_round_baseline(root / "round-baseline-capture"),
         ),
+        # --- 带外投递的发起横幅落地（INV-A 达成信号 / 不 arm 锁 / 检测器互斥 / 撤回中和） ---
+        (
+            "rvf_user_prompt_submit_observes_delivered_decision_point_banner",
+            lambda: test_rvf_user_prompt_submit_observes_delivered_decision_point_banner(
+                root / "banner-observed"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_never_arms_in_flight_lock(
+                root / "banner-no-arm"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector",
+            lambda: test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector(
+                root / "banner-detectors"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing",
+            lambda: test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing(
+                root / "banner-withdrawn"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced",
+            lambda: test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
+                root / "banner-expired-not-advanced"
+            ),
+        ),
         (
             "allocate_review_scope_includes_committed_round",
             lambda: test_allocate_review_scope_includes_committed_round(root / "committed-allocate-e2e"),
@@ -8559,6 +10850,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist",
             lambda: test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist(
                 root / "prompt-submit-revive"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_declines_reviving_stale_prep",
+            lambda: test_rvf_user_prompt_submit_declines_reviving_stale_prep(
+                root / "prompt-submit-stale-revive"
             ),
         ),
         (
@@ -8658,9 +10955,21 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
-            "rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject",
-            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_does_not_reinject(
+            "rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_is_overridden_by_user(
                 root / "prompt-submit-manual-cooldown"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure",
+            lambda: test_rvf_user_prompt_submit_manual_declined_cooldown_override_survives_clear_failure(
+                root / "prompt-submit-manual-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker",
+            lambda: test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker(
+                root / "prompt-submit-manual-breaker-exempt"
             ),
         ),
         (
@@ -8813,6 +11122,10 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "contract_check_parallel_test_steps_record_parallel_timing",
             lambda: test_contract_check_parallel_test_steps_record_parallel_timing(),
+        ),
+        (
+            "contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third",
+            lambda: test_contract_check_parallel_jobs_derive_from_host_cpu_capped_at_one_third(),
         ),
         (
             "contract_check_timing_report_accounts_internal_steps",
@@ -8979,6 +11292,88 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate",
+            lambda: test_prepare_from_prep_file_waits_for_local_base_bootstrap_with_recoverable_gate(
+                root / "bootstrap-gate-waiting"
+            ),
+        ),
+        (
+            "bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed",
+            lambda: test_bootstrap_gate_reconciles_receipt_conflict_and_tamper_fail_closed(
+                root / "bootstrap-gate-conflict-tamper"
+            ),
+        ),
+        (
+            "bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising",
+            lambda: test_bootstrap_gate_reports_artifact_loss_and_opt_in_withdrawal_without_raising(
+                root / "bootstrap-gate-artifact-loss"
+            ),
+        ),
+        (
+            "bootstrap_gate_never_carries_environment_or_credential_values",
+            lambda: test_bootstrap_gate_never_carries_environment_or_credential_values(
+                root / "bootstrap-gate-no-env-leak"
+            ),
+        ),
+        (
+            "agent_cli_start_parks_on_bootstrap_then_resumes_same_run",
+            lambda: test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run(
+                root / "bootstrap-agent-cli-resume"
+            ),
+        ),
+        (
+            "ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock",
+            lambda: test_ups_stamps_waiting_bootstrap_onto_armed_kanban_followup_lock(
+                root / "bootstrap-ups-lock-stamp"
+            ),
+        ),
+        (
+            "bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end",
+            lambda: test_bootstrap_replay_after_receipt_reuses_the_same_run_end_to_end(
+                root / "bootstrap-replay-same-run"
+            ),
+        ),
+        (
+            "held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered",
+            lambda: test_held_bootstrap_gate_persists_verified_receipt_digest_so_swapped_receipt_is_tampered(
+                root / "bootstrap-gate-digest-writeback"
+            ),
+        ),
+        (
+            "bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts",
+            lambda: test_bootstrap_gate_g0_rejects_forged_origin_run_lineage_and_lost_run_artifacts(
+                root / "bootstrap-gate-g0-forgery"
+            ),
+        ),
+        (
+            "bootstrap_gate_recovers_when_local_base_advances_during_the_wait",
+            lambda: test_bootstrap_gate_recovers_when_local_base_advances_during_the_wait(
+                root / "bootstrap-gate-base-advanced"
+            ),
+        ),
+        (
+            "agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait",
+            lambda: test_agent_cli_start_retry_resumes_after_local_base_advances_during_the_wait(
+                root / "bootstrap-agent-cli-base-advanced"
+            ),
+        ),
+        (
+            "agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once",
+            lambda: test_agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once(
+                root / "bootstrap-agent-cli-replay-claim"
+            ),
+        ),
+        (
+            "bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess",
+            lambda: test_bootstrap_replay_hard_bounds_a_stuck_prepare_in_a_killable_subprocess(
+                root / "bootstrap-replay-hard-deadline"
+            ),
+        ),
+        (
+            "alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification",
+            lambda: test_alternative_reviewer_config_helper_call_sites_declare_idle_timeout_classification(),
+        ),
+        (
             "alternative_reviewer_prompt_uses_session_env_refs",
             lambda: test_alternative_reviewer_prompt_uses_session_env_refs(root / "alternative-prompt-env"),
         ),
@@ -9067,6 +11462,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "alternative_reviewer_idle_timeout_flag",
             lambda: test_alternative_reviewer_idle_timeout_flag(root / "alternative-timeout"),
+        ),
+        (
+            "alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups",
+            lambda: test_alternative_reviewer_delivers_entire_prompt_over_stdin_despite_watchdog_wakeups(
+                root / "alternative-prompt-stdin-delivery"
+            ),
+        ),
+        (
+            "alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer",
+            lambda: test_alternative_reviewer_stdin_writer_thread_start_failure_cleans_up_reviewer(
+                root / "alternative-prompt-stdin-writer-start-failure"
+            ),
         ),
         (
             "alternative_reviewer_activity_probe_keeps_silent_reviewer_alive",
@@ -9549,6 +11956,42 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_tracker_schema_v4_rebuilds_legacy_tombstoned_review_state(root / "lease-T0b"),
         ),
         (
+            "declare_units_review_not_required_survives_tracker_refresh",
+            lambda: test_declare_units_review_not_required_survives_tracker_refresh(
+                root / "waiver-T1"
+            ),
+        ),
+        (
+            "declare_units_review_not_required_is_not_inherited_by_changed_hunk",
+            lambda: test_declare_units_review_not_required_is_not_inherited_by_changed_hunk(
+                root / "waiver-T2"
+            ),
+        ),
+        (
+            "allocate_review_scope_unions_prior_scope_after_lease_expiry",
+            lambda: test_allocate_review_scope_unions_prior_scope_after_lease_expiry(
+                root / "union-T1"
+            ),
+        ),
+        (
+            "invalidate_reviewed_units_for_run_excludes_review_not_required_declarations",
+            lambda: test_invalidate_reviewed_units_for_run_excludes_review_not_required_declarations(
+                root / "waiver-T3"
+            ),
+        ),
+        (
+            "allocate_review_scope_union_list_excludes_units_held_by_active_lease",
+            lambda: test_allocate_review_scope_union_list_excludes_units_held_by_active_lease(
+                root / "union-T2"
+            ),
+        ),
+        (
+            "kanban_followup_trigger_transcript_scan_reads_only_bounded_tail",
+            lambda: test_kanban_followup_trigger_transcript_scan_reads_only_bounded_tail(
+                root / "trigger-presence-scan-T1"
+            ),
+        ),
+        (
             "lease_acquire_creates_lease_and_assigns_units",
             lambda: test_lease_acquire_creates_lease_and_assigns_units(root / "lease-T1"),
         ),
@@ -9771,6 +12214,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_decision_token_declined_fingerprint_cooldown_write_query(root / "dts-cooldown"),
         ),
         (
+            "decision_token_mint_explicit_user_request_clears_declined_cooldown",
+            lambda: test_decision_token_mint_explicit_user_request_clears_declined_cooldown(
+                root / "dts-user-clears-cooldown"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails",
+            lambda: test_decision_token_mint_explicit_user_request_reports_override_even_when_cooldown_clear_fails(
+                root / "dts-user-cooldown-clear-fails"
+            ),
+        ),
+        (
+            "decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker",
+            lambda: test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(
+                root / "dts-user-breaker-exempt"
+            ),
+        ),
+        (
             "decision_token_mint_circuit_breaker_window",
             lambda: test_decision_token_mint_circuit_breaker_window(root / "dts-breaker"),
         ),
@@ -9812,8 +12273,50 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_agent_cli_dispatch_finalizes_scope_and_records_strictness(root / "agent-cli-dispatch"),
         ),
         (
+            "agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff",
+            lambda: test_agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff(
+                root / "agent-cli-start-receipt"
+            ),
+        ),
+        (
+            "agent_cli_start_consumes_review_reopen_marker_before_allocate",
+            lambda: test_agent_cli_start_consumes_review_reopen_marker_before_allocate(
+                root / "agent-cli-start-reopen"
+            ),
+        ),
+        (
+            "agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub",
+            lambda: test_agent_cli_dispatch_refuses_while_scope_of_work_is_still_the_hook_written_stub(
+                root / "agent-cli-dispatch-stub-gate"
+            ),
+        ),
+        (
+            "agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure",
+            lambda: test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(
+                root / "agent-cli-dispatch-request"
+            ),
+        ),
+        (
+            "default_reviewer_dispatcher_speaks_detached_execute_contract",
+            lambda: test_default_reviewer_dispatcher_speaks_detached_execute_contract(
+                root / "agent-cli-dispatcher-detached"
+            ),
+        ),
+        (
+            "kanban_followup_lock_key_separates_colliding_task_ids_across_repositories",
+            lambda: test_kanban_followup_lock_key_separates_colliding_task_ids_across_repositories(
+                root / "followup-lock-repo-key"
+            ),
+        ),
+        (
             "agent_cli_decline_persists_reason_and_cooldown",
             lambda: test_agent_cli_decline_persists_reason_and_cooldown(root / "agent-cli-decline"),
+        ),
+        (
+            "agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives",
+            lambda: test_agent_cli_decline_dispatched_review_clears_lock_and_optionally_waives(
+                root / "agent-cli-decline-dispatched"
+            ),
         ),
         (
             "agent_cli_error_paths_missing_and_terminal_tokens",
@@ -9911,6 +12414,9 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
+        # 注意：``RVF_HOME`` 的强制隔离**不在这里**，而在本文件模块导入期（见文件顶部
+        # ``_ISOLATED_RVF_HOME_FOR_TESTS``）。放在 ``main()`` 里只能盖住手写 runner 这一条
+        # 入口，bare pytest 直接收集本文件时不经过 ``main()`` ⇒ 隔离整个失效。别再往回搬。
         cases = selected_test_cases(
             review_support_test_cases(root),
             shard_count=args.shard_count,
@@ -9977,7 +12483,9 @@ _alt.inject(
     run=run,
     read_jsonl=read_jsonl,
     init_repo=init_repo,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     clean_review_result_python=clean_review_result_python,
     load_diff_tracker_module=load_diff_tracker_module,
     _slice_2b_repo_with_two_dirty=_slice_2b_repo_with_two_dirty,
@@ -9998,6 +12506,7 @@ from _rvf_review_support import rvf_user_prompt_submit_hook as _ups
 _ups.inject(
     run=run,
     read_jsonl=read_jsonl,
+    init_repo=init_repo,
     load_rvf_user_prompt_submit_module=load_rvf_user_prompt_submit_module,
     load_rvf_prep_file_module=load_rvf_prep_file_module,
     load_kanban_followup_lock_module=load_kanban_followup_lock_module,
@@ -10019,7 +12528,9 @@ _altrev.inject(
     load_alternative_reviewer_module=load_alternative_reviewer_module,
     read_jsonl=read_jsonl,
     run=run,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _cursor_tool_call_line=_cursor_tool_call_line,
 )
 globals().update({_n: getattr(_altrev, _n) for _n in _altrev.__all__})
@@ -10057,12 +12568,19 @@ _disprev.inject(
     load_dispatch_reviewers_module=load_dispatch_reviewers_module,
     load_harness_limit_cooldown_module=load_harness_limit_cooldown_module,
     write_fake_tmux_script=write_fake_tmux_script,
-    write_alternative_reviewer_config=write_alternative_reviewer_config,
+    write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse=write_alternative_reviewer_config_with_idle_timeout_as_hang_prevention_fuse,
+    HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS=HANG_PREVENTION_ACTIVITY_PROBE_TIMEOUT_SECONDS,
+    write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior=write_alternative_reviewer_config_with_idle_timeout_as_asserted_timeout_behavior,
     _dispatch_registry=_dispatch_registry,
     _make_usage_or_clean_registry=_make_usage_or_clean_registry,
     _with_cooldown_env=_with_cooldown_env,
     init_repo=init_repo,
     SCRIPT_DIR=SCRIPT_DIR,
+    # detached 幂等锁的 staleness 现场构造器：dispatch 侧「非完成态终态退出码 ⇒ 锁可重夺」
+    # 的闭合断言要用（退出码语义归 dispatch_reviewers.py 所有，故断言留在本簇）。
+    load_rvf_detached_thread_module=load_rvf_detached_thread_module,
+    _seed_detached_stale_lock=_seed_detached_stale_lock,
+    _launch_detached_with_staleness_env=_launch_detached_with_staleness_env,
 )
 globals().update({_n: getattr(_disprev, _n) for _n in _disprev.__all__})
 
@@ -10122,6 +12640,16 @@ _preprev.inject(
     PREPARE_REVIEW_RUN=PREPARE_REVIEW_RUN,
     COMMAND_LOCK=COMMAND_LOCK,
     APPLY_WORKTREE_BOOTSTRAP=APPLY_WORKTREE_BOOTSTRAP,
+    # pre-review local-base bootstrap 等待生命周期簇所需（进程内直调 prepare / gate / 入口 A CLI）。
+    load_prepare_review_run_module=load_prepare_review_run_module,
+    load_rvf_bootstrap_gate_module=load_rvf_bootstrap_gate_module,
+    load_rvf_prep_file_module=load_rvf_prep_file_module,
+    load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
+    load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,
+    load_rvf_user_prompt_submit_module=load_rvf_user_prompt_submit_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    _agent_cli_roots=_agent_cli_roots,
+    _mint_agent_decision_token=_mint_agent_decision_token,
 )
 globals().update({_n: getattr(_preprev, _n) for _n in _preprev.__all__})
 

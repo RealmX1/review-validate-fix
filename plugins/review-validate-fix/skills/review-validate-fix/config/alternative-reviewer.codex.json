@@ -25,9 +25,27 @@
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],
+  "_comment_health_command_must_share_the_real_dispatch_entrypoint": [
+    "为什么 health_command 是一次真实的 `exec` 调用、而不是 `codex login status`：理由同 claude/cursor",
+    "两份模板——旁路查询命令不是真实可用性的充分判据，只有走评审那条命令路径的探针才是。",
+    "",
+    "`--disable hooks` 必须【显式】写在这里：派发命令是在运行期由 ensure_codex_hooks_disabled_command",
+    "注入它的，而探针不经过那条注入路径。漏掉它，探针自己就会触发本机的 RVF Stop hook——",
+    "即每一轮 RVF 的可用性检查都会在探针里再起一轮 RVF。",
+    "",
+    "prompt 走位置参数而不是 `-`：`-` 是 stdin 占位符，而 run_health 不喂 stdin，照搬会挂到超时。"
+  ],
   "health_command": [
     "codex",
-    "login",
-    "status"
+    "--ask-for-approval",
+    "never",
+    "--disable",
+    "hooks",
+    "exec",
+    "--json",
+    "--ephemeral",
+    "--sandbox",
+    "workspace-write",
+    "Reply with exactly: OK"
   ]
 }

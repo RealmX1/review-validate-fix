@@ -15,4 +15,5 @@ from core.reviewer_harness_selection.reviewer_harness_selection import (  # noqa
     ReviewerHarnessSelection,
     compute_reviewer_harness_selection,
     pseudo_random_select_from_eligible_pool,
+    pseudo_random_select_two_avoiding_shared_quota_pool,
 )

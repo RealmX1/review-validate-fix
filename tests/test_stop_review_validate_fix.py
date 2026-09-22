@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from _rvf_test_support.repo import templated_repo
+from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
     assert_every_defined_test_is_registered,
     registered_names_from_callables,
@@ -834,7 +835,25 @@ def test_stop_hook_active_skips(tmp_path: Path) -> None:
     dirty = init_repo(tmp_path / "dirty", dirty=True)
     stdout, _ = invoke({"cwd": str(dirty), "stop_hook_active": True})
     payload = assert_skip_reason(stdout, "stop_hook_active=true")
+    # host 未标明 → 兜底 Codex。
     assert "detail=Codex 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
+
+
+def test_stop_hook_active_skip_names_the_current_host_not_a_hardcoded_one(
+    tmp_path: Path,
+) -> None:
+    """同一条诊断在 Claude 会话里必须说 "Claude Code"——写死 host 名会指错报错主体。"""
+    dirty = init_repo(tmp_path / "dirty", dirty=True)
+    stdout, _ = invoke(
+        {
+            "cwd": str(dirty),
+            "stop_hook_active": True,
+            "source": {"provider": "claude-code", "plugin": "review-validate-fix"},
+        }
+    )
+    payload = assert_skip_reason(stdout, "stop_hook_active=true")
+    assert "detail=Claude Code 已在执行 Stop hook，RVF 跳过以避免递归" in payload["systemMessage"]
+    assert "Codex 已在执行" not in payload["systemMessage"], payload["systemMessage"]
 
 
 def test_codex_goal_mode_skips_direct_stop_hook(tmp_path: Path) -> None:
@@ -2595,7 +2614,11 @@ def test_review_reopen_marker_reopens_run_scope_before_dispatch(tmp_path: Path) 
             "session_id": "session-reopen-1",
             "last_user_message": "ok, continuing",
         },
-        extra_env={"KANBAN_TASK_ID": "reopent1"},
+        # P1 之后**默认**发起路径是「注入决策点横幅 → agent 显式 rvf-agent start」，消费点随之
+        # 移到 start 侧（见 rvf_agent_decision_cli._consume_review_reopen_marker_before_allocate
+        # 与其专测）。本用例覆盖的是 Stop hook 保留的**显式延续 transport** 那条路径，故显式点名
+        # kanban-followup；两条入口共用 review_reopen_marker 里的同一份消费实现。
+        extra_env={"KANBAN_TASK_ID": "reopent1", "CODEX_RVF_FORK_MODE": "kanban-followup"},
         state_dir=state,
     )
 
@@ -2654,7 +2677,8 @@ def test_review_reopen_marker_stale_is_discarded_without_reopen(tmp_path: Path) 
             "session_id": "session-reopen-2",
             "last_user_message": "ok, continuing",
         },
-        extra_env={"KANBAN_TASK_ID": "reopent2"},
+        # 同上：走 Stop hook 保留的显式延续 transport（默认路径的消费点已移到 rvf-agent start）。
+        extra_env={"KANBAN_TASK_ID": "reopent2", "CODEX_RVF_FORK_MODE": "kanban-followup"},
         state_dir=state,
     )
 
@@ -2667,11 +2691,15 @@ def test_review_reopen_marker_stale_is_discarded_without_reopen(tmp_path: Path) 
     assert discarded[-1]["reason_code"] == "review_reopen_stale"
 
 
-def _seed_followup_lock(state: Path, task_id: str, run_id: str) -> Path:
+def _seed_followup_lock(state: Path, task_id: str, run_id: str, repo: Path) -> Path:
     """Write an active kanban-followup in-progress lock file directly."""
     lock_dir = state / "kanban-followup-in-progress"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock = lock_dir / f"task-{task_id}.json"
+    # 文件名现算：锁 key 含仓身份（见 kanban_followup_lock.marker_paths），硬编码会写出一份
+    # 生产代码永远读不到的锁，断言反而「通过」。
+    lock = lock_dir / in_progress_lock_marker_name(
+        load_kanban_followup_lock_module(), repo=repo, task_id=task_id
+    )
     lock.write_text(
         json.dumps(
             {
@@ -2702,7 +2730,7 @@ def test_review_reopen_reconciles_abandoned_followup_lock(tmp_path: Path) -> Non
     assert before >= 1
 
     # 一把仍 active 的 followup 锁（属被放弃 run），原本会 6h 空转阻塞下次 dispatch。
-    lock = _seed_followup_lock(state, "reopent3", abandoned_followup)
+    lock = _seed_followup_lock(state, "reopent3", abandoned_followup, repo)
     marker = _seed_review_reopen_marker(state, "reopent3", impl_run_id, repo)
     assert lock.exists() and marker.exists()
 
@@ -2713,7 +2741,9 @@ def test_review_reopen_reconciles_abandoned_followup_lock(tmp_path: Path) -> Non
             "session_id": "session-reopen-3",
             "last_user_message": "ok, continuing",
         },
-        extra_env={"KANBAN_TASK_ID": "reopent3"},
+        # 锁的 reopen 对账在 gate **之前**、与发起路径无关；但 marker 的消费在发起路径上，故
+        # 同样显式点名延续 transport（默认路径的消费点已移到 rvf-agent start）。
+        extra_env={"KANBAN_TASK_ID": "reopent3", "CODEX_RVF_FORK_MODE": "kanban-followup"},
         state_dir=state,
     )
 
@@ -3688,7 +3718,7 @@ def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_pat
     )
     # Precondition that reproduced the bug: round-baseline alone == HEAD → empty window.
     assert rbm.resolve_round_baseline_head(
-        task_id=None, session_id=session_id, root=state
+        task_id=None, session_id=session_id, repo=str(repo), root=state
     ) == c2
 
     # Stop hook must prefer high-water (C1) and surface the orphan C1..C2 (g.txt) in the injected
@@ -4025,11 +4055,15 @@ def test_stop_event_log_path_is_not_used_as_fork_rollout_path(tmp_path: Path) ->
 def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) -> None:
     tmp_path.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state"
+    # cwd 必须是真实 git 仓：锁 key 含仓身份，清锁侧要按同一身份才定位得到这把锁。
+    repo = init_repo_with_head(tmp_path / "repo")
     handoff = tmp_path / "handoff.md"
     handoff.write_text("# handoff\n", encoding="utf-8")
     marker_dir = state / "kanban-followup-in-progress"
     marker_dir.mkdir(parents=True)
-    marker_path = marker_dir / "task-task-active.json"
+    marker_path = marker_dir / in_progress_lock_marker_name(
+        load_kanban_followup_lock_module(), repo=repo, task_id="task-active"
+    )
     marker_path.write_text(
         json.dumps(
             {
@@ -4051,7 +4085,7 @@ def test_handoff_file_clears_kanban_followup_in_progress_marker(tmp_path: Path) 
 
     stdout, _ = invoke(
         {
-            "cwd": str(tmp_path),
+            "cwd": str(repo),
             "session_id": "session-active",
             "stop_hook_active": False,
             "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
@@ -4874,6 +4908,7 @@ def test_resolve_cline_kanban_agent_id_mirrors_parent_harness(tmp_path: Path) ->
 from _rvf_stop_hook_support import kanban_followup_dispatch_and_lock as _kbfu
 _kbfu.inject(
     SCRIPT=SCRIPT,
+    run=run,
     init_repo=init_repo,
     init_repo_with_head=init_repo_with_head,
     invoke=invoke,
@@ -4894,6 +4929,35 @@ globals().update({_n: getattr(_kbfu, _n) for _n in _kbfu.__all__})
 
 # 有界拆分：cline-kanban stop-hook 派发 测试簇（9 个）移入子模块；模块级 inject 共享依赖后重绑测试名（def main() 之前），
 # 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。注册顺序 / 分片身份保持不变。
+# 有界拆分：发起决策点横幅的**带外投递** 测试簇（8 个，本轮新增）移入子模块；模块级 inject 共享依赖后重绑测试名，
+# 让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
+from _rvf_stop_hook_support import decision_point_out_of_band_delivery as _f2oob
+_f2oob.inject(
+    SCRIPT=SCRIPT,
+    assert_decision_point_injection=assert_decision_point_injection,
+    decision_token_records=decision_token_records,
+    init_repo=init_repo,
+    injection_attempt_records=injection_attempt_records,
+    invoke=invoke,
+    latest_events=latest_events,
+    latest_summary=latest_summary,
+    load_hook_module=load_hook_module,
+    load_kanban_followup_lock_module=load_kanban_followup_lock_module,
+    parse_json=parse_json,
+    rvf_home_dir=rvf_home_dir,
+)
+globals().update({_n: getattr(_f2oob, _n) for _n in _f2oob.__all__})
+
+
+# 有界拆分：决策 token store 的**并发互斥**与**熔断额度记账** 测试簇（7 个）移入子模块；
+# 模块级 inject 共享依赖后重绑测试名，让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
+from _rvf_stop_hook_support import (
+    decision_point_token_store_concurrency_and_breaker as _f2tokenstore,
+)
+_f2tokenstore.inject(SCRIPT=SCRIPT)
+globals().update({_n: getattr(_f2tokenstore, _n) for _n in _f2tokenstore.__all__})
+
+
 from _rvf_stop_hook_support import cline_kanban_stop_hook_dispatch as _f2clkb
 _f2clkb.inject(
     assert_decision_point_injection=assert_decision_point_injection,
@@ -5138,13 +5202,25 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
     _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
 
     # ② in-process 对齐 invoke 的隔离根,驱动 CLI 决策链。
+    # ⚠ `RVF_KANBAN_FOLLOWUP_LOCK_ROOT` 必须一并隔离：`run_start` 成功后会 arm 在途凭证
+    # （arm_accepted_review_run_in_flight_receipt），而 kanban_followup_lock 的落盘根**不认**
+    # `$RVF_HOME`，只认这一条专用 env。`invoke()` 只把它设给了子进程，in-process 这段不设就会
+    # 把 marker 写进真实 `~/.rvf/kanban-followup-in-progress`（live infra 污染，实测已积压多份
+    # `sess-e2e-dogfood-session--repo-dirty-*.json`）。
     saved_env = {
         k: os.environ.get(k)
-        for k in ("RVF_HOME", "CODEX_RVF_STATE_DIR", "CODEX_RVF_PREP_ROOT", "CODEX_RVF_LOG_ROOT")
+        for k in (
+            "RVF_HOME",
+            "CODEX_RVF_STATE_DIR",
+            "CODEX_RVF_PREP_ROOT",
+            "CODEX_RVF_LOG_ROOT",
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT",
+        )
     }
     os.environ["RVF_HOME"] = str(state / "rvf-home")
     os.environ["CODEX_RVF_STATE_DIR"] = str(state)
     os.environ["CODEX_RVF_PREP_ROOT"] = str(state / "prep-root")
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
     os.environ.pop("CODEX_RVF_LOG_ROOT", None)
     try:
         if str(SCRIPT.parent) not in sys.path:
@@ -5174,6 +5250,16 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         assert start_result.status == "ok", (start_result.status, start_result.message)
         assert start_result.token_state == dts.STATE_ACKNOWLEDGED
         assert "changed.txt" in start_result.detail["auto_scope_paths"], start_result.detail
+        # 本用例的 transcript 是纯用户消息(无编辑证据)⇒ 归属为空 ⇒ tracker scope 拿不到。
+        # 关键回归:这种情形必须**显式降级**并把理由冒泡到 message,而不是静默产出一份没有
+        # lease 的 contract(RVF-1:静默回落正是该缺陷潜伏到默认路径的原因)。
+        allocation = start_result.detail["tracker_scope_allocation"]
+        assert (
+            allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_DEGRADED_ALLOCATOR_EMPTY
+        ), allocation
+        assert allocation["tracker_lease_id"] is None, allocation
+        assert allocation["session_manifest_has_owned_paths"] is False, allocation
+        assert "降级" in start_result.message, start_result.message
         run_dir = Path(start_result.detail["run_dir"])
         assert run_dir.is_dir(), run_dir
         assert str(run_dir).startswith(str(state)), run_dir  # run 落盘同样被隔离
@@ -5198,6 +5284,30 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         def fake_reviewer_dispatcher(**kwargs: object) -> dict:
             dispatched_calls.append(dict(kwargs))
             return {"status": "ok", "returncode": 0, "plan_path": None}
+
+        # contract gate:此刻 scope-of-work 还是 start 写的 stub ⇒ 必须**拒派**且不碰 reviewer。
+        # 派了也白派——reviewer 侧的 contract gate 会当场把这一轮退回成 kind: request。
+        blocked = cli.run_dispatch(
+            token=token,
+            strictness="standard",
+            dry_run=True,
+            reviewer_dispatcher=fake_reviewer_dispatcher,
+        )
+        assert blocked.status == "scope_of_work_still_stub", (blocked.status, blocked.message)
+        assert dispatched_calls == [], dispatched_calls
+
+        # agent 按指引写真实 scope-of-work,再经**受支持的重渲入口**把它渲进已冻结的 packet。
+        # 只改盘上的文件不够:packet 在 start 时就把 stub 内联冻结了。
+        scope_of_work_path = Path(prepare_artifacts["scope_of_work"])
+        scope_of_work_path.write_text(
+            "# Scope of Work\n\nE2E dogfood:本轮唯一实质改动是 changed.txt,审查请盯它。\n",
+            encoding="utf-8",
+        )
+        rerender = cli.run_scope_rerender_scope_of_work(token=token)
+        assert rerender.status == "ok", (rerender.status, rerender.message)
+        assert (
+            "E2E dogfood" in Path(prepare_artifacts["review_packet"]).read_text(encoding="utf-8")
+        ), "重渲之后 packet 里必须是真 scope-of-work,不再是 stub"
 
         dispatch = cli.run_dispatch(
             token=token,
@@ -5228,6 +5338,209 @@ def test_agentic_initiation_e2e_dogfood_signal_to_guardian(tmp_path: Path) -> No
         # 负路径不变量收口:本次注入在 injection-attempt ledger 有记录(canary 分子)。
         attempts = injection_ledger.read_injection_attempts(worktree=str(dirty.resolve()))
         assert attempts and any(r.get("decision_token") == token for r in attempts), attempts
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_agentic_initiation_start_produces_session_owned_scope_with_tracker_lease(
+    tmp_path: Path,
+) -> None:
+    """RVF-1 回归：`rvf-agent start` 必须产出与旧 kanban-followup 派发路径**同口径**的 scope
+    contract —— `session-owned` + 非空 `primary_units` + 真 `tracker_lease_id` + `session_manifest_path`。
+
+    历史缺陷：`default_prepare_pipeline` 把 `tracker_scope_path` / `tracker_lease_id` /
+    `tracker_scope_hash` 写死成 `None`，且默认发起路径上 `transcript_path` 恒为 None
+    （横幅的 start 样例里也没有 `--transcript-path`）⇒ contract 退化成 `manual-all-uncommitted`、
+    `primary_units=0`、`lease=None`。后果有二：(a) 无 lease ⇒ handoff 无法把本轮 units 标成
+    reviewed ⇒ 同一批未提交 diff 被后续每次 Stop 反复重新提议；(b) `manual-all-uncommitted` ⇒
+    别的会话的背景 dirty 进 `primary_files` / `fix_allowlist`。P1 把这条路变成**所有**自动 RVF
+    的默认路径之后，本用例就是「session-scope / review-highwater 那套机制还在不在」的判据。
+
+    全链真实件：真实 git repo + 真实 apply_patch transcript（提供归属证据）+ 真实 Stop hook
+    子进程铸 token/注入 + 真实 `run_start`（含 build_manifest → allocate_review_scope → prepare
+    全套）。唯一替身是 provider-health runner（避免真探 provider 认证）。落盘全在 tmp。
+    """
+    repo = init_repo_with_head(tmp_path / "dirty")
+    state = tmp_path / "state"
+    session_id = "tracker-scope-session"
+    transcript = write_apply_patch_transcript(
+        tmp_path / "session.jsonl", repo, session_id=session_id
+    )
+
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+            "session_id": session_id,
+        },
+        state_dir=state,
+    )
+    payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+    # 横幅的 start 样例必须带上 transcript：它决定本轮 scope 口径，而 agent 无从自己得知该路径。
+    # 渲染的是 `first_readable_session_path` 解析后的绝对路径（macOS 下 /var → /private/var）。
+    reason = str(payload["reason"])
+    assert (
+        f"start --token {token} --transcript-path {transcript.resolve()}" in reason
+    ), reason
+
+    saved_env = {
+        k: os.environ.get(k)
+        for k in (
+            "RVF_HOME",
+            "CODEX_RVF_STATE_DIR",
+            "CODEX_RVF_PREP_ROOT",
+            "CODEX_RVF_LOG_ROOT",
+            "RVF_KANBAN_FOLLOWUP_LOCK_ROOT",
+        )
+    }
+    os.environ["RVF_HOME"] = str(state / "rvf-home")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(state / "prep-root")
+    os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state / "kanban-followup-in-progress")
+    os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+    try:
+        if str(SCRIPT.parent) not in sys.path:
+            sys.path.insert(0, str(SCRIPT.parent))
+        import importlib.util as _ilu  # noqa: PLC0415
+
+        cli_spec = _ilu.spec_from_file_location(
+            "rvf_agent_decision_cli_tracker_scope", SCRIPT.parent / "rvf_agent_decision_cli.py"
+        )
+        assert cli_spec is not None and cli_spec.loader is not None
+        cli = _ilu.module_from_spec(cli_spec)
+        sys.modules[cli_spec.name] = cli
+        cli_spec.loader.exec_module(cli)
+
+        # 刻意**不传** --transcript-path：默认路径上 agent 通常不会带它，回退必须由候选摘要里
+        # Stop hook 盖的那份兜住（这正是横幅之外的第二条保险）。
+        start_result = cli.run_start(
+            token=token,
+            reason="回归：验证 start 侧 scope 口径",
+            provider_health_runner=lambda req, timeout: {"status": "ok", "provider": "stub"},
+        )
+        assert start_result.status == "ok", (start_result.status, start_result.message)
+        assert (
+            start_result.detail["transcript_path_source"]
+            == cli.TRANSCRIPT_PATH_SOURCE_DECISION_TOKEN_CANDIDATE_SUMMARY
+        ), start_result.detail
+        allocation = start_result.detail["tracker_scope_allocation"]
+        assert allocation["status"] == cli.AGENTIC_INITIATION_TRACKER_SCOPE_ALLOCATED, allocation
+        assert allocation["tracker_lease_id"], allocation
+        assert allocation["tracker_unit_count"] >= 1, allocation
+        assert Path(allocation["tracker_scope_path"]).is_file(), allocation
+
+        contract = json.loads(
+            Path(start_result.detail["prepare_artifacts"]["scope_contract"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert contract["scope_mode"] == "session-owned", contract["scope_mode"]
+        assert contract["primary_units"], contract
+        assert contract["tracker_lease_id"] == allocation["tracker_lease_id"], contract
+        assert contract["tracker_scope_hash"] == allocation["tracker_scope_hash"], contract
+        assert contract["session_manifest_path"], contract
+        assert contract["primary_files"] == ["changed.txt"], contract["primary_files"]
+        # 在途凭证与 run 工件都必须落在隔离 state 下（绝不写真实 ~/.rvf）。
+        assert str(start_result.detail["run_dir"]).startswith(str(state)), start_result.detail
+        marker_path = start_result.detail["in_flight_receipt"].get("marker_path")
+        assert marker_path and str(marker_path).startswith(str(state)), start_result.detail
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_agentic_initiation_start_releases_tracker_lease_when_prepare_does_not_complete(
+    tmp_path: Path,
+) -> None:
+    """prepare 没跑到 completed（失败 / 超时 / bootstrap 等待）时，本轮刚分配的 lease 必须归还。
+
+    不归还的话那批 unit 在整个 TTL（1h）里都是 `assigned`，而候选查询只收 `available` ⇒ 下一次
+    `start --retry` 会开一个新 run 再分配一次、必然拿到 `empty` 而静默降级——修复反倒制造一个
+    只在重试路径上发作的新盲区。同时回执里的 tracker 字段必须被抹回 None，不能声称拿到了一条
+    其实已经不存在的 lease。
+    """
+    repo = init_repo_with_head(tmp_path / "dirty")
+    state = tmp_path / "state"
+    session_id = "lease-release-session"
+    transcript = write_apply_patch_transcript(
+        tmp_path / "session.jsonl", repo, session_id=session_id
+    )
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+            "session_id": session_id,
+        },
+        state_dir=state,
+    )
+    _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+
+    saved_env = {
+        k: os.environ.get(k)
+        for k in ("RVF_HOME", "CODEX_RVF_STATE_DIR", "CODEX_RVF_PREP_ROOT", "CODEX_RVF_LOG_ROOT")
+    }
+    os.environ["RVF_HOME"] = str(state / "rvf-home")
+    os.environ["CODEX_RVF_STATE_DIR"] = str(state)
+    os.environ["CODEX_RVF_PREP_ROOT"] = str(state / "prep-root")
+    os.environ.pop("CODEX_RVF_LOG_ROOT", None)
+    try:
+        if str(SCRIPT.parent) not in sys.path:
+            sys.path.insert(0, str(SCRIPT.parent))
+        import importlib.util as _ilu  # noqa: PLC0415
+
+        cli_spec = _ilu.spec_from_file_location(
+            "rvf_agent_decision_cli_lease_release", SCRIPT.parent / "rvf_agent_decision_cli.py"
+        )
+        assert cli_spec is not None and cli_spec.loader is not None
+        cli = _ilu.module_from_spec(cli_spec)
+        sys.modules[cli_spec.name] = cli
+        cli_spec.loader.exec_module(cli)
+        import prepare_review_run  # noqa: PLC0415
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from core.session_scope_allocation import reviewable_unit_diff_tracker as tracker  # noqa: PLC0415
+
+        # 让 prepare 报 failed（不改真实 prepare 语义，只在本用例内替身掉那一个调用）。
+        original = prepare_review_run.prepare_run_from_prep_file
+        prepare_review_run.prepare_run_from_prep_file = lambda *a, **k: {
+            "status": "failed",
+            "error": "injected prepare failure",
+        }
+        try:
+            prepared = cli.default_prepare_pipeline(
+                token_record=cli.token_store.acknowledge_decision_token(token),
+                repo=str(repo),
+                session_id=session_id,
+                transcript_path=str(transcript),
+                now=datetime.now(timezone.utc),
+            )
+        finally:
+            prepare_review_run.prepare_run_from_prep_file = original
+
+        allocation = prepared["tracker_scope_allocation"]
+        assert prepared["status"] == "failed", prepared
+        # 回执侧：三个 tracker 字段抹回 None + 降级理由点名「已归还」。
+        assert allocation["tracker_lease_id"] is None, allocation
+        assert allocation["tracker_scope_path"] is None, allocation
+        assert allocation["tracker_scope_hash"] is None, allocation
+        assert "已归还" in (allocation["degradation_reason"] or ""), allocation
+        # DB 侧：units 真的翻回 available —— 再分配一次必须还能拿到同一批（而不是 empty）。
+        second = tracker.allocate_review_scope(
+            repo=Path(repo),
+            session_id=session_id,
+            run_id="second-attempt",
+            reviewer_id="regression-probe",
+            auto_claim_observed=False,
+        )
+        assert second["status"] == "allocated", second
     finally:
         for key, value in saved_env.items():
             if value is None:
@@ -5500,6 +5813,7 @@ def main() -> int:
         test_fork_experiment_marker_no_longer_triggers_stop_hook_fork,
         test_diagnose_fork_dry_run_writes_requests,
         test_stop_hook_active_skips,
+        test_stop_hook_active_skip_names_the_current_host_not_a_hardcoded_one,
         test_codex_goal_mode_skips_direct_stop_hook,
         test_codex_user_text_goal_marker_without_status_does_not_skip_direct_stop_hook,
         test_codex_completed_goal_does_not_skip_direct_stop_hook,
@@ -5515,7 +5829,7 @@ def main() -> int:
         test_allocate_auto_review_scope_writes_artifact_when_scope_present,
         test_patch_ownership_incomplete_detects_partial_tracker_scope,
         test_patch_ownership_incomplete_skip_payload_does_not_duplicate_reason_code,
-        test_kanban_followup_auto_review_scope_uses_one_hour_lease_ttl,
+        test_kanban_followup_auto_review_scope_lease_ttl_matches_in_flight_lock_ttl,
         test_kanban_followup_without_task_id_does_not_allocate_review_scope,
         test_evaluate_session_gate_skips_when_manual_run_recorded_for_scope_hash,
         test_manual_scope_suppression_sweeps_expired_lease_before_probe,
@@ -5557,7 +5871,8 @@ def main() -> int:
         test_kanban_followup_stranded_sweep_escalates_other_skips_current,
         test_kanban_followup_stranded_sweep_consumed_refinement_clears_marker,
         test_kanban_followup_stranded_sweep_redispatch_enabled_but_unreachable,
-        test_kanban_followup_s2_redispatch_stable_idem_and_preserves_prompt_path,
+        test_kanban_followup_s2_redispatch_binds_idempotency_key_to_fresh_token_and_preserves_prompt_path,
+        test_kanban_followup_pending_reconciliation_never_waits_without_an_upper_bound,
         test_kanban_followup_title_falls_back_to_local_board_state,
         test_kanban_followup_title_ignores_unrelated_board_with_same_task_id,
         test_kanban_followup_title_uses_session_matched_board_state,
@@ -5573,6 +5888,24 @@ def main() -> int:
         test_kanban_followup_stale_takeover_rechecks_marker_before_unlink,
         test_kanban_followup_shared_lock_blocks_second_dispatch_with_different_state_roots,
         test_awaiting_dispatched_agent_marker_skips_rvf_when_main_agent_parks_on_dispatch,
+        test_kanban_followup_waiting_bootstrap_lock_directs_sync_instead_of_handoff,
+        test_kanban_followup_stale_waiting_bootstrap_lock_revives_instead_of_reopening,
+        test_kanban_followup_bootstrap_gate_resume_reuses_run_and_artifact_loss_clears,
+        test_kanban_followup_stale_bootstrap_gate_resume_reactivates_lock,
+        test_kanban_followup_bootstrap_replay_claim_is_atomic_across_concurrent_stops,
+        test_kanban_followup_lock_without_bootstrap_gate_keeps_legacy_stale_consumption,
+        test_kanban_followup_bootstrap_waiting_is_bounded_by_reengage_and_revive_budgets,
+        test_kanban_followup_bootstrap_replay_classifies_artifact_loss_and_retries_after_timeout,
+        test_kanban_followup_bootstrap_reengage_budget_exhausted_diagnostic_splits_replay_pending,
+        test_accepted_review_run_receipt_suppresses_repeated_decision_point_injection,
+        test_rewound_acceptance_reconciles_receipt_via_decision_token_needle,
+        test_kanban_followup_awaiting_agent_decision_lock_skips_without_nudging,
+        test_kanban_followup_awaiting_agent_decision_window_expiry_returns_to_normal_gate,
+        test_kanban_followup_awaiting_lock_promoted_when_trigger_on_ancestor_chain,
+        test_kanban_followup_lock_reconciled_when_trigger_rewound_off_ancestor_chain,
+        test_kanban_followup_awaiting_window_expiry_releases_tracker_lease,
+        test_kanban_followup_rewind_reconcile_releases_tracker_lease,
+        test_kanban_followup_awaiting_promotion_write_failure_fails_closed_without_nudging,
         test_rvf_analyze_followup_trigger_marker_skips_one_turn,
         test_rvf_analyze_manual_invocation_skips_one_turn,
         test_review_reopen_marker_reopens_run_scope_before_dispatch,
@@ -5646,6 +5979,8 @@ def main() -> int:
         test_launch_keep_park_signal_uses_real_hook_payload_shape,
         test_guardian_liveness_alarm_merges_into_stop_payload,
         test_agentic_initiation_e2e_dogfood_signal_to_guardian,
+        test_agentic_initiation_start_produces_session_owned_scope_with_tracker_lease,
+        test_agentic_initiation_start_releases_tracker_lease_when_prepare_does_not_complete,
         test_guardian_main_exit_policy_excludes_suppress_and_covers_early_blocks,
         test_skip_decision_should_unpark_keeps_park_for_resume_pending,
         test_stop_unparks_on_dispatch_failure_and_no_dispatch,
@@ -5661,6 +5996,57 @@ def main() -> int:
         test_preserved_guards_short_circuit_before_decision_point_injection,
         # S5：bootstrap 独立确认闸废除（Stop 侧闸中和；UPS 侧 resume 闸退役见 UPS 套件）。
         test_bootstrap_size_confirmation_gate_abolished_never_blocks,
+        # 本轮：横幅带外投递（四态处置 / 次序 / TTL / 崩溃窗口 / 两条撤回路径）。
+        test_decision_point_out_of_band_delivered_receipts_keep_token_minted,
+        test_decision_point_out_of_band_uses_longer_ttl_than_self_injection,
+        test_decision_point_out_of_band_delivery_never_started_falls_back_to_self_injection,
+        # 「拿不到可解析回执」= 结论未知 ≠ 确定失败：不回落、保留意图、由后续对账处置。
+        test_decision_point_out_of_band_unparseable_receipt_after_delivery_never_self_injects,
+        test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered,
+        test_decision_point_transport_override_without_task_id_falls_back_honestly,
+        test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker,
+        test_decision_point_out_of_band_single_flight_busy_does_not_mint,
+        test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once,
+        # 搁浅对账的枚举面是跨 task 全局的，早退判据必须先收敛到本轮这条投递通道。
+        test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point,
+        # `state=minted` ≠「从未成为 turn」：UPS 的 mark_injected 失败分支留下的形状完全相同。
+        test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off,
+        test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
+        # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
+        test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,
+        test_decision_point_crash_between_send_and_receipt_is_reconciled_from_intent,
+        test_decision_point_declined_fingerprint_is_not_delivered_out_of_band_again,
+        # 本轮：决策 token store 的写侧互斥（回执 vs lifecycle）与撤回的熔断额度冲销（INV-C）。
+        test_decision_token_stale_receipt_snapshot_cannot_roll_back_injected_lifecycle_state,
+        test_decision_token_receipt_write_and_lifecycle_transition_are_mutually_exclusive_under_threads,
+        test_decision_token_withdrawal_writes_payload_exactly_once_with_dedup_index_field,
+        test_two_consecutive_rewind_withdrawals_do_not_trip_circuit_breaker_on_third_ask,
+        test_decision_token_withdrawal_reversal_is_append_only_and_scoped_to_its_own_mint_request,
+        test_illegal_second_withdrawal_leaves_mint_request_ledger_untouched,
+        # 同键并发撞陈旧去重索引：覆盖必须与首建同样互斥（一个 dedup key 至多一枚活跃 token）。
+        test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_minted_token,
+        # withdrawn 的两种成因对熔断额度处置相反：空转保留额度（退避）、rewind 冲销（INV-C）。
+        test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stranding_backs_off,
+        test_unknown_withdrawal_cause_fails_closed_to_retaining_mint_request_charge,
+        # 第三种成因：横幅成为过 turn、只是记账没跟上 ⇒ 通道健康，冲销额度（不许按空转退避）。
+        test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_charge,
+        # in-progress 锁的心跳续期与绝对硬顶：活着就续、久无活动即清、越过硬顶一律清。
+        test_stale_in_progress_lock_with_recent_run_activity_is_revived_not_cleared,
+        test_stale_in_progress_lock_without_recent_run_activity_is_cleared_as_before,
+        test_stale_in_progress_lock_past_revival_absolute_cap_is_cleared_despite_activity,
+        # RVF-004：存活证据探针必须看得见 artifacts/ 下两层的 reviewer / fix-attempt 写入，
+        # 且枚举代价有结构性上界（不得退化成整树 rglob）。
+        test_run_activity_probe_sees_reviewer_stream_writes_below_artifacts_root,
+        test_run_activity_probe_sees_fix_attempt_result_writes_below_artifacts_root,
+        test_run_activity_probe_does_not_descend_into_fix_attempt_worktree_tree,
+        test_run_activity_probe_anchor_enumeration_stays_within_stat_budget,
+        test_stale_in_progress_lock_with_recent_activity_only_below_artifacts_root_is_revived,
+        # 硬顶的**上界**本身也要有守卫：续期只判「续之前有没有越界」，不截断续期后的 expires_at，
+        # 硬顶就能被整整绕过一个 TTL。
+        test_revived_in_progress_lock_never_outlives_the_revival_absolute_cap,
+        # 心跳坐在 bootstrap「复活预算耗尽 ⇒ 放弃本轮」的 fall-through 上，必须尊重那个放弃。
+        # 走调用方，因为只调内层函数的既有守卫对这条缝结构性失明（假绿）。
+        test_bootstrap_revive_budget_exhaustion_is_not_undone_by_run_activity_heartbeat,
     ]
     assert_every_defined_test_is_registered(
         globals(),

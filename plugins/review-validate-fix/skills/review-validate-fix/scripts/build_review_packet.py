@@ -554,6 +554,28 @@ def build_packet(
             lines.append(f"- takeover from session: `{takeover_session}`")
         else:
             lines.append("- takeover from session: (none)")
+        # 并集全审的两段构成：lease 过期后重新分配时，本轮 scope = 上一轮仍可审的 unit ∪ 当时
+        # 工作树。两段的成熟度不同（一段已定稿、一段刚写），reviewer 必须能分辨，否则会把两批
+        # 改动当成同一时刻的产物一起评判。
+        unioned_raw = tracker_scope.get("unioned_prior_scope_unit_ids")
+        unioned_prior_unit_ids = (
+            [uid for uid in unioned_raw if isinstance(uid, str)]
+            if isinstance(unioned_raw, list)
+            else []
+        )
+        if unioned_prior_unit_ids:
+            lines.extend(
+                [
+                    "",
+                    f"⚠️ 本轮 scope 是**并集重分配**的结果（上一轮 lease 过期后恢复）："
+                    f"其中 {len(unioned_prior_unit_ids)} 个 unit 来自**上一轮已圈定但未审完**的 scope，"
+                    "其余为本次重新观察到的改动。两段写作时刻不同，请分别判断成熟度，"
+                    "不要把后写的一段的问题归到前一段上。",
+                    "",
+                    "承接自上一轮 scope 的 unit：",
+                ]
+            )
+            lines.extend(f"- `{uid}`" for uid in unioned_prior_unit_ids)
         lines.append("")
         scope_unit_ids = [uid for uid in tracker_scope["unit_ids"] if isinstance(uid, str)]
         scope_hunks_raw = tracker_scope.get("hunks")

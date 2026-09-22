@@ -4,8 +4,8 @@
   "preset_selection_is_single_tier_choice_by_agent": true,
   "reasoning_effort_level_ascending_order": ["medium", "high", "xhigh"],
   "reviewer_model_cost_tier_ascending_order": ["cheap", "standard", "premium"],
-  "reviewer_harness_pool_tier1_full_membership": ["claude_code", "codex", "cursor"],
-  "reviewer_harness_pool_selection_note": "实际可派发池 = Tier-1 全集 − 主 harness（R15/R20），池内伪随机选二；各 preset 的 external_reviewer_count_target 会被 clamp 到当时可用池大小，不足则按降级路径（R1–R3）处理。",
+  "reviewer_harness_pool_tier1_full_membership": ["claude_code", "codex", "cursor", "kimi_code", "oh_my_pi"],
+  "reviewer_harness_pool_selection_note": "实际可派发池 = Tier-1 全集 − 主 harness（R15/R20），池内伪随机选二；各 preset 的 external_reviewer_count_target 会被 clamp 到当时可用池大小，不足则按降级路径（R1–R3）处理。本表必须与 config/reviewer-registry.json 的 harnesses 逐字同源（由 god test 的同源断言钉住，不再两处各抄一份名单）。池内唯一的偏序约束是同额度池互斥：underlying_provider_account_quota_pool_identity 相同的两条腿（今天是 codex 与 oh_my_pi）不会被同时选中，除非池内已无异池组合。",
   "presets": {
     "light": {
       "strictness_tier_name": "light",

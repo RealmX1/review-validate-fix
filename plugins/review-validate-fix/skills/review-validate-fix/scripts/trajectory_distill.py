@@ -62,6 +62,9 @@ from adapters.codex.transcript import (  # noqa: E402,F401  — re-export
 from adapters.claude_code.transcript import (  # noqa: E402,F401  — re-export
     distill_claude_jsonl,
 )
+from adapters.kimi.transcript import (  # noqa: E402,F401  — re-export
+    distill_kimi_wire_jsonl,
+)
 
 
 def main() -> int:

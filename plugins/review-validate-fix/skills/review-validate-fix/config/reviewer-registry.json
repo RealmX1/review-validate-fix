@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "RVF santa-method 双 review 的 external reviewer harness 注册表。dispatch_reviewers.py 据此 probe 可用 harness 并路由出恰好两路 external_cli reviewer。config_path 相对 skill 根目录解析。",
+  "description": "RVF santa-method 双 review 的 external reviewer harness 注册表。dispatch_reviewers.py 据此 probe 可用 harness 并路由出恰好两路 external_cli reviewer。config_path 相对 skill 根目录解析。underlying_provider_account_quota_pool_identity 声明这条腿最终消耗谁的额度：同值的两条腿既是同一底层模型、又会被同一次额度耗尽一起打掉，选腿层据此互斥（core/reviewer_harness_selection）。取额度池而非模型名，是因为五条腿里只有 omp pin 了模型，其余四条跟随各自 CLI 的默认模型、随时会变。",
   "harnesses": {
     "cursor": {
       "harness_id": "cursor",
@@ -8,7 +8,8 @@
       "config_path": "config/alternative-reviewer.cursor.json",
       "dispatch_mode": "external_cli",
       "enabled": true,
-      "priority_default": 100
+      "priority_default": 100,
+      "underlying_provider_account_quota_pool_identity": "cursor-subscription"
     },
     "claude_code": {
       "harness_id": "claude_code",
@@ -16,7 +17,8 @@
       "config_path": "config/alternative-reviewer.claude.json",
       "dispatch_mode": "external_cli",
       "enabled": true,
-      "priority_default": 50
+      "priority_default": 50,
+      "underlying_provider_account_quota_pool_identity": "anthropic-claude-subscription"
     },
     "codex": {
       "harness_id": "codex",
@@ -24,7 +26,26 @@
       "config_path": "config/alternative-reviewer.codex.json",
       "dispatch_mode": "external_cli",
       "enabled": true,
-      "priority_default": 50
+      "priority_default": 50,
+      "underlying_provider_account_quota_pool_identity": "openai-codex-subscription"
+    },
+    "kimi_code": {
+      "harness_id": "kimi_code",
+      "label_prefix": "alternative-reviewer:kimi-code",
+      "config_path": "config/alternative-reviewer.kimi.json",
+      "dispatch_mode": "external_cli",
+      "enabled": true,
+      "priority_default": 50,
+      "underlying_provider_account_quota_pool_identity": "kimi-code-subscription"
+    },
+    "oh_my_pi": {
+      "harness_id": "oh_my_pi",
+      "label_prefix": "alternative-reviewer:oh-my-pi",
+      "config_path": "config/alternative-reviewer.oh-my-pi.json",
+      "dispatch_mode": "external_cli",
+      "enabled": true,
+      "priority_default": 50,
+      "underlying_provider_account_quota_pool_identity": "openai-codex-subscription"
     }
   }
 }

@@ -10,13 +10,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from prepare_review_run import pre_review_base_sync_state, resolve_local_base_ref
 from validation_result_cache import clean_git_environment
 from write_reviewed_task_candidate_evidence import (
     EVIDENCE_RELATIVE_PATH,
     StaleReviewedTaskCandidateEvidence,
-    optional_receipt,
-    validate_bootstrap_receipt_subject,
     validated_reviewed_task_candidate_evidence,
 )
 
@@ -63,12 +60,6 @@ INTAKE_HINT_LABELS = {
     "rejected / not accepted changes": "rejected_changes",
     "main-session validation commands": "main_session_validation_commands",
 }
-RVF_LAND_BLOCKING_BASE_SYNC_STATUSES = {
-    "bootstrap_required_before_rvf_land",
-    "bootstrap_receipt_invalid_before_rvf_land",
-}
-
-
 def read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -323,119 +314,6 @@ def load_candidate_evidence(
     return "valid", evidence_path, digest, records if isinstance(records, list) else []
 
 
-def pre_rvf_land_base_sync_gate(
-    repo: Path, scope_contract_path: Path | None
-) -> dict[str, Any]:
-    """Fail closed before rvf-land can validate, stage, or commit a stale task.
-
-    The opt-in marker is always read from the current local base commit.  A
-    legacy handoff therefore cannot bypass the prepare-time gate merely because
-    its old worktree or scope contract predates the marker.
-    """
-    root = git_root(repo)
-    if root is None:
-        return {
-            "status": "bootstrap_receipt_invalid_before_rvf_land",
-            "reason": "current repository is not a verifiable Git worktree",
-        }
-    contract_payload = read_json(scope_contract_path) if scope_contract_path else None
-    contract = contract_payload if isinstance(contract_payload, dict) else {}
-    configured_base_ref = contract.get("base_ref")
-    explicit_base_ref = (
-        configured_base_ref.strip()
-        if isinstance(configured_base_ref, str) and configured_base_ref.strip()
-        else None
-    )
-    try:
-        local_base_ref = resolve_local_base_ref(
-            root,
-            explicit_local_base_ref=explicit_base_ref,
-            committed_base_ref=None,
-        )
-        sync_state = pre_review_base_sync_state(root, local_base_ref)
-    except (OSError, RuntimeError, ValueError) as exc:
-        return {
-            "status": "bootstrap_receipt_invalid_before_rvf_land",
-            "reason": f"local base identity could not be verified: {exc}",
-            "local_base_ref": explicit_base_ref,
-        }
-    if sync_state is None:
-        return {
-            "status": "not_applicable",
-            "reason": "local base does not opt into pre-review base sync",
-            "local_base_ref": local_base_ref,
-        }
-    if sync_state.get("status") == "bootstrap_required_before_rvf":
-        return {
-            **sync_state,
-            "status": "bootstrap_required_before_rvf_land",
-            "reason": "current task HEAD has not absorbed the current local base",
-        }
-
-    reviewed_base_tip = contract.get("reviewed_base_tip")
-    if (
-        isinstance(reviewed_base_tip, str)
-        and reviewed_base_tip
-        and reviewed_base_tip != sync_state.get("local_base_tip")
-    ):
-        return {
-            **sync_state,
-            "status": "bootstrap_required_before_rvf_land",
-            "reason": "local base moved after the RVF candidate was reviewed",
-            "reviewed_base_tip": reviewed_base_tip,
-        }
-
-    receipt_path_value = contract.get("bootstrap_receipt_path")
-    receipt_digest_value = contract.get("bootstrap_receipt_digest")
-    if receipt_path_value is not None or receipt_digest_value is not None:
-        code, absolute_git_dir, _stderr = run_git(root, ["rev-parse", "--absolute-git-dir"])
-        common_dir = git_common_dir(root)
-        if code != 0 or not absolute_git_dir or common_dir is None:
-            return {
-                **sync_state,
-                "status": "bootstrap_receipt_invalid_before_rvf_land",
-                "reason": "task git-dir/common-dir identity could not be verified",
-            }
-        try:
-            receipt_path, receipt_digest = optional_receipt(
-                receipt_path_value,
-                receipt_digest_value,
-                "bootstrap receipt",
-                required_path=(
-                    Path(absolute_git_dir)
-                    / "base-branch-sync"
-                    / "local-base-into-task-worktree-bootstrap-receipt.json"
-                ),
-            )
-            validate_bootstrap_receipt_subject(
-                receipt_path,
-                contract=contract,
-                repo=root,
-                common_dir=common_dir,
-                current_head=str(sync_state["task_head"]),
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            return {
-                **sync_state,
-                "status": "bootstrap_receipt_invalid_before_rvf_land",
-                "reason": f"bootstrap receipt could not be verified: {exc}",
-            }
-        return {
-            **sync_state,
-            "status": "ready",
-            "reason": "current local base is absorbed and the contracted receipt is valid",
-            "bootstrap_receipt_path": receipt_path,
-            "bootstrap_receipt_digest": receipt_digest,
-        }
-    return {
-        **sync_state,
-        "status": "ready",
-        "reason": "current local base was already absorbed; no bootstrap receipt was required",
-        "bootstrap_receipt_path": None,
-        "bootstrap_receipt_digest": None,
-    }
-
-
 def infer_run_dir(values: dict[str, str], run_id: str | None) -> Path | None:
     if value_is_available(values.get("run_dir")):
         return Path(values["run_dir"]).expanduser()
@@ -594,10 +472,6 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
     else:
         validation_evidence_source = "legacy_handoff_markdown"
         validation_commands = parse_validation_commands(sections)
-    pre_land_base_sync_gate = pre_rvf_land_base_sync_gate(
-        repo, expected_scope_contract_path
-    )
-
     return {
         "handoff_path": str(handoff_path.expanduser()) if handoff_path else None,
         "run_id": run_id,
@@ -626,7 +500,6 @@ def build_payload(text: str, repo: Path, handoff_path: Path | None) -> dict[str,
         "validation_evidence_source": validation_evidence_source,
         "validation_records": validation_records,
         "validation_commands": validation_commands,
-        "pre_rvf_land_base_sync_gate": pre_land_base_sync_gate,
         "conflict_hints": conflict_hints(text),
         "intake_hints": intake_hints,
         "summary_status": (summary or {}).get("status"),
@@ -643,7 +516,6 @@ def render_text(payload: dict[str, Any]) -> str:
         f"- current_repo: {payload.get('current_repo_snapshot', {}).get('repo') or '<unknown>'}",
         f"- same_git_common_dir: {payload.get('target_repo_same_git_common_dir_as_current')}",
         f"- rvf_worktree_differs_from_current: {payload.get('rvf_worktree_differs_from_current')}",
-        f"- pre_rvf_land_base_sync_gate: {(payload.get('pre_rvf_land_base_sync_gate') or {}).get('status')}",
         "",
         "Reviewed scope paths:",
     ]
@@ -693,12 +565,6 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(render_text(payload))
-    gate = payload.get("pre_rvf_land_base_sync_gate")
-    if (
-        isinstance(gate, dict)
-        and gate.get("status") in RVF_LAND_BLOCKING_BASE_SYNC_STATUSES
-    ):
-        return 3
     return 0
 
 

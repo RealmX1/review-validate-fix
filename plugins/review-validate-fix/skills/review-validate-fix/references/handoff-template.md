@@ -76,6 +76,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 - run dir: <run 目录绝对路径>
 - 目标仓库: <绝对路径>
 - Review 开始时的 git HEAD: <sha 或 "未提交工作树">
+- intent_artifact_status: consumed / missing / invalid / n-a（非 opt-in 仓库填 n-a；取值照抄 prepare 的 `intent_artifact_status`，不要自己判断）
 
 ## Origin
 
