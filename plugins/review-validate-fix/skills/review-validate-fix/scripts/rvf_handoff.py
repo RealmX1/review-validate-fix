@@ -17,6 +17,12 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import RunLedger, rvf_state_fields, safe_token  # noqa: E402
+from handoff_document_contract import handoff_document_violations  # noqa: E402
+from handoff_generated_header import (  # noqa: E402
+    apply_generated_header,
+    generated_header_block,
+    generated_header_is_current,
+)
 
 
 HANDOFF_FILE_MARKER = "RVF_HANDOFF_FILE"
@@ -686,6 +692,27 @@ def main(argv: list[str] | None = None) -> int:
     notify_parser.add_argument("--task-url", default=None, help="Kanban task URL for click-to-open.")
     notify_parser.add_argument("--summary", default=None, help="Short notification body text.")
     notify_parser.add_argument("--group", default=None, help="terminal-notifier -group ref.")
+
+    render_parser = subparsers.add_parser(
+        "render-header",
+        help="Render the script-owned deterministic header block for a run (stdout only).",
+    )
+    render_parser.add_argument("--run-dir", required=True, help="RVF run dir.")
+
+    restore_parser = subparsers.add_parser(
+        "restore-header",
+        help="Write/refresh the script-owned header block inside the run's handoff.md.",
+    )
+    restore_parser.add_argument("--run-dir", required=True, help="RVF run dir.")
+    restore_parser.add_argument("--handoff", default=None, help="Override handoff.md path.")
+
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Check the handoff document contract (header freshness + agent-owned body).",
+    )
+    check_parser.add_argument("--run-dir", required=True, help="RVF run dir.")
+    check_parser.add_argument("--handoff", default=None, help="Override handoff.md path.")
+
     args = parser.parse_args(argv)
 
     if args.command == "notify":
@@ -713,6 +740,50 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps({"valid": True, "handoff_path": str(resolved), **result}, ensure_ascii=False))
         return 0
+
+    if args.command == "render-header":
+        print(generated_header_block(Path(args.run_dir).expanduser()))
+        return 0
+
+    if args.command == "restore-header":
+        result = apply_generated_header(
+            Path(args.run_dir).expanduser(),
+            handoff_path=Path(args.handoff).expanduser() if args.handoff else None,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
+    if args.command == "check":
+        run_dir = Path(args.run_dir).expanduser()
+        handoff_path = (
+            Path(args.handoff).expanduser()
+            if args.handoff
+            else run_dir.resolve() / "artifacts" / "handoff.md"
+        )
+        if not handoff_path.is_file():
+            print(
+                json.dumps(
+                    {"ok": False, "handoff_path": str(handoff_path), "violations": ["handoff.md 不存在"]},
+                    ensure_ascii=False,
+                )
+            )
+            return 1
+        header_current = generated_header_is_current(run_dir, handoff_path=handoff_path)
+        violations = handoff_document_violations(handoff_path.read_text(encoding="utf-8"))
+        if not header_current:
+            violations = ["生成表头区块缺失或已过期（跑 `restore-header` 复原）", *violations]
+        print(
+            json.dumps(
+                {
+                    "ok": not violations,
+                    "handoff_path": str(handoff_path),
+                    "generated_header_current": header_current,
+                    "violations": violations,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0 if not violations else 1
     return 2
 
 

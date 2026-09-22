@@ -1,6 +1,6 @@
 # Handoff Template
 
-Handoff 默认开启，但只适用于 `mode: full` 且 handoff 未关闭的完整流程。除非用户明确要求 `no handoff` / `skip handoff` / `不要 handoff`，主会话必须在当前 RVF run 的 artifacts 目录创建并持续维护 `handoff.md`，最终回复第一行输出 handoff 路径，空一行后按下面的固定结构分两行追加极短中文摘要（每行各自一句、不要挤成一段）：
+Handoff 默认开启，但只适用于 `mode: full` 且 handoff 未关闭的完整流程。`handoff.md` 由 prepare 阶段的脚本预先建好并写入确定性表头，主会话只负责**表头之外的正文**；除非用户明确要求 `no handoff` / `skip handoff` / `不要 handoff`，主会话必须补齐正文，最终回复第一行输出 handoff 路径，空一行后按下面的固定结构分两行追加极短中文摘要（每行各自一句、不要挤成一段）：
 
 ```text
 RVF_HANDOFF_FILE: <handoff.md 绝对路径>
@@ -15,13 +15,22 @@ Validate/fixers：<极短说明 validate/fixers 验证/修复/驳回/升级了�
 
 如果用户显式关闭 handoff、当前是 `pass_type: review_only` / `pass_type: validate_fix` 子 pass，或当前是 `mode: research_checkpoint_no_handoff` / `no-handoff research checkpoint`，不创建 `handoff.md`，不输出 `RVF_HANDOFF_FILE`，也不要输出空模板。只给当前任务要求的中文结果。
 
+## 所有权：脚本拥有表头，agent 拥有正文
+
+`handoff.md` 分两个所有权区，**混写就是 bug**：
+
+- **脚本拥有**：`<!-- rvf:generated-header:begin -->` 与 `<!-- rvf:generated-header:end -->` 之间的一切——run id、run dir、目标仓库、起始 git HEAD、`## Origin`（含 Kanban 四行）、`## Review scope` 的各条路径。这些事实由 `scripts/handoff_generated_header.py` 从 run artifacts（`summary.json` / `artifacts/origin.json` / `artifacts/inputs/scope.contract.json` / `artifacts/before-workspace-snapshot.json`）渲染，prepare 阶段已经写好。**不要手改、不要凭上下文默写这些字段、不要把整份文件删掉重写**——run finalize 会重渲该区块，你写进去的版本会被覆盖，白花 token。
+- **agent 拥有**：marker 之外的一切——`## 状态` 的 `handoff_status` / `review_status` 两行，以及 `## 原始任务` 起的全部正文。
+
+因此不再要求「初始化后持续维护」。正文可以在末尾一次写完（历史轨迹显示这本来就是多数 run 的实际做法），也可以边做边补，两种都合规。
+
 ## 维护时机
 
-- Prepare/run 初始化后立即创建 `handoff.md`，至少写入 pending 状态、origin、run id、run dir、目标 repo、review scope / scope-of-work 文件路径、review packet / manifest 路径（若有）。如果 prompt 或环境提供 `RVF_PARENT_CONVERSATION_NAME` / `RVF_PARENT_CONVERSATION_REF`、`RVF_PARENT_CONVERSATION_NAME_SOURCE`、`RVF_PARENT_CODEX_URL`、`RVF_PARENT_TRANSCRIPT_PATH`、`RVF_ORIGIN_METADATA`，必须在文件顶部原样保留这些字段，方便从 handoff 反查原始 Codex chat。`RVF_PARENT_SESSION_ID` 只是稳定 id，不是 conversation name source；不得把它写进 `conversation name source`。带双引号的 conversation name 表示原始会话没有设置 name，当前值来自第一条 user prompt 的前缀。
-- Origin 区域内的 4 条 Kanban 行（`source Kanban task id` / `source Kanban attempt id` / `source Kanban task title at trigger` / `generated Kanban task`）只在 prompt 或环境真的提供 `RVF_PARENT_KANBAN_TASK_ID` 时出现；提供时必须直接渲染实际值，不要写 `unavailable`。当前 run 不是从 Cline Kanban task 派生时，整段 4 行连同标题一并省略，避免 Origin 区出现一片 `unavailable` 噪音。
-- Review 阶段后更新 reviewer 来源、review 状态、发现的问题或 `kind: no_issues`。
-- Merge 与 validate/fix 阶段后更新 canonical issue、Validate/fix 分组、每条 attempt 完成状态、真实修复 / 误报 / 升级。
-- 最终阶段更新 repo delta、验证命令、继续指引、升级事项和 deterministic intake hints；最终回复只给文件路径和分行的 `Reviewers：` / `Validate/fixers：` 标签摘要。
+- 表头由 prepare 自动生成，无需 agent 参与；万一 marker 区块不见了（例如被整份重写），跑
+  `scripts/rvf_handoff.py restore-header --run-dir "$RVF_RUN_DIR"` 复原，正文不受影响。
+- Review / merge / validate-fix 结束后把结果写进正文：reviewer 来源与 review 状态、canonical issue、Validate/fix 分组与每条 attempt 完成状态、真实修复 / 误报 / 升级。
+- 最终阶段写 repo delta、验证命令、继续指引、升级事项和 deterministic intake hints，并把 `handoff_status` / `review_status` 翻成 `COMPLETED`；最终回复只给文件路径和分行的 `Reviewers：` / `Validate/fixers：` 标签摘要。
+- 收尾前跑一次 `scripts/rvf_handoff.py check --run-dir "$RVF_RUN_DIR"`：它校验表头是否新鲜，以及正文是否满足被脚本消费的结构（COMPLETED 状态、canonical 计数句与 `[fixed]` / `[false_positive]` / `[elevated]` 条目自洽、`## Handoff intake hints` 必填标签、验证段）。退出码非 0 就按输出的 violations 补齐——这些结构是 candidate evidence 门控与 deterministic intake 的硬依赖，不是排版偏好。
 
 ## Deterministic intake hints
 
@@ -51,6 +60,8 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 
 ## handoff.md 模板
 
+表头区块（`## 状态` 的后四行、`## Origin`、`## Review scope`）由脚本渲染，下面只是让你知道它长什么样；你要写的是 `## 原始任务` 起的部分。
+
 ```markdown
 # Review-validate-fix 交接上下文
 
@@ -58,33 +69,39 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 
 - handoff_status: PENDING / COMPLETED
 - review_status: PENDING / COMPLETED / SKIPPED_BY_USER
+
+<!-- rvf:generated-header:begin — 脚本渲染，勿手改 -->
+
 - run id: <RVF run id>
-- run dir: <state/runs/<run_id>>
+- run dir: <run 目录绝对路径>
 - 目标仓库: <绝对路径>
 - Review 开始时的 git HEAD: <sha 或 "未提交工作树">
 
 ## Origin
 
-- original Codex conversation: <RVF_PARENT_CONVERSATION_NAME 或 RVF_PARENT_CONVERSATION_REF 或 unavailable>
-- conversation name source: <RVF_PARENT_CONVERSATION_NAME_SOURCE 或 unavailable>
-- original Codex URL: <RVF_PARENT_CODEX_URL 或 unavailable>
-- original transcript: <RVF_PARENT_TRANSCRIPT_PATH 或 unavailable>
-- origin metadata: <RVF_ORIGIN_METADATA 或 unavailable>
-- source Kanban task id: <RVF_PARENT_KANBAN_TASK_ID>
-- source Kanban attempt id: <RVF_PARENT_KANBAN_ATTEMPT_ID>
-- source Kanban task title at trigger: <RVF_PARENT_KANBAN_TASK_TITLE>
-- generated Kanban task: <task title 或 task id>
-
-## 原始任务
-
-<review 触发之前的用户任务，1-2 句>
+- original Codex conversation: <origin.json label 或 unavailable>
+- conversation name source: <origin.json name_source 或 unavailable>
+- original Codex URL: <origin.json codex_url 或 unavailable>
+- original transcript: <parent transcript 路径 或 unavailable>
+- origin metadata: <artifacts/origin.json 路径 或 unavailable>
+- source Kanban task id: <仅 Cline Kanban 派生的 run 才出现，下同>
+- source Kanban attempt id: <...>
+- source Kanban task title at trigger: <...>
+- generated Kanban task: <task id / attempt id>
 
 ## Review scope
 
 - scope-of-work: <路径>
 - session manifest: <路径或 unavailable>
 - review packet: <路径>
-- 主审查文件 / 范围: <列表>
+- scope contract: <路径>
+- 主审查文件 / 范围: <N 个文件（scope_mode=…, review_kind=…）>
+
+<!-- rvf:generated-header:end -->
+
+## 原始任务
+
+<review 触发之前的用户任务，1-2 句>
 
 ## Handoff intake hints
 

@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from handoff_document_contract import (  # noqa: E402
+    canonical_issue_summary,
+    completion_statuses_complete,
+    has_unresolved_outcomes,
+    outcome_marker_counts,
+)
 from validation_result_cache import (  # noqa: E402
     CONTENT_MANIFEST_ALGORITHM,
     candidate_content_manifest_sha256,
@@ -170,26 +176,22 @@ def completed_review(run_dir: Path, handoff_text: str) -> tuple[int, str]:
                 raise ValueError(f"review result {reviewer_id} has an invalid issue")
     if len(set(reviewer_ids)) != 2:
         raise ValueError("reviewer plan reviewer ids must be distinct")
-    if not re.search(r"handoff_status:\s*COMPLETED", handoff_text, re.IGNORECASE) or not re.search(
-        r"review_status:\s*COMPLETED", handoff_text, re.IGNORECASE
-    ):
+    # handoff 正文契约的正则事实源是 handoff_document_contract；这里只保留 candidate
+    # evidence 特有的判定（elevated/failed 一律不构成可复用 candidate）。
+    if not completion_statuses_complete(handoff_text):
         raise ValueError("handoff and review must both be completed")
-    if re.search(r"\[(?:elevated|failed)\]", handoff_text, re.IGNORECASE):
+    if has_unresolved_outcomes(handoff_text):
         raise ValueError("handoff contains unresolved elevated or failed outcomes")
-    summary_match = re.search(
-        r"共\s*(\d+)\s*条\s*[，,]\s*(\d+)\s*真实修复\s*/\s*(\d+)\s*误报\s*/\s*(\d+)\s*升级",
-        handoff_text,
-    )
-    if summary_match is None:
+    summary_counts = canonical_issue_summary(handoff_text)
+    if summary_counts is None:
         raise ValueError("handoff canonical issue summary is missing")
-    canonical_count, fixed_count, false_positive_count, elevated_count = map(int, summary_match.groups())
-    fixed_outcomes = len(re.findall(r"\[fixed\]", handoff_text, re.IGNORECASE))
-    false_positive_outcomes = len(re.findall(r"\[false_positive\]", handoff_text, re.IGNORECASE))
+    canonical_count, fixed_count, false_positive_count, elevated_count = summary_counts
+    outcome_counts = outcome_marker_counts(handoff_text)
     if (
         elevated_count != 0
         or fixed_count + false_positive_count != canonical_count
-        or fixed_outcomes != fixed_count
-        or false_positive_outcomes != false_positive_count
+        or outcome_counts["fixed"] != fixed_count
+        or outcome_counts["false_positive"] != false_positive_count
     ):
         raise ValueError("handoff canonical issue summary does not match completed outcomes")
     if any_reviewer_reported_issues != (canonical_count > 0):

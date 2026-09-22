@@ -25,8 +25,14 @@ Normative source:
 
 Normative source:
 
-- Writer/opener: `scripts/rvf_handoff.py`
+- CLI / 完成信号 / OS 通知: `scripts/rvf_handoff.py`
+- 脚本拥有的确定性表头（`rvf:generated-header` marker 区块）: `scripts/handoff_generated_header.py`
+- agent 拥有的正文契约（状态行、canonical 计数句、intake hints、验证段）: `scripts/handoff_document_contract.py`
 - Template: `references/handoff-template.md`
+
+表头由 `prepare_review_run.py` 在 prepare 阶段写入、由 `rvf_run_finalize.py` 在 run 终态幂等重渲；
+正文契约由 `write_reviewed_task_candidate_evidence.py`（landing candidate 硬门控）与 finalize 的
+`handoff_contract` 体检（只报不拦）共用同一组正则。
 
 ## Run Ledger And Dispatch State
 

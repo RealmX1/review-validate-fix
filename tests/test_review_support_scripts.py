@@ -1673,6 +1673,316 @@ def test_rvf_handoff_maybe_trigger_kanban_notification(tmp_path: Path) -> None:
             os.environ[mod.KANBAN_NOTIFY_CMD_ENV] = saved
 
 
+def _load_handoff_generated_header_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import handoff_generated_header
+
+    return handoff_generated_header
+
+
+def _load_handoff_document_contract_module():
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import handoff_document_contract
+
+    return handoff_document_contract
+
+
+def _fake_rvf_run_dir(root: Path, *, kanban: bool = False) -> Path:
+    """造一个只含表头事实源的最小 run dir（不跑真 prepare）。"""
+    run_dir = root / "rvf-20260725T000000Z-prepare-run-deadbeef"
+    artifacts = run_dir / "artifacts"
+    (artifacts / "inputs").mkdir(parents=True, exist_ok=True)
+    (run_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "run_id": "rvf-20260725T000000Z-prepare-run-deadbeef",
+                "repo": "/tmp/target-repo",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "inputs" / "scope.contract.json").write_text(
+        json.dumps(
+            {
+                "repo": "/tmp/target-repo",
+                "run_id": "rvf-20260725T000000Z-prepare-run-deadbeef",
+                "scope_mode": "session-owned",
+                "review_kind": "implementation",
+                "primary_files": ["a.py", "b.py"],
+                "primary_units": [],
+                "scope_of_work_path": str(artifacts / "scope-of-work.md"),
+                "session_manifest_path": str(artifacts / "session-manifest.json"),
+                "review_packet_path": str(artifacts / "review-packet.md"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "before-workspace-snapshot.json").write_text(
+        json.dumps({"repo": "/tmp/target-repo", "head": "a" * 40}),
+        encoding="utf-8",
+    )
+    origin = {
+        "label": "把 frontier 3D 迁到 Three.js",
+        "name_source": "cline_kanban_board_lookup",
+        "codex_url": "codex://local/019f-abc",
+        "transcript_path": "/tmp/rollout.jsonl",
+    }
+    if kanban:
+        origin.update(
+            {
+                "source_kind": "cline-kanban-task",
+                "kanban_task_id": "bcfb4",
+                "kanban_attempt_id": "att-1",
+                "kanban_task_title": "把 frontier 3D 迁到 Three.js",
+            }
+        )
+    (artifacts / "origin.json").write_text(json.dumps(origin, ensure_ascii=False), encoding="utf-8")
+    return run_dir
+
+
+COMPLIANT_HANDOFF_BODY = """
+## 原始任务
+
+把 frontier 3D 迁到 Three.js。
+
+## Handoff intake hints
+
+- reviewed scope paths:
+  - a.py
+- accepted changes:
+  - RVF-001 修复
+- main-session validation commands:
+  - `python3 -m compileall -q .`
+
+## 本次 review
+
+共 2 条，1 真实修复 / 1 误报 / 0 升级
+
+## Issue 处理结果
+
+- **[fixed]** `a.py:1` - 空 creator
+- **[false_positive]** `b.py:2` - 误报
+
+## 验证
+
+- `python3 -m compileall -q .` -> passed
+"""
+
+
+def test_handoff_generated_header_renders_run_facts(tmp_path: Path) -> None:
+    mod = _load_handoff_generated_header_module()
+    run_dir = _fake_rvf_run_dir(tmp_path / "plain")
+    block = mod.generated_header_block(run_dir)
+
+    assert block.startswith(mod.GENERATED_HEADER_BEGIN)
+    assert block.rstrip().endswith(mod.GENERATED_HEADER_END)
+    assert "- run id: rvf-20260725T000000Z-prepare-run-deadbeef" in block
+    assert "- 目标仓库: /tmp/target-repo" in block
+    assert f"- Review 开始时的 git HEAD: {'a' * 40}" in block
+    assert "- original Codex conversation: 把 frontier 3D 迁到 Three.js" in block
+    assert "- conversation name source: cline_kanban_board_lookup" in block
+    assert "- original transcript: /tmp/rollout.jsonl" in block
+    assert "- 主审查文件 / 范围: 2 个文件（scope_mode=session-owned" in block
+    # 非 Kanban run：整段 4 行连同标题省略，不留 unavailable 噪音。
+    assert "source Kanban task id" not in block
+
+    kanban_block = mod.generated_header_block(_fake_rvf_run_dir(tmp_path / "kanban", kanban=True))
+    assert "- source Kanban task id: bcfb4" in kanban_block
+    assert "- source Kanban attempt id: att-1" in kanban_block
+    assert "- generated Kanban task: bcfb4 / att-1" in kanban_block
+
+
+def test_handoff_generated_header_create_and_refresh(tmp_path: Path) -> None:
+    mod = _load_handoff_generated_header_module()
+    run_dir = _fake_rvf_run_dir(tmp_path)
+    handoff = run_dir / "artifacts" / "handoff.md"
+
+    created = mod.apply_generated_header(run_dir)
+    assert created["action"] == "created"
+    text = handoff.read_text(encoding="utf-8")
+    # agent 拥有的状态两行在 marker 之外，脚本只播种 PENDING。
+    assert "- handoff_status: PENDING" in text
+    assert text.index("- handoff_status: PENDING") < text.index(mod.GENERATED_HEADER_BEGIN)
+    assert mod.generated_header_is_current(run_dir)
+
+    # 幂等：事实没变就不重写文件。
+    assert mod.apply_generated_header(run_dir)["action"] == "unchanged"
+
+    # 区块过期（run 事实变了）→ 只替换区块，正文一字不动。
+    handoff.write_text(text.replace("deadbeef", "deadbeef") + COMPLIANT_HANDOFF_BODY, encoding="utf-8")
+    stale = handoff.read_text(encoding="utf-8").replace("- 目标仓库: /tmp/target-repo", "- 目标仓库: /tmp/wrong")
+    handoff.write_text(stale, encoding="utf-8")
+    assert mod.generated_header_is_current(run_dir) is False
+    assert mod.apply_generated_header(run_dir)["action"] == "replaced"
+    refreshed = handoff.read_text(encoding="utf-8")
+    assert "- 目标仓库: /tmp/target-repo" in refreshed
+    assert "/tmp/wrong" not in refreshed
+    assert "共 2 条，1 真实修复 / 1 误报 / 0 升级" in refreshed
+
+
+def test_handoff_generated_header_survives_full_rewrite(tmp_path: Path) -> None:
+    """agent 把 handoff.md 整份删掉重写（实测约三分之一 run 的行为）后仍能复原。"""
+    mod = _load_handoff_generated_header_module()
+    run_dir = _fake_rvf_run_dir(tmp_path)
+    handoff = run_dir / "artifacts" / "handoff.md"
+    handoff.parent.mkdir(parents=True, exist_ok=True)
+    handoff.write_text(
+        "# Review-validate-fix 交接上下文\n\n"
+        "## 状态\n\n"
+        "- handoff_status: COMPLETED\n"
+        "- review_status: COMPLETED\n"
+        "- run id: 被 agent 默写错的 run id\n"
+        "- 目标仓库: /tmp/agent-guessed-repo\n\n"
+        "## Origin\n\n"
+        "- original Codex conversation: agent 凭记忆默写的名字\n\n"
+        "## Review scope\n\n"
+        "- scope-of-work: /tmp/agent-guessed.md\n"
+        + COMPLIANT_HANDOFF_BODY,
+        encoding="utf-8",
+    )
+
+    assert mod.apply_generated_header(run_dir)["action"] == "reinserted"
+    text = handoff.read_text(encoding="utf-8")
+
+    assert mod.generated_header_is_current(run_dir)
+    # agent 默写的表头内容被脚本事实取代，且不留重复区块。
+    assert text.count("## Origin") == 1
+    assert text.count("## Review scope") == 1
+    assert "被 agent 默写错的 run id" not in text
+    assert "/tmp/agent-guessed-repo" not in text
+    assert "agent 凭记忆默写的名字" not in text
+    assert "- 目标仓库: /tmp/target-repo" in text
+    # agent 拥有的状态行与正文原样保留。
+    assert "- handoff_status: COMPLETED" in text
+    assert "共 2 条，1 真实修复 / 1 误报 / 0 升级" in text
+    assert "## 需要开发者决策的升级事项" not in text
+
+
+def test_handoff_document_contract_violations() -> None:
+    mod = _load_handoff_document_contract_module()
+    compliant = (
+        "## 状态\n\n- handoff_status: COMPLETED\n- review_status: COMPLETED\n"
+        + COMPLIANT_HANDOFF_BODY
+    )
+    assert mod.handoff_document_violations(compliant) == []
+
+    # 仍是 PENDING → 明确报出当前值。
+    pending = compliant.replace("- handoff_status: COMPLETED", "- handoff_status: PENDING")
+    assert any("handoff_status 仍为" in item for item in mod.handoff_document_violations(pending))
+
+    # 计数句缺失（实测最常见的违规：agent 用散文代替计数句）。
+    prose = compliant.replace("共 2 条，1 真实修复 / 1 误报 / 0 升级", "两个 issue 都已修复，没有误报。")
+    assert any("canonical 计数句" in item for item in mod.handoff_document_violations(prose))
+
+    # 计数与条目不符。
+    mismatched = compliant.replace(
+        "共 2 条，1 真实修复 / 1 误报 / 0 升级", "共 3 条，2 真实修复 / 1 误报 / 0 升级"
+    )
+    violations = mod.handoff_document_violations(mismatched)
+    assert any("正文实际 1 条" in item for item in violations)
+
+    # intake hints 缺标签。
+    missing_label = compliant.replace("- accepted changes:", "- 采纳的改动:")
+    assert any("accepted changes" in item for item in mod.handoff_document_violations(missing_label))
+
+    # 验证段缺失。
+    no_validation = compliant.replace("## 验证", "## 随手记")
+    assert any("验证段" in item for item in mod.handoff_document_violations(no_validation))
+
+    # elevated 收尾是合法终态，不算违规（与 candidate evidence 门控的区别）。
+    elevated = compliant.replace(
+        "共 2 条，1 真实修复 / 1 误报 / 0 升级", "共 3 条，1 真实修复 / 1 误报 / 1 升级"
+    ).replace("## 验证", "- **[elevated]** `c.py:3` - 需拍板\n\n## 验证")
+    assert mod.handoff_document_violations(elevated) == []
+
+
+def test_rvf_handoff_check_cli(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    header_mod = _load_handoff_generated_header_module()
+    run_dir = _fake_rvf_run_dir(tmp_path)
+    header_mod.apply_generated_header(run_dir)
+    handoff = run_dir / "artifacts" / "handoff.md"
+
+    # 只有骨架 → 正文契约未满足，退出码非 0（因此绕开会对非零退出断言的 run helper）。
+    incomplete = subprocess.run(
+        [sys.executable, str(RVF_HANDOFF), "check", "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert incomplete.returncode == 1
+    payload = json.loads(incomplete.stdout)
+    assert payload["ok"] is False
+    assert payload["generated_header_current"] is True
+    assert any("canonical 计数句" in item for item in payload["violations"])
+
+    # 补齐正文 + 翻状态 → ok。
+    text = handoff.read_text(encoding="utf-8").replace(
+        "- handoff_status: PENDING\n- review_status: PENDING",
+        "- handoff_status: COMPLETED\n- review_status: COMPLETED",
+    )
+    handoff.write_text(text + COMPLIANT_HANDOFF_BODY, encoding="utf-8")
+    completed = run([sys.executable, str(RVF_HANDOFF), "check", "--run-dir", str(run_dir)])
+    assert json.loads(completed.stdout)["ok"] is True
+
+
+def test_rvf_run_finalize_handoff_contract_stage(tmp_path: Path) -> None:
+    """finalize 的 handoff_contract 槽：复原表头 + 上报正文违规，且 cancel 路径跳过。"""
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_run_finalize
+
+    run_dir = _fake_rvf_run_dir(tmp_path)
+    handoff = run_dir / "artifacts" / "handoff.md"
+    handoff.write_text(
+        "# Review-validate-fix 交接上下文\n\n"
+        "## 状态\n\n- handoff_status: COMPLETED\n- review_status: COMPLETED\n"
+        + COMPLIANT_HANDOFF_BODY,
+        encoding="utf-8",
+    )
+
+    record = rvf_run_finalize._restore_and_check_handoff_document(run_dir, "handoff-advisory")
+    assert record["status"] == "ok"
+    assert record["generated_header_action"] == "reinserted"
+    assert record["violations"] == []
+    assert _load_handoff_generated_header_module().generated_header_is_current(run_dir)
+
+    # 正文违规 → 报出来（但不阻断，status 仍是 run 的终态记录）。
+    handoff.write_text(
+        handoff.read_text(encoding="utf-8").replace(
+            "共 2 条，1 真实修复 / 1 误报 / 0 升级", "两个都修好了"
+        ),
+        encoding="utf-8",
+    )
+    broken = rvf_run_finalize._restore_and_check_handoff_document(run_dir, "handoff")
+    assert broken["status"] == "violations"
+    assert any("canonical 计数句" in item for item in broken["violations"])
+
+    # cancel 终态没有 handoff 要维护。
+    cancelled = rvf_run_finalize._restore_and_check_handoff_document(run_dir, "cancelled")
+    assert cancelled == {"status": "skipped", "reason": "decision_kind=cancelled"}
+
+    # 契约违规走独立通道，不冒充 finalize 阶段失败。
+    class _FakeLedger:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+            self.summary_path = None
+
+        def event(self, **fields: object) -> None:
+            self.events.append(fields)
+
+    ledger = _FakeLedger()
+    payload = {"systemMessage": "review-validate-fix run 已结束"}
+    record = {"run_dir": str(run_dir), "errors": [], "handoff_contract": broken}
+    assert rvf_run_finalize.surface_finalize_record_errors(ledger, record, payload=payload) == []
+    assert rvf_run_finalize.public_handoff_contract_violations(record) == broken["violations"]
+    assert [item["event"] for item in ledger.events] == ["handoff_contract_violations"]
+    assert "finalize_errors=" not in payload["systemMessage"]
+    assert "handoff_contract_violations=1" in payload["systemMessage"]
+
+
 @functools.lru_cache(maxsize=1)
 def _repo_template() -> Path:
     """Build the canonical repo once per process; callers copy it.
@@ -8211,6 +8521,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_handoff_maybe_trigger_kanban_notification",
             lambda: test_rvf_handoff_maybe_trigger_kanban_notification(root / "handoff-kanban-trigger"),
+        ),
+        (
+            "handoff_generated_header_renders_run_facts",
+            lambda: test_handoff_generated_header_renders_run_facts(root / "handoff-header-render"),
+        ),
+        (
+            "handoff_generated_header_create_and_refresh",
+            lambda: test_handoff_generated_header_create_and_refresh(root / "handoff-header-refresh"),
+        ),
+        (
+            "handoff_generated_header_survives_full_rewrite",
+            lambda: test_handoff_generated_header_survives_full_rewrite(root / "handoff-header-rewrite"),
+        ),
+        (
+            "handoff_document_contract_violations",
+            lambda: test_handoff_document_contract_violations(),
+        ),
+        (
+            "rvf_handoff_check_cli",
+            lambda: test_rvf_handoff_check_cli(root / "handoff-check-cli"),
+        ),
+        (
+            "rvf_run_finalize_handoff_contract_stage",
+            lambda: test_rvf_run_finalize_handoff_contract_stage(root / "handoff-finalize-stage"),
         ),
         ("rvf_prep_file_round_trip_and_sweep", lambda: test_rvf_prep_file_round_trip_and_sweep(root / "prep-file")),
         (

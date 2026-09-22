@@ -81,7 +81,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 ## Handoff
 
-- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md` 并持续更新。
+- Handoff 默认写入当前 RVF run 的 `artifacts/handoff.md`。该文件在 prepare 阶段已由脚本建好并填入确定性表头（run 身份、`## Origin`、`## Review scope`，包在 `rvf:generated-header` marker 内）：**不要手改 marker 区块、不要凭上下文默写这些字段、不要把文件整份删掉重写**；主会话只写 marker 之外的正文与 `handoff_status` / `review_status` 两行。表头意外丢失时跑 `scripts/rvf_handoff.py restore-header --run-dir "$RVF_RUN_DIR"`，收尾前跑 `scripts/rvf_handoff.py check --run-dir "$RVF_RUN_DIR"` 自检正文契约。
 - 最终回复第一行输出 `RVF_HANDOFF_FILE: <绝对路径>`，空一行后按 `references/handoff-template.md` 规定的固定分行标签结构追加极短中文摘要（不要挤成一段）；该模板是摘要结构的唯一详述处。Stop hook 会把该 marker 当作完成信号，run 结束时发送 OS 系统通知（不再自动用编辑器打开 handoff）；不要再手动调用任何「打开 handoff」脚本。
 - **存在任何 `[elevated]` 时，只在所有非 elevated issue 验证/修复完、handoff 与相关 brief 更新完之后，才于 workflow 末端的最终回复里逐条把升级直接摆给用户（简述卡点 + 候选方向）**，绝不只塞进 handoff 正文靠两行标签摘要带过，也不在 review 一发现就当场打断流程去问——升级即「需用户决策」。当某条升级是只有用户能拍板的方案选择（trade-off）时，用 `AskUserQuestion` 把选项摆出来让其当场选。
 - Handoff 只写确认过的事实，不把背景 WIP 或其他 session 的改动混成本轮工作。

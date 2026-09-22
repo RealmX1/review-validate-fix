@@ -23,6 +23,8 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from handoff_document_contract import handoff_document_violations  # noqa: E402
+from handoff_generated_header import apply_generated_header  # noqa: E402
 from trajectory_capture import capture_run  # noqa: E402
 from workspace_diff import capture_after, compute as compute_workspace_diff  # noqa: E402
 
@@ -379,6 +381,28 @@ def _advance_review_highwater(
     }
 
 
+def _restore_and_check_handoff_document(run_dir: Path, decision_kind: str) -> dict[str, Any]:
+    """复原 handoff.md 里脚本拥有的表头区块，并体检 agent 拥有的正文契约。
+
+    主会话在约三分之一的 run 里会把 handoff.md 整份重写，marker 区块随之消失；这里是
+    最后一次把确定性表头放回去的机会（幂等，不动正文）。正文违规只报不拦：文件已经就绪，
+    完成信号仍由 ``RVF_HANDOFF_FILE`` marker 决定。
+    """
+    if "handoff" not in decision_kind:
+        return {"status": "skipped", "reason": f"decision_kind={decision_kind}"}
+    handoff_path = run_dir / "artifacts" / "handoff.md"
+    if not handoff_path.is_file():
+        return {"status": "skipped", "reason": "missing_handoff_file"}
+    header = apply_generated_header(run_dir, handoff_path=handoff_path)
+    violations = handoff_document_violations(handoff_path.read_text(encoding="utf-8"))
+    return {
+        "status": "violations" if violations else "ok",
+        "handoff_path": str(handoff_path),
+        "generated_header_action": header.get("action"),
+        "violations": violations,
+    }
+
+
 def finalize_run(
     *,
     run_dir: Path,
@@ -414,6 +438,7 @@ def finalize_run(
         "workspace_diff": None,
         "tracker_lease_release": None,
         "review_highwater": None,
+        "handoff_contract": None,
         "analysis": None,
         "errors": [],
     }
@@ -511,6 +536,23 @@ def finalize_run(
             }
         )
 
+    try:
+        # 契约违规**不**进 errors：``errors`` 是「finalize 某个阶段自身失败」的通道，而这里
+        # 阶段跑通了、只是发现 agent 正文不合规。两者混写会让 finalize_errors 计数变成
+        # 「handoff 少写了一句计数句」的代称。违规经 surface_finalize_record_errors 的
+        # 独立 handoff_contract_violations 通道上浮。
+        finalize_record["handoff_contract"] = _restore_and_check_handoff_document(
+            run_dir, decision_kind
+        )
+    except Exception as exc:
+        finalize_record["errors"].append(
+            {
+                "stage": "handoff_contract",
+                "error": f"{type(exc).__name__}: {exc}",
+                "trace": traceback.format_exc(),
+            }
+        )
+
     finalize_record["completed_at"] = _utc_now()
 
     summary_path = run_dir / "summary.json"
@@ -598,6 +640,19 @@ def public_finalize_errors(record: dict[str, Any] | None) -> list[dict[str, Any]
     return public_errors
 
 
+def public_handoff_contract_violations(record: dict[str, Any] | None) -> list[str]:
+    """返回 finalize 记录里 handoff 正文契约的违规描述（不含表头复原动作）。"""
+    if not isinstance(record, dict):
+        return []
+    contract = record.get("handoff_contract")
+    if not isinstance(contract, dict):
+        return []
+    violations = contract.get("violations")
+    if not isinstance(violations, list):
+        return []
+    return [item for item in violations if isinstance(item, str) and item]
+
+
 def surface_finalize_record_errors(
     ledger: Any,
     record: dict[str, Any] | None,
@@ -609,26 +664,46 @@ def surface_finalize_record_errors(
     finalize_run 仍保留 trajectory/workspace_diff/analysis 的非致命错误模型；
     该 helper 只负责让 handoff completion caller 不再把这些错误隐藏在 actual run
     summary 内部。
+
+    handoff 正文契约违规走**独立**通道（``handoff_contract_violations``）：它不是
+    finalize 阶段失败，而是 agent 写的正文缺了被脚本消费的结构，混进 ``finalize_errors``
+    会让两类问题在计数上无法区分。返回值仍只含 errors，保持既有调用方语义不变。
     """
     errors = public_finalize_errors(record)
-    if not errors:
+    violations = public_handoff_contract_violations(record)
+    if not errors and not violations:
         return []
 
     run_dir = record.get("run_dir") if isinstance(record, dict) else None
     paths = {"run_dir": run_dir} if isinstance(run_dir, str) and run_dir else {}
-    try:
-        ledger.event(
-            phase="handoff",
-            event="finalize_completed_with_errors",
-            status="warning",
-            reason_code="finalize_error",
-            level="warn",
-            paths=paths,
-            finalize_error_count=len(errors),
-            finalize_errors=errors,
-        )
-    except Exception:
-        pass
+    if errors:
+        try:
+            ledger.event(
+                phase="handoff",
+                event="finalize_completed_with_errors",
+                status="warning",
+                reason_code="finalize_error",
+                level="warn",
+                paths=paths,
+                finalize_error_count=len(errors),
+                finalize_errors=errors,
+            )
+        except Exception:
+            pass
+    if violations:
+        try:
+            ledger.event(
+                phase="handoff",
+                event="handoff_contract_violations",
+                status="warning",
+                reason_code="handoff_contract_violation",
+                level="warn",
+                paths=paths,
+                handoff_contract_violation_count=len(violations),
+                handoff_contract_violations=violations,
+            )
+        except Exception:
+            pass
 
     summary_path = getattr(ledger, "summary_path", None)
     if summary_path is not None:
@@ -636,9 +711,14 @@ def surface_finalize_record_errors(
             path = Path(summary_path)
             summary = _read_summary(path)
             if summary:
-                summary["finalize_status"] = "warning"
-                summary["finalize_error_count"] = len(errors)
-                summary["finalize_errors"] = errors
+                if errors:
+                    summary["finalize_status"] = "warning"
+                    summary["finalize_error_count"] = len(errors)
+                    summary["finalize_errors"] = errors
+                if violations:
+                    summary["handoff_contract_status"] = "violations"
+                    summary["handoff_contract_violation_count"] = len(violations)
+                    summary["handoff_contract_violations"] = violations
                 if isinstance(run_dir, str) and run_dir:
                     summary["finalized_run_dir"] = run_dir
                 _atomic_write_json(path, summary)
@@ -647,8 +727,12 @@ def surface_finalize_record_errors(
 
     if payload is not None:
         message = payload.get("systemMessage")
-        if isinstance(message, str) and "finalize_errors=" not in message:
-            payload["systemMessage"] = f"{message}; finalize_errors={len(errors)}"
+        if isinstance(message, str):
+            if errors and "finalize_errors=" not in message:
+                message = f"{message}; finalize_errors={len(errors)}"
+            if violations and "handoff_contract_violations=" not in message:
+                message = f"{message}; handoff_contract_violations={len(violations)}"
+            payload["systemMessage"] = message
 
     return errors
 

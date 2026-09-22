@@ -469,6 +469,7 @@ repo_required_files=(
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
+  "tests/test_reviewed_task_candidate_evidence.py"
 )
 
 for file in "${repo_required_files[@]}"; do
@@ -579,6 +580,11 @@ run_step "tests: rvf_local_deploy" \
 run_step "tests: trajectory_distill" \
   python3 -m pytest -q \
     "$tests_dir/test_trajectory_distill.py"
+# handoff 正文契约（handoff_document_contract）唯一的回归守卫；此前该文件从未被任何
+# runner 执行过（孤儿测试），completed_review 的门控实际处于无守卫状态。
+run_step "tests: reviewed_task_candidate_evidence" \
+  python3 -m pytest -q \
+    "$tests_dir/test_reviewed_task_candidate_evidence.py"
 
 require_literal "prompts/reviewer.md" 'RVF_WRITE_REVIEW_RESULT'
 require_literal "prompts/reviewer.md" 'RVF_CHECK_REVIEW_RESULT'

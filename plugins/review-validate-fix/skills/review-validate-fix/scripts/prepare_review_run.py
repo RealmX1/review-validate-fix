@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 import concurrent.futures
 import rvf_prep_file
+from handoff_generated_header import apply_generated_header
 from rvf_dispatch_prompts import dispatch_scope_of_work_text
 from core.run_ledger.run_ledger import normalize_rvf_backend, rvf_state_fields, start_run
 from core.session_scope_allocation import reviewable_unit_diff_tracker
@@ -494,6 +495,7 @@ def review_agent_context_text(
     lines.extend(
         [
             "- review packet: `$RVF_REVIEW_PACKET`",
+            "- handoff: `$RVF_ARTIFACTS_DIR/handoff.md` (deterministic header block is script-owned; write only the body below it)",
             "- command lock wrapper: `$RVF_COMMAND_LOCK`",
             "- review result writer: `$RVF_WRITE_REVIEW_RESULT`",
             "- review result checker: `$RVF_CHECK_REVIEW_RESULT`",
@@ -1069,6 +1071,7 @@ def prepare_run(
     committed_base_ref: str | None = None,
     local_base_ref: str | None = None,
     scope_contract_extensions: Mapping[str, Any] | None = None,
+    generate_handoff_header: bool = True,
 ) -> dict[str, Any]:
     root = git_root(repo)
     resolved_local_base_ref = resolve_local_base_ref(
@@ -1503,6 +1506,14 @@ def prepare_run(
         session_manifest_path=manifest_path,
     )
     review_agent_context_path.write_text(review_agent_context, encoding="utf-8")
+    # handoff.md 的确定性表头由脚本渲染，agent 只写正文。best-effort：表头渲染失败
+    # 不能让整个 prepare 失败（review 本身不依赖 handoff 文件存在）。
+    handoff_header: dict[str, Any] | None = None
+    if generate_handoff_header:
+        try:
+            handoff_header = apply_generated_header(ledger.run_dir)
+        except Exception as exc:  # noqa: BLE001 — 表头是附属产物，失败只记不抛
+            handoff_header = {"error": f"{type(exc).__name__}: {exc}"}
     result = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "repo": str(root),
@@ -1519,6 +1530,8 @@ def prepare_run(
         "review_packet": str(packet_path),
         "review_packet_metadata": str(metadata_path),
         "before_workspace_snapshot": str(snapshot_path),
+        "handoff_file": handoff_header.get("handoff_path") if handoff_header else None,
+        "handoff_generated_header": handoff_header,
         "input_review_packet": str(resolved_input_packet_path),
         "input_review_packet_metadata": str(resolved_input_metadata_path),
         "input_before_workspace_snapshot": str(resolved_input_snapshot_path),
@@ -1953,6 +1966,14 @@ def main() -> int:
         action="store_true",
         help="Debug-only escape hatch. Normal review runs must pass --session-context.",
     )
+    parser.add_argument(
+        "--no-handoff-header",
+        action="store_true",
+        help=(
+            "Skip seeding artifacts/handoff.md with the script-owned header block. "
+            "Use for review_only / validate_fix sub-passes, which never write a handoff."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -2025,6 +2046,7 @@ def main() -> int:
             base_ref=args.base_ref,
             local_base_ref=args.local_base_ref,
             scope_contract_extensions=contract_extensions,
+            generate_handoff_header=not args.no_handoff_header,
         )
     except BootstrapRequiredBeforeRvf as exc:
         payload = json.dumps(exc.payload, ensure_ascii=False, indent=2) + "\n"
