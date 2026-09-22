@@ -1464,7 +1464,9 @@ def build_execution_handoff(
         "origin_metadata": str(run_dir_path / "artifacts" / "origin.json") if run_dir_path else None,
         "handoff_path": str(run_dir_path / "artifacts" / "handoff.md") if run_dir_path else None,
         "handoff_contract": (
-            "从准备阶段开始创建并持续维护 run artifact `handoff.md`；完成后最终回复第一行输出 "
+            "run artifact `handoff.md` 已由 prepare 建好并写入脚本拥有的确定性表头"
+            "（`rvf:generated-header` marker 区块）；只写 marker 之外的正文，不要手改表头、"
+            "也不要把该文件整份删掉重写。完成后最终回复第一行输出 "
             "`RVF_HANDOFF_FILE: <handoff.md 绝对路径>`，"
             f"{HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION}，也不要在正文里重复 handoff 文件内容。"
             "Stop hook 把 `RVF_HANDOFF_FILE` marker 当作完成信号：它同时清掉本轮的在途凭证，"
