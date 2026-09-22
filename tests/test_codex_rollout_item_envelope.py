@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
-"""第三代 Codex rollout（``item_completed`` 信封）的解包与三代并存归属测试。
+"""Codex rollout ``item_completed`` 信封的解包与多形态并存归属测试。
 
-背景：2026-08 的 ``codex-tui`` 把原先散在 ``event_msg`` 的若干子类型搬进统一的
-``payload.type == "item_completed"`` 信封（真内容在 ``payload.item``、由 ``item.type``
-区分）。RVF 的编辑归属只认 ``patch_apply_end``，于是归属归零，fail-loud 守卫把整个
-Stop hook loud-skip（run rvf-20260812T153919Z-dispatcher-ac459543）。
+背景：Codex 的 rollout 记录**存在多种形态，它们按前端 / 工具配置并存，不是按时间先后
+替换的「世代」**——Codex 支持 resume、切换模型、不同前端，同一天不同会话可能不同形态，
+同一个 session 内也可能前后段不同。其中 ``payload.type == "item_completed"`` 信封形态把
+若干子类型收进统一信封（真内容在 ``payload.item``、由 ``item.type`` 区分）；本机 1955 个
+rollout 语料实测（2026-09-23 复查），该信封承载 ``FileChange`` / ``CommandExecution``
+**最早见于 2026-04-02**（``codex-tui 0.118.0``），含 ``FileChange`` 的有 705 个。而 RVF
+的编辑归属只认 ``patch_apply_end``，碰上这一形态就归属归零，fail-loud 守卫把整个 Stop
+hook loud-skip（run rvf-20260812T153919Z-dispatcher-ac459543）。完整取证见
+``core/transcript/codex_rollout_item_envelope.py`` 的模块 docstring。
 
 这些测试锁定三件事：
 1. 信封解包原语对每种 item 的字段映射（含 ``text``/``Text`` 大小写混用、``file://`` cwd）。
-2. **三代并存**下归属不重不漏——Codex 支持 resume / 切换模型 / 不同前端，同一天甚至同一
-   session 内会出现不同代记录。
-3. 刻意不翻译 ``UserMessage`` / ``AgentMessage``：这两类已有 ``response_item/message``
-   兜底，再翻一遍会把旧世代的双份冗余搬过来（重复切分 / 重复计数）。
+2. **多形态并存**下归属不重不漏——同一天甚至同一 session 内都会出现不同形态的记录。
+3. 刻意不翻译 ``UserMessage``：这一类已有 ``response_item/message`` 兜底（实测
+   5484/5486），再翻一遍会把非信封形态本就有的双份冗余搬过来（重复切分 / 重复计数）。
+   ``AgentMessage`` **不在此列**——实测 63921 条里有 4731 条没有任何孪生，按类型一刀切会
+   丢掉这批助手过程说明，所以 parent-context 改为逐条判定孪生存在与否。
 
-⚠️ 世代判定一律基于 payload/item 结构，**绝不能看 ``cli_version``**——实测同一版本号
-（0.147.0）在 Codex Desktop 与 codex-tui 下走不同 schema。
+⚠️ 形态判定一律基于 payload/item 结构，**绝不能看 ``cli_version`` / 日期 /
+``originator``**——实测同一版本号（0.147.0）在 Codex Desktop 与 codex-tui 下走不同
+schema，而信封形态自 2026-04-02 起就与其它形态长期并存，按日期或版本号切分必然误判。
+
+注：下文用例与注释里的「第一/二/三代」只是这几种记录形态的简称，**不表示时间先后**。
 """
 
 from __future__ import annotations
@@ -538,8 +547,9 @@ def test_parent_context_renders_file_change_success_marker_without_duplicating_t
     """父会话 context 渲染的第四处信封缺口：``patch_apply_end`` 的编辑成功标记在第三代整条
     消失。补回后必须与第二代严格 parity——两代都是「exec 调用渲染补丁内容 + 一行成功标记」。
 
-    同时守住「不补 UserMessage/AgentMessage/Reasoning/CommandExecution 分支」的决定：它们的
-    ``response_item`` 孪生记录已各自渲染，再补一遍就是重复渲染。
+    同时守住「不补 UserMessage 分支」的决定：它的 ``response_item`` 孪生记录已各自渲染，
+    再补一遍就是重复渲染。``AgentMessage`` 的孪生去重另见
+    ``test_parent_context_renders_envelope_only_agent_message_but_not_twinned_one``。
     """
     scripts = ROOT / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix" / "scripts"
     sys.path.insert(0, str(scripts))
@@ -603,6 +613,71 @@ def test_parent_context_renders_file_change_success_marker_without_duplicating_t
     )
 
 
+def test_parent_context_renders_envelope_only_agent_message_but_not_twinned_one(tmp_path: Path) -> None:
+    """信封 ``AgentMessage`` 的两个不变量必须同时成立：**无孪生不丢内容、有孪生不重复**。
+
+    取证（本机 1955 个 rollout，2026-09-23）：63921 条 ``AgentMessage`` 里 4731 条没有任何
+    ``response_item`` 孪生（几乎全是 ``phase == "commentary"`` 的助手过程说明），按 item 类型
+    一刀切忽略会把它们整条丢给不可见；而另有 310 条的孪生**比信封正文更长**（``response_item``
+    那份还带着被 UI 剥掉的 ``<proposed_plan>`` 正文），所以孪生判据必须是「孪生以信封正文为
+    前缀」——用「逐字相等」判据，这批最终回答会各渲染两遍。
+    """
+    scripts = ROOT / "plugins" / "review-validate-fix" / "skills" / "review-validate-fix" / "scripts"
+    sys.path.insert(0, str(scripts))
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("rvf_parent_context", scripts / "rvf_parent_context.py")
+    parent_context = importlib.util.module_from_spec(spec)
+    sys.modules["rvf_parent_context"] = parent_context
+    spec.loader.exec_module(parent_context)
+
+    def _agent_message_item(item_id: str, text: str, *, phase: str = "commentary") -> dict:
+        return {"type": "AgentMessage", "id": item_id, "content": [{"type": "Text", "text": text}], "phase": phase}
+
+    def _assistant_response_item(text: str, *, phase: str = "commentary") -> dict:
+        return {
+            "timestamp": "2026-08-12T23:00:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+                "phase": phase,
+            },
+        }
+
+    transcript = _write_jsonl(
+        tmp_path / "agent_message_twins.jsonl",
+        [
+            {"timestamp": "2026-08-12T23:00:00Z", "type": "session_meta", "payload": {"id": "PC", "cwd": "/repo"}},
+            # ① envelope-only：下一条不是助手 response_item —— 当前实现整条丢弃。
+            _envelope_record(_agent_message_item("item-1", "我先去看 X，再改 Y。")),
+            {
+                "timestamp": "2026-08-12T23:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {}},
+            },
+            # ② 逐字相等的相邻孪生 —— 只能出现一次。
+            _envelope_record(_agent_message_item("item-2", "测试已通过，接着跑构建。")),
+            _assistant_response_item("测试已通过，接着跑构建。"),
+            # ③ 孪生是信封正文的**超集** —— 只能出现一次，且必须保留更完整的那份。
+            _envelope_record(_agent_message_item("item-3", "已完成。", phase="final_answer")),
+            _assistant_response_item("已完成。\n\n<proposed_plan>细节计划</proposed_plan>", phase="final_answer"),
+            # ④ 空正文信封 —— 不渲染空行。
+            _envelope_record({"type": "AgentMessage", "id": "item-4", "content": [{"type": "Text", "text": "   "}]}),
+        ],
+    )
+
+    assistant_lines = [
+        line for line in parent_context.render_lines(transcript, host="codex") if line.startswith("assistant: ")
+    ]
+    assert assistant_lines == [
+        "assistant: 我先去看 X，再改 Y。",
+        "assistant: 测试已通过，接着跑构建。",
+        "assistant: 已完成。\n\n<proposed_plan>细节计划</proposed_plan>",
+    ], "envelope-only 必须渲染；两种孪生形态都只能出现一次，且超集孪生要保留更完整的那份"
+
+
 def test_bridge_recovers_invoked_skill_from_envelope_and_matches_vendored_on_legacy(tmp_path: Path) -> None:
     """显式 ``$skill`` 触发检测：vendored 迭代器只认第二代，对第三代信封全盲（失败形式是
     「什么都没发生」，比 loud-skip 更隐蔽）。桥接必须认回来，且对第二代与 vendored 逐项等价。"""
@@ -645,3 +720,110 @@ def test_bridge_recovers_invoked_skill_from_envelope_and_matches_vendored_on_leg
     legacy_vendored = [s.placeholder for s in vendored.invoked_skills_from_transcript(second_generation, which="all")]
     legacy_bridge = [s.placeholder for s in bridge.invoked_skills_from_transcript(second_generation, which="all")]
     assert legacy_bridge == legacy_vendored == ["$review-validate-fix:review-validate-fix"]
+
+
+# ── 10. 插件工具的文件写入：登记为「已知类型」与「可能改过仓库」必须是两本独立的账
+
+
+def _mcp_tool_call_item(code: str, *, server: str | None = "node_repl", tool: str = "js") -> dict:
+    item: dict = {"type": "McpToolCall", "id": "mcp-1", "status": "completed", "tool": tool,
+                  "arguments": {"code": code, "timeout_ms": 30000, "title": "t"}}
+    if server is not None:
+        item["server"] = server
+    return item
+
+
+def test_plugin_tool_writes_are_flagged_without_being_reclassified_as_unknown_types() -> None:
+    """本 fix 的核心不变式：``McpToolCall`` / ``DynamicToolCall`` 仍然算**已普查的已知类型**
+    （不许触发「从未见过的新类型」告警，否则本机 115/1955 个正常会话都要刷噪声），但它们
+    携带的文件写入必须由**另一条**信号说话——两件事分账，互不掩盖。
+
+    样本形状取自本机语料实测命中（``server=node_repl`` / ``tool=js``，``arguments.code``
+    里 ``mkdirSync`` + ``writeFileSync``，且路径算进 JS 变量因而无法静态还原）。
+    """
+    records = [
+        _envelope_record(
+            _mcp_tool_call_item(
+                "var fsMod = await import('node:fs');\n"
+                "var pathMod = await import('node:path');\n"
+                "var outDir = '/repo/generated';\n"
+                "fsMod.mkdirSync(outDir, { recursive: true });\n"
+                "var target = pathMod.join(outDir, 'report.json');\n"
+                "fsMod.writeFileSync(target, body);"
+            )
+        ),
+        _envelope_record({"type": "DynamicToolCall", "id": "dyn-1", "tool": "load_workspace_dependencies",
+                          "status": "completed", "arguments": {"workspace": "/repo"}}),
+    ]
+    assert envelope.unrecognized_codex_item_types(records) == []
+    assert envelope.plugin_tool_filesystem_write_signatures(records) == ["node_repl.js"]
+
+
+def test_plugin_tool_write_detector_ignores_read_only_mentions_and_tool_output() -> None:
+    """与 ``EMBEDDED_EXEC_COMMAND_CALL_RE`` 同一口径：只出现名字而不是**调用形态**不算写入
+    （否则一次 ``grep writeFileSync`` 就误报）；工具**输出**里出现写入调用也不算——那说明
+    该工具读到了别处的源码，与本次会话有没有改文件无关。"""
+    read_only_argument = _envelope_record(
+        _mcp_tool_call_item("var hits = await search('writeFileSync'); nodeRepl.write(hits);")
+    )
+    grep_style = _envelope_record(
+        {"type": "McpToolCall", "id": "m2", "server": "gitnexus", "tool": "query", "status": "completed",
+         "arguments": {"search_query": "writeFileSync mkdirSync appendFileSync"}}
+    )
+    output_only = _envelope_record(
+        {"type": "McpToolCall", "id": "m3", "server": "gitnexus", "tool": "context", "status": "completed",
+         "arguments": {"name": "x"}, "result": "fs.writeFileSync(p, b);"}
+    )
+    non_plugin_item = _envelope_record({"type": "AgentMessage", "content": [{"type": "Text", "text": "fs.writeFileSync(p, b);"}]})
+    assert envelope.plugin_tool_filesystem_write_signatures(
+        [read_only_argument, grep_style, output_only, non_plugin_item]
+    ) == []
+
+
+def test_failed_plugin_tool_write_still_flagged_and_signature_falls_back_to_tool_name() -> None:
+    """``failed`` 的调用可能已经写了一半才失败；对「疑似漏审」告警而言漏报比误报贵，
+    所以不按 ``status`` 过滤。``DynamicToolCall`` 实测没有 ``server``，签名退回工具名。"""
+    records = [
+        _envelope_record({"type": "DynamicToolCall", "id": "d", "tool": "js", "status": "failed",
+                          "arguments": {"code": "fs.writeFileSync('/repo/a.txt', 'x');"}})
+    ]
+    assert envelope.plugin_tool_filesystem_write_signatures(records) == ["js"]
+
+
+def test_plugin_tool_write_warning_fires_only_when_dirty_stays_unattributed(tmp_path: Path) -> None:
+    """端到端坐实这条静默漏审通道，并锁住告警的闸门。
+
+    纯插件工具编辑的会话：``saw_edit_evidence`` 为 False（没有 ``patch_apply_end``、也没有
+    内嵌 ``apply_patch``）⇒ ``schema_drift_suspected`` 也是 False，于是旧有的两道 fail-loud
+    守卫都不会说话，dirty 文件却无人认领——这正是漏审形态。新告警必须在此开口。
+
+    反面：工作树干净（实测本机命中全部写进 gitignore 掉的产物目录，根本不进 dirty）时必须
+    保持静默，不给正常会话刷噪声。
+    """
+    def _run(repo_name: str, *, dirty: bool) -> dict:
+        repo = _init_repo(tmp_path / repo_name)
+        if dirty:
+            (repo / "seed.txt").write_text("seed\nwritten by a plugin tool\n", encoding="utf-8")
+        after_commit = _timestamp_after_head_commit(repo)
+        transcript = _write_jsonl(
+            tmp_path / f"{repo_name}.jsonl",
+            [
+                {"timestamp": after_commit, "type": "session_meta", "payload": {"id": "S", "originator": "codex-tui"}},
+                _envelope_record(
+                    _mcp_tool_call_item("var fsMod = await import('node:fs');\nfsMod.writeFileSync(target, body);"),
+                    timestamp=after_commit,
+                ),
+            ],
+        )
+        return _build_manifest(repo, transcript, tmp_path / f"{repo_name}.json")
+
+    dirty_manifest = _run("repo-dirty", dirty=True)
+    assert dirty_manifest["owned_paths"] == []
+    assert dirty_manifest["unattributed_dirty_paths"] == ["seed.txt"]
+    assert dirty_manifest["schema_drift_suspected"] is False, "既有守卫认不出插件工具写入——正是本告警存在的理由"
+    assert any(w.startswith("suspected_unattributed_plugin_tool_filesystem_writes: node_repl.js") for w in dirty_manifest["warnings"])
+    assert not any(w.startswith("unrecognized_codex_item_types") for w in dirty_manifest["warnings"])
+
+    clean_manifest = _run("repo-clean", dirty=False)
+    assert clean_manifest["unattributed_dirty_paths"] == []
+    assert not any(w.startswith("suspected_unattributed_plugin_tool_filesystem_writes") for w in clean_manifest["warnings"])

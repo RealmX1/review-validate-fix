@@ -31,6 +31,7 @@ from core.transcript.codex_rollout_item_envelope import (  # noqa: E402
     codex_item_of_type,
     embedded_exec_command_invocation_from_tool_input,
     legacy_patch_apply_end_payload_from_file_change_item,
+    plugin_tool_filesystem_write_signatures,
     shell_command_and_workdir_from_command_execution_item,
     unrecognized_codex_item_types,
 )
@@ -1377,6 +1378,11 @@ def build_manifest(
     # 走 loud-skip 而非静默 no_codebase_changes。
     schema_drift_suspected = bool(saw_edit_evidence and dirty_set and not owned_paths)
     unrecognized_item_types = unrecognized_codex_item_types(records)
+    # 插件工具（McpToolCall / DynamicToolCall）能执行任意代码改仓库文件，却没有可静态
+    # 还原的路径可供归属，也不算 schema_drift_suspected 的「编辑证据」。只在**确实留下
+    # 无人认领的 dirty 路径**时才说话：这正是「插件工具写了文件却零归属」的签名，而写进
+    # gitignore 产物目录（实测本机语料全部如此）根本不进 dirty，于是保持静默、不刷噪声。
+    plugin_tool_write_signatures = plugin_tool_filesystem_write_signatures(records)
 
     tracker_payload: dict[str, Any] = {"status": "skipped"}
     tracker_units: list[dict[str, Any]] = []
@@ -1520,6 +1526,18 @@ def build_manifest(
                     "not map; ownership attribution for those records is skipped."
                 ]
                 if unrecognized_item_types
+                else []
+            ),
+            *(
+                [
+                    "suspected_unattributed_plugin_tool_filesystem_writes: "
+                    + ", ".join(plugin_tool_write_signatures)
+                    + " — plugin tool calls carried filesystem write calls in their arguments, "
+                    "those records expose no statically recoverable path so they produce no "
+                    "ownership, and the worktree still has unattributed dirty paths; this session "
+                    "may have edited files through a channel RVF cannot attribute — review manually."
+                ]
+                if plugin_tool_write_signatures and unattributed_dirty
                 else []
             ),
             *baseline_warnings,

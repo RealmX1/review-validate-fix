@@ -57,7 +57,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401  — 把 pyroot 加入 sys.path，供 core.* import
 
-from core.transcript.codex_rollout_item_envelope import codex_item_of_type  # noqa: E402
+from core.transcript.codex_rollout_item_envelope import (  # noqa: E402
+    agent_message_text_from_item,
+    codex_item_of_type,
+)
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
@@ -115,8 +118,49 @@ def _collect_texts(node: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_codex_record_to_single_line(record: dict[str, Any]) -> str | None:
-    """把一条 raw Codex rollout 记录压成一行可读 context；返回 None=丢弃。"""
+def _codex_agent_message_text_superseded_by_adjacent_response_item_twin(
+    agent_message_text: str, next_record: dict[str, Any] | None
+) -> bool:
+    """信封 ``AgentMessage`` 的正文是否已由**紧随其后**的 ``response_item`` 孪生承载。
+
+    本机 1955 个 rollout 的逐条普查（2026-09-23）给出的结构规律，是这里敢用「只看下一条
+    记录」这种窄判据的全部依据：
+
+    * 63921 条 ``AgentMessage`` 信封里，59167 条有 ``response_item/message role=assistant``
+      孪生，其中 **58856 条孪生就在下一条记录**、58856+310 条与信封逐字相等或以信封正文
+      **为前缀**；跨距 >1 的孪生全语料只有 1 条（且方向相反，见下）。
+    * 310 条孪生比信封正文**更长**——``response_item`` 那份额外带着被 UI 剥掉的
+      ``<proposed_plan>`` 等正文。所以孪生判据必须是「孪生以信封正文为前缀」而不是
+      「逐字相等」：用相等判据，这 310 条最终回答会各渲染两遍。
+    * 反过来「看上一条记录」不能用：24 条信封的上一条恰好是**另一条**助手
+      ``response_item``（连续两条助手消息），按上一条去重会把这 24 条真内容误删。
+      唯一一条孪生在前的记录（1/63921）因此是已知残留，宁可多渲染一条也不误删 24 条——
+      重复只是让 reviewer 多读一行，误删是静默丢内容，正是本函数要根治的那类失败。
+
+    全语料回归（用本文件的 ``render_lines`` 逐个渲染 1955 个 rollout）：assistant 行
+    59338 → 64069，净增 4731 恰等于无孪生的条数；**零内容丢失**；新增重复 1 条，即上述
+    已知残留。
+    """
+    if not isinstance(next_record, dict) or next_record.get("type") != "response_item":
+        return False
+    payload = next_record.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "message":
+        return False
+    if payload.get("role") != "assistant":
+        return False
+    twin_text = " ".join(_collect_texts(payload.get("content"))).strip()
+    return twin_text.startswith(agent_message_text)
+
+
+def _render_codex_record_to_single_line(
+    record: dict[str, Any], next_record: dict[str, Any] | None = None
+) -> str | None:
+    """把一条 raw Codex rollout 记录压成一行可读 context；返回 None=丢弃。
+
+    ``next_record`` 只用于信封 ``AgentMessage`` 的孪生去重（见
+    ``_codex_agent_message_text_superseded_by_adjacent_response_item_twin``）；其余分支
+    与记录一一对应，不看邻居。
+    """
     rtype = record.get("type")
     payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
     sub = payload.get("type")
@@ -138,16 +182,35 @@ def _render_codex_record_to_single_line(record: dict[str, Any]) -> str | None:
             return f"[{sub}]"
         if sub == "patch_apply_end":
             return f"[patch_apply success={payload.get('success')}]"
-        # 第三代 rollout（2026-08 codex-tui）把 patch_apply_end 搬进 ``item_completed``
-        # 信封的 ``FileChange`` item，该编辑成功标记在这一代会整条消失。补回后与第二代
-        # 严格 parity：两代都是「exec 调用渲染出补丁内容 + 一行成功标记」，不产生重复。
-        # 信封里的 UserMessage / AgentMessage / Reasoning / CommandExecution 刻意**不**
-        # 补分支——实测它们的 ``response_item`` 孪生记录已被下面的分支逐条渲染
-        # （message 50 覆盖 UserMessage 5 + AgentMessage 41、reasoning 105 一一对应、
-        # custom_tool_call 126 覆盖 CommandExecution 92），再补一遍就是重复渲染。
+        # ``item_completed`` 信封把 patch_apply_end 搬进了 ``FileChange`` item，该编辑成功
+        # 标记在信封形态下会整条消失。补回后与第二代严格 parity：两代都是「exec 调用渲染出
+        # 补丁内容 + 一行成功标记」，不产生重复。
         file_change_item = codex_item_of_type(payload, "FileChange")
         if file_change_item is not None:
             return f"[patch_apply success={file_change_item.get('status') == 'completed'}]"
+        # ``AgentMessage`` 曾按「``response_item`` 孪生已逐条渲染，补了就是重复」被刻意
+        # 跳过。该论证在单个样本上成立，在全语料上不成立：1955 个 rollout 里 4731 条
+        # ``AgentMessage`` **没有任何**孪生（全文件比对，也不与 reasoning summary 重合），
+        # 其中绝大多数是 ``phase == "commentary"`` 的助手过程说明（「我先去看 X，再改 Y」）。
+        # 它们整条被丢弃，reviewer 因此看不到父会话的意图与自述。这不是历史遗留：仅
+        # 2026-07 一个月就有 3969/14577 条（27%）是这种 envelope-only 形态。
+        #
+        # 所以改成**按孪生存在与否逐条判定**，而不是按 item 类型无条件忽略整类——两个
+        # 不变量同时守住：有孪生不重复渲染，无孪生不丢内容。
+        #
+        # 其余三类维持现状，依据各不相同、不可一概而论：``UserMessage`` 实测 5484/5486
+        # 有 ``response_item`` 孪生覆盖，跳过成立；``Reasoning`` / ``CommandExecution``
+        # 未按本次口径全语料复核过，此处不对它们作任何「已验证」断言。
+        agent_message_item = codex_item_of_type(payload, "AgentMessage")
+        if agent_message_item is not None:
+            text = (agent_message_text_from_item(agent_message_item) or "").strip()
+            if not text:
+                return None
+            if _codex_agent_message_text_superseded_by_adjacent_response_item_twin(
+                text, next_record
+            ):
+                return None
+            return f"assistant: {text}"
         return None
     if rtype == "response_item":
         if sub == "message":
@@ -181,14 +244,19 @@ def _render_codex_record_to_single_line(record: dict[str, Any]) -> str | None:
     return None
 
 
-def _render_codex_record(record: dict[str, Any]) -> list[str]:
+def _render_codex_record(
+    record: dict[str, Any], next_record: dict[str, Any] | None = None
+) -> list[str]:
     """Codex 渲染器的 ``list[str]`` 外壳——三家渲染器共用一个「0..N 行」契约。
 
     Codex 的 record 与行是一对一的（历史实现返回 ``str | None``），Claude / Kimi 的一条
     record 可以展开成多行。分派表要能无差别地调用它们，契约就必须统一；单行逻辑原样留在
-    ``_render_codex_record_to_single_line`` 里，一个字符都没动。
+    ``_render_codex_record_to_single_line`` 里。
+
+    ``next_record`` 是共用契约的第二半：``render_lines`` 对每条记录都带上它的下一条，三家
+    渲染器签名一致，只有 Codex 目前真的需要它（信封 ``AgentMessage`` 的孪生去重）。
     """
-    line = _render_codex_record_to_single_line(record)
+    line = _render_codex_record_to_single_line(record, next_record)
     return [line] if line is not None else []
 
 
@@ -197,11 +265,16 @@ def _render_codex_record(record: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_claude_record(record: dict[str, Any]) -> list[str]:
+def _render_claude_record(
+    record: dict[str, Any], next_record: dict[str, Any] | None = None
+) -> list[str]:
     """把一条 Claude Code NDJSON 记录压成 0..N 行可读 context。
 
     一条 ``assistant`` record 可能同时含 ``text`` / ``thinking`` / 多条
     ``tool_use``；一条 ``user`` record 可能含 ``tool_result``，逐 block 展开。
+
+    ``next_record`` 只为对齐三家渲染器的共用签名；Claude transcript 没有「同一条消息写两
+    份记录」的形态，这里不需要看邻居。
     """
     rtype = record.get("type")
     if rtype not in ("user", "assistant"):
@@ -265,8 +338,13 @@ def _render_claude_record(record: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _render_kimi_record(record: dict[str, Any]) -> list[str]:
+def _render_kimi_record(
+    record: dict[str, Any], next_record: dict[str, Any] | None = None
+) -> list[str]:
     """把一条 Kimi wire JSONL 记录压成 0..N 行可读 context。
+
+    ``next_record`` 只为对齐三家渲染器的共用签名；Kimi 侧的双份记录（``turn.prompt`` 与
+    ``append_message``）已按记录类型正向筛掉，不需要看邻居。
 
     Kimi 与另两家的**结构性**差异（取证见 ``adapters/kimi/transcript.py``）：助手输出与
     工具调用**都不在** ``context.append_message`` 里，而在 ``context.append_loop_event``
@@ -373,7 +451,8 @@ def _kimi_part_text(parts: Any) -> str | None:
 
 
 def _host_record_renderer(host: str | None):
-    """按 host 选 record 渲染器；每个渲染器返回 ``list[str]``（0..N 行）。
+    """按 host 选 record 渲染器；每个渲染器签名为 ``(record, next_record)``、返回
+    ``list[str]``（0..N 行）。
 
     未知 host 兜底 Codex，与 ``detect_transcript_format`` 的「无证据回 None、调用方兜底
     Codex」约定一致。**漏接一个 host 不会抛**，只会让它的 context blob 静默变空，故由
@@ -416,8 +495,12 @@ def render_lines(transcript_path: Path, host: str | None = None) -> list[str]:
         host = detect_transcript_format(transcript_path) or HOST_CODEX
     renderer = _host_record_renderer(host)
     lines: list[str] = []
-    for record in _iter_records(transcript_path):
-        lines.extend(renderer(record))
+    records = _iter_records(transcript_path)
+    for index, record in enumerate(records):
+        # 每条记录都带上它的下一条：Codex 的信封 ``AgentMessage`` 要靠它判断孪生是否存在，
+        # 从而在「无孪生就不丢内容」与「有孪生就不重复渲染」之间逐条取舍。
+        next_record = records[index + 1] if index + 1 < len(records) else None
+        lines.extend(renderer(record, next_record))
     return lines
 
 

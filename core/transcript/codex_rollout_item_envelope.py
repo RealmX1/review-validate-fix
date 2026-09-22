@@ -31,13 +31,26 @@ Codex 的 rollout JSONL 至今出现过几种并存的记录形态，**它们不
 刻意不提供「整条 record 的宽归一化」
 --------------------------------------
 本模块**故意不导出**「把 ``item_completed`` 记录翻译回旧 ``event_msg`` 子类型」的通用
-函数。原因：读用户/助手消息的十余处站点**早已带 ``response_item/message`` 兜底分支**，
-新 schema 下仍能取到全部文本。实测同一 transcript 里每个用户回合都成对出现
-（``response_item`` 在前、``item_completed`` 紧随），旧 schema 本来就是**双份**
-（``event_msg`` 一份 + ``response_item`` 一份）；新 schema 只是把 ``event_msg`` 那份
-搬进信封，对这些站点而言是**去重而非失真**。若为了「形式 parity」把 ``UserMessage`` /
-``AgentMessage`` 也翻译回去，只会把旧世代的冗余原样搬来（parent-context 重复渲染、
-trajectory 重复切分、``user_messages_containing`` 重复计数）。
+函数。原因：读用户消息的十余处站点**早已带 ``response_item/message`` 兜底分支**，新
+schema 下仍能取到全部文本。实测同一 transcript 里每个用户回合都成对出现（``response_item``
+与 ``item_completed`` 相邻），旧 schema 本来就是**双份**（``event_msg`` 一份 +
+``response_item`` 一份）；新 schema 只是把 ``event_msg`` 那份搬进信封，对这些站点而言是
+**去重而非失真**。若为了「形式 parity」把 ``UserMessage`` 无条件翻译回去，只会把旧世代的
+冗余原样搬来（trajectory 重复切分、``user_messages_containing`` 重复计数）。
+
+⚠️ **「有兜底」是逐类结论，不能推广到 ``AgentMessage``**
+--------------------------------------------------------
+1955 个 rollout 的逐条比对（2026-09-23）：``UserMessage`` 确有孪生兜底（5484/5486），但
+``AgentMessage`` 的 63921 条里有 **4731 条完全没有 ``response_item`` 孪生**（同文件全量比
+对，也不与 reasoning summary 重合），全是助手的过程说明（``phase == "commentary"``）。
+更要命的是另一端：310 条孪生比信封正文**更长**（``response_item`` 那份还带着被 UI 剥掉的
+``<proposed_plan>`` 等正文），所以「按正文逐字相等去重」两头都错——会漏掉 4731 条、又把
+这 310 条渲染两遍。
+
+结论是**去重必须逐条判定孪生是否存在，而不是按 item 类型一刀切**。
+``rvf_parent_context`` 已按这个口径处理 ``AgentMessage``（孪生规律与判据取证写在
+``_codex_agent_message_text_superseded_by_adjacent_response_item_twin``）。其余消费者若要
+读助手消息，同样不能假设「``response_item`` 侧一定有」。
 
 真正失明、因而由本模块承接的，只有**没有任何兜底**的那几处：编辑归属
 （``FileChange``）、trajectory 的 ``artifact_refs``（``FileChange``）、显式 skill 触发
@@ -47,6 +60,7 @@ trajectory 重复切分、``user_messages_containing`` 重复计数）。
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from typing import Any, Iterable
@@ -56,8 +70,8 @@ CODEX_ITEM_ENVELOPE_PAYLOAD_TYPE = "item_completed"
 
 # 本机语料 1955 个 rollout 普查（2026-09-23）实测出现过的全部 ``item.type``。
 # ``unrecognized_codex_item_types`` 据此做前向兼容告警：**语义是「从未见过的新类型」**，
-# 所以已普查、已判定「不携带文件编辑或 shell 命令证据、刻意不做归属」的类型也必须列在这里，
-# 否则每个正常会话都会刷警告、真正的新类型反而被淹没。
+# 所以凡是已普查过的类型都必须列在这里（哪怕刻意不做归属），否则正常会话就会刷警告、
+# 真正的新类型反而被淹没。
 #
 # 参与归属的：FileChange（编辑真相源）、CommandExecution（命令归属）、
 # UserMessage（显式 $skill 触发检测）。
@@ -66,6 +80,23 @@ CODEX_ITEM_ENVELOPE_PAYLOAD_TYPE = "item_completed"
 # （带 namespace 的插件工具，无结构化 diff 或 argv，归属只能靠猜）、
 # SubAgentActivity / CollabAgentToolCall / FunctionCallOutput / HookPrompt（代理间消息与指针）、
 # EnteredReviewMode / ExitedReviewMode（Codex 自带 review 模式的进出标记）。
+#
+# ⚠️ 「刻意不归属」**不等于「不可能改动仓库」**，这两件事必须分开记账
+# ------------------------------------------------------------------
+# ``McpToolCall`` / ``DynamicToolCall`` 携带结构化 ``arguments``，其中 ``node_repl`` /
+# ``cua_repl`` 的 ``js`` 工具（682 条里占 449 条）执行的是**任意 JS**。实测 682 条里有 7 条
+# （同一个 2026-07-02 会话）的 ``arguments.code`` 含 ``mkdirSync`` / ``writeFileSync`` 真实
+# 文件写入——只是恰好全部落在 ``.gitignore`` 掉的产物目录，至今未造成漏审。
+#
+# 这类写入仍然**不做归属**：实测 7 条里有 4 条把目标路径算进 JS 变量
+# （``pathMod.join(shotDir, …)``），没有可静态还原的路径，按本模块「抽不到就放弃、不猜」
+# 的一贯口径只能放弃。但它同时**也逃过 fail-loud 守卫**——``schema_drift_suspected`` 只认
+# ``patch_apply_end`` / 内嵌 ``apply_patch`` 作为「编辑证据」——于是「插件工具写了仓库文件
+# → 零归属 → 零告警」是一条完整的静默漏审通道。
+#
+# 因此由 ``plugin_tool_filesystem_write_signatures`` **另发一条独立告警**承接该通道，而不是
+# 把这两个类型从本集合里摘掉：摘掉会让 115/1955（5.9%）的正常会话误报「从未见过的新类型」，
+# 其中 114 个会话根本没写过任何文件，正是本集合存在的意义所要避免的噪声。
 KNOWN_CODEX_ITEM_TYPES = frozenset(
     {
         "AgentMessage",
@@ -88,6 +119,22 @@ KNOWN_CODEX_ITEM_TYPES = frozenset(
         "WebSearch",
     }
 )
+
+# 带结构化 ``arguments`` 的插件工具 item：``arguments`` 里可能是任意可执行代码，
+# 因而**可以写仓库文件**，却没有 ``changes`` diff 或 argv 可供归属（见上文 ⚠️ 段）。
+PLUGIN_TOOL_ITEM_TYPES_WITH_STRUCTURED_ARGUMENTS = frozenset({"DynamicToolCall", "McpToolCall"})
+
+# Node 文件系统写入 API 的**调用形态**（sync 家族 + ``fs.promises`` 家族）。
+# 与 ``EMBEDDED_EXEC_COMMAND_CALL_RE`` 同一口径锚定 ``name(``：只出现名字而不是调用
+# （例如某次 mcp 搜索的实参正好是字符串 ``"writeFileSync"``）不算一次写入，避免把只读
+# 检索误报成文件改动。本机语料上该正则命中 7 条 / 1 个文件，与裸子串同召回、但不误报。
+PLUGIN_TOOL_FILESYSTEM_WRITE_CALL_RE = re.compile(
+    r"\b(?:writeFileSync|appendFileSync|mkdirSync|unlinkSync|renameSync|rmSync|rmdirSync"
+    r"|copyFileSync|cpSync|truncateSync|createWriteStream)\s*\("
+    r"|\.\s*promises\s*\.\s*(?:writeFile|appendFile|mkdir|unlink|rename|rm|rmdir|copyFile"
+    r"|cp|truncate)\s*\("
+)
+
 
 # 第二代（gpt-5.6-sol）把 shell 调用以 JS 文本内嵌在 ``custom_tool_call`` name=``exec``
 # 的 input，形态是 ``const r = await tools.exec_command({...}); text(r.output);``。
@@ -428,3 +475,50 @@ def unrecognized_codex_item_types(records: Iterable[dict[str, Any]]) -> list[str
         if isinstance(item_type, str) and item_type not in KNOWN_CODEX_ITEM_TYPES:
             seen.add(item_type)
     return sorted(seen)
+
+
+def _plugin_tool_call_signature(item: dict[str, Any]) -> str:
+    """把一条插件工具 item 压成 ``server.tool`` 形态的可读签名（如 ``node_repl.js``）。
+
+    ``DynamicToolCall`` 实测没有 ``server``，退回单独的工具名；两者都取不到时退回
+    ``item.type``，保证告警里永远有个能让人回头去查的锚点。
+    """
+    parts = [
+        value
+        for value in (item.get("server"), item.get("tool") or item.get("name"))
+        if isinstance(value, str) and value
+    ]
+    return ".".join(parts) if parts else str(item.get("type"))
+
+
+def plugin_tool_filesystem_write_signatures(records: Iterable[dict[str, Any]]) -> list[str]:
+    """扫出 ``arguments`` 里含文件系统写入调用的插件工具 item 签名（去重、排序）。
+
+    存在的理由见 ``KNOWN_CODEX_ITEM_TYPES`` 上方的 ⚠️ 段：这些 item **已登记为已知**
+    （不该再触发「从未见过的新类型」告警），也**刻意不做归属**（没有可静态还原的路径），
+    但它们能改仓库文件，而 ``schema_drift_suspected`` 只认 ``patch_apply_end`` /
+    内嵌 ``apply_patch``，所以这条通道既无归属也无告警。此函数就是补上的那条告警信号。
+
+    刻意**只看 ``arguments``**、不看工具输出：输出里出现 ``writeFileSync`` 多半是该工具
+    读到了别处的源码，与本次会话有没有写文件无关。
+
+    刻意**不按 ``status`` 过滤**：``failed`` 的调用可能已经写了一部分才失败，对「疑似漏审」
+    这种告警而言漏报比误报贵。
+    """
+    signatures: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        item = codex_item_from_envelope_payload(record.get("payload"))
+        if item is None or item.get("type") not in PLUGIN_TOOL_ITEM_TYPES_WITH_STRUCTURED_ARGUMENTS:
+            continue
+        arguments = item.get("arguments")
+        if arguments is None:
+            continue
+        try:
+            serialized = json.dumps(arguments, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            continue
+        if PLUGIN_TOOL_FILESYSTEM_WRITE_CALL_RE.search(serialized):
+            signatures.add(_plugin_tool_call_signature(item))
+    return sorted(signatures)
