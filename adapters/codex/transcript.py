@@ -201,13 +201,14 @@ def _distill_codex_record(
                 ),
                 artifact_refs=[],
             )
-        # 第三代 rollout（2026-08 codex-tui）把 patch_apply_end 搬进 ``item_completed``
-        # 信封的 ``item.type == "FileChange"``；``changes`` 形状未变，故归一回
-        # patch_apply_end payload 形状后与第二代**共用下面同一分支**（含既有的路径级去重），
-        # 恢复 rvf-analyze 的 issue↔patch 因果链——否则该链在 codex-tui 会话里**静默**全盲。
+        # ``item_completed`` 信封把 patch_apply_end 搬进 ``item.type == "FileChange"``；
+        # ``changes`` 形状未变，故归一回 patch_apply_end payload 形状后与它**共用下面同一
+        # 分支**（含既有的路径级去重），恢复 rvf-analyze 的 issue↔patch 因果链——否则该链在
+        # ``codex-tui`` 会话里**静默**全盲。该形态并非某次版本升级新增：本机 1955 个 rollout
+        # 里最早见于 2026-04-02，与其余形态并存，故**判据只看结构、不看版本或日期**。
         # UserMessage / AgentMessage 刻意**不加**分支：它们的文本已由下方
         # ``response_item/message`` 分支覆盖（实测每个回合两侧成对出现），再翻译一遍只会把
-        # 旧世代的双份冗余搬过来，造成 trajectory 重复切分。
+        # 另一形态的双份冗余搬过来，造成 trajectory 重复切分。
         _file_change_item = codex_item_of_type(payload, "FileChange")
         patch_apply_end_payload = (
             payload
@@ -220,8 +221,11 @@ def _distill_codex_record(
             # 新 Codex（gpt-5.6-sol 世代）把编辑工具统一成 custom_tool_call name=``exec``、
             # apply_patch 以 JS 文本内嵌在 input，旧的 apply_patch 工具调用消失——那条
             # tool_call 分支不再产出 artifact_refs，issue↔patch 因果归属会全盲。
-            # patch_apply_end 是跨版本稳定、结构化、带 success 的编辑真相源：由它合成
-            # apply_patch 补丁文本、复用同一 artifact 提炼，恢复 rvf-analyze 因果链。
+            # patch_apply_end 形状（含信封 FileChange 归一而来的那份）是结构化、带 success
+            # 的编辑真相源：由它合成 apply_patch 补丁文本、复用同一 artifact 提炼，恢复
+            # rvf-analyze 因果链。（此处原写「跨版本稳定」，2026-09-23 复查 1955 个 rollout
+            # 证伪：``patch_apply_end`` 从未作为 ``payload.type`` 出现过，本机实际形态是信封
+            # 里的 ``FileChange``；该分支保留只为兼容其它 host / 更早的存档。）
             # 旧格式两者并存（apply_patch tool_call 已带 artifact_refs），此时 patch_apply_end
             # 保持旧行为（返回 None、不进 distilled），避免同一编辑被双重归属，且旧格式
             # trajectory 逐字节不变。去重按**编辑路径**精确判定，而非「transcript 里存在任意

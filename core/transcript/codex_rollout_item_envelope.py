@@ -35,8 +35,8 @@ Codex 的 rollout JSONL 至今出现过几种并存的记录形态，**它们不
 schema 下仍能取到全部文本。实测同一 transcript 里每个用户回合都成对出现（``response_item``
 与 ``item_completed`` 相邻），旧 schema 本来就是**双份**（``event_msg`` 一份 +
 ``response_item`` 一份）；新 schema 只是把 ``event_msg`` 那份搬进信封，对这些站点而言是
-**去重而非失真**。若为了「形式 parity」把 ``UserMessage`` 无条件翻译回去，只会把旧世代的
-冗余原样搬来（trajectory 重复切分、``user_messages_containing`` 重复计数）。
+**去重而非失真**。若为了「形式 parity」把 ``UserMessage`` 无条件翻译回去，只会把另一形态
+里的冗余原样搬来（trajectory 重复切分、``user_messages_containing`` 重复计数）。
 
 ⚠️ **「有兜底」是逐类结论，不能推广到 ``AgentMessage``**
 --------------------------------------------------------
@@ -55,7 +55,7 @@ schema 下仍能取到全部文本。实测同一 transcript 里每个用户回�
 真正失明、因而由本模块承接的，只有**没有任何兜底**的那几处：编辑归属
 （``FileChange``）、trajectory 的 ``artifact_refs``（``FileChange``）、显式 skill 触发
 检测（``UserMessage.content[].text_elements``）、以及 exec 命令归属
-（``CommandExecution`` 与第二代内嵌 JS）。
+（``CommandExecution`` 与 ``exec`` 内嵌 JS）。
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ PLUGIN_TOOL_FILESYSTEM_WRITE_CALL_RE = re.compile(
 )
 
 
-# 第二代（gpt-5.6-sol）把 shell 调用以 JS 文本内嵌在 ``custom_tool_call`` name=``exec``
+# ``custom_tool_call`` name=``exec`` 形态把 shell 调用以 JS 文本内嵌在
 # 的 input，形态是 ``const r = await tools.exec_command({...}); text(r.output);``。
 # 锚定 ``tools.exec_command(`` 调用形态（容忍空白），与 session_change_manifest 里
 # ``_EMBEDDED_APPLY_PATCH_CALL_RE`` 同一口径：避免把 ``rg -n exec_command`` /
@@ -155,7 +155,7 @@ def codex_item_from_envelope_payload(payload: Any) -> dict[str, Any] | None:
     """从一条 record 的 ``payload`` 取出 ``item_completed`` 信封里的 ``item``。
 
     非信封 payload / ``item`` 非 dict / ``item.type`` 非字符串 → ``None``。
-    调用方据此以「返回非 None」作为「这是第三代信封记录」的唯一判据。
+    调用方据此以「返回非 None」作为「这是 ``item_completed`` 信封记录」的唯一判据。
     """
     if not isinstance(payload, dict):
         return None
@@ -178,7 +178,7 @@ def codex_item_of_type(payload: Any, item_type: str) -> dict[str, Any] | None:
 def legacy_patch_apply_end_payload_from_file_change_item(
     item: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """把第三代 ``FileChange`` item 映射成第二代 ``patch_apply_end`` payload 形状。
+    """把信封里的 ``FileChange`` item 映射成 ``patch_apply_end`` payload 形状。
 
     实测两者的 ``changes`` 字典**形状完全一致**
     （``{abs_path: {type, unified_diff | content, move_path}}``），差异只在信封字段：
@@ -192,11 +192,11 @@ def legacy_patch_apply_end_payload_from_file_change_item(
     ======================  ==========================
 
     因此这里只做信封层映射，下游 ``synthesize_apply_patch_text_from_patch_apply_end``
-    /``parse_apply_patch_details`` 一行不用改——两代 schema 复用同一套解析，避免各写
+    /``parse_apply_patch_details`` 一行不用改——两种形态复用同一套解析，避免各写
     一份再次一起过时。
 
     ``status`` 非 ``"completed"``（用户中断 / 失败）→ ``success: False``，下游合成函数
-    会返回 ``None``，该条不产生归属，与第二代失败 ``patch_apply_end`` 行为一致。
+    会返回 ``None``，该条不产生归属，与失败的 ``patch_apply_end`` 事件行为一致。
     """
     if not isinstance(item, dict) or item.get("type") != "FileChange":
         return None
@@ -242,11 +242,12 @@ def user_message_text_and_elements_from_user_message_item(
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """从 ``UserMessage`` item 取回 ``(消息文本, text_elements)``。
 
-    第二代把这两项放在 payload 顶层（``message`` 是裸字符串、``text_elements`` 平铺），
-    第三代搬进了 ``item.content[]``：文本在 ``content[].text``，而承载显式 ``$skill``
-    调用标记的 ``text_elements`` 挂在**每个 content 块上**，此处按块顺序展平。
+    ``user_message`` 形态把这两项放在 payload 顶层（``message`` 是裸字符串、
+    ``text_elements`` 平铺）；信封形态搬进了 ``item.content[]``：文本在 ``content[].text``，
+    而承载显式 ``$skill`` 调用标记的 ``text_elements`` 挂在**每个 content 块上**，
+    此处按块顺序展平。
 
-    返回的形状刻意与第二代 payload 对齐（``message`` + ``text_elements``），使
+    返回的形状刻意与 ``user_message`` payload 对齐（``message`` + ``text_elements``），使
     ``codex_invoked_skill`` 这类只认旧形状的消费者能原样复用其匹配逻辑。
     """
     if not isinstance(item, dict) or item.get("type") != "UserMessage":
@@ -280,7 +281,7 @@ def _strip_file_uri(value: str) -> str:
     ``file:///Users/x/Project%20Theseus``。只剥前缀不解码会同时造成两处损坏——
 
     1. 去重键与 ``exec_command`` 工具调用侧的 ``workdir``（那边是未编码的字面路径）
-       不匹配，同一次执行被两代记录各登记一次；
+       不匹配，同一次执行被两种记录形态各登记一次；
     2. ``command_workdir`` 解析不出 ``%20`` 路径 → 返回 ``None`` → 该次执行的相对路径
        候选被整体丢弃，归属反而比不修更差。
 
@@ -298,8 +299,8 @@ def _strip_file_uri(value: str) -> str:
 def shell_command_and_workdir_from_command_execution_item(
     item: dict[str, Any],
 ) -> tuple[str, str | None] | None:
-    """从 ``CommandExecution`` item 还原 ``(命令文本, workdir)``，形状与第一代
-    ``exec_command`` 的 ``{"cmd": ..., "workdir": ...}`` 参数对齐。
+    """从 ``CommandExecution`` item 还原 ``(命令文本, workdir)``，形状与
+    ``exec_command`` 工具调用的 ``{"cmd": ..., "workdir": ...}`` 实参对齐。
 
     ``item.command`` 是 argv 数组，实测普遍是 ``["/bin/zsh", "-lc", "<真实命令>"]``：
     argv[1] 命中 shell 的「命令字符串」标志时取 argv[-1]，否则 ``shlex.join`` 整个
@@ -392,7 +393,7 @@ def js_object_literal_string_fields(
 
     实测这些内嵌实参**只有约 17% 是严格 JSON**（其余用无引号 key，如
     ``{cmd:"git status", "workdir":"/x"}``），所以 ``json.loads`` 恢复率为 0——这正是
-    第二代 exec 归属全盘失效的第二个死因。此处按 JS 对象字面量的语法逐项扫描（引号 key
+    ``exec`` 形态归属全盘失效的第二个死因。此处按 JS 对象字面量的语法逐项扫描（引号 key
     与裸标识符 key 同等对待，值按类型跳过），只取需要的字符串字段，不做完整 JS 求值。
 
     非字符串字面量的值（表达式、变量、带插值的模板串）一律跳过而非猜测。
@@ -440,7 +441,7 @@ def js_object_literal_string_fields(
 def embedded_exec_command_invocation_from_tool_input(
     tool_input: Any,
 ) -> tuple[str, str | None] | None:
-    """从第二代 ``exec`` 工具 input 的 JS 文本里还原 ``(命令文本, workdir)``。
+    """从 ``exec`` 工具 input 的 JS 文本里还原 ``(命令文本, workdir)``。
 
     只认 ``tools.exec_command(`` 这一调用形态（见 ``EMBEDDED_EXEC_COMMAND_CALL_RE``
     的说明），抽不到 ``cmd`` 字符串字面量就返回 ``None``——保持「不猜」的既有行为。
@@ -461,7 +462,7 @@ def embedded_exec_command_invocation_from_tool_input(
 def unrecognized_codex_item_types(records: Iterable[dict[str, Any]]) -> list[str]:
     """扫出 ``KNOWN_CODEX_ITEM_TYPES`` 之外的 ``item.type``（去重、排序）。
 
-    前向兼容信号：第四代漂移新增 item 类型时，让 manifest 的 ``warnings`` 先说话，
+    前向兼容信号：**下一次**形态漂移新增 item 类型时，让 manifest 的 ``warnings`` 先说话，
     而不是等到归属归零、fail-loud 守卫整体 skip 才被发现。
     """
     seen: set[str] = set()

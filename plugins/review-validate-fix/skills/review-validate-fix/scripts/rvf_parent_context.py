@@ -183,8 +183,8 @@ def _render_codex_record_to_single_line(
         if sub == "patch_apply_end":
             return f"[patch_apply success={payload.get('success')}]"
         # ``item_completed`` 信封把 patch_apply_end 搬进了 ``FileChange`` item，该编辑成功
-        # 标记在信封形态下会整条消失。补回后与第二代严格 parity：两代都是「exec 调用渲染出
-        # 补丁内容 + 一行成功标记」，不产生重复。
+        # 标记在信封形态下会整条消失。补回后与 ``patch_apply_end`` 形态严格 parity：两种
+        # 形态都是「exec 调用渲染出补丁内容 + 一行成功标记」，不产生重复。
         file_change_item = codex_item_of_type(payload, "FileChange")
         if file_change_item is not None:
             return f"[patch_apply success={file_change_item.get('status') == 'completed'}]"

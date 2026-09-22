@@ -587,17 +587,19 @@ _EMBEDDED_APPLY_PATCH_CALL_RE = re.compile(r"tools\s*\.\s*apply_patch\s*\(")
 
 
 def patch_apply_end_payload_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
-    """取出该记录的结构化编辑真相源 payload（``patch_apply_end`` 形状），跨两代 schema。
+    """取出该记录的结构化编辑真相源 payload（``patch_apply_end`` 形状），跨多种记录形态。
 
-    * 第二代（gpt-5.6-sol）把 shell/编辑工具统一成 ``custom_tool_call`` name=``exec``、
-      真正的 ``apply_patch`` 以 JS 文本内嵌在 input，旧的 ``exec_command_end`` 事件消失；
-      当时唯一跨版本稳定的结构化编辑真相源是 ``event_msg`` 的 ``patch_apply_end``。
-    * 第三代（2026-08 codex-tui）又把它搬进 ``item_completed`` 信封的
-      ``item.type == "FileChange"``。``changes`` 形状未变，故此处只做信封层映射，
-      下游合成/解析链一行不用改。
+    编辑证据有两种写法，**并存而非先后替换**（取证见
+    ``core.transcript.codex_rollout_item_envelope`` 的模块 docstring）：
 
-    两代都不是 → ``None``。**判据一律是 payload/item 结构，不看 ``cli_version``**
-    （实测同一版本号会走不同 schema）。
+    * ``event_msg`` 的 ``patch_apply_end`` 事件。本机 1955 个 rollout 的语料里它**从未
+      作为 ``payload.type`` 出现过**，保留只为兼容其它 host / 更早的存档。
+    * ``item_completed`` 信封里的 ``item.type == "FileChange"``——本机语料的实际形态
+      （705 个文件含它，最早见于 2026-04-02）。``changes`` 形状与前者一致，故此处只做
+      信封层映射，下游合成/解析链一行不用改。
+
+    两种都不是 → ``None``。**判据一律是 payload/item 结构，绝不看 ``cli_version`` / 日期 /
+    ``originator``**（实测同一版本号在不同前端下会走不同形态）。
     """
     payload = record.get("payload")
     if not isinstance(payload, dict):
@@ -611,15 +613,16 @@ def patch_apply_end_payload_from_record(record: dict[str, Any]) -> dict[str, Any
 
 
 def is_patch_apply_end_record(record: dict[str, Any]) -> bool:
-    """该记录是否为结构化编辑真相源（两代 schema 任一形态）。"""
+    """该记录是否为结构化编辑真相源（两种记录形态任一）。"""
     return patch_apply_end_payload_from_record(record) is not None
 
 
-# 一次 shell 执行的三代记录形态。归属侧只关心 ``(命令文本, workdir)``，故统一还原成
-# 第一代 ``exec_command`` 参数的形状，再喂给既有的 command_path_candidates / command_workdir。
-# ``source`` 用于跨代去重：第三代 transcript 里同一条命令**同时**有第二代的 ``exec``
-# 调用记录与第三代的 ``CommandExecution`` 结果记录（实测解码后命令逐字节相同、
-# exec ⊆ CommandExecution），若两条都登记会重复计数；而同一代内的重复命令是真实的
+# 一次 shell 执行的三种记录形态（并存，非先后替换）。归属侧只关心 ``(命令文本, workdir)``，
+# 故统一还原成 ``exec_command`` 工具调用实参的形状，再喂给既有的
+# command_path_candidates / command_workdir。
+# ``source`` 用于**跨形态**去重：同一份 transcript 里同一条命令可能**同时**有 ``exec``
+# 调用记录与 ``CommandExecution`` 结果记录（实测解码后命令逐字节相同、
+# exec ⊆ CommandExecution），若两条都登记会重复计数；而**同一形态内**的重复命令是真实的
 # 两次执行，必须各自保留。故按 (cmd, workdir) 记住首次来源，仅跳过**不同来源**的重复。
 SHELL_INVOCATION_SOURCE_EXEC_COMMAND_TOOL = "exec_command_tool_call"
 SHELL_INVOCATION_SOURCE_EMBEDDED_JS = "embedded_exec_command_js"
@@ -643,7 +646,7 @@ def shell_invocation_from_record(record: dict[str, Any]) -> tuple[str, str | Non
         raw_workdir = args.get("workdir") if isinstance(args.get("workdir"), str) else None
         return cmd, raw_workdir, SHELL_INVOCATION_SOURCE_EXEC_COMMAND_TOOL
     if tool_name == "exec":
-        # 第二代：实参是 JS 对象字面量（实测仅约 17% 是严格 JSON），json.loads 恢复率为 0。
+        # ``exec`` 形态：实参是 JS 对象字面量（实测仅约 17% 是严格 JSON），json.loads 恢复率为 0。
         embedded = embedded_exec_command_invocation_from_tool_input(payload_tool_input(payload))
         if embedded is None:
             return None
@@ -1091,7 +1094,7 @@ def build_manifest(
 
     live_owned_units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     live_exec_paths: set[str] = set()
-    # (cmd, workdir) -> 首次登记该执行的记录来源；跨代去重用，见 shell_invocation_from_record。
+    # (cmd, workdir) -> 首次登记该执行的记录来源；跨形态去重用，见 shell_invocation_from_record。
     shell_invocation_source_by_key: dict[tuple[str, str | None], str] = {}
     included_tool_record_count = 0
     ignored_tool_record_count = 0
@@ -1175,10 +1178,9 @@ def build_manifest(
                 "message": user_message,
             }
         payload = record.get("payload")
-        # 新 Codex schema：patch_apply_end event（第二代）/ item_completed 信封里的
-        # FileChange item（第三代）是结构化编辑真相源。两代都归一到 patch_apply_end
-        # 形状后合成 apply_patch 补丁文本，复用同一归属路径（helper 仅对 success 记录
-        # 返回非 None）。
+        # 结构化编辑真相源有两种写法：``patch_apply_end`` 事件，与 ``item_completed``
+        # 信封里的 ``FileChange`` item。两者都归一到 patch_apply_end 形状后合成
+        # apply_patch 补丁文本，复用同一归属路径（helper 仅对 success 记录返回非 None）。
         patch_apply_end_payload = patch_apply_end_payload_from_record(record)
         if patch_apply_end_payload is not None:
             patch_text = synthesize_apply_patch_text_from_patch_apply_end(patch_apply_end_payload)
@@ -1225,7 +1227,7 @@ def build_manifest(
             # 与 F3 联动后会造成高频误跳过（RVF-001 F4）。
             if isinstance(tool_input, str) and _EMBEDDED_APPLY_PATCH_CALL_RE.search(tool_input):
                 saw_edit_evidence = True
-        # 三代 shell 执行记录统一还原成 (cmd, workdir)；不是 shell 记录才走 Claude 写工具分支。
+        # 三种形态的 shell 执行记录统一还原成 (cmd, workdir)；不是 shell 记录才走 Claude 写工具分支。
         shell_invocation = shell_invocation_from_record(record)
         if shell_invocation is None:
             for item in claude_tool_uses(record):
@@ -1259,9 +1261,9 @@ def build_manifest(
                     ignored_tool_record_count += 1
             continue
         cmd, raw_workdir, shell_invocation_source = shell_invocation
-        # 跨代去重：第三代 transcript 同时含第二代 ``exec`` 调用与第三代 ``CommandExecution``
+        # 跨形态去重：同一份 transcript 可能同时含 ``exec`` 调用与 ``CommandExecution``
         # 结果，两条描述的是**同一次执行**（实测解码后命令逐字节相同）。只跳过来源不同的
-        # 重复；同一来源的相同命令是真实的两次执行，照常各自登记（保旧世代逐字节等价）。
+        # 重复；同一来源的相同命令是真实的两次执行，照常各自登记（保既有形态逐字节等价）。
         _invocation_key = (cmd, raw_workdir)
         _first_source = shell_invocation_source_by_key.get(_invocation_key)
         if _first_source is not None and _first_source != shell_invocation_source:
@@ -1515,9 +1517,9 @@ def build_manifest(
                 if schema_drift_suspected
                 else []
             ),
-            # 前向兼容信号：第三代 rollout 把内容装进 item_completed 信封、按 item.type 分派。
-            # 出现已知集合外的新 item.type 时先在 warnings 说话，让第四代漂移在**降级/失明前**
-            # 就可见，而不是等到归属归零、fail-loud 守卫整体 skip 才被回溯发现。
+            # 前向兼容信号：``item_completed`` 信封把内容装进 payload.item、按 item.type 分派。
+            # 出现已知集合外的新 item.type 时先在 warnings 说话，让**下一次**形态漂移在
+            # 降级/失明前就可见，而不是等到归属归零、fail-loud 守卫整体 skip 才被回溯发现。
             *(
                 [
                     "unrecognized_codex_item_types: "

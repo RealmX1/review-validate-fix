@@ -1,4 +1,4 @@
-"""让 vendored ``codex_invoked_skill`` 认得第三代 Codex rollout schema 的薄桥接。
+"""让 vendored ``codex_invoked_skill`` 认得 Codex rollout 信封形态的薄桥接。
 
 为什么要有这一层
 ----------------
@@ -6,9 +6,9 @@
 其文件头明写 **“Do not edit here — change upstream and re-vendor.”**——在本地直接打补丁会
 在下次 re-vendor 时被静默冲掉，是典型的「修好了又悄悄坏回去」。
 
-而它确实盲了一处：``_iter_user_messages`` 只认第二代的
-``event_msg`` / ``payload.type == "user_message"``，**没有任何兜底**。2026-08 的
-``codex-tui`` rollout（第三代）把用户消息搬进了
+而它确实盲了一处：``_iter_user_messages`` 只认
+``event_msg`` / ``payload.type == "user_message"``，**没有任何兜底**。而 ``codex-tui``
+前端的 rollout 把用户消息装进了
 ``event_msg`` / ``payload.type == "item_completed"`` 的 ``item.type == "UserMessage"``，
 承载显式 ``$skill`` 调用标记的 ``text_elements`` 也随之搬到 ``item.content[].text_elements``。
 标记本身完好——实测那次失败的 transcript 里就有
@@ -22,7 +22,7 @@
 本模块的边界
 ------------
 只重写 **schema 耦合的那一段**（怎么从 rollout 里迭代出用户消息 payload），并把结果整形成
-vendored 模块期待的第二代形状 ``{"message": str, "text_elements": [...]}``；**skill 匹配
+vendored 模块期待的 ``user_message`` 形状 ``{"message": str, "text_elements": [...]}``；**skill 匹配
 判定一律回调 vendored 模块**（``_element_to_skill`` / ``match_invocation_in_text`` /
 ``InvokedSkill.matches``），不复制第二套判定——避免再造第三套触发检测。
 
@@ -58,15 +58,15 @@ __all__ = [
     "was_skill_invoked",
 ]
 
-# 行级快筛：第二代写 ``"user_message"``，第三代写 ``"UserMessage"``。两者都不含 → 跳过。
-# 与 vendored 的单串快筛同一意图（避免对每行做 json.loads），只是多认一代。
+# 行级快筛：旧形态写 ``"user_message"``，信封形态写 ``"UserMessage"``。两者都不含 → 跳过。
+# 与 vendored 的单串快筛同一意图（避免对每行做 json.loads），只是多认一种形态。
 _USER_MESSAGE_LINE_HINTS = ('"user_message"', '"UserMessage"')
 
 
 def _iter_user_message_payloads(transcript_path: "str | Path") -> "Iterator[dict[str, Any]]":
-    """按文件顺序产出「第二代形状」的用户消息 payload，跨两代 schema。
+    """按文件顺序产出「``user_message`` 形状」的用户消息 payload，跨两种记录形态。
 
-    第二代原样产出；第三代把 ``item_completed`` 信封里的 ``UserMessage`` item 整形成
+    ``user_message`` 形态原样产出；信封形态把 ``UserMessage`` item 整形成
     ``{"message": ..., "text_elements": [...]}``。best-effort：文件不可读 → 不产出；
     坏行跳过（与 vendored 同口径）。
     """
@@ -116,7 +116,7 @@ def invoked_skills_from_transcript(
     match_prompt: "str | None" = None,
 ) -> "list[InvokedSkill]":
     """与 ``codex_invoked_skill.invoked_skills_from_transcript`` 同语义、同参数，
-    但迭代器认第二代与第三代两种 rollout schema。"""
+    但迭代器认 ``user_message`` 与 ``item_completed`` 信封两种 rollout 记录形态。"""
     payloads = list(_iter_user_message_payloads(transcript_path))
     if match_prompt is not None:
         for payload in reversed(payloads):
