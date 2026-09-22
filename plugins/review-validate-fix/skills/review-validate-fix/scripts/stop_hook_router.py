@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 from core.rvf_user_local_data_paths import (  # noqa: E402
-    resolved_rvf_user_local_data_paths,
+    resolved_rvf_session_hook_state_dir,
 )
 
 
@@ -65,13 +65,10 @@ def safe_state_key(value: str) -> str:
 
 
 def state_dir() -> Path:
-    explicit = os.environ.get("CODEX_RVF_SESSION_HOOK_STATE_DIR")
-    if explicit and explicit.strip():
-        return Path(explicit).expanduser()
-    root = os.environ.get("CODEX_RVF_STATE_DIR") or os.environ.get("CODEX_RVF_LOG_ROOT")
-    if root and root.strip():
-        return Path(root).expanduser() / "session-hook"
-    return resolved_rvf_user_local_data_paths().runtime_state_root / "session-hook"
+    # 单一裁决点见 core.rvf_user_local_data_paths；此处刻意不再自行解析，
+    # 历史上这里比 stop_review_validate_fix 多一条「回落到 CODEX_RVF_LOG_ROOT」
+    # 的分支，两者对同一环境会给出不同目录。
+    return resolved_rvf_session_hook_state_dir()
 
 
 def state_path(session_id: str) -> Path:

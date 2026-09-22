@@ -73,6 +73,16 @@ MANUAL_RVF_MARKER_KEYS = (
 )
 MANUAL_RVF_MARKER_TTL_SECONDS = 12 * 60 * 60
 
+# 过期 dispatch prep 「就地复活」（FU-1 方案 B）的时效上界。
+#
+# 复活的本意是救「prep 刚过 5min TTL、投递只是慢了一步」的那一类，而不是把一条**会话早已走远**
+# 的旧派发原地唤醒：实测 09:08 创建的 prep 在 49 分钟后（用户已中断、已 rewind、已改做别的事）
+# 被无条件复活并上锁，于是一次从未被 agent 看到的 RVF 被强制续跑。超过本上界即不复活，改记
+# ``dispatch_prep_stale_not_revived``、走既有 ``dispatch_no_prep`` 早返回，由后续 Stop 按当时
+# 工作树重新决策。
+DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS = 15 * 60
+DISPATCH_PREP_REVIVE_MAX_AGE_ENV = "RVF_DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS"
+
 # host transcript / session 路径在 Stop event 里可能出现的键名（按优先序探测）；
 # SESSION_SCOPE_PATH_KEYS 去掉 log_path（日志路径不参与 session 作用域归属）。
 SESSION_PATH_KEYS = (

@@ -66,16 +66,42 @@ USAGE_LIMIT_429_SIGNATURES: tuple[str, ...] = (
     "status 429",
     "429 too many requests",
 )
+PROMPT_DELIVERY_STDIN = "stdin"
+PROMPT_DELIVERY_ARGV_PROMPT_FLAG_WITH_PROMPT_FILE_POINTER = (
+    "argv_prompt_flag_with_prompt_file_pointer"
+)
+PROMPT_DELIVERY_ARGV_POSITIONAL_PROMPT_FILE_REFERENCE = (
+    "argv_positional_prompt_file_reference"
+)
+SUPPORTED_PROMPT_DELIVERY_MODES = {
+    PROMPT_DELIVERY_STDIN,
+    PROMPT_DELIVERY_ARGV_PROMPT_FLAG_WITH_PROMPT_FILE_POINTER,
+    PROMPT_DELIVERY_ARGV_POSITIONAL_PROMPT_FILE_REFERENCE,
+}
+REVIEWER_PROMPT_FILE_ENV = "RVF_REVIEWER_PROMPT_FILE"
 OUTPUT_FORMAT_TEXT = "text"
 OUTPUT_FORMAT_CLAUDE_STREAM_JSON = "claude_stream_json"
 OUTPUT_FORMAT_CODEX_JSON = "codex_json"
 OUTPUT_FORMAT_CURSOR_STREAM_JSON = "cursor_stream_json"
+OUTPUT_FORMAT_KIMI_STREAM_JSON = "kimi_stream_json"
+OUTPUT_FORMAT_OH_MY_PI_JSON = "oh_my_pi_json"
 SUPPRESS_STOP_HOOK_ENV = "RVF_SUPPRESS_STOP_HOOK"
 SUPPORTED_OUTPUT_FORMATS = {
     OUTPUT_FORMAT_TEXT,
     OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
     OUTPUT_FORMAT_CODEX_JSON,
     OUTPUT_FORMAT_CURSOR_STREAM_JSON,
+    OUTPUT_FORMAT_KIMI_STREAM_JSON,
+    OUTPUT_FORMAT_OH_MY_PI_JSON,
+}
+# 逐行 JSON 的格式集合：raw stdout 落工件前要按 JSON 行做脱敏，否则 `env_set` 的秘密值不脱敏。
+# 新增结构化格式**必须**同时进这个集合——这是本文件历史上最容易漏的一处。
+STRUCTURED_JSON_LINES_OUTPUT_FORMATS = {
+    OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
+    OUTPUT_FORMAT_CODEX_JSON,
+    OUTPUT_FORMAT_CURSOR_STREAM_JSON,
+    OUTPUT_FORMAT_KIMI_STREAM_JSON,
+    OUTPUT_FORMAT_OH_MY_PI_JSON,
 }
 CHILD_RVF_ENV_KEYS = {
     "RVF_RUN_DIR",
@@ -90,6 +116,7 @@ CHILD_RVF_ENV_KEYS = {
     "RVF_REVIEW_PACKET_METADATA",
     "RVF_REVIEW_RESULT",
     "RVF_REVIEWER_ID",
+    REVIEWER_PROMPT_FILE_ENV,
 }
 USER_LOCAL_ALTERNATIVE_REVIEWER_CONFIG_OVERRIDE_RELATIVE_DIRECTORY = (
     Path(".rvf") / "alternative-reviewer-config-overrides"
@@ -388,6 +415,19 @@ def is_cursor_print_command(command: list[str]) -> bool:
     )
 
 
+def is_kimi_prompt_command(command: list[str]) -> bool:
+    # kimi 的 `-p/--prompt` 是**带值 flag**，且其值（prompt 指针）由 runner 在运行期追加，
+    # 所以这里刻意不看 `-p`——只认二进制名，否则 config 里的静态 flag 组永远匹配不上。
+    return bool(command) and Path(command[0]).name == "kimi"
+
+
+def is_oh_my_pi_print_command(command: list[str]) -> bool:
+    return bool(command) and Path(command[0]).name == "omp" and any(
+        item in {"-p", "--print", "--mode"} or item.startswith("--mode=")
+        for item in command
+    )
+
+
 def codex_subcommand_index(command: list[str]) -> int | None:
     if not command or Path(command[0]).name != "codex":
         return None
@@ -438,7 +478,7 @@ def is_codex_exec_command(command: list[str]) -> bool:
     return codex_subcommand_index(command) is not None
 
 
-def claude_output_format_arg(command: list[str]) -> str | None:
+def output_format_argument_value(command: list[str]) -> str | None:
     for index, item in enumerate(command):
         if item.startswith("--output-format="):
             return item.split("=", 1)[1]
@@ -506,6 +546,60 @@ def ensure_cursor_stream_json_command(command: list[str]) -> list[str]:
     return patched
 
 
+def ensure_kimi_stream_json_command(command: list[str]) -> list[str]:
+    """保证 `--output-format stream-json`。
+
+    ⚠️ 绝不注入 `-y/--yolo` 或 `--auto`：kimi 的 prompt 模式**隐含** forceAuto，
+    显式加上反而与 `-p` 互斥报错。也绝不注入 `-p`——它的值是运行期才生成的指针文本，
+    由 `finalize_reviewer_command_for_prompt_delivery` 追加。
+    """
+    patched = list(command)
+    equals_index = next(
+        (index for index, item in enumerate(patched) if item.startswith("--output-format=")),
+        None,
+    )
+    if equals_index is not None:
+        patched[equals_index] = "--output-format=stream-json"
+    elif "--output-format" in patched:
+        index = patched.index("--output-format")
+        if index + 1 < len(patched):
+            patched[index + 1] = "stream-json"
+        else:
+            patched.append("stream-json")
+    else:
+        patched.extend(["--output-format", "stream-json"])
+    return patched
+
+
+def ensure_oh_my_pi_json_command(command: list[str]) -> list[str]:
+    """保证 print 模式 + `--mode json`，并保住「评审腿不得递归触发 RVF」这条硬约束。
+
+    `--no-extensions` 是 omp 侧等价于 codex `--disable hooks` 的东西：omp 的 Stop 语义完全
+    活在进程内的 TS extension 里，reviewer 子进程一旦加载它们，就会在评审腿里再起一轮 RVF。
+    `RVF_SUPPRESS_STOP_HOOK=1` 是第二道保险，不是它的替代品。
+    """
+    patched = list(command)
+    if not any(item in {"-p", "--print"} for item in patched):
+        patched.append("-p")
+    equals_index = next(
+        (index for index, item in enumerate(patched) if item.startswith("--mode=")),
+        None,
+    )
+    if equals_index is not None:
+        patched[equals_index] = "--mode=json"
+    elif "--mode" in patched:
+        index = patched.index("--mode")
+        if index + 1 < len(patched):
+            patched[index + 1] = "json"
+        else:
+            patched.append("json")
+    else:
+        patched.extend(["--mode", "json"])
+    if "--no-extensions" not in patched:
+        patched.append("--no-extensions")
+    return patched
+
+
 def codex_json_enabled(command: list[str]) -> bool:
     return "--json" in command
 
@@ -541,22 +635,34 @@ def ensure_codex_json_command(command: list[str]) -> list[str]:
     return patched
 
 
-def ensure_codex_exec_add_dir(command: list[str], directory: Path) -> list[str]:
-    exec_index = codex_subcommand_index(command)
-    if exec_index is None:
-        return command
+def ensure_run_directory_grant_argument(
+    command: list[str],
+    directory: Path,
+    *,
+    grant_flag: str,
+    scan_from_index: int = 1,
+    insert_before_token: str | None = None,
+) -> list[str]:
+    """幂等地保证 argv 里带上「把 RVF run directory 授权成子进程可写目录」的参数。
 
+    这不是 codex 专属需求：reviewer 要写的 `$RVF_REVIEW_RESULT` 落在 run directory 里、
+    位于目标仓库之外，因此凡是带工作目录沙箱的 reviewer CLI 都必须显式授权它。
+    codex / kimi / oh-my-pi 三家的 flag 名恰好都是 `--add-dir`，但位置约束不同：
+    codex 必须插在 `exec` 子命令之后、stdin 占位符 `-` 之前，故位置约束由调用方
+    通过 scan_from_index / insert_before_token 表达，而不是写死在本函数里。
+    """
     directory_arg = str(directory)
     patched = list(command)
-    index = exec_index + 1
+    equals_prefix = f"{grant_flag}="
+    index = max(scan_from_index, 0)
     while index < len(patched):
         item = patched[index]
-        if item == "--add-dir" and index + 1 < len(patched):
+        if item == grant_flag and index + 1 < len(patched):
             if Path(patched[index + 1]).expanduser() == directory:
                 return patched
             index += 2
             continue
-        if item.startswith("--add-dir="):
+        if item.startswith(equals_prefix):
             if Path(item.split("=", 1)[1]).expanduser() == directory:
                 return patched
             index += 1
@@ -564,12 +670,259 @@ def ensure_codex_exec_add_dir(command: list[str], directory: Path) -> list[str]:
         index += 1
 
     insert_at = len(patched)
-    for index in range(exec_index + 1, len(patched)):
-        if patched[index] == "-":
-            insert_at = index
-            break
-    patched[insert_at:insert_at] = ["--add-dir", directory_arg]
+    if insert_before_token is not None:
+        for index in range(max(scan_from_index, 0), len(patched)):
+            if patched[index] == insert_before_token:
+                insert_at = index
+                break
+    patched[insert_at:insert_at] = [grant_flag, directory_arg]
     return patched
+
+
+def ensure_codex_exec_add_dir(command: list[str], directory: Path) -> list[str]:
+    exec_index = codex_subcommand_index(command)
+    if exec_index is None:
+        return command
+    return ensure_run_directory_grant_argument(
+        command,
+        directory,
+        grant_flag="--add-dir",
+        scan_from_index=exec_index + 1,
+        insert_before_token="-",
+    )
+
+
+REVIEWER_PROMPT_FILE_POINTER_INSTRUCTION_TEMPLATE = (
+    "Your review instructions and review packet are too large to pass on the command line, "
+    "so they were written to this file:\n"
+    "{prompt_file_path}\n"
+    "That absolute path is also exported as $RVF_REVIEWER_PROMPT_FILE. Read the whole file "
+    "first, then do exactly what it says. Do not begin reviewing, and do not answer, before "
+    "you have read it. This message is only a pointer, never the review instructions."
+)
+
+
+def build_reviewer_prompt_file_pointer_instruction(prompt_file_path: Path) -> str:
+    """生成投给 argv 的短指针指令（绝对路径逐字写入，避免 reviewer 读不到 env 时无路可走）。"""
+    return REVIEWER_PROMPT_FILE_POINTER_INSTRUCTION_TEMPLATE.format(
+        prompt_file_path=prompt_file_path
+    )
+
+
+def finalize_reviewer_command_for_prompt_delivery(
+    command: list[str],
+    *,
+    prompt_delivery: str,
+    prompt_flag: str | None,
+    prompt_file_path: Path,
+    prompt_text: str,
+) -> tuple[list[str], str]:
+    """按 harness 的 prompt 投递形态终结 argv，并给出真正要写进 stdin 的文本。
+
+    返回 `(final_argv, stdin_text)`。三种形态：
+
+    - `stdin`：整份 prompt 走 stdin，逐字保持既有行为（cursor / claude / codex）。
+    - `argv_prompt_flag_with_prompt_file_pointer`：整份 prompt 留在磁盘，argv 只带一段
+      固定短指令。kimi 的 `-p` 是带值 flag 且从不读 stdin，而真实评审 packet 远超
+      ARG_MAX，两头堵死才走到这一步。**代价是投递不保证送达**——模型得先自己去读那个
+      文件，读失败与「拒绝评审」在产物上不可区分。
+    - `argv_positional_prompt_file_reference`：argv 追加 `@<绝对路径>`，由 harness 自己
+      把文件内容展开进 prompt（omp 的原生语法）。比上一条强：展开发生在 harness 进程内，
+      不依赖模型自觉去读文件，送达性与 stdin 等价，同时 argv 只有一个短路径。
+
+    omp 走第三条而不是 stdin，是被实测逼出来的：`omp -p` **不读 stdin**，喂进去的整份
+    prompt 会被静默丢弃——进程 exit 0、stderr 全空、stdout 只有一行 session、零 turn。
+    比 kimi 那条（至少 exit 1 报 argument missing）更难发现，端到端跑一次才暴露。
+    """
+    if prompt_delivery == PROMPT_DELIVERY_STDIN:
+        return list(command), prompt_text
+    if prompt_delivery == PROMPT_DELIVERY_ARGV_PROMPT_FLAG_WITH_PROMPT_FILE_POINTER:
+        if not prompt_flag:
+            raise ValueError(
+                f"prompt_delivery={prompt_delivery} requires a non-empty prompt_flag"
+            )
+        pointer_instruction = build_reviewer_prompt_file_pointer_instruction(prompt_file_path)
+        return [*command, prompt_flag, pointer_instruction], ""
+    if prompt_delivery == PROMPT_DELIVERY_ARGV_POSITIONAL_PROMPT_FILE_REFERENCE:
+        return [*command, f"@{prompt_file_path}"], ""
+    raise ValueError(f"unsupported prompt_delivery: {prompt_delivery}")
+
+
+def reviewer_command_argv_bytes(command: list[str]) -> int:
+    """argv 在 execve 侧占用的字节数近似（每个参数含结尾 NUL），用于对照 ARG_MAX。"""
+    return sum(len(item.encode("utf-8")) + 1 for item in command)
+
+
+HEALTH_PROBE_SHARES_DISPATCH_ENTRYPOINT = "shared_dispatch_entrypoint"
+HEALTH_PROBE_PARITY_EXEMPTION_CONFIG_FIELD = "health_probe_parity_exemption"
+# 唯一合法的豁免取值，且**只**给测试夹具用：夹具的 "reviewer" 是 `python3 -c "<脚本>"`，
+# 两边 `-c` 的载荷本来就必须不同（健康脚本验环境、评审脚本写工件），根本不存在可比对的
+# CLI 入口。刻意做成「一个自证其为夹具的字面量」而不是布尔开关：布尔 opt-out 正是
+# 「配错即静默退化」的形状，而这个名字一旦出现在出厂模板里，contract gate 会当场拒绝。
+HEALTH_PROBE_PARITY_EXEMPTION_INLINE_SCRIPT_FIXTURE = (
+    "inline_script_fixture_has_no_shared_cli_entrypoint"
+)
+HEALTH_PROBE_PARITY_EXEMPTED = "exempted_inline_script_fixture"
+HEALTH_PROBE_USES_EXTERNAL_EXECUTABLE = "external_probe_executable"
+
+
+def reviewer_dispatch_flag_multiset(
+    argv: list[str],
+    *,
+    prompt_flag: str | None,
+    run_directory_grant_flag: str | None,
+) -> list[str]:
+    """一条 reviewer 命令「走的是哪条后端路径」的签名。
+
+    刻意剥掉三类与后端路径无关的东西：可执行名（由调用方单独比对）、prompt 承载 token
+    （`-` 占位符或 ``prompt_flag`` 及其值）、运行期注入的 run-directory 授权。
+    结果排序后比较——这里要钉的是「flag 集合相同」，不是「顺序相同」。
+    """
+    tokens: list[str] = []
+    index = 1
+    while index < len(argv):
+        item = argv[index]
+        if item == "-":
+            index += 1
+            continue
+        if run_directory_grant_flag and item == run_directory_grant_flag:
+            index += 2
+            continue
+        if run_directory_grant_flag and item.startswith(f"{run_directory_grant_flag}="):
+            index += 1
+            continue
+        if prompt_flag and item == prompt_flag:
+            index += 2
+            continue
+        tokens.append(item)
+        index += 1
+    return sorted(tokens)
+
+
+def split_health_command_positional_prompt(
+    health_command: list[str],
+    *,
+    prompt_flag: str | None,
+    dispatch_signature: list[str] | None = None,
+) -> tuple[list[str], str | None]:
+    """把 health 命令拆成「flag 部分」与「末尾位置参数 prompt」。
+
+    位置参数是必须的形态：`run_health` 调 `subprocess.run` 时**既不传 input= 也不设 stdin=**，
+    照搬 claude 的裸 `-p` 或 codex 的 `exec -` 会让探针阻塞在 stdin 上、一路挂到超时。
+
+    ⚠️ 末尾 token 只有在它**不是派发签名里已有的 token** 时才算 prompt。少了这条，
+    ``["kimi","--output-format","stream-json"]``（一条根本没有 prompt 的探针）会把
+    ``stream-json`` 当成 prompt，而同源规整又会把 ``--output-format stream-json`` 补回来，
+    两边多重集恰好相等 ⇒ **一条不发起任何调用的探针静默通过**。这正是本 gate 要防的形状。
+    """
+    if prompt_flag and prompt_flag in health_command:
+        return list(health_command), None
+    if len(health_command) >= 2 and not health_command[-1].startswith("-"):
+        candidate = health_command[-1]
+        if dispatch_signature is None or candidate not in dispatch_signature:
+            return list(health_command[:-1]), candidate
+    return list(health_command), None
+
+
+def assert_health_command_shares_dispatch_flag_set(
+    command: list[str],
+    health_command: list[str],
+    *,
+    prompt_flag: str | None,
+    run_directory_grant_flag: str | None,
+) -> str:
+    """把 cursor 那条用真实故障买来的注释纪律变成可执行不变量。
+
+    2026-08-11 的 run rvf-20260811T170157Z：cursor 登录已过期，`cursor-agent status` 退 0
+    而 `cursor-agent -p ...` 退 1。probe 只看前者，于是把 cursor 判为可用、选进两腿；那一腿
+    派出去立刻失败、不产出 review-result，本轮实际只剩单路评审结论。**旁路的 auth 查询命令
+    不是真实可用性的充分判据——只有走评审那条命令路径的探针才是。**
+
+    判据刻意只钉住教训本身：**同一个可执行名**时，两边的 flag 多重集必须完全相等。
+    可执行名不同（例如运维显式把探针指向自建网关的 curl 健康检查）不属于本 gate 管辖——
+    那是一次显式的运维决策，不是「没人审视过的默认值」这个失效模式；但它必须被记进 ledger
+    而不是无声通过。
+    """
+    if not command or not health_command:
+        raise ValueError("command 与 health_command 都必须非空才能比对健康探针路径")
+    if Path(health_command[0]).name != Path(command[0]).name:
+        return HEALTH_PROBE_USES_EXTERNAL_EXECUTABLE
+
+    dispatch_signature = reviewer_dispatch_flag_multiset(
+        command,
+        prompt_flag=prompt_flag,
+        run_directory_grant_flag=run_directory_grant_flag,
+    )
+    health_flags, positional_prompt = split_health_command_positional_prompt(
+        health_command,
+        prompt_flag=prompt_flag,
+        dispatch_signature=dispatch_signature,
+    )
+    health_signature = reviewer_dispatch_flag_multiset(
+        health_flags,
+        prompt_flag=prompt_flag,
+        run_directory_grant_flag=run_directory_grant_flag,
+    )
+    if dispatch_signature != health_signature:
+        only_in_dispatch = sorted(set(dispatch_signature) - set(health_signature))
+        only_in_health = sorted(set(health_signature) - set(dispatch_signature))
+        raise ValueError(
+            "health_command 与 command 没有走同一条后端路径，健康探针因此不能证明评审腿可用"
+            f"（只在 command 里: {only_in_dispatch or '无'}；只在 health_command 里: "
+            f"{only_in_health or '无'}）。"
+            "健康探针必须与派发命令共用同一组 flag，只把 prompt 换成一句最小指令，"
+            "且 prompt 要走位置参数——run_health 不喂 stdin。"
+        )
+    if positional_prompt is None and not (prompt_flag and prompt_flag in health_command):
+        raise ValueError(
+            "health_command 缺少 prompt：它必须真的发起一次最小评审调用，"
+            "而不是一条旁路查询命令"
+        )
+    return HEALTH_PROBE_SHARES_DISPATCH_ENTRYPOINT
+
+
+def normalise_reviewer_command_for_output_format(
+    argv: list[str], output_format: str
+) -> list[str]:
+    """按 output_format 把一条 reviewer 命令规整成「真正会被执行的那一条」。
+
+    派发命令与健康探针共用本函数——这样「探针和评审走同一条路径」是**构造出来的**，
+    而不是靠运维记得在两处各抄一遍 flag（抄漏一个就换一道门，正是 cursor 那次故障的形状）。
+    """
+    if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(argv):
+        return ensure_claude_stream_json_command(argv)
+    if output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON and is_cursor_print_command(argv):
+        return ensure_cursor_stream_json_command(argv)
+    if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(argv):
+        return ensure_codex_json_command(ensure_codex_hooks_disabled_command(argv))
+    if output_format == OUTPUT_FORMAT_KIMI_STREAM_JSON and is_kimi_prompt_command(argv):
+        return ensure_kimi_stream_json_command(argv)
+    if output_format == OUTPUT_FORMAT_OH_MY_PI_JSON and is_oh_my_pi_print_command(argv):
+        return ensure_oh_my_pi_json_command(argv)
+    return list(argv)
+
+
+def normalise_health_command_for_output_format(
+    health_command: list[str],
+    output_format: str,
+    *,
+    prompt_flag: str | None,
+    dispatch_signature: list[str] | None = None,
+) -> list[str]:
+    """健康探针的规整：与派发同源，但 prompt 走位置参数、且不留 stdin 占位符 `-`。"""
+    flags, positional_prompt = split_health_command_positional_prompt(
+        health_command,
+        prompt_flag=prompt_flag,
+        dispatch_signature=dispatch_signature,
+    )
+    normalised = [
+        item
+        for item in normalise_reviewer_command_for_output_format(flags, output_format)
+        if item != "-"
+    ]
+    if positional_prompt is not None:
+        normalised.append(positional_prompt)
+    return normalised
 
 
 def check_repo(repo: Path) -> None:
@@ -1013,6 +1366,14 @@ class ClaudeStreamActivityMonitor:
     def waiting_on_long_command(self) -> bool:
         return bool(self.active_bash_tool_ids or self.active_anonymous_bash_tools > 0)
 
+    @property
+    def tool_layer_unavailable(self) -> bool:
+        return False
+
+    @property
+    def early_fail_over_reason_code(self) -> str | None:
+        return None
+
     def ingest(self, output: str) -> None:
         self._pending_line += output
         lines = self._pending_line.splitlines(keepends=True)
@@ -1089,6 +1450,12 @@ class CursorStreamActivityMonitor:
             and self.tool_successes == 0
         )
 
+    @property
+    def early_fail_over_reason_code(self) -> str | None:
+        if self.tool_layer_unavailable:
+            return "cursor_tool_layer_unavailable"
+        return None
+
     def ingest(self, output: str) -> None:
         self._pending_line += output
         lines = self._pending_line.splitlines(keepends=True)
@@ -1118,6 +1485,137 @@ class CursorStreamActivityMonitor:
             self.tool_successes += 1
 
 
+class KimiStreamActivityMonitor:
+    """kimi stream-json 的极小 monitor —— 职责与 cursor 的那个**不同**，不是它的翻版。
+
+    kimi 的 ``{"role":"tool", ...}`` 行**没有任何成功/失败标记**（writer 只写 content），
+    因此**做不了工具层 fail-over**。这是取证后的结论，不是待办：写成 TODO 会诱使后人拿
+    猜测填坑。它只干两件真事：
+
+    1. **重试耗尽**才置 :attr:`provider_usage_limit_signalled`。刻意**不**在「发生了一次
+       429 重试」时就置位——``turn.step.retrying`` 按定义是重试事件，那一轮仍可能成功，
+       在这里提前 fail-over 等于把可恢复重试变成硬失败腿。权威信号是 kimi 自己给的
+       ``failed_attempt >= max_attempts``。
+    2. 记录 ``session.resume_hint`` 是否出现。它只在成功路径写出（失败先 throw），
+       因此**缺席**是「异常终止」的可靠判据；但它**不是**判决点——review-result 才是。
+    """
+
+    def __init__(self) -> None:
+        self._pending_line = ""
+        self.provider_usage_limit_signalled = False
+        self.resume_hint_observed = False
+
+    @property
+    def waiting_on_long_command(self) -> bool:
+        # 重试期间 stdout 一直在长，idle-timeout 本就不会误杀；这里没有需要抑制的长静默命令。
+        return False
+
+    @property
+    def tool_layer_unavailable(self) -> bool:
+        return False
+
+    @property
+    def structured_output_terminated_cleanly(self) -> bool:
+        return self.resume_hint_observed
+
+    @property
+    def early_fail_over_reason_code(self) -> str | None:
+        if self.provider_usage_limit_signalled:
+            return "kimi_provider_usage_limit_exhausted"
+        return None
+
+    def ingest(self, output: str) -> None:
+        self._pending_line += output
+        lines = self._pending_line.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_line = lines.pop()
+        else:
+            self._pending_line = ""
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line:
+                self._ingest_line(line)
+
+    def _ingest_line(self, line: str) -> None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        if "session" in payload and isinstance(payload.get("session"), dict):
+            if payload["session"].get("resume_hint"):
+                self.resume_hint_observed = True
+        if payload.get("resume_hint"):
+            self.resume_hint_observed = True
+        if payload.get("role") != "meta":
+            return
+        if kimi_retry_event_exhausted_provider_usage(payload):
+            self.provider_usage_limit_signalled = True
+
+
+class OhMyPiJsonStreamActivityMonitor:
+    """oh-my-pi 事件流的极小 monitor。
+
+    ⚠️ **刻意不累计 ``tool_execution_end.isError``**：它并不是 cursor ``spawnError`` 的对偶。
+    omp 会在**普通非零 shell exit** 与**工具参数校验错误**上同样置起它，因此「连续三次
+    isError 判工具层不可用」会把三条正常失败的 shell 命令误报成 runtime 坏掉，进而杀掉一条
+    健康的评审腿。这同样是取证后的结论，不是待办。
+
+    它只干一件真事：在终局记录里读出 ``stopReason == "error"`` 且错误正文命中额度签名时置
+    :attr:`provider_usage_limit_signalled`。这条之所以必要，是因为 omp 在 ``--mode json``
+    下**报错也退 0** ⇒ 只认非零退出码的文本兜底永远不会触发。
+    """
+
+    def __init__(self) -> None:
+        self._pending_line = ""
+        self.provider_usage_limit_signalled = False
+        self.terminal_turn_observed = False
+
+    @property
+    def waiting_on_long_command(self) -> bool:
+        return False
+
+    @property
+    def tool_layer_unavailable(self) -> bool:
+        return False
+
+    @property
+    def structured_output_terminated_cleanly(self) -> bool:
+        return self.terminal_turn_observed
+
+    @property
+    def early_fail_over_reason_code(self) -> str | None:
+        if self.provider_usage_limit_signalled:
+            return "oh_my_pi_provider_usage_limit_exhausted"
+        return None
+
+    def ingest(self, output: str) -> None:
+        self._pending_line += output
+        lines = self._pending_line.splitlines(keepends=True)
+        if lines and not lines[-1].endswith(("\n", "\r")):
+            self._pending_line = lines.pop()
+        else:
+            self._pending_line = ""
+        for raw_line in lines:
+            line = raw_line.strip()
+            if line:
+                self._ingest_line(line)
+
+    def _ingest_line(self, line: str) -> None:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") in {"message_end", "turn_end", "agent_end"}:
+            self.terminal_turn_observed = True
+            error_text = oh_my_pi_record_error_text(payload)
+            if error_text and looks_like_usage_limit(error_text):
+                self.provider_usage_limit_signalled = True
+
+
 class ReviewerRunResult:
     def __init__(
         self,
@@ -1143,7 +1641,14 @@ class ReviewerRunResult:
         self.probe_history = probe_history or []
 
 
-class CodexJsonOutputError(ValueError):
+class ReviewerStructuredOutputError(ValueError):
+    """结构化 stdout 里读出的、足以否定整条评审腿的 typed 错误。
+
+    不止 codex 会有：kimi 的重试耗尽与 oh-my-pi 的 `stopReason:"error"` 都必须走这里。
+    尤其 omp——它在 `--mode json` 下**报错也退 0**，若不 typed 识别，只认非零退出码的
+    D2 文本兜底永远不会触发（这是「omp 比 kimi 省事」那个判断反了的根因）。
+    """
+
     def __init__(self, reason_code: str, message: str) -> None:
         super().__init__(message)
         self.reason_code = reason_code
@@ -1377,14 +1882,26 @@ def run_with_activity_timeout(
     #  - cursor：解析 tool_call(completed) 事件，统计 cursor 自身工具执行层失败；不抑制 idle，
     #    只在工具层整体坏掉时（tool_layer_unavailable）让下方循环提前 fail-over。
     #    背景见 CursorStreamActivityMonitor 与 DEFAULT_CURSOR_TOOL_FAILURE_THRESHOLD。
+    #  - kimi：只认「额度类失败且重试已耗尽」，不做工具层 fail-over（kimi 的 tool 行没有成败标记）。
+    #  - oh-my-pi：只认终局 stopReason:"error" 的额度签名，同样不做工具层 fail-over
+    #    （它的 isError 会在普通非零 shell exit 上置起，不是 runtime 故障信号）。
+    stream_monitor: (
+        ClaudeStreamActivityMonitor
+        | CursorStreamActivityMonitor
+        | KimiStreamActivityMonitor
+        | OhMyPiJsonStreamActivityMonitor
+        | None
+    )
     if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON:
-        stream_monitor: ClaudeStreamActivityMonitor | CursorStreamActivityMonitor | None = (
-            ClaudeStreamActivityMonitor()
-        )
+        stream_monitor = ClaudeStreamActivityMonitor()
     elif output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON:
         stream_monitor = CursorStreamActivityMonitor(
             tool_failure_threshold=tool_failure_threshold
         )
+    elif output_format == OUTPUT_FORMAT_KIMI_STREAM_JSON:
+        stream_monitor = KimiStreamActivityMonitor()
+    elif output_format == OUTPUT_FORMAT_OH_MY_PI_JSON:
+        stream_monitor = OhMyPiJsonStreamActivityMonitor()
     else:
         stream_monitor = None
 
@@ -1468,12 +1985,15 @@ def run_with_activity_timeout(
                     last_stdout_len = stdout_len
                     last_stderr_len = stderr_len
                     consecutive_probe_failures = 0
-                    # 快速失败：cursor 工具执行层整体坏掉（连续 spawnError/Aborted 且零成功）时
-                    # 立即终止并 fail-over，不再等 idle_timeout 白烧（实测可省 ~83s）。
-                    if (
-                        isinstance(stream_monitor, CursorStreamActivityMonitor)
-                        and stream_monitor.tool_layer_unavailable
-                    ):
+                    # 快速失败：monitor 判定「继续等下去也不会有合法评审」时立即终止并 fail-over，
+                    # 不再等 idle_timeout 白烧（cursor 工具层整体坏掉实测可省 ~83s；kimi/omp 则是
+                    # 额度耗尽——重试期间 stdout 一直在长，idle-timeout 永远不会触发）。
+                    early_fail_over_reason_code = (
+                        stream_monitor.early_fail_over_reason_code
+                        if stream_monitor is not None
+                        else None
+                    )
+                    if early_fail_over_reason_code is not None:
                         return timeout_completed(
                             process,
                             command,
@@ -1483,7 +2003,7 @@ def run_with_activity_timeout(
                             activity_probe_timeout_seconds=activity_probe_timeout_seconds,
                             activity_probe_failure_threshold=activity_probe_failure_threshold,
                             max_runtime_seconds=max_runtime_seconds,
-                            reason="cursor_tool_layer_unavailable",
+                            reason=early_fail_over_reason_code,
                             probe_history=probe_history,
                         )
                     continue
@@ -1784,7 +2304,7 @@ def extract_codex_json_result(output: str) -> str:
         if error_record is not None:
             error_text = _codex_error_text(error_record)
             if error_text and looks_like_usage_limit(error_text):
-                raise CodexJsonOutputError(
+                raise ReviewerStructuredOutputError(
                     "usage_limit_exhausted",
                     f"{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG} {error_text.strip()[:2000]}",
                 )
@@ -1824,7 +2344,7 @@ def extract_codex_json_result(output: str) -> str:
     if result is not None:
         return result.strip()
     if looks_like_codex_backend_challenge(output):
-        raise CodexJsonOutputError(
+        raise ReviewerStructuredOutputError(
             "codex_backend_challenge",
             (
                 f"{CODEX_BACKEND_CHALLENGE_FLAG} Codex CLI returned ChatGPT/Codex "
@@ -1832,6 +2352,185 @@ def extract_codex_json_result(output: str) -> str:
             ),
         )
     return output.strip()
+
+
+def kimi_retry_event_exhausted_provider_usage(record: dict[str, Any]) -> bool:
+    """kimi 的 ``turn.step.retrying`` 是否代表「额度类失败且重试已耗尽」。
+
+    两个条件都要满足才算数：① 错误是额度/429 类；② kimi 自己报告 ``failed_attempt``
+    已达 ``max_attempts``。只满足①的是**可恢复重试**，判死会把整条腿连同它随后可能写出的
+    合法 review-result 一起丢掉（`_leg_is_effective` 要求 returncode == 0，
+    `check_review_result_artifact` 也只在 returncode == 0 时才跑）。
+    """
+    if record.get("type") != "turn.step.retrying":
+        return False
+    status_code = record.get("status_code", record.get("statusCode"))
+    error_message = record.get("error_message") or record.get("errorMessage") or ""
+    if not isinstance(error_message, str):
+        error_message = ""
+    usage_flavoured = status_code == 429 or bool(looks_like_usage_limit(error_message))
+    if not usage_flavoured:
+        return False
+    failed_attempt = record.get("failed_attempt", record.get("failedAttempt"))
+    max_attempts = record.get("max_attempts", record.get("maxAttempts"))
+    if not isinstance(failed_attempt, int) or not isinstance(max_attempts, int):
+        return False
+    return failed_attempt >= max_attempts
+
+
+def extract_kimi_stream_json_result(output: str) -> str:
+    """从 kimi ``--output-format stream-json`` 的 JSONL 里提取最后一条 assistant 正文。
+
+    kimi **没有** ``type == "result"`` 这种终止信封，所以既有的 `extract_result_event_text`
+    会整份回退成 raw stdout（把整条 JSONL 当成「评审正文」落进工件）。这里改成取最后一条
+    ``role == "assistant"`` 且 content 为非空字符串的行。
+    """
+    result: str | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("role") == "meta":
+            if kimi_retry_event_exhausted_provider_usage(record):
+                error_message = (
+                    record.get("error_message") or record.get("errorMessage") or "provider usage limit"
+                )
+                raise ReviewerStructuredOutputError(
+                    "usage_limit_exhausted",
+                    f"{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG} {str(error_message).strip()[:2000]}",
+                )
+            continue
+        if record.get("role") != "assistant":
+            continue
+        content = record.get("content")
+        if isinstance(content, str) and content.strip():
+            result = content
+        elif isinstance(content, list):
+            parts = text_parts_from_content(content)
+            if parts:
+                result = "\n".join(parts)
+    if result is not None:
+        return result.strip()
+    return output.strip()
+
+
+def oh_my_pi_record_error_text(record: dict[str, Any]) -> str | None:
+    """从 omp 的终局记录里取错误正文（``stopReason == "error"`` 才算）。"""
+    candidates: list[dict[str, Any]] = [record]
+    message = record.get("message")
+    if isinstance(message, dict):
+        candidates.append(message)
+    for candidate in candidates:
+        stop_reason = candidate.get("stopReason", candidate.get("stop_reason"))
+        if stop_reason != "error":
+            continue
+        error_message = candidate.get("errorMessage") or candidate.get("error_message")
+        if isinstance(error_message, str) and error_message.strip():
+            return error_message
+        return "oh-my-pi reported stopReason: error without an errorMessage"
+    return None
+
+
+def extract_oh_my_pi_json_result(output: str) -> str:
+    """从 omp ``--mode json`` 的事件流里提取最后一条 assistant 正文。
+
+    ⚠️ omp 在 ``--mode json`` 下**报错也退 0**（把 ``errorMessage → stderr → exit(1)``
+    那整段包在 ``if (mode === "text")`` 里），所以只认非零退出码的文本兜底**永远不会触发**。
+    额度类错误必须在这里 typed 识别并 raise，否则该腿会被当成「跑完了但没写结果」。
+    """
+    result: str | None = None
+    fallback_from_agent_end: str | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        record_type = record.get("type")
+        if record_type in {"message_end", "turn_end", "agent_end"}:
+            error_text = oh_my_pi_record_error_text(record)
+            if error_text and looks_like_usage_limit(error_text):
+                raise ReviewerStructuredOutputError(
+                    "usage_limit_exhausted",
+                    f"{EXTERNAL_REVIEWER_USAGE_LIMIT_FLAG} {error_text.strip()[:2000]}",
+                )
+        if record_type in {"message_end", "turn_end"}:
+            message = record.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                parts = text_parts_from_content(message.get("content"))
+                if parts:
+                    result = "\n".join(parts)
+        elif record_type == "agent_end":
+            messages = record.get("messages")
+            if isinstance(messages, list) and messages:
+                last = messages[-1]
+                if isinstance(last, dict):
+                    parts = text_parts_from_content(last.get("content"))
+                    if parts:
+                        fallback_from_agent_end = "\n".join(parts)
+    if result is not None:
+        return result.strip()
+    if fallback_from_agent_end is not None:
+        return fallback_from_agent_end.strip()
+    return output.strip()
+
+
+# 会抛 typed 错误的结构化提取器：这些格式的 stdout 里可能藏着足以否定整条腿的错误事件，
+# 必须统一走同一条 raise → reason_code → 125 的路径。
+STRUCTURED_OUTPUT_RESULT_EXTRACTORS = {
+    OUTPUT_FORMAT_CODEX_JSON: extract_codex_json_result,
+    OUTPUT_FORMAT_KIMI_STREAM_JSON: extract_kimi_stream_json_result,
+    OUTPUT_FORMAT_OH_MY_PI_JSON: extract_oh_my_pi_json_result,
+}
+
+
+def structured_output_terminated_cleanly(output: str, output_format: str) -> bool | None:
+    """结构化 stdout 是否带着「正常走完一个 turn」的终止证据。返回 None 表示该格式无此概念。
+
+    ⚠️ 它**不是**判决点——review-result 工件才是。它只进 `reviewer.summary.json` 供取证：
+    kimi 的 ``session.resume_hint`` 只在成功路径写出（失败先 throw），omp 则看有没有终局事件。
+    """
+    if output_format == OUTPUT_FORMAT_KIMI_STREAM_JSON:
+        terminal_marker_present = False
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            session = record.get("session")
+            if isinstance(session, dict) and session.get("resume_hint"):
+                terminal_marker_present = True
+            elif record.get("resume_hint"):
+                terminal_marker_present = True
+        return terminal_marker_present
+    if output_format == OUTPUT_FORMAT_OH_MY_PI_JSON:
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("type") in {"turn_end", "agent_end"}:
+                return True
+        return False
+    return None
 
 
 def normalize_review_output(output: str) -> str:
@@ -1964,17 +2663,50 @@ def main() -> int:
             if user_local_config_override_summary.get("applied") is not True
             else {}
         )
+        prompt_delivery = config.get("prompt_delivery", PROMPT_DELIVERY_STDIN)
+        if not isinstance(prompt_delivery, str):
+            raise ValueError("prompt_delivery must be a string")
+        if prompt_delivery not in SUPPORTED_PROMPT_DELIVERY_MODES:
+            raise ValueError(
+                "prompt_delivery must be one of: "
+                f"{', '.join(sorted(SUPPORTED_PROMPT_DELIVERY_MODES))}"
+            )
+        prompt_flag = config.get("prompt_flag")
+        if prompt_flag is not None and not (isinstance(prompt_flag, str) and prompt_flag):
+            raise ValueError("prompt_flag must be a non-empty string when present")
+        if prompt_delivery == PROMPT_DELIVERY_ARGV_PROMPT_FLAG_WITH_PROMPT_FILE_POINTER:
+            if prompt_flag is None:
+                raise ValueError(
+                    "prompt_delivery="
+                    f"{PROMPT_DELIVERY_ARGV_PROMPT_FLAG_WITH_PROMPT_FILE_POINTER}"
+                    " requires prompt_flag"
+                )
+            if prompt_flag in command or any(
+                item.startswith(f"{prompt_flag}=") for item in command
+            ):
+                raise ValueError(
+                    f"prompt_flag {prompt_flag!r} must not appear in command: the prompt pointer "
+                    "is appended at run time and a second occurrence would shadow it"
+                )
+        run_directory_grant_flag = config.get("run_directory_grant_flag")
+        if run_directory_grant_flag is not None and not (
+            isinstance(run_directory_grant_flag, str)
+            and run_directory_grant_flag.startswith("-")
+        ):
+            raise ValueError(
+                "run_directory_grant_flag must be a flag string starting with '-' when present"
+            )
         output_format = config.get("output_format")
         if output_format is None and is_claude_print_command(command):
-            cli_output_format = claude_output_format_arg(command)
+            cli_output_format = output_format_argument_value(command)
             if cli_output_format in {None, "stream-json"}:
                 output_format = OUTPUT_FORMAT_CLAUDE_STREAM_JSON
                 command = ensure_claude_stream_json_command(command)
             else:
                 output_format = OUTPUT_FORMAT_TEXT
         elif output_format is None and is_cursor_print_command(command):
-            # claude_output_format_arg 只解析通用 --output-format flag，对 cursor 同样适用。
-            cli_output_format = claude_output_format_arg(command)
+            # output_format_argument_value 只解析通用 --output-format flag，对 cursor 同样适用。
+            cli_output_format = output_format_argument_value(command)
             if cli_output_format in {None, "stream-json"}:
                 output_format = OUTPUT_FORMAT_CURSOR_STREAM_JSON
                 command = ensure_cursor_stream_json_command(command)
@@ -1982,21 +2714,95 @@ def main() -> int:
                 output_format = OUTPUT_FORMAT_TEXT
         elif output_format is None and is_codex_exec_command(command):
             output_format = OUTPUT_FORMAT_CODEX_JSON if codex_json_enabled(command) else OUTPUT_FORMAT_TEXT
+        elif output_format is None and is_kimi_prompt_command(command):
+            cli_output_format = output_format_argument_value(command)
+            if cli_output_format in {None, "stream-json"}:
+                output_format = OUTPUT_FORMAT_KIMI_STREAM_JSON
+                command = ensure_kimi_stream_json_command(command)
+            else:
+                output_format = OUTPUT_FORMAT_TEXT
+        elif output_format is None and is_oh_my_pi_print_command(command):
+            output_format = OUTPUT_FORMAT_OH_MY_PI_JSON
+            command = ensure_oh_my_pi_json_command(command)
         elif output_format is None:
             output_format = OUTPUT_FORMAT_TEXT
         if output_format not in SUPPORTED_OUTPUT_FORMATS:
             raise ValueError(
                 f"output_format must be one of: {', '.join(sorted(SUPPORTED_OUTPUT_FORMATS))}"
             )
-        if output_format == OUTPUT_FORMAT_CLAUDE_STREAM_JSON and is_claude_print_command(command):
-            command = ensure_claude_stream_json_command(command)
-        if output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON and is_cursor_print_command(command):
-            command = ensure_cursor_stream_json_command(command)
-        if output_format == OUTPUT_FORMAT_CODEX_JSON and is_codex_exec_command(command):
-            command = ensure_codex_hooks_disabled_command(command)
-            command = ensure_codex_json_command(command)
+        command = normalise_reviewer_command_for_output_format(command, output_format)
+        # 健康探针与派发命令必须走同一条后端路径（cursor rvf-20260811T170157Z 的教训）。
+        # gate 在 run-directory 授权与 prompt 终结**之前**跑：那两步是运行期注入，
+        # 两边不对称是设计使然，拿它们去比对只会得到「修对了也红」。
+        health_probe_parity_exemption = config.get(HEALTH_PROBE_PARITY_EXEMPTION_CONFIG_FIELD)
+        if health_probe_parity_exemption is not None and (
+            health_probe_parity_exemption != HEALTH_PROBE_PARITY_EXEMPTION_INLINE_SCRIPT_FIXTURE
+        ):
+            raise ValueError(
+                f"{HEALTH_PROBE_PARITY_EXEMPTION_CONFIG_FIELD} 只接受字面量 "
+                f"{HEALTH_PROBE_PARITY_EXEMPTION_INLINE_SCRIPT_FIXTURE!r}"
+            )
+        health_probe_entrypoint_relationship: str | None = None
+        if health_command is not None and health_probe_parity_exemption is not None:
+            health_command = normalise_health_command_for_output_format(
+                health_command,
+                output_format,
+                prompt_flag=prompt_flag,
+                dispatch_signature=reviewer_dispatch_flag_multiset(
+                    command,
+                    prompt_flag=prompt_flag,
+                    run_directory_grant_flag=run_directory_grant_flag,
+                ),
+            )
+            health_probe_entrypoint_relationship = HEALTH_PROBE_PARITY_EXEMPTED
+            health_command_ledger_metadata = (
+                {
+                    "command": health_command,
+                    "health_probe_entrypoint_relationship": health_probe_entrypoint_relationship,
+                }
+                if user_local_config_override_summary.get("applied") is not True
+                else {
+                    "health_probe_entrypoint_relationship": health_probe_entrypoint_relationship
+                }
+            )
+        elif health_command is not None:
+            health_command = normalise_health_command_for_output_format(
+                health_command,
+                output_format,
+                prompt_flag=prompt_flag,
+                dispatch_signature=reviewer_dispatch_flag_multiset(
+                    command,
+                    prompt_flag=prompt_flag,
+                    run_directory_grant_flag=run_directory_grant_flag,
+                ),
+            )
+            health_probe_entrypoint_relationship = (
+                assert_health_command_shares_dispatch_flag_set(
+                    command,
+                    health_command,
+                    prompt_flag=prompt_flag,
+                    run_directory_grant_flag=run_directory_grant_flag,
+                )
+            )
+            health_command_ledger_metadata = (
+                {
+                    "command": health_command,
+                    "health_probe_entrypoint_relationship": health_probe_entrypoint_relationship,
+                }
+                if user_local_config_override_summary.get("applied") is not True
+                else {
+                    "health_probe_entrypoint_relationship": health_probe_entrypoint_relationship
+                }
+            )
         if is_codex_exec_command(command):
+            # codex 的位置约束（exec 之后、stdin 占位符 `-` 之前）优先于配置声明的通用形态。
             command = ensure_codex_exec_add_dir(command, ledger.run_dir)
+        elif run_directory_grant_flag is not None:
+            command = ensure_run_directory_grant_argument(
+                command,
+                ledger.run_dir,
+                grant_flag=run_directory_grant_flag,
+            )
     except Exception as exc:
         ledger.event(
             phase="review",
@@ -2195,13 +3001,62 @@ def main() -> int:
     reviewer_subprocess_environment["RVF_REVIEWER_ID"] = reviewer_id
     reviewer_subprocess_environment["RVF_REVIEW_RESULT"] = str(review_result_path)
 
+    # prompt artifact 与 argv 终结必须先于 --dry-run：指针形态的 argv 里逐字带着 prompt 文件的
+    # 绝对路径，只有先落盘、先终结，--dry-run 打印出来的 command 才是真实将被执行的那一条。
+    # pre_run_health 仍留在 --dry-run 之后，保住「--dry-run 零 API 成本」这条出口。
+    cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
+    try:
+        prompt_path = write_child_artifact(reviewer_dir, "reviewer.prompt.txt", prompt, unique=True)
+    except OSError as exc:
+        ledger.event(
+            phase="review",
+            event="artifact_write_failed",
+            status="failed",
+            reason_code="reviewer_artifact_write_failed",
+            error=f"{type(exc).__name__}: {exc}",
+            paths={"reviewer_dir": str(reviewer_dir)},
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_artifact_write_failed",
+            message=f"failed to write reviewer artifact: {exc}",
+            paths={"reviewer_dir": str(reviewer_dir)},
+        )
+        return fail(f"failed to write reviewer artifact: {exc}", 2)
+
+    reviewer_subprocess_environment[REVIEWER_PROMPT_FILE_ENV] = prompt_path
+    try:
+        command, reviewer_stdin_text = finalize_reviewer_command_for_prompt_delivery(
+            command,
+            prompt_delivery=prompt_delivery,
+            prompt_flag=prompt_flag,
+            prompt_file_path=Path(prompt_path),
+            prompt_text=prompt,
+        )
+    except ValueError as exc:
+        ledger.event(
+            phase="review",
+            event="config_invalid",
+            status="failed",
+            reason_code="reviewer_config_invalid",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        ledger.summary(
+            status="failed",
+            reason_code="reviewer_config_invalid",
+            message=f"alternative reviewer 配置无效: {exc}",
+        )
+        return fail(f"alternative reviewer 配置无效: {exc}", 2)
+
     if args.dry_run:
-        cwd = str(repo) if repo is not None and allow_repo_cwd else str(review_packet.parent if review_packet is not None else SKILL_DIR)
         payload = {
             "label": label,
             "command": command,
-            "cwd": cwd,
+            "cwd": str(cwd),
             "prompt_chars": len(prompt),
+            "prompt_delivery": prompt_delivery,
+            "prompt_file": prompt_path,
+            "command_argv_bytes": reviewer_command_argv_bytes(command),
             "activity_probe_configured": activity_probe_command is not None,
             "scope_contract": str(scope_contract) if scope_contract is not None else None,
             "review_result": str(review_result_path),
@@ -2212,8 +3067,10 @@ def main() -> int:
             event="dry_run",
             status="completed",
             reason_code="reviewer_dry_run",
-            cwd=cwd,
+            cwd=str(cwd),
             prompt_chars=len(prompt),
+            prompt_delivery=prompt_delivery,
+            command_argv_bytes=payload["command_argv_bytes"],
         )
         ledger.summary(
             status="completed",
@@ -2254,26 +3111,6 @@ def main() -> int:
             )
             return returncode
 
-    cwd = repo if repo is not None and allow_repo_cwd else (review_packet.parent if review_packet is not None else SKILL_DIR)
-    try:
-        prompt_path = write_child_artifact(reviewer_dir, "reviewer.prompt.txt", prompt, unique=True)
-    except OSError as exc:
-        ledger.event(
-            phase="review",
-            event="artifact_write_failed",
-            status="failed",
-            reason_code="reviewer_artifact_write_failed",
-            error=f"{type(exc).__name__}: {exc}",
-            paths={"reviewer_dir": str(reviewer_dir)},
-        )
-        ledger.summary(
-            status="failed",
-            reason_code="reviewer_artifact_write_failed",
-            message=f"failed to write reviewer artifact: {exc}",
-            paths={"reviewer_dir": str(reviewer_dir)},
-        )
-        return fail(f"failed to write reviewer artifact: {exc}", 2)
-
     lease_runtime = TrackerLeaseRuntime(
         repo=repo,
         scope_contract=scope_contract_payload,
@@ -2287,7 +3124,7 @@ def main() -> int:
         try:
             completed = run_with_activity_timeout(
                 command,
-                input_text=prompt,
+                input_text=reviewer_stdin_text,
                 cwd=cwd,
                 reviewer_subprocess_environment=reviewer_subprocess_environment,
                 activity_probe_subprocess_environment=reviewer_support_subprocess_environment,
@@ -2333,10 +3170,10 @@ def main() -> int:
         stdout = extract_claude_stream_result(stdout)
     elif output_format == OUTPUT_FORMAT_CURSOR_STREAM_JSON:
         stdout = extract_result_event_text(stdout)
-    elif output_format == OUTPUT_FORMAT_CODEX_JSON:
+    elif output_format in STRUCTURED_OUTPUT_RESULT_EXTRACTORS:
         try:
-            stdout = extract_codex_json_result(stdout)
-        except CodexJsonOutputError as exc:
+            stdout = STRUCTURED_OUTPUT_RESULT_EXTRACTORS[output_format](stdout)
+        except ReviewerStructuredOutputError as exc:
             output_error_reason = exc.reason_code
             output_error_message = str(exc)
             stdout = str(exc)
@@ -2387,11 +3224,7 @@ def main() -> int:
         )
         if output_error_message is None:
             output_error_message = stderr[:2000]
-    if output_format in {
-        OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
-        OUTPUT_FORMAT_CODEX_JSON,
-        OUTPUT_FORMAT_CURSOR_STREAM_JSON,
-    }:
+    if output_format in STRUCTURED_JSON_LINES_OUTPUT_FORMATS:
         redacted_raw_stdout = redact_configured_environment_variable_values_in_json_lines(
             raw_stdout,
             env_set,
@@ -2443,6 +3276,9 @@ def main() -> int:
             "command": command,
             "cwd": str(cwd),
             "output_format": output_format,
+            "structured_output_terminated_cleanly": structured_output_terminated_cleanly(
+                raw_stdout, output_format
+            ),
             "scope_contract": str(scope_contract) if scope_contract is not None else None,
             "review_packet": str(review_packet) if review_packet is not None else None,
             "session_context": str(session_context) if session_context is not None else None,

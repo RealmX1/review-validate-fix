@@ -44,6 +44,14 @@ INJECTION_OUTCOME_DEDUPLICATED_PENDING = "deduplicated_pending"  # 同键活跃 
 INJECTION_OUTCOME_DECLINED_COOLDOWN = "declined_cooldown"  # 指纹处于 declined 冷却，静默停
 INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"  # 铸造频率熔断，静默停
 INJECTION_OUTCOME_MINT_ANOMALY = "mint_anomaly"  # 铸造抛异常（best-effort 兜底记录）
+# 横幅已交给 cline-kanban 终端投递（带外），**这一刻 agent 还什么都没拿到**。
+#
+# 为什么必须单列一个取值：这条路上 ``injected`` 只能记 ``False``——记 True 就是谎报，canary 的
+# 分子会被一批「投出去了但可能根本没落地」的记录污染，而那正是 canary 要发现的故障本身。
+# 「agent 到底接到没有」的答案在 token 状态里（UPS 观测到 needle 才推进 ``injected``），两边靠
+# ``decision_token`` 关联即可对账；刻意**不**在 UPS 侧再补一条记录，否则「候选非空的 Stop 次数」
+# 这个分母会被搅浑。
+INJECTION_OUTCOME_DELIVERED_OUT_OF_BAND = "delivered_out_of_band"
 
 # 字段分隔符（ASCII Unit Separator，正常字段值不含）。
 _KEY_FIELD_SEPARATOR = "\x1e"
@@ -171,6 +179,7 @@ __all__ = [
     "INJECTION_OUTCOME_DECLINED_COOLDOWN",
     "INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED",
     "INJECTION_OUTCOME_MINT_ANOMALY",
+    "INJECTION_OUTCOME_DELIVERED_OUT_OF_BAND",
     "injection_attempt_ledger_root",
     "record_injection_attempt",
     "read_injection_attempts",

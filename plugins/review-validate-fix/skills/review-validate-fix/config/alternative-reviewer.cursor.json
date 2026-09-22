@@ -41,14 +41,44 @@
   "activity_probe_timeout_seconds": 10,
   "activity_probe_failure_threshold": 3,
   "max_runtime_seconds": null,
-  "health_timeout_seconds": 30,
+  "health_timeout_seconds": 45,
   "pre_run_health": true,
   "output_format": "cursor_stream_json",
   "env_unset": [
     "ANTHROPIC_API_KEY"
   ],
+  "_comment_health_command_must_share_the_real_dispatch_entrypoint": [
+    "为什么 health_command 是一次真实的 `-p` 调用、而不是 `cursor-agent status`：",
+    "2026-08-11 的 run rvf-20260811T170157Z 上，cursor 登录已过期，但两条命令给出相反结论——",
+    "  `cursor-agent status`  → exit 0（文本里写了 `unable to fetch user details`，退出码却是 0）",
+    "  `cursor-agent -p ...`  → exit 1 `Error: Authentication required.`",
+    "probe 只看 status 的退出码，于是把 cursor 判为可用、选进两腿；那一腿派出去后立刻失败、",
+    "不产出 review-result，本轮实际只剩单路评审结论。旁路的 auth 查询命令【不是】真实可用性的",
+    "充分判据——只有走评审那条命令路径的探针才是。",
+    "",
+    "故此处的 health_command 与上方 `command` 逐字共用同一组 flag，只把 prompt 换成一句最小指令。",
+    "【别再试图精简这些 flag】：曾试过省掉 `--force --trust --sandbox disabled`（理由是『auth 检查",
+    "发生在它们之前，探针不需要写权限』），实测直接撞上 cursor 的 Workspace Trust gate——",
+    "`⚠ Workspace Trust Required ... Pass --trust, --yolo, or -f`，探针在任何未 trust 的目录里都会",
+    "非零退出，把【健康】的 cursor 误判为不可用。探针少一个 flag 就换一道门，也就不再是同一条路径；",
+    "何况真实评审本就以同一组 flag 跑同一个目录，探针带上它们不新增任何权限暴露面。",
+    "",
+    "成本：登录过期/未认证时 <1s 就退出（auth 在启动即拒、根本不进模型），只有健康时才多烧一次",
+    "极短会话。health_timeout_seconds 须小于 dispatch_reviewers.py 的 --probe-timeout（默认 60s），",
+    "否则外层会先超时、把健康的 harness 误判为不可用。",
+    "",
+    "覆盖边界：本探针验到 auth/启动层，【不】验工具执行层——上方 _comment_cursor_tool_layer 描述的",
+    "那类坏 build 仍能通过本探针，由评审过程中的 CursorStreamActivityMonitor 实时 fail-over 兜底。"
+  ],
   "health_command": [
     "cursor-agent",
-    "status"
+    "-p",
+    "--output-format",
+    "stream-json",
+    "--force",
+    "--trust",
+    "--sandbox",
+    "disabled",
+    "Reply with exactly: OK"
   ]
 }

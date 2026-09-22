@@ -66,6 +66,44 @@ def read_existing(path: Path) -> dict[str, Any] | None:
     return payload
 
 
+SUPERSEDED_RESULT_ARTIFACTS_DIRNAME = "superseded-review-result-artifacts"
+
+# 唯一**携带 finding** 的完成态：一旦写进 canonical，就不能再被换成别的 kind。
+# （另一个完成态 ``no_issues`` 只携带 audit_summary，被取代不会藏掉任何缺陷，故不设终态。）
+FINDING_BEARING_TERMINAL_KIND = "issues"
+
+
+def ensure_supersession_allowed(existing: dict[str, Any], new_kind: str) -> None:
+    """归档式换 kind 的唯一收口闸：**已记录 issues 的工件不得被换成别的 kind**。
+
+    为什么归档不够（2026-08-15 RVF-003）：归档保住的是**取证**能力，不是**判定**能力。
+    canonical ``kind`` 的读者——``check_review_result.classify``、``dispatch_reviewers``
+    的 ``_leg_produced_review_result`` / ``_leg_review_request_pending``、
+    ``write_reviewed_task_candidate_evidence`` 的 protocol 校验、``analysis_artifacts``
+    的 issue 抽取、以及 ``references/review-merge-policy.md`` 的合并规则——**没有一个**
+    会去合并 ``superseded`` 链。于是 ``issues → no_issues`` 之后，已找到的 REAL issue 只
+    躺在归档里，下游一律按 clean 合并：假绿，而且是最贵的那种（评审跑过了、结论被吞了）。
+
+    为什么**只**把 ``issues`` 设成终态，而不是把两个完成态都设成终态：另一个方向
+    （``no_issues → issues``）恰恰是在**补**结论，把它一并封死等于让「先误判 clean、
+    后发现真 bug」的 reviewer 永远交不出那条 issue——那是同一类假绿的镜像。同理
+    ``no_issues → request``（clean 退回待处理）是 fail-closed 方向，也不封。
+
+    误报怎么办：交给 validate/fix 环节判 ``false_positive``，而不是让 reviewer 把它从
+    结论里抹掉——前者留下判定痕迹，后者不留。开新一轮评审怎么办：由
+    ``dispatch_reviewers.py --redispatch-review-request-legs-only`` 先把旧工件轮转进
+    归档目录，新一轮从**没有 canonical 文件**的干净起点开始，本闸自然不触发。
+    """
+    old_kind = str(existing.get("kind") or "unknown")
+    if old_kind == FINDING_BEARING_TERMINAL_KIND and new_kind != FINDING_BEARING_TERMINAL_KIND:
+        raise ValueError(
+            f"已记录 issues 的结果工件是终态，不能改写成 {new_kind}：canonical 消费者只读 "
+            "kind、不会合并 superseded 链，这一步会把已发现的 REAL issue 从最终结论里抹掉，"
+            "下游按 clean 合并。误报请在 validate/fix 环节判 false_positive；要开新一轮评审，"
+            "请由 dispatch_reviewers.py --redispatch-review-request-legs-only 先轮转旧工件。"
+        )
+
+
 def base_payload(kind: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -74,6 +112,49 @@ def base_payload(kind: str) -> dict[str, Any]:
         "issues": [],
         "requests": [],
     }
+
+
+def supersede_existing_result(out: Path, existing: dict[str, Any], new_kind: str) -> dict[str, Any]:
+    """把当前这份**另一 kind** 的结果工件归档，并返回新 payload（带指向归档的溯源链）。
+
+    为什么需要它（2026-08-15 run 实测的死结）：旧规则是「kind 不一致就报错」，于是一份
+    ``kind: request`` 的结果在同一 run 内**永远**转不成 ``issues``——reviewer 契约又禁止它删改
+    工件，两条规则合起来把整轮评审锁死（实测废掉一整轮 codex 评审）。而同一份代码里
+    ``no-issues`` 却是**无条件原地覆写**：``request → no_issues`` 放行、``request → issues`` 禁止，
+    契约不对称，合法 request 可以无归档地凭空消失。
+
+    统一口径：**同 kind ⇒ 原地追加/覆写；换 kind ⇒ 先归档旧工件，再起一份新的**——但换 kind
+    先过 ``ensure_supersession_allowed``：**已记录 issues 的工件是终态**，因为归档只保住取证
+    能力、保不住判定能力（canonical 消费者不读 ``superseded`` 链，见该函数 docstring）。
+
+    崩溃语义：先 ``os.replace`` 归档、再写新文件。中间崩溃 ⇒ canonical 文件缺失但内容完整躺在
+    归档里（可恢复、且绝不会出现「半份混合内容」）。归档目录与 canonical 同父目录，故 replace
+    在同一文件系统内，是原子的。闸在 ``os.replace`` **之前**，故被拒时磁盘一个字节都没动。
+    """
+    ensure_supersession_allowed(existing, new_kind)
+    archive_dir = out.parent / SUPERSEDED_RESULT_ARTIFACTS_DIRNAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    old_kind = str(existing.get("kind") or "unknown")
+    sequence = 1 + sum(1 for _ in archive_dir.glob("review-result.*.json"))
+    archive_path = archive_dir / f"review-result.{sequence:02d}.{old_kind}.json"
+    os.replace(out, archive_path)
+
+    payload = base_payload(new_kind)
+    lineage = [
+        entry
+        for entry in (existing.get("superseded") or [])
+        if isinstance(entry, dict)
+    ]
+    lineage.append(
+        {
+            "kind": old_kind,
+            "path": str(archive_path),
+            "superseded_at": datetime.now(timezone.utc).isoformat(),
+            "superseded_by_kind": new_kind,
+        }
+    )
+    payload["superseded"] = lineage
+    return payload
 
 
 def write_payload(path: Path, payload: dict[str, Any]) -> None:
@@ -92,9 +173,22 @@ def optional_fields(args: argparse.Namespace, names: tuple[str, ...]) -> dict[st
 
 
 def command_no_issues(args: argparse.Namespace) -> int:
-    payload = base_payload("no_issues")
+    out = Path(args.out)
+    existing = read_existing(out)
+    if existing is not None and existing.get("kind") != "no_issues":
+        # 换 kind ⇒ 先归档。历史上这里是**无条件覆写**：一份合法的 request（或已找到的 issues）
+        # 会被一句 no-issues 无声抹掉，事后连它存在过都查不到。
+        # 注意 ``issues → no_issues`` 现在被 ``ensure_supersession_allowed`` 直接拒绝：归档
+        # 保住了取证、保不住判定，canonical 读者只看 kind，这条路等于把 REAL issue 洗成 clean。
+        payload = supersede_existing_result(out, existing, "no_issues")
+    else:
+        payload = base_payload("no_issues")
+        if existing is not None:
+            payload["superseded"] = [
+                entry for entry in (existing.get("superseded") or []) if isinstance(entry, dict)
+            ]
     payload["audit_summary"] = args.audit_summary.strip()
-    write_payload(Path(args.out), payload)
+    write_payload(out, payload)
     return 0
 
 
@@ -110,9 +204,11 @@ def command_issue(args: argparse.Namespace) -> int:
     existing = read_existing(out)
     if existing is None:
         payload = base_payload("issues")
+    elif existing.get("kind") != "issues":
+        # 换 kind ⇒ 归档旧工件后起新的。旧规则在这里直接报错，于是 ``request → issues`` 在同一
+        # run 内**永远**走不通（而 ``request → no_issues`` 却放行）——那正是把整轮评审锁死的死结。
+        payload = supersede_existing_result(out, existing, "issues")
     else:
-        if existing.get("kind") != "issues":
-            return fail("cannot append issue to a non-issues review result")
         payload = existing
         if not isinstance(payload.get("issues"), list):
             return fail("existing issues field must be an array")
@@ -137,9 +233,12 @@ def append_request(args: argparse.Namespace, request: dict[str, Any]) -> int:
     existing = read_existing(out)
     if existing is None:
         payload = base_payload("request")
+    elif existing.get("kind") != "request":
+        # 与 no_issues 同一口径：换 kind ⇒ 归档旧工件再起新的（``no_issues → request`` 是
+        # 「已完成退回待处理」，fail-closed 方向，放行）。唯一被拒的是 ``issues → request``：
+        # 它同样会把已找到的 REAL issue 从 canonical 结论里摘掉（见 ensure_supersession_allowed）。
+        payload = supersede_existing_result(out, existing, "request")
     else:
-        if existing.get("kind") != "request":
-            return fail("cannot append request to a completed review result")
         payload = existing
         if not isinstance(payload.get("requests"), list):
             return fail("existing requests field must be an array")

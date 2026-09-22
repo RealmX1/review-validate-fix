@@ -25,6 +25,12 @@ durable（**无 TTL 过期**）：高水位是「这个 commit 已被审过」�
 的『是否为当前 HEAD 祖先』判定，而非时间过期——时间过期会让久未活动的 task 重新落入漏审。
 键与 ``round_baseline_marker`` 对齐：``task_id`` 优先、``session_id`` 回退、同一 ``log_root()``，
 确保 finalize/seal 写到的 ``(task,session)`` 路径正是 committed-round 读的那一个。
+
+key 里**还含仓身份**（``scope_marker_identity_key``）：cline-kanban 的 task id 是短哈希
+前缀，不同 project 会撞，撞了就等于把一个仓的水位盖到另一个仓上（实测反例见
+``scope_marker_identity_key`` 模块头）。但**刻意不含 harness 身份**——高水位是仓/工作树层面
+的事实，与哪个 harness 发起 review 无关，切开只会把水位切碎并让历史 marker 全部作废；
+那条不对称的完整论证同样在 ``scope_marker_identity_key`` 模块头。
 """
 
 from __future__ import annotations
@@ -52,6 +58,10 @@ for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
             sys.path.insert(0, str(_pyroot_candidate))
         break
 from core.run_ledger.run_ledger import log_root, safe_token  # noqa: E402
+from core.session_scope_allocation.scope_marker_identity_key import (  # noqa: E402
+    resolve_repository_identity_for_scope_marker_key,
+    scope_marker_candidate_paths,
+)
 
 
 SUBDIR_NAME = "review-highwater"
@@ -69,8 +79,12 @@ def _reviewed_head_would_regress(repo: str | None, old_head: str, new_head: str)
     B3..A5 偏宽 → 对边界两侧均改动的文件 canonical-hash 去重 miss → 重派已审工作。
 
     仅当 ``new_head`` 严格落后于 ``old_head`` 时返回 True（拒绝覆盖、保留更高水位）；前移 /
-    分叉 / 相等一律 False（照常写入）。best-effort：repo 不可用或 git 失败一律 False（退化为
-    盲写，保持旧行为、绝不阻断 finalize/seal）。
+    分叉 / 相等一律 False（照常写入）。best-effort：git 调用本身失败一律 False（退化为盲写，
+    绝不阻断 finalize/seal）。
+
+    注意 ``repo`` 为空这一支现在**够不到**：仓身份自 F1.1e 起是 marker key 的一部分，拿不到
+    repo 就连候选路径都产不出、根本走不到这里；拿得到 key 就同样拿得到 ancestry 判据。留着
+    是因为它还服务「repo 有、但 git 调用失败」那一种。
     """
     if not repo or not old_head or old_head == new_head:
         return False
@@ -91,30 +105,26 @@ def _highwater_root(root: Path | None = None) -> Path:
     return (root.expanduser() if root is not None else log_root()) / SUBDIR_NAME
 
 
-def _task_path(task_id: str, root: Path | None = None) -> Path:
-    return _highwater_root(root) / f"task-{safe_token(task_id)}.json"
-
-
-def _session_path(session_id: str, root: Path | None = None) -> Path:
-    return _highwater_root(root) / f"sess-{safe_token(session_id)}.json"
-
-
 def marker_paths(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> list[Path]:
     """该上下文下可能持有高水位的候选路径，task_id 优先（与 round_baseline 对齐）。
 
-    两者都缺则返回空列表，调用方据此跳过写 / 读。
+    ``task_id`` / ``session_id`` 都缺，或 ``repo`` 的仓身份解析不出来，都返回空列表，
+    调用方据此跳过写 / 读。仓身份解析失败**不**退化成某个共享占位桶——那等于把撞 key
+    的问题原样搬个地方；退化成「本次不写 / 读不到」只会让窗口偏宽（多审），是安全方向。
     """
-    paths: list[Path] = []
-    if task_id:
-        paths.append(_task_path(task_id, root))
-    if session_id:
-        paths.append(_session_path(session_id, root))
-    return paths
+    return scope_marker_candidate_paths(
+        marker_directory=_highwater_root(root),
+        task_id_token=safe_token(task_id) if task_id else None,
+        session_id_token=safe_token(session_id) if session_id else None,
+        repository_identity=resolve_repository_identity_for_scope_marker_key(repo),
+        parent_harness_identity=None,
+    )
 
 
 def _iso_now() -> str:
@@ -154,6 +164,9 @@ def marker_payload(
         "captured_at": captured_at or _iso_now(),
         "reviewed_head": reviewed_head,
         "repo": repo,
+        # 落盘 key 里那段仓身份的明文来源。marker 文件名里只剩一个哈希短码，取证时无从
+        # 反查是哪个仓；迁移工具也靠它把旧格式文件名重映射到新 key。
+        "repository_identity": resolve_repository_identity_for_scope_marker_key(repo),
         "kanban_task_id": task_id,
         "session_id": session_id,
         "source": source,
@@ -182,7 +195,7 @@ def write_review_highwater(
     if not isinstance(reviewed_head, str) or not reviewed_head.strip():
         return None
     new_head = reviewed_head.strip()
-    paths = marker_paths(task_id=task_id, session_id=session_id, root=root)
+    paths = marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root)
     if not paths:
         return None
     target = paths[0]
@@ -210,10 +223,11 @@ def read_review_highwater(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> dict[str, Any] | None:
     """读取高水位；找到第一个匹配（task 优先）就返回，不做副作用。"""
-    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
+    for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
         data = _read_json(path)
         if data is not None:
             data.setdefault("_marker_path", str(path))
@@ -225,10 +239,13 @@ def resolve_review_highwater_head(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> str | None:
     """便捷读取：存在则返回 ``reviewed_head``，否则 None（不做 ancestry 判定——交消费端）。"""
-    marker = read_review_highwater(task_id=task_id, session_id=session_id, root=root)
+    marker = read_review_highwater(
+        task_id=task_id, session_id=session_id, repo=repo, root=root
+    )
     if not isinstance(marker, dict):
         return None
     head = marker.get("reviewed_head")
@@ -239,11 +256,12 @@ def clear_review_highwater(
     *,
     task_id: str | None,
     session_id: str | None,
+    repo: str | Path | None,
     root: Path | None = None,
 ) -> list[str]:
     """删除该上下文下的所有高水位标记（task 与 session 各一）。供显式清理 / 测试使用。"""
     removed: list[str] = []
-    for path in marker_paths(task_id=task_id, session_id=session_id, root=root):
+    for path in marker_paths(task_id=task_id, session_id=session_id, repo=repo, root=root):
         try:
             path.unlink()
         except FileNotFoundError:

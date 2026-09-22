@@ -239,6 +239,14 @@ def revive_prep_file(
     created_at = (now or utc_now()).astimezone(timezone.utc)
     expires_at = created_at + timedelta(seconds=ttl_seconds)
     payload = dict(lookup.payload)
+    # 复活会把 ``created_at`` 推到此刻，原始派发时刻就此丢失——而「这条派发有多老」正是复活
+    # 时效闸唯一的判据（连续多次复活否则可以把年龄无限刷新回 0）。故第一次复活时把原值另存，
+    # 之后原样保留（``setdefault``），使 ``originally_created_at`` 始终是**首次派发**的时刻。
+    original_created_at = payload.get("originally_created_at")
+    if not isinstance(original_created_at, str) or not original_created_at.strip():
+        existing_created_at = payload.get("created_at")
+        if isinstance(existing_created_at, str) and existing_created_at.strip():
+            payload["originally_created_at"] = existing_created_at
     payload.update(
         {
             "schema_version": SCHEMA_VERSION,

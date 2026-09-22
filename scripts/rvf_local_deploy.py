@@ -13,6 +13,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import string
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -32,6 +34,36 @@ DEPLOYMENT_SOURCE_WORKTREE_OWNERSHIP_MARKER_FILENAME = (
 PARTIAL_REMEDIATION = (
     "修复失败原因后，从 local main 重新运行 runner；payload 只能来自 RVF 专用 deploy 源 "
     "worktree 的 HEAD checkout，不得降级到手写 plugin cache 或 installed payload。"
+)
+OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE = 3
+"""verifier 判定「宿主里存在第二份 RVF 注册 / payload 树」时的专属退出码。
+
+必须与 `plugins/review-validate-fix/skills/rvf-local-deploy/scripts/verify_local_deploy.py`
+的 ``REGISTRATION_UNIQUENESS_EXIT_CODE`` 逐字一致（两边同源于一个 commit，
+`tests/test_official_cli_local_deploy_verification.py` 里有等值断言守着漂移）。
+
+这个退出码是「不回滚」的唯一判据：注册唯一性失败必须**保留刚装好的 canonical**、只拒绝认证；
+把它并进通用失败分支就会回滚掉 canonical，把机器留在「只剩残留那份」的更差状态。
+
+注意它**只**是 verifier 子进程的退出码，不透传成 runner 自己的退出码——runner 的 3 早已是
+「已有 RVF local deploy 正在运行」（见 `_deployment_lock`）。
+"""
+CODEX_SOLE_REGISTRATION_STATUS = "sole_registration"
+"""`_sole_review_validate_fix_registration_in_codex_config` 唯一够格认证部署的状态。
+
+门禁按「是否等于这个状态」判定，而不是「是否等于某个已识别的坏状态」：后者会把
+`unavailable`（根本没核到）与 `canonical_selector_not_registered`（canonical 根本没注册）
+当成好状态放行。
+"""
+CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS = "canonical_selector_not_registered"
+"""config.toml 可读、但 canonical selector 根本不在 `[plugins.*]` 注册表里。
+
+不能读成「唯一」：没有第二份，不等于 canonical 那一份在。
+"""
+REGISTRATION_UNIQUENESS_REMEDIATION = (
+    "先按上面的清理命令清掉非 canonical 的 RVF 注册/残留，再重新运行 runner 重新认证；"
+    "canonical 安装本身已就位，**不要**用回滚去「修」这个失败——回滚只会移除 canonical、"
+    "把机器留在只剩残留那份的更差状态。"
 )
 
 
@@ -90,6 +122,34 @@ def _git_optional(repo: Path, *args: str) -> str | None:
     if completed.returncode != 0:
         return None
     return completed.stdout.strip()
+
+
+def _git_optional_narration_text(repo: Path, *args: str) -> str | None:
+    """`_git_optional` 的容错解码版：专供「输出只拿去讲给人看」的 git 查询。
+
+    与 `_git_optional` 的差别只有一处：不做严格解码。git 输出的字节序列并不保证是 UTF-8
+    —— 仓库可以设 `i18n.logOutputEncoding=ISO-8859-1`，历史里也可能本就存在非 UTF-8 的提交
+    信息 —— 此时 `text=True` 的严格解码会抛 `UnicodeDecodeError`。而 commit subject 这类
+    查询是**事后统计**：一次已经安装并验证通过、receipt 也已收敛的部署，绝不能因为讲述用的
+    字节不好解码而以异常收场。所以这里退化标准与非零退出对齐（返回 `None`，交调用方降级），
+    能拿到字节就用 `errors="replace"` 容错解码。
+
+    刻意**不**把这个宽容度并进 `_git_optional`：那个 helper 的其它调用点读的是路径、ref 名、
+    `rev-parse --verify` 解析结果这类**结构性**值，用 U+FFFD 顶替坏字节只会把一次硬失败换成
+    一个看着正常、实则错误的路径/ref 继续往下走。容错解码只在「输出纯属人读叙述」时才是对的。
+
+    错误处理器必须是 `replace` 而不是 `surrogateescape`：这段文本最终会进 result receipt 的
+    JSON，`surrogateescape` 留下的孤立代理字符会让 `json.dumps` 当场抛错——那等于把解码期的
+    异常挪到序列化期，一次已收敛的部署照样以异常收场。
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.decode("utf-8", errors="replace").strip()
 
 
 def _git_common_directory(repo: Path) -> Path | None:
@@ -572,6 +632,186 @@ def _installed_release_summary(installation_receipt_path: Path) -> dict[str, Any
     }
 
 
+_SOURCE_COMMIT_LOG_FIELD_SEPARATOR = "\x1f"
+
+
+def _looks_like_commit_sha(revision: str) -> bool:
+    """只放行纯十六进制的 commit 名。
+
+    双重作用：既是「这串东西还像不像一个 commit」的廉价证伪，也堵死把 receipt 里的任意
+    字符串直接当 git revision 参数递进去（`-` 开头会被当 flag 解析）的路径。
+    """
+    return len(revision) >= 7 and all(character in string.hexdigits for character in revision)
+
+
+def _read_source_commit_log(
+    repository: Path, *revision_arguments: str
+) -> list[dict[str, str]] | None:
+    """读一段 commit 列表；git 查询失败返回 None（交给调用方降级，不抛错）。
+
+    走 `_git_optional_narration_text` 而不是 `_git_optional`：subject 是纯人读叙述，且不保证
+    是 UTF-8，严格解码抛出的 `UnicodeDecodeError` 会绕过调用方的降级分支直接逃逸。
+    """
+    output = _git_optional_narration_text(
+        repository,
+        "log",
+        "--no-decorate",
+        f"--format=%H{_SOURCE_COMMIT_LOG_FIELD_SEPARATOR}%s",
+        *revision_arguments,
+    )
+    if output is None:
+        return None
+    commits: list[dict[str, str]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        sha, _, subject = line.partition(_SOURCE_COMMIT_LOG_FIELD_SEPARATOR)
+        commits.append({"sha": sha, "subject": subject})
+    return commits
+
+
+def describe_source_commit_delta_since_last_installation(
+    *,
+    repository: Path,
+    previously_installed_commit: str | None,
+    newly_installed_commit: str,
+) -> dict[str, Any]:
+    """回答「已安装 plugin 现在反映了哪些源 commit」。
+
+    OLD 的唯一事实源是**部署开始时读到的 official installation receipt**
+    （`latest-official-cli-installation.json` 的 `local_main_commit`）。
+    **禁止用当前 HEAD 冒充 OLD**：HEAD 是本次要装的 NEW，拿它当 OLD 会让每一次部署都塌成
+    `unchanged`；`generated_plugin_version` 只是版本串，也反推不出 commit。
+
+    分类先证伪再归类，顺序固定：无基线 → 基线不可解析（`unknown_revision`）→ 未变 →
+    前进（`forward`）→ 回退或分叉（`rollback_or_diverged`）。函数内一律走 `_git_optional`，
+    任何 git 查询失败都降级成 `unknown_revision` 而不是抛 `DeployError` —— 一次已经成功并
+    收敛的部署，不该因为事后统计失败被判成失败。
+
+    `boundary_explanation` 是措辞的唯一事实源：人读输出与 skill 汇报都直接引用它，措辞一律
+    锚在 runtime 语义（「已安装 plugin 现在反映…」），不写成「源码集成了这些 commit」。
+    """
+    # OLD 直接来自磁盘上的 receipt JSON，字段类型不受本进程控制：非字符串一律按「没有基线」
+    # 处理，绝不让一次已经收敛的部署栽在类型上。
+    old_commit = (
+        previously_installed_commit.strip() or None
+        if isinstance(previously_installed_commit, str)
+        else None
+    )
+    new_commit = (
+        newly_installed_commit.strip() if isinstance(newly_installed_commit, str) else ""
+    )
+    new_commit_is_addressable = _looks_like_commit_sha(new_commit)
+
+    def delta(
+        kind: str,
+        *,
+        forward_commits: list[dict[str, str]],
+        reverse_commits: list[dict[str, str]],
+        boundary_explanation: str,
+    ) -> dict[str, Any]:
+        return {
+            "kind": kind,
+            "old_commit": old_commit,
+            "new_commit": new_commit or None,
+            "forward_commits": forward_commits,
+            "reverse_commits": reverse_commits,
+            "boundary_explanation": boundary_explanation,
+        }
+
+    def unknown_revision(reason: str) -> dict[str, Any]:
+        return delta(
+            "unknown_revision",
+            forward_commits=[],
+            reverse_commits=[],
+            boundary_explanation=(
+                f"{reason}，无法计算区间；只能给出两端：上次安装反映 "
+                f"{old_commit or '（无记录）'}，现在反映 {new_commit or '（无记录）'}。"
+            ),
+        )
+
+    if old_commit is None:
+        newly_installed = (
+            _read_source_commit_log(repository, "-n", "1", new_commit)
+            if new_commit_is_addressable
+            else None
+        )
+        return delta(
+            "no_baseline",
+            forward_commits=newly_installed or [],
+            reverse_commits=[],
+            boundary_explanation=(
+                "没有可用的上一次安装基线（official installation receipt 不存在或未记录 "
+                f"local main commit），不做区间比较；已安装 plugin 现在反映到源 commit "
+                f"{new_commit[:12] or '（无记录）'}。"
+            ),
+        )
+
+    if not _looks_like_commit_sha(old_commit) or not new_commit_is_addressable:
+        return unknown_revision("上次安装记录的源 commit 不是一个可寻址的 commit 名")
+    # 存在性检查与「归一成同一个 commit object id」是同一件事：receipt 里的 OLD 可能是 NEW 的
+    # 合法缩写（≥7 位十六进制）或大小写异体，字符串比较会把「同一个 commit」误判成两端不同，
+    # 进而落到 `forward` 却带着空区间，说出「前进了 0 个源 commit」这种自相矛盾的话。先各自
+    # 解析成完整 object id，再拿解析结果做后续比较与区间查询。解析失败（不在对象库里、缩写
+    # 歧义）沿用既有约定降级成 `unknown_revision`，不抛错。
+    resolved_commits: list[str] = []
+    for revision in (old_commit, new_commit):
+        resolved_commit = _git_optional(
+            repository, "rev-parse", "--verify", f"{revision}^{{commit}}"
+        )
+        if not resolved_commit:
+            return unknown_revision(f"源 commit {revision[:12]} 不在本仓对象库里")
+        resolved_commits.append(resolved_commit)
+    resolved_old_commit, resolved_new_commit = resolved_commits
+
+    if resolved_old_commit == resolved_new_commit:
+        return delta(
+            "unchanged",
+            forward_commits=[],
+            reverse_commits=[],
+            boundary_explanation=(
+                f"已安装 plugin 反映的源 commit 没有变化（仍是 {resolved_new_commit[:12]}），"
+                "本次部署没有让它反映任何新的源 commit。"
+            ),
+        )
+
+    forward_commits = _read_source_commit_log(
+        repository, f"{resolved_old_commit}..{resolved_new_commit}"
+    )
+    if forward_commits is None:
+        return unknown_revision("读取源 commit 区间失败")
+
+    if _git_optional(
+        repository, "merge-base", "--is-ancestor", resolved_old_commit, resolved_new_commit
+    ) is not None:
+        return delta(
+            "forward",
+            forward_commits=forward_commits,
+            reverse_commits=[],
+            boundary_explanation=(
+                f"已安装 plugin 现在反映到源 commit {resolved_new_commit[:12]}，"
+                f"比上次安装反映的 {resolved_old_commit[:12]} 前进了 "
+                f"{len(forward_commits)} 个源 commit。"
+            ),
+        )
+
+    reverse_commits = _read_source_commit_log(
+        repository, f"{resolved_new_commit}..{resolved_old_commit}"
+    )
+    if reverse_commits is None:
+        return unknown_revision("读取反向源 commit 区间失败")
+    return delta(
+        "rollback_or_diverged",
+        forward_commits=forward_commits,
+        reverse_commits=reverse_commits,
+        boundary_explanation=(
+            f"已安装 plugin 现在反映的源 commit {resolved_new_commit[:12]} 并不在上次安装的 "
+            f"{resolved_old_commit[:12]} 之后（回退或分叉）：{len(reverse_commits)} 个源 commit "
+            f"不再被反映，{len(forward_commits)} 个源 commit 新被反映。"
+        ),
+    )
+
+
 def _snapshot_structured_hook_configuration(
     hooks_path: Path,
 ) -> StructuredHookConfigurationSnapshot:
@@ -688,7 +928,15 @@ def _run_phase(
     *,
     deployment_source_worktree: Path,
     environment: dict[str, str],
+    child_exit_codes_preserved_on_failure: frozenset[int] = frozenset(),
 ) -> str:
+    """跑一个部署阶段；非零退出一律抛 `DeployError`。
+
+    ``child_exit_codes_preserved_on_failure`` 里的退出码会被原样带进
+    ``DeployError.exit_code``，让调用方分辨**这一类**失败该走哪条处置路径（当前用途：verifier
+    的注册唯一性失败不得回滚）。其余退出码一律折叠成 1，避免子进程的退出码约定悄悄变成 runner
+    自己的对外契约。
+    """
     completed = subprocess.run(
         argv,
         cwd=deployment_source_worktree,
@@ -700,7 +948,14 @@ def _run_phase(
     )
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip()
-        raise DeployError(f"{label} 失败: {detail}")
+        raise DeployError(
+            f"{label} 失败: {detail}",
+            exit_code=(
+                completed.returncode
+                if completed.returncode in child_exit_codes_preserved_on_failure
+                else 1
+            ),
+        )
     return completed.stdout.strip()
 
 
@@ -818,6 +1073,9 @@ def run_local_deploy(
                 result=failed,
             ) from exc
 
+        # 失败 receipt 也要能带上「失败前已经拿到的现场」，所以先绑定，避免异常处置分支撞上未绑定名。
+        contract_output: str | None = None
+        installer_receipt: dict[str, Any] | None = None
         contract_command = [sys.executable, str(paths["contract"])]
         installer_command = [
             sys.executable,
@@ -828,6 +1086,7 @@ def run_local_deploy(
             source.commit,
             "--configure-stop-hook",
             "--configure-user-prompt-submit-hook",
+            "--configure-kimi-plugin-registration",
             "--json",
         ]
 
@@ -885,6 +1144,10 @@ def run_local_deploy(
                 verifier_command,
                 deployment_source_worktree=deployment_source_worktree,
                 environment=environment,
+                # verifier 的注册唯一性失败必须能与其余验证失败分开处置（不回滚）。
+                child_exit_codes_preserved_on_failure=frozenset(
+                    {OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE}
+                ),
             )
             try:
                 verification = json.loads(verifier_output)
@@ -898,6 +1161,33 @@ def run_local_deploy(
                     "部署后 official installation receipt 未收敛到 local main commit"
                 )
         except DeployError as exc:
+            if exc.exit_code == OFFICIAL_CLI_VERIFIER_REGISTRATION_UNIQUENESS_EXIT_CODE:
+                # verifier 判定宿主里存在第二份 RVF 注册 / payload 树。**刻意不回滚**：canonical
+                # 刚装好，回滚会把它一并移除，只留下残留那份——正是这条门禁要消灭的局面。正确的
+                # severity 是「部署做完但拒绝认证」。
+                #
+                # 这个判断必须写在这里（通用 except 的最前面）而不是下游的 config.toml 门禁里：
+                # verifier 先抛，先被这个通用 except 接住，写在下游根本轮不到执行。
+                registration_uniqueness_not_certified = result_for(
+                    status="failed",
+                    phase="official_cli_plugin_registration_uniqueness",
+                    error=str(exc),
+                    rollback_status="not_required",
+                    remediation=REGISTRATION_UNIQUENESS_REMEDIATION,
+                    contract_output=contract_output,
+                    installer=installer_receipt,
+                )
+                _write_result_receipt(
+                    result_receipt_path, registration_uniqueness_not_certified
+                )
+                raise DeployError(
+                    f"{exc}；{REGISTRATION_UNIQUENESS_REMEDIATION}",
+                    # 刻意**不**把 verifier 的退出码原样透传给 runner 自己的 CLI：runner 的 3
+                    # 早已是「已有 RVF local deploy 正在运行」。这里与下游 config.toml 门禁
+                    # 统一用 2（部署失败/拒绝认证）。
+                    exit_code=2,
+                    result=registration_uniqueness_not_certified,
+                ) from exc
             rollback_result: dict[str, Any] | None = None
             rollback_error: str | None = None
             if installation_mutation_phase_started:
@@ -969,15 +1259,311 @@ def run_local_deploy(
                 result=failed,
             ) from exc
 
+        codex_registration_uniqueness = (
+            _sole_review_validate_fix_registration_in_codex_config(
+                home, installer_receipt=installer_receipt
+            )
+        )
+        codex_hook_trust = _observe_codex_hook_trust(
+            home, installer_receipt=installer_receipt
+        )
+        if codex_registration_uniqueness.get("status") != CODEX_SOLE_REGISTRATION_STATUS:
+            # 认证要的是**正向证明**：canonical 确实在册、且只有它一份。任何别的状态都不够格——
+            # `multiple_registrations` 是已识别的多注册，`canonical_selector_not_registered`
+            # 是 canonical 根本没注册，`unavailable` 是根本没核到（「核不到」不是「核过了」）。
+            # 只排除已识别的坏状态，会把后两类当成好状态放行。
+            #
+            # 刻意不走上面的 rollback 分支：回滚会移除刚装好的 canonical，只留下残留那份，更差。
+            registration_not_certified = result_for(
+                status="failed",
+                phase="codex_registration_uniqueness",
+                error=codex_registration_uniqueness["note"],
+                rollback_status="not_required",
+                remediation=REGISTRATION_UNIQUENESS_REMEDIATION,
+                contract_output=contract_output,
+                installer=installer_receipt,
+                verification=verification,
+                codex_hook_trust=codex_hook_trust,
+                codex_registration_uniqueness=codex_registration_uniqueness,
+            )
+            _write_result_receipt(result_receipt_path, registration_not_certified)
+            cleanup_commands = codex_registration_uniqueness.get("remediation")
+            raise DeployError(
+                codex_registration_uniqueness["note"]
+                + (f" 清理命令: {cleanup_commands}" if cleanup_commands else ""),
+                exit_code=2,
+                result=registration_not_certified,
+            )
+        # `source_commit_delta` 只挂在**成功**结果上，且必须走 `result_for(**extra)`：
+        # `result_for` 同时服务 status=running / failed，把它塞进函数本体等于给失败与回滚
+        # 结果也发一份「已投入使用」的 forward 列表。位置也必须在上面那个 except 之外——
+        # 部署已经收敛了，一次事后统计的异常不该把它拖回回滚分支。
         completed = result_for(
             status="ok",
             phase="completed",
             contract_output=contract_output,
             installer=installer_receipt,
             verification=verification,
+            source_commit_delta=describe_source_commit_delta_since_last_installation(
+                repository=source.worktree_path,
+                previously_installed_commit=(installed_before or {}).get(
+                    "local_main_commit"
+                ),
+                newly_installed_commit=source.commit,
+            ),
+            codex_hook_trust=codex_hook_trust,
+            codex_registration_uniqueness=codex_registration_uniqueness,
         )
         _write_result_receipt(result_receipt_path, completed)
         return completed
+
+
+def _deployed_plugin_payload_root_from_installer_receipt(
+    installer_receipt: dict[str, Any] | None,
+) -> tuple[Path | None, str | None, str | None]:
+    """从安装器回执取**真实**的 plugin payload 根与 plugin selector。
+
+    绝不硬拼 `$HOME/plugins/<plugin>`：本安装器把 payload 装进
+    `$HOME/.rvf/developer-plugin-marketplaces/<marketplace>/plugins/<plugin>`。
+    `$HOME/plugins/` 在本机上是一个早已停更的历史目录——照着它核对，核到的是一份陈旧快照
+    （或者干脆什么都核不到），而真正被 Codex 加载的那份一次都没被核对，结果还报「全部一致」。
+
+    返回 ``(payload_root, plugin_selector, 无法定位时的说明)``。定位不到就如实返回 ``None``
+    并带上说明，**不**退回猜路径——猜错的路径正是这条缺陷本身。
+    """
+    if not isinstance(installer_receipt, dict):
+        return (
+            None,
+            None,
+            "安装器回执不可用 ⇒ 无法定位已部署 plugin payload 根，bundled hook 源未进核对。",
+        )
+    raw_selector = installer_receipt.get("plugin_selector")
+    selector = raw_selector if isinstance(raw_selector, str) and raw_selector else None
+    raw_marketplace_root = installer_receipt.get("active_marketplace_root")
+    if not isinstance(raw_marketplace_root, str) or not raw_marketplace_root:
+        return (
+            None,
+            selector,
+            "安装器回执缺 active_marketplace_root ⇒ bundled hook 源未进核对。",
+        )
+    plugin_name = selector.split("@", 1)[0] if selector else ""
+    if not plugin_name:
+        return (
+            None,
+            selector,
+            "安装器回执缺 plugin_selector ⇒ 无法确定 payload 目录名，bundled hook 源未进核对。",
+        )
+    payload_root = (
+        Path(raw_marketplace_root).expanduser() / "plugins" / plugin_name
+    )
+    if not payload_root.is_dir():
+        return (
+            payload_root,
+            selector,
+            f"回执给出的 plugin payload 根不存在: {payload_root}",
+        )
+    return payload_root, selector, None
+
+
+def _sole_review_validate_fix_registration_in_codex_config(
+    home: Path, *, installer_receipt: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """核对 `~/.codex/config.toml` 里 **canonical selector 在册、且只有它一份**。**阻断 deploy。**
+
+    与同文件的 `_observe_codex_hook_trust` 刻意分成两件事：那一项是观测（重新信任是人的决定，
+    且本机未必用 Codex），这一项是硬约束。本机的双份 RVF 注册正是「只观测、只写文档、从不阻断」
+    烂了三周的产物——两棵不同 commit 的插件树并行执行、各写各的 `review-highwater` 高水位。
+
+    刻意**不触发部署回滚**：回滚会移除刚装好的 canonical、把机器留在「只剩旧那份」的更差状态。
+    正确的 severity 是「部署做完但拒绝认证」，让人去清理残留。
+
+    canonical selector 一律取自安装器回执的 ``plugin_selector``，不在这里硬拼 marketplace 名。
+
+    返回的 ``status`` 只有 `CODEX_SOLE_REGISTRATION_STATUS` 一种够格放行，其余三类都必须阻断：
+
+    - ``multiple_registrations``：已识别的多注册；
+    - `CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS`：config 可读但 canonical 不在
+      ``[plugins.*]`` 里——「没有第二份」不等于「canonical 在册」，把它读成唯一等于谎报；
+    - ``unavailable``：根本没核到（回执缺 selector / config 读不到 / 扫描抛异常）——「核不到」
+      不是「核过了、没问题」，这正是 hook 信任观测那条同款失败模式。
+    """
+    canonical_selector = (
+        installer_receipt.get("plugin_selector")
+        if isinstance(installer_receipt, dict)
+        else None
+    )
+    if not isinstance(canonical_selector, str) or not canonical_selector.strip():
+        return {
+            "status": "unavailable",
+            "selectors": [],
+            "note": (
+                "安装器回执缺 plugin_selector ⇒ 无从判断哪个 selector 是 canonical，"
+                "本次未核对 Codex 侧是否存在多份 RVF 注册。"
+            ),
+        }
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_hook_trust_fingerprint as trust  # noqa: PLC0415
+
+        codex_home = Path(home) / ".codex"
+        document = trust.read_codex_config_document(codex_home)
+        if document is None:
+            return {
+                "status": "unavailable",
+                "selectors": [],
+                "note": (
+                    f"读不到 {codex_home / 'config.toml'}（文件缺失 / 无 tomllib / 解析失败）；"
+                    "本次无法判断 Codex 侧是否存在多份 RVF 注册。"
+                ),
+            }
+        registration_sources = (
+            trust.rvf_plugin_selector_registration_sources_in_codex_config(document)
+        )
+        plugin_registration_table = trust.CODEX_CONFIG_PLUGIN_REGISTRATION_TABLE
+        hook_trust_table = trust.CODEX_CONFIG_HOOK_TRUST_TABLE
+    except Exception as exc:  # noqa: BLE001 - 核对本身失败不得伪装成「唯一」
+        return {
+            "status": "unavailable",
+            "selectors": [],
+            "note": f"Codex config 里的 RVF 注册核对失败：{type(exc).__name__}: {exc}",
+        }
+    selectors = list(registration_sources)
+    extra_selectors = [
+        selector for selector in selectors if selector != canonical_selector
+    ]
+    if extra_selectors:
+        # 两类残留的清理手段不同，实测：`codex plugin remove` 删 cache 与 [plugins.*]，
+        # 但**不**清 [hooks.state.*]。对只剩信任条目的 selector 建议跑 remove 等于给了
+        # 一条证明无效的命令——那正是这条检查要终结的那种「看起来有指引」。
+        remediation_steps: list[str] = []
+        for selector in extra_selectors:
+            tables = registration_sources.get(selector, ())
+            if plugin_registration_table in tables:
+                remediation_steps.append(f"codex plugin remove {selector} --json")
+            if hook_trust_table in tables:
+                remediation_steps.append(
+                    f'手工删除 ~/.codex/config.toml 里所有 [hooks.state."{selector}:…"] 块'
+                    "（codex plugin remove 不清这张表）"
+                )
+        return {
+            "status": "multiple_registrations",
+            "selectors": selectors,
+            "extra_selectors": extra_selectors,
+            "registration_sources": {
+                selector: list(tables)
+                for selector, tables in registration_sources.items()
+            },
+            "canonical_selector": canonical_selector,
+            "note": (
+                f"{Path(home) / '.codex/config.toml'} 里存在多份 RVF 注册: {selectors}；"
+                f"canonical 只应是 {canonical_selector}。"
+            ),
+            "remediation": "；".join(remediation_steps),
+        }
+    if plugin_registration_table not in registration_sources.get(
+        canonical_selector, ()
+    ):
+        # 「一个 RVF selector 都没有」和「canonical 只剩 [hooks.state] 残迹」在旧实现里都会落到
+        # sole_registration，把「canonical 根本没注册」谎报成「唯一」。认证要的是正向证明。
+        return {
+            "status": CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS,
+            "selectors": selectors,
+            "registration_sources": {
+                selector: list(tables)
+                for selector, tables in registration_sources.items()
+            },
+            "canonical_selector": canonical_selector,
+            "note": (
+                f"{Path(home) / '.codex/config.toml'} 的 [{plugin_registration_table}] 表里"
+                f"没有 canonical RVF 注册 {canonical_selector}"
+                f"（本次扫到的 RVF selector: {selectors or '无'}）；"
+                "「没有第二份」不等于「canonical 在册」，本次部署不予认证。"
+            ),
+            "remediation": (
+                f"确认 `codex plugin list` 里有 {canonical_selector}；"
+                "若没有，说明官方 CLI 的安装没有落到 config.toml，"
+                "查完安装器输出后从 local main 重新运行 runner。"
+            ),
+        }
+    return {
+        "status": CODEX_SOLE_REGISTRATION_STATUS,
+        "selectors": selectors,
+        "registration_sources": {
+            selector: list(tables) for selector, tables in registration_sources.items()
+        },
+        "canonical_selector": canonical_selector,
+    }
+
+
+def _observe_codex_hook_trust(
+    home: Path, *, installer_receipt: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """部署收尾核对 Codex 的 hook 信任指纹（**只观测、不改 live config**）。
+
+    为什么必须有这一步：Codex 对每条 command hook 记信任指纹，改了命令而不重新信任 ⇒ 该 hook 被
+    判 Modified 并**跳过**，而 `codex exec` 下这件事完全静默（实测 0.147.0：stdout+stderr 里
+    `hook`/`trust`/`/hooks` 命中全为 0）。于是 deploy 会报告一切成功，而 RVF 在 Codex 上从此
+    一次都不执行。
+
+    刻意**不**自动改 `~/.codex/config.toml`：重新信任是一个信任决定，必须由人做。
+    也刻意**不**让它使 deploy 失败：它是观测项，而这台机器上 Codex 未必是被使用的 host。
+
+    ⚠️ 已知盲区：deploy verifier 的 synthetic smoke 是**直接执行脚本**，绕过 Codex 自己的 hook
+    发现与信任层——所以只补普通 smoke 仍然会假绿，真正的端到端校验必须走 Codex 的发现路径。
+    本观测是那条缝的**指纹侧**补丁，不是它的替代。
+
+    bundled hook 源的位置一律从 ``installer_receipt`` 里取（``active_marketplace_root`` +
+    ``plugin_selector``），**不**按 `$HOME/plugins/<plugin>` 硬拼——那个路径本安装器根本不写。
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import codex_hook_trust_fingerprint as trust  # noqa: PLC0415
+
+        codex_home = Path(home) / ".codex"
+        table = trust.read_codex_hook_trust_table(codex_home)
+        (
+            payload_root,
+            plugin_selector,
+            payload_root_resolution_note,
+        ) = _deployed_plugin_payload_root_from_installer_receipt(installer_receipt)
+        sources = trust.rvf_codex_hook_sources(
+            codex_home=codex_home,
+            deployed_plugin_root=payload_root,
+            trust_table=table,
+            deployed_plugin_selector=plugin_selector,
+        )
+        observation = trust.verify_codex_hook_trust(
+            codex_home=codex_home, hook_sources=sources
+        )
+        observation["deployed_plugin_payload_root"] = (
+            str(payload_root) if payload_root is not None else None
+        )
+        observation["deployed_plugin_selector"] = plugin_selector
+        if payload_root_resolution_note:
+            # 定位不到 payload 根 = bundled hook 源一条都没进核对；这必须压到非 trusted，
+            # 否则又回到「核到 0 条却报全部一致」。已经是非 trusted 的更严重结论不覆盖。
+            if observation.get("status") == trust.TRUST_STATUS_TRUSTED:
+                observation["status"] = trust.TRUST_STATUS_CHECK_COVERAGE_INCOMPLETE
+            observation["coverage_incomplete"] = True
+            observation["note"] = " ".join(
+                part
+                for part in (observation.get("note"), payload_root_resolution_note)
+                if part
+            )
+            observation.setdefault(
+                "remediation", trust.INCOMPLETE_COVERAGE_REMEDIATION
+            )
+        return observation
+    except Exception as exc:  # noqa: BLE001 - 观测项永不阻断 deploy
+        return {
+            "status": "unavailable",
+            "checked": 0,
+            "untrusted": [],
+            "missing_sources": [],
+            "sources_without_any_trust_entry": [],
+            "coverage_incomplete": True,
+            "note": f"Codex hook 信任核对本身失败：{type(exc).__name__}: {exc}",
+        }
 
 
 def _print_text(result: dict[str, Any]) -> None:
@@ -990,11 +1576,151 @@ def _print_text(result: dict[str, Any]) -> None:
     print("installed before:", result["installed_before"])
     print("installed after:", result["installed_after"])
     print("stale before:", result["stale_before"])
+    _print_source_commit_delta(result.get("source_commit_delta") or {})
     if not result.get("runner_matches_local_main_head", True):
         print(
             "注意: runner 自身含未提交改动，与本次被部署的 HEAD 版本不是同一份"
             "（runner_matches_local_main_head=false）"
         )
+    _print_codex_registration_uniqueness(
+        result.get("codex_registration_uniqueness") or {}
+    )
+    _print_codex_hook_trust_observation(result.get("codex_hook_trust") or {})
+
+
+# C0（含 ESC / BEL / 换行 / 制表）、DEL 与 C1：终端会把它们当命令而不是字符看待。
+# U+FFFD（`errors="replace"` 容错解码留下的 `�`）刻意不在此列：它是一个普通可打印
+# 字符，讲述坏字节这件事本身要如实呈现，不该被当成控制序列吃掉。
+_TERMINAL_CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _neutralize_terminal_control_sequences_for_human_readable_output(
+    value: object,
+) -> str:
+    """把外部可控字符串里的终端控制字符转成可见转义，**只用于人读打印路径**。
+
+    这些串的内容都不受本进程控制：commit `subject` 来自提交信息（任何能往本仓写提交的人
+    都能构造），`old_commit` / `new_commit` 来自磁盘上的 official installation receipt。
+    原样 `print` 会让 ESC/OSC 等序列直达终端，可以伪造输出行、清屏盖掉前面的真实结论，或
+    触发终端功能——而人读输出恰恰是开发者用来判断「到底装了什么」的那一路，伪造的代价正好
+    落在它上面。
+
+    处理只发生在打印侧：`--json` 回执与 receipt 落盘必须继续携带原始值，转义不得回灌进
+    结构化结果。换行 / 回车 / 制表符一并转义——它们同样能凭空造出一整行看着像真结论的输出。
+    """
+    return _TERMINAL_CONTROL_CHARACTER_PATTERN.sub(
+        lambda match: f"\\x{ord(match.group()):02x}",
+        "" if value is None else str(value),
+    )
+
+
+def _print_source_commit_delta(delta: dict[str, Any]) -> None:
+    """把 commit 级 delta 印成人能读的结论。
+
+    措辞不在这里另起炉灶：一律先印 runner 自己写的 `boundary_explanation`，再按 kind 决定
+    要不要展开列表。只报版本串、不给 commit 列表，等于没有汇报。
+
+    这一路上的每个外部可控串（commit `subject`、`old_commit` / `new_commit`，以及内插了
+    它们的 `boundary_explanation`）在打印前都过
+    `_neutralize_terminal_control_sequences_for_human_readable_output`：转义只发生在人读
+    打印侧，`--json` 回执与 receipt 里的原始值保持原样。
+    """
+    kind = delta.get("kind")
+    if not kind:
+        return
+    neutralize = _neutralize_terminal_control_sequences_for_human_readable_output
+    print("已安装 plugin 现在反映的源 commit:", kind)
+    print("  ", neutralize(delta.get("boundary_explanation", "")))
+
+    def print_commits(caption: str, commits: list[dict[str, str]]) -> None:
+        if not commits:
+            return
+        print(f"   {caption}（{len(commits)} 个）:")
+        for commit in commits:
+            sha = neutralize(commit.get("sha", ""))[:12]
+            print(f"     - {sha} {neutralize(commit.get('subject', ''))}")
+
+    forward_commits = delta.get("forward_commits") or []
+    reverse_commits = delta.get("reverse_commits") or []
+    if kind == "forward":
+        print_commits("本次新投入使用的源 commit", forward_commits)
+    elif kind == "no_baseline":
+        print_commits("本次安装所在的源 commit", forward_commits)
+    elif kind == "rollback_or_diverged":
+        print("   ⚠️ 相对上次安装是回退或分叉，两个方向都必须一起看：")
+        print_commits("不再被已安装 plugin 反映的源 commit", reverse_commits)
+        print_commits("新被已安装 plugin 反映的源 commit", forward_commits)
+    elif kind == "unknown_revision":
+        print("   ⚠️ 上次: ", neutralize(delta.get("old_commit")))
+        print("   ⚠️ 现在: ", neutralize(delta.get("new_commit")))
+
+def _print_codex_registration_uniqueness(uniqueness: dict[str, Any]) -> None:
+    """印 RVF 注册唯一性结论；只有 `sole_registration` 可以读成正常。
+
+    `unavailable`（没核到）与 `canonical_selector_not_registered`（canonical 不在册）都必须
+    长得像告警——它们在后果上与「存在多份」同级：都不构成「canonical 唯一」的证明。
+    """
+    status = uniqueness.get("status")
+    if not status:
+        return
+    selectors = uniqueness.get("selectors") or []
+    if status == CODEX_SOLE_REGISTRATION_STATUS:
+        print(f"Codex RVF 注册: 唯一（{selectors[0] if selectors else '无条目'}）")
+    elif status == "multiple_registrations":
+        print(f"⚠️ Codex RVF 注册: 存在多份 {selectors}")
+        print("   清理:", uniqueness.get("remediation"))
+    elif status == CODEX_CANONICAL_SELECTOR_NOT_REGISTERED_STATUS:
+        print(f"⚠️ Codex RVF 注册: canonical 未在册（{uniqueness.get('note')}）")
+        print("   处置:", uniqueness.get("remediation"))
+    else:
+        print(f"⚠️ Codex RVF 注册唯一性: 未能核对（{uniqueness.get('note')}）")
+
+
+def _print_codex_hook_trust_observation(trust: dict[str, Any]) -> None:
+    """把 hook 信任观测印成人能读的结论。
+
+    唯一的硬约束：**只有 `trusted` 一种状态可以读成「一切正常」**。核不到、核不全、源从没被
+    信任过——每一种都要长得像告警，因为它们在后果上与「未受信」等价（Codex 静默不执行）。
+    """
+    status = trust.get("status")
+    if not status:
+        return
+    checked = trust.get("checked")
+    untrusted = trust.get("untrusted") or []
+    missing_sources = trust.get("missing_sources") or []
+    never_trusted_sources = trust.get("sources_without_any_trust_entry") or []
+    if status == "trusted":
+        print(f"Codex hook 信任指纹: 全部一致（核对 {checked} 条，所有 hook 源均已登记）")
+    elif status in {"untrusted_entries", "trust_table_absent"}:
+        print(
+            f"⚠️ Codex hook 信任指纹: {len(untrusted)}/{checked} 条**未受信**"
+            "——它们会被 Codex 静默跳过（exec 下无任何警告），RVF 在 Codex 侧等于停摆。"
+        )
+        for entry in untrusted:
+            print(f"   - {entry['key']}  ({entry['reason']})")
+            print(f"     current_fingerprint: {entry['current_fingerprint']}")
+    elif status == "check_coverage_incomplete":
+        print(
+            f"⚠️ Codex hook 信任指纹: 核对**覆盖不完整**（只核到 {checked} 条）"
+            "——本次结果**不能**当作「一切正常」读：没被核到的 hook 与「未受信」后果相同。"
+        )
+    else:
+        print(f"⚠️ Codex hook 信任指纹: 未能核对（{status}）——这**不是**「一切正常」。")
+    if status != "trusted":
+        payload_root = trust.get("deployed_plugin_payload_root")
+        if payload_root:
+            print(f"   已部署 plugin payload 根: {payload_root}")
+        for entry in never_trusted_sources:
+            print(
+                f"   - 从未被信任过的 hook 源（信任表里一个键都没有）: "
+                f"{entry['source']} -> {entry['path']}"
+            )
+        for item in missing_sources:
+            print(f"   - 缺失 / 不可读的 hook 源: {item}")
+        if trust.get("note"):
+            print(f"   注: {trust['note']}")
+        if trust.get("remediation"):
+            print(f"   处置: {trust['remediation']}")
 
 
 def main(argv: list[str] | None = None) -> int:

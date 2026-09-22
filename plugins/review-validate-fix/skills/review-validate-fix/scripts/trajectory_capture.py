@@ -73,11 +73,13 @@ from subagent_capture import capture_all_subagents  # noqa: E402
 from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
     HOST_CLAUDE,
     HOST_CODEX,
+    HOST_KIMI_CODE,
     detect_transcript_format,
 )
 from trajectory_distill import (  # noqa: E402
     distill_claude_jsonl,
     distill_codex_jsonl,
+    distill_kimi_wire_jsonl,
     distill_reviewer_stream,
     read_codex_originator,
     write_jsonl,
@@ -318,6 +320,138 @@ def find_rvf_start_in_jsonl(
     if latest is None:
         return None
     return dataclasses.replace(latest, line_count_total=last_index + 1)
+
+
+def _kimi_user_message_text(record: dict[str, Any]) -> str | None:
+    """从一条 Kimi wire JSONL record 中抽出**真实用户**输入文本。
+
+    两个 record type 都认：``turn.prompt``（``input`` 是 part 列表，不是字符串）与
+    ``context.append_message``（``message.content`` 同为 part 列表）。实测两者在同一次
+    输入上成对出现、内容一致；同时收下是为了不依赖「哪一条先落盘」这个未取证的顺序。
+
+    ⚠️ **``role`` 区分不出来源**：``context.append_message`` 的 ``role`` 实测全是
+    ``"user"``，真正的判据是 ``origin.kind == "user"``（其余取值是 harness 注入的系统
+    提醒 / skill 激活 / 后台任务）。用负向判据（「不等于 injection」）会让新增来源默认
+    落进「用户发言」——静默地把系统提醒当成 RVF 触发。
+    """
+    record_type = record.get("type")
+    if record_type == "turn.prompt":
+        container: Any = record
+        parts = record.get("input")
+    elif record_type == "context.append_message":
+        container = record.get("message")
+        if not isinstance(container, dict):
+            return None
+        parts = container.get("content")
+    else:
+        return None
+    origin = container.get("origin") if isinstance(container, dict) else None
+    if not isinstance(origin, dict) or origin.get("kind") != "user":
+        return None
+    if isinstance(parts, str):
+        return parts or None
+    if not isinstance(parts, list):
+        return None
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        # think 的正文在 ``think`` 键下而不是 ``text`` 键下（见 adapters/kimi/transcript.py）。
+        field = "think" if part.get("type") == "think" else "text"
+        value = part.get(field)
+        if isinstance(value, str) and value:
+            chunks.append(value)
+    joined = "\n".join(chunks)
+    return joined or None
+
+
+def _kimi_record_timestamp(record: dict[str, Any]) -> str | None:
+    """把 Kimi 的 ``time`` 归一成与 ``since_timestamp`` 同域的 ISO8601-UTC 串。
+
+    ⚠️ **Kimi 的 ``time`` 是 epoch 毫秒整数**（实测 ``{"time":1787371449620}``），另两家的
+    ``timestamp`` 是 ISO8601 串。照抄 ``record.get("timestamp") if isinstance(..., str)``
+    会让每条候选都取到 ``None``，于是 ``since_timestamp`` 一非空就把**全部**候选滤掉 ⇒
+    cut 永远找不到，**且不报错**。同一会话内连着跑两次 RVF 时 ``since_timestamp`` 必然非空，
+    所以那是常态路径而不是边角。
+    """
+    value = record.get("time")
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        moment = datetime.fromtimestamp(value / 1000.0, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def find_rvf_start_in_kimi_wire_jsonl(
+    path: Path,
+    *,
+    since_timestamp: str | None = None,
+) -> CutPoint | None:
+    """与 ``find_rvf_start_in_jsonl`` 等价，但解析 Kimi Code CLI 的 per-agent wire JSONL。
+
+    其他行为（取最近一条匹配、``since_timestamp`` 过滤、``CutPoint`` 字段语义）与另两家
+    完全一致——pre = [0, byte_offset)，post = [byte_offset, end)。
+
+    ``turn.prompt`` 与 ``context.append_message`` 是同一次输入的两次记录；两条都匹配时
+    「取最近一条」会让 cut 落在后写的那条上，于是先写的那条留在 pre。内容重复、不丢信息，
+    与另两家「取最近一条」的语义保持一致，故不为它引入特例。
+    """
+    last_index = -1
+    latest: CutPoint | None = None
+    for line_index, byte_start, _byte_end, record in _iter_jsonl_with_offsets(path):
+        last_index = line_index
+        if record is None:
+            continue
+        text = _kimi_user_message_text(record)
+        if not text:
+            continue
+        matched = next((trigger for trigger in RVF_START_TRIGGERS if trigger in text), None)
+        if matched is None:
+            continue
+        ts = _kimi_record_timestamp(record)
+        if since_timestamp is not None:
+            if ts is None or ts < since_timestamp:
+                continue
+        latest = CutPoint(
+            line_index=line_index,
+            byte_offset=byte_start,
+            timestamp=ts,
+            marker_matched=matched,
+            line_count_total=last_index + 1,
+        )
+    if latest is None:
+        return None
+    return dataclasses.replace(latest, line_count_total=last_index + 1)
+
+
+def _host_distill(host_kind: str | None):
+    """按 host 选主轨迹 distiller（公共边界统一返回 ``(list[dict], index)``）。
+
+    与 ``subagent_capture._host_distill`` 同形。**漏接一个 host 不会抛**——Codex 的解析器
+    读别家的 transcript 只会返回 0 条，于是那个 host 的主轨迹静默变空。结构性 gate
+    （``tests/test_kimi_host_adapter_and_transcript.py``）逐 host 断言这里各有其人。
+    """
+    if host_kind == HOST_CLAUDE:
+        return distill_claude_jsonl
+    if host_kind == HOST_KIMI_CODE:
+        return distill_kimi_wire_jsonl
+    return distill_codex_jsonl
+
+
+def _host_find_rvf_start(host_kind: str | None):
+    """按 host 选 RVF-起点 cut finder。漏接一个 host ⇒ 该 host 恒 ``no_marker_found``。"""
+    if host_kind == HOST_CLAUDE:
+        return find_rvf_start_in_claude_jsonl
+    if host_kind == HOST_KIMI_CODE:
+        return find_rvf_start_in_kimi_wire_jsonl
+    return find_rvf_start_in_jsonl
 
 
 def _count_lines(path: Path) -> int:
@@ -711,16 +845,10 @@ def capture_run(
                             since_timestamp = ts_value
             except (OSError, json.JSONDecodeError):
                 since_timestamp = None
-            if post_host_kind == HOST_CLAUDE:
-                cut = find_rvf_start_in_claude_jsonl(
-                    current_transcript,
-                    since_timestamp=since_timestamp,
-                )
-            else:
-                cut = find_rvf_start_in_jsonl(
-                    current_transcript,
-                    since_timestamp=since_timestamp,
-                )
+            cut = _host_find_rvf_start(post_host_kind)(
+                current_transcript,
+                since_timestamp=since_timestamp,
+            )
             if cut is not None:
                 pre_kind = "same-session-slice"
                 post_kind = "same-session-slice"
@@ -791,9 +919,9 @@ def capture_run(
                 encoding="utf-8",
             )
 
-    # 蒸馏 post-rvf：按 post_host_kind 选 distiller。rollout 文件名统一为
-    # host-中性的 rollout.jsonl（Codex / Claude 共用同名）；host 区分由
-    # manifest 的 host 字段表达。
+    # 蒸馏 post-rvf：按 post_host_kind 选 distiller（Codex / Claude / Kimi 各一，
+    # 未知 host 兜底 Codex）。rollout 文件名统一为 host-中性的 rollout.jsonl；host
+    # 区分由 manifest 的 host 字段表达。
     distill_index: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "rollout_file": "rollout.jsonl",
@@ -802,18 +930,11 @@ def capture_run(
     }
     rvf_rollout = rvf_dir / "rollout.jsonl"
     if rvf_rollout.exists():
-        if post_host_kind == HOST_CLAUDE:
-            distilled, distill_index = distill_claude_jsonl(
-                rollout_path=rvf_rollout,
-                rollout_filename="rollout.jsonl",
-                repo=repo,
-            )
-        else:
-            distilled, distill_index = distill_codex_jsonl(
-                rollout_path=rvf_rollout,
-                rollout_filename="rollout.jsonl",
-                repo=repo,
-            )
+        distilled, distill_index = _host_distill(post_host_kind)(
+            rollout_path=rvf_rollout,
+            rollout_filename="rollout.jsonl",
+            repo=repo,
+        )
         write_jsonl(distilled, rvf_dir / "trajectory.jsonl")
         (rvf_dir / "trajectory.index.json").write_text(
             json.dumps(distill_index, ensure_ascii=False, indent=2) + "\n",

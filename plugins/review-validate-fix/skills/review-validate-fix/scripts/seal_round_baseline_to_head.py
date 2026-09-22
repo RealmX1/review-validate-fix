@@ -112,6 +112,11 @@ def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:
             "repo": repo,
             "baseline_head": head,
         }
+    # 不显式传 parent_harness_identity：本脚本跑在 agent shell 里（`/rvf-land` 的一步），
+    # 拿不到 hook shim 注入的 agent id，只能靠 harness 原生环境标记那一层判定——而
+    # UPS / Stop 走的是 shim 注入那一层。两层**必须归一到同一个 token**，否则封窗写进的
+    # 是一个 Stop 读不到的文件、封窗静默失效。跨信号层一致性由
+    # `core.host_adapter.parent_harness_identity` 的规范化保证，并有测试逐层钉死。
     try:
         marker_path = round_baseline_marker.write_round_baseline_marker(
             task_id=task_id,

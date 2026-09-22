@@ -27,6 +27,63 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
    - 审**已提交**工作（无父会话自动检测时的显式杠杆）：传 `--base-ref <commit>`（committed-round baseline）+ `--transcript <session.jsonl>`，packet 即用 `git diff <base-ref>` 渲染已提交改动（base-ref 须是 HEAD 祖先，否则自动回退 HEAD）。仍然不需要 `git reset`。
 7. 后续使用脚本生成的 `review-agent-context.md` / `review-env.sh` / prompt artifacts；不要手写 `RVF_*` export block，也不要把脚本内部 env/config 当成 agent 需要记忆的状态机。
 
+### 统一发起协议：唯一的发起消息是**发起决策点横幅**
+
+自动 RVF 的发起**一律**先给你一条决策点横幅，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
+
+变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
+
+| 在哪 | transport | 你看到的形态 |
+| --- | --- | --- |
+| **cline-kanban task 内**（默认） | 经 cline-kanban 终端投递成为一条**真实 user message** | 隔几秒到达并开启一个新回合；因为它是真实 user 条目，所以在会话历史里是一个**可回退的边界**（Claude Code 双 ESC 的 rewind 列表里能看到它），用户随时可以回到它之前 |
+| task 外 / 非 kanban backend / 逃生口 | Stop hook 自注入 | 与 Stop 同一刻直接出现在上下文里 |
+
+带外投递那条路上，横幅多两行「来源声明 + 时效说明」，其余逐字相同。四件必须知道的事：
+
+- **Stop 那一刻你什么也看不到是正常的。** 默认短等为 0ms，横幅数秒后才作为 user message 到达。这不是降级——正因为它开启新回合，才有 rewind 边界。
+- **只有确定失败才回落自注入。** 投递结论未知时本轮静默停、不回落，由投递意图在后续 Stop 对账（宁可晚问一轮，也不要两条通道各问一次）。回落发生时开发者旁注会明说「本轮已回落为 Stop hook 自注入」。
+- **投出去却始终没成为 turn 的横幅会被撤回。** 那枚 token 进 `withdrawn` 终态，即便消息迟到落地，`rvf-agent start` 也会硬失败——不要试图绕过它去手动开一轮。
+- 逃生口：`RVF_DECISION_POINT_DELIVERY_TRANSPORT=stop_hook_self_injection|cline_kanban_task_chat_session` 可强制指定通道。
+
+**用户 rewind 掉横幅之后**：那枚 token 当轮作废（移出去重索引、**不计** decline 冷却与铸造熔断），下一次 Stop 会重新征询一次。所以看到「同一批改动又被问了一遍」且中间发生过 rewind，那是设计行为，不是重复派发。
+
+接受之后**不会再有第二条注入消息**。执行所需的一切从 `rvf-agent start` 的回执里读：`detail.execution_handoff` 带 `target_repo` / `prep_file` / `review_env` / `review_packet` / `scope_contract` / `scope_of_work` / `review_agent_context` / `session_manifest` / `worktree_bootstrap` / `origin_metadata` / `handoff_path` 与 handoff 契约；人类可读行与 `RVF_AGENT_RESULT_JSON:` 两种形态都有。完整流程：
+
+```
+rvf-agent start --token <decision-token> [--transcript-path <session.jsonl>] --reason "<一句话理由>"
+rvf-agent scope exclude|include|annotate --token <decision-token> …     # 可选
+rvf-agent dispatch --token <decision-token> --strictness <light|standard|strict>
+```
+
+`--transcript-path` 直接照抄横幅里 `start` 那一行给出的值即可（横幅只在能解析出该路径时才渲染它）；你不需要自己去找 transcript 落在哪。省略也可以——铸 token 那一刻的路径已随候选摘要存进 token，CLI 会自行回退读回来。它决定本轮 scope 的口径：拿得到 ⇒ `scope_mode=session-owned` + 真 tracker lease + `primary_units`；拿不到 ⇒ 退回 `manual-all-uncommitted`（会把别的会话的背景 dirty 一并纳入，且**审完无法把这批单元标成 reviewed**，同一批改动可能被下一次 Stop 再提议一次）。`start` 回执的 `message` 与 `detail.tracker_scope_allocation` 会明说本轮是哪一种；看到降级就以 scope contract 的 `fix_allowlist` 为准，别按候选路径全量改。
+
+`dispatch` 之后由**你自己**在当前会话调用 `$review-validate-fix` skill，按本文件就地走 review → merge → validate/fix → handoff。不要新建 Kanban task，也不要 fork 新会话；上面那些路径就是本轮 run 的全部输入，**不需要重新 prepare**。
+
+`dispatch` 的退出码：`0` = 已派发（detached，接着按下面「Review」节轮询）；`8` = `blocked_on_reviewer_request`，有腿返回 `kind: request`，是待处理终态而非故障，按「Review」节走 Contract Gate 后重派；`5` = 真派发失败，token 仍在 `acknowledged`，可修复后重试。
+
+> 例外只有一个：操作者显式设置 `CODEX_RVF_FORK_MODE=kanban-followup` 时，Stop hook 仍走旧的终端投递（注入一条 `$review-validate-fix` 开头的祈使句）。那是保留的逃生口/兼容入口，不是默认路径。
+
+### 谢绝一轮**已派发**的自动 RVF
+
+上面那条逃生口投递下来的祈使句（正文带 `RVF_DISPATCH=token=`）若你判断这一轮不该审（本轮改动与你正在做的事无关、用户已明确让你转做别的工作），**不要硬跑、也不要干停**，走谢绝出口：
+
+```
+rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话理由>
+```
+
+`<dispatch-token>` 取注入消息里 `RVF_DISPATCH=token=` 后面那串（**dispatch token，不是 S3 决策 token**；后者用的是 `rvf-agent decline`）。它清掉 kanban-followup 锁、释放本轮 lease、把理由写进 rewind 抹不掉的磁盘 ledger。默认语义是「这一轮不审」：scope 退回可审池，后续 Stop 仍可能重新提议同一批改动。
+
+确定这批 diff **根本不需要审核**时再加 `--mark-declined-scope-units-review-not-required`：后续 RVF 不再纳入范围。该标记是 **diff（hunk）级而非文件级**——被豁免的 diff 内容一旦被改动，会作为新改动重新进入审核范围。默认不加。
+
+**退出码必须看**：`0` 才表示谢绝完全生效。非 0（`7 = decline_incomplete`）表示副作用只做成了一部分——例如锁属于**另一轮** dispatch 而被保留、lease 未释放、或请求了豁免却没声明成。此时**不要当作已谢绝**：读输出里的 `failed_steps` 与 `next_steps` 按提示补救，或如实告诉开发者哪一步没成。尤其是带豁免时，只要 exit 非 0，那批 diff 就**没有**被声明为「不需审核」，下一轮仍会被纳入范围。
+
+> 在途锁的状态与你是否真的接受过这一轮有关，两条入口不同：
+>
+> - **逃生口投递**：UPS 投递落地只落 `delivered_awaiting_agent_decision`（只做互斥去重、**不催收尾**），Stop 侧确认这条 trigger 仍在当前 transcript 祖先链上才升格为 `in_progress`。
+> - **默认路径（你自己 `rvf-agent start` 接受）**：直接落 `in_progress` —— 你显式表过态了，不存在「收没收到」这一维。
+>
+> 两条都受同一套 rewind 对账保护：用户 rewind 掉那一段（trigger 或横幅离开祖先链）则锁被 reconcile 清掉。所以「被拽回去跑一轮自己从没见过的 RVF」不该再发生；若仍发生，是缺陷，请如实上报而不是照跑。
+
 ### Opt-in 仓库的预审 base 同步
 
 - `prepare_review_run.py` 从 local base ref 对应提交里的 `AGENTS.md` 读取 `RVF-PRE-REVIEW-BASE-SYNC-SKILL:`，不依赖旧 task worktree 自己是否已有该标记。
@@ -49,7 +106,9 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
     `RVF_KANBAN_FOLLOWUP_BOOTSTRAP_REPLAY_IN_FLIGHT_WINDOW_SECONDS` 是它的**接手**窗口（默认按
     重放预算 + 子进程强杀余量 + 余量推导），只用于持有者崩在半路时让下一个 Stop 接手。
 - 调用同步 skill 时传 `BASE_BRANCH_SYNC_POST_ABSORPTION_REVIEW_OWNER=RVF`，声明吸收后的审查归 RVF。
-- 单向同步只提供 bootstrap receipt 和 base delta 事实。其后的 implementation review 统一审查实现与该 delta，不再由同步流程重复做一轮完整语义审查。
+- 单向同步只提供 bootstrap receipt、base delta 事实，以及（若上游写了）一份 base↔task intent 复核 artifact；同步流程本身不再做一轮完整语义审查。
+- 其后的 implementation review **仍是普通实现审查**：base delta 本身不进 finding 范围（那是 `review_kind=base_drift_integration` 轮次的职责）。intent artifact 以 context 形式注入 reviewer/fixer，用于**归因分类**与背景理解，**不**扩大也不缩小 finding 范围。
+- intent artifact 缺失或非法时**一律标注放行、绝不阻断**：两侧部署节奏天然不同步，「文件没写出来」不等于「状态不安全」。结局落成机器事实 `intent_artifact_status`（`consumed` / `missing` / `invalid`），写进 run 工件 `base-task-intent-reconciliation-status.json`、handoff `## 状态`，并追加到 `$RVF_HOME/intent-artifact-consumption-outcomes/<repo>.jsonl`。
 - 未 opt-in 的仓库、旧 scope contract 和普通用户维持原行为。
 
 ## 模式
@@ -73,8 +132,23 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 - 默认执行两个独立 review pass，除非用户显式跳过 review。
 - 派发由脚本完成，且**与前台 Bash 的 600s 上限解耦**（一次彻底 review 可能 > 10 分钟）：`source review-env.sh` 后运行 `scripts/dispatch_reviewers.py --execute --detached`。它把整轮派发（解析主 dispatch harness、probe `reviewer-registry.json` 中的 harness、按路由规则选出**恰好两路 external reviewer**、并行派发、额度 reroute/cooldown）self-fork 进一个 detached tmux 线程并**立即返回**，stdout 打印 `RVF_DISPATCH_STATUS=<status.json 路径>` 与 `RVF_DISPATCH_LAUNCH=<launched|already_running|launch_failed>`。这是 host-agnostic 的（不用 Claude 专属 `run_in_background`），Codex / Claude 驱动的 Kanban task 行为一致。
-- 随后**循环有界轮询**直到终态：`scripts/dispatch_reviewers.py --wait-status --status-path <上面打印的 status.json> --max-wait 480`，每次最多阻塞 480s（< 600s 上限，永不被砍断）。打印 `RVF_DISPATCH_STATE=running launch_status=<...>` 就再调一次继续等；打印 `RVF_DISPATCH_STATE=done launch_status=<...> returncode=<n>` 即派发结束——`returncode=0` 表示派发成功，非 0 读 status.json 的 `error` 与同目录 `.dispatch-thread.log` 排障。选路 / reroute / cooldown 全在 detached 的 `--execute` 本体内完成，主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
-- 轮询到 `done` 后，照常读取 `artifacts/reviewers/reviewer-plan.json` 与各路 reviewer artifact；只在该 plan 报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
+- 随后**循环有界轮询**直到终态：`scripts/dispatch_reviewers.py --wait-status --status-path <上面打印的 status.json> --max-wait 480`，每次最多阻塞 480s（< 600s 上限，永不被砍断）。打印 `RVF_DISPATCH_STATE=running launch_status=<...>` 就再调一次继续等；打印 `RVF_DISPATCH_STATE=done launch_status=<...> returncode=<n> plan_status=<...> effective_reviewers=<k>/<n>` 即派发结束。选路 / reroute / cooldown 全在 detached 的 `--execute` 本体内完成，主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
+- **判「本轮 double-review 是否成立」只看 `plan_status`，不看 `returncode`。** `returncode` 只说 detached 派发进程怎么退出，`plan_status` 才说两腿到底有没有产出评审结论：
+  - `plan_status=completed` 且 `effective_reviewers=2/2` → 双评审成立，继续。
+  - `plan_status=failed`（含某腿登录过期/认证失败/崩溃而补位不足，reason `reviewer_leg_produced_no_review_result`；或额度耗尽类 `*_usage_limit_*`；两类同时发生则 reason 为 `reviewer_legs_failed_mixed_usage_limit_and_no_review_result`，此时**两类都要处置**，别只等配额恢复）→ **不要拿现有结论当双评审用**。stderr 的 `RVF_DISPATCH_PLAN_REASON=` 给出原因，读对应 reviewer 目录下 `reviewer.stderr*.txt` 排障，处置后重跑。reason 末尾带 `_with_review_request_pending` 后缀时，说明**除失败腿外还夹着一条 `kind: request` 腿**，必须连同下一条一起处置（fail-close 优先，但那条 request 同样得走 Contract Gate）。
+  - `plan_status=blocked_on_reviewer_request`（reason `reviewer_review_request_pending`）→ 有腿返回 `kind: request`，这是待处理终态、不是故障也不是完成态 review。按 `references/review-merge-policy.md` 的 Contract Gate / Request Handling 满足、驳回或 spawn 子任务后，让 plan `review_request_pending_reviewer_ids` 里的**同一** reviewer 用同一 review packet 重试；request 不得进入 merge table。重试仍走**同一入口**，且**必须带 `--redispatch-review-request-legs-only`**：对同一 run 跑 `scripts/dispatch_reviewers.py --execute --detached --redispatch-review-request-legs-only`（该终态以专用退出码 `3` 收尾，detached 幂等锁据此判定本 run **未**干净完成、放行重派，不会卡在 `already_running`）。该 flag 复用上一轮 `reviewer-plan.json`，**只重派停在 `kind: request` 的腿**；健康且已完成的腿保留上一轮结果、不重跑也不被覆写（不带它的整盘重派会把那条腿重跑一遍并覆写掉它的 issue 列表）。该模式不调用 `route()`，所以**不需要** `--selection-seed`——reviewer 身份直接来自上一轮 plan；`--selection-seed <seed>` 只在你确实要整盘换一轮时才用于复现同一对 reviewer。想先看会重派哪几腿，可加 `--dry-run` 预演：它只打印 plan，不会动任何 `review-result.json`。
+  - `plan_status=partial` / `unknown` → 同样不成立，按上一条排障。
+  - `returncode` 非 0 或 `launch_status=launch_failed` → 读 status.json 的 `error` 与同目录 `.dispatch-thread.log`。唯一例外是 `returncode=3`：它是 `blocked_on_reviewer_request` 的专用码（非故障、也非完成），按上一条处置即可。
+- 轮询到 `done` 后，照常读取 `artifacts/reviewers/reviewer-plan.json` 与各路 reviewer artifact；**核对每一路都存在合法 `review-result.json`**（plan 的 `effective_reviewer_count` 是同一事实的汇总）。只在该 plan 报告 0 个 external 可用（`needs_last_resort_fallback: true`）时，才按 `references/zero-external-reviewer-last-resort-in-harness-fallback.md` 走最后兜底。
+- **lease 过期后重新分配必须走并集，不得静默换口径。** 若 reviewer 报 `lease_not_found` / lease 已过期（典型成因：这一轮被中断、隔了很久才回来），**不要**直接按当时工作树重新 allocate 一次了事——那会把原本圈定的那批改动整个踢出 packet，口径从 committed-round 悄悄翻成纯 dirty，最终审的可能 100% 是另一批东西。正确做法是把上一轮的 `tracker-scope.json` 传回去：
+
+  ```
+  python3 core/session_scope_allocation/reviewable_unit_diff_tracker.py allocate-review-scope \
+      --repo "$RVF_REPO" --session-id <sid> --run-id <run> --reviewer-id <rid> \
+      --union-with-prior-scope <上一轮 tracker-scope.json> --output-scope <新 scope 路径> --print-result
+  ```
+
+  它把上一轮 scope 里仍可审的 unit 并回本轮（已被真正审掉的不会复活），并从该 artifact 继承 `committed_baseline` / `committed_base_ref` 以恢复口径。结果里 `unioned_prior_scope_unit_ids` 与 events 里的 `scope_reallocated_after_lease_expiry` 是这次并集的证据；packet 的 `## Tracker Scope` 会标出承接自上一轮的那一段，reviewer 据此分辨两段的成熟度。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
 - scope contract v3 的 `review_kind=implementation` 仍审实现整体；`review_kind=base_drift_integration` 只审 `interaction_primary_paths` 所描述的 base/task 交互面，`base_delta_paths` 与 `task_change_paths` 是上下文事实，`candidate_evidence_path` / digest 是必须保持的父证据绑定。v1/v2 contract 继续按既有实现审查读取。
 - `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。

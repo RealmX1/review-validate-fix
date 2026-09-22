@@ -45,6 +45,7 @@
 - **Claude Code 的 hook 是 trigger-only**：`hooks/stop.py` / `hooks/user_prompt_submit.py` 是薄 shim，读 stdin → normalize → 转发到 Codex core 脚本（`stop_review_validate_fix.py` / `rvf_user_prompt_submit.py`）。Claude Code **不重写** review 业务逻辑，只做触发器——这就是「bridged to Codex core」的含义。两入口共享单一 host-ownership 契约 `hooks/_claude_hook_entry.py`（S3，见 §3）。
 - **Codex 的 hook 标 Installer-registered 而非 Native**：Codex runtime 只扫 `~/.codex/hooks.json`、不自动加载 plugin 根的 `hooks.json`（反模式 ③ / 上游 `openai/codex#16430`）。`scripts/install_to_codex.py --configure-stop-hook` 负责把 router 绝对路径写入 `~/.codex/hooks.json`。
 - **OpenCode / Cursor / Hermes / OpenClaw 保持 Reference-only**：只发布 `agentskills.io` 兼容的 skill 文档，不接线 hook / subagent。要升级到 Adapter-backed，按 6 维契约新增一个 `adapters/<host>/`，不动 core。
+- **hook 的「输出」维度另有专文**：Stop hook 有三条出口且各 host 支持面不同（Codex 的 `stop.command.output` 是 `additionalProperties:false`，多发一个 `hookSpecificOutput` 会让整条输出 Failed）。受众分级、线材分流、防死循环保险丝见 [`stop-hook-output-audience-contract.md`](stop-hook-output-audience-contract.md)。
 
 ---
 
@@ -100,4 +101,4 @@
 
 **通用判据**：任一 host 维度若仍需在 `core/` 内写 `if host == "codex"` 式分支，即视为该维度归一未闭合（`rg 'host\s*==\s*["'\'']codex' core/` 应命中 0）。
 
-`scripts/sync-manifest.sh` 是这套形态在 manifest 层的 fail-fast 守护：校验三份 manifest 的 `name`（三处一致）、`version`（两份 plugin.json 一致）、`source` 指向、description 非空；**有意不校验 description 内容相等**（跨 host 文案是设计，不是漂移）。`scripts/check_skill_contracts.sh` 会在本地契约检查中运行它。
+`scripts/sync-manifest.sh` 是这套形态在 manifest 层的 fail-fast 守护：校验**四份** manifest（Claude / Codex / Kimi 三份 nested plugin.json + 源仓库 marketplace）的 `name`（四处一致）、`version`（Claude 与 Codex 两份 plugin.json 一致；marketplace 与 Kimi manifest 都不带 version，跳过）、`source` 指向、description 非空，以及 **Kimi manifest 的 hook 事件集合恰为 `Stop,UserPromptSubmit`**（Kimi 对单条不合格 hook 只 warn + 静默丢弃该条、plugin 仍报 healthy ⇒「看起来装好了、hook 根本不存在」是零报错状态，只能靠这条正向断言抓）；**有意不校验 description 内容相等**（跨 host 文案是设计，不是漂移）。`scripts/check_skill_contracts.sh` 会在本地契约检查中运行它。
