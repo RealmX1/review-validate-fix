@@ -8,7 +8,8 @@
 「重叠 follow-up」历史上确实修过（`5de0c59`），但 `87e9338` 显式接受了「dispatch→delivery 在途窗口
 无去重」这条权衡，理由是「成功时亚秒级」——该前提只对 **app-server 通道**成立。`107e383` 事后用一个
 **15 分钟纯计时器**（pending marker）把去重补了回来，而 terminal fallback 的真实投递延迟由「目标 agent
-还要忙多久」决定，**无上界**，实测 10–17 分钟。计时器于是在旧 prompt 仍排队时判它「丢投」并重投。
+还要忙多久」决定，**无上界**：快时可以 1 分钟内落地，而本文取证的那批出问题的投递实测在 10–17
+分钟（口径与样本偏倚见第 3 节 RC-2）。计时器于是在旧 prompt 仍排队时判它「丢投」并重投。
 
 ## 1. 现象
 
@@ -22,7 +23,7 @@ follow-up prompt 被 UPS 判为 `检测到 dispatch token 但 prep 不可用，�
 |---|---|
 | 16:54:54.108 | run `rvf-20260728T165420Z-stop-hook-4e74ecb0` 写 prep，token `32cce7cf7095790d`，TTL 300s → **16:59:54 过期** |
 | 16:54:58.371 | dispatch 完成：`kanban_followup_delivery_channel=terminal`、`kanban_followup_delivery_confirmed=false`；写 pending，TTL 900s → **17:09:58 过期** |
-| 16:59:54 后 | prep 文件被某次 `sweep_stale()` 从磁盘删除。两条**有** ledger 的 sweep（16:54:54 与 17:10:33，各 24 个文件）的 `removed_paths` 都**不含**它 → 删除者是无 ledger 记录的那个 sweeper |
+| 16:59:54–17:10:33 之间 | prep 文件从磁盘消失。两条**有** ledger 的 sweep（16:54:54 与 17:10:33，各 24 个文件）的 `removed_paths` 都**不含**它；而 17:10:33 那次若还看得见这个已过期的 prep 必然会删它并记进 `removed_paths`，故删除只能发生在它之前 → **删除者未查明**（不是任何有 ledger 的 sweep；具体是谁见第 5 节「观测缺口」行） |
 | 17:10:20.911 | run `rvf-20260728T171007Z-stop-hook-671e13a2` 记 `kanban_followup_prior_dispatch_unconfirmed` → 清 pending、放行重投。**距 pending 过期仅 22 秒** |
 | 17:10:37 | 第二轮 dispatch，token `2810f136fe398bce`，新 pending 至 17:25:37 |
 | 17:11:37.439 | **16:54 那条 terminal prompt 这时才真正成为 user turn** —— 比重投决策晚 77 秒，比 dispatch 晚 16m39s |
@@ -43,8 +44,8 @@ terminal fallback 只是把 prompt 打进目标 session 的**输入队列**；�
 ### RC-2 prep TTL(300s) ≪ 在途窗口(900s)，两个 TTL 倒挂
 于是存在一个结构性的 10 分钟区间：既拒绝重投，手里那条投递又已不可能再跑。
 
-物证（4 个独立日期，全部 terminal 通道）——**凡真正落地过的 terminal follow-up，无一例外是在 prep
-过期之后才落地的**，UPS 一律拒跑：
+物证（4 个独立日期，全部 terminal 通道）——**在「被判丢投」这个样本内**，真正落地过的 terminal
+follow-up 无一例外是在 prep 过期之后才落地的，UPS 一律拒跑：
 
 | token | 日期 | 落地延迟 | UPS 判定 |
 |---|---|---|---|
@@ -53,9 +54,16 @@ terminal fallback 只是把 prompt 打进目标 session 的**输入队列**；�
 | `fb2284f552feb6ea` | 06-22 | +9m55s | `prep expired` |
 | `32cce7cf7095790d` | 07-28 | +16m39s | `prep missing` |
 
-同期共 24 次 `kanban_followup_prior_dispatch_unconfirmed`（`delivery_channel` **全部**为 terminal）；
-其余 20 个 token 在任何 transcript 中都没有作为 user prompt 出现过 = 真丢投，那 20 次重投是对的。
-**只有 4/24 是误判，但误判的代价是双份 dispatch + 一次白跑。**
+样本口径与其偏倚：上表 4 例出自同期 24 次 `kanban_followup_prior_dispatch_unconfirmed`
+（`delivery_channel` **全部**为 terminal）。该事件**按构造**只在 pending 仍在场时才发，而快速落地
+并成功 arm 的投递会把 pending 清掉 —— 这类投递因此永远不会进入这个样本。故上面那条规律只对
+「被判丢投」的子集成立，**不能**推广成「所有 terminal follow-up 都落地于 prep 过期之后」。
+直接反例（同一天、同一 task `052e2`，不在这 24 例内）：token `7ba8d69103ec9943` 15:49:21.839
+写 prep（TTL 300s → 15:54:21.839 过期）、15:49:23.250 派发、**15:50:26.907 就成为 user turn**
+（距 dispatch 63.7s，早于 prep 过期 3m55s），随后正常 arm，不留 pending。
+其余 20 个 token 在任何 transcript 中都**未观测到**作为 user prompt 出现——这是「无落地物证」，
+不足以证明它们真的丢投，也就不足以证明那 20 次重投都是对的。
+**该样本内可确证的误判是 4/24，代价是双份 dispatch + 一次白跑。**
 
 ### RC-3 FU-1「过期可复活」的前提被 sweeper 系统性拆掉
 `revive_prep_file` 只在 `lookup.status == "expired"`（**文件还在**）时可用；而 `sweep_stale()` 会
@@ -95,7 +103,7 @@ UPS 的拒绝分支只写 `payload["systemMessage"]`，而 systemMessage 是 **u
 | RC-3 | **未变，且可救回窗口更窄**。`sweep_stale()` 仍无 protected-token 概念，仍删一切非 `valid`；复活侧新增 `_dispatch_prep_revive_staleness_veto`，进一步收窄 | `rvf_prep_file.py:305`、`rvf_user_prompt_submit.py:1610` 起 |
 | RC-4 | **部分修复**。新增的 `withdrawn` 分支已做到「模型可见 `additionalContext` + 用户可见 `systemMessage`」双管；但 `dispatch_no_prep` 的两个出口仍只写 user-only `systemMessage`（注释明写「不进模型上下文」）→ 模型侧仍是一条裸 `$review-validate-fix` | 已修：`rvf_user_prompt_submit.py:1350`；未修：`:1641`、`:1675` |
 | RC-5 | **主路径被前置封堵，结构缺口未补**。`arm_kanban_followup_lock_on_delivery` 仍无条件 `write_marker` 覆盖；但上游新增 withdrawal tombstone + token CAS，迟到落地的投递在 UPS 侧被硬中和，双跑主路径已切断 | `rvf_user_prompt_submit.py:614`、`rvf_withdrawn_dispatch_tombstone.py` |
-| 观测缺口 | **未变**。`rvf_agent_decision_cli.py:1330` 的 `sweep_stale()` 仍是裸调、无 ledger —— 这正是 07-28 那个 prep「凭空消失、无记录」的元凶所在；stop hook 侧 `:1437` 有 `dispatch_prep_file_sweep_completed` | 同左 |
+| 观测缺口 | **未变**。`rvf_agent_decision_cli.py:1330` 的 `sweep_stale()` 仍是裸调、无 ledger；stop hook 侧 `:1437` 有 `dispatch_prep_file_sweep_completed`（且只在 `swept_paths` 非空时才发）。**但它并不是 07-28 那次删除的元凶**：该裸调只出现在 `default_prepare_pipeline` 内，紧跟在 `start_run("agentic-initiation-start")` 之后，因此每次执行都会留下一个 `*-agentic-initiation-start-*` run 目录；07-28 当天只有一个（`rvf-20260728T095053Z-…-f067daa6`，事件止于 12:32:27Z），完全落在 16:59:54–17:10:33 窗口之外。事故当时部署版 `d6e246c` 里能 unlink prep 文件的只有 `sweep_stale()` 与 `write_prep_file()` 的 token 碰撞分支，两者都对不上 → **删除者仍未查明**，F4 是为把这类删除变得可归因，不是已证实的因果 | 同左 |
 
 ### 5.1 同一事故若发生在 `90a6160` 上会怎样
 
@@ -112,8 +120,17 @@ UPS 的拒绝分支只写 `payload["systemMessage"]`，而 systemMessage 是 **u
 ## 6. 修复方向（建议，本轮不实施）
 
 - **F1 prep 保活**：`sweep_stale()` 增 `protected_tokens`（在途 pending / in-progress marker 引用的
-  token 不删）；prep TTL 与 pending TTL 对齐，消除 300s/900s 倒挂。这能把「落地即废」的 4/4 转成
-  「复活后真正跑起来」。**前提**：必须确认 withdrawal tombstone 覆盖所有撤回路径，否则等于把
+  token 不删）；prep TTL 与 pending TTL 对齐，消除 300s/900s 倒挂。**收益上限是上表 4 例里的 2 例，
+  不是 4/4**：保住文件只解决 `missing`，复活侧还有一道独立上界 ——
+  `_dispatch_prep_revive_staleness_veto` 按 prep 的 `originally_created_at` 起算，超过
+  `DISPATCH_PREP_REVIVE_MAX_AGE_SECONDS`（默认 `15 * 60` = 900s）即否决。于是
+  `c303b7c1161f8e93`（+15m20s）与 `32cce7cf7095790d`（+16m39s）越界，仍复活不了；只有
+  `6710c29bb365c1e9`（+10m02s）与 `fb2284f552feb6ea`（+9m55s）在界内，且还要过该守卫的第二条
+  判据（派发后 transcript 里没有显式人类 prompt）。要真拿到 4/4，得连这条上界一起改，那是另一个
+  权衡（它本身是为挡「会话已走远的旧派发被原地唤醒」而加的）。另外 07-28 那例按第 5.1 节自己的
+  推演属于**已撤回**投递：UPS 在读 prep **之前**先查 withdrawal tombstone 并硬中和，根本走不到
+  复活分支——把一条已撤回的旧轮重新跑起来也不该算作 F1 的收益。F1 的目标应只限
+  「仍有效的在途投递」。**前提**：必须确认 withdrawal tombstone 覆盖所有撤回路径，否则等于把
   「靠 prep 已死而侥幸不双跑」变成真双跑。
 - **F2 补齐 arm 守卫**：`arm_kanban_followup_lock_on_delivery` 增「已有 ACTIVE 且 run_id 不同 → 拒绝、
   `STALE` → 允许接管」。tombstone 是止血机制（其自身注释亦如此定位），不该是唯一防线。
@@ -130,10 +147,18 @@ UPS 的拒绝分支只写 `payload["systemMessage"]`，而 systemMessage 是 **u
 
 ## 7. 复核方式（全部只读）
 
-1. 时间线：`~/.claude/rvf/runs/rvf-20260728T{165420Z-stop-hook-4e74ecb0,171007Z-stop-hook-671e13a2,171315Z-stop-hook-0a5fdf79}/{summary.json,events.jsonl}`。
-2. 「判丢投→重投」全量：扫 `~/.claude/rvf/runs/*/events.jsonl` 里 `event == "kanban_followup_prior_dispatch_unconfirmed"`（24 条）。
-3. 「是否真的落地过」：在 `~/.claude/projects/**/*.jsonl` 中按 token 搜 `type == "user"` 且正文含 `RVF_DISPATCH` 的消息（4/24 落地）。
-4. 「谁删了 prep」：把 `dispatch_prep_file_sweep_completed` 事件的 `removed_paths` 与目标 token 对照 —— 不在任何一条里，即无 ledger 的 sweeper 所为。
+1. 时间线（**run 根口径**：事故当时的 run 根是 `~/.claude/rvf/runs`；双根统一后该 legacy 根已归档、
+   本机不再存在，历史 run 全部迁到 `~/.rvf/user-local-data/run-logs/runs`。以下按**当前**根写，
+   照旧路径执行会直接落空）：
+   `~/.rvf/user-local-data/run-logs/runs/rvf-20260728T{165420Z-stop-hook-4e74ecb0,171007Z-stop-hook-671e13a2,171315Z-stop-hook-0a5fdf79}/{summary.json,events.jsonl}`。
+2. 「判丢投→重投」全量：扫 `~/.rvf/user-local-data/run-logs/runs/*/events.jsonl` 里
+   `event == "kanban_followup_prior_dispatch_unconfirmed"`。**必须加 `timestamp <= 2026-07-28`
+   这条上界**才得到本文的事故窗口口径 24 条；不加上界，2026-09-23 复核时为 33 条。两种口径下
+   `delivery_channel` 都仍是**全部** terminal（该字段在事件内嵌的
+   `kanban_followup_pending_marker.delivery_channel` 里，不在事件顶层）。
+3. 「是否真的落地过」：在 `~/.claude/projects/**/*.jsonl` 中按 token 搜 `type == "user"` 且正文含
+   `RVF_DISPATCH` 的消息（上述 24 条样本内 4 条有落地物证）。
+4. 「谁删了 prep」：把**全量 run** 的 `dispatch_prep_file_sweep_completed` 事件的 `removed_paths` 与目标 token 对照（prep 根 `/tmp/rvf-prep` 是全机共享的，扫某几个 run 不够）——不在任何一条里，只证明「不是任何有 ledger 的 sweep 干的」，**不能**据此指认删除者；再按 `*-agentic-initiation-start-*` run 的时间范围排除 `rvf_agent_decision_cli.py` 的那条裸调（见第 5 节）。
 5. 现状复核：在 local main `90a6160` 上核对第 5 节表格的各处代码锚点。
 
 ## 8. 相关工作
