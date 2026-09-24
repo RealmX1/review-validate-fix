@@ -36,6 +36,7 @@ from typing import Any, Mapping
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 from validation_result_cache import (  # noqa: E402
     canonical_json_bytes,
     clean_git_environment,
@@ -329,8 +330,8 @@ def intent_context_markdown(outcome: Mapping[str, Any]) -> str:
             "凡是与你实际读到的 diff 对不上的条目，按你读到的为准，并在 finding 里点出该出入。"
         )
         lines.append("")
-        for path_value in mechanical_paths:
-            lines.append(f"- `{path_value}`")
+        lines.append("路径相对目标仓库；绝对路径保留前导 /：")
+        lines.append(render_compact_path_tree_block(mechanical_paths))
     else:
         lines.append("_(上游未标注任何机械适配路径)_")
     lines.append("")

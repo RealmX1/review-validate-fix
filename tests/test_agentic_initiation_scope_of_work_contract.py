@@ -108,7 +108,8 @@ def test_agentic_initiation_stub_seeds_the_candidate_paths_as_a_skeleton() -> No
         rvf_dispatch_prompts.AGENTIC_INITIATION_FLOW,
         candidate_paths=["core/a.py", "plugins/b.py"],
     )
-    assert "`core/a.py`" in text and "`plugins/b.py`" in text, text[:600]
+    assert "├── core/\n│   └── a.py\n└── plugins/\n    └── b.py" in text, text[:700]
+    assert "每个文件" in text and "完整的仓库相对路径" in text
     assert "待填" in text
 
     empty = _stub_text(rvf_dispatch_prompts.AGENTIC_INITIATION_FLOW, candidate_paths=[])

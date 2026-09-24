@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from compact_path_tree_rendering import render_compact_path_tree_block
 
 CONFIRM_DIRNAME = "dispatch-confirmations"
 DEFAULT_THRESHOLD_PATHS = 10
@@ -272,11 +273,10 @@ def format_system_message(decision: Decision, *, marker_path: Path) -> str:
         f"- 总 dirty paths: {decision.total_path_count}",
         f"- 触发原因: {decision.reason}",
         "",
-        "前若干超阈路径:",
+        "前若干超阈路径（相对目标仓库）:",
     ]
     if decision.oversize_paths:
-        for path in decision.oversize_paths[:10]:
-            lines.append(f"  - {path}")
+        lines.append(render_compact_path_tree_block(decision.oversize_paths[:10]))
         remaining = max(0, decision.unattributed_path_count - len(decision.oversize_paths[:10]))
         if remaining:
             lines.append(f"  - ...还有 {remaining} 个未显示")

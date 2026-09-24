@@ -184,7 +184,7 @@ def test_intent_artifact_bound_to_this_rounds_receipt_is_consumed(tmp_path: Path
 
     rendered = intent_module.intent_context_markdown(outcome)
     assert "base 把 hook 出口受众收敛成单一契约" in rendered
-    assert "adapters/host_adapter.py" in rendered
+    assert "adapters/\n└── host_adapter.py" in rendered
     assert "Kimi 侧的 systemMessage" in rendered
     # 归因分类的自报性质必须逐字写进注入文本——reviewer 不能把它当已核实事实用。
     assert "自报值" in rendered and "没有任何机器校验" in rendered

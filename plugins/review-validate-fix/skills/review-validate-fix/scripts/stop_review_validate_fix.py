@@ -270,6 +270,7 @@ from rvf_dispatch_prompts import (
 # 破 S4 环），故此处可安全 top-level import，不成环。
 import rvf_decision_token_store as decision_token_store  # noqa: E402
 import stop_decision_candidate_summary  # noqa: E402
+from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 import agentic_initiation_injection_attempt_ledger as injection_attempt_ledger  # noqa: E402
 
 
@@ -9259,13 +9260,22 @@ def _render_decision_point_injection_prompt(
         )
     )
     if candidates:
-        lines.append("  候选路径（change_state / ownership）:")
-        for c in candidates[:40]:
+        shown_candidates = candidates[:40]
+        lines.append(
+            "  候选路径（相对目标 worktree；分组属性适用于组内全部文件）："
+            f"已展示 {len(shown_candidates)} / {len(candidates)} 个文件"
+        )
+        candidate_groups: dict[tuple[str, str], list[str]] = {}
+        for candidate in shown_candidates:
+            group_key = (str(candidate.get("change_state")), str(candidate.get("ownership")))
+            candidate_groups.setdefault(group_key, []).append(str(candidate.get("path")))
+        for (change_state, ownership), paths in sorted(candidate_groups.items()):
             lines.append(
-                f"    - {c.get('path')}  [{c.get('change_state')} / {c.get('ownership')}]"
+                f"\nchange_state={change_state}; ownership={ownership}（本组展示 {len(paths)} 文件）"
             )
+            lines.append(render_compact_path_tree_block(paths))
         if len(candidates) > 40:
-            lines.append(f"    …… 其余 {len(candidates) - 40} 个路径略")
+            lines.append(f"\n其余 {len(candidates) - 40} 个路径略")
     if fork_context is not None:
         lines.append("")
         lines.append(

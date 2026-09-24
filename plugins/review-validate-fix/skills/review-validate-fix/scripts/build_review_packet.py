@@ -12,6 +12,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 IGNORE_FILE = ".review-validate-fix-ignore"
@@ -464,11 +465,11 @@ def build_packet(
         lines.extend(["## Review Scope", ""])
         if primary_files:
             lines.extend(["Primary files for this turn:"])
-            lines.extend(f"- {path}" for path in primary_files)
+            lines.append(render_compact_path_tree_block(primary_files))
             lines.append("")
         if background_files:
             lines.extend(["Background WIP files already present before this turn:"])
-            lines.extend(f"- {path}" for path in background_files)
+            lines.append(render_compact_path_tree_block(background_files))
             lines.append("")
 
     if session_context_text:
@@ -489,13 +490,13 @@ def build_packet(
             ]
         )
         if owned_paths:
-            lines.extend(f"- {path}" for path in owned_paths)
+            lines.append(render_compact_path_tree_block(owned_paths))
         else:
             lines.append("(none)")
         lines.extend(["", "Unattributed dirty paths (background, not default review scope):"])
         unattributed = string_list(session_manifest.get("unattributed_dirty_paths"))
         if unattributed:
-            lines.extend(f"- {path}" for path in unattributed)
+            lines.append(render_compact_path_tree_block(unattributed))
         else:
             lines.append("(none)")
         lines.append("")
@@ -608,7 +609,7 @@ def build_packet(
         scope_paths = [path for path in tracker_scope["paths"] if isinstance(path, str)]
         lines.append("Allocated paths:")
         if scope_paths:
-            lines.extend(f"- {path}" for path in scope_paths)
+            lines.append(render_compact_path_tree_block(scope_paths))
         else:
             lines.append("(none — units are hunk-only; see allocated units above)")
         lines.append("")
@@ -715,7 +716,7 @@ def build_packet(
                     "",
                 ]
             )
-            lines.extend(f"- {path}" for path in background_untracked)
+            lines.append(render_compact_path_tree_block(background_untracked))
             lines.append("")
         inline_untracked = owned_untracked if session_manifest is not None else untracked
         if session_manifest is not None:

@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from _rvf_test_support.compact_path_tree_assertions import paths_from_compact_path_tree_blocks
+
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
     'test_build_packet_metadata_and_scope',
@@ -172,8 +174,10 @@ def test_build_packet_uses_session_manifest_as_scope_anchor(tmp_path: Path) -> N
     assert "## Session-Owned Git Diff" in packet_text
     assert "## Full Git Diff HEAD (Evidence Only)" in packet_text
     assert "Session-owned paths:" in packet_text
-    assert "- tracked.txt" in packet_text
-    assert "- background.txt" in packet_text
+    owned_section = packet_text.split("Session-owned paths:", 1)[1].split("Unattributed dirty paths", 1)[0]
+    assert "tracked.txt" in paths_from_compact_path_tree_blocks(owned_section)
+    background_section = packet_text.split("Unattributed dirty paths (background, not default review scope):", 1)[1]
+    assert "background.txt" in paths_from_compact_path_tree_blocks(background_section.split("\n\n", 1)[0])
     assert "Background untracked paths below were not attributed to this session and are not inlined" in packet_text
     assert "### owned-new.txt" in packet_text
     assert "owned contents" in packet_text
@@ -599,4 +603,3 @@ def test_build_packet_omits_cross_session_section_when_clean(tmp: Path) -> None:
     payload = json.loads(metadata.read_text(encoding="utf-8"))
     assert "## Cross-Session Conflicts" not in packet_text
     assert payload["cross_session_conflicts"] == []
-

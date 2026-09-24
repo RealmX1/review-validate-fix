@@ -25,6 +25,9 @@ SCRIPT_DIR = (
 def load_script_module(name: str):
     if name in sys.modules:
         return sys.modules[name]
+    # 与直接执行 scripts/ 下的入口一致，让共享展示模块等同目录依赖正常导入。
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
     script_path = SCRIPT_DIR / f"{name}.py"
     if not script_path.exists():
         # 已迁入 ``core/`` 的模块（去-codex 重构 S10+）：按 canonical 包路径 import，

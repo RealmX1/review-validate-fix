@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from compact_path_tree_rendering import render_compact_path_tree_block
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
@@ -654,8 +656,8 @@ def render_text(payload: dict[str, Any]) -> str:
     lines.append(f"- Claude write paths before stop: {len(transcript.get('claude_write_paths') or [])}")
     lines.append(f"- Claude write paths still dirty: {len(dirty_write_paths)}")
     if dirty_write_paths:
-        for path in dirty_write_paths:
-            lines.append(f"  - {path}")
+        lines.append("路径相对 repo；绝对路径保留前导 /：")
+        lines.append(render_compact_path_tree_block(dirty_write_paths))
     lines.append("")
     lines.append("Diagnoses:")
     diagnoses = payload.get("diagnoses") if isinstance(payload.get("diagnoses"), list) else []

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from _rvf_test_support.repo import templated_repo
+from _rvf_test_support.compact_path_tree_assertions import paths_from_compact_path_tree_blocks
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 from _rvf_test_support.registry_completeness_guard import (
     assert_every_defined_test_is_registered,
@@ -410,10 +411,11 @@ def assert_decision_point_injection(
     assert "REVIEW-VALIDATE-FIX 发起决策点" in reason, reason[:200]
     assert "RVF_DECISION_TOKEN=" in reason, reason[:200]
     token = reason.split("RVF_DECISION_TOKEN=", 1)[1].splitlines()[0].strip()
+    candidate_paths = paths_from_compact_path_tree_blocks(reason)
     for p in expect_paths:
-        assert p in reason, (p, reason)
+        assert p in candidate_paths, (p, reason)
     for p in forbid_paths:
-        assert p not in reason, (p, reason)
+        assert p not in candidate_paths, (p, reason)
     assert "已注入 RVF 发起决策点" in str(payload.get("systemMessage", "")), payload
     return payload, token
 

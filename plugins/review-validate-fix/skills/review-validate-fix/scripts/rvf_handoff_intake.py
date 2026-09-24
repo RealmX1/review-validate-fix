@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from compact_path_tree_rendering import render_compact_path_tree_block
 from validation_result_cache import clean_git_environment
 from write_reviewed_task_candidate_evidence import (
     EVIDENCE_RELATIVE_PATH,
@@ -517,18 +518,23 @@ def render_text(payload: dict[str, Any]) -> str:
         f"- same_git_common_dir: {payload.get('target_repo_same_git_common_dir_as_current')}",
         f"- rvf_worktree_differs_from_current: {payload.get('rvf_worktree_differs_from_current')}",
         "",
-        "Reviewed scope paths:",
     ]
-    for item in payload.get("scoped_status_in_current_repo") or []:
-        lines.append(f"- {item.get('status') or '--'} {item.get('path')}")
-    unrelated = payload.get("unrelated_dirty_paths_in_current_repo") or []
-    lines.append("")
-    lines.append("Unrelated dirty paths in current repo:")
-    if unrelated:
-        for item in unrelated:
-            lines.append(f"- {item.get('status')} {item.get('path')}")
-    else:
-        lines.append("- <none>")
+    lines.append("路径相对 current_repo；分组 git_status 适用于组内全部文件。")
+    for heading, status_entries in (
+        ("Reviewed scope paths:", payload.get("scoped_status_in_current_repo") or []),
+        ("Unrelated dirty paths in current repo:", payload.get("unrelated_dirty_paths_in_current_repo") or []),
+    ):
+        lines.extend(["", heading])
+        status_groups: dict[str, list[str]] = {}
+        for item in status_entries:
+            status_groups.setdefault(item.get("status") or "--", []).append(item["path"])
+        for status, paths in sorted(status_groups.items()):
+            lines.extend([
+                f"\ngit_status={json.dumps(status, ensure_ascii=False)}（{len(paths)} 文件）",
+                render_compact_path_tree_block(paths),
+            ])
+        if not status_groups:
+            lines.append("- <none>")
     hints = payload.get("conflict_hints") or []
     if hints:
         lines.append("")

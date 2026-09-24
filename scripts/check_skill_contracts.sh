@@ -754,6 +754,9 @@ run_step "tests: stop_hook_output_audience_contract" \
 run_step "tests: agentic_initiation_scope_of_work_contract" \
   python3 -m pytest -q \
     "$tests_dir/test_agentic_initiation_scope_of_work_contract.py"
+run_step "tests: compact_path_tree_rendering" \
+  python3 -m pytest -q \
+    "$tests_dir/test_compact_path_tree_rendering.py"
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
 # request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
 run_step "tests: reviewer_result_artifact_lifecycle" \

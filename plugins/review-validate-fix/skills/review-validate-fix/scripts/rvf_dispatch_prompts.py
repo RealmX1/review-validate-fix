@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from compact_path_tree_rendering import render_compact_path_tree_block
 
 KANBAN_TASK_FLOWS = frozenset({"flow-2-branch", "flow-2-inplace"})
 SELF_RISING_FLOWS = frozenset({"flow-1-self-rising"})
@@ -46,7 +47,12 @@ def _candidate_skeleton_block(candidate_paths: list[str] | None) -> str:
     if not paths:
         return "- _(决策点未带候选路径；请自行列出本轮改动并逐条说明)_\n"
     shown = paths[:40]
-    lines = "".join(f"- `{path}` —— _(待填：这处改了什么、为什么、审的时候该盯哪里)_\n" for path in shown)
+    lines = (
+        "待填：请为下列**每个文件**补充这处改了什么、为什么、审的时候该盯哪里；"
+        "填写时使用完整的仓库相对路径。目录树只压缩展示，不替代逐文件 reasoning。\n\n"
+        f"候选路径（相对目标仓库）：已展示 {len(shown)} / {len(paths)} 个文件\n\n"
+        + render_compact_path_tree_block(shown) + "\n"
+    )
     if len(paths) > len(shown):
         lines += f"- _(另有 {len(paths) - len(shown)} 个候选路径未列出，见 scope contract)_\n"
     return lines

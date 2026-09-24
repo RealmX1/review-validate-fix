@@ -16,8 +16,8 @@ artifact 里：
 设计意图：让 LLM agent 接管时已有结构清晰的起点；同时保证即便 LLM 步骤被跳过，
 用户仍可读到一份带骨架的 artifact。
 
-本模块不依赖任何同 plugin 的兄弟脚本（不 import ``trajectory_capture`` 等），
-保持自包含；所有 schema 字段名以本模块文档为准。
+本模块仅复用无 IO 的路径树渲染器，不 import ``trajectory_capture`` 等运行时模块；
+所有 schema 字段名以本模块文档为准。
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from compact_path_tree_rendering import render_compact_path_tree_block
 ANALYSIS_SCHEMA_VERSION = 2
 ANALYSIS_DIR_NAME = "analysis"
 
@@ -645,13 +646,15 @@ def scaffold_summary_md(
         f"- 每位 reviewer 的 issue 数: {_format_reviewer_counts(stats.reviewer_issue_counts)}"
     )
     if inputs.reviewer_results:
-        lines.append("- review-result.json:")
-        for path in inputs.reviewer_results:
-            lines.append(f"  - `{_rel_or_abs(path, run_dir)}`")
+        lines.append("- review-result.json（相对 run_dir；绝对路径保留前导 /）:")
+        lines.append(render_compact_path_tree_block([
+            _rel_or_abs(path, run_dir) for path in inputs.reviewer_results
+        ]))
     if inputs.reviewer_trajectories:
-        lines.append("- reviewer trajectory.jsonl:")
-        for path in inputs.reviewer_trajectories:
-            lines.append(f"  - `{_rel_or_abs(path, run_dir)}`")
+        lines.append("- reviewer trajectory.jsonl（相对 run_dir；绝对路径保留前导 /）:")
+        lines.append(render_compact_path_tree_block([
+            _rel_or_abs(path, run_dir) for path in inputs.reviewer_trajectories
+        ]))
     lines.append("")
     lines.append(_todo("逐 reviewer 抽取主要 issue 类别、误报模式与遗漏，配合 causality.json 的 issues[] 一起读"))
     lines.append("")
@@ -671,15 +674,14 @@ def scaffold_summary_md(
 
     classification = _classify_changed_paths(inputs)
     if classification is not None:
-        lines.append("- changed_paths × scope contract:")
+        lines.append("- changed_paths × scope contract（相对目标仓库）:")
         for label in ("in_fix_allowlist", "session_owned", "background_wip"):
             members = classification.get(label, [])
             if not members:
                 lines.append(f"  - `{label}`: -")
                 continue
             lines.append(f"  - `{label}` ({len(members)}):")
-            for path in members:
-                lines.append(f"    - `{path}`")
+            lines.append(render_compact_path_tree_block(members))
     lines.append("")
     lines.append(_todo("总结 RVF 真正改了哪些文件 / 哪些是新增 vs 修改 vs 删除，并指出与 issue 的对应关系；workspace-diff 包含背景 WIP 时以 `in_fix_allowlist` 和 attempt `scope_expansion.expanded_paths` 作为本轮真实修复范围"))
     lines.append("")

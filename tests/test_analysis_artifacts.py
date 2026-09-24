@@ -659,13 +659,13 @@ def test_scaffold_summary_classifies_changed_paths_against_scope_contract(
     out_path = run_dir / "artifacts" / "analysis" / "summary.md"
     mod.scaffold_summary_md(inputs, stats, out_path)
     text = out_path.read_text(encoding="utf-8")
-    assert "changed_paths × scope contract:" in text
+    assert "changed_paths × scope contract（相对目标仓库）:" in text
     assert "`in_fix_allowlist` (1):" in text
     assert "`session_owned` (1):" in text
     assert "`background_wip` (1):" in text
-    assert "    - `allowed/a.py`" in text
-    assert "    - `session/b.py`" in text
-    assert "    - `background/c.py`" in text
+    assert "allowed/\n└── a.py" in text
+    assert "session/\n└── b.py" in text
+    assert "background/\n└── c.py" in text
 
 
 # --------------------------------------------------------------------------- #
