@@ -18,7 +18,8 @@ RVF overhaul 把 Stop hook 降级为决策点信使：每当 Stop hook 走到「
 一条记录一行 JSONL，按 ``worktree`` 分片文件（避免所有 worktree 抢同一文件的写竞争）。
 记录字段（过度指定命名，语义自解释）：``recorded_at`` / ``worktree`` / ``session_id`` /
 ``candidate_fingerprint`` / ``candidate_path_count`` / ``has_committed_but_unreviewed`` /
-``mint_outcome``（injected|deduplicated_pending|declined_cooldown|circuit_breaker_tripped 等）/
+``mint_outcome``（injected|deduplicated_pending|declined_cooldown|declined_session_scope_snooze|
+circuit_breaker_tripped 等）/
 ``decision_token``（铸成才有）/ ``injected``（本次是否真的发出了注入 block）/ ``note``。
 """
 from __future__ import annotations
@@ -42,6 +43,8 @@ INJECTION_ATTEMPT_LEDGER_DIRNAME = "agentic-initiation-injection-attempt-ledger"
 INJECTION_OUTCOME_INJECTED = "injected"  # 新铸 token 并发出注入 block
 INJECTION_OUTCOME_DEDUPLICATED_PENDING = "deduplicated_pending"  # 同键活跃 token 已在等待，不重注入
 INJECTION_OUTCOME_DECLINED_COOLDOWN = "declined_cooldown"  # 指纹处于 declined 冷却，静默停
+# 本会话谢绝过这片工作范围、尚未出现工作边界（闸 2b），静默停
+INJECTION_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE = "declined_session_scope_snooze"
 INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"  # 铸造频率熔断，静默停
 INJECTION_OUTCOME_MINT_ANOMALY = "mint_anomaly"  # 铸造抛异常（best-effort 兜底记录）
 # 横幅已交给 cline-kanban 终端投递（带外），**这一刻 agent 还什么都没拿到**。
@@ -177,6 +180,7 @@ __all__ = [
     "INJECTION_OUTCOME_INJECTED",
     "INJECTION_OUTCOME_DEDUPLICATED_PENDING",
     "INJECTION_OUTCOME_DECLINED_COOLDOWN",
+    "INJECTION_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE",
     "INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED",
     "INJECTION_OUTCOME_MINT_ANOMALY",
     "INJECTION_OUTCOME_DELIVERED_OUT_OF_BAND",

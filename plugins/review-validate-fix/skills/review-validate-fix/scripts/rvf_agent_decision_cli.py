@@ -2852,7 +2852,11 @@ def run_decline(
     roots: AgentDecisionRoots | None = None,
     now: datetime | None = None,
 ) -> CommandResult:
-    """``decline`` 子命令：mark_declined（终态 + 指纹入冷却表）+ 理由落 append-only ledger。
+    """``decline`` 子命令：mark_declined（终态 + 指纹入冷却表 + 会话级 snooze）+ 理由落 append-only ledger。
+
+    回执如实报告会话级 snooze 是否落盘（读回磁盘，而非假设 mark_declined 一定写成）：落盘了就告诉
+    agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（无
+    session_id、候选摘要缺工作范围身份、I/O 失败）就只承诺内容指纹冷却。
 
     理由持久化的落点是**磁盘上的 append-only ledger**（``~/.rvf`` 下，路径可注入），刻意在
     transcript / context 之外——rewind 抹不掉磁盘记录（R5/R12：理由必须持久化到 context 之外）。
@@ -2896,10 +2900,28 @@ def run_decline(
         token=token, event="declined", worktree=worktree, session_id=session_id,
         now=now_dt, root=roots.telemetry_root, detail={"reason": reason, "candidate_fingerprint": fingerprint},
     )
+    declined_session_scope_snooze_recorded = (
+        token_store.read_declined_session_scope_snooze(
+            worktree=str(declined.payload.get("worktree") or ""),
+            session_id=str(declined.payload.get("session_id") or ""),
+            cooldown_root=roots.cooldown_root,
+        )
+        is not None
+    )
+    message = "已谢绝本次审查发起；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）"
+    message += (
+        "；本会话已 snooze 这片工作范围——直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），自动 Stop 不再为它弹横幅。"
+        if declined_session_scope_snooze_recorded
+        else "；会话级 snooze 未落盘（缺会话身份或工作范围快照），之后内容一变仍可能再次征询。"
+    )
     return CommandResult(
         command="decline", status="ok", exit_code=EXIT_OK, token=token, token_state=declined.state,
-        message="已谢绝本次审查发起；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）。",
-        detail={"declined_reason_ledger": str(ledger_path), "candidate_fingerprint": fingerprint},
+        message=message,
+        detail={
+            "declined_reason_ledger": str(ledger_path),
+            "candidate_fingerprint": fingerprint,
+            "declined_session_scope_snooze_recorded": declined_session_scope_snooze_recorded,
+        },
     )
 
 
