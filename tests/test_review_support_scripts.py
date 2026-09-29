@@ -7589,6 +7589,299 @@ def test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breake
     assert a3.circuit_breaker.request_count == 3
 
 
+# ---------------------------------------------------------------------------
+# 闸 2b：declined 会话级 snooze（内容变了但工作范围没变 → 静默）
+# ---------------------------------------------------------------------------
+
+def _candidate_summary_carrying_scope_identity(
+    *, paths: list[str], head: str | None, unreviewed_lines: int, baseline: str | None = "base0"
+) -> dict:
+    """用**生产者自己的**打包函数造工作范围身份（不手抄 schema，防 fixture 与生产漂移）。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    return {
+        "candidate_scope_identity_for_declined_session_snooze": (
+            summary_mod._candidate_scope_identity_for_declined_session_snooze(
+                included_candidate_paths=paths,
+                committed_round_baseline=baseline,
+                worktree_head_commit_sha=head,
+                unreviewed_nonblank_changed_line_estimate=unreviewed_lines,
+            )
+        )
+    }
+
+
+def _decline_with_scope_snapshot(dts, roots, *, session_id: str, fingerprint: str, summary: dict, now):
+    minted = dts.mint_decision_token(
+        worktree="/wt", session_id=session_id, candidate_fingerprint=fingerprint,
+        candidate_summary=summary, now=now, **roots,
+    )
+    assert minted.outcome == dts.MINT_OUTCOME_MINTED, minted
+    dts.mark_declined(
+        minted.token, reason="work in progress", root=roots["root"], now=now,
+        cooldown_root=roots["cooldown_root"],
+    )
+    return minted.token
+
+
+def _snooze_lifecycle_events(dts, cooldown_root: Path) -> list[dict]:
+    ledger = (
+        dts.declined_session_scope_snooze_root(cooldown_root)
+        / dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_LEDGER_FILENAME
+    )
+    if not ledger.is_file():
+        return []
+    return [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _snooze_release_events(dts, cooldown_root: Path) -> list[dict]:
+    return [
+        e for e in _snooze_lifecycle_events(dts, cooldown_root)
+        if e["snooze_lifecycle_event"] == dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_RELEASED
+    ]
+
+
+def test_decision_token_declined_session_scope_snooze_silences_content_change_within_same_scope(
+    tmp: Path,
+) -> None:
+    """闸 2b 主用例：agent 谢绝后，同会话同 worktree 内**内容变了但工作范围没变**（同路径集、同 HEAD、
+    未审行数小幅增长）→ 自动铸造静默（``declined_session_scope_snooze``），不落 token、不占熔断额度；
+    snooze 只限定到 ``(worktree, session_id)``——别的会话 / 别的 worktree 照常铸造。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    t0 = _fixed_utc(0)
+    declined_summary = _candidate_summary_carrying_scope_identity(
+        paths=["a.py"], head="h1", unreviewed_lines=10
+    )
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-content-1", summary=declined_summary, now=t0)
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", cooldown_root=roots["cooldown_root"]
+    ) is not None
+    breaker_charge_before = dts.count_recent_mint_requests(
+        "s1", now=t0, root=roots["circuit_breaker_root_dir"]
+    )
+    token_files_before = sorted(Path(roots["root"]).glob("*.json"))
+
+    content_changed_same_scope = _candidate_summary_carrying_scope_identity(
+        paths=["a.py"], head="h1", unreviewed_lines=14
+    )
+    silenced = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-2",
+        candidate_summary=content_changed_same_scope, now=_fixed_utc(60), **roots,
+    )
+    assert silenced.outcome == dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE, silenced
+    assert silenced.token is None and silenced.record is None and silenced.message
+    assert sorted(Path(roots["root"]).glob("*.json")) == token_files_before, "snooze 拒铸不得落 token"
+    assert dts.count_recent_mint_requests(
+        "s1", now=_fixed_utc(60), root=roots["circuit_breaker_root_dir"]
+    ) == breaker_charge_before, "被闸 2b 拦下的请求不得占熔断额度"
+
+    # 限定到会话：另一会话、同 worktree、同内容 → 照常铸造。
+    other_session = dts.mint_decision_token(
+        worktree="/wt", session_id="s2", candidate_fingerprint="fp-content-2",
+        candidate_summary=content_changed_same_scope, now=_fixed_utc(60), **roots,
+    )
+    assert other_session.outcome == dts.MINT_OUTCOME_MINTED, other_session
+    # 限定到 worktree：同会话、另一 worktree → 照常铸造。
+    other_worktree = dts.mint_decision_token(
+        worktree="/other-wt", session_id="s1", candidate_fingerprint="fp-content-2",
+        candidate_summary=content_changed_same_scope, now=_fixed_utc(60), **roots,
+    )
+    assert other_worktree.outcome == dts.MINT_OUTCOME_MINTED, other_worktree
+    # 摘要缺工作范围身份（无从比较）→ 放行（退回今天的行为），快照保留。挪到熔断窗口之外，
+    # 免得与上面同会话的两次铸造一起凑满 3 次/小时。
+    no_identity = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-3",
+        candidate_summary={"paths": ["a.py"]}, now=_fixed_utc(3700), **roots,
+    )
+    assert no_identity.outcome == dts.MINT_OUTCOME_MINTED, no_identity
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", cooldown_root=roots["cooldown_root"]
+    ) is not None
+
+
+def test_decision_token_declined_session_scope_snooze_release_conditions(tmp: Path) -> None:
+    """闸 2b 的解除矩阵：HEAD 变化 / 新路径且未审行数增长 > 50% / 12h 硬 TTL 解除并记解除事件；
+    「只有新路径」或「只有行数暴涨」都**不**解除（两者须同时成立）。"""
+    dts = load_rvf_decision_token_store_module()
+    t0 = _fixed_utc(0)
+
+    def fresh_case(name: str):
+        roots = _decision_token_store_roots(tmp / name)
+        _decline_with_scope_snapshot(
+            dts, roots, session_id="s", fingerprint="fp-declined",
+            summary=_candidate_summary_carrying_scope_identity(paths=["a.py"], head="h1", unreviewed_lines=10),
+            now=t0,
+        )
+        return roots
+
+    def mint(roots, *, paths, head, lines, now, fingerprint="fp-next"):
+        return dts.mint_decision_token(
+            worktree="/wt", session_id="s", candidate_fingerprint=fingerprint,
+            candidate_summary=_candidate_summary_carrying_scope_identity(
+                paths=paths, head=head, unreviewed_lines=lines
+            ),
+            now=now, **roots,
+        )
+
+    # 只有新路径（行数 10→12，+20%）→ 仍静默。
+    roots = fresh_case("new-path-only")
+    assert mint(roots, paths=["a.py", "b.py"], head="h1", lines=12, now=_fixed_utc(60)).outcome == (
+        dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    )
+    # 只有行数暴涨（同路径集，10→100）→ 仍静默。
+    assert mint(roots, paths=["a.py"], head="h1", lines=100, now=_fixed_utc(60)).outcome == (
+        dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    )
+    # 恰好 +50%（10→15）不算「超过」→ 仍静默。
+    assert mint(roots, paths=["a.py", "b.py"], head="h1", lines=15, now=_fixed_utc(60)).outcome == (
+        dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    )
+    # 新路径 **且** 增长 > 50%（10→16）→ 解除。
+    released = mint(roots, paths=["a.py", "b.py"], head="h1", lines=16, now=_fixed_utc(60))
+    assert released.outcome == dts.MINT_OUTCOME_MINTED, released
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s", cooldown_root=roots["cooldown_root"]
+    ) is None, "解除后快照应被清掉"
+    assert [e["release_reason"] for e in _snooze_release_events(dts, roots["cooldown_root"])] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_SCOPE_EXPANSION
+    ]
+
+    # HEAD 变化（提交是工作边界）→ 解除。
+    roots = fresh_case("head-changed")
+    head_changed = mint(roots, paths=["a.py"], head="h2", lines=10, now=_fixed_utc(60))
+    assert head_changed.outcome == dts.MINT_OUTCOME_MINTED, head_changed
+    assert [e["release_reason"] for e in _snooze_release_events(dts, roots["cooldown_root"])] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_WORKTREE_HEAD_CHANGE
+    ]
+
+    # 12h 硬 TTL：差 1 秒仍静默，到点解除。
+    roots = fresh_case("hard-ttl")
+    ttl = dts.DECLINED_SESSION_SCOPE_SNOOZE_HARD_TTL_SECONDS
+    assert ttl == 12 * 3600
+    assert mint(roots, paths=["a.py"], head="h1", lines=10, now=_fixed_utc(ttl - 1)).outcome == (
+        dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    )
+    expired = mint(roots, paths=["a.py"], head="h1", lines=10, now=_fixed_utc(ttl))
+    assert expired.outcome == dts.MINT_OUTCOME_MINTED, expired
+    assert [e["release_reason"] for e in _snooze_release_events(dts, roots["cooldown_root"])] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_HARD_TTL
+    ]
+
+    # 损坏快照按「已过期」处理：宁可多问一次，不让坏快照永久静音。
+    roots = fresh_case("corrupt-snapshot")
+    snooze_files = sorted(dts.declined_session_scope_snooze_root(roots["cooldown_root"]).glob("*/*.json"))
+    assert len(snooze_files) == 1, snooze_files
+    corrupt = json.loads(snooze_files[0].read_text(encoding="utf-8"))
+    corrupt["declined_at"] = "not-a-timestamp"
+    snooze_files[0].write_text(json.dumps(corrupt), encoding="utf-8")
+    assert mint(roots, paths=["a.py"], head="h1", lines=10, now=_fixed_utc(60)).outcome == (
+        dts.MINT_OUTCOME_MINTED
+    )
+
+
+def test_decision_token_explicit_user_request_clears_declined_session_scope_snooze(tmp: Path) -> None:
+    """用户显式触发与闸二同理：闸 2b 对它不适用，且**清除**快照（后续自动路径也重回可审）。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    t0 = _fixed_utc(0)
+    same_scope = _candidate_summary_carrying_scope_identity(paths=["a.py"], head="h1", unreviewed_lines=10)
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-1", summary=same_scope, now=t0)
+
+    manual = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-2", candidate_summary=same_scope,
+        now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED, manual
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", cooldown_root=roots["cooldown_root"]
+    ) is None
+    assert [e["release_reason"] for e in _snooze_release_events(dts, roots["cooldown_root"])] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_EXPLICIT_USER_REQUEST
+    ]
+    automatic_after = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-3", candidate_summary=same_scope,
+        now=_fixed_utc(120), **roots,
+    )
+    assert automatic_after.outcome == dts.MINT_OUTCOME_MINTED, automatic_after
+
+    # 无 session_id 时绝不写 snooze（宁可不 snooze，也不跨会话误伤）。
+    assert dts.record_declined_session_scope_snooze(
+        worktree="/wt", session_id="", candidate_summary=same_scope, cooldown_root=roots["cooldown_root"]
+    ) is None
+
+
+def test_decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing(
+    tmp: Path,
+) -> None:
+    """开发者发话（UPS）**不解除** snooze，只把「范围扩大」基线重置为发话那一刻（=发话前最后一次 Stop
+    的观测）。HEAD 判据仍对照 decline 那一刻；按会话整目录处理，别的会话不受影响；snooze 期间尚无
+    观测时基线保持 decline 那一刻。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cooldown_root = roots["cooldown_root"]
+    t0 = _fixed_utc(0)
+
+    def summary(paths, lines, head="h1"):
+        return _candidate_summary_carrying_scope_identity(paths=paths, head=head, unreviewed_lines=lines)
+
+    def mint(paths, lines, *, seconds, head="h1", session_id="s1", fingerprint=None):
+        return dts.mint_decision_token(
+            worktree="/wt", session_id=session_id,
+            candidate_fingerprint=fingerprint or f"fp-{session_id}-{seconds}",
+            candidate_summary=summary(paths, lines, head), now=_fixed_utc(seconds), **roots,
+        )
+
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-0", summary=summary(["a.py"], 10), now=t0)
+    # snooze 期间继续打磨 a.py（行数 10→40，无新路径）→ 仍静默，并记下这次观测。
+    assert mint(["a.py"], 40, seconds=60).outcome == dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    observed = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+    assert observed["latest_observed_scope_identity_while_snoozed"]["unreviewed_nonblank_changed_line_estimate"] == 40
+    assert observed["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == 10
+
+    # 另一会话也有 snooze（尚无观测）。
+    _decline_with_scope_snapshot(dts, roots, session_id="s2", fingerprint="fp-s2", summary=summary(["a.py"], 10), now=t0)
+
+    rebased = dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+        session_id="s1", now=_fixed_utc(120), cooldown_root=cooldown_root
+    )
+    assert rebased == 1, rebased
+    after_prompt = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+    assert after_prompt is not None, "开发者发话不得解除 snooze"
+    assert after_prompt["scope_expansion_baseline_source"] == "developer_prompt"
+    assert after_prompt["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == 40
+    # HEAD 判据仍对照 decline 那一刻。
+    assert after_prompt["candidate_scope_identity_for_declined_session_snooze"]["unreviewed_nonblank_changed_line_estimate"] == 10
+    lifecycle = _snooze_lifecycle_events(dts, cooldown_root)
+    assert [e["snooze_lifecycle_event"] for e in lifecycle] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_SCOPE_EXPANSION_BASELINE_REBASED_ON_DEVELOPER_PROMPT
+    ]
+    assert lifecycle[0]["scope_expansion_baseline_changed"] is True
+    # 别的会话不受影响。
+    other = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s2", cooldown_root=cooldown_root)
+    assert other["scope_expansion_baseline_source"] == "declined"
+
+    # 相对 decline 那一刻本会解除（新路径 + 10→55），但相对新基线 40 只涨到 55（未超 60）→ 仍静默。
+    assert mint(["a.py", "b.py"], 55, seconds=180).outcome == dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    # 转去做新工作：新路径 + 超过新基线的 50%（40→61）→ 解除并重新征询。
+    released = mint(["a.py", "b.py"], 61, seconds=240)
+    assert released.outcome == dts.MINT_OUTCOME_MINTED, released
+    assert [e["release_reason"] for e in _snooze_release_events(dts, cooldown_root)] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_SCOPE_EXPANSION
+    ]
+
+    # 尚无观测时发话：基线保持 decline 那一刻（s2：10），新路径 + 16 行即解除。
+    assert dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+        session_id="s2", now=_fixed_utc(300), cooldown_root=cooldown_root
+    ) == 1
+    s2_after = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s2", cooldown_root=cooldown_root)
+    assert s2_after["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == 10
+    assert mint(["a.py", "b.py"], 16, seconds=360, session_id="s2").outcome == dts.MINT_OUTCOME_MINTED
+    # 无会话身份 → 什么都不做。
+    assert dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+        session_id="", cooldown_root=cooldown_root
+    ) == 0
+
+
 def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
     """铸造频率熔断（R24 裁决 b）：同 session 3600s 窗口内第 ≥3 次铸造请求拒铸，写 tripped ledger；
     纯计数、零语义；请求滑出窗口后计数重置。"""
@@ -9091,6 +9384,64 @@ def test_candidate_summary_fingerprint_stable_and_change_sensitive(tmp: Path) ->
     assert build()["candidate_fingerprint"] == fp1
 
 
+def test_candidate_summary_scope_fingerprint_ignores_content_but_tracks_paths_and_head(tmp: Path) -> None:
+    """工作范围指纹（闸 2b 用）：内容变 → 不变；新增纳入路径 → 变；HEAD 变 → 变。内容指纹照旧敏感。
+    空摘要也带稳定的工作范围指纹，但不携带身份子字典（无候选根本到不了铸造）。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    repo, base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    (repo / "f.txt").write_text("base\ndirtyA\n", encoding="utf-8")
+
+    def build():
+        return summary_mod.build_candidate_summary(
+            event={"cwd": str(repo)},
+            cwd=str(repo),
+            repo=str(repo),
+            ledger=None,
+            log_root_override=log_root,
+            workspace_guard=lambda **_k: None,
+            task_id_resolver=lambda _e: None,
+            session_id_resolver=lambda _e: "sess-A",
+            committed_baseline_resolver=lambda _rp, _t, _s: base,
+            committed_base_ref_resolver=lambda _rp: None,
+        )
+
+    first = build()
+    identity = first["candidate_scope_identity_for_declined_session_snooze"]
+    assert first["candidate_scope_fingerprint"] == identity["candidate_scope_fingerprint"]
+    assert identity["worktree_head_commit_sha"] == base
+    assert identity["committed_round_baseline"] == base
+    assert identity["included_candidate_paths"] == ["f.txt"]
+    assert identity["unreviewed_nonblank_changed_line_estimate"] >= 1
+    assert identity["candidate_scope_fingerprint_algorithm_version"] == (
+        summary_mod.CANDIDATE_SCOPE_FINGERPRINT_ALGORITHM_VERSION
+    )
+
+    # 内容变：内容指纹变，工作范围指纹不变。
+    (repo / "f.txt").write_text("base\ndirtyA\ndirtyB\n", encoding="utf-8")
+    content_changed = build()
+    assert content_changed["candidate_fingerprint"] != first["candidate_fingerprint"]
+    assert content_changed["candidate_scope_fingerprint"] == first["candidate_scope_fingerprint"]
+
+    # 新增纳入路径：工作范围指纹变。
+    (repo / "g.txt").write_text("new\n", encoding="utf-8")
+    path_added = build()
+    assert path_added["candidate_scope_fingerprint"] != first["candidate_scope_fingerprint"]
+    (repo / "g.txt").unlink()
+
+    # HEAD 变（提交一个无关文件，f.txt 保持 dirty）：工作范围指纹变。
+    (repo / "unrelated.txt").write_text("x\n", encoding="utf-8")
+    run(["git", "add", "unrelated.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "unrelated"], cwd=repo)
+    head_moved = build()
+    assert head_moved["candidate_scope_identity_for_declined_session_snooze"]["worktree_head_commit_sha"] != base
+    assert head_moved["candidate_scope_fingerprint"] != content_changed["candidate_scope_fingerprint"]
+
+    empty = summary_mod._empty_summary(repo=None)
+    assert empty["candidate_scope_fingerprint"].startswith("sha256:")
+    assert empty["candidate_scope_identity_for_declined_session_snooze"] is None
+
+
 def test_candidate_summary_ownership_filters_other_session(tmp: Path) -> None:
     """Q4=a：ownership 作为 filter —— tracker 缓存归属他 session 的路径被排除出候选。"""
     summary_mod, _calc, _hw, dt = _load_candidate_summary_modules()
@@ -9951,6 +10302,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "candidate_summary_scope_fingerprint_ignores_content_but_tracks_paths_and_head",
+            lambda: test_candidate_summary_scope_fingerprint_ignores_content_but_tracks_paths_and_head(
+                root / "candidate-scope-fingerprint"
+            ),
+        ),
+        (
             "candidate_summary_ownership_filters_other_session",
             lambda: test_candidate_summary_ownership_filters_other_session(
                 root / "candidate-ownership"
@@ -10654,6 +11011,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker",
             lambda: test_rvf_user_prompt_submit_manual_is_exempt_from_mint_circuit_breaker(
                 root / "prompt-submit-manual-breaker-exempt"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not",
+            lambda: test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not(
+                root / "prompt-submit-developer-prompt-rebases-session-scope-snooze"
             ),
         ),
         (
@@ -11913,6 +12276,30 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker",
             lambda: test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breaker(
                 root / "dts-user-breaker-exempt"
+            ),
+        ),
+        (
+            "decision_token_declined_session_scope_snooze_silences_content_change_within_same_scope",
+            lambda: test_decision_token_declined_session_scope_snooze_silences_content_change_within_same_scope(
+                root / "dts-session-scope-snooze-silences"
+            ),
+        ),
+        (
+            "decision_token_declined_session_scope_snooze_release_conditions",
+            lambda: test_decision_token_declined_session_scope_snooze_release_conditions(
+                root / "dts-session-scope-snooze-release"
+            ),
+        ),
+        (
+            "decision_token_explicit_user_request_clears_declined_session_scope_snooze",
+            lambda: test_decision_token_explicit_user_request_clears_declined_session_scope_snooze(
+                root / "dts-session-scope-snooze-explicit-clear"
+            ),
+        ),
+        (
+            "decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing",
+            lambda: test_decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing(
+                root / "dts-session-scope-snooze-developer-prompt-rebase"
             ),
         ),
         (
