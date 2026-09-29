@@ -824,7 +824,7 @@ def test_rvf_user_prompt_submit_manual_scope_directive_surfaces_hint_in_injectio
     assert payload["manual_scope_files"] == ["src/a.py", "src/b.py"]
     additional_context = payload["hookSpecificOutput"]["additionalContext"]
     assert "内联指定了 scope: src/a.py, src/b.py" in additional_context
-    assert "rvf-agent scope include/exclude" in additional_context
+    assert "rvf scope include/exclude" in additional_context
 
 
 def test_rvf_user_prompt_submit_manual_no_candidates_emits_systemmessage_no_ledger(

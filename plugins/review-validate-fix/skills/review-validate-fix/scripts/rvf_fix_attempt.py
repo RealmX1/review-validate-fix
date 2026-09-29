@@ -8,6 +8,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -254,17 +255,24 @@ def _commit_all(repo: Path, message: str) -> str:
     return _run(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
 
 
-def command_prepare(args: argparse.Namespace) -> int:
-    run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
-    repo = _required_path(args.repo, "RVF_REPO", "--repo")
-    run_id = _run_id(run_dir, args.run_id)
-    issue = _issue_payload(run_dir, args.issue_id)
+def prepare_fix_attempt(
+    *,
+    run_dir: Path,
+    repo: Path,
+    issue_id: str,
+    run_id_override: str | None = None,
+    attempt_id_override: str | None = None,
+    log_root: Path | None = None,
+) -> dict[str, Any]:
+    """为一条 canonical issue 建隔离 attempt worktree 并落 ``attempt.json``（status=prepared）。"""
+    run_id = _run_id(run_dir, run_id_override)
+    issue = _issue_payload(run_dir, issue_id)
     paths = _issue_paths(issue)
     if not paths:
         raise ValueError("canonical issue must contain at least one relative path")
     fix_allowlist = _scope_fix_allowlist(run_dir)
     boundary_paths = _attempt_boundary(paths, fix_allowlist)
-    attempt_id = args.attempt_id or _attempt_id(run_id, args.issue_id)
+    attempt_id = attempt_id_override or _attempt_id(run_id, issue_id)
     attempt_dir = _attempt_dir(run_dir, attempt_id)
     worktree = attempt_dir / "worktree"
     base_head = _run(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
@@ -279,11 +287,14 @@ def command_prepare(args: argparse.Namespace) -> int:
         if apply_result.returncode != 0:
             raise RuntimeError(apply_result.stderr.strip() or "failed to apply baseline overlay")
     copied_untracked = _copy_untracked(repo, worktree, boundary_paths)
-    baseline_commit = _commit_all(worktree, f"rvf baseline for {args.issue_id}")
+    baseline_commit = _commit_all(worktree, f"rvf baseline for {issue_id}")
     attempt = {
         "schema_version": 1,
         "attempt_id": attempt_id,
-        "issue_id": args.issue_id,
+        "issue_id": issue_id,
+        # ``apply --all-stopped`` 按它排序合回顺序；attempt.json 会被 stop/apply 反复重写，
+        # 文件 mtime 不能当创建时间用。
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "run_id": run_id,
         "repo": str(repo),
         "worktree_path": str(worktree),
@@ -300,7 +311,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=run_id,
-        issue_id=args.issue_id,
+        issue_id=issue_id,
         attempt_id=attempt_id,
         worktree_path=worktree,
         base_head=base_head,
@@ -308,30 +319,84 @@ def command_prepare(args: argparse.Namespace) -> int:
         baseline_commit=baseline_commit,
         status="prepared",
         result_payload=attempt,
-        log_root_override=Path(args.log_root).expanduser().resolve() if args.log_root else None,
+        log_root_override=log_root,
+    )
+    return attempt
+
+
+def _log_root_arg(raw: str | None) -> Path | None:
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    attempt = prepare_fix_attempt(
+        run_dir=_required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir"),
+        repo=_required_path(args.repo, "RVF_REPO", "--repo"),
+        issue_id=args.issue_id,
+        run_id_override=args.run_id,
+        attempt_id_override=args.attempt_id,
+        log_root=_log_root_arg(args.log_root),
     )
     print(json.dumps(attempt, ensure_ascii=False, sort_keys=True))
     return 0
 
 
-def command_start(args: argparse.Namespace) -> int:
-    run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
-    attempt = _load_attempt(run_dir, args.attempt_id)
-    repo = _optional_repo(args.repo, attempt)
+def mark_fix_attempt_started(
+    *,
+    run_dir: Path,
+    attempt_id: str,
+    repo_override: str | None = None,
+    log_root: Path | None = None,
+) -> dict[str, Any]:
+    """纯记账：attempt → started。``rvf fix prepare`` 在派发前一并调用，子代理侧不再需要调它。"""
+    attempt = _load_attempt(run_dir, attempt_id)
+    repo = _optional_repo(repo_override, attempt)
     attempt["status"] = "started"
-    _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
-    result = reviewable_unit_diff_tracker.rvf_attempt_upsert(
+    _write_json(_attempt_dir(run_dir, attempt_id) / "attempt.json", attempt)
+    return reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
         issue_id=attempt["issue_id"],
-        attempt_id=args.attempt_id,
+        attempt_id=attempt_id,
         worktree_path=attempt["worktree_path"],
         status="started",
         result_payload=attempt,
-        log_root_override=Path(args.log_root).expanduser().resolve() if args.log_root else None,
+        log_root_override=log_root,
+    )
+
+
+def command_start(args: argparse.Namespace) -> int:
+    result = mark_fix_attempt_started(
+        run_dir=_required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir"),
+        attempt_id=args.attempt_id,
+        repo_override=args.repo,
+        log_root=_log_root_arg(args.log_root),
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+ATTEMPT_WORKTREE_DIRECTORY_NAME = "worktree"
+FIX_ATTEMPTS_DIRECTORY_NAME = "fix-attempts"
+
+
+def infer_run_dir_and_attempt_id_from_attempt_worktree_path(path: Path) -> tuple[Path, str] | None:
+    """cwd 落在 ``<run_dir>/artifacts/fix-attempts/<attempt_id>/worktree[/…]`` 里时反推两者。
+
+    validate/fix 子代理的 cwd 就是 attempt worktree，路径本身已经编码了它属于哪个 run、哪个
+    attempt——让子代理再手抄一遍 ``--attempt-id`` / ``RVF_RUN_DIR`` 只是多一处出错点。
+    """
+    resolved = Path(path).expanduser().resolve()
+    for candidate in (resolved, *resolved.parents):
+        attempt_dir = candidate.parent
+        if (
+            candidate.name == ATTEMPT_WORKTREE_DIRECTORY_NAME
+            and attempt_dir.parent.name == FIX_ATTEMPTS_DIRECTORY_NAME
+            and attempt_dir.parent.parent.name == "artifacts"
+            and (attempt_dir / "attempt.json").is_file()
+        ):
+            return attempt_dir.parent.parent.parent, attempt_dir.name
+    return None
 
 
 def _intent_to_add_untracked(repo: Path, paths: list[str]) -> None:
@@ -464,7 +529,20 @@ def _sync_issue_state(
 
 
 def command_stop(args: argparse.Namespace) -> int:
-    run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
+    inferred = infer_run_dir_and_attempt_id_from_attempt_worktree_path(Path.cwd())
+    if args.attempt_id is None:
+        if inferred is None:
+            raise ValueError(
+                "--attempt-id is required outside an attempt worktree "
+                "(cwd is not <run_dir>/artifacts/fix-attempts/<attempt_id>/worktree)"
+            )
+        args.attempt_id = inferred[1]
+    if args.run_dir or os.environ.get("RVF_RUN_DIR"):
+        run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
+    elif inferred is not None:
+        run_dir = inferred[0]
+    else:
+        run_dir = _required_path(None, "RVF_RUN_DIR", "--run-dir")
     attempt = _load_attempt(run_dir, args.attempt_id)
     repo = _optional_repo(args.repo, attempt)
     worktree = Path(attempt["worktree_path"]).expanduser().resolve()
@@ -559,11 +637,22 @@ def command_stop(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_apply(args: argparse.Namespace) -> int:
-    run_dir = _required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir")
-    attempt = _load_attempt(run_dir, args.attempt_id)
-    repo = _optional_repo(args.target_repo, attempt)
-    fix_patch = Path(attempt.get("fix_patch_path") or _attempt_dir(run_dir, args.attempt_id) / "fix.patch").resolve()
+FIX_ATTEMPT_APPLY_STATUS_APPLIED = "applied"
+FIX_ATTEMPT_APPLY_STATUS_MERGE_CONFLICT = "merge_conflict"
+FIX_ATTEMPT_APPLY_STATUS_SCOPE_EXPANSION_CONFLICT = "scope_expansion_conflict"
+
+
+def apply_fix_attempt(
+    *,
+    run_dir: Path,
+    attempt_id: str,
+    target_repo_override: str | None = None,
+    log_root: Path | None = None,
+) -> dict[str, Any]:
+    """把 attempt 的 ``fix.patch`` 合回主 RVF worktree，返回 ``{attempt_id, status, stderr}``。"""
+    attempt = _load_attempt(run_dir, attempt_id)
+    repo = _optional_repo(target_repo_override, attempt)
+    fix_patch = Path(attempt.get("fix_patch_path") or _attempt_dir(run_dir, attempt_id) / "fix.patch").resolve()
     if not fix_patch.is_file():
         raise ValueError(f"fix patch not found: {fix_patch}")
     scope_expansion = attempt.get("scope_expansion")
@@ -578,18 +667,26 @@ def command_apply(args: argparse.Namespace) -> int:
             stdout="",
             stderr="scope expansion paths are dirty in target repo: " + ", ".join(expanded_dirty_paths),
         )
-        status = "scope_expansion_conflict"
+        status = FIX_ATTEMPT_APPLY_STATUS_SCOPE_EXPANSION_CONFLICT
     else:
         apply_result = _run(repo, ["apply", "--whitespace=nowarn", str(fix_patch)], check=False)
-        status = "applied" if apply_result.returncode == 0 else "merge_conflict"
+        status = (
+            FIX_ATTEMPT_APPLY_STATUS_APPLIED
+            if apply_result.returncode == 0
+            else FIX_ATTEMPT_APPLY_STATUS_MERGE_CONFLICT
+        )
     attempt["status"] = status
-    _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
-    tracker_status = "merge_conflict" if status == "scope_expansion_conflict" else status
+    _write_json(_attempt_dir(run_dir, attempt_id) / "attempt.json", attempt)
+    tracker_status = (
+        FIX_ATTEMPT_APPLY_STATUS_MERGE_CONFLICT
+        if status == FIX_ATTEMPT_APPLY_STATUS_SCOPE_EXPANSION_CONFLICT
+        else status
+    )
     reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,
         run_id=attempt["run_id"],
         issue_id=attempt["issue_id"],
-        attempt_id=args.attempt_id,
+        attempt_id=attempt_id,
         worktree_path=attempt["worktree_path"],
         fix_patch_path=fix_patch,
         status=tracker_status,
@@ -599,13 +696,23 @@ def command_apply(args: argparse.Namespace) -> int:
             "stdout": apply_result.stdout,
             "stderr": apply_result.stderr,
         },
-        log_root_override=Path(args.log_root).expanduser().resolve() if args.log_root else None,
+        log_root_override=log_root,
     )
-    payload = {"attempt_id": args.attempt_id, "status": status, "stderr": apply_result.stderr}
+    return {"attempt_id": attempt_id, "status": status, "stderr": apply_result.stderr}
+
+
+def command_apply(args: argparse.Namespace) -> int:
+    payload = apply_fix_attempt(
+        run_dir=_required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir"),
+        attempt_id=args.attempt_id,
+        target_repo_override=args.target_repo,
+        log_root=_log_root_arg(args.log_root),
+    )
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-    if status == "applied":
+    status = payload["status"]
+    if status == FIX_ATTEMPT_APPLY_STATUS_APPLIED:
         return 0
-    if status == "scope_expansion_conflict":
+    if status == FIX_ATTEMPT_APPLY_STATUS_SCOPE_EXPANSION_CONFLICT:
         return 4
     return 3
 
@@ -647,7 +754,11 @@ def build_parser() -> argparse.ArgumentParser:
     start.set_defaults(func=command_start)
 
     stop = sub.add_parser("stop")
-    stop.add_argument("--attempt-id", required=True)
+    stop.add_argument(
+        "--attempt-id",
+        default=None,
+        help="Defaults to the attempt whose worktree contains the cwd.",
+    )
     stop.add_argument("--repo", default=None)
     stop.add_argument("--run-dir", default=None)
     stop.add_argument(
