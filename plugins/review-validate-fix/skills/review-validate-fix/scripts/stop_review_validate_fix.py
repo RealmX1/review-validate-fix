@@ -8843,7 +8843,7 @@ def _rvf_analyze_manually_invoked(event: dict[str, Any], latest_user: str | None
 # | minted / injected            | 是    | 保留 park（决策点等 agent）|
 # | acknowledged                 | 是    | 保留 park（start 在途）    |
 # | dispatched                   | 否    | unpark（已派发，交常规流程）|
-# | declined / declined_cooldown | 否    | unpark（已谢绝）          |
+# | declined / declined_cooldown / declined_session_scope_snooze | 否 | unpark（已谢绝）|
 # | lost / expired               | 否    | unpark（决策点已死）      |
 # | 无候选 / 熔断 / 无 token       | 否    | unpark（无 resume）      |
 # 实现：注入/dedup-pending 决策用「resume 在途」reason_code（见 _DECISION_POINT_RESUME_PENDING_REASONS，
@@ -8942,6 +8942,7 @@ def classify_review_initiation_lifecycle(
 REASON_DECISION_POINT_INJECTED = "decision_point_injected"
 REASON_DECISION_POINT_DEDUPLICATED_PENDING = "decision_point_deduplicated_pending"
 REASON_DECISION_POINT_DECLINED_COOLDOWN = "decision_point_declined_cooldown"
+REASON_DECISION_POINT_DECLINED_SESSION_SCOPE_SNOOZE = "decision_point_declined_session_scope_snooze"
 REASON_DECISION_POINT_CIRCUIT_BREAKER = "decision_point_circuit_breaker_tripped"
 REASON_DECISION_POINT_NO_CANDIDATES = "decision_point_no_candidates"
 # 本次 Stop 刚撤掉一枚搁浅横幅 ⇒ 当次就地结束，不在同一次 Stop 里重铸（C-①）。
@@ -9316,6 +9317,10 @@ def _render_decision_point_injection_prompt(
         f"{rvf} dispatch --token {token} --strictness {suggested_tier}"
     )
     lines.append(f"  谢绝（不发起）: {rvf} decline --token {token} --reason \"<一句话理由>\"")
+    lines.append(
+        "  （谢绝会在本会话内 snooze 这片工作范围：直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），"
+        "自动 Stop 都不会再为它弹这条横幅。）"
+    )
     lines.append("")
     lines.append("— 接受之后怎么进入执行（**不会再有第二条注入消息**）—")
     lines.append(
@@ -9942,7 +9947,8 @@ def decision_point_injection_decision(
         - **同步自注入**（task 外 / 非 kanban backend / 逃生口）：mint 后：
             - minted：mark_injected + 以受众 agent_must_act_now 返回（模型可见；线材由 host adapter 决定）；
             - deduplicated：同键活跃 token 已在等待 → 不重注入（R25 幂等），静默停并提醒用户；
-            - declined_cooldown / circuit_breaker_tripped：静默停（后者附熔断告警 systemMessage）。
+            - declined_cooldown / declined_session_scope_snooze / circuit_breaker_tripped：静默停
+              （最后者附熔断告警 systemMessage）。
     * **无论哪种候选非空结局都写 injection-attempt ledger**（负路径不变量：候选非空 ⇒ 有记录）。
 
     接入点标注（S9；范围铁律：以下均**不在本 repo 实现**，录入 Linear 跟踪）：
@@ -10481,7 +10487,8 @@ def _decision_point_non_minted_outcome_decision(
     has_committed: bool,
     lost_warnings: list[str],
 ) -> StopDecision:
-    """三闸拒铸（deduplicated / declined_cooldown / circuit_breaker）的共用出口。
+    """诸闸拒铸（deduplicated / declined_cooldown / declined_session_scope_snooze /
+    circuit_breaker）的共用出口。
 
     两条 transport 走同一份处置：这三种结局都发生在**投递之前**，与横幅怎么送出去无关。
     """
@@ -10548,6 +10555,41 @@ def _decision_point_non_minted_outcome_decision(
             message=(
                 "review-validate-fix: 候选指纹处于 declined 冷却中（agent 已谢绝且改动未变），"
                 "本次 Stop 静默停，不再注入。"
+            ),
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
+    if outcome == decision_token_store.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE:
+        # 闸 2b：本会话谢绝过这片工作范围、尚未出现工作边界。与 declined 冷却同一处置：写注入
+        # 尝试 ledger（候选非空 ⇒ 必有记录）、developer_only 静默停，绝不驱动 agent。
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=injection_attempt_ledger.INJECTION_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE,
+            injected=False,
+            note=mint.message,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_declined_session_scope_snooze",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_DECLINED_SESSION_SCOPE_SNOOZE,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_DECLINED_SESSION_SCOPE_SNOOZE,
+            message=(
+                "review-validate-fix: agent 已在本会话谢绝过这片工作范围（内容有变但范围未明显扩大），"
+                "本次 Stop 静默停，不再注入；提交、范围明显扩大（开发者发话后以那一刻为基线）或 12h 后会重新征询。"
             ),
             repo=repo,
             cwd=cwd,

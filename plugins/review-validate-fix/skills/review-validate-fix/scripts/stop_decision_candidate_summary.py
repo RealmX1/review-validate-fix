@@ -57,6 +57,16 @@ RVF overhaul 把「要不要审、审什么」的发起决策权交给主 agent�
 空候选集 → 仅 ``DOMAIN_TAG`` + 记录分隔符的 sha256（稳定值）。指纹**只看内容**（路径集 + 各
 文件内容摘要），**不含** committed/uncommitted 状态：内容相同时「dirty → committed」这种纯提交
 状态迁移不改变指纹（与 tracker 的 canonical-hash 去重哲学一致——相同可审内容即同一次审查）。
+
+## 工作范围指纹（declined 会话级 snooze 用）—— 与内容指纹**刻意分开**
+
+内容指纹逐字节敏感：工作还在进行时，两次 Stop 之间几乎总有字节改动，于是「指纹未变不再注入」的
+declined 冷却在「边做边停」的会话里形同虚设（实测同一会话 8 天内重复谢绝 12 次）。因此另算一枚
+**粗粒度**的 ``candidate_scope_fingerprint``（``compute_candidate_scope_fingerprint``，版本
+``CANDIDATE_SCOPE_FINGERPRINT_ALGORITHM_VERSION``）：只看「纳入候选集的路径集合 +
+committed_round_baseline + 工作树 HEAD」，**不看**文件内容。它连同判定 snooze 解除所需的原始量
+（HEAD、路径集合、未审行数估计）一起放进摘要的 ``candidate_scope_identity_for_declined_session_snooze``
+子字典，由 token store 的闸 2b 消费。内容指纹的算法与语义保持不变。
 """
 
 from __future__ import annotations
@@ -100,6 +110,8 @@ SUMMARY_SCHEMA_VERSION = 1
 CANDIDATE_FINGERPRINT_ALGORITHM_VERSION = 1
 CANDIDATE_FINGERPRINT_DOMAIN_TAG = b"rvf-agentic-initiation-candidate-fingerprint-v1"
 CANDIDATE_FINGERPRINT_ABSENT_SENTINEL = "absent"
+CANDIDATE_SCOPE_FINGERPRINT_ALGORITHM_VERSION = 1
+CANDIDATE_SCOPE_FINGERPRINT_DOMAIN_TAG = b"rvf-agentic-initiation-candidate-scope-fingerprint-v1"
 
 # change_state 取值。
 CHANGE_STATE_COMMITTED = "committed"
@@ -613,6 +625,69 @@ def compute_candidate_fingerprint(entries: list[tuple[str, str]]) -> str:
     return "sha256:" + hasher.hexdigest()
 
 
+def compute_candidate_scope_fingerprint(
+    included_candidate_paths: Sequence[str],
+    *,
+    committed_round_baseline: str | None,
+    worktree_head_commit_sha: str | None,
+) -> str:
+    """工作范围指纹（粗粒度，**不看内容**）：``sorted(纳入路径) + committed_round_baseline + HEAD``。
+
+    序列化：``DOMAIN_TAG`` + ``\\x1e`` + ``baseline`` + ``\\x00`` + ``HEAD`` + ``\\x00`` + 依次每条
+    ``path + \\x00``（路径按 UTF-8 字节序升序、去重）。缺失的 baseline / HEAD 记空串——NUL 分隔使
+    「空」与任何真实 SHA 不可混淆。输出 ``"sha256:" + hexdigest``。
+    """
+    ordered = sorted(
+        set(included_candidate_paths), key=lambda item: item.encode("utf-8", "surrogateescape")
+    )
+    hasher = hashlib.sha256()
+    hasher.update(CANDIDATE_SCOPE_FINGERPRINT_DOMAIN_TAG)
+    hasher.update(b"\x1e")
+    hasher.update((committed_round_baseline or "").encode("ascii", "surrogateescape"))
+    hasher.update(b"\x00")
+    hasher.update((worktree_head_commit_sha or "").encode("ascii", "surrogateescape"))
+    hasher.update(b"\x00")
+    for path in ordered:
+        hasher.update(path.encode("utf-8", "surrogateescape"))
+        hasher.update(b"\x00")
+    return "sha256:" + hasher.hexdigest()
+
+
+def _candidate_scope_identity_for_declined_session_snooze(
+    *,
+    included_candidate_paths: Sequence[str],
+    committed_round_baseline: str | None,
+    worktree_head_commit_sha: str | None,
+    unreviewed_nonblank_changed_line_estimate: int,
+) -> dict[str, Any]:
+    """闸 2b（declined 会话级 snooze）判定所需的全部原始量，打包成一个子字典。
+
+    token store 只读这个子字典，不去翻 ``candidates`` 列表的形状——摘要 schema 的其余部分可以自由
+    演进而不牵动 snooze 判定。"""
+    ordered_paths = sorted(
+        set(included_candidate_paths), key=lambda item: item.encode("utf-8", "surrogateescape")
+    )
+    return {
+        "candidate_scope_fingerprint": compute_candidate_scope_fingerprint(
+            ordered_paths,
+            committed_round_baseline=committed_round_baseline,
+            worktree_head_commit_sha=worktree_head_commit_sha,
+        ),
+        "candidate_scope_fingerprint_algorithm_version": CANDIDATE_SCOPE_FINGERPRINT_ALGORITHM_VERSION,
+        "worktree_head_commit_sha": worktree_head_commit_sha,
+        "committed_round_baseline": committed_round_baseline,
+        "included_candidate_paths": ordered_paths,
+        "unreviewed_nonblank_changed_line_estimate": int(unreviewed_nonblank_changed_line_estimate),
+    }
+
+
+def _worktree_head_commit_sha(repo_path: Path) -> str | None:
+    """工作树 HEAD 的 commit SHA（空仓 / 非 git / 失败 → None，best-effort）。"""
+    out = _run_git(repo_path, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+    head = (out or "").strip()
+    return head or None
+
+
 # ---------------------------------------------------------------------------
 # committed-round 窗口种子来源标注（R9 后：种子=bootstrap，非「已审」裁决权威）
 # ---------------------------------------------------------------------------
@@ -882,6 +957,17 @@ def build_candidate_summary(
         [(c.path, c.content_sha256) for c in included_candidates]
     )
 
+    # ⑥.5 工作范围身份（闸 2b 用，粗粒度、不看内容；见模块 docstring「工作范围指纹」）。
+    candidate_scope_identity = _candidate_scope_identity_for_declined_session_snooze(
+        included_candidate_paths=[c.path for c in included_candidates],
+        committed_round_baseline=baseline,
+        worktree_head_commit_sha=_worktree_head_commit_sha(repo_path),
+        unreviewed_nonblank_changed_line_estimate=(
+            int(unreviewed_line_estimate["nonblank_added_lines"])
+            + int(unreviewed_line_estimate["nonblank_deleted_lines"])
+        ),
+    )
+
     has_committed_but_unreviewed = any(
         c.change_state in (CHANGE_STATE_COMMITTED, CHANGE_STATE_COMMITTED_AND_UNCOMMITTED)
         for c in included_candidates
@@ -907,6 +993,8 @@ def build_candidate_summary(
         "unreviewed_line_estimate": unreviewed_line_estimate,
         "candidate_fingerprint": fingerprint,
         "candidate_fingerprint_algorithm_version": CANDIDATE_FINGERPRINT_ALGORITHM_VERSION,
+        "candidate_scope_fingerprint": candidate_scope_identity["candidate_scope_fingerprint"],
+        "candidate_scope_identity_for_declined_session_snooze": candidate_scope_identity,
         "strictness_reference": strictness_reference,
         "strictness_reference_unreviewed_estimate": strictness_reference_unreviewed_estimate,
     }
@@ -952,6 +1040,11 @@ def _empty_summary(
         },
         "candidate_fingerprint": compute_candidate_fingerprint([]),
         "candidate_fingerprint_algorithm_version": CANDIDATE_FINGERPRINT_ALGORITHM_VERSION,
+        "candidate_scope_fingerprint": compute_candidate_scope_fingerprint(
+            [], committed_round_baseline=None, worktree_head_commit_sha=None
+        ),
+        # 空摘要不参与 snooze 判定（无候选根本到不了铸造），故身份子字典记 None。
+        "candidate_scope_identity_for_declined_session_snooze": None,
         "strictness_reference": strictness_calculator.compute_strictness_reference([]),
         "strictness_reference_unreviewed_estimate": (
             strictness_calculator.compute_strictness_reference([])
@@ -985,6 +1078,7 @@ def _main(argv: list[str] | None = None) -> int:
 __all__ = [
     "SUMMARY_SCHEMA_VERSION",
     "CANDIDATE_FINGERPRINT_ALGORITHM_VERSION",
+    "CANDIDATE_SCOPE_FINGERPRINT_ALGORITHM_VERSION",
     "CHANGE_STATE_COMMITTED",
     "CHANGE_STATE_UNCOMMITTED",
     "CHANGE_STATE_COMMITTED_AND_UNCOMMITTED",
@@ -998,6 +1092,7 @@ __all__ = [
     "COMMITTED_ROUND_WINDOW_SEED_NONE",
     "CandidateFileChange",
     "compute_candidate_fingerprint",
+    "compute_candidate_scope_fingerprint",
     "build_candidate_summary",
 ]
 

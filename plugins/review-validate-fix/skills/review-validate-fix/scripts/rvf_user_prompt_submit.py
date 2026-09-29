@@ -1537,6 +1537,25 @@ def inspect_user_prompt_submit(
         except Exception:
             pass
 
+    # 闸 2b（declined 会话级 snooze）：开发者发来了真实 prompt ⇒ **不解除** snooze，只把本会话各
+    # snooze 的「范围扩大」对比基线重置为发话那一刻（开发者若转去做新工作，出现新路径且新增量超阈值
+    # 即重新征询；纯提问 / 继续打磨同一批文件仍保持安静）。判据与上面的再入预算复位**同源**——RVF 自己
+    # 的三类机器正文（dispatch token / origin marker / 带外横幅）都不是开发者发话。按会话整目录处理
+    # （不依赖 Stop 侧的 worktree 字符串逐字对齐）；会话身份口径同上：只取 ``event["session_id"]``，
+    # 对不上只会少重置（基线停在 decline 那一刻，更容易解除），不会误伤。best-effort、纯副作用：失败永不
+    # 阻断这条 prompt。
+    if token is None and origin_marker is None and decision_point_token is None:
+        try:
+            import rvf_decision_token_store  # noqa: PLC0415 - lazy, stdlib-only
+
+            snooze_session_id = event.get("session_id")
+            if isinstance(snooze_session_id, str) and snooze_session_id.strip():
+                rvf_decision_token_store.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+                    session_id=snooze_session_id.strip()
+                )
+        except Exception:
+            pass
+
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
     record: rvf_prep_file.PrepFileRecord | None = None

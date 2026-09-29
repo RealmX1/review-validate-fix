@@ -53,6 +53,7 @@ __all__ = [
     'test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector',
     'test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing',
     'test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced',
+    'test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not',
 ]
 
 
@@ -2006,5 +2007,69 @@ def test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
             # ④ 投递意图未被误清，留给后续对账。
             assert Path(intent_path).is_file(), "未推进时不得清掉投递意图"
             assert payload.get("cleared_decision_point_delivery_intent_paths") is None, payload
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not(
+    tmp_path: Path,
+) -> None:
+    """闸 2b：开发者发来真实 prompt ⇒ **不解除** snooze，只把本会话 snooze 的「范围扩大」基线重置为
+    发话那一刻（取 snooze 期间最近一次 Stop 的观测）。
+
+    反例同样关键：带外投递的发起横幅落地成的那条 user message 是 RVF 自己的机器正文，**绝不**能
+    触碰 snooze。别的会话的 snooze 也不能被波及。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, summary_mod = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "snooze-rebase-sess"
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        try:
+            summary = summary_mod.build_candidate_summary(
+                event={"cwd": str(repo), "session_id": session_id},
+                cwd=str(repo), repo=str(repo), ledger=None,
+            )
+            worktree = str(repo.resolve())
+            # 横幅必须在 snooze 落盘**之前**铸出——之后闸 2b 会（正确地）拒铸。
+            _token, banner = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+            for snooze_session_id in (session_id, "someone-else-sess"):
+                assert dts.record_declined_session_scope_snooze(
+                    worktree=worktree, session_id=snooze_session_id, candidate_summary=summary,
+                    reason="work in progress",
+                ) is not None
+            # 模拟 snooze 期间一次 Stop 的观测（未审行数更大）。
+            observed_identity = dict(summary["candidate_scope_identity_for_declined_session_snooze"])
+            observed_identity["unreviewed_nonblank_changed_line_estimate"] = 999
+            dts.consult_declined_session_scope_snooze(
+                worktree=worktree, session_id=session_id,
+                candidate_summary={"candidate_scope_identity_for_declined_session_snooze": observed_identity},
+            )
+
+            def baseline_lines(sid):
+                record = dts.read_declined_session_scope_snooze(worktree=worktree, session_id=sid)
+                assert record is not None, f"{sid} 的 snooze 不应被解除"
+                return record["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"]
+
+            original_lines = summary["candidate_scope_identity_for_declined_session_snooze"][
+                "unreviewed_nonblank_changed_line_estimate"
+            ]
+
+            # ① 横幅作为 user message 落地：机器正文，不碰 snooze。
+            submit.inspect_user_prompt_submit(
+                {"prompt": banner, "cwd": str(repo), "session_id": session_id,
+                 "hook_event_name": "UserPromptSubmit"}
+            )
+            assert baseline_lines(session_id) == original_lines, "横幅落地不得重置基线"
+
+            # ② 开发者真实 prompt：snooze 仍在，基线挪到最近一次观测；别的会话不动。
+            submit.inspect_user_prompt_submit(
+                {"prompt": "继续把 f.txt 的重构做完", "cwd": str(repo), "session_id": session_id,
+                 "hook_event_name": "UserPromptSubmit"}
+            )
+            assert baseline_lines(session_id) == 999
+            assert baseline_lines("someone-else-sess") == original_lines
         finally:
             os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
