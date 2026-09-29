@@ -1294,6 +1294,22 @@ def run_local_deploy(
                 exit_code=2,
                 result=registration_not_certified,
             )
+        # `rvf` 快捷入口 shim：best-effort。装不上时横幅 / 回执自动退到入口脚本绝对路径，
+        # 功能不受影响，所以不因它回滚一次已经收敛的部署——只在结果里如实报出。
+        deployed_plugin_payload_root, _selector, _locate_note = (
+            _deployed_plugin_payload_root_from_installer_receipt(installer_receipt)
+        )
+        try:
+            rvf_command_line_shortcut_shim = install_rvf_command_line_shortcut_shim(
+                home=home,
+                deployed_plugin_payload_root=deployed_plugin_payload_root,
+                python_executable=sys.executable,
+            )
+        except OSError as exc:
+            rvf_command_line_shortcut_shim = {
+                "status": RVF_COMMAND_LINE_SHORTCUT_SHIM_INSTALL_FAILED,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         # `source_commit_delta` 只挂在**成功**结果上，且必须走 `result_for(**extra)`：
         # `result_for` 同时服务 status=running / failed，把它塞进函数本体等于给失败与回滚
         # 结果也发一份「已投入使用」的 forward 列表。位置也必须在上面那个 except 之外——
@@ -1313,9 +1329,85 @@ def run_local_deploy(
             ),
             codex_hook_trust=codex_hook_trust,
             codex_registration_uniqueness=codex_registration_uniqueness,
+            rvf_command_line_shortcut_shim=rvf_command_line_shortcut_shim,
         )
         _write_result_receipt(result_receipt_path, completed)
         return completed
+
+
+RVF_COMMAND_LINE_SHORTCUT_SHIM_INSTALLED = "installed"
+RVF_COMMAND_LINE_SHORTCUT_SHIM_SKIPPED_PAYLOAD_ROOT_UNRESOLVED = "skipped_deployed_payload_root_unresolved"
+RVF_COMMAND_LINE_SHORTCUT_SHIM_SKIPPED_ENTRYPOINT_MISSING = "skipped_entrypoint_missing_in_deployed_payload"
+RVF_COMMAND_LINE_SHORTCUT_SHIM_INSTALL_FAILED = "install_failed"
+RVF_COMMAND_LINE_SHORTCUT_USER_PATH_LINK_CREATED_OR_REFRESHED = "created_or_refreshed"
+RVF_COMMAND_LINE_SHORTCUT_USER_PATH_LINK_SKIPPED_FOREIGN_COMMAND = "skipped_foreign_command_already_present"
+DEPLOYED_PLUGIN_PAYLOAD_RELATIVE_SCRIPTS_DIRECTORY = Path("skills/review-validate-fix/scripts")
+
+
+def install_rvf_command_line_shortcut_shim(
+    *,
+    home: Path,
+    deployed_plugin_payload_root: Path | None,
+    python_executable: str,
+) -> dict[str, Any]:
+    """把 PATH 上的 ``rvf`` 指向**本次部署**的入口脚本。
+
+    写两处：``~/.rvf/bin/rvf``（RVF 自有目录里的 shim 本体，每次部署整份覆盖）与
+    ``~/.local/bin/rvf``（指向 shim 的符号链接，该目录在 Claude Code / Codex 的 shell PATH 上都
+    常见）。后者已被**别人的**同名命令占用时不覆盖，只报出来——渲染侧此时自动退到 shim 绝对路径。
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from core.rvf_command_line_shortcut_shim_location import (  # noqa: PLC0415
+        RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME,
+        is_rvf_owned_command_line_shortcut_shim,
+        render_rvf_command_line_shortcut_shim_script,
+        rvf_command_line_shortcut_shim_path,
+        rvf_command_line_shortcut_user_path_link_path,
+    )
+
+    if deployed_plugin_payload_root is None:
+        return {"status": RVF_COMMAND_LINE_SHORTCUT_SHIM_SKIPPED_PAYLOAD_ROOT_UNRESOLVED}
+    entrypoint = (
+        deployed_plugin_payload_root
+        / DEPLOYED_PLUGIN_PAYLOAD_RELATIVE_SCRIPTS_DIRECTORY
+        / RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME
+    )
+    if not entrypoint.is_file():
+        return {
+            "status": RVF_COMMAND_LINE_SHORTCUT_SHIM_SKIPPED_ENTRYPOINT_MISSING,
+            "entrypoint": str(entrypoint),
+        }
+    shim_path = rvf_command_line_shortcut_shim_path(home)
+    shim_path.parent.mkdir(parents=True, exist_ok=True)
+    staging = shim_path.with_name(f".{shim_path.name}.{os.getpid()}.tmp")
+    staging.write_text(
+        render_rvf_command_line_shortcut_shim_script(
+            entrypoint_script_path=entrypoint, python_executable=python_executable
+        ),
+        encoding="utf-8",
+    )
+    staging.chmod(0o755)
+    staging.replace(shim_path)
+
+    link_path = rvf_command_line_shortcut_user_path_link_path(home)
+    if os.path.lexists(link_path) and not (
+        link_path.is_symlink() and Path(os.readlink(link_path)) == shim_path
+    ) and not is_rvf_owned_command_line_shortcut_shim(link_path):
+        link_status = RVF_COMMAND_LINE_SHORTCUT_USER_PATH_LINK_SKIPPED_FOREIGN_COMMAND
+    else:
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(link_path):
+            link_path.unlink()
+        link_path.symlink_to(shim_path)
+        link_status = RVF_COMMAND_LINE_SHORTCUT_USER_PATH_LINK_CREATED_OR_REFRESHED
+    return {
+        "status": RVF_COMMAND_LINE_SHORTCUT_SHIM_INSTALLED,
+        "shim_path": str(shim_path),
+        "entrypoint": str(entrypoint),
+        "user_path_link": str(link_path),
+        "user_path_link_status": link_status,
+    }
 
 
 def _deployed_plugin_payload_root_from_installer_receipt(
@@ -1586,6 +1678,15 @@ def _print_text(result: dict[str, Any]) -> None:
         result.get("codex_registration_uniqueness") or {}
     )
     _print_codex_hook_trust_observation(result.get("codex_hook_trust") or {})
+    shim = result.get("rvf_command_line_shortcut_shim") or {}
+    print(
+        "rvf 快捷入口 shim:",
+        shim.get("status"),
+        shim.get("shim_path") or shim.get("entrypoint") or shim.get("error") or "",
+        f"(PATH 链接 {shim.get('user_path_link')}: {shim.get('user_path_link_status')})"
+        if shim.get("user_path_link")
+        else "",
+    )
 
 
 # C0（含 ESC / BEL / 换行 / 制表）、DEL 与 C1：终端会把它们当命令而不是字符看待。

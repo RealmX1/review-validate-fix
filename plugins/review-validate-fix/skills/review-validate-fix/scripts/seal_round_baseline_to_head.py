@@ -33,6 +33,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import（marker 迁 core 后需自举）
 from core.session_scope_allocation import round_baseline_marker  # noqa: E402
 from core.session_scope_allocation import review_highwater_marker  # noqa: E402
+from core.host_adapter.current_agent_session_identity_from_environment import (  # noqa: E402
+    resolve_current_agent_session_id_from_environment,
+)
 
 SEAL_PROMPT_EXCERPT = "rvf-land seal (round baseline advanced to landed HEAD)"
 
@@ -84,11 +87,9 @@ def _resolve_task_id() -> str | None:
 
 
 def _resolve_session_id() -> str | None:
-    for key in ("CODEX_SESSION_ID", "CLAUDE_SESSION_ID", "RVF_SESSION_ID"):
-        value = os.environ.get(key)
-        if value and value.strip():
-            return value.strip()
-    return None
+    # 历史上这里读 ``CLAUDE_SESSION_ID``——Claude Code 从未设过这个名字（实际是
+    # ``CLAUDE_CODE_SESSION_ID``），非 kanban 的 Claude 会话里封窗因此一直静默 no-op。
+    return resolve_current_agent_session_id_from_environment()
 
 
 def seal_round_baseline_to_head(repo_arg: str | None = None) -> dict[str, Any]:

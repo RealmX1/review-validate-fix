@@ -66,19 +66,20 @@ def _write_mirror(run_dir: Path, issue_id: str, payload: dict[str, Any]) -> Path
     return path
 
 
-def command_upsert(args: argparse.Namespace) -> int:
-    run_dir_raw = args.run_dir or os.environ.get("RVF_RUN_DIR")
-    if not run_dir_raw:
-        raise ValueError("--run-dir or RVF_RUN_DIR is required")
-    repo_raw = args.repo or os.environ.get("RVF_REPO")
-    if not repo_raw:
-        raise ValueError("--repo or RVF_REPO is required")
-    run_dir = Path(run_dir_raw).expanduser().resolve()
-    repo = Path(repo_raw).expanduser().resolve()
-    issue_file = Path(args.issue_file).expanduser().resolve()
+def upsert_canonical_issue(
+    *,
+    run_dir: Path,
+    repo: Path,
+    issue_file: Path,
+    issue_id_override: str | None = None,
+    run_id_override: str | None = None,
+    state: str = "open",
+    log_root: Path | None = None,
+) -> dict[str, Any]:
+    """把一份 canonical issue JSON 镜像进 run 工件并写入全局 tracker ledger。"""
     payload = _read_json(issue_file)
-    issue_id = _issue_id(payload, args.issue_id)
-    run_id = _run_id(payload, args.run_id, run_dir)
+    issue_id = _issue_id(payload, issue_id_override)
+    run_id = _run_id(payload, run_id_override, run_dir)
     payload = {**payload, "issue_id": issue_id, "run_id": run_id}
     mirror_path = _write_mirror(run_dir, issue_id, payload)
     result = reviewable_unit_diff_tracker.rvf_issue_upsert(
@@ -88,10 +89,29 @@ def command_upsert(args: argparse.Namespace) -> int:
         payload=payload,
         artifact_path=mirror_path,
         source_refs=_source_refs(payload),
-        state=args.state,
-        log_root_override=Path(args.log_root).expanduser().resolve() if args.log_root else None,
+        state=state,
+        log_root_override=log_root,
     )
-    print(json.dumps({**result, "issue_artifact_path": str(mirror_path)}, ensure_ascii=False, sort_keys=True))
+    return {**result, "issue_id": issue_id, "issue_artifact_path": str(mirror_path)}
+
+
+def command_upsert(args: argparse.Namespace) -> int:
+    run_dir_raw = args.run_dir or os.environ.get("RVF_RUN_DIR")
+    if not run_dir_raw:
+        raise ValueError("--run-dir or RVF_RUN_DIR is required")
+    repo_raw = args.repo or os.environ.get("RVF_REPO")
+    if not repo_raw:
+        raise ValueError("--repo or RVF_REPO is required")
+    result = upsert_canonical_issue(
+        run_dir=Path(run_dir_raw).expanduser().resolve(),
+        repo=Path(repo_raw).expanduser().resolve(),
+        issue_file=Path(args.issue_file).expanduser().resolve(),
+        issue_id_override=args.issue_id,
+        run_id_override=args.run_id,
+        state=args.state,
+        log_root=Path(args.log_root).expanduser().resolve() if args.log_root else None,
+    )
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 
 
