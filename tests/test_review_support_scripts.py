@@ -8651,7 +8651,9 @@ def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(t
     )
     assert ok.status == "ok", ok
     assert ok.detail["dispatch_status_path"].endswith(".dispatch-thread.status.json")
-    assert any("--wait-status" in step for step in ok.next_steps), ok.next_steps
+    # 等待改走 `rvf wait`（按 host 分流），不再指引 agent 手动 --wait-status 轮询。
+    assert any(" wait`" in step for step in ok.next_steps), ok.next_steps
+    assert not any("--wait-status" in step for step in ok.next_steps), ok.next_steps
     assert any("plan_status" in step for step in ok.next_steps), ok.next_steps
 
 
@@ -12393,6 +12395,43 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "agent_cli_error_paths_missing_and_terminal_tokens",
             lambda: test_agent_cli_error_paths_missing_and_terminal_tokens(root / "agent-cli-errors"),
         ),
+        # --- RVF 降本 T1：`rvf` 快捷入口（执行段减停） ---
+        (
+            "rvf_shortcut_run_context_resolution_priority",
+            lambda: test_rvf_shortcut_run_context_resolution_priority(root / "rvf-shortcut-context"),
+        ),
+        (
+            "rvf_shortcut_infers_decision_token_for_start_and_dispatch",
+            lambda: test_rvf_shortcut_infers_decision_token_for_start_and_dispatch(root / "rvf-shortcut-token"),
+        ),
+        (
+            "rvf_shortcut_results_summary_reads_canonical_legs_only",
+            lambda: test_rvf_shortcut_results_summary_reads_canonical_legs_only(root / "rvf-shortcut-results"),
+        ),
+        (
+            "rvf_shortcut_wait_mode_and_default_duration_by_host",
+            lambda: test_rvf_shortcut_wait_mode_and_default_duration_by_host(root / "rvf-shortcut-wait-mode"),
+        ),
+        (
+            "rvf_shortcut_fix_prepare_stop_apply_all_stopped_end_to_end",
+            lambda: test_rvf_shortcut_fix_prepare_stop_apply_all_stopped_end_to_end(root / "rvf-shortcut-fix-loop"),
+        ),
+        (
+            "rvf_shortcut_redispatch_reviewers_argv_carries_current_run_dir",
+            lambda: test_rvf_shortcut_redispatch_reviewers_argv_carries_current_run_dir(root / "rvf-shortcut-redispatch"),
+        ),
+        (
+            "rvf_command_line_shortcut_shim_install_and_invocation_resolution",
+            lambda: test_rvf_command_line_shortcut_shim_install_and_invocation_resolution(root / "rvf-shortcut-shim"),
+        ),
+        (
+            "current_agent_session_id_reads_claude_code_session_id",
+            lambda: test_current_agent_session_id_reads_claude_code_session_id(root / "rvf-shortcut-session-id"),
+        ),
+        (
+            "agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
+            lambda: test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root / "agent-cli-start-receipt"),
+        ),
     ]
 
 
@@ -12723,6 +12762,20 @@ _preprev.inject(
     _mint_agent_decision_token=_mint_agent_decision_token,
 )
 globals().update({_n: getattr(_preprev, _n) for _n in _preprev.__all__})
+# RVF 降本 T1：`rvf` 快捷入口测试簇（上下文推断 / wait 摘要 / fix 循环批量化 / shim）。
+from _rvf_review_support import rvf_command_line_shortcut_entrypoint_behaviors as _rvfshortcut
+_rvfshortcut.inject(
+    ROOT=ROOT,
+    SCRIPT_DIR=SCRIPT_DIR,
+    load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,
+    load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
+    _agent_cli_roots=_agent_cli_roots,
+    _mint_agent_decision_token=_mint_agent_decision_token,
+    _agent_cli_stub_prepare=_agent_cli_stub_prepare,
+    _agent_cli_worktree=_agent_cli_worktree,
+    _fixed_utc=_fixed_utc,
+)
+globals().update({_n: getattr(_rvfshortcut, _n) for _n in _rvfshortcut.__all__})
 
 
 

@@ -1248,7 +1248,7 @@ def test_agent_cli_start_parks_on_bootstrap_then_resumes_same_run(tmp_path: Path
     steps = "\n".join(first.next_steps)
     assert "sync-local-base-into-task-worktree-only" in steps
     assert gate_module.SYNC_SKILL_POST_ABSORPTION_REVIEW_OWNER_ENV in steps
-    assert f"rvf-agent start --token {token} --retry" in steps
+    assert f" start --token {token} --retry" in steps
 
     stored = json.loads((roots.token_root / f"{token}.json").read_text(encoding="utf-8"))
     assert gate_module.is_waiting_gate(stored["bootstrap_gate"])
@@ -1874,7 +1874,7 @@ def test_agent_cli_concurrent_bootstrap_resume_claims_prepare_exactly_once(
     assert blocked.detail["bootstrap_reason"] == "bootstrap_replay_in_flight"
     steps = "\n".join(blocked.next_steps)
     assert "**不要**再跑一次同步 skill" in steps
-    assert f"rvf-agent start --token {token} --retry" in steps
+    assert f" start --token {token} --retry" in steps
 
     # ③ 占位在 prepare 收尾后已释放，且它不是一枚会被 token 扫描看见的第二个 token 文件。
     claim_path = dts.bootstrap_replay_claim_path(token, roots.token_root)
