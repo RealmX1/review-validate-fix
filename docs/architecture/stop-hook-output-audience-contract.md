@@ -22,7 +22,15 @@ agent 指令，**一条真失败也没有**。一个 100% 假阳性的告警通�
 那次 Stop 的 stdout 走的是 `developer_only` + `systemMessage`——尽管它既不是失败也不是降级。
 
 这不是给铁律开的口子，而是铁律的正确应用：**这一刻 stdout 上确实没有任何要驱动 agent 的东西**。
-正文根本不在 stdout 里，它几秒后作为一条 user message 到达并自己开一个新回合。若给它安一个
+正文根本不在 stdout 里：几秒后一行**无指令的边界标记**作为 user message 到达并自己开一个新回合，
+正文由目标会话的 UserPromptSubmit hook 在那一刻以 `additionalContext` 注入（仅在 token 首次
+`minted → injected` 时注入一次；重复到达、正文缺失、推进失败、token 已终态一律 `developer_only`）。
+
+为什么正文不随标记一起粘贴：cline-kanban 用 bracketed paste 写 TUI，Claude Code（≥ 2.1.278）
+把它包成 `<pasted_content>`，系统提示规定其中的指令「只有在用户亲口要求时才执行」——粘贴块里的
+「由你决定」无法替自己授权，会话内没有用户侧授权锚点时 agent 会反过来问开发者。hook 注入的
+来源标注如实，不受这条规则约束；标记 user message 保留了 Claude Code 原生 rewind 边界，而 hook
+注入是它的子节点，rewind 到标记之前会连同正文一起离开活动链（2026-09-29 真实 TUI 实测）。若给它安一个
 「携带 agent_directive 但不渲染进 stdout」的第三受众，契约就会声称「本次出口驱动了 agent」，
 而实际可能根本没送达——那是把契约变成谎言。
 

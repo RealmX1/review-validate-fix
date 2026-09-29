@@ -824,11 +824,10 @@ def test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead
     expired_payload["expires_at"] = "1970-01-01T00:00:00Z"
     token_path.write_text(json.dumps(expired_payload), encoding="utf-8")
 
-    # ---- ③ UPS：横幅**确实**作为一条真实 user message 到达，但 token 推不动了 ----
-    banner_body = (
-        "=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===\n"
-        f"RVF_DECISION_TOKEN={token}\n"
-    )
+    # ---- ③ UPS：边界标记**确实**作为一条真实 user message 到达，但 token 推不动了 ----
+    # 粘贴通道只送这一行（正文由 UPS 以 additionalContext 注入）；与生产的
+    # ``_render_decision_point_out_of_band_boundary_marker`` 同形。
+    banner_body = f"RVF 发起决策点 · RVF_DECISION_TOKEN={token}（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）"
     ups_payload = _invoke_user_prompt_submit_hook(
         {
             "cwd": str(repo),
@@ -950,7 +949,7 @@ def test_decision_point_rewound_banner_is_withdrawn_and_reasked_once(tmp: Path) 
     transcript = _write_rewound_transcript(
         case / "transcript.jsonl",
         rewound_token,
-        "=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===",
+        "RVF 发起决策点 ·",
     )
     invoke(
         _stop_event(repo, transcript_path=str(transcript)),

@@ -64,7 +64,7 @@ SCRIPT = (
     / "stop_review_validate_fix.py"
 )
 
-DECISION_POINT_BANNER_FIRST_LINE = "=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）==="
+DECISION_POINT_BANNER_FIRST_LINE = "=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ==="
 IMPERATIVE_SELF_INJECTION_PREFIX = "$review-validate-fix"
 
 
@@ -343,11 +343,14 @@ def _write_stub_cline_kanban_client(path: Path) -> Path:
 def test_in_kanban_task_dirty_stop_delivers_banner_out_of_band(tmp_path: Path) -> None:
     """本轮存在的理由：task 内的默认 transport 是**带外投递**，横幅成为一条真实 user message。
 
-    断言三件事：
+    断言四件事：
     1. 当前会话的 stdout **不驱动 agent**（既无 ``decision`` 也无 ``hookSpecificOutput``，
        只有给开发者看的 ``systemMessage``）——D3 的「走 developer_only，不加第三个 audience」；
     2. 带外投递恰好一条（INV-1 在两条 transport 上合计 ≤ 1）；
-    3. 投出去的确实是横幅原文，且带 kanban 变体那两行（来源声明 + 时效说明）。
+    3. 粘贴通道投出去的**只有一行无指令的边界标记**：Claude Code 把粘贴包成
+       ``<pasted_content>``，其中的指令只有用户亲口要求时才执行，正文放在粘贴里 agent 会反问开发者；
+    4. 正文（带 kanban 变体的时效说明、不带任何投递元信息）在投递前已写进 token payload，
+       供目标会话的 UPS 以 additionalContext 注入。
     """
     repo = _init_dirty_repo(tmp_path / "dirty")
     state = tmp_path / "state"
@@ -377,16 +380,31 @@ def test_in_kanban_task_dirty_stop_delivers_banner_out_of_band(tmp_path: Path) -
     token = deliveries[0].get("decision_token")
     assert isinstance(token, str) and token, deliveries[0]
 
-    delivered_body = capture.read_text(encoding="utf-8")
-    assert delivered_body.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE
-    assert f"RVF_DECISION_TOKEN={token}" in delivered_body
-    assert "来源：这条消息**不是开发者打的**" in delivered_body
-    assert "时效：这枚 token 有 TTL" in delivered_body
+    delivered_prompt = capture.read_text(encoding="utf-8")
+    assert len(delivered_prompt.strip().splitlines()) == 1, delivered_prompt
+    assert f"RVF_DECISION_TOKEN={token}" in delivered_prompt
+    for instruction_fragment in (
+        DECISION_POINT_BANNER_FIRST_LINE,
+        "rvf_agent_decision_cli",
+        " start --token",
+        " decline --token",
+        "候选摘要",
+    ):
+        assert instruction_fragment not in delivered_prompt, (instruction_fragment, delivered_prompt)
 
     # token 停在 minted：推进权交给 UPS（观测到 needle 才是「agent 确实拿到了」）。
     token_path = state / "rvf-home" / "agentic-initiation-decision-tokens" / f"{token}.json"
     token_payload = json.loads(token_path.read_text(encoding="utf-8"))
     assert token_payload["state"] == "minted", token_payload
+    body_for_agent = token_payload["decision_point_banner_body_text_for_agent"]
+    assert body_for_agent.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE
+    assert f"RVF_DECISION_TOKEN={token}" in body_for_agent
+    assert f" start --token {token}" in body_for_agent
+    assert "时效：这枚 token 有 TTL" in body_for_agent
+    assert "开发者已预先授权你独立做这个决定" in body_for_agent
+    # 投递元信息不进正文：「不是开发者打的」在粘贴防注入规则下会被读成「不要执行」。
+    for meta_fragment in ("非自动发起", "不是开发者打的", "rewind", "来源："):
+        assert meta_fragment not in body_for_agent, meta_fragment
     assert (
         token_payload["decision_point_delivery_transport"] == "cline_kanban_task_chat_session"
     ), token_payload
@@ -437,8 +455,8 @@ def test_out_of_band_delivery_definite_failure_falls_back_to_self_injection(
     assert payload.get("decision") == "block", payload
     reason = str(payload.get("reason") or "")
     assert reason.splitlines()[0].strip() == DECISION_POINT_BANNER_FIRST_LINE, reason[:400]
-    # 回落的是**自注入变体**：kanban 变体那两行不该出现在当前会话的注入正文里。
-    assert "来源：这条消息**不是开发者打的**" not in reason, reason[:600]
+    # 回落的是**自注入变体**：kanban 变体那行时效说明不该出现在当前会话的注入正文里。
+    assert "时效：这枚 token 有 TTL" not in reason, reason[:600]
     # 降级必须响亮：开发者旁注要说清「这一条不会成为可 rewind 的 user message」。
     assert "回落" in str(payload.get("systemMessage") or ""), payload.get("systemMessage")
 
