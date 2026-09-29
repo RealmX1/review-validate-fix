@@ -1226,21 +1226,39 @@ def _observe_delivered_decision_point_banner(
     *,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """带外投递的横幅**确实成了一条 user message**——INV-A 达成，在此结算。
+    """带外投递的边界标记**确实成了一条 user message**——INV-A 达成，在此结算。
 
-    它只做三件事：
+    粘贴通道只送一行无指令的边界标记（见 Stop 侧 ``_render_decision_point_out_of_band_boundary_marker``）；
+    决策正文在投递前已写进 token payload，**由这里以 ``additionalContext`` 注入**。正文不走粘贴，
+    是因为 Claude Code 把粘贴包成 ``<pasted_content>`` 并规定其中的指令只有在用户亲口要求时才执行
+    ——粘贴块里的「由你决定」无法替自己授权，agent 会反过来问开发者。hook 注入的来源标注如实。
 
-    1. 把 token 推进 ``injected``（``mark_injected`` 的新语义 = 「agent 确实拿到了这份正文」；
+    它做四件事：
+
+    1. 把 token 推进 ``injected``（``mark_injected`` 的语义 = 「agent 确实拿到了这份正文」；
        同步自注入由 Stop hook 当场推进，带外的推进点就是**这里**）；
     2. 清掉那份带外投递意图（它的使命——覆盖「送出去了没有」的崩溃窗口——到此结束）；
-    3. 落一条诊断 + 一条 user-facing ``systemMessage``。
+    3. 以 ``hookSpecificOutput.additionalContext`` 注入正文（model-facing；各 host 的线材由 hook
+       shim 翻译，例如 Kimi 映射到顶层 ``message``）；
+    4. 落一条诊断 + 一条 user-facing ``systemMessage``。
 
-    **三条出口的文案必须互不借用**（每一步都可能不成立，出口断言只能说到那一步真做成的事）：
+    **正文只在 token 首次 ``minted → injected`` 时注入。** 实测 Claude Code 双 ESC rewind 到标记
+    之前会把标记放回输入框；用户再回车 = 同一个 token 第二次到达。rewind 的本意就是去掉这次征询，
+    所以重复到达一律不注入，只走 developer_only。
 
-    * token 已达终态（withdrawn / dispatched / declined）⇒ 不推进、不清意图，如实报一句；
-    * ``mark_injected`` 抛 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒
-      **未推进**，同样不清意图，走专用文案并保留异常类型；
-    * 只有真的推进成功，才允许输出「推进为 injected」这句断言。
+    **各条出口的文案必须互不借用**（每一步都可能不成立，出口断言只能说到那一步真做成的事）：
+
+    * token 已达终态（withdrawn / dispatched / declined）⇒ 不推进、不清意图、不注入，如实报一句；
+    * 首次到达但 payload 里没有正文 ⇒ **不推进**（agent 并没拿到正文）、不清意图，交给对账；
+    * 迁移（``claim_first_minted_to_injected_transition_exclusively``，锁内原子判定首次到达）抛 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒
+      **未推进**，同样不清意图、不注入，走专用文案并保留异常类型；
+    * 非首次到达（token 已是 injected / acknowledged；含并发到达时在锁内输掉迁移权的那一次）⇒
+      不推进、不注入，如实报一句；
+    * 只有首次到达且真的推进成功，才注入正文并输出「推进为 injected」这句断言。
+
+    推进发生在 stdout 打印之前：若随后 stdout 破裂，token 已是 injected 而 agent 没拿到正文，
+    到期按「看到了没决定」静默 expired。这个窗口只在 hook 进程输出管道断裂时出现，与 manual 路径
+    「flush 后再推进」相比的代价是少一次 lost 告警，换来推进失败时绝不注入正文。
 
     **它绝不 arm 在途锁。** in-progress marker 里 ``decision_token`` 的语义是「agent 已在决策点上
     **显式接受**」，而 awaiting 锁一旦在祖先链上发现 needle 就会把状态升格 ``in_progress`` ⇒ 会对
@@ -1277,10 +1295,51 @@ def _observe_delivered_decision_point_banner(
                 status=str(lookup.state),
             )
             return result
+        decision_point_body_text_for_agent = payload_data.get(
+            decision_token_store.DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY
+        )
+        # 只有 injected / acknowledged 能证明「此前已经到达过一次」。expired / lost / 查无此 token
+        # 是迟到或异常，不是重复提交——它们照旧落进下面锁内迁移的「未能推进」出口。
+        token_already_arrived_before = lookup.state in (
+            decision_token_store.STATE_INJECTED,
+            decision_token_store.STATE_ACKNOWLEDGED,
+        )
+        if token_already_arrived_before:
+            # 同一个 token 第二次到达（rewind 后标记被放回输入框再回车，或用户手抄了标记）：
+            # 首次到达时已经注入过正文并清过意图，这里什么都不再做——连锁内迁移也不调，
+            # 否则 acknowledged / 已过 TTL 的 token 会落进「本该推进但没推成」那条不相干的文案。
+            result["decision_point_banner_resubmitted_without_body_reinjection"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_resubmitted_without_body_reinjection",
+                token=decision_token,
+                status=str(lookup.state),
+            )
+            return result
+
+        if lookup.state == decision_token_store.STATE_MINTED and not (
+            isinstance(decision_point_body_text_for_agent, str)
+            and decision_point_body_text_for_agent.strip()
+        ):
+            # agent 此刻只拿到一行无指令的标记，并没有拿到正文 ⇒ 不推进（injected 的语义是「拿到了
+            # 正文」），意图留给对账（到期撤回并重新征询）。
+            result["decision_token_advanced_to_injected"] = False
+            result["decision_point_banner_body_text_missing"] = True
+            result["decision_point_delivery_intent_left_for_reconciliation"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_arrived_but_body_text_missing",
+                token=decision_token,
+                status=str(lookup.state),
+            )
+            return result
         try:
-            advanced = decision_token_store.mark_injected(decision_token)
-            result["decision_token_state"] = advanced.state
-            result["decision_token_advanced_to_injected"] = True
+            # 上面锁外的读只是快路径：同一 token 的两次 UPS 可能并发到达、都读到 minted。「首次到达」
+            # 的真相必须在 token 排他锁内与迁移一起原子地判定——只有亲手执行了 minted → injected
+            # 的那一次才注入正文；输家走下面「重复到达」的出口（developer_only，只出 systemMessage）。
+            claim_outcome = (
+                decision_token_store.claim_first_minted_to_injected_transition_exclusively(
+                    decision_token
+                )
+            )
         except decision_token_store.DecisionTokenError as exc:
             # 没能推进（TTL 已过 ⇒ ``DecisionTokenExpiredError``、token 文件缺失 ⇒
             # ``DecisionTokenNotFoundError``、状态机拒绝 ⇒ ``DecisionTokenStateError``）。
@@ -1304,6 +1363,20 @@ def _observe_delivered_decision_point_banner(
                 detail=f"{type(exc).__name__}: {exc}",
             )
             return result
+        if not claim_outcome.this_call_won_first_minted_to_injected_transition:
+            # 锁内发现另一次到达已抢先推进（并发到达的输家）：与上面锁外判定出的重复到达同一出口，
+            # 不注入正文、不清意图（赢家负责清）。
+            result["decision_token_state"] = claim_outcome.record.state
+            result["decision_point_banner_resubmitted_without_body_reinjection"] = True
+            result["decision_point_banner_concurrent_arrival_lost_first_injection_claim"] = True
+            result["systemMessage"] = _trigger_system_message(
+                kind="decision_point_banner_resubmitted_without_body_reinjection",
+                token=decision_token,
+                status=claim_outcome.state_observed_inside_lock_before_claim,
+            )
+            return result
+        result["decision_token_state"] = claim_outcome.record.state
+        result["decision_token_advanced_to_injected"] = True
 
         detail = payload_data.get("out_of_band_delivery_detail")
         task_id = detail.get("kanban_task_id") if isinstance(detail, dict) else None
@@ -1316,10 +1389,15 @@ def _observe_delivered_decision_point_banner(
                 task_id=task_id, decision_token=decision_token
             )
             result["cleared_decision_point_delivery_intent_paths"] = cleared
+        result["hookSpecificOutput"] = {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": decision_point_body_text_for_agent,
+        }
+        result["decision_point_banner_body_text_injected_as_additional_context"] = True
         result["systemMessage"] = _trigger_system_message(
             kind="decision_point_banner_delivered",
             token=decision_token,
-            detail="横幅已作为一条真实 user message 到达（可 rewind）",
+            detail="边界标记已作为一条真实 user message 到达（可 rewind）；决策正文已随本 hook 注入",
         )
     except Exception as exc:  # noqa: BLE001 - 记账永不阻断这条 prompt
         result["decision_token_observation_error"] = f"{type(exc).__name__}: {exc}"
@@ -1905,11 +1983,15 @@ def _trigger_system_message(
     - ``manual_summary_failed`` / ``manual_mint_anomaly``：manual 决策点摘要构造 / 铸造异常兜底。
       （declined 冷却 / 铸造熔断对 manual 路径不适用，故无对应 kind——见
       :func:`_handle_manual_decision_point`。）
-    - ``decision_point_banner_delivered``：带外投递的发起横幅**已成为一条真实 user message**
-      （INV-A 达成，token 推进 injected）。
+    - ``decision_point_banner_delivered``：带外投递的边界标记**已成为一条真实 user message**
+      （INV-A 达成，token 推进 injected，决策正文已随本 hook 以 additionalContext 注入）。
+    - ``decision_point_banner_resubmitted_without_body_reinjection``：同一个 token 的标记第二次到达
+      （典型是 rewind 后标记被放回输入框再回车），**不再注入正文**。
+    - ``decision_point_banner_arrived_but_body_text_missing``：标记首次到达，但 token payload 里没有
+      决策正文 ⇒ 未推进、未注入，投递意图留给对账。
     - ``decision_point_banner_terminal_on_arrival``：一份已达终态（withdrawn / dispatched /
       declined）的横幅迟到落地，未推进任何状态。
-    - ``decision_point_banner_arrived_but_token_not_advanced``：横幅落地了但 ``mark_injected``
+    - ``decision_point_banner_arrived_but_token_not_advanced``：横幅落地了但锁内首次迁移
       抛了 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒ **未推进**。与上一条
       刻意分开：那条是「本来就不该推进」，这条是「本该推进但没推成」，善后不同（后者保留投递
       意图交给对账）。两者都**绝不**能借用 ``decision_point_banner_delivered`` 那句断言性文案。
@@ -2004,8 +2086,26 @@ def _trigger_system_message(
         return notice(
             status_value="decision_point_banner_delivered",
             message=(
-                "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，"
-                "决策 token 推进为 injected（等待 agent 显式 start / decline）"
+                "带外投递的 RVF 发起决策点边界标记已作为一条真实 user message 到达，"
+                "决策正文已注入 agent 上下文，决策 token 推进为 injected（等待 agent 显式 start / decline）"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_resubmitted_without_body_reinjection":
+        return notice(
+            status_value=status or "resubmitted",
+            message=(
+                "RVF 发起决策点边界标记再次到达（常见于 rewind 后标记被放回输入框再提交），"
+                "决策正文只在首次到达时注入，本次未注入、未改变任何状态"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_arrived_but_body_text_missing":
+        return notice(
+            status_value=status or "body_text_missing",
+            message=(
+                "RVF 发起决策点边界标记已到达，但 token 里没有决策正文，未注入、决策 token "
+                "未推进；投递意图**未清除**，留给后续对账处置（到期撤回并重新征询）"
             ),
             extra_fields=detail_fields,
         )

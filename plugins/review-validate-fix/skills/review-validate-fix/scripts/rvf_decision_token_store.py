@@ -252,6 +252,10 @@ DECISION_POINT_DELIVERY_TRANSPORTS = frozenset(
 )
 
 
+#: 带外投递时决策点正文在 token payload 里的键。粘贴通道只送一行无指令的边界标记；正文在 mint 后、
+#: 投递前写进这里，目标会话的 UPS hook 观测到标记时读出，以 ``additionalContext`` 注入。
+DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY = "decision_point_banner_body_text_for_agent"
+
 def decision_token_ttl_seconds_for_delivery_transport(transport: str | None) -> int:
     """按 transport 选 TTL：带外投递用 1200s，其余（含 None=同步自注入）沿用 900s。
 
@@ -1520,6 +1524,65 @@ def mark_injected(
         return _apply_lifecycle_transition(record, STATE_INJECTED, now=now_dt)
 
 
+@dataclass(frozen=True)
+class DecisionTokenFirstMintedToInjectedTransitionClaimOutcome:
+    """``claim_first_minted_to_injected_transition_exclusively`` 的结果。
+
+    ``this_call_won_first_minted_to_injected_transition`` 为真 ⇔ 本次调用在 token 排他锁内亲手
+    执行了 ``minted → injected``；为假 ⇔ 锁内看到 token 已经到达过（injected / acknowledged），
+    本次什么都没改。``state_observed_inside_lock_before_claim`` 是锁内读到的那一刻的状态。
+    """
+
+    record: DecisionTokenRecord
+    this_call_won_first_minted_to_injected_transition: bool
+    state_observed_inside_lock_before_claim: str
+
+
+def claim_first_minted_to_injected_transition_exclusively(
+    token: str,
+    *,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+    ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
+) -> DecisionTokenFirstMintedToInjectedTransitionClaimOutcome:
+    """在 token 排他锁内**原子地**抢「首次 ``minted → injected``」的迁移权，并如实报告是否抢到。
+
+    专供带外投递的 UPS 观测点：正文只能在首次到达时注入一次。``mark_injected`` 对已 injected 幂等
+    返回、分不出「是我推进的」还是「别人已推进」，调用方若在锁外先读 state 判定首次到达、再调它，
+    同一 token 的两次 UPS 并发到达都会读到 minted、都认为自己是首次 ⇒ 正文被注入两次。故把
+    「判定 + 迁移」收进同一把锁：
+
+    * 锁内读到 injected / acknowledged ⇒ 已到达过，不改任何东西，返回 ``won=False``（TTL 已过也
+      照此返回——重复到达与 TTL 无关，不该落进「推进失败」那条不相干的出口）；
+    * 否则按 ``mark_injected`` 同一路径加载（含可复活则复活）并迁移，返回 ``won=True``；TTL 过期
+      不可复活 / 缺失 / 非法迁移照旧抛 ``DecisionTokenError`` 子类。
+
+    ``mark_injected`` 本身不变：Stop 自注入与 manual 路径仍按其幂等语义调用。
+    """
+    now_dt = _coerce_now(now)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        lookup_inside_lock = read_decision_token(token, root=root, now=now_dt)
+        if lookup_inside_lock.payload is not None and lookup_inside_lock.state in (
+            STATE_INJECTED,
+            STATE_ACKNOWLEDGED,
+        ):
+            return DecisionTokenFirstMintedToInjectedTransitionClaimOutcome(
+                record=_record_from_lookup(lookup_inside_lock),
+                this_call_won_first_minted_to_injected_transition=False,
+                state_observed_inside_lock_before_claim=str(lookup_inside_lock.state),
+            )
+        record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
+        state_before_claim = record.state
+        advanced = _apply_lifecycle_transition(record, STATE_INJECTED, now=now_dt)
+        return DecisionTokenFirstMintedToInjectedTransitionClaimOutcome(
+            record=advanced,
+            this_call_won_first_minted_to_injected_transition=True,
+            state_observed_inside_lock_before_claim=state_before_claim,
+        )
+
+
 def record_out_of_band_delivery_status(
     token: str,
     *,
@@ -1555,6 +1618,34 @@ def record_out_of_band_delivery_status(
         payload["out_of_band_delivery_status_updated_at"] = format_timestamp(now_dt)
         if detail is not None:
             payload["out_of_band_delivery_detail"] = dict(detail)
+        _atomic_write_json(record.path, payload)
+    return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
+
+
+def record_decision_point_banner_body_text_for_agent(
+    token: str,
+    *,
+    body_text: str,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> DecisionTokenRecord:
+    """把带外投递的决策点正文持久化进 token payload（**正交字段，不动 ``state``**）。
+
+    必须在投递**之前**成功：边界标记一旦落地，UPS 就要从这里读正文；读不到的话 agent 只拿到一行
+    无指令的标记，这次征询白白消耗掉。所以 Stop 侧写失败即当场回落自注入（此刻还没有任何外部副作用）。
+
+    与 ``record_out_of_band_delivery_status`` / ``mark_injected`` 同一把每 token 排他锁，理由相同：
+    锁外读快照再整份覆盖会把并发写入的另一方抹掉。
+    """
+    if not isinstance(body_text, str) or not body_text.strip():
+        raise ValueError("decision point banner body text must be a non-empty string")
+    now_dt = _coerce_now(now)
+    with _with_decision_token_payload_mutation_lock(
+        _decision_token_path_for_payload_mutation_lock(token, root)
+    ):
+        record = _read_record_any(token, root=root, now=now_dt)
+        payload = dict(record.payload)
+        payload[DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY] = body_text
         _atomic_write_json(record.path, payload)
     return DecisionTokenRecord(token=record.token, path=record.path, payload=payload)
 

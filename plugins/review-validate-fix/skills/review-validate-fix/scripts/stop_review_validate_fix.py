@@ -9165,6 +9165,32 @@ def _render_decision_point_unreviewed_estimate_lines(
     return rendered
 
 
+#: 决策点正文的首行。正向陈述「由你决定」，不写任何关于投递方式的元信息。
+DECISION_POINT_BANNER_TITLE_LINE = "=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ==="
+
+
+def _render_decision_point_out_of_band_boundary_marker(*, token: str) -> str:
+    """带外投递时**终端粘贴通道唯一送出的内容**：一行无指令的边界标记。
+
+    为什么正文不走粘贴：cline-kanban 用 bracketed paste 写 TUI，Claude Code（≥2.1.278）把它包成
+    ``<pasted_content>``，系统提示规定粘贴块里的指令「只有在用户亲口要求时才执行」。正文在粘贴块里
+    无法替自己授权 ⇒ 会话内没有用户侧授权锚点时 agent 反问开发者（2026-09-29 实测 3 次中 2 次）。
+
+    所以拆成两半：这一行仍是一条真实 user message（Claude Code 原生 rewind 边界不变，rewind 列表里
+    一眼能认出），但它**不含任何指令**；正文由 UPS hook 以 ``additionalContext`` 注入，来源标注如实
+    是 hook。needle ``RVF_DECISION_TOKEN=<token>`` 必须留在这一行——UPS 靠它观测「边界已成为
+    一条 user message」并注入正文，Stop 的投递回执 (b) 也靠它探 transcript。
+
+    括号里的后半句是给「只看到标记、没看到正文」那种情形的：rewind 到标记之前会把它放回输入框，
+    用户再回车就是一次重复提交，UPS 不再注入正文（见 ``_observe_delivered_decision_point_banner``）。
+    此时 SKILL.md 正文通常不在上下文里，标记必须自己说明白，否则 agent 会反过来问开发者要正文
+    （2026-09-29 真实 TUI 实测）。
+
+    ⚠️ 这一行不得命中除决策点检测器以外的任何 UPS 检测器（尤其是手动触发正则）。
+    """
+    return f"RVF 发起决策点 · RVF_DECISION_TOKEN={token}（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）"
+
+
 def _render_decision_point_injection_prompt(
     *,
     summary: dict[str, Any],
@@ -9180,8 +9206,15 @@ def _render_decision_point_injection_prompt(
     下一次 Stop 的投递回执 (b) 信号在 transcript 中探测，以及带外投递时目标会话的
     UserPromptSubmit hook——**UPS 观测到它 = 横幅确实成了一条真实 user message**（INV-A 的达成信号）。
 
-    ``delivery_transport`` = ``cline_kanban_task_chat_session`` 时补两行：① 来源声明（这条不是开发者
-    打的）；② 时效说明（token 有 TTL；工作树若已变，``start`` 会按候选指纹诚实报出失效）。
+    ``delivery_transport`` = ``cline_kanban_task_chat_session`` 时补一行时效说明（token 有 TTL；工作树
+    若已变，``start`` 会按候选指纹诚实报出失效）。该 transport 下这份正文**不再**经终端粘贴送达：
+    粘贴通道只送 :func:`_render_decision_point_out_of_band_boundary_marker` 那一行无指令的边界标记，
+    正文持久化进 token payload，由目标会话的 UPS hook 以 ``additionalContext`` 注入（见
+    :func:`_decision_point_out_of_band_delivery_decision`）。
+
+    **只写 agent 做决策用得上的话**：传输通道、rewind 语义、「这条是谁打的」之类是写给设计者的
+    元信息，放进设计文档而不是这里——曾经的「（agent 决策，非自动发起）」被读成「不该由你自行
+    发起」，「这条消息不是开发者打的」在 Claude Code 的粘贴防注入规则下被读成「不要执行」。
 
     ⚠️ **改这段文案必须重跑 UPS 全检测器回归**：正文里两处 ``$review-validate-fix`` 只因被反引号
     包着才没命中 ``RVF_MANUAL_TRIGGER_RE``（它要求前面是行首或空白）。一次无心的换行就会让横幅把
@@ -9204,12 +9237,13 @@ def _render_decision_point_injection_prompt(
     ]
 
     lines: list[str] = []
-    lines.append("=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===")
+    lines.append(DECISION_POINT_BANNER_TITLE_LINE)
     lines.append(
         "本轮工作停下时检测到本 worktree **存在未提交（或本轮已提交但未审）的改动**——发起闸看的是"
         "工作树是否干净，**不是**「有没有新工作」；上一轮 RVF 刚审完、你把修复落盘还没提交，这里照样"
         "会再问一次。规模行下方的「已审 / 未审」估算才是判断「还剩多少真没审」的依据。是否发起 RVF 由你"
         "（主 agent）决定：简要评估后，用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。"
+        "开发者已预先授权你独立做这个决定，不需要征询开发者。"
     )
     lines.append(f"RVF_DECISION_TOKEN={token}")
     if (
@@ -9217,11 +9251,6 @@ def _render_decision_point_injection_prompt(
         == decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
     ):
         lines.append("")
-        lines.append(
-            "  来源：这条消息**不是开发者打的**，是 RVF 的 Stop hook 经 cline-kanban 终端投递投进来的"
-            "发起征询。它以一条真实 user message 的形态到达，因此在会话历史里是一个可回退的边界"
-            "（双 ESC 的 rewind 列表里能看到它）——用户随时可以回到它之前。"
-        )
         lines.append(
             "  时效：这枚 token 有 TTL（20 分钟）。若你读到它时工作树已经又变过，直接照常 start 即可"
             "——CLI 会按候选指纹诚实报出失效，不会拿一份过时的候选集去审。"
@@ -10299,8 +10328,8 @@ def _decision_point_self_injection_decision(
 ) -> StopDecision:
     """同步自注入出口：渲染横幅 → 推进 token → 记账 → 以 ``agent_must_act_now`` 返回。
 
-    两个调用方：默认的自注入路径，以及带外投递**确定失败**后的当场回落（INV-B：只在确定失败时
-    回落；结论未知一律静默停）。回落时 ``fell_back_from_out_of_band_delivery`` 带着失败诊断，
+    调用方：默认的自注入路径，以及带外投递**确定失败**后的当场回落（INV-B：只在确定失败时
+    回落；结论未知一律静默停）——「确定失败」含投递前决策点正文写不进 token payload 的情形。回落时 ``fell_back_from_out_of_band_delivery`` 带着失败诊断，
     进 ledger 与开发者旁注——降级必须响亮。
 
     **跨 turn 再入预算必须在这里判，不能只留给出口层 ``emit_stop_hook_payload``。** 出口层那道
@@ -10633,9 +10662,10 @@ def _decision_point_out_of_band_delivery_decision(
     2. 闸内复检本 session 有无「已投出去、agent 还没接到」的横幅——有则静默停，同样不 mint、
        不计熔断。迟到窗口内的重复铸币在此消解。
     3. mint（三闸内建）。
-    4. **写投递意图**——外部副作用之前先持久化，这样进程若在 send 之后、回执之前崩溃，
+    4. 渲染决策点正文并写进 token payload；写不成即当场回落自注入（尚无外部副作用）。
+    5. **写投递意图**——外部副作用之前先持久化，这样进程若在 send 之后、回执之前崩溃，
        下一次 Stop 能从意图对账，不必靠「本进程有没有返回」猜。
-    5. 投递，按回执四态处置（见下表）。
+    6. 投递**一行无指令的边界标记**（正文由 UPS 注入），按回执四态处置（见下表）。
 
     | 回执 | token | 意图 | stdout |
     | --- | --- | --- | --- |
@@ -10782,7 +10812,10 @@ def _decision_point_out_of_band_delivery_decision(
             )
 
         token = mint.token
-        banner = _render_decision_point_injection_prompt(
+        # 正文不走粘贴：粘贴块里的指令会被 Claude Code 的防注入规则当成「用户没写的第三方文本」，
+        # 无法替自己授权。正文先落进 token payload，粘贴只送一行无指令的边界标记，由 UPS 观测到
+        # 标记时以 additionalContext 注入正文（见 _render_decision_point_out_of_band_boundary_marker）。
+        decision_point_body_text_for_agent = _render_decision_point_injection_prompt(
             summary=summary,
             token=token,
             fork_context=fork_context,
@@ -10790,9 +10823,52 @@ def _decision_point_out_of_band_delivery_decision(
                 decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
             ),
         )
+        try:
+            decision_token_store.record_decision_point_banner_body_text_for_agent(
+                token, body_text=decision_point_body_text_for_agent
+            )
+        except Exception as exc:  # noqa: BLE001 - 正文落不了盘 ⇒ 带外这条路走不通
+            # 此刻还没有任何外部副作用（意图未写、没投），回落自注入是**确定安全**的：标记若照投，
+            # UPS 读不到正文，agent 只拿到一行无指令的标记，这次征询白白消耗掉。
+            body_persist_error = f"{type(exc).__name__}: {exc}"
+            ledger.event(
+                phase="gate",
+                event="decision_point_banner_body_text_persist_failed",
+                status="warning",
+                level="warn",
+                reason_code="decision_point_banner_body_text_persist_failed",
+                repo=repo,
+                cwd=cwd,
+                session_id=session_id,
+                decision_token=token,
+                cline_kanban_task_id=task_id,
+                error=body_persist_error,
+            )
+            return _decision_point_self_injection_decision(
+                token=token,
+                summary=summary,
+                fork_context=fork_context,
+                ledger=ledger,
+                repo=repo,
+                cwd=cwd,
+                worktree=worktree,
+                session_id=session_id,
+                fingerprint=fingerprint,
+                candidate_count=candidate_count,
+                has_committed=has_committed,
+                gate_status=gate_status,
+                lost_warnings=lost_warnings,
+                event=event,
+                fell_back_from_out_of_band_delivery={
+                    "summary": f"决策点正文写入 token 失败（{body_persist_error}）",
+                    "terminal_delivery_status": None,
+                    "terminal_delivery_failure_reason": None,
+                },
+            )
+        boundary_marker = _render_decision_point_out_of_band_boundary_marker(token=token)
         idempotency_key = decision_point_out_of_band_idempotency_key(token)
 
-        # ④ 先落意图再产生外部副作用。写不成也继续投——少一条对账线索，好过因为一次
+        # ⑤ 先落意图再产生外部副作用。写不成也继续投——少一条对账线索，好过因为一次
         # 文件系统抖动就把发起路径整个堵死；这一步失败会如实进 ledger。
         intent_path: Any = None
         try:
@@ -10833,7 +10909,7 @@ def _decision_point_out_of_band_delivery_decision(
                 project_path=project_path,
                 task_id=task_id,
                 attempt_id=attempt_id,
-                prompt=banner,
+                prompt=boundary_marker,
                 ledger=ledger,
                 idempotency_key=idempotency_key,
                 artifact_label="decision-point-banner",
@@ -11036,14 +11112,19 @@ def _decision_point_out_of_band_delivery_decision(
             kanban_terminal_delivery_summary=(
                 describe_terminal_delivery_receipt_for_operator(receipt)
             ),
+            # 粘贴通道实际送出的是边界标记；正文在 token payload 里、由 UPS 注入。两份各记一个指纹。
+            decision_point_out_of_band_delivery_boundary_marker_sha256=hashlib.sha256(
+                boundary_marker.encode("utf-8")
+            ).hexdigest(),
             decision_point_out_of_band_delivery_body_sha256=hashlib.sha256(
-                banner.encode("utf-8")
+                decision_point_body_text_for_agent.encode("utf-8")
             ).hexdigest(),
         )
         notice = (
-            f"发起决策点横幅已交给 cline-kanban 终端投递（token={token}，候选 {candidate_count} "
+            f"发起决策点边界标记已交给 cline-kanban 终端投递（token={token}，候选 {candidate_count} "
             f"文件，回执 {receipt.terminal_delivery_status or 'unknown'}）。"
-            "它会以一条**真实 user message** 到达并开启新回合——因此可被 rewind。"
+            "它会以一条**真实 user message** 到达并开启新回合——因此可被 rewind；"
+            "决策正文由 UPS hook 在它到达时注入。"
             "本次 Stop 不向当前会话注入任何东西。"
         )
         if lost_warnings:

@@ -53,6 +53,9 @@ __all__ = [
     'test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detector',
     'test_rvf_user_prompt_submit_withdrawn_decision_point_banner_advances_nothing',
     'test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced',
+    'test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinjects_body',
+    'test_rvf_user_prompt_submit_decision_point_marker_without_body_text_advances_nothing',
+    'test_rvf_user_prompt_submit_concurrent_decision_point_marker_arrivals_inject_body_exactly_once',
 ]
 
 
@@ -1716,22 +1719,23 @@ def test_rvf_user_prompt_submit_declines_reviving_stale_prep(tmp_path: Path) -> 
 
 # --- 带外投递的发起横幅落地：INV-A 的达成信号 --------------------------------------
 
-def _delivered_decision_point_banner_prompt(stop_hook, summary: dict, token: str) -> str:
-    """用**生产渲染函数**造出这条 user message 的正文，绝不在测试里手抄横幅。
+def _delivered_decision_point_boundary_marker_prompt(stop_hook, token: str) -> str:
+    """用**生产渲染函数**造出落地的那条 user message（一行边界标记），绝不在测试里手抄。
 
-    手抄等于给自己发一份永远不会漂移的假正文——而 D9 恰恰要改这段文案，
-    「改文案会不会让横幅把自己判成手动触发」正是这几条用例要守的东西。
+    手抄等于给自己发一份永远不会漂移的假正文——「改文案会不会让标记把自己判成手动触发」
+    正是这几条用例要守的东西。
     """
-    return stop_hook._render_decision_point_injection_prompt(
-        summary=summary,
-        token=token,
-        fork_context=None,
-        delivery_transport="cline_kanban_task_chat_session",
-    )
+    return stop_hook._render_decision_point_out_of_band_boundary_marker(token=token)
 
 
-def _mint_out_of_band_decision_token(dts, stop_hook, repo: Path, session_id: str):
-    """铸一枚带外 transport 的 token 并返回 ``(token, banner)``。"""
+def _mint_out_of_band_decision_token(
+    dts, stop_hook, repo: Path, session_id: str, *, persist_body_text_for_agent: bool = True
+):
+    """铸一枚带外 transport 的 token，按生产次序把正文写进 payload，返回 ``(token, marker)``。
+
+    ``persist_body_text_for_agent=False`` 专供「正文缺失」那条出口：生产上 Stop 侧写不进正文会
+    当场回落自注入、不投标记，这里直接造出那个本不该出现的组合来钉 UPS 的防御。
+    """
     import stop_decision_candidate_summary  # noqa: PLC0415
 
     summary = stop_decision_candidate_summary.build_candidate_summary(
@@ -1748,7 +1752,17 @@ def _mint_out_of_band_decision_token(dts, stop_hook, repo: Path, session_id: str
         delivery_transport=dts.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION,
     )
     assert mint.outcome == dts.MINT_OUTCOME_MINTED, mint
-    return mint.token, _delivered_decision_point_banner_prompt(stop_hook, summary, mint.token)
+    if persist_body_text_for_agent:
+        dts.record_decision_point_banner_body_text_for_agent(
+            mint.token,
+            body_text=stop_hook._render_decision_point_injection_prompt(
+                summary=summary,
+                token=mint.token,
+                fork_context=None,
+                delivery_transport=dts.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION,
+            ),
+        )
+    return mint.token, _delivered_decision_point_boundary_marker_prompt(stop_hook, mint.token)
 
 
 def _load_stop_hook_module_for_ups_tests():
@@ -1808,8 +1822,21 @@ def test_rvf_user_prompt_submit_observes_delivered_decision_point_banner(
             assert dts.read_decision_token(token).state == dts.STATE_INJECTED
             assert not Path(intent_path).exists(), "投递意图应在观测后被清掉"
             assert "真实 user message" in str(payload.get("systemMessage") or "")
-            # 横幅是 RVF 自己的机器正文，不是用户的工作轮边界 ⇒ 不得前移 round baseline。
+            # 标记是 RVF 自己的机器正文，不是用户的工作轮边界 ⇒ 不得前移 round baseline。
             assert "round_baseline" not in payload, payload
+            # 决策正文**只**经 hook 的 model-facing 通道注入（粘贴通道只送了那一行标记）。
+            body_for_agent = dts.read_decision_token(token).payload[
+                dts.DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY
+            ]
+            assert payload["hookSpecificOutput"] == {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": body_for_agent,
+            }, payload
+            assert body_for_agent.splitlines()[0] == stop_hook.DECISION_POINT_BANNER_TITLE_LINE
+            assert "开发者已预先授权你独立做这个决定" in body_for_agent
+            rendered = submit._render_hook_payload(payload)
+            assert rendered["hookSpecificOutput"]["additionalContext"] == body_for_agent, rendered
+            assert isinstance(rendered.get("systemMessage"), str), rendered
         finally:
             os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
 
@@ -1879,6 +1906,14 @@ def test_rvf_user_prompt_submit_decision_point_banner_misses_every_other_detecto
     assert submit._classify_manual_trigger(event, banner) == "none"
     for name, pattern in submit.DISPATCH_ORIGIN_MARKERS:
         assert pattern.search(banner) is None, name
+    # 带外正文经 UPS 注入，不进 prompt，但它会进 transcript（hook 附件）——同样不得命中其它检测器。
+    with _manual_decision_env(tmp_path):
+        body_for_agent = dts.read_decision_token(token).payload[
+            dts.DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY
+        ]
+    assert submit.decision_point_token_from_text(body_for_agent) == token
+    assert submit.dispatch_token_from_text(body_for_agent) is None
+    assert submit.detect_manual_trigger(body_for_agent) is False
     # 自注入变体（transport=None）同样不得命中——两条 transport 用的是同一份正文。
     with _manual_decision_env(tmp_path):
         import stop_decision_candidate_summary  # noqa: PLC0415
@@ -2007,4 +2042,204 @@ def test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
             assert Path(intent_path).is_file(), "未推进时不得清掉投递意图"
             assert payload.get("cleared_decision_point_delivery_intent_paths") is None, payload
         finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinjects_body(
+    tmp_path: Path,
+) -> None:
+    """同一枚 token 的标记第二次到达 ⇒ **不再注入正文**，也不改任何状态。
+
+    实测（Claude Code 2.1.284 交互式 TUI）：双 ESC rewind 到标记之前，标记会被放回输入框；用户再
+    回车就是第二次到达。rewind 的本意就是去掉这次征询，若照样注入正文就等于 rewind 没生效。
+    已 acknowledged（agent 已 start）的 token 同理，也不得落进「本该推进但没推成」的文案。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    event_base = {
+        "cwd": str(repo),
+        "session_id": "banner-resubmit-sess",
+        "hook_event_name": "UserPromptSubmit",
+        "kanban_task_id": "task-banner-resubmit",
+    }
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        try:
+            token, marker = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-resubmit-sess"
+            )
+            first = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+            assert "hookSpecificOutput" in first, first
+            assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+
+            for label in ("injected", "acknowledged"):
+                if label == "acknowledged":
+                    dts.acknowledge_decision_token(token)
+                state_before = dts.read_decision_token(token).state
+                again = submit.inspect_user_prompt_submit(
+                    {**event_base, "prompt": f"{marker}\n用户接着打的字"}
+                )
+                assert "hookSpecificOutput" not in again, (label, again)
+                assert again.get("decision_point_banner_resubmitted_without_body_reinjection") is True, (
+                    label,
+                    again,
+                )
+                system_message = str(again.get("systemMessage") or "")
+                assert "只在首次到达时注入" in system_message, (label, system_message)
+                assert "未能推进" not in system_message, (label, system_message)
+                assert dts.read_decision_token(token).state == state_before, label
+                rendered = submit._render_hook_payload(again)
+                assert "hookSpecificOutput" not in rendered, (label, rendered)
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+def test_rvf_user_prompt_submit_decision_point_marker_without_body_text_advances_nothing(
+    tmp_path: Path,
+) -> None:
+    """标记首次到达但 token 里没有正文 ⇒ 不推进、不注入、不清意图。
+
+    ``injected`` 的语义是「agent 确实拿到了正文」。此刻 agent 只拿到一行无指令的标记，推进就等于
+    谎报交付，TTL 对账会把一次「投出去了没人接」误判成「看到了没决定」而静默 expired。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        try:
+            token, marker = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-bodyless-sess", persist_body_text_for_agent=False
+            )
+            import kanban_followup_lock as kfl  # noqa: PLC0415
+
+            intent_path = kfl.write_decision_point_delivery_intent(
+                task_id="task-banner-bodyless",
+                session_id="banner-bodyless-sess",
+                worktree=str(repo.resolve()),
+                cwd=str(repo),
+                decision_token=token,
+                candidate_fingerprint="fp",
+                kanban_project_path=str(repo),
+                idempotency_key=f"rvf-decision-point-{token}",
+                state=kfl.DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT,
+            )
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": marker,
+                    "cwd": str(repo),
+                    "session_id": "banner-bodyless-sess",
+                    "hook_event_name": "UserPromptSubmit",
+                    "kanban_task_id": "task-banner-bodyless",
+                }
+            )
+            assert "hookSpecificOutput" not in payload, payload
+            assert payload.get("decision_token_advanced_to_injected") is False, payload
+            assert payload.get("decision_point_banner_body_text_missing") is True, payload
+            assert "推进为 injected" not in str(payload.get("systemMessage") or ""), payload
+            assert dts.read_decision_token(token).state == dts.STATE_MINTED
+            assert Path(intent_path).is_file(), "未推进时不得清掉投递意图"
+        finally:
+            os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+
+def test_rvf_user_prompt_submit_concurrent_decision_point_marker_arrivals_inject_body_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """同一枚 token 的两次 UPS **并发**到达 ⇒ 只有赢得锁内 ``minted → injected`` 迁移的那一次注入正文。
+
+    旧实现在 token 锁外 ``read_decision_token`` 判定「首次到达」，随后才调幂等的 ``mark_injected``：
+    两次到达都读到 minted、后到者的 ``mark_injected`` 幂等返回 ⇒ 两次都注入正文、都声称推进成功。
+
+    用受控交错复现：第一次调用的锁外读刚返回（看到 minted）时，插入另一次**完整**的调用，再放第一次
+    带着陈旧的 minted 快照继续往下走。判据只看生产函数的输出与磁盘，不手抄任何正文。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    event_base = {
+        "cwd": str(repo),
+        "session_id": "banner-concurrent-sess",
+        "hook_event_name": "UserPromptSubmit",
+        "kanban_task_id": "task-banner-concurrent",
+    }
+    with _manual_decision_env(tmp_path):
+        os.environ["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(tmp_path / "locks")
+        real_read_decision_token = dts.read_decision_token
+        interleaved_arrival_payloads: list[dict] = []
+        interleaving_already_started: list[bool] = []
+        try:
+            token, marker = _mint_out_of_band_decision_token(
+                dts, stop_hook, repo, "banner-concurrent-sess"
+            )
+
+            def read_then_let_another_arrival_run_to_completion(*args, **kwargs):
+                lookup = real_read_decision_token(*args, **kwargs)
+                if not interleaving_already_started:
+                    # 只交错一次：第一次到达的锁外读已返回 minted，此刻另一次到达完整跑完（先置标志，
+                    # 否则插入的那次调用自己的读也会再触发交错）。
+                    interleaving_already_started.append(True)
+                    assert lookup.state == dts.STATE_MINTED, lookup
+                    interleaved_arrival_payloads.append(
+                        submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+                    )
+                return lookup
+
+            dts.read_decision_token = read_then_let_another_arrival_run_to_completion
+            try:
+                stale_snapshot_arrival = submit.inspect_user_prompt_submit(
+                    {**event_base, "prompt": marker}
+                )
+            finally:
+                dts.read_decision_token = real_read_decision_token
+
+            assert len(interleaved_arrival_payloads) == 1, interleaved_arrival_payloads
+            winner = interleaved_arrival_payloads[0]
+            assert winner["status"] == "decision_point_banner_delivered", winner
+            assert winner.get("decision_token_advanced_to_injected") is True, winner
+            assert "hookSpecificOutput" in winner, winner
+
+            # 输家：持有陈旧的 minted 快照，但锁内输掉迁移权 ⇒ 走「重复到达」出口。
+            assert "decision_token_observation_error" not in stale_snapshot_arrival, stale_snapshot_arrival
+            assert "hookSpecificOutput" not in stale_snapshot_arrival, stale_snapshot_arrival
+            assert stale_snapshot_arrival.get("decision_token_advanced_to_injected") is not True, (
+                stale_snapshot_arrival
+            )
+            assert (
+                stale_snapshot_arrival.get("decision_point_banner_resubmitted_without_body_reinjection")
+                is True
+            ), stale_snapshot_arrival
+            assert (
+                stale_snapshot_arrival.get(
+                    "decision_point_banner_concurrent_arrival_lost_first_injection_claim"
+                )
+                is True
+            ), stale_snapshot_arrival
+            system_message = str(stale_snapshot_arrival.get("systemMessage") or "")
+            assert "只在首次到达时注入" in system_message, system_message
+            assert "推进为 injected" not in system_message, system_message
+            assert "hookSpecificOutput" not in submit._render_hook_payload(stale_snapshot_arrival)
+
+            # 磁盘上恰好一次 minted → injected。
+            payload_on_disk = dts.read_decision_token(token).payload
+            assert payload_on_disk["state"] == dts.STATE_INJECTED, payload_on_disk
+            transitions_to_injected = [
+                entry
+                for entry in payload_on_disk.get("history") or []
+                if entry.get("to") == dts.STATE_INJECTED
+            ]
+            assert len(transitions_to_injected) == 1, payload_on_disk.get("history")
+
+            # store 层直接判据：已到达过的 token 再 claim 只能输，且不改任何东西。
+            second_claim = dts.claim_first_minted_to_injected_transition_exclusively(token)
+            assert second_claim.this_call_won_first_minted_to_injected_transition is False
+            assert second_claim.state_observed_inside_lock_before_claim == dts.STATE_INJECTED
+            assert dts.read_decision_token(token).payload == payload_on_disk
+        finally:
+            dts.read_decision_token = real_read_decision_token
             os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)

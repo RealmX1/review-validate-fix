@@ -10480,6 +10480,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinjects_body",
+            lambda: test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinjects_body(
+                root / "banner-marker-resubmitted"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_decision_point_marker_without_body_text_advances_nothing",
+            lambda: test_rvf_user_prompt_submit_decision_point_marker_without_body_text_advances_nothing(
+                root / "banner-marker-without-body"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_concurrent_decision_point_marker_arrivals_inject_body_exactly_once",
+            lambda: test_rvf_user_prompt_submit_concurrent_decision_point_marker_arrivals_inject_body_exactly_once(
+                root / "banner-marker-concurrent-arrivals"
+            ),
+        ),
+        (
             "allocate_review_scope_includes_committed_round",
             lambda: test_allocate_review_scope_includes_committed_round(root / "committed-allocate-e2e"),
         ),

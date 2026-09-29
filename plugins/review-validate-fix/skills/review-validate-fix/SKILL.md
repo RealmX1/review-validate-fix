@@ -29,18 +29,19 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 ### 统一发起协议：唯一的发起消息是**发起决策点横幅**
 
-自动 RVF 的发起**一律**先给你一条决策点横幅，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点（agent 决策，非自动发起）===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
+自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf-agent start`（发起）或 `rvf-agent decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
 | 在哪 | transport | 你看到的形态 |
 | --- | --- | --- |
-| **cline-kanban task 内**（默认） | 经 cline-kanban 终端投递成为一条**真实 user message** | 隔几秒到达并开启一个新回合；因为它是真实 user 条目，所以在会话历史里是一个**可回退的边界**（Claude Code 双 ESC 的 rewind 列表里能看到它），用户随时可以回到它之前 |
+| **cline-kanban task 内**（默认） | 终端投递一行**边界标记** user message，正文由 RVF 的 UserPromptSubmit hook 随之注入 | 隔几秒到达并开启一个新回合：先是一行 `RVF 发起决策点 · RVF_DECISION_TOKEN=<token>（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）`，紧随其后的 hook 上下文里就是决策点正文 |
 | task 外 / 非 kanban backend / 逃生口 | Stop hook 自注入 | 与 Stop 同一刻直接出现在上下文里 |
 
-带外投递那条路上，横幅多两行「来源声明 + 时效说明」，其余逐字相同。四件必须知道的事：
+带外投递那条路上，正文多一行时效说明，其余逐字相同。五件必须知道的事：
 
 - **Stop 那一刻你什么也看不到是正常的。** 默认短等为 0ms，横幅数秒后才作为 user message 到达。这不是降级——正因为它开启新回合，才有 rewind 边界。
+- **只看到边界标记、没有随附正文 = 这是同一枚 token 的重复提交**（例如用户 rewind 后标记被放回输入框又发了出去）。正文只随首次到达注入一次；此时不要 start、不要 decline、也不要为此询问开发者，照这条消息里用户其余的话继续即可。
 - **只有确定失败才回落自注入。** 投递结论未知时本轮静默停、不回落，由投递意图在后续 Stop 对账（宁可晚问一轮，也不要两条通道各问一次）。回落发生时开发者旁注会明说「本轮已回落为 Stop hook 自注入」。
 - **投出去却始终没成为 turn 的横幅会被撤回。** 那枚 token 进 `withdrawn` 终态，即便消息迟到落地，`rvf-agent start` 也会硬失败——不要试图绕过它去手动开一轮。
 - 逃生口：`RVF_DECISION_POINT_DELIVERY_TRANSPORT=stop_hook_self_injection|cline_kanban_task_chat_session` 可强制指定通道。

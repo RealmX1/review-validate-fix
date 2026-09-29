@@ -98,6 +98,16 @@ SANCTIONED_AGENT_DRIVING_KEY_CONSTRUCTORS: dict[tuple[str, str], str] = {
         "inspect_user_prompt_submit",
     ): "UPS turn-riding injection：bootstrap checkpoint 上下文，同样搭用户这一条 prompt 的车。",
     (
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+        "_observe_delivered_decision_point_banner",
+    ): (
+        "带外决策点正文的 UPS 出口（铁律允许驱动 agent 的「是否发起 RVF 的决策点」那一类）。"
+        "cline-kanban 粘贴通道只送一行无指令的边界标记，Claude Code 把粘贴包成 <pasted_content>、"
+        "其中的指令只有用户亲口要求时才执行 ⇒ 正文必须改由 hook 以 additionalContext 注入，"
+        "来源标注如实。它搭的是标记那条 user message 的车，不额外开回合；只在 token 首次 "
+        "minted→injected 时注入，终态 / 重复到达 / 正文缺失 / 推进失败一律只出 systemMessage。"
+    ),
+    (
         "plugins/review-validate-fix/hooks/_kimi_hook_entry.py",
         "translate_core_payload_to_kimi_user_prompt_submit_wire",
     ): (
