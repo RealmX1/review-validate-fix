@@ -4832,6 +4832,46 @@ def test_decision_point_declined_cooldown_suppresses_reinjection(tmp_path: Path)
     assert any(a.get("mint_outcome") == "declined_cooldown" for a in attempts), attempts
 
 
+def test_decision_point_declined_session_scope_snooze_silences_work_in_progress_until_commit(
+    tmp_path: Path,
+) -> None:
+    """闸 2b 端到端（「工作中反复谢绝」场景）：agent 经真实 rvf-agent decline 谢绝后，同会话里继续
+    改**同一批文件**（内容指纹次次都变、declined 冷却因此次次失效），后续 Stop 一律静默、只弹过
+    1 次横幅；直到出现 commit（HEAD 变化 = 工作边界）才重新征询。"""
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    session = "snooze-wip-1"
+    event = {"cwd": str(repo), "session_id": session, "stop_hook_active": False}
+
+    stdout, _ = invoke(event, state_dir=state)
+    _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+    declined = _run_rvf_agent(state, repo, "decline", "--token", token, "--reason", "还在施工，收尾后再审")
+    assert declined.returncode == 0, (declined.stdout, declined.stderr)
+    assert "snooze" in declined.stdout, declined.stdout
+
+    # 边做边停：每次都改同一文件的内容（内容指纹变、工作范围不变）→ 次次静默。
+    for round_index in range(3):
+        (repo / "changed.txt").write_text(f"dirty\nwip round {round_index}\n", encoding="utf-8")
+        stdout_wip, _ = invoke(event, state_dir=state)
+        payload_wip = parse_json(stdout_wip)
+        assert "decision" not in payload_wip, payload_wip
+        assert "hookSpecificOutput" not in payload_wip, payload_wip
+        assert latest_summary(state)["reason_code"] == "decision_point_declined_session_scope_snooze"
+    attempts = injection_attempt_records(state)
+    assert [a.get("mint_outcome") for a in attempts].count("injected") == 1, attempts
+    assert [a.get("mint_outcome") for a in attempts].count("declined_session_scope_snooze") == 3, attempts
+    assert not any(a.get("mint_outcome") == "declined_cooldown" for a in attempts), (
+        "内容一直在变，旧的内容指纹冷却本就挡不住——拦下它们的必须是闸 2b"
+    )
+
+    # 提交一个无关文件（HEAD 变化 = 工作边界），changed.txt 仍 dirty → 重新征询。
+    (repo / "unrelated.txt").write_text("x\n", encoding="utf-8")
+    run(["git", "add", "unrelated.txt"], repo)
+    run(["git", "commit", "-q", "-m", "unrelated"], repo)
+    stdout_after_commit, _ = invoke(event, state_dir=state)
+    assert_decision_point_injection(stdout_after_commit, expect_paths=("changed.txt",))
+
+
 def test_decision_point_circuit_breaker_suppresses_after_repeated_mints(tmp_path: Path) -> None:
     """失效路径（铸造频率熔断，R24 裁决 b）：同 session 短窗口内第 3 次铸造请求（不同指纹，避开去重）
     触发熔断 → 静默停、不注入，注入尝试 ledger 留 circuit_breaker_tripped 记录 + systemMessage 告警。"""
@@ -6118,6 +6158,7 @@ def main() -> int:
         # S4：决策点信使新增用例（负路径不变量 / 失效路径 / 护栏矩阵）。
         test_decision_point_nonempty_candidates_always_leave_injection_ledger_record,
         test_decision_point_declined_cooldown_suppresses_reinjection,
+        test_decision_point_declined_session_scope_snooze_silences_work_in_progress_until_commit,
         test_decision_point_circuit_breaker_suppresses_after_repeated_mints,
         test_decision_point_receipt_ttl_lost_warns_without_retry,
         test_preserved_guards_short_circuit_before_decision_point_injection,
