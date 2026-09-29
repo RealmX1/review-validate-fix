@@ -196,6 +196,8 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 
 - reviewer 的探索性命令仍按 `$RVF_COMMAND_LOCK` 协调，但不构成可供 landing 复用的最终验证证据。
 - merge / validate-fix 完成后，主会话把最终 landing suites 按 handoff 顺序命名为 `handoff-validation-001`、`handoff-validation-002`……，并通过 `scripts/validation_result_cache.py run --repo "$RVF_REPO" --name <name> --rvf-run-dir "$RVF_RUN_DIR" -- <argv...>` 执行。这个 cache wrapper 自己就是该 suite 的唯一 single-flight lock，**不得**再套 `$RVF_COMMAND_LOCK`。
+- 带 `--rvf-run-dir`（缺省回退 `$RVF_RUN_DIR`）时，wrapper 每次都会把该 suite 的 `{name, argv, cwd, environment_keys, validation_context_kind}` 按 name upsert 进 `artifacts/handoff-validation-commands.json`（带 `.sha256`）。这是 `$rvf-land` 补修正后重跑验证的唯一事实源，land 按它重放、不解析 handoff markdown，所以 argv 必须能脱离当前 shell 独立复现：工作目录用 `--working-directory`、需要的环境变量用 `--environment-key` 声明，不要写成 `cd x && …` 或 `VAR=1 …` 这类依赖 shell 状态的前缀。
+- 失败时 wrapper 直接在 stderr 打印 stdout/stderr 尾部，结束时 JSON 里带 run validation index 摘要；不要为了看失败原因在缓存外再跑一遍，也不要再去翻 `validation-records.json`。
 - handoff 的验证段记录与 cache record 完全相同的命令 argv / cwd；cache record、candidate content、命令或非秘密环境指纹任一变化都会自动失效。日志与 evidence 只保存 hash、状态和脱敏元数据。
 - 不要在 reviewer、validate-fix、handoff 与 landing 各跑一遍相同 suite；同一 candidate 的后续阶段应调用同一 wrapper/name，让它返回 `cache_status=hit`。
 

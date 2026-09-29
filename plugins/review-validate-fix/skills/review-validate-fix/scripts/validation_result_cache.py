@@ -32,6 +32,20 @@ SECRET_LIKE_ENVIRONMENT_KEY = re.compile(
 )
 PACKAGE_MANAGER_EXECUTABLES = {"bun", "npm", "npx", "pnpm", "yarn"}
 VALIDATION_CONTEXT_KINDS = {"task_worktree", "base_worktree"}
+# run 目录的环境变量回退：显式 ``--rvf-run-dir`` 优先。更高层的「当前 run」推断由 rvf CLI
+# 入口负责，本脚本只认显式参数与这一个环境变量，不自行猜 run。
+RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE = "RVF_RUN_DIR"
+# land 重跑验证的结构化事实源：与 validation-records.json 同目录、同锁写入。land 按它的 argv 经
+# 本缓存重放，不再从 handoff markdown 里解析命令字符串。argv 与 handoff 验证段是同一份内容，
+# 环境变量只记键名不记值（值进环境指纹的哈希）。
+HANDOFF_VALIDATION_COMMANDS_ARTIFACT_NAME = "handoff-validation-commands.json"
+HANDOFF_VALIDATION_COMMANDS_SCHEMA_NAME = "rvf-handoff-validation-commands"
+HANDOFF_VALIDATION_COMMANDS_SCHEMA_VERSION = 1
+# 失败输出尾部落在 run 自己的 artifacts 下（与 handoff 同级、同保密级别），不进全局缓存：
+# 缓存 record 按设计只存 hash 与脱敏元数据。缓存命中一条「已失败」记录时从这里取回尾部。
+VALIDATION_FAILURE_OUTPUT_TAILS_DIRECTORY_NAME = "validation-failure-output-tails"
+# EXPERIMENT_NODE: 失败时回显 stdout/stderr 各多少行尾部——够 agent 定位失败原因、又不把大段日志灌进上下文
+VALIDATION_FAILURE_OUTPUT_TAIL_LINE_COUNT = 60
 
 
 def canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -313,7 +327,12 @@ def validated_validation_record_reference(
     return record, record_digest
 
 
-def append_run_validation_record(run_dir: Path | None, record: Mapping[str, Any], record_digest: str) -> None:
+def append_run_validation_record(
+    run_dir: Path | None,
+    record: Mapping[str, Any],
+    record_digest: str,
+    handoff_validation_command_entry: Mapping[str, Any] | None = None,
+) -> None:
     if run_dir is None:
         return
     artifacts = run_dir.expanduser().resolve() / "artifacts"
@@ -350,8 +369,208 @@ def append_run_validation_record(run_dir: Path | None, record: Mapping[str, Any]
             records = [item for item in records if not (isinstance(item, dict) and item.get("name") == record["name"])]
             records.append(reference)
             write_json_with_digest(index_path, {"schema_version": 1, "validation_records": records})
+            if handoff_validation_command_entry is not None:
+                _record_handoff_validation_command_locked(run_dir, handoff_validation_command_entry)
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _read_canonical_json_artifact_with_digest(path: Path, label: str) -> dict[str, Any] | None:
+    sidecar = path.with_suffix(path.suffix + ".sha256")
+    if not path.exists() and not sidecar.exists():
+        return None
+    if path.is_symlink() or sidecar.is_symlink() or not path.is_file() or not sidecar.is_file():
+        raise ValueError(f"corrupt {label}: artifact and sidecar must be regular files")
+    try:
+        encoded = path.read_bytes()
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"corrupt {label}: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or encoded != canonical_json_bytes(payload)
+        or sidecar.read_bytes() != f"{sha256_hex(encoded)}\n".encode("ascii")
+    ):
+        raise ValueError(f"corrupt {label}: digest mismatch")
+    return payload
+
+
+def handoff_validation_commands_artifact_path(run_dir: Path) -> Path:
+    return run_dir.expanduser().resolve() / "artifacts" / HANDOFF_VALIDATION_COMMANDS_ARTIFACT_NAME
+
+
+def load_handoff_validation_commands(run_dir: Path) -> list[dict[str, Any]] | None:
+    """读 land 重放用的结构化 argv 工件；工件不存在返回 None，损坏则 raise ValueError。"""
+    payload = _read_canonical_json_artifact_with_digest(
+        handoff_validation_commands_artifact_path(run_dir), "handoff validation commands artifact"
+    )
+    if payload is None:
+        return None
+    entries = payload.get("validation_commands")
+    if (
+        payload.get("schema") != HANDOFF_VALIDATION_COMMANDS_SCHEMA_NAME
+        or payload.get("schema_version") != HANDOFF_VALIDATION_COMMANDS_SCHEMA_VERSION
+        or not isinstance(entries, list)
+    ):
+        raise ValueError("corrupt handoff validation commands artifact: schema mismatch")
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("name"), str)
+            or not isinstance(entry.get("argv"), list)
+            or not entry["argv"]
+            or not all(isinstance(argument, str) for argument in entry["argv"])
+            or not isinstance(entry.get("working_directory_relative_to_worktree"), str)
+            or not isinstance(entry.get("environment_keys"), list)
+            or entry.get("validation_context_kind") not in VALIDATION_CONTEXT_KINDS
+            or not isinstance(entry.get("requires_base_worktree_context"), bool)
+        ):
+            raise ValueError("corrupt handoff validation commands artifact: invalid entry")
+    return entries
+
+
+def _record_handoff_validation_command_locked(run_dir: Path, command_entry: Mapping[str, Any]) -> None:
+    """按 name upsert 一条结构化 argv；同名替换原位，保持 handoff-validation-NNN 的首次出现顺序。
+
+    调用方必须已持有 run 的 ``.validation-records.lock``。
+    """
+    path = handoff_validation_commands_artifact_path(run_dir)
+    existing_entries = load_handoff_validation_commands(run_dir) or []
+    replaced = False
+    updated_entries: list[dict[str, Any]] = []
+    for entry in existing_entries:
+        if entry.get("name") == command_entry["name"]:
+            updated_entries.append(dict(command_entry))
+            replaced = True
+        else:
+            updated_entries.append(entry)
+    if not replaced:
+        updated_entries.append(dict(command_entry))
+    write_json_with_digest(
+        path,
+        {
+            "schema": HANDOFF_VALIDATION_COMMANDS_SCHEMA_NAME,
+            "schema_version": HANDOFF_VALIDATION_COMMANDS_SCHEMA_VERSION,
+            "validation_commands": updated_entries,
+        },
+    )
+
+
+def summarize_run_validation_index(
+    run_dir: Path,
+    *,
+    current_candidate_content_manifest_sha256: str,
+    expected_git_common_directory: Path,
+) -> dict[str, Any]:
+    """run 自己的 validation index 相对**当前**内容的摘要。
+
+    ``all_records_passed_for_current_content`` 为真 ⇔ index 非空、每条引用都能校验回全局缓存
+    record、全部 passed 且内容摘要等于当前摘要——与 candidate evidence 的验证门槛逐条同口径
+    （``write_reviewed_task_candidate_evidence.validated_validation_records``），因此它为真时
+    land 可以零执行复用。
+    """
+    index_path = run_dir.expanduser().resolve() / "artifacts" / "validation-records.json"
+    try:
+        index = _read_canonical_json_artifact_with_digest(index_path, "run validation record index")
+    except ValueError as exc:
+        return {
+            "index_status": "corrupt",
+            "error": str(exc),
+            "record_count": 0,
+            "records": [],
+            "all_records_passed_for_current_content": False,
+        }
+    if index is None:
+        return {
+            "index_status": "missing",
+            "record_count": 0,
+            "records": [],
+            "all_records_passed_for_current_content": False,
+        }
+    references = index.get("validation_records")
+    if not isinstance(references, list):
+        references = []
+    records: list[dict[str, Any]] = []
+    all_passed_for_current_content = bool(references)
+    for reference in references:
+        name = reference.get("name") if isinstance(reference, dict) else None
+        try:
+            if not isinstance(reference, dict):
+                raise ValueError("validation record reference must be an object")
+            validated_validation_record_reference(
+                reference, expected_git_common_directory=expected_git_common_directory
+            )
+        except (OSError, ValueError) as exc:
+            records.append({"name": name, "status": "corrupt", "error": str(exc)})
+            all_passed_for_current_content = False
+            continue
+        matches_current_content = (
+            reference["candidate_content_manifest_sha256"] == current_candidate_content_manifest_sha256
+        )
+        passed = reference["status"] == "passed" and reference["exit_code"] == 0
+        records.append(
+            {
+                "name": name,
+                "status": reference["status"],
+                "exit_code": reference["exit_code"],
+                "matches_current_candidate_content": matches_current_content,
+            }
+        )
+        all_passed_for_current_content = all_passed_for_current_content and passed and matches_current_content
+    return {
+        "index_status": "present",
+        "record_count": len(records),
+        "records": records,
+        "all_records_passed_for_current_content": all_passed_for_current_content,
+    }
+
+
+def _output_tail_text(output: bytes) -> str:
+    lines = output.decode("utf-8", errors="replace").splitlines()
+    return "\n".join(lines[-VALIDATION_FAILURE_OUTPUT_TAIL_LINE_COUNT:])
+
+
+def _validation_failure_output_tail_path(run_dir: Path, name: str) -> Path:
+    safe_name = name if re.fullmatch(r"[A-Za-z0-9._-]{1,120}", name) else sha256_hex(name.encode("utf-8"))
+    return (
+        run_dir.expanduser().resolve()
+        / "artifacts"
+        / VALIDATION_FAILURE_OUTPUT_TAILS_DIRECTORY_NAME
+        / f"{safe_name}.txt"
+    )
+
+
+def _render_validation_failure_output_tail(name: str, exit_code: int, stdout_tail: str, stderr_tail: str) -> str:
+    return (
+        f"=== validation {name} failed (exit {exit_code}) — stdout 尾部 "
+        f"(最多 {VALIDATION_FAILURE_OUTPUT_TAIL_LINE_COUNT} 行) ===\n{stdout_tail}\n"
+        f"=== validation {name} — stderr 尾部 "
+        f"(最多 {VALIDATION_FAILURE_OUTPUT_TAIL_LINE_COUNT} 行) ===\n{stderr_tail}\n"
+    )
+
+
+def _persist_validation_failure_output_tail(
+    run_dir: Path | None, name: str, cache_key: str, rendered_tail: str
+) -> None:
+    if run_dir is None:
+        return
+    atomic_write(
+        _validation_failure_output_tail_path(run_dir, name),
+        f"cache_key: {cache_key}\n{rendered_tail}".encode("utf-8"),
+    )
+
+
+def _persisted_validation_failure_output_tail(run_dir: Path | None, name: str, cache_key: str) -> str | None:
+    if run_dir is None:
+        return None
+    path = _validation_failure_output_tail_path(run_dir, name)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    header, _separator, body = text.partition("\n")
+    # 只回显与这条缓存 record 同一身份的那次失败输出，防止把别的内容/命令的旧失败张冠李戴。
+    return body if header == f"cache_key: {cache_key}" else None
 
 
 def run_validation(args: argparse.Namespace) -> int:
@@ -376,8 +595,19 @@ def run_validation(args: argparse.Namespace) -> int:
             "base_worktree validation context requires --requires-base-worktree-context"
         )
 
+    rvf_run_dir_argument = args.rvf_run_dir or os.environ.get(RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE, "").strip()
+    rvf_run_dir = Path(rvf_run_dir_argument).expanduser() if rvf_run_dir_argument else None
+
     content_digest = candidate_content_manifest_sha256(repo_root)
     environment_digest, public_environment = environment_fingerprint(command, args.environment_key)
+    handoff_validation_command_entry = {
+        "name": args.name,
+        "argv": command,
+        "working_directory_relative_to_worktree": cwd_relative,
+        "environment_keys": sorted(set(args.environment_key)),
+        "validation_context_kind": args.validation_context_kind,
+        "requires_base_worktree_context": bool(args.requires_base_worktree_context),
+    }
     command_payload = {"argv": command, "working_directory_relative_to_worktree": cwd_relative}
     command_digest = sha256_hex(canonical_json_bytes(command_payload))
     validation_context_worktree_realpath_sha256 = (
@@ -418,11 +648,31 @@ def run_validation(args: argparse.Namespace) -> int:
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
                 return 76
             append_run_validation_record(
-                Path(args.rvf_run_dir) if args.rvf_run_dir else None,
-                record,
-                record_digest,
+                rvf_run_dir, record, record_digest, handoff_validation_command_entry
             )
-            print(json.dumps({"cache_status": "hit", **record}, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "cache_status": "hit",
+                        **record,
+                        **_run_validation_index_summary_field(rvf_run_dir, content_digest, common_dir),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            if record["status"] == "failed":
+                persisted_tail = _persisted_validation_failure_output_tail(rvf_run_dir, args.name, cache_key)
+                print(
+                    persisted_tail
+                    if persisted_tail is not None
+                    else (
+                        f"validation {args.name} 命中一条已失败的缓存记录（exit {record['exit_code']}）；"
+                        "该次失败的输出尾部不在本 run 的 artifacts 里（缓存只存 hash）。"
+                        "修改内容后本 wrapper 会自动重跑并回显新的失败尾部。"
+                    ),
+                    file=sys.stderr,
+                )
             return int(record["exit_code"])
 
         command_environment = clean_git_environment()
@@ -476,12 +726,45 @@ def run_validation(args: argparse.Namespace) -> int:
         }
         record_digest = write_json_with_digest(record_path, record)
         append_run_validation_record(
-            Path(args.rvf_run_dir) if args.rvf_run_dir else None,
-            record,
-            record_digest,
+            rvf_run_dir, record, record_digest, handoff_validation_command_entry
         )
-        print(json.dumps({"cache_status": "executed", **record, "cache_record_sha256": record_digest}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "cache_status": "executed",
+                    **record,
+                    "cache_record_sha256": record_digest,
+                    **_run_validation_index_summary_field(rvf_run_dir, content_digest, common_dir),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if completed.returncode != 0:
+            # 失败时直接回显尾部：否则 agent 只拿到 hash，会在缓存外再跑一遍来看失败原因。
+            rendered_tail = _render_validation_failure_output_tail(
+                args.name,
+                completed.returncode,
+                _output_tail_text(completed.stdout),
+                _output_tail_text(completed.stderr),
+            )
+            _persist_validation_failure_output_tail(rvf_run_dir, args.name, cache_key, rendered_tail)
+            print(rendered_tail, file=sys.stderr, end="")
         return completed.returncode
+
+
+def _run_validation_index_summary_field(
+    rvf_run_dir: Path | None, content_digest: str, common_dir: Path
+) -> dict[str, Any]:
+    if rvf_run_dir is None:
+        return {}
+    return {
+        "run_validation_index_summary": summarize_run_validation_index(
+            rvf_run_dir,
+            current_candidate_content_manifest_sha256=content_digest,
+            expected_git_common_directory=common_dir,
+        )
+    }
 
 
 def main() -> int:
@@ -500,7 +783,10 @@ def main() -> int:
         choices=sorted(VALIDATION_CONTEXT_KINDS),
         default="task_worktree",
     )
-    run_parser.add_argument("--rvf-run-dir")
+    run_parser.add_argument(
+        "--rvf-run-dir",
+        help=f"RVF run 目录；缺省时回退到环境变量 {RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE}。",
+    )
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
