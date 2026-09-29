@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rvf-agent 决策 CLI（RVF overhaul S3：主 agent 发起审查的**单一入口**）。
+"""RVF 决策 CLI（经 PATH 上的 ``rvf`` 快捷入口调用；RVF overhaul S3：主 agent 发起审查的**单一入口**）。
 
 RVF overhaul 把「要不要审、审什么」的发起决策权从 Stop hook 交给主 agent。Stop hook 降级为
 决策点信使：它铸一枚决策 token、把 token 连同候选摘要注入给主 agent；主 agent 简析后经**本
@@ -62,6 +62,22 @@ import review_reopen_marker  # noqa: E402 — 失败再入（$rvf-reopen）在 a
 from core.rvf_shared_runtime_constants.rvf_shared_runtime_constants import (  # noqa: E402
     HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION,
 )
+from core.rvf_command_line_shortcut_shim_location import (  # noqa: E402
+    RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME,
+    resolve_rvf_command_line_shortcut_invocation,
+)
+
+
+def _rvf() -> str:
+    """回执 / next_steps 里渲染的命令前缀：PATH 上的 ``rvf`` > shim 绝对路径 > 入口脚本绝对路径。
+
+    历史上这里硬写 ``rvf-agent``——PATH 上根本没有这个命令，agent 照抄即 command not found。
+    """
+    return resolve_rvf_command_line_shortcut_invocation(
+        fallback_entrypoint_script_path=Path(__file__).resolve().with_name(
+            RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +102,9 @@ EXIT_DECLINE_DISPATCHED_REVIEW_INCOMPLETE = 7
 # agent 引向「修一修再重跑 dispatch」，而正确处置是先走 Contract Gate 处理那条 request，再用
 # `--redispatch-review-request-legs-only` 经同一入口**只重派那条 request 腿**
 #（见 REVIEW_REQUEST_REDISPATCH_FLAG）。
+# ⚠ 默认的 detached 派发里 dispatch 在 reviewer 跑完之前就返回，所以**这个码实际不会出现**：
+# request 终态由 `rvf wait` 的摘要（plan_status=blocked_on_reviewer_request）报出。只有同步返回
+# 结果的 dispatcher（测试注入 / 未来的同步模式）才可能走到这里。
 EXIT_DISPATCH_BLOCKED_ON_REVIEWER_REQUEST = 8
 # dispatch 的 contract gate：scope-of-work 仍是 hook 生成的 stub（未被 agent 覆盖）。**不是故障**，
 # 而是「还差一步没做」。与 EXIT_DISPATCH_FAILED 分开的理由：派了也白派——reviewer 的 contract
@@ -521,10 +540,12 @@ class CommandResult:
         "worktree_bootstrap",
         "origin_metadata",
         "handoff_path",
+        # handoff `## 状态` 的 intent_artifact_status 要照抄它；不渲染出来 agent 就得去翻 JSON。
+        "intent_artifact_status_file",
     )
 
     def render(self) -> str:
-        head = f"[rvf-agent {self.command}] {self.status}"
+        head = f"[rvf {self.command}] {self.status}"
         lines = [head]
         if self.token:
             state = f" ({self.token_state})" if self.token_state else ""
@@ -603,7 +624,7 @@ def _require_acknowledged_record(
     record = _load_advanceable_record(token, token_root=token_root, now=now)
     if record.state != token_store.STATE_ACKNOWLEDGED:
         raise TokenLoadError(
-            f"该操作要求 token 处 acknowledged 态（先跑 rvf-agent start），当前 state={record.state}。",
+            f"该操作要求 token 处 acknowledged 态（先跑 {_rvf()} start），当前 state={record.state}。",
             token_state=record.state,
         )
     return record
@@ -1639,7 +1660,7 @@ def run_start(
         return CommandResult(
             command="start", status="start_failed", exit_code=EXIT_START_FAILED,
             token=token, token_state=token_store.STATE_ACKNOWLEDGED, message=reason_text,
-            next_steps=[f"rvf-agent start --token {token} --retry --reason <诊断后重试>"],
+            next_steps=[f"{_rvf()} start --token {token} --retry --reason <诊断后重试>"],
             detail=detail,
         )
 
@@ -1675,7 +1696,7 @@ def run_start(
             session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
             detail={"retry": retry, **reconciliation.to_dict()},
         )
-        resume_command = f"rvf-agent start --token {token} --retry --reason <bootstrap 完成后恢复本轮>"
+        resume_command = f"{_rvf()} start --token {token} --retry --reason <bootstrap 完成后恢复本轮>"
         return CommandResult(
             command="start",
             status="bootstrap_required",
@@ -1715,7 +1736,7 @@ def run_start(
         下一轮按 digest 判 tampered。故这里复用「别再动它、等一下再 --retry」的定向文案。
         """
         age_text = f"{in_flight_age_seconds:.0f}" if in_flight_age_seconds is not None else "0"
-        resume_command = f"rvf-agent start --token {token} --retry --reason <稍后重试，等在途 prepare 收尾>"
+        resume_command = f"{_rvf()} start --token {token} --retry --reason <稍后重试，等在途 prepare 收尾>"
         append_decision_telemetry(
             token=token, event="start_bootstrap_replay_in_flight", worktree=worktree,
             session_id=tok_session_id, now=now_dt, root=roots.telemetry_root,
@@ -1925,9 +1946,9 @@ def run_start(
                 "只会让同一批 diff 在下一次 Stop 再被提议一遍。"
             ),
             next_steps=[
-                f'① 通常应当谢绝本轮：rvf-agent decline --token {token} --reason "上一轮 RVF 产物，无未审单元"',
+                f'① 通常应当谢绝本轮：{_rvf()} decline --token {token} --reason "上一轮 RVF 产物，无未审单元"',
                 f"② 确知有 tracker 看不见的新工作（例如经 shell heredoc 写入的文件）而要重审："
-                f"rvf-agent start --token {token} --retry --force-full-rescope --reason <重审理由>",
+                f"{_rvf()} start --token {token} --retry --force-full-rescope --reason <重审理由>",
             ],
             detail={
                 "phase": "tracker_scope_allocation",
@@ -2065,12 +2086,11 @@ def run_start(
         command="start", status="ok", exit_code=EXIT_OK, token=token,
         token_state=token_store.STATE_ACKNOWLEDGED,
         message=scope_mode_note,
-        next_steps=[
-            f"rvf-agent scope annotate|exclude|include --token {token} …（可选，改动自动 scope）",
-            f"rvf-agent dispatch --token {token} --strictness <light|standard|strict>",
-            "dispatch 之后：在**当前会话**调用 `$review-validate-fix` skill 就地执行"
-            "（执行所需路径全在 detail.execution_handoff，不需要重新 prepare）。",
-        ],
+        next_steps=_start_success_ordered_next_steps(
+            token=token,
+            scope_of_work_path=artifacts.get("scope_of_work"),
+            candidate_summary=candidate_summary if isinstance(candidate_summary, Mapping) else None,
+        ),
         detail={
             "run_id": run_id, "run_dir": run_dir, "scope_artifact": str(scope_artifact_path),
             "auto_scope_paths": auto_scope_paths, "prepare_artifacts": dict(artifacts),
@@ -2084,6 +2104,41 @@ def run_start(
     )
 
 
+def _suggested_strictness_tier_from_candidate_summary(candidate_summary: Mapping[str, Any] | None) -> str:
+    summary = candidate_summary or {}
+    for key in ("strictness_reference_unreviewed_estimate", "strictness_reference"):
+        reference = summary.get(key)
+        if isinstance(reference, Mapping):
+            tier = reference.get("suggested_strictness_tier")
+            if isinstance(tier, str) and tier in STRICTNESS_TIERS:
+                return tier
+    return "<light|standard|strict>"
+
+
+def _host_specific_reviewer_wait_step() -> str:
+    import rvf_command_line_shortcut_entrypoint  # noqa: PLC0415 - 只为共用同一份 host 分流文案
+
+    return rvf_command_line_shortcut_entrypoint.render_host_specific_reviewer_wait_instruction(_rvf())
+
+
+def _start_success_ordered_next_steps(
+    *, token: str, scope_of_work_path: Any, candidate_summary: Mapping[str, Any] | None
+) -> list[str]:
+    """``start`` 成功后按顺序排好、参数已填好的下一步——agent 照抄即可，不必翻 SKILL.md 拼命令。"""
+    rvf = _rvf()
+    return [
+        f"① 用真实 reasoning 覆盖 scope-of-work `{scope_of_work_path}`（本轮改了什么、为什么、审时盯哪里；"
+        f"删掉顶部单独成行的 `{rvf_dispatch_prompts.SCOPE_OF_WORK_STUB_MARKER}` 行），"
+        f"然后 `{rvf} scope rerender-scope-of-work --token {token}`。",
+        f"②（可选）`{rvf} scope exclude|include --token {token} <path>… --reason \"<理由>\"` 微调自动 scope。",
+        f"③ `{rvf} dispatch --token {token} --strictness "
+        f"{_suggested_strictness_tier_from_candidate_summary(candidate_summary)}`。",
+        f"④ 等 reviewer：{_host_specific_reviewer_wait_step()}",
+        "⑤ 之后在**当前会话**按 `$review-validate-fix` SKILL.md 就地走 merge → validate/fix → handoff"
+        "（执行所需路径全在 execution_handoff，不需要重新 prepare）。",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # scope annotate / exclude / include（仅 acknowledged 态）
 # ---------------------------------------------------------------------------
@@ -2095,7 +2150,7 @@ def _load_overlay_for_scope(
     overlay = read_scope_adjustment(token, root=roots.scope_adjustment_root)
     if overlay is None:
         raise TokenLoadError(
-            f"未找到 token {token} 的自动 scope 产出（先跑 rvf-agent start）。",
+            f"未找到 token {token} 的自动 scope 产出（先跑 {_rvf()} start）。",
             token_state=record.state,
         )
     return record, overlay
@@ -2133,7 +2188,7 @@ def run_scope_annotate(
         command="scope annotate", status="ok", exit_code=EXIT_OK, token=token,
         token_state=record.state,
         message=f"已注释 {len(entries)} 个路径（累计注释 {len(annotations)}）。",
-        next_steps=[f"rvf-agent dispatch --token {token} --strictness <…>"],
+        next_steps=[f"{_rvf()} dispatch --token {token} --strictness <…>"],
         detail={"annotated_paths": [p for p, _ in entries]},
     )
 
@@ -2190,7 +2245,7 @@ def _run_scope_exception(
     return CommandResult(
         command=command, status="ok", exit_code=EXIT_OK, token=token, token_state=record.state,
         message=message,
-        next_steps=[f"rvf-agent dispatch --token {token} --strictness <…>"],
+        next_steps=[f"{_rvf()} dispatch --token {token} --strictness <…>"],
         detail={
             "operation_type": operation_type,
             "newly_added_paths": newly_added,
@@ -2259,12 +2314,12 @@ def run_scope_rerender_scope_of_work(
         f"scope-of-work 已重渲进 review packet（第 {result.get('round')} 轮，"
         f"旧工件归档在 {result.get('archive_dir')}）。"
     )
-    next_steps = [f"rvf-agent dispatch --token {token} --strictness <…>"]
+    next_steps = [f"{_rvf()} dispatch --token {token} --strictness <…>"]
     if still_stub:
         message += " ⚠️ 但 dispatch 的 contract gate 仍会拒派：" + _scope_of_work_gate_message(still_stub)
         next_steps = [
             *_scope_of_work_gate_next_steps(still_stub, token=token),
-            f"处理完再重渲一次，然后 rvf-agent dispatch --token {token} --strictness <…>",
+            f"处理完再重渲一次，然后 {_rvf()} dispatch --token {token} --strictness <…>",
         ]
     return CommandResult(
         command="scope rerender-scope-of-work",
@@ -2635,7 +2690,7 @@ def _scope_of_work_gate_next_steps(detail: Mapping[str, Any], *, token: str) -> 
     reason = detail.get("reason")
     scope_of_work = detail.get("scope_of_work")
     rerender_step = (
-        f"跑 `rvf-agent scope rerender-scope-of-work --token {token}` 把新正文重渲进 "
+        f"跑 `{_rvf()} scope rerender-scope-of-work --token {token}` 把新正文重渲进 "
         "review packet——packet 在 start 时就冻结了旧正文，只改盘上的文件不会进 packet。"
     )
     if reason == SCOPE_OF_WORK_GATE_REASON_UNREADABLE:
@@ -2661,7 +2716,7 @@ def _scope_of_work_gate_next_steps(detail: Mapping[str, Any], *, token: str) -> 
             f"并删掉顶部单独成行的 `{rvf_dispatch_prompts.SCOPE_OF_WORK_STUB_MARKER}` 标记行。"
         )
     steps = [step for step in (first, rerender_step) if step]
-    steps.append("然后重跑 `rvf-agent dispatch`。")
+    steps.append(f"然后重跑 `{_rvf()} dispatch --token {token} --strictness <…>`。")
     return steps
 
 
@@ -2764,11 +2819,10 @@ def run_dispatch(
                 "再对**同一** run 重派；request 不得进入 merge table。"
             ),
             next_steps=[
-                "读 artifacts/reviewers/reviewer-plan.json 的 review_request_pending_reviewer_ids "
-                "与对应 reviewer 目录，处置那条 request。",
-                "处置完对**同一 run** 重跑 "
-                f"`scripts/dispatch_reviewers.py --execute --detached {REVIEW_REQUEST_REDISPATCH_FLAG}`"
-                "：它复用上一轮 plan、只重派停在 `kind: request` 的腿，健康且已完成的腿保留结果、"
+                f"`{_rvf()} results` 打印各腿摘要（含 request 正文），处置那条 request。",
+                f"处置完对**同一 run** 跑 `{_rvf()} redispatch-reviewers --review-request-legs-only`"
+                f"（= dispatch_reviewers `--execute --detached {REVIEW_REQUEST_REDISPATCH_FLAG}`，自动带当前"
+                " run 目录）：它复用上一轮 plan、只重派停在 `kind: request` 的腿，健康且已完成的腿保留结果、"
                 "不重跑也不被覆写。该模式不调用 route()，因此**不需要** `--selection-seed`"
                 "（reviewer 身份直接来自上一轮 plan）。",
             ],
@@ -2807,14 +2861,13 @@ def run_dispatch(
     next_steps = (
         [
             # detached：整轮派发跑在 tmux 线程里、不受前台 Bash 600s 上限约束，故这里只拿到
-            # status.json 的落点，必须由 agent 有界轮询到终态。
-            f"有界轮询到终态：`python3 {Path(__file__).resolve().parent / 'dispatch_reviewers.py'} "
-            f"--wait-status --status-path {dispatch_status_path} --max-wait 480`"
-            "（打印 RVF_DISPATCH_STATE=running 就再调一次）。",
-            "**判双评审是否成立只看 `plan_status`，不看 `returncode`**："
-            "completed + effective_reviewers=2/2 才成立；failed / partial / unknown 一律不成立；"
-            "blocked_on_reviewer_request 走 Contract Gate。详见 SKILL.md「Review」节。",
-            "成立后：读 reviewer artifact → merge → validate → fix → handoff（不变）。",
+            # status.json 的落点；等待方式按 host 分流（见 rvf_command_line_shortcut_entrypoint）。
+            f"等 reviewer 终态：{_host_specific_reviewer_wait_step()}",
+            "`wait` 到 done 时直接打印合并摘要（每腿 kind / issues / audit_summary / requests，"
+            "失败腿给 stderr 路径）与判定——**只看 `plan_status`，不看 `returncode`**；"
+            "不要再逐腿跑 check_review_result、也不要再去读 reviewer 目录。",
+            f"成立后：按摘要 merge → `{_rvf()} fix prepare <issue.json>…` → 子代理 → "
+            f"`{_rvf()} apply --all-stopped` → handoff。",
         ]
         if dispatch_status_path
         else ["等待 reviewer 结果 → validate → fix → handoff（不变）。"]
@@ -3368,7 +3421,7 @@ def _parse_annotate_entry(raw: str) -> tuple[str, str]:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="rvf-agent",
+        prog="rvf",
         description="RVF 主 agent 发起审查的单一入口（S3）：start / scope / dispatch / decline。",
     )
     sub = parser.add_subparsers(dest="command", required=True)

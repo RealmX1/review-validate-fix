@@ -48,6 +48,10 @@ from core.run_ledger.run_ledger import (
     skill_deploy_metadata,
     start_run,
 )
+from core.rvf_command_line_shortcut_shim_location import (  # noqa: E402 — 横幅里的 `rvf` 命令前缀
+    RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME,
+    resolve_rvf_command_line_shortcut_invocation,
+)
 from core.rvf_user_local_data_paths import (
     resolved_rvf_session_hook_state_dir,
     resolved_rvf_user_local_data_paths,
@@ -1564,7 +1568,7 @@ def kanban_followup_decline_prompt_block() -> str:
         "如果你判断这一轮**不该审**（例如本轮改动与你正在做的事无关、或用户已明确让你转做别的"
         "工作），不要硬跑、也不要干停，改用谢绝出口：\n"
         "```\n"
-        "rvf-agent decline-dispatched-review --token <dispatch-token> --reason <一句话理由>\n"
+        f"{_rvf_command_line_shortcut_invocation()} decline-dispatched-review --token <dispatch-token> --reason <一句话理由>\n"
         "```\n"
         "`<dispatch-token>` 取本条消息里 `RVF_DISPATCH=token=` 后面那串。默认语义是「这一轮"
         "不审」——本轮 scope 退回可审池，后续 Stop 仍可能重新提议同一批改动。\n"
@@ -1634,7 +1638,7 @@ def kanban_followup_review_validate_fix_prompt(
         "不要创建新的 Kanban task，不要 fork 新会话，也不要把这条消息当作 hook system context。\n\n"
         "为什么你收到的是这条而不是发起决策点横幅：本轮被**显式**配置成了 "
         "`CODEX_RVF_FORK_MODE=kanban-followup`（保留的终端投递逃生口）。默认路径是横幅 + "
-        "`rvf-agent start`/`decline`，由你决定发不发起；这条投递没有事前决策点，故谢绝出口在下方。\n\n"
+        "`rvf start`/`decline`，由你决定发不发起；这条投递没有事前决策点，故谢绝出口在下方。\n\n"
         "请在当前 task worktree 中运行完整 review-validate-fix。目标仓库为上面的 "
         "`RVF_TARGET_REPO`；如果当前 task worktree 的 repo root 与该路径不同，以当前 task "
         "worktree 为执行位置，并在 handoff 中记录这一点。\n\n"
@@ -9048,10 +9052,16 @@ def resolve_decision_point_delivery_transport(
     return decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
 
 
-def _rvf_agent_cli_path() -> Path:
-    """rvf-agent 决策 CLI（S3）的落盘路径——与本 Stop hook 同目录的兄弟脚本，注入提示里渲染成
-    可复制粘贴的命令样例。"""
-    return Path(__file__).resolve().with_name("rvf_agent_decision_cli.py")
+def _rvf_command_line_shortcut_invocation() -> str:
+    """横幅命令样例的前缀：PATH 上的 ``rvf`` > shim 绝对路径 > 同目录入口脚本绝对路径。
+
+    历史上横幅渲染 ``python3 <部署绝对路径>/rvf_agent_decision_cli.py``，而回执写的是一个 PATH 上
+    不存在的 ``rvf-agent``——两处各说各的，agent 只能 ``--help`` 摸索。现在两处同源。"""
+    return resolve_rvf_command_line_shortcut_invocation(
+        fallback_entrypoint_script_path=Path(__file__).resolve().with_name(
+            RVF_COMMAND_LINE_SHORTCUT_ENTRYPOINT_SCRIPT_FILENAME
+        )
+    )
 
 
 # 候选摘要里承载「这一轮源自哪份会话 transcript」的键。名字与 ``prepare_review_run`` 的 prep
@@ -9187,7 +9197,7 @@ def _render_decision_point_injection_prompt(
     ⚠️ **改这段文案必须重跑 UPS 全检测器回归**：正文里两处 ``$review-validate-fix`` 只因被反引号
     包着才没命中 ``RVF_MANUAL_TRIGGER_RE``（它要求前面是行首或空白）。一次无心的换行就会让横幅把
     自己判成手动触发、再铸一枚 token 再注入一遍。"""
-    cli = str(_rvf_agent_cli_path())
+    rvf = _rvf_command_line_shortcut_invocation()
     repo = str(summary.get("repo") or "")
     count = summary.get("candidate_path_count") or 0
     has_committed = bool(summary.get("has_committed_but_unreviewed"))
@@ -9210,7 +9220,7 @@ def _render_decision_point_injection_prompt(
         "本轮工作停下时检测到本 worktree **存在未提交（或本轮已提交但未审）的改动**——发起闸看的是"
         "工作树是否干净，**不是**「有没有新工作」；上一轮 RVF 刚审完、你把修复落盘还没提交，这里照样"
         "会再问一次。规模行下方的「已审 / 未审」估算才是判断「还剩多少真没审」的依据。是否发起 RVF 由你"
-        "（主 agent）决定：简要评估后，用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。"
+        "（主 agent）决定：简要评估后，用下面的 `rvf` 命令**显式** start（发起）或 decline（谢绝）。"
     )
     lines.append(f"RVF_DECISION_TOKEN={token}")
     if (
@@ -9295,18 +9305,18 @@ def _render_decision_point_injection_prompt(
         else ""
     )
     lines.append(
-        f"  发起（简析后开审）: python3 {cli} start --token {token}{transcript_flag} "
+        f"  发起（简析后开审）: {rvf} start --token {token}{transcript_flag} "
         f"--reason \"<一句话理由>\""
     )
     lines.append(
         f"  自动 scope 微调（可选，仅 start 后 acknowledged 态）: "
-        f"python3 {cli} scope exclude --token {token} <path>... --reason \"<理由>\""
+        f"{rvf} scope exclude --token {token} <path>... --reason \"<理由>\""
     )
     lines.append(
         f"  定稿派发（选严格度档 light|standard|strict）: "
-        f"python3 {cli} dispatch --token {token} --strictness {suggested_tier}"
+        f"{rvf} dispatch --token {token} --strictness {suggested_tier}"
     )
-    lines.append(f"  谢绝（不发起）: python3 {cli} decline --token {token} --reason \"<一句话理由>\"")
+    lines.append(f"  谢绝（不发起）: {rvf} decline --token {token} --reason \"<一句话理由>\"")
     lines.append(
         "  （谢绝会在本会话内 snooze 这片工作范围：直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），"
         "自动 Stop 都不会再为它弹这条横幅。）"
@@ -9412,7 +9422,7 @@ def reconcile_pending_decision_token_receipts(
                 session_id=session_id,
             )
             warnings.append(
-                f"决策 token {token} 在 TTL 内既未被 rvf-agent CLI 触碰、也未在 transcript 探到"
+                f"决策 token {token} 在 TTL 内既未被 rvf 决策 CLI 触碰、也未在 transcript 探到"
                 "投递痕迹，已标记为 lost（发起层疑似静默丢投）。**不会自动重试**；如仍需审查，"
                 "请在下一轮真实改动后重新触发，或手动 $review-validate-fix。"
             )
@@ -9843,7 +9853,7 @@ def reconcile_stranded_decision_point_delivery_intents(
             notices.append(
                 f"发起横幅（token={token}）投出去后在有效期内始终没成为一条真实 user message"
                 f"（transcript 证据：{banner_presence.presence}），"
-                "已撤回该 token（即便消息迟到落地，rvf-agent start 也会硬失败）。"
+                "已撤回该 token（即便消息迟到落地，rvf start 也会硬失败）。"
                 "**本次 Stop 不再重铸**——重新征询最早发生在下一次 Stop，且这次空转会如实计入"
                 "铸造熔断（通道持续坏着时自动退避；手动 /review-validate-fix 不受影响）。"
             )

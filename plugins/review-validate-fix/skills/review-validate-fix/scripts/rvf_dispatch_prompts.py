@@ -124,7 +124,7 @@ def dispatch_scope_of_work_text(
         return (
             "# Scope of Work: agentic RVF initiation (agent 经决策点显式 start)\n\n"
             f"{SCOPE_OF_WORK_STUB_MARKER}\n\n"
-            "本文件由 `rvf-agent start` 在 agent 接受 Stop hook 的发起决策点后生成，用于冻结本轮 "
+            "本文件由 `rvf start` 在 agent 接受 Stop hook 的发起决策点后生成，用于冻结本轮 "
             "review 输入。**不是**用户手动触发，也**不是**任何 followup/fork 派发。\n\n"
             f"- target_flow：`{target_flow}`\n"
             f"- 目标仓库：`{cwd}`\n"
@@ -137,9 +137,9 @@ def dispatch_scope_of_work_text(
             + "\n"
             "**dispatch 前必须把上面的骨架填成真实 reasoning 内容，并删掉本文件顶部那一整行 stub 标记**"
             f"（`{SCOPE_OF_WORK_STUB_MARKER}`，就是标题下面单独成行的那一行；本段这句里的引用不必动，"
-            "判据只认顶部单独成行的标记）——`rvf-agent dispatch` 有 contract gate，"
+            "判据只认顶部单独成行的标记）——`rvf dispatch` 有 contract gate，"
             "stub 未被覆盖会直接拒派，不会让 reviewer 空审一轮。\n"
-            "改完后用 `rvf-agent scope rerender-scope-of-work --token <token>` 把新正文重渲进 "
+            "改完后用 `rvf scope rerender-scope-of-work` 把新正文重渲进 "
             "review packet：packet 在 start 时就内联冻结了这份 stub，光改盘上的文件不会进 packet"
             "（重渲会把旧 packet 归档到 `scope-of-work-rerender-rounds/`，冻结输入仍可审计）。\n"
         )

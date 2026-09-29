@@ -936,7 +936,7 @@ def _manual_decision_additional_context_text(
             "⚠️ 注意：你早前对**同一批改动**谢绝过一次 RVF，用户这次的显式触发已推翻该谢绝。"
             "请不要以「上次已判断过不必审」为由再次 decline——除非你有本次新出现的理由。"
         )
-    lines.append("请简要评估后用下面的 rvf-agent CLI **显式** start（发起）或 decline（谢绝）。")
+    lines.append("请简要评估后用下面的 `rvf` 命令**显式** start（发起）或 decline（谢绝）。")
     lines.append("")
     try:
         import stop_review_validate_fix as stop_hook  # noqa: PLC0415 - 惰性、仅 manual 触发
@@ -947,17 +947,16 @@ def _manual_decision_additional_context_text(
             )
         )
     except Exception:  # pragma: no cover - 渲染降级永不阻断
-        cli = "rvf_agent_decision_cli.py"
         lines.append(f"RVF_DECISION_TOKEN={token}")
         lines.append(f"候选文件数: {summary.get('candidate_path_count')}")
-        lines.append(f"发起: python3 {cli} start --token {token} --reason \"<一句话理由>\"")
-        lines.append(f"谢绝: python3 {cli} decline --token {token} --reason \"<一句话理由>\"")
+        lines.append(f"发起: rvf start --token {token} --reason \"<一句话理由>\"")
+        lines.append(f"谢绝: rvf decline --token {token} --reason \"<一句话理由>\"")
     if inline_scope:
         lines.append("")
         lines.append(
             "用户在触发串里内联指定了 scope: "
             + ", ".join(inline_scope)
-            + "。start（acknowledged 态）后可用 `rvf-agent scope include/exclude` 据此收窄。"
+            + "。start（acknowledged 态）后可用 `rvf scope include/exclude` 据此收窄。"
         )
     return "\n".join(lines)
 
@@ -2033,7 +2032,7 @@ def _trigger_system_message(
             status_value=status or "terminal",
             message=(
                 "一份**已作废**的 RVF 发起决策点横幅迟到落地（token 已达终态），"
-                "未推进任何状态；rvf-agent start 会硬失败"
+                "未推进任何状态；rvf start 会硬失败"
             ),
             extra_fields=detail_fields,
         )
@@ -2043,7 +2042,7 @@ def _trigger_system_message(
             message=(
                 "带外投递的 RVF 发起决策点横幅已作为一条真实 user message 到达，但"
                 "**决策 token 未能推进**（TTL 已过 / token 文件缺失 / 状态机拒绝，详见 detail）；"
-                "token 仍停在原状态，rvf-agent start 会硬失败。投递意图**未清除**，"
+                "token 仍停在原状态，rvf start 会硬失败。投递意图**未清除**，"
                 "留给后续对账处置（到期撤回并重新征询）"
             ),
             extra_fields=detail_fields,

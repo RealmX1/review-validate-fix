@@ -668,6 +668,9 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/apply_worktree_bootstrap.py" \
   "$skill_dir/scripts/cline_kanban_client.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
+  "$skill_dir/scripts/rvf_command_line_shortcut_entrypoint.py" \
+  "$repo_root/core/rvf_command_line_shortcut_shim_location.py" \
+  "$repo_root/core/host_adapter/current_agent_session_identity_from_environment.py" \
   "$repo_root/core/run_ledger/run_ledger.py" \
   "$repo_root/core/rvf_user_local_data_paths.py" \
   "$repo_root/core/rvf_shared_runtime_constants/rvf_shared_runtime_constants.py" \
