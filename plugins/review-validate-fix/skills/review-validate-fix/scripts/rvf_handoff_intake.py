@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -324,12 +323,16 @@ def infer_run_dir(values: dict[str, str], run_id: str | None) -> Path | None:
         if path.name == "origin.json" and path.parent.name == "artifacts":
             return path.parent.parent
     if run_id:
-        for env_name in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR"):
-            root = os.environ.get(env_name)
-            if root:
-                candidate = Path(root).expanduser() / "runs" / run_id
-                if candidate.exists():
-                    return candidate
+        # 与铸 run 的一侧同一个裁决点：显式 LOG_ROOT / STATE_DIR 覆盖优先，否则落到统一状态根的
+        # run-logs。只认环境变量会让「handoff 只写了 run id」的情形在默认配置下永远找不到 run。
+        # 惰性 import：UPS hook（rvf_user_prompt_submit）在 try/except 里 import 本模块只为用两个
+        # 纯函数，模块级多一条 core.* 依赖，一旦在 hook 环境里失败就会静默关掉它的误触发守卫。
+        import _rvf_pyroot  # noqa: F401,PLC0415 — 供 core.* import
+        from core.rvf_user_local_data_paths import resolved_rvf_runtime_log_root  # noqa: PLC0415
+
+        candidate = resolved_rvf_runtime_log_root() / "runs" / run_id
+        if candidate.exists():
+            return candidate
     return None
 
 

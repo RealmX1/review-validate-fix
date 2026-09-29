@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -20,7 +21,13 @@ VALIDATION_RESULT_CACHE = (
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
+    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("GIT_", "RVF_", "CODEX_RVF_"))
+    }
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -458,3 +465,155 @@ def test_failed_result_is_cached_with_original_exit_code_and_base_context_identi
     second_payload = json.loads(second.stdout)
     assert second_payload["cache_status"] == "hit"
     assert second_payload["requires_base_worktree_context"] is True
+
+
+def run_cache_with_run_directory(
+    repo: Path,
+    user_data_root: Path,
+    name: str,
+    command: list[str],
+    *,
+    rvf_run_dir: Path | None = None,
+    environment_overrides: dict[str, str] | None = None,
+    wrapper_arguments: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = clean_test_environment(
+        {"RVF_USER_LOCAL_DATA_ROOT": str(user_data_root), **(environment_overrides or {})}
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATION_RESULT_CACHE),
+            "run",
+            "--repo",
+            str(repo),
+            "--name",
+            name,
+            *(wrapper_arguments or []),
+            *(["--rvf-run-dir", str(rvf_run_dir)] if rvf_run_dir is not None else []),
+            "--",
+            *command,
+        ],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_run_directory_records_structured_argv_in_first_seen_order_on_execute_and_hit(tmp_path: Path) -> None:
+    """land 重放的事实源：每次经 wrapper 跑（含缓存命中）都按 name upsert argv / cwd / 环境键。"""
+    repo = initialized_repository(tmp_path / "repo")
+    (repo / "sub").mkdir()
+    run_dir = tmp_path / "run"
+    user_data = tmp_path / "user-data"
+    first_command = [sys.executable, "-c", "print('first suite')"]
+    second_command = [sys.executable, "-c", "print('second suite')"]
+    executed = run_cache_with_run_directory(
+        repo,
+        user_data,
+        "handoff-validation-001",
+        first_command,
+        rvf_run_dir=run_dir,
+        environment_overrides={"RVF_TEST_DECLARED_FLAVOR": "alpha"},
+        wrapper_arguments=["--working-directory", "sub", "--environment-key", "RVF_TEST_DECLARED_FLAVOR"],
+    )
+    assert executed.returncode == 0, executed.stderr
+    assert run_cache_with_run_directory(
+        repo, user_data, "handoff-validation-002", second_command, rvf_run_dir=run_dir
+    ).returncode == 0
+    hit = run_cache_with_run_directory(
+        repo,
+        user_data,
+        "handoff-validation-001",
+        first_command,
+        rvf_run_dir=run_dir,
+        environment_overrides={"RVF_TEST_DECLARED_FLAVOR": "alpha"},
+        wrapper_arguments=["--working-directory", "sub", "--environment-key", "RVF_TEST_DECLARED_FLAVOR"],
+    )
+    hit_payload = json.loads(hit.stdout)
+    assert hit_payload["cache_status"] == "hit"
+    assert hit_payload["run_validation_index_summary"]["all_records_passed_for_current_content"] is True
+    assert [record["name"] for record in hit_payload["run_validation_index_summary"]["records"]] == [
+        "handoff-validation-002",
+        "handoff-validation-001",
+    ]
+
+    artifact = run_dir / "artifacts" / "handoff-validation-commands.json"
+    encoded = artifact.read_bytes()
+    assert (run_dir / "artifacts" / "handoff-validation-commands.json.sha256").read_text() == (
+        hashlib.sha256(encoded).hexdigest() + "\n"
+    )
+    entries = json.loads(encoded)["validation_commands"]
+    assert entries == [
+        {
+            "name": "handoff-validation-001",
+            "argv": first_command,
+            "working_directory_relative_to_worktree": "sub",
+            "environment_keys": ["RVF_TEST_DECLARED_FLAVOR"],
+            "validation_context_kind": "task_worktree",
+            "requires_base_worktree_context": False,
+        },
+        {
+            "name": "handoff-validation-002",
+            "argv": second_command,
+            "working_directory_relative_to_worktree": ".",
+            "environment_keys": [],
+            "validation_context_kind": "task_worktree",
+            "requires_base_worktree_context": False,
+        },
+    ]
+    assert "alpha" not in encoded.decode("utf-8"), "环境变量的值不得落进 argv 工件"
+
+
+def test_run_directory_falls_back_to_rvf_run_dir_environment_variable(tmp_path: Path) -> None:
+    repo = initialized_repository(tmp_path / "repo")
+    run_dir = tmp_path / "run-from-environment"
+    completed = run_cache_with_run_directory(
+        repo,
+        tmp_path / "user-data",
+        "handoff-validation-001",
+        [sys.executable, "-c", "print('ok')"],
+        environment_overrides={"RVF_RUN_DIR": str(run_dir)},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (run_dir / "artifacts" / "validation-records.json").is_file()
+    assert (run_dir / "artifacts" / "handoff-validation-commands.json").is_file()
+    assert json.loads(completed.stdout)["run_validation_index_summary"]["record_count"] == 1
+
+
+def test_failed_validation_prints_output_tail_on_execute_and_replays_it_on_cache_hit(tmp_path: Path) -> None:
+    """失败时直接回显尾部，免得 agent 在缓存外再跑一遍；缓存命中一条已失败记录时从 run artifacts 取回。"""
+    repo = initialized_repository(tmp_path / "repo")
+    run_dir = tmp_path / "run"
+    user_data = tmp_path / "user-data"
+    noisy_failure = [
+        sys.executable,
+        "-c",
+        "import sys\n"
+        "for index in range(200):\n"
+        "    print(f'progress line {index}')\n"
+        "print('FAILURE CAUSE: expected 1 got 2', file=sys.stderr)\n"
+        "sys.exit(5)",
+    ]
+    executed = run_cache_with_run_directory(repo, user_data, "failing-suite", noisy_failure, rvf_run_dir=run_dir)
+    assert executed.returncode == 5
+    payload = json.loads(executed.stdout)
+    assert payload["cache_status"] == "executed"
+    assert payload["run_validation_index_summary"]["all_records_passed_for_current_content"] is False
+    assert "FAILURE CAUSE: expected 1 got 2" in executed.stderr
+    assert "progress line 199" in executed.stderr
+    assert "progress line 100" not in executed.stderr, "尾部应截断在最后 60 行"
+
+    hit = run_cache_with_run_directory(repo, user_data, "failing-suite", noisy_failure, rvf_run_dir=run_dir)
+    assert hit.returncode == 5
+    assert json.loads(hit.stdout)["cache_status"] == "hit"
+    assert "FAILURE CAUSE: expected 1 got 2" in hit.stderr
+
+    other_run = tmp_path / "other-run"
+    hit_without_tail = run_cache_with_run_directory(
+        repo, user_data, "failing-suite", noisy_failure, rvf_run_dir=other_run
+    )
+    assert hit_without_tail.returncode == 5
+    assert "命中一条已失败的缓存记录" in hit_without_tail.stderr
