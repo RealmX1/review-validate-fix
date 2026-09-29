@@ -3660,6 +3660,130 @@ def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -
     assert decision_token_records(state) == []
 
 
+def test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_state_root(
+    tmp_path: Path,
+) -> None:
+    """backlog d3f64：land 收尾后紧随的 Stop 不得再发起一轮 RVF。
+
+    事故（run rvf-20260809T033515Z-stop-hook-c6fe2516）里封窗其实成功了，但 seal 写进
+    ``~/.rvf/user-local-data/run-logs``、Stop 读 ``~/.claude/rvf``（双状态根），于是 Stop 仍拿
+    land commit 的父作窗口下界、把刚 land 的 16 个文件当成「已提交未审」派了 follow-up。
+    上面那条 seal e2e 给 seal 与 Stop **显式钉同一个** ``CODEX_RVF_STATE_DIR``，恰好绕开了
+    这个成因；这里三方（UPS hook / agent shell 里的 ``rvf_land.py commit`` / Stop hook）都
+    **不设**任何 LOG_ROOT / STATE_DIR 覆盖，各自从 ``RVF_USER_LOCAL_DATA_ROOT`` 推导状态根，
+    钉的是「land 的封窗与 Stop 的读取落在同一个根」这件事本身。
+    """
+    repo = _init_committed_round_repo(tmp_path)
+    user_local_data_root = tmp_path / "user-local-data"
+    session_id = "d3f64d3f-0000-1111-2222-333344445555"
+    transcript = _committed_round_session(tmp_path, repo, session_id)
+    self_derived_root_env = os.environ.copy()
+    for name in tuple(self_derived_root_env):
+        if name.startswith(("CODEX_RVF_", "RVF_", "KANBAN_", "CLINE_KANBAN_")):
+            self_derived_root_env.pop(name, None)
+    self_derived_root_env.pop("CODEX_THREAD_ID", None)
+    self_derived_root_env["RVF_USER_LOCAL_DATA_ROOT"] = str(user_local_data_root)
+    self_derived_root_env["RVF_HOME"] = str(rvf_home_dir(tmp_path))
+
+    subprocess.run(
+        [sys.executable, str(UPS_SCRIPT)],
+        input=json.dumps(
+            {
+                "cwd": str(repo),
+                "session_id": session_id,
+                "prompt": "请加一行",
+                "transcript_path": str(transcript),
+            }
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+        env=self_derived_root_env,
+    )
+    (repo / "f.txt").write_text("base\nadded\n", encoding="utf-8")
+
+    run_dir = tmp_path / "rvf-run"
+    (run_dir / "artifacts").mkdir(parents=True)
+    handoff_path = run_dir / "artifacts" / "handoff.md"
+    handoff_path.write_text(
+        "# Review-validate-fix 交接上下文\n\n## 状态\n\n"
+        "- handoff_status: COMPLETED\n- review_status: COMPLETED\n"
+        f"- 目标仓库: {repo}\n\n"
+        "## Handoff intake hints\n\n- reviewed scope paths:\n  - f.txt\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT.with_name("validation_result_cache.py")),
+            "run",
+            "--repo",
+            str(repo),
+            "--name",
+            "handoff-validation-001",
+            "--rvf-run-dir",
+            str(run_dir),
+            "--",
+            sys.executable,
+            "-c",
+            "print('ok')",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=self_derived_root_env,
+    )
+    land_env = {**self_derived_root_env, "RVF_SESSION_ID": session_id}
+    rvf_land_script = SCRIPT.with_name("rvf_land.py")
+    prepare = subprocess.run(
+        [sys.executable, str(rvf_land_script), "prepare", "--handoff", str(handoff_path), "--repo", str(repo)],
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        env=land_env,
+    )
+    assert prepare.returncode == 0, (prepare.stdout, prepare.stderr)
+    commit = subprocess.run(
+        [sys.executable, str(rvf_land_script), "commit", "--run-dir", str(run_dir), "--message-file", "-"],
+        input="feat: 加一行\n\n验证：\n[[rvf-land-validation-summary]]\n",
+        capture_output=True,
+        text=True,
+        cwd=repo,
+        env=land_env,
+    )
+    assert commit.returncode == 0, (commit.stdout, commit.stderr)
+    land_result = json.loads(commit.stdout)
+    assert land_result["status"] == "committed", land_result
+    assert land_result["validation"]["mode"] == "reused_run_validation_index_with_zero_execution", land_result
+    assert land_result["round_baseline_seal"]["sealed"] is True, land_result
+    landed_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert land_result["commit_oid"] == landed_head
+    # 非空转判据：UPS 写的 marker 与 land 封窗写的 marker 必须落在同一个自推导根下，且已前移到 land HEAD。
+    marker_directory = user_local_data_root / "run-logs" / "round-baseline-pending"
+    marker_heads = {
+        json.loads(marker.read_text(encoding="utf-8")).get("baseline_head")
+        for marker in marker_directory.glob("*.json")
+    }
+    assert landed_head in marker_heads, (marker_heads, landed_head)
+
+    stdout, _stderr = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "stop_hook_active": False,
+            "transcript_path": str(transcript),
+        },
+        extra_env={
+            "RVF_USER_LOCAL_DATA_ROOT": str(user_local_data_root),
+            "RVF_HOME": str(rvf_home_dir(tmp_path)),
+        },
+    )
+    assert_skip_reason(stdout, "无可审候选改动")
+    assert decision_token_records(tmp_path) == []
+
+
 def test_committed_round_highwater_routes_orphan_below_advanced_baseline(tmp_path: Path) -> None:
     """漏审第三面盲区 e2e — reported run rvf-20260626T133034Z (task 498db). Work
     committed in an earlier turn (C1) was reviewed → last-reviewed high-water = C1.
@@ -5937,6 +6061,7 @@ def main() -> int:
         test_clean_repo_skips,
         test_committed_round_clean_repo_injects_decision_point,
         test_committed_round_seal_after_land_suppresses_redispatch,
+        test_rvf_land_commit_leaves_next_stop_without_candidates_under_self_derived_state_root,
         test_committed_round_highwater_routes_orphan_below_advanced_baseline,
         test_committed_round_without_transcript_evidence_injects_decision_point,
         test_committed_round_skip_review_trailer_excludes_from_candidate_summary,

@@ -15,7 +15,13 @@ WRITE_CANDIDATE_EVIDENCE = SCRIPT_DIRECTORY / "write_reviewed_task_candidate_evi
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
+    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("GIT_", "RVF_", "CODEX_RVF_"))
+    }
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",

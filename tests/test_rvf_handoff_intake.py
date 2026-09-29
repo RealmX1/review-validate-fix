@@ -26,7 +26,13 @@ VALIDATION_RESULT_CACHE = SCRIPT.parent / "validation_result_cache.py"
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
+    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("GIT_", "RVF_", "CODEX_RVF_"))
+    }
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -577,6 +583,35 @@ def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stal
     assert payload["validation_evidence_source"] == "invalid_candidate_evidence"
     assert payload["validation_records"] == []
     assert payload["validation_commands"] == ["npm test"]
+
+
+def test_candidate_evidence_fixture_does_not_write_into_ambient_rvf_run_directory(
+    tmp_path: Path,
+) -> None:
+    # 回归：validation_result_cache 的 --rvf-run-dir 缺省回退到 RVF_RUN_DIR；fixture 不传该参数，
+    # 若 clean_test_environment 不剥 RVF_*，在活 run shell 里跑测试会把 targeted-* 记录写进活 run。
+    ambient_run_directory = tmp_path / "ambient-rvf-run-directory-must-stay-untouched"
+    ambient_run_directory.mkdir()
+    repo = init_repo(tmp_path / "repo")
+    previous_rvf_run_directory = os.environ.get("RVF_RUN_DIR")
+    os.environ["RVF_RUN_DIR"] = str(ambient_run_directory)
+    try:
+        create_valid_reviewed_candidate_evidence_fixture(
+            tmp_path,
+            repo,
+            cache_key_character="e",
+            command_digest_character="f",
+            environment_digest_character="0",
+        )
+    finally:
+        if previous_rvf_run_directory is None:
+            os.environ.pop("RVF_RUN_DIR", None)
+        else:
+            os.environ["RVF_RUN_DIR"] = previous_rvf_run_directory
+    artifacts = ambient_run_directory / "artifacts"
+    assert not (artifacts / "validation-records.json").exists()
+    assert not (artifacts / "handoff-validation-commands.json").exists()
+    assert not artifacts.exists()
 
 
 def test_handoff_intake_ignores_poisoned_git_repository_location_environment(

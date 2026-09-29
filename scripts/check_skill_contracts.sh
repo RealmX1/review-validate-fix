@@ -508,6 +508,9 @@ required_files=(
   "scripts/rvf_prep_file.py"
   "scripts/rvf_user_prompt_submit.py"
   "scripts/rvf_handoff_intake.py"
+  "scripts/rvf_land.py"
+  "scripts/validation_result_cache.py"
+  "scripts/write_reviewed_task_candidate_evidence.py"
   "scripts/workspace_snapshot.py"
   "scripts/stop_hook_dispatcher.py"
   "scripts/stop_hook_router.py"
@@ -584,6 +587,9 @@ repo_required_files=(
   "tests/test_review_support_scripts.py"
   "tests/test_review_reopen_marker.py"
   "tests/test_rvf_handoff_intake.py"
+  "tests/test_rvf_land_single_step_prepare_and_commit.py"
+  "tests/test_validation_result_cache_v2.py"
+  "tests/test_reviewed_task_candidate_evidence.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
   "tests/test_kimi_host_adapter_and_transcript.py"
@@ -680,6 +686,9 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/rvf_user_prompt_submit.py" \
   "$skill_dir/scripts/rvf_withdrawn_dispatch_tombstone.py" \
   "$skill_dir/scripts/rvf_handoff_intake.py" \
+  "$skill_dir/scripts/rvf_land.py" \
+  "$skill_dir/scripts/validation_result_cache.py" \
+  "$skill_dir/scripts/write_reviewed_task_candidate_evidence.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/stop_hook_dispatcher.py" \
@@ -716,6 +725,7 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_review_support_scripts.py" \
   "$tests_dir/test_review_reopen_marker.py" \
   "$tests_dir/test_rvf_handoff_intake.py" \
+  "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
   "$tests_dir/test_review_initiation_decision_point_is_sole_self_injection.py" \
   "$tests_dir/test_reviewer_prompt_delivery_contract.py" \
   "$tests_dir/test_reviewer_structured_output_extraction.py" \
@@ -757,6 +767,14 @@ run_step "tests: agentic_initiation_scope_of_work_contract" \
 run_step "tests: compact_path_tree_rendering" \
   python3 -m pytest -q \
     "$tests_dir/test_compact_path_tree_rendering.py"
+# land 单步化链路：验证缓存（含结构化 argv 工件 / 失败尾部）→ candidate evidence → rvf_land
+# prepare/commit 端到端。前两份曾经不在任何 gate 里（改了缓存或 evidence 门槛也不会有测试变红），
+# 而 rvf_land 的零执行复用恰恰建立在二者口径一致之上，所以三份一起跑。
+run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
+  python3 -m pytest -q \
+    "$tests_dir/test_validation_result_cache_v2.py" \
+    "$tests_dir/test_reviewed_task_candidate_evidence.py" \
+    "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py"
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
 # request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
 run_step "tests: reviewer_result_artifact_lifecycle" \
@@ -984,6 +1002,15 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'bas
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '用户已经明确要求后续运行'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不要停下询问“是否现在运行”'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '如果用户没有明确要求后续 base 同步'
+# land 单步化：三个 land 入口的机械步骤都必须经 rvf_land.py，而不是回到逐条手跑（每条都是一次 agent 请求）。
+# 占位符字面量两侧各钉一次：SKILL 叫 agent 保留它、脚本按它替换验证结果，任一侧改名另一侧就静默失效。
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_land.py prepare'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_land.py commit'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '[[rvf-land-validation-summary]]'
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_land.py" 'RVF_LAND_COMMIT_MESSAGE_VALIDATION_SUMMARY_PLACEHOLDER = "[[rvf-land-validation-summary]]"'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-handoff-intake/SKILL.md" 'rvf_land.py prepare --cross-worktree'
+require_repo_literal "plugins/review-validate-fix/commands/rvf-handoff-commit.md" 'rvf_land.py prepare --cross-worktree'
+require_literal "SKILL.md" 'handoff-validation-commands.json'
 # 失败再入 $rvf-reopen skill + 确定性后端脚本（防部署门漂移、漏部署）；入口已统一为 namespaced skill
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'rvf_rescope.py'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-reopen/SKILL.md" 'target_run_id'
