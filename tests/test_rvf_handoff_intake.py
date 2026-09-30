@@ -26,8 +26,8 @@ VALIDATION_RESULT_CACHE = SCRIPT.parent / "validation_result_cache.py"
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
-    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    # 同时剥掉 RVF_* / CODEX_RVF_*：被测脚本不得读到活 run 的环境。validation_result_cache 曾回退读
+    # RVF_RUN_DIR、把测试记录写进活 run 的 validation index；源头已删，这里保留为纵深防御。
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -588,8 +588,8 @@ def test_handoff_intake_treats_incomplete_candidate_evidence_as_invalid_not_stal
 def test_candidate_evidence_fixture_does_not_write_into_ambient_rvf_run_directory(
     tmp_path: Path,
 ) -> None:
-    # 回归：validation_result_cache 的 --rvf-run-dir 缺省回退到 RVF_RUN_DIR；fixture 不传该参数，
-    # 若 clean_test_environment 不剥 RVF_*，在活 run shell 里跑测试会把 targeted-* 记录写进活 run。
+    # 回归：validation_result_cache 的 --rvf-run-dir 曾缺省回退到 RVF_RUN_DIR；fixture 不传该参数，
+    # 在活 run shell 里跑测试会把 targeted-* 记录写进活 run。源头与 clean_test_environment 两层都挡。
     ambient_run_directory = tmp_path / "ambient-rvf-run-directory-must-stay-untouched"
     ambient_run_directory.mkdir()
     repo = init_repo(tmp_path / "repo")

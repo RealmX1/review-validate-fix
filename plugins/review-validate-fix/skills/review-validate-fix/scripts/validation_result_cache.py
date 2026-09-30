@@ -32,9 +32,9 @@ SECRET_LIKE_ENVIRONMENT_KEY = re.compile(
 )
 PACKAGE_MANAGER_EXECUTABLES = {"bun", "npm", "npx", "pnpm", "yarn"}
 VALIDATION_CONTEXT_KINDS = {"task_worktree", "base_worktree"}
-# run 目录的环境变量回退：显式 ``--rvf-run-dir`` 优先。更高层的「当前 run」推断由 rvf CLI
-# 入口负责，本脚本只认显式参数与这一个环境变量，不自行猜 run。
-RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE = "RVF_RUN_DIR"
+# run 目录只认显式 ``--rvf-run-dir``，不回退任何环境变量：reviewer 子进程被显式注入 RVF_RUN_DIR、Codex
+# task shell 也会 export 它，回退会把外来测试记录写进活 run 的验证索引与 argv 工件（land 随后重放它们）。
+# 更高层的「当前 run」推断由 rvf CLI 入口负责（``rvf validate`` 显式补参数）。
 # land 重跑验证的结构化事实源：与 validation-records.json 同目录、同锁写入。land 按它的 argv 经
 # 本缓存重放，不再从 handoff markdown 里解析命令字符串。argv 与 handoff 验证段是同一份内容，
 # 环境变量只记键名不记值（值进环境指纹的哈希）。
@@ -595,8 +595,7 @@ def run_validation(args: argparse.Namespace) -> int:
             "base_worktree validation context requires --requires-base-worktree-context"
         )
 
-    rvf_run_dir_argument = args.rvf_run_dir or os.environ.get(RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE, "").strip()
-    rvf_run_dir = Path(rvf_run_dir_argument).expanduser() if rvf_run_dir_argument else None
+    rvf_run_dir = Path(args.rvf_run_dir).expanduser() if args.rvf_run_dir else None
 
     content_digest = candidate_content_manifest_sha256(repo_root)
     environment_digest, public_environment = environment_fingerprint(command, args.environment_key)
@@ -785,7 +784,7 @@ def main() -> int:
     )
     run_parser.add_argument(
         "--rvf-run-dir",
-        help=f"RVF run 目录；缺省时回退到环境变量 {RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE}。",
+        help="RVF run 目录；只认显式参数，缺省时不写任何 run（不回退 RVF_RUN_DIR）。",
     )
     run_parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
