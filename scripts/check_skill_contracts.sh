@@ -1006,9 +1006,10 @@ require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '用
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '不要停下询问“是否现在运行”'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '如果用户没有明确要求后续 base 同步'
 # land 单步化：三个 land 入口的机械步骤都必须经 rvf_land.py，而不是回到逐条手跑（每条都是一次 agent 请求）。
+# $rvf-land 经 `rvf land` 快捷入口转给 rvf_land.py（省掉手拼脚本路径与手抄 run_dir）。
 # 占位符字面量两侧各钉一次：SKILL 叫 agent 保留它、脚本按它替换验证结果，任一侧改名另一侧就静默失效。
-require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_land.py prepare'
-require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf_land.py commit'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf land prepare'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf land commit'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" '[[rvf-land-validation-summary]]'
 require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_land.py" 'RVF_LAND_COMMIT_MESSAGE_VALIDATION_SUMMARY_PLACEHOLDER = "[[rvf-land-validation-summary]]"'
 require_repo_literal "plugins/review-validate-fix/skills/rvf-handoff-intake/SKILL.md" 'rvf_land.py prepare --cross-worktree'
