@@ -31,6 +31,8 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
+**谢绝会在本会话 snooze 这片工作范围。** `rvf decline` 之后，同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。所以同一批工作谢绝过一次后不会再被反复问；开发者手动触发 `/review-validate-fix` 不受 snooze 限制，此时横幅会明说「用户推翻了你的谢绝」，不要照上次的判断再谢绝一次。
+
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
 | 在哪 | transport | 你看到的形态 |
@@ -41,7 +43,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 带外投递那条路上，正文多一行时效说明，其余逐字相同。五件必须知道的事：
 
 - **Stop 那一刻你什么也看不到是正常的。** 默认短等为 0ms，横幅数秒后才作为 user message 到达。这不是降级——正因为它开启新回合，才有 rewind 边界。
-- **只看到边界标记、没有随附正文 = 这是同一枚 token 的重复提交**（例如用户 rewind 后标记被放回输入框又发了出去）。正文只随首次到达注入一次；此时不要 start、不要 decline、也不要为此询问开发者，照这条消息里用户其余的话继续即可。
+- **只看到边界标记、没有随附正文 = 这是同一枚 token 的重复提交**（例如用户 rewind 后标记被放回输入框又发了出去）。正文只随首次到达注入一次；你还没表态的话，这枚 token 已随之作废，下一次 Stop 会重新征询。此时不要 start、不要 decline、也不要为此询问开发者，照这条消息里用户其余的话继续即可。若这其实是首次到达、只是正文没能随附（例如在你回合中途排队送达），下一次 Stop 会直接补发完整正文，届时照常决策。
 - **只有确定失败才回落自注入。** 投递结论未知时本轮静默停、不回落，由投递意图在后续 Stop 对账（宁可晚问一轮，也不要两条通道各问一次）。回落发生时开发者旁注会明说「本轮已回落为 Stop hook 自注入」。
 - **投出去却始终没成为 turn 的横幅会被撤回。** 那枚 token 进 `withdrawn` 终态，即便消息迟到落地，`rvf start` 也会硬失败——不要试图绕过它去手动开一轮。
 - 逃生口：`RVF_DECISION_POINT_DELIVERY_TRANSPORT=stop_hook_self_injection|cline_kanban_task_chat_session` 可强制指定通道。
