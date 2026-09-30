@@ -1371,8 +1371,9 @@ def _explicit_option_value_in_argv(argv: Sequence[str], option_name: str) -> str
 
 # 与 Stop hook 的 ``is_truthy`` 同一口径。
 SUPPRESS_ENVIRONMENT_VALUES_TREATED_AS_SET = frozenset({"1", "true", "yes", "y", "on"})
-# ``validation_result_cache.py run`` 缺 ``--rvf-run-dir`` 时回退读的环境变量；不写主 run 的那一支必须从子进程
-# 环境里剥掉它（调用方 shell 继承来的值正指向主 run），不能只靠「不注入 --rvf-run-dir」。
+# 调用方 shell 继承来的 run 目录变量（reviewer 子进程被显式注入、Codex task shell 会 export），值正指向主 run。
+# ``validation_result_cache.py`` 自身已只认显式 ``--rvf-run-dir``，但被验证的命令及其下游仍会原样继承它；
+# 不写主 run 的那一支从子进程环境里剥掉它，不能只靠「不注入 --rvf-run-dir」。
 RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE_STRIPPED_WHEN_VALIDATION_STAYS_OFF_MAIN_RUN = "RVF_RUN_DIR"
 
 

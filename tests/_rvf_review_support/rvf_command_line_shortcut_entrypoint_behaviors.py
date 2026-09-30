@@ -1088,8 +1088,9 @@ def test_rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays
     记录写进主 run、land 时被重放。
 
     RVF-001：隔离分支只「不注入 ``--rvf-run-dir``」不够——子进程从调用方 shell 继承来的 ``RVF_RUN_DIR``
-    （这里指向本用例自建的主 run）会让 ``validation_result_cache.py`` 回退写进主 run；继承来的
-    ``GIT_DIR`` / ``GIT_WORK_TREE``（指向主 worktree）会让 ``--repo`` 解析成主 worktree。两者都必须挡掉。"""
+    （这里指向本用例自建的主 run）会原样流进被验证的命令（F1 之前还会让 ``validation_result_cache.py``
+    回退写进主 run）；继承来的 ``GIT_DIR`` / ``GIT_WORK_TREE``（指向主 worktree）会让 ``--repo`` 解析成
+    主 worktree。两者都必须挡掉。"""
     session_id = "sess-validate-isolation"
     repo, run_dir, issue_files = _fix_loop_repo_and_run(root)
     environment = _isolated_environment(root, RVF_SESSION_ID=session_id)
