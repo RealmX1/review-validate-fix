@@ -24,12 +24,12 @@ description: Use only when the user explicitly invokes $rvf-land or /rvf-land. �
 
 ## 流程：两条命令，中间只做一次判断
 
-脚本是与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`（在 RVF 源仓库里即 `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_land.py`，部署后是对应 payload 路径），下文记作 `<skill-scripts-dir>/rvf_land.py`。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
+两条命令都经 `rvf land`：部署装到 PATH 上的 RVF 快捷入口（`~/.rvf/bin/rvf`，PATH 上找不到 `rvf` 时用这个绝对路径），原样转给与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`，不用自己拼脚本路径。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
 
 ### 1. prepare（一次调用拿全部事实）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py prepare --stdin --repo . <<'RVF_HANDOFF'
+rvf land prepare --stdin --repo . <<'RVF_HANDOFF'
 <粘贴的 handoff 正文>
 RVF_HANDOFF
 ```
@@ -61,10 +61,12 @@ reviewed scope 的上界：run 的 scope contract 给得出路径全集（`prima
 ### 3. commit（一次调用做完剩下的机械步骤）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py commit --run-dir <prepare 输出的 run_dir> --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
+rvf land commit --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
 <定稿的 commit message>
 RVF_LAND_COMMIT_MESSAGE
 ```
+
+`--run-dir` 可省：缺省取本仓最近一次 `rvf land prepare` 落下 plan 的 run（找不到时 exit 2，先跑 prepare 或显式传 `--run-dir <prepare 输出的 run_dir>`）。
 
 依次执行并输出一份 JSON：
 

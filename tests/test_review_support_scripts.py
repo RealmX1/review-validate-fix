@@ -8652,7 +8652,10 @@ def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(t
     assert ok.status == "ok", ok
     assert ok.detail["dispatch_status_path"].endswith(".dispatch-thread.status.json")
     # 等待改走 `rvf wait`（按 host 分流），不再指引 agent 手动 --wait-status 轮询。
-    assert any(" wait`" in step for step in ok.next_steps), ok.next_steps
+    # 解析不出会话 id 时回执会直接带上 `--run-dir <run>`，两种形态都算。
+    assert any(
+        " wait`" in step or " wait --run-dir " in step for step in ok.next_steps
+    ), ok.next_steps
     assert not any("--wait-status" in step for step in ok.next_steps), ok.next_steps
     assert any("plan_status" in step for step in ok.next_steps), ok.next_steps
 
@@ -12431,6 +12434,55 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
             lambda: test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root / "agent-cli-start-receipt"),
+        ),
+        # --- T1/T2/T3 集成审计修复包 F2：执行段 ---
+        (
+            "rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl",
+            lambda: test_rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl(
+                root / "rvf-wait-awaiting-marker-stop-e2e"
+            ),
+        ),
+        (
+            "rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work",
+            lambda: test_rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work(
+                root / "rvf-wait-awaiting-marker-host-gate"
+            ),
+        ),
+        (
+            "rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd",
+            lambda: test_rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd(
+                root / "rvf-fix-prepare-awaiting-marker"
+            ),
+        ),
+        (
+            "rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run",
+            lambda: test_rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run(
+                root / "rvf-validate-off-main-run"
+            ),
+        ),
+        (
+            "rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository",
+            lambda: test_rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository(
+                root / "rvf-land-passthrough"
+            ),
+        ),
+        (
+            "rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback",
+            lambda: test_rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback(
+                root / "rvf-apply-created-at-order"
+            ),
+        ),
+        (
+            "rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable",
+            lambda: test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable(
+                root / "rvf-receipts-explicit-run-dir"
+            ),
+        ),
+        (
+            "rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol",
+            lambda: test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol(
+                root / "rvf-execution-segment-docs"
+            ),
         ),
     ]
 

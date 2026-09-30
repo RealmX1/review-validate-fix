@@ -44,7 +44,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 - **非完成态终态不得以 rc=0 收尾**：`dispatch_reviewers.py --execute` 的退出码是 `completed`→0、`failed`→1、`blocked_on_reviewer_request`→**专用码 3**。这不是风格问题：detached 派发的每-run `O_EXCL` 幂等锁按「被包命令 rc==0 即该 run 已干净完成」判定不可重派，若 request 终态以 0 收尾，主会话按 Request Handling 处置完再跑 `--execute --detached` 只会得到 `already_running`，本 run 永远产不出 `status: completed` 的 reviewed-candidate 证据，只能绕过单一入口或手改协议 artifact。以 3 收尾则锁被判陈旧、可被重夺，重派走同一入口，并**必须带 `--redispatch-review-request-legs-only`**（见下面 Request Handling 第 5 条）。
 - **`kind: request` 的重派形态只有一种**：`dispatch_reviewers.py --execute --detached --redispatch-review-request-legs-only`。它复用上一轮 `reviewer-plan.json`、只重跑停在 `kind: request` 的腿；不带这个 flag 的整盘重派会连健康且已完成的那条腿一起重跑，新一轮结果原地覆写掉旧的（实测一条 cursor 腿跑了三轮 2/4/3 条 issue，只留最后一轮）。该模式不调用 `route()`，因此 `--selection-seed` 在它下面无效也不需要——reviewer 身份直接来自上一轮 plan；`--selection-seed <seed>` 只在整盘重派（确实要换一轮）时用于复现同一对 reviewer。flag 保持显式而非在该终态下隐式生效：同一入口也服务全新一轮派发，且它在没有上一轮 plan 时是 fail-closed 抛错的，隐式翻转会让「开新一轮」和「续上一轮」两种意图无法区分。
 - **`--dry-run` / `--plan-only` 对结果工件是只读的**：request-only 重派的工件轮转只发生在真正 `--execute` 之前，所以可以先 `--dry-run --redispatch-review-request-legs-only` 预演会重派哪几腿，不会动任何 `review-result.json`。
-- **轮询侧不得只看 `returncode`**：`--wait-status` 打印的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `effective_reviewers=k/n` 才是判据（详见 SKILL.md 的轮询协议）。
+- **等待侧不得只看 `returncode`**：`rvf wait` 摘要首行的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `有效腿=k/n` 与每腿当前 canonical 结果才是判据，摘要末行直接给出判定（详见 SKILL.md「Review」节）。
 
 ## Contract Gate
 
