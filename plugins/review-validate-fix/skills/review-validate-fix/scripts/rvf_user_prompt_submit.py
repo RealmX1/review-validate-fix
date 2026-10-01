@@ -349,6 +349,76 @@ def _git_head_oid(repo: str) -> str | None:
     return None
 
 
+def _extend_round_baseline_expiry_for_host_synthesized_turn(event: dict[str, Any]) -> str | None:
+    """host 合成的回合：只续期本会话**活跃**的 round baseline marker，不前移 head（理由见
+    ``round_baseline_marker.extend_round_baseline_marker_expiry_without_moving_baseline_head``）。
+
+    键解析与 :func:`_capture_round_baseline` 同口径（task_id 优先 / session_id 回退）。best-effort：
+    任何失败都返回 None，绝不阻断这条 prompt。
+    """
+    try:
+        from core.session_scope_allocation import round_baseline_marker  # noqa: PLC0415 - lazy
+
+        cwd = event.get("cwd")
+        if not isinstance(cwd, str) or not cwd.strip():
+            return None
+        repo = _git_resolved_repo(cwd) or cwd
+        try:
+            from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+            task_id = current_kanban_task_id(event)
+        except Exception:
+            task_id = None
+        raw_session = event.get("session_id")
+        session_id = raw_session.strip() if isinstance(raw_session, str) and raw_session.strip() else None
+        extended_path = (
+            round_baseline_marker.extend_round_baseline_marker_expiry_without_moving_baseline_head(
+                task_id=task_id, session_id=session_id, repo=repo
+            )
+        )
+        return str(extended_path) if extended_path is not None else None
+    except Exception:
+        return None
+
+
+def _mark_new_turn_observed_for_deferred_until_condition_declines(event: dict[str, Any]) -> bool:
+    """给本会话所有延后型谢绝记录打「出现了新回合」标志（闸 2c 据此放行重新征询）。
+
+    会话身份只取 ``event["session_id"]``（与 snooze 基线重置同口径）；best-effort，失败永不阻断 prompt
+    ——少打一次标志只让重新征询晚一个回合。返回是否真的打了至少一条。
+    """
+    try:
+        import rvf_decision_token_store  # noqa: PLC0415 - lazy, stdlib-only
+
+        raw_session_id = event.get("session_id")
+        if not (isinstance(raw_session_id, str) and raw_session_id.strip()):
+            return False
+        return (
+            rvf_decision_token_store.mark_new_turn_observed_for_deferred_until_condition_declines_in_session(
+                session_id=raw_session_id.strip()
+            )
+            > 0
+        )
+    except Exception:
+        return False
+
+
+def _host_synthesized_user_prompt_submit_turn_kind(event: dict[str, Any], prompt: str) -> str | None:
+    """这条 UPS 是否 host 自己合成的回合（经**当前会话**的 HostAdapter 判定；core 不写 host 字面量）。
+
+    判定失败一律按「开发者 prompt」处理（返回 None）＝改动前的行为：误判成合成会吞掉一条真实的
+    开发者 prompt（手动触发失效、round baseline 不前移），代价远比少排除一条通知大。
+    """
+    try:
+        from host_adapter_resolver import resolve_current_session_host_adapter  # noqa: PLC0415
+
+        host_adapter = resolve_current_session_host_adapter(event)
+        turn_kind = host_adapter.host_synthesized_user_prompt_submit_turn_kind(event, prompt)
+    except Exception:  # noqa: BLE001 - 判定失败退回改动前的行为
+        return None
+    return turn_kind if isinstance(turn_kind, str) and turn_kind else None
+
+
 def _capture_round_baseline(event: dict[str, Any], prompt: str | None) -> dict[str, Any] | None:
     """Record HEAD at this genuine user prompt as the lower bound for the next
     RVF round's committed-change detection (see ``round_baseline_marker``).
@@ -911,6 +981,9 @@ def _manual_decision_additional_context_text(
     newly_minted: bool,
     inline_scope: list[str] | None = None,
     overrode_agent_declined_cooldown: bool = False,
+    overrode_agent_declined_session_scope_snooze: bool = False,
+    overrode_agent_deferred_until_condition_decline: bool = False,
+    overridden_deferred_until_condition_decline_reason: str | None = None,
 ) -> str:
     """manual 决策点注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
 
@@ -923,6 +996,13 @@ def _manual_decision_additional_context_text(
     的谢绝**。这句不能省——否则 agent 拿到 token 后极可能照上次判断再谢绝一次，用户白打一遍。该参数
     只反映「是否命中并推翻了 agent 的谢绝」，与冷却记录能否被物理清除无关（清除失败只影响后续自动
     路径，对本轮 agent 无意义），故这段文案不提「冷却已清除」，恒为真话。
+
+    ``overrode_agent_declined_session_scope_snooze=True`` 同理，对应闸 2b：agent 早前在**本会话**对这片
+    工作范围谢绝过（此后改动还在继续，所以内容指纹已变、冷却不命中，只剩 snooze 挡着）。T3 之后这是
+    最常见的被推翻形态，两者任一为真都要告知；措辞按实际命中的那一种写，不把「范围」说成「同一批改动」。
+
+    ``overrode_agent_deferred_until_condition_decline=True`` 对应闸 2c：agent 早前说过「等 X 之后再审」。
+    用户显式触发就是「现在就审」，所以要引用那条延后理由，提醒 agent 不要以同一条件再延后一次。
     """
     lines: list[str] = []
     if newly_minted:
@@ -931,10 +1011,25 @@ def _manual_decision_additional_context_text(
         lines.append(
             "你手动触发了 /review-validate-fix；本候选指纹已有一枚活跃决策 token 在等待（幂等复用）；"
         )
-    if overrode_agent_declined_cooldown:
+    if overrode_agent_declined_cooldown or overrode_agent_declined_session_scope_snooze:
+        overridden_decline_description = (
+            "你早前对**同一批改动**谢绝过一次 RVF"
+            if overrode_agent_declined_cooldown
+            else "你早前已在**本会话**对这片工作范围谢绝过 RVF（此后改动还在继续）"
+        )
         lines.append(
-            "⚠️ 注意：你早前对**同一批改动**谢绝过一次 RVF，用户这次的显式触发已推翻该谢绝。"
+            f"⚠️ 注意：{overridden_decline_description}，用户这次的显式触发已推翻该谢绝。"
             "请不要以「上次已判断过不必审」为由再次 decline——除非你有本次新出现的理由。"
+        )
+    if overrode_agent_deferred_until_condition_decline:
+        quoted_reason = (
+            f"「{overridden_deferred_until_condition_decline_reason}」"
+            if overridden_deferred_until_condition_decline_reason
+            else "某个条件满足之后"
+        )
+        lines.append(
+            f"⚠️ 注意：你早前在本会话把审查延后到{quoted_reason}；用户这次的显式触发表示现在就审。"
+            "请不要以同一个条件再延后一次——除非你有本次新出现的理由。"
         )
     lines.append("请简要评估后用下面的 `rvf` 命令**显式** start（发起）或 decline（谢绝）。")
     lines.append("")
@@ -950,7 +1045,10 @@ def _manual_decision_additional_context_text(
         lines.append(f"RVF_DECISION_TOKEN={token}")
         lines.append(f"候选文件数: {summary.get('candidate_path_count')}")
         lines.append(f"发起: rvf start --token {token} --reason \"<一句话理由>\"")
-        lines.append(f"谢绝: rvf decline --token {token} --reason \"<一句话理由>\"")
+        lines.append(
+            f"谢绝: rvf decline --token {token} --decline-kind "
+            "<structural_not_needed|deferred_until_condition> --reason \"<一句话理由>\""
+        )
     if inline_scope:
         lines.append("")
         lines.append(
@@ -1066,6 +1164,9 @@ def _handle_manual_decision_point(
             candidate_summary=summary,
             now=now_dt,
             initiated_by_explicit_user_request=True,
+            explicit_user_request_provenance=(
+                decision_token_store.EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT
+            ),
         )
     except Exception as exc:  # pragma: no cover - 铸造异常兜底
         injection_attempt_ledger.record_injection_attempt(
@@ -1106,12 +1207,26 @@ def _handle_manual_decision_point(
         cooldown_record_still_blocks_automatic_path = (
             mint.declined_cooldown_record_still_blocks_automatic_path
         )
+        # 闸 2b 的同构两事实（M7）：与闸二字段**合并**判断是否告知 agent，各自如实写进用户可见文案。
+        overrode_session_scope_snooze = (
+            mint.explicit_user_request_overrode_agent_declined_session_scope_snooze
+        )
+        session_scope_snooze_record_still_blocks_automatic_path = (
+            mint.declined_session_scope_snooze_record_still_blocks_automatic_path
+        )
         additional_context = _manual_decision_additional_context_text(
             summary=summary,
             token=token,
             newly_minted=newly_minted,
             inline_scope=inline_scope,
             overrode_agent_declined_cooldown=overrode_cooldown,
+            overrode_agent_declined_session_scope_snooze=overrode_session_scope_snooze,
+            overrode_agent_deferred_until_condition_decline=(
+                mint.explicit_user_request_overrode_agent_deferred_until_condition_decline
+            ),
+            overridden_deferred_until_condition_decline_reason=(
+                mint.overridden_deferred_until_condition_decline_reason
+            ),
         )
         detail = f"候选 {candidate_count} 文件"
         if overrode_cooldown:
@@ -1122,6 +1237,15 @@ def _handle_manual_decision_point(
                 if cooldown_record_still_blocks_automatic_path
                 else "，并已清除对应的谢绝冷却记录"
             )
+        if overrode_session_scope_snooze:
+            detail += "；已推翻 agent 早前在本会话对这片工作范围的谢绝（snooze）"
+            detail += (
+                "，但 snooze 记录清除失败，后续自动 Stop 可能仍被它静默"
+                if session_scope_snooze_record_still_blocks_automatic_path
+                else "，并已清除该 snooze"
+            )
+        if mint.explicit_user_request_overrode_agent_deferred_until_condition_decline:
+            detail += "；已推翻 agent 早前在本会话的延后型谢绝（「等条件满足再审」）"
         manual_payload.update(
             {
                 "status": "manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
@@ -1219,6 +1343,134 @@ def _confirm_manual_decision_delivery(
         pass
 
 
+def _decision_point_delivery_intent_task_id_for_banner(
+    decision_token_payload: dict[str, Any], event: dict[str, Any]
+) -> str | None:
+    """投递意图按 kanban task 落盘：优先铸造时记在 token 上的那个 task，拿不到再看本事件所在 task。"""
+    detail = decision_token_payload.get("out_of_band_delivery_detail")
+    task_id = detail.get("kanban_task_id") if isinstance(detail, dict) else None
+    if isinstance(task_id, str) and task_id:
+        return task_id
+    try:
+        from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
+
+        task_id = current_kanban_task_id(event)
+    except Exception:  # noqa: BLE001 - 取不到 task 只意味着这份观测记不下
+        return None
+    return task_id if isinstance(task_id, str) and task_id else None
+
+
+def _record_first_arrival_observation_on_delivery_intent(
+    result: dict[str, Any],
+    *,
+    task_id: str | None,
+    decision_token: str,
+    decision_point_banner_body_text_injected: bool,
+    outcome: str,
+) -> None:
+    """把「UPS 首次观测到标记时发生了什么」写进投递意图，供搁浅对账判定该不该冲销熔断额度（M9）。
+
+    best-effort：写不成只让对账按「UPS 没处理过」计费（多退避一次），绝不阻断这条 prompt。
+    """
+    try:
+        recorded = kanban_followup_lock.record_user_prompt_submit_first_arrival_observation_on_decision_point_delivery_intent(
+            task_id=task_id,
+            decision_token=decision_token,
+            decision_point_banner_body_text_injected=decision_point_banner_body_text_injected,
+            outcome=outcome,
+        )
+    except Exception:  # noqa: BLE001
+        recorded = False
+    result["decision_point_delivery_intent_first_arrival_observation_recorded"] = bool(recorded)
+
+
+# RVF-001：「首次注入已交付完毕」凭证。M10 把「锁外读到 injected 的重复到达」判为「用户 rewind 后重交」，
+# 但锁外读到 injected 排除不了并发：首个到达刚在锁内提交 minted → injected、还没把正文交付完时，同一
+# token 的另一次到达读到的同样是 injected——把它当 rewind 撤回，agent 随后拿到正文，``rvf start`` 却必然
+# 因 withdrawn 硬失败。
+#
+# 故由赢得迁移的那次到达在它**全部工作的最后一步**（正文已放进 hook 输出、记账已做完）以 ``O_EXCL``
+# 原子地创建这份凭证；凭证只增不删（token 文件被清扫之后才作为孤儿回收），所以「先查凭证、再撤回」
+# 不存在凭证被收回的窗口：读到它 ⇒ 首次注入早已交付完毕；读不到 ⇒ 一律按并发到达处置、不撤回。
+# 残留窗口只剩「本函数返回 → ``main`` 打印 stdout」之间的纯 CPU 步骤，与本路径「推进发生在 stdout 打印
+# 之前」的既有取舍同源。赢家若在写凭证前崩溃，之后的重交不撤回、token 到期静默 expired——退回 M10 之前
+# 的行为，方向安全（漏撤回只是多等一次 TTL，误撤回是让已交付的决策硬失败）。
+#
+# 凭证放在 token 文件旁、以 ``.`` 开头且不以 ``.json`` 结尾：token store 的 ``*.json`` 枚举（清扫、
+# 按会话遍历、测试计数）看不见它，形状与 payload 读-改-写锁文件相同。
+DECISION_POINT_BANNER_FIRST_INJECTION_HANDOFF_COMPLETED_CREDENTIAL_FILENAME_SUFFIX = (
+    ".decision-point-banner-first-injection-handoff-completed.credential"
+)
+
+
+def _decision_point_banner_first_injection_handoff_completed_credential_path(
+    decision_token_store: Any, decision_token: str
+) -> Path:
+    token_path = decision_token_store.decision_token_path(decision_token)
+    return token_path.with_name(
+        f".{token_path.name}{DECISION_POINT_BANNER_FIRST_INJECTION_HANDOFF_COMPLETED_CREDENTIAL_FILENAME_SUFFIX}"
+    )
+
+
+def _decision_point_banner_first_injection_handoff_completed_credential_exists(
+    decision_token_store: Any, decision_token: str
+) -> bool:
+    """凭证在场 ⇔ 首次注入早已交付完毕。读不到（含路径算不出 / I/O 报错）一律 False ⇒ 不撤回。"""
+    try:
+        return _decision_point_banner_first_injection_handoff_completed_credential_path(
+            decision_token_store, decision_token
+        ).is_file()
+    except Exception:  # noqa: BLE001 - 查不清就按「未交付完毕」保守处置
+        return False
+
+
+def _sweep_orphaned_decision_point_banner_first_injection_handoff_completed_credentials(
+    decision_token_directory: Path,
+) -> None:
+    """回收对应 token 文件已被清扫的凭证（token 文件没了，M10 也就不会再读到它），防止每枚 token 永久堆积一个。"""
+    suffix = DECISION_POINT_BANNER_FIRST_INJECTION_HANDOFF_COMPLETED_CREDENTIAL_FILENAME_SUFFIX
+    for credential_path in decision_token_directory.glob(f".*{suffix}"):
+        token_file_name = credential_path.name[1 : -len(suffix)]
+        if not (decision_token_directory / token_file_name).exists():
+            credential_path.unlink(missing_ok=True)
+
+
+def _record_decision_point_banner_first_injection_handoff_completed_credential(
+    decision_token_store: Any, decision_token: str
+) -> bool:
+    """首次到达的最后一步：原子创建「首次注入已交付完毕」凭证。best-effort，永不抛异常。
+
+    写不成的后果只是之后的重交不会被判为 rewind（见上方常量注释），绝不反过来拖红这条 prompt。
+    """
+    try:
+        credential_path = _decision_point_banner_first_injection_handoff_completed_credential_path(
+            decision_token_store, decision_token
+        )
+        try:
+            file_descriptor = os.open(
+                str(credential_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            return True
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "decision_token": decision_token,
+                    "first_injection_handoff_completed_at": datetime.now(timezone.utc).isoformat(),
+                },
+                handle,
+            )
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        _sweep_orphaned_decision_point_banner_first_injection_handoff_completed_credentials(
+            credential_path.parent
+        )
+    except Exception:  # noqa: BLE001 - 回收孤儿纯属清洁，失败不影响凭证本身
+        pass
+    return True
+
+
 def _observe_delivered_decision_point_banner(
     event: dict[str, Any],
     decision_token: str,
@@ -1252,8 +1504,19 @@ def _observe_delivered_decision_point_banner(
     * 迁移（``claim_first_minted_to_injected_transition_exclusively``，锁内原子判定首次到达）抛 ``DecisionTokenError``（TTL 已过 / token 缺失 / 状态机拒绝）⇒
       **未推进**，同样不清意图、不注入，走专用文案并保留异常类型；
     * 非首次到达（token 已是 injected / acknowledged；含并发到达时在锁内输掉迁移权的那一次）⇒
-      不推进、不注入，如实报一句；
+      不推进、不注入，如实报一句；其中**锁外就看到 injected、且「首次注入已交付完毕」凭证在场**的
+      那一次，按「用户 rewind 掉了征询、又把放回输入框的标记重交」处置：``mark_withdrawn(rewound_by_user)``
+      （M10）。凭证缺席 ⇒ 首个到达可能刚在锁内提交迁移、还没交付完正文，这次是并发到达而不是 rewind，
+      不撤回（RVF-001，见 ``DECISION_POINT_BANNER_FIRST_INJECTION_HANDOFF_COMPLETED_CREDENTIAL_FILENAME_SUFFIX``）。
+      rewind 之后正文已不在 agent 上下文里，这枚 token 再没有人能据以决策；不撤回的话，标记落在
+      祖先链上会让 rewind 对账永远判它「在链上」，同一指纹被静默去重直到 20 分钟后静默过期，
+      与 SKILL.md「当轮作废、下次重问」相悖。acknowledged（agent 已 start）不撤——那是在途的一轮；
     * 只有首次到达且真的推进成功，才注入正文并输出「推进为 injected」这句断言。
+
+    首次到达的每一种结局都写进投递意图（``user_prompt_submit_first_arrival_observation``）：搁浅
+    对账只凭「正文确实注入过」这份正向证据冲销熔断额度；标记落地而这份记录缺失，本身就说明 UPS
+    没处理它（M9）。成功那一支**先设置输出、再清意图**：两步之间抛出的异常会被外层吞掉，顺序反了
+    就会留下「token 已 injected、正文却没注入」的组合（L-F3d）。
 
     推进发生在 stdout 打印之前：若随后 stdout 破裂，token 已是 injected 而 agent 没拿到正文，
     到期按「看到了没决定」静默 expired。这个窗口只在 hook 进程输出管道断裂时出现，与 manual 路径
@@ -1305,15 +1568,52 @@ def _observe_delivered_decision_point_banner(
         )
         if token_already_arrived_before:
             # 同一个 token 第二次到达（rewind 后标记被放回输入框再回车，或用户手抄了标记）：
-            # 首次到达时已经注入过正文并清过意图，这里什么都不再做——连锁内迁移也不调，
+            # 首次到达时已经注入过正文并清过意图，正文绝不再注入——连锁内迁移也不调，
             # 否则 acknowledged / 已过 TTL 的 token 会落进「本该推进但没推成」那条不相干的文案。
             result["decision_point_banner_resubmitted_without_body_reinjection"] = True
+            if lookup.state == decision_token_store.STATE_INJECTED and not (
+                _decision_point_banner_first_injection_handoff_completed_credential_exists(
+                    decision_token_store, decision_token
+                )
+            ):
+                # RVF-001：锁外读到 injected 排除不了并发——首个到达可能刚在锁内提交 minted → injected、
+                # 还没把正文交付完。凭证缺席就不能判为 rewind：不撤回，只报重复到达。
+                result[
+                    "decision_point_banner_first_injection_handoff_not_yet_completed_so_token_not_withdrawn"
+                ] = True
+            elif lookup.state == decision_token_store.STATE_INJECTED:
+                # M10：还停在 injected（agent 没 start 也没 decline）、且首次注入早已交付完毕（凭证在场，
+                # 只增不删）⇒ 这是 rewind 之后的重交，按用户 rewind 处置、当轮作废。
+                try:
+                    decision_token_store.mark_withdrawn(
+                        decision_token,
+                        reason="decision_point_boundary_marker_resubmitted_after_user_rewind",
+                        withdrawal_cause=(
+                            decision_token_store.DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER
+                        ),
+                    )
+                    result["decision_token_withdrawn_after_marker_resubmission"] = True
+                    result["systemMessage"] = _trigger_system_message(
+                        kind="decision_point_banner_resubmitted_after_rewind_token_withdrawn",
+                        token=decision_token,
+                        status=str(lookup.state),
+                    )
+                    return result
+                except decision_token_store.DecisionTokenError as exc:
+                    # 撤回没成（例如刚被 agent 抢先 start / decline）：退回「只报重复到达」。
+                    result["decision_token_withdrawal_after_marker_resubmission_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             result["systemMessage"] = _trigger_system_message(
                 kind="decision_point_banner_resubmitted_without_body_reinjection",
                 token=decision_token,
                 status=str(lookup.state),
             )
             return result
+
+        delivery_intent_task_id = _decision_point_delivery_intent_task_id_for_banner(
+            payload_data, event
+        )
 
         if lookup.state == decision_token_store.STATE_MINTED and not (
             isinstance(decision_point_body_text_for_agent, str)
@@ -1324,6 +1624,13 @@ def _observe_delivered_decision_point_banner(
             result["decision_token_advanced_to_injected"] = False
             result["decision_point_banner_body_text_missing"] = True
             result["decision_point_delivery_intent_left_for_reconciliation"] = True
+            _record_first_arrival_observation_on_delivery_intent(
+                result,
+                task_id=delivery_intent_task_id,
+                decision_token=decision_token,
+                decision_point_banner_body_text_injected=False,
+                outcome="banner_body_text_missing_from_decision_token_payload",
+            )
             result["systemMessage"] = _trigger_system_message(
                 kind="decision_point_banner_arrived_but_body_text_missing",
                 token=decision_token,
@@ -1355,6 +1662,13 @@ def _observe_delivered_decision_point_banner(
             result["decision_token_error"] = f"{type(exc).__name__}: {exc}"
             result["decision_token_advanced_to_injected"] = False
             result["decision_point_delivery_intent_left_for_reconciliation"] = True
+            _record_first_arrival_observation_on_delivery_intent(
+                result,
+                task_id=delivery_intent_task_id,
+                decision_token=decision_token,
+                decision_point_banner_body_text_injected=False,
+                outcome=f"decision_token_not_advanced_to_injected:{type(exc).__name__}",
+            )
             result["systemMessage"] = _trigger_system_message(
                 kind="decision_point_banner_arrived_but_token_not_advanced",
                 token=decision_token,
@@ -1376,18 +1690,8 @@ def _observe_delivered_decision_point_banner(
             return result
         result["decision_token_state"] = claim_outcome.record.state
         result["decision_token_advanced_to_injected"] = True
-
-        detail = payload_data.get("out_of_band_delivery_detail")
-        task_id = detail.get("kanban_task_id") if isinstance(detail, dict) else None
-        if not (isinstance(task_id, str) and task_id):
-            from rvf_analyze_advisory import current_kanban_task_id  # noqa: PLC0415
-
-            task_id = current_kanban_task_id(event)
-        if isinstance(task_id, str) and task_id:
-            cleared = kanban_followup_lock.clear_decision_point_delivery_intent(
-                task_id=task_id, decision_token=decision_token
-            )
-            result["cleared_decision_point_delivery_intent_paths"] = cleared
+        # 先把正文与告知放进输出，再做任何可能抛异常的记账：token 已推进为 injected，此后哪一步
+        # 失败都只能少一条记账，绝不能让 agent 拿不到正文（L-F3d）。
         result["hookSpecificOutput"] = {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": decision_point_body_text_for_agent,
@@ -1398,6 +1702,28 @@ def _observe_delivered_decision_point_banner(
             token=decision_token,
             detail="边界标记已作为一条真实 user message 到达（可 rewind）；决策正文已随本 hook 注入",
         )
+        try:
+            # 清意图之前先记下「正文已注入」：清除若失败，残留的意图如实带着这份正向证据。
+            _record_first_arrival_observation_on_delivery_intent(
+                result,
+                task_id=delivery_intent_task_id,
+                decision_token=decision_token,
+                decision_point_banner_body_text_injected=True,
+                outcome="banner_body_text_injected_as_additional_context",
+            )
+            if delivery_intent_task_id:
+                cleared = kanban_followup_lock.clear_decision_point_delivery_intent(
+                    task_id=delivery_intent_task_id, decision_token=decision_token
+                )
+                result["cleared_decision_point_delivery_intent_paths"] = cleared
+        finally:
+            # RVF-001：凭证必须是首次到达的**最后一步**（记账抛异常也照写：正文已在输出里）。写早了，
+            # 记账期间并发到达的另一次就会读到凭证、把刚交付的 token 当 rewind 撤回。
+            result["decision_point_banner_first_injection_handoff_completed_credential_recorded"] = (
+                _record_decision_point_banner_first_injection_handoff_completed_credential(
+                    decision_token_store, decision_token
+                )
+            )
     except Exception as exc:  # noqa: BLE001 - 记账永不阻断这条 prompt
         result["decision_token_observation_error"] = f"{type(exc).__name__}: {exc}"
     return result
@@ -1541,6 +1867,35 @@ def inspect_user_prompt_submit(
     if prompt is None:
         return {**base_payload, "status": "no_prompt"}
 
+    # host 自己合成的回合（Claude：后台 Bash / 后台子代理完成时的 ``<task-notification>``）不是开发者
+    # prompt，而下面每一道判定都预设「这是一条人或 RVF 发来的 prompt」：
+    #   * 再入预算复位 / snooze 基线重置 / round baseline 前移 / park 资格——四处共用「是不是开发者
+    #     真实 prompt」这一个判据，合成回合对四者都应视为**上一回合的延续**（逐项理由见下方各处注释
+    #     与对应测试）；
+    #   * dispatch token / origin marker / 决策点 token / 手动触发——合成正文会原样带回子代理与后台
+    #     命令读写过的文本，在本仓里常含 RVF 自己的字面量，照跑检测器会把一句引用当成一次投递或手动触发。
+    # 所以在任何检测器之前整段短路。只做一件事：续期活跃的 round baseline（不前移），免得长时间自主
+    # 工作的会话掉回 dirty-only。对开发者与 agent 都静默（developer_only 且无话可说）。
+    host_synthesized_turn_kind = _host_synthesized_user_prompt_submit_turn_kind(event, prompt)
+    if host_synthesized_turn_kind is not None:
+        synthesized_payload: dict[str, Any] = {
+            **base_payload,
+            "status": "host_synthesized_turn_is_not_a_developer_prompt",
+            "host_synthesized_user_prompt_submit_turn_kind": host_synthesized_turn_kind,
+        }
+        extended_round_baseline_marker_path = (
+            _extend_round_baseline_expiry_for_host_synthesized_turn(event)
+        )
+        if extended_round_baseline_marker_path is not None:
+            synthesized_payload["round_baseline_expiry_extended_without_moving_head_marker_path"] = (
+                extended_round_baseline_marker_path
+            )
+        # 唯一的例外：对「延后型谢绝」而言合成回合**就是**新回合——后台测试跑完、后台子代理写完，
+        # 正是 agent 最常写下的延后条件。
+        if _mark_new_turn_observed_for_deferred_until_condition_declines(event):
+            synthesized_payload["deferred_until_condition_declines_marked_new_turn_observed"] = True
+        return synthesized_payload
+
     token = dispatch_token_from_text(prompt)
     origin_marker = detect_origin_marker(prompt) if token is None else None
     # 发起决策点横幅经带外投递落地成的那条 user message。它与 dispatch token / origin marker
@@ -1622,7 +1977,10 @@ def inspect_user_prompt_submit(
     # （不依赖 Stop 侧的 worktree 字符串逐字对齐）；会话身份口径同上：只取 ``event["session_id"]``，
     # 对不上只会少重置（基线停在 decline 那一刻，更容易解除），不会误伤。best-effort、纯副作用：失败永不
     # 阻断这条 prompt。
-    if token is None and origin_marker is None and decision_point_token is None:
+    #
+    # 手动触发（``is_manual``）跳过：它马上会以「用户显式请求」清掉本会话本 worktree 的 snooze，先重置
+    # 一次基线只会在 lifecycle ledger 里留下一条紧接着就被解除的噪声。host 合成的回合在更上面已整段短路。
+    if token is None and origin_marker is None and decision_point_token is None and not is_manual:
         try:
             import rvf_decision_token_store  # noqa: PLC0415 - lazy, stdlib-only
 
@@ -1633,6 +1991,11 @@ def inspect_user_prompt_submit(
                 )
         except Exception:
             pass
+
+    # 闸 2c（延后型谢绝）：开发者发话是新回合，放行「等 X 之后再审」的重新征询。判据与上面同源：RVF 自己
+    # 的三类机器正文不算回合边界（带外横幅本身落地时 agent 才刚要决定，拿它放行会立刻自问自答）。
+    if token is None and origin_marker is None and decision_point_token is None:
+        _mark_new_turn_observed_for_deferred_until_condition_declines(event)
 
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 
@@ -2005,6 +2368,8 @@ def _trigger_system_message(
       （INV-A 达成，token 推进 injected，决策正文已随本 hook 以 additionalContext 注入）。
     - ``decision_point_banner_resubmitted_without_body_reinjection``：同一个 token 的标记第二次到达
       （典型是 rewind 后标记被放回输入框再回车），**不再注入正文**。
+    - ``decision_point_banner_resubmitted_after_rewind_token_withdrawn``：同上，且 token 还停在
+      injected ⇒ 已按用户 rewind 当轮作废（M10）。
     - ``decision_point_banner_arrived_but_body_text_missing``：标记首次到达，但 token payload 里没有
       决策正文 ⇒ 未推进、未注入，投递意图留给对账。
     - ``decision_point_banner_terminal_on_arrival``：一份已达终态（withdrawn / dispatched /
@@ -2115,6 +2480,16 @@ def _trigger_system_message(
             message=(
                 "RVF 发起决策点边界标记再次到达（常见于 rewind 后标记被放回输入框再提交），"
                 "决策正文只在首次到达时注入，本次未注入、未改变任何状态"
+            ),
+            extra_fields=detail_fields,
+        )
+    if kind == "decision_point_banner_resubmitted_after_rewind_token_withdrawn":
+        return notice(
+            status_value="withdrawn_rewound_by_user",
+            message=(
+                "RVF 发起决策点边界标记再次到达（rewind 后标记被放回输入框再提交）：决策正文只在首次到达时"
+                "注入，本次未注入；这枚 token 已按「用户 rewind 掉了征询」当轮作废（不计冷却、不计熔断），"
+                "下一次 Stop 会重新征询一次"
             ),
             extra_fields=detail_fields,
         )

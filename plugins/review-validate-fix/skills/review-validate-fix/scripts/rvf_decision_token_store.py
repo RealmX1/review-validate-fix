@@ -25,6 +25,8 @@
     粗粒度的工作范围快照；在出现真正的工作边界（HEAD 变化 / 范围明显扩大 / 硬 TTL）之前，同会话同
     worktree 的自动铸造一律静默。开发者发来真实 prompt 不解除 snooze，只把「范围扩大」的对比基线
     挪到发话那一刻。
+  * 谢绝分两类（``decline_kind``）：只有**结构性**谢绝写冷却表与 snooze；**延后型**谢绝（「等 X 之后
+    再审」）两者都不写，只挡谢绝所在的那个回合，新回合或 HEAD 变化后重新征询（闸 2c）。
   * 铸造侧频率熔断（R24 裁决 b）：同 session、3600 秒滚动窗口内第 ≥3 次**铸造请求**即拒铸，写
     circuit-breaker-tripped ledger，并回结构化结果供 hook 出 systemMessage 告警。纯计数，零语义判断。
   * TTL 复活（参照 rvf_prep_file 的 FU-1 方案 B）：token 已过 TTL、但其锚定 run_dir 仍在磁盘（run
@@ -101,7 +103,8 @@ _KEY_FIELD_SEPARATOR = "\x1e"
 # 隔离手段（显式 ``cooldown_root`` / 专用 env / ``$RVF_HOME``），不会出现「测试注入了冷却根、
 # snooze 却写进真实 ~/.rvf」的漏网。冷却表只在根目录顶层放 ``<hash>.json``，子目录与它互不相干。
 # 目录结构：``<snooze 根>/<sha(session_id)>/<sha(worktree)>.json``——按会话分目录，UPS 在开发者
-# 发来真实 prompt 时整目录清空该会话的 snooze，无需知道 Stop 侧用的 worktree 字符串。
+# 发来真实 prompt 时按会话整目录**重置各 snooze 的「范围扩大」对比基线**（不解除 snooze，见下方
+# 方向 C 的 EXPERIMENT_NODE），无需知道 Stop 侧用的 worktree 字符串。
 DECLINED_SESSION_SCOPE_SNOOZE_SUBDIRNAME = "declined-session-scope-snoozes"
 DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_LEDGER_FILENAME = (
     "declined-session-scope-snooze-lifecycle-events.jsonl"
@@ -116,12 +119,18 @@ DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_SCOPE_EXPANSION_BASELINE_REBASED_O
 DECLINED_SESSION_SCOPE_SNOOZE_HARD_TTL_SECONDS = 12 * 3600
 # EXPERIMENT_NODE: 「范围明显扩大」= 出现新路径 **且** 未审行数估计增长超过 50%（两者须同时成立）；只看新路径会被顺手改一个小文件解除，只看行数会被同一批文件的持续打磨解除。
 DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_RATIO_THRESHOLD = 0.5
+# EXPERIMENT_NODE: 「同一批文件上的工作量翻几倍」单独即可解除：未审行数 ≥ 对比基线的 3 倍 **且** 绝对增量 ≥ 150 非空行（两者须同时成立；倍数挡住大基线上的持续打磨，绝对值挡住小基线被几行改动顶开）。d7741 裁定的默认值；本机 48 对历史「谢绝→下一次征询」里它命中 9 对、全部与上面那条规则重合，唯一「无新路径、行数大涨」的样本（2.36 倍，+7257 行）agent 自己又谢绝了一次，暂无放宽依据。
+DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_MULTIPLE_OF_BASELINE = 3
+DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_ABSOLUTE_NONBLANK_LINES = 150
 
 # snooze 解除原因（写进生命周期事件 ledger，供部署后评估上面几个 EXPERIMENT_NODE 的阈值）。
 # EXPERIMENT_NODE: HEAD 变化（任何 commit / checkout / reset）一律视为工作边界、解除 snooze；备选是只认「HEAD 前进且新提交落在候选路径上」。
 DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_WORKTREE_HEAD_CHANGE = "worktree_head_changed"
 DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_SCOPE_EXPANSION = (
     "new_candidate_paths_and_unreviewed_line_growth_exceeded_threshold"
+)
+DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_UNREVIEWED_LINE_GROWTH_ALONE = (
+    "unreviewed_line_count_alone_grew_past_multiple_of_scope_expansion_baseline"
 )
 DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_HARD_TTL = "hard_ttl_elapsed"
 DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_EXPLICIT_USER_REQUEST = "explicit_user_request"
@@ -187,6 +196,23 @@ DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADV
 铸造熔断打跳（默认窗口 3600s），整个 session 的自动发起被静默封禁——那是**漏审**方向，比多问
 一次严重得多。冲销并不会让熔断失效：它只在拿到「横幅确实落地过」的正向证据时才成立，而那份
 证据本身就说明这不是一次空转。
+
+⚠️ **59ffd 之后「落地过」的正向证据只能是「决策正文确实注入过」**：粘贴通道只送一行无指令的边界
+标记，正文由 UPS 注入。标记在 transcript 祖先链上只说明那一行成了 turn，agent 看到的是「未随附即
+忽略」。故搁浅对账只在投递意图里记着 UPS「正文已注入」时才用本成因；标记落地而正文没注入，用下面
+那个**不冲销**的成因（审计 M9）。
+"""
+
+DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED = (
+    "out_of_band_boundary_marker_became_a_turn_but_banner_body_never_injected"
+)
+"""带外边界标记**确实**成了一条 user message，但决策正文**从未**注入 agent 上下文。**不**冲销熔断额度。
+
+正文只能经 UserPromptSubmit hook 以 additionalContext 注入。UPS 没跑 / 超时 / 崩溃、token 里没有
+正文、标记到达时 token 已过 TTL——这几种情形下 agent 只拿到一行「未随附即忽略」的标记，每次征询
+都空转一回合。它们在对账侧都表现为「标记在祖先链上、token 仍是 minted」。UPS 持续失效时若照旧
+冲销，就是无退避的「铸 → 空转 → 撤回」循环且开发者看不到 UPS 坏了；所以计入熔断，并由调用方以
+developer_only 如实点名 UPS 那一侧的原因。
 """
 
 DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED = (
@@ -206,11 +232,25 @@ DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED = (
 在它之上再叠一层 session 级熔断，是对同一件事退避两次。
 """
 
+DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TERMINAL_DELIVERY_RECEIPT = (
+    "out_of_band_delivery_failed_per_cline_kanban_terminal_delivery_receipt"
+)
+"""cline-kanban 的终端投递回执（``terminal_delivery_status``）已判定这条横幅**投递失败**（开发者正在该
+终端打字 / 输入框有草稿、会话没起来等）。**不**冲销熔断额度。
+
+与 ``…_never_became_a_turn`` 同属「没送到」：横幅从未到达 agent 眼前，退避的前提成立。区别只在
+证据来源与时机——那一支要等投递意图 900s TTL 到期、再拿 transcript 证明「没成为 turn」；这一支在
+意图 TTL 之内就拿到了对方的确定结论（kanban 判失败的 P50 约 75s），于是下一次 Stop 不必再空等十几
+分钟（回溯实测：从铸出到撤回 P50 26 分钟，这期间共 25 次 Stop 被「已有横幅在途」静默）。
+"""
+
 DECISION_POINT_WITHDRAWAL_CAUSES = frozenset(
     {
+        DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TERMINAL_DELIVERY_RECEIPT,
         DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+        DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED,
         DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
     }
 )
@@ -308,6 +348,10 @@ MINT_OUTCOME_MINTED = "minted"
 MINT_OUTCOME_DEDUPLICATED = "deduplicated"
 MINT_OUTCOME_DECLINED_COOLDOWN = "declined_cooldown"
 MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE = "declined_session_scope_snooze"
+# 闸 2c：本会话最近一次是**延后型**谢绝，且此后还没出现新回合 / HEAD 变化。
+MINT_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY = (
+    "deferred_until_condition_decline_awaiting_turn_boundary"
+)
 MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"
 
 
@@ -387,9 +431,9 @@ class MintResult:
     """``mint_decision_token`` 的结构化返回。
 
     ``outcome`` ∈ {``minted``, ``deduplicated``, ``declined_cooldown``,
-    ``declined_session_scope_snooze``, ``circuit_breaker_tripped``}。仅 ``minted`` /
-    ``deduplicated`` 携带可用 token/record；其余三种表示拒铸（``record`` 为 None），
-    调用方据 ``message`` 出用户告警。
+    ``declined_session_scope_snooze``, ``deferred_until_condition_decline_awaiting_turn_boundary``,
+    ``circuit_breaker_tripped``}。仅 ``minted`` / ``deduplicated`` 携带可用 token/record；其余表示
+    拒铸（``record`` 为 None），调用方据 ``message`` 出用户告警。
     """
 
     outcome: str
@@ -406,6 +450,17 @@ class MintResult:
     # 于是后续**自动**路径依旧会被这条陈旧 decline 挡住。它只影响自动路径与面向用户的措辞，
     # 绝不参与「是否告知推翻」的判定。未发生推翻时恒为 False（无记录可挡）。
     declined_cooldown_record_still_blocks_automatic_path: bool = False
+    # 闸 2b 的同构两事实。事实一：用户显式触发时本 ``(worktree, session_id)`` 确有一份 declined 会话级
+    # snooze 快照——命中即证成「用户推翻了 agent 在本会话对这片工作范围的谢绝」。T3 之后这恰是最常见
+    # 的被推翻形态（内容已变 ⇒ 闸二冷却不命中，只剩 snooze 挡着），只回报闸二字段会让 agent 收不到告知。
+    explicit_user_request_overrode_agent_declined_session_scope_snooze: bool = False
+    # 事实二：那份快照删不掉（I/O 失败），后续**自动**路径仍会被它静默。同样绝不参与告知判定。
+    declined_session_scope_snooze_record_still_blocks_automatic_path: bool = False
+    # 闸 2c 的告知类事实：用户显式触发时本 ``(worktree, session_id)`` 有一条延后型谢绝记录（agent 说过
+    # 「等 X 之后再审」）。用户显式触发即「现在就审」，调用方据此告知 agent 别再以同一条件延后。
+    explicit_user_request_overrode_agent_deferred_until_condition_decline: bool = False
+    # 被推翻的那条延后理由（原文），供告知文案引用；无推翻时为 None。
+    overridden_deferred_until_condition_decline_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1160,6 +1215,13 @@ def _register_mint_request_and_check_breaker(
     追加的那一行带一个稳定的 ``mint_request_record_id`` 并随 ``CircuitBreakerStatus`` 带回；
     调用方把它写进 token payload，使这枚 token 被 ``mark_withdrawn`` 撤回时能追加一条冲销记录
     把额度还回去（INV-C）。
+
+    **被熔断拒掉的请求当场冲销自己那一份**：它没有铸出任何 token，不是一次征询。不冲销的话，熔断
+    会自我续命——只要 Stop 间隔短于「窗口 / 阈值」（默认约 20 分钟），每次被拒的请求都把窗口内
+    计数顶在阈值以上，熔断永不解除。实例：会话 893079be 在 09-18 11:03–13:33 的 11 个 Stop 全被
+    熔断（计数 3→7），期间没有任何递归发起；该会话里「唯一看见它的 Stop 被熔断拦下、随后落出
+    窗口」的已提交工作共约 8,700 行，从未经审。冲销后熔断仍把「滚动窗口内真正铸出的 token」限制在
+    阈值以下。
     """
     mint_request_record_id = f"mint-request-{secrets.token_hex(8)}"
     ledger = _mint_request_ledger_path(session_id, root)
@@ -1174,6 +1236,18 @@ def _register_mint_request_and_check_breaker(
     )
     count = count_recent_mint_requests(session_id, now=now, window_seconds=window_seconds, root=root)
     if count >= max_requests:
+        try:
+            _append_jsonl(
+                ledger,
+                {
+                    MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD: mint_request_record_id,
+                    "at": format_timestamp(now),
+                    "reversed_because": "circuit_breaker_refused_this_mint_request_so_no_token_was_minted",
+                    "token": None,
+                },
+            )
+        except OSError:
+            pass
         tripped_ledger = _tripped_ledger_path(session_id, root)
         _append_jsonl(
             tripped_ledger,
@@ -1330,6 +1404,53 @@ def _declined_session_scope_snooze_path(
     )
 
 
+# 同一会话的 snooze 快照有四个读改写方：decline 写入（CLI）、Stop 侧 consult 回写观测 / 就地解除、
+# UPS 侧开发者发话重置基线、显式手动触发清除。它们各自都是「读 → 改 → 整份写回」，交错时后写者会
+# 静默覆盖先写者（实测可复现：Stop 读到快照后 UPS 重置了基线，Stop 再把旧快照写回，重置丢失）。
+# 按会话一把排他锁把它们串行化；锁文件放在会话目录里、不以 ``.json`` 结尾，重置时的 ``*.json``
+# 枚举不会把它当快照。互斥靠 ``flock``（崩溃即释放，无需陈旧回收，理由同上方铸造占坑锁）。
+DECLINED_SESSION_SCOPE_SNOOZE_SESSION_MUTATION_LOCK_FILENAME = (
+    ".declined-session-scope-snooze-session-mutation.lock"
+)
+
+
+@contextmanager
+def _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+    session_id: str, cooldown_root: str | Path | None
+):
+    """持有某会话全部 snooze 快照的读改写排他锁；文件系统报错即降级为无锁（与铸造占坑锁同款、同理由）。
+
+    **不可重入**：``flock`` 按「打开文件描述」计，同一进程里再开一次同一个锁文件也会互斥。锁内只调
+    ``_…_without_session_mutation_lock`` 系列内部函数，绝不回调加锁的公开函数。
+    """
+    lock_path = (
+        _declined_session_scope_snooze_session_dir(session_id, cooldown_root)
+        / DECLINED_SESSION_SCOPE_SNOOZE_SESSION_MUTATION_LOCK_FILENAME
+    )
+    try:
+        _ensure_parent_dir(lock_path)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    acquired_flock = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired_flock = True
+        except OSError:
+            acquired_flock = False
+        yield
+    finally:
+        if acquired_flock:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
 def candidate_scope_identity_from_candidate_summary(
     candidate_summary: Mapping[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1410,29 +1531,54 @@ def record_declined_session_scope_snooze(
         return None
     path = _declined_session_scope_snooze_path(worktree, session_id, cooldown_root)
     try:
-        _atomic_write_json(
-            path,
-            {
-                "schema_version": SCHEMA_VERSION,
-                "worktree": worktree,
-                "session_id": session_id,
-                "declined_at": format_timestamp(_coerce_now(now)),
-                "reason": reason,
-                "token": token,
-                # decline 那一刻的工作范围：HEAD 变化判据永远对照它。
-                "candidate_scope_identity_for_declined_session_snooze": identity,
-                # 「范围明显扩大」判据的对比基线：初始即 decline 那一刻；开发者发话时被重置。
-                "scope_expansion_baseline_identity": identity,
-                "scope_expansion_baseline_source": "declined",
-                "scope_expansion_baseline_rebased_at": None,
-                # 仍处 snooze 期间最近一次 Stop 观测到的工作范围——开发者发话时拿它当「发话那一刻」
-                # 的状态（发话前 agent 已停下，最后一次 Stop 的观测即发话时刻的工作树）。
-                "latest_observed_scope_identity_while_snoozed": None,
-            },
-        )
+        with _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+            session_id, cooldown_root
+        ):
+            _write_declined_session_scope_snooze_snapshot_at_decline_without_session_mutation_lock(
+                path,
+                worktree=worktree,
+                session_id=session_id,
+                identity=identity,
+                reason=reason,
+                token=token,
+                now=now,
+            )
     except OSError:
         return None
     return path
+
+
+def _write_declined_session_scope_snooze_snapshot_at_decline_without_session_mutation_lock(
+    path: Path,
+    *,
+    worktree: str,
+    session_id: str,
+    identity: dict[str, Any],
+    reason: str | None,
+    token: str | None,
+    now: datetime | None,
+) -> None:
+    """（调用方须已持有会话 snooze 锁）落 decline 那一刻的快照。"""
+    _atomic_write_json(
+        path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "worktree": worktree,
+            "session_id": session_id,
+            "declined_at": format_timestamp(_coerce_now(now)),
+            "reason": reason,
+            "token": token,
+            # decline 那一刻的工作范围：HEAD 变化判据永远对照它。
+            "candidate_scope_identity_for_declined_session_snooze": identity,
+            # 「范围明显扩大」判据的对比基线：初始即 decline 那一刻；开发者发话时被重置。
+            "scope_expansion_baseline_identity": identity,
+            "scope_expansion_baseline_source": "declined",
+            "scope_expansion_baseline_rebased_at": None,
+            # 仍处 snooze 期间最近一次 Stop 观测到的工作范围——开发者发话时拿它当「发话那一刻」
+            # 的状态（发话前 agent 已停下，最后一次 Stop 的观测即发话时刻的工作树）。
+            "latest_observed_scope_identity_while_snoozed": None,
+        },
+    )
 
 
 def read_declined_session_scope_snooze(
@@ -1463,6 +1609,17 @@ def clear_declined_session_scope_snooze(
     """移除 ``(worktree, session_id)`` 的 snooze 快照（返回是否真的删除了文件）。"""
     if not session_id:
         return False
+    with _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        return _unlink_declined_session_scope_snooze_snapshot_without_session_mutation_lock(
+            worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+        )
+
+
+def _unlink_declined_session_scope_snooze_snapshot_without_session_mutation_lock(
+    *, worktree: str, session_id: str, cooldown_root: str | Path | None
+) -> bool:
     try:
         _declined_session_scope_snooze_path(worktree, session_id, cooldown_root).unlink()
         return True
@@ -1494,47 +1651,70 @@ def rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt
         snooze_paths = sorted(session_dir.glob("*.json"))
     except OSError:
         return 0
+    if not snooze_paths:
+        return 0
     now_dt = _coerce_now(now)
     rebased = 0
-    for snooze_path in snooze_paths:
-        try:
-            parsed = json.loads(snooze_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        latest_observed = candidate_scope_identity_from_candidate_summary(
-            {
-                "candidate_scope_identity_for_declined_session_snooze": parsed.get(
-                    "latest_observed_scope_identity_while_snoozed"
-                )
-            }
-        )
-        previous_baseline = parsed.get("scope_expansion_baseline_identity")
-        scope_expansion_baseline_changed = (
-            latest_observed is not None and latest_observed != previous_baseline
-        )
-        if latest_observed is not None:
-            parsed["scope_expansion_baseline_identity"] = latest_observed
+    with _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        for snooze_path in snooze_paths:
+            if _rebase_one_declined_session_scope_snooze_without_session_mutation_lock(
+                snooze_path, session_id=session_id, now=now_dt, cooldown_root=cooldown_root
+            ):
+                rebased += 1
+    return rebased
+
+
+def _rebase_one_declined_session_scope_snooze_without_session_mutation_lock(
+    snooze_path: Path,
+    *,
+    session_id: str,
+    now: datetime,
+    cooldown_root: str | Path | None,
+) -> bool:
+    """（调用方须已持有会话 snooze 锁）重置一份快照的「范围扩大」基线；返回这份快照是否被处理了。
+
+    基线**真的变了**才改写快照（含 ``scope_expansion_baseline_source``）——没有新观测、或观测与基线
+    相同时，来源仍如实是上一次设定它的那件事。lifecycle 事件两种情形都记，并标明基线变没变。
+    """
+    try:
+        parsed = json.loads(snooze_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    latest_observed = candidate_scope_identity_from_candidate_summary(
+        {
+            "candidate_scope_identity_for_declined_session_snooze": parsed.get(
+                "latest_observed_scope_identity_while_snoozed"
+            )
+        }
+    )
+    previous_baseline = parsed.get("scope_expansion_baseline_identity")
+    scope_expansion_baseline_changed = (
+        latest_observed is not None and latest_observed != previous_baseline
+    )
+    if scope_expansion_baseline_changed:
+        parsed["scope_expansion_baseline_identity"] = latest_observed
         parsed["scope_expansion_baseline_source"] = "developer_prompt"
-        parsed["scope_expansion_baseline_rebased_at"] = format_timestamp(now_dt)
+        parsed["scope_expansion_baseline_rebased_at"] = format_timestamp(now)
         try:
             _atomic_write_json(snooze_path, parsed)
         except OSError:
-            continue
-        rebased += 1
-        _append_declined_session_scope_snooze_lifecycle_event(
-            snooze_lifecycle_event=(
-                DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_SCOPE_EXPANSION_BASELINE_REBASED_ON_DEVELOPER_PROMPT
-            ),
-            worktree=parsed.get("worktree"),
-            session_id=session_id,
-            snooze_record=parsed,
-            now=now_dt,
-            cooldown_root=cooldown_root,
-            scope_expansion_baseline_changed=scope_expansion_baseline_changed,
-        )
-    return rebased
+            return False
+    _append_declined_session_scope_snooze_lifecycle_event(
+        snooze_lifecycle_event=(
+            DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_SCOPE_EXPANSION_BASELINE_REBASED_ON_DEVELOPER_PROMPT
+        ),
+        worktree=parsed.get("worktree"),
+        session_id=session_id,
+        snooze_record=parsed,
+        now=now,
+        cooldown_root=cooldown_root,
+        scope_expansion_baseline_changed=scope_expansion_baseline_changed,
+    )
+    return True
 
 
 def evaluate_declined_session_scope_snooze_release_reason(
@@ -1546,7 +1726,8 @@ def evaluate_declined_session_scope_snooze_release_reason(
     """纯函数：snooze 是否已满足解除条件；满足 → 返回解除原因，仍应静默 → None。
 
     判定顺序（先命中者为准）：硬 TTL → HEAD 变化（对照 decline 那一刻）→ 范围明显扩大（对照
-    ``scope_expansion_baseline_identity``：新路径 **且** 未审行数增长超阈值）。
+    ``scope_expansion_baseline_identity``：新路径 **且** 未审行数增长超阈值）→ 同一批文件上的工作量
+    翻几倍（同一对比基线；只看行数，阈值见 EXPERIMENT_NODE）。
     快照损坏（时间戳 / 身份字段读不出）按「已过期」处理——宁可多问一次，也不让一份坏快照永久静音。
     """
     try:
@@ -1594,6 +1775,14 @@ def evaluate_declined_session_scope_snooze_release_reason(
     )
     if new_candidate_paths and unreviewed_line_growth_exceeds_threshold:
         return DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_SCOPE_EXPANSION
+    unreviewed_line_count_alone_grew_past_multiple_of_baseline = (
+        current_lines
+        >= recorded_lines * DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_MULTIPLE_OF_BASELINE
+        and current_lines - recorded_lines
+        >= DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_ABSOLUTE_NONBLANK_LINES
+    )
+    if unreviewed_line_count_alone_grew_past_multiple_of_baseline:
+        return DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_UNREVIEWED_LINE_GROWTH_ALONE
     return None
 
 
@@ -1612,36 +1801,47 @@ def consult_declined_session_scope_snooze(
     """
     if not session_id:
         return DeclinedSessionScopeSnoozeConsultation(still_snoozed=False)
-    snooze_record = read_declined_session_scope_snooze(
+    # 快路径（锁外）：绝大多数 Stop 根本没有 snooze，不为它们建会话目录与锁文件。
+    unlocked_snooze_record = read_declined_session_scope_snooze(
         worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
     )
-    if snooze_record is None:
+    if unlocked_snooze_record is None:
         return DeclinedSessionScopeSnoozeConsultation(still_snoozed=False)
     current_scope_identity = candidate_scope_identity_from_candidate_summary(candidate_summary)
     if current_scope_identity is None:
         return DeclinedSessionScopeSnoozeConsultation(
-            still_snoozed=False, snooze_record=snooze_record
+            still_snoozed=False, snooze_record=unlocked_snooze_record
         )
     now_dt = _coerce_now(now)
-    release_reason = evaluate_declined_session_scope_snooze_release_reason(
-        snooze_record=snooze_record, current_scope_identity=current_scope_identity, now=now_dt
-    )
-    if release_reason is None:
-        # 记下本次观测，供开发者下一次发话时当作「发话那一刻」的对比基线。best-effort。
-        snooze_record["latest_observed_scope_identity_while_snoozed"] = current_scope_identity
-        try:
-            _atomic_write_json(
-                _declined_session_scope_snooze_path(worktree, session_id, cooldown_root),
-                snooze_record,
-            )
-        except OSError:
-            pass
-        return DeclinedSessionScopeSnoozeConsultation(
-            still_snoozed=True, snooze_record=snooze_record
+    # 读 → 判 → 回写观测 / 就地解除 必须在同一把会话锁里：锁外读到的快照在 UPS 并发重置基线后
+    # 就是旧的，拿它整份写回会把那次重置静默抹掉。
+    with _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        snooze_record = read_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
         )
-    clear_declined_session_scope_snooze(
-        worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
-    )
+        if snooze_record is None:
+            return DeclinedSessionScopeSnoozeConsultation(still_snoozed=False)
+        release_reason = evaluate_declined_session_scope_snooze_release_reason(
+            snooze_record=snooze_record, current_scope_identity=current_scope_identity, now=now_dt
+        )
+        if release_reason is None:
+            # 记下本次观测，供开发者下一次发话时当作「发话那一刻」的对比基线。best-effort。
+            snooze_record["latest_observed_scope_identity_while_snoozed"] = current_scope_identity
+            try:
+                _atomic_write_json(
+                    _declined_session_scope_snooze_path(worktree, session_id, cooldown_root),
+                    snooze_record,
+                )
+            except OSError:
+                pass
+            return DeclinedSessionScopeSnoozeConsultation(
+                still_snoozed=True, snooze_record=snooze_record
+            )
+        _unlink_declined_session_scope_snooze_snapshot_without_session_mutation_lock(
+            worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+        )
     _append_declined_session_scope_snooze_lifecycle_event(
         snooze_lifecycle_event=DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_RELEASED,
         worktree=worktree,
@@ -1654,6 +1854,397 @@ def consult_declined_session_scope_snooze(
     return DeclinedSessionScopeSnoozeConsultation(
         still_snoozed=False, release_reason=release_reason, snooze_record=snooze_record
     )
+
+
+# ---------------------------------------------------------------------------
+# 延后型谢绝（deferred_until_condition）：等到回合边界再重新征询（闸 2c）
+# ---------------------------------------------------------------------------
+#
+# 为什么要和结构性谢绝分开：回溯 160 条谢绝，结构性谢绝（R24 / 在途、琐碎、非本会话、开发者明确
+# 不要审）72 条 0 条强证据错误；「等测试跑完 / 提交后 / 子代理写完再审」这类延后型谢绝 25 条错误率
+# 16–48%，主因是机制兑现不了「之后再审」：内容不变时下一次 Stop 被同指纹冷却静默，T3 的会话级
+# snooze 又会把它整片压住。所以延后型谢绝**不写**冷却表、**不写** snooze，只在这里记一条「延后到
+# 什么条件」。
+#
+# 但也不能对「谢绝之后什么都没发生」的那次 Stop 重问：agent 谢绝完立刻结束回合时，这次 Stop 离
+# 谢绝只隔零秒，条件不可能已经满足；重问只会和 agent 乒乓，把铸造熔断（每会话每小时 2 枚）烧光，
+# 结果真正该重问的那一次反而被熔断静默——那正是回溯里列出的失灵机制之一。所以满足以下任一条件才
+# 放行重新征询（「谢绝之后世界变了」）：
+#
+#   * UPS 观测到一个**新回合**：开发者发来真实 prompt，或 host 自己合成的回合（Claude 的
+#     ``<task-notification>``——后台测试跑完、后台子代理写完，恰好就是最常见的延后条件）；
+#     RVF 自己产生的机器正文（dispatch token / origin marker / 带外横幅）不算；
+#   * 工作树 HEAD 变了（「提交后再审」的条件本身就是提交）；
+#   * 候选的内容指纹变了：agent 谢绝后在**同一回合**里接着干活、把条件做完再停下（回溯样例
+#     ac08e 08-22 03:12：「提炼子代理仍在读」→ 同一回合内改完文件停下 → 重问后开审，没有新回合
+#     也没有提交，只有内容变了）。
+#
+# 放行后记录随即清除（这次延后已兑现为一次重新征询），并把理由盖进候选摘要，横幅据此写「你上次
+# 延后到：<理由>」。重新征询照常经过铸造熔断。
+#
+# EXPERIMENT_NODE: 延后型谢绝的放行条件 = 新回合 / HEAD 变化 / 候选内容指纹变化，任一即放行（只挡「谢绝后原样停下」的那次 Stop）；审计原文是「下一次 Stop 只要候选还在就重问、只受熔断保护」，收紧的理由是那样会乒乓烧熔断。备选是再加「距谢绝超过 N 分钟」或去掉内容指纹条件。
+# 「用户显式推翻 agent 谢绝」这一类铸造的来源（落进 token payload 的
+# ``explicit_user_request_provenance``，回执与遥测据此区分两条入口）：
+#   * 开发者在 prompt 里手动触发 RVF 主 skill（UPS manual 分支）；
+#   * 开发者口头要求开审，agent 用 ``rvf start --reopen-own-declined-decision`` 撤回自己的谢绝。
+EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT = (
+    "developer_manual_trigger_via_user_prompt_submit"
+)
+EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST = (
+    "agent_reopened_own_declined_decision_on_developer_verbal_request"
+)
+EXPLICIT_USER_REQUEST_PROVENANCES = frozenset(
+    {
+        EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT,
+        EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST,
+    }
+)
+# :func:`mint_decision_token` 自己写进 token payload 的显式请求两键。调用方的
+# ``extra_token_payload_fields`` 不得带同名键——否则能铸出 ``initiated_by_explicit_user_request=False``
+# 的手动 token 或伪造来源。它们不在 :func:`_create_token_record` 的基础 payload 里，那里的覆盖守卫
+# 看不到，故在铸造入口、任何闸门副作用之前单独拦截。
+MINT_SYSTEM_WRITTEN_EXPLICIT_USER_REQUEST_TOKEN_PAYLOAD_FIELDS = (
+    "initiated_by_explicit_user_request",
+    "explicit_user_request_provenance",
+)
+
+DECLINE_KIND_STRUCTURAL_NOT_NEEDED = "structural_not_needed"
+DECLINE_KIND_DEFERRED_UNTIL_CONDITION = "deferred_until_condition"
+DECLINE_KINDS = frozenset({DECLINE_KIND_STRUCTURAL_NOT_NEEDED, DECLINE_KIND_DEFERRED_UNTIL_CONDITION})
+
+# 与 snooze 同理挂在 declined 冷却根下（自动继承冷却根的全部隔离手段）。结构：
+# ``<子目录>/<sha(session_id)>/<sha(worktree)>.json``——按会话分目录，UPS 按会话整目录打回合边界标志。
+DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY_SUBDIRNAME = (
+    "deferred-until-condition-declines-awaiting-turn-boundary"
+)
+DEFERRED_UNTIL_CONDITION_DECLINE_SESSION_MUTATION_LOCK_FILENAME = (
+    ".deferred-until-condition-declines-session-mutation.lock"
+)
+# 候选摘要里「本会话上一次延后型谢绝」的键：闸 2c 放行时由铸造写入，横幅渲染读取。
+CANDIDATE_SUMMARY_PREVIOUS_DEFERRED_UNTIL_CONDITION_DECLINE_IN_THIS_SESSION_KEY = (
+    "previous_deferred_until_condition_decline_in_this_session"
+)
+DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_TURN_BOUNDARY = (
+    "user_prompt_submit_observed_a_new_turn_since_deferral"
+)
+DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_WORKTREE_HEAD_CHANGE = (
+    "worktree_head_changed_since_deferral"
+)
+DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_CANDIDATE_CONTENT_CHANGE = (
+    "candidate_content_fingerprint_changed_since_deferral"
+)
+
+
+def deferred_until_condition_decline_root(cooldown_root: str | Path | None = None) -> Path:
+    return declined_fingerprint_root(cooldown_root) / DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY_SUBDIRNAME
+
+
+def _deferred_until_condition_decline_session_dir(
+    session_id: str, cooldown_root: str | Path | None
+) -> Path:
+    return deferred_until_condition_decline_root(cooldown_root) / _digest(session_id)
+
+
+def _deferred_until_condition_decline_path(
+    worktree: str, session_id: str, cooldown_root: str | Path | None
+) -> Path:
+    return _deferred_until_condition_decline_session_dir(session_id, cooldown_root) / (
+        f"{_digest(worktree)}.json"
+    )
+
+
+@contextmanager
+def _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+    session_id: str, cooldown_root: str | Path | None
+):
+    """某会话全部延后型谢绝记录的读改写排他锁（Stop 侧放行清除 vs UPS 侧打回合边界）。
+
+    文件系统报错即降级为无锁（与 snooze 锁同款、同理由）；**不可重入**。
+    """
+    lock_path = (
+        _deferred_until_condition_decline_session_dir(session_id, cooldown_root)
+        / DEFERRED_UNTIL_CONDITION_DECLINE_SESSION_MUTATION_LOCK_FILENAME
+    )
+    try:
+        _ensure_parent_dir(lock_path)
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    handle = os.fdopen(fd, "w", encoding="utf-8")
+    acquired_flock = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired_flock = True
+        except OSError:
+            acquired_flock = False
+        yield
+    finally:
+        if acquired_flock:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _read_json_object_or_none(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def record_deferred_until_condition_decline(
+    *,
+    worktree: str,
+    session_id: str,
+    candidate_summary: Mapping[str, Any] | None,
+    candidate_fingerprint: str | None,
+    reason: str,
+    token: str | None = None,
+    now: datetime | None = None,
+    cooldown_root: str | Path | None = None,
+) -> Path | None:
+    """延后型谢绝时写入（幂等覆盖）「等到回合边界再重新征询」的记录；返回落盘路径。
+
+    无 session_id 时不写（返回 None）：此时闸 2c 无从按会话放行，退回「下一次 Stop 即重新征询」，
+    只受熔断保护——方向是多问，不会漏审。落盘失败同样返回 None、绝不让 decline 失败。
+    """
+    if not session_id:
+        return None
+    identity = candidate_scope_identity_from_candidate_summary(candidate_summary) or {}
+    path = _deferred_until_condition_decline_path(worktree, session_id, cooldown_root)
+    try:
+        with _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+            session_id, cooldown_root
+        ):
+            _atomic_write_json(
+                path,
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "worktree": worktree,
+                    "session_id": session_id,
+                    "declined_at": format_timestamp(_coerce_now(now)),
+                    "reason": reason,
+                    "token": token,
+                    "worktree_head_commit_sha_at_deferral": identity.get("worktree_head_commit_sha"),
+                    "candidate_fingerprint_at_deferral": candidate_fingerprint,
+                    "user_prompt_submit_observed_a_new_turn_since_deferral": False,
+                    "user_prompt_submit_new_turn_observed_at": None,
+                },
+            )
+    except OSError:
+        return None
+    return path
+
+
+def read_deferred_until_condition_decline(
+    *,
+    worktree: str,
+    session_id: str,
+    cooldown_root: str | Path | None = None,
+) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    return _read_json_object_or_none(
+        _deferred_until_condition_decline_path(worktree, session_id, cooldown_root)
+    )
+
+
+def clear_deferred_until_condition_decline(
+    *,
+    worktree: str,
+    session_id: str,
+    cooldown_root: str | Path | None = None,
+) -> bool:
+    """移除 ``(worktree, session_id)`` 的延后型谢绝记录（返回是否真的删除了文件）。"""
+    if not session_id:
+        return False
+    with _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        try:
+            _deferred_until_condition_decline_path(worktree, session_id, cooldown_root).unlink()
+            return True
+        except OSError:
+            return False
+
+
+def mark_new_turn_observed_for_deferred_until_condition_declines_in_session(
+    *,
+    session_id: str,
+    now: datetime | None = None,
+    cooldown_root: str | Path | None = None,
+) -> int:
+    """UPS 观测到一个新回合（开发者 prompt 或 host 合成回合）：给本会话**所有** worktree 上的延后型
+    谢绝记录打上回合边界标志。返回打标的条数。
+
+    按会话整目录处理（与 snooze 基线重置同理：UPS 侧的 repo 字符串未必与 Stop 侧逐字一致，而「出现了
+    新回合」本就是会话级事实）。best-effort，I/O 失败吞掉——少打一次标志只会让重新征询晚一个回合。
+    """
+    if not session_id:
+        return 0
+    session_dir = _deferred_until_condition_decline_session_dir(session_id, cooldown_root)
+    try:
+        record_paths = sorted(session_dir.glob("*.json"))
+    except OSError:
+        return 0
+    if not record_paths:
+        return 0
+    observed_at = format_timestamp(_coerce_now(now))
+    marked = 0
+    with _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        for record_path in record_paths:
+            record = _read_json_object_or_none(record_path)
+            if record is None or record.get("user_prompt_submit_observed_a_new_turn_since_deferral"):
+                continue
+            record["user_prompt_submit_observed_a_new_turn_since_deferral"] = True
+            record["user_prompt_submit_new_turn_observed_at"] = observed_at
+            try:
+                _atomic_write_json(record_path, record)
+            except OSError:
+                continue
+            marked += 1
+    return marked
+
+
+def evaluate_deferred_until_condition_decline_release_reason(
+    *,
+    deferred_record: Mapping[str, Any],
+    current_scope_identity: Mapping[str, Any] | None,
+    current_candidate_fingerprint: str | None,
+) -> str | None:
+    """纯函数：延后型谢绝是否已到重新征询的时机；到了 → 返回放行原因，否则 None（本回合静默）。"""
+    if deferred_record.get("user_prompt_submit_observed_a_new_turn_since_deferral"):
+        return DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_TURN_BOUNDARY
+    head_at_deferral = deferred_record.get("worktree_head_commit_sha_at_deferral")
+    current_head = (current_scope_identity or {}).get("worktree_head_commit_sha")
+    # 任一侧读不出 HEAD 就不拿它判（不猜），只等回合边界。
+    if head_at_deferral and current_head and head_at_deferral != current_head:
+        return DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_WORKTREE_HEAD_CHANGE
+    fingerprint_at_deferral = deferred_record.get("candidate_fingerprint_at_deferral")
+    if (
+        fingerprint_at_deferral
+        and current_candidate_fingerprint
+        and fingerprint_at_deferral != current_candidate_fingerprint
+    ):
+        return DEFERRED_UNTIL_CONDITION_DECLINE_RELEASED_BY_CANDIDATE_CONTENT_CHANGE
+    return None
+
+
+@dataclass(frozen=True)
+class DeferredUntilConditionDeclineConsultation:
+    """闸 2c 对一次自动铸造请求的裁决。``still_awaiting_turn_boundary=True`` ⇒ 拒铸。"""
+
+    still_awaiting_turn_boundary: bool
+    release_reason: str | None = None
+    deferred_record: dict[str, Any] | None = None
+
+
+def consult_deferred_until_condition_decline(
+    *,
+    worktree: str,
+    session_id: str,
+    candidate_fingerprint: str | None,
+    candidate_summary: Mapping[str, Any] | None,
+    cooldown_root: str | Path | None = None,
+) -> DeferredUntilConditionDeclineConsultation:
+    """闸 2c 的自动路径裁决。**只读不删**：放行时记录原样保留，由铸造在真正取得可投递 token 之后
+    调 :func:`_consume_deferred_until_condition_decline_after_deliverable_token` 消费。
+
+    放行 ≠ 这次延后已兑现：放行之后还有闸三熔断与 token 落盘，二者任一失败本次都没有横幅。若在这里
+    就删记录，下一次重试时「你上次延后到：「理由」」的盖章依据已经没了。
+    """
+    if not session_id:
+        return DeferredUntilConditionDeclineConsultation(still_awaiting_turn_boundary=False)
+    if read_deferred_until_condition_decline(
+        worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+    ) is None:
+        return DeferredUntilConditionDeclineConsultation(still_awaiting_turn_boundary=False)
+    current_scope_identity = candidate_scope_identity_from_candidate_summary(candidate_summary)
+    path = _deferred_until_condition_decline_path(worktree, session_id, cooldown_root)
+    with _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        deferred_record = _read_json_object_or_none(path)
+        if deferred_record is None:
+            return DeferredUntilConditionDeclineConsultation(still_awaiting_turn_boundary=False)
+        release_reason = evaluate_deferred_until_condition_decline_release_reason(
+            deferred_record=deferred_record,
+            current_scope_identity=current_scope_identity,
+            current_candidate_fingerprint=candidate_fingerprint,
+        )
+        if release_reason is None:
+            return DeferredUntilConditionDeclineConsultation(
+                still_awaiting_turn_boundary=True, deferred_record=deferred_record
+            )
+    return DeferredUntilConditionDeclineConsultation(
+        still_awaiting_turn_boundary=False,
+        release_reason=release_reason,
+        deferred_record=deferred_record,
+    )
+
+
+def _consume_deferred_until_condition_decline_after_deliverable_token(
+    *,
+    worktree: str,
+    session_id: str,
+    consulted_deferred_record: Mapping[str, Any],
+    cooldown_root: str | Path | None = None,
+) -> bool:
+    """铸造已取得可投递 token（新铸或并发竞态的胜者）之后，消费闸 2c 当初读到的那条延后记录。
+
+    只删「仍是同一条」的记录（按 ``token`` + ``declined_at`` 认身份；UPS 打回合边界标志只改标志字段、
+    不改身份）：裁决与消费之间若已写入一条新的延后谢绝，那是另一次延后，不能被这次重新征询顺手吞掉。
+    返回是否真的删除了文件；删不掉吞掉——残留记录下次会再判出放行并重新盖章，方向是多提一次理由。
+    """
+    if not session_id:
+        return False
+    path = _deferred_until_condition_decline_path(worktree, session_id, cooldown_root)
+    with _with_deferred_until_condition_declines_session_mutation_exclusive_lock(
+        session_id, cooldown_root
+    ):
+        current_deferred_record = _read_json_object_or_none(path)
+        if current_deferred_record is None:
+            return False
+        if any(
+            current_deferred_record.get(identity_field) != consulted_deferred_record.get(identity_field)
+            for identity_field in ("token", "declined_at")
+        ):
+            return False
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False
+
+
+def _stamp_previous_deferred_until_condition_decline_on_candidate_summary(
+    candidate_summary: dict[str, Any] | None,
+    deferred_record: Mapping[str, Any],
+    *,
+    release_reason: str | None,
+) -> None:
+    """把「本会话上一次延后型谢绝」盖进候选摘要（就地修改调用方传入的那份 dict）。
+
+    就地修改是刻意的：Stop 的两条 transport 与 UPS 都在铸造**之后**用同一个 ``summary`` 对象渲染横幅，
+    而 token payload 里的 ``candidate_summary`` 也是同一份——一处写入、三处可见。
+    """
+    if not isinstance(candidate_summary, dict):
+        return
+    candidate_summary[CANDIDATE_SUMMARY_PREVIOUS_DEFERRED_UNTIL_CONDITION_DECLINE_IN_THIS_SESSION_KEY] = {
+        "reason": deferred_record.get("reason"),
+        "declined_at": deferred_record.get("declined_at"),
+        "token": deferred_record.get("token"),
+        "release_reason": release_reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1675,6 +2266,8 @@ def mint_decision_token(
     circuit_breaker_window_seconds: int = DEFAULT_MINT_CIRCUIT_BREAKER_WINDOW_SECONDS,
     circuit_breaker_max_requests: int = DEFAULT_MINT_CIRCUIT_BREAKER_MAX_REQUESTS,
     initiated_by_explicit_user_request: bool = False,
+    explicit_user_request_provenance: str | None = None,
+    extra_token_payload_fields: Mapping[str, Any] | None = None,
 ) -> MintResult:
     """铸造一枚决策 token（Stop hook 侧唯一入口），依次经三道闸：
 
@@ -1684,7 +2277,13 @@ def mint_decision_token(
     2b. **declined 会话级 snooze**：本会话在本 worktree 上谢绝过、且尚未出现工作边界（HEAD 变化 /
        范围明显扩大 / 硬 TTL；开发者真实 prompt 只重置「范围扩大」基线）则拒铸（``outcome=declined_session_scope_snooze``）。
        它补的是闸二的盲区——内容一直在变的「边做边停」会话。放在闸二之后、闸三之前：两种 transport
-       与 UPS 的铸造都经过它；被它拦下的请求也不占熔断额度（本就不是递归自发起）。
+       与 UPS 的铸造都经过它；被它拦下的请求也不占熔断额度（本就不是递归自发起）。闸二与 2b 只由
+       **结构性**谢绝写入。
+    2c. **延后型谢绝等回合边界**：本会话最近一次是延后型谢绝、此后没有新回合、HEAD 没变、候选内容
+       指纹也没变则拒铸
+       （``outcome=deferred_until_condition_decline_awaiting_turn_boundary``）；之后放行（重新征询照常
+       经过闸三），并把延后理由盖进候选摘要供横幅引用。同样不占熔断额度。延后记录直到本次真正取得可投递
+       token 才被消费：被闸三拒铸或落盘失败时记录原样保留，重试仍能盖章。
     3. **铸造频率熔断（R24 裁决 b）**：同 session 窗口内第 ≥K 次铸造请求即拒铸
        （``outcome=circuit_breaker_tripped``），写 ledger 并回告警文案。纯计数，零语义判断。
 
@@ -1713,7 +2312,9 @@ def mint_decision_token(
       ``declined_cooldown_record_still_blocks_automatic_path``（unlink 失败时 True，只说明这条
       陈旧冷却仍会挡住后续自动路径）。清不掉绝不能吞掉推翻告知。
     * 闸 2b 不适用：理由同闸二（用户显式触发就是在推翻 agent 的谢绝），同样**清除**该
-      ``(worktree, session_id)`` 的 snooze 快照再往下铸。
+      ``(worktree, session_id)`` 的 snooze 快照再往下铸，并同样拆成两个字段回报：
+      ``explicit_user_request_overrode_agent_declined_session_scope_snooze``（有快照即 True）与
+      ``declined_session_scope_snooze_record_still_blocks_automatic_path``（删不掉时 True）。
     * 闸三不适用：熔断（R24）防的是 agent 对自己的 RVF 结果递归自发起；手动触发按定义来自用户
       而非自注入（manual 判定路径已把带 token/marker 的自注入 prompt 全部短路掉），因此**整段跳过**
       ——既不注册铸造请求、也不判定，不占用自动路径的窗口配额，``mint_request_record_id`` 留 None
@@ -1721,7 +2322,22 @@ def mint_decision_token(
       一份从未占用的额度）。
 
     默认 ``False`` ⇒ 自动路径（Stop hook）行为完全不变。
+
+    ``initiated_by_explicit_user_request=True`` 时必须同时给出 ``explicit_user_request_provenance``
+    （:data:`EXPLICIT_USER_REQUEST_PROVENANCES` 之一），落进 token payload：豁免语义两条入口一致，但
+    「开发者自己触发」与「agent 按开发者口头要求撤回自己的谢绝」是两件事，回执与遥测都要能分开。
+    ``extra_token_payload_fields`` 原样并入新铸 token 的 payload（不得覆盖既有字段）。
     """
+    if initiated_by_explicit_user_request and (
+        explicit_user_request_provenance not in EXPLICIT_USER_REQUEST_PROVENANCES
+    ):
+        raise DecisionTokenError(
+            "用户显式请求的铸造必须注明来源 explicit_user_request_provenance，取值为 "
+            f"{sorted(EXPLICIT_USER_REQUEST_PROVENANCES)} 之一，收到 {explicit_user_request_provenance!r}"
+        )
+    for system_written_field in MINT_SYSTEM_WRITTEN_EXPLICIT_USER_REQUEST_TOKEN_PAYLOAD_FIELDS:
+        if system_written_field in (extra_token_payload_fields or {}):
+            raise DecisionTokenError(f"extra_token_payload_fields 不得覆盖既有字段 {system_written_field!r}")
     if ttl_seconds is None:
         ttl_seconds = decision_token_ttl_seconds_for_delivery_transport(delivery_transport)
     if ttl_seconds <= 0:
@@ -1761,16 +2377,38 @@ def mint_decision_token(
         )
 
     # 闸 2b：declined 会话级 snooze（粗粒度工作范围，补闸二「内容一直在变」的盲区）。用户显式触发
-    # 与闸二同理：清掉快照再往下铸。自动路径命中且未满足解除条件 ⇒ 拒铸。
+    # 与闸二同理：清掉快照再往下铸，并与闸二一样把「命中」与「删掉」拆成两个事实回报。自动路径命中
+    # 且未满足解除条件 ⇒ 拒铸。
+    overrode_agent_declined_session_scope_snooze = False
+    declined_session_scope_snooze_record_still_blocks_automatic_path = False
     if initiated_by_explicit_user_request:
         snooze_record_overridden_by_explicit_user_request = read_declined_session_scope_snooze(
             worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
         )
-        if snooze_record_overridden_by_explicit_user_request is not None and (
-            clear_declined_session_scope_snooze(
-                worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
-            )
-        ):
+        snooze_record_cleared = False
+        if snooze_record_overridden_by_explicit_user_request is not None:
+            # 读与删在同一把会话锁里：否则删之前 Stop 可能刚把新观测写回，被推翻的就不是读到的那份。
+            with _with_declined_session_scope_snooze_session_mutation_exclusive_lock(
+                session_id, cooldown_root
+            ):
+                snooze_record_overridden_by_explicit_user_request = (
+                    read_declined_session_scope_snooze(
+                        worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+                    )
+                )
+                if snooze_record_overridden_by_explicit_user_request is not None:
+                    snooze_record_cleared = (
+                        _unlink_declined_session_scope_snooze_snapshot_without_session_mutation_lock(
+                            worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+                        )
+                    )
+        overrode_agent_declined_session_scope_snooze = (
+            snooze_record_overridden_by_explicit_user_request is not None
+        )
+        declined_session_scope_snooze_record_still_blocks_automatic_path = (
+            overrode_agent_declined_session_scope_snooze and not snooze_record_cleared
+        )
+        if snooze_record_cleared:
             _append_declined_session_scope_snooze_lifecycle_event(
                 snooze_lifecycle_event=DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_RELEASED,
                 worktree=worktree,
@@ -1797,6 +2435,53 @@ def mint_decision_token(
                     "边界（提交 / 范围明显扩大 / 12h 到期），跳过铸造。"
                 ),
             )
+
+    # 闸 2c：延后型谢绝（「等 X 之后再审」）。它不进冷却、不进 snooze，只挡「谢绝后原样停下」的 Stop：
+    # 新回合（UPS 观测到）、HEAD 变化、候选内容变化之前拒铸；之后放行并把延后理由盖进候选摘要。用户
+    # 显式触发与闸二 / 2b 同理：清掉记录（取得可投递 token 后消费）、如实回报「推翻了 agent 的延后」。
+    overrode_agent_deferred_until_condition_decline = False
+    overridden_deferred_until_condition_decline_reason: str | None = None
+    # 本次铸造取得可投递 token 之后要消费的那条延后记录（显式推翻 / 自动放行两条路径共用）。在熔断或
+    # 落盘失败之前就删，重试时会丢掉「你上次延后到」的理由与推翻告知的依据。
+    deferred_record_to_consume_after_deliverable_token: dict[str, Any] | None = None
+    if initiated_by_explicit_user_request:
+        deferred_record_overridden_by_explicit_user_request = read_deferred_until_condition_decline(
+            worktree=worktree, session_id=session_id, cooldown_root=cooldown_root
+        )
+        if deferred_record_overridden_by_explicit_user_request is not None:
+            overrode_agent_deferred_until_condition_decline = True
+            raw_reason = deferred_record_overridden_by_explicit_user_request.get("reason")
+            overridden_deferred_until_condition_decline_reason = (
+                raw_reason if isinstance(raw_reason, str) else None
+            )
+            deferred_record_to_consume_after_deliverable_token = (
+                deferred_record_overridden_by_explicit_user_request
+            )
+    else:
+        deferred_consultation = consult_deferred_until_condition_decline(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=candidate_fingerprint,
+            candidate_summary=candidate_summary,
+            cooldown_root=cooldown_root,
+        )
+        if deferred_consultation.still_awaiting_turn_boundary:
+            deferred_record = deferred_consultation.deferred_record or {}
+            return MintResult(
+                outcome=MINT_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY,
+                message=(
+                    f"agent 于 {deferred_record.get('declined_at')} 把本次审查延后到"
+                    f"「{deferred_record.get('reason')}」，此后没有新回合、没有提交、候选内容也没变，"
+                    "跳过铸造（出现其中任一即重新征询）。"
+                ),
+            )
+        if deferred_consultation.deferred_record is not None:
+            _stamp_previous_deferred_until_condition_decline_on_candidate_summary(
+                candidate_summary,
+                deferred_consultation.deferred_record,
+                release_reason=deferred_consultation.release_reason,
+            )
+            deferred_record_to_consume_after_deliverable_token = deferred_consultation.deferred_record
 
     # 闸三：铸造频率熔断（纯计数）。用户显式触发整段跳过——不注册请求、不判定、不占配额。
     breaker: CircuitBreakerStatus | None = None
@@ -1834,6 +2519,13 @@ def mint_decision_token(
         ttl_seconds=ttl_seconds,
         now=now_dt,
         root=root,
+        extra_payload_fields={
+            "initiated_by_explicit_user_request": initiated_by_explicit_user_request,
+            "explicit_user_request_provenance": (
+                explicit_user_request_provenance if initiated_by_explicit_user_request else None
+            ),
+            **dict(extra_token_payload_fields or {}),
+        },
     )
 
     # 为这个 dedup key 占坑。**首建与「顶掉陈旧索引」是同一件事**（都是占同一个坑，只差坑里有没有
@@ -1861,6 +2553,14 @@ def mint_decision_token(
         )
         if index_claim_holder_active is not None:
             _discard_token_record(record)
+            # 竞态胜者的 token 同样可投递：这次延后已兑现为一次重新征询，照样消费。
+            if deferred_record_to_consume_after_deliverable_token is not None:
+                _consume_deferred_until_condition_decline_after_deliverable_token(
+                    worktree=worktree,
+                    session_id=session_id,
+                    consulted_deferred_record=deferred_record_to_consume_after_deliverable_token,
+                    cooldown_root=cooldown_root,
+                )
             return MintResult(
                 outcome=MINT_OUTCOME_DEDUPLICATED,
                 token=index_claim_holder_active.token,
@@ -1870,8 +2570,27 @@ def mint_decision_token(
                 declined_cooldown_record_still_blocks_automatic_path=(
                     declined_cooldown_record_still_blocks_automatic_path
                 ),
+                explicit_user_request_overrode_agent_declined_session_scope_snooze=(
+                    overrode_agent_declined_session_scope_snooze
+                ),
+                declined_session_scope_snooze_record_still_blocks_automatic_path=(
+                    declined_session_scope_snooze_record_still_blocks_automatic_path
+                ),
+                explicit_user_request_overrode_agent_deferred_until_condition_decline=(
+                    overrode_agent_deferred_until_condition_decline
+                ),
+                overridden_deferred_until_condition_decline_reason=(
+                    overridden_deferred_until_condition_decline_reason
+                ),
             )
         _atomic_write_json(index_path, index_payload)
+    if deferred_record_to_consume_after_deliverable_token is not None:
+        _consume_deferred_until_condition_decline_after_deliverable_token(
+            worktree=worktree,
+            session_id=session_id,
+            consulted_deferred_record=deferred_record_to_consume_after_deliverable_token,
+            cooldown_root=cooldown_root,
+        )
     return MintResult(
         outcome=MINT_OUTCOME_MINTED,
         token=record.token,
@@ -1879,6 +2598,18 @@ def mint_decision_token(
         explicit_user_request_overrode_agent_declined_cooldown=overrode_agent_declined_cooldown,
         declined_cooldown_record_still_blocks_automatic_path=(
             declined_cooldown_record_still_blocks_automatic_path
+        ),
+        explicit_user_request_overrode_agent_declined_session_scope_snooze=(
+            overrode_agent_declined_session_scope_snooze
+        ),
+        declined_session_scope_snooze_record_still_blocks_automatic_path=(
+            declined_session_scope_snooze_record_still_blocks_automatic_path
+        ),
+        explicit_user_request_overrode_agent_deferred_until_condition_decline=(
+            overrode_agent_deferred_until_condition_decline
+        ),
+        overridden_deferred_until_condition_decline_reason=(
+            overridden_deferred_until_condition_decline_reason
         ),
     )
 
@@ -1894,6 +2625,7 @@ def _create_token_record(
     ttl_seconds: int,
     now: datetime,
     root: str | Path | None,
+    extra_payload_fields: Mapping[str, Any] | None = None,
 ) -> DecisionTokenRecord:
     """分配唯一 token 并原子落盘初始（``minted``）payload。"""
     expires_at = now + timedelta(seconds=ttl_seconds)
@@ -1922,6 +2654,10 @@ def _create_token_record(
             "revived_count": 0,
             "history": [{"from": None, "to": STATE_MINTED, "at": format_timestamp(now)}],
         }
+        for extra_key, extra_value in (extra_payload_fields or {}).items():
+            if extra_key in payload:
+                raise DecisionTokenError(f"extra_payload_fields 不得覆盖既有字段 {extra_key!r}")
+            payload[extra_key] = extra_value
         path = decision_token_path(token, root)
         try:
             _atomic_create_json(path, payload)
@@ -2532,6 +3268,7 @@ def mark_declined(
     token: str,
     *,
     reason: str,
+    decline_kind: str,
     root: str | Path | None = None,
     now: datetime | None = None,
     ttl_seconds: int = DEFAULT_DECISION_TOKEN_TTL_SECONDS,
@@ -2539,18 +3276,49 @@ def mark_declined(
 ) -> DecisionTokenRecord:
     """``minted|injected|acknowledged → declined``（rvf-agent ``decline``，终态）。
 
-    同时把 ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表——指纹未变即不再注入；并按
-    ``(worktree, session_id)`` 写一份会话级 snooze 快照（闸 2b）——内容变了但工作范围没变也不再注入。
-    snooze 写入是 best-effort（见 :func:`record_declined_session_scope_snooze`），失败不影响 decline。
+    ``decline_kind`` 必填，取 :data:`DECLINE_KINDS` 之一，决定谢绝之后多久再问：
+
+    * ``structural_not_needed``（R24 / 在途 run、琐碎、非本会话、开发者明确不要审）：把
+      ``(worktree, candidate_fingerprint)`` 写入 declined 冷却表——指纹未变即不再注入；并按
+      ``(worktree, session_id)`` 写一份会话级 snooze 快照（闸 2b）——内容变了但工作范围没变也不再注入。
+      snooze 写入是 best-effort（见 :func:`record_declined_session_scope_snooze`），失败不影响 decline。
+    * ``deferred_until_condition``（现在不审，条件满足后再审）：冷却与 snooze **都不写**，只记一条
+      「等到回合边界再重新征询」（闸 2c，见 :func:`record_deferred_until_condition_decline`）。
+
+    结构性谢绝顺带清掉本会话本 worktree 上旧的延后记录（新判断取代旧承诺）；延后型谢绝覆盖写入。
     """
+    if decline_kind not in DECLINE_KINDS:
+        raise DecisionTokenError(
+            f"decline_kind 必须是 {sorted(DECLINE_KINDS)} 之一，收到 {decline_kind!r}"
+        )
     now_dt = _coerce_now(now)
     with _with_decision_token_payload_mutation_lock(
         _decision_token_path_for_payload_mutation_lock(token, root)
     ):
         record = _load_active_record(token, root=root, now=now_dt, ttl_seconds=ttl_seconds)
         updated = _apply_lifecycle_transition(
-            record, STATE_DECLINED, now=now_dt, extra_updates={"decline_reason": reason}
+            record,
+            STATE_DECLINED,
+            now=now_dt,
+            extra_updates={"decline_reason": reason, "decline_kind": decline_kind},
         )
+    declined_worktree = str(updated.payload.get("worktree"))
+    declined_session_id = str(updated.payload.get("session_id") or "")
+    if decline_kind == DECLINE_KIND_DEFERRED_UNTIL_CONDITION:
+        record_deferred_until_condition_decline(
+            worktree=declined_worktree,
+            session_id=declined_session_id,
+            candidate_summary=updated.payload.get("candidate_summary"),
+            candidate_fingerprint=str(updated.payload.get("candidate_fingerprint") or "") or None,
+            reason=reason,
+            token=updated.token,
+            now=now_dt,
+            cooldown_root=cooldown_root,
+        )
+        return updated
+    clear_deferred_until_condition_decline(
+        worktree=declined_worktree, session_id=declined_session_id, cooldown_root=cooldown_root
+    )
     record_declined_fingerprint(
         worktree=str(updated.payload.get("worktree")),
         candidate_fingerprint=str(updated.payload.get("candidate_fingerprint")),

@@ -15,12 +15,14 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_marker_name
 
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
+    'test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not',
     'test_rvf_user_prompt_submit_dispatches_shared_workflow',
     'test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist',
     'test_rvf_user_prompt_submit_declines_reviving_stale_prep',
@@ -57,6 +59,17 @@ __all__ = [
     'test_rvf_user_prompt_submit_decision_point_marker_without_body_text_advances_nothing',
     'test_rvf_user_prompt_submit_concurrent_decision_point_marker_arrivals_inject_body_exactly_once',
     'test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not',
+    'test_rvf_user_prompt_submit_claude_task_notification_does_not_reset_stop_hook_reentry_budget',
+    'test_rvf_user_prompt_submit_claude_task_notification_does_not_rebase_declined_session_scope_snooze',
+    'test_rvf_user_prompt_submit_claude_task_notification_keeps_round_baseline_head_but_extends_its_expiry',
+    'test_rvf_user_prompt_submit_claude_task_notification_keeps_previous_turn_park_eligibility',
+    'test_rvf_user_prompt_submit_claude_task_notification_quoting_rvf_literals_triggers_nothing',
+    'test_rvf_user_prompt_submit_manual_trigger_tells_agent_it_overrode_declined_session_scope_snooze',
+    'test_rvf_user_prompt_submit_manual_trigger_does_not_first_rebase_the_snooze_it_is_about_to_release',
+    'test_rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_still_injected_token',
+    'test_rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_being_handed_to_host_never_withdraws_token',
+    'test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises',
+    'test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger',
 ]
 
 
@@ -2049,11 +2062,12 @@ def test_rvf_user_prompt_submit_expired_banner_never_claims_token_was_advanced(
 def test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinjects_body(
     tmp_path: Path,
 ) -> None:
-    """同一枚 token 的标记第二次到达 ⇒ **不再注入正文**，也不改任何状态。
+    """同一枚 token 的标记第二次到达 ⇒ **不再注入正文**；token 已 acknowledged（agent 已 start、
+    一轮在途）时也不改任何状态，更不得落进「本该推进但没推成」的文案。
 
     实测（Claude Code 2.1.284 交互式 TUI）：双 ESC rewind 到标记之前，标记会被放回输入框；用户再
     回车就是第二次到达。rewind 的本意就是去掉这次征询，若照样注入正文就等于 rewind 没生效。
-    已 acknowledged（agent 已 start）的 token 同理，也不得落进「本该推进但没推成」的文案。
+    （还停在 injected 的那一种由 M10 另行处置：当轮作废，见下一条用例。）
     """
     submit = load_rvf_user_prompt_submit_module()
     dts, _il, _summary = _load_manual_decision_modules()
@@ -2075,9 +2089,8 @@ def test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinject
             assert "hookSpecificOutput" in first, first
             assert dts.read_decision_token(token).state == dts.STATE_INJECTED
 
-            for label in ("injected", "acknowledged"):
-                if label == "acknowledged":
-                    dts.acknowledge_decision_token(token)
+            dts.acknowledge_decision_token(token)
+            for label in ("acknowledged",):
                 state_before = dts.read_decision_token(token).state
                 again = submit.inspect_user_prompt_submit(
                     {**event_base, "prompt": f"{marker}\n用户接着打的字"}
@@ -2277,7 +2290,8 @@ def test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_ban
                 ) is not None
             # 模拟 snooze 期间一次 Stop 的观测（未审行数更大）。
             observed_identity = dict(summary["candidate_scope_identity_for_declined_session_snooze"])
-            observed_identity["unreviewed_nonblank_changed_line_estimate"] = 999
+            # 观测比基线多 100 行：够让「重置基线」可观测，又不触发 M11 的纯行数解除（绝对增量 < 150）。
+            observed_identity["unreviewed_nonblank_changed_line_estimate"] += 100
             dts.consult_declined_session_scope_snooze(
                 worktree=worktree, session_id=session_id,
                 candidate_summary={"candidate_scope_identity_for_declined_session_snooze": observed_identity},
@@ -2304,7 +2318,708 @@ def test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_ban
                 {"prompt": "继续把 f.txt 的重构做完", "cwd": str(repo), "session_id": session_id,
                  "hook_event_name": "UserPromptSubmit"}
             )
-            assert baseline_lines(session_id) == 999
+            assert baseline_lines(session_id) == original_lines + 100
             assert baseline_lines("someone-else-sess") == original_lines
         finally:
             os.environ.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+
+
+# --- M8：host 自己合成的回合（Claude ``<task-notification>``）不是开发者 prompt -----------------
+#
+# 「这条 UPS 是不是开发者真实 prompt」的判定同时驱动四件事：再入预算复位、snooze 基线重置、
+# round baseline 前移、PostToolUse park 资格。Claude Code 在后台 Bash / 后台子代理完成时会合成
+# 一条 ``<task-notification>`` user message 并照常触发 UPS（2026-09-30 真机取证：2.1.285 的
+# UPS 事件里 ``prompt`` 就是原样的通知正文，事件里没有任何 origin 字段）。下面按用途逐一钉住。
+
+
+def _claude_code_background_task_completion_notification_prompt(*, result_text: str | None = None) -> str:
+    """与 Claude Code 2.1.285 真机 UPS 事件逐字同形的后台任务完成通知（取证见 handoff）。"""
+    lines = [
+        "<task-notification>",
+        "<task-id>brgmq1qmh</task-id>",
+        "<tool-use-id>toolu_01AnhVp3qhQTGFsibhigt6cm</tool-use-id>",
+        "<output-file>/private/tmp/claude-503/probe/tasks/brgmq1qmh.output</output-file>",
+        "<status>completed</status>",
+        '<summary>Background command "rvf wait" completed (exit code 0)</summary>',
+    ]
+    if result_text is not None:
+        lines.append(f"<result>{result_text}</result>")
+    lines.append("</task-notification>")
+    return "\n".join(lines)
+
+
+def _claude_code_user_prompt_submit_event(repo: Path, session_id: str, prompt: str, **extra: object) -> dict:
+    """Claude 插件入口转发给 core 的 UPS 事件形状（``_claude_hook_entry`` 会盖上 claude-code stamp）。"""
+    return {
+        "prompt": prompt,
+        "cwd": str(repo),
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "source": {"provider": "claude-code", "plugin": "review-validate-fix"},
+        **extra,
+    }
+
+
+def _temporary_environment(**overrides: str):
+    import contextlib  # noqa: PLC0415
+
+    @contextlib.contextmanager
+    def _ctx():
+        saved = {key: os.environ.get(key) for key in overrides}
+        os.environ.update({key: str(value) for key, value in overrides.items()})
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    return _ctx()
+
+
+def test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not(
+    tmp_path: Path,
+) -> None:
+    """D1 闸 2c 的回合边界信号由 UPS 打：后台任务 / 子代理完成通知（host 合成回合）与开发者真实 prompt
+    都是「新回合」——前者恰好就是最常见的延后条件；RVF 自己的带外横幅落地则不是（那时 agent 才刚要
+    决定，拿它放行会立刻自问自答）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_decision_token_store as store  # noqa: PLC0415
+
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "deferred-turn-boundary-sess"
+
+    def record_deferral() -> None:
+        assert store.record_deferred_until_condition_decline(
+            worktree=str(repo), session_id=session_id, candidate_summary=None,
+            candidate_fingerprint="fp", reason="子代理还在写，写完再审",
+        ) is not None
+
+    def new_turn_observed() -> bool:
+        record = store.read_deferred_until_condition_decline(worktree=str(repo), session_id=session_id)
+        assert record is not None
+        return bool(record["user_prompt_submit_observed_a_new_turn_since_deferral"])
+
+    with _manual_decision_env(tmp_path):
+        record_deferral()
+        banner_marker_prompt = "RVF 发起决策点 · RVF_DECISION_TOKEN=0123456789abcdef"
+        assert submit.decision_point_token_from_text(banner_marker_prompt) == "0123456789abcdef"
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, banner_marker_prompt)
+        )
+        assert not new_turn_observed(), "RVF 自己的带外横幅落地不是新回合"
+
+        notification_payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        assert notification_payload.get("host_synthesized_user_prompt_submit_turn_kind"), notification_payload
+        assert notification_payload.get("deferred_until_condition_declines_marked_new_turn_observed") is True
+        assert new_turn_observed(), "后台任务完成通知是新回合"
+
+        record_deferral()
+        assert not new_turn_observed()
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "测试跑完了，继续")
+        )
+        assert new_turn_observed(), "开发者真实 prompt 是新回合"
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_does_not_reset_stop_hook_reentry_budget(
+    tmp_path: Path,
+) -> None:
+    """用途①再入预算：后台任务完成通知是 agent 自己派出去的活回来了，不是人类打断了驱动链。
+
+    拿它复位，等于让「Stop 驱动 → agent 起后台任务 → 通知 → 复位 → 再驱动」这条环永远到不了上限。
+    识别必须走 HostAdapter：同一段字面量出现在 Codex 会话里时 Claude 的判据不适用，照旧复位。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import _rvf_pyroot  # noqa: F401,PLC0415
+    from core.stop_hook_reentry_budget import consume_stop_hook_reentry_budget  # noqa: PLC0415
+
+    repo = _manual_candidate_repo(tmp_path)
+    session_hook_state_dir = tmp_path / "session-hook-state"
+    session_id = "reentry-budget-sess"
+
+    def consume() -> int:
+        return consume_stop_hook_reentry_budget(
+            session_identifier=session_id,
+            stable_agent_directive_scope_digest_source="continue-the-rvf-round",
+            state_directory=session_hook_state_dir,
+        ).consecutive_agent_directive_count
+
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        CODEX_RVF_SESSION_HOOK_STATE_DIR=str(session_hook_state_dir)
+    ):
+        assert consume() == 1
+        assert consume() == 2
+        notification = _claude_code_background_task_completion_notification_prompt()
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, notification)
+        )
+        assert payload.get("host_synthesized_user_prompt_submit_turn_kind"), payload
+        assert consume() == 3, "后台任务完成通知不得复位再入预算"
+
+        # 同一段文本出现在 Codex 会话里：Claude 的判据不适用（识别走 HostAdapter，不是 core 写死字面量）。
+        codex_home = tmp_path / "codex-home"
+        codex_rollout = codex_home / "sessions" / "2026" / "09" / "30" / "rollout-probe.jsonl"
+        codex_rollout.parent.mkdir(parents=True, exist_ok=True)
+        codex_rollout.write_text("", encoding="utf-8")
+        with _temporary_environment(CODEX_HOME=str(codex_home)):
+            codex_payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": notification,
+                    "cwd": str(repo),
+                    "session_id": session_id,
+                    "hook_event_name": "UserPromptSubmit",
+                    "transcript_path": str(codex_rollout),
+                    "turn_id": "turn-probe",
+                }
+            )
+        assert "host_synthesized_user_prompt_submit_turn_kind" not in codex_payload, codex_payload
+        assert consume() == 1, "Codex 会话里的同一段文本是开发者 prompt，应复位"
+
+        # 开发者真实 prompt：复位。
+        assert consume() == 2
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "继续把 f.txt 做完")
+        )
+        assert consume() == 1, "开发者真实 prompt 应复位再入预算"
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_does_not_rebase_declined_session_scope_snooze(
+    tmp_path: Path,
+) -> None:
+    """用途②snooze 基线：方向 C 的前提是「开发者发话」。后台完成通知若也重置基线，基线会随每次
+    后台完成前移，snooze 比设计的更难解除；lifecycle ledger 也被这些伪发话污染（T3 验收靠它）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "snooze-notification-sess"
+    with _manual_decision_env(tmp_path):
+        summary = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo), "session_id": session_id},
+            cwd=str(repo), repo=str(repo), ledger=None,
+        )
+        worktree = str(repo.resolve())
+        assert dts.record_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
+        ) is not None
+        observed_identity = dict(summary["candidate_scope_identity_for_declined_session_snooze"])
+        # 观测比基线多 100 行：够让「重置基线」可观测，又不触发 M11 的纯行数解除（绝对增量 < 150）。
+        observed_identity["unreviewed_nonblank_changed_line_estimate"] += 100
+        dts.consult_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id,
+            candidate_summary={"candidate_scope_identity_for_declined_session_snooze": observed_identity},
+        )
+        original_lines = summary["candidate_scope_identity_for_declined_session_snooze"][
+            "unreviewed_nonblank_changed_line_estimate"
+        ]
+
+        def snooze_record():
+            record = dts.read_declined_session_scope_snooze(worktree=worktree, session_id=session_id)
+            assert record is not None
+            return record
+
+        def lifecycle_events():
+            ledger = (
+                dts.declined_session_scope_snooze_root()
+                / dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_LEDGER_FILENAME
+            )
+            if not ledger.is_file():
+                return []
+            return [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        record = snooze_record()
+        assert record["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == original_lines
+        assert record["scope_expansion_baseline_source"] == "declined", record
+        assert lifecycle_events() == [], "后台完成通知不得在 lifecycle ledger 里记一条「开发者发话」"
+
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "继续把 f.txt 做完")
+        )
+        record = snooze_record()
+        assert record["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == original_lines + 100
+        assert record["scope_expansion_baseline_source"] == "developer_prompt"
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_keeps_round_baseline_head_but_extends_its_expiry(
+    tmp: Path,
+) -> None:
+    """用途③round baseline：通知不是新一轮的起点——只延长**活跃** marker 的有效期，绝不前移 head。
+
+    前移是漏审方向：通知之前本轮已提交的改动会落到下界之下（bootstrap 期没有高水位兜底时即永久漏审，
+    同「孤儿提交」那一族）。只延期、不前移 ⇒ 窗口只会比改动前更宽，不会更窄；同时长时间自主工作
+    （全是通知、没有人类 prompt）的会话也不会因 6h TTL 到期而掉回 dirty-only。已过期的 marker 不复活。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    session_id = "round-baseline-notification-sess"
+    state_root = tmp / "state"
+    kanban_env_keys = ("KANBAN_TASK_ID", "CLINE_KANBAN_TASK_ID", "KANBAN_HOOK_TASK_ID")
+    saved_env = {k: os.environ.get(k) for k in (*kanban_env_keys, "CODEX_RVF_LOG_ROOT")}
+    for k in kanban_env_keys:
+        os.environ.pop(k, None)
+    os.environ["CODEX_RVF_LOG_ROOT"] = str(state_root)
+
+    def read_marker():
+        return rbm.read_round_baseline_marker(
+            task_id=None, session_id=session_id, repo=str(repo), root=state_root
+        )
+
+    def commit(content: str) -> str:
+        (repo / "f.txt").write_text(content, encoding="utf-8")
+        run(["git", "add", "f.txt"], cwd=repo)
+        run(["git", "commit", "-q", "-m", content.strip()[-8:]], cwd=repo)
+        return run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    try:
+        head_at_developer_prompt = commit("base\nround-start\n")
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "开始这一轮")
+        )
+        assert read_marker()["baseline_head"] == head_at_developer_prompt
+
+        # 本轮 agent 又提交了一次，然后后台任务完成通知到达。
+        commit("base\nround-start\nagent-commit\n")
+        marker_path = Path(read_marker()["_marker_path"])
+        near_expiry = json.loads(marker_path.read_text(encoding="utf-8"))
+        near_expiry["expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=60)
+        ).isoformat().replace("+00:00", "Z")
+        marker_path.write_text(json.dumps(near_expiry), encoding="utf-8")
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        assert "round_baseline" not in payload, payload
+        after_notification = read_marker()
+        assert after_notification["baseline_head"] == head_at_developer_prompt, (
+            "后台完成通知不得前移 round baseline（否则本轮通知前的提交落到下界之下）"
+        )
+        assert after_notification["expires_at"] > near_expiry["expires_at"], (
+            "活跃 marker 的有效期应被延长，长时间自主工作不该掉回 dirty-only"
+        )
+        assert after_notification["captured_at"] == near_expiry["captured_at"]
+
+        # 已过期的 marker：通知不得把它复活（过期即「太旧不可信」）。
+        stale = dict(after_notification)
+        stale.pop("_marker_path", None)
+        stale["expires_at"] = "2000-01-01T00:00:00Z"
+        marker_path.write_text(json.dumps(stale), encoding="utf-8")
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        assert read_marker()["expires_at"] == "2000-01-01T00:00:00Z"
+        assert rbm.round_baseline_status(read_marker()) == rbm.STATUS_STALE
+
+        # 开发者真实 prompt：照常前移到当前 HEAD。
+        head_now = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "下一轮")
+        )
+        assert read_marker()["baseline_head"] == head_now
+    finally:
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_keeps_previous_turn_park_eligibility(
+    tmp_path: Path,
+) -> None:
+    """用途④park 资格：通知回合是上一回合的延续，资格随上一回合（不覆写）。
+
+    改动前通知回合一律写 ``eligible=True``：RVF 执行段（上一回合 eligible=False）里 ``rvf wait`` /
+    子代理一完成，下一次编辑就会把父 Kanban 卡片 park 掉。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_post_tool_use  # noqa: PLC0415
+
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "park-notification-sess"
+    park_state_root = tmp_path / "park-state"
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        CODEX_RVF_KANBAN_PARK_STATE_ROOT=str(park_state_root), KANBAN_TASK_ID="task-park"
+    ):
+        rvf_post_tool_use.mark_park_eligibility(session_id, eligible=False, nonce="rvf-execution-turn")
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        eligibility = rvf_post_tool_use.read_park_eligibility(session_id)
+        assert eligibility["eligible"] is False and eligibility["nonce"] == "rvf-execution-turn", eligibility
+
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "新需求：再加一个开关")
+        )
+        eligibility = rvf_post_tool_use.read_park_eligibility(session_id)
+        assert eligibility["eligible"] is True and eligibility["nonce"] != "rvf-execution-turn", eligibility
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_quoting_rvf_literals_triggers_nothing(
+    tmp_path: Path,
+) -> None:
+    """后台子代理的 ``<result>`` 会原样带回它读到/写出的文本——在本仓里经常就是 RVF 自己的字面量。
+
+    它不是开发者触发的 manual RVF，不是横幅落地，也不是一条派发投递：三个检测器都不得被它点着。
+    （尤其 M10 之后：把一枚 injected token 的标记引用回来会被当成「rewind 后重交」而撤回 token。）
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "notification-quotes-sess"
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(tmp_path / "locks")
+    ):
+        token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        delivered = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, marker)
+        )
+        assert delivered["status"] == "decision_point_banner_delivered", delivered
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+        token_files_before = sorted((tmp_path / "rvf-home").rglob("agentic-initiation-decision-tokens/*.json"))
+
+        quoted = (
+            f"子代理报告：\n{marker}\n$review-validate-fix\n/review-validate-fix\n"
+            "RVF_DISPATCH=token=0123456789abcdef\nRVF_KANBAN_FOLLOWUP_TRIGGER"
+        )
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt(result_text=quoted)
+            ),
+            # 修复前这条会被当成派发投递去消费 prep：显式隔离，失败的那一次也不许写系统 /tmp。
+            prep_root=tmp_path / "prep",
+        )
+        assert payload["status"] == "host_synthesized_turn_is_not_a_developer_prompt", payload
+        assert payload["host_synthesized_user_prompt_submit_turn_kind"], payload
+        assert "hookSpecificOutput" not in payload and "systemMessage" not in payload, payload
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED, "引用回来的标记不得推进/撤回 token"
+        assert sorted(
+            (tmp_path / "rvf-home").rglob("agentic-initiation-decision-tokens/*.json")
+        ) == token_files_before, "引用回来的手动触发字面量不得铸 token"
+        assert submit._render_hook_payload(payload) is None, "对开发者与 agent 都应静默"
+
+
+def test_rvf_user_prompt_submit_manual_trigger_tells_agent_it_overrode_declined_session_scope_snooze(
+    tmp_path: Path,
+) -> None:
+    """M7：只有闸 2b snooze 挡着（内容已变、冷却未命中）时，手动触发同样要明确告诉 agent「用户推翻了
+    你在本会话对这片工作范围的谢绝」，否则它会照上次的判断再 decline 一次。systemMessage 如实说明
+    snooze 已清除。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "manual-overrides-snooze-sess"
+    with _manual_decision_env(tmp_path):
+        summary = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo), "session_id": session_id},
+            cwd=str(repo), repo=str(repo), ledger=None,
+        )
+        worktree = str(summary.get("repo") or repo.resolve())
+        assert dts.record_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
+        ) is not None
+        assert not dts.is_fingerprint_in_declined_cooldown(
+            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"]
+        ), "前提：只有 snooze 挡着，冷却没命中"
+
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "/review-validate-fix"),
+            prep_root=str(tmp_path / "prep-root"),
+        )
+        assert payload["status"] == "manual_decision_injected", payload
+        assert dts.read_declined_session_scope_snooze(worktree=worktree, session_id=session_id) is None
+        additional_context = payload["hookSpecificOutput"]["additionalContext"]
+        assert "推翻" in additional_context and "不要以" in additional_context, additional_context
+        assert "本会话" in additional_context, "要说清被推翻的是本会话对这片工作范围的谢绝"
+        system_message = payload["systemMessage"]
+        assert "已推翻" in system_message and "snooze" in system_message, system_message
+
+
+def test_rvf_user_prompt_submit_manual_trigger_does_not_first_rebase_the_snooze_it_is_about_to_release(
+    tmp_path: Path,
+) -> None:
+    """L-F3b：手动触发本身就会清掉 snooze；之前先按「开发者发话」重置一次基线，只会在 lifecycle
+    ledger 里留下一条紧跟着就被解除的「重置」噪声（T3 验收读的正是这份 ledger）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "manual-skips-rebase-sess"
+    with _manual_decision_env(tmp_path):
+        summary = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo), "session_id": session_id},
+            cwd=str(repo), repo=str(repo), ledger=None,
+        )
+        worktree = str(summary.get("repo") or repo.resolve())
+        dts.record_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
+        )
+        observed_identity = dict(summary["candidate_scope_identity_for_declined_session_snooze"])
+        # 观测比基线多 100 行：够让「重置基线」可观测，又不触发 M11 的纯行数解除（绝对增量 < 150）。
+        observed_identity["unreviewed_nonblank_changed_line_estimate"] += 100
+        dts.consult_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id,
+            candidate_summary={"candidate_scope_identity_for_declined_session_snooze": observed_identity},
+        )
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "$review-validate-fix"),
+            prep_root=str(tmp_path / "prep-root"),
+        )
+        assert payload["status"] == "manual_decision_injected", payload
+        ledger = (
+            dts.declined_session_scope_snooze_root()
+            / dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_LEDGER_FILENAME
+        )
+        events = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert [(e["snooze_lifecycle_event"], e["release_reason"]) for e in events] == [
+            (
+                dts.DECLINED_SESSION_SCOPE_SNOOZE_LIFECYCLE_EVENT_RELEASED,
+                dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_EXPLICIT_USER_REQUEST,
+            )
+        ], events
+
+
+def test_rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_still_injected_token(
+    tmp_path: Path,
+) -> None:
+    """M10：rewind 后用户把放回输入框的标记重交，而 token 还停在 injected（agent 没 start 也没 decline）。
+
+    rewind 之后正文已不在 agent 上下文里，这枚 token 再没有人能据以决策；标记重新落在祖先链上又让
+    Stop 侧的 rewind 对账永远判它「在链上」。改动前的结局是同一指纹被静默去重 20 分钟、随后静默过期，
+    与 SKILL.md「当轮作废、下次重问」相悖。现在：UPS 直接按 rewound_by_user 撤回（不计冷却 / 熔断），
+    去重索引随之移除，下一次 Stop 能重新征询。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "marker-resubmitted-after-rewind-sess"
+    event_base = {
+        "cwd": str(repo),
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "kanban_task_id": "task-marker-resubmitted",
+    }
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(tmp_path / "locks")
+    ):
+        token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        charged_before = dts.count_recent_mint_requests(session_id)
+        first = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+        assert "hookSpecificOutput" in first, first
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+
+        again = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+        assert "hookSpecificOutput" not in again, "正文只在首次到达时注入"
+        assert again.get("decision_token_withdrawn_after_marker_resubmission") is True, again
+        withdrawn = dts.read_decision_token(token)
+        assert withdrawn.state == dts.STATE_WITHDRAWN, withdrawn.state
+        assert withdrawn.payload["withdrawal_cause"] == dts.DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER
+        system_message = str(again.get("systemMessage") or "")
+        assert "只在首次到达时注入" in system_message and "重新征询" in system_message, system_message
+        assert dts.count_recent_mint_requests(session_id) == charged_before - 1, "rewind 撤回不计熔断"
+
+        # 去重索引已移除：同一候选指纹下一次能重新铸出一枚（= 下一次 Stop 会重新征询）。
+        reminted_token, _reminted_marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        assert reminted_token != token
+
+
+def test_rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_being_handed_to_host_never_withdraws_token(
+    tmp_path: Path,
+) -> None:
+    """RVF-001：M10 的「锁外读到 injected ⇒ 用户 rewind 后重交」只能在首次注入**已交付完毕**之后成立。
+
+    首个 UPS 在锁内赢得 ``minted → injected`` 之后、把正文交给 host 之前，同一 token 的另一次到达
+    在锁外读到的也是 injected——它是并发到达，不是 rewind。改动前它会走进 M10 把 token 撤回：agent
+    随后拿到正文，``rvf start`` 却必然因 withdrawn 硬失败。
+
+    用受控交错在首个到达的两个在途点各插入一次**完整**到达：锁内迁移刚提交时、以及最后一步记账
+    （清投递意图）进行中。两处都不得撤回；首个到达全部完成之后的重交（真正的 rewind）照旧撤回。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    interleave_points = (
+        (
+            "after_winning_first_injection_claim_inside_token_lock",
+            dts,
+            "claim_first_minted_to_injected_transition_exclusively",
+        ),
+        (
+            "while_clearing_the_delivery_intent_as_the_last_bookkeeping_step",
+            submit.kanban_followup_lock,
+            "clear_decision_point_delivery_intent",
+        ),
+    )
+    for interleave_point_label, patched_owner, patched_attribute in interleave_points:
+        case_root = tmp_path / interleave_point_label
+        repo = _manual_candidate_repo(case_root)
+        session_id = f"first-injection-in-flight-sess-{interleave_point_label}"
+        event_base = {
+            "cwd": str(repo),
+            "session_id": session_id,
+            "hook_event_name": "UserPromptSubmit",
+            "kanban_task_id": f"task-first-injection-in-flight-{interleave_point_label}",
+        }
+        with _manual_decision_env(case_root), _temporary_environment(
+            RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(case_root / "locks")
+        ):
+            token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+            real_attribute = getattr(patched_owner, patched_attribute)
+            interleaved_arrival_payloads: list[dict] = []
+
+            def let_another_full_arrival_run_mid_first_injection(*args, **kwargs):
+                outcome = real_attribute(*args, **kwargs)
+                if not interleaved_arrival_payloads:
+                    # 先占位再跑，防止插入的那次到达自己再触发交错。
+                    interleaved_arrival_payloads.append({})
+                    assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+                    interleaved_arrival_payloads[0] = submit.inspect_user_prompt_submit(
+                        {**event_base, "prompt": marker}
+                    )
+                return outcome
+
+            setattr(patched_owner, patched_attribute, let_another_full_arrival_run_mid_first_injection)
+            try:
+                first = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+            finally:
+                setattr(patched_owner, patched_attribute, real_attribute)
+
+            assert len(interleaved_arrival_payloads) == 1, (interleave_point_label, interleaved_arrival_payloads)
+            concurrent_arrival = interleaved_arrival_payloads[0]
+            assert "hookSpecificOutput" in first, (interleave_point_label, first)
+            assert "hookSpecificOutput" not in concurrent_arrival, (interleave_point_label, concurrent_arrival)
+            assert concurrent_arrival.get("decision_token_withdrawn_after_marker_resubmission") is not True, (
+                interleave_point_label,
+                concurrent_arrival,
+            )
+            assert (
+                concurrent_arrival.get("decision_point_banner_resubmitted_without_body_reinjection") is True
+            ), (interleave_point_label, concurrent_arrival)
+            assert dts.read_decision_token(token).state == dts.STATE_INJECTED, (
+                interleave_point_label,
+                "agent 已拿到正文，token 不得被并发到达撤回",
+            )
+
+            # 首个到达全部完成之后再重交 = 真正的 rewind ⇒ 照旧当轮作废。
+            rewound = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+            assert rewound.get("decision_token_withdrawn_after_marker_resubmission") is True, (
+                interleave_point_label,
+                rewound,
+            )
+            assert dts.read_decision_token(token).state == dts.STATE_WITHDRAWN, interleave_point_label
+
+
+def test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises(
+    tmp_path: Path,
+) -> None:
+    """L-F3d：抢到 ``minted → injected`` 之后，任何记账步骤抛异常都不得让正文丢失。
+
+    改动前的顺序是「先清投递意图、后设置输出」，清意图时一抛异常就被外层吞掉：token 已是 injected，
+    agent 却没拿到正文（`rvf start` 可用但 agent 不知道要决策），直到 TTL 静默过期。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "clear-intent-raises-sess"
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(tmp_path / "locks")
+    ):
+        token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        original_clear = submit.kanban_followup_lock.clear_decision_point_delivery_intent
+
+        def clear_raises(**_kwargs):
+            raise OSError(5, "Input/output error")
+
+        submit.kanban_followup_lock.clear_decision_point_delivery_intent = clear_raises
+        try:
+            payload = submit.inspect_user_prompt_submit(
+                {
+                    "prompt": marker,
+                    "cwd": str(repo),
+                    "session_id": session_id,
+                    "hook_event_name": "UserPromptSubmit",
+                    "kanban_task_id": "task-clear-intent-raises",
+                }
+            )
+        finally:
+            submit.kanban_followup_lock.clear_decision_point_delivery_intent = original_clear
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+        body = dts.read_decision_token(token).payload[dts.DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY]
+        assert payload.get("hookSpecificOutput") == {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }, payload
+        assert "decision_token_observation_error" in payload, "异常照样如实记下，只是不再吞掉正文"
+
+
+def test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger(
+    tmp_path: Path,
+) -> None:
+    """M8b（与 M8 同根）：子代理结果里出现主 skill 的手动触发字面量，不是开发者手动触发。
+
+    实例：会话 fe8a938a 在 09-30 01:59 / 02:14 各被这样判成过一次 manual（当时无候选、无害）。有候选时
+    会铸出一枚误发的决策 token，并执行只属于「用户显式请求」的豁免：清 declined 冷却、跳熔断、清 snooze。
+    """
+    submit = load_rvf_user_prompt_submit_module()
+    dts, il, summary_mod = _load_manual_decision_modules()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "notification-quotes-manual-trigger-sess"
+    with _manual_decision_env(tmp_path):
+        summary = summary_mod.build_candidate_summary(
+            event={"cwd": str(repo), "session_id": session_id},
+            cwd=str(repo), repo=str(repo), ledger=None,
+        )
+        worktree = str(summary.get("repo") or repo.resolve())
+        assert int(summary["candidate_path_count"]) > 0, "前提：有候选，误判时会真的铸 token"
+        assert dts.record_declined_session_scope_snooze(
+            worktree=worktree, session_id=session_id, candidate_summary=summary, reason="wip",
+        ) is not None
+        dts.record_declined_fingerprint(
+            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"], reason="wip"
+        )
+        subagent_result = (
+            "审查完成。要复核的话，在主会话里跑\n/review-validate-fix\n或者 $review-validate-fix 即可。"
+        )
+        payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo,
+                session_id,
+                _claude_code_background_task_completion_notification_prompt(result_text=subagent_result),
+            ),
+            prep_root=str(tmp_path / "prep-root"),
+        )
+        assert payload["status"] == "host_synthesized_turn_is_not_a_developer_prompt", payload
+        token_dir = dts.decision_token_root()
+        assert not token_dir.exists() or not list(token_dir.glob("*.json")), "不得铸出误发的决策 token"
+        assert il.read_injection_attempts(worktree=worktree) == []
+        assert dts.read_declined_session_scope_snooze(worktree=worktree, session_id=session_id) is not None, (
+            "不得执行「用户显式请求」才有的 snooze 清除"
+        )
+        assert dts.is_fingerprint_in_declined_cooldown(
+            worktree=worktree, candidate_fingerprint=summary["candidate_fingerprint"]
+        ), "不得执行「用户显式请求」才有的冷却清除"

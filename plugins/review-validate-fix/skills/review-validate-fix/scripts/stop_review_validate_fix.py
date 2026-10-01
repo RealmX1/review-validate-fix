@@ -148,6 +148,7 @@ from kanban_followup_lock import (
     write_pending_marker as write_kanban_followup_pending,
     DECISION_POINT_DELIVERY_INTENT_STATE_RECORDED_BEFORE_SEND,
     DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT,
+    DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY,
     clear_decision_point_delivery_intent,
     decision_point_delivery_intent_status,
     iter_decision_point_delivery_intents,
@@ -247,6 +248,8 @@ from core.host_adapter.host_transcript_format_detection import (  # noqa: F401 �
 )
 import rvf_parent_context
 from host_adapter_resolver import resolve_host_adapter  # noqa: E402 — HostAdapter 装配 resolver（S10 注入面）
+# 「当前这次 hook 事件属于哪个 host 的会话」的判定住在装配层（UPS 也要用、又不能 import 本引擎）。
+from host_adapter_resolver import resolve_current_session_host_adapter  # noqa: E402
 from core.stop_hook_reentry_budget import (  # noqa: E402 — Stop 驱动 agent 的跨 turn 再入预算（host-中性）
     consume_stop_hook_reentry_budget,
 )
@@ -1432,7 +1435,7 @@ def write_dispatch_prep_file(
         },
         "handoff_expectations": {
             "handoff_path": str(artifacts_dir / "handoff.md"),
-            "expected_artifacts": ["review-result.json", "merge-table.md", "handoff.md"],
+            "expected_artifacts": ["review-result.json", "merge/merge_dispositions.json", "handoff.md"],
         },
         "workflow_constraints": {
             "pause_origin_edits": target_flow == "flow-2-branch",
@@ -8943,6 +8946,9 @@ REASON_DECISION_POINT_INJECTED = "decision_point_injected"
 REASON_DECISION_POINT_DEDUPLICATED_PENDING = "decision_point_deduplicated_pending"
 REASON_DECISION_POINT_DECLINED_COOLDOWN = "decision_point_declined_cooldown"
 REASON_DECISION_POINT_DECLINED_SESSION_SCOPE_SNOOZE = "decision_point_declined_session_scope_snooze"
+REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY = (
+    "decision_point_deferred_until_condition_decline_awaiting_turn_boundary"
+)
 REASON_DECISION_POINT_CIRCUIT_BREAKER = "decision_point_circuit_breaker_tripped"
 REASON_DECISION_POINT_NO_CANDIDATES = "decision_point_no_candidates"
 # 本次 Stop 刚撤掉一枚搁浅横幅 ⇒ 当次就地结束，不在同一次 Stop 里重铸（C-①）。
@@ -9179,6 +9185,18 @@ def _render_decision_point_unreviewed_estimate_lines(
 #: 决策点正文的首行。正向陈述「由你决定」，不写任何关于投递方式的元信息。
 DECISION_POINT_BANNER_TITLE_LINE = "=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ==="
 
+FALLBACK_HAPPENED_BEFORE_ANY_TERMINAL_DELIVERY_ATTEMPT_KEY = (
+    "fallback_happened_before_any_terminal_delivery_attempt"
+)
+"""回落诊断里的布尔键：True = 回落发生在把消息交给 cline-kanban **之前**（正文写不进 token、task id
+消失等）。开发者旁注据此区分「带外投递未发起」与「终端投递确定失败」，两者善后不同，不能共用一句。"""
+
+FALLBACK_AFTER_BOUNDARY_MARKER_LANDED_WITHOUT_BANNER_BODY_INJECTION_KEY = (
+    "fallback_after_boundary_marker_landed_without_banner_body_injection"
+)
+"""回落诊断里的布尔键：True = 边界标记**已经**作为 user prompt 落地，但决策正文没有经 UPS 注入，
+本次 Stop 补发完整正文（审计 M13）。与上面两种回落（未发起 / 终端投递确定失败）的旁注互不借用。"""
+
 
 def _render_decision_point_out_of_band_boundary_marker(*, token: str) -> str:
     """带外投递时**终端粘贴通道唯一送出的内容**：一行无指令的边界标记。
@@ -9209,7 +9227,7 @@ def _render_decision_point_injection_prompt(
     fork_context: dict[str, str] | None,
     delivery_transport: str | None = None,
 ) -> str:
-    """渲染决策点横幅正文（两条 transport 共用**同一份**正文，只差两行来源/时效说明）。
+    """渲染决策点横幅正文（两条 transport 共用**同一份**正文，带外那条只多一行时效说明）。
 
     必含（计划 §四 S4 bullet 3）：候选摘要渲染 + token 字符串 + start/scope/dispatch/decline CLI 命令
     样例 + 「简析后立刻 start 或 decline，不要搁置」指引 + R24 递归护栏文案；fork-context（已在 RVF
@@ -9253,10 +9271,23 @@ def _render_decision_point_injection_prompt(
         "本轮工作停下时检测到本 worktree **存在未提交（或本轮已提交但未审）的改动**——发起闸看的是"
         "工作树是否干净，**不是**「有没有新工作」；上一轮 RVF 刚审完、你把修复落盘还没提交，这里照样"
         "会再问一次。规模行下方的「已审 / 未审」估算才是判断「还剩多少真没审」的依据。是否发起 RVF 由你"
-        "（主 agent）决定：简要评估后，用下面的 `rvf` 命令**显式** start（发起）或 decline（谢绝）。"
+        f"（主 agent）决定：简要评估后，用下面的 `{rvf}` 命令**显式** start（发起）或 decline（谢绝）。"
         "开发者已预先授权你独立做这个决定，不需要征询开发者。"
     )
     lines.append(f"RVF_DECISION_TOKEN={token}")
+    previous_deferred_until_condition_decline = summary.get(
+        decision_token_store.CANDIDATE_SUMMARY_PREVIOUS_DEFERRED_UNTIL_CONDITION_DECLINE_IN_THIS_SESSION_KEY
+    )
+    if isinstance(previous_deferred_until_condition_decline, dict):
+        lines.append("")
+        lines.append(
+            "  你上次延后到：「{reason}」（{declined_at} 的延后型谢绝）。此后出现了新回合、提交或改动，所以"
+            "重新征询：先判断这个条件现在是否已经满足——满足了就 start；确实仍未满足可以再延后一次，"
+            "但如果其实是「这批改动不需要审」，请改用结构性谢绝。".format(
+                reason=previous_deferred_until_condition_decline.get("reason") or "（未记录理由）",
+                declined_at=previous_deferred_until_condition_decline.get("declined_at") or "未知时间",
+            )
+        )
     if (
         delivery_transport
         == decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
@@ -9345,10 +9376,29 @@ def _render_decision_point_injection_prompt(
         f"  定稿派发（选严格度档 light|standard|strict）: "
         f"{rvf} dispatch --token {token} --strictness {suggested_tier}"
     )
-    lines.append(f"  谢绝（不发起）: {rvf} decline --token {token} --reason \"<一句话理由>\"")
     lines.append(
-        "  （谢绝会在本会话内 snooze 这片工作范围：直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），"
-        "自动 Stop 都不会再为它弹这条横幅。）"
+        f"  谢绝（不发起）: {rvf} decline --token {token} "
+        f"--decline-kind <{decision_token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED}"
+        f"|{decision_token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION}> --reason \"<一句话理由>\""
+    )
+    lines.append("  谢绝必须选类型（--decline-kind），两类之后多久再问完全不同：")
+    lines.append(
+        f"    · {decision_token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED}＝这批改动本就不需要 RVF："
+        "候选是你刚跑完的一轮 RVF 的产物（R24）或已有 RVF 在途、改动琐碎（只有一行日志 / 注释 / "
+        "工具生成配置）、改动不是本会话做的、开发者明确说过不要审。之后本会话 snooze 这片工作范围：直到"
+        "提交、范围明显扩大或同一批文件上的改动量翻了几倍（开发者发来新 prompt 后以那一刻为新基线），"
+        "自动 Stop 都不会再为它弹这条横幅。"
+    )
+    lines.append(
+        f"    · {decision_token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION}＝现在不审、条件满足后要审："
+        "「测试还在跑，跑完再审」「提交后再审」「子代理还在写，写完再审」。不进冷却、不进 snooze："
+        "下一个回合（开发者发话、后台任务或子代理的完成通知）、提交、或你接着改了候选文件之后，只要"
+        "候选还在就会重新问你，"
+        "横幅会带上你这次写的理由。理由里写清楚在等什么。"
+    )
+    lines.append(
+        "    拿不准时按「这批改动将来要不要审」判断：要审只是不是现在 → deferred；不需要审 → structural。"
+        "别用 structural 表达「晚点再审」——那会让这批工作在本会话里一直不被问到。"
     )
     lines.append("")
     lines.append("— 接受之后怎么进入执行（**不会再有第二条注入消息**）—")
@@ -9366,8 +9416,8 @@ def _render_decision_point_injection_prompt(
     lines.append("")
     lines.append(
         "指引：**简析后立刻 start 或 decline，不要搁置**——决策 token 有 TTL，超时无任一信号会被标"
-        "为 lost 并告警。start 后紧接着 dispatch 才真正派发 reviewer；start 只是重量级准备，失败可"
-        "`start --retry`。"
+        "为 lost 并告警。start 后紧接着 dispatch 才真正派发 reviewer；start 只是重量级准备，失败可 "
+        f"`{rvf} start --token {token} --retry`。"
     )
     lines.append("")
     lines.append(
@@ -9570,6 +9620,154 @@ def reconcile_rewound_decision_point_deliveries(
 
 
 @dataclass(frozen=True)
+class OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection:
+    """一枚「边界标记已落在本会话祖先链上、决策正文却从未注入、token 仍有效且停在 minted」的带外横幅。"""
+
+    delivery_intent: dict[str, Any]
+    decision_token_lookup: Any
+    boundary_marker_presence: TriggerPresence
+
+
+def find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_injection(
+    event: dict[str, Any],
+    *,
+    cwd: str | None,
+    worktree: str | None,
+) -> OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection | None:
+    """审计 M13：找出本轮这条投递通道上「标记落地了、正文没注入」而 token 还来得及决策的那一枚。
+
+    决策正文只能经 UserPromptSubmit 注入；标记在 agent 回合中途以 ``queued_command`` 送达时，
+    Claude Code < 2.1.260 **不触发** UPS（UPS 没跑 / 超时 / 崩溃同理）。agent 此时只看到一行
+    「未随附即忽略」的标记，按文案忽略它，决策点静默丢失；而投递意图仍在途，在途闸会把后续 Stop
+    全部静默挡住，直到 15 分钟意图 TTL 过后搁浅对账撤回、再下一次 Stop 才重铸。
+
+    判据（全部为正向证据，任一不满足即不接手，交还给在途闸 / 搁浅对账）：意图属于本轮这条通道；
+    意图里**没有**「UPS 已注入正文」的首次到达记录；token 仍 ``valid`` 且停在 ``minted``（过期的
+    token 补发了也 start 不了，那一格归 M9 的撤回 + 计费）；标记在本次 Stop 的 transcript 祖先链上。
+    不看意图是否已过 TTL——「不等在途 TTL」正是这条的目的。
+    """
+    stop_transcript_path = first_readable_session_path(event)
+    if stop_transcript_path is None:
+        return None
+    stop_kanban_task_id = current_kanban_task_id(event)
+    try:
+        markers = iter_decision_point_delivery_intents()
+    except Exception:  # pragma: no cover - 枚举永不阻断
+        return None
+    for marker in markers:
+        token = marker.get("decision_token")
+        if not (isinstance(token, str) and token):
+            continue
+        if not stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel(
+            marker,
+            stop_worktree=worktree,
+            stop_cwd=cwd,
+            stop_kanban_task_id=stop_kanban_task_id,
+        ):
+            continue
+        first_arrival_observation = marker.get(
+            DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY
+        )
+        if (
+            isinstance(first_arrival_observation, dict)
+            and first_arrival_observation.get("decision_point_banner_body_text_injected") is True
+        ):
+            continue
+        lookup = decision_token_store.read_decision_token(token)
+        if lookup.status != "valid" or lookup.state != decision_token_store.STATE_MINTED:
+            continue
+        presence = classify_dispatch_trigger_presence(
+            transcript_path=stop_transcript_path,
+            dispatch_token=token,
+            trigger_literal=decision_token_literal(token),
+        )
+        if presence.presence != TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN:
+            continue
+        return OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection(
+            delivery_intent=marker,
+            decision_token_lookup=lookup,
+            boundary_marker_presence=presence,
+        )
+    return None
+
+
+def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_injection(
+    landed_without_body: OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection,
+    *,
+    event: dict[str, Any],
+    ledger: RunLedger,
+    repo: str,
+    cwd: str | None,
+    gate_status: str,
+    fork_context: dict[str, str] | None,
+) -> StopDecision:
+    """M13 的处置：本次 Stop 以**同一枚** token 自注入完整正文（受众 agent_must_act_now）。
+
+    不撤回、不重铸 ⇒ 既不冲销也不新增熔断额度；token 由自注入出口推进为 injected（跨 turn 再入预算
+    照常在那里判，耗尽时由那条出口按「根本没发」撤回）。随后清掉这份投递意图——正文已经送达，
+    它不再有对账价值，留着只会让搁浅对账事后把一枚已注入的 token 当成搁浅。
+    """
+    lookup = landed_without_body.decision_token_lookup
+    token_payload = lookup.payload if isinstance(lookup.payload, dict) else {}
+    summary = token_payload.get("candidate_summary")
+    summary = dict(summary) if isinstance(summary, dict) else {}
+    delivery_intent = landed_without_body.delivery_intent
+    first_arrival_observation = delivery_intent.get(
+        DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY
+    )
+    if isinstance(first_arrival_observation, dict):
+        user_prompt_submit_side_explanation = (
+            "UserPromptSubmit hook 收到了这条标记但没有注入正文："
+            f"{first_arrival_observation.get('outcome') or 'unknown'}"
+        )
+    else:
+        user_prompt_submit_side_explanation = (
+            "UserPromptSubmit hook 没有处理这条标记——回合中途以 queued_command 送达时 "
+            "Claude Code < 2.1.260 不触发 UPS；也可能是 UPS 没跑 / 超时 / 崩溃"
+        )
+    ledger.event(
+        phase="gate",
+        event="decision_point_boundary_marker_landed_without_banner_body_reinjected_by_stop",
+        status="completed",
+        reason_code="decision_point_boundary_marker_landed_without_banner_body_reinjected_by_stop",
+        repo=repo,
+        cwd=cwd,
+        decision_token=lookup.token,
+        cline_kanban_task_id=delivery_intent.get("kanban_task_id"),
+        decision_point_delivery_intent_path=delivery_intent.get("_marker_path"),
+        user_prompt_submit_first_arrival_observation=first_arrival_observation,
+        **landed_without_body.boundary_marker_presence.as_ledger_fields(),
+    )
+    decision = _decision_point_self_injection_decision(
+        token=lookup.token,
+        summary=summary,
+        fork_context=fork_context,
+        ledger=ledger,
+        repo=repo,
+        cwd=cwd,
+        worktree=str(token_payload.get("worktree") or summary.get("repo") or repo),
+        session_id=token_payload.get("session_id") or session_id_from_event(event),
+        fingerprint=str(token_payload.get("candidate_fingerprint") or ""),
+        candidate_count=int(summary.get("candidate_path_count") or 0),
+        has_committed=bool(summary.get("has_committed_but_unreviewed")),
+        gate_status=gate_status,
+        lost_warnings=[],
+        event=event,
+        fell_back_from_out_of_band_delivery={
+            "summary": user_prompt_submit_side_explanation,
+            FALLBACK_AFTER_BOUNDARY_MARKER_LANDED_WITHOUT_BANNER_BODY_INJECTION_KEY: True,
+        },
+    )
+    task_id = delivery_intent.get("kanban_task_id")
+    if isinstance(task_id, str) and task_id:
+        try:
+            clear_decision_point_delivery_intent(task_id=task_id, decision_token=lookup.token)
+        except Exception:  # noqa: BLE001 - 清理 best-effort；残留意图会被搁浅对账按非 minted 清掉
+            pass
+    return decision
+
+
+@dataclass(frozen=True)
 class StrandedDecisionPointDeliveryReconciliationOutcome:
     """一次「搁浅横幅」对账的结果：给开发者的旁注，以及**本次真的撤回了哪些 token**。
 
@@ -9661,23 +9859,29 @@ def classify_stranded_decision_point_delivery_withdrawal_cause(
     *,
     transcript_path: Path | None,
     decision_token: str,
+    stranded_decision_point_delivery_intent: dict[str, Any] | None = None,
 ) -> tuple[str, TriggerPresence]:
     """一枚搁浅 token 该按哪个**成因**撤回（决定它烧不烧熔断额度）。返回 ``(成因, 证据)``。
 
     ``state`` 仍停在 ``minted`` **不足以**断言「从未成为 turn」：
-    ``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在 ``mark_injected``
-    抛 ``DecisionTokenExpiredError``（横幅确实落地了、但排在一个长回合之后越过了 1200s TTL）时
-    **提前返回且刻意不清投递意图**，而 ``read_decision_token`` 对已过 TTL 的 token 照样返回
-    ``state=minted``。于是「agent 看到过横幅」与「横幅从未落地」在对账侧形状完全一致。
+    ``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在锁内首次迁移
+    （``claim_first_minted_to_injected_transition_exclusively``）抛 ``DecisionTokenExpiredError``
+    （标记确实落地了、但排在一个长回合之后越过了 1200s TTL）时**提前返回且刻意不清投递意图**，而
+    ``read_decision_token`` 对已过 TTL 的 token 照样返回 ``state=minted``。于是「标记成了 turn」与
+    「横幅从未落地」在对账侧形状完全一致。
 
-    唯一能把这两者分开的现成证据是 transcript：带外横幅是以一条**真实 user message** 进
+    能把这两者分开的现成证据是 transcript：带外横幅是以一条**真实 user message** 进
     transcript 的（这正是 ``reconcile_rewound_decision_point_deliveries`` 的立论），所以
     ``RVF_DECISION_TOKEN=<token>`` 这枚 needle 出现与否就是「它有没有成为一条 turn」的直答。
 
-    三分：
+    **但成为 turn ≠ 征询到达了 agent。** 59ffd 之后那一行标记不含任何指令，正文只能经 UPS 注入。
+    所以「在祖先链上」再按投递意图里 UPS 的首次到达记录二分（审计 M9）：
 
-    * 在祖先链上 ⇒ 横幅**确实**成为了 turn，只是记账没跟上 ⇒ 通道健康，冲销额度（不然连续 3 次
-      记账失败就把熔断打跳、整个 session 静默封禁一个窗口 = 漏审方向）；
+    * 在祖先链上、且 UPS 记着「正文已注入」⇒ 征询确实到达过、只是记账没跟上 ⇒ 通道健康，冲销额度
+      （不然连续 3 次记账失败就把熔断打跳、整个 session 静默封禁一个窗口 = 漏审方向）；
+    * 在祖先链上、但没有这份正向证据（UPS 没跑 / 超时 / 崩溃，或 UPS 记着正文缺失 / token 未推进）
+      ⇒ agent 只看到一行「未随附即忽略」，这次征询空转了 ⇒ ``…_banner_body_never_injected``，
+      **不**冲销，由调用方如实告警；
     * 不在祖先链上但出现过 ⇒ 横幅成为过 turn 且被用户 rewind 掉了 ⇒ 复用 ``rewound_by_user``
       （与 ``reconcile_rewound_decision_point_deliveries`` 同一事实、同一处置，不另造成因）；
     * 整份 transcript 里找不到 / transcript 不可读（含调用方判定「这条意图不属于本轮这条通道」
@@ -9686,9 +9890,6 @@ def classify_stranded_decision_point_delivery_withdrawal_cause(
       那一支也改成冲销等于把退避整个删掉，实测过的空转环（一个 session 连铸三枚、全程
       ``minted → withdrawn``）会立刻回来。残留缺口记在下面。
 
-    ⚠️ **已知残留**：拿不到 transcript 的 host 上，「横幅落地过但记账失败」仍会被按空转计费。
-    彻底修法是让 UPS 在那条失败分支上把事实写进投递意图 marker（``rvf_user_prompt_submit.py``
-    不在本轮改动面内），使对账侧无需 transcript 也能区分。
     """
     presence = classify_dispatch_trigger_presence(
         transcript_path=transcript_path,
@@ -9696,9 +9897,21 @@ def classify_stranded_decision_point_delivery_withdrawal_cause(
         trigger_literal=decision_token_literal(decision_token),
     )
     if presence.presence == TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN:
+        first_arrival_observation = (
+            stranded_decision_point_delivery_intent or {}
+        ).get(DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY)
+        if (
+            isinstance(first_arrival_observation, dict)
+            and first_arrival_observation.get("decision_point_banner_body_text_injected") is True
+        ):
+            return (
+                decision_token_store
+                .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+                presence,
+            )
         return (
             decision_token_store
-            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
+            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED,
             presence,
         )
     if presence.presence == TRIGGER_PRESENCE_OFF_ANCESTOR_CHAIN_REWOUND:
@@ -9711,6 +9924,99 @@ def classify_stranded_decision_point_delivery_withdrawal_cause(
         .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
         presence,
     )
+
+
+def _withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure(
+    marker: dict[str, Any],
+    *,
+    ledger: RunLedger,
+    cwd: str | None,
+    worktree: str | None,
+    stop_kanban_task_id: str | None,
+    developer_visible_notices: list[str],
+) -> str | None:
+    """一份仍在意图 TTL 内的横幅投递：cline-kanban 已判定投递失败 ⇒ 现在就撤回，返回被撤回的 token。
+
+    为什么要提前：在途闸（``find_decision_token_awaiting_out_of_band_delivery``）在意图 TTL（900s）内
+    把每一次 Stop 都静默挡住，而 kanban 判失败的 P50 只要约 75s——终端争用（开发者正在该终端打字 /
+    输入框里有草稿）是送达失败的主因，回溯里从铸出到撤回 P50 26 分钟。follow-up 路径早就会现查
+    ``terminal_delivery_status``，横幅路径复用同一个查询函数
+    （:func:`_query_kanban_terminal_delivery_receipt`，意图里本就带 task id / project path /
+    idempotency key），不另写一套判据。
+
+    只查**本轮这条投递通道**上的意图（每查一次是一个 kanban 子进程，别的通道等它们自己的 Stop），
+    且只在 token 仍是 ``minted`` 时动手——``injected`` 以后说明 UPS 已经把正文送到了。查不到结论
+    （接口不存在 / 超时 / 还没定论 / 已送达）一律什么都不做，留给原有的 TTL 对账。
+
+    撤回成因不冲销熔断额度（横幅从未到达 agent，退避前提成立）；调用方据返回值走「本次 Stop 撤回了
+    本通道的横幅 ⇒ 当次就地结束」的既有路径，下一次 Stop 重新征询。
+    """
+    token = marker.get("decision_token")
+    task_id = marker.get("kanban_task_id")
+    if not (isinstance(token, str) and token and isinstance(task_id, str) and task_id):
+        return None
+    if not stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel(
+        marker,
+        stop_worktree=worktree,
+        stop_cwd=cwd,
+        stop_kanban_task_id=stop_kanban_task_id,
+    ):
+        return None
+    lookup = decision_token_store.read_decision_token(token)
+    if lookup.state != decision_token_store.STATE_MINTED:
+        return None
+    receipt, _terminal_delivery_query_degraded_reason = _query_kanban_terminal_delivery_receipt(marker)
+    if receipt is None or not receipt.is_failed:
+        return None
+    withdrawal_cause = (
+        decision_token_store
+        .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TERMINAL_DELIVERY_RECEIPT
+    )
+    try:
+        decision_token_store.mark_withdrawn(
+            token,
+            reason=f"decision_point_delivery_failed_per_kanban:{receipt.terminal_delivery_failure_reason}",
+            withdrawal_cause=withdrawal_cause,
+        )
+    except decision_token_store.DecisionTokenError as exc:
+        ledger.event(
+            phase="gate",
+            event="decision_point_out_of_band_delivery_failed_per_kanban_withdraw_failed",
+            status="warning",
+            level="warn",
+            reason_code="decision_point_out_of_band_delivery_failed_per_kanban_withdraw_failed",
+            cwd=cwd,
+            decision_token=token,
+            cline_kanban_task_id=task_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    try:
+        clear_decision_point_delivery_intent(task_id=task_id, decision_token=token)
+    except Exception:  # noqa: BLE001 - 清理 best-effort
+        pass
+    ledger.event(
+        phase="gate",
+        event="decision_point_out_of_band_delivery_failed_per_kanban_withdrawn",
+        status="warning",
+        level="warn",
+        reason_code="decision_point_out_of_band_delivery_failed_per_kanban_withdrawn",
+        cwd=cwd,
+        decision_token=token,
+        cline_kanban_task_id=task_id,
+        decision_point_delivery_intent_path=marker.get("_marker_path"),
+        decision_point_stranded_withdrawal_cause=withdrawal_cause,
+        kanban_terminal_delivery_status=receipt.terminal_delivery_status,
+        kanban_terminal_delivery_failure_reason=receipt.terminal_delivery_failure_reason,
+        kanban_terminal_delivery_receipt_field_source=receipt.receipt_field_source,
+        kanban_terminal_delivery_redispatch_disposition=receipt.redispatch_disposition,
+    )
+    developer_visible_notices.append(
+        f"发起横幅（token={token}）被 cline-kanban 判定投递失败"
+        f"（{describe_terminal_delivery_receipt_for_operator(receipt)}），已撤回该 token，"
+        "不再等投递意图到期；下一次 Stop 会重新征询。"
+    )
+    return token
 
 
 def reconcile_stranded_decision_point_delivery_intents(
@@ -9730,17 +10036,20 @@ def reconcile_stranded_decision_point_delivery_intents(
     store 本身就是权威，``rvf-agent start`` 读到终态自然硬失败（既有 ``DecisionTokenStateError``
     路径）。落地顺序刻意是「先物理取消、再语义中和」：取消能赶上就根本不会落地；赶不上也有终态兜底。
 
-    只处理 **stale**（TTL 已过）的意图。意图 TTL（900s）严格小于带外 token TTL（1200s），
-    所以走到这里时 token 一定还读得出来——这正是两个 TTL 那样取值的原因。
+    主体只处理 **stale**（TTL 已过）的意图。意图 TTL（900s）严格小于带外 token TTL（1200s），
+    所以走到这里时 token 一定还读得出来——这正是两个 TTL 那样取值的原因。仍在 TTL 内的意图只有
+    一种提前处置：本通道上、cline-kanban 已判定投递失败（见
+    :func:`_withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure`）。
 
     **枚举面 ≠ 早退面。** ``iter_decision_point_delivery_intents`` 是跨 task 全局枚举，垃圾回收
     本来就该跨 task 做；但返回的撤回清单按 ``worktree``/``cwd``/kanban task 归属拆成两份，
     只有本轮这条投递通道上的那份够格触发调用方的当次早退——判据与理由见
     ``stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel``。
 
-    撤回**成因**按 transcript 证据三分（见
+    撤回**成因**按 transcript 证据 + UPS 首次到达记录分（见
     ``classify_stranded_decision_point_delivery_withdrawal_cause``）：``state`` 停在 ``minted``
-    并不蕴含「从未成为 turn」，UPS 的 ``mark_injected`` 失败分支会留下形状完全相同的一枚。
+    并不蕴含「从未成为 turn」，UPS 锁内首次迁移失败的分支会留下形状完全相同的一枚；而「成了
+    turn」也不蕴含「正文到了 agent 眼前」。
     """
     notices: list[str] = []
     withdrawn_tokens_on_this_stop_delivery_channel: list[str] = []
@@ -9767,6 +10076,21 @@ def reconcile_stranded_decision_point_delivery_intents(
         return _outcome()
     for marker in markers:
         if decision_point_delivery_intent_status(marker) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+            # 意图仍在 TTL 内：只有 cline-kanban 已经给出「投递失败」的确定结论时才提前撤回（D4）。
+            withdrawn_token_after_kanban_reported_delivery_failure = (
+                _withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure(
+                    marker,
+                    ledger=ledger,
+                    cwd=cwd,
+                    worktree=worktree,
+                    stop_kanban_task_id=stop_kanban_task_id,
+                    developer_visible_notices=notices,
+                )
+            )
+            if withdrawn_token_after_kanban_reported_delivery_failure is not None:
+                withdrawn_tokens_on_this_stop_delivery_channel.append(
+                    withdrawn_token_after_kanban_reported_delivery_failure
+                )
             continue
         token = marker.get("decision_token")
         task_id = marker.get("kanban_task_id")
@@ -9806,12 +10130,11 @@ def reconcile_stranded_decision_point_delivery_intents(
                     stop_transcript_path if belongs_to_this_stop_delivery_channel else None
                 ),
                 decision_token=token,
+                stranded_decision_point_delivery_intent=marker,
             )
         )
-        banner_became_a_turn = (
-            withdrawal_cause
-            != decision_token_store
-            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
+        first_arrival_observation = marker.get(
+            DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY
         )
         cancel_diagnostics = _cancel_stranded_decision_point_delivery(marker)
         try:
@@ -9849,6 +10172,7 @@ def reconcile_stranded_decision_point_delivery_intents(
                 belongs_to_this_stop_delivery_channel
             ),
             decision_point_stranded_withdrawal_cause=withdrawal_cause,
+            user_prompt_submit_first_arrival_observation=first_arrival_observation,
             **banner_presence.as_ledger_fields(),
             **cancel_diagnostics,
         )
@@ -9870,13 +10194,40 @@ def reconcile_stranded_decision_point_delivery_intents(
                 "它与本 worktree 本轮该不该征询无关，**不影响本次 Stop 的发起决策**。"
             )
             continue
-        if banner_became_a_turn:
+        if (
+            withdrawal_cause
+            == decision_token_store
+            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED
+        ):
             notices.append(
-                f"发起横幅（token={token}）**确实**作为一条真实 user message 落地过"
-                f"（transcript 证据：{banner_presence.presence}），但决策 token 没能推进到 injected"
-                "（多半是横幅排在长回合之后越过了 TTL）。已撤回该 token；"
-                f"撤回成因记为 {withdrawal_cause}，**冲销**这次铸造占用的熔断额度——通道是通的，"
+                f"发起横幅（token={token}）的决策正文**确实**已由 UserPromptSubmit hook 注入过"
+                f"（transcript 证据：{banner_presence.presence}；UPS 首次到达记录：正文已注入），"
+                "但决策 token 停在 minted。已撤回该 token；"
+                f"撤回成因记为 {withdrawal_cause}，**冲销**这次铸造占用的熔断额度——征询确实到达过，"
                 "不该按空转退避。**本次 Stop 不再重铸**，重新征询最早发生在下一次 Stop。"
+            )
+        elif (
+            withdrawal_cause
+            == decision_token_store
+            .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED
+        ):
+            if isinstance(first_arrival_observation, dict):
+                user_prompt_submit_side_explanation = (
+                    "UserPromptSubmit hook 收到了这条标记，但**没有注入决策正文**"
+                    f"（{first_arrival_observation.get('outcome') or 'unknown'}）"
+                )
+            else:
+                user_prompt_submit_side_explanation = (
+                    "UserPromptSubmit hook **从未处理**这条标记（没跑 / 超时 / 崩溃；"
+                    "也可能是这份投递意图记录写入失败）"
+                )
+            notices.append(
+                f"⚠ 发起横幅（token={token}）的边界标记确实作为一条真实 user message 落地了"
+                f"（transcript 证据：{banner_presence.presence}），但{user_prompt_submit_side_explanation}"
+                "——决策正文只能经 UPS 注入，agent 只看到了一行「未随附即忽略」的标记，这次征询空转了。"
+                f"已撤回该 token（成因 {withdrawal_cause}），这次空转**计入**铸造熔断（UPS 持续失效时自动"
+                "退避）；请检查 RVF 的 UserPromptSubmit hook 是否已部署、受信且能在超时内跑完。"
+                "**本次 Stop 不再重铸**；手动 /review-validate-fix 不受熔断影响。"
             )
         else:
             notices.append(
@@ -9991,6 +10342,25 @@ def decision_point_injection_decision(
       fork 机制在「上下文保真 + 决策可追溯 + decline 理由持久化」三项上**不劣于**
       checkpoint/rewind 机制（fork≽checkpoint），否则不得切换注入对象。
     """
+    # M13：先看本轮这条通道上是否有「标记落地了、正文没注入、token 还有效」的横幅——有就当场以同一
+    # 枚 token 补发完整正文。必须早于搁浅对账（后者会把一份过了意图 TTL 的它撤回并计费）与在途闸
+    # （后者会把意图 TTL 内的每一次 Stop 静默挡住）。
+    landed_without_body = (
+        find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_injection(
+            event, cwd=cwd, worktree=repo
+        )
+    )
+    if landed_without_body is not None:
+        return _decision_point_reinject_banner_body_after_boundary_marker_landed_without_injection(
+            landed_without_body,
+            event=event,
+            ledger=ledger,
+            repo=repo,
+            cwd=cwd,
+            gate_status=gate_status,
+            fork_context=fork_context,
+        )
+
     # 每次 Stop 都先做一次「搁浅横幅」对账（D6）。**必须早于候选摘要**：一份投出去却从未成为
     # turn 的横幅，其危害与本轮有没有新候选无关——不撤回它，它 20 分钟后落地照样能跑出一轮
     # 无 lease、无 scope 契约的 review。
@@ -10447,10 +10817,23 @@ def _decision_point_self_injection_decision(
         "等待主 agent 显式 start / decline（非自动审查已开始）。"
     )
     if fell_back_from_out_of_band_delivery:
+        fallback_summary = fell_back_from_out_of_band_delivery.get("summary") or "unknown"
+        if fell_back_from_out_of_band_delivery.get(
+            FALLBACK_AFTER_BOUNDARY_MARKER_LANDED_WITHOUT_BANNER_BODY_INJECTION_KEY
+        ):
+            fallback_headline = (
+                f" ⚠ 发起横幅的边界标记已落地，但决策正文没有经 UserPromptSubmit 注入（{fallback_summary}）；"
+                "本次 Stop 以同一枚 token 补发完整正文，"
+            )
+        elif fell_back_from_out_of_band_delivery.get(
+            FALLBACK_HAPPENED_BEFORE_ANY_TERMINAL_DELIVERY_ATTEMPT_KEY
+        ):
+            fallback_headline = f" ⚠ 带外投递**未发起**（{fallback_summary}），"
+        else:
+            fallback_headline = f" ⚠ cline-kanban 终端投递**确定失败**（{fallback_summary}），"
         user_notice += (
-            " ⚠ cline-kanban 终端投递**确定失败**"
-            f"（{fell_back_from_out_of_band_delivery.get('summary') or 'unknown'}），"
-            "本轮已回落为 Stop hook 自注入——这一条不会成为可 rewind 的 user message。"
+            fallback_headline
+            + "本轮已回落为 Stop hook 自注入——这一条不会成为可 rewind 的 user message。"
         )
     if lost_warnings:
         user_notice = user_notice + " " + " ".join(lost_warnings)
@@ -10637,6 +11020,47 @@ def _decision_point_non_minted_outcome_decision(
             lost_warnings=lost_warnings,
         )
 
+    if (
+        outcome
+        == decision_token_store.MINT_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY
+    ):
+        # 闸 2c：agent 在这个回合里刚把审查延后到某个条件，条件不可能已经满足。与冷却 / snooze 同一
+        # 处置：写注入尝试 ledger、developer_only 静默停，绝不驱动 agent。
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=(
+                injection_attempt_ledger
+                .INJECTION_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY
+            ),
+            injected=False,
+            note=mint.message,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_deferred_until_condition_decline_awaiting_turn_boundary",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY,
+            message=(
+                "review-validate-fix: "
+                + (mint.message or "agent 刚把本次审查延后到某个条件，本回合不再征询。")
+            ),
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
     # circuit_breaker_tripped（或其它未识别 outcome）：静默停 + 熔断告警（R24 裁决 b）。
     injection_attempt_ledger.record_injection_attempt(
         worktree=worktree,
@@ -10776,7 +11200,10 @@ def _decision_point_out_of_band_delivery_decision(
             has_committed=has_committed,
             gate_status=gate_status,
             lost_warnings=lost_warnings,
-            fallback_diagnostics={"summary": "kanban task id 在 transport 解析后消失"},
+            fallback_diagnostics={
+                "summary": "kanban task id 在 transport 解析后消失",
+                FALLBACK_HAPPENED_BEFORE_ANY_TERMINAL_DELIVERY_ATTEMPT_KEY: True,
+            },
             event=event,
         )
 
@@ -10927,6 +11354,8 @@ def _decision_point_out_of_band_delivery_decision(
                     "summary": f"决策点正文写入 token 失败（{body_persist_error}）",
                     "terminal_delivery_status": None,
                     "terminal_delivery_failure_reason": None,
+                    # 终端投递根本没有发起：旁注不得说成「终端投递确定失败」（L-F3d）。
+                    FALLBACK_HAPPENED_BEFORE_ANY_TERMINAL_DELIVERY_ATTEMPT_KEY: True,
                 },
             )
         boundary_marker = _render_decision_point_out_of_band_boundary_marker(token=token)
@@ -11468,18 +11897,6 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
-    if event.get("stop_hook_active") is True:
-        # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
-        # 开发者看的诊断，报错主体必须是当前这个 host）。
-        host_label = resolve_current_session_host_adapter(event).host_display_name()
-        return skip_decision(
-            "检测到 stop_hook_active=true，为避免递归已跳过。",
-            ledger,
-            "stop_hook_active",
-            cwd=cwd,
-            detail=f"{host_label} 已在执行 Stop hook，RVF 跳过以避免递归",
-        )
-
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
             "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
@@ -11502,6 +11919,11 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             **codex_goal_mode,
         )
 
+    # RVF run 的 finalize（标 units reviewed、释放 lease、清在途锁、推高水位、analyze 骨架）只有
+    # 这一个触发点，所以它必须排在下面的递归守卫**之前**：handoff 回合常常正是被 Stop 拉起的续跑
+    # （stop_hook_active=true）——F5·H5a 取证 Claude 9/9 个漏 finalize 的 run 都是这样丢的，下一次
+    # Stop 的最后一条消息里已经没有标记，run 就永远不 finalize。这里只发 developer_only 的
+    # handoff 提示、不驱动 agent，放在递归守卫之前不会造成递归。
     handoff_path_value = handoff_path_from_event(event)
     if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger, cwd=cwd)
@@ -11535,6 +11957,18 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 handoff_path=str(handoff_path_value),
             )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    if event.get("stop_hook_active") is True:
+        # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
+        # 开发者看的诊断，报错主体必须是当前这个 host）。
+        host_label = resolve_current_session_host_adapter(event).host_display_name()
+        return skip_decision(
+            "检测到 stop_hook_active=true，为避免递归已跳过。",
+            ledger,
+            "stop_hook_active",
+            cwd=cwd,
+            detail=f"{host_label} 已在执行 Stop hook，RVF 跳过以避免递归",
+        )
 
     awaiting_decision = awaiting_dispatched_agent_decision(event, ledger, cwd=cwd)
     if awaiting_decision is not None:
@@ -11815,159 +12249,6 @@ def _apply_guardian_liveness_alarm(payload: dict[str, Any] | None) -> dict[str, 
         existing = payload.get("systemMessage")
         payload["systemMessage"] = (f"{existing}\n{alarm_text}" if existing else alarm_text)
     return payload
-
-
-CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL = "/.codex/sessions/"
-"""Codex rollout **默认**根 ``~/.codex/sessions/`` 的路径字面量。
-
-单独命名是为了钉住它**不是**判定 Codex 的充分条件：``CODEX_HOME`` 一改，真实 rollout
-路径里根本不含这个字面量（见 ``codex_rollout_session_path_markers``）。
-"""
-
-
-def codex_rollout_session_path_markers() -> tuple[str, ...]:
-    """能判定「这是一条 Codex rollout 文件路径」的路径证据集合（正向证据，保守）。
-
-    除默认根 ``~/.codex/sessions/`` 外，还认 ``$CODEX_HOME/sessions/``——Codex CLI 自己
-    就用 ``CODEX_HOME`` override 安装根（本仓 ``adapters.codex.subagent.codex_sessions_root``
-    正是这么解析的），自定义过它的用户，其 rollout 路径里根本不含默认字面量。
-
-    ``CODEX_HOME`` 在这里**只**用来回答「sessions 目录在哪」，绝不当成「当前会话是 Codex」
-    的身份信号——后者是 ``core/host_adapter/parent_harness_identity`` 明令禁止的误用（它是
-    常驻安装路径 override，本机装过 Codex 的用户在任何 host 下都设着它）。
-    """
-    markers = [CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL]
-    codex_home = os.environ.get("CODEX_HOME")
-    if isinstance(codex_home, str) and codex_home.strip():
-        try:
-            root = os.path.normpath(str(Path(codex_home).expanduser() / "sessions"))
-        except (OSError, ValueError, RuntimeError):  # 解析失败按「无此证据」处理
-            root = ""
-        if root:
-            markers.append(root.rstrip(os.sep) + os.sep)
-    return tuple(markers)
-
-
-def event_session_path_is_codex_rollout(event: dict[str, Any]) -> bool:
-    """event 的任一会话路径键落在 Codex rollout 根下 ⇒ 确诊 Codex（正向证据）。
-
-    覆盖**全部** ``SESSION_PATH_KEYS``（含 ``log_path``），而不是其中一个子集：漏掉的键
-    正是「真 Codex 会话溜过守卫」的入口。
-
-    与 ``_claude_hook_entry.is_foreign_invocation`` **同判据**；那个模块刻意 stdlib-only、
-    不 import 本仓 ``core``（hook 是最该 fail-open 的安全面），故那边自带一份等价副本——
-    两处改动必须同步。
-    """
-    markers = codex_rollout_session_path_markers()
-    for path in event_session_paths(event):
-        raw = str(path)
-        try:
-            normalized = os.path.normpath(str(Path(raw).expanduser()))
-        except (OSError, ValueError, RuntimeError):  # 规范化失败退回原串
-            normalized = raw
-        for marker in markers:
-            if marker == CODEX_ROLLOUT_DEFAULT_SESSIONS_PATH_LITERAL:
-                if marker in normalized or marker in raw:
-                    return True
-            elif normalized.startswith(marker):
-                return True
-    return False
-
-
-HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP: dict[str, str] = {
-    "claude-code": HOST_CLAUDE,
-    "kimi-code": HOST_KIMI_CODE,
-}
-"""``event["source"]["provider"]`` → host 身份。键是各 host 的 plugin 入口 ``setdefault``
-上去的那个字面量（``hooks/_claude_hook_entry.py`` / ``hooks/_kimi_hook_entry.py``）。
-
-**每多一个自带 hook 入口的 host，这里就必须多一条**：漏一条时该 host 的 stamp 会被无视，
-在 transcript 探测落空的场合直接掉进「未知 → Codex」兜底。Codex 兜底对 Codex 自己是安全的
-（发错键会**响亮**地整条 Failed），对 Kimi 则是**静默 allow**，RVF 完全失声、零报错。
-
-Codex 不在表里，也不需要在：它没有自己的 stamp，而它的两条正向证据（会话路径、rollout
-schema）排在本表之前。
-"""
-
-
-def resolve_current_session_host_adapter(event: dict[str, Any]) -> Any:
-    """装配**当前这次 Stop 事件所属会话**的 HostAdapter（≠ 父会话 host）。
-
-    出口线材必须按「谁在读这次 hook 输出」决定，而既有的
-    ``resolve_host_adapter(parent_origin["host_kind"])`` 问的是父会话——两者在
-    Kanban task / fork 场景下会不同，用错会把 ``hookSpecificOutput`` 发给 Codex
-    （其 ``stop.command.output`` 是 ``additionalProperties:false``，整条 Failed）。
-
-    **判据顺序刻意「先否定 Claude、后采信 stamp」**，因为两个方向的误判代价不对称：
-
-    - Claude 被误判成 Codex：只是少了个非错误通道（降级到 ``decision: block``），仍能工作。
-    - Codex 被误判成 Claude：出口里会出现 ``hookSpecificOutput.additionalContext``，而
-      Codex 的 ``stop.command.output`` 是 ``additionalProperties: false`` ⇒ **整条 hook
-      输出被判 Failed**，RVF 在 Codex 上静默停摆（``codex exec`` 下零警告）。
-
-    而 ``source.provider`` stamp 并不可信到可以压过路径/内容证据：它是
-    ``hooks/_claude_hook_entry.py`` 在**它自己那道 foreign check 之后** ``setdefault``
-    上去的。那道 check 一旦漏判（自定义 ``CODEX_HOME``、或事件只带它没查的路径键），一个
-    真实的 Codex 会话就会带着 ``claude-code`` stamp 走到这里。所以顺序是：
-
-    1. 任一会话路径落在 Codex rollout 根下（默认 ``~/.codex/sessions/`` 或
-       ``$CODEX_HOME/sessions/``）→ Codex。**否定 Claude 的证据排在 stamp 之前。**
-    2. ``detect_transcript_format`` 嗅出当前会话 transcript 是 Codex rollout schema →
-       Codex。这条不依赖任何 env / 路径约定，是路径约定被改掉时的真相源。
-    3. ``detect_transcript_format`` 嗅出当前会话是 **Kimi** wire schema → Kimi；嗅出
-       Claude transcript schema → Claude。理由与第 2 条一致：schema 是文件内容的事实，
-       stamp 只是入口自己 ``setdefault`` 的，所以**整层** schema 证据排在**整层** stamp 之前。
-       Kimi 方向的代价更高：它若被误判成 Claude 会收到 ``hookSpecificOutput.additionalContext``，
-       而 Kimi 的 hook 输出 schema 是 ``looseObject`` 且只读 ``permissionDecision`` ⇒
-       **静默 allow、零报错**，RVF 完全失声。实测（2026-08-23）：不加 Kimi schema 这条时，
-       一个带 ``claude-code`` stamp 的 Kimi 会话确实被判成 Claude —— 这不是假想，Kimi 的 shim
-       要做大量事件归一，复用或误配 Claude 入口逻辑就会打上那个 stamp。
-    4. ``event["source"]["provider"]`` stamp——各 host 的 plugin 入口亲手打的标
-       （``claude-code`` → Claude，``kimi-code`` → Kimi）。在没有任何 schema / 路径反证时
-       它是最强的正向 host 证据，也是 **transcript 不可读 / 尚未落盘时唯一的线索**。
-       Kimi 尤其依赖这一层：它的 Stop 事件原本**没有** ``transcript_path``，那个键由
-       ``hooks/_kimi_hook_entry.py`` 合成（会话目录 → ``agents/main/wire.jsonl``），而合成
-       有两条正常的落空路径——会话目录还没进 ``session_index.jsonl`` 且扫桶没命中，以及
-       ``wire.jsonl`` 尚未落盘（``resolve_agent_wire_transcript_path`` 要求 ``is_file()``）。
-       落空即探测为 ``None`` ⇒ 兜底 Codex ⇒ 发 ``decision:block`` ⇒ Kimi 静默 allow。
-       这是 HOST-2（「Claude 在 transcript 不可读时仍采信 stamp」）的 Kimi 对偶。
-    5. 探测结果本身（``HOST_CLAUDE`` → Claude；``None`` → resolver 兜底 Codex + 阻塞通道），
-       沿用「无法识别退回 Codex」口径：兜底到最保守的通道，绝不赌未知 host 认识
-       ``hookSpecificOutput``。
-
-    **stamp 之间不排序，因为 ``provider`` 只有一个值**；而 stamp 整体仍排在第 1–3 条
-    schema / 路径证据之后，所以即使某个入口的归属判据漏判、把 stamp 打到了别家的会话上，
-    正向的 Codex 证据依旧最先命中——Codex 方向的既有不对称性一个字符都没被放松。
-
-    ⚠️ **兜底的不对称性只覆盖 Codex 方向。** 「未知 → Codex + 阻塞通道」之所以安全，是因为
-    Codex 收到不认识的键会**响亮**地整条 Failed。Kimi 方向没有这层保护：任何把 Kimi 判成
-    别家的路径都是静默失效，所以 Kimi 只能靠**正向识别**，兜底救不了它。
-    """
-    if event_session_path_is_codex_rollout(event):
-        return resolve_host_adapter(HOST_CODEX)
-    session_path = first_readable_session_path(event)
-    detected = None
-    if session_path is not None:
-        try:
-            detected = detect_transcript_format(session_path)
-        except Exception:  # noqa: BLE001 - 探测失败按未知处理，走兜底
-            detected = None
-    if detected == HOST_CODEX:
-        return resolve_host_adapter(HOST_CODEX)
-    if detected == HOST_KIMI_CODE:
-        return resolve_host_adapter(HOST_KIMI_CODE)
-    if detected == HOST_CLAUDE:
-        # 第 3.5 条：**所有** schema 证据都排在**所有** stamp 之前。对既有行为是恒等的
-        # ——探测出 Claude 时，旧代码要么走 claude-code stamp 分支、要么落到末尾的
-        # ``resolve_host_adapter(detected)``，两条路都返回 Claude。它存在是为了让新增的
-        # 第二枚 stamp（kimi-code）无法抢走一个内容上明确是 Claude 的会话。
-        return resolve_host_adapter(HOST_CLAUDE)
-    source = event.get("source")
-    if isinstance(source, dict):
-        stamped_host = HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP.get(source.get("provider"))
-        if stamped_host is not None:
-            return resolve_host_adapter(stamped_host)
-    return resolve_host_adapter(detected)
 
 
 _STOP_HOOK_REENTRY_BUDGET_DECISION_HANDED_OFF_TO_THE_EXIT_LAYER: dict[tuple[str, str], Any] = {}

@@ -215,6 +215,12 @@ def _run_reviewer(tmp_path: Path, config: dict, *, extra_args: list[str] | None 
     run_dir.mkdir()
     environment = dict(os.environ)
     environment["RVF_SUPPRESS_STOP_HOOK"] = "1"
+    # 给了 tmp ``--rvf-run-dir``，但 RunLedger 的 ``latest.json`` 指针写在 log 根下；不隔离落盘根就会
+    # 把指向 tmp run 的指针写进开发者真实的 ``~/.rvf/user-local-data/run-logs/``（F5·H5b）。
+    environment["RVF_HOME"] = str(tmp_path / "isolated-rvf-home")
+    environment["RVF_USER_LOCAL_DATA_ROOT"] = str(tmp_path / "isolated-rvf-user-local-data")
+    for overriding_root_name in ("CODEX_RVF_LOG_ROOT", "CODEX_RVF_STATE_DIR"):
+        environment.pop(overriding_root_name, None)
     return subprocess.run(
         [
             sys.executable,

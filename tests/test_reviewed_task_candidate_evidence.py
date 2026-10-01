@@ -15,8 +15,8 @@ WRITE_CANDIDATE_EVIDENCE = SCRIPT_DIRECTORY / "write_reviewed_task_candidate_evi
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
-    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    # 同时剥掉 RVF_* / CODEX_RVF_*：被测脚本不得读到活 run 的环境。validation_result_cache 曾回退读
+    # RVF_RUN_DIR、把测试记录写进活 run 的 validation index；源头已删，这里保留为纵深防御。
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -164,6 +164,48 @@ def create_completed_run(tmp_path: Path, repo: Path, run_name: str = "run") -> P
     )
     assert json.loads(validation.stdout)["status"] == "passed"
     return run_dir
+
+
+def write_merge_dispositions_and_upsert_fix_issues(
+    tmp_path: Path, repo: Path, run_dir: Path, decisions: dict[str, object], issue_ids: list[str]
+) -> None:
+    """经真实 ``rvf_merge_dispositions.py write`` + ``rvf_fix_issue.py upsert`` 落合并处置与 fix-issue 镜像。"""
+    environment = clean_test_environment()
+    written = subprocess.run(
+        [sys.executable, str(SCRIPT_DIRECTORY / "rvf_merge_dispositions.py"), "write", "--run-dir", str(run_dir)],
+        input=json.dumps(decisions),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert written.returncode == 0, written.stderr
+    for issue_id in issue_ids:
+        issue_file = tmp_path / f"{issue_id}-canonical-issue.json"
+        issue_file.write_text(
+            json.dumps({"issue_id": issue_id, "path": "tracked.txt", "line": 1, "message": "canonical issue"}) + "\n",
+            encoding="utf-8",
+        )
+        upserted = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_DIRECTORY / "rvf_fix_issue.py"),
+                "upsert",
+                "--repo",
+                str(repo),
+                "--run-dir",
+                str(run_dir),
+                "--issue-file",
+                str(issue_file),
+                "--log-root",
+                str(tmp_path / "fix-issue-tracker-log-root"),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert upserted.returncode == 0, upserted.stderr
 
 
 def bind_scope_to_parent_evidence(
@@ -354,8 +396,24 @@ def test_uses_handoff_canonical_issue_count_instead_of_raw_reviewer_issue_count(
         result_path = reviewer_root / reviewer_id / "review-result.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
         result["kind"] = "issues"
-        result["issues"] = [{"path": "tracked.txt", "line": 1, "message": message}]
+        result["issues"] = [
+            {"path": "tracked.txt", "line": 1, "kind": "REAL", "severity": "medium", "message": message}
+        ]
+        result.pop("audit_summary", None)
         result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+    # 两腿同根因：合并处置把它们并成一条 canonical fix-issue（真实 CLI 写处置 + upsert，不手抄形状）。
+    write_merge_dispositions_and_upsert_fix_issues(
+        tmp_path,
+        repo,
+        run_dir,
+        {
+            "dispositions": [
+                {"reviewer_id": "reviewer-a", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"},
+                {"reviewer_id": "reviewer-b", "index": 1, "disposition": "merged_into", "issue_id": "RVF-001"},
+            ]
+        },
+        ["RVF-001"],
+    )
     (run_dir / "artifacts/handoff.md").write_text(
         "- handoff_status: COMPLETED\n- review_status: COMPLETED\n\n"
         "## 本次 review\n\n共 1 条，1 真实修复 / 0 误报 / 0 升级\n\n"

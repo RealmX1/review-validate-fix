@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -58,6 +60,18 @@ import adapters.codex.codex_gui_fork_app_server_bridge as appserver  # noqa: E40
 for _name in tuple(os.environ):
     if _name.startswith("CODEX_RVF_") or _name.startswith("RVF_"):
         os.environ.pop(_name, None)
+
+# 上面的清扫把 RVF 落盘根也一并摘掉了，于是**进程内**调用的引擎函数（不经 ``invoke()`` 的那些用例）
+# 解析 RunLedger 根时回落到开发者真实的 ``~/.rvf``：显式给了 tmp ``run_dir`` 的 ledger 仍会把
+# ``latest.json`` 指针写进真实 ``run-logs/``（F5·H5b 守卫在整套运行里抓到）。与
+# ``test_review_support_scripts.py`` 同口径：模块导入期把两个根强制指向 tmp。``invoke()`` 给子进程
+# 另行构造隔离环境，不受影响；个别用例在自己作用域内 set/restore 覆盖即可。
+_ISOLATED_RVF_STATE_ROOT_FOR_STOP_HOOK_TESTS = tempfile.mkdtemp(prefix="rvf-test-stop-hook-module-state-")
+os.environ["RVF_HOME"] = str(Path(_ISOLATED_RVF_STATE_ROOT_FOR_STOP_HOOK_TESTS) / "rvf-home")
+os.environ["RVF_USER_LOCAL_DATA_ROOT"] = str(
+    Path(_ISOLATED_RVF_STATE_ROOT_FOR_STOP_HOOK_TESTS) / "user-local-data"
+)
+atexit.register(shutil.rmtree, _ISOLATED_RVF_STATE_ROOT_FOR_STOP_HOOK_TESTS, ignore_errors=True)
 
 
 def run(cmd: list[str], cwd: Path) -> None:
@@ -242,15 +256,13 @@ def invoke(
     # S4 隔离铁律：Stop hook 决策点信使会铸决策 token / 写注入尝试 ledger / declined 冷却，默认落盘根
     # 为 $RVF_HOME/~/.rvf。上面的 env 清理已把 RVF_HOME 一并 pop（RVF_ 前缀），故此处**必须**显式把
     # RVF_HOME 指向隔离 tmp，否则任何触达决策点的测试都会污染真实 ~/.rvf（live infra，假绿）。
-    if state_dir is not None:
-        env["RVF_HOME"] = str(state_dir / "rvf-home")
-    else:
-        env["RVF_HOME"] = tempfile.mkdtemp(prefix="rvf-test-home-")
-    if state_dir is not None:
-        env["CODEX_RVF_STATE_DIR"] = str(state_dir)
-        env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(
-            state_dir / "kanban-followup-in-progress"
-        )
+    # 不传 state_dir 的用例同样要有 state 根：此前那条分支只给了 RVF_HOME，Stop 自己的 RunLedger
+    # （log_root ← CODEX_RVF_STATE_DIR）照样写进真实 ``run-logs/runs/``（F5·H5b 普查）。
+    if state_dir is None:
+        state_dir = Path(tempfile.mkdtemp(prefix="rvf-test-stop-hook-state-"))
+    env["RVF_HOME"] = str(state_dir / "rvf-home")
+    env["CODEX_RVF_STATE_DIR"] = str(state_dir)
+    env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state_dir / "kanban-followup-in-progress")
     if extra_env is not None:
         env.update(extra_env)
     # 默认把 detached analyze 线程的 tmux 指向假 tmux，避免任意触发 handoff→
@@ -4627,30 +4639,112 @@ def test_suppress_env_skips_handoff_marker_before_advisory(tmp_path: Path) -> No
     assert not (state / "handoff-notified").exists()
 
 
-def test_stop_hook_active_skips_handoff_marker_before_advisory(tmp_path: Path) -> None:
-    dirty = init_repo(tmp_path / "dirty", dirty=True)
+def test_stop_hook_active_continuation_still_finalizes_run_named_by_handoff_marker(
+    tmp_path: Path,
+) -> None:
+    """F5·H5a：handoff 回合是 Stop 驱动的续跑（``stop_hook_active=true``）时也必须 finalize。
+
+    取证（2026-08-15～09-22，部署版 0aac3ba→f57cdf0，Claude 9/9）：漏 finalize 的 run，写
+    handoff 的那一回合全是被 Stop 拉起的续跑——早期是决策点自注入，f57cdf0 起是「RVF 未完成」
+    续跑提示。递归守卫排在 handoff 收尾之前 ⇒ 标记被跳过；下一次 Stop 的最后一条消息里已经
+    没有标记 ⇒ 这个 run 永远不 finalize（units 留在 available、lease 与在途锁挂到 TTL、没有
+    analyze / trajectory / usage）。handoff 收尾只发 developer_only，不驱动 agent，放在递归
+    守卫之前不会造成递归。
+    """
     state = tmp_path / "state"
-    handoff = tmp_path / "handoff.md"
-    handoff.write_text("# handoff\n", encoding="utf-8")
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
     notifier_log = tmp_path / "notify.log"
     notifier = write_fake_notifier(tmp_path / "fake_notifier.py", notifier_log)
+    marker_dir = state / "kanban-followup-in-progress"
+    marker_dir.mkdir(parents=True)
+    marker_path = marker_dir / in_progress_lock_marker_name(
+        load_kanban_followup_lock_module(), repo=repo, task_id="task-active"
+    )
+    marker_path.write_text(
+        json.dumps(
+            {
+                "marker_version": 1,
+                "state": "in_progress",
+                "armed_at": "2026-05-21T15:57:55Z",
+                "expires_at": "2999-01-01T00:00:00Z",
+                "kanban_task_id": "task-active",
+                "session_id": "child-session",
+                "run_id": "rvf-child",
+                "run_dir": str(run_dir),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     payload = parse_json(
         invoke(
             {
-                "cwd": str(dirty),
+                "cwd": str(repo),
                 "session_id": "child-session",
                 "stop_hook_active": True,
                 "last_assistant_message": f"RVF_HANDOFF_FILE: {handoff}",
             },
             state_dir=state,
-            extra_env={"RVF_TERMINAL_NOTIFIER_BIN": str(notifier)},
+            extra_env={
+                "RVF_TERMINAL_NOTIFIER_BIN": str(notifier),
+                "KANBAN_TASK_ID": "task-active",
+            },
         )[0]
     )
+    # 只给开发者看：不能再造一个续跑回合（那才是递归守卫要防的东西）。
     assert payload["continue"] is True
-    assert "reason=stop_hook_active" in payload["systemMessage"]
-    assert not notifier_log.exists()
-    assert not (state / "handoff-notified").exists()
+    assert "decision" not in payload
+    assert "hookSpecificOutput" not in payload
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
+    assert (run_dir / "artifacts" / ".finalize.lock").is_file()
+    assert not marker_path.exists(), "在途锁必须随 handoff 收尾清掉，否则后续 Stop 会继续催一个已结束的 run"
+    assert notifier_log.exists()
+
+
+def test_kimi_stop_event_without_last_assistant_message_still_finalizes_run(
+    tmp_path: Path,
+) -> None:
+    """F5·H5a：Kimi 的 Stop 事件没有 ``last_assistant_message``，handoff 标记只在 wire.jsonl 里。
+
+    取证：4/4 个 Kimi run（2026-08-28/29，部署版 2297c29 / f57cdf0）Stop hook 都在跑，标记也确实
+    在 wire 的 ``content.part`` 里，却因回落读取器只认 Codex rollout 而永远不 finalize。
+    """
+    state = tmp_path / "state"
+    repo = init_repo_with_head(tmp_path / "repo")
+    run_dir, handoff = seed_finalize_run_dir(state=state, repo=repo)
+    wire = tmp_path / "kimi-home" / "sessions" / "wd_repo_0" / "session_abc" / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire_records = [
+        {"type": "metadata", "protocol_version": "1.4", "created_at": 1787371449575},
+        {"type": "turn.prompt", "input": [{"type": "text", "text": "跑 RVF"}], "origin": {"kind": "user"}},
+        {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part", "turnId": "1", "step": 3, "stepUuid": "s3",
+                "part": {"type": "text", "text": f"RVF_HANDOFF_FILE: {handoff}\n\n两条已修复。"},
+            },
+        },
+    ]
+    wire.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in wire_records), encoding="utf-8")
+
+    payload = parse_json(
+        invoke(
+            {
+                "hook_event_name": "Stop",
+                "session_id": "session_abc",
+                "cwd": str(repo),
+                "stop_hook_active": False,
+                "source": {"provider": "kimi-code", "plugin": "review-validate-fix"},
+                "transcript_path": str(wire),
+                "session_file": str(wire),
+            },
+            state_dir=state,
+        )[0]
+    )
+    assert "reason=handoff_file_ready" in payload["systemMessage"]
+    assert (run_dir / "artifacts" / ".finalize.lock").is_file()
 
 
 def test_handoff_marker_in_dirty_repo_does_not_create_new_fork(tmp_path: Path) -> None:
@@ -4847,7 +4941,7 @@ def test_decision_point_declined_cooldown_suppresses_reinjection(tmp_path: Path)
     _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
 
     # 真实 CLI 谢绝该 token（指纹入 declined 冷却表）。
-    result = _run_rvf_agent(state, dirty, "decline", "--token", token, "--reason", "这是我刚跑完的 RVF 结果，不重复审")
+    result = _run_rvf_agent(state, dirty, "decline", "--token", token, "--decline-kind", "structural_not_needed", "--reason", "这是我刚跑完的 RVF 结果，不重复审")
     assert result.returncode == 0, (result.stdout, result.stderr)
 
     # 同一 dirty（同指纹）再次 Stop → 命中 declined 冷却 → 不注入、静默停。
@@ -4874,7 +4968,7 @@ def test_decision_point_declined_session_scope_snooze_silences_work_in_progress_
 
     stdout, _ = invoke(event, state_dir=state)
     _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
-    declined = _run_rvf_agent(state, repo, "decline", "--token", token, "--reason", "还在施工，收尾后再审")
+    declined = _run_rvf_agent(state, repo, "decline", "--token", token, "--decline-kind", "structural_not_needed", "--reason", "只是格式化，琐碎改动")
     assert declined.returncode == 0, (declined.stdout, declined.stderr)
     assert "snooze" in declined.stdout, declined.stdout
 
@@ -4899,6 +4993,61 @@ def test_decision_point_declined_session_scope_snooze_silences_work_in_progress_
     run(["git", "commit", "-q", "-m", "unrelated"], repo)
     stdout_after_commit, _ = invoke(event, state_dir=state)
     assert_decision_point_injection(stdout_after_commit, expect_paths=("changed.txt",))
+
+
+def test_decision_point_deferred_until_condition_decline_is_reasked_with_previous_reason_instead_of_snoozed(
+    tmp_path: Path,
+) -> None:
+    """D1 端到端：延后型谢绝（「测试还在跑，跑完再审」）不进指纹冷却、不进会话 snooze。
+
+    谢绝后原样停下的那次 Stop 静默（条件不可能零秒满足，重问只会乒乓烧熔断）；agent 接着改了候选
+    文件再停下 ⇒ 重新征询，横幅带上「你上次延后到：<理由>」。修复前 decline 不分类型，同一场景会被
+    同指纹冷却 / T3 snooze 一路压住（回溯里延后型谢绝错误率 16–48% 的主因）。
+    """
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    event = {"cwd": str(repo), "session_id": "deferred-decline-1", "stop_hook_active": False}
+
+    stdout, _ = invoke(event, state_dir=state)
+    payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+    banner_text = json.dumps(payload, ensure_ascii=False)
+    assert "--decline-kind" in banner_text and "deferred_until_condition" in banner_text, banner_text
+
+    missing_kind = _run_rvf_agent(state, repo, "decline", "--token", token, "--reason", "没写类型")
+    assert missing_kind.returncode != 0, (missing_kind.stdout, missing_kind.stderr)
+    declined = _run_rvf_agent(
+        state, repo, "decline", "--token", token,
+        "--decline-kind", "deferred_until_condition", "--reason", "测试还在跑，跑完再审",
+    )
+    assert declined.returncode == 0, (declined.stdout, declined.stderr)
+    cooldown_root = rvf_home_dir(state) / "agentic-initiation-declined-fingerprints"
+    assert sorted(cooldown_root.glob("*.json")) == [], "延后型谢绝不得写指纹冷却"
+    assert not (cooldown_root / "declined-session-scope-snoozes").exists() or not any(
+        (cooldown_root / "declined-session-scope-snoozes").rglob("*.json")
+    ), "延后型谢绝不得写会话 snooze"
+
+    # 谢绝后原样停下：静默，且不占熔断额度。
+    stdout_same_turn, _ = invoke(event, state_dir=state)
+    payload_same_turn = parse_json(stdout_same_turn)
+    assert "decision" not in payload_same_turn and "hookSpecificOutput" not in payload_same_turn
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_deferred_until_condition_decline_awaiting_turn_boundary"
+    )
+
+    # agent 接着把条件做完（改了候选文件）再停下 ⇒ 重新征询，横幅引用上次的延后理由。
+    (repo / "changed.txt").write_text("dirty\ntests finished, follow-up edit\n", encoding="utf-8")
+    stdout_after_change, _ = invoke(event, state_dir=state)
+    payload_after_change, token_after_change = assert_decision_point_injection(
+        stdout_after_change, expect_paths=("changed.txt",)
+    )
+    assert token_after_change != token
+    assert "你上次延后到：「测试还在跑，跑完再审」" in json.dumps(
+        payload_after_change, ensure_ascii=False
+    ), payload_after_change
+    outcomes = [a.get("mint_outcome") for a in injection_attempt_records(state)]
+    assert outcomes.count("injected") == 2, outcomes
+    assert outcomes.count("deferred_until_condition_decline_awaiting_turn_boundary") == 1, outcomes
+    assert "declined_cooldown" not in outcomes and "declined_session_scope_snooze" not in outcomes
 
 
 def test_decision_point_circuit_breaker_suppresses_after_repeated_mints(tmp_path: Path) -> None:
@@ -6159,7 +6308,8 @@ def main() -> int:
         test_analyze_thread_launch_failure_does_not_break_handoff,
         test_handoff_advisory_records_notify_failure,
         test_suppress_env_skips_handoff_marker_before_advisory,
-        test_stop_hook_active_skips_handoff_marker_before_advisory,
+        test_stop_hook_active_continuation_still_finalizes_run_named_by_handoff_marker,
+        test_kimi_stop_event_without_last_assistant_message_still_finalizes_run,
         test_handoff_marker_in_dirty_repo_does_not_create_new_fork,
         test_forked_rvf_session_waits_for_handoff_before_advisory,
         test_forked_rvf_session_waits_when_handoff_message_missing,
@@ -6189,6 +6339,7 @@ def main() -> int:
         test_decision_point_nonempty_candidates_always_leave_injection_ledger_record,
         test_decision_point_declined_cooldown_suppresses_reinjection,
         test_decision_point_declined_session_scope_snooze_silences_work_in_progress_until_commit,
+        test_decision_point_deferred_until_condition_decline_is_reasked_with_previous_reason_instead_of_snoozed,
         test_decision_point_circuit_breaker_suppresses_after_repeated_mints,
         test_decision_point_receipt_ttl_lost_warns_without_retry,
         test_preserved_guards_short_circuit_before_decision_point_injection,
@@ -6203,12 +6354,18 @@ def main() -> int:
         test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered,
         test_decision_point_transport_override_without_task_id_falls_back_honestly,
         test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker,
+        test_decision_point_in_flight_banner_is_withdrawn_as_soon_as_kanban_reports_delivery_failure,
         test_decision_point_out_of_band_single_flight_busy_does_not_mint,
         test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once,
         # 搁浅对账的枚举面是跨 task 全局的，早退判据必须先收敛到本轮这条投递通道。
         test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point,
         # `state=minted` ≠「从未成为 turn」：UPS 的 mark_injected 失败分支留下的形状完全相同。
-        test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off,
+        test_stranded_banner_whose_marker_arrived_after_ttl_keeps_mint_request_charge_because_body_was_never_injected,
+        test_stranded_banner_whose_marker_became_a_turn_without_user_prompt_submit_ever_handling_it_backs_off_and_says_so,
+        test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected,
+        test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why,
+        test_decision_point_banner_command_wording_matches_the_rendered_command_prefix,
+        test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop,
         test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
         # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
         test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,

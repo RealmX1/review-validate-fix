@@ -75,11 +75,33 @@ def resolve_current_host_reviewer_wait_mode(environ: Mapping[str, str] | None = 
     return REVIEWER_WAIT_MODE_BOUNDED_FOREGROUND_POLLING
 
 
+# 主 agent 结束回合去等后台工作时，host 会不会在那份后台工作结束时**重新唤起**它（host 专属能力）。
+# 只有会唤起的 host，等待期间才能让 Stop 静默（awaiting-dispatched-agent shield）——否则静默就是
+# 把停下来的 agent 永久晾着，续跑提示反而是唯一能把它拉回来的东西。
+# * Claude Code：后台 Bash（``run_in_background``）与后台子代理结束时都有完成通知 ⇒ 会唤起。
+# * Codex：exec 会话 / 子代理结束后不会在回合外唤起主 agent（agent 自己 ``write_stdin`` / ``wait_agent``）。
+# * 其它 host（Kimi 等）：未取证到会唤起，按不会处理（宁可多一次续跑提示，也不晾住 agent）。
+REVIEWER_WAIT_MODES_WHERE_HOST_WAKES_MAIN_AGENT_WHEN_BACKGROUND_WORK_COMPLETES = frozenset(
+    {REVIEWER_WAIT_MODE_CLAUDE_BACKGROUND_TASK_COMPLETION_NOTIFICATION}
+)
+
+
+def current_host_wakes_main_agent_when_background_work_completes(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    return (
+        resolve_current_host_reviewer_wait_mode(environ)
+        in REVIEWER_WAIT_MODES_WHERE_HOST_WAKES_MAIN_AGENT_WHEN_BACKGROUND_WORK_COMPLETES
+    )
+
+
 __all__ = [
     "CURRENT_AGENT_SESSION_ID_ENVIRONMENT_VARIABLE_NAMES",
+    "REVIEWER_WAIT_MODES_WHERE_HOST_WAKES_MAIN_AGENT_WHEN_BACKGROUND_WORK_COMPLETES",
     "REVIEWER_WAIT_MODE_BOUNDED_FOREGROUND_POLLING",
     "REVIEWER_WAIT_MODE_CLAUDE_BACKGROUND_TASK_COMPLETION_NOTIFICATION",
     "REVIEWER_WAIT_MODE_CODEX_SINGLE_LONG_EXEC_SESSION_YIELD",
+    "current_host_wakes_main_agent_when_background_work_completes",
     "resolve_current_agent_session_id_from_environment",
     "resolve_current_host_reviewer_wait_mode",
 ]

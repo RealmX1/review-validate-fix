@@ -485,7 +485,7 @@ def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_mint
                 # agent 谢绝 ⇒ 前任进终态（并写下 declined 冷却，由手动路径自己清掉）。
                 store.mark_declined(
                     predecessor.token,
-                    reason="agent_declined_for_stale_index_race_test",
+                    decline_kind="structural_not_needed", reason="agent_declined_for_stale_index_race_test",
                     root=roots["decision_token_root_dir"],
                     cooldown_root=roots["declined_fingerprint_root_dir"],
                     now=store.parse_timestamp(minted_at),
@@ -506,6 +506,11 @@ def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_mint
                     result = mint_for_this_round(
                         now=raced_at,
                         initiated_by_explicit_user_request=initiated_by_explicit_user_request,
+                        explicit_user_request_provenance=(
+                            store.EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT
+                            if initiated_by_explicit_user_request
+                            else None
+                        ),
                     )
                     with results_lock:
                         mint_results.append(result)
@@ -625,20 +630,31 @@ def test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stra
             circuit_breaker_root_dir=roots["circuit_breaker_root_dir"],
         )
 
-    # 三次铸造请求的额度**全部**留在账上（阈值 3 ⇒ 第三次即跳闸）。
+    # 两枚铸出后空转撤回的 token，额度**全部**留在账上（阈值 3 ⇒ 第三次请求即跳闸）。第三次请求
+    # 被熔断拒掉、没铸出 token，它自己那一份当场冲销——不冲销的话熔断会自我续命。
+    assert outcomes == [
+        store.MINT_OUTCOME_MINTED,
+        store.MINT_OUTCOME_MINTED,
+        store.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+    ], outcomes
     assert (
         store.count_recent_mint_requests(
             session_id, root=roots["circuit_breaker_root_dir"]
         )
-        == 3
+        == 2
     ), _mint_request_ledger_lines(store, roots, session_id)
-    # 一条冲销行都不该有。
+    # 撤回不该留下任何冲销行；唯一的冲销行属于被熔断拒掉的那次请求。
     reversal_lines = [
         line
         for line in _mint_request_ledger_lines(store, roots, session_id)
         if store.MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD in line
     ]
-    assert reversal_lines == [], reversal_lines
+    assert [line.get("token") for line in reversal_lines] == [None], reversal_lines
+    assert all(
+        line.get("reversed_because")
+        == "circuit_breaker_refused_this_mint_request_so_no_token_was_minted"
+        for line in reversal_lines
+    ), reversal_lines
     # 第三次铸造把窗口内计数推到阈值 ⇒ 熔断跳闸，第四次不再铸。
     assert outcomes[-1] in (
         store.MINT_OUTCOME_MINTED,
@@ -701,11 +717,11 @@ def test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_c
     是同一函数、相反期望的一对：那条钉「通道坏着要退避」，这条钉「通道是通的就不许退避」。
     两条同时绿才说明分叉判据落在**成因**上，而不是落在「凡是搁浅撤回一律计费」这个过粗的规则上。
 
-    可达路径：``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在
-    ``mark_injected`` 抛 ``DecisionTokenExpiredError``（横幅排在长回合之后越过 1200s TTL）时提前
-    返回、**刻意不清投递意图**，而 ``read_decision_token`` 对过期 token 仍返回 ``state=minted``。
-    若这一族按空转计费，连续 3 次记账失败就会把铸造熔断打跳，整个 session 的自动发起被静默封禁
-    一个窗口（默认 3600s）——那是**漏审**方向，比多问一次严重得多。
+    对账侧只在投递意图里有 UPS 记下的「决策正文已注入」这份正向证据时才用本成因（审计 M9）：59ffd
+    之后粘贴通道只送一行无指令的边界标记，「标记成了 turn」不再等于「征询到达了 agent」。标记落地
+    而正文从未注入（UPS 没跑 / 超时 / 崩溃 / 到达时 token 已过 TTL）用的是另一个**不冲销**的成因，
+    见下方最后一组断言。征询确实到达过却按空转计费的话，连续 3 次记账失败就会把铸造熔断打跳，
+    整个 session 的自动发起被静默封禁一个窗口（默认 3600s）——那是**漏审**方向。
     """
     store = _load_decision_token_store_module()
     roots = _isolated_decision_token_store_roots(tmp / "became-a-turn-reverses-charge")
@@ -755,6 +771,15 @@ def test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_c
     assert (
         store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
         not in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    # 「标记成了 turn、正文却从未注入」同样是空转（M9），同样留在白名单外。
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED
+        not in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED
+        in store.DECISION_POINT_WITHDRAWAL_CAUSES
     )
     # 撤回同样不写冷却表（这一半三种成因共享）。
     assert sorted(roots["declined_fingerprint_root_dir"].glob("*.json")) == []

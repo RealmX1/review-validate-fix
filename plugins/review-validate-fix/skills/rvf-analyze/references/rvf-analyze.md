@@ -83,7 +83,10 @@ classification 与用户决策。后续重入时该文件会被 classify 读出�
   handoff 各阶段实际发生了什么。引用 ``trajectory.index.json::kind_counts``。
 - ``## Reviewer 发现``——每位 reviewer 提了哪些 REAL/NIT/ELEVATE issue，
   哪些被 validate-fix 处理、哪些被绕过。证据来自
-  ``artifacts/reviewers/<id>/review-result.json``。
+  ``artifacts/reviewers/<id>/review-result.json``；每条 reviewer issue 的合并处置
+  （adopted / merged_into / dropped + reason_code）与按 reviewer 汇总的最终 fix-issue
+  状态直接读 ``causality.json::merge_dispositions``（``check_errors`` 非空时如实写出
+  哪里没对上），不要从 handoff 文本反推。
 - ``## 工作区改动``——最终 ``workspace-diff.json`` 里改了什么文件，是否
   与 reviewer 建议一致。引用 ``changed_paths[].path``。
 - ``## 待 LLM 补全的叙事``——这一节就是给你的"自由发挥"区，写一段对

@@ -21,8 +21,8 @@ VALIDATION_RESULT_CACHE = (
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
-    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    # 同时剥掉 RVF_* / CODEX_RVF_*：被测脚本不得读到活 run 的环境。validation_result_cache 曾回退读
+    # RVF_RUN_DIR、把测试记录写进活 run 的 validation index；源头已删，这里保留为纵深防御。
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -567,20 +567,21 @@ def test_run_directory_records_structured_argv_in_first_seen_order_on_execute_an
     assert "alpha" not in encoded.decode("utf-8"), "环境变量的值不得落进 argv 工件"
 
 
-def test_run_directory_falls_back_to_rvf_run_dir_environment_variable(tmp_path: Path) -> None:
+def test_run_directory_ignores_rvf_run_dir_environment_variable_and_writes_no_run_records(tmp_path: Path) -> None:
+    """审计 H2a：缺 ``--rvf-run-dir`` 时曾回退读 RVF_RUN_DIR。reviewer 子进程被显式注入它、Codex task shell 也
+    export 它，外来测试记录于是写进活 run 的验证索引与 argv 工件，land 再把外来失败命令重放成 exit 21 假红。"""
     repo = initialized_repository(tmp_path / "repo")
-    run_dir = tmp_path / "run-from-environment"
+    live_run_dir = tmp_path / "live-run-that-must-stay-untouched"
     completed = run_cache_with_run_directory(
         repo,
         tmp_path / "user-data",
-        "handoff-validation-001",
+        "foreign-exploratory-validation",
         [sys.executable, "-c", "print('ok')"],
-        environment_overrides={"RVF_RUN_DIR": str(run_dir)},
+        environment_overrides={"RVF_RUN_DIR": str(live_run_dir)},
     )
     assert completed.returncode == 0, completed.stderr
-    assert (run_dir / "artifacts" / "validation-records.json").is_file()
-    assert (run_dir / "artifacts" / "handoff-validation-commands.json").is_file()
-    assert json.loads(completed.stdout)["run_validation_index_summary"]["record_count"] == 1
+    assert not (live_run_dir / "artifacts").exists()
+    assert "run_validation_index_summary" not in json.loads(completed.stdout)
 
 
 def test_failed_validation_prints_output_tail_on_execute_and_replays_it_on_cache_hit(tmp_path: Path) -> None:

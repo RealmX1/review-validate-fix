@@ -116,16 +116,6 @@ def _issue_paths(issue: dict[str, Any]) -> list[str]:
     return _safe_relative_paths(paths)
 
 
-def _issue_source_refs(issue: dict[str, Any]) -> list[dict[str, Any]]:
-    refs = issue.get("source_refs")
-    if isinstance(refs, list):
-        return [item for item in refs if isinstance(item, dict)]
-    reviewer_id = issue.get("reviewer_id")
-    if isinstance(reviewer_id, str) and reviewer_id:
-        return [{"reviewer_id": reviewer_id}]
-    return []
-
-
 def _scope_contract_path(run_dir: Path) -> Path | None:
     env_value = os.environ.get("RVF_SCOPE_CONTRACT")
     if env_value:
@@ -365,6 +355,54 @@ def mark_fix_attempt_started(
     )
 
 
+# validate/fix 子代理在后台跑、主 agent 结束回合等它的完成通知时，这段等待期间 Stop 不应发续跑提示
+# （读取方：Stop 的 ``awaiting_dispatched_agent_decision``）。``rvf fix prepare`` 按 attempt 登记，
+# 子代理 ``stop`` 成功、或主会话 ``rvf apply`` 消费结果时清除。子代理可能静默死掉、根本不调 stop，
+# 故 marker 以 TTL 兜底自释放。
+# EXPERIMENT_NODE: fix 子代理 awaiting marker 的 TTL——太短则长修复期间误发续跑提示并耗掉预算，太长则子代理死掉后主 agent 真卡住时迟迟没有提示
+FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_TTL_SECONDS = 60 * 60
+FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_DISPATCHER = "rvf fix prepare（validate/fix 子代理）"
+# 子代理的 shell 未必带主会话的 session id（Codex / Kimi 子代理、或 host 给子代理另发会话），
+# clear 时不能靠环境反推，故 arm 时把主会话 id 记进 attempt.json。
+ATTEMPT_FIELD_MAIN_AGENT_SESSION_ID_AWAITING_FIX_SUBAGENT = "main_agent_session_id_awaiting_fix_subagent"
+
+
+def arm_fix_attempt_subagent_awaiting_marker(
+    *, run_dir: Path, attempt_id: str, main_agent_session_id: str
+) -> Path | None:
+    """登记「主会话正在等这个 attempt 的子代理」，返回 marker 路径；并把主会话 id 记进 attempt.json。"""
+    import rvf_awaiting_dispatched_agent_marker  # noqa: PLC0415 - 只在真要登记时加载 marker 族
+
+    attempt_path = _attempt_dir(run_dir, attempt_id) / "attempt.json"
+    attempt = _read_json(attempt_path)
+    attempt[ATTEMPT_FIELD_MAIN_AGENT_SESSION_ID_AWAITING_FIX_SUBAGENT] = main_agent_session_id
+    _write_json(attempt_path, attempt)
+    return rvf_awaiting_dispatched_agent_marker.arm_awaiting_dispatched_agent(
+        main_session_id=main_agent_session_id,
+        dispatched_agent_id=attempt_id,
+        dispatcher=FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_DISPATCHER,
+        description=f"validate/fix 子代理处理 issue {attempt.get('issue_id')}",
+        repo=attempt.get("repo"),
+        cwd=attempt.get("worktree_path"),
+        ttl_seconds_override=FIX_ATTEMPT_SUBAGENT_AWAITING_MARKER_TTL_SECONDS,
+    )
+
+
+def clear_fix_attempt_subagent_awaiting_marker(attempt: dict[str, Any]) -> list[str]:
+    """清掉该 attempt 的子代理 awaiting marker（未登记过时是 no-op）。best-effort，从不抛。"""
+    main_agent_session_id = attempt.get(ATTEMPT_FIELD_MAIN_AGENT_SESSION_ID_AWAITING_FIX_SUBAGENT)
+    if not isinstance(main_agent_session_id, str) or not main_agent_session_id:
+        return []
+    try:
+        import rvf_awaiting_dispatched_agent_marker  # noqa: PLC0415
+
+        return rvf_awaiting_dispatched_agent_marker.clear_awaiting_dispatched_agent(
+            main_session_id=main_agent_session_id, dispatched_agent_id=attempt.get("attempt_id")
+        )
+    except Exception:  # noqa: BLE001 - 清不掉只会让 TTL 兜底，不得打断 stop / apply
+        return []
+
+
 def command_start(args: argparse.Namespace) -> int:
     result = mark_fix_attempt_started(
         run_dir=_required_path(args.run_dir, "RVF_RUN_DIR", "--run-dir"),
@@ -522,7 +560,8 @@ def _sync_issue_state(
         issue_id=issue_id,
         payload=issue,
         artifact_path=issue_path,
-        source_refs=_issue_source_refs(issue),
+        # 镜像已剥掉来源字段；None = 保留 tracker 里由合并处置派生的 source_refs。
+        source_refs=None,
         state=state,
         log_root_override=log_root,
     )
@@ -601,6 +640,9 @@ def command_stop(args: argparse.Namespace) -> int:
         }
     )
     _write_json(_attempt_dir(run_dir, args.attempt_id) / "attempt.json", attempt)
+    # 完成状态已落盘 = 子代理这一份工作已交付；此后主 agent 再停下就该照常收到续跑提示。
+    # 放在 tracker 记账之前：记账抛错时 attempt 也已经是 stopped，marker 不能残留到 TTL。
+    clear_fix_attempt_subagent_awaiting_marker(attempt)
     log_root = Path(args.log_root).expanduser().resolve() if args.log_root else None
     reviewable_unit_diff_tracker.rvf_attempt_upsert(
         repo=repo,

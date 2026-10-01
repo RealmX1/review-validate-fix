@@ -45,6 +45,10 @@ INJECTION_OUTCOME_DEDUPLICATED_PENDING = "deduplicated_pending"  # 同键活跃 
 INJECTION_OUTCOME_DECLINED_COOLDOWN = "declined_cooldown"  # 指纹处于 declined 冷却，静默停
 # 本会话谢绝过这片工作范围、尚未出现工作边界（闸 2b），静默停
 INJECTION_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE = "declined_session_scope_snooze"
+# agent 在本会话把审查延后到某个条件（延后型谢绝），此后还没有新回合 / 提交（闸 2c），静默停
+INJECTION_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY = (
+    "deferred_until_condition_decline_awaiting_turn_boundary"
+)
 INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED = "circuit_breaker_tripped"  # 铸造频率熔断，静默停
 INJECTION_OUTCOME_MINT_ANOMALY = "mint_anomaly"  # 铸造抛异常（best-effort 兜底记录）
 # 横幅已交给 cline-kanban 终端投递（带外），**这一刻 agent 还什么都没拿到**。
@@ -181,6 +185,7 @@ __all__ = [
     "INJECTION_OUTCOME_DEDUPLICATED_PENDING",
     "INJECTION_OUTCOME_DECLINED_COOLDOWN",
     "INJECTION_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE",
+    "INJECTION_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY",
     "INJECTION_OUTCOME_CIRCUIT_BREAKER_TRIPPED",
     "INJECTION_OUTCOME_MINT_ANOMALY",
     "INJECTION_OUTCOME_DELIVERED_OUT_OF_BAND",
