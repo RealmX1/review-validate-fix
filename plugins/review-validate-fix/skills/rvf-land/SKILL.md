@@ -24,12 +24,12 @@ description: Use only when the user explicitly invokes $rvf-land or /rvf-land. �
 
 ## 流程：两条命令，中间只做一次判断
 
-脚本是与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`（在 RVF 源仓库里即 `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_land.py`，部署后是对应 payload 路径），下文记作 `<skill-scripts-dir>/rvf_land.py`。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
+两条命令都经 `rvf land`：部署装到 PATH 上的 RVF 快捷入口（`~/.rvf/bin/rvf`，PATH 上找不到 `rvf` 时用这个绝对路径），原样转给与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`，不用自己拼脚本路径。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
 
 ### 1. prepare（一次调用拿全部事实）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py prepare --stdin --repo . <<'RVF_HANDOFF'
+rvf land prepare --stdin --repo . <<'RVF_HANDOFF'
 <粘贴的 handoff 正文>
 RVF_HANDOFF
 ```
@@ -61,12 +61,14 @@ RVF_HANDOFF
 ### 3. commit（一次调用做完剩下的机械步骤）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py commit --run-dir <prepare 输出的 run_dir> --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
+rvf land commit --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
 <定稿的 commit message>
 RVF_LAND_COMMIT_MESSAGE
 ```
 
-`--run-dir` 必填，只认显式参数（不回退 `RVF_RUN_DIR`：reviewer 子进程与 Codex task shell 里它指向别的活 run）。依次执行并输出一份 JSON：
+`--run-dir` 可省：`rvf land commit` 会替你显式带上本仓最近一次 `rvf land prepare` 落下 plan 的 run（找不到时 exit 2，先跑 prepare 或显式传 `--run-dir <prepare 输出的 run_dir>`）。`rvf_land.py` 本身只认显式 `--run-dir`，不回退 `RVF_RUN_DIR`（reviewer 子进程与 Codex task shell 里它指向别的活 run）。
+
+依次执行并输出一份 JSON：
 
 1. **验证**：run 的 validation index 全部 passed 且对应当前内容 ⇒ 零执行复用；做过最小修正 ⇒ 按 run 里的结构化 argv（`artifacts/handoff-validation-commands.json`）经 `validation_result_cache.py` 重跑。失败时直接打印失败输出尾部（exit 21），不 stage、不 commit；不要再去翻 validation-records。旧 run 没有结构化 argv 时 exit 22，按提示逐条经缓存 wrapper 跑完再重跑 commit。
 2. **stage**：`reviewed 主审边界 ∩ dirty` 加上 `--extra-path`；scope 外仍有脏文件时 exit 12（带了保留开关则原样留下）。JSON 的 `dirty_paths_changed_since_prepare` 列出 prepare 之后变过的路径（内容变了或被 `git add` 过）：除了你自己的最小修正，其余都是并发改动，核对后再决定是否继续。
