@@ -200,6 +200,53 @@ def first_user_prompt_text(path: Path, max_records: int = 256) -> str | None:
     return None
 
 
+def latest_assistant_reply_text_in_most_recent_turn(path: Path) -> str | None:
+    """最近一个回合里、最后一个产出过 ``text`` 的 step 的助手回复正文；该回合没有回复则 None。
+
+    Stop hook 的 handoff 标记识别靠它：Kimi 的 Stop 事件没有 ``last_assistant_message``
+    （见 ``hooks/_kimi_hook_entry.py``），只能从 wire 里还原。此前回落读取器只认 Codex rollout，
+    于是 Kimi 上的 RVF run 写完 handoff 也永远不 finalize（F5·H5a：4/4）。
+
+    * 回合边界是 ``turn.prompt``：遇到就清空——上一回合的 handoff 标记不能在下一回合被再次
+      认出，否则之后每次 Stop 都会被当成 handoff 回合。
+    * 只收 ``part.type == "text"``；``think`` 不算回复（实测 Kimi 会在 think 里复述
+      「first line ``RVF_HANDOFF_FILE: <absolute path>``」）。
+    * 同一 step 的多个 text part 按出现顺序拼接（本机 210 份 wire / 1040 个出文字的 step 实测
+      每 step 至多一条，拼接只是防御）。
+    """
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        return None
+    latest_step_identity: tuple[Any, Any, Any] | None = None
+    latest_step_text_chunks: list[str] = []
+    for record in _iter_wire_records(path):
+        record_type = record.get("type")
+        if record_type == WIRE_RECORD_TYPE_TURN_PROMPT:
+            latest_step_identity = None
+            latest_step_text_chunks = []
+            continue
+        if record_type != WIRE_RECORD_TYPE_CONTEXT_APPEND_LOOP_EVENT:
+            continue
+        event = record.get("event")
+        if not isinstance(event, dict) or event.get("type") != LOOP_EVENT_TYPE_CONTENT_PART:
+            continue
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != CONTENT_PART_TYPE_TEXT:
+            continue
+        text = part.get(CONTENT_PART_TEXT_FIELD_BY_PART_TYPE[CONTENT_PART_TYPE_TEXT])
+        if not isinstance(text, str) or not text.strip():
+            continue
+        step_identity = (event.get("turnId"), event.get("step"), event.get("stepUuid"))
+        if step_identity != latest_step_identity:
+            latest_step_identity = step_identity
+            latest_step_text_chunks = []
+        latest_step_text_chunks.append(text)
+    joined = "\n".join(latest_step_text_chunks)
+    return joined or None
+
+
 _ARTIFACT_PATH_ARGUMENT_NAME = "path"
 """⚠️ Kimi 的 ``Write`` / ``Edit`` 用 ``path``，**不是** Claude 的 ``file_path``。
 

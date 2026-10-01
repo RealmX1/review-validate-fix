@@ -17,6 +17,11 @@ from urllib.parse import quote
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from core.run_ledger.run_ledger import RunLedger, rvf_state_fields, safe_token  # noqa: E402
+from core.host_adapter.host_transcript_format_detection import (  # noqa: E402
+    HOST_CLAUDE,
+    HOST_KIMI_CODE,
+    detect_transcript_format,
+)
 
 
 HANDOFF_FILE_MARKER = "RVF_HANDOFF_FILE"
@@ -69,7 +74,8 @@ def handoff_path_from_text(text: str | None) -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
-def latest_assistant_message(path: Path) -> str | None:
+def latest_codex_rollout_agent_message(path: Path) -> str | None:
+    """Codex rollout 里最后一条助手消息（``agent_message`` 事件或 ``response_item`` 助手消息）。"""
     latest: str | None = None
     try:
         with path.expanduser().open(encoding="utf-8") as handle:
@@ -96,6 +102,37 @@ def latest_assistant_message(path: Path) -> str | None:
     except (OSError, UnicodeDecodeError):
         return None
     return latest
+
+
+def latest_assistant_message_reader_for_host(host: str | None):
+    """按 transcript 的 host 身份选「最近一条助手回复」读取器；host 未知兜底 Codex。
+
+    Stop 事件缺 ``last_assistant_message`` 时，handoff 标记只能从 transcript 还原，而 RVF run
+    的 finalize 唯一的触发点就是认出这个标记。此前这里只有 Codex 一种解析，Kimi 的 Stop 事件
+    恰好永远不带 ``last_assistant_message`` ⇒ Kimi 上的 run 写完 handoff 却从不 finalize
+    （F5·H5a 取证：4/4）。漏接一个 host 不报错、只静默失效，所以
+    ``tests/test_rvf_handoff_marker_detection_across_host_transcripts.py`` 逐
+    ``KNOWN_HOST_IDENTITIES`` 结构性断言这里各有其人。
+    """
+    if host == HOST_CLAUDE:
+        from adapters.claude_code.transcript import (  # noqa: PLC0415 — 只在回落时才付 import 成本
+            latest_assistant_reply_text_in_most_recent_turn as read_claude_code_reply,
+        )
+
+        return read_claude_code_reply
+    if host == HOST_KIMI_CODE:
+        from adapters.kimi.transcript import (  # noqa: PLC0415 — 只在回落时才付 import 成本
+            latest_assistant_reply_text_in_most_recent_turn as read_kimi_code_reply,
+        )
+
+        return read_kimi_code_reply
+    return latest_codex_rollout_agent_message
+
+
+def latest_assistant_message(path: Path) -> str | None:
+    expanded_path = path.expanduser()
+    reader = latest_assistant_message_reader_for_host(detect_transcript_format(expanded_path))
+    return reader(expanded_path)
 
 
 def event_session_paths(event: dict[str, Any]) -> list[Path]:

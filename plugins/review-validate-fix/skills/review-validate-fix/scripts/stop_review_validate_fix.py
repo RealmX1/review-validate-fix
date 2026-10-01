@@ -11699,18 +11699,6 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
 
-    if event.get("stop_hook_active") is True:
-        # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
-        # 开发者看的诊断，报错主体必须是当前这个 host）。
-        host_label = resolve_current_session_host_adapter(event).host_display_name()
-        return skip_decision(
-            "检测到 stop_hook_active=true，为避免递归已跳过。",
-            ledger,
-            "stop_hook_active",
-            cwd=cwd,
-            detail=f"{host_label} 已在执行 Stop hook，RVF 跳过以避免递归",
-        )
-
     if is_truthy(os.environ.get(RVF_ANALYZE_THREAD)):
         return skip_decision(
             "检测到 RVF_ANALYZE_THREAD：当前 Stop event 来自 detached "
@@ -11733,6 +11721,11 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             **codex_goal_mode,
         )
 
+    # RVF run 的 finalize（标 units reviewed、释放 lease、清在途锁、推高水位、analyze 骨架）只有
+    # 这一个触发点，所以它必须排在下面的递归守卫**之前**：handoff 回合常常正是被 Stop 拉起的续跑
+    # （stop_hook_active=true）——F5·H5a 取证 Claude 9/9 个漏 finalize 的 run 都是这样丢的，下一次
+    # Stop 的最后一条消息里已经没有标记，run 就永远不 finalize。这里只发 developer_only 的
+    # handoff 提示、不驱动 agent，放在递归守卫之前不会造成递归。
     handoff_path_value = handoff_path_from_event(event)
     if handoff_path_value is not None:
         payload = handoff_completion_payload(event, ledger, cwd=cwd)
@@ -11766,6 +11759,18 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
                 handoff_path=str(handoff_path_value),
             )
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
+
+    if event.get("stop_hook_active") is True:
+        # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
+        # 开发者看的诊断，报错主体必须是当前这个 host）。
+        host_label = resolve_current_session_host_adapter(event).host_display_name()
+        return skip_decision(
+            "检测到 stop_hook_active=true，为避免递归已跳过。",
+            ledger,
+            "stop_hook_active",
+            cwd=cwd,
+            detail=f"{host_label} 已在执行 Stop hook，RVF 跳过以避免递归",
+        )
 
     awaiting_decision = awaiting_dispatched_agent_decision(event, ledger, cwd=cwd)
     if awaiting_decision is not None:

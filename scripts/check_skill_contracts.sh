@@ -28,6 +28,14 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# 测试卫生守卫（F5·H5b）：本次套件独占一个唯一名的 TMPDIR，于是每个测试的临时仓库 / run / HOME
+# 路径都带着这个名字；脚本末尾扫真实 RVF 状态根，出现引用它的新文件即判测试泄漏。判据与原理见
+# scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py 的模块 docstring。
+contract_suite_started_at_epoch_seconds="$(python3 -c 'import time; print(time.time())')"
+contract_suite_private_temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/rvf-contract-suite-private-tmp.XXXXXX")"
+trap 'rm -rf "$contract_suite_private_temporary_directory"' EXIT
+export TMPDIR="$contract_suite_private_temporary_directory"
+
 timestamp_ms() {
   python3 -c 'import time; print(time.time_ns() // 1000000)'
 }
@@ -661,6 +669,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/install_to_codex.py" \
   "$repo_root/scripts/rvf_local_deploy.py" \
   "$repo_root/scripts/merge_rvf_state_roots.py" \
+  "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
   "$skill_dir/scripts/write_review_result.py" \
@@ -875,6 +884,21 @@ run_step "kimi session layout self-check" \
 run_step "tests: kimi_host_adapter_and_transcript" \
   python3 -m pytest -q \
     "$tests_dir/test_kimi_host_adapter_and_transcript.py"
+# 结构性 + 行为 gate（F5·H5a）：Stop 事件缺 last_assistant_message 时按 host 读 transcript 找 handoff
+# 标记——漏接一个 host 不报错，只会让它的 RVF run 写完 handoff 却永不 finalize（Kimi 曾 4/4）。
+run_step "tests: rvf_handoff_marker_detection_across_host_transcripts" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_handoff_marker_detection_across_host_transcripts.py"
+# finalize 本身（标 units reviewed / 释放 lease / 推高水位）。这两份此前不在任何 gate 里，
+# test_rvf_run_finalize 因此从 2026-06-25（a0f206c 的 no-op 守卫）起红了三个月没人看见。
+run_step "tests: rvf_run_finalize" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_run_finalize.py" \
+    "$tests_dir/test_cancel_rvf_run_finalize.py"
+# 测试卫生守卫本身的判据：认得出本次套件的泄漏、放得过活会话的并发写入（F5·H5b）。
+run_step "tests: check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots" \
+  python3 -m pytest -q \
+    "$tests_dir/test_check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py"
 require_repo_literal "adapters/kimi/transcript.py" \
   '_ARTIFACT_PATH_ARGUMENT_NAME = "path"'
 require_repo_literal "adapters/kimi/transcript.py" \
@@ -1838,6 +1862,12 @@ forbid_repo_literal "docs/multi-harness-plugin-guideline/04-anti-patterns.md" '�
 # ——同一 base 在 CODEX_RVF_ 与裸 RVF_ 两命名空间都被 env 访问 = 运行时变量分裂、
 # 静默损坏（无语法/import 错，未覆盖路径假绿）。ALLOWLIST 在脚本内随坍缩切片收窄。
 python3 "$repo_root/scripts/check_env_namespace_collision.py"
+
+# 必须是最后一个测试相关步骤：它核对的是「上面所有测试跑完之后」真实 RVF 状态根的样子。
+run_step "real RVF state roots hold no artifacts from this contract suite" \
+  python3 "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
+    --suite-private-temporary-directory "$contract_suite_private_temporary_directory" \
+    --suite-started-at-epoch-seconds "$contract_suite_started_at_epoch_seconds"
 
 if [ "$verbose" -eq 1 ]; then
   printf 'contract check OK\n'

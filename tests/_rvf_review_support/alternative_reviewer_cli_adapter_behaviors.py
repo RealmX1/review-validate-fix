@@ -15,6 +15,23 @@ import sys
 import time
 from pathlib import Path
 
+
+def _minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(
+    tmp_path: Path,
+) -> dict[str, str]:
+    """只带 PATH 的最小子进程环境 + 两个 RVF 落盘根。
+
+    最小环境是为了钉住「reviewer CLI 不依赖调用方 env」；但它连 HOME 都没有，RVF 的 RunLedger
+    便回落到 ``Path.home()``——即开发者真实的 ``~/.rvf/user-local-data/run-logs``（F5·H5b 普查：
+    本文件 4 个用例每轮各写一个 reviewer run 进去）。落盘根不是被测行为的一部分，显式给 tmp。
+    """
+    return {
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "RVF_HOME": str(tmp_path / "isolated-rvf-home"),
+        "RVF_USER_LOCAL_DATA_ROOT": str(tmp_path / "isolated-rvf-user-local-data"),
+    }
+
+
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
     'test_alternative_reviewer_prompt_uses_session_env_refs',
@@ -1647,7 +1664,7 @@ def test_alternative_reviewer_codex_exec_json_command_is_patched(tmp_path: Path)
             "--rvf-run-dir",
             str(run_dir),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -1709,7 +1726,7 @@ def test_alternative_reviewer_codex_exec_after_global_options_is_patched(tmp_pat
             "--rvf-run-dir",
             str(run_dir),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -1842,7 +1859,7 @@ def test_alternative_reviewer_legacy_claude_config_gets_stream_json(tmp_path: Pa
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -1898,7 +1915,7 @@ def test_alternative_reviewer_respects_explicit_claude_text_output(tmp_path: Pat
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -2132,7 +2149,7 @@ def test_alternative_reviewer_cursor_command_not_claude_patched(tmp_path: Path) 
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,
@@ -2193,7 +2210,7 @@ def test_alternative_reviewer_cursor_autodetects_stream_json(tmp_path: Path) -> 
             "--review-packet",
             str(packet),
         ],
-        env={"PATH": f"{tmp_path}:{os.environ.get('PATH', '')}"},
+        env=_minimal_reviewer_subprocess_environment_with_isolated_rvf_state_roots(tmp_path),
         capture_output=True,
         text=True,
         check=False,

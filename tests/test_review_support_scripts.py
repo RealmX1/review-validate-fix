@@ -93,6 +93,15 @@ for _name in tuple(os.environ):
 # 个别测试仍可在自己作用域内 set/restore 覆盖本默认值，那条既有行为不受影响。
 _ISOLATED_RVF_HOME_FOR_TESTS = tempfile.mkdtemp(prefix="rvf-test-home-")
 os.environ["RVF_HOME"] = _ISOLATED_RVF_HOME_FOR_TESTS
+# ``RVF_HOME`` 管不到 ``user-local-data``（run-logs / diff-tracker / runtime-state 另有自己的根
+# ``RVF_USER_LOCAL_DATA_ROOT``，缺省 ``~/.rvf/user-local-data``）。继承本进程环境的子进程——
+# prepare_review_run / run_alternative_reviewer / command_lock 的用例大多直接 ``env=None``——
+# 此前因此把 RunLedger 写进真实 ``run-logs/runs/``（F5·H5b 普查：一轮套件 180 个文件）。
+# 设这一档而不是 ``CODEX_RVF_LOG_ROOT``：后者优先级更高，会遮住专测「run-logs 从
+# RVF_USER_LOCAL_DATA_ROOT 派生」的用例。
+os.environ["RVF_USER_LOCAL_DATA_ROOT"] = str(
+    Path(_ISOLATED_RVF_HOME_FOR_TESTS) / "user-local-data"
+)
 atexit.register(shutil.rmtree, _ISOLATED_RVF_HOME_FOR_TESTS, ignore_errors=True)
 
 
@@ -720,6 +729,42 @@ def test_rvf_prep_file_revive_expired_restamps_ttl(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("expected revive of payload-less lookup to fail")
+
+
+def test_kanban_followup_marker_family_roots_follow_rvf_home_when_no_dedicated_root_is_set(
+    tmp_path: Path,
+) -> None:
+    """F5·H5b：三族 marker 的落盘根必须和 RVF_HOME 家族其余成员一样认 ``$RVF_HOME``。
+
+    本文件在模块导入期把 ``RVF_HOME`` 强制指向 tmp，注释里承诺的解析链是「显式参数 > 专用
+    env > ``$RVF_HOME`` > ``~/.rvf``」——但这三族此前跳过了 ``$RVF_HOME`` 一档，于是
+    ``rvf_agent_decision_cli.run_start`` 这类不传 ``lock_root`` 的调用（cad8824 引入的 bootstrap
+    agent CLI 测试）把 in-progress 锁写进了开发者真实的 ``~/.rvf/kanban-followup-in-progress/``
+    （2026-09-30 实测 872 个里 854 个是测试残留，当天仍在写）。那个目录正是 Stop 读侧判断
+    「有没有 RVF 在途」的地方。
+    """
+    k = load_kanban_followup_lock_module()
+    rvf_home = tmp_path / "isolated-rvf-home"
+    saved = {name: os.environ.get(name) for name in ("RVF_HOME", k.LOCK_ROOT_ENV)}
+    try:
+        os.environ["RVF_HOME"] = str(rvf_home)
+        os.environ.pop(k.LOCK_ROOT_ENV, None)
+        assert k._root() == rvf_home / k.SUBDIR_NAME
+        assert k._pending_root() == rvf_home / k.PENDING_SUBDIR_NAME
+        assert k._decision_point_delivery_intent_root() == (
+            rvf_home / k.DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
+        )
+        # 专用 env 仍然优先于 RVF_HOME（既有的测试 / 生产覆盖手段不受影响）。
+        dedicated = tmp_path / "dedicated-lock-root"
+        os.environ[k.LOCK_ROOT_ENV] = str(dedicated)
+        assert k._root() == dedicated
+        assert k._pending_root() == dedicated / k.PENDING_SUBDIR_NAME
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def test_kanban_followup_pending_marker_round_trip(tmp_path: Path) -> None:
@@ -11297,6 +11342,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery",
             lambda: test_rvf_user_prompt_submit_arms_kanban_followup_lock_on_delivery(
                 root / "prompt-submit-followup-arm"
+            ),
+        ),
+        (
+            "kanban_followup_marker_family_roots_follow_rvf_home_when_no_dedicated_root_is_set",
+            lambda: test_kanban_followup_marker_family_roots_follow_rvf_home_when_no_dedicated_root_is_set(
+                root / "kanban-followup-marker-family-roots-follow-rvf-home"
             ),
         ),
         (

@@ -36,6 +36,16 @@ def _init_repo(path: Path) -> Path:
     return path
 
 
+def _write_reviewer_result_artifact(run_dir: Path) -> None:
+    """finalize 只在「至少一条 reviewer 腿真的产出了 review-result」时才把 units 标 reviewed
+    （a0f206c 的 no-op 守卫：0 reviewer 的空转完成不能把没审过的工作洗成已审）。这两条用例写于
+    守卫之前、没造 reviewer 产物，于是自 2026-06-25 起一直是红的——本文件当时不在契约套件里，
+    没人看见。"""
+    reviewer_directory = run_dir / "artifacts" / "reviewers" / "reviewer-a"
+    reviewer_directory.mkdir(parents=True, exist_ok=True)
+    (reviewer_directory / "review-result.json").write_text("{}\n", encoding="utf-8")
+
+
 def _make_run(tmp_path: Path, repo: Path, transcript: Path) -> Path:
     run_dir = tmp_path / "rvf-run"
     artifacts = run_dir / "artifacts"
@@ -225,6 +235,7 @@ def test_finalize_run_releases_tracker_lease_from_scope_contract(tmp_path: Path,
         encoding="utf-8",
     )
 
+    _write_reviewer_result_artifact(run_dir)
     record = finalize.finalize_run(
         run_dir=run_dir,
         event={"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)},
@@ -305,6 +316,7 @@ def test_finalize_run_marks_stale_tracker_scope_reviewed_from_contract_units(
         encoding="utf-8",
     )
 
+    _write_reviewer_result_artifact(run_dir)
     record = finalize.finalize_run(
         run_dir=run_dir,
         event={"transcript_path": str(transcript), "session_id": "S", "cwd": str(repo)},

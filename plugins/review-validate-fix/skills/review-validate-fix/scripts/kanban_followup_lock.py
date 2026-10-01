@@ -70,6 +70,11 @@ MARKER_VERSION = 1
 DEFAULT_TTL_SECONDS = 2 * 60 * 60
 TTL_ENV = "RVF_KANBAN_FOLLOWUP_IN_PROGRESS_TTL_SECONDS"
 LOCK_ROOT_ENV = "RVF_KANBAN_FOLLOWUP_LOCK_ROOT"
+# 三族 marker 的落盘根解析链：显式 ``root`` > ``LOCK_ROOT_ENV`` > ``$RVF_HOME`` > ``~/.rvf``——与
+# token store / 注入尝试 ledger / withdrawn tombstone 等 RVF_HOME 家族成员同一口径。此前这里跳过了
+# ``$RVF_HOME`` 一档：测试把 RVF_HOME 指向 tmp 以为已经隔离，锁照样写进真实 ``~/.rvf``（F5·H5b：
+# ``kanban-followup-in-progress/`` 872 个 marker 里 854 个是测试残留）。生产环境不设 RVF_HOME，行为不变。
+RVF_HOME_ENV = "RVF_HOME"
 STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"
 STATUS_INVALID = "invalid"
@@ -204,13 +209,20 @@ class AcquireResult:
     status: str
 
 
+def _rvf_home_directory() -> Path:
+    raw = os.environ.get(RVF_HOME_ENV)
+    if raw and raw.strip():
+        return Path(raw).expanduser()
+    return Path.home() / ".rvf"
+
+
 def _root(root: Path | None = None) -> Path:
     if root is not None:
         return root.expanduser() / SUBDIR_NAME
     raw = os.environ.get(LOCK_ROOT_ENV)
     if raw and raw.strip():
         return Path(raw).expanduser()
-    return Path.home() / ".rvf" / SUBDIR_NAME
+    return _rvf_home_directory() / SUBDIR_NAME
 
 
 def _task_path(task_id: str, repository_identity: str, root: Path | None = None) -> Path:
@@ -1128,7 +1140,7 @@ def _pending_root(root: Path | None = None) -> Path:
         # in-progress 锁把该 env 视为「直接就是 in-progress 目录」；pending 在其下另起子目录，
         # 与 in-progress marker 物理隔离，避免同名 task-*.json 互相覆盖。
         return Path(raw).expanduser() / PENDING_SUBDIR_NAME
-    return Path.home() / ".rvf" / PENDING_SUBDIR_NAME
+    return _rvf_home_directory() / PENDING_SUBDIR_NAME
 
 
 def _pending_task_path(task_id: str, root: Path | None = None) -> Path:
@@ -1491,7 +1503,7 @@ def _decision_point_delivery_intent_root(root: Path | None = None) -> Path:
     raw = os.environ.get(LOCK_ROOT_ENV)
     if raw and raw.strip():
         return Path(raw).expanduser() / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
-    return Path.home() / ".rvf" / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
+    return _rvf_home_directory() / DECISION_POINT_DELIVERY_INTENT_SUBDIR_NAME
 
 
 def _decision_point_delivery_intent_path(task_id: str, root: Path | None = None) -> Path:
