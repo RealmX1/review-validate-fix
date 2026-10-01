@@ -116,16 +116,6 @@ def _issue_paths(issue: dict[str, Any]) -> list[str]:
     return _safe_relative_paths(paths)
 
 
-def _issue_source_refs(issue: dict[str, Any]) -> list[dict[str, Any]]:
-    refs = issue.get("source_refs")
-    if isinstance(refs, list):
-        return [item for item in refs if isinstance(item, dict)]
-    reviewer_id = issue.get("reviewer_id")
-    if isinstance(reviewer_id, str) and reviewer_id:
-        return [{"reviewer_id": reviewer_id}]
-    return []
-
-
 def _scope_contract_path(run_dir: Path) -> Path | None:
     env_value = os.environ.get("RVF_SCOPE_CONTRACT")
     if env_value:
@@ -570,7 +560,8 @@ def _sync_issue_state(
         issue_id=issue_id,
         payload=issue,
         artifact_path=issue_path,
-        source_refs=_issue_source_refs(issue),
+        # 镜像已剥掉来源字段；None = 保留 tracker 里由合并处置派生的 source_refs。
+        source_refs=None,
         state=state,
         log_root_override=log_root,
     )

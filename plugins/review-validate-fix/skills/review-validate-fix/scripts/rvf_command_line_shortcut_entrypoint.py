@@ -793,6 +793,13 @@ def render_reviewer_results_summary(
                 else "两腿均 no_issues → clean path，直接写 handoff。"
             )
         )
+        if any_issues:
+            lines.append(
+                "- 合并处置是 fix prepare 的前置闸：每条 reviewer issue（上面的编号就是处置里的 index，从 1 起）"
+                "都要记 adopted / merged_into / dropped（dropped 带 reason_code），经 "
+                f"`{invocation} merge write{run_dir_argument}`（决定 JSON 走 stdin）写成 artifacts/merge/merge_dispositions.json；"
+                "没写或没覆盖到的 issue_id，fix prepare 会拒绝。全部 dropped 也要写，然后走 clean path。"
+            )
     elif status == "blocked_on_reviewer_request":
         lines.append(
             "- 判定：有腿返回 kind: request（待处理终态）。按 Contract Gate 满足或驳回后，"
@@ -1159,6 +1166,19 @@ def run_fix_prepare(args: argparse.Namespace) -> int:
         print(f"[rvf fix prepare] 失败，已停在这一条：{failure}", file=sys.stderr)
         return EXIT_FIX_PREPARE_FAILED
     return EXIT_OK
+
+
+def run_merge(rest: list[str]) -> int:
+    """``rvf merge write|check``：转给 ``rvf_merge_dispositions``，缺 ``--run-dir`` 时补当前 run。"""
+    import rvf_merge_dispositions  # noqa: PLC0415
+
+    if not rest or _argv_asks_for_help(rest):
+        return int(rvf_merge_dispositions.main(rest or ["--help"]))
+    explicit_run_dir = _explicit_option_value_in_argv(rest, "--run-dir")
+    injected: list[str] = []
+    if explicit_run_dir is None:
+        injected = ["--run-dir", str(_require_run_context(None).run_dir)]
+    return int(rvf_merge_dispositions.main([rest[0], *injected, *rest[1:]]))
 
 
 def run_fix_stop(rest: list[str]) -> int:
@@ -1572,7 +1592,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description=(
             "RVF 执行段快捷入口。token / run 目录全部可推断。决策：start / scope / dispatch / decline / "
             "decline-dispatched-review（参数同 rvf_agent_decision_cli，--token 可省）；执行：wait / results / "
-            "redispatch-reviewers / fix prepare|stop / apply / status / validate / handoff。"
+            "redispatch-reviewers / merge write|check / fix prepare|stop / apply / status / validate / handoff。"
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1606,6 +1626,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_fix_prepare.add_argument("--run-dir", default=None)
     p_fix_prepare.add_argument("--json", action="store_true")
     fix_sub.add_parser("stop", add_help=False, help="转给 rvf_fix_attempt stop（照抄 fix prepare 给的整行命令：cd + --attempt-id + --run-dir）")
+
+    sub.add_parser(
+        "merge", add_help=False,
+        help="合并阶段处置：merge write（决定 JSON 走 stdin）/ merge check（自动补 --run-dir）",
+    )
 
     p_apply = sub.add_parser("apply", help="把已 stop 的 fixed attempt 合回主 worktree")
     group = p_apply.add_mutually_exclusive_group(required=True)
@@ -1653,6 +1678,12 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_CURRENT_RUN_CONTEXT_UNRESOLVED
     if len(arguments) >= 2 and arguments[0] == "fix" and arguments[1] == "stop":
         return run_fix_stop(arguments[2:])
+    if arguments and arguments[0] == "merge":
+        try:
+            return run_merge(arguments[1:])
+        except CurrentRunContextUnresolved as exc:
+            print(f"[rvf merge] {exc}", file=sys.stderr)
+            return EXIT_CURRENT_RUN_CONTEXT_UNRESOLVED
     args = parser.parse_args(arguments)
     try:
         if args.command == "wait":

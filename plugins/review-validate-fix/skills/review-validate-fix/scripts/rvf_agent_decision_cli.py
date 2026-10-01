@@ -1336,7 +1336,7 @@ def default_prepare_pipeline(
         },
         "handoff_expectations": {
             "handoff_path": str(artifacts_dir / "handoff.md"),
-            "expected_artifacts": ["review-result.json", "merge-table.md", "handoff.md"],
+            "expected_artifacts": ["review-result.json", "merge/merge_dispositions.json", "handoff.md"],
         },
         "workflow_constraints": {
             "pause_origin_edits": False,

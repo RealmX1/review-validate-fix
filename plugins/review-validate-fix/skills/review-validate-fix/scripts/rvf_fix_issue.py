@@ -11,6 +11,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
+import rvf_merge_dispositions  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
@@ -48,21 +49,14 @@ def _run_id(payload: dict[str, Any], override: str | None, run_dir: Path) -> str
     raise ValueError("run_id missing; pass --run-id or use a run_dir with summary.json")
 
 
-def _source_refs(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    raw = payload.get("source_refs")
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, dict)]
-    refs = []
-    reviewer_id = payload.get("reviewer_id")
-    if isinstance(reviewer_id, str) and reviewer_id:
-        refs.append({"reviewer_id": reviewer_id})
-    return refs
-
-
 def _write_mirror(run_dir: Path, issue_id: str, payload: dict[str, Any]) -> Path:
-    path = run_dir / "artifacts" / "fix-issues" / f"{reviewable_unit_diff_tracker.safe_token(issue_id)}.json"
+    """写给 fixer 读的 ``artifacts/fix-issues/<id>.json``：一律去掉来源字段（source-agnostic 隔离）。
+
+    来源只留在 tracker 的 ``source_refs`` 列和 ``artifacts/merge/merge_dispositions.json`` 里。"""
+    path = rvf_merge_dispositions.fix_issue_mirror_path(run_dir, issue_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    mirror = rvf_merge_dispositions.strip_source_attribution_keys_from_fix_issue_payload(payload)
+    path.write_text(json.dumps(mirror, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
 
 
@@ -76,11 +70,35 @@ def upsert_canonical_issue(
     state: str = "open",
     log_root: Path | None = None,
 ) -> dict[str, Any]:
-    """把一份 canonical issue JSON 镜像进 run 工件并写入全局 tracker ledger。"""
-    payload = _read_json(issue_file)
-    issue_id = _issue_id(payload, issue_id_override)
-    run_id = _run_id(payload, run_id_override, run_dir)
-    payload = {**payload, "issue_id": issue_id, "run_id": run_id}
+    """把一份 canonical issue JSON 镜像进 run 工件并写入全局 tracker ledger。
+
+    强制点（CLI upsert 与 ``rvf fix prepare`` 共用）：``artifacts/merge/merge_dispositions.json`` 必须
+    结构合法、未过期，且覆盖这个 ``issue_id``（adopted / merged_into 目标或非 reviewer 来源），否则拒绝。
+    ``source_refs`` 只从处置工件派生，不信任 payload；payload 里的来源字段被剥掉，剩余正文不得提到
+    本轮 reviewer 的来源标签。"""
+    raw_payload = _read_json(issue_file)
+    issue_id = _issue_id(raw_payload, issue_id_override)
+    run_id = _run_id(raw_payload, run_id_override, run_dir)
+    # 处置按 run_dir 校验放行，记录就必须落在同一个 run：payload / --run-id 指向别的 run 会把
+    # issue 写进另一个 run 的 ledger，当前 run 的因果与最终状态随之缺失。
+    run_directory_run_id = rvf_merge_dispositions.run_id_for_run_directory(run_dir)
+    if run_id != run_directory_run_id:
+        raise ValueError(
+            f"run_id {run_id!r} (from issue payload or --run-id) does not match the run directory's own run_id "
+            f"{run_directory_run_id!r}; merge dispositions are checked against {run_dir}, so the issue must be "
+            "upserted into that run"
+        )
+    source_refs, source_markers = rvf_merge_dispositions.resolve_fix_issue_source_refs_for_upsert(run_dir, issue_id)
+    payload = {
+        **rvf_merge_dispositions.strip_source_attribution_keys_from_fix_issue_payload(raw_payload),
+        "issue_id": issue_id,
+        "run_id": run_id,
+    }
+    leaks = rvf_merge_dispositions.fix_issue_payload_source_attribution_errors(
+        payload, source_markers=source_markers, label=f"canonical issue {issue_id}"
+    )
+    if leaks:
+        raise rvf_merge_dispositions.MergeDispositionsCheckFailed(leaks)
     mirror_path = _write_mirror(run_dir, issue_id, payload)
     result = reviewable_unit_diff_tracker.rvf_issue_upsert(
         repo=repo,
@@ -88,10 +106,11 @@ def upsert_canonical_issue(
         issue_id=issue_id,
         payload=payload,
         artifact_path=mirror_path,
-        source_refs=_source_refs(payload),
+        source_refs=source_refs,
         state=state,
         log_root_override=log_root,
     )
+    rvf_merge_dispositions.record_fix_issue_source_refs_written_to_tracker_at_upsert(run_dir, issue_id, source_refs)
     return {**result, "issue_id": issue_id, "issue_artifact_path": str(mirror_path)}
 
 

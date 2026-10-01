@@ -89,6 +89,7 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 | 24 | `git commit` 本身失败（pre-commit hook 拒绝、签名失败等） | stage 保留便于排查；看 `git_output`。原因在 scope 内就修好后重跑 commit（HEAD 没动，plan 仍有效）；不要手动 `git commit`（会跳过封窗与 evidence）；原因在 scope 外就停止并报告 |
 | 25 | 已提交、内容摘要不变，但工作树还有保留开关放行范围之外的脏路径（`dirty_paths_remaining_beyond_declared_unrelated`） | 提交与封窗已完成，evidence 跳过。如实报告这些路径；不要补写 evidence |
 | 26 | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了本次提交（`reason_code=committed_paths_outside_stage_set`，列在 `committed_paths_outside_stage_set`） | 提交已发生、不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件；**不要手动封窗、不要伪造 evidence** |
+| 27 | 提交前拒绝：reviewer 报过 issue（或已有处置工件），而合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`，明细在 `merge_dispositions_errors`） | 未 stage、未 commit。按明细用 `rvf merge write` 补齐处置（旧 run 的 fix-issue 需重新 upsert 记下 source_refs），`rvf merge check` 复核后重跑 commit。按保留开关留下 scope 外脏文件时 evidence 本就跳过，不做这道预检 |
 
 **land 前后不做任何 base intake。** 「当前 base 吸收了吗」归 prepare 侧门禁：`prepare_review_run.py` 在 `bootstrap_required_before_rvf` 时直接拒绝建 run，能走到 rvf-land 的 run 必然已经过闸。land 侧再加一道会自相矛盾：那道门禁要求的同步会重写 bootstrap receipt，亲手打破它自己依赖的冻结值。残余风险（marker 生效前产生的旧 handoff + 陈旧 worktree）已知且已接受。
 
@@ -107,6 +108,7 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 - handoff scope、当前 dirty paths 和 artifact 摘要互相矛盾（exit 11），或存在无法判定归属的 scope 外脏文件（exit 12）。
 - 需要的修复依赖 scope 外 runtime 改动，但这些改动未被明确纳入本次提交。
 - 相关验证无法运行或未通过（exit 21 / 22），或 `git commit` 失败且原因不在 scope 内（exit 24）。
+- reviewer 报过 issue（或已有处置工件）而合并处置缺失/不合法/过期（exit 27，`reason_code=merge_dispositions_check_failed`）：提交前拒绝、未 stage 未 commit；按 `merge_dispositions_errors` 用 `rvf merge write` 补齐（`rvf merge check` 复核）后重跑 commit。按开关保留 scope 外脏文件（evidence 本就跳过）时不做这道预检。
 - commit 后 worktree 不 clean（exit 25），因而无法把已审内容绑定到唯一 HEAD/tree；停止 evidence-aware handback。
 - commit 期间 hook 改写了内容（exit 26）：提交已发生但未封窗；如实报告被改写的文件，停止 evidence-aware handback，不要手动封窗或伪造 evidence。
 

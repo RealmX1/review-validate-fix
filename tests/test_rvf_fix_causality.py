@@ -20,6 +20,7 @@ SCRIPT_DIR = (
 )
 ISSUE_SCRIPT = SCRIPT_DIR / "rvf_fix_issue.py"
 ATTEMPT_SCRIPT = SCRIPT_DIR / "rvf_fix_attempt.py"
+MERGE_DISPOSITIONS_SCRIPT = SCRIPT_DIR / "rvf_merge_dispositions.py"
 
 
 from _rvf_test_support.loader import load_script_module as _load
@@ -140,7 +141,53 @@ def _json_output(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     return payload
 
 
+def _register_issue_in_merge_dispositions(run_dir: Path, issue_file: Path) -> None:
+    """upsert 的强制点要求 issue_id 被合并处置覆盖：两腿 no_issues，把它登记为主 agent 自审的非 reviewer 来源。
+
+    reviewer plan / 结果缺失时补一份最小的两腿 no_issues；已登记的 issue 保留（处置工件整份重写）。"""
+    reviewers = run_dir / "artifacts" / "reviewers"
+    if not (reviewers / "reviewer-plan.json").is_file():
+        for reviewer_id in ("reviewer-a", "reviewer-b"):
+            (reviewers / reviewer_id).mkdir(parents=True, exist_ok=True)
+            (reviewers / reviewer_id / "review-result.json").write_text(
+                json.dumps(
+                    {"schema_version": 1, "kind": "no_issues", "issues": [], "requests": [], "audit_summary": "clean"}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        (reviewers / "reviewer-plan.json").write_text(
+            json.dumps(
+                {
+                    "status": "completed",
+                    "reviewers": [{"reviewer_id": "reviewer-a", "returncode": 0}, {"reviewer_id": "reviewer-b", "returncode": 0}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    issue_id = json.loads(issue_file.read_text(encoding="utf-8"))["issue_id"]
+    dispositions_path = run_dir / "artifacts" / "merge" / "merge_dispositions.json"
+    sources = (
+        json.loads(dispositions_path.read_text(encoding="utf-8"))["non_reviewer_fix_issue_sources"]
+        if dispositions_path.is_file()
+        else []
+    )
+    if all(source["issue_id"] != issue_id for source in sources):
+        sources.append({"issue_id": issue_id, "origin": "main_agent_self_review"})
+    completed = subprocess.run(
+        [sys.executable, str(MERGE_DISPOSITIONS_SCRIPT), "write", "--run-dir", str(run_dir)],
+        input=json.dumps({"non_reviewer_fix_issue_sources": sources}),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr or completed.stdout)
+
+
 def _upsert_issue(repo: Path, run_dir: Path, issue_file: Path, log_root: Path) -> None:
+    _register_issue_in_merge_dispositions(run_dir, issue_file)
     _run(
         [
             sys.executable,

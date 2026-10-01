@@ -1435,7 +1435,7 @@ def write_dispatch_prep_file(
         },
         "handoff_expectations": {
             "handoff_path": str(artifacts_dir / "handoff.md"),
-            "expected_artifacts": ["review-result.json", "merge-table.md", "handoff.md"],
+            "expected_artifacts": ["review-result.json", "merge/merge_dispositions.json", "handoff.md"],
         },
         "workflow_constraints": {
             "pause_origin_edits": target_flow == "flow-2-branch",
