@@ -330,7 +330,7 @@ def test_rvf_shortcut_infers_decision_token_for_start_and_dispatch(root: Path) -
             candidate_summary={"candidates": []},
         ).token
     completed = subprocess.run(
-        [sys.executable, str(_entrypoint_script()), "decline", "--reason", "测试谢绝"],
+        [sys.executable, str(_entrypoint_script()), "decline", "--decline-kind", "structural_not_needed", "--reason", "测试谢绝"],
         cwd=worktree, env=environment, capture_output=True, text=True, check=False,
     )
     output = completed.stdout + completed.stderr

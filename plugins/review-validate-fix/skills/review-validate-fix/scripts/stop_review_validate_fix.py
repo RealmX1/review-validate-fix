@@ -8946,6 +8946,9 @@ REASON_DECISION_POINT_INJECTED = "decision_point_injected"
 REASON_DECISION_POINT_DEDUPLICATED_PENDING = "decision_point_deduplicated_pending"
 REASON_DECISION_POINT_DECLINED_COOLDOWN = "decision_point_declined_cooldown"
 REASON_DECISION_POINT_DECLINED_SESSION_SCOPE_SNOOZE = "decision_point_declined_session_scope_snooze"
+REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY = (
+    "decision_point_deferred_until_condition_decline_awaiting_turn_boundary"
+)
 REASON_DECISION_POINT_CIRCUIT_BREAKER = "decision_point_circuit_breaker_tripped"
 REASON_DECISION_POINT_NO_CANDIDATES = "decision_point_no_candidates"
 # 本次 Stop 刚撤掉一枚搁浅横幅 ⇒ 当次就地结束，不在同一次 Stop 里重铸（C-①）。
@@ -9272,6 +9275,19 @@ def _render_decision_point_injection_prompt(
         "开发者已预先授权你独立做这个决定，不需要征询开发者。"
     )
     lines.append(f"RVF_DECISION_TOKEN={token}")
+    previous_deferred_until_condition_decline = summary.get(
+        decision_token_store.CANDIDATE_SUMMARY_PREVIOUS_DEFERRED_UNTIL_CONDITION_DECLINE_IN_THIS_SESSION_KEY
+    )
+    if isinstance(previous_deferred_until_condition_decline, dict):
+        lines.append("")
+        lines.append(
+            "  你上次延后到：「{reason}」（{declined_at} 的延后型谢绝）。此后出现了新回合、提交或改动，所以"
+            "重新征询：先判断这个条件现在是否已经满足——满足了就 start；确实仍未满足可以再延后一次，"
+            "但如果其实是「这批改动不需要审」，请改用结构性谢绝。".format(
+                reason=previous_deferred_until_condition_decline.get("reason") or "（未记录理由）",
+                declined_at=previous_deferred_until_condition_decline.get("declined_at") or "未知时间",
+            )
+        )
     if (
         delivery_transport
         == decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
@@ -9360,10 +9376,29 @@ def _render_decision_point_injection_prompt(
         f"  定稿派发（选严格度档 light|standard|strict）: "
         f"{rvf} dispatch --token {token} --strictness {suggested_tier}"
     )
-    lines.append(f"  谢绝（不发起）: {rvf} decline --token {token} --reason \"<一句话理由>\"")
     lines.append(
-        "  （谢绝会在本会话内 snooze 这片工作范围：直到提交、范围明显扩大或同一批文件上的改动量翻了几倍"
-        "（开发者发来新 prompt 后以那一刻为新基线），自动 Stop 都不会再为它弹这条横幅。）"
+        f"  谢绝（不发起）: {rvf} decline --token {token} "
+        f"--decline-kind <{decision_token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED}"
+        f"|{decision_token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION}> --reason \"<一句话理由>\""
+    )
+    lines.append("  谢绝必须选类型（--decline-kind），两类之后多久再问完全不同：")
+    lines.append(
+        f"    · {decision_token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED}＝这批改动本就不需要 RVF："
+        "候选是你刚跑完的一轮 RVF 的产物（R24）或已有 RVF 在途、改动琐碎（只有一行日志 / 注释 / "
+        "工具生成配置）、改动不是本会话做的、开发者明确说过不要审。之后本会话 snooze 这片工作范围：直到"
+        "提交、范围明显扩大或同一批文件上的改动量翻了几倍（开发者发来新 prompt 后以那一刻为新基线），"
+        "自动 Stop 都不会再为它弹这条横幅。"
+    )
+    lines.append(
+        f"    · {decision_token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION}＝现在不审、条件满足后要审："
+        "「测试还在跑，跑完再审」「提交后再审」「子代理还在写，写完再审」。不进冷却、不进 snooze："
+        "下一个回合（开发者发话、后台任务或子代理的完成通知）、提交、或你接着改了候选文件之后，只要"
+        "候选还在就会重新问你，"
+        "横幅会带上你这次写的理由。理由里写清楚在等什么。"
+    )
+    lines.append(
+        "    拿不准时按「这批改动将来要不要审」判断：要审只是不是现在 → deferred；不需要审 → structural。"
+        "别用 structural 表达「晚点再审」——那会让这批工作在本会话里一直不被问到。"
     )
     lines.append("")
     lines.append("— 接受之后怎么进入执行（**不会再有第二条注入消息**）—")
@@ -9891,6 +9926,99 @@ def classify_stranded_decision_point_delivery_withdrawal_cause(
     )
 
 
+def _withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure(
+    marker: dict[str, Any],
+    *,
+    ledger: RunLedger,
+    cwd: str | None,
+    worktree: str | None,
+    stop_kanban_task_id: str | None,
+    developer_visible_notices: list[str],
+) -> str | None:
+    """一份仍在意图 TTL 内的横幅投递：cline-kanban 已判定投递失败 ⇒ 现在就撤回，返回被撤回的 token。
+
+    为什么要提前：在途闸（``find_decision_token_awaiting_out_of_band_delivery``）在意图 TTL（900s）内
+    把每一次 Stop 都静默挡住，而 kanban 判失败的 P50 只要约 75s——终端争用（开发者正在该终端打字 /
+    输入框里有草稿）是送达失败的主因，回溯里从铸出到撤回 P50 26 分钟。follow-up 路径早就会现查
+    ``terminal_delivery_status``，横幅路径复用同一个查询函数
+    （:func:`_query_kanban_terminal_delivery_receipt`，意图里本就带 task id / project path /
+    idempotency key），不另写一套判据。
+
+    只查**本轮这条投递通道**上的意图（每查一次是一个 kanban 子进程，别的通道等它们自己的 Stop），
+    且只在 token 仍是 ``minted`` 时动手——``injected`` 以后说明 UPS 已经把正文送到了。查不到结论
+    （接口不存在 / 超时 / 还没定论 / 已送达）一律什么都不做，留给原有的 TTL 对账。
+
+    撤回成因不冲销熔断额度（横幅从未到达 agent，退避前提成立）；调用方据返回值走「本次 Stop 撤回了
+    本通道的横幅 ⇒ 当次就地结束」的既有路径，下一次 Stop 重新征询。
+    """
+    token = marker.get("decision_token")
+    task_id = marker.get("kanban_task_id")
+    if not (isinstance(token, str) and token and isinstance(task_id, str) and task_id):
+        return None
+    if not stranded_decision_point_delivery_intent_belongs_to_this_stop_delivery_channel(
+        marker,
+        stop_worktree=worktree,
+        stop_cwd=cwd,
+        stop_kanban_task_id=stop_kanban_task_id,
+    ):
+        return None
+    lookup = decision_token_store.read_decision_token(token)
+    if lookup.state != decision_token_store.STATE_MINTED:
+        return None
+    receipt, _terminal_delivery_query_degraded_reason = _query_kanban_terminal_delivery_receipt(marker)
+    if receipt is None or not receipt.is_failed:
+        return None
+    withdrawal_cause = (
+        decision_token_store
+        .DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TERMINAL_DELIVERY_RECEIPT
+    )
+    try:
+        decision_token_store.mark_withdrawn(
+            token,
+            reason=f"decision_point_delivery_failed_per_kanban:{receipt.terminal_delivery_failure_reason}",
+            withdrawal_cause=withdrawal_cause,
+        )
+    except decision_token_store.DecisionTokenError as exc:
+        ledger.event(
+            phase="gate",
+            event="decision_point_out_of_band_delivery_failed_per_kanban_withdraw_failed",
+            status="warning",
+            level="warn",
+            reason_code="decision_point_out_of_band_delivery_failed_per_kanban_withdraw_failed",
+            cwd=cwd,
+            decision_token=token,
+            cline_kanban_task_id=task_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return None
+    try:
+        clear_decision_point_delivery_intent(task_id=task_id, decision_token=token)
+    except Exception:  # noqa: BLE001 - 清理 best-effort
+        pass
+    ledger.event(
+        phase="gate",
+        event="decision_point_out_of_band_delivery_failed_per_kanban_withdrawn",
+        status="warning",
+        level="warn",
+        reason_code="decision_point_out_of_band_delivery_failed_per_kanban_withdrawn",
+        cwd=cwd,
+        decision_token=token,
+        cline_kanban_task_id=task_id,
+        decision_point_delivery_intent_path=marker.get("_marker_path"),
+        decision_point_stranded_withdrawal_cause=withdrawal_cause,
+        kanban_terminal_delivery_status=receipt.terminal_delivery_status,
+        kanban_terminal_delivery_failure_reason=receipt.terminal_delivery_failure_reason,
+        kanban_terminal_delivery_receipt_field_source=receipt.receipt_field_source,
+        kanban_terminal_delivery_redispatch_disposition=receipt.redispatch_disposition,
+    )
+    developer_visible_notices.append(
+        f"发起横幅（token={token}）被 cline-kanban 判定投递失败"
+        f"（{describe_terminal_delivery_receipt_for_operator(receipt)}），已撤回该 token，"
+        "不再等投递意图到期；下一次 Stop 会重新征询。"
+    )
+    return token
+
+
 def reconcile_stranded_decision_point_delivery_intents(
     event: dict[str, Any],
     *,
@@ -9908,8 +10036,10 @@ def reconcile_stranded_decision_point_delivery_intents(
     store 本身就是权威，``rvf-agent start`` 读到终态自然硬失败（既有 ``DecisionTokenStateError``
     路径）。落地顺序刻意是「先物理取消、再语义中和」：取消能赶上就根本不会落地；赶不上也有终态兜底。
 
-    只处理 **stale**（TTL 已过）的意图。意图 TTL（900s）严格小于带外 token TTL（1200s），
-    所以走到这里时 token 一定还读得出来——这正是两个 TTL 那样取值的原因。
+    主体只处理 **stale**（TTL 已过）的意图。意图 TTL（900s）严格小于带外 token TTL（1200s），
+    所以走到这里时 token 一定还读得出来——这正是两个 TTL 那样取值的原因。仍在 TTL 内的意图只有
+    一种提前处置：本通道上、cline-kanban 已判定投递失败（见
+    :func:`_withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure`）。
 
     **枚举面 ≠ 早退面。** ``iter_decision_point_delivery_intents`` 是跨 task 全局枚举，垃圾回收
     本来就该跨 task 做；但返回的撤回清单按 ``worktree``/``cwd``/kanban task 归属拆成两份，
@@ -9946,6 +10076,21 @@ def reconcile_stranded_decision_point_delivery_intents(
         return _outcome()
     for marker in markers:
         if decision_point_delivery_intent_status(marker) == KANBAN_FOLLOWUP_LOCK_ACTIVE:
+            # 意图仍在 TTL 内：只有 cline-kanban 已经给出「投递失败」的确定结论时才提前撤回（D4）。
+            withdrawn_token_after_kanban_reported_delivery_failure = (
+                _withdraw_in_flight_decision_point_delivery_after_kanban_reported_delivery_failure(
+                    marker,
+                    ledger=ledger,
+                    cwd=cwd,
+                    worktree=worktree,
+                    stop_kanban_task_id=stop_kanban_task_id,
+                    developer_visible_notices=notices,
+                )
+            )
+            if withdrawn_token_after_kanban_reported_delivery_failure is not None:
+                withdrawn_tokens_on_this_stop_delivery_channel.append(
+                    withdrawn_token_after_kanban_reported_delivery_failure
+                )
             continue
         token = marker.get("decision_token")
         task_id = marker.get("kanban_task_id")
@@ -10857,6 +11002,47 @@ def _decision_point_non_minted_outcome_decision(
             message=(
                 "review-validate-fix: agent 已在本会话谢绝过这片工作范围（内容有变但范围未明显扩大），"
                 "本次 Stop 静默停，不再注入；提交、范围明显扩大（开发者发话后以那一刻为基线）或 12h 后会重新征询。"
+            ),
+            repo=repo,
+            cwd=cwd,
+            lost_warnings=lost_warnings,
+        )
+
+    if (
+        outcome
+        == decision_token_store.MINT_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY
+    ):
+        # 闸 2c：agent 在这个回合里刚把审查延后到某个条件，条件不可能已经满足。与冷却 / snooze 同一
+        # 处置：写注入尝试 ledger、developer_only 静默停，绝不驱动 agent。
+        injection_attempt_ledger.record_injection_attempt(
+            worktree=worktree,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+            candidate_path_count=candidate_count,
+            has_committed_but_unreviewed=has_committed,
+            mint_outcome=(
+                injection_attempt_ledger
+                .INJECTION_OUTCOME_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY
+            ),
+            injected=False,
+            note=mint.message,
+        )
+        ledger.event(
+            phase="gate",
+            event="decision_point_deferred_until_condition_decline_awaiting_turn_boundary",
+            status="skipped",
+            reason_code=REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY,
+            repo=repo,
+            cwd=cwd,
+            session_id=session_id,
+            candidate_fingerprint=fingerprint,
+        )
+        return _decision_point_silent_stop(
+            ledger,
+            reason_code=REASON_DECISION_POINT_DEFERRED_UNTIL_CONDITION_DECLINE_AWAITING_TURN_BOUNDARY,
+            message=(
+                "review-validate-fix: "
+                + (mint.message or "agent 刚把本次审查延后到某个条件，本回合不再征询。")
             ),
             repo=repo,
             cwd=cwd,

@@ -485,7 +485,7 @@ def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_mint
                 # agent 谢绝 ⇒ 前任进终态（并写下 declined 冷却，由手动路径自己清掉）。
                 store.mark_declined(
                     predecessor.token,
-                    reason="agent_declined_for_stale_index_race_test",
+                    decline_kind="structural_not_needed", reason="agent_declined_for_stale_index_race_test",
                     root=roots["decision_token_root_dir"],
                     cooldown_root=roots["declined_fingerprint_root_dir"],
                     now=store.parse_timestamp(minted_at),
@@ -506,6 +506,11 @@ def test_same_dedup_key_concurrent_mints_over_stale_index_yield_exactly_one_mint
                     result = mint_for_this_round(
                         now=raced_at,
                         initiated_by_explicit_user_request=initiated_by_explicit_user_request,
+                        explicit_user_request_provenance=(
+                            store.EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT
+                            if initiated_by_explicit_user_request
+                            else None
+                        ),
                     )
                     with results_lock:
                         mint_results.append(result)
@@ -625,20 +630,31 @@ def test_stranded_delivery_withdrawal_retains_mint_request_charge_so_repeat_stra
             circuit_breaker_root_dir=roots["circuit_breaker_root_dir"],
         )
 
-    # 三次铸造请求的额度**全部**留在账上（阈值 3 ⇒ 第三次即跳闸）。
+    # 两枚铸出后空转撤回的 token，额度**全部**留在账上（阈值 3 ⇒ 第三次请求即跳闸）。第三次请求
+    # 被熔断拒掉、没铸出 token，它自己那一份当场冲销——不冲销的话熔断会自我续命。
+    assert outcomes == [
+        store.MINT_OUTCOME_MINTED,
+        store.MINT_OUTCOME_MINTED,
+        store.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED,
+    ], outcomes
     assert (
         store.count_recent_mint_requests(
             session_id, root=roots["circuit_breaker_root_dir"]
         )
-        == 3
+        == 2
     ), _mint_request_ledger_lines(store, roots, session_id)
-    # 一条冲销行都不该有。
+    # 撤回不该留下任何冲销行；唯一的冲销行属于被熔断拒掉的那次请求。
     reversal_lines = [
         line
         for line in _mint_request_ledger_lines(store, roots, session_id)
         if store.MINT_REQUEST_LEDGER_CHARGE_REVERSAL_FIELD in line
     ]
-    assert reversal_lines == [], reversal_lines
+    assert [line.get("token") for line in reversal_lines] == [None], reversal_lines
+    assert all(
+        line.get("reversed_because")
+        == "circuit_breaker_refused_this_mint_request_so_no_token_was_minted"
+        for line in reversal_lines
+    ), reversal_lines
     # 第三次铸造把窗口内计数推到阈值 ⇒ 熔断跳闸，第四次不再铸。
     assert outcomes[-1] in (
         store.MINT_OUTCOME_MINTED,

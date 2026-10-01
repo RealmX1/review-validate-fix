@@ -4912,7 +4912,7 @@ def test_decision_point_declined_cooldown_suppresses_reinjection(tmp_path: Path)
     _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
 
     # 真实 CLI 谢绝该 token（指纹入 declined 冷却表）。
-    result = _run_rvf_agent(state, dirty, "decline", "--token", token, "--reason", "这是我刚跑完的 RVF 结果，不重复审")
+    result = _run_rvf_agent(state, dirty, "decline", "--token", token, "--decline-kind", "structural_not_needed", "--reason", "这是我刚跑完的 RVF 结果，不重复审")
     assert result.returncode == 0, (result.stdout, result.stderr)
 
     # 同一 dirty（同指纹）再次 Stop → 命中 declined 冷却 → 不注入、静默停。
@@ -4939,7 +4939,7 @@ def test_decision_point_declined_session_scope_snooze_silences_work_in_progress_
 
     stdout, _ = invoke(event, state_dir=state)
     _payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
-    declined = _run_rvf_agent(state, repo, "decline", "--token", token, "--reason", "还在施工，收尾后再审")
+    declined = _run_rvf_agent(state, repo, "decline", "--token", token, "--decline-kind", "structural_not_needed", "--reason", "只是格式化，琐碎改动")
     assert declined.returncode == 0, (declined.stdout, declined.stderr)
     assert "snooze" in declined.stdout, declined.stdout
 
@@ -4964,6 +4964,61 @@ def test_decision_point_declined_session_scope_snooze_silences_work_in_progress_
     run(["git", "commit", "-q", "-m", "unrelated"], repo)
     stdout_after_commit, _ = invoke(event, state_dir=state)
     assert_decision_point_injection(stdout_after_commit, expect_paths=("changed.txt",))
+
+
+def test_decision_point_deferred_until_condition_decline_is_reasked_with_previous_reason_instead_of_snoozed(
+    tmp_path: Path,
+) -> None:
+    """D1 端到端：延后型谢绝（「测试还在跑，跑完再审」）不进指纹冷却、不进会话 snooze。
+
+    谢绝后原样停下的那次 Stop 静默（条件不可能零秒满足，重问只会乒乓烧熔断）；agent 接着改了候选
+    文件再停下 ⇒ 重新征询，横幅带上「你上次延后到：<理由>」。修复前 decline 不分类型，同一场景会被
+    同指纹冷却 / T3 snooze 一路压住（回溯里延后型谢绝错误率 16–48% 的主因）。
+    """
+    repo = init_repo_with_head(tmp_path / "repo")
+    state = tmp_path / "state"
+    event = {"cwd": str(repo), "session_id": "deferred-decline-1", "stop_hook_active": False}
+
+    stdout, _ = invoke(event, state_dir=state)
+    payload, token = assert_decision_point_injection(stdout, expect_paths=("changed.txt",))
+    banner_text = json.dumps(payload, ensure_ascii=False)
+    assert "--decline-kind" in banner_text and "deferred_until_condition" in banner_text, banner_text
+
+    missing_kind = _run_rvf_agent(state, repo, "decline", "--token", token, "--reason", "没写类型")
+    assert missing_kind.returncode != 0, (missing_kind.stdout, missing_kind.stderr)
+    declined = _run_rvf_agent(
+        state, repo, "decline", "--token", token,
+        "--decline-kind", "deferred_until_condition", "--reason", "测试还在跑，跑完再审",
+    )
+    assert declined.returncode == 0, (declined.stdout, declined.stderr)
+    cooldown_root = rvf_home_dir(state) / "agentic-initiation-declined-fingerprints"
+    assert sorted(cooldown_root.glob("*.json")) == [], "延后型谢绝不得写指纹冷却"
+    assert not (cooldown_root / "declined-session-scope-snoozes").exists() or not any(
+        (cooldown_root / "declined-session-scope-snoozes").rglob("*.json")
+    ), "延后型谢绝不得写会话 snooze"
+
+    # 谢绝后原样停下：静默，且不占熔断额度。
+    stdout_same_turn, _ = invoke(event, state_dir=state)
+    payload_same_turn = parse_json(stdout_same_turn)
+    assert "decision" not in payload_same_turn and "hookSpecificOutput" not in payload_same_turn
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_deferred_until_condition_decline_awaiting_turn_boundary"
+    )
+
+    # agent 接着把条件做完（改了候选文件）再停下 ⇒ 重新征询，横幅引用上次的延后理由。
+    (repo / "changed.txt").write_text("dirty\ntests finished, follow-up edit\n", encoding="utf-8")
+    stdout_after_change, _ = invoke(event, state_dir=state)
+    payload_after_change, token_after_change = assert_decision_point_injection(
+        stdout_after_change, expect_paths=("changed.txt",)
+    )
+    assert token_after_change != token
+    assert "你上次延后到：「测试还在跑，跑完再审」" in json.dumps(
+        payload_after_change, ensure_ascii=False
+    ), payload_after_change
+    outcomes = [a.get("mint_outcome") for a in injection_attempt_records(state)]
+    assert outcomes.count("injected") == 2, outcomes
+    assert outcomes.count("deferred_until_condition_decline_awaiting_turn_boundary") == 1, outcomes
+    assert "declined_cooldown" not in outcomes and "declined_session_scope_snooze" not in outcomes
 
 
 def test_decision_point_circuit_breaker_suppresses_after_repeated_mints(tmp_path: Path) -> None:
@@ -6254,6 +6309,7 @@ def main() -> int:
         test_decision_point_nonempty_candidates_always_leave_injection_ledger_record,
         test_decision_point_declined_cooldown_suppresses_reinjection,
         test_decision_point_declined_session_scope_snooze_silences_work_in_progress_until_commit,
+        test_decision_point_deferred_until_condition_decline_is_reasked_with_previous_reason_instead_of_snoozed,
         test_decision_point_circuit_breaker_suppresses_after_repeated_mints,
         test_decision_point_receipt_ttl_lost_warns_without_retry,
         test_preserved_guards_short_circuit_before_decision_point_injection,
@@ -6268,6 +6324,7 @@ def main() -> int:
         test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered,
         test_decision_point_transport_override_without_task_id_falls_back_honestly,
         test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker,
+        test_decision_point_in_flight_banner_is_withdrawn_as_soon_as_kanban_reports_delivery_failure,
         test_decision_point_out_of_band_single_flight_busy_does_not_mint,
         test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once,
         # 搁浅对账的枚举面是跨 task 全局的，早退判据必须先收敛到本轮这条投递通道。

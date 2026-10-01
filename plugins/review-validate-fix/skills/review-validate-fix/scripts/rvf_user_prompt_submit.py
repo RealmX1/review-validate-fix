@@ -381,6 +381,28 @@ def _extend_round_baseline_expiry_for_host_synthesized_turn(event: dict[str, Any
         return None
 
 
+def _mark_new_turn_observed_for_deferred_until_condition_declines(event: dict[str, Any]) -> bool:
+    """给本会话所有延后型谢绝记录打「出现了新回合」标志（闸 2c 据此放行重新征询）。
+
+    会话身份只取 ``event["session_id"]``（与 snooze 基线重置同口径）；best-effort，失败永不阻断 prompt
+    ——少打一次标志只让重新征询晚一个回合。返回是否真的打了至少一条。
+    """
+    try:
+        import rvf_decision_token_store  # noqa: PLC0415 - lazy, stdlib-only
+
+        raw_session_id = event.get("session_id")
+        if not (isinstance(raw_session_id, str) and raw_session_id.strip()):
+            return False
+        return (
+            rvf_decision_token_store.mark_new_turn_observed_for_deferred_until_condition_declines_in_session(
+                session_id=raw_session_id.strip()
+            )
+            > 0
+        )
+    except Exception:
+        return False
+
+
 def _host_synthesized_user_prompt_submit_turn_kind(event: dict[str, Any], prompt: str) -> str | None:
     """这条 UPS 是否 host 自己合成的回合（经**当前会话**的 HostAdapter 判定；core 不写 host 字面量）。
 
@@ -960,6 +982,8 @@ def _manual_decision_additional_context_text(
     inline_scope: list[str] | None = None,
     overrode_agent_declined_cooldown: bool = False,
     overrode_agent_declined_session_scope_snooze: bool = False,
+    overrode_agent_deferred_until_condition_decline: bool = False,
+    overridden_deferred_until_condition_decline_reason: str | None = None,
 ) -> str:
     """manual 决策点注入的 ``additionalContext`` 正文（model-facing，喂进主 agent 上下文）。
 
@@ -976,6 +1000,9 @@ def _manual_decision_additional_context_text(
     ``overrode_agent_declined_session_scope_snooze=True`` 同理，对应闸 2b：agent 早前在**本会话**对这片
     工作范围谢绝过（此后改动还在继续，所以内容指纹已变、冷却不命中，只剩 snooze 挡着）。T3 之后这是
     最常见的被推翻形态，两者任一为真都要告知；措辞按实际命中的那一种写，不把「范围」说成「同一批改动」。
+
+    ``overrode_agent_deferred_until_condition_decline=True`` 对应闸 2c：agent 早前说过「等 X 之后再审」。
+    用户显式触发就是「现在就审」，所以要引用那条延后理由，提醒 agent 不要以同一条件再延后一次。
     """
     lines: list[str] = []
     if newly_minted:
@@ -994,6 +1021,16 @@ def _manual_decision_additional_context_text(
             f"⚠️ 注意：{overridden_decline_description}，用户这次的显式触发已推翻该谢绝。"
             "请不要以「上次已判断过不必审」为由再次 decline——除非你有本次新出现的理由。"
         )
+    if overrode_agent_deferred_until_condition_decline:
+        quoted_reason = (
+            f"「{overridden_deferred_until_condition_decline_reason}」"
+            if overridden_deferred_until_condition_decline_reason
+            else "某个条件满足之后"
+        )
+        lines.append(
+            f"⚠️ 注意：你早前在本会话把审查延后到{quoted_reason}；用户这次的显式触发表示现在就审。"
+            "请不要以同一个条件再延后一次——除非你有本次新出现的理由。"
+        )
     lines.append("请简要评估后用下面的 `rvf` 命令**显式** start（发起）或 decline（谢绝）。")
     lines.append("")
     try:
@@ -1008,7 +1045,10 @@ def _manual_decision_additional_context_text(
         lines.append(f"RVF_DECISION_TOKEN={token}")
         lines.append(f"候选文件数: {summary.get('candidate_path_count')}")
         lines.append(f"发起: rvf start --token {token} --reason \"<一句话理由>\"")
-        lines.append(f"谢绝: rvf decline --token {token} --reason \"<一句话理由>\"")
+        lines.append(
+            f"谢绝: rvf decline --token {token} --decline-kind "
+            "<structural_not_needed|deferred_until_condition> --reason \"<一句话理由>\""
+        )
     if inline_scope:
         lines.append("")
         lines.append(
@@ -1124,6 +1164,9 @@ def _handle_manual_decision_point(
             candidate_summary=summary,
             now=now_dt,
             initiated_by_explicit_user_request=True,
+            explicit_user_request_provenance=(
+                decision_token_store.EXPLICIT_USER_REQUEST_PROVENANCE_DEVELOPER_MANUAL_TRIGGER_VIA_USER_PROMPT_SUBMIT
+            ),
         )
     except Exception as exc:  # pragma: no cover - 铸造异常兜底
         injection_attempt_ledger.record_injection_attempt(
@@ -1178,6 +1221,12 @@ def _handle_manual_decision_point(
             inline_scope=inline_scope,
             overrode_agent_declined_cooldown=overrode_cooldown,
             overrode_agent_declined_session_scope_snooze=overrode_session_scope_snooze,
+            overrode_agent_deferred_until_condition_decline=(
+                mint.explicit_user_request_overrode_agent_deferred_until_condition_decline
+            ),
+            overridden_deferred_until_condition_decline_reason=(
+                mint.overridden_deferred_until_condition_decline_reason
+            ),
         )
         detail = f"候选 {candidate_count} 文件"
         if overrode_cooldown:
@@ -1195,6 +1244,8 @@ def _handle_manual_decision_point(
                 if session_scope_snooze_record_still_blocks_automatic_path
                 else "，并已清除该 snooze"
             )
+        if mint.explicit_user_request_overrode_agent_deferred_until_condition_decline:
+            detail += "；已推翻 agent 早前在本会话的延后型谢绝（「等条件满足再审」）"
         manual_payload.update(
             {
                 "status": "manual_decision_injected" if newly_minted else "manual_decision_deduplicated",
@@ -1839,6 +1890,10 @@ def inspect_user_prompt_submit(
             synthesized_payload["round_baseline_expiry_extended_without_moving_head_marker_path"] = (
                 extended_round_baseline_marker_path
             )
+        # 唯一的例外：对「延后型谢绝」而言合成回合**就是**新回合——后台测试跑完、后台子代理写完，
+        # 正是 agent 最常写下的延后条件。
+        if _mark_new_turn_observed_for_deferred_until_condition_declines(event):
+            synthesized_payload["deferred_until_condition_declines_marked_new_turn_observed"] = True
         return synthesized_payload
 
     token = dispatch_token_from_text(prompt)
@@ -1936,6 +1991,11 @@ def inspect_user_prompt_submit(
                 )
         except Exception:
             pass
+
+    # 闸 2c（延后型谢绝）：开发者发话是新回合，放行「等 X 之后再审」的重新征询。判据与上面同源：RVF 自己
+    # 的三类机器正文不算回合边界（带外横幅本身落地时 agent 才刚要决定，拿它放行会立刻自问自答）。
+    if token is None and origin_marker is None and decision_point_token is None:
+        _mark_new_turn_observed_for_deferred_until_condition_declines(event)
 
     diagnostic_session_keys = ("cwd", "hook_event_name", "session_id", "agent_id", "agent_type")
 

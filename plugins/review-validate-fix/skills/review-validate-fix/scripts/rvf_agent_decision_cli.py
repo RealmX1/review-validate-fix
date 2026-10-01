@@ -24,8 +24,10 @@ prompt 里拿到、显式回传（本 CLI 不枚举、不发现 token —— R18
   * ``dispatch --token --strictness <light|standard|strict>``：scope 定稿 → 严格度终选（读 S2
     preset）→ 派发 reviewer（复用现有 ``dispatch_reviewers`` 语义，S7 才模块化，本切片不重写它）
     → ``mark_dispatched``（终态）。
-  * ``decline --token --reason``：理由持久化到 context 之外（rewind 不可抹的落盘 ledger）+
-    ``mark_declined``（指纹自动入 declined 冷却表，指纹未变不再注入）→ token 终态 ``declined``。
+  * ``decline --token --reason --decline-kind <structural_not_needed|deferred_until_condition>``：
+    理由持久化到 context 之外（rewind 不可抹的落盘 ledger）+ ``mark_declined`` → token 终态
+    ``declined``。结构性谢绝入 declined 冷却表 + 会话级 snooze；延后型谢绝两者都不进，下一个回合或
+    HEAD 变化后重新征询。
 
 **明确不做**（R18/R22）：``candidates`` 子命令不存在；``_backfill_child_session`` /
 ``_resolve_child_transcript_path`` 不迁入本 CLI（留 UPS —— 它们必须在 child 的 UPS 事件到达后
@@ -1946,7 +1948,8 @@ def run_start(
                 "只会让同一批 diff 在下一次 Stop 再被提议一遍。"
             ),
             next_steps=[
-                f'① 通常应当谢绝本轮：{_rvf()} decline --token {token} --reason "上一轮 RVF 产物，无未审单元"',
+                f'① 通常应当谢绝本轮：{_rvf()} decline --token {token} --decline-kind '
+                f'{token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED} --reason "上一轮 RVF 产物，无未审单元"',
                 f"② 确知有 tracker 看不见的新工作（例如经 shell heredoc 写入的文件）而要重审："
                 f"{_rvf()} start --token {token} --retry --force-full-rescope --reason <重审理由>",
             ],
@@ -2918,14 +2921,16 @@ def run_decline(
     *,
     token: str,
     reason: str,
+    decline_kind: str,
     roots: AgentDecisionRoots | None = None,
     now: datetime | None = None,
 ) -> CommandResult:
-    """``decline`` 子命令：mark_declined（终态 + 指纹入冷却表 + 会话级 snooze）+ 理由落 append-only ledger。
+    """``decline`` 子命令：mark_declined（终态 + 按 ``decline_kind`` 分流）+ 理由落 append-only ledger。
 
-    回执如实报告会话级 snooze 是否落盘（读回磁盘，而非假设 mark_declined 一定写成）：落盘了就告诉
-    agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（无
-    session_id、候选摘要缺工作范围身份、I/O 失败）就只承诺内容指纹冷却。
+    结构性谢绝：回执如实报告会话级 snooze 是否落盘（读回磁盘，而非假设 mark_declined 一定写成）：
+    落盘了就告诉 agent「本会话内这片工作范围不会再弹横幅，直到提交 / 范围明显扩大」；没落盘（无
+    session_id、候选摘要缺工作范围身份、I/O 失败）就只承诺内容指纹冷却。延后型谢绝：如实告诉 agent
+    下一次在什么时候重新征询（同样读回磁盘上的延后记录，没落盘就说「下一次 Stop 即重新征询」）。
 
     理由持久化的落点是**磁盘上的 append-only ledger**（``~/.rvf`` 下，路径可注入），刻意在
     transcript / context 之外——rewind 抹不掉磁盘记录（R5/R12：理由必须持久化到 context 之外）。
@@ -2941,7 +2946,12 @@ def run_decline(
 
     try:
         declined = token_store.mark_declined(
-            token, reason=reason, root=roots.token_root, now=now_dt, cooldown_root=roots.cooldown_root
+            token,
+            reason=reason,
+            decline_kind=decline_kind,
+            root=roots.token_root,
+            now=now_dt,
+            cooldown_root=roots.cooldown_root,
         )
     except token_store.DecisionTokenError as exc:
         return CommandResult(
@@ -2962,13 +2972,50 @@ def run_decline(
             "session_id": session_id,
             "candidate_fingerprint": fingerprint,
             "reason": reason,
+            "decline_kind": decline_kind,
             "declined_at": _format_timestamp(now_dt),
         },
     )
     append_decision_telemetry(
         token=token, event="declined", worktree=worktree, session_id=session_id,
-        now=now_dt, root=roots.telemetry_root, detail={"reason": reason, "candidate_fingerprint": fingerprint},
+        now=now_dt, root=roots.telemetry_root,
+        detail={"reason": reason, "decline_kind": decline_kind, "candidate_fingerprint": fingerprint},
     )
+    reopen_own_declined_decision_next_step = (
+        "开发者之后口头要求开审时，不必请他手动触发："
+        f'{_rvf()} start --reopen-own-declined-decision --reason "<开发者原话>"'
+        "（只能撤回本会话最近一次谢绝）"
+    )
+    if decline_kind == token_store.DECLINE_KIND_DEFERRED_UNTIL_CONDITION:
+        deferred_until_condition_decline_recorded = (
+            token_store.read_deferred_until_condition_decline(
+                worktree=str(declined.payload.get("worktree") or ""),
+                session_id=str(declined.payload.get("session_id") or ""),
+                cooldown_root=roots.cooldown_root,
+            )
+            is not None
+        )
+        message = (
+            "已把本次审查延后（延后型谢绝）；理由已持久化（rewind 不可抹）。不进指纹冷却、不进会话级 "
+            "snooze："
+            + (
+                "原样停下不会再问；出现下一个回合（开发者发话、后台任务或子代理完成通知）、提交、或你"
+                "接着改了候选文件之后，只要候选还在就会重新征询，横幅会写明你这次延后到什么条件。"
+                if deferred_until_condition_decline_recorded
+                else "延后记录未落盘（缺会话身份或 I/O 失败），下一次 Stop 只要候选还在就会重新征询。"
+            )
+        )
+        return CommandResult(
+            command="decline", status="ok", exit_code=EXIT_OK, token=token, token_state=declined.state,
+            message=message,
+            next_steps=[reopen_own_declined_decision_next_step],
+            detail={
+                "declined_reason_ledger": str(ledger_path),
+                "candidate_fingerprint": fingerprint,
+                "decline_kind": decline_kind,
+                "deferred_until_condition_decline_recorded": deferred_until_condition_decline_recorded,
+            },
+        )
     declined_session_scope_snooze_recorded = (
         token_store.read_declined_session_scope_snooze(
             worktree=str(declined.payload.get("worktree") or ""),
@@ -2977,7 +3024,7 @@ def run_decline(
         )
         is not None
     )
-    message = "已谢绝本次审查发起；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）"
+    message = "已谢绝本次审查发起（结构性谢绝）；理由已持久化（rewind 不可抹），候选指纹已入 declined 冷却表（指纹未变不再注入）"
     message += (
         "；本会话已 snooze 这片工作范围——直到提交或范围明显扩大（开发者发来新 prompt 后以那一刻为新基线），自动 Stop 不再为它弹横幅。"
         if declined_session_scope_snooze_recorded
@@ -2986,11 +3033,244 @@ def run_decline(
     return CommandResult(
         command="decline", status="ok", exit_code=EXIT_OK, token=token, token_state=declined.state,
         message=message,
+        next_steps=[reopen_own_declined_decision_next_step],
         detail={
             "declined_reason_ledger": str(ledger_path),
             "candidate_fingerprint": fingerprint,
+            "decline_kind": decline_kind,
             "declined_session_scope_snooze_recorded": declined_session_scope_snooze_recorded,
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# start --reopen-own-declined-decision：agent 按开发者口头要求撤回自己的谢绝（D2）
+#
+# 回溯里 agent 误读 / 外推开发者指令而谢绝的情形仍在（例：把「调查期不跑真实 RVF」外推到真正的
+# 源码修复）。开发者随后口头说「审一下」时，agent 只能回答「token 已终态，请你手动触发」——它没有
+# 任何入口推翻自己的谢绝。这里给它一个：语义与开发者手动触发**完全一致**（复用
+# ``initiated_by_explicit_user_request`` 的豁免：清指纹冷却、清会话 snooze、清延后记录、跳过熔断），
+# 但只许撤回**本会话最近一枚** token、且它必须是 declined；token payload 与遥测记下来源与开发者原话，
+# 与真正的手动触发区分开。
+# ---------------------------------------------------------------------------
+
+def _git_toplevel_of_directory(directory: Path) -> Path | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(directory), capture_output=True, text=True, check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    output = completed.stdout.strip()
+    return Path(output).resolve() if completed.returncode == 0 and output else None
+
+
+def _paths_name_same_directory(left: Any, right: Path) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    try:
+        return Path(left).expanduser().resolve() == right
+    except OSError:
+        return False
+
+
+def find_newest_decision_token_of_session_on_worktree(
+    *, worktree: Path, session_id: str, root: str | Path | None = None
+) -> dict[str, Any] | None:
+    """本会话在本 worktree 上铸出的**最近一枚**决策 token 的 payload（任意状态；按 ``minted_at``）。"""
+    try:
+        token_paths = sorted(token_store.decision_token_root(root).glob("*.json"))
+    except OSError:
+        return None
+    newest: dict[str, Any] | None = None
+    for token_path in token_paths:
+        try:
+            payload = json.loads(token_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("session_id") != session_id:
+            continue
+        if not _paths_name_same_directory(payload.get("worktree"), worktree):
+            continue
+        if newest is None or str(payload.get("minted_at") or "") > str(newest.get("minted_at") or ""):
+            newest = payload
+    return newest
+
+
+def _default_candidate_summary_builder_for_reopen(event: dict[str, Any], worktree: str) -> dict[str, Any]:
+    import stop_decision_candidate_summary  # noqa: PLC0415 - 惰性：只有撤回谢绝才需要现算候选
+
+    summary = stop_decision_candidate_summary.build_candidate_summary(
+        event=event, cwd=worktree, repo=worktree, ledger=None
+    )
+    try:
+        import stop_review_validate_fix as stop_hook  # noqa: PLC0415
+
+        stop_hook.stamp_origin_transcript_path_on_candidate_summary(summary, event)
+    except Exception:  # noqa: BLE001 - 加料失败退化成「无 transcript」，由 start 侧显式降级承接
+        pass
+    return summary
+
+
+def run_start_reopening_own_declined_decision_on_developer_verbal_request(
+    *,
+    developer_verbal_request: str,
+    repo: str | None = None,
+    session_id: str | None = None,
+    transcript_path: str | None = None,
+    force_full_rescope: bool = False,
+    roots: AgentDecisionRoots | None = None,
+    now: datetime | None = None,
+    candidate_summary_builder: Callable[[dict[str, Any], str], dict[str, Any]] | None = None,
+    start_runner: Callable[..., CommandResult] | None = None,
+) -> CommandResult:
+    """``start --reopen-own-declined-decision --reason "<开发者原话>"``：撤回本会话最近一次谢绝并开审。
+
+    前置（任一不满足就拒绝、什么都不改）：解析得出当前会话身份；本会话在本 worktree 上最近一枚
+    token 是 ``declined``；现算的候选非空。满足后以「用户显式请求」铸一枚新 token（来源
+    ``agent_reopened_own_declined_decision_on_developer_verbal_request``），再对它走常规 ``start``。
+    """
+    roots = roots or AgentDecisionRoots()
+    now_dt = _coerce_now(now)
+    candidate_summary_builder = candidate_summary_builder or _default_candidate_summary_builder_for_reopen
+    start_runner = start_runner or run_start
+    command = "start"
+
+    def _refuse(message: str, **detail: Any) -> CommandResult:
+        return CommandResult(
+            command=command, status="error", exit_code=EXIT_TOKEN_STATE, message=message,
+            detail={"reopen_own_declined_decision_refused": True, **detail},
+        )
+
+    if not developer_verbal_request.strip():
+        return _refuse("--reason 必须是开发者要求开审的原话（会写进回执与遥测），不能为空。")
+    if session_id is None:
+        from core.host_adapter.current_agent_session_identity_from_environment import (  # noqa: PLC0415
+            resolve_current_agent_session_id_from_environment,
+        )
+
+        session_id = resolve_current_agent_session_id_from_environment()
+    if not session_id:
+        return _refuse(
+            "解析不出当前会话身份，无法确认「最近一次谢绝是本会话做的」，拒绝撤回。"
+            "请显式传 --session-id，或请开发者手动触发 RVF。"
+        )
+    worktree_path = (
+        Path(repo).expanduser().resolve() if repo else _git_toplevel_of_directory(Path.cwd())
+    )
+    if worktree_path is None:
+        return _refuse("cwd 不在 git worktree 内；请传 --repo 指明要撤回谢绝的 worktree。")
+    newest = find_newest_decision_token_of_session_on_worktree(
+        worktree=worktree_path, session_id=session_id, root=roots.token_root
+    )
+    if newest is None or newest.get("state") != token_store.STATE_DECLINED:
+        newest_description = (
+            "本会话在这个 worktree 上没有任何决策 token"
+            if newest is None
+            else f"本会话最近一枚决策 token {newest.get('token')} 的状态是 {newest.get('state')}，不是 declined"
+        )
+        return _refuse(
+            f"{newest_description}。--reopen-own-declined-decision 只能撤回本会话**最近一次**的谢绝；"
+            "若横幅还在等你表态，直接 start 那枚 token。",
+            newest_decision_token_of_session=(newest or {}).get("token"),
+            newest_decision_token_state=(newest or {}).get("state"),
+        )
+    declined_token = str(newest.get("token"))
+    declined_summary = newest.get("candidate_summary") if isinstance(newest.get("candidate_summary"), dict) else {}
+    if transcript_path is None:
+        try:
+            import stop_review_validate_fix as stop_hook  # noqa: PLC0415
+
+            stamped_transcript_path = declined_summary.get(
+                stop_hook.CANDIDATE_SUMMARY_ORIGIN_TRANSCRIPT_PATH_KEY
+            )
+        except Exception:  # noqa: BLE001
+            stamped_transcript_path = None
+        transcript_path = stamped_transcript_path if isinstance(stamped_transcript_path, str) else None
+    worktree = str(newest.get("worktree") or worktree_path)
+    event: dict[str, Any] = {"cwd": worktree, "session_id": session_id}
+    if transcript_path:
+        event["transcript_path"] = transcript_path
+    summary = candidate_summary_builder(event, worktree)
+    candidate_count = int(summary.get("candidate_path_count") or 0)
+    if candidate_count <= 0:
+        return _refuse(
+            "这个 worktree 现在没有可审的候选改动（自上次 review 以来无改动，或都已审过），没有可撤回重开的东西。",
+            reopened_declined_decision_token=declined_token,
+        )
+    try:
+        mint = token_store.mint_decision_token(
+            worktree=str(summary.get("repo") or worktree),
+            session_id=session_id,
+            candidate_fingerprint=str(summary.get("candidate_fingerprint") or ""),
+            candidate_summary=summary,
+            now=now_dt,
+            root=roots.token_root,
+            cooldown_root=roots.cooldown_root,
+            initiated_by_explicit_user_request=True,
+            explicit_user_request_provenance=(
+                token_store.EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST
+            ),
+            extra_token_payload_fields={
+                "reopened_declined_decision_token": declined_token,
+                "developer_verbal_request_that_reopened_declined_decision": developer_verbal_request,
+            },
+        )
+    except token_store.DecisionTokenError as exc:
+        return _refuse(f"重新铸造决策 token 失败：{exc}", reopened_declined_decision_token=declined_token)
+    if not mint.token:
+        return _refuse(
+            f"重新铸造决策 token 未成功（outcome={mint.outcome}）：{mint.message or ''}",
+            reopened_declined_decision_token=declined_token,
+        )
+    reopen_detail = {
+        "explicit_user_request_provenance": (
+            token_store.EXPLICIT_USER_REQUEST_PROVENANCE_AGENT_REOPENED_OWN_DECLINED_DECISION_ON_DEVELOPER_VERBAL_REQUEST
+        ),
+        "reopened_declined_decision_token": declined_token,
+        "reopened_declined_decision_kind": newest.get("decline_kind"),
+        "developer_verbal_request_that_reopened_declined_decision": developer_verbal_request,
+        "reopened_decision_token": mint.token,
+        "reopened_decision_token_mint_outcome": mint.outcome,
+        "explicit_user_request_overrode_agent_declined_cooldown": (
+            mint.explicit_user_request_overrode_agent_declined_cooldown
+        ),
+        "explicit_user_request_overrode_agent_declined_session_scope_snooze": (
+            mint.explicit_user_request_overrode_agent_declined_session_scope_snooze
+        ),
+        "explicit_user_request_overrode_agent_deferred_until_condition_decline": (
+            mint.explicit_user_request_overrode_agent_deferred_until_condition_decline
+        ),
+    }
+    append_decision_telemetry(
+        token=mint.token, event="agent_reopened_own_declined_decision_on_developer_verbal_request",
+        worktree=worktree, session_id=session_id, now=now_dt, root=roots.telemetry_root,
+        detail=reopen_detail,
+    )
+    started = start_runner(
+        token=mint.token,
+        reason=f"开发者口头要求开审，撤回本会话的谢绝 {declined_token}：{developer_verbal_request}",
+        repo=repo,
+        session_id=session_id,
+        transcript_path=transcript_path,
+        roots=roots,
+        now=now_dt,
+        force_full_rescope=force_full_rescope,
+    )
+    return CommandResult(
+        command=started.command,
+        status=started.status,
+        exit_code=started.exit_code,
+        token=started.token,
+        token_state=started.token_state,
+        message=(
+            f"已按开发者口头要求撤回本会话的谢绝（token {declined_token}），以新 token {mint.token} 开审"
+            "（与开发者手动触发同样豁免冷却 / snooze / 熔断；来源记为「agent 按开发者口头要求撤回」）。"
+            + (" " + started.message if started.message else "")
+        ),
+        next_steps=list(started.next_steps),
+        detail={**dict(started.detail), **reopen_detail},
     )
 
 
@@ -3443,8 +3723,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_start = sub.add_parser("start", help="token→acknowledged + 前置校验 + prepare 全套 + 自动 scope 产出")
-    p_start.add_argument("--token", required=True, help="注入 prompt 里拿到的决策 token（显式回传）")
-    p_start.add_argument("--reason", required=True, help="简析后开启审查的理由")
+    p_start.add_argument(
+        "--token", default=None, help="注入 prompt 里拿到的决策 token（显式回传；与 --reopen-own-declined-decision 二选一）"
+    )
+    p_start.add_argument(
+        "--reopen-own-declined-decision",
+        action="store_true",
+        help=(
+            "开发者口头要求开审、而你本会话最近一次表态是谢绝时用：撤回那次谢绝并直接开审"
+            "（与开发者手动触发同样豁免冷却 / snooze / 熔断）。此时 --reason 写开发者的原话。"
+            "只能撤回本会话最近一枚 token，且它必须是 declined"
+        ),
+    )
+    p_start.add_argument("--reason", required=True, help="简析后开启审查的理由（--reopen-own-declined-decision 时写开发者原话）")
     p_start.add_argument("--repo", default=None, help="目标 worktree（默认取 token 记录的 worktree）")
     p_start.add_argument("--session-id", default=None, help="覆盖 session id（默认取 token 记录）")
     p_start.add_argument(
@@ -3495,9 +3786,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--strictness", required=True, choices=list(STRICTNESS_TIERS))
     p_disp.add_argument("--dry-run", action="store_true", help="dispatch_reviewers 走 --dry-run，不真拉起 reviewer")
 
-    p_dec = sub.add_parser("decline", help="谢绝发起：理由持久化 + 指纹入冷却表 + 终态 declined")
+    p_dec = sub.add_parser("decline", help="谢绝发起：理由持久化 + 按谢绝类型分流 + 终态 declined")
     p_dec.add_argument("--token", required=True)
     p_dec.add_argument("--reason", required=True, help="谢绝理由（持久化到 context 之外，rewind 不可抹）")
+    p_dec.add_argument(
+        "--decline-kind",
+        required=True,
+        choices=sorted(token_store.DECLINE_KINDS),
+        help=(
+            "structural_not_needed＝这批改动本就不需要 RVF（R24 / 在途 run 的产物、琐碎改动、非本会话"
+            "改动、开发者明确说不要审）：入指纹冷却 + 本会话 snooze。"
+            "deferred_until_condition＝现在不审、条件满足后要审（测试还在跑、提交后再审、子代理还在写）："
+            "不冷却不 snooze，下一个回合、提交或候选内容变化后重新征询，横幅会写明你延后到的条件"
+        ),
+    )
 
     p_dec_dispatched = sub.add_parser(
         "decline-dispatched-review",
@@ -3525,7 +3827,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "start":
+    if args.command == "start" and args.reopen_own_declined_decision:
+        if args.token or args.retry:
+            parser.error("--reopen-own-declined-decision 不能与 --token / --retry 同用（它会自己铸新 token）")
+        result = run_start_reopening_own_declined_decision_on_developer_verbal_request(
+            developer_verbal_request=args.reason, repo=args.repo, session_id=args.session_id,
+            transcript_path=args.transcript_path, force_full_rescope=args.force_full_rescope,
+        )
+    elif args.command == "start":
+        if not args.token:
+            parser.error("start 需要 --token（或用 --reopen-own-declined-decision 撤回本会话最近一次谢绝）")
         result = run_start(
             token=args.token, reason=args.reason, repo=args.repo,
             session_id=args.session_id, transcript_path=args.transcript_path, retry=args.retry,
@@ -3543,7 +3854,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "dispatch":
         result = run_dispatch(token=args.token, strictness=args.strictness, dry_run=args.dry_run)
     elif args.command == "decline":
-        result = run_decline(token=args.token, reason=args.reason)
+        result = run_decline(token=args.token, reason=args.reason, decline_kind=args.decline_kind)
     elif args.command == "decline-dispatched-review":
         result = run_decline_dispatched_review(
             token=args.token,
@@ -3578,7 +3889,8 @@ __all__ = [
     "append_decision_telemetry", "record_scope_exception_and_maybe_file_issue",
     "compute_effective_primary_files", "load_strictness_preset", "finalize_scope_contract",
     "resolve_agent_initiation_backend", "default_launch_preflight", "default_provider_health_requirements",
-    "run_start", "run_scope_annotate", "run_scope_exclude", "run_scope_include", "run_dispatch", "run_decline",
+    "run_start", "run_start_reopening_own_declined_decision_on_developer_verbal_request",
+    "find_newest_decision_token_of_session_on_worktree", "run_scope_annotate", "run_scope_exclude", "run_scope_include", "run_dispatch", "run_decline",
     "run_decline_dispatched_review",
     "build_argument_parser", "main",
 ]

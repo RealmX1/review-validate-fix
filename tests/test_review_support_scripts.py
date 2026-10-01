@@ -7395,7 +7395,7 @@ def test_decision_token_direct_minted_paths_to_ack_and_decline(tmp: Path) -> Non
     assert acked.state == dts.STATE_ACKNOWLEDGED
 
     m2 = dts.mint_decision_token(worktree="/wt", session_id="sb", candidate_fingerprint="fpB", now=t0, **roots)
-    declined = dts.mark_declined(m2.token, reason="not this round", root=tok_root, now=t0, cooldown_root=cd_root)
+    declined = dts.mark_declined(m2.token, decline_kind="structural_not_needed", reason="not this round", root=tok_root, now=t0, cooldown_root=cd_root)
     assert declined.state == dts.STATE_DECLINED
     assert declined.payload["decline_reason"] == "not this round"
     # decline 顺带把指纹写入冷却表。
@@ -7447,7 +7447,7 @@ def test_decision_token_illegal_transitions_rejected(tmp: Path) -> None:
     for op in (
         lambda: dts.mark_injected(tk4, root=tok_root, now=t0),
         lambda: dts.acknowledge_decision_token(tk4, root=tok_root, now=t0),
-        lambda: dts.mark_declined(tk4, reason="x", root=tok_root, now=t0, cooldown_root=cd_root),
+        lambda: dts.mark_declined(tk4, decline_kind="structural_not_needed", reason="x", root=tok_root, now=t0, cooldown_root=cd_root),
         lambda: dts.mark_dispatched(tk4, root=tok_root, now=t0),
     ):
         try:
@@ -7458,7 +7458,7 @@ def test_decision_token_illegal_transitions_rejected(tmp: Path) -> None:
 
     # 从终态 declined 再迁移 → 非法。
     tk5 = _mint("s5", "f5")
-    dts.mark_declined(tk5, reason="done", root=tok_root, now=t0, cooldown_root=cd_root)
+    dts.mark_declined(tk5, decline_kind="structural_not_needed", reason="done", root=tok_root, now=t0, cooldown_root=cd_root)
     try:
         dts.acknowledge_decision_token(tk5, root=tok_root, now=t0)
         raise AssertionError("从终态 declined 再 acknowledge 应被拒绝")
@@ -7600,7 +7600,7 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
 
     manual = dts.mint_decision_token(
         worktree="/wt", session_id="su", candidate_fingerprint="fpU", now=t0,
-        initiated_by_explicit_user_request=True, **roots,
+        initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
     )
     assert manual.outcome == dts.MINT_OUTCOME_MINTED
     assert manual.token and manual.record is not None
@@ -7616,7 +7616,7 @@ def test_decision_token_mint_explicit_user_request_clears_declined_cooldown(tmp:
     # 未命中冷却时两个标志都保持 False（不谎报推翻、也不谎报仍被挡）。
     fresh = dts.mint_decision_token(
         worktree="/wt", session_id="su", candidate_fingerprint="fpV", now=t0,
-        initiated_by_explicit_user_request=True, **roots,
+        initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
     )
     assert fresh.outcome == dts.MINT_OUTCOME_MINTED
     assert fresh.explicit_user_request_overrode_agent_declined_cooldown is False
@@ -7654,7 +7654,7 @@ def test_decision_token_mint_explicit_user_request_reports_override_even_when_co
     try:
         manual = dts.mint_decision_token(
             worktree="/wt", session_id="sw", candidate_fingerprint="fpW", now=t0,
-            initiated_by_explicit_user_request=True, **roots,
+            initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
         )
     finally:
         Path.unlink = original_unlink
@@ -7685,7 +7685,7 @@ def test_decision_token_mint_explicit_user_request_is_exempt_from_circuit_breake
     for index in range(5):  # 远超默认阈值 3
         result = dts.mint_decision_token(
             worktree="/wt", session_id="sm", candidate_fingerprint=f"fpM{index}", now=t0,
-            initiated_by_explicit_user_request=True, **roots,
+            initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
         )
         assert result.outcome == dts.MINT_OUTCOME_MINTED, (index, result)
         assert result.circuit_breaker is None
@@ -7731,7 +7731,7 @@ def _decline_with_scope_snapshot(dts, roots, *, session_id: str, fingerprint: st
     )
     assert minted.outcome == dts.MINT_OUTCOME_MINTED, minted
     dts.mark_declined(
-        minted.token, reason="work in progress", root=roots["root"], now=now,
+        minted.token, decline_kind="structural_not_needed", reason="work in progress", root=roots["root"], now=now,
         cooldown_root=roots["cooldown_root"],
     )
     return minted.token
@@ -7903,7 +7903,7 @@ def test_decision_token_explicit_user_request_clears_declined_session_scope_snoo
 
     manual = dts.mint_decision_token(
         worktree="/wt", session_id="s1", candidate_fingerprint="fp-2", candidate_summary=same_scope,
-        now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+        now=_fixed_utc(60), initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
     )
     assert manual.outcome == dts.MINT_OUTCOME_MINTED, manual
     assert dts.read_declined_session_scope_snooze(
@@ -8185,7 +8185,7 @@ def test_decision_token_explicit_user_request_reports_it_overrode_agent_declined
     _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-declined", summary=same_scope, now=t0)
     manual = dts.mint_decision_token(
         worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-changed",
-        candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+        candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
     )
     assert manual.outcome == dts.MINT_OUTCOME_MINTED, manual
     assert manual.explicit_user_request_overrode_agent_declined_session_scope_snooze is True
@@ -8196,7 +8196,7 @@ def test_decision_token_explicit_user_request_reports_it_overrode_agent_declined
     roots = _decision_token_store_roots(tmp / "snooze-absent")
     manual_without_snooze = dts.mint_decision_token(
         worktree="/wt", session_id="s1", candidate_fingerprint="fp-x",
-        candidate_summary=same_scope, now=t0, initiated_by_explicit_user_request=True, **roots,
+        candidate_summary=same_scope, now=t0, initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
     )
     assert manual_without_snooze.explicit_user_request_overrode_agent_declined_session_scope_snooze is False
     assert manual_without_snooze.declined_session_scope_snooze_record_still_blocks_automatic_path is False
@@ -8216,7 +8216,7 @@ def test_decision_token_explicit_user_request_reports_it_overrode_agent_declined
     try:
         manual_clear_fails = dts.mint_decision_token(
             worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-changed",
-            candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+            candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, explicit_user_request_provenance="developer_manual_trigger_via_user_prompt_submit", **roots,
         )
     finally:
         Path.unlink = original_unlink
@@ -8320,9 +8320,11 @@ def test_decision_token_mint_circuit_breaker_window(tmp: Path) -> None:
 
     r4 = dts.mint_decision_token(worktree="/wt", session_id="s1", candidate_fingerprint="g4", now=t0, **roots)
     assert r4.outcome == dts.MINT_OUTCOME_CIRCUIT_BREAKER_TRIPPED
-    assert r4.circuit_breaker.request_count == 4
+    # 被拒的第 3 次请求当场冲销了自己那一份（没铸出 token），所以第 4 次仍只算到 3。
+    assert r4.circuit_breaker.request_count == 3
 
-    assert dts.count_recent_mint_requests("s1", now=t0, root=cb_root) == 4
+    # 窗口内仍占额度的只有真正铸出 token 的那 2 次。
+    assert dts.count_recent_mint_requests("s1", now=t0, root=cb_root) == 2
     # tripped ledger 记了两条（第 3、4 次）。
     tripped_lines = [ln for ln in r3.circuit_breaker.ledger_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(tripped_lines) == 2, tripped_lines
@@ -9168,7 +9170,7 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     wt = _agent_cli_worktree(tmp)
     tok = _mint_agent_decision_token(dts, roots, worktree=wt, fingerprint="fpDecline", now=t0)
 
-    result = cli.run_decline(token=tok, reason="fork 噪声，无真实改动，不再自审", roots=roots, now=t0)
+    result = cli.run_decline(token=tok, decline_kind="structural_not_needed", reason="fork 噪声，无真实改动，不再自审", roots=roots, now=t0)
     assert result.status == "ok" and result.exit_code == cli.EXIT_OK
     assert result.token_state == dts.STATE_DECLINED
 
@@ -9186,7 +9188,7 @@ def test_agent_cli_decline_persists_reason_and_cooldown(tmp: Path) -> None:
     assert "declined" in [r["event"] for r in read_jsonl(roots.telemetry_root / f"{tok}.jsonl")]
 
     # 已终态再次 decline → 错误。
-    again = cli.run_decline(token=tok, reason="再次", roots=roots, now=t0)
+    again = cli.run_decline(token=tok, decline_kind="structural_not_needed", reason="再次", roots=roots, now=t0)
     assert again.status == "error" and again.exit_code == cli.EXIT_TOKEN_STATE
 
 
@@ -10689,12 +10691,57 @@ def test_run_start_no_unreviewed_scope_holds_token_acknowledged_and_offers_force
     steps = "\n".join(result.next_steps or [])
     assert "decline" in steps and "--force-full-rescope" in steps, steps
     # token 仍是非终态：decline 这条出路必须真的还走得通。
-    declined = cli.run_decline(token=tok, reason="上一轮 RVF 产物，无未审单元", roots=roots, now=t0)
+    declined = cli.run_decline(token=tok, decline_kind="structural_not_needed", reason="上一轮 RVF 产物，无未审单元", roots=roots, now=t0)
     assert declined.exit_code == cli.EXIT_OK, declined
 
 
 def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
     return [
+        # --- 修复包 F4：谢绝语义与重新征询 ---
+        (
+            "decline_kind_is_required_and_unknown_kind_is_rejected_without_touching_the_token",
+            lambda: test_decline_kind_is_required_and_unknown_kind_is_rejected_without_touching_the_token(root / "f4-0"),
+        ),
+        (
+            "deferred_until_condition_decline_writes_neither_fingerprint_cooldown_nor_session_scope_snooze",
+            lambda: test_deferred_until_condition_decline_writes_neither_fingerprint_cooldown_nor_session_scope_snooze(root / "f4-1"),
+        ),
+        (
+            "deferred_until_condition_decline_is_reasked_only_after_new_turn_head_change_or_content_change",
+            lambda: test_deferred_until_condition_decline_is_reasked_only_after_new_turn_head_change_or_content_change(root / "f4-2"),
+        ),
+        (
+            "structural_decline_supersedes_earlier_deferred_until_condition_decline",
+            lambda: test_structural_decline_supersedes_earlier_deferred_until_condition_decline(root / "f4-3"),
+        ),
+        (
+            "explicit_user_request_overrides_deferred_until_condition_decline_and_records_provenance",
+            lambda: test_explicit_user_request_overrides_deferred_until_condition_decline_and_records_provenance(root / "f4-4"),
+        ),
+        (
+            "circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped",
+            lambda: test_circuit_breaker_refused_mint_requests_do_not_keep_the_breaker_tripped(root / "f4-5"),
+        ),
+        (
+            "reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined",
+            lambda: test_reopen_own_declined_decision_refuses_unless_newest_token_of_this_session_is_declined(root / "f4-6"),
+        ),
+        (
+            "reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze",
+            lambda: test_reopen_own_declined_decision_mints_with_agent_provenance_and_overrides_cooldown_and_snooze(root / "f4-7"),
+        ),
+        (
+            "extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields",
+            lambda: test_extra_token_payload_fields_cannot_override_system_written_explicit_user_request_fields(root / "f4-10"),
+        ),
+        (
+            "kanban_task_committed_round_baseline_bootstraps_from_branch_point_when_never_reviewed",
+            lambda: test_kanban_task_committed_round_baseline_bootstraps_from_branch_point_when_never_reviewed(root / "f4-8"),
+        ),
+        (
+            "retrospective_deferred_declines_are_reasked_while_structural_declines_stay_snoozed",
+            lambda: test_retrospective_deferred_declines_are_reasked_while_structural_declines_stay_snoozed(root / "f4-9"),
+        ),
         # --- S2：候选摘要 + 严格度参考档 ---
         (
             "review_strictness_reference_weights_and_classification",
@@ -11488,6 +11535,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger",
             lambda: test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger(
                 root / "prompt-submit-task-notification-quotes-manual-trigger"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not",
+            lambda: test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not(
+                root / "ups-deferred-turn-boundary"
             ),
         ),
         (
@@ -13354,6 +13407,20 @@ _rvfshortcut.inject(
     _fixed_utc=_fixed_utc,
 )
 globals().update({_n: getattr(_rvfshortcut, _n) for _n in _rvfshortcut.__all__})
+# 修复包 F4：谢绝分型 / 撤回自己的谢绝 / Kanban task 首轮分支点 bootstrap / 熔断不自我续命 / 回溯回放。
+from _rvf_review_support import decline_kind_reopen_and_kanban_task_committed_round_bootstrap as _f4decline
+_f4decline.inject(
+    ROOT=ROOT,
+    load_rvf_decision_token_store_module=load_rvf_decision_token_store_module,
+    load_rvf_agent_decision_cli_module=load_rvf_agent_decision_cli_module,
+    _decision_token_store_roots=_decision_token_store_roots,
+    _fixed_utc=_fixed_utc,
+    _candidate_summary_carrying_scope_identity=_candidate_summary_carrying_scope_identity,
+    _agent_cli_roots=_agent_cli_roots,
+    _agent_cli_worktree=_agent_cli_worktree,
+    _mint_agent_decision_token=_mint_agent_decision_token,
+)
+globals().update({_n: getattr(_f4decline, _n) for _n in _f4decline.__all__})
 
 
 

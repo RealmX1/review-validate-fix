@@ -31,7 +31,18 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
-**谢绝会在本会话 snooze 这片工作范围。** `rvf decline` 之后，同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。所以同一批工作谢绝过一次后不会再被反复问；开发者手动触发 `/review-validate-fix` 不受 snooze 限制，此时横幅会明说「用户推翻了你的谢绝」，不要照上次的判断再谢绝一次。
+**谢绝必须选类型（`--decline-kind`），两类之后多久再问完全不同。** 判断标准是「这批改动将来要不要审」：
+
+| 类型 | 什么时候用 | 例子 | 之后多久再问 |
+| --- | --- | --- | --- |
+| `structural_not_needed` | 这批改动本就不需要 RVF | 候选是你刚跑完的一轮 RVF 的产物（R24）或已有 RVF 在途；改动琐碎（只有一行日志 / 注释 / 工具生成配置）；改动不是本会话做的；开发者明确说过不要审 | 本会话 snooze 这片工作范围，直到工作边界（见下） |
+| `deferred_until_condition` | 要审，只是不是现在 | 「测试还在跑，跑完再审」「提交后再审」「子代理还在写，写完再审」 | 谢绝后原样停下不会再问；下一个回合（开发者发话、后台任务或子代理的完成通知）、提交、或你接着改了候选文件之后，只要候选还在就重问，横幅会写「你上次延后到：<理由>」 |
+
+别用 `structural_not_needed` 表达「晚点再审」：那会让这批工作在本会话里一直不被问到。延后时把等待的条件写进 `--reason`。
+
+**结构性谢绝会在本会话 snooze 这片工作范围。** 同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。开发者手动触发 `/review-validate-fix` 不受 snooze 与延后的限制，此时横幅会明说「用户推翻了你的谢绝 / 延后」，不要照上次的判断再谢绝一次。
+
+**开发者口头要求开审、而你本会话最近一次表态是谢绝时**，不要回答「token 已终态，请你手动触发」，直接撤回自己的谢绝：`rvf start --reopen-own-declined-decision --reason "<开发者原话>"`。它与开发者手动触发同样豁免冷却 / snooze / 熔断，但只能撤回本会话**最近一枚** token、且那枚必须是 declined；回执与遥测会记成「agent 按开发者口头要求撤回」，与开发者手动触发区分开。
 
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
@@ -140,7 +151,8 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 
 | 步骤 | 命令 | 需要你判断的点 |
 | --- | --- | --- |
-| 发起 / 谢绝 | `rvf start --reason "…"` / `rvf decline --reason "…"` | 要不要审 |
+| 发起 / 谢绝 | `rvf start --reason "…"` / `rvf decline --decline-kind <structural_not_needed\|deferred_until_condition> --reason "…"` | 要不要审；不审的话是「不需要审」还是「晚点再审」 |
+| 撤回自己的谢绝 | `rvf start --reopen-own-declined-decision --reason "<开发者原话>"` | 开发者口头要求开审时用 |
 | 写 scope-of-work | 覆盖回执给出的 `scope_of_work` 文件，再 `rvf scope rerender-scope-of-work` | 本轮改了什么、为什么、审时盯哪里 |
 | 派发 | `rvf dispatch --strictness <light\|standard\|strict>` | 严格度档 |
 | 等 reviewer | `rvf wait`（按 host 的等法见下） | 无 |

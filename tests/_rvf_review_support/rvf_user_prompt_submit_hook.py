@@ -22,6 +22,7 @@ from _rvf_test_support.kanban_followup_lock_marker_name import in_progress_lock_
 
 # 由 aggregator（tests/test_review_support_scripts.py）在导入后 inject 注入共享依赖。
 __all__ = [
+    'test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not',
     'test_rvf_user_prompt_submit_dispatches_shared_workflow',
     'test_rvf_user_prompt_submit_revives_expired_prep_when_run_artifacts_exist',
     'test_rvf_user_prompt_submit_declines_reviving_stale_prep',
@@ -2376,6 +2377,57 @@ def _temporary_environment(**overrides: str):
                     os.environ[key] = value
 
     return _ctx()
+
+
+def test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decline_but_rvf_banner_does_not(
+    tmp_path: Path,
+) -> None:
+    """D1 闸 2c 的回合边界信号由 UPS 打：后台任务 / 子代理完成通知（host 合成回合）与开发者真实 prompt
+    都是「新回合」——前者恰好就是最常见的延后条件；RVF 自己的带外横幅落地则不是（那时 agent 才刚要
+    决定，拿它放行会立刻自问自答）。"""
+    submit = load_rvf_user_prompt_submit_module()
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    import rvf_decision_token_store as store  # noqa: PLC0415
+
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "deferred-turn-boundary-sess"
+
+    def record_deferral() -> None:
+        assert store.record_deferred_until_condition_decline(
+            worktree=str(repo), session_id=session_id, candidate_summary=None,
+            candidate_fingerprint="fp", reason="子代理还在写，写完再审",
+        ) is not None
+
+    def new_turn_observed() -> bool:
+        record = store.read_deferred_until_condition_decline(worktree=str(repo), session_id=session_id)
+        assert record is not None
+        return bool(record["user_prompt_submit_observed_a_new_turn_since_deferral"])
+
+    with _manual_decision_env(tmp_path):
+        record_deferral()
+        banner_marker_prompt = "RVF 发起决策点 · RVF_DECISION_TOKEN=0123456789abcdef"
+        assert submit.decision_point_token_from_text(banner_marker_prompt) == "0123456789abcdef"
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, banner_marker_prompt)
+        )
+        assert not new_turn_observed(), "RVF 自己的带外横幅落地不是新回合"
+
+        notification_payload = submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(
+                repo, session_id, _claude_code_background_task_completion_notification_prompt()
+            )
+        )
+        assert notification_payload.get("host_synthesized_user_prompt_submit_turn_kind"), notification_payload
+        assert notification_payload.get("deferred_until_condition_declines_marked_new_turn_observed") is True
+        assert new_turn_observed(), "后台任务完成通知是新回合"
+
+        record_deferral()
+        assert not new_turn_observed()
+        submit.inspect_user_prompt_submit(
+            _claude_code_user_prompt_submit_event(repo, session_id, "测试跑完了，继续")
+        )
+        assert new_turn_observed(), "开发者真实 prompt 是新回合"
 
 
 def test_rvf_user_prompt_submit_claude_task_notification_does_not_reset_stop_hook_reentry_budget(

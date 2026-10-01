@@ -27,6 +27,7 @@ __all__ = [
     'test_decision_point_unknown_delivery_outcome_is_reconciled_not_redelivered',
     'test_decision_point_transport_override_without_task_id_falls_back_honestly',
     'test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_breaker',
+    'test_decision_point_in_flight_banner_is_withdrawn_as_soon_as_kanban_reports_delivery_failure',
     'test_decision_point_out_of_band_single_flight_busy_does_not_mint',
     'test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once',
     'test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point',
@@ -547,6 +548,107 @@ def test_decision_point_out_of_band_in_flight_blocks_remint_without_charging_bre
         ), summary
         assert len(decision_token_records(state)) == 1, decision_token_records(state)
         assert len(_mint_request_records(state)) == 1, _mint_request_records(state)
+
+
+_STUB_KANBAN_TASK_COMMAND_ANSWERING_MESSAGE_STATUS_SOURCE = '''#!/usr/bin/env python3
+"""测试替身：冒充 ``kanban task message-status``，按环境变量回一份终端投递回执。"""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+if not argv or argv[0] != "message-status":
+    sys.stderr.write(f"stub kanban task cmd: unexpected argv {argv}\\n")
+    sys.exit(2)
+task_id = argv[argv.index("--task-id") + 1]
+idempotency_key = argv[argv.index("--idempotency-key") + 1]
+log_path = os.environ.get("RVF_TEST_MESSAGE_STATUS_QUERY_LOG_PATH")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(idempotency_key + "\\n")
+receipt = {
+    "ok": True,
+    "task_id": task_id,
+    "idempotency_key": idempotency_key,
+    "message_id": f"terminal:{task_id}:{idempotency_key}",
+    "terminal_delivery_status": os.environ["RVF_TEST_MESSAGE_STATUS_TERMINAL_DELIVERY_STATUS"],
+}
+reason = os.environ.get("RVF_TEST_MESSAGE_STATUS_TERMINAL_DELIVERY_FAILURE_REASON")
+if reason:
+    receipt["terminal_delivery_failure_reason"] = reason
+sys.stdout.write(json.dumps(receipt))
+'''
+
+
+def test_decision_point_in_flight_banner_is_withdrawn_as_soon_as_kanban_reports_delivery_failure(
+    tmp: Path,
+) -> None:
+    """D4：横幅投出去后 cline-kanban 判定投递失败（开发者正在该终端打字），不必等 900s 意图 TTL。
+
+    修复前横幅路径从不读 ``terminal_delivery_status``，在途闸把意图 TTL 内的每一次 Stop 都静默挡住
+    （回溯：从铸出到撤回 P50 26 分钟、期间 25 次 Stop 被静默；kanban 判失败的 P50 只要约 75s）。
+    修复后：下一次 Stop 现查回执 → 判失败 → 撤回（不冲销熔断额度）并当次结束；再下一次 Stop 重新征询。
+    回执还没定论时（accepted_pending_submit_confirmation）照旧等，不提前撤回。
+    """
+    case = tmp / "kanban-reported-delivery-failure"
+    repo = init_repo(case / "repo", dirty=True)
+    state = case / "state"
+    stub = _write_stub_client(case / "stub-client.py")
+    stub_task_command = case / "stub-kanban-task-command.py"
+    stub_task_command.write_text(
+        _STUB_KANBAN_TASK_COMMAND_ANSWERING_MESSAGE_STATUS_SOURCE, encoding="utf-8"
+    )
+    query_log = case / "message-status-queries.log"
+    env = _out_of_band_env(stub_client=stub, task_id="task-kanban-failed")
+    env.update(
+        {
+            "CODEX_RVF_CLINE_KANBAN_TASK_CMD": f"{sys.executable} {stub_task_command}",
+            "RVF_TEST_MESSAGE_STATUS_QUERY_LOG_PATH": str(query_log),
+            "RVF_TEST_MESSAGE_STATUS_TERMINAL_DELIVERY_STATUS": "accepted_pending_submit_confirmation",
+        }
+    )
+
+    invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    first = decision_token_records(state)
+    assert len(first) == 1 and first[0]["state"] == "minted", first
+    banner_token = first[0]["token"]
+
+    # 回执还没定论：照旧挡在途，不撤回（但确实问过 kanban）。
+    invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_out_of_band_delivery_in_flight"
+    ), latest_summary(state)
+    assert decision_token_records(state)[0]["state"] == "minted"
+    assert query_log.read_text(encoding="utf-8").count(f"rvf-decision-point-{banner_token}") == 1
+
+    # kanban 判定失败（人正在该终端打字）⇒ 这次 Stop 撤回并当次结束。
+    env["RVF_TEST_MESSAGE_STATUS_TERMINAL_DELIVERY_STATUS"] = "delivery_failed"
+    env["RVF_TEST_MESSAGE_STATUS_TERMINAL_DELIVERY_FAILURE_REASON"] = (
+        "human_terminal_contention_timeout"
+    )
+    stdout, _stderr = invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    records = {record["token"]: record for record in decision_token_records(state)}
+    assert records[banner_token]["state"] == "withdrawn", records[banner_token]
+    assert records[banner_token]["withdrawal_cause"] == (
+        "out_of_band_delivery_failed_per_cline_kanban_terminal_delivery_receipt"
+    ), records[banner_token]
+    assert latest_summary(state)["reason_code"] == (
+        "decision_point_stranded_delivery_withdrawn_this_stop"
+    ), latest_summary(state)
+    names = [event.get("event") for event in latest_events(state)]
+    assert "decision_point_out_of_band_delivery_failed_per_kanban_withdrawn" in names, names
+    withdrawal_payload = parse_json(stdout)
+    assert "decision" not in withdrawal_payload and "hookSpecificOutput" not in withdrawal_payload
+    assert _delivery_intents(state) == [], _delivery_intents(state)
+    # 横幅从未到达 agent ⇒ 熔断额度保留（退避前提成立）。
+    assert len(_effective_mint_request_charges(state)) == 1, _mint_request_records(state)
+
+    # 下一次 Stop 重新征询，恰好一次。
+    invoke(_stop_event(repo), state_dir=state, extra_env=env)
+    records = {record["token"]: record for record in decision_token_records(state)}
+    fresh = [token for token in records if token != banner_token]
+    assert len(fresh) == 1 and records[fresh[0]]["state"] == "minted", records
+    assert len(_delivery_events(state)) == 1, latest_events(state)
 
 
 def test_decision_point_out_of_band_single_flight_busy_does_not_mint(tmp: Path) -> None:
@@ -1311,7 +1413,9 @@ def test_decision_point_declined_fingerprint_is_not_delivered_out_of_band_again(
     saved_home = os.environ.get("RVF_HOME")
     os.environ["RVF_HOME"] = str(rvf_home_dir(state))
     try:
-        store.mark_declined(str(token_record["token"]), reason="dogfood-decline")
+        store.mark_declined(
+            str(token_record["token"]), decline_kind="structural_not_needed", reason="dogfood-decline"
+        )
     finally:
         if saved_home is None:
             os.environ.pop("RVF_HOME", None)
