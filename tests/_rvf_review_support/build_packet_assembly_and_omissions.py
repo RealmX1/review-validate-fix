@@ -27,6 +27,7 @@ __all__ = [
     'test_build_packet_requires_session_context',
     'test_build_packet_honors_review_validate_fix_ignore',
     'test_build_packet_treats_ignore_prefixes_as_literal_pathspecs',
+    'test_build_packet_excludes_nested_paths_under_review_scope_excluded_path_prefixes',
     'test_build_packet_emits_cross_session_conflict_section',
     'test_build_packet_omits_cross_session_section_when_clean',
 ]
@@ -399,6 +400,9 @@ def test_build_packet_honors_review_validate_fix_ignore(tmp_path: Path) -> None:
     (repo / "secret.txt").write_text("ignored secret contents\n", encoding="utf-8")
     (repo / "secret-alpha.txt").write_text("ignored secret prefix contents\n", encoding="utf-8")
     (repo / "kept.txt").write_text("visible contents\n", encoding="utf-8")
+    # Serena 会话启动时写进工作树的文件：内置前缀 .serena/ 让它们不进 packet。
+    (repo / ".serena").mkdir()
+    (repo / ".serena" / "project.yml").write_text("serena generated project config\n", encoding="utf-8")
 
     packet = tmp_path / "packet.md"
     metadata = tmp_path / "packet.json"
@@ -419,11 +423,14 @@ def test_build_packet_honors_review_validate_fix_ignore(tmp_path: Path) -> None:
 
     packet_text = packet.read_text(encoding="utf-8")
     payload = json.loads(metadata.read_text(encoding="utf-8"))
-    assert payload["excluded_path_prefixes"] == ["secret", "slide-versions/"]
+    assert payload["excluded_path_prefixes"] == [".serena/", "secret", "slide-versions/"]
     assert payload["untracked_count"] == 3
     assert "## Excluded Paths" in packet_text
     assert "- secret" in packet_text
     assert "- slide-versions/" in packet_text
+    assert "- .serena/" in packet_text
+    assert ".serena/project.yml" not in packet_text
+    assert "serena generated project config" not in packet_text
     assert "### .review-validate-fix-ignore" in packet_text
     assert "### kept.txt" in packet_text
     assert "### new.txt" in packet_text
@@ -482,6 +489,108 @@ def test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(tmp_path: Path
     assert "visible wildcard-like dir" in packet_text
     assert "### secret-alpha.txt" in packet_text
     assert "visible wildcard-like file" in packet_text
+
+
+def _packet_section_body(packet_text: str, section_heading: str) -> str:
+    """取 packet 里某个 ``## `` 二级标题下、到下一个二级标题为止的正文。"""
+    start = packet_text.index(f"\n{section_heading}\n")
+    next_heading = packet_text.find("\n## ", start + 1)
+    return packet_text[start:] if next_heading == -1 else packet_text[start:next_heading]
+
+
+def test_build_packet_excludes_nested_paths_under_review_scope_excluded_path_prefixes(tmp_path: Path) -> None:
+    """排除前缀是「字符串前缀」语义，覆盖任意深度的嵌套路径，且与候选集侧 matcher 口径一致。
+
+    回归：以前每个前缀只发一条 ``:(exclude,top,glob)<prefix>*``，glob magic 下 ``*`` 不跨 ``/``，
+    于是「已跟踪文件在嵌套子目录里被修改」与「父目录已跟踪、嵌套子目录里有未跟踪文件」两种形态
+    都会漏进 Git Status / Git Diff HEAD / Untracked Files 三段，而 Stop 候选集那侧早已把它们排除。
+    """
+    repo = init_repo(tmp_path / "repo")
+    context = tmp_path / "context.md"
+    context.write_text(
+        "## Session context\n"
+        "- 用户最初的请求 / 意图：test\n"
+        "- 本 turn 主会话实际完成的工作：prepared nested excluded paths\n",
+        encoding="utf-8",
+    )
+    (repo / ".review-validate-fix-ignore").write_text("secret\n", encoding="utf-8")
+    tracked_paths_expected_excluded = [
+        ".serena/project.yml",
+        ".serena/memories/auth.md",
+        "secret.txt",
+        "secret/x.txt",
+        "secret-dir/nested.txt",
+    ]
+    tracked_paths_expected_visible = ["keep.txt", "docs/secret/visible-tracked.txt"]
+    for rel in [*tracked_paths_expected_excluded, *tracked_paths_expected_visible]:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text("base\n", encoding="utf-8")
+    run(["git", "add", ".review-validate-fix-ignore", *tracked_paths_expected_excluded, *tracked_paths_expected_visible], cwd=repo)
+    run(["git", "commit", "-q", "-m", "add nested paths"], cwd=repo)
+    for rel in tracked_paths_expected_excluded:
+        (repo / rel).write_text(f"base\nexcluded tracked change in {rel}\n", encoding="utf-8")
+    for rel in tracked_paths_expected_visible:
+        (repo / rel).write_text(f"base\nvisible tracked change in {rel}\n", encoding="utf-8")
+    untracked_paths_expected_excluded = [
+        ".serena/memories/new.md",
+        ".serena/cache/deep/c.bin",
+        "secret/new.txt",
+        "secret-dir/deeper/new.txt",
+    ]
+    untracked_paths_expected_visible = ["docs/secret/visible-untracked.txt"]
+    for rel in untracked_paths_expected_excluded:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(f"excluded untracked contents in {rel}\n", encoding="utf-8")
+    for rel in untracked_paths_expected_visible:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_text(f"visible untracked contents in {rel}\n", encoding="utf-8")
+
+    packet = tmp_path / "packet.md"
+    metadata = tmp_path / "packet.json"
+    run(
+        [
+            sys.executable,
+            str(BUILD_PACKET),
+            "--repo",
+            str(repo),
+            "--session-context",
+            str(context),
+            "--output",
+            str(packet),
+            "--metadata-output",
+            str(metadata),
+        ]
+    )
+
+    packet_text = packet.read_text(encoding="utf-8")
+    payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert payload["excluded_path_prefixes"] == [".serena/", "secret"]
+    git_status_section = _packet_section_body(packet_text, "## Git Status")
+    git_diff_section = _packet_section_body(packet_text, "## Git Diff HEAD")
+    untracked_files_section = _packet_section_body(packet_text, "## Untracked Files")
+    for rel in [*tracked_paths_expected_excluded, *untracked_paths_expected_excluded]:
+        assert rel not in git_status_section, (rel, git_status_section)
+        assert rel not in git_diff_section, (rel, git_diff_section)
+        assert rel not in untracked_files_section, (rel, untracked_files_section)
+    assert "excluded tracked change" not in packet_text
+    assert "excluded untracked contents" not in packet_text
+    # 正向对照：前缀锚定在仓库根，docs/secret/ 不以 secret 开头，不能被过度排除。
+    for rel in tracked_paths_expected_visible:
+        assert rel in git_status_section, (rel, git_status_section)
+        assert f"visible tracked change in {rel}" in git_diff_section
+    for rel in untracked_paths_expected_visible:
+        assert rel in git_status_section, (rel, git_status_section)
+        assert f"### {rel}" in untracked_files_section
+        assert f"visible untracked contents in {rel}" in untracked_files_section
+    # 候选集侧（Stop 发起闸）与 packet 侧口径统一：同一批路径的「排除 / 保留」结论逐条一致。
+    if str(BUILD_PACKET.parent) not in sys.path:
+        sys.path.insert(0, str(BUILD_PACKET.parent))
+    import review_scope_excluded_path_prefixes as prefixes_module
+
+    for rel in [*tracked_paths_expected_excluded, *untracked_paths_expected_excluded]:
+        assert prefixes_module.path_matches_review_scope_excluded_path_prefix(rel, payload["excluded_path_prefixes"]), rel
+    for rel in [*tracked_paths_expected_visible, *untracked_paths_expected_visible]:
+        assert not prefixes_module.path_matches_review_scope_excluded_path_prefix(rel, payload["excluded_path_prefixes"]), rel
 
 
 def test_build_packet_emits_cross_session_conflict_section(tmp: Path) -> None:

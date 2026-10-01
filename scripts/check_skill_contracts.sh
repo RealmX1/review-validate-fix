@@ -672,6 +672,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/scripts/check_contract_suite_left_no_test_artifacts_in_real_rvf_state_roots.py" \
   "$skill_dir/scripts/run_alternative_reviewer.py" \
   "$skill_dir/scripts/build_review_packet.py" \
+  "$skill_dir/scripts/review_scope_excluded_path_prefixes.py" \
   "$skill_dir/scripts/write_review_result.py" \
   "$skill_dir/scripts/check_review_result.py" \
   "$skill_dir/scripts/command_lock.py" \

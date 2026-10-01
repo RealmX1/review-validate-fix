@@ -10461,6 +10461,11 @@ def decision_point_injection_decision(
     # 无候选 → 静默停，不写 injection ledger（保持 canary 分母干净：只有「候选非空」才是发起层
     # 该表态的分母）。
     if candidate_count <= 0:
+        # 只有命中审查排除前缀的路径（如 Serena 自动生成的 .serena/）是脏的，也走这里；计数进 ledger，
+        # run-logs 里才分得清「真干净」和「只有被排除路径是脏的」。
+        review_scope_excluded_path_prefix_count = int(
+            summary.get("filtered_out_review_scope_excluded_path_prefix_count") or 0
+        )
         ledger.event(
             phase="gate",
             event="decision_point_no_candidates",
@@ -10470,11 +10475,18 @@ def decision_point_injection_decision(
             cwd=cwd,
             session_id=session_id,
             workspace_guard_blocked=bool(summary.get("workspace_guard_blocked")),
+            filtered_out_review_scope_excluded_path_prefix_count=review_scope_excluded_path_prefix_count,
+        )
+        review_scope_excluded_path_prefix_notice = (
+            [f"{review_scope_excluded_path_prefix_count} 个路径命中审查排除前缀被略过。"]
+            if review_scope_excluded_path_prefix_count > 0
+            else []
         )
         return skip_decision(
             " ".join(
                 [
                     f"本 worktree 自上次 review 以来无可审候选改动，Stop 静默停。repo={worktree}",
+                    *review_scope_excluded_path_prefix_notice,
                     *stranded_notices,
                 ]
             ),

@@ -9918,6 +9918,156 @@ def test_candidate_summary_ownership_filters_other_session(tmp: Path) -> None:
     assert summ["filtered_out_other_session_path_count"] == 1
 
 
+def _write_serena_session_start_files(repo: Path) -> None:
+    """模拟 Serena 在会话启动时往 cwd 写的两个文件（形态 A：新 worktree 首次激活）。"""
+    (repo / ".serena").mkdir(exist_ok=True)
+    (repo / ".serena" / ".gitignore").write_text("/cache\n/project.local.yml\n", encoding="utf-8")
+    (repo / ".serena" / "project.yml").write_text(
+        'project_name: "repo"\nlanguage_servers:\n- python\nencoding: "utf-8"\n', encoding="utf-8"
+    )
+
+
+def _candidate_summary_without_committed_window(summary_mod, repo: Path, log_root: Path, session_id: str = "sess-A"):
+    return summary_mod.build_candidate_summary(
+        event={"cwd": str(repo)},
+        cwd=str(repo),
+        repo=str(repo),
+        ledger=None,
+        log_root_override=log_root,
+        workspace_guard=lambda **_k: None,
+        task_id_resolver=lambda _e: None,
+        session_id_resolver=lambda _e: session_id,
+        committed_baseline_resolver=lambda _rp, _t, _s: None,
+        committed_base_ref_resolver=lambda _rp: None,
+    )
+
+
+def test_candidate_summary_excludes_serena_generated_untracked_files(tmp: Path) -> None:
+    """只有 Serena 启动时生成的 .serena/ 未跟踪文件是脏的 → 候选集为空，不该铸决策点。
+
+    被排除的路径仍留在 candidates 清单里（included=False + 排除原因），指纹等于空候选集指纹。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    repo, _base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    _write_serena_session_start_files(repo)
+
+    summ = _candidate_summary_without_committed_window(summary_mod, repo, log_root)
+
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert set(by_path) == {".serena/.gitignore", ".serena/project.yml"}, sorted(by_path)
+    for candidate in by_path.values():
+        assert candidate["included_in_candidate_set"] is False
+        assert candidate["candidate_set_exclusion_reason"] == (
+            summary_mod.CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX
+        )
+    assert summ["candidate_path_count"] == 0
+    assert summ["bootstrap_size"]["candidate_path_count"] == 0
+    assert summ["filtered_out_review_scope_excluded_path_prefix_count"] == 2
+    assert summ["filtered_out_other_session_path_count"] == 0
+    assert ".serena/" in summ["review_scope_excluded_path_prefixes"]
+    assert summ["candidate_fingerprint"] == summary_mod.compute_candidate_fingerprint([])
+
+
+def test_candidate_summary_excludes_tracked_serena_rewrite_without_touching_real_work_fingerprint(
+    tmp: Path,
+) -> None:
+    """形态 B：仓库已跟踪的 .serena/project.yml 被 Serena 就地重写（gitignore 治不了的那种）。
+
+    与真实改动并存时，候选集只剩真实改动，且内容指纹与工作范围指纹都和「.serena 没被动过」时一致——
+    Serena 的重写不会让 declined 冷却失效、也不会让横幅规模虚高。"""
+    summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
+    repo, _base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    _write_serena_session_start_files(repo)
+    run(["git", "add", ".serena"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "track serena project"], cwd=repo)
+    (repo / "src.py").write_text("def real_work():\n    return 1\n", encoding="utf-8")
+
+    only_real_work = _candidate_summary_without_committed_window(summary_mod, repo, log_root)
+    assert only_real_work["candidate_path_count"] == 1
+    assert only_real_work["filtered_out_review_scope_excluded_path_prefix_count"] == 0
+
+    (repo / ".serena" / "project.yml").write_text(
+        'project_name: "repo"\nlanguage_servers:\n- python\nencoding: "utf-8"\nline_ending:\n',
+        encoding="utf-8",
+    )
+    porcelain = run(["git", "status", "--porcelain"], cwd=repo).stdout
+    assert " M .serena/project.yml" in porcelain, porcelain
+    with_serena_rewrite = _candidate_summary_without_committed_window(summary_mod, repo, log_root)
+
+    by_path = {c["path"]: c for c in with_serena_rewrite["candidates"]}
+    assert by_path[".serena/project.yml"]["included_in_candidate_set"] is False
+    assert by_path[".serena/project.yml"]["candidate_set_exclusion_reason"] == (
+        summary_mod.CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX
+    )
+    assert by_path["src.py"]["included_in_candidate_set"] is True
+    assert by_path["src.py"]["candidate_set_exclusion_reason"] is None
+    assert with_serena_rewrite["candidate_path_count"] == 1
+    assert with_serena_rewrite["filtered_out_review_scope_excluded_path_prefix_count"] == 1
+    assert with_serena_rewrite["candidate_fingerprint"] == only_real_work["candidate_fingerprint"]
+    assert (
+        with_serena_rewrite["candidate_scope_fingerprint"]
+        == only_real_work["candidate_scope_fingerprint"]
+    )
+    assert with_serena_rewrite["bootstrap_size"] == only_real_work["bootstrap_size"]
+
+
+def test_candidate_summary_honors_repo_local_ignore_file_and_keeps_exclusion_counts_separate(
+    tmp: Path,
+) -> None:
+    """.review-validate-fix-ignore 在发起前的候选阶段就生效（以前只在 start 后的 packet 里生效）；
+    前缀排除与他 session 归属排除各自计数，互不串味。"""
+    summary_mod, _calc, _hw, dt = _load_candidate_summary_modules()
+    prefixes_mod = importlib.import_module("review_scope_excluded_path_prefixes")
+    repo, _base = _stop_candidate_repo(tmp)
+    log_root = tmp / "logroot"
+    (repo / ".review-validate-fix-ignore").write_text("# 生成物\ngenerated/\n", encoding="utf-8")
+    (repo / "b.txt").write_text("base\n", encoding="utf-8")
+    run(["git", "add", ".review-validate-fix-ignore", "b.txt"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "ignore file + b"], cwd=repo)
+    (repo / "generated").mkdir()
+    (repo / "generated" / "bundle.js").write_text("console.log(1)\n", encoding="utf-8")
+    (repo / "f.txt").write_text("base\ndirtyF\n", encoding="utf-8")
+    (repo / "b.txt").write_text("base\ndirtyB\n", encoding="utf-8")
+
+    assert prefixes_mod.load_review_scope_excluded_path_prefixes(repo, []) == [".serena/", "generated/"]
+    assert prefixes_mod.path_matches_review_scope_excluded_path_prefix("generated/bundle.js", ["generated/"])
+    assert not prefixes_mod.path_matches_review_scope_excluded_path_prefix("generated.txt", ["generated/"])
+
+    for session_id, run_id, path in (
+        ("sess-OTHER", "rO", "f.txt"),
+        ("sess-A", "rA", "b.txt"),
+    ):
+        owned = dt.OwnedUnit(path=path, unit="path", hunk_anchor=None)
+        dt.register_claims(
+            repo=repo,
+            session_id=session_id,
+            run_id=run_id,
+            worktree=repo,
+            branch=None,
+            owned_paths=[path],
+            apply_patch_paths={path},
+            exec_only_paths=set(),
+            owned_units_override=[(owned, "apply_patch")],
+            log_root_override=log_root,
+        )
+
+    summ = _candidate_summary_without_committed_window(summary_mod, repo, log_root)
+
+    by_path = {c["path"]: c for c in summ["candidates"]}
+    assert by_path["generated/bundle.js"]["candidate_set_exclusion_reason"] == (
+        summary_mod.CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX
+    )
+    assert by_path["f.txt"]["candidate_set_exclusion_reason"] == (
+        summary_mod.CANDIDATE_SET_EXCLUSION_REASON_OTHER_SESSION_OWNED
+    )
+    assert by_path["b.txt"]["included_in_candidate_set"] is True
+    assert summ["candidate_path_count"] == 1
+    assert summ["filtered_out_other_session_path_count"] == 1
+    assert summ["filtered_out_review_scope_excluded_path_prefix_count"] == 1
+    assert summ["review_scope_excluded_path_prefixes"] == [".serena/", "generated/"]
+
+
 def test_candidate_summary_workspace_guard_short_circuits(tmp: Path) -> None:
     """先过 kanban_task_workspace_guard：命中 → 短路空候选（不审 unrelated dirty repo）。"""
     summary_mod, _calc, _hw, _dt = _load_candidate_summary_modules()
@@ -10781,6 +10931,24 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "candidate_summary_ownership_filters_other_session",
             lambda: test_candidate_summary_ownership_filters_other_session(
                 root / "candidate-ownership"
+            ),
+        ),
+        (
+            "candidate_summary_excludes_serena_generated_untracked_files",
+            lambda: test_candidate_summary_excludes_serena_generated_untracked_files(
+                root / "candidate-serena-untracked"
+            ),
+        ),
+        (
+            "candidate_summary_excludes_tracked_serena_rewrite_without_touching_real_work_fingerprint",
+            lambda: test_candidate_summary_excludes_tracked_serena_rewrite_without_touching_real_work_fingerprint(
+                root / "candidate-serena-tracked-rewrite"
+            ),
+        ),
+        (
+            "candidate_summary_honors_repo_local_ignore_file_and_keeps_exclusion_counts_separate",
+            lambda: test_candidate_summary_honors_repo_local_ignore_file_and_keeps_exclusion_counts_separate(
+                root / "candidate-repo-local-ignore-file"
             ),
         ),
         (
@@ -11872,6 +12040,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "build_packet_treats_ignore_prefixes_as_literal_pathspecs",
             lambda: test_build_packet_treats_ignore_prefixes_as_literal_pathspecs(root / "packet-literal-ignore"),
+        ),
+        (
+            "build_packet_excludes_nested_paths_under_review_scope_excluded_path_prefixes",
+            lambda: test_build_packet_excludes_nested_paths_under_review_scope_excluded_path_prefixes(
+                root / "packet-nested-excluded-path-prefixes"
+            ),
         ),
         ("prepare_review_run_and_command_lock", lambda: test_prepare_review_run_and_command_lock(root / "prepare")),
         (
@@ -13326,7 +13500,7 @@ _disprev.inject(
 globals().update({_n: getattr(_disprev, _n) for _n in _disprev.__all__})
 
 
-# 有界拆分：review packet 组装与省略规则 测试簇移入子模块；inject 共享依赖后重绑 11 个测试名，
+# 有界拆分：review packet 组装与省略规则 测试簇移入子模块；inject 共享依赖后重绑 12 个测试名，
 # 让（未改动的）注册表 lambda 解析到它们。注册顺序 / 分片身份保持不变。
 from _rvf_review_support import build_packet_assembly_and_omissions as _bldpkt
 _bldpkt.inject(
