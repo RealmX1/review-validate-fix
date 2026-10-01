@@ -109,6 +109,71 @@ def _claude_message_text_blocks(content: Any) -> tuple[list[str], list[str]]:
     return text_parts, thinking_parts
 
 
+def _claude_user_record_opens_a_new_turn(record: dict[str, Any]) -> bool:
+    """``tool_result`` 回填也是 ``type:"user"``，但它是同一回合的延续，不开新回合。"""
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict) and block.get("type") != "tool_result" for block in content
+        )
+    return False
+
+
+def latest_assistant_reply_text_in_most_recent_turn(path: Path) -> str | None:
+    """最近一个回合里、最后一条带正文的助手消息（按 ``message.id`` 归并）的 ``text``；无则 None。
+
+    Claude 的 Stop 事件通常自带 ``last_assistant_message``，这里是它缺席时（实测 06–09 月约 1%
+    的 Stop）的 handoff 标记回落。Claude 把同一条助手消息按 content block 拆成多条 record、
+    共用 ``message.id``，所以按 id 归并；``thinking`` 不算回复。回合边界是「不是 tool_result
+    回填的 user record」——上一回合的 handoff 标记不能在下一回合被再次认出。
+    """
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.is_file():
+        return None
+    latest_message_identity: Any = None
+    latest_message_text_chunks: list[str] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                record_type = record.get("type")
+                if record_type == "user":
+                    if _claude_user_record_opens_a_new_turn(record):
+                        latest_message_identity = None
+                        latest_message_text_chunks = []
+                    continue
+                if record_type != "assistant":
+                    continue
+                message = record.get("message")
+                if not isinstance(message, dict):
+                    continue
+                text_parts, _thinking_parts = _claude_message_text_blocks(message.get("content"))
+                if not text_parts:
+                    continue
+                message_identity = message.get("id") or record.get("uuid")
+                if message_identity is None or message_identity != latest_message_identity:
+                    latest_message_identity = message_identity
+                    latest_message_text_chunks = []
+                latest_message_text_chunks.extend(text_parts)
+    except OSError:
+        return None
+    joined = "\n".join(latest_message_text_chunks)
+    return joined or None
+
+
 def _distill_claude_record(
     record: dict[str, Any],
     *,

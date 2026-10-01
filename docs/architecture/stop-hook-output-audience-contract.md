@@ -279,7 +279,7 @@ ledger，不是宿主 transcript。
 | Oh My Pi | 8 | ✅ |
 | DeepSeek | ❌ **无**（源码 TODO） | ❌ **恒 false** |
 
-`evaluate_stop_event` 开头那道 `stop_hook_active` 早退守卫在 Kimi / DeepSeek 上**永不触发**。
+`evaluate_stop_event` 里那道 `stop_hook_active` 早退守卫（排在 handoff 收尾之后、一切发起闸之前）在 Kimi / DeepSeek 上**永不触发**。
 现有 nudge 预算（`CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET`，默认 2）是**唯一保险丝**
 ——动它之前先想清楚这一点。
 
