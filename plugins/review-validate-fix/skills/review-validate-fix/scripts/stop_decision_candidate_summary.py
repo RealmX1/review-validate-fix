@@ -11,7 +11,8 @@ RVF overhaul 把「要不要审、审什么」的发起决策权交给主 agent�
   （不调 ``build_manifest`` / ``ownership_baseline``）。ownership 走 tracker 缓存的 best-effort
   读取，读不到就标 ``unattributed``（默认纳入）。
 * **候选全集程序化构造**（R1）：本 worktree「自上次 review 以来」的 committed ∪ uncommitted
-  改动，ownership 过滤。agent 不枚举全集。
+  改动，先按审查范围排除前缀（``review_scope_excluded_path_prefixes``：内置工具托管目录如
+  ``.serena/`` ∪ ``.review-validate-fix-ignore``）过滤，再按 ownership 过滤。agent 不枚举全集。
 * **必含 committed-but-unreviewed**（committed-round 漏审盲区家族教训）：committed 分支的**窗口
   种子**用 committed-round 的 SHA 同源 resolver（种子 = review 高水位 / round-baseline），因此
   ``种子..工作树`` 里「已提交但未审」的孤儿提交先进枚举窗口，再由 review_state 过滤掉其中已审的。
@@ -44,7 +45,7 @@ RVF overhaul 把「要不要审、审什么」的发起决策权交给主 agent�
 或重算。序列化格式（``compute_candidate_fingerprint``，版本
 ``CANDIDATE_FINGERPRINT_ALGORITHM_VERSION``）：
 
-  1. 取**纳入候选集**（ownership 未被过滤）的每个路径及其**当前内容摘要**
+  1. 取**纳入候选集**（未被排除前缀或 ownership 过滤）的每个路径及其**当前内容摘要**
      ``content_sha256``（工作树文件字节的 sha256 十六进制；文件不存在/已删除记字面量
      ``"absent"``）。
   2. 按路径的 **UTF-8 字节序升序**排序（路径唯一，无需去重歧义）。
@@ -86,6 +87,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* import
 
 import review_strictness_reference_calculator as strictness_calculator  # noqa: E402
+from review_scope_excluded_path_prefixes import (  # noqa: E402
+    BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE,
+    load_review_scope_excluded_path_prefixes,
+    path_matches_review_scope_excluded_path_prefix,
+)
 from core.session_scope_allocation import review_highwater_marker  # noqa: E402
 from core.session_scope_allocation.committed_round_detection import (  # noqa: E402 — committed-round 窗口下界检测「中性核」（S10h-b 已迁 core，内部消费 core 的 round_baseline/review_highwater marker）；直接 top-level import，无需惰性、无 S4 环
     _resolve_committed_round_base_ref,
@@ -122,6 +128,12 @@ CHANGE_STATE_COMMITTED_AND_UNCOMMITTED = "committed_and_uncommitted"
 OWNERSHIP_SESSION_OWNED = "session_owned"
 OWNERSHIP_OTHER_SESSION_OWNED = "other_session_owned"
 OWNERSHIP_UNATTRIBUTED = "unattributed"
+
+# ``candidate_set_exclusion_reason``：路径为什么没进候选集（纳入时为 None）。被排除的路径仍留在
+# ``candidates`` 清单里（``included_in_candidate_set=False``），便于在 run-logs 里追溯。
+# 审查范围排除前缀先于 ownership 判定：命中前缀的路径无论归谁都不该审。
+CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX = "review_scope_excluded_path_prefix"
+CANDIDATE_SET_EXCLUSION_REASON_OTHER_SESSION_OWNED = "other_session_owned"
 
 # ``lower_bound_source``（R9 真相源迁移后=「已审/未审」**裁决权威**，非窗口种子 SHA 来源）：
 # review_state 是 committed 候选「是否已审」的真相源。有 committed 窗口种子时=tracker_review_state，
@@ -287,6 +299,7 @@ class CandidateFileChange:
     ownership: str
     included_in_candidate_set: bool
     content_sha256: str
+    candidate_set_exclusion_reason: str | None = None
     added_lines: tuple[str, ...] = field(default=())
     deleted_lines: tuple[str, ...] = field(default=())
     # 「扣掉上一轮 review 已审那部分」之后剩下的行。默认与全量相同 —— 没有可信的 tracker 观测
@@ -303,6 +316,7 @@ class CandidateFileChange:
             "change_state": self.change_state,
             "ownership": self.ownership,
             "included_in_candidate_set": self.included_in_candidate_set,
+            "candidate_set_exclusion_reason": self.candidate_set_exclusion_reason,
             "content_sha256": self.content_sha256,
             "nonblank_added_lines": strictness_calculator.count_nonblank_lines(self.added_lines)[0],
             "nonblank_deleted_lines": strictness_calculator.count_nonblank_lines(self.deleted_lines)[0],
@@ -814,6 +828,7 @@ def build_candidate_summary(
     )
 
     all_paths = sorted(committed_set | uncommitted_set)
+    review_scope_excluded_path_prefixes = _load_review_scope_excluded_path_prefixes_best_effort(repo_path)
     untracked = _untracked_paths(repo_path)
     ownership_labels = _read_tracker_ownership(repo_path, session_id, log_root_override)
     diff_base = baseline if baseline else None
@@ -839,9 +854,18 @@ def build_candidate_summary(
         else:
             change_state = CHANGE_STATE_UNCOMMITTED
         ownership = ownership_labels.get(path, OWNERSHIP_UNATTRIBUTED)
-        # ownership 作为 filter（Q4=a）：仅**明确归属他 session** 的路径被排除出候选；
-        # unattributed（今日单 agent 常态）默认纳入。
-        included = ownership != OWNERSHIP_OTHER_SESSION_OWNED
+        # 两道 filter，先前缀后归属：
+        # * 审查范围排除前缀（内置工具托管目录 ∪ .review-validate-fix-ignore）：工具自动生成的文件
+        #   不是任何人的工作，只有它们变脏时不该铸决策点；
+        # * ownership（Q4=a）：仅**明确归属他 session** 的路径被排除；unattributed（今日单 agent
+        #   常态）默认纳入。
+        if path_matches_review_scope_excluded_path_prefix(path, review_scope_excluded_path_prefixes):
+            candidate_set_exclusion_reason = CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX
+        elif ownership == OWNERSHIP_OTHER_SESSION_OWNED:
+            candidate_set_exclusion_reason = CANDIDATE_SET_EXCLUSION_REASON_OTHER_SESSION_OWNED
+        else:
+            candidate_set_exclusion_reason = None
+        included = candidate_set_exclusion_reason is None
         added, deleted = _added_deleted_for_path(
             repo_path, diff_base, path, path in untracked
         )
@@ -866,6 +890,7 @@ def build_candidate_summary(
                 change_state=change_state,
                 ownership=ownership,
                 included_in_candidate_set=included,
+                candidate_set_exclusion_reason=candidate_set_exclusion_reason,
                 content_sha256=_content_sha256(repo_path, path),
                 added_lines=tuple(added),
                 deleted_lines=tuple(deleted),
@@ -876,7 +901,9 @@ def build_candidate_summary(
         )
 
     included_candidates = [c for c in candidates if c.included_in_candidate_set]
-    filtered_out_count = len(candidates) - len(included_candidates)
+    exclusion_reason_counts = Counter(
+        c.candidate_set_exclusion_reason for c in candidates if not c.included_in_candidate_set
+    )
 
     # ④ 严格度参考档（R13）：仅对纳入候选集的文件计算。
     strictness_reference = strictness_calculator.compute_strictness_reference(
@@ -987,7 +1014,13 @@ def build_candidate_summary(
         "review_state_filtered_committed_path_count": len(review_state_filtered_committed_paths),
         "candidates": [c.to_public_dict() for c in candidates],
         "candidate_path_count": len(included_candidates),
-        "filtered_out_other_session_path_count": filtered_out_count,
+        "filtered_out_other_session_path_count": exclusion_reason_counts[
+            CANDIDATE_SET_EXCLUSION_REASON_OTHER_SESSION_OWNED
+        ],
+        "filtered_out_review_scope_excluded_path_prefix_count": exclusion_reason_counts[
+            CANDIDATE_SET_EXCLUSION_REASON_REVIEW_SCOPE_EXCLUDED_PATH_PREFIX
+        ],
+        "review_scope_excluded_path_prefixes": review_scope_excluded_path_prefixes,
         "has_committed_but_unreviewed": has_committed_but_unreviewed,
         "bootstrap_size": bootstrap_size,
         "unreviewed_line_estimate": unreviewed_line_estimate,
@@ -998,6 +1031,14 @@ def build_candidate_summary(
         "strictness_reference": strictness_reference,
         "strictness_reference_unreviewed_estimate": strictness_reference_unreviewed_estimate,
     }
+
+
+def _load_review_scope_excluded_path_prefixes_best_effort(repo_path: Path) -> list[str]:
+    """读仓库的审查范围排除前缀；ignore 文件读不了（权限、编码）时退回只用内置前缀，绝不阻断 Stop。"""
+    try:
+        return load_review_scope_excluded_path_prefixes(repo_path, [])
+    except (OSError, UnicodeDecodeError):
+        return sorted(BUILTIN_DEVELOPER_TOOL_MANAGED_PATH_PREFIXES_EXCLUDED_FROM_REVIEW_SCOPE)
 
 
 def _empty_summary(
@@ -1023,6 +1064,8 @@ def _empty_summary(
         "candidates": [],
         "candidate_path_count": 0,
         "filtered_out_other_session_path_count": 0,
+        "filtered_out_review_scope_excluded_path_prefix_count": 0,
+        "review_scope_excluded_path_prefixes": [],
         "has_committed_but_unreviewed": False,
         "bootstrap_size": {
             "candidate_path_count": 0,

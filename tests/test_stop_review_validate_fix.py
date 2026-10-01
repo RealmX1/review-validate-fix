@@ -3593,6 +3593,35 @@ def test_clean_repo_with_committed_work_but_no_marker_skips(tmp_path: Path) -> N
     assert decision_token_records(state) == []
 
 
+def test_serena_generated_files_only_dirty_repo_skips_without_decision_point(tmp_path: Path) -> None:
+    """只有 Serena 启动时生成的 .serena/ 文件是脏的（案例 rvf-20260930T003419Z-stop-hook-9ba2aa2e）：
+    闸门 DIRTY，但候选集按内置排除前缀 .serena/ 过滤后为空 → 决策点静默停，不注入、不铸 token；
+    ledger 与 skip 文案带上被略过的路径数，run-logs 里分得清「真干净」与「只有被排除路径是脏的」。"""
+    repo = _init_committed_round_repo(tmp_path)
+    (repo / ".serena").mkdir()
+    (repo / ".serena" / ".gitignore").write_text("/cache\n/project.local.yml\n", encoding="utf-8")
+    (repo / ".serena" / "project.yml").write_text('project_name: "repo"\n', encoding="utf-8")
+    assert ".serena/" in _porcelain(repo)
+    state = tmp_path / "state"
+    stdout, _ = invoke(
+        {
+            "cwd": str(repo),
+            "session_id": "5e7e4a00-0000-0000-0000-000000000000",
+            "stop_hook_active": False,
+        },
+        state_dir=state,
+    )
+    assert_skip_reason(stdout, "无可审候选改动")
+    assert_skip_reason(stdout, "2 个路径命中审查排除前缀被略过")
+    assert injection_attempt_records(state) == []
+    assert decision_token_records(state) == []
+    no_candidate_events = [
+        event for event in latest_events(state) if event.get("event") == "decision_point_no_candidates"
+    ]
+    assert len(no_candidate_events) == 1, no_candidate_events
+    assert no_candidate_events[0]["filtered_out_review_scope_excluded_path_prefix_count"] == 2
+
+
 def test_committed_round_seal_after_land_suppresses_redispatch(tmp_path: Path) -> None:
     """rvf-land 封窗 e2e — the reported over-dispatch (rvf-20260624T101913Z). After
     the round's work is committed, `test_committed_round_clean_repo_routes_to_review`
@@ -6107,6 +6136,7 @@ def main() -> int:
         test_committed_round_skip_review_trailer_excludes_from_candidate_summary,
         test_committed_round_excludes_rebased_base_branch_commits,
         test_clean_repo_with_committed_work_but_no_marker_skips,
+        test_serena_generated_files_only_dirty_repo_skips_without_decision_point,
         test_plan_document_only_injects_decision_point,
         test_read_only_session_with_background_plan_docs_injects_decision_point,
         test_plan_document_route_does_not_hide_source_rename,

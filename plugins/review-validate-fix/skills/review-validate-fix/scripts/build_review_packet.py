@@ -14,8 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — pyroot 上 sys.path，供 core.* import
 from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
-
-IGNORE_FILE = ".review-validate-fix-ignore"
+from review_scope_excluded_path_prefixes import (  # noqa: E402
+    REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME,
+    load_review_scope_excluded_path_prefixes,
+)
 
 
 def fail(message: str, code: int = 1) -> int:
@@ -89,42 +91,22 @@ def resolve_owned_diff_base_ref(
     return "HEAD"
 
 
-def normalize_exclude_prefix(prefix: str) -> str | None:
-    normalized = prefix.strip().replace("\\", "/")
-    if not normalized or normalized.startswith("#"):
-        return None
-    is_directory_prefix = normalized.endswith("/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    normalized = normalized.lstrip("/")
-    normalized = normalized.rstrip("/")
-    if not normalized:
-        return None
-    return f"{normalized}/" if is_directory_prefix else normalized
-
-
-def load_exclude_prefixes(repo: Path, extra_prefixes: list[str]) -> list[str]:
-    prefixes: list[str] = []
-    ignore_file = repo / IGNORE_FILE
-    if ignore_file.is_file():
-        for line in ignore_file.read_text(encoding="utf-8").splitlines():
-            normalized = normalize_exclude_prefix(line)
-            if normalized is not None:
-                prefixes.append(normalized)
-    for prefix in extra_prefixes:
-        normalized = normalize_exclude_prefix(prefix)
-        if normalized is not None:
-            prefixes.append(normalized)
-    return sorted(set(prefixes))
-
-
 def exclude_pathspecs(exclude_prefixes: list[str]) -> list[str]:
+    """把「审查范围排除前缀」翻成 git exclude pathspec，语义 = 字符串前缀（与候选集侧
+    ``path_matches_review_scope_excluded_path_prefix`` 的 ``startswith`` 一致）。
+
+    glob magic 下 ``*`` 不跨 ``/``，单条 ``<prefix>*`` 只盖住前缀所在那一层：已跟踪的嵌套文件、
+    父目录已跟踪时的嵌套未跟踪文件都会漏进 status / diff / untracked。所以每个前缀发两条：
+    ``<prefix>*`` 盖同层路径，``<prefix>*/**`` 盖以它开头的目录下任意深度的路径，两条之并恰为
+    「以该前缀开头的全部路径」。前缀里的 glob 元字符先转义，保证按字面匹配。
+    """
     pathspecs: list[str] = []
     for prefix in exclude_prefixes:
         escaped = prefix.replace("\\", "\\\\")
         for char in "*?[]":
             escaped = escaped.replace(char, f"\\{char}")
         pathspecs.append(f":(exclude,top,glob){escaped}*")
+        pathspecs.append(f":(exclude,top,glob){escaped}*/**")
     return pathspecs
 
 
@@ -334,7 +316,7 @@ def build_packet(
     base_ref_override: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     root = git_root(repo)
-    all_exclude_prefixes = load_exclude_prefixes(root, exclude_prefixes or [])
+    all_exclude_prefixes = load_review_scope_excluded_path_prefixes(root, exclude_prefixes or [])
     generated = datetime.now(timezone.utc).isoformat()
     status_args = ["status", "--short", "-uall"]
     diff_args = ["diff", "--find-renames", "HEAD", "--"]
@@ -390,7 +372,7 @@ def build_packet(
         "generated": generated,
         "repo": str(root),
         "max_file_bytes": max_file_bytes,
-        "ignore_file": IGNORE_FILE,
+        "ignore_file": REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME,
         "excluded_path_prefixes": all_exclude_prefixes,
         "status_bytes": len(status.encode("utf-8")),
         "diff_bytes": len(diff.encode("utf-8")),
@@ -648,7 +630,11 @@ def build_packet(
     )
     lines.extend(["## Excluded Paths", ""])
     if all_exclude_prefixes:
-        lines.append(f"Source ignore file: `{IGNORE_FILE}` when present, plus any `--exclude-path-prefix` arguments.")
+        lines.append(
+            "Sources: built-in developer-tool-managed prefixes (e.g. `.serena/`), "
+            f"`{REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME}` when present, "
+            "plus any `--exclude-path-prefix` arguments."
+        )
         lines.append("")
         lines.extend(f"- {prefix}" for prefix in all_exclude_prefixes)
         lines.append("")
@@ -754,7 +740,7 @@ def main() -> int:
     parser.add_argument("--max-packet-bytes", type=int, default=0, help="Fail if the generated packet exceeds this many bytes. 0 disables the check.")
     parser.add_argument("--primary-file", action="append", default=[], help="Path known to be primary work for this turn. May be repeated.")
     parser.add_argument("--background-file", action="append", default=[], help="Path known to be pre-existing background WIP. May be repeated.")
-    parser.add_argument("--exclude-path-prefix", action="append", default=[], help=f"Path prefix to omit from status, diff, and untracked packet sections. May be repeated. {IGNORE_FILE} is also honored when present.")
+    parser.add_argument("--exclude-path-prefix", action="append", default=[], help=f"Path prefix to omit from status, diff, and untracked packet sections. May be repeated. {REVIEW_VALIDATE_FIX_REPO_LOCAL_IGNORE_FILE_NAME} and the built-in developer-tool-managed prefixes are also honored.")
     parser.add_argument(
         "--base-ref",
         help="Diff base for the path-restricted owned-diff. Overrides the manifest's committed_round_baseline "

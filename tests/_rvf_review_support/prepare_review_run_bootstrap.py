@@ -89,7 +89,7 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert payload["session_context"] == payload["scope_of_work_file"]
     assert payload["source_session_context"] == str(context.resolve())
     assert payload["session_context_provided"] is True
-    assert payload["excluded_path_prefixes"] == ["secret.txt"]
+    assert payload["excluded_path_prefixes"] == [".serena/", "secret.txt"]
     assert payload["review_env"]["RVF_REPO"] == str(repo.resolve())
     assert payload["review_env"]["RVF_INPUTS_DIR"] == payload["inputs_dir"]
     assert payload["review_env"]["RVF_SCOPE_CONTRACT"] == payload["scope_contract"]
@@ -135,7 +135,7 @@ def test_prepare_review_run_and_command_lock(tmp_path: Path) -> None:
     assert payload["review_packet"] not in review_agent_context_text
     metadata = json.loads(Path(payload["review_packet_metadata"]).read_text(encoding="utf-8"))
     packet_text = Path(payload["review_packet"]).read_text(encoding="utf-8")
-    assert metadata["excluded_path_prefixes"] == ["secret.txt"]
+    assert metadata["excluded_path_prefixes"] == [".serena/", "secret.txt"]
     assert metadata["scope_of_work_file"] == payload["scope_of_work_file"]
     assert "## Excluded Paths" in packet_text
     assert "- secret.txt" in packet_text
