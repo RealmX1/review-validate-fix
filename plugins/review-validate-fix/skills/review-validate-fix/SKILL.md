@@ -31,6 +31,8 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
+**谢绝会在本会话 snooze 这片工作范围。** `rvf decline` 之后，同一会话、同一 worktree 的自动横幅会保持静默，直到出现工作边界：提交（HEAD 变化）、范围明显扩大（出现新路径**且**未审行数比基线多出 50% 以上）、同一批文件上的未审行数涨到基线的 3 倍**且**多出至少 150 行，或 12 小时到期。开发者发来新 prompt 不解除 snooze，只把「范围扩大 / 行数翻倍」的对比基线挪到那一刻（后台任务完成通知之类 host 自己合成的回合不算发话）。所以同一批工作谢绝过一次后不会再被反复问；开发者手动触发 `/review-validate-fix` 不受 snooze 限制，此时横幅会明说「用户推翻了你的谢绝」，不要照上次的判断再谢绝一次。
+
 变的只是横幅**怎么送到你面前**（transport，与决策协议正交）：
 
 | 在哪 | transport | 你看到的形态 |
@@ -41,7 +43,7 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 带外投递那条路上，正文多一行时效说明，其余逐字相同。五件必须知道的事：
 
 - **Stop 那一刻你什么也看不到是正常的。** 默认短等为 0ms，横幅数秒后才作为 user message 到达。这不是降级——正因为它开启新回合，才有 rewind 边界。
-- **只看到边界标记、没有随附正文 = 这是同一枚 token 的重复提交**（例如用户 rewind 后标记被放回输入框又发了出去）。正文只随首次到达注入一次；此时不要 start、不要 decline、也不要为此询问开发者，照这条消息里用户其余的话继续即可。
+- **只看到边界标记、没有随附正文 = 这是同一枚 token 的重复提交**（例如用户 rewind 后标记被放回输入框又发了出去）。正文只随首次到达注入一次；你还没表态的话，这枚 token 已随之作废，下一次 Stop 会重新征询。此时不要 start、不要 decline、也不要为此询问开发者，照这条消息里用户其余的话继续即可。若这其实是首次到达、只是正文没能随附（例如在你回合中途排队送达），下一次 Stop 会直接补发完整正文，届时照常决策。
 - **只有确定失败才回落自注入。** 投递结论未知时本轮静默停、不回落，由投递意图在后续 Stop 对账（宁可晚问一轮，也不要两条通道各问一次）。回落发生时开发者旁注会明说「本轮已回落为 Stop hook 自注入」。
 - **投出去却始终没成为 turn 的横幅会被撤回。** 那枚 token 进 `withdrawn` 终态，即便消息迟到落地，`rvf start` 也会硬失败——不要试图绕过它去手动开一轮。
 - 逃生口：`RVF_DECISION_POINT_DELIVERY_TRANSPORT=stop_hook_self_injection|cline_kanban_task_chat_session` 可强制指定通道。
@@ -134,7 +136,7 @@ rvf decline-dispatched-review --token <dispatch-token> --reason <一句话理由
 
 ## 执行段速查：每一步一条 `rvf` 命令
 
-token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。没有决策 token 的 fallback 路径（直接跑 `prepare_review_run.py`）给 `rvf` 显式 `--run-dir <run_dir>`。
+token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > 当前 cwd 所在 fix attempt worktree > 本会话本仓的 in-flight marker > 本 worktree 最近一次已接受的决策 token」自动推断（Claude Code 的 Bash 不保留 shell 状态，所以不要指望 `source review-env.sh` 跨调用生效）。没有决策 token 的 fallback 路径（直接跑 `prepare_review_run.py`）给 `rvf` 显式 `--run-dir <run_dir>`。解析不出当前会话 id 的 host（Kimi 等）上推断一律 fail-closed：回执里给出的命令已经带好 `--run-dir`，照抄即可；自己拼的 `rvf` 命令也带上（`rvf validate` 用 `--rvf-run-dir`）。
 
 | 步骤 | 命令 | 需要你判断的点 |
 | --- | --- | --- |
@@ -142,10 +144,11 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 | 写 scope-of-work | 覆盖回执给出的 `scope_of_work` 文件，再 `rvf scope rerender-scope-of-work` | 本轮改了什么、为什么、审时盯哪里 |
 | 派发 | `rvf dispatch --strictness <light\|standard\|strict>` | 严格度档 |
 | 等 reviewer | `rvf wait`（按 host 的等法见下） | 无 |
-| 合并 | 读 `rvf wait` 打印的摘要，按 `references/review-merge-policy.md` 合并 | 去重、分组、request 处置 |
+| 合并 | 读 `rvf wait` 打印的摘要，按 `references/review-merge-policy.md` 合并；有 issue 时 `rvf merge write` 记下每条 reviewer issue 的处置 | 去重、分组、丢弃理由、request 处置 |
 | 建 fix attempt | `rvf fix prepare <issue.json>…` | 怎么分验证包 |
-| 子代理收尾 | 子代理在 attempt worktree 内 `rvf fix stop --status …` | （子代理判断） |
+| 子代理收尾 | 子代理照抄派发参数块里的整行 `cd <attempt worktree> && rvf fix stop --attempt-id … --run-dir … --status …` | （子代理判断） |
 | 合回 | `rvf apply --all-stopped` | 冲突怎么处置 |
+| 最终验证 | `rvf validate --name handoff-validation-NNN -- <argv…>` | 跑哪些 suite |
 | 看状态 | `rvf status` / `rvf results` / `rvf handoff` | 无 |
 
 ## Review
@@ -153,7 +156,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 - 默认执行两个独立 review pass，除非用户显式跳过 review。
 - 派发由脚本完成，且**与前台 Bash 的 600s 上限解耦**（一次彻底 review 可能 > 10 分钟）：`rvf dispatch`（无 token 的 fallback 路径是 `source review-env.sh` 后运行 `scripts/dispatch_reviewers.py --execute --detached`）把整轮派发（解析主 dispatch harness、probe `reviewer-registry.json` 中的 harness、按路由规则选出**恰好两路 external reviewer**、并行派发、额度 reroute/cooldown）self-fork 进一个 detached tmux 线程并**立即返回**。选路 / reroute / cooldown 全在 detached 本体内完成，主会话不自行选择 harness、不拼装 CLI、也不把 in-harness subagent 当作 double-review 的一腿。
 - **等待不轮询，按 host 分流**（派发本身 host-agnostic，只有「怎么等」是 host 专属能力）：
-  - **Claude Code**：用 Bash `run_in_background: true` 跑**一次** `rvf wait`，然后结束本回合；进程退出时完成通知会唤醒你，通知里的输出就是合并摘要。不要轮询、不要 `sleep`、不要中途读 status.json。`rvf wait` 在 Claude 下默认等到 detached 派发的总超时（2700s）之后，一次就能等到终态。等 validate/fix 子代理同理：用后台子代理 + 完成通知，不轮询。
+  - **Claude Code**：用 Bash `run_in_background: true` 且 **`timeout: 3000000`** 跑**一次** `rvf wait`，然后结束本回合；进程退出时完成通知会唤醒你，通知里的输出就是合并摘要。不要轮询、不要 `sleep`、不要中途读 status.json。`rvf wait` 在 Claude 下默认等到 detached 派发的总超时（2700s）之后，一次就能等到终态；而后台 Bash 不传 `timeout` 时 host 缺省 30 分钟就砍掉它（上限 ≥ 2 小时），所以 `timeout` 必须显式给。等待期间 `rvf wait` 自己登记 awaiting marker，Stop 不会发续跑提示把你拉起来。等 validate/fix 子代理同理：用后台子代理 + 完成通知，不轮询（`rvf fix prepare` 已按 attempt 登记 awaiting marker，子代理 `fix stop` 或你 `rvf apply` 时清除）。
   - **Codex**：在 exec 会话里跑**一次** `rvf wait`（它一直阻塞到终态）；拿到 session 后用 `write_stdin` 空轮询，`yield_time_ms` 取 300000（Codex 空轮询的上限，见 `adapters/codex/README.md`），直到进程退出。等 validate/fix 子代理用 `wait_agent` 的长超时。
   - **Kimi 等其它 host**：`rvf wait` 单次最多阻塞 480s（< 前台工具 600s 上限），打印 `RVF_DISPATCH_STATE=running` 就再调一次。
 - **`rvf wait` 到 done 时直接打印合并摘要**：`plan_status`、有效腿数、`fallbacks`，每条腿的 kind 与 issues（path / line / kind / severity / message）或 `audit_summary`、requests；没有合法结果的腿给出 `reviewer.stderr*.txt` 路径。摘要只读每腿 **canonical** `review-result.json`（不读 `superseded-review-result-artifacts/`），并用与 Contract Gate 同一个校验器 `scripts/check_review_result.py` 判定——runner 已经逐腿校验并落盘过，**不要再逐腿手动跑 check_review_result、也不要再去翻 reviewer 目录**。需要机器可读形态时加 `--json`；不等待、只看结果用 `rvf results`。
@@ -182,12 +185,13 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 ## Validate / Fix
 
 - `kind: no_issues` 进入 clean path。
+- **合并处置先于 fix**：任一腿 `kind: issues` 时，先用 `rvf merge write`（决定 JSON 走 stdin）把每条 reviewer issue 记成 `adopted` / `merged_into` / `dropped`（带 `reason_code`），主会话自审发现的 finding 登记为 `non_reviewer_fix_issue_sources`（`origin: main_agent_self_review`）；格式见 `references/review-merge-policy.md` 的 Merge Rules。`rvf fix prepare` 只接受被处置覆盖的 `issue_id`，`source_refs` 由处置派生，canonical issue JSON 不写任何来源字段。全部 dropped 时同样要写处置，然后走 clean path（handoff「共 0 条」，evidence 允许）。
 - `kind: issues` 进入 validate/fix；每条 issue 先验证，再通过 `rvf fix stop --status fixed|false_positive|elevated|failed`（即 `rvf_fix_attempt.py stop`）写入完成状态。
 - 默认 `full` 流程中，只要有可解析 issue list，主会话必须至少启动一个 `validate_fix` 子代理，除非平台没有子代理接口、用户明确要求本地执行，或只剩机械收尾。
 - 按根因、文件区域、测试路径或决策前提把 issue 分组；最终汇总要说明 validate/fix 分组和结果。
 - **fix 循环三步**：
-  1. 把合并后的每条 canonical issue 写成 JSON，`rvf fix prepare <issue.json>…` 一次完成 ledger upsert + attempt prepare + start，并打印每条的**子代理派发参数块**（attempt_id、attempt worktree、run_dir、repo、scope contract、scope_hash、fix_allowlist）。把参数块原样放进 `prompts/validate-fix.md` 的子代理 prompt；子代理**不需要**再调 start。
-  2. 子代理在 attempt worktree 内改完后 `rvf fix stop --status …`（attempt 与 run 从 cwd 反推）。
+  1. 把合并后的每条 canonical issue 写成 JSON，`rvf fix prepare <issue.json>…` 一次完成 ledger upsert + attempt prepare + start，并打印每条的**子代理派发参数块**（attempt_id、attempt worktree、run_dir、repo、scope contract、scope_hash、fix_allowlist、整行收尾命令）。把参数块原样放进 `prompts/validate-fix.md` 的子代理 prompt；子代理**不需要**再调 start。
+  2. 子代理在 attempt worktree 内改完后，照抄参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id … --run-dir … --status …`。不能靠 cwd 反推：Claude 子代理每次 Bash 调用都会重置 cwd。
   3. 全部子代理结束后 `rvf apply --all-stopped`：按 attempt 创建顺序合回所有已 stop 的 fixed attempt，逐条报告 `applied` / `merge_conflict` / `scope_expansion_conflict`，**遇到冲突就停下交给你判断**（merge_conflict 记为该 attempt 未合并，不得手工搬运后伪装成已归因 patch）。
 - `--status elevated` 必须通过 `--result-file <elevation-detail.json>` 写入升级详情；自然语言 final 只作日志。
 - **elevated 不即时交开发者，先自解析、再延迟到末端。** 收到 reviewer / fixer 标记的 elevated concern 后，主会话先尝试自行决断：① 以自身 context 判断；② 依据不足则派 subagent 在代码库中找分辨/决策依据。只有 context + 代码库都不足以决断时，才真正记为 `elevated`（能决断的就地转 `fixed` / `false_positive`）。即便确属 elevated，也不当场打断流程去问，而是先把所有非 elevated issue 验证/修复完，到 workflow 末端再处理（见 Handoff）。
@@ -195,8 +199,9 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 ## 最终验证证据
 
 - reviewer 的探索性命令仍按 `$RVF_COMMAND_LOCK` 协调，但不构成可供 landing 复用的最终验证证据。
-- merge / validate-fix 完成后，主会话把最终 landing suites 按 handoff 顺序命名为 `handoff-validation-001`、`handoff-validation-002`……，并通过 `scripts/validation_result_cache.py run --repo "$RVF_REPO" --name <name> --rvf-run-dir "$RVF_RUN_DIR" -- <argv...>` 执行。这个 cache wrapper 自己就是该 suite 的唯一 single-flight lock，**不得**再套 `$RVF_COMMAND_LOCK`。
-- 带 `--rvf-run-dir`（缺省回退 `$RVF_RUN_DIR`）时，wrapper 每次都会把该 suite 的 `{name, argv, cwd, environment_keys, validation_context_kind}` 按 name upsert 进 `artifacts/handoff-validation-commands.json`（带 `.sha256`）。这是 `$rvf-land` 补修正后重跑验证的唯一事实源，land 按它重放、不解析 handoff markdown，所以 argv 必须能脱离当前 shell 独立复现：工作目录用 `--working-directory`、需要的环境变量用 `--environment-key` 声明，不要写成 `cd x && …` 或 `VAR=1 …` 这类依赖 shell 状态的前缀。
+- merge / validate-fix 完成后，主会话把最终 landing suites 按 handoff 顺序命名为 `handoff-validation-001`、`handoff-validation-002`……，并在主 worktree 里通过 `rvf validate --name <name> -- <argv...>` 执行（即 `scripts/validation_result_cache.py run`，`--repo` 与 `--rvf-run-dir` 由 `rvf` 从当前 run 补上）。**不要**手写 `--repo "$RVF_REPO"` / `--rvf-run-dir "$RVF_RUN_DIR"`：Claude 的 Bash 里这两个变量是空的，记录进不了 run，land 时 exit 22、evidence 拒写。这个 cache wrapper 自己就是该 suite 的唯一 single-flight lock，**不得**再套 `$RVF_COMMAND_LOCK`。
+- `rvf validate` 每次都显式带上当前 run 的 `--rvf-run-dir`（wrapper 只认显式参数，不回退 `RVF_RUN_DIR` 环境变量），并把该 suite 的 `{name, argv, cwd, environment_keys, validation_context_kind}` 按 name upsert 进当前 run 的 `artifacts/handoff-validation-commands.json`（带 `.sha256`）。这是 `$rvf-land` 补修正后重跑验证的唯一事实源，land 按它重放、不解析 handoff markdown，所以 argv 必须能脱离当前 shell 独立复现：工作目录用 `--working-directory`、需要的环境变量用 `--environment-key` 声明，不要写成 `cd x && …` 或 `VAR=1 …` 这类依赖 shell 状态的前缀。
+- validate/fix 子代理在自己的 attempt worktree 里跑 `rvf validate`（或 reviewer 等 Stop hook 被抑制的子进程里跑）时，它只验证 cwd 所在 worktree、**不**写主 run 的验证记录——那只是 fixer 自己的检查，不是 landing 证据，land 也不会重放它。
 - 失败时 wrapper 直接在 stderr 打印 stdout/stderr 尾部，结束时 JSON 里带 run validation index 摘要；不要为了看失败原因在缓存外再跑一遍，也不要再去翻 `validation-records.json`。
 - handoff 的验证段记录与 cache record 完全相同的命令 argv / cwd；cache record、candidate content、命令或非秘密环境指纹任一变化都会自动失效。日志与 evidence 只保存 hash、状态和脱敏元数据。
 - 不要在 reviewer、validate-fix、handoff 与 landing 各跑一遍相同 suite；同一 candidate 的后续阶段应调用同一 wrapper/name，让它返回 `cache_status=hit`。

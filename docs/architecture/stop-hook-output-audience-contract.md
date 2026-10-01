@@ -327,6 +327,30 @@ Codex 二进制里不存在任何失败计数器标识符，也**没有**把 hoo
 **改任何写 hook 命令串的代码时（`hooks/hooks.json`、`install_to_codex.py` 的烘焙点），
 都必须经由该守卫**——`tests/test_hook_command_spawn_guard.py` 有结构性 gate。
 
+### 带外决策点的正文只能经 UserPromptSubmit 送达
+
+带外投递（cline-kanban 终端粘贴）时，Stop 只把一行**无指令**的边界标记交给粘贴通道，决策正文
+写进 token payload，由 UPS 在观测到标记时以 `additionalContext` 注入（为什么不粘贴正文见
+`_render_decision_point_out_of_band_boundary_marker`）。于是 **UPS 本身成了一个失败面**：UPS
+没跑、超时、崩溃、token 里没有正文、或标记到达时 token 已过 TTL，agent 都只看到一行「未随附即
+忽略」的标记，这次征询空转一回合。这一族在 Stop 侧都长成「标记在 transcript 祖先链上、token
+仍是 minted」，与「征询确实到达过、只是记账没跟上」形状相同。
+
+区分靠 UPS 自己留证据：首次观测到标记时，把结局（正文注入了没有、没注入的原因）写进该 token 的
+投递意图 `user_prompt_submit_first_arrival_observation`。没有这份记录本身就意味着 UPS 没处理这条标记
+——一个已证实的成因是 agent 回合中途以 `queued_command` 送达的消息在 Claude Code < 2.1.260 上**不触发**
+UPS（本机 45 天 transcript：≤2.1.257 约 800 条仅 1 条触发，≥2.1.260 全部触发），而 transcript 扫描器
+必须把 `queued_command` 附件的 `attachment.prompt` 当作一次 user prompt 落地。
+
+处置分两格：
+
+- **token 仍有效**（审计 M13）：下一次 Stop **立即**以同一枚 token 自注入完整正文（`agent_must_act_now`，
+  这是决策点本身、够格驱动 agent），不等在途意图 TTL、不撤回、不冲销也不新增熔断额度。
+- **token 已过期**（审计 M9）：意图过 TTL 后由搁浅对账撤回。只有记录里写着「正文已注入」时才用冲销
+  熔断额度的成因；否则用 `out_of_band_boundary_marker_became_a_turn_but_banner_body_never_injected`
+  计入熔断（UPS 持续失效时自动退避），并以 **developer_only** 点名 UPS 那一侧的原因。这条告警与 §0
+  一致：它是诊断，不驱动 agent。
+
 ---
 
 ## 7. 已知残留

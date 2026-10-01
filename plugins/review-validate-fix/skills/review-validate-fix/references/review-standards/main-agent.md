@@ -9,7 +9,7 @@
 - 让 reviewer 读取 `reviewer.md`，并按需要提供专项 subset。
 - 合并 reviewer result artifact 时保留来源标签，但不要把来源传给 validate/fix 子代理。
 - 处理 `kind: request` artifact，记录决策和结果。
-- 维护 processed issue merge table 和 validate/fix grouping audit table。
+- 用 `rvf merge write` 维护合并处置（`artifacts/merge/merge_dispositions.json`：每条 reviewer issue 的 adopted / merged_into / dropped + reason_code），以及 validate/fix grouping audit table。
 - 最终 handoff 只写可确认事实，不混入背景 WIP。
 
 ## Request 处理

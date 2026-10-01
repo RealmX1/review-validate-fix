@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -60,6 +61,32 @@ INTAKE_HINT_LABELS = {
     "rejected / not accepted changes": "rejected_changes",
     "main-session validation commands": "main_session_validation_commands",
 }
+# 只剥离「指向别处仓库」的 git 位置变量；hooks、身份、签名、全局 core.excludesFile 等用户配置保持与
+# 手动 git 一致。
+GIT_REPOSITORY_LOCATION_ENVIRONMENT_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+)
+
+
+def git_environment_with_user_configuration_without_repository_location_overrides() -> dict[str, str]:
+    """列脏文件、``rvf_land`` 的 stage / commit / commit 后 clean 检查共用这一份环境。
+
+    列脏文件若用 ``clean_git_environment``（全局配置被置空），用户全局 ignore 的文件（如
+    ``**/.claude/settings.local.json``）会被当成 scope 外脏文件报 exit 12，而 commit 后的 clean 检查
+    看不见它们；agent 照提示加 ``--extra-path`` 就会把本地配置提交进去。两处必须同一口径。
+    """
+    environment = dict(os.environ)
+    for name in GIT_REPOSITORY_LOCATION_ENVIRONMENT_VARIABLES:
+        environment.pop(name, None)
+    return environment
+
+
 def read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -81,13 +108,15 @@ def run_git(repo: Path, args: list[str]) -> tuple[int, str, str]:
     return completed.returncode, completed.stdout.rstrip("\n"), completed.stderr.rstrip("\n")
 
 
-def run_git_bytes(repo: Path, args: list[str]) -> tuple[int, bytes, str]:
+def run_git_bytes(
+    repo: Path, args: list[str], environment: dict[str, str] | None = None
+) -> tuple[int, bytes, str]:
     try:
         completed = subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True,
             check=False,
-            env=clean_git_environment(),
+            env=environment if environment is not None else clean_git_environment(),
         )
     except OSError as exc:
         return 127, b"", f"{type(exc).__name__}: {exc}"
@@ -147,7 +176,11 @@ def repo_snapshot(repo: Path) -> dict[str, Any]:
         return {"repo": str(repo), "is_git_repo": False}
     _code_branch, branch, _stderr_branch = run_git(root, ["branch", "--show-current"])
     _code_head, head, _stderr_head = run_git(root, ["rev-parse", "--short", "HEAD"])
-    code_status, status_out, status_err = run_git_bytes(root, ["status", "--porcelain=v1", "-z", "-uall"])
+    code_status, status_out, status_err = run_git_bytes(
+        root,
+        ["status", "--porcelain=v1", "-z", "-uall"],
+        git_environment_with_user_configuration_without_repository_location_overrides(),
+    )
     return {
         "repo": str(root),
         "is_git_repo": True,

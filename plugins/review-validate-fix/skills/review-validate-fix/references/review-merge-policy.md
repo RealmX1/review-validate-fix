@@ -44,7 +44,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 - **非完成态终态不得以 rc=0 收尾**：`dispatch_reviewers.py --execute` 的退出码是 `completed`→0、`failed`→1、`blocked_on_reviewer_request`→**专用码 3**。这不是风格问题：detached 派发的每-run `O_EXCL` 幂等锁按「被包命令 rc==0 即该 run 已干净完成」判定不可重派，若 request 终态以 0 收尾，主会话按 Request Handling 处置完再跑 `--execute --detached` 只会得到 `already_running`，本 run 永远产不出 `status: completed` 的 reviewed-candidate 证据，只能绕过单一入口或手改协议 artifact。以 3 收尾则锁被判陈旧、可被重夺，重派走同一入口，并**必须带 `--redispatch-review-request-legs-only`**（见下面 Request Handling 第 5 条）。
 - **`kind: request` 的重派形态只有一种**：`dispatch_reviewers.py --execute --detached --redispatch-review-request-legs-only`。它复用上一轮 `reviewer-plan.json`、只重跑停在 `kind: request` 的腿；不带这个 flag 的整盘重派会连健康且已完成的那条腿一起重跑，新一轮结果原地覆写掉旧的（实测一条 cursor 腿跑了三轮 2/4/3 条 issue，只留最后一轮）。该模式不调用 `route()`，因此 `--selection-seed` 在它下面无效也不需要——reviewer 身份直接来自上一轮 plan；`--selection-seed <seed>` 只在整盘重派（确实要换一轮）时用于复现同一对 reviewer。flag 保持显式而非在该终态下隐式生效：同一入口也服务全新一轮派发，且它在没有上一轮 plan 时是 fail-closed 抛错的，隐式翻转会让「开新一轮」和「续上一轮」两种意图无法区分。
 - **`--dry-run` / `--plan-only` 对结果工件是只读的**：request-only 重派的工件轮转只发生在真正 `--execute` 之前，所以可以先 `--dry-run --redispatch-review-request-legs-only` 预演会重派哪几腿，不会动任何 `review-result.json`。
-- **轮询侧不得只看 `returncode`**：`--wait-status` 打印的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `effective_reviewers=k/n` 才是判据（详见 SKILL.md 的轮询协议）。
+- **等待侧不得只看 `returncode`**：`rvf wait` 摘要首行的 `returncode` 是 detached 派发进程自己的退出码，与「两腿是否都产出结论」是两回事。同一行的 `plan_status=` / `有效腿=k/n` 与每腿当前 canonical 结果才是判据，摘要末行直接给出判定（详见 SKILL.md「Review」节）。
 
 ## Contract Gate
 
@@ -52,7 +52,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 
 1. 用 `scripts/check_review_result.py "$RVF_REVIEW_RESULT"` 或等价解析器校验 canonical artifact。stdout/stderr 和 reviewer final prose 只作为 diagnostic，不作为 clean/issues/request 判定来源。
 2. artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、excluded path、clean/issues/request 混合状态时，该 reviewer 标记为 `CONTRACT_VIOLATION`。
-3. 如果 artifact 是 `kind: request`，这不是完成态 review；主会话应满足、驳回、spawn 子任务或提供上下文后重试 reviewer。request 不得进入 merge table。
+3. 如果 artifact 是 `kind: request`，这不是完成态 review；主会话应满足、驳回、spawn 子任务或提供上下文后重试 reviewer。request 不得进入合并处置（`rvf merge write` 拒绝 request 腿）。
 4. 如果 reviewer 运行期间 `scripts/workspace_snapshot.py compare` 报告状态变化，标记为 `WORKSPACE_CHANGED_DURING_REVIEW`。这只是状态污染信号，不推断 reviewer 的意图，也不要自动 revert；测试缓存、报告、coverage、临时构建产物等可解释副作用不构成 review 契约违规。
 5. `CONTRACT_VIOLATION` 的 artifact 不得进入合格 merge。`WORKSPACE_CHANGED_DURING_REVIEW` 需要主会话先检查污染范围；如果只是可解释测试副作用，仍可保留 reviewer artifact；如果出现未授权源文件、lockfile、snapshot 或文档写入，应 fail-close 或询问用户。
 
@@ -60,20 +60,35 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 
 ## Merge Rules
 
-合并两个 reviewer 的结果时，先保留一张主会话内部合并表：
+合并两个 reviewer 的结果时，**每条 reviewer issue 都要落一条结构化处置**，经 `rvf merge write`（= `scripts/rvf_merge_dispositions.py write`，自动补当前 run 的 `--run-dir`）写成 `artifacts/merge/merge_dispositions.json`（带 `.sha256` 旁证；它取代旧的自由格式合并表）。主会话只给决定，脚本补全 run_id、每腿 canonical 结果哈希、issue 计数与每条 `issue_sha256`：
 
-| processed_id | canonical_issue | source_reviewers | source_items |
-|-------------|-----------------|------------------|--------------|
-| RVF-001 | <合并后的 issue 描述> | alternative-reviewer:cursor-cli, alternative-reviewer:codex-cli | A1, B2 |
+```bash
+rvf merge write <<'EOF'
+{"dispositions": [
+  {"reviewer_id": "cursor-cli", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"},
+  {"reviewer_id": "codex-cli", "index": 2, "disposition": "merged_into", "issue_id": "RVF-001"},
+  {"reviewer_id": "codex-cli", "index": 1, "disposition": "dropped", "reason_code": "style_or_preference_only"}
+ ],
+ "non_reviewer_fix_issue_sources": [{"issue_id": "RVF-002", "origin": "main_agent_self_review"}]}
+EOF
+```
+
+- `reviewer_id` / `index`：`rvf wait` 摘要里的腿名与 issue 编号。**index 从 1 起**（工件里记为 `reviewer_issue_index_base: 1`），指向该腿**当前 canonical** `review-result.json` 的 `issues[index-1]`。
+- `disposition`：`adopted`（成为该 fix-issue 的来源）/ `merged_into`（同根因，并入已被 adopted 的那条 fix-issue）/ `dropped`（必须带 `reason_code`）。每条 reviewer issue 恰好一条处置；每个 fix-issue 至少有一条 `adopted` 来源。
+- `reason_code`：`style_or_preference_only`、`generic_refactor_suggestion`、`not_traceable_to_current_diff`（这三类对应规则 6）、`outside_review_scope_protected_background_or_excluded`、`other_with_reason`（必须写 `reason`）。
+- `non_reviewer_fix_issue_sources`：主会话自审发现、不来自任何 reviewer 的 fix-issue（`origin: main_agent_self_review`）。reviewer 也报了的同一问题记 reviewer 的 `adopted`，不在这里重复登记（两者互斥）。
+- **只覆盖 canonical 结果，superseded 代际不覆盖**：reviewer 结果不是 append-only——`--redispatch-review-request-legs-only` 会把旧 canonical 轮转进 `superseded-review-result-artifacts/`。处置逐腿记下写入时刻 canonical `review-result.json` 的 sha256；之后 canonical 变了（重派、手改），`rvf merge check` 与 upsert 都以哈希不一致判处置过期，重新 `rvf merge write`。
+- **强制点**：`rvf fix prepare` 与 `rvf_fix_issue.py upsert` 共用的 `upsert_canonical_issue` 在处置缺失、结构不合法、过期或未覆盖该 `issue_id` 时拒绝；candidate evidence writer 在 reviewer 报过 issue 时要求全量 `rvf merge check` 通过（每个处置目标都已 upsert、每个 fix-issue 都有来源），并以处置覆盖的 fix-issue 数核对 handoff 的 canonical 计数。**全部 dropped 时 canonical 计数 0 合法**：走 clean path（handoff 写「共 0 条」），处置照写。
+- `rvf merge check` 缺省做全量核对；fix-issue 还没全部 upsert 时用 `--without-fix-issue-cross-reference` 只查结构、完整性与哈希。
 
 规则：
 
-1. 两边 artifact 都是 `kind: no_issues`：进入 clean path。
-2. 一边 `kind: no_issues`、另一边 `kind: issues`：保留有 issue 的一边，source 只记发现该 issue 的 reviewer。
-3. 两边报同一根因或同一失败模式：合并为一个 processed issue，source 记两个 reviewer。
-4. 同一文件相邻行、同一测试失败、同一 API contract 或同一状态机不变量导致的问题：优先分组为一个 processed issue，并在描述里列出涉及的 path/line。
-5. 表面相似但修复方向不同的问题不要强行合并；保留多个 processed issue。
-6. 只保留 bug、回归、遗漏边界、安全问题、错误假设、未完成实现和死代码；过滤风格偏好、泛泛重构建议和无法追溯到当前 diff 的问题。
+1. 两边 artifact 都是 `kind: no_issues`：进入 clean path，不需要写处置。
+2. 一边 `kind: no_issues`、另一边 `kind: issues`：只有报 issue 的那一腿需要处置。
+3. 两边报同一根因或同一失败模式：合并为一个 fix-issue——一边 `adopted`、另一边 `merged_into` 同一个 `issue_id`。
+4. 同一文件相邻行、同一测试失败、同一 API contract 或同一状态机不变量导致的问题：优先分组为一个 fix-issue（其余条目 `merged_into` 它），并在描述里列出涉及的 path/line。
+5. 表面相似但修复方向不同的问题不要强行合并；各自 `adopted` 成不同的 fix-issue。
+6. 只保留 bug、回归、遗漏边界、安全问题、错误假设、未完成实现和死代码；风格偏好、泛泛重构建议和无法追溯到当前 diff 的问题一律 `dropped` 并选对应 `reason_code`。
 
 ## Request Handling
 
@@ -89,10 +104,12 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 
 ## Source Tracking
 
-主会话必须记住每个 processed issue 的来源：
+来源只由 `artifacts/merge/merge_dispositions.json` 记录。fix-issue 的 `source_refs`（tracker `rvf_issues.source_refs` 列）由它派生，统一 schema：
 
-- `source_reviewers`：本轮 `reviewer-plan.json` 派发的两路 `alternative-reviewer:<harness-id>`（如 `alternative-reviewer:cursor-cli`、`alternative-reviewer:codex-cli`）、最后兜底时的两个 mimic reviewer，或其中多个来源。
-- `source_items`：原 reviewer 输出中的编号，例如 `alternative-reviewer:cursor-cli#1`、`alternative-reviewer:codex-cli#2`。
+- reviewer 来源：`{source_origin: reviewer_result_issue, reviewer_id, index, issue_sha256, disposition}`，`disposition` ∈ {`adopted`, `merged_into`}，`index` 从 1 起；
+- 非 reviewer 来源：`{source_origin: main_agent_self_review}`。
+
+canonical issue JSON 里写的 `source_refs` / `reviewer_id` / `source_reviewers` / `source_items` 等来源字段一律被 upsert 剥掉、不被信任。按 reviewer 统计采纳 / 丢弃 / 最终修复（Reviewer 效能评估）直接读处置工件与 `$rvf-analyze` 生成的 `causality.json::merge_dispositions`，不需要再从 handoff 文本反推。
 
 来源可以出现在主会话合并摘要和 handoff 中，方便后续理解；但它不能传给 validate/fix 子代理。
 
@@ -104,5 +121,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 - 不写“两个模型都认为”或“只有某模型发现”。
 - 不写来源编号。
 - 只给 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
+
+脚本侧的隔离：处置工件放在 fixer prompt 从不引用的 `artifacts/merge/` 下；给 fixer 读的 `artifacts/fix-issues/<issue_id>.json` 镜像不含任何来源字段；canonical issue 正文若提到本轮 reviewer 的精确来源标签（例如本轮 plan 里的 `alternative-reviewer:<harness-id>` label，或 mimic 兜底腿身份），upsert 直接拒绝。
 
 这样 validate/fix 子代理只验证问题本身，不受来源模型声望、重复发现或分歧影响。

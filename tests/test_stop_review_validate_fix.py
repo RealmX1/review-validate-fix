@@ -6273,7 +6273,12 @@ def main() -> int:
         # 搁浅对账的枚举面是跨 task 全局的，早退判据必须先收敛到本轮这条投递通道。
         test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point,
         # `state=minted` ≠「从未成为 turn」：UPS 的 mark_injected 失败分支留下的形状完全相同。
-        test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off,
+        test_stranded_banner_whose_marker_arrived_after_ttl_keeps_mint_request_charge_because_body_was_never_injected,
+        test_stranded_banner_whose_marker_became_a_turn_without_user_prompt_submit_ever_handling_it_backs_off_and_says_so,
+        test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected,
+        test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why,
+        test_decision_point_banner_command_wording_matches_the_rendered_command_prefix,
+        test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop,
         test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
         # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
         test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,

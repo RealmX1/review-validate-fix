@@ -28,9 +28,11 @@ key 里**还含仓身份与父 harness 身份**（``scope_marker_identity_key``�
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import secrets
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -65,6 +67,8 @@ PROMPT_EXCERPT_MAX_CHARS = 200
 STATUS_ACTIVE = "active"
 STATUS_STALE = "stale"
 STATUS_INVALID = "invalid"
+#: 与 marker 同目录的 sidecar 锁文件后缀（点号开头的隐藏文件，不匹配任何 ``*.json`` / ``task-*`` 扫描）。
+ROUND_BASELINE_MARKER_WRITER_SERIALIZATION_LOCK_SUFFIX = ".writer-serialization.lock"
 
 
 def _baseline_root(root: Path | None = None) -> Path:
@@ -148,6 +152,34 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     tmp.replace(path)
+
+
+def _round_baseline_marker_writer_serialization_lock_path(marker_path: Path) -> Path:
+    return marker_path.with_name(
+        f".{marker_path.name}{ROUND_BASELINE_MARKER_WRITER_SERIALIZATION_LOCK_SUFFIX}"
+    )
+
+
+@contextmanager
+def _hold_round_baseline_marker_writer_serialization_lock(marker_path: Path):
+    """串行化**同一份** marker 文件的全部写者（覆盖写 / 只续期的 read-modify-write / 删除）。
+
+    为什么需要：续期是「读旧 marker → 按旧 ``baseline_head`` 重建 → 整份写回」。若读与写之间真实 prompt
+    写入了新 baseline，续期会把旧 ``baseline_head`` / ``captured_at`` 整份写回，真实 prompt 的 round 边界
+    被静默抹掉。marker 是按 task 优先键的，同一 task 下多个会话共用一份，合成回合与真实 prompt 并发并不罕见。
+
+    锁是按 marker 路径的 sidecar ``flock``；锁文件刻意**不删**（删锁文件会让「删前已打开的旧 inode」与
+    「删后新建的 inode」各拿一把互不相干的锁）。持锁期间绝不调用另一个取同一把锁的函数，故不会自锁死。
+    """
+    lock_path = _round_baseline_marker_writer_serialization_lock_path(marker_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file_descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_file_descriptor, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -234,7 +266,64 @@ def write_round_baseline_marker(
         parent_harness_identity=resolved_harness_identity,
     )
     target = paths[0]
-    _atomic_write(target, payload)
+    with _hold_round_baseline_marker_writer_serialization_lock(target):
+        _atomic_write(target, payload)
+    return target
+
+
+def extend_round_baseline_marker_expiry_without_moving_baseline_head(
+    *,
+    task_id: str | None,
+    session_id: str | None,
+    repo: str | None,
+    parent_harness_identity: str | None = None,
+    root: Path | None = None,
+) -> Path | None:
+    """host 合成的回合（如 Claude 后台任务完成通知）到达：**只**续期本会话自己那份**活跃** marker，
+    ``baseline_head`` / ``captured_at`` 原样不动。返回续期后的路径；没有可续的 marker 返回 None。
+
+    为什么不前移：合成回合不是新一轮的起点，前移会让通知之前本轮已提交的改动落到窗口下界之下
+    （bootstrap 期没有高水位兜底时即永久漏审）。为什么要续期：长时间自主工作的会话可能几个小时
+    只有合成回合、没有人类 prompt，marker 过了 TTL 就退回 dirty-only——那比改动前（每条通知都
+    前移、至少还覆盖「上一条通知以来」）更窄。续期让窗口只宽不窄。
+
+    只续**精确键**（候选列表第一项）上的那份：回退候选可能是别的会话 / 未判出 harness 时留下的，
+    把它复制成自己的会把别人的下界据为己有。已过期（stale）/ 损坏（invalid）的不复活——过期的
+    语义就是「太旧、不再可信」。
+
+    读—判定—写回整段持有该 marker 的写者锁（``_hold_round_baseline_marker_writer_serialization_lock``）：
+    与真实 prompt 的覆盖写串行化，续期要么先完成、随后被新 baseline 覆盖，要么读到的就已经是新 baseline，
+    绝不会用读到的旧 ``baseline_head`` 覆盖并发写入的新值。
+    """
+    resolved_harness_identity = resolve_parent_harness_identity_for_scope_marker_key(
+        parent_harness_identity
+    )
+    paths = marker_paths(
+        task_id=task_id,
+        session_id=session_id,
+        repo=repo,
+        parent_harness_identity=resolved_harness_identity,
+        root=root,
+    )
+    if not paths:
+        return None
+    target = paths[0]
+    with _hold_round_baseline_marker_writer_serialization_lock(target):
+        existing = _read_json(target)
+        if round_baseline_status(existing) != STATUS_ACTIVE:
+            return None
+        assert existing is not None
+        payload = marker_payload(
+            task_id=task_id,
+            session_id=session_id,
+            baseline_head=str(existing["baseline_head"]).strip(),
+            repo=repo,
+            prompt_excerpt=existing.get("prompt_excerpt") if isinstance(existing.get("prompt_excerpt"), str) else None,
+            captured_at=existing.get("captured_at") if isinstance(existing.get("captured_at"), str) else None,
+            parent_harness_identity=resolved_harness_identity,
+        )
+        payload["expiry_extended_without_moving_baseline_head_at"] = _iso_now()
+        _atomic_write(target, payload)
     return target
 
 
@@ -286,8 +375,12 @@ def clear_round_baseline_marker(
         parent_harness_identity=parent_harness_identity,
         root=root,
     ):
+        # 与续期串行化：否则续期「读到活跃 → 删除 → 续期写回」会把刚清掉的 marker 复活。
+        if not path.exists():
+            continue
         try:
-            path.unlink()
+            with _hold_round_baseline_marker_writer_serialization_lock(path):
+                path.unlink()
         except FileNotFoundError:
             continue
         except OSError:

@@ -12,6 +12,8 @@
   「本次 Stop 应跳过」概念。
 - ``parent_transcript_quoted_session_name`` → 从 per-agent ``wire.jsonl`` 抽首条用户输入。
 - ``stop_hook_agent_directive_channel`` → ``hookSpecificOutput.permissionDecision:"deny"``。
+- ``host_synthesized_user_prompt_submit_turn_kind`` → 恒 ``None``：尚无 Kimi 会合成 user 回合并触发
+  UserPromptSubmit 的证据（未取证，不是已证否）。
 
 ## 为什么这条通道不能选错（Kimi 与 Codex 的失败形态是相反的）
 
@@ -115,3 +117,9 @@ class KimiCodeCliHostAdapter:
 
     def stop_hook_agent_directive_channel(self) -> str:
         return STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_HOOK_SPECIFIC_OUTPUT_PERMISSION_DECISION_DENY
+
+    def host_synthesized_user_prompt_submit_turn_kind(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        # 没有 Kimi 会合成 user 回合并触发 UserPromptSubmit 的证据；按 Protocol 约定无正向证据即 None。
+        return None

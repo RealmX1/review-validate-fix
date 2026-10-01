@@ -6266,6 +6266,75 @@ def test_round_baseline_marker_round_trip(tmp: Path) -> None:
     assert rbm.write_round_baseline_marker(task_id="t2", session_id=None, baseline_head=head_a, repo=None, root=root) is None
 
 
+def test_round_baseline_marker_expiry_extension_does_not_overwrite_concurrent_developer_prompt_baseline(
+    tmp: Path,
+) -> None:
+    """续期（host 合成回合）与真实 prompt 的 baseline 写入对同一份 marker 必须串行化。
+
+    交错时序：续期读到旧 marker（head_a）→ 真实 prompt 写入新 baseline（head_b）→ 续期把它**之前读到**的
+    head_a / captured_at 整份写回 ⇒ 真实 prompt 的 round 边界被静默抹掉。同一把按 marker 文件的排他锁
+    把两者串行化：续期要么先完成（随后被新 baseline 覆盖），要么读到的就已经是新 baseline。
+    """
+    import threading  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    _dt, _sm, rbm = _round_baseline_committed_modules()
+    repo, _baseline = _committed_round_repo(tmp)
+    root = tmp / "state"
+    head_before_developer_prompt = "a" * 40
+    head_at_concurrent_developer_prompt = "b" * 40
+    rbm.write_round_baseline_marker(
+        task_id="t1", session_id="s1", baseline_head=head_before_developer_prompt, repo=str(repo), root=root
+    )
+
+    extension_side_has_read_marker = threading.Event()
+    developer_prompt_side_started = threading.Event()
+    original_round_baseline_status = rbm.round_baseline_status
+
+    def round_baseline_status_paused_after_extension_side_read(marker, **kwargs):
+        extension_side_has_read_marker.set()
+        developer_prompt_side_started.wait(timeout=5)
+        _time.sleep(0.4)  # 无锁时真实 prompt 在这段窗口里早已写完新 baseline
+        return original_round_baseline_status(marker, **kwargs)
+
+    extension_results: list[object] = []
+
+    def extension_side():
+        extension_results.append(
+            rbm.extend_round_baseline_marker_expiry_without_moving_baseline_head(
+                task_id="t1", session_id="s1", repo=str(repo), root=root
+            )
+        )
+
+    def developer_prompt_side():
+        extension_side_has_read_marker.wait(timeout=5)
+        developer_prompt_side_started.set()
+        rbm.write_round_baseline_marker(
+            task_id="t1", session_id="s1", baseline_head=head_at_concurrent_developer_prompt,
+            repo=str(repo), root=root,
+        )
+
+    rbm.round_baseline_status = round_baseline_status_paused_after_extension_side_read
+    try:
+        threads = [threading.Thread(target=extension_side), threading.Thread(target=developer_prompt_side)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive(), "锁不得造成死锁"
+    finally:
+        rbm.round_baseline_status = original_round_baseline_status
+
+    assert extension_results and extension_results[0] is not None, (
+        "续期本身应照常发生（它先拿到了锁、读到的是活跃 marker）", extension_results
+    )
+    final = rbm.read_round_baseline_marker(task_id="t1", session_id="s1", repo=str(repo), root=root)
+    assert final["baseline_head"] == head_at_concurrent_developer_prompt, (
+        "续期把旧 baseline_head 整份写回，覆盖了并发真实 prompt 写入的新 round 边界", final
+    )
+    assert rbm.round_baseline_status(final) == rbm.STATUS_ACTIVE, final
+
+
 def test_allocate_review_scope_includes_committed_round(tmp: Path) -> None:
     """End-to-end: round-baseline marker present + in-round commit ⇒ the
     committed unit reaches allocator scope through resolve→build_manifest→allocate."""
@@ -7855,6 +7924,310 @@ def test_decision_token_explicit_user_request_clears_declined_session_scope_snoo
     ) is None
 
 
+def test_decision_token_declined_session_scope_snooze_releases_on_unreviewed_line_growth_alone(
+    tmp: Path,
+) -> None:
+    """M11：同一批文件上的工作量翻几倍，本身就是新工作，不必等出现新路径。
+
+    改动前「范围扩大」要求新路径 **且** 行数增长 > 50%：审计探针里同一批文件行数涨 100 倍，到第
+    11 小时仍然静默（本仓默认不提交、改动常集中在几个巨型文件上）。新增一条只看行数的解除条件：
+    未审行数 ≥ 对比基线的 3 倍 **且** 绝对增量 ≥ 150 非空行（两者都卡边界）。
+    """
+    dts = load_rvf_decision_token_store_module()
+    t0 = _fixed_utc(0)
+
+    def case(name: str, baseline_lines: int):
+        roots = _decision_token_store_roots(tmp / name)
+        _decline_with_scope_snapshot(
+            dts, roots, session_id="s", fingerprint="fp-declined",
+            summary=_candidate_summary_carrying_scope_identity(
+                paths=["huge.py"], head="h1", unreviewed_lines=baseline_lines
+            ),
+            now=t0,
+        )
+        return roots
+
+    def mint_same_paths(roots, lines: int, *, seconds: int = 60):
+        return dts.mint_decision_token(
+            worktree="/wt", session_id="s", candidate_fingerprint=f"fp-{lines}-{seconds}",
+            candidate_summary=_candidate_summary_carrying_scope_identity(
+                paths=["huge.py"], head="h1", unreviewed_lines=lines
+            ),
+            now=_fixed_utc(seconds), **roots,
+        )
+
+    # 审计探针：同一批文件、行数 ×100、第 11 小时 ⇒ 必须解除。
+    roots = case("probe-100x-at-hour-11", 10)
+    released = mint_same_paths(roots, 1000, seconds=11 * 3600)
+    assert released.outcome == dts.MINT_OUTCOME_MINTED, released
+    assert [e["release_reason"] for e in _snooze_release_events(dts, roots["cooldown_root"])] == [
+        dts.DECLINED_SESSION_SCOPE_SNOOZE_RELEASED_BY_UNREVIEWED_LINE_GROWTH_ALONE
+    ]
+
+    # 倍数边界：100 → 299（2.99 倍，增量 199）仍静默；100 → 300（恰 3 倍，增量 200）解除。
+    roots = case("ratio-boundary", 100)
+    assert mint_same_paths(roots, 299).outcome == dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    assert mint_same_paths(roots, 300).outcome == dts.MINT_OUTCOME_MINTED
+
+    # 绝对增量边界：10 → 159（增量 149，远超 3 倍）仍静默；10 → 160（增量 150）解除——小基线不许
+    # 靠倍数被几行改动顶开。
+    roots = case("absolute-growth-boundary", 10)
+    assert mint_same_paths(roots, 159).outcome == dts.MINT_OUTCOME_DECLINED_SESSION_SCOPE_SNOOZE
+    assert mint_same_paths(roots, 160).outcome == dts.MINT_OUTCOME_MINTED
+    assert dts.DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_MULTIPLE_OF_BASELINE == 3
+    assert dts.DECLINED_SESSION_SCOPE_SNOOZE_UNREVIEWED_LINE_GROWTH_ALONE_MINIMUM_ABSOLUTE_NONBLANK_LINES == 150
+
+
+def test_decision_token_developer_prompt_rebase_rewrites_nothing_when_baseline_is_unchanged(
+    tmp: Path,
+) -> None:
+    """L-F3b：开发者发话时基线**没变**（snooze 期间尚无观测，或观测与基线相同）⇒ 快照不改写，
+    ``scope_expansion_baseline_source`` 如实停在 ``declined``；lifecycle 事件照记但标明「基线未变」。"""
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cooldown_root = roots["cooldown_root"]
+    summary = _candidate_summary_carrying_scope_identity(paths=["a.py"], head="h1", unreviewed_lines=10)
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-0", summary=summary, now=_fixed_utc(0))
+    before = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+
+    assert dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+        session_id="s1", now=_fixed_utc(60), cooldown_root=cooldown_root
+    ) == 1
+    after = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+    assert after == before, "基线没变时快照不得被改写"
+    assert after["scope_expansion_baseline_source"] == "declined"
+    assert after["scope_expansion_baseline_rebased_at"] is None
+
+    # 观测与基线相同：同样不改写。
+    dts.consult_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", candidate_summary=summary, now=_fixed_utc(90),
+        cooldown_root=cooldown_root,
+    )
+    observed_same = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+    dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+        session_id="s1", now=_fixed_utc(120), cooldown_root=cooldown_root
+    )
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", cooldown_root=cooldown_root
+    ) == observed_same
+    lifecycle = _snooze_lifecycle_events(dts, cooldown_root)
+    assert [e["scope_expansion_baseline_changed"] for e in lifecycle] == [False, False], lifecycle
+
+
+def test_decision_token_declined_session_scope_snooze_read_modify_write_is_serialized_between_stop_and_user_prompt_submit(
+    tmp: Path,
+) -> None:
+    """待证项（已取成本低的修法）：Stop 侧 consult 与 UPS 侧 rebase 都是对同一份快照的读改写。
+
+    交错时序：Stop 读到快照 → UPS 重置基线并写回 → Stop 把它**之前读到**的旧快照（附上本次观测）
+    写回 ⇒ UPS 的重置被静默覆盖。同一把按会话的排他锁把两边（以及 decline 写入 / 解除清除）串行化。
+    """
+    import threading  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    dts = load_rvf_decision_token_store_module()
+    roots = _decision_token_store_roots(tmp)
+    cooldown_root = roots["cooldown_root"]
+
+    def summary(lines: int):
+        return _candidate_summary_carrying_scope_identity(paths=["a.py"], head="h1", unreviewed_lines=lines)
+
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-0", summary=summary(10), now=_fixed_utc(0))
+    dts.consult_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", candidate_summary=summary(40), now=_fixed_utc(30),
+        cooldown_root=cooldown_root,
+    )
+
+    stop_side_has_read_snapshot = threading.Event()
+    user_prompt_submit_side_started = threading.Event()
+    original_evaluate = dts.evaluate_declined_session_scope_snooze_release_reason
+
+    def evaluate_paused_after_read(**kwargs):
+        stop_side_has_read_snapshot.set()
+        user_prompt_submit_side_started.wait(timeout=5)
+        _time.sleep(0.4)  # 无锁时 UPS 在这段窗口里早已写完
+        return original_evaluate(**kwargs)
+
+    def stop_side():
+        dts.consult_declined_session_scope_snooze(
+            worktree="/wt", session_id="s1", candidate_summary=summary(50), now=_fixed_utc(60),
+            cooldown_root=cooldown_root,
+        )
+
+    def user_prompt_submit_side():
+        stop_side_has_read_snapshot.wait(timeout=5)
+        user_prompt_submit_side_started.set()
+        dts.rebase_declined_session_scope_snooze_expansion_baselines_on_developer_prompt(
+            session_id="s1", now=_fixed_utc(61), cooldown_root=cooldown_root
+        )
+
+    dts.evaluate_declined_session_scope_snooze_release_reason = evaluate_paused_after_read
+    try:
+        threads = [threading.Thread(target=stop_side), threading.Thread(target=user_prompt_submit_side)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive(), "锁不得造成死锁"
+    finally:
+        dts.evaluate_declined_session_scope_snooze_release_reason = original_evaluate
+
+    final = dts.read_declined_session_scope_snooze(worktree="/wt", session_id="s1", cooldown_root=cooldown_root)
+    assert final["scope_expansion_baseline_source"] == "developer_prompt", (
+        "UPS 的基线重置被 Stop 的旧快照写回覆盖了", final
+    )
+    assert final["scope_expansion_baseline_identity"]["unreviewed_nonblank_changed_line_estimate"] == 50, final
+
+
+def test_decision_point_delivery_intent_read_merge_write_is_serialized_between_stop_receipt_and_user_prompt_submit_observation(
+    tmp: Path,
+) -> None:
+    """Stop 侧写投递回执与 UPS 侧写首达观测，都是对同一份 task 投递意图的 read-merge-write。
+
+    交错时序：Stop 读到意图 → UPS 把 ``user_prompt_submit_first_arrival_observation`` 合并写回 →
+    Stop 把它**之前读到**的旧副本（附上回执字段）整份写回 ⇒ 观测被静默抹掉，而两次更新都返回 True；
+    搁浅对账随后会把「UPS 收到但没注入正文」误判成「UPS 从未处理」。同一把按意图文件的排他锁把两边串行化，
+    两次合并都必须保留。
+    """
+    import threading  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    kfl = load_kanban_followup_lock_module()
+    root = tmp / "lock-root"
+    task_id = "task-intent-rmw"
+    decision_token = "decision-token-intent-rmw"
+    assert kfl.write_decision_point_delivery_intent(
+        task_id=task_id, root=root, session_id="s1", worktree="/wt", cwd="/wt",
+        decision_token=decision_token, candidate_fingerprint="fp-1", kanban_project_path="/proj",
+    ) is not None
+
+    stop_side_thread_name = "stop-side-delivery-receipt-update"
+    stop_side_has_read_intent = threading.Event()
+    user_prompt_submit_side_started = threading.Event()
+    original_iso_now = kfl._iso_now
+
+    def iso_now_paused_after_stop_side_read():
+        # 只暂停 Stop 线程：它在 read 之后、写回之前取 ``updated_at``。
+        if threading.current_thread().name == stop_side_thread_name:
+            stop_side_has_read_intent.set()
+            user_prompt_submit_side_started.wait(timeout=5)
+            _time.sleep(0.4)  # 无锁时 UPS 在这段窗口里早已写完观测
+        return original_iso_now()
+
+    update_results: dict[str, object] = {}
+
+    def stop_side():
+        update_results["stop_receipt"] = kfl.update_decision_point_delivery_intent(
+            task_id=task_id,
+            decision_token=decision_token,
+            updates={
+                "state": kfl.DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT,
+                "out_of_band_delivery_status": "accepted_pending_submit_confirmation",
+            },
+            root=root,
+        )
+
+    def user_prompt_submit_side():
+        stop_side_has_read_intent.wait(timeout=5)
+        user_prompt_submit_side_started.set()
+        update_results["user_prompt_submit_observation"] = (
+            kfl.record_user_prompt_submit_first_arrival_observation_on_decision_point_delivery_intent(
+                task_id=task_id,
+                decision_token=decision_token,
+                decision_point_banner_body_text_injected=True,
+                outcome="decision_point_banner_body_text_injected",
+                root=root,
+            )
+        )
+
+    kfl._iso_now = iso_now_paused_after_stop_side_read
+    try:
+        threads = [
+            threading.Thread(target=stop_side, name=stop_side_thread_name),
+            threading.Thread(target=user_prompt_submit_side),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+            assert not thread.is_alive(), "锁不得造成死锁"
+    finally:
+        kfl._iso_now = original_iso_now
+
+    assert update_results == {"stop_receipt": True, "user_prompt_submit_observation": True}, update_results
+    intent = kfl.read_decision_point_delivery_intent(task_id=task_id, root=root)
+    assert intent is not None
+    observation = intent.get(
+        kfl.DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY
+    )
+    assert isinstance(observation, dict) and observation.get(
+        "decision_point_banner_body_text_injected"
+    ) is True, ("UPS 的首达观测被 Stop 的旧副本写回静默抹掉了", intent)
+    assert intent["out_of_band_delivery_status"] == "accepted_pending_submit_confirmation", intent
+    assert intent["state"] == kfl.DECISION_POINT_DELIVERY_INTENT_STATE_SENT_AWAITING_AGENT_RECEIPT, intent
+
+
+def test_decision_token_explicit_user_request_reports_it_overrode_agent_declined_session_scope_snooze(
+    tmp: Path,
+) -> None:
+    """M7：显式触发清掉闸 2b snooze 时，``MintResult`` 必须如实回报「用户推翻了 agent 的谢绝」。
+
+    T3 之后「内容变了、冷却没命中、只有 snooze 挡着」恰是最常见的被推翻形态；只回报闸二那个字段，
+    UPS 就不会告诉 agent，agent 很可能照上次的判断再谢绝一次。与闸二同理拆成两个事实：**命中**即
+    证成推翻（与删文件成败无关），删不掉只说明后续自动路径仍被这份快照挡着。
+    """
+    dts = load_rvf_decision_token_store_module()
+    t0 = _fixed_utc(0)
+    same_scope = _candidate_summary_carrying_scope_identity(paths=["a.py"], head="h1", unreviewed_lines=10)
+
+    # 有 snooze（且冷却没命中：指纹不同）→ 推翻 snooze 为真、推翻冷却为假。
+    roots = _decision_token_store_roots(tmp / "snooze-present")
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-declined", summary=same_scope, now=t0)
+    manual = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-changed",
+        candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual.outcome == dts.MINT_OUTCOME_MINTED, manual
+    assert manual.explicit_user_request_overrode_agent_declined_session_scope_snooze is True
+    assert manual.declined_session_scope_snooze_record_still_blocks_automatic_path is False
+    assert manual.explicit_user_request_overrode_agent_declined_cooldown is False
+
+    # 没有 snooze → 两个事实都为假（不许凭空告知一次不存在的推翻）。
+    roots = _decision_token_store_roots(tmp / "snooze-absent")
+    manual_without_snooze = dts.mint_decision_token(
+        worktree="/wt", session_id="s1", candidate_fingerprint="fp-x",
+        candidate_summary=same_scope, now=t0, initiated_by_explicit_user_request=True, **roots,
+    )
+    assert manual_without_snooze.explicit_user_request_overrode_agent_declined_session_scope_snooze is False
+    assert manual_without_snooze.declined_session_scope_snooze_record_still_blocks_automatic_path is False
+
+    # 快照删不掉（I/O 失败）→ 推翻照报，另报「自动路径仍被挡」。
+    roots = _decision_token_store_roots(tmp / "snooze-clear-fails")
+    _decline_with_scope_snapshot(dts, roots, session_id="s1", fingerprint="fp-declined", summary=same_scope, now=t0)
+    snooze_root = dts.declined_session_scope_snooze_root(roots["cooldown_root"]).resolve()
+    original_unlink = Path.unlink
+
+    def unlink_failing_only_inside_snooze_root(self, *args, **kwargs):
+        if snooze_root in self.resolve().parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_unlink(self, *args, **kwargs)
+
+    Path.unlink = unlink_failing_only_inside_snooze_root
+    try:
+        manual_clear_fails = dts.mint_decision_token(
+            worktree="/wt", session_id="s1", candidate_fingerprint="fp-content-changed",
+            candidate_summary=same_scope, now=_fixed_utc(60), initiated_by_explicit_user_request=True, **roots,
+        )
+    finally:
+        Path.unlink = original_unlink
+    assert manual_clear_fails.outcome == dts.MINT_OUTCOME_MINTED, manual_clear_fails
+    assert manual_clear_fails.explicit_user_request_overrode_agent_declined_session_scope_snooze is True
+    assert manual_clear_fails.declined_session_scope_snooze_record_still_blocks_automatic_path is True
+    assert dts.read_declined_session_scope_snooze(
+        worktree="/wt", session_id="s1", cooldown_root=roots["cooldown_root"]
+    ) is not None
+
+
 def test_decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing(
     tmp: Path,
 ) -> None:
@@ -8697,7 +9070,10 @@ def test_agent_cli_dispatch_separates_blocked_on_reviewer_request_from_failure(t
     assert ok.status == "ok", ok
     assert ok.detail["dispatch_status_path"].endswith(".dispatch-thread.status.json")
     # 等待改走 `rvf wait`（按 host 分流），不再指引 agent 手动 --wait-status 轮询。
-    assert any(" wait`" in step for step in ok.next_steps), ok.next_steps
+    # 解析不出会话 id 时回执会直接带上 `--run-dir <run>`，两种形态都算。
+    assert any(
+        " wait`" in step or " wait --run-dir " in step for step in ok.next_steps
+    ), ok.next_steps
     assert not any("--wait-status" in step for step in ok.next_steps), ok.next_steps
     assert any("plan_status" in step for step in ok.next_steps), ok.next_steps
 
@@ -10849,6 +11225,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             lambda: test_round_baseline_marker_round_trip(root / "round-baseline-marker"),
         ),
         (
+            "round_baseline_marker_expiry_extension_does_not_overwrite_concurrent_developer_prompt_baseline",
+            lambda: test_round_baseline_marker_expiry_extension_does_not_overwrite_concurrent_developer_prompt_baseline(
+                root / "round-baseline-extension-vs-developer-prompt-serialized"
+            ),
+        ),
+        (
             "rvf_user_prompt_submit_captures_round_baseline",
             lambda: test_rvf_user_prompt_submit_captures_round_baseline(root / "round-baseline-capture"),
         ),
@@ -11070,6 +11452,72 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             "rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not",
             lambda: test_rvf_user_prompt_submit_developer_prompt_rebases_snooze_baseline_but_banner_delivery_does_not(
                 root / "prompt-submit-developer-prompt-rebases-session-scope-snooze"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_trigger_tells_agent_it_overrode_declined_session_scope_snooze",
+            lambda: test_rvf_user_prompt_submit_manual_trigger_tells_agent_it_overrode_declined_session_scope_snooze(
+                root / "prompt-submit-manual-overrides-session-scope-snooze"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_manual_trigger_does_not_first_rebase_the_snooze_it_is_about_to_release",
+            lambda: test_rvf_user_prompt_submit_manual_trigger_does_not_first_rebase_the_snooze_it_is_about_to_release(
+                root / "prompt-submit-manual-skips-snooze-rebase"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_still_injected_token",
+            lambda: test_rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_still_injected_token(
+                root / "prompt-submit-marker-resubmitted-after-rewind"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_being_handed_to_host_never_withdraws_token",
+            lambda: test_rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_being_handed_to_host_never_withdraws_token(
+                root / "prompt-submit-marker-arriving-while-first-injection-in-flight"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises",
+            lambda: test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises(
+                root / "prompt-submit-first-arrival-clear-intent-raises"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger(
+                root / "prompt-submit-task-notification-quotes-manual-trigger"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_does_not_reset_stop_hook_reentry_budget",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_does_not_reset_stop_hook_reentry_budget(
+                root / "prompt-submit-task-notification-keeps-reentry-budget"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_does_not_rebase_declined_session_scope_snooze",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_does_not_rebase_declined_session_scope_snooze(
+                root / "prompt-submit-task-notification-keeps-snooze-baseline"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_keeps_round_baseline_head_but_extends_its_expiry",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_keeps_round_baseline_head_but_extends_its_expiry(
+                root / "prompt-submit-task-notification-keeps-round-baseline-head"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_keeps_previous_turn_park_eligibility",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_keeps_previous_turn_park_eligibility(
+                root / "prompt-submit-task-notification-keeps-park-eligibility"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_claude_task_notification_quoting_rvf_literals_triggers_nothing",
+            lambda: test_rvf_user_prompt_submit_claude_task_notification_quoting_rvf_literals_triggers_nothing(
+                root / "prompt-submit-task-notification-quotes-rvf-literals"
             ),
         ),
         (
@@ -12350,6 +12798,36 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "decision_token_declined_session_scope_snooze_releases_on_unreviewed_line_growth_alone",
+            lambda: test_decision_token_declined_session_scope_snooze_releases_on_unreviewed_line_growth_alone(
+                root / "decision-token-snooze-releases-on-line-growth-alone"
+            ),
+        ),
+        (
+            "decision_token_developer_prompt_rebase_rewrites_nothing_when_baseline_is_unchanged",
+            lambda: test_decision_token_developer_prompt_rebase_rewrites_nothing_when_baseline_is_unchanged(
+                root / "decision-token-snooze-rebase-unchanged-baseline"
+            ),
+        ),
+        (
+            "decision_token_declined_session_scope_snooze_read_modify_write_is_serialized_between_stop_and_user_prompt_submit",
+            lambda: test_decision_token_declined_session_scope_snooze_read_modify_write_is_serialized_between_stop_and_user_prompt_submit(
+                root / "decision-token-snooze-read-modify-write-serialized"
+            ),
+        ),
+        (
+            "decision_point_delivery_intent_read_merge_write_is_serialized_between_stop_receipt_and_user_prompt_submit_observation",
+            lambda: test_decision_point_delivery_intent_read_merge_write_is_serialized_between_stop_receipt_and_user_prompt_submit_observation(
+                root / "decision-point-delivery-intent-read-merge-write-serialized"
+            ),
+        ),
+        (
+            "decision_token_explicit_user_request_reports_it_overrode_agent_declined_session_scope_snooze",
+            lambda: test_decision_token_explicit_user_request_reports_it_overrode_agent_declined_session_scope_snooze(
+                root / "decision-token-explicit-user-request-overrode-session-scope-snooze"
+            ),
+        ),
+        (
             "decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing",
             lambda: test_decision_token_developer_prompt_rebases_snooze_scope_expansion_baseline_without_releasing(
                 root / "dts-session-scope-snooze-developer-prompt-rebase"
@@ -12482,6 +12960,55 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
             lambda: test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(root / "agent-cli-start-receipt"),
+        ),
+        # --- T1/T2/T3 集成审计修复包 F2：执行段 ---
+        (
+            "rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl",
+            lambda: test_rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl(
+                root / "rvf-wait-awaiting-marker-stop-e2e"
+            ),
+        ),
+        (
+            "rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work",
+            lambda: test_rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work(
+                root / "rvf-wait-awaiting-marker-host-gate"
+            ),
+        ),
+        (
+            "rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd",
+            lambda: test_rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd(
+                root / "rvf-fix-prepare-awaiting-marker"
+            ),
+        ),
+        (
+            "rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run",
+            lambda: test_rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run(
+                root / "rvf-validate-off-main-run"
+            ),
+        ),
+        (
+            "rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository",
+            lambda: test_rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository(
+                root / "rvf-land-passthrough"
+            ),
+        ),
+        (
+            "rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback",
+            lambda: test_rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback(
+                root / "rvf-apply-created-at-order"
+            ),
+        ),
+        (
+            "rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable",
+            lambda: test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable(
+                root / "rvf-receipts-explicit-run-dir"
+            ),
+        ),
+        (
+            "rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol",
+            lambda: test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol(
+                root / "rvf-execution-segment-docs"
+            ),
         ),
     ]
 

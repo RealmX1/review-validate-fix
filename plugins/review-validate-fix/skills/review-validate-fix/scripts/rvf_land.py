@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -35,10 +36,14 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401
-from rvf_handoff_intake import build_payload, parse_sections, repo_snapshot  # noqa: E402
+from rvf_handoff_intake import (  # noqa: E402
+    build_payload,
+    git_environment_with_user_configuration_without_repository_location_overrides,
+    parse_sections,
+    repo_snapshot,
+)
 from seal_round_baseline_to_head import seal_round_baseline_to_head  # noqa: E402
 from validation_result_cache import (  # noqa: E402
-    RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE,
     candidate_content_manifest_sha256,
     canonical_json_bytes,
     load_handoff_validation_commands,
@@ -49,6 +54,7 @@ from validation_result_cache import (  # noqa: E402
 )
 from write_reviewed_task_candidate_evidence import (  # noqa: E402
     CandidateEvidenceNotApplicable,
+    merge_dispositions_errors_that_would_refuse_candidate_evidence,
     reviewed_scope_path_universe,
     write_evidence,
 )
@@ -70,13 +76,24 @@ RVF_LAND_EXIT_VALIDATION_NOT_REPLAYABLE = 22
 RVF_LAND_EXIT_STAGED_DIFF_CHECK_FAILED = 23
 RVF_LAND_EXIT_GIT_COMMIT_FAILED = 24
 RVF_LAND_EXIT_WORKTREE_NOT_CLEAN_AFTER_COMMIT = 25
-# commit 已发生，但 commit 期间（pre-commit 等 hook 改写文件）内容摘要不再等于验证时的摘要：
-# 提交进去的字节未经验证，因此不封窗、不写 evidence。
+# commit 已发生，但 commit 期间 pre-commit 等 hook 改变了提交内容：内容摘要不再等于验证时的摘要
+# （``reason_code=candidate_content_changed_during_commit``），或提交实际包含了 stage 集合外的路径
+# （``reason_code=committed_paths_outside_stage_set``）。提交进去的内容未经审查/验证，因此不封窗、不写 evidence。
 RVF_LAND_EXIT_CANDIDATE_CONTENT_CHANGED_DURING_COMMIT = 26
+# 提交前拒绝：evidence 会走合并处置强校验（reviewer 报过 issue 或处置工件存在）而处置缺失/不合法/过期——
+# 放行则提交后 evidence 必然 refused_fail_closed。未 stage、未 commit。
+RVF_LAND_EXIT_MERGE_DISPOSITIONS_CHECK_FAILED_BEFORE_COMMIT = 27
 
 RVF_LAND_PREPARE_PLAN_ARTIFACT_NAME = "rvf-land-prepare-plan.json"
 RVF_LAND_PREPARE_PLAN_SCHEMA_NAME = "rvf-land-prepare-plan"
-RVF_LAND_PREPARE_PLAN_SCHEMA_VERSION = 1
+RVF_LAND_PREPARE_PLAN_SCHEMA_VERSION = 2
+# 显式开关：只提交 stage 集合、把 scope 外脏文件原样留在工作树（不 stage、不 revert）、跳过 evidence。
+# 主会话 worktree 有并行 WIP 是常态（跨 worktree 模式）；不加开关时 scope 外脏文件仍是 exit 12。
+LEAVE_UNRELATED_DIRTY_PATHS_FLAG = "--commit-staged-scope-only-and-leave-unrelated-dirty-paths"
+# 零执行复用成立 ⇔ 当前工作树全量内容摘要等于 RVF run 验证时的摘要（同 worktree 模式下还额外依赖
+# 「修复就应用在当前 worktree」）。跨 worktree 模式只有在这一条成立时才证明「提交进去的就是 RVF 审过并
+# 验证过的字节」，才允许封窗；否则主会话在 fork 之后落在同一文件的改动会被封窗一并宣称已审。
+VALIDATION_MODE_REUSED_RUN_VALIDATION_INDEX_WITH_ZERO_EXECUTION = "reused_run_validation_index_with_zero_execution"
 # commit 把实际验证结果替换进这一行；agent 定稿 message 时保留它即可，不必手抄验证结果。
 RVF_LAND_COMMIT_MESSAGE_VALIDATION_SUMMARY_PLACEHOLDER = "[[rvf-land-validation-summary]]"
 # 草稿里需要 agent 填写的占位；commit 时仍残留即拒绝，防止把草稿原样提交。
@@ -92,16 +109,12 @@ HANDOFF_SECTION_HEADINGS_SHOWN_TO_LAND_AGENT = (
     "需要开发者决策的升级事项",
 )
 UNMERGED_PORCELAIN_STATUSES = {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}
-# 只剥离「指向别处仓库」的 git 位置变量；hooks、身份、签名等用户配置保持与手动 commit 一致。
-GIT_REPOSITORY_LOCATION_ENVIRONMENT_VARIABLES = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-)
+# 自动 stage 集合的上界只取 scope contract 的这三个字段（reviewed 主审边界）。evidence 的落地 delta
+# 收敛判据还额外包含 ``background_files``（``REVIEWED_SCOPE_PATH_UNIVERSE_FIELD_NAMES``），那是「落地
+# delta 碰到它不算越界」的判据，不是「它属于本次工作」的判据，不能拿来决定替谁提交。
+LAND_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES = ("primary_files", "fix_allowlist", "task_change_paths")
+# 不得自动 stage 的 scope contract 字段：其他会话 / 未归属的脏文件。显式出现在上面三个字段里的路径例外。
+LAND_NOT_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES = ("protected_files", "background_files")
 
 
 class RvfLandHardGateFailure(Exception):
@@ -122,20 +135,13 @@ class RvfLandHardGateFailure(Exception):
         }
 
 
-def git_environment_for_user_commit() -> dict[str, str]:
-    environment = dict(os.environ)
-    for name in GIT_REPOSITORY_LOCATION_ENVIRONMENT_VARIABLES:
-        environment.pop(name, None)
-    return environment
-
-
 def run_git(repo_root: Path, *arguments: str, check: bool = False) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         ["git", "-C", str(repo_root), *arguments],
         capture_output=True,
         text=True,
         check=False,
-        env=git_environment_for_user_commit(),
+        env=git_environment_with_user_configuration_without_repository_location_overrides(),
     )
     if check and completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or f"git {arguments[0]} failed")
@@ -145,6 +151,14 @@ def run_git(repo_root: Path, *arguments: str, check: bool = False) -> subprocess
 def head_oid(repo_root: Path) -> str | None:
     completed = run_git(repo_root, "rev-parse", "--verify", "HEAD")
     return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def paths_changed_by_commit_relative_to_its_parent(repo_root: Path, commit_oid: str) -> set[str]:
+    # ``--no-renames``：rename 拆成删旧、加新两端，与 stage 集合（新旧两端都列入）同口径；``--root``：首个提交没有父提交。
+    listed = run_git(
+        repo_root, "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "--no-renames", "-z", commit_oid, check=True
+    )
+    return {path for path in listed.stdout.split("\0") if path}
 
 
 def prepare_plan_artifact_path(run_dir: Path) -> Path:
@@ -233,31 +247,84 @@ def reviewed_scope_contract(run_dir: Path) -> dict[str, Any] | None:
     return read_json_object_or_none(run_dir / "artifacts" / "inputs" / "scope.contract.json")
 
 
+def scope_contract_path_list(contract: dict[str, Any], field_names: tuple[str, ...]) -> set[str]:
+    return {
+        path
+        for field_name in field_names
+        for path in contract.get(field_name) or []
+        if isinstance(path, str) and path
+    }
+
+
+def path_matches_scope_contract_path_pattern(path: str, patterns: set[str]) -> bool:
+    """与 ``rvf_fix_attempt._prefix_matches`` 同口径：精确路径，或以 ``/`` 结尾 / 目录名形式的前缀。"""
+    for raw_pattern in patterns:
+        pattern = raw_pattern.strip().replace("\\", "/").lstrip("/")
+        if not pattern:
+            continue
+        if path == pattern.rstrip("/") or path.startswith(pattern.rstrip("/") + "/"):
+            return True
+    return False
+
+
 def land_stageable_path_universe(
     intake: dict[str, Any], contract: dict[str, Any] | None, dispositions: list[dict[str, Any]]
 ) -> list[str]:
-    """允许 stage 的路径全集 = reviewed scope 上界 ∪ 已合回 fix 的改动路径，再剔除 handoff 标注的 protected 路径。
+    """允许**自动** stage 的路径全集 = reviewed 主审边界 ∪ 已合回 fix 的改动路径，再剔除不得自动 stage 的路径。
 
-    reviewed scope 上界：scope contract 给得出路径全集时**只用它**——它与 evidence 的落地 delta 收敛判据
-    同口径（``reviewed_scope_path_universe``）；handoff 的 ``reviewed_scope_paths`` 是从粘贴正文/manifest
-    解析出来的，不能把上界撑到 contract 之外，否则提交会越过 evidence 判据、而 evidence 拒绝发生在提交之后。
-    contract 缺失或全集为空时才退回 handoff 的 ``reviewed_scope_paths``。
+    reviewed 主审边界：scope contract 给得出路径全集时只用它的 ``primary_files ∪ fix_allowlist ∪
+    task_change_paths``；handoff 的 ``reviewed_scope_paths`` 是从粘贴正文/manifest 解析出来的，不能把上界撑到
+    contract 之外，否则提交会越过 evidence 判据、而 evidence 拒绝发生在提交之后。contract 缺失或全集为空时
+    才退回 handoff 的 ``reviewed_scope_paths``。
+
+    **background 不自动 stage**：``background_files`` 是 prepare 时其他会话 / 未归属的脏文件。evidence 的落地
+    delta 收敛判据把它算进路径全集（``reviewed_scope_path_universe``，既有口径不动），但把它自动 stage 等于
+    替别人提交 WIP、再封窗宣称已审。确属本次工作（例如本会话用 shell 改的文件归属落空）时用
+    ``--extra-path`` 显式纳入。
+
+    不得自动 stage = contract ``protected_files ∪ background_files`` ∪ handoff 标注的 protected 路径。例外：
+    显式出现在 contract 主审边界里的路径照常可 stage——``rvf scope --include`` 把 background 路径并入
+    ``primary_files`` 时不会把它从 background / protected 里删掉；这与 fix attempt 的口径一致（fix_allowlist
+    内的路径不受 protected 拦截，protected 只拦边界之外的路径）。handoff 标注的 protected 路径没有例外。
 
     已合回 fix 的补丁路径照常并入：其中 scope expansion 路径是 fix attempt 显式声明过的，但它们不在
     contract 全集里、evidence 会拒绝——prepare 用 ``stageable_dirty_paths_outside_candidate_evidence_
     landing_universe`` 在提交前把这一后果摆出来。
     """
-    contract_universe = reviewed_scope_path_universe(contract) if contract is not None else set()
-    universe = set(contract_universe) if contract_universe else set(intake.get("reviewed_scope_paths") or [])
+    contract_has_path_universe = contract is not None and bool(reviewed_scope_path_universe(contract))
+    reviewed_primary_boundary = (
+        scope_contract_path_list(contract, LAND_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES)
+        if contract is not None
+        else set()
+    )
+    universe = (
+        set(reviewed_primary_boundary)
+        if contract_has_path_universe
+        else set(intake.get("reviewed_scope_paths") or [])
+    )
     for disposition in dispositions:
         if disposition["fix_applied_to_worktree"]:
             universe.update(disposition["changed_paths"])
-    protected = {
+    contract_not_automatically_stageable_patterns = (
+        scope_contract_path_list(contract, LAND_NOT_AUTOMATICALLY_STAGEABLE_SCOPE_CONTRACT_FIELD_NAMES)
+        if contract is not None
+        else set()
+    )
+    handoff_protected = {
         path
         for path in (intake.get("intake_hints") or {}).get("protected_paths") or []
         if isinstance(path, str)
     }
-    return sorted(path for path in universe if path and path not in protected)
+    return sorted(
+        path
+        for path in universe
+        if path
+        and path not in handoff_protected
+        and (
+            path in reviewed_primary_boundary
+            or not path_matches_scope_contract_path_pattern(path, contract_not_automatically_stageable_patterns)
+        )
+    )
 
 
 def partition_dirty_entries(
@@ -287,6 +354,8 @@ def reviewed_scope_dirty_gate_failures(
     stageable_paths: set[str],
     in_scope: list[dict[str, str]],
     unrelated: list[dict[str, str]],
+    *,
+    leave_unrelated_dirty_paths_uncommitted: bool,
 ) -> list[RvfLandHardGateFailure]:
     failures: list[RvfLandHardGateFailure] = []
     if dirty_entries and not stageable_paths:
@@ -307,18 +376,47 @@ def reviewed_scope_dirty_gate_failures(
                 paths=unmerged,
             )
         )
-    if unrelated:
+    if unrelated and not leave_unrelated_dirty_paths_uncommitted:
         failures.append(
             RvfLandHardGateFailure(
                 RVF_LAND_EXIT_UNRELATED_DIRTY_PATHS_WOULD_REMAIN,
                 "unrelated_dirty_paths_would_remain_after_commit",
                 "存在 reviewed scope 之外的脏文件：commit 后工作树不会 clean，evidence 无法绑定唯一 HEAD。"
                 "若它们属于本次工作（例如测试注册、补修正的直接 fallout），用 --extra-path 显式纳入；"
-                "否则先把它们移出本 worktree 再重跑。",
+                f"若是别人的并行改动且必须保留，加 {LEAVE_UNRELATED_DIRTY_PATHS_FLAG} 只提交 stage 集合"
+                "（evidence 跳过）；否则先把它们移出本 worktree 再重跑。",
                 paths=dirty_paths_outside(unrelated, stageable_paths),
             )
         )
     return failures
+
+
+def worktree_path_content_fingerprint(repo_root: Path, path: str) -> str:
+    """单个路径的工作树内容指纹（不含 git 状态）：普通文件按字节 + 可执行位，符号链接按目标，不存在记 absent。"""
+    filesystem_path = repo_root / path
+    try:
+        metadata = filesystem_path.lstat()
+    except FileNotFoundError:
+        return "absent"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink:" + sha256_hex(os.fsencode(os.readlink(filesystem_path)))
+    if stat.S_ISREG(metadata.st_mode):
+        executable_marker = "x" if metadata.st_mode & 0o111 else "-"
+        return f"file{executable_marker}:" + sha256_hex(filesystem_path.read_bytes())
+    return "other"
+
+
+def dirty_path_fingerprints(repo_root: Path, dirty_entries: list[dict[str, str]]) -> dict[str, str]:
+    """每个脏路径的「porcelain 状态 + 内容指纹」：内容变了、或被别人 ``git add`` 过（状态变了）都会反映出来。"""
+    fingerprints: dict[str, str] = {}
+    for entry in dirty_entries:
+        for path in sorted(dirty_entry_paths(entry)):
+            fingerprints[path] = f"{entry.get('status')}|{worktree_path_content_fingerprint(repo_root, path)}"
+    return fingerprints
+
+
+def dirty_paths_changed_between_fingerprints(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    return sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
 
 
 def validation_reuse_assessment(repo_root: Path, run_dir: Path) -> dict[str, Any]:
@@ -489,7 +587,13 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
     stageable = set(stageable_universe) | set(extra_paths)
     dirty_entries = [entry for entry in current_snapshot.get("dirty_paths") or [] if isinstance(entry, dict)]
     in_scope, unrelated = partition_dirty_entries(dirty_entries, stageable)
-    gate_failures += reviewed_scope_dirty_gate_failures(dirty_entries, stageable, in_scope, unrelated)
+    gate_failures += reviewed_scope_dirty_gate_failures(
+        dirty_entries,
+        stageable,
+        in_scope,
+        unrelated,
+        leave_unrelated_dirty_paths_uncommitted=args.commit_staged_scope_only_and_leave_unrelated_dirty_paths,
+    )
 
     validation = (
         validation_reuse_assessment(repo_root, run_dir)
@@ -510,6 +614,9 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
         "hard_gate_failures": [failure.as_payload() for failure in gate_failures],
         "stageable_dirty_paths": [entry["path"] for entry in in_scope],
         "unrelated_dirty_paths": dirty_paths_outside(unrelated, stageable),
+        "leave_unrelated_dirty_paths_uncommitted": bool(
+            args.commit_staged_scope_only_and_leave_unrelated_dirty_paths
+        ),
         # 会进提交、但不在 evidence 落地 delta 收敛判据（scope contract 路径全集）内的路径：contract 已 opt-in
         # evidence 时，提交后 evidence 必然 refused_fail_closed（提交不回滚）。来源只可能是 --extra-path 或已合回 fix 的 scope expansion 路径。
         "stageable_dirty_paths_outside_candidate_evidence_landing_universe": (
@@ -552,6 +659,12 @@ def build_prepare_report(args: argparse.Namespace) -> tuple[dict[str, Any], int]
             ),
             "stageable_path_universe": stageable_universe,
             "extra_paths": extra_paths,
+            "leave_unrelated_dirty_paths_uncommitted": bool(
+                args.commit_staged_scope_only_and_leave_unrelated_dirty_paths
+            ),
+            # commit 在 stage 前与之比对，列出 prepare 之后变化过的路径（含 agent 自己的最小修正，
+            # 也含并发改动 / 别人的 git add）；验证只会因内容变化而重跑，不会告诉 agent 是哪些路径变了。
+            "dirty_path_fingerprints_at_prepare": dirty_path_fingerprints(repo_root, dirty_entries),
             "prepared_at": datetime.now(timezone.utc).isoformat(),
         }
         write_json_with_digest(prepare_plan_artifact_path(run_dir), plan)
@@ -575,12 +688,15 @@ def render_prepare_report_text(report: dict[str, Any], exit_code: int) -> str:
         lines.append("\n## 硬门槛：全部通过")
     if not report["handoff_status_completed"]:
         lines.append("⚠️ handoff 未标 handoff_status: COMPLETED——RVF 可能没跑完，evidence 会被拒。")
-    lines.append("\n## 将要 stage 的路径（reviewed scope ∩ dirty）")
+    lines.append("\n## 将要 stage 的路径（reviewed 主审边界 ∩ dirty；background / protected 不自动 stage）")
     lines += [f"- {path}" for path in report["stageable_dirty_paths"]] or ["- <无：没有可提交的改动，commit 只做验证/封窗/evidence>"]
     outside_evidence = report["stageable_dirty_paths_outside_candidate_evidence_landing_universe"]
     if outside_evidence:
         lines.append("⚠️ 以下路径会进提交，但不在 scope contract 路径全集内：contract 已 opt-in evidence 时，提交后 evidence 必然 refused_fail_closed（提交不回滚）。")
         lines += [f"  - {path}" for path in outside_evidence]
+    if report["unrelated_dirty_paths"] and report["leave_unrelated_dirty_paths_uncommitted"]:
+        lines.append(f"\n## scope 外脏文件：按 {LEAVE_UNRELATED_DIRTY_PATHS_FLAG} 原样保留，不 stage、不提交（evidence 跳过）")
+        lines += [f"- {path}" for path in report["unrelated_dirty_paths"]]
     validation = report["validation"]
     if validation is not None:
         index = validation["run_validation_index_summary"]
@@ -741,7 +857,7 @@ def ensure_validation_satisfies_evidence_gate(repo_root: Path, run_dir: Path) ->
     assessment = validation_reuse_assessment(repo_root, run_dir)
     if assessment["validation_reusable"]:
         return {
-            "mode": "reused_run_validation_index_with_zero_execution",
+            "mode": VALIDATION_MODE_REUSED_RUN_VALIDATION_INDEX_WITH_ZERO_EXECUTION,
             "outcomes": [
                 {"name": record["name"], "cache_status": "reused_run_index", "status": record["status"]}
                 for record in assessment["run_validation_index_summary"]["records"]
@@ -799,10 +915,9 @@ def read_commit_message(message_file: str) -> str:
 
 
 def command_commit(args: argparse.Namespace) -> int:
-    run_dir_text = args.run_dir or os.environ.get(RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE, "").strip()
-    if not run_dir_text:
-        raise ValueError(f"需要 --run-dir（或环境变量 {RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE}）")
-    run_dir = Path(run_dir_text).expanduser().resolve()
+    # 只认显式 --run-dir：reviewer 子进程与 Codex task shell 都带着 RVF_RUN_DIR（指向活 run），
+    # 环境变量回退会把别处 shell 的 land 引到那个 run 上。
+    run_dir = Path(args.run_dir).expanduser().resolve()
     message = read_commit_message(args.message_file)
     plan = load_prepare_plan(run_dir)
     repo_root = Path(repository_identity(Path(args.repo).expanduser().resolve())[0]).resolve()
@@ -820,25 +935,79 @@ def command_commit(args: argparse.Namespace) -> int:
             plan_repo_root=plan["repo_root"],
             plan_head_oid=plan.get("head_oid_at_prepare"),
         )
+    dirty_entries = [entry for entry in repo_snapshot(repo_root).get("dirty_paths") or [] if isinstance(entry, dict)]
+    dirty_paths_changed_since_prepare = dirty_paths_changed_between_fingerprints(
+        plan.get("dirty_path_fingerprints_at_prepare") or {}, dirty_path_fingerprints(repo_root, dirty_entries)
+    )
+    try:
+        result = land_commit_after_prepare_plan_checks(args, plan, run_dir, repo_root, message, dirty_entries)
+    except RvfLandHardGateFailure as failure:
+        failure.details.setdefault("dirty_paths_changed_since_prepare", dirty_paths_changed_since_prepare)
+        raise
+    result["dirty_paths_changed_since_prepare"] = dirty_paths_changed_since_prepare
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result["exit_code"]
+
+
+def land_commit_after_prepare_plan_checks(
+    args: argparse.Namespace,
+    plan: dict[str, Any],
+    run_dir: Path,
+    repo_root: Path,
+    message: str,
+    dirty_entries: list[dict[str, str]],
+) -> dict[str, Any]:
     extra_paths = sorted(
         set(plan.get("extra_paths") or []) | {repo_relative_path(repo_root, path) for path in args.extra_path}
     )
+    leave_unrelated_dirty_paths_uncommitted = bool(
+        args.commit_staged_scope_only_and_leave_unrelated_dirty_paths
+        or plan.get("leave_unrelated_dirty_paths_uncommitted")
+    )
     stageable = set(plan.get("stageable_path_universe") or []) | set(extra_paths)
-    dirty_entries = [entry for entry in repo_snapshot(repo_root).get("dirty_paths") or [] if isinstance(entry, dict)]
     in_scope, unrelated = partition_dirty_entries(dirty_entries, stageable)
-    failures = reviewed_scope_dirty_gate_failures(dirty_entries, stageable, in_scope, unrelated)
+    failures = reviewed_scope_dirty_gate_failures(
+        dirty_entries,
+        stageable,
+        in_scope,
+        unrelated,
+        leave_unrelated_dirty_paths_uncommitted=leave_unrelated_dirty_paths_uncommitted,
+    )
     if failures:
         raise failures[0]
+    unrelated_dirty_paths_left_uncommitted = dirty_paths_outside(unrelated, stageable)
+    # 处置预检只在 evidence 真会写时才拦：按显式开关保留 scope 外脏文件时 commit 后工作树不 clean，
+    # evidence 必然以 skipped_unrelated_dirty_paths_left_uncommitted_by_explicit_flag 跳过，预检拦下只会凭空多一道闸。
+    evidence_will_be_skipped_for_unrelated_dirty_paths_left_uncommitted = bool(
+        leave_unrelated_dirty_paths_uncommitted and unrelated_dirty_paths_left_uncommitted
+    )
+    merge_dispositions_errors = (
+        ()
+        if evidence_will_be_skipped_for_unrelated_dirty_paths_left_uncommitted
+        else merge_dispositions_errors_that_would_refuse_candidate_evidence(repo_root, run_dir)
+    )
+    if merge_dispositions_errors:
+        raise RvfLandHardGateFailure(
+            RVF_LAND_EXIT_MERGE_DISPOSITIONS_CHECK_FAILED_BEFORE_COMMIT,
+            "merge_dispositions_check_failed",
+            "reviewer 报过 issue（或已有处置工件），但合并处置缺失/不合法/过期，提交后 evidence 必然 refused_fail_closed；"
+            "用 `rvf merge write` 补齐处置（`rvf merge check` 复核）后重跑 commit。未 stage、未 commit。",
+            merge_dispositions_errors=list(merge_dispositions_errors),
+        )
 
     validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
 
     stage_paths = sorted({path for entry in in_scope for path in (entry.get("path"), entry.get("old_path")) if path})
     if stage_paths:
         run_git(repo_root, "add", "-A", "--", *stage_paths, check=True)
-    has_staged_changes = run_git(repo_root, "diff", "--cached", "--quiet").returncode == 1
+    # 检查与提交都限定在 stage 集合：``commit --only`` 只提交列出的路径，别人预先 stage（或在
+    # 本命令运行期间 git add）的 scope 外路径原样留在 index，既不进提交，也不影响这里的判定。
+    has_staged_changes = (
+        bool(stage_paths) and run_git(repo_root, "diff", "--cached", "--quiet", "--", *stage_paths).returncode == 1
+    )
     commit_oid: str | None = None
     if has_staged_changes:
-        diff_check = run_git(repo_root, "diff", "--cached", "--check")
+        diff_check = run_git(repo_root, "diff", "--cached", "--check", "--", *stage_paths)
         if diff_check.returncode != 0:
             run_git(repo_root, "reset", "-q", "--", *stage_paths)
             raise RvfLandHardGateFailure(
@@ -854,7 +1023,7 @@ def command_commit(args: argparse.Namespace) -> int:
             handle.write(final_message + "\n")
             message_path = Path(handle.name)
         try:
-            committed = run_git(repo_root, "commit", "-q", "-F", str(message_path))
+            committed = run_git(repo_root, "commit", "-q", "--only", "-F", str(message_path), "--", *stage_paths)
         finally:
             message_path.unlink(missing_ok=True)
         if committed.returncode != 0:
@@ -865,16 +1034,47 @@ def command_commit(args: argparse.Namespace) -> int:
                 git_output=(committed.stdout + committed.stderr)[-6000:],
             )
         commit_oid = head_oid(repo_root)
+    # ``commit --only`` 让 hook 跑在临时 index 上：pre-commit ``git add`` 了 stage 集合外的路径时，它照样进入本次提交，
+    # 真实 index 却不含它（残留 D+?? 等状态）。这些路径的字节可以完全没变——内容摘要判据与「无关脏文件」判据都
+    # 看不见——只能直接比对提交实际包含的路径。任何模式都查，不限于保留开关。
+    committed_paths_outside_stage_set = (
+        sorted(paths_changed_by_commit_relative_to_its_parent(repo_root, commit_oid) - set(stage_paths))
+        if commit_oid
+        else []
+    )
 
-    worktree_clean = not run_git(repo_root, "status", "--porcelain=v1", "-uall").stdout.strip()
+    dirty_paths_remaining_after_commit = sorted(
+        {
+            path
+            for entry in repo_snapshot(repo_root).get("dirty_paths") or []
+            if isinstance(entry, dict)
+            for path in dirty_entry_paths(entry)
+        }
+    )
+    worktree_clean = not dirty_paths_remaining_after_commit
+    # 开关只放行 commit 前就已列出的 scope 外脏文件；commit 之后多出来的脏路径照常算「不 clean」。
+    dirty_paths_remaining_beyond_declared_unrelated = sorted(
+        set(dirty_paths_remaining_after_commit)
+        - (set(unrelated_dirty_paths_left_uncommitted) if leave_unrelated_dirty_paths_uncommitted else set())
+    )
     # 零执行复用 / 重放验证都以「提交前后内容摘要不变」为前提；commit 会跑仓库 hooks，
     # pre-commit 改写文件（纳入提交或留在工作树）即打破前提。此时提交的字节未经验证：
     # 不封窗（否则下一次 Stop 把它当已审跳过）、不写 evidence；commit 已发生，如实报告不回滚。
     content_digest_after_commit = candidate_content_manifest_sha256(repo_root)
     content_changed_during_commit = content_digest_after_commit != validation["candidate_content_manifest_sha256"]
     candidate_evidence: dict[str, Any]
-    if content_changed_during_commit:
+    if committed_paths_outside_stage_set:
+        # 与内容被改写同一处置：提交里混进了未经审查、未经验证的路径，不封窗、不写 evidence，如实报告不回滚。
         round_baseline_seal: dict[str, Any] = {
+            "sealed": False,
+            "reason": "skipped_committed_paths_outside_stage_set",
+        }
+        candidate_evidence = {
+            "status": "skipped_committed_paths_outside_stage_set",
+            "reason": "commit 期间 hook 把 stage 集合外的路径加入了本次提交（真实 index 未含它们），这些路径未经审查。",
+        }
+    elif content_changed_during_commit:
+        round_baseline_seal = {
             "sealed": False,
             "reason": "skipped_content_changed_during_commit",
         }
@@ -883,13 +1083,32 @@ def command_commit(args: argparse.Namespace) -> int:
             "reason": "commit 期间内容摘要变化（通常是 pre-commit hook 改写文件），提交的字节未经验证。",
         }
     else:
-        # 封窗与 evidence 以函数方式调用：与 Stop hook 读同一个状态根（``resolved_rvf_*``），
-        # 这是下一次 Stop 判定「无候选」的前提——seal 写一个根、Stop 读另一个根正是旧事故的成因。
-        round_baseline_seal = seal_round_baseline_to_head(str(repo_root))
-        if not worktree_clean:
+        if (
+            plan.get("cross_worktree_mode")
+            and validation["mode"] != VALIDATION_MODE_REUSED_RUN_VALIDATION_INDEX_WITH_ZERO_EXECUTION
+        ):
+            # 跨 worktree：tracker 的已审单元按 worktree 记账，fork 里审过的内容在当前 worktree 不算已审；
+            # 只有「当前内容 = RVF 验证过的内容」时封窗才不会把主会话 fork 之后的改动一并宣称已审。
+            # 不封窗的代价只是下一次 Stop 可能再问一次是否 review 这段提交。
+            # EXPERIMENT_NODE: 跨 worktree 封窗的证明粒度——现为「全量内容摘要一致」；可实验改为 stage 集合逐路径与 RVF worktree 比对，放宽主会话有无关并行 WIP 时的封窗
+            round_baseline_seal = {
+                "sealed": False,
+                "reason": "skipped_cross_worktree_landed_content_not_proven_identical_to_rvf_validated_content",
+            }
+        else:
+            # 封窗与 evidence 以函数方式调用：与 Stop hook 读同一个状态根（``resolved_rvf_*``），
+            # 这是下一次 Stop 判定「无候选」的前提——seal 写一个根、Stop 读另一个根正是旧事故的成因。
+            round_baseline_seal = seal_round_baseline_to_head(str(repo_root))
+        if dirty_paths_remaining_beyond_declared_unrelated:
             candidate_evidence = {
                 "status": "skipped_worktree_not_clean_after_commit",
                 "reason": "commit 后工作树不 clean，无法把已审内容绑定到唯一 HEAD/tree。",
+            }
+        elif not worktree_clean:
+            candidate_evidence = {
+                "status": "skipped_unrelated_dirty_paths_left_uncommitted_by_explicit_flag",
+                "reason": f"按 {LEAVE_UNRELATED_DIRTY_PATHS_FLAG} 保留了 scope 外脏文件，工作树不 clean，"
+                "evidence 无法绑定唯一 HEAD/tree。",
             }
         else:
             try:
@@ -898,31 +1117,38 @@ def command_commit(args: argparse.Namespace) -> int:
                 candidate_evidence = {"status": "skipped_not_applicable", "reason": str(exc)}
             except (OSError, RuntimeError, ValueError) as exc:
                 candidate_evidence = {"status": "refused_fail_closed", "reason": str(exc)}
-    if content_changed_during_commit:
+    if committed_paths_outside_stage_set or content_changed_during_commit:
         exit_code = RVF_LAND_EXIT_CANDIDATE_CONTENT_CHANGED_DURING_COMMIT
-    elif worktree_clean:
-        exit_code = RVF_LAND_EXIT_OK
-    else:
+    elif dirty_paths_remaining_beyond_declared_unrelated:
         exit_code = RVF_LAND_EXIT_WORKTREE_NOT_CLEAN_AFTER_COMMIT
+    else:
+        exit_code = RVF_LAND_EXIT_OK
     result = {
         "status": "committed" if commit_oid else "nothing_to_commit",
         "exit_code": exit_code,
         "run_id": plan.get("run_id"),
         "run_dir": str(run_dir),
         "repo_root": str(repo_root),
+        "cross_worktree_mode": bool(plan.get("cross_worktree_mode")),
         "commit_oid": commit_oid,
         "commit_subject": message.splitlines()[0] if commit_oid else None,
         "staged_paths": stage_paths,
+        "committed_paths_outside_stage_set": committed_paths_outside_stage_set,
+        "unrelated_dirty_paths_left_uncommitted": (
+            unrelated_dirty_paths_left_uncommitted if leave_unrelated_dirty_paths_uncommitted else []
+        ),
         "validation": validation,
         "worktree_clean_after_commit": worktree_clean,
+        "dirty_paths_remaining_beyond_declared_unrelated": dirty_paths_remaining_beyond_declared_unrelated,
         "candidate_content_manifest_sha256_after_commit": content_digest_after_commit,
         "round_baseline_seal": round_baseline_seal,
         "candidate_evidence": candidate_evidence,
     }
-    if content_changed_during_commit:
+    if committed_paths_outside_stage_set:
+        result["reason_code"] = "committed_paths_outside_stage_set"
+    elif content_changed_during_commit:
         result["reason_code"] = "candidate_content_changed_during_commit"
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-    return result["exit_code"]
+    return result
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -942,14 +1168,25 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跨 worktree handoff（$rvf-handoff-intake / /rvf-handoff-commit）：同仓另一 worktree 不再判 exit 10。",
     )
+    prepare.add_argument(
+        LEAVE_UNRELATED_DIRTY_PATHS_FLAG,
+        action="store_true",
+        help="scope 外脏文件（别人的并行改动）原样留在工作树：不判 exit 12、不 stage、不提交，evidence 跳过。"
+        "prepare 带上即写进 plan，commit 自动沿用。",
+    )
     prepare.add_argument("--diff-max-lines", type=int, default=RVF_LAND_SCOPED_DIFF_DEFAULT_MAX_LINES)
     prepare.add_argument("--format", choices=["text", "json"], default="text")
 
     commit = subparsers.add_parser("commit", help="验证 → stage → commit → 封窗 → evidence，输出 JSON。")
-    commit.add_argument("--run-dir", help=f"RVF run 目录；缺省回退到 {RVF_RUN_DIRECTORY_ENVIRONMENT_VARIABLE}。")
+    commit.add_argument("--run-dir", required=True, help="RVF run 目录（prepare 输出的 run_dir）；只认显式参数。")
     commit.add_argument("--repo", default=".")
     commit.add_argument("--message-file", required=True, help="commit message 文件；'-' 表示从 stdin 读。")
     commit.add_argument("--extra-path", action="append", default=[], help="补修正触及的 reviewed scope 外路径。")
+    commit.add_argument(
+        LEAVE_UNRELATED_DIRTY_PATHS_FLAG,
+        action="store_true",
+        help="同 prepare 的同名开关（prepare 已带上时可省）。",
+    )
     return parser
 
 

@@ -24,19 +24,19 @@ description: Use only when the user explicitly invokes $rvf-land or /rvf-land. �
 
 ## 流程：两条命令，中间只做一次判断
 
-脚本是与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`（在 RVF 源仓库里即 `plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_land.py`，部署后是对应 payload 路径），下文记作 `<skill-scripts-dir>/rvf_land.py`。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
+两条命令都经 `rvf land`：部署装到 PATH 上的 RVF 快捷入口（`~/.rvf/bin/rvf`，PATH 上找不到 `rvf` 时用这个绝对路径），原样转给与本 SKILL 同级的 `../review-validate-fix/scripts/rvf_land.py`，不用自己拼脚本路径。机械步骤全部在脚本里，**不要**再手动逐条跑 intake、`validation_result_cache.py`、`git add`、`seal_round_baseline_to_head.py` 或 evidence writer。
 
 ### 1. prepare（一次调用拿全部事实）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py prepare --stdin --repo . <<'RVF_HANDOFF'
+rvf land prepare --stdin --repo . <<'RVF_HANDOFF'
 <粘贴的 handoff 正文>
 RVF_HANDOFF
 ```
 
-路径输入改用 `--handoff <handoff.md>`。prepare 内部先跑 `rvf_handoff_intake.py` 同一套 intake，再过硬门槛，输出：将要 stage 的路径（reviewed scope ∩ dirty）、精简 scoped diff、fix ledger 里每条 RVF-NNN 的处置、handoff 的 review / issue 段、`validation_reusable=true|false`、预填的 commit message 草稿。它只读仓库，只在 run 目录写一份 prepare plan 供 commit 复核。
+路径输入改用 `--handoff <handoff.md>`。prepare 内部先跑 `rvf_handoff_intake.py` 同一套 intake，再过硬门槛，输出：将要 stage 的路径（reviewed 主审边界 ∩ dirty）、精简 scoped diff、fix ledger 里每条 RVF-NNN 的处置、handoff 的 review / issue 段、`validation_reusable=true|false`、预填的 commit message 草稿。它只读仓库，只在 run 目录写一份 prepare plan 供 commit 复核。
 
-reviewed scope 的上界：run 的 scope contract 给得出路径全集（`primary_files ∪ fix_allowlist ∪ task_change_paths ∪ background_files`，即 evidence 落地 delta 的收敛判据）时只用它，handoff 正文里的 reviewed scope 不能把上界撑到 contract 之外；contract 缺失时才退回 handoff 的 reviewed scope。已合回的 fix 补丁路径照常可 stage。rename / copy 必须新旧两端都在可 stage 集合内，否则整条算 scope 外（exit 12，列出越界的那一端）。`stageable_dirty_paths_outside_candidate_evidence_landing_universe` 非空（`--extra-path` 或 fix 的 scope expansion 路径）表示（contract 已 opt-in evidence 时）提交后 evidence 必然 `refused_fail_closed`——提交不回滚，决定提交前先知情。
+自动 stage 集合 = scope contract 的 reviewed 主审边界（`primary_files ∪ fix_allowlist ∪ task_change_paths`）∪ 已合回的 fix 补丁路径；handoff 正文里的 reviewed scope 不能把上界撑到 contract 之外，contract 缺失时才退回 handoff 的 reviewed scope。**contract 的 `background_files` / `protected_files` 与 handoff 标注的 protected 路径不会被自动 stage**——它们是 prepare 时其他会话或未归属的脏文件；只有显式出现在主审边界里的路径例外（`rvf scope --include` 并入 primary 的路径）。background 路径确属本次工作（例如本会话用 shell 改的文件没被归属）时用 `--extra-path` 显式纳入；evidence 落地 delta 的收敛判据本身包含 `background_files`，所以这样纳入不会让 evidence 拒绝。rename / copy 必须新旧两端都在可 stage 集合内，否则整条算 scope 外（exit 12，列出越界的那一端）。`stageable_dirty_paths_outside_candidate_evidence_landing_universe` 非空（`--extra-path` 或 fix 的 scope expansion 路径落在 contract 路径全集之外）表示（contract 已 opt-in evidence 时）提交后 evidence 必然 `refused_fail_closed`——提交不回滚，决定提交前先知情。
 
 退出码即硬门槛（非 0 一律不得 commit）：
 
@@ -45,14 +45,14 @@ reviewed scope 的上界：run 的 scope contract 给得出路径全集（`prima
 | 0 | 全部通过 | 进入第 2 步 |
 | 10 | 跨 worktree（`rvf_worktree_differs_from_current` 为真）或目标仓库不同/未知 | 停止；跨 worktree handoff 改走 `$rvf-handoff-intake` / `/rvf-handoff-commit` |
 | 11 | reviewed scope 与 dirty 矛盾（给不出 scope 却有改动 / scope 内有冲突文件） | 停止并报告 |
-| 12 | 有 reviewed scope 外的脏文件（含只有一端在 scope 内的 rename / copy），commit 后工作树不会 clean | 若确属本次工作（测试注册、直接 fallout），加 `--extra-path <path>` 重跑 prepare（contract 外的路径会让 evidence 拒绝）；否则停止，保留它们并报告 |
+| 12 | 有 reviewed scope 外的脏文件（含 background 路径、只有一端在 scope 内的 rename / copy），commit 后工作树不会 clean | 若确属本次工作（测试注册、直接 fallout、本会话 shell 改动），加 `--extra-path <path>` 重跑 prepare（contract 路径全集外的路径会让 evidence 拒绝）；若是别人的并行改动、必须原样保留，加 `--commit-staged-scope-only-and-leave-unrelated-dirty-paths` 重跑 prepare（只提交 stage 集合，evidence 跳过）；都不是就停止，保留它们并报告 |
 | 13 | 找不到 run 目录 | 用 `--run-dir <dir>` 显式给出后重跑 |
 
 ### 2. 判断：sanity-check、必要时最小修正、定稿 commit message
 
 这是唯一需要你判断的一步，只基于 prepare 的输出；需要看被截断的 diff 时按它给出的命令补看。
 
-- 核对 scoped diff 与 handoff 描述的 fixes / reviewed scope 自洽：没有缺失的修复、没有越界改动、没有与 handoff 冲突的状态。handoff 标注的 protected / background 路径已由脚本排除出 stage 集合。
+- 核对 scoped diff 与 handoff 描述的 fixes / reviewed scope 自洽：没有缺失的修复、没有越界改动、没有与 handoff 冲突的状态。scope contract 的 background / protected 与 handoff 标注的 protected 路径不会被自动 stage。
 - handoff 表示 `no_issues`、或最终没有采纳任何 suggestion 时，只要 worktree 里的工作仍然有效，照样继续提交。
 - 仅当暴露出明确、范围内的小问题（future-self 漏改的一处、明显笔误）时，在 reviewed scope 或其直接 fallout 内做最小修正；不要借机扩大改动。补修正碰到 scope 外路径时，commit 加 `--extra-path`。
 - handoff 的 fix 无效、scope 不完整、或 worktree 状态与 handoff 严重冲突：停止并报告，不要 commit。
@@ -61,21 +61,35 @@ reviewed scope 的上界：run 的 scope contract 给得出路径全集（`prima
 ### 3. commit（一次调用做完剩下的机械步骤）
 
 ```bash
-python3 <skill-scripts-dir>/rvf_land.py commit --run-dir <prepare 输出的 run_dir> --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
+rvf land commit --message-file - <<'RVF_LAND_COMMIT_MESSAGE'
 <定稿的 commit message>
 RVF_LAND_COMMIT_MESSAGE
 ```
 
+`--run-dir` 可省：`rvf land commit` 会替你显式带上本仓最近一次 `rvf land prepare` 落下 plan 的 run（找不到时 exit 2，先跑 prepare 或显式传 `--run-dir <prepare 输出的 run_dir>`）。`rvf_land.py` 本身只认显式 `--run-dir`，不回退 `RVF_RUN_DIR`（reviewer 子进程与 Codex task shell 里它指向别的活 run）。
+
 依次执行并输出一份 JSON：
 
 1. **验证**：run 的 validation index 全部 passed 且对应当前内容 ⇒ 零执行复用；做过最小修正 ⇒ 按 run 里的结构化 argv（`artifacts/handoff-validation-commands.json`）经 `validation_result_cache.py` 重跑。失败时直接打印失败输出尾部（exit 21），不 stage、不 commit；不要再去翻 validation-records。旧 run 没有结构化 argv 时 exit 22，按提示逐条经缓存 wrapper 跑完再重跑 commit。
-2. **stage**：`reviewed scope ∩ dirty` 加上 `--extra-path`；scope 外仍有脏文件时 exit 12。
-3. **`git diff --cached --check`** 后 commit（未通过则撤销本次 stage，exit 23）。没有可提交的改动时跳过 commit，其余步骤照做。
-4. **确认 commit 前后内容摘要不变、工作树 clean**：pre-commit 等 hook 在 commit 期间改写了文件（纳入提交或留在工作树）⇒ 提交进去的字节未经验证，exit 26（`reason_code=candidate_content_changed_during_commit`），commit 已发生、不回滚，但**不封窗、不写 evidence**（第 5、6 步跳过），让下一次 Stop 照常审这些字节；摘要不变但工作树不 clean ⇒ exit 25，evidence 跳过。
+2. **stage**：`reviewed 主审边界 ∩ dirty` 加上 `--extra-path`；scope 外仍有脏文件时 exit 12（带了保留开关则原样留下）。JSON 的 `dirty_paths_changed_since_prepare` 列出 prepare 之后变过的路径（内容变了或被 `git add` 过）：除了你自己的最小修正，其余都是并发改动，核对后再决定是否继续。
+3. **`git diff --cached --check`** 后 `git commit --only -- <stage 集合>`（未通过则撤销本次 stage，exit 23）：别人预先 stage 的 scope 外路径不会被带进提交。没有可提交的改动时跳过 commit，其余步骤照做。
+4. **确认 commit 前后内容摘要不变、提交只含 stage 集合、工作树 clean**：pre-commit 等 hook 在 commit 期间改写了文件（纳入提交或留在工作树）⇒ 提交进去的字节未经验证，exit 26（`reason_code=candidate_content_changed_during_commit`）；hook `git add` 了 stage 集合外的路径、使它进入本次提交 ⇒ 同样 exit 26（`reason_code=committed_paths_outside_stage_set`），commit 已发生、不回滚，但**不封窗、不写 evidence**（第 5、6 步跳过），让下一次 Stop 照常审这些字节；摘要不变但工作树不 clean ⇒ exit 25，evidence 跳过。
 5. **封窗**：把 round-baseline 与 last-reviewed 高水位推进到新 HEAD，让紧随的 Stop 不再把刚 land 的已审工作当成未审（`round_baseline_seal.sealed=false` 只表示本环境无法封窗，不影响提交）。
 6. **写 reviewed candidate evidence**：`status=written|reused` 成功；`skipped_not_applicable` 表示 scope contract 未 opt-in；`refused_fail_closed` 表示 writer 拒绝——提交本身仍成功，但 evidence-aware fast handback 不可用，后续 base sync 走 legacy fail-safe 路径，不得伪造 receipt。
 
-HEAD 在 prepare 之后移动过、或没跑 prepare 时 exit 20：重跑 prepare。
+commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按当时的工作树重判 11 / 12）：
+
+| exit | 含义 | 怎么办 |
+|---|---|---|
+| 2 | 参数或输入错误：缺 `--run-dir`、commit message 为空或仍含草稿占位（`<type>(<scope>)` 等）、`--extra-path` 不在当前 worktree 内 | 未 stage、未 commit。按 stderr 的 `rvf_land: …` 修正输入后重跑同一条命令 |
+| 20 | 没跑 prepare、plan 损坏，或 HEAD / worktree 在 prepare 之后变了 | 重跑 prepare，再 commit |
+| 21 | 验证未通过（失败尾部已打到 stderr），或重跑期间内容又变了（`validation_index_not_current_after_replay`） | 未 stage、未 commit。失败属于 scope 内就最小修正后重跑 commit；内容被并发改动就看 `dirty_paths_changed_since_prepare`，不是你的改动就停止并报告 |
+| 22 | 当前内容与 run 的验证记录不一致，且没有可重放的结构化 argv | 按提示逐条经 `validation_result_cache.py run … --rvf-run-dir <run_dir>` 跑完，再重跑 commit |
+| 23 | `git diff --cached --check` 未通过 | 已撤销本次 stage。修掉 scope 内的空白错误后重跑 commit（内容变了会自动重跑验证） |
+| 24 | `git commit` 本身失败（pre-commit hook 拒绝、签名失败等） | stage 保留便于排查；看 `git_output`。原因在 scope 内就修好后重跑 commit（HEAD 没动，plan 仍有效）；不要手动 `git commit`（会跳过封窗与 evidence）；原因在 scope 外就停止并报告 |
+| 25 | 已提交、内容摘要不变，但工作树还有保留开关放行范围之外的脏路径（`dirty_paths_remaining_beyond_declared_unrelated`） | 提交与封窗已完成，evidence 跳过。如实报告这些路径；不要补写 evidence |
+| 26 | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了本次提交（`reason_code=committed_paths_outside_stage_set`，列在 `committed_paths_outside_stage_set`） | 提交已发生、不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件；**不要手动封窗、不要伪造 evidence** |
+| 27 | 提交前拒绝：reviewer 报过 issue（或已有处置工件），而合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`，明细在 `merge_dispositions_errors`） | 未 stage、未 commit。按明细用 `rvf merge write` 补齐处置（旧 run 的 fix-issue 需重新 upsert 记下 source_refs），`rvf merge check` 复核后重跑 commit。按保留开关留下 scope 外脏文件时 evidence 本就跳过，不做这道预检 |
 
 **land 前后不做任何 base intake。** 「当前 base 吸收了吗」归 prepare 侧门禁：`prepare_review_run.py` 在 `bootstrap_required_before_rvf` 时直接拒绝建 run，能走到 rvf-land 的 run 必然已经过闸。land 侧再加一道会自相矛盾：那道门禁要求的同步会重写 bootstrap receipt，亲手打破它自己依赖的冻结值。残余风险（marker 生效前产生的旧 handoff + 陈旧 worktree）已知且已接受。
 
@@ -93,7 +107,8 @@ HEAD 在 prepare 之后移动过、或没跑 prepare 时 exit 20：重跑 prepar
 - 无法证明 handoff 描述的工作就是当前 worktree 的改动（exit 10 / 13）。
 - handoff scope、当前 dirty paths 和 artifact 摘要互相矛盾（exit 11），或存在无法判定归属的 scope 外脏文件（exit 12）。
 - 需要的修复依赖 scope 外 runtime 改动，但这些改动未被明确纳入本次提交。
-- 相关验证无法运行或未通过（exit 21 / 22）。
+- 相关验证无法运行或未通过（exit 21 / 22），或 `git commit` 失败且原因不在 scope 内（exit 24）。
+- reviewer 报过 issue（或已有处置工件）而合并处置缺失/不合法/过期（exit 27，`reason_code=merge_dispositions_check_failed`）：提交前拒绝、未 stage 未 commit；按 `merge_dispositions_errors` 用 `rvf merge write` 补齐（`rvf merge check` 复核）后重跑 commit。按开关保留 scope 外脏文件（evidence 本就跳过）时不做这道预检。
 - commit 后 worktree 不 clean（exit 25），因而无法把已审内容绑定到唯一 HEAD/tree；停止 evidence-aware handback。
 - commit 期间 hook 改写了内容（exit 26）：提交已发生但未封窗；如实报告被改写的文件，停止 evidence-aware handback，不要手动封窗或伪造 evidence。
 

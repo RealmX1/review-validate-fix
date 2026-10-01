@@ -33,6 +33,11 @@ host 身份词汇（守卫 `rg 'HOST_CLAUDE|HOST_CODEX|host_kind' core/ --glob '
   ``hookSpecificOutput.additionalContext``，Codex / Cursor / Kimi / DeepSeek 用
   ``decision:block``。core 只声明受众（见
   ``core.stop_hook_output_audience``），线材是 host 行为、归注入面。
+- ``host_synthesized_user_prompt_submit_turn_kind(event, prompt_text)``——这条
+  UserPromptSubmit 是不是 **host 自己合成**的回合（不是开发者打的字）。UPS 的「开发者真实
+  prompt」判定同时驱动再入预算复位、snooze 基线重置、round baseline 前移与 park 资格；
+  合成回合的形态逐 host 不同（Claude Code 的后台任务完成通知是一条 ``<task-notification>``
+  user message，Codex 的 Stop 续跑根本不触发 UPS），故识别归注入面，core 不写任何 host 字面量。
 
 ## 刻意**不**进 v1 的（避免 dead scaffolding / 提前 S10 工作）
 
@@ -127,6 +132,21 @@ class HostAdapter(Protocol):
         """
         ...
 
+    def host_synthesized_user_prompt_submit_turn_kind(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        """这条 UserPromptSubmit 若是**本 host 自己合成**的回合（开发者没有打字），返回合成回合的种类名；
+        开发者真实输入（或本 host 无法判定）返回 None。
+
+        返回非 None 时，UPS 把这一回合当作**上一回合的延续**：不复位再入预算、不重置 snooze 基线、
+        不前移 round baseline、不改写 park 资格，也不跑任何 RVF 字面量检测器（合成正文会原样带回
+        子代理 / 后台命令读写过的文本，常含 RVF 自己的 token 与触发字面量）。
+
+        判定必须基于**正向证据**：误判成「合成」会吞掉一条真实的开发者 prompt（手动触发失效、
+        round baseline 不前移），误判成「开发者」只是退回改动前的行为。拿不准就返回 None。
+        """
+        ...
+
 
 def _self_check() -> None:
     """runtime_checkable 一致性自检：齐方法的 stub 通过 isinstance、缺方法的不通过。
@@ -154,6 +174,11 @@ def _self_check() -> None:
         def stop_hook_agent_directive_channel(self) -> str:
             return STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
 
+        def host_synthesized_user_prompt_submit_turn_kind(
+            self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+        ) -> str | None:
+            return None
+
     class _MissingSkipMode:
         def host_display_name(self) -> str:
             return "Claude Code"
@@ -168,7 +193,7 @@ def _self_check() -> None:
     partial = _MissingSkipMode()
     assert isinstance(conforming, HostAdapter), "齐方法 stub 应满足 HostAdapter Protocol"
     assert not isinstance(partial, HostAdapter), "缺 detect_host_skip_mode 的 stub 不应满足"
-    # 顺带验证注入面的方法名集合就是这 6 个，防止悄悄增删。
+    # 顺带验证注入面的方法名集合就是这 7 个，防止悄悄增删。
     expected = {
         "host_display_name",
         "session_deep_link",
@@ -176,6 +201,7 @@ def _self_check() -> None:
         "detect_host_skip_mode",
         "parent_transcript_quoted_session_name",
         "stop_hook_agent_directive_channel",
+        "host_synthesized_user_prompt_submit_turn_kind",
     }
     actual = {name for name in dir(HostAdapter) if not name.startswith("_")}
     assert actual == expected, f"HostAdapter 注入面漂移：{actual} != {expected}"

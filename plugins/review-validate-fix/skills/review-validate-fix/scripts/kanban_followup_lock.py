@@ -1510,6 +1510,36 @@ def _decision_point_delivery_intent_path(task_id: str, root: Path | None = None)
     return _decision_point_delivery_intent_root(root) / f"task-{safe_token(task_id)}.json"
 
 
+#: 与意图文件同目录的 sidecar 锁文件后缀（点号开头，不匹配 ``task-*.json`` 枚举）。
+DECISION_POINT_DELIVERY_INTENT_WRITER_SERIALIZATION_LOCK_SUFFIX = ".writer-serialization.lock"
+
+
+@contextmanager
+def _hold_decision_point_delivery_intent_writer_serialization_lock(intent_path: Path):
+    """串行化**同一份** task 投递意图的全部写者：整份写入 / read-merge-write / 删除。
+
+    为什么需要：Stop 侧投递后写回执、UPS 侧首达时写观测，都是对同一文件的 read-merge-write；无锁时
+    「Stop 读 → UPS 合并写回 → Stop 把旧副本整份写回」会静默抹掉 UPS 的观测（两次更新都返回 True），
+    搁浅对账随即把「UPS 收到但没注入正文」误判成「UPS 从未处理」。整份写入与删除也要进同一把锁：否则
+    一次在途的 read-merge-write 能把刚写入的新 token 意图盖回旧 token，或把刚清掉的意图复活。
+
+    按意图路径的 sidecar ``flock``，锁文件刻意不删（理由同 ``_with_takeover_lock``）。持锁期间绝不调用
+    另一个取同一把锁的函数（``update`` / ``write`` / ``clear`` 互不嵌套，``record_*`` 只经 ``update``），
+    故不会自锁死。
+    """
+    lock_path = intent_path.with_name(
+        f".{intent_path.name}{DECISION_POINT_DELIVERY_INTENT_WRITER_SERIALIZATION_LOCK_SUFFIX}"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file_descriptor = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(lock_file_descriptor, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def decision_point_delivery_intent_ttl_seconds() -> float:
     raw = os.environ.get(DECISION_POINT_DELIVERY_INTENT_TTL_ENV)
     if raw is None or not raw.strip():
@@ -1575,7 +1605,8 @@ def write_decision_point_delivery_intent(
         return None
     payload = decision_point_delivery_intent_payload(task_id=task_id, **fields)
     target = _decision_point_delivery_intent_path(task_id, root)
-    _atomic_write(target, payload)
+    with _hold_decision_point_delivery_intent_writer_serialization_lock(target):
+        _atomic_write(target, payload)
     return target
 
 
@@ -1608,28 +1639,72 @@ def update_decision_point_delivery_intent(
 
     与 ``stamp_pending_notified`` 同款：直接读原始文件、合并后整体写回，绝不经
     ``read_decision_point_delivery_intent``（它会注入 ``_marker_path``）。
+
+    读—合并—写回整段持有该意图的写者锁：Stop 的回执更新与 UPS 的首达观测并发时两次合并都保留。
     """
     if not (isinstance(task_id, str) and task_id.strip()):
         return False
     path = _decision_point_delivery_intent_path(task_id, root)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    if not path.exists():
         return False
-    if not isinstance(payload, dict):
-        return False
-    if decision_token is not None:
-        stored = payload.get("decision_token")
-        if isinstance(stored, str) and stored and stored != decision_token:
-            return False
-    payload.pop("_marker_path", None)
-    payload.update(updates)
-    payload["updated_at"] = _iso_now()
     try:
-        _atomic_write(path, payload)
+        with _hold_decision_point_delivery_intent_writer_serialization_lock(path):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(payload, dict):
+                return False
+            if decision_token is not None:
+                stored = payload.get("decision_token")
+                if isinstance(stored, str) and stored and stored != decision_token:
+                    return False
+            payload.pop("_marker_path", None)
+            payload.update(updates)
+            payload["updated_at"] = _iso_now()
+            _atomic_write(path, payload)
     except OSError:
         return False
     return True
+
+
+DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY = (
+    "user_prompt_submit_first_arrival_observation"
+)
+"""投递意图里记「UPS 首次观测到边界标记时发生了什么」的键（值见下方 recorder）。
+
+搁浅对账靠它区分「标记落地且正文已注入」（通道健康，撤回时冲销熔断额度）与「标记落地但正文从未
+注入」（UPS 没跑 / 超时 / 崩溃 / 正文缺失 / 到达时 token 已过期——每次都空转一回合，必须退避）：
+59ffd 之后边界标记本身不含任何指令，「标记在 transcript 祖先链上」已不再意味着征询到达了 agent。
+"""
+
+
+def record_user_prompt_submit_first_arrival_observation_on_decision_point_delivery_intent(
+    *,
+    task_id: str | None,
+    decision_token: str,
+    decision_point_banner_body_text_injected: bool,
+    outcome: str,
+    root: Path | None = None,
+) -> bool:
+    """UPS 首次观测到某枚 token 的边界标记时，把结局写进对应投递意图（best-effort，写不成返回 False）。
+
+    没有这份记录本身就是证据：标记落地了而 UPS 从未写过它 ⇒ UPS 根本没处理这条标记。
+    """
+    return update_decision_point_delivery_intent(
+        task_id=task_id,
+        decision_token=decision_token,
+        updates={
+            DECISION_POINT_DELIVERY_INTENT_USER_PROMPT_SUBMIT_FIRST_ARRIVAL_OBSERVATION_KEY: {
+                "observed_at": _iso_now(),
+                "decision_point_banner_body_text_injected": bool(
+                    decision_point_banner_body_text_injected
+                ),
+                "outcome": outcome,
+            }
+        },
+        root=root,
+    )
 
 
 def clear_decision_point_delivery_intent(
@@ -1641,15 +1716,19 @@ def clear_decision_point_delivery_intent(
     """清掉某 task 的投递意图（``decision_token`` 不匹配时**不清**，避免误删更新的一份）。"""
     if not (isinstance(task_id, str) and task_id.strip()):
         return []
-    if decision_token is not None:
-        existing = read_decision_point_delivery_intent(task_id=task_id, root=root)
-        if isinstance(existing, dict):
-            stored = existing.get("decision_token")
-            if isinstance(stored, str) and stored and stored != decision_token:
-                return []
     path = _decision_point_delivery_intent_path(task_id, root)
+    if not path.exists():
+        return []
     try:
-        path.unlink()
+        # token 判定与删除同在写者锁内：否则判定之后、删除之前被写入的新 token 意图会被误删。
+        with _hold_decision_point_delivery_intent_writer_serialization_lock(path):
+            if decision_token is not None:
+                existing = read_decision_point_delivery_intent(task_id=task_id, root=root)
+                if isinstance(existing, dict):
+                    stored = existing.get("decision_token")
+                    if isinstance(stored, str) and stored and stored != decision_token:
+                        return []
+            path.unlink()
     except (FileNotFoundError, OSError):
         return []
     return [str(path)]
