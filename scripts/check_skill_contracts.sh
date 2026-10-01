@@ -905,9 +905,9 @@ require_repo_literal "core/host_adapter/parent_harness_identity.py" \
   '("kimi", PARENT_HARNESS_IDENTITY_KIMI_CODE),'
 # kimi-code stamp 是 HOST-2 的 Kimi 对偶：transcript 合成落空时它是唯一的 Kimi 线索，没有它
 # 整条链路兜底 Codex ⇒ 发 decision:block ⇒ Kimi 静默 allow（零报错）。
-require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/host_adapter_resolver.py" \
   '"kimi-code": HOST_KIMI_CODE,'
-require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" \
+require_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/host_adapter_resolver.py" \
   'HOST_BY_PLUGIN_ENTRY_SOURCE_PROVIDER_STAMP.get(source.get("provider"))'
 # Kimi hook 入口：事件只有四个字段、**没有 transcript_path**，shim 必须合成它——否则 host 判成
 # Codex ⇒ 发 decision:block ⇒ 被 Kimi 的 looseObject 静默吞掉 ⇒ RVF 完全失声且零报错。
