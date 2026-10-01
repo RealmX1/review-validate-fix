@@ -49,6 +49,7 @@ from validation_result_cache import (  # noqa: E402
 )
 from write_reviewed_task_candidate_evidence import (  # noqa: E402
     CandidateEvidenceNotApplicable,
+    merge_dispositions_errors_that_would_refuse_candidate_evidence,
     reviewed_scope_path_universe,
     write_evidence,
 )
@@ -73,6 +74,9 @@ RVF_LAND_EXIT_WORKTREE_NOT_CLEAN_AFTER_COMMIT = 25
 # commit 已发生，但 commit 期间（pre-commit 等 hook 改写文件）内容摘要不再等于验证时的摘要：
 # 提交进去的字节未经验证，因此不封窗、不写 evidence。
 RVF_LAND_EXIT_CANDIDATE_CONTENT_CHANGED_DURING_COMMIT = 26
+# 提交前拒绝：evidence 会走合并处置强校验（reviewer 报过 issue 或处置工件存在）而处置缺失/不合法/过期——
+# 放行则提交后 evidence 必然 refused_fail_closed。未 stage、未 commit。
+RVF_LAND_EXIT_MERGE_DISPOSITIONS_CHECK_FAILED_BEFORE_COMMIT = 27
 
 RVF_LAND_PREPARE_PLAN_ARTIFACT_NAME = "rvf-land-prepare-plan.json"
 RVF_LAND_PREPARE_PLAN_SCHEMA_NAME = "rvf-land-prepare-plan"
@@ -829,6 +833,15 @@ def command_commit(args: argparse.Namespace) -> int:
     failures = reviewed_scope_dirty_gate_failures(dirty_entries, stageable, in_scope, unrelated)
     if failures:
         raise failures[0]
+    merge_dispositions_errors = merge_dispositions_errors_that_would_refuse_candidate_evidence(repo_root, run_dir)
+    if merge_dispositions_errors:
+        raise RvfLandHardGateFailure(
+            RVF_LAND_EXIT_MERGE_DISPOSITIONS_CHECK_FAILED_BEFORE_COMMIT,
+            "merge_dispositions_check_failed",
+            "reviewer 报过 issue（或已有处置工件），但合并处置缺失/不合法/过期，提交后 evidence 必然 refused_fail_closed；"
+            "用 `rvf merge write` 补齐处置（`rvf merge check` 复核）后重跑 commit。未 stage、未 commit。",
+            merge_dispositions_errors=list(merge_dispositions_errors),
+        )
 
     validation = ensure_validation_satisfies_evidence_gate(repo_root, run_dir)
 

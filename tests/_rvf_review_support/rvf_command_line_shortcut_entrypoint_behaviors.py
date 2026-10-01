@@ -472,6 +472,38 @@ def test_rvf_shortcut_fix_prepare_stop_apply_all_stopped_end_to_end(root: Path) 
         )
     ]
     environment = _isolated_environment(root)
+    # 合并处置是 fix prepare 的前置闸：没写处置时 prepare 必须拒绝；`rvf merge write` 从当前 run 补 --run-dir。
+    reviewers = run_dir / "artifacts" / "reviewers"
+    legs = [
+        _write_reviewer_leg(reviewers, reviewer_id, returncode=0, result={
+            "schema_version": 1, "kind": "issues", "requests": [],
+            "issues": [{"path": path, "line": 1, "kind": "REAL", "severity": "medium", "message": message}
+                       for path, message in issues]})
+        for reviewer_id, issues in (
+            ("cursor-cli", (("a.txt", "line-2 错"), ("a.txt", "line-2 可另改"))),
+            ("kimi-code", (("c.txt", "c 要改"), ("a.txt", "line-2 同根因"))),
+        )
+    ]
+    _write_json(reviewers / "reviewer-plan.json",
+                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+    refused = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "prepare", str(issue_files[0]),
+         "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert refused.returncode != 0 and "merge dispositions are missing" in refused.stderr, refused.stderr
+    merged = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "merge", "write"],
+        input=json.dumps({"dispositions": [
+            {"reviewer_id": "cursor-cli", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"},
+            {"reviewer_id": "cursor-cli", "index": 2, "disposition": "adopted", "issue_id": "RVF-002"},
+            {"reviewer_id": "kimi-code", "index": 1, "disposition": "adopted", "issue_id": "RVF-003"},
+            {"reviewer_id": "kimi-code", "index": 2, "disposition": "merged_into", "issue_id": "RVF-001"},
+        ]}),
+        cwd=repo, env={**environment, "RVF_RUN_DIR": str(run_dir)}, capture_output=True, text=True, check=False,
+    )
+    assert merged.returncode == 0, merged.stderr + merged.stdout
+    assert (run_dir / "artifacts" / "merge" / "merge_dispositions.json").is_file()
     prepared = subprocess.run(
         [sys.executable, str(_entrypoint_script()), "fix", "prepare", *map(str, issue_files),
          "--run-dir", str(run_dir), "--json"],
@@ -480,6 +512,11 @@ def test_rvf_shortcut_fix_prepare_stop_apply_all_stopped_end_to_end(root: Path) 
     assert prepared.returncode == 0, prepared.stderr + prepared.stdout
     attempts = json.loads(prepared.stdout)["prepared"]
     assert [item["issue_id"] for item in attempts] == ["RVF-001", "RVF-002", "RVF-003"]
+    checked = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "merge", "check", "--run-dir", str(run_dir)],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert checked.returncode == 0, checked.stderr + checked.stdout
     for item in attempts:
         assert item["scope_hash"] == "sha256:" + "0" * 64
         assert item["fix_allowlist"] == ["a.txt", "c.txt"]

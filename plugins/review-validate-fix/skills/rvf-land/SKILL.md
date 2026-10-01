@@ -94,6 +94,7 @@ HEAD 在 prepare 之后移动过、或没跑 prepare 时 exit 20：重跑 prepar
 - handoff scope、当前 dirty paths 和 artifact 摘要互相矛盾（exit 11），或存在无法判定归属的 scope 外脏文件（exit 12）。
 - 需要的修复依赖 scope 外 runtime 改动，但这些改动未被明确纳入本次提交。
 - 相关验证无法运行或未通过（exit 21 / 22）。
+- reviewer 报过 issue（或已有处置工件）而合并处置缺失/不合法/过期（exit 27，`reason_code=merge_dispositions_check_failed`）：提交前拒绝、未 stage 未 commit；按 `merge_dispositions_errors` 用 `rvf merge write` 补齐（`rvf merge check` 复核）后重跑 commit。
 - commit 后 worktree 不 clean（exit 25），因而无法把已审内容绑定到唯一 HEAD/tree；停止 evidence-aware handback。
 - commit 期间 hook 改写了内容（exit 26）：提交已发生但未封窗；如实报告被改写的文件，停止 evidence-aware handback，不要手动封窗或伪造 evidence。
 

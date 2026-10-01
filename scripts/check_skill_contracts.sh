@@ -511,6 +511,7 @@ required_files=(
   "scripts/rvf_land.py"
   "scripts/validation_result_cache.py"
   "scripts/write_reviewed_task_candidate_evidence.py"
+  "scripts/rvf_merge_dispositions.py"
   "scripts/workspace_snapshot.py"
   "scripts/stop_hook_dispatcher.py"
   "scripts/stop_hook_router.py"
@@ -590,6 +591,7 @@ repo_required_files=(
   "tests/test_rvf_land_single_step_prepare_and_commit.py"
   "tests/test_validation_result_cache_v2.py"
   "tests/test_reviewed_task_candidate_evidence.py"
+  "tests/test_rvf_merge_dispositions_structured_merge_phase.py"
   "tests/test_review_initiation_decision_point_is_sole_self_injection.py"
   "tests/test_stop_hook_output_audience_contract.py"
   "tests/test_kimi_host_adapter_and_transcript.py"
@@ -692,6 +694,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/rvf_land.py" \
   "$skill_dir/scripts/validation_result_cache.py" \
   "$skill_dir/scripts/write_reviewed_task_candidate_evidence.py" \
+  "$skill_dir/scripts/rvf_merge_dispositions.py" \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/stop_hook_dispatcher.py" \
@@ -772,12 +775,14 @@ run_step "tests: compact_path_tree_rendering" \
     "$tests_dir/test_compact_path_tree_rendering.py"
 # land 单步化链路：验证缓存（含结构化 argv 工件 / 失败尾部）→ candidate evidence → rvf_land
 # prepare/commit 端到端。前两份曾经不在任何 gate 里（改了缓存或 evidence 门槛也不会有测试变红），
-# 而 rvf_land 的零执行复用恰恰建立在二者口径一致之上，所以三份一起跑。
+# 而 rvf_land 的零执行复用恰恰建立在二者口径一致之上，所以三份一起跑。合并阶段结构化处置（T4）是
+# evidence 的 canonical 计数事实源（全部 dropped 时 N=0 才能 land），同一步一起跑。
 run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
   python3 -m pytest -q \
     "$tests_dir/test_validation_result_cache_v2.py" \
     "$tests_dir/test_reviewed_task_candidate_evidence.py" \
-    "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py"
+    "$tests_dir/test_rvf_land_single_step_prepare_and_commit.py" \
+    "$tests_dir/test_rvf_merge_dispositions_structured_merge_phase.py"
 # reviewer 结果工件生命周期：三态互转对称且换 kind 必归档（旧规则 request→issues 是死结、
 # request→no_issues 却静默覆写）；重派只重跑 kind: request 的腿，健康腿结果不被覆写。
 run_step "tests: reviewer_result_artifact_lifecycle" \
@@ -1246,6 +1251,16 @@ require_literal "references/review-merge-policy.md" 'CONTRACT_VIOLATION'
 require_literal "references/review-merge-policy.md" 'WORKSPACE_CHANGED_DURING_REVIEW'
 require_literal "references/review-merge-policy.md" 'check_review_result.py'
 require_literal "references/review-merge-policy.md" 'kind: request'
+# 合并阶段结构化处置（RVF 降本 T4）：每条 reviewer issue 都有可机读处置；强制点在 upsert_canonical_issue
+# （CLI upsert 与 rvf fix prepare 共用），只卡 fix prepare 会被 CLI upsert 绕过。
+require_literal "references/review-merge-policy.md" 'rvf merge write'
+require_literal "references/review-merge-policy.md" 'reviewer_issue_index_base: 1'
+require_literal "SKILL.md" 'rvf merge write'
+require_literal "prompts/validate-fix.md" 'main_agent_self_review'
+require_literal "scripts/rvf_fix_issue.py" 'rvf_merge_dispositions.resolve_fix_issue_source_refs_for_upsert(run_dir, issue_id)'
+require_literal "scripts/write_reviewed_task_candidate_evidence.py" 'rvf_merge_dispositions.require_passing_merge_dispositions('
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/stop_review_validate_fix.py" '"merge-table.md"'
+forbid_repo_literal "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_agent_decision_cli.py" '"merge-table.md"'
 require_literal "prompts/reviewer.md" 'lock-request'
 require_literal "prompts/reviewer.md" 'standard-request'
 require_literal "prompts/reviewer.md" 'measurement-request'

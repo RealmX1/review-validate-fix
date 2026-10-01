@@ -373,6 +373,23 @@ def test_prepare_reads_fix_ledger_written_by_real_fix_attempt_script(tmp_path: P
         + "\n",
         encoding="utf-8",
     )
+    # 两腿 no_issues、这条 fix-issue 来自主 agent 自审：先在合并处置里登记为非 reviewer 来源，upsert 才放行。
+    merge_decisions_file = tmp_path / "rvf-land-ledger-merge-decisions.json"
+    merge_decisions_file.write_text(
+        json.dumps({"non_reviewer_fix_issue_sources": [{"issue_id": "RVF-L1", "origin": "main_agent_self_review"}]})
+        + "\n",
+        encoding="utf-8",
+    )
+    run_fix_ledger_script(
+        tmp_path,
+        "rvf_merge_dispositions.py",
+        "write",
+        "--run-dir",
+        str(run_dir),
+        "--decisions-file",
+        str(merge_decisions_file),
+        "--json",
+    )
     common = ["--run-dir", str(run_dir), "--log-root", str(log_root)]
     run_fix_ledger_script(
         tmp_path, "rvf_fix_issue.py", "upsert", "--repo", str(repo), "--issue-file", str(issue_file), *common

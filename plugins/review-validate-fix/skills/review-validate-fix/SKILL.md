@@ -142,7 +142,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 | 写 scope-of-work | 覆盖回执给出的 `scope_of_work` 文件，再 `rvf scope rerender-scope-of-work` | 本轮改了什么、为什么、审时盯哪里 |
 | 派发 | `rvf dispatch --strictness <light\|standard\|strict>` | 严格度档 |
 | 等 reviewer | `rvf wait`（按 host 的等法见下） | 无 |
-| 合并 | 读 `rvf wait` 打印的摘要，按 `references/review-merge-policy.md` 合并 | 去重、分组、request 处置 |
+| 合并 | 读 `rvf wait` 打印的摘要，按 `references/review-merge-policy.md` 合并；有 issue 时 `rvf merge write` 记下每条 reviewer issue 的处置 | 去重、分组、丢弃理由、request 处置 |
 | 建 fix attempt | `rvf fix prepare <issue.json>…` | 怎么分验证包 |
 | 子代理收尾 | 子代理在 attempt worktree 内 `rvf fix stop --status …` | （子代理判断） |
 | 合回 | `rvf apply --all-stopped` | 冲突怎么处置 |
@@ -182,6 +182,7 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 ## Validate / Fix
 
 - `kind: no_issues` 进入 clean path。
+- **合并处置先于 fix**：任一腿 `kind: issues` 时，先用 `rvf merge write`（决定 JSON 走 stdin）把每条 reviewer issue 记成 `adopted` / `merged_into` / `dropped`（带 `reason_code`），主会话自审发现的 finding 登记为 `non_reviewer_fix_issue_sources`（`origin: main_agent_self_review`）；格式见 `references/review-merge-policy.md` 的 Merge Rules。`rvf fix prepare` 只接受被处置覆盖的 `issue_id`，`source_refs` 由处置派生，canonical issue JSON 不写任何来源字段。全部 dropped 时同样要写处置，然后走 clean path（handoff「共 0 条」，evidence 允许）。
 - `kind: issues` 进入 validate/fix；每条 issue 先验证，再通过 `rvf fix stop --status fixed|false_positive|elevated|failed`（即 `rvf_fix_attempt.py stop`）写入完成状态。
 - 默认 `full` 流程中，只要有可解析 issue list，主会话必须至少启动一个 `validate_fix` 子代理，除非平台没有子代理接口、用户明确要求本地执行，或只剩机械收尾。
 - 按根因、文件区域、测试路径或决策前提把 issue 分组；最终汇总要说明 validate/fix 分组和结果。

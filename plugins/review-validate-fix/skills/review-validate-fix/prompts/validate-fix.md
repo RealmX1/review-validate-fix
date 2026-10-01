@@ -44,6 +44,7 @@ pass_type: validate_fix
   - 输出仍要逐项通过 `rvf_fix_attempt.py stop --status fixed|false_positive|elevated|failed` 写入完成状态。
 - 验证包必须 source-agnostic：不要告诉子代理该 issue 来自 Codex、alternative reviewer、两个 reviewer 共同发现，或某个 reviewer 的原始编号。
 - 子代理只接收 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
+- 派发前的合并处置：主会话先用 `rvf merge write` 写 `artifacts/merge/merge_dispositions.json`（见 `references/review-merge-policy.md` 的 Merge Rules）。**主 agent 自审发现的 finding** 不来自任何 reviewer，登记在 `non_reviewer_fix_issue_sources`（`origin: main_agent_self_review`）；ledger upsert 只接受被处置覆盖的 `issue_id`，并从处置派生 `source_refs`（canonical issue JSON 里的来源字段会被剥掉，正文提到本轮 reviewer 的来源标签会被拒绝）。
 - 子代理还应接收同一份 `scope.contract.json` 路径、`scope_hash` 和 `fix_allowlist`；验证包之外的 dirty changes 视为并行工作，除非它们是 declared scope expansion 的最小必要修复路径，否则不处理、不清理。
 - 派发子代理前，主会话把每条 canonical issue 写成 JSON artifact，运行 `rvf fix prepare <issue.json>…`：它一次完成 `rvf_fix_issue.py upsert` + `rvf_fix_attempt.py prepare` + start，并打印每条的子代理派发参数块（attempt_id、attempt worktree、run_dir、repo、scope contract、scope_hash、fix_allowlist、收尾命令）。把参数块原样放进子代理 prompt；子代理 cwd 应切到 attempt worktree。
 - 主会话自己执行 validate/fix 的允许例外（见上文）也必须先运行 `rvf_fix_issue.py upsert` 把 canonical issue 写入 ledger，再用 `rvf fix prepare` → `rvf fix stop` → `rvf apply` 走完同样的 attempt 链路。主 agent 自审 finding 不能跳过 ledger upsert：causality 与 `$rvf-analyze` scaffold 都依赖 ledger；遗漏会让 analyze 阶段没有 finding 承载结构，并把所有 patch 重新归因到 trajectory fallback。

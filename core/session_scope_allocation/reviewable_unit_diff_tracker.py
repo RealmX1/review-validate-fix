@@ -6610,6 +6610,10 @@ def rvf_issue_upsert(
     log_root_override: Path | None = None,
     now: str | None = None,
 ) -> dict[str, Any]:
+    """``source_refs=None`` 表示「不改来源」：已有记录保留原 ``source_refs`` 列，新记录写 ``[]``。
+
+    来源只由合并处置派生（``rvf_fix_issue.upsert_canonical_issue``）；只同步状态的调用方（fix attempt
+    stop / apply 读的是已剥掉来源字段的镜像）必须传 None，否则会把来源清空。"""
     if state not in {"open", "fixed", "false_positive", "elevated", "failed", "superseded"}:
         raise ValueError("invalid RVF issue state")
     _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
@@ -6620,10 +6624,16 @@ def rvf_issue_upsert(
         conn = _open_conn(db_path)
         with _begin_immediate(conn):
             existing = conn.execute(
-                "SELECT created_at FROM rvf_issues WHERE issue_key=?",
+                "SELECT created_at, source_refs FROM rvf_issues WHERE issue_key=?",
                 (issue_key,),
             ).fetchone()
             created_at = existing["created_at"] if existing is not None else now_iso
+            if source_refs is not None:
+                stored_source_refs = _json_dumps(source_refs)
+            elif existing is not None:
+                stored_source_refs = existing["source_refs"]
+            else:
+                stored_source_refs = _json_dumps([])
             conn.execute(
                 """
                 INSERT INTO rvf_issues(
@@ -6644,7 +6654,7 @@ def rvf_issue_upsert(
                     run_id,
                     issue_id,
                     _json_dumps(payload),
-                    _json_dumps(source_refs or []),
+                    stored_source_refs,
                     str(artifact_path) if artifact_path is not None else None,
                     state,
                     created_at,

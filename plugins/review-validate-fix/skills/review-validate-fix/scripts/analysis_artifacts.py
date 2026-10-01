@@ -11,7 +11,9 @@ artifact 里：
   位置。
 - ``<run_dir>/artifacts/analysis/causality.json``：结构化 ``issues[]`` 与
   ``patches[]`` 列表，``candidate_patch_call_ids`` 等 mapping 字段留空，由 LLM
-  agent 填写。
+  agent 填写；``merge_dispositions`` 段收录合并阶段每条 reviewer issue 的处置
+  （``artifacts/merge/merge_dispositions.json``）及按 reviewer 汇总的采纳 / 丢弃 /
+  最终 fix-issue 状态（Reviewer 效能评估的数据来源）。
 
 设计意图：让 LLM agent 接管时已有结构清晰的起点；同时保证即便 LLM 步骤被跳过，
 用户仍可读到一份带骨架的 artifact。
@@ -905,6 +907,39 @@ def _enrich_candidate_patch_call_ids(
         issue["candidate_patch_call_ids"] = candidates
 
 
+def _merge_dispositions_section(run_dir: Path, ledger_issues: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """causality.json 的 ``merge_dispositions`` 段；run 没写过处置工件时为 None。
+
+    ``check_errors`` 如实列出全量校验（含 fix-issue 交叉核对）的失败项，不因校验失败而丢掉数据——
+    复盘恰恰需要看到哪里没对上。最终状态取自 tracker ledger 的 ``rvf_issues.state``。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import rvf_merge_dispositions  # noqa: WPS433,PLC0415
+
+    if not rvf_merge_dispositions.merge_dispositions_path(run_dir).is_file():
+        return None
+    check = rvf_merge_dispositions.check_merge_dispositions(run_dir, require_fix_issue_cross_reference=True)
+    payload = check.payload or {}
+    fix_issue_state_by_issue_id = {
+        str(issue.get("issue_id")): str(issue.get("state"))
+        for issue in ledger_issues
+        if isinstance(issue, dict) and issue.get("issue_id") is not None and issue.get("state") is not None
+    }
+    return {
+        "path": str(rvf_merge_dispositions.MERGE_DISPOSITIONS_RELATIVE_PATH),
+        "check_errors": list(check.errors),
+        "reviewer_issue_index_base": payload.get("reviewer_issue_index_base"),
+        "review_result_coverage": payload.get("review_result_coverage"),
+        "reviewer_results": payload.get("reviewer_results") or [],
+        "dispositions": payload.get("dispositions") or [],
+        "non_reviewer_fix_issue_sources": payload.get("non_reviewer_fix_issue_sources") or [],
+        "per_reviewer_disposition_and_final_fix_issue_outcome_summary": (
+            rvf_merge_dispositions.summarize_reviewer_issue_dispositions_and_final_fix_issue_outcomes(
+                payload, fix_issue_state_by_issue_id
+            )
+        ),
+    }
+
+
 def scaffold_causality_json(
     inputs: AnalysisInputs,
     stats: ScaffoldStats,
@@ -940,6 +975,14 @@ def scaffold_causality_json(
     # candidate_patch_call_ids（DB 侧 call_id 恒 null，故在此只读关联）。
     _enrich_candidate_patch_call_ids(issues, patch_events, patches)
 
+    try:
+        merge_dispositions = _merge_dispositions_section(
+            inputs.run_dir, ledger_issues if isinstance(ledger_issues, list) else []
+        )
+    except Exception as exc:  # noqa: BLE001 - scaffold must not fail analysis.
+        diagnostics.append(f"merge_dispositions_read_failed: {type(exc).__name__}: {exc}")
+        merge_dispositions = None
+
     payload = {
         "schema_version": ANALYSIS_SCHEMA_VERSION,
         "run_id": stats.run_id,
@@ -949,6 +992,7 @@ def scaffold_causality_json(
         "fix_attempts": ledger.get("fix_attempts", []) if isinstance(ledger, dict) else [],
         "patch_events": patch_events,
         "patches": patches,
+        "merge_dispositions": merge_dispositions,
     }
     _atomic_write_json(out_path, payload)
     return out_path

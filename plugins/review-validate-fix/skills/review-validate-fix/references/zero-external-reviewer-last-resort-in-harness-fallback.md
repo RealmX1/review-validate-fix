@@ -34,7 +34,7 @@ santa-method double review，让 review loop 不被 setup 缺失阻塞。
 ## 来源标签
 
 两路使用两个独立来源标签：`codex-mimic-reviewer-a` 和 `codex-mimic-reviewer-b`。
-它们只出现在主会话合并表和 handoff 审计里，**不得**传给 validate/fix 子代理
+它们只出现在合并处置（`artifacts/merge/merge_dispositions.json`）和 handoff 审计里，**不得**传给 validate/fix 子代理
 （validate/fix 的 issue context 必须 source-agnostic，见 `review-merge-policy.md`）。
 
 ## 合并

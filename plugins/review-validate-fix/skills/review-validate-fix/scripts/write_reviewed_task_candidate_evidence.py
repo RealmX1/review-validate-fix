@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rvf_merge_dispositions  # noqa: E402
 from validation_result_cache import (  # noqa: E402
     CONTENT_MANIFEST_ALGORITHM,
     candidate_content_manifest_sha256,
@@ -32,6 +33,13 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 GIT_OBJECT_ID_PATTERN = re.compile(r"[0-9a-f]{40,64}")
 REVIEW_KINDS = {"implementation", "base_drift_integration"}
 REVIEW_CONCLUSIONS = {"no_issues", "fixes_applied_and_validated"}
+# 四个 tip 任一为 None ⇒ scope contract 未 opt-in reviewed candidate evidence（CandidateEvidenceNotApplicable）。
+SCOPE_CONTRACT_TIP_NAMES_REQUIRED_FOR_CANDIDATE_EVIDENCE_OPT_IN = (
+    "comparison_base_tip",
+    "reviewed_base_tip",
+    "reviewed_task_tip",
+    "candidate_task_tip",
+)
 
 
 class StaleReviewedTaskCandidateEvidence(ValueError):
@@ -121,12 +129,7 @@ def validated_scope_contract(run_dir: Path, repo: Path) -> tuple[dict[str, Any],
 def validate_scope_tips(repo: Path, contract: Mapping[str, Any], current_head: str) -> None:
     if contract.get("review_kind") not in {"implementation", "base_drift_integration"}:
         raise ValueError("scope contract review kind is invalid")
-    tip_names = (
-        "comparison_base_tip",
-        "reviewed_base_tip",
-        "reviewed_task_tip",
-        "candidate_task_tip",
-    )
+    tip_names = SCOPE_CONTRACT_TIP_NAMES_REQUIRED_FOR_CANDIDATE_EVIDENCE_OPT_IN
     if any(contract.get(name) is None for name in tip_names):
         raise CandidateEvidenceNotApplicable(
             "scope contract does not opt into reviewed candidate evidence"
@@ -202,9 +205,51 @@ def completed_review(run_dir: Path, handoff_text: str) -> tuple[int, str]:
         or false_positive_outcomes != false_positive_count
     ):
         raise ValueError("handoff canonical issue summary does not match completed outcomes")
-    if any_reviewer_reported_issues != (canonical_count > 0):
+    # reviewer 报过 issue（或主 agent 登记过非 reviewer 来源的 fix-issue）时，合并处置是 canonical 计数的
+    # 唯一事实源：每条 reviewer issue 都有处置、每条 fix-issue 都有来源且都已 upsert。全部 dropped 时
+    # 它覆盖 0 条 fix-issue，canonical 计数 0 即合法——不能再用「reviewer 报过 issue ⇒ 计数 > 0」判，
+    # 那会让按 Merge Rule 6 全部过滤掉的 run 永远写不出 evidence、无法 land。
+    if any_reviewer_reported_issues or rvf_merge_dispositions.merge_dispositions_path(run_dir).exists():
+        dispositions = rvf_merge_dispositions.require_passing_merge_dispositions(
+            run_dir, require_fix_issue_cross_reference=True
+        )
+        accounted_fix_issue_count = len(dispositions.accounted_fix_issue_ids)
+        if canonical_count != accounted_fix_issue_count:
+            raise ValueError(
+                f"handoff canonical issue count {canonical_count} disagrees with merge dispositions "
+                f"({accounted_fix_issue_count} fix-issues)"
+            )
+    elif canonical_count > 0:
         raise ValueError("handoff canonical issue count disagrees with reviewer results")
     return canonical_count, "no_issues" if canonical_count == 0 else "fixes_applied_and_validated"
+
+
+def merge_dispositions_errors_that_would_refuse_candidate_evidence(repo: Path, run_dir: Path) -> tuple[str, ...]:
+    """``rvf_land commit`` 在 git commit **之前**调用：提前跑 ``completed_review`` 的处置强校验。
+
+    否则缺失/过期的处置要到提交之后才被 evidence 拒绝（``refused_fail_closed``），而提交不回滚。
+    只在 evidence 真会走到处置分支时判定，判据与 ``write_evidence`` 同源：scope contract 指向本 worktree
+    （跨 worktree 模式下 contract 指向另一个 worktree，evidence 本就无从写起）、四个 tip 齐全（opt-in），
+    且 reviewer 报过 issue 或处置工件已存在。其余情形返回空——那里 evidence 根本不校验处置，提前拦截
+    只会凭空多一道闸（未 opt-in 的 run、两腿都 no_issues 且没有处置工件的 run 因此照常 land；T4 之前起、reviewer 报过 issue 却没写处置的在途 run 会在这里被拦下，需先补 `rvf merge write`）。"""
+    try:
+        contract = read_json_object(run_dir / "artifacts/inputs/scope.contract.json", "scope contract")
+    except ValueError:
+        return ()
+    if Path(str(contract.get("repo", ""))).resolve() != repo.resolve() or any(
+        contract.get(name) is None for name in SCOPE_CONTRACT_TIP_NAMES_REQUIRED_FOR_CANDIDATE_EVIDENCE_OPT_IN
+    ):
+        return ()
+    try:
+        any_reviewer_reported_issues = any(
+            leg.issues for leg in rvf_merge_dispositions.read_canonical_reviewer_leg_results(run_dir)
+        )
+    except ValueError:
+        # reviewer plan 读不出时 evidence 会以别的理由拒绝；此处只在处置工件已存在时继续判它。
+        any_reviewer_reported_issues = False
+    if not any_reviewer_reported_issues and not rvf_merge_dispositions.merge_dispositions_path(run_dir).exists():
+        return ()
+    return rvf_merge_dispositions.check_merge_dispositions(run_dir, require_fix_issue_cross_reference=True).errors
 
 
 def validated_validation_records(
