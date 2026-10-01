@@ -797,7 +797,7 @@ def render_reviewer_results_summary(
             lines.append(
                 "- 合并处置是 fix prepare 的前置闸：每条 reviewer issue（上面的编号就是处置里的 index，从 1 起）"
                 "都要记 adopted / merged_into / dropped（dropped 带 reason_code），经 "
-                f"`{invocation} merge write`（决定 JSON 走 stdin）写成 artifacts/merge/merge_dispositions.json；"
+                f"`{invocation} merge write{run_dir_argument}`（决定 JSON 走 stdin）写成 artifacts/merge/merge_dispositions.json；"
                 "没写或没覆盖到的 issue_id，fix prepare 会拒绝。全部 dropped 也要写，然后走 clean path。"
             )
     elif status == "blocked_on_reviewer_request":

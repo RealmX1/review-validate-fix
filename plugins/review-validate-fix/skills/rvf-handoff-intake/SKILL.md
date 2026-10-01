@@ -59,6 +59,7 @@ RVF_LAND_COMMIT_MESSAGE
 | 24 | commit | `git commit` 本身失败（hook 拒绝、签名失败等） | stage 保留；看 `git_output`。原因在 scope 内就修好后重跑 commit，不要手动 `git commit`（会跳过封窗与 evidence）；否则停止并报告 |
 | 25 | commit | 已提交，但工作树还有保留开关放行范围之外的脏路径 | evidence 跳过；如实报告 `dirty_paths_remaining_beyond_declared_unrelated`，不要补写 evidence |
 | 26 | commit | 已提交，但 commit 期间 hook 改变了提交内容：改写了文件（`reason_code=candidate_content_changed_during_commit`），或把 stage 集合外的路径加进了提交（`reason_code=committed_paths_outside_stage_set`） | 不回滚；**未封窗、未写 evidence**，下一次 Stop 会照常审这些字节。如实报告被改写的文件，**不要手动封窗、不要伪造 evidence** |
+| 27 | commit | 提交前拒绝：合并处置缺失 / 不合法 / 过期（`reason_code=merge_dispositions_check_failed`） | 跨 worktree 模式下 contract 指向 RVF worktree、evidence 本就不写，预检放行，正常不会出现；若出现，按 `merge_dispositions_errors` 用 `rvf merge write` 补齐、`rvf merge check` 复核后重跑 commit |
 
 ## Failure Gates
 

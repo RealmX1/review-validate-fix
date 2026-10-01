@@ -974,6 +974,29 @@ def _fix_loop_repo_and_run(root: Path) -> tuple[Path, Path, list[Path]]:
                     {"issue_id": issue_id, "path": path, "line": 1, "message": f"{path} 要改", "run_id": run_dir.name})
         for issue_id, path in (("RVF-001", "a.txt"), ("RVF-002", "b.txt"), ("RVF-003", "c.txt"), ("RVF-004", "d.txt"))
     ]
+    # 合并处置是 fix prepare 的前置闸（T4）：一腿报出 5 条、另一腿 no_issues，逐条 adopted 成 RVF-001…005
+    # （RVF-005 供用例自建的「批量中途失败」那一批使用）。处置经真实 `rvf_merge_dispositions.py write` 写出。
+    reviewers = run_dir / "artifacts" / "reviewers"
+    reviewer_issue_paths = ("a.txt", "b.txt", "c.txt", "d.txt", "d.txt")
+    legs = [
+        _write_reviewer_leg(reviewers, "cursor-cli", returncode=0, result={
+            "schema_version": 1, "kind": "issues", "requests": [],
+            "issues": [{"path": path, "line": 1, "kind": "REAL", "severity": "medium", "message": f"{path} 要改"}
+                       for path in reviewer_issue_paths]}),
+        _write_reviewer_leg(reviewers, "kimi-code", returncode=0, result={
+            "schema_version": 1, "kind": "no_issues", "issues": [], "requests": [], "audit_summary": "审过全部文件"}),
+    ]
+    _write_json(reviewers / "reviewer-plan.json",
+                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+    merged = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "rvf_merge_dispositions.py"), "write", "--run-dir", str(run_dir)],  # noqa: F821
+        input=json.dumps({"dispositions": [
+            {"reviewer_id": "cursor-cli", "index": index, "disposition": "adopted", "issue_id": f"RVF-00{index}"}
+            for index in range(1, len(reviewer_issue_paths) + 1)
+        ]}),
+        env=_isolated_environment(root), capture_output=True, text=True, check=False,
+    )
+    assert merged.returncode == 0, merged.stderr + merged.stdout
     return repo, run_dir, issue_files
 
 
