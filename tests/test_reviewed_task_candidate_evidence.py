@@ -15,8 +15,8 @@ WRITE_CANDIDATE_EVIDENCE = SCRIPT_DIRECTORY / "write_reviewed_task_candidate_evi
 
 
 def clean_test_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
-    # 同时剥掉 RVF_* / CODEX_RVF_*：validation_result_cache 会回退读 RVF_RUN_DIR，在带着活 run 环境的
-    # shell 里跑测试时，不剥就会把测试记录写进那个活 run 的 validation index。
+    # 同时剥掉 RVF_* / CODEX_RVF_*：被测脚本不得读到活 run 的环境。validation_result_cache 曾回退读
+    # RVF_RUN_DIR、把测试记录写进活 run 的 validation index；源头已删，这里保留为纵深防御。
     environment = {
         name: value
         for name, value in os.environ.items()

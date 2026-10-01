@@ -105,7 +105,7 @@ def is_foreign_invocation(event: dict[str, object]) -> bool:
     **这里的误判代价与核心侧恰好相反**，故判据只许按「路径证据」扩宽、不许引入 env 身份
     猜测：本函数返回 True 会让 Claude 入口整体静默 no-op，一旦对 Claude 假阳性，RVF 在
     Claude 上就彻底不触发（无任何报错）。核心侧
-    ``stop_review_validate_fix.resolve_current_session_host_adapter`` 用的是同一套路径判据，
+    ``host_adapter_resolver.resolve_current_session_host_adapter`` 用的是同一套路径判据，
     但它在此之上还叠了 transcript schema 探测——因为那边的假阴性才是致命的那一侧。
     """
     markers = codex_rollout_session_path_markers()

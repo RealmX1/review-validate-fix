@@ -10,15 +10,15 @@ pass_type: validate_fix
 给定一个 review issue：
 
 1. 先读相关文件，验证 flag 的问题在当前代码里是否真的是一个问题。
-2. 是真问题且你能独立修好：实施最小化修复，在 attempt worktree 内运行 `rvf fix stop --status fixed`。
-3. 不是真问题：不要改任何文件，运行 `rvf fix stop --status false_positive`。
-4. 是真问题但你不应该或不能独立修：不要改任何文件，运行 `rvf fix stop --status elevated --result-file <elevation-detail.json>`。例如需要架构决策、存在多种等价修复需要开发者拍板、涉及权限或 scope 外改动、原始需求不明确。
+2. 是真问题且你能独立修好：实施最小化修复，用收尾命令（见下）以 `--status fixed` 收尾。
+3. 不是真问题：不要改任何文件，用收尾命令以 `--status false_positive` 收尾。
+4. 是真问题但你不应该或不能独立修：不要改任何文件，用收尾命令以 `--status elevated --result-file <elevation-detail.json>` 收尾。例如需要架构决策、存在多种等价修复需要开发者拍板、涉及权限或 scope 外改动、原始需求不明确。
 
 只处理主会话分配给你的 issue。不要重新执行 double review，不要主动寻找未分配问题，不要生成 handoff.md，也不要输出 reviewer 来源审计。`pass_type: validate_fix` 不是 full mode；即使上下文提到 `$review-validate-fix` 或 research checkpoint，也只写 attempt 结果和必要的人类日志，不输出 `RVF_HANDOFF_FILE`。
 
 你应收到 `scope.contract.json` 路径和 `scope_hash`。读取合同，把 `fix_allowlist` 当作默认 owned region，而不是绝对修复上限。若最小真实修复必须修改 allowlist 外文件，可以在 attempt worktree 内修改，但完成时必须对每个外部路径传 `rvf fix stop --scope-expansion-path <path>`，并传 `--scope-expansion-reason <why this is the minimal correct fix>`。不得扩展到 `protected_files`、`background_files` 或 `excluded_path_prefixes`；这类情况必须升级为 `elevated`。allowlist 外 dirty changes、并行 agent 新增文件、reviewer liveness/probe artifacts、背景 WIP 或 protected files 都可能是预期存在的并行工作，不得清理、删除、格式化或顺手修复。
 
-如果主会话提供了 RVF fix attempt 信息，你必须只在 attempt worktree 中工作，不要回到主 RVF worktree 修改文件。attempt 在派发前已由主会话标为 started，你**不需要**再调 start；完成前在 attempt worktree 内运行 `rvf fix stop --status fixed|false_positive|elevated|failed`（它就是 `rvf_fix_attempt.py stop`，attempt_id 与 run 目录从 cwd 反推；`rvf` 不在 PATH 上时用派发参数块里给出的完整命令）。attempt worktree 是本次 issue 的 patch ownership 边界；不要写 handoff，不要清理主 worktree，也不要处理未分配 issue。
+如果主会话提供了 RVF fix attempt 信息，你必须只在 attempt worktree 中工作，不要回到主 RVF worktree 修改文件。你的 shell 每次调用都可能重置 cwd：读写文件一律用 attempt worktree 下的绝对路径，跑命令先 `cd <attempt worktree> && …`。attempt 在派发前已由主会话标为 started，你**不需要**再调 start；完成前照抄派发参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id <attempt_id> --run-dir <run_dir> --status <fixed|false_positive|elevated|failed>`（它就是 `rvf_fix_attempt.py stop`；`--status` 四选一，其余参数原样保留）。在 attempt worktree 里跑 `rvf validate` 只检查你自己的 attempt、不会写进主 run。attempt worktree 是本次 issue 的 patch ownership 边界；不要写 handoff，不要清理主 worktree，也不要处理未分配 issue。
 
 按 issue 类型读取 RVF 定制 standards pack 的相关子集：`references/review-standards/validate-fix.md` 是默认标准；复杂度问题读取 `simplification-subset.md`，安全问题读取 `security-subset.md`，性能问题读取 `performance-subset.md`。这些 standards 只用于验证和最小修复，不允许你扩大 scope 或重新 review。
 
@@ -46,8 +46,8 @@ pass_type: validate_fix
 - 子代理只接收 canonical issue、相关 path/line、必要代码上下文、复现线索和 validate/fix 指令。
 - 派发前的合并处置：主会话先用 `rvf merge write` 写 `artifacts/merge/merge_dispositions.json`（见 `references/review-merge-policy.md` 的 Merge Rules）。**主 agent 自审发现的 finding** 不来自任何 reviewer，登记在 `non_reviewer_fix_issue_sources`（`origin: main_agent_self_review`）；ledger upsert 只接受被处置覆盖的 `issue_id`，并从处置派生 `source_refs`（canonical issue JSON 里的来源字段会被剥掉，正文提到本轮 reviewer 的来源标签会被拒绝）。
 - 子代理还应接收同一份 `scope.contract.json` 路径、`scope_hash` 和 `fix_allowlist`；验证包之外的 dirty changes 视为并行工作，除非它们是 declared scope expansion 的最小必要修复路径，否则不处理、不清理。
-- 派发子代理前，主会话把每条 canonical issue 写成 JSON artifact，运行 `rvf fix prepare <issue.json>…`：它一次完成 `rvf_fix_issue.py upsert` + `rvf_fix_attempt.py prepare` + start，并打印每条的子代理派发参数块（attempt_id、attempt worktree、run_dir、repo、scope contract、scope_hash、fix_allowlist、收尾命令）。把参数块原样放进子代理 prompt；子代理 cwd 应切到 attempt worktree。
-- 主会话自己执行 validate/fix 的允许例外（见上文）也必须先运行 `rvf_fix_issue.py upsert` 把 canonical issue 写入 ledger，再用 `rvf fix prepare` → `rvf fix stop` → `rvf apply` 走完同样的 attempt 链路。主 agent 自审 finding 不能跳过 ledger upsert：causality 与 `$rvf-analyze` scaffold 都依赖 ledger；遗漏会让 analyze 阶段没有 finding 承载结构，并把所有 patch 重新归因到 trajectory fallback。
+- 派发子代理前，主会话把每条 canonical issue 写成 JSON artifact，运行 `rvf fix prepare <issue.json>…`：它一次完成 `rvf_fix_issue.py upsert` + `rvf_fix_attempt.py prepare` + start，并打印每条的子代理派发参数块（attempt_id、attempt worktree、run_dir、repo、scope contract、scope_hash、fix_allowlist、带 `cd` / `--attempt-id` / `--run-dir` 的整行收尾命令）。把参数块原样放进子代理 prompt。
+- 主会话自己执行 validate/fix 的允许例外（见上文）同样用 `rvf fix prepare` → `rvf fix stop` → `rvf apply` 走完 attempt 链路（`rvf fix prepare` 自带 ledger upsert，不必另跑 `rvf_fix_issue.py upsert`）。主 agent 自审 finding 也必须走这条链路进 ledger：causality 与 `$rvf-analyze` scaffold 都依赖 ledger；遗漏会让 analyze 阶段没有 finding 承载结构，并把所有 patch 重新归因到 trajectory fallback。
 - 子代理全部返回后，主会话用 `rvf apply --all-stopped` 按创建顺序把已 stop 的 fixed attempt 的 `fix.patch` 合回主 RVF worktree（单条用 `rvf apply --attempt-id <attempt_id>`）；它遇到 `merge_conflict` / `scope_expansion_conflict` 就停下，记录为该 attempt 的未合并状态，不得手工搬运后伪装为已归因 patch。
 - 子代理可以用 `RVF_*_REQUEST` 请求缺失标准、测量、受控子任务或上下文，但 request 本身不是完成状态，不得进入最终结果。
 

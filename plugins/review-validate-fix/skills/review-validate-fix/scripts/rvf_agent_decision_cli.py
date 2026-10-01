@@ -2090,6 +2090,7 @@ def run_start(
             token=token,
             scope_of_work_path=artifacts.get("scope_of_work"),
             candidate_summary=candidate_summary if isinstance(candidate_summary, Mapping) else None,
+            run_dir=run_dir,
         ),
         detail={
             "run_id": run_id, "run_dir": run_dir, "scope_artifact": str(scope_artifact_path),
@@ -2115,14 +2116,25 @@ def _suggested_strictness_tier_from_candidate_summary(candidate_summary: Mapping
     return "<light|standard|strict>"
 
 
-def _host_specific_reviewer_wait_step() -> str:
+def _host_specific_reviewer_wait_step(run_dir: Any) -> str:
     import rvf_command_line_shortcut_entrypoint  # noqa: PLC0415 - 只为共用同一份 host 分流文案
 
-    return rvf_command_line_shortcut_entrypoint.render_host_specific_reviewer_wait_instruction(_rvf())
+    return rvf_command_line_shortcut_entrypoint.render_host_specific_reviewer_wait_instruction(
+        _rvf(), run_dir=run_dir or None
+    )
+
+
+def _explicit_run_dir_argument_when_current_session_unresolvable(run_dir: Any) -> str:
+    """会话 id 解析不出（Kimi 等）时，回执里的 ``rvf`` 执行段命令直接带 ``--run-dir``（否则首跑必 exit 2）。"""
+    import rvf_command_line_shortcut_entrypoint  # noqa: PLC0415
+
+    return rvf_command_line_shortcut_entrypoint.render_explicit_run_dir_argument_when_current_session_unresolvable(
+        run_dir or None
+    )
 
 
 def _start_success_ordered_next_steps(
-    *, token: str, scope_of_work_path: Any, candidate_summary: Mapping[str, Any] | None
+    *, token: str, scope_of_work_path: Any, candidate_summary: Mapping[str, Any] | None, run_dir: Any
 ) -> list[str]:
     """``start`` 成功后按顺序排好、参数已填好的下一步——agent 照抄即可，不必翻 SKILL.md 拼命令。"""
     rvf = _rvf()
@@ -2133,7 +2145,7 @@ def _start_success_ordered_next_steps(
         f"②（可选）`{rvf} scope exclude|include --token {token} <path>… --reason \"<理由>\"` 微调自动 scope。",
         f"③ `{rvf} dispatch --token {token} --strictness "
         f"{_suggested_strictness_tier_from_candidate_summary(candidate_summary)}`。",
-        f"④ 等 reviewer：{_host_specific_reviewer_wait_step()}",
+        f"④ 等 reviewer：{_host_specific_reviewer_wait_step(run_dir)}",
         "⑤ 之后在**当前会话**按 `$review-validate-fix` SKILL.md 就地走 merge → validate/fix → handoff"
         "（执行所需路径全在 execution_handoff，不需要重新 prepare）。",
     ]
@@ -2514,7 +2526,7 @@ def default_reviewer_dispatcher(
     就是「整轮派发不受前台 Bash 工具 600s 上限约束」——一次彻底 review 常常 > 10 分钟。历史实现
     用不带 ``--detached`` 的 ``--execute`` + 无超时 ``subprocess.run`` 同步等整轮跑完；P1 之后
     本函数是**所有**发起的必经之路，那条路在 Claude 里必被砍断。改为立即返回 status.json 路径，
-    由 agent 按 SKILL.md 用 ``--wait-status`` 有界轮询。
+    由 agent 按 SKILL.md「Review」节用 ``rvf wait`` 等终态（等法按 host 分流，不轮询）。
 
     **``returncode`` 不是判据**：它只说派发进程怎么退出。判「本轮 double-review 是否成立」一律
     看 ``plan_status``（见 SKILL.md「Review」节）。特别地退出码 ``3`` =
@@ -2819,8 +2831,10 @@ def run_dispatch(
                 "再对**同一** run 重派；request 不得进入 merge table。"
             ),
             next_steps=[
-                f"`{_rvf()} results` 打印各腿摘要（含 request 正文），处置那条 request。",
-                f"处置完对**同一 run** 跑 `{_rvf()} redispatch-reviewers --review-request-legs-only`"
+                f"`{_rvf()} results{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}`"
+                " 打印各腿摘要（含 request 正文），处置那条 request。",
+                f"处置完对**同一 run** 跑 `{_rvf()} redispatch-reviewers --review-request-legs-only"
+                f"{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}`"
                 f"（= dispatch_reviewers `--execute --detached {REVIEW_REQUEST_REDISPATCH_FLAG}`，自动带当前"
                 " run 目录）：它复用上一轮 plan、只重派停在 `kind: request` 的腿，健康且已完成的腿保留结果、"
                 "不重跑也不被覆写。该模式不调用 route()，因此**不需要** `--selection-seed`"
@@ -2862,12 +2876,14 @@ def run_dispatch(
         [
             # detached：整轮派发跑在 tmux 线程里、不受前台 Bash 600s 上限约束，故这里只拿到
             # status.json 的落点；等待方式按 host 分流（见 rvf_command_line_shortcut_entrypoint）。
-            f"等 reviewer 终态：{_host_specific_reviewer_wait_step()}",
+            f"等 reviewer 终态：{_host_specific_reviewer_wait_step(overlay.get('run_dir'))}",
             "`wait` 到 done 时直接打印合并摘要（每腿 kind / issues / audit_summary / requests，"
             "失败腿给 stderr 路径）与判定——**只看 `plan_status`，不看 `returncode`**；"
             "不要再逐腿跑 check_review_result、也不要再去读 reviewer 目录。",
-            f"成立后：按摘要 merge → `{_rvf()} fix prepare <issue.json>…` → 子代理 → "
-            f"`{_rvf()} apply --all-stopped` → handoff。",
+            f"成立后：按摘要 merge → `{_rvf()} fix prepare <issue.json>…"
+            f"{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}` → 子代理 → "
+            f"`{_rvf()} apply --all-stopped"
+            f"{_explicit_run_dir_argument_when_current_session_unresolvable(overlay.get('run_dir'))}` → handoff。",
         ]
         if dispatch_status_path
         else ["等待 reviewer 结果 → validate → fix → handoff（不变）。"]

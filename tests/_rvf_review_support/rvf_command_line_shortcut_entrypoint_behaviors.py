@@ -16,10 +16,12 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 __all__ = [
     "test_rvf_shortcut_run_context_resolution_priority",
@@ -31,6 +33,14 @@ __all__ = [
     "test_rvf_command_line_shortcut_shim_install_and_invocation_resolution",
     "test_current_agent_session_id_reads_claude_code_session_id",
     "test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps",
+    "test_rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl",
+    "test_rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work",
+    "test_rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd",
+    "test_rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run",
+    "test_rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository",
+    "test_rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback",
+    "test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable",
+    "test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol",
 ]
 
 HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES = (
@@ -85,6 +95,32 @@ def _process_environment_and_cwd(environment: dict[str, str], cwd: Path) -> Iter
         os.chdir(saved_cwd)
         os.environ.clear()
         os.environ.update(saved_environment)
+
+
+@contextlib.contextmanager
+def _only_these_host_session_environment_variables(**values: str) -> Iterator[None]:
+    """进程内测试：临时抹掉宿主会话身份变量，只留下 ``values``（回执是否带 --run-dir 取决于它）。"""
+    names = (*HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES, "RVF_SESSION_ID")
+    saved = {name: os.environ.get(name) for name in (*names, *values)}
+    for name in names:
+        os.environ.pop(name, None)
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _wait_until(predicate: Callable[[], bool], *, timeout_seconds: float, what: str) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"{timeout_seconds}s 内未等到：{what}")
+        time.sleep(0.05)
 
 
 def _load_entrypoint_module():
@@ -735,8 +771,9 @@ def test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(ro
         prepared["artifacts"]["intent_artifact_status_file"] = str(intent)
         return prepared
 
-    result = cli.run_start(token=token, reason="开审", roots=roots, now=t0,
-                           prepare_pipeline=_prepare_with_intent_status)
+    with _only_these_host_session_environment_variables(CLAUDE_CODE_SESSION_ID="sess-receipt"):
+        result = cli.run_start(token=token, reason="开审", roots=roots, now=t0,
+                               prepare_pipeline=_prepare_with_intent_status)
     assert result.exit_code == cli.EXIT_OK, result.message
     rendered = result.render()
     assert "    - intent_artifact_status_file: " in rendered, rendered
@@ -746,3 +783,546 @@ def test_agent_cli_start_receipt_renders_intent_status_and_ordered_next_steps(ro
     assert f"scope rerender-scope-of-work --token {token}" in steps[0], steps
     assert f"dispatch --token {token} --strictness light" in steps[2], steps
     assert " wait`" in steps[3], steps
+
+
+# ---------------------------------------------------------------------------
+# F2（T1/T2/T3 集成审计修复包：执行段）
+# ---------------------------------------------------------------------------
+
+def _stop_hook_script() -> Path:
+    return SCRIPT_DIR / "stop_review_validate_fix.py"  # noqa: F821 - injected
+
+
+def _awaiting_dispatched_agent_marker_directory(environment: dict[str, str]) -> Path:
+    # 与 rvf_awaiting_dispatched_agent_marker._root 同一口径：锁根 env 之下的固定子目录。
+    return Path(environment["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"]) / "awaiting-dispatched-agent"
+
+
+def _awaiting_marker_files_for_session(environment: dict[str, str], session_id: str) -> list[Path]:
+    directory = _awaiting_dispatched_agent_marker_directory(environment)
+    return sorted(directory.glob(f"sess-{session_id}__dispatch-*.json")) if directory.is_dir() else []
+
+
+def _invoke_real_stop_hook(environment: dict[str, str], *, repo: Path, session_id: str, state: Path) -> dict:
+    """跑**真** Stop hook（子进程），返回本次 ledger summary。env 与 ``rvf wait`` 同一套隔离根，
+    保证 marker 的写入方与 Stop 侧读取方看到的是同一个目录。"""
+    # ledger 根：CODEX_RVF_LOG_ROOT 优先于 CODEX_RVF_STATE_DIR（run_ledger），这里只留后者，summary 落 ``state``。
+    stop_environment = {
+        key: value for key, value in environment.items()
+        if key not in HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES and key != "CODEX_RVF_LOG_ROOT"
+    }
+    stop_environment.update(
+        {
+            "CODEX_RVF_STATE_DIR": str(state),
+            "CODEX_RVF_KANBAN_FOLLOWUP_IN_PROGRESS_NUDGE_BUDGET": "10",
+            "RVF_TMUX_BIN": "/usr/bin/true",
+            "RVF_TERMINAL_NOTIFIER_BIN": "/usr/bin/true",
+        }
+    )
+    completed = subprocess.run(
+        [sys.executable, str(_stop_hook_script())],
+        input=json.dumps({"cwd": str(repo), "session_id": session_id, "stop_hook_active": False,
+                          "last_user_message": "已后台跑 rvf wait，等完成通知。"}),
+        capture_output=True, text=True, check=False, env=stop_environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    pointer = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    return json.loads(Path(pointer["summary_path"]).read_text(encoding="utf-8"))
+
+
+def _write_dispatch_status(run_dir: Path, *, finished: bool) -> None:
+    reviewers = run_dir / "artifacts" / "reviewers"
+    _write_json(reviewers / "reviewer-plan.json",
+                {"status": "completed", "effective_reviewer_count": 0, "reviewers": [], "fallbacks": []})
+    status = {"launch_status": "launched", "returncode": None}
+    if finished:
+        status.update({"returncode": 0, "finished_at": "2020-01-01T00:00:00Z"})
+    _write_json(reviewers / ".dispatch-thread.status.json", status)
+
+
+def _start_background_rvf_wait(environment: dict[str, str], *, run_dir: Path, cwd: Path) -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, str(_entrypoint_script()), "wait", "--run-dir", str(run_dir), "--max-wait", "60"],
+        cwd=cwd, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_rvf_wait_awaiting_marker_keeps_stop_silent_while_waiting_and_reengage_returns_after_exit_kill_or_ttl(
+    root: Path,
+) -> None:
+    """H3：Claude 下后台 ``rvf wait`` 在跑时，真 Stop hook 不得发续跑提示（走 awaiting shield 静默）；
+    wait 正常退出 / 被 SIGKILL 后 TTL 过期 / 被 SIGTERM 终止后，续跑提示恢复。
+
+    修复前 ``rvf wait`` 从不写 marker ⇒ 等待期间那次 Stop 直接 reengage（run beb3c652 的事故形态）。"""
+    _load_entrypoint_module()  # 顺带把 scripts 目录放上 sys.path（下面进程内 import 锁模块）
+    session_id = "sess-rvf-wait-shield"
+    repo = _git_repo(root / "repo").resolve()
+    (repo / "a.txt").write_text("a\n", encoding="utf-8")
+    _commit_all(repo, "base")
+    run_dir = root / "runs" / "rvf-run-wait-shield"
+    _write_json(run_dir / "summary.json", {"run_id": run_dir.name, "repo": str(repo)})
+    environment = _isolated_environment(root, CLAUDE_CODE_SESSION_ID=session_id)
+    state = root / "stop-state"
+
+    # rvf start 接受这一轮时落下的在途锁：Stop 看到它且 agent 未 handoff ⇒ 预算内会 reengage。
+    with _process_environment_and_cwd(environment, repo):
+        import kanban_followup_lock  # noqa: PLC0415
+
+        assert kanban_followup_lock.write_marker(
+            task_id=None, session_id=session_id, run_id=run_dir.name, run_dir=str(run_dir), repo=str(repo),
+            cwd=str(repo), decision_token="dddddddddddddddd", state=kanban_followup_lock.STATE_IN_PROGRESS,
+        ) is not None
+
+    # ① 等待期间：marker 已登记（TTL = 最长等待 + 余量），Stop 静默、不耗续跑预算。
+    _write_dispatch_status(run_dir, finished=False)
+    waiting = _start_background_rvf_wait(environment, run_dir=run_dir, cwd=repo)
+    try:
+        _wait_until(lambda: bool(_awaiting_marker_files_for_session(environment, session_id)),
+                    timeout_seconds=20, what="rvf wait 登记 awaiting marker")
+        marker = json.loads(_awaiting_marker_files_for_session(environment, session_id)[0].read_text("utf-8"))
+        assert marker["ttl_seconds"] == 60 + 300, marker
+        assert marker["dispatched_agent_id"].endswith(f"-pid-{waiting.pid}"), marker
+        summary = _invoke_real_stop_hook(environment, repo=repo, session_id=session_id, state=state)
+        assert summary["reason_code"] == "awaiting_dispatched_agent", summary
+
+        # ② wait 正常退出（reviewer 终态）：finally 清 marker ⇒ 下一次 Stop 恢复续跑提示。
+        _write_dispatch_status(run_dir, finished=True)
+        stdout, stderr = waiting.communicate(timeout=30)
+        assert waiting.returncode == 0, stderr
+        assert "已登记 awaiting marker" in stdout, stdout
+    finally:
+        if waiting.poll() is None:
+            waiting.kill()
+    assert _awaiting_marker_files_for_session(environment, session_id) == []
+    summary = _invoke_real_stop_hook(environment, repo=repo, session_id=session_id, state=state)
+    assert summary["reason_code"] == "kanban_followup_in_progress_reengage", summary
+
+    # ③ 进程被 SIGKILL（finally 跑不到）：marker 残留 ⇒ TTL 内仍静默；TTL 一过即恢复续跑提示。
+    _write_dispatch_status(run_dir, finished=False)
+    killed = _start_background_rvf_wait(environment, run_dir=run_dir, cwd=repo)
+    try:
+        _wait_until(lambda: bool(_awaiting_marker_files_for_session(environment, session_id)),
+                    timeout_seconds=20, what="第二个 rvf wait 登记 awaiting marker")
+    finally:
+        killed.send_signal(signal.SIGKILL)
+        killed.communicate(timeout=30)
+    leftover = _awaiting_marker_files_for_session(environment, session_id)
+    assert len(leftover) == 1, leftover
+    summary = _invoke_real_stop_hook(environment, repo=repo, session_id=session_id, state=state)
+    assert summary["reason_code"] == "awaiting_dispatched_agent", summary
+    expired = json.loads(leftover[0].read_text(encoding="utf-8"))
+    expired["expires_at"] = "2020-01-01T00:00:00Z"
+    leftover[0].write_text(json.dumps(expired), encoding="utf-8")
+    summary = _invoke_real_stop_hook(environment, repo=repo, session_id=session_id, state=state)
+    assert summary["reason_code"] == "kanban_followup_in_progress_reengage", summary
+    assert _awaiting_marker_files_for_session(environment, session_id) == []  # 读侧惰性清掉过期 marker
+
+    # ④ host 用 SIGTERM 砍后台任务（如 Claude 后台 Bash 超时）：信号转成 SystemExit，finally 照样清。
+    terminated = _start_background_rvf_wait(environment, run_dir=run_dir, cwd=repo)
+    try:
+        _wait_until(lambda: bool(_awaiting_marker_files_for_session(environment, session_id)),
+                    timeout_seconds=20, what="第三个 rvf wait 登记 awaiting marker")
+    finally:
+        terminated.send_signal(signal.SIGTERM)
+        terminated.communicate(timeout=30)
+    assert terminated.returncode == 128 + signal.SIGTERM, terminated.returncode
+    assert _awaiting_marker_files_for_session(environment, session_id) == []
+
+
+def test_rvf_wait_awaiting_marker_armed_only_on_hosts_that_wake_main_agent_after_background_work(
+    root: Path,
+) -> None:
+    """只有「后台工作结束会唤起主 agent」的 host（Claude）才登记：Codex / Kimi 上静默 = 把 agent 晾住。
+    异常路径也必须清掉。"""
+    module = _load_entrypoint_module()
+    environment = _isolated_environment(root)
+    with _process_environment_and_cwd(environment, root):
+        for non_waking_host_environment in ({"CODEX_THREAD_ID": "codex-thread"}, {}):
+            with module.awaiting_dispatched_reviewers_marker_armed_while_waiting(
+                max_wait_seconds=100.0, environ=non_waking_host_environment,
+            ) as marker_path:
+                assert marker_path is None, non_waking_host_environment
+        claude_environment = {"CLAUDE_CODE_SESSION_ID": "sess-claude"}
+        with module.awaiting_dispatched_reviewers_marker_armed_while_waiting(
+            max_wait_seconds=0.0, environ=claude_environment,
+        ) as marker_path:
+            assert marker_path is None, "results（不等待）不登记"
+        try:
+            with module.awaiting_dispatched_reviewers_marker_armed_while_waiting(
+                max_wait_seconds=100.0, environ=claude_environment,
+            ) as marker_path:
+                assert marker_path is not None and Path(marker_path).is_file()
+                raise RuntimeError("等待中途抛错")
+        except RuntimeError:
+            pass
+        assert not Path(marker_path).exists(), "异常路径也必须清掉 marker"
+
+
+def _fix_loop_repo_and_run(root: Path) -> tuple[Path, Path, list[Path]]:
+    repo = _git_repo(root / "repo").resolve()
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (repo / name).write_text(f"{name}-1\n", encoding="utf-8")
+    _commit_all(repo, "base")
+    run_dir = (root / "runs" / "rvf-run-fix-shield").resolve()
+    _write_json(run_dir / "summary.json", {"run_id": run_dir.name, "repo": str(repo)})
+    _write_json(run_dir / "artifacts" / "inputs" / "scope.contract.json",
+                {"run_id": run_dir.name, "repo": str(repo), "fix_allowlist": ["a.txt", "b.txt", "c.txt", "d.txt"],
+                 "scope_hash": "sha256:" + "1" * 64, "protected_files": [], "background_files": [],
+                 "excluded_path_prefixes": []})
+    issue_files = [
+        _write_json(root / "issues" / f"{issue_id}.json",
+                    {"issue_id": issue_id, "path": path, "line": 1, "message": f"{path} 要改", "run_id": run_dir.name})
+        for issue_id, path in (("RVF-001", "a.txt"), ("RVF-002", "b.txt"), ("RVF-003", "c.txt"), ("RVF-004", "d.txt"))
+    ]
+    return repo, run_dir, issue_files
+
+
+def test_rvf_fix_prepare_arms_awaiting_marker_per_attempt_and_full_stop_command_works_from_any_cwd(
+    root: Path,
+) -> None:
+    """H3（fix attempt 那一半）+ M2：
+
+    * Claude 下 ``fix prepare`` 按 attempt 登记 awaiting marker，主会话 id 记进 attempt.json；Stop 侧读取方
+      认得出它们（同一会话、ACTIVE）。
+    * 参数块给出的整行收尾命令自带 ``cd`` / ``--attempt-id`` / ``--run-dir``：从任意 cwd 照抄即成功（Claude
+      子代理每次 Bash 都重置 cwd）；旧写法 ``rvf fix stop --status …`` 离开 attempt worktree 即 exit 2。
+    * 子代理 stop 清掉自己那条；``apply --attempt-id`` 兜底清掉已 stop 的残留、仍在跑的不动；
+      ``apply --all-stopped``（协议：全部子代理已结束）连没调 stop 的也清。
+    * Codex 下不登记。
+    * 批量中途失败（exit 4）时整批都不登记：失败前已建好的 attempt 不留 awaiting marker。"""
+    _load_entrypoint_module()  # 顺带把 scripts 目录放上 sys.path（下面进程内 import marker / attempt 模块）
+    session_id = "sess-fix-shield"
+    repo, run_dir, issue_files = _fix_loop_repo_and_run(root)
+    environment = _isolated_environment(root, CLAUDE_CODE_SESSION_ID=session_id)
+    prepared = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "prepare", *map(str, issue_files[:3]),
+         "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert prepared.returncode == 0, prepared.stderr + prepared.stdout
+    attempts = {item["issue_id"]: item for item in json.loads(prepared.stdout)["prepared"]}
+    for item in attempts.values():
+        assert item["awaiting_dispatched_agent_marker_path"] and Path(item["awaiting_dispatched_agent_marker_path"]).is_file()
+        attempt = json.loads((Path(item["attempt_worktree"]).parent / "attempt.json").read_text(encoding="utf-8"))
+        assert attempt["main_agent_session_id_awaiting_fix_subagent"] == session_id, attempt
+    with _process_environment_and_cwd(environment, root):
+        import rvf_awaiting_dispatched_agent_marker  # noqa: PLC0415
+
+        active_ids = sorted(m["dispatched_agent_id"]
+                            for m in rvf_awaiting_dispatched_agent_marker.iter_active_awaiting_for_session(session_id))
+    assert active_ids == sorted(item["attempt_id"] for item in attempts.values()), active_ids
+
+    # M2：旧写法离开 attempt worktree 即失败；整行命令从无关 cwd 照抄即成功。
+    unrelated_cwd = root / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    subagent_environment = {k: v for k, v in environment.items() if k not in HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES}
+    legacy = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "stop", "--status", "fixed"],
+        cwd=unrelated_cwd, env=subagent_environment, capture_output=True, text=True, check=False,
+    )
+    assert legacy.returncode == 2 and "--attempt-id is required" in legacy.stderr, legacy.stderr
+    first = attempts["RVF-001"]
+    stop_command = first["fix_stop_command"]
+    assert stop_command.startswith("cd ") and f"--attempt-id {first['attempt_id']}" in stop_command, stop_command
+    assert "--run-dir " in stop_command and "--status <fixed|false_positive|elevated|failed>" in stop_command
+    (Path(first["attempt_worktree"]) / "a.txt").write_text("a.txt-fixed\n", encoding="utf-8")
+    # 子代理 shell 里没有 `rvf` 也没有主会话 session id：把命令前缀换成入口脚本、状态填 fixed 后照抄。
+    runnable = stop_command.replace("--status <fixed|false_positive|elevated|failed>", "--status fixed")
+    runnable = runnable.replace(f"&& {_rvf_invocation_for_test(stop_command)} fix stop",
+                                f"&& {sys.executable} {_entrypoint_script()} fix stop")
+    stopped = subprocess.run(["bash", "-c", runnable], cwd=unrelated_cwd, env=subagent_environment,
+                             capture_output=True, text=True, check=False)
+    assert stopped.returncode == 0, stopped.stderr + stopped.stdout
+    assert not Path(first["awaiting_dispatched_agent_marker_path"]).exists(), "子代理 stop 必须清掉自己那条"
+    assert Path(attempts["RVF-002"]["awaiting_dispatched_agent_marker_path"]).is_file(), "别的 attempt 不受影响"
+
+    # RVF-002 stop 成 false_positive，但模拟「stop 时清除失败」留下残留；RVF-003 仍在跑。
+    second = attempts["RVF-002"]
+    runnable_second = second["fix_stop_command"].replace(
+        "--status <fixed|false_positive|elevated|failed>", "--status false_positive"
+    ).replace(f"&& {_rvf_invocation_for_test(second['fix_stop_command'])} fix stop",
+              f"&& {sys.executable} {_entrypoint_script()} fix stop")
+    assert subprocess.run(["bash", "-c", runnable_second], cwd=unrelated_cwd, env=subagent_environment,
+                          capture_output=True, text=True, check=False).returncode == 0
+    with _process_environment_and_cwd(environment, root):
+        import rvf_fix_attempt  # noqa: PLC0415
+
+        rvf_fix_attempt.arm_fix_attempt_subagent_awaiting_marker(
+            run_dir=run_dir, attempt_id=second["attempt_id"], main_agent_session_id=session_id
+        )
+    assert Path(second["awaiting_dispatched_agent_marker_path"]).is_file()
+    # 边收结果边合回（--attempt-id）：兜底清掉已 stop 的残留，仍在跑的 RVF-003 不动。
+    applied_one = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "apply", "--attempt-id", first["attempt_id"],
+         "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert applied_one.returncode == 0, applied_one.stderr + applied_one.stdout
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "a.txt-fixed\n"
+    assert not Path(second["awaiting_dispatched_agent_marker_path"]).exists(), "apply 兜底清掉已 stop 的残留"
+    assert Path(attempts["RVF-003"]["awaiting_dispatched_agent_marker_path"]).is_file(), "仍在跑的 attempt 不动"
+    # --all-stopped 按协议意味着「全部子代理已结束」：没调 stop 就死掉的 RVF-003 也不能把 marker 留到 TTL
+    # （否则本会话此后每次 Stop 都被静默，连新工作的决策点都发不出）。
+    applied_all = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "apply", "--all-stopped", "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert applied_all.returncode == 0, applied_all.stderr + applied_all.stdout
+    assert json.loads(applied_all.stdout)["attempts_not_stopped"] == [attempts["RVF-003"]["attempt_id"]]
+    assert not Path(attempts["RVF-003"]["awaiting_dispatched_agent_marker_path"]).exists()
+
+    # Codex：子代理结束不会唤起主 agent ⇒ 不登记（静默会把 agent 晾住）。
+    codex_environment = {k: v for k, v in environment.items() if k not in HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES}
+    codex_environment["CODEX_THREAD_ID"] = "codex-thread"
+    codex_prepared = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "prepare", str(issue_files[3]),
+         "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=codex_environment, capture_output=True, text=True, check=False,
+    )
+    assert codex_prepared.returncode == 0, codex_prepared.stderr + codex_prepared.stdout
+    assert json.loads(codex_prepared.stdout)["prepared"][0]["awaiting_dispatched_agent_marker_path"] is None
+
+    # 批量中途失败（后一条 issue JSON 损坏）⇒ exit 4，主会话拿到的是失败、通常不派发子代理：前面已建好的
+    # attempt 不得留下 awaiting marker，否则本会话的 Stop 会被静默到 TTL、续跑提示发不出。
+    failed_batch_session_id = "sess-fix-shield-failed-batch"
+    failed_batch_environment = _isolated_environment(root, CLAUDE_CODE_SESSION_ID=failed_batch_session_id)
+    valid_issue_file_before_corrupt_one = _write_json(
+        root / "issues" / "RVF-005.json",
+        {"issue_id": "RVF-005", "path": "d.txt", "line": 1, "message": "d.txt 要改", "run_id": run_dir.name},
+    )
+    corrupt_issue_file = root / "issues" / "RVF-006-corrupt.json"
+    corrupt_issue_file.write_text("{不是合法 JSON", encoding="utf-8")
+    failed_batch = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "prepare",
+         str(valid_issue_file_before_corrupt_one), str(corrupt_issue_file), "--run-dir", str(run_dir), "--json"],
+        cwd=repo, env=failed_batch_environment, capture_output=True, text=True, check=False,
+    )
+    assert failed_batch.returncode == 4, failed_batch.stderr + failed_batch.stdout
+    failed_batch_payload = json.loads(failed_batch.stdout)
+    assert failed_batch_payload["failure"] and str(corrupt_issue_file) in failed_batch_payload["failure"]
+    assert [item["issue_id"] for item in failed_batch_payload["prepared"]] == ["RVF-005"], failed_batch_payload
+    assert failed_batch_payload["prepared"][0]["awaiting_dispatched_agent_marker_path"] is None, failed_batch_payload
+    with _process_environment_and_cwd(failed_batch_environment, root):
+        import rvf_awaiting_dispatched_agent_marker  # noqa: PLC0415
+
+        leftover_active_markers_after_failed_batch = list(
+            rvf_awaiting_dispatched_agent_marker.iter_active_awaiting_for_session(failed_batch_session_id)
+        )
+    assert leftover_active_markers_after_failed_batch == [], leftover_active_markers_after_failed_batch
+
+
+def _rvf_invocation_for_test(stop_command: str) -> str:
+    """从渲染出的收尾命令里取 `rvf` 前缀（PATH 上的 rvf / shim 绝对路径 / python3 入口脚本三种之一）。"""
+    after_cd = stop_command.split(" && ", 1)[1]
+    return after_cd.split(" fix stop", 1)[0]
+
+
+def test_rvf_validate_inside_fix_attempt_worktree_or_suppressed_subprocess_stays_off_main_run(root: Path) -> None:
+    """H2b：attempt worktree 里的 ``rvf validate`` 验证的是 attempt 自己（``--repo`` 取 cwd），且不写主 run；
+    Stop hook 被抑制的子进程同理。对照组：主会话在主 worktree 里照常写进 run。
+
+    修复前：attempt 里推断出主 run，``--repo`` 取主 worktree（验错对象，只存在于 attempt 的文件找不到），
+    记录写进主 run、land 时被重放。
+
+    RVF-001：隔离分支只「不注入 ``--rvf-run-dir``」不够——子进程从调用方 shell 继承来的 ``RVF_RUN_DIR``
+    （这里指向本用例自建的主 run）会原样流进被验证的命令（F1 之前还会让 ``validation_result_cache.py``
+    回退写进主 run）；继承来的 ``GIT_DIR`` / ``GIT_WORK_TREE``（指向主 worktree）会让 ``--repo`` 解析成
+    主 worktree。两者都必须挡掉。"""
+    session_id = "sess-validate-isolation"
+    repo, run_dir, issue_files = _fix_loop_repo_and_run(root)
+    environment = _isolated_environment(root, RVF_SESSION_ID=session_id)
+    rvf_home = Path(environment["RVF_HOME"])
+    _write_decision_token(rvf_home, token="eeeeeeeeeeeeeeee", state="dispatched", worktree=repo,
+                          session_id=session_id, minted_at="2020-01-01T01:00:00Z")
+    _write_scope_overlay(rvf_home, token="eeeeeeeeeeeeeeee", worktree=repo, session_id=session_id,
+                         run_dir=run_dir, updated_at="2020-01-01T01:00:00Z")
+    prepared = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "fix", "prepare", str(issue_files[0]), "--json"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert prepared.returncode == 0, prepared.stderr + prepared.stdout
+    attempt_worktree = Path(json.loads(prepared.stdout)["prepared"][0]["attempt_worktree"])
+    (attempt_worktree / "only-in-attempt-worktree.txt").write_text("x\n", encoding="utf-8")
+    run_validation_index = run_dir / "artifacts" / "validation-records.json"
+    run_validation_commands = run_dir / "artifacts" / "handoff-validation-commands.json"
+    probe = ["--name", "fixer-probe", "--", "sh", "-c", "test -f only-in-attempt-worktree.txt"]
+    environment_inherited_from_main_session_shell = {
+        **environment,
+        "RVF_RUN_DIR": str(run_dir),
+        "GIT_DIR": str(repo / ".git"),
+        "GIT_WORK_TREE": str(repo),
+    }
+
+    in_attempt = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "validate", *probe],
+        cwd=attempt_worktree, env=environment_inherited_from_main_session_shell,
+        capture_output=True, text=True, check=False,
+    )
+    assert in_attempt.returncode == 0, in_attempt.stderr + in_attempt.stdout  # 验证的是 attempt 自己
+    assert "不写主 run" in in_attempt.stderr, in_attempt.stderr
+    assert not run_validation_index.exists() and not run_validation_commands.exists()
+
+    suppressed = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "validate", "--name", "reviewer-probe", "--", "true"],
+        cwd=repo, env={**environment_inherited_from_main_session_shell, "RVF_SUPPRESS_STOP_HOOK": "1"},
+        capture_output=True, text=True, check=False,
+    )
+    assert suppressed.returncode == 0, suppressed.stderr + suppressed.stdout
+    assert not run_validation_index.exists() and not run_validation_commands.exists()
+
+    # 对照：主会话在主 worktree 里跑，照常推断 run 并写进验证记录（否则上面两条是空断言）。
+    main_session = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "validate", "--name", "handoff-validation-001", "--", "true"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert main_session.returncode == 0, main_session.stderr + main_session.stdout
+    assert run_validation_index.is_file() and run_validation_commands.is_file()
+    recorded_names = [entry.get("name") for entry in
+                      json.loads(run_validation_commands.read_text(encoding="utf-8")).get("validation_commands", [])]
+    assert "handoff-validation-001" in recorded_names, recorded_names
+    assert "fixer-probe" not in recorded_names and "reviewer-probe" not in recorded_names, recorded_names
+
+
+def test_rvf_land_passthrough_commit_defaults_to_most_recent_prepare_run_of_this_repository(root: Path) -> None:
+    """M4：``rvf land prepare`` 原样转给 rvf_land.py 并记下本仓这次 prepare 的 run；``rvf land commit`` 不带
+    ``--run-dir`` 即落到那个 run。没 prepare 过的仓库诚实报找不到，不猜。"""
+    sys.path.insert(0, str(ROOT / "tests"))  # noqa: F821 - injected
+    from test_reviewed_task_candidate_evidence import create_completed_run, repository  # noqa: PLC0415
+
+    root.mkdir(parents=True, exist_ok=True)
+    repo = repository(root / "repo").resolve()
+    (repo / "tracked.txt").write_text("candidate\nreviewed change\n", encoding="utf-8")
+    run_dir = create_completed_run(root, repo)
+    environment = _isolated_environment(root)
+    environment.pop("RVF_KANBAN_FOLLOWUP_LOCK_ROOT", None)
+    recorded = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "validate", "--rvf-run-dir", str(run_dir),
+         "--name", "handoff-validation-001", "--", "true"],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert recorded.returncode == 0, recorded.stderr + recorded.stdout
+
+    other_repo = _git_repo(root / "never-prepared").resolve()
+    (other_repo / "x.txt").write_text("x\n", encoding="utf-8")
+    _commit_all(other_repo, "base")
+    no_pointer = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "land", "commit", "--message-file", "-"],
+        cwd=other_repo, env=environment, input="x\n", capture_output=True, text=True, check=False,
+    )
+    assert no_pointer.returncode == 2 and "最近一次 `rvf land prepare`" in no_pointer.stderr, no_pointer.stderr
+
+    # RVF-001：调用方 shell 里指向别的仓库的 GIT_DIR / GIT_WORK_TREE 不能带偏指针的仓库键——rvf_land 自己
+    # 清洗这些变量后按 cwd 定位仓库，入口也必须同口径，否则 prepare 不记指针、commit 误报找不到。
+    environment_with_git_location_pointing_at_other_repository = {
+        **environment,
+        "GIT_DIR": str(other_repo / ".git"),
+        "GIT_WORK_TREE": str(other_repo),
+    }
+    prepared = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "land", "prepare", "--handoff",
+         str(run_dir / "artifacts" / "handoff.md"), "--repo", "."],
+        cwd=repo, env=environment_with_git_location_pointing_at_other_repository,
+        capture_output=True, text=True, check=False,
+    )
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    assert prepared.stdout.startswith("RVF_LAND_PREPARE exit=0"), prepared.stdout  # 文本输出原样透传
+
+    committed = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "land", "commit", "--message-file", "-"],
+        cwd=repo, env=environment_with_git_location_pointing_at_other_repository,
+        input="fix(test): rvf land 透传\n\nsanity-check：自洽\n验证：\n[[rvf-land-validation-summary]]\n",
+        capture_output=True, text=True, check=False,
+    )
+    assert committed.returncode == 0, committed.stdout + committed.stderr
+    assert f"run_dir={run_dir.resolve()}" in committed.stderr, committed.stderr
+    result = json.loads(committed.stdout)
+    assert result["status"] == "committed", result
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True,
+                          check=True).stdout == ""
+
+
+def test_rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback(root: Path) -> None:
+    """L-F2a：给「早于 created_at 字段的旧 attempt」用 baseline.patch mtime 兜底，是 RVF 自身的向后兼容代码
+    （项目未分发，按 AGENTS.md 清理）。缺 created_at 的记录不再读文件 mtime。"""
+    module = _load_entrypoint_module()
+    run_dir = root / "run"
+    attempts = run_dir / "artifacts" / "fix-attempts"
+    _write_json(attempts / "rvf-attempt-new" / "attempt.json",
+                {"attempt_id": "rvf-attempt-new", "created_at": "2020-01-02T00:00:00+00:00", "status": "fixed"})
+    _write_json(attempts / "rvf-attempt-legacy" / "attempt.json", {"attempt_id": "rvf-attempt-legacy", "status": "fixed"})
+    (attempts / "rvf-attempt-legacy" / "baseline.patch").write_text("", encoding="utf-8")
+    records = module._attempt_records(run_dir)
+    by_id = {record["attempt_id"]: record for record in records}
+    assert by_id["rvf-attempt-legacy"]["_created_at_sort_key"] == "", by_id["rvf-attempt-legacy"]
+    assert [record["attempt_id"] for record in records] == ["rvf-attempt-legacy", "rvf-attempt-new"]
+
+
+def test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable(root: Path) -> None:
+    """L-F2c：Kimi 等拿不到会话 id 的 host 上 run 推断一律 fail-closed ⇒ 回执给的下一步命令直接带 run 目录；
+    拿得到会话 id 时保持短命令。覆盖 ``rvf wait`` 文案、reviewer 摘要与 start 回执三处。"""
+    module = _load_entrypoint_module()
+    run_dir = root / "runs" / "rvf run with space"
+    quoted = f"--run-dir '{run_dir}'"
+    assert module.render_explicit_run_dir_argument_when_current_session_unresolvable(run_dir, environ={}) == " " + quoted
+    assert module.render_explicit_run_dir_argument_when_current_session_unresolvable(
+        run_dir, environ={"CLAUDE_CODE_SESSION_ID": "s"}) == ""
+    assert module.render_explicit_run_dir_argument_when_current_session_unresolvable(
+        run_dir, option_name="--rvf-run-dir", environ={}) == f" --rvf-run-dir '{run_dir}'"
+
+    summary = {"plan_status": "completed", "effective_reviewer_count": 2, "reviewer_count": 2, "plan_path": "p",
+               "legs": [{"reviewer_id": r, "kind": "issues", "valid": True, "issues": [{"path": "a", "line": 1}]}
+                        for r in ("a", "b")]}
+    with _only_these_host_session_environment_variables():
+        kimi_wait = module.render_host_specific_reviewer_wait_instruction(
+            "rvf", module.REVIEWER_WAIT_MODE_BOUNDED_FOREGROUND_POLLING, run_dir=run_dir)
+        kimi_summary = module.render_reviewer_results_summary(summary, dispatch_state=None, run_dir=run_dir)
+    assert f"rvf wait {quoted}" in kimi_wait, kimi_wait
+    assert f"fix prepare <issue.json>… {quoted}" in kimi_summary, kimi_summary
+    with _only_these_host_session_environment_variables(CLAUDE_CODE_SESSION_ID="s"):
+        claude_wait = module.render_host_specific_reviewer_wait_instruction("rvf", run_dir=run_dir)
+    assert "--run-dir" not in claude_wait and "`rvf wait`" in claude_wait, claude_wait
+    # M1：Claude 文案必须显式给后台 Bash 的 timeout，且它盖得住 Claude 下的缺省等待时长。
+    assert f"`timeout: {module.CLAUDE_BACKGROUND_BASH_TIMEOUT_MILLISECONDS_FOR_REVIEWER_WAIT}`" in claude_wait
+    assert module.CLAUDE_BACKGROUND_BASH_TIMEOUT_MILLISECONDS_FOR_REVIEWER_WAIT > 1000 * module.default_reviewer_wait_seconds_for_host(
+        module.REVIEWER_WAIT_MODE_CLAUDE_BACKGROUND_TASK_COMPLETION_NOTIFICATION)
+    assert module.CLAUDE_BACKGROUND_BASH_TIMEOUT_MILLISECONDS_FOR_REVIEWER_WAIT <= 7_200_000
+
+    cli = load_rvf_agent_decision_cli_module()  # noqa: F821
+    dts = load_rvf_decision_token_store_module()  # noqa: F821
+    roots = _agent_cli_roots(cli, root)  # noqa: F821
+    t0 = _fixed_utc(0)  # noqa: F821
+    token = _mint_agent_decision_token(dts, roots, worktree=_agent_cli_worktree(root), now=t0)  # noqa: F821
+    with _only_these_host_session_environment_variables():
+        result = cli.run_start(token=token, reason="开审", roots=roots, now=t0,
+                               prepare_pipeline=_agent_cli_stub_prepare(root))  # noqa: F821
+    assert result.exit_code == cli.EXIT_OK, result.message
+    wait_step = result.next_steps[3]
+    assert "--run-dir" in wait_step and str(result.detail["run_dir"]) in wait_step, wait_step
+
+
+def test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol(root: Path) -> None:
+    """M1 / M3 / M2 / L-F2b 的文档面：agent 按文档照做就不会踩回旧坑。"""
+    del root
+    skill_directory = SCRIPT_DIR.parent  # noqa: F821
+    skill = (skill_directory / "SKILL.md").read_text(encoding="utf-8")
+    validate_fix = (skill_directory / "prompts" / "validate-fix.md").read_text(encoding="utf-8")
+    merge_policy = (skill_directory / "references" / "review-merge-policy.md").read_text(encoding="utf-8")
+    decision_cli = (SCRIPT_DIR / "rvf_agent_decision_cli.py").read_text(encoding="utf-8")  # noqa: F821
+    land_skill = (skill_directory.parent / "rvf-land" / "SKILL.md").read_text(encoding="utf-8")
+
+    # M3：验证段教 `rvf validate`，不再教 Claude Bash 里为空的 $RVF_REPO / $RVF_RUN_DIR。
+    assert "rvf validate --name" in skill
+    assert 'validation_result_cache.py run --repo "$RVF_REPO"' not in skill
+    # M1：Claude 后台等待必须显式给 timeout。
+    assert "`timeout: 3000000`" in skill
+    # M2：子代理收尾是整行命令，不再宣称「从 cwd 反推」。
+    assert "attempt 与 run 从 cwd 反推" not in skill + validate_fix
+    assert "cd <attempt worktree> && rvf fix stop --attempt-id" in skill + validate_fix
+    # L-F2b：已删除的轮询协议 / --wait-status 不再出现在 agent 面文档与 decision CLI docstring；
+    # fix prepare 自带 upsert，不再要求先手动 upsert。
+    assert "轮询协议" not in merge_policy and "--wait-status" not in merge_policy
+    assert "``--wait-status`` 有界轮询" not in decision_cli
+    assert "也必须先运行 `rvf_fix_issue.py upsert`" not in validate_fix
+    # M4：land 两步都经 `rvf land`。
+    assert "rvf land prepare" in land_skill and "rvf land commit" in land_skill
+    assert "<skill-scripts-dir>/rvf_land.py" not in land_skill

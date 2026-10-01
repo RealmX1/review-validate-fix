@@ -30,7 +30,12 @@ __all__ = [
     'test_decision_point_out_of_band_single_flight_busy_does_not_mint',
     'test_decision_point_stranded_delivery_intent_is_withdrawn_and_reasked_once',
     'test_stranded_delivery_intent_from_another_worktree_does_not_suppress_this_worktree_decision_point',
-    'test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off',
+    'test_stranded_banner_whose_marker_arrived_after_ttl_keeps_mint_request_charge_because_body_was_never_injected',
+    'test_stranded_banner_whose_marker_became_a_turn_without_user_prompt_submit_ever_handling_it_backs_off_and_says_so',
+    'test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected',
+    'test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why',
+    'test_decision_point_banner_command_wording_matches_the_rendered_command_prefix',
+    'test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop',
     'test_decision_point_rewound_banner_is_withdrawn_and_reasked_once',
     'test_decision_point_self_injected_token_is_not_withdrawn_as_rewound',
     'test_decision_point_crash_between_send_and_receipt_is_reconciled_from_intent',
@@ -783,71 +788,13 @@ def _invoke_user_prompt_submit_hook(
     return json.loads(completed.stdout) if completed.stdout.strip() else {}
 
 
-def test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead_of_backing_off(
-    tmp: Path,
-) -> None:
-    """横幅**确实落地成一条 turn**、只是 ``mark_injected`` 撞 TTL 失败 ⇒ 撤回时**冲销**熔断额度。
+def _decision_point_boundary_marker_rendered_by_production(token: str) -> str:
+    """落地成 user message 的那一行边界标记——**调生产渲染函数**，绝不在测试里手抄正文。"""
+    return load_hook_module()._render_decision_point_out_of_band_boundary_marker(token=token)  # noqa: F821
 
-    ``state`` 仍停在 ``minted`` 并不蕴含「从未成为 turn」：
-    ``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在 ``mark_injected`` 抛
-    ``DecisionTokenExpiredError``（横幅排在一个长回合之后，越过了 1200s 带外 TTL）时**提前返回
-    且刻意不清投递意图**（逐字：留给后续对账），而 ``read_decision_token`` 对已过 TTL 的 token
-    照样返回 ``state=minted``。于是「agent 已经看到过横幅」与「横幅从未落地」在对账侧形状全同。
 
-    若这一族按空转如实计费，连续 3 次就把铸造熔断打跳，整个 session 的自动发起被静默封禁一个
-    窗口（默认 3600s）——**漏审**方向。C-② 的退避前提（用户根本没看到过横幅、通道坏着）在这里
-    不成立，故必须按成因分开：transcript 里那条 ``RVF_DECISION_TOKEN=`` 就是「它成为过 turn」的
-    直答证据。
-    """
-    case = tmp / "became-a-turn"
-    repo = init_repo(case / "repo", dirty=True)
-    state = case / "state"
-    stub = _write_stub_client(case / "stub-client.py")
-    env = _out_of_band_env(
-        stub_client=stub,
-        task_id="task-became-a-turn",
-        RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS="0",
-    )
-
-    # ---- ① Stop：铸 token + 带外投出横幅 ----
-    invoke(_stop_event(repo, session_id="sess-became-a-turn"), state_dir=state, extra_env=env)
-    minted = decision_token_records(state)
-    assert len(minted) == 1 and minted[0]["state"] == "minted", minted
-    token = minted[0]["token"]
-    assert len(_effective_mint_request_charges(state)) == 1, _mint_request_records(state)
-
-    # ---- ② 横幅排在一个长回合之后才落地：带外 TTL 在排队期间烧完 ----
-    token_path = next(
-        (rvf_home_dir(state) / "agentic-initiation-decision-tokens").glob("*.json")
-    )
-    expired_payload = json.loads(token_path.read_text(encoding="utf-8"))
-    expired_payload["expires_at"] = "1970-01-01T00:00:00Z"
-    token_path.write_text(json.dumps(expired_payload), encoding="utf-8")
-
-    # ---- ③ UPS：边界标记**确实**作为一条真实 user message 到达，但 token 推不动了 ----
-    # 粘贴通道只送这一行（正文由 UPS 以 additionalContext 注入）；与生产的
-    # ``_render_decision_point_out_of_band_boundary_marker`` 同形。
-    banner_body = f"RVF 发起决策点 · RVF_DECISION_TOKEN={token}（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）"
-    ups_payload = _invoke_user_prompt_submit_hook(
-        {
-            "cwd": str(repo),
-            "session_id": "sess-became-a-turn",
-            "hook_event_name": "UserPromptSubmit",
-            "prompt": banner_body,
-        },
-        state_dir=state,
-        extra_env={"KANBAN_TASK_ID": "task-became-a-turn"},
-    )
-    # UPS 必须**如实**说「未推进」，绝不能借用那句断言性的「已推进为 injected」文案。
-    assert "决策 token 未能推进" in str(ups_payload.get("systemMessage", "")), ups_payload
-    after_ups = {record["token"]: record for record in decision_token_records(state)}
-    assert after_ups[token]["state"] == "minted", after_ups[token]
-    # 前提的另一半：意图**没有**被清掉（UPS 把它留给了对账）。
-    assert len(_delivery_intents(state)) == 1, _delivery_intents(state)
-
-    # ---- ④ 下一次 Stop：横幅那条 user message 就在 transcript 的祖先链上 ----
-    transcript = case / "session.jsonl"
-    transcript.write_text(
+def _write_transcript_with_banner_marker_on_ancestor_chain(path: Path, marker: str) -> Path:
+    path.write_text(
         "\n".join(
             json.dumps(entry, ensure_ascii=False)
             for entry in [
@@ -861,7 +808,7 @@ def test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead
                     "uuid": "entry-banner",
                     "parentUuid": "entry-root",
                     "type": "user",
-                    "message": {"role": "user", "content": banner_body},
+                    "message": {"role": "user", "content": marker},
                 },
                 {
                     "uuid": "entry-after-banner",
@@ -874,32 +821,293 @@ def test_stranded_banner_that_became_a_turn_reverses_mint_request_charge_instead
         + "\n",
         encoding="utf-8",
     )
-    invoke(
-        _stop_event(
-            repo, session_id="sess-became-a-turn", transcript_path=str(transcript)
-        ),
+    return path
+
+
+def _mint_out_of_band_banner_that_goes_stale(case: Path, *, task_id: str, session_id: str):
+    """Stop 铸 token + 带外投出边界标记；投递意图 TTL=0 ⇒ 下一次 Stop 必判搁浅。"""
+    repo = init_repo(case / "repo", dirty=True)  # noqa: F821
+    state = case / "state"
+    stub = _write_stub_client(case / "stub-client.py")
+    env = _out_of_band_env(
+        stub_client=stub, task_id=task_id, RVF_DECISION_POINT_DELIVERY_INTENT_TTL_SECONDS="0"
+    )
+    invoke(_stop_event(repo, session_id=session_id), state_dir=state, extra_env=env)  # noqa: F821
+    minted = decision_token_records(state)  # noqa: F821
+    assert len(minted) == 1 and minted[0]["state"] == "minted", minted
+    assert len(_effective_mint_request_charges(state)) == 1, _mint_request_records(state)
+    return repo, state, env, minted[0]["token"]
+
+
+def test_stranded_banner_whose_marker_arrived_after_ttl_keeps_mint_request_charge_because_body_was_never_injected(
+    tmp: Path,
+) -> None:
+    """M9：边界标记**确实**成了一条 turn，但 UPS 到达时 token 已过 TTL、没能推进 ⇒ 正文从未注入。
+
+    59ffd 之后「标记在祖先链上」≠「征询到达了 agent 眼前」：标记本身不含任何指令，agent 只看到
+    「未随附即忽略」那一行。冲销白名单的判据（有正向证据表明征询确实到达过）在这里不成立——每次
+    都是「铸 → 空转一回合 → 撤回」，必须计入熔断退避，并以 developer_only 如实说明 UPS 那一侧的原因。
+    """
+    case = tmp / "marker-arrived-after-ttl"
+    repo, state, env, token = _mint_out_of_band_banner_that_goes_stale(
+        case, task_id="task-marker-after-ttl", session_id="sess-marker-after-ttl"
+    )
+    token_path = next((rvf_home_dir(state) / "agentic-initiation-decision-tokens").glob("*.json"))  # noqa: F821
+    expired_payload = json.loads(token_path.read_text(encoding="utf-8"))
+    expired_payload["expires_at"] = "1970-01-01T00:00:00Z"
+    token_path.write_text(json.dumps(expired_payload), encoding="utf-8")
+
+    marker = _decision_point_boundary_marker_rendered_by_production(token)
+    ups_payload = _invoke_user_prompt_submit_hook(
+        {
+            "cwd": str(repo),
+            "session_id": "sess-marker-after-ttl",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": marker,
+        },
+        state_dir=state,
+        extra_env={"KANBAN_TASK_ID": "task-marker-after-ttl"},
+    )
+    assert "决策 token 未能推进" in str(ups_payload.get("systemMessage", "")), ups_payload
+    assert "hookSpecificOutput" not in ups_payload, "未推进就绝不注入正文"
+    intents = _delivery_intents(state)
+    assert len(intents) == 1, intents
+    observation = intents[0]["user_prompt_submit_first_arrival_observation"]
+    assert observation["decision_point_banner_body_text_injected"] is False, observation
+    assert "DecisionTokenExpiredError" in observation["outcome"], observation
+
+    transcript = _write_transcript_with_banner_marker_on_ancestor_chain(case / "session.jsonl", marker)
+    invoke(  # noqa: F821
+        _stop_event(repo, session_id="sess-marker-after-ttl", transcript_path=str(transcript)),
         state_dir=state,
         extra_env=env,
     )
-
-    reconciled = {record["token"]: record for record in decision_token_records(state)}
+    reconciled = {record["token"]: record for record in decision_token_records(state)}  # noqa: F821
     assert reconciled[token]["state"] == "withdrawn", reconciled[token]
+    assert reconciled[token]["withdrawal_cause"] == (
+        "out_of_band_boundary_marker_became_a_turn_but_banner_body_never_injected"
+    ), reconciled[token]
+    assert len(_effective_mint_request_charges(state)) == 1, "正文从未注入 ⇒ 这次空转必须计入熔断"
+    summary = latest_summary(state)  # noqa: F821
+    assert summary["reason_code"] == "decision_point_stranded_delivery_withdrawn_this_stop", summary
+    assert summary["status"] == "skipped", "如实告警必须是 developer_only，不驱动 agent"
+    notice = str(summary.get("message") or summary.get("reason") or json.dumps(summary, ensure_ascii=False))
+    assert "UPS" in notice and "DecisionTokenExpiredError" in notice, notice
+    assert "通道是通的" not in notice, notice
+
+
+def test_stranded_banner_whose_marker_became_a_turn_without_user_prompt_submit_ever_handling_it_backs_off_and_says_so(
+    tmp: Path,
+) -> None:
+    """M9：标记落地了，但 UPS 根本没处理它（没装 / 超时 / 崩溃）。正文只能经 UPS 注入，UPS 持续失效时
+    改动前会无限「铸 → 空转 → 撤回 → 冲销」且开发者看不到 UPS 坏了。现在：计入熔断 + 点名 UPS。"""
+    case = tmp / "user-prompt-submit-never-ran"
+    repo, state, env, token = _mint_out_of_band_banner_that_goes_stale(
+        case, task_id="task-ups-never-ran", session_id="sess-ups-never-ran"
+    )
+    # token 也已过 TTL：M13 的「下一次 Stop 立即自注入补发」只救得了仍有效的 token（过期 token 的
+    # 正文补发了 agent 也 start 不了），这一格才轮到 M9 的撤回 + 计费。
+    token_path = next((rvf_home_dir(state) / "agentic-initiation-decision-tokens").glob("*.json"))  # noqa: F821
+    expired_payload = json.loads(token_path.read_text(encoding="utf-8"))
+    expired_payload["expires_at"] = "1970-01-01T00:00:00Z"
+    token_path.write_text(json.dumps(expired_payload), encoding="utf-8")
+    marker = _decision_point_boundary_marker_rendered_by_production(token)
+    transcript = _write_transcript_with_banner_marker_on_ancestor_chain(case / "session.jsonl", marker)
+    invoke(  # noqa: F821
+        _stop_event(repo, session_id="sess-ups-never-ran", transcript_path=str(transcript)),
+        state_dir=state,
+        extra_env=env,
+    )
+    reconciled = {record["token"]: record for record in decision_token_records(state)}  # noqa: F821
+    assert reconciled[token]["withdrawal_cause"] == (
+        "out_of_band_boundary_marker_became_a_turn_but_banner_body_never_injected"
+    ), reconciled[token]
+    assert len(_effective_mint_request_charges(state)) == 1, _mint_request_records(state)
+    summary = latest_summary(state)  # noqa: F821
+    assert summary["status"] == "skipped", summary
+    notice = json.dumps(summary, ensure_ascii=False)
+    assert "UserPromptSubmit" in notice and "从未处理" in notice, notice
+
+
+def _write_transcript_with_banner_marker_as_mid_turn_queued_command(path: Path, marker: str) -> Path:
+    """Claude Code < 2.1.260 的落盘形态：标记在 agent 回合中途以 ``queued_command`` 附件送达。
+
+    这种形态下没有 ``message.content``，正文在 ``attachment.prompt`` 里；那些版本上它**不触发** UPS
+    （2026-09-30 本机 45 天 transcript：≤2.1.257 约 800 条 queued_command 仅 1 条后跟 UPS 附件，
+    ≥2.1.260 全部后跟）。
+    """
+    entries = [
+        {"uuid": "entry-root", "parentUuid": None, "type": "user",
+         "message": {"role": "user", "content": "开始干活"}},
+        {"uuid": "entry-tool-use", "parentUuid": "entry-root", "type": "assistant",
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": "toolu_probe", "name": "Bash", "input": {"command": "make test"}}]}},
+        {"uuid": "entry-tool-result", "parentUuid": "entry-tool-use", "type": "user",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_probe", "content": "ok"}]}},
+        {"uuid": "entry-queued-banner", "parentUuid": "entry-tool-result", "type": "attachment",
+         "attachment": {"type": "queued_command", "prompt": marker, "commandMode": "prompt",
+                        "origin": {"kind": "human"}}},
+        {"uuid": "entry-after-queued-banner", "parentUuid": "entry-queued-banner", "type": "assistant",
+         "message": {"role": "assistant", "content": "（标记未随附正文，按说明忽略）测试都过了。"}},
+    ]
+    path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n", encoding="utf-8")
+    return path
+
+
+def test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop(
+    tmp: Path,
+) -> None:
+    """M13：标记在回合中途以 queued_command 送达、UPS 没触发 ⇒ agent 只看到「未随附即忽略」的一行，
+    决策点静默丢失。下一次 Stop **立即**以自注入补发完整正文（同一枚 token），不等在途意图 TTL、
+    不撤回、不冲销也不新增熔断额度。
+
+    修复前：意图仍在途 ⇒ 在途闸静默挡住本次 Stop；15 分钟后搁浅对账才撤回，再下一次 Stop 才重铸。
+    """
+    case = tmp / "queued-command-marker"
+    repo = init_repo(case / "repo", dirty=True)  # noqa: F821
+    state = case / "state"
+    stub = _write_stub_client(case / "stub-client.py")
+    env = _out_of_band_env(stub_client=stub, task_id="task-queued-command")  # 意图 TTL 保持默认（在途）
+    invoke(_stop_event(repo, session_id="sess-queued-command"), state_dir=state, extra_env=env)  # noqa: F821
+    minted = decision_token_records(state)  # noqa: F821
+    assert len(minted) == 1 and minted[0]["state"] == "minted", minted
+    token = minted[0]["token"]
+    assert len(_delivery_intents(state)) == 1
+
+    marker = _decision_point_boundary_marker_rendered_by_production(token)
+    transcript = _write_transcript_with_banner_marker_as_mid_turn_queued_command(
+        case / "session.jsonl", marker
+    )
+    stdout, _stderr = invoke(  # noqa: F821
+        _stop_event(repo, session_id="sess-queued-command", transcript_path=str(transcript)),
+        state_dir=state,
+        extra_env=env,
+    )
+    payload = parse_json(stdout)  # noqa: F821
+    body = str(
+        payload.get("reason")
+        or (payload.get("hookSpecificOutput") or {}).get("additionalContext")
+        or ""
+    )
+    stop_hook = load_hook_module()  # noqa: F821
+    assert body.startswith(stop_hook.DECISION_POINT_BANNER_TITLE_LINE), payload
+    assert f"RVF_DECISION_TOKEN={token}" in body, "补发的必须是同一枚 token 的完整正文"
+    records = decision_token_records(state)  # noqa: F821
+    assert [record["token"] for record in records] == [token], "不得另铸新 token"
+    assert records[0]["state"] == "injected", records[0]
+    assert _delivery_intents(state) == [], "补发之后这份投递意图已无对账价值"
+    assert len(_effective_mint_request_charges(state)) == 1, "不冲销、也不新增熔断额度"
+    names = [event.get("event") for event in latest_events(state)]  # noqa: F821
+    assert "decision_point_boundary_marker_landed_without_banner_body_reinjected_by_stop" in names, names
+    notice = str(payload.get("systemMessage") or "")
+    assert "UserPromptSubmit" in notice and "自注入" in notice, notice
+
+
+def test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected(
+    tmp: Path,
+) -> None:
+    """M9 的另一半：只有投递意图里记着「UPS 已把正文注入」时，才按「通道健康、只是记账没跟上」冲销。
+
+    这一格在当前 UPS 流程里构造上不可达（UPS 先锁内推进 token 再注入正文），这里直接摆出那份证据，
+    钉住对账侧「凭证据、不凭推测」的判据：冲销只看这份正向证据，不看 transcript 上有没有标记。
+    """
+    case = tmp / "body-injected-evidence"
+    repo, state, env, token = _mint_out_of_band_banner_that_goes_stale(
+        case, task_id="task-body-injected", session_id="sess-body-injected"
+    )
+    intent_path = next(
+        (state / "kanban-followup-in-progress" / "kanban-decision-point-delivery-intent").glob("task-*.json")
+    )
+    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+    intent["user_prompt_submit_first_arrival_observation"] = {
+        "observed_at": "2026-09-30T00:00:00Z",
+        "decision_point_banner_body_text_injected": True,
+        "outcome": "banner_body_text_injected_as_additional_context",
+    }
+    intent_path.write_text(json.dumps(intent), encoding="utf-8")
+    marker = _decision_point_boundary_marker_rendered_by_production(token)
+    transcript = _write_transcript_with_banner_marker_on_ancestor_chain(case / "session.jsonl", marker)
+    invoke(  # noqa: F821
+        _stop_event(repo, session_id="sess-body-injected", transcript_path=str(transcript)),
+        state_dir=state,
+        extra_env=env,
+    )
+    reconciled = {record["token"]: record for record in decision_token_records(state)}  # noqa: F821
     assert reconciled[token]["withdrawal_cause"] == (
         "out_of_band_delivery_became_a_turn_but_token_advance_failed"
     ), reconciled[token]
-    # 记账方向：额度被**冲销**，不得留下「保留」标记。
-    assert "withdrawn_mint_request_charge_retained" not in reconciled[token], (
-        reconciled[token]
-    )
     assert _effective_mint_request_charges(state) == [], _mint_request_records(state)
-    # 撤回本身仍在本轮这条通道上 ⇒ 当次 Stop 仍就地结束（C-① 不因成因不同而改变）。
-    assert latest_summary(state)["reason_code"] == (
-        "decision_point_stranded_delivery_withdrawn_this_stop"
-    ), latest_summary(state)
 
 
-def _write_rewound_transcript(path: Path, token: str, banner_excerpt: str) -> Path:
-    """造一份「token 落地过、但被 rewind 掉」的 transcript：needle 在文件里，但不在祖先链上。"""
+def test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why(
+    tmp: Path,
+) -> None:
+    """L-F3d：正文写不进 token payload ⇒ 带外这条路走不通、当场回落自注入（此前没有任何测试）。
+
+    回落旁注必须说**真实原因**：终端投递根本没有发起，不能沿用「cline-kanban 终端投递确定失败」。
+    """
+    case = tmp / "body-persist-fails"
+    repo = init_repo(case / "repo", dirty=True)  # noqa: F821
+    state = case / "state"
+    stub = _write_stub_client(case / "stub-client.py")
+    fault_injection = case / "fault-injection"
+    fault_injection.mkdir(parents=True)
+    (fault_injection / "sitecustomize.py").write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(Path(SCRIPT).parent)!r})\n"  # noqa: F821
+        "import rvf_decision_token_store\n"
+        "def _record_body_fails(*args, **kwargs):\n"
+        "    raise OSError(28, 'No space left on device')\n"
+        "rvf_decision_token_store.record_decision_point_banner_body_text_for_agent = _record_body_fails\n",
+        encoding="utf-8",
+    )
+    capture = case / "delivered-prompts.txt"
+    stdout, _stderr = invoke(  # noqa: F821
+        _stop_event(repo),
+        state_dir=state,
+        extra_env={
+            **_out_of_band_env(stub_client=stub, task_id="task-body-persist-fails"),
+            "PYTHONPATH": str(fault_injection),
+            "RVF_TEST_DELIVERED_PROMPT_CAPTURE_PATH": str(capture),
+        },
+    )
+    payload, _token = assert_decision_point_injection(stdout)  # noqa: F821
+    assert not capture.exists(), "正文落不了盘时不得再把标记投出去"
+    assert _delivery_intents(state) == []
+    names = [event.get("event") for event in latest_events(state)]  # noqa: F821
+    assert "decision_point_banner_body_text_persist_failed" in names, names
+    notice = str(payload.get("systemMessage") or "")
+    assert "已回落为 Stop hook 自注入" in notice, notice
+    assert "终端投递**确定失败**" not in notice, notice
+    assert "未发起" in notice and "No space left on device" in notice, notice
+
+
+def test_decision_point_banner_command_wording_matches_the_rendered_command_prefix(tmp: Path) -> None:
+    """L-F3c：未装 shim 时横幅给的是 ``python3 <入口脚本>``，正文就不能再说「用下面的 `rvf` 命令」；
+    ``start --retry`` 那句也要带上实际前缀和 token，否则 agent 照抄出来的是一条不存在的命令。"""
+    stop_hook = load_hook_module()  # noqa: F821
+    summary = {"repo": str(tmp), "candidate_path_count": 1, "candidates": []}
+    token = "0123456789abcdef"
+    original_prefix = stop_hook._rvf_command_line_shortcut_invocation
+    for prefix in ("rvf", "python3 /opt/rvf/scripts/rvf_command_line_shortcut_entrypoint.py"):
+        stop_hook._rvf_command_line_shortcut_invocation = lambda prefix=prefix: prefix
+        try:
+            body = stop_hook._render_decision_point_injection_prompt(
+                summary=summary, token=token, fork_context=None
+            )
+        finally:
+            stop_hook._rvf_command_line_shortcut_invocation = original_prefix
+        assert f"用下面的 `{prefix}` 命令" in body, (prefix, body[:600])
+        assert f"`{prefix} start --token {token} --retry`" in body, (prefix, body)
+        if prefix != "rvf":
+            assert "用下面的 `rvf` 命令" not in body, body[:600]
+
+
+def _write_rewound_transcript(path: Path, landed_boundary_marker: str) -> Path:
+    """造一份「token 落地过、但被 rewind 掉」的 transcript：needle 在文件里，但不在祖先链上。
+
+    落地的那条 user message 由调用方传**生产渲染**出的边界标记，不在 fixture 里手抄。"""
     entries = [
         {
             "uuid": "entry-root",
@@ -911,7 +1119,7 @@ def _write_rewound_transcript(path: Path, token: str, banner_excerpt: str) -> Pa
             "uuid": "entry-banner",
             "parentUuid": "entry-root",
             "type": "user",
-            "message": {"role": "user", "content": f"{banner_excerpt}\nRVF_DECISION_TOKEN={token}"},
+            "message": {"role": "user", "content": landed_boundary_marker},
         },
         # 用户 rewind 后重发的 prompt 把 parentUuid 挂回更早的条目 ⇒ 横幅那条落在祖先链之外。
         {
@@ -948,8 +1156,7 @@ def test_decision_point_rewound_banner_is_withdrawn_and_reasked_once(tmp: Path) 
 
     transcript = _write_rewound_transcript(
         case / "transcript.jsonl",
-        rewound_token,
-        "RVF 发起决策点 ·",
+        _decision_point_boundary_marker_rendered_by_production(rewound_token),
     )
     invoke(
         _stop_event(repo, transcript_path=str(transcript)),

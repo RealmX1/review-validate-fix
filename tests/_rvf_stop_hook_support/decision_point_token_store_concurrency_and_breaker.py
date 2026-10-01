@@ -701,11 +701,11 @@ def test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_c
     是同一函数、相反期望的一对：那条钉「通道坏着要退避」，这条钉「通道是通的就不许退避」。
     两条同时绿才说明分叉判据落在**成因**上，而不是落在「凡是搁浅撤回一律计费」这个过粗的规则上。
 
-    可达路径：``rvf_user_prompt_submit._observe_delivered_decision_point_banner`` 在
-    ``mark_injected`` 抛 ``DecisionTokenExpiredError``（横幅排在长回合之后越过 1200s TTL）时提前
-    返回、**刻意不清投递意图**，而 ``read_decision_token`` 对过期 token 仍返回 ``state=minted``。
-    若这一族按空转计费，连续 3 次记账失败就会把铸造熔断打跳，整个 session 的自动发起被静默封禁
-    一个窗口（默认 3600s）——那是**漏审**方向，比多问一次严重得多。
+    对账侧只在投递意图里有 UPS 记下的「决策正文已注入」这份正向证据时才用本成因（审计 M9）：59ffd
+    之后粘贴通道只送一行无指令的边界标记，「标记成了 turn」不再等于「征询到达了 agent」。标记落地
+    而正文从未注入（UPS 没跑 / 超时 / 崩溃 / 到达时 token 已过 TTL）用的是另一个**不冲销**的成因，
+    见下方最后一组断言。征询确实到达过却按空转计费的话，连续 3 次记账失败就会把铸造熔断打跳，
+    整个 session 的自动发起被静默封禁一个窗口（默认 3600s）——那是**漏审**方向。
     """
     store = _load_decision_token_store_module()
     roots = _isolated_decision_token_store_roots(tmp / "became-a-turn-reverses-charge")
@@ -755,6 +755,15 @@ def test_banner_that_became_a_turn_but_failed_to_advance_reverses_mint_request_c
     assert (
         store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN
         not in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    # 「标记成了 turn、正文却从未注入」同样是空转（M9），同样留在白名单外。
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED
+        not in store.DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE
+    )
+    assert (
+        store.DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_BOUNDARY_MARKER_BECAME_A_TURN_BUT_BANNER_BODY_NEVER_INJECTED
+        in store.DECISION_POINT_WITHDRAWAL_CAUSES
     )
     # 撤回同样不写冷却表（这一半三种成因共享）。
     assert sorted(roots["declined_fingerprint_root_dir"].glob("*.json")) == []

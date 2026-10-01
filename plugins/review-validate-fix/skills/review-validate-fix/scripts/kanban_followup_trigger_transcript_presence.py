@@ -188,7 +188,15 @@ def _entry_text(entry: dict[str, Any]) -> str:
     只取 ``message.content``（str 或 block 列表的 ``text``）。刻意不 ``json.dumps`` 整条条目：
     那会把 hook 诊断、工具参数等**引用**了 token 的地方也算成「trigger 在场」，而我们要找的是
     这条 trigger 本身作为一个 user prompt 落地。
+
+    唯一的例外是 Claude Code 的 ``queued_command`` 附件：agent 回合进行中送达的消息以它落盘，
+    正文在 ``attachment.prompt``、没有 ``message``。它**就是**一条 user prompt 落地（审计 M13：
+    Claude Code < 2.1.260 上它还不触发 UserPromptSubmit），不认它就会把「标记在链上」判成「从未落地」。
     """
+    attachment = entry.get("attachment")
+    if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+        queued_prompt = attachment.get("prompt")
+        return queued_prompt if isinstance(queued_prompt, str) else ""
     message = entry.get("message")
     if not isinstance(message, dict):
         return ""
