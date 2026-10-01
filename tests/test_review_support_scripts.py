@@ -11694,6 +11694,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
             ),
         ),
         (
+            "rvf_user_prompt_submit_marker_arriving_before_first_injection_hook_output_reaches_host_never_withdraws_token",
+            lambda: test_rvf_user_prompt_submit_marker_arriving_before_first_injection_hook_output_reaches_host_never_withdraws_token(
+                root / "prompt-submit-marker-arriving-before-first-injection-hook-output-reaches-host"
+            ),
+        ),
+        (
+            "rvf_user_prompt_submit_first_injection_handoff_completed_credential_is_never_visible_before_its_content_is_fully_written",
+            lambda: test_rvf_user_prompt_submit_first_injection_handoff_completed_credential_is_never_visible_before_its_content_is_fully_written(
+                root / "prompt-submit-first-injection-credential-content-atomicity"
+            ),
+        ),
+        (
             "rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises",
             lambda: test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises(
                 root / "prompt-submit-first-arrival-clear-intent-raises"

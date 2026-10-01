@@ -244,8 +244,25 @@ DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TER
 分钟（回溯实测：从铸出到撤回 P50 26 分钟，这期间共 25 次 Stop 被「已有横幅在途」静默）。
 """
 
+DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED = (
+    "agent_resumed_work_before_decision_point_delivery_landed"
+)
+"""Stop 铸出带外横幅之后、边界标记以「空闲时开出的新回合」落地之前，agent **已经复工**（后台任务通知
+唤醒、开发者发话、Stop 续跑、标记在回合中途被并入……）。**冲销**熔断额度。
+
+复工本身说明两件事都过时了：候选范围是铸 token 那一刻的工作树（之后又改了），时机也不对（agent 正在
+干活）。所以不注入正文、撤回 token，由 Stop 在同一次（或下一次）按当时的工作树重新评估。判据见
+``decision_point_agent_resumed_work_after_token_mint_evidence``。
+
+为什么进冲销白名单（白名单默认不冲销，这里要论证）：与 ``stop_hook_reentry_budget_exhausted`` 同理——
+投递通道是**健康**的，只是时机不对；agent 也从没看到过这份正文。按空转计费的话，agent 连续几次在横幅
+落地前复工就会把铸造熔断打跳、整个 session 的自动发起被静默一个窗口，那是**漏审**方向。这一支自己的
+空转由 Stop 侧的独立上界约束（连续若干次复工撤回后改走同步自注入），不借用熔断。
+"""
+
 DECISION_POINT_WITHDRAWAL_CAUSES = frozenset(
     {
+        DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_FAILED_PER_CLINE_KANBAN_TERMINAL_DELIVERY_RECEIPT,
         DECISION_POINT_WITHDRAWAL_CAUSE_REWOUND_BY_USER,
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_NEVER_BECAME_A_TURN,
@@ -266,6 +283,8 @@ DECISION_POINT_WITHDRAWAL_CAUSES_THAT_REVERSE_MINT_REQUEST_CHARGE = frozenset(
         DECISION_POINT_WITHDRAWAL_CAUSE_OUT_OF_BAND_DELIVERY_BECAME_A_TURN_BUT_TOKEN_ADVANCE_FAILED,
         # 「根本没发出去」这一支：通道健康、重铸不会空转 ⇒ 退避前提不成立。理由见该常量 docstring。
         DECISION_POINT_WITHDRAWAL_CAUSE_STOP_HOOK_REENTRY_BUDGET_EXHAUSTED,
+        # 「发出去了、但 agent 先复工」这一支：通道健康、只是时机不对；空转由 Stop 侧独立上界约束。
+        DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED,
     }
 )
 
@@ -332,6 +351,45 @@ DECISION_POINT_DELIVERY_TRANSPORTS = frozenset(
 #: 投递前写进这里，目标会话的 UPS hook 观测到标记时读出，以 ``additionalContext`` 注入。
 DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY = "decision_point_banner_body_text_for_agent"
 
+
+def render_decision_point_out_of_band_boundary_marker(*, token: str) -> str:
+    """带外投递时终端粘贴通道唯一送出的那一行边界标记——Stop 渲染它、UPS 按它逐字识别的**唯一**真相源。
+
+    文案为什么长这样见 Stop 侧 ``_render_decision_point_out_of_band_boundary_marker``（它委派到这里）。
+    放在本模块是因为 UPS 必须按「与这一行逐字一致」认出标记，而 UPS 刻意不 import Stop 那个巨型引擎。
+    """
+    return f"RVF 发起决策点 · RVF_DECISION_TOKEN={token}（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）"
+
+
+_DECISION_TOKEN_LITERAL_INSIDE_OUT_OF_BAND_BOUNDARY_MARKER_RE = re.compile(
+    r"RVF_DECISION_TOKEN=([0-9A-Fa-f]{16})"
+)
+
+
+def decision_token_of_text_that_is_exactly_one_out_of_band_boundary_marker(text: str | None) -> str | None:
+    """``text`` 去掉首尾空白后**逐字等于**某枚 token 的边界标记（见上）时返回该 token（小写），否则 None。
+
+    只认整条独立的标记：机器投递与 rewind 重交送来的都是这一行本身。开发者在一条 prompt 里引用标记、
+    再附上自己的话（粘日志 / handoff / 旧横幅）不是标记落地，一律返回 None（RVF-001）。host 的粘贴
+    包裹不在这里剥——那是 host 行为，由调用方经 HostAdapter 剥掉后再传进来。
+    """
+    if not isinstance(text, str):
+        return None
+    stripped_text = text.strip()
+    match = _DECISION_TOKEN_LITERAL_INSIDE_OUT_OF_BAND_BOUNDARY_MARKER_RE.search(stripped_text)
+    if match is None:
+        return None
+    if stripped_text != render_decision_point_out_of_band_boundary_marker(token=match.group(1)):
+        return None
+    return match.group(1).lower()
+
+#: 铸出这枚 token 的那次 Stop 事件所属 agent 回合的标识（host 提供：Claude Code 的 ``prompt_id``、
+#: Codex 的 ``turn_id``；拿不到为 None）。之后任一 hook 事件带着**同一个**回合标识出现 ⇒ 铸 token 的
+#: 那个回合在铸出之后又被续跑了（Stop 续跑 / 标记被并入那个回合）⇒ agent 复工。只有带外投递写它。
+DECISION_TOKEN_PAYLOAD_KEY_AGENT_TURN_IDENTIFIER_OF_THE_STOP_EVENT_THAT_MINTED_THIS_TOKEN = (
+    "agent_turn_identifier_of_the_stop_event_that_minted_this_token"
+)
+
 def decision_token_ttl_seconds_for_delivery_transport(transport: str | None) -> int:
     """按 transport 选 TTL：带外投递用 1200s，其余（含 None=同步自注入）沿用 900s。
 
@@ -365,6 +423,15 @@ class DecisionTokenError(ValueError):
 
 class DecisionTokenStateError(DecisionTokenError):
     """非法状态迁移（如从终态再迁移、或跳过前置状态）。"""
+
+
+class DecisionTokenWithdrawalPreconditionNotMetError(DecisionTokenStateError):
+    """``mark_withdrawn`` 的调用方要求「锁内状态必须仍是某几种之一」，而锁内读到的不是（CAS 输了）。
+
+    典型：锁外读到 ``minted`` 判定 agent 复工、要撤回，进锁时 UPS 已经抢先 ``minted → injected`` 把正文
+    送到了 agent 眼前；或锁外读到 ``injected`` 判定 rewind 重交，进锁时 agent 已经 ``start``。此时
+    ``… → withdrawn`` 在状态机上仍合法，但撤回的前提已经不成立，必须什么都不改。
+    """
 
 
 class DecisionTokenExpiredError(DecisionTokenError):
@@ -2848,8 +2915,15 @@ def mark_withdrawn(
     root: str | Path | None = None,
     now: datetime | None = None,
     circuit_breaker_root_dir: str | Path | None = None,
+    withdraw_only_if_state_inside_lock_is: frozenset[str] | None = None,
 ) -> DecisionTokenRecord:
     """旁路终态 ``… → withdrawn``：这次征询已被用户 rewind / 被 RVF 主动撤回。
+
+    ``withdraw_only_if_state_inside_lock_is``：调用方在**锁外**读了一次状态、据此判定要撤回时，必须把
+    「撤回的前提」写成这里的集合，由锁内复核（CAS）。锁内状态不在集合里 ⇒ 抛
+    :class:`DecisionTokenWithdrawalPreconditionNotMetError`、什么都不改。``None`` = 不复核（只校验迁移合法，
+    与改动前逐字一致）。合法迁移表管不住这一层：``acknowledged → withdrawn`` 对「用户在 start 之后 rewind」
+    是合法的，但对「锁外读到 injected 判为 rewind 重交、进锁时 agent 已 start」就是误撤一轮已接受的 run。
 
     进入终态的同时做两件对账：
 
@@ -2880,8 +2954,17 @@ def mark_withdrawn(
         _decision_token_path_for_payload_mutation_lock(token, root)
     ):
         record = _read_record_any(token, root=root, now=now_dt)
+        state_inside_lock = str(record.payload.get("state"))
+        if (
+            withdraw_only_if_state_inside_lock_is is not None
+            and state_inside_lock not in withdraw_only_if_state_inside_lock_is
+        ):
+            raise DecisionTokenWithdrawalPreconditionNotMetError(
+                f"撤回前提不成立：锁内状态是 {state_inside_lock}，调用方要求 "
+                f"{sorted(withdraw_only_if_state_inside_lock_is)}（token={record.token}）"
+            )
         _ensure_lifecycle_transition_is_legal(
-            str(record.payload.get("state")), STATE_WITHDRAWN, token=record.token
+            state_inside_lock, STATE_WITHDRAWN, token=record.token
         )
         extra_updates: dict[str, Any] = {
             "withdrawn_reason": reason,
@@ -2949,6 +3032,72 @@ def iter_decision_tokens_for_session(
             continue
         results.append(lookup)
     return results
+
+
+def iter_decision_tokens_for_session_in_any_worktree(
+    *,
+    session_id: str | None,
+    root: str | Path | None = None,
+    now: datetime | None = None,
+) -> list[DecisionTokenLookup]:
+    """枚举 ``session_id`` 名下、**不论哪个 worktree** 的全部 token（best-effort，坏文件跳过，永不抛）。
+
+    专供「agent 复工」判定：复工是**会话级**事实（同一个 agent 在同一个会话里又干起活来），与那枚 token
+    当初按哪个 worktree 算的候选无关；而 Stop 的递归短路分支手里只有 cwd、拿不到候选摘要解析出的
+    worktree 串，按 worktree 过滤会把它整个漏掉。复工撤回的空转上界计数也必须用它（与撤回同一口径），
+    否则轮流落在不同 worktree 上的撤回序列会被拆散、永远到不了阈值。
+    """
+    results: list[DecisionTokenLookup] = []
+    if not session_id:
+        return results
+    try:
+        base = decision_token_root(root)
+        if not base.is_dir():
+            return results
+        token_files = sorted(base.glob("*.json"))
+    except OSError:
+        return results
+    for path in token_files:
+        try:
+            lookup = read_decision_token(path.stem, root=root, now=now)
+        except DecisionTokenError:
+            continue
+        if not isinstance(lookup.payload, dict):
+            continue
+        if lookup.payload.get("session_id") != session_id:
+            continue
+        results.append(lookup)
+    return results
+
+
+def count_most_recent_consecutive_decision_tokens_withdrawn_because_agent_resumed_work(
+    lookups: list[DecisionTokenLookup],
+) -> int:
+    """按 ``minted_at`` 从新到旧数：最近连续多少枚 token 都以「agent 复工」撤回（纯函数，不读盘）。
+
+    遇到第一枚别的结局（被决策 / 被别的成因撤回 / 仍在途 / 同步自注入……）即停：连续性一断，空转就
+    不成立。``minted_at`` 不可解析的 token 排到最旧，不参与打断也不参与计数之外的判断。
+    """
+
+    def _minted_at_sort_key(lookup: DecisionTokenLookup) -> datetime:
+        raw = (lookup.payload or {}).get("minted_at")
+        try:
+            return parse_timestamp(raw) if isinstance(raw, str) else datetime.min.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    consecutive = 0
+    for lookup in sorted(lookups, key=_minted_at_sort_key, reverse=True):
+        payload = lookup.payload or {}
+        if (
+            payload.get("state") == STATE_WITHDRAWN
+            and payload.get("withdrawal_cause")
+            == DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED
+        ):
+            consecutive += 1
+            continue
+        break
+    return consecutive
 
 
 def find_decision_token_awaiting_out_of_band_delivery(

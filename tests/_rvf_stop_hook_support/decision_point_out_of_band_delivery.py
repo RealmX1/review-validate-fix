@@ -36,7 +36,6 @@ __all__ = [
     'test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected',
     'test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why',
     'test_decision_point_banner_command_wording_matches_the_rendered_command_prefix',
-    'test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop',
     'test_decision_point_rewound_banner_is_withdrawn_and_reasked_once',
     'test_decision_point_self_injected_token_is_not_withdrawn_as_rewound',
     'test_decision_point_crash_between_send_and_receipt_is_reconciled_from_intent',
@@ -877,6 +876,9 @@ def _invoke_user_prompt_submit_hook(
     env["CODEX_RVF_STATE_DIR"] = str(state_dir)
     env["RVF_HOME"] = str(state_dir / "rvf-home")
     env["RVF_KANBAN_FOLLOWUP_LOCK_ROOT"] = str(state_dir / "kanban-followup-in-progress")
+    # UPS 在 kanban task 内会写 PostToolUse-park 资格；它的根默认是 ``~/.rvf/kanban-park-turn-eligibility``，
+    # 不隔离就会往真实状态根里留测试会话的文件（文件里不含 TMPDIR 名，套件末尾的泄漏守卫看不见）。
+    env["CODEX_RVF_KANBAN_PARK_STATE_ROOT"] = str(state_dir / "kanban-park-turn-eligibility")
     if extra_env:
         env.update(extra_env)
     completed = subprocess.run(
@@ -1031,79 +1033,8 @@ def test_stranded_banner_whose_marker_became_a_turn_without_user_prompt_submit_e
     assert "UserPromptSubmit" in notice and "从未处理" in notice, notice
 
 
-def _write_transcript_with_banner_marker_as_mid_turn_queued_command(path: Path, marker: str) -> Path:
-    """Claude Code < 2.1.260 的落盘形态：标记在 agent 回合中途以 ``queued_command`` 附件送达。
-
-    这种形态下没有 ``message.content``，正文在 ``attachment.prompt`` 里；那些版本上它**不触发** UPS
-    （2026-09-30 本机 45 天 transcript：≤2.1.257 约 800 条 queued_command 仅 1 条后跟 UPS 附件，
-    ≥2.1.260 全部后跟）。
-    """
-    entries = [
-        {"uuid": "entry-root", "parentUuid": None, "type": "user",
-         "message": {"role": "user", "content": "开始干活"}},
-        {"uuid": "entry-tool-use", "parentUuid": "entry-root", "type": "assistant",
-         "message": {"role": "assistant", "content": [
-             {"type": "tool_use", "id": "toolu_probe", "name": "Bash", "input": {"command": "make test"}}]}},
-        {"uuid": "entry-tool-result", "parentUuid": "entry-tool-use", "type": "user",
-         "message": {"role": "user", "content": [
-             {"type": "tool_result", "tool_use_id": "toolu_probe", "content": "ok"}]}},
-        {"uuid": "entry-queued-banner", "parentUuid": "entry-tool-result", "type": "attachment",
-         "attachment": {"type": "queued_command", "prompt": marker, "commandMode": "prompt",
-                        "origin": {"kind": "human"}}},
-        {"uuid": "entry-after-queued-banner", "parentUuid": "entry-queued-banner", "type": "assistant",
-         "message": {"role": "assistant", "content": "（标记未随附正文，按说明忽略）测试都过了。"}},
-    ]
-    path.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n", encoding="utf-8")
-    return path
-
-
-def test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop(
-    tmp: Path,
-) -> None:
-    """M13：标记在回合中途以 queued_command 送达、UPS 没触发 ⇒ agent 只看到「未随附即忽略」的一行，
-    决策点静默丢失。下一次 Stop **立即**以自注入补发完整正文（同一枚 token），不等在途意图 TTL、
-    不撤回、不冲销也不新增熔断额度。
-
-    修复前：意图仍在途 ⇒ 在途闸静默挡住本次 Stop；15 分钟后搁浅对账才撤回，再下一次 Stop 才重铸。
-    """
-    case = tmp / "queued-command-marker"
-    repo = init_repo(case / "repo", dirty=True)  # noqa: F821
-    state = case / "state"
-    stub = _write_stub_client(case / "stub-client.py")
-    env = _out_of_band_env(stub_client=stub, task_id="task-queued-command")  # 意图 TTL 保持默认（在途）
-    invoke(_stop_event(repo, session_id="sess-queued-command"), state_dir=state, extra_env=env)  # noqa: F821
-    minted = decision_token_records(state)  # noqa: F821
-    assert len(minted) == 1 and minted[0]["state"] == "minted", minted
-    token = minted[0]["token"]
-    assert len(_delivery_intents(state)) == 1
-
-    marker = _decision_point_boundary_marker_rendered_by_production(token)
-    transcript = _write_transcript_with_banner_marker_as_mid_turn_queued_command(
-        case / "session.jsonl", marker
-    )
-    stdout, _stderr = invoke(  # noqa: F821
-        _stop_event(repo, session_id="sess-queued-command", transcript_path=str(transcript)),
-        state_dir=state,
-        extra_env=env,
-    )
-    payload = parse_json(stdout)  # noqa: F821
-    body = str(
-        payload.get("reason")
-        or (payload.get("hookSpecificOutput") or {}).get("additionalContext")
-        or ""
-    )
-    stop_hook = load_hook_module()  # noqa: F821
-    assert body.startswith(stop_hook.DECISION_POINT_BANNER_TITLE_LINE), payload
-    assert f"RVF_DECISION_TOKEN={token}" in body, "补发的必须是同一枚 token 的完整正文"
-    records = decision_token_records(state)  # noqa: F821
-    assert [record["token"] for record in records] == [token], "不得另铸新 token"
-    assert records[0]["state"] == "injected", records[0]
-    assert _delivery_intents(state) == [], "补发之后这份投递意图已无对账价值"
-    assert len(_effective_mint_request_charges(state)) == 1, "不冲销、也不新增熔断额度"
-    names = [event.get("event") for event in latest_events(state)]  # noqa: F821
-    assert "decision_point_boundary_marker_landed_without_banner_body_reinjected_by_stop" in names, names
-    notice = str(payload.get("systemMessage") or "")
-    assert "UserPromptSubmit" in notice and "自注入" in notice, notice
+# M13 的两支（回合中途到达 ⇒ 撤回、不补发；空闲时开出自己的回合 ⇒ 补发）由
+# ``decision_point_agent_resumed_work_after_token_mint`` 子模块覆盖（task 8d3ac 的设计修正）。
 
 
 def test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected(

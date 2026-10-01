@@ -26,6 +26,22 @@ Claude Code 侧的 host 行为全是 host 常量：
     message 里 118 条紧跟 UPS 附件，正文全部以 ``<task-notification>`` 开头。
   二进制里同一个 UPS 构造函数只拼 ``prompt``，故正文前缀是 hook 侧**唯一**可用的证据。
 
+- ``agent_turn_identifier_shared_by_hook_events_of_one_turn`` → 事件的 ``prompt_id``。2026-10-02
+  真机取证（2.1.287，``claude -p`` stream-json + 仅含落盘 UPS/Stop hook 的隔离 settings）：
+  * agent 跑 ``sleep 15`` 时从 stdin 再写一条 ⇒ 这条排队消息在工具结果之后**并入当前回合**（transcript
+    ``queue-operation remove reason=absorbed_mid_turn`` + ``queued_command`` 附件），它的 UPS 在并入那一刻
+    才触发，``prompt_id`` 与该回合首条 prompt 的 UPS、该回合的 Stop **相同**；
+  * Stop hook ``decision:block`` 一次 ⇒ 续跑后的第二次 Stop（``stop_hook_active=true``）``prompt_id``
+    **不变**；
+  * 空闲时发出的下一条 prompt 换新 ``prompt_id``。
+
+- ``user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste`` → 剥一层
+  ``<pasted_content id="…">…</pasted_content id="…">``。Claude Code（≥2.1.278）把 bracketed paste 包成这一层，
+  UPS 事件的 ``prompt`` 里就是包好的形态。2026-10-02 取证：本机 round-baseline 记录的 UPS ``prompt`` 摘录里，
+  cline-kanban 投递的消息逐字以 ``\\n\\n<pasted_content id="…">\\n`` 起头、以 ``\\n</pasted_content id="…">\\n``
+  收尾；transcript 里 158 处开标签全部带 ``id``、闭标签重复同一个 ``id``；单行边界标记的 A/B transcript
+  是同一形态。包裹前面有开发者打的字（13 例）或一条里有多段粘贴（3 例）⇒ 不是整条单段粘贴，不剥。
+
 因全是常量，本 bundle 除该受众契约的常量外**不 import 任何 adapter / core 业务模块**。装配由
 ``host_adapter_resolver.resolve_host_adapter`` 按 host 探测在本 bundle 与
 ``CodexHostAdapter`` 间二选一完成；本 bundle 只认识 Claude Code、不知道 Codex。
@@ -33,6 +49,7 @@ Claude Code 侧的 host 行为全是 host 常量：
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from core.stop_hook_output_audience import (
@@ -47,6 +64,20 @@ CLAUDE_CODE_BACKGROUND_TASK_COMPLETION_NOTIFICATION_TURN_KIND = (
 
 CLAUDE_CODE_BACKGROUND_TASK_COMPLETION_NOTIFICATION_OPENING_TAG = "<task-notification>"
 CLAUDE_CODE_BACKGROUND_TASK_COMPLETION_NOTIFICATION_CLOSING_TAG = "</task-notification>"
+
+CLAUDE_CODE_HOOK_EVENT_AGENT_TURN_IDENTIFIER_FIELD = "prompt_id"
+"""Claude Code hook 事件里标识「这一回合」的字段。取证见模块 docstring 的
+``agent_turn_identifier_shared_by_hook_events_of_one_turn`` 一条。"""
+
+CLAUDE_CODE_PASTED_CONTENT_ENVELOPE_OPENING_TAG_PREFIX = "<pasted_content"
+CLAUDE_CODE_WHOLE_PROMPT_IS_ONE_PASTED_CONTENT_ENVELOPE_RE = re.compile(
+    r'<pasted_content(?P<pasted_content_envelope_attributes>(?: id="[^"]*")?)>'
+    r"(?P<pasted_text>.*)"
+    r"</pasted_content(?P=pasted_content_envelope_attributes)>",
+    re.DOTALL,
+)
+"""整条（已去首尾空白的）prompt 恰好是一段粘贴包裹：闭标签重复开标签的 ``id``。取证见模块 docstring 的
+``user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste`` 一条。"""
 
 
 class ClaudeCodeHostAdapter:
@@ -87,3 +118,23 @@ class ClaudeCodeHostAdapter:
         if CLAUDE_CODE_BACKGROUND_TASK_COMPLETION_NOTIFICATION_CLOSING_TAG not in prompt_text:
             return None
         return CLAUDE_CODE_BACKGROUND_TASK_COMPLETION_NOTIFICATION_TURN_KIND
+
+    def agent_turn_identifier_shared_by_hook_events_of_one_turn(
+        self, hook_event: Mapping[str, Any]
+    ) -> str | None:
+        value = hook_event.get(CLAUDE_CODE_HOOK_EVENT_AGENT_TURN_IDENTIFIER_FIELD)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        if not isinstance(prompt_text, str):
+            return None
+        match = CLAUDE_CODE_WHOLE_PROMPT_IS_ONE_PASTED_CONTENT_ENVELOPE_RE.fullmatch(prompt_text.strip())
+        if match is None:
+            return None
+        pasted_text = match.group("pasted_text")
+        # 一条里有多段粘贴时，贪婪匹配可能把「第一段开标签 … 最后一段闭标签」整个吞下（id 恰好相同时）。
+        if CLAUDE_CODE_PASTED_CONTENT_ENVELOPE_OPENING_TAG_PREFIX in pasted_text:
+            return None
+        return pasted_text

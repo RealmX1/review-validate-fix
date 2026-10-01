@@ -279,6 +279,7 @@ import rvf_decision_token_store as decision_token_store  # noqa: E402
 import stop_decision_candidate_summary  # noqa: E402
 from compact_path_tree_rendering import render_compact_path_tree_block  # noqa: E402
 import agentic_initiation_injection_attempt_ledger as injection_attempt_ledger  # noqa: E402
+import decision_point_agent_resumed_work_after_token_mint_evidence as decision_point_agent_resumed_work_evidence  # noqa: E402
 
 
 class BootstrapConfirmationRequired(Exception):
@@ -8972,6 +8973,10 @@ REASON_DECISION_POINT_OUT_OF_BAND_DELIVERY_OUTCOME_UNKNOWN = (
 # 跨 turn 再入预算已耗尽 ⇒ 本轮自注入横幅**不发**，已铸的 token 当场撤回。它不是投递失败，
 # 也不是 agent 的决策：是 RVF 自己在「宣称 agent 已收到」之前就决定不问这一次。
 REASON_DECISION_POINT_REENTRY_BUDGET_EXHAUSTED = "decision_point_reentry_budget_exhausted"
+# M13 补发时锁内首次迁移没抢到（UPS 刚把正文注入）或 token 已无法推进 ⇒ 不补发，静默停。
+REASON_DECISION_POINT_SELF_INJECTION_SKIPPED_BECAUSE_TOKEN_ALREADY_ADVANCED_OR_UNADVANCEABLE = (
+    "decision_point_self_injection_skipped_because_token_already_advanced_or_unadvanceable"
+)
 
 # 撤回理由（写进 token payload 的 ``withdrawn_reason``，供 $rvf-analyze 与人工对账区分撤回成因）。
 DECISION_POINT_WITHDRAWN_REASON_REENTRY_BUDGET_EXHAUSTED = "stop-hook-reentry-budget-exhausted"
@@ -9197,6 +9202,15 @@ FALLBACK_AFTER_BOUNDARY_MARKER_LANDED_WITHOUT_BANNER_BODY_INJECTION_KEY = (
 """回落诊断里的布尔键：True = 边界标记**已经**作为 user prompt 落地，但决策正文没有经 UPS 注入，
 本次 Stop 补发完整正文（审计 M13）。与上面两种回落（未发起 / 终端投递确定失败）的旁注互不借用。"""
 
+FALLBACK_AFTER_CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_KEY = (
+    "fallback_after_consecutive_agent_resumed_work_withdrawals"
+)
+"""回落诊断里的布尔键：True = 本会话最近连续若干份带外横幅都在落地前因「agent 复工」被撤回，本次改走
+同步自注入（复工撤回的空转上界）。旁注不得借用「投递未发起 / 终端投递确定失败」的说法。"""
+
+# EXPERIMENT_NODE: 连续几份带外横幅在落地前因「agent 复工」被撤回之后，下一份改走同步自注入（取 3 与铸造熔断默认阈值同档；待真实会话回放校准，可选的另一形态是按时间窗口计数）
+CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_BEFORE_FALLING_BACK_TO_STOP_HOOK_SELF_INJECTION = 3
+
 
 def _render_decision_point_out_of_band_boundary_marker(*, token: str) -> str:
     """带外投递时**终端粘贴通道唯一送出的内容**：一行无指令的边界标记。
@@ -9216,8 +9230,11 @@ def _render_decision_point_out_of_band_boundary_marker(*, token: str) -> str:
     （2026-09-29 真实 TUI 实测）。
 
     ⚠️ 这一行不得命中除决策点检测器以外的任何 UPS 检测器（尤其是手动触发正则）。
+
+    文案的真相源在 ``rvf_decision_token_store``：UPS 只把与这一行**逐字一致**的独立消息认作标记（开发者
+    prompt 里引用它不算），而 UPS 不 import 本模块，两边必须共用同一个渲染函数。
     """
-    return f"RVF 发起决策点 · RVF_DECISION_TOKEN={token}（决策正文见随附的 hook 上下文；未随附即为重复提交，忽略本行）"
+    return decision_token_store.render_decision_point_out_of_band_boundary_marker(token=token)
 
 
 def _render_decision_point_injection_prompt(
@@ -9626,6 +9643,7 @@ class OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection:
     delivery_intent: dict[str, Any]
     decision_token_lookup: Any
     boundary_marker_presence: TriggerPresence
+    boundary_marker_turn_verdict: Any
 
 
 def find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_injection(
@@ -9634,14 +9652,19 @@ def find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_i
     cwd: str | None,
     worktree: str | None,
 ) -> OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection | None:
-    """审计 M13：找出本轮这条投递通道上「标记落地了、正文没注入」而 token 还来得及决策的那一枚。
+    """审计 M13 的**保留支**：标记在 agent **空闲时**开出了自己的回合、正文却没注入，token 还来得及决策。
 
-    决策正文只能经 UserPromptSubmit 注入；标记在 agent 回合中途以 ``queued_command`` 送达时，
-    Claude Code < 2.1.260 **不触发** UPS（UPS 没跑 / 超时 / 崩溃同理）。agent 此时只看到一行
-    「未随附即忽略」的标记，按文案忽略它，决策点静默丢失；而投递意图仍在途，在途闸会把后续 Stop
-    全部静默挡住，直到 15 分钟意图 TTL 过后搁浅对账撤回、再下一次 Stop 才重铸。
+    决策正文只能经 UserPromptSubmit 注入；UPS 没跑 / 超时 / 崩溃时 agent 只看到一行「未随附即忽略」的
+    标记，决策点静默丢失，而投递意图仍在途、在途闸会把后续 Stop 全部静默挡住直到意图 TTL 过期。这一支
+    由下一次 Stop 以同一枚 token 补发正文。
 
-    判据（全部为正向证据，任一不满足即不接手，交还给在途闸 / 搁浅对账）：意图属于本轮这条通道；
+    **回合中途到达不在此列**（8d3ac 修正）：标记以 ``queued_command`` 并入、或排在一个复工过的回合之后，
+    说明铸 token 之后 agent 已复工，那份决策点的范围与时机都已过时——它由更早一步的
+    ``withdraw_out_of_band_decision_points_whose_agent_resumed_work_after_token_mint`` 撤回，绝不补发。
+    所以本函数要求**正向证据**「标记自己开了回合」（判据的 ``turn_opened_by_decision_point_boundary_marker``），
+    拿不到证据（无证据 / 复工）都不接手。
+
+    其余判据（全部为正向证据，任一不满足即不接手，交还给在途闸 / 搁浅对账）：意图属于本轮这条通道；
     意图里**没有**「UPS 已注入正文」的首次到达记录；token 仍 ``valid`` 且停在 ``minted``（过期的
     token 补发了也 start 不了，那一格归 M9 的撤回 + 计费）；标记在本次 Stop 的 transcript 祖先链上。
     不看意图是否已过 TTL——「不等在途 TTL」正是这条的目的。
@@ -9683,10 +9706,26 @@ def find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_i
         )
         if presence.presence != TRIGGER_PRESENCE_ON_ANCESTOR_CHAIN:
             continue
+        token_payload = lookup.payload if isinstance(lookup.payload, dict) else {}
+        boundary_marker_turn_verdict = (
+            classify_whether_agent_resumed_work_after_out_of_band_decision_token_mint_at_stop(
+                event,
+                decision_token=token,
+                decision_token_payload=token_payload,
+                user_prompt_submit_arrivals_recorded_for_session=(
+                    decision_point_agent_resumed_work_evidence.read_user_prompt_submit_arrivals_recorded_for_session(
+                        session_id=session_hook_id_from_event(event)
+                    )
+                ),
+            )
+        )
+        if not boundary_marker_turn_verdict.turn_opened_by_decision_point_boundary_marker:
+            continue
         return OutOfBandDecisionPointBoundaryMarkerLandedWithoutBannerBodyInjection(
             delivery_intent=marker,
             decision_token_lookup=lookup,
             boundary_marker_presence=presence,
+            boundary_marker_turn_verdict=boundary_marker_turn_verdict,
         )
     return None
 
@@ -9703,9 +9742,12 @@ def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_in
 ) -> StopDecision:
     """M13 的处置：本次 Stop 以**同一枚** token 自注入完整正文（受众 agent_must_act_now）。
 
-    不撤回、不重铸 ⇒ 既不冲销也不新增熔断额度；token 由自注入出口推进为 injected（跨 turn 再入预算
-    照常在那里判，耗尽时由那条出口按「根本没发」撤回）。随后清掉这份投递意图——正文已经送达，
-    它不再有对账价值，留着只会让搁浅对账事后把一枚已注入的 token 当成搁浅。
+    不撤回、不重铸 ⇒ 既不冲销也不新增熔断额度；跨 turn 再入预算照常在自注入出口里判，耗尽时由那条出口
+    按「根本没发」撤回。推进 ``minted → injected`` 用**锁内首次迁移的 CAS**
+    （``claim_first_minted_to_injected_transition_exclusively``），抢到才注入：UPS 可能刚好已锁内推进并把
+    正文放进输出、还没来得及写首次到达记录——此刻幂等的 ``mark_injected`` 分不出「是我推进的」，照注入就是
+    同一份正文送两次。随后清掉这份投递意图——正文已经送达，它不再有对账价值，留着只会让搁浅对账事后把
+    一枚已注入的 token 当成搁浅。
     """
     lookup = landed_without_body.decision_token_lookup
     token_payload = lookup.payload if isinstance(lookup.payload, dict) else {}
@@ -9722,8 +9764,7 @@ def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_in
         )
     else:
         user_prompt_submit_side_explanation = (
-            "UserPromptSubmit hook 没有处理这条标记——回合中途以 queued_command 送达时 "
-            "Claude Code < 2.1.260 不触发 UPS；也可能是 UPS 没跑 / 超时 / 崩溃"
+            "UserPromptSubmit hook 没有处理这条标记（UPS 没跑 / 超时 / 崩溃）"
         )
     ledger.event(
         phase="gate",
@@ -9737,6 +9778,7 @@ def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_in
         decision_point_delivery_intent_path=delivery_intent.get("_marker_path"),
         user_prompt_submit_first_arrival_observation=first_arrival_observation,
         **landed_without_body.boundary_marker_presence.as_ledger_fields(),
+        **landed_without_body.boundary_marker_turn_verdict.as_ledger_fields(),
     )
     decision = _decision_point_self_injection_decision(
         token=lookup.token,
@@ -9757,6 +9799,7 @@ def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_in
             "summary": user_prompt_submit_side_explanation,
             FALLBACK_AFTER_BOUNDARY_MARKER_LANDED_WITHOUT_BANNER_BODY_INJECTION_KEY: True,
         },
+        require_exclusive_first_minted_to_injected_claim_before_injecting=True,
     )
     task_id = delivery_intent.get("kanban_task_id")
     if isinstance(task_id, str) and task_id:
@@ -9765,6 +9808,190 @@ def _decision_point_reinject_banner_body_after_boundary_marker_landed_without_in
         except Exception:  # noqa: BLE001 - 清理 best-effort；残留意图会被搁浅对账按非 minted 清掉
             pass
     return decision
+
+
+def _agent_turn_identifier_from_stop_event(event: dict[str, Any]) -> str | None:
+    """这次 Stop 所属 agent 回合的标识（经当前会话的 HostAdapter 取；取不到为 None = 无此证据）。"""
+    try:
+        identifier = resolve_current_session_host_adapter(
+            event
+        ).agent_turn_identifier_shared_by_hook_events_of_one_turn(event)
+    except Exception:  # noqa: BLE001 - 取不到只是少一份证据
+        return None
+    return identifier if isinstance(identifier, str) and identifier else None
+
+
+def classify_whether_agent_resumed_work_after_out_of_band_decision_token_mint_at_stop(
+    event: dict[str, Any],
+    *,
+    decision_token: str,
+    decision_token_payload: dict[str, Any],
+    user_prompt_submit_arrivals_recorded_for_session: list[dict[str, Any]],
+) -> Any:
+    """Stop 侧的复工判定：把本次 Stop 手里的三份证据（UPS 到达记录 / transcript 祖先链 / host 回合标识）
+    交给 ``decision_point_agent_resumed_work_after_token_mint_evidence``（判据与取证见其 docstring）。"""
+    return decision_point_agent_resumed_work_evidence.classify_whether_agent_resumed_work_after_decision_token_mint(
+        decision_token=decision_token,
+        decision_token_payload=decision_token_payload,
+        current_hook_event_session_id=session_hook_id_from_event(event),
+        current_hook_event_agent_turn_identifier=_agent_turn_identifier_from_stop_event(event),
+        agent_turn_identifier_of_the_stop_event_that_minted_this_token=decision_token_payload.get(
+            decision_token_store.DECISION_TOKEN_PAYLOAD_KEY_AGENT_TURN_IDENTIFIER_OF_THE_STOP_EVENT_THAT_MINTED_THIS_TOKEN
+        ),
+        transcript_path=first_readable_session_path(event),
+        user_prompt_submit_arrivals_recorded_for_session=user_prompt_submit_arrivals_recorded_for_session,
+    )
+
+
+@dataclass(frozen=True)
+class OutOfBandDecisionPointAgentResumedWorkWithdrawalOutcome:
+    """一次「复工撤回」的结果：给开发者的旁注，以及本次 Stop 真的撤回了哪些 token。"""
+
+    developer_visible_notices: list[str]
+    withdrawn_decision_tokens: list[str]
+
+
+def withdraw_out_of_band_decision_points_whose_agent_resumed_work_after_token_mint(
+    event: dict[str, Any],
+    *,
+    ledger: RunLedger,
+    cwd: str | None,
+    this_stop_reevaluates_after_withdrawal: bool,
+) -> OutOfBandDecisionPointAgentResumedWorkWithdrawalOutcome:
+    """本会话里仍停在 ``minted`` 的带外横幅，凡铸出之后 agent 已复工的，一律撤回。
+
+    复工 ⇒ 这份决策点的候选范围（铸 token 那一刻的工作树）与时机（agent 刚停下）都已过时，它的标记
+    要么已在回合中途被并入、要么还在路上。处置：best-effort 物理取消（只在写进终端之前有效，多半赶不上）
+    → CAS 撤回（锁内仍须是 minted；输了说明 UPS 刚把正文注入，什么都不改）→ 清投递意图。撤回会删去重
+    索引、冲销熔断额度（成因进白名单，理由见成因常量），于是在途闸随即放行。
+
+    **不早退**：调用方在同一次 Stop 里继续往下，按当时的工作树重新评估、按新指纹铸 token。这与 C-①
+    （搁浅撤回当次就地结束）不同：那里撤回的证据是「通道此刻不通」，这里通道是健康的，只是时机不对。
+    空转由独立上界约束（见 ``CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_BEFORE_FALLING_BACK_TO_STOP_HOOK_SELF_INJECTION``）。
+
+    复工是**会话级**事实，故按会话枚举、不按 worktree 过滤：Stop 的递归短路分支手里只有 cwd，也要能调用
+    本函数（那一支负责「铸 token 的那个回合被续跑」，见 ``evaluate_stop_event``）。判据拿不到证据时一律
+    不动手，交还给在途闸与搁浅对账。整段 best-effort，永不抛。
+    """
+    notices: list[str] = []
+    withdrawn_tokens: list[str] = []
+    outcome = OutOfBandDecisionPointAgentResumedWorkWithdrawalOutcome(
+        developer_visible_notices=notices, withdrawn_decision_tokens=withdrawn_tokens
+    )
+    session_id = session_hook_id_from_event(event)
+    if not session_id:
+        return outcome
+    try:
+        lookups = decision_token_store.iter_decision_tokens_for_session_in_any_worktree(
+            session_id=session_id
+        )
+    except Exception:  # pragma: no cover - 枚举永不阻断
+        return outcome
+    out_of_band_tokens_still_minted = [
+        lookup
+        for lookup in lookups
+        if lookup.state == decision_token_store.STATE_MINTED
+        and isinstance(lookup.payload, dict)
+        and lookup.payload.get("decision_point_delivery_transport")
+        == decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
+    ]
+    if not out_of_band_tokens_still_minted:
+        return outcome
+    user_prompt_submit_arrivals = (
+        decision_point_agent_resumed_work_evidence.read_user_prompt_submit_arrivals_recorded_for_session(
+            session_id=session_id
+        )
+    )
+    try:
+        delivery_intents_by_token = {
+            marker.get("decision_token"): marker
+            for marker in iter_decision_point_delivery_intents()
+            if isinstance(marker.get("decision_token"), str)
+        }
+    except Exception:  # noqa: BLE001 - 没有意图只意味着没有物理取消的抓手
+        delivery_intents_by_token = {}
+    for lookup in out_of_band_tokens_still_minted:
+        token_payload = lookup.payload
+        verdict = classify_whether_agent_resumed_work_after_out_of_band_decision_token_mint_at_stop(
+            event,
+            decision_token=lookup.token,
+            decision_token_payload=token_payload,
+            user_prompt_submit_arrivals_recorded_for_session=user_prompt_submit_arrivals,
+        )
+        if not verdict.agent_resumed_work_after_token_mint:
+            continue
+        delivery_intent = delivery_intents_by_token.get(lookup.token)
+        cancel_diagnostics = (
+            _cancel_stranded_decision_point_delivery(delivery_intent)
+            if isinstance(delivery_intent, dict)
+            else {
+                "decision_point_delivery_physical_cancel": {
+                    "attempted": False,
+                    "outcome": "no_decision_point_delivery_intent",
+                }
+            }
+        )
+        try:
+            decision_token_store.mark_withdrawn(
+                lookup.token,
+                reason="agent_resumed_work_after_decision_token_mint",
+                withdrawal_cause=(
+                    decision_token_store
+                    .DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED
+                ),
+                withdraw_only_if_state_inside_lock_is=frozenset({decision_token_store.STATE_MINTED}),
+            )
+        except decision_token_store.DecisionTokenError as exc:
+            # CAS 输了（UPS 刚把正文注入，agent 已拿到决策点）或 token 不可写：什么都不改，留给既有路径。
+            ledger.event(
+                phase="gate",
+                event="decision_point_agent_resumed_work_withdrawal_not_applied",
+                status="skipped",
+                reason_code="decision_point_agent_resumed_work_withdrawal_not_applied",
+                cwd=cwd,
+                decision_token=lookup.token,
+                error=f"{type(exc).__name__}: {exc}",
+                **verdict.as_ledger_fields(),
+                **cancel_diagnostics,
+            )
+            continue
+        withdrawn_tokens.append(lookup.token)
+        delivery_detail = token_payload.get("out_of_band_delivery_detail")
+        task_id = (delivery_intent or {}).get("kanban_task_id") or (
+            delivery_detail.get("kanban_task_id") if isinstance(delivery_detail, dict) else None
+        )
+        if isinstance(task_id, str) and task_id:
+            try:
+                clear_decision_point_delivery_intent(task_id=task_id, decision_token=lookup.token)
+            except Exception:  # noqa: BLE001 - 清理 best-effort；残留意图会被搁浅对账按非 minted 清掉
+                pass
+        ledger.event(
+            phase="gate",
+            event="decision_point_out_of_band_delivery_withdrawn_because_agent_resumed_work_after_token_mint",
+            status="completed",
+            reason_code="decision_point_out_of_band_delivery_withdrawn_because_agent_resumed_work_after_token_mint",
+            cwd=cwd,
+            session_id=session_id,
+            decision_token=lookup.token,
+            cline_kanban_task_id=task_id,
+            decision_point_delivery_intent_path=(delivery_intent or {}).get("_marker_path"),
+            decision_point_withdrawal_cause=(
+                decision_token_store
+                .DECISION_POINT_WITHDRAWAL_CAUSE_AGENT_RESUMED_WORK_BEFORE_DECISION_POINT_DELIVERY_LANDED
+            ),
+            **verdict.as_ledger_fields(),
+            **cancel_diagnostics,
+        )
+        notices.append(
+            f"发起横幅（token={lookup.token}）铸出之后 agent 已经复工（证据：{verdict.evidence_source}），"
+            "它承载的候选范围与时机都已过时：已撤回该 token（不计熔断）、不注入正文；"
+            + (
+                "本次 Stop 按当前工作树重新评估。"
+                if this_stop_reevaluates_after_withdrawal
+                else "本次 Stop 处于递归短路、不重新评估，重新征询发生在下一次 Stop。"
+            )
+        )
+    return outcome
 
 
 @dataclass(frozen=True)
@@ -10342,8 +10569,15 @@ def decision_point_injection_decision(
       fork 机制在「上下文保真 + 决策可追溯 + decline 理由持久化」三项上**不劣于**
       checkpoint/rewind 机制（fork≽checkpoint），否则不得切换注入对象。
     """
-    # M13：先看本轮这条通道上是否有「标记落地了、正文没注入、token 还有效」的横幅——有就当场以同一
-    # 枚 token 补发完整正文。必须早于搁浅对账（后者会把一份过了意图 TTL 的它撤回并计费）与在途闸
+    # 复工撤回（8d3ac）：铸出之后 agent 已复工的带外横幅一律先撤回——它的范围与时机都已过时。排在一切
+    # 之前：撤回会删去重索引、清投递意图，于是下面的 M13 不会补发它、在途闸不再挡、本次 Stop 按当前工作树
+    # 重新评估（不早退）。
+    resumed_work_withdrawal = withdraw_out_of_band_decision_points_whose_agent_resumed_work_after_token_mint(
+        event, ledger=ledger, cwd=cwd, this_stop_reevaluates_after_withdrawal=True
+    )
+
+    # M13 保留支：本轮这条通道上「标记在空闲时开出了自己的回合、正文没注入、token 还有效」的横幅——当场
+    # 以同一枚 token 补发完整正文。必须早于搁浅对账（后者会把一份过了意图 TTL 的它撤回并计费）与在途闸
     # （后者会把意图 TTL 内的每一次 Stop 静默挡住）。
     landed_without_body = (
         find_out_of_band_decision_point_boundary_marker_landed_without_banner_body_injection(
@@ -10367,7 +10601,10 @@ def decision_point_injection_decision(
     stranded_reconciliation = reconcile_stranded_decision_point_delivery_intents(
         event, ledger=ledger, cwd=cwd, worktree=repo
     )
-    stranded_notices = stranded_reconciliation.developer_visible_notices
+    stranded_notices = [
+        *resumed_work_withdrawal.developer_visible_notices,
+        *stranded_reconciliation.developer_visible_notices,
+    ]
 
     # C-①：本次 Stop 刚把**本轮这条投递通道上**的一枚搁浅横幅推进 ``withdrawn`` ⇒ **当次就地结束**。
     #
@@ -10524,6 +10761,58 @@ def decision_point_injection_decision(
         delivery_transport
         == decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
     ):
+        # 复工撤回的空转上界：本会话最近连续 N 份带外横幅都在落地前因 agent 复工被撤回 ⇒ 这一份改走同步
+        # 自注入（当场送达、没有粘贴竞态）。自注入成功铸出的 token 本身就打断了连续计数，之后恢复带外。
+        # 不用「静默一段时间」：静默期里的最后一次 Stop 之后 agent 进入空闲，就再没有 Stop 来征询（漏审方向）。
+        # 计数口径必须与撤回口径一致（按会话、跨 worktree）：撤回本就按会话跨 worktree 进行，只数当前
+        # worktree 会把轮流落在不同 worktree 上的撤回序列拆散，永远到不了阈值（兜底被无限绕过）。
+        consecutive_agent_resumed_work_withdrawals = (
+            decision_token_store.count_most_recent_consecutive_decision_tokens_withdrawn_because_agent_resumed_work(
+                decision_token_store.iter_decision_tokens_for_session_in_any_worktree(
+                    session_id=session_id
+                )
+            )
+        )
+        if (
+            consecutive_agent_resumed_work_withdrawals
+            >= CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_BEFORE_FALLING_BACK_TO_STOP_HOOK_SELF_INJECTION
+        ):
+            ledger.event(
+                phase="gate",
+                event="decision_point_out_of_band_delivery_replaced_by_self_injection_after_consecutive_agent_resumed_work_withdrawals",
+                status="warning",
+                level="warn",
+                reason_code="decision_point_out_of_band_delivery_replaced_by_self_injection_after_consecutive_agent_resumed_work_withdrawals",
+                repo=repo,
+                cwd=cwd,
+                session_id=session_id,
+                consecutive_agent_resumed_work_withdrawals=consecutive_agent_resumed_work_withdrawals,
+                consecutive_agent_resumed_work_withdrawals_threshold=(
+                    CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_BEFORE_FALLING_BACK_TO_STOP_HOOK_SELF_INJECTION
+                ),
+            )
+            return _decision_point_fall_back_to_self_injection(
+                summary=summary,
+                fork_context=fork_context,
+                ledger=ledger,
+                repo=repo,
+                cwd=cwd,
+                worktree=worktree,
+                session_id=session_id,
+                fingerprint=fingerprint,
+                candidate_count=candidate_count,
+                has_committed=has_committed,
+                gate_status=gate_status,
+                lost_warnings=lost_warnings,
+                fallback_diagnostics={
+                    "summary": (
+                        f"本会话最近连续 {consecutive_agent_resumed_work_withdrawals} 份带外横幅都在落地前因 agent "
+                        "复工被撤回"
+                    ),
+                    FALLBACK_AFTER_CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_KEY: True,
+                },
+                event=event,
+            )
         return _decision_point_out_of_band_delivery_decision(
             event,
             ledger=ledger,
@@ -10723,8 +11012,13 @@ def _decision_point_self_injection_decision(
     lost_warnings: list[str],
     event: dict[str, Any] | None,
     fell_back_from_out_of_band_delivery: dict[str, Any] | None = None,
+    require_exclusive_first_minted_to_injected_claim_before_injecting: bool = False,
 ) -> StopDecision:
     """同步自注入出口：渲染横幅 → 推进 token → 记账 → 以 ``agent_must_act_now`` 返回。
+
+    ``require_exclusive_first_minted_to_injected_claim_before_injecting``：token 的正文**可能已由别处送达**
+    时（M13 补发：UPS 可能刚把同一份正文注入）必须为 True——推进改用锁内首次迁移的 CAS，抢不到即静默停、
+    不注入。默认 False 时沿用幂等的 ``mark_injected``（新铸的 token 只有本出口会推进它）。
 
     调用方：默认的自注入路径，以及带外投递**确定失败**后的当场回落（INV-B：只在确定失败时
     回落；结论未知一律静默停）——「确定失败」含投递前决策点正文写不进 token payload 的情形。回落时 ``fell_back_from_out_of_band_delivery`` 带着失败诊断，
@@ -10766,10 +11060,45 @@ def _decision_point_self_injection_decision(
     # mark_injected 的语义是「agent 确实拿到了这份正文」。自注入这条路上它成立：正文由 main()
     # 在本函数返回后**同步**写 stdout 投递，故此处推进 minted→injected 不是 87e9338 所诫的
     # 「乐观预 arm」。带外投递那条路推进权在 UPS，见 _decision_point_out_of_band_delivery_decision。
-    try:
-        decision_token_store.mark_injected(token)
-    except decision_token_store.DecisionTokenError:
-        pass
+    if require_exclusive_first_minted_to_injected_claim_before_injecting:
+        try:
+            claim_outcome = decision_token_store.claim_first_minted_to_injected_transition_exclusively(token)
+            claim_error = None
+        except decision_token_store.DecisionTokenError as exc:
+            claim_outcome = None
+            claim_error = f"{type(exc).__name__}: {exc}"
+        if claim_outcome is None or not claim_outcome.this_call_won_first_minted_to_injected_transition:
+            ledger.event(
+                phase="gate",
+                event="decision_point_self_injection_skipped_because_token_already_advanced_or_unadvanceable",
+                status="skipped",
+                reason_code=REASON_DECISION_POINT_SELF_INJECTION_SKIPPED_BECAUSE_TOKEN_ALREADY_ADVANCED_OR_UNADVANCEABLE,
+                repo=repo,
+                cwd=cwd,
+                session_id=session_id,
+                decision_token=token,
+                decision_token_state_observed_inside_lock=(
+                    claim_outcome.state_observed_inside_lock_before_claim if claim_outcome else None
+                ),
+                error=claim_error,
+            )
+            return _decision_point_silent_stop(
+                ledger,
+                reason_code=REASON_DECISION_POINT_SELF_INJECTION_SKIPPED_BECAUSE_TOKEN_ALREADY_ADVANCED_OR_UNADVANCEABLE,
+                message=(
+                    f"review-validate-fix: 发起横幅（token={token}）的正文已由别处送达或这枚 token 已无法推进"
+                    f"（{claim_error or '锁内已是 ' + str(claim_outcome.state_observed_inside_lock_before_claim)}），"
+                    "本次 Stop 不再补发。"
+                ),
+                repo=repo,
+                cwd=cwd,
+                lost_warnings=lost_warnings,
+            )
+    else:
+        try:
+            decision_token_store.mark_injected(token)
+        except decision_token_store.DecisionTokenError:
+            pass
     injection_attempt_ledger.record_injection_attempt(
         worktree=worktree,
         session_id=session_id,
@@ -10824,6 +11153,12 @@ def _decision_point_self_injection_decision(
             fallback_headline = (
                 f" ⚠ 发起横幅的边界标记已落地，但决策正文没有经 UserPromptSubmit 注入（{fallback_summary}）；"
                 "本次 Stop 以同一枚 token 补发完整正文，"
+            )
+        elif fell_back_from_out_of_band_delivery.get(
+            FALLBACK_AFTER_CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_KEY
+        ):
+            fallback_headline = (
+                f" ⚠ {fallback_summary}（复工撤回的空转上界），本次不再走带外投递，"
             )
         elif fell_back_from_out_of_band_delivery.get(
             FALLBACK_HAPPENED_BEFORE_ANY_TERMINAL_DELIVERY_ATTEMPT_KEY
@@ -11273,6 +11608,12 @@ def _decision_point_out_of_band_delivery_decision(
                 delivery_transport=(
                     decision_token_store.DECISION_POINT_DELIVERY_TRANSPORT_CLINE_KANBAN_TASK_CHAT_SESSION
                 ),
+                # 复工判据 E3：之后任一 hook 事件与这次 Stop 同属一个回合 ⇒ 铸 token 的回合又被续跑了。
+                extra_token_payload_fields={
+                    decision_token_store.DECISION_TOKEN_PAYLOAD_KEY_AGENT_TURN_IDENTIFIER_OF_THE_STOP_EVENT_THAT_MINTED_THIS_TOKEN: (
+                        _agent_turn_identifier_from_stop_event(event)
+                    ),
+                },
             )
         except Exception as exc:  # pragma: no cover - 铸造异常兜底
             return _decision_point_mint_anomaly_decision(
@@ -11959,11 +12300,23 @@ def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecisio
             return payload_decision(payload, reason_code="handoff_file_ready", cwd=cwd)
 
     if event.get("stop_hook_active") is True:
+        # 递归短路之前只做一件不驱动 agent 的事：续跑本身就是「agent 在铸 token 之后复工」——别的 Stop hook
+        # 让 agent 接着干活时，RVF 刚铸出的带外横幅就过时了（复工判据 E3：续跑 Stop 与铸 token 的 Stop 同属
+        # 一个回合；Codex 的续跑不触发 UPS，这里是唯一能看到它的地方）。只撤回、不重新评估：重新征询在下一次
+        # 非续跑的 Stop。
+        resumed_work_withdrawal = withdraw_out_of_band_decision_points_whose_agent_resumed_work_after_token_mint(
+            event, ledger=ledger, cwd=cwd, this_stop_reevaluates_after_withdrawal=False
+        )
         # host 名由注入面提供：写死 "Codex" 会在 Claude 会话里印出错误的 host（本消息是给
         # 开发者看的诊断，报错主体必须是当前这个 host）。
         host_label = resolve_current_session_host_adapter(event).host_display_name()
         return skip_decision(
-            "检测到 stop_hook_active=true，为避免递归已跳过。",
+            " ".join(
+                [
+                    "检测到 stop_hook_active=true，为避免递归已跳过。",
+                    *resumed_work_withdrawal.developer_visible_notices,
+                ]
+            ),
             ledger,
             "stop_hook_active",
             cwd=cwd,

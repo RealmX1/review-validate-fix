@@ -342,14 +342,53 @@ Codex 二进制里不存在任何失败计数器标识符，也**没有**把 hoo
 UPS（本机 45 天 transcript：≤2.1.257 约 800 条仅 1 条触发，≥2.1.260 全部触发），而 transcript 扫描器
 必须把 `queued_command` 附件的 `attachment.prompt` 当作一次 user prompt 落地。
 
-处置分两格：
+但「标记在祖先链上」还要再分一刀：**标记是在 agent 空闲时开出了自己的回合，还是在回合中途并入的？**
+后者说明 Stop 铸出 token 之后 agent 已经**复工**（后台任务通知唤醒、开发者发话、别的 Stop hook 让它续跑……），
+这份决策点承载的候选范围（铸 token 那一刻的工作树）与时机（agent 刚停下）都已过时（task 8d3ac 的设计修正）。
+判据见 `decision_point_agent_resumed_work_after_token_mint_evidence`，三个证据源任一判复工即复工，全部只看
+与 token 同一会话的证据：
 
-- **token 仍有效**（审计 M13）：下一次 Stop **立即**以同一枚 token 自注入完整正文（`agent_must_act_now`，
-  这是决策点本身、够格驱动 agent），不等在途意图 TTL、不撤回、不冲销也不新增熔断额度。
+- **UPS 按会话的到达记录**：铸 token 之后到达过任何不是这枚 token 自身标记的 prompt（到达时已作废的迟到
+  标记除外）。记录写在 UPS 的合成回合短路**之前**——任务通知正是最主要的复工信号。
+- **transcript 祖先链**：标记以 `queued_command` 并入；或标记之前（标记还没落盘时看 leaf 之前）最近一条
+  user / assistant 条目晚于铸出时刻。回扫时透明跳过开发者本地斜杠命令整组（caveat / `<command-name>` /
+  `<local-command-stdout|stderr>`）与 compact 摘要——空闲时跑 `/compact`、`/model` 不是复工；isMeta 不整体
+  透明（`Stop hook feedback:` 就是复工）。先撞到 `compact_boundary`：auto 且晚于铸出 ⇒ 复工，manual 或 auto
+  不晚于铸出 ⇒ 无证据（不沿 `logicalParentUuid` 回溯）。
+- **host 回合标识**（`HostAdapter.agent_turn_identifier_shared_by_hook_events_of_one_turn`：Claude Code
+  `prompt_id`、Codex `turn_id`）：当前 hook 事件与铸 token 的 Stop 同属一个回合 ⇒ 那个回合被续跑了。
+
+2026-10-02 真机取证（Claude Code 2.1.287）：排队消息的 UPS 在**并入上下文那一刻**才触发、触发时 transcript
+里还没有 `queued_command`；同一回合（含 Stop 续跑与并入的排队消息）的 hook 事件共享 `prompt_id`；对排队消息
+返回 `decision:block` 有效（`dropped_by_hook`）。
+
+处置分三格：
+
+- **复工**：撤回 token（CAS：锁内仍须是 `minted`；成因 `agent_resumed_work_before_decision_point_delivery_landed`，
+  **冲销**熔断额度——通道健康、只是时机不对），清投递意图、best-effort 物理取消，**不注入正文**。Stop 侧
+  **不早退**，同一次 Stop 按当前工作树重新评估（撤回删了去重索引、清了意图，在途闸随即放行）；标记若在
+  UPS 侧到达，走下面的作废出口，重新评估发生在这一回合结束时的 Stop。Stop 的递归短路分支（续跑）也做这一步
+  （只撤回、不重新评估）：Codex 的续跑不触发 UPS，那里是唯一看得到它的地方。
+  **空转上界**：本会话最近连续 `CONSECUTIVE_AGENT_RESUMED_WORK_WITHDRAWALS_BEFORE_FALLING_BACK_TO_STOP_HOOK_SELF_INJECTION`
+  （`EXPERIMENT_NODE`，现取 3）份带外横幅都因复工撤回 ⇒ 下一份改走同步自注入（当场送达、没有粘贴竞态），
+  自注入铸出的 token 自然打断连续计数。不用「静默期」：静默期里的最后一次 Stop 之后 agent 进入空闲，就再
+  没有 Stop 来征询（漏审方向）。
+- **空闲落地、正文没注入、token 仍有效**（审计 M13 的保留支，须拿到「标记开了自己的回合」的正向证据）：下一次
+  Stop **立即**以同一枚 token 自注入完整正文（`agent_must_act_now`，这是决策点本身、够格驱动 agent），不等在途
+  意图 TTL、不撤回、不冲销也不新增熔断额度。推进用锁内首次迁移的 CAS（UPS 可能刚把正文注入、还没写首次到达
+  记录），抢不到即静默停。
 - **token 已过期**（审计 M9）：意图过 TTL 后由搁浅对账撤回。只有记录里写着「正文已注入」时才用冲销
   熔断额度的成因；否则用 `out_of_band_boundary_marker_became_a_turn_but_banner_body_never_injected`
   计入熔断（UPS 持续失效时自动退避），并以 **developer_only** 点名 UPS 那一侧的原因。这条告警与 §0
   一致：它是诊断，不驱动 agent。
+
+三格都拿不到证据（判据「无证据」）时**维持现状**：不撤回、不补发，交给在途闸与搁浅对账。理由：Codex rollout
+没有 uuid 链，若「无证据 ⇒ 撤回」，UPS 失效的 Codex 会话会无限「铸 → 撤」。
+
+**作废标记**（token 已撤回 / 已决策，或到达时判定复工）落地时，UPS 走
+`_apply_void_decision_point_boundary_marker_hard_neutralization`：`decision:block`（挡掉这次提交，空闲时
+不白开一个回合）+ 只说「已作废、无需处理」的 `additionalContext`（**不含决策正文**）+ `systemMessage`。
+它是 prompt 抑制，不驱动 agent，在契约测试的豁免表里带理由登记。
 
 ---
 
@@ -361,3 +400,14 @@ UPS（本机 45 天 transcript：≤2.1.257 约 800 条仅 1 条触发，≥2.1.
   ⇒ 该告警在 Codex 上目前是哑的。
 - 两条通道的**服从度**只做过 n=1、极简指令的对照实验（无可观察差异）。多步指令在真实长
   上下文下是否仍等价，须上线后留指标观察。
+- 带外决策点「复工撤回」不在同一次 Stop 里重新评估的两处（§6）：标记在 UPS 侧被判复工、且那个回合以
+  Stop 续跑结束（续跑 Stop 走递归短路）；Stop 的递归短路分支自己撤回。两处的重新征询都要等下一次非续跑的
+  Stop——若 agent 此后一直空闲，候选会一直没人问。
+- 复工判据「无证据 ⇒ 维持现状」：Codex 上 UPS 事件是否带 `turn_id`、回合中途 steer 进来的消息是否沿用
+  当前 `turn_id` 未取证；Kimi 没有回合标识。这两个 host 上复工撤回只靠 UPS 到达记录。
+- 作废出口的 `decision:block` 只在 Claude Code 上取证过对排队消息生效；不认 block 的 host 上作废标记
+  仍会开一个回合（agent 只看到「已作废、无需处理」）。
+- 根治在投递侧：粘贴前确认 agent 空闲。cline-kanban 的 prompt queue（task 24508，已合入其本地 main）带
+  这道门控，但缺程序化入队入口，且把「parked 等后台工作」算作空闲——需求见
+  `~/.rvf/cross-repo-coordination-with-cline-kanban/`（挂 task 33612）。落地后 RVF 改走排队入口，复工撤回
+  与空转上界仍保留（出队瞬间的唤醒、忙闲误判、Codex 续跑都会漏过排队）。

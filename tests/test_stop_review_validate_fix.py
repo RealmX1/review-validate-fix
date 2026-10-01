@@ -5293,6 +5293,23 @@ _f2oob.inject(
 globals().update({_n: getattr(_f2oob, _n) for _n in _f2oob.__all__})
 
 
+# 有界拆分：带外决策点「铸 token 之后 agent 复工 ⇒ 撤回」测试簇（task 8d3ac）。借用上面带外投递子模块的
+# helper（已 inject 过），模块级 inject 共享依赖后重绑测试名。
+from _rvf_stop_hook_support import (
+    decision_point_agent_resumed_work_after_token_mint as _f3resumedwork,
+)
+_f3resumedwork.inject(
+    decision_token_records=decision_token_records,
+    init_repo=init_repo,
+    invoke=invoke,
+    latest_events=latest_events,
+    latest_summary=latest_summary,
+    load_hook_module=load_hook_module,
+    parse_json=parse_json,
+)
+globals().update({_n: getattr(_f3resumedwork, _n) for _n in _f3resumedwork.__all__})
+
+
 # 有界拆分：决策 token store 的**并发互斥**与**熔断额度记账** 测试簇（7 个）移入子模块；
 # 模块级 inject 共享依赖后重绑测试名，让（未改动的）扁平 tests=[...] 注册表按裸名解析到它们。
 from _rvf_stop_hook_support import (
@@ -6365,7 +6382,28 @@ def main() -> int:
         test_stranded_banner_reverses_mint_request_charge_only_on_positive_evidence_the_body_was_injected,
         test_decision_point_banner_body_text_persist_failure_falls_back_to_self_injection_and_says_why,
         test_decision_point_banner_command_wording_matches_the_rendered_command_prefix,
-        test_decision_point_boundary_marker_that_arrived_as_queued_command_without_user_prompt_submit_is_reinjected_by_the_next_stop,
+        # 8d3ac：铸 token 之后 agent 复工 ⇒ 撤回、不补发、同一次 Stop 重新评估；M13 只保留「空闲时开出自己
+        # 的回合」那一支；作废标记三管齐下；复工撤回的空转上界；三处 CAS（补发 / 复工撤回 / M10）。
+        test_decision_point_boundary_marker_absorbed_mid_turn_is_withdrawn_and_the_same_stop_remints_for_the_current_worktree,
+        test_late_boundary_marker_of_a_withdrawn_decision_point_is_blocked_at_user_prompt_submit_without_the_body,
+        test_developer_prompt_quoting_a_void_decision_point_boundary_marker_alongside_its_own_text_is_delivered_untouched_at_user_prompt_submit,
+        test_developer_prompt_quoting_the_boundary_marker_of_an_injected_decision_point_alongside_its_own_text_is_not_withdrawn_as_a_rewind_resubmission,
+        test_developer_prompt_quoting_a_minted_decision_point_boundary_marker_alongside_its_own_text_neither_injects_nor_withdraws_and_counts_as_agent_resumed_work,
+        test_boundary_marker_that_opened_its_own_turn_while_agent_was_idle_is_still_reinjected_when_user_prompt_submit_never_handled_it,
+        test_user_prompt_submit_withdraws_decision_point_when_a_task_notification_arrived_between_mint_and_marker,
+        test_user_prompt_submit_withdraws_decision_point_when_marker_shares_the_agent_turn_of_the_minting_stop,
+        test_codex_stop_continuation_of_the_minting_turn_withdraws_decision_point_but_no_evidence_keeps_it_in_flight,
+        test_consecutive_agent_resumed_work_withdrawals_fall_back_to_self_injection_then_return_to_out_of_band,
+        test_consecutive_agent_resumed_work_withdrawals_spread_across_two_worktrees_of_one_session_still_fall_back_to_self_injection,
+        test_boundary_marker_reinjection_by_stop_loses_to_a_user_prompt_submit_that_already_claimed_the_token,
+        test_agent_resumed_work_withdrawal_compare_and_set_refuses_a_token_already_injected,
+        test_rewind_resubmission_withdrawal_compare_and_set_refuses_a_token_the_agent_already_started,
+        test_agent_resumed_work_evidence_from_another_session_never_withdraws_this_session_decision_point,
+        test_developer_local_slash_command_after_token_mint_is_transparent_to_transcript_ancestor_chain_evidence,
+        test_manual_compact_after_token_mint_yields_no_evidence_rather_than_agent_resumed_work_or_turn_opened_by_marker,
+        test_auto_compact_after_token_mint_still_counts_as_agent_resumed_work_in_transcript_ancestor_chain_evidence,
+        test_is_meta_stop_hook_feedback_after_token_mint_still_counts_as_agent_resumed_work_in_transcript_ancestor_chain_evidence,
+        test_host_adapters_report_agent_turn_identifier_shared_by_hook_events_of_one_turn,
         test_decision_point_rewound_banner_is_withdrawn_and_reasked_once,
         # rewind 对账的 transport 过滤：自注入 token 不适用 off-ancestor-chain 判据。
         test_decision_point_self_injected_token_is_not_withdrawn_as_rewound,

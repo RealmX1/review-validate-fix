@@ -68,6 +68,8 @@ __all__ = [
     'test_rvf_user_prompt_submit_manual_trigger_does_not_first_rebase_the_snooze_it_is_about_to_release',
     'test_rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_still_injected_token',
     'test_rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_being_handed_to_host_never_withdraws_token',
+    'test_rvf_user_prompt_submit_marker_arriving_before_first_injection_hook_output_reaches_host_never_withdraws_token',
+    'test_rvf_user_prompt_submit_first_injection_handoff_completed_credential_is_never_visible_before_its_content_is_fully_written',
     'test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises',
     'test_rvf_user_prompt_submit_claude_task_notification_quoting_the_manual_trigger_is_not_a_manual_trigger',
 ]
@@ -2090,11 +2092,18 @@ def test_rvf_user_prompt_submit_resubmitted_decision_point_marker_never_reinject
             assert dts.read_decision_token(token).state == dts.STATE_INJECTED
 
             dts.acknowledge_decision_token(token)
+            # rewind 放回输入框后用户又接着打了字 ⇒ 整条已不是那一行标记，按开发者 prompt 原样放行（RVF-001）：
+            # 同样不注入正文、不改 token，也不走重复到达出口。
+            appended = submit.inspect_user_prompt_submit({**event_base, "prompt": f"{marker}\n用户接着打的字"})
+            assert "hookSpecificOutput" not in appended, appended
+            assert "decision_point_banner_resubmitted_without_body_reinjection" not in appended, appended
+            assert appended.get(
+                "decision_point_token_literal_quoted_inside_developer_prompt_not_treated_as_boundary_marker"
+            ) == token, appended
+            assert dts.read_decision_token(token).state == dts.STATE_ACKNOWLEDGED
             for label in ("acknowledged",):
                 state_before = dts.read_decision_token(token).state
-                again = submit.inspect_user_prompt_submit(
-                    {**event_base, "prompt": f"{marker}\n用户接着打的字"}
-                )
+                again = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
                 assert "hookSpecificOutput" not in again, (label, again)
                 assert again.get("decision_point_banner_resubmitted_without_body_reinjection") is True, (
                     label,
@@ -2406,7 +2415,11 @@ def test_rvf_user_prompt_submit_new_turn_releases_deferred_until_condition_decli
 
     with _manual_decision_env(tmp_path):
         record_deferral()
-        banner_marker_prompt = "RVF 发起决策点 · RVF_DECISION_TOKEN=0123456789abcdef"
+        # 必须是生产渲染的整行标记：UPS 只把「整条就是那一行」认作标记落地（RVF-001），手抄的残缺标记
+        # 会被正确地当成开发者 prompt。
+        banner_marker_prompt = _delivered_decision_point_boundary_marker_prompt(
+            _load_stop_hook_module_for_ups_tests(), "0123456789abcdef"
+        )
         assert submit.decision_point_token_from_text(banner_marker_prompt) == "0123456789abcdef"
         submit.inspect_user_prompt_submit(
             _claude_code_user_prompt_submit_event(repo, session_id, banner_marker_prompt)
@@ -2831,6 +2844,11 @@ def test_rvf_user_prompt_submit_marker_resubmitted_after_rewind_withdraws_the_st
         first = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
         assert "hookSpecificOutput" in first, first
         assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+        # 生产上由 main() 在 hook 输出 flush 之后发布「首次注入已交付完毕」凭证（RVF-003）；进程内直调
+        # inspect 跳过了 main()，这里补上同一步。
+        submit._publish_decision_point_banner_first_injection_handoff_completed_credential_after_hook_output_flushed(
+            first
+        )
 
         again = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
         assert "hookSpecificOutput" not in again, "正文只在首次到达时注入"
@@ -2924,13 +2942,191 @@ def test_rvf_user_prompt_submit_marker_arriving_while_first_injection_is_still_b
                 "agent 已拿到正文，token 不得被并发到达撤回",
             )
 
-            # 首个到达全部完成之后再重交 = 真正的 rewind ⇒ 照旧当轮作废。
+            # 首个到达全部完成（含 main() 在 hook 输出 flush 之后发布凭证，进程内直调 inspect 时补上这一步）
+            # 之后再重交 = 真正的 rewind ⇒ 照旧当轮作废。
+            submit._publish_decision_point_banner_first_injection_handoff_completed_credential_after_hook_output_flushed(
+                first
+            )
             rewound = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
             assert rewound.get("decision_token_withdrawn_after_marker_resubmission") is True, (
                 interleave_point_label,
                 rewound,
             )
             assert dts.read_decision_token(token).state == dts.STATE_WITHDRAWN, interleave_point_label
+
+
+def test_rvf_user_prompt_submit_marker_arriving_before_first_injection_hook_output_reaches_host_never_withdraws_token(
+    tmp_path: Path,
+) -> None:
+    """RVF-003：「首次注入已交付完毕」凭证必须在 hook 输出 print+flush **之后**才发布。
+
+    M10 只在凭证在场时才把锁外读到 injected 的到达当成 rewind 重交撤回。改动前凭证在 inspect 阶段
+    （``_observe_delivered_decision_point_banner`` 的最后一步）就发布了，早于 ``main()`` 把正文写进 stdout：
+    在这之间插入一次完整到达，它读到凭证在场就把 token 撤回，随后首个 hook 照样把正文交给 host ⇒ agent
+    拿到一枚已 withdrawn 的 token，``rvf start`` 必然硬失败。
+
+    用真实 ``main()``（进程内）驱动首个到达，在它往 stdout 写 hook 输出的那一刻插入另一次完整到达：不得
+    撤回。``main()`` 返回（输出已 flush）之后凭证才在场，此后的重交（真正的 rewind）照旧撤回。stdout 破裂
+    时正文没交出去 ⇒ 凭证不发布 ⇒ 之后的重交不撤回（方向安全：漏撤回只是多等一次 TTL）。
+    """
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+
+    class HookStdoutRunningCallbackBeforeFirstWriteReachesHost(io.StringIO):
+        def __init__(self, callback_before_first_write) -> None:
+            super().__init__()
+            self._callback_before_first_write = callback_before_first_write
+
+        def write(self, text: str) -> int:
+            callback, self._callback_before_first_write = self._callback_before_first_write, None
+            if callback is not None:
+                callback()
+            return super().write(text)
+
+    class HookStdoutWithBrokenPipe(io.StringIO):
+        def write(self, text: str) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    def run_user_prompt_submit_hook_main_in_process(event: dict, hook_stdout: io.StringIO) -> int:
+        saved_argv, saved_stdin, saved_stdout = sys.argv, sys.stdin, sys.stdout
+        sys.argv = ["rvf_user_prompt_submit.py"]
+        sys.stdin = io.StringIO(json.dumps(event, ensure_ascii=False))
+        sys.stdout = hook_stdout
+        try:
+            return submit.main()
+        finally:
+            sys.argv, sys.stdin, sys.stdout = saved_argv, saved_stdin, saved_stdout
+
+    # ① 首个到达已在锁内赢得迁移、正文已进 hook 结果，但还没写到 stdout 时，插入一次完整到达。
+    case_root = tmp_path / "interleaved-arrival-before-hook-output-reaches-host"
+    repo = _manual_candidate_repo(case_root)
+    session_id = "first-injection-hook-output-not-yet-written-sess"
+    event_base = {
+        "cwd": str(repo),
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "kanban_task_id": "task-first-injection-hook-output-not-yet-written",
+    }
+    with _manual_decision_env(case_root), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(case_root / "locks")
+    ):
+        token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        interleaved_arrival_payloads: list[dict] = []
+
+        def let_another_full_arrival_run_before_hook_output_reaches_host() -> None:
+            assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+            interleaved_arrival_payloads.append(
+                submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+            )
+
+        hook_stdout = HookStdoutRunningCallbackBeforeFirstWriteReachesHost(
+            let_another_full_arrival_run_before_hook_output_reaches_host
+        )
+        assert run_user_prompt_submit_hook_main_in_process({**event_base, "prompt": marker}, hook_stdout) == 0
+
+        assert len(interleaved_arrival_payloads) == 1, interleaved_arrival_payloads
+        concurrent_arrival = interleaved_arrival_payloads[0]
+        assert concurrent_arrival.get("decision_token_withdrawn_after_marker_resubmission") is not True, (
+            concurrent_arrival
+        )
+        assert concurrent_arrival.get("decision_point_banner_resubmitted_without_body_reinjection") is True, (
+            concurrent_arrival
+        )
+        assert "hookSpecificOutput" not in concurrent_arrival, concurrent_arrival
+        token_record = dts.read_decision_token(token)
+        assert token_record.state == dts.STATE_INJECTED, "agent 已拿到正文，token 不得被并发到达撤回"
+        delivered_to_host = json.loads(hook_stdout.getvalue())
+        assert delivered_to_host.get("hookSpecificOutput") == {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": token_record.payload[dts.DECISION_POINT_BANNER_BODY_TEXT_FOR_AGENT_PAYLOAD_KEY],
+        }, delivered_to_host
+        assert submit._decision_point_banner_first_injection_handoff_completed_credential_exists(dts, token), (
+            "输出 flush 之后凭证必须在场"
+        )
+
+        # 首个到达的输出已交给 host 之后再重交 = 真正的 rewind ⇒ 照旧当轮作废。
+        rewound = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+        assert rewound.get("decision_token_withdrawn_after_marker_resubmission") is True, rewound
+        assert dts.read_decision_token(token).state == dts.STATE_WITHDRAWN
+
+    # ② stdout 破裂：正文没交给 host ⇒ 凭证不得发布 ⇒ 之后的重交不撤回。
+    case_root = tmp_path / "hook-output-pipe-broken"
+    repo = _manual_candidate_repo(case_root)
+    session_id = "first-injection-hook-output-pipe-broken-sess"
+    event_base = {
+        "cwd": str(repo),
+        "session_id": session_id,
+        "hook_event_name": "UserPromptSubmit",
+        "kanban_task_id": "task-first-injection-hook-output-pipe-broken",
+    }
+    with _manual_decision_env(case_root), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(case_root / "locks")
+    ):
+        token, marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        with contextlib.suppress(BrokenPipeError):
+            run_user_prompt_submit_hook_main_in_process({**event_base, "prompt": marker}, HookStdoutWithBrokenPipe())
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+        assert not submit._decision_point_banner_first_injection_handoff_completed_credential_exists(dts, token), (
+            "正文没交给 host，凭证不得在场"
+        )
+        resubmitted = submit.inspect_user_prompt_submit({**event_base, "prompt": marker})
+        assert resubmitted.get("decision_token_withdrawn_after_marker_resubmission") is not True, resubmitted
+        assert dts.read_decision_token(token).state == dts.STATE_INJECTED
+
+
+def test_rvf_user_prompt_submit_first_injection_handoff_completed_credential_is_never_visible_before_its_content_is_fully_written(
+    tmp_path: Path,
+) -> None:
+    """RVF-003：凭证的最终路径只能随完整内容一起出现（先写临时文件再改名），写失败不得留下最终路径。
+
+    改动前用 ``O_EXCL`` 直接创建最终路径再写内容：写的过程中 ``is_file()`` 已为 True；写失败（磁盘满）时
+    函数报告「未发布」，最终路径却留在原地，M10 照样读到「凭证在场」。
+    """
+    import errno  # noqa: PLC0415
+
+    submit = load_rvf_user_prompt_submit_module()
+    dts, _il, _summary = _load_manual_decision_modules()
+    stop_hook = _load_stop_hook_module_for_ups_tests()
+    repo = _manual_candidate_repo(tmp_path)
+    session_id = "first-injection-credential-content-atomicity-sess"
+    with _manual_decision_env(tmp_path), _temporary_environment(
+        RVF_KANBAN_FOLLOWUP_LOCK_ROOT=str(tmp_path / "locks")
+    ):
+        token, _marker = _mint_out_of_band_decision_token(dts, stop_hook, repo, session_id)
+        assert dts.claim_first_minted_to_injected_transition_exclusively(token).this_call_won_first_minted_to_injected_transition
+        credential_exists = submit._decision_point_banner_first_injection_handoff_completed_credential_exists
+        credential_visible_while_its_content_is_being_written: list[bool] = []
+        real_json_dump = json.dump
+
+        def json_dump_observing_credential_visibility_then_failing_with_disk_full(*_args, **_kwargs):
+            credential_visible_while_its_content_is_being_written.append(credential_exists(dts, token))
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        json.dump = json_dump_observing_credential_visibility_then_failing_with_disk_full
+        try:
+            published = submit._record_decision_point_banner_first_injection_handoff_completed_credential(dts, token)
+        finally:
+            json.dump = real_json_dump
+        assert credential_visible_while_its_content_is_being_written == [False], (
+            "内容写完之前最终路径不得可见"
+        )
+        assert published is False
+        assert not credential_exists(dts, token), "写失败不得留下最终路径"
+        token_directory = Path(dts.decision_token_path(token)).parent
+        suffix = submit.DECISION_POINT_BANNER_FIRST_INJECTION_HANDOFF_COMPLETED_CREDENTIAL_FILENAME_SUFFIX
+        assert not [path.name for path in token_directory.iterdir() if suffix in path.name], (
+            "写失败不得残留临时文件"
+        )
+
+        assert submit._record_decision_point_banner_first_injection_handoff_completed_credential(dts, token) is True
+        assert credential_exists(dts, token)
+        assert [path.name for path in token_directory.iterdir() if suffix in path.name] == [
+            submit._decision_point_banner_first_injection_handoff_completed_credential_path(dts, token).name
+        ], "发布成功后只剩最终路径，不残留临时文件"
 
 
 def test_rvf_user_prompt_submit_first_marker_arrival_injects_body_even_if_clearing_the_delivery_intent_raises(

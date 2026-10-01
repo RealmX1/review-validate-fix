@@ -306,6 +306,84 @@ def _scan(
     return entries, truncated, None
 
 
+@dataclass(frozen=True)
+class TranscriptAncestorChainFromCurrentLeaf:
+    """当前 leaf 的祖先链（**从根到 leaf** 的顺序）。``error`` 非空 = 无结论（不可读 / 空 / 无 uuid 链）。"""
+
+    entries_from_root_to_leaf: tuple[dict[str, Any], ...]
+    transcript_path: str | None
+    truncated: bool = False
+    error: str | None = None
+
+
+def transcript_ancestor_chain_from_current_leaf(
+    *,
+    transcript_path: str | Path | None,
+    max_scanned_lines: int = DEFAULT_MAX_SCANNED_LINES,
+) -> TranscriptAncestorChainFromCurrentLeaf:
+    """沿 ``parentUuid`` 从当前 leaf（文件里最后一条带 uuid 的条目）回溯，返回整条祖先链。绝不抛。
+
+    与 ``classify_dispatch_trigger_presence`` 同一套扫描（尾部有界）与同一个 leaf 判据，只是把链本身交给
+    调用方：「铸 token 之后 agent 是否复工」要看的是标记之前那段链上发生了什么，而不只是标记在不在链上。
+    没有 uuid 链的 transcript（如 Codex rollout）返回 ``error="no_uuid_ancestor_chain"``。
+    """
+    if not transcript_path:
+        return TranscriptAncestorChainFromCurrentLeaf((), None, error="no_transcript_path")
+    try:
+        path = Path(transcript_path).expanduser()
+    except (OSError, ValueError) as exc:
+        return TranscriptAncestorChainFromCurrentLeaf(
+            (), str(transcript_path), error=f"{type(exc).__name__}: {exc}"
+        )
+    entries, truncated, error = _scan(path, max_scanned_lines=max_scanned_lines)
+    if error is not None or not entries:
+        return TranscriptAncestorChainFromCurrentLeaf(
+            (), str(path), truncated=truncated, error=error or "empty_transcript"
+        )
+    by_uuid: dict[str, dict[str, Any]] = {}
+    leaf_uuid: str | None = None
+    for entry in entries:
+        uuid = entry.get("uuid")
+        if isinstance(uuid, str) and uuid:
+            by_uuid[uuid] = entry
+            leaf_uuid = uuid
+    if leaf_uuid is None:
+        return TranscriptAncestorChainFromCurrentLeaf(
+            (), str(path), truncated=truncated, error="no_uuid_ancestor_chain"
+        )
+    chain_from_leaf: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    cursor: str | None = leaf_uuid
+    # 环形 parentUuid 靠 visited 去重截断（与 ``classify_dispatch_trigger_presence`` 同理）。
+    while isinstance(cursor, str) and cursor and cursor not in visited:
+        visited.add(cursor)
+        entry = by_uuid.get(cursor)
+        if entry is None:
+            break
+        chain_from_leaf.append(entry)
+        parent = entry.get("parentUuid")
+        cursor = parent if isinstance(parent, str) and parent else None
+    return TranscriptAncestorChainFromCurrentLeaf(
+        tuple(reversed(chain_from_leaf)), str(path), truncated=truncated
+    )
+
+
+def entry_is_queued_command_attachment(entry: dict[str, Any]) -> bool:
+    """这条 transcript 条目是不是 Claude Code 的 ``queued_command`` 附件（回合中途并入的排队消息）。"""
+    attachment = entry.get("attachment")
+    return isinstance(attachment, dict) and attachment.get("type") == "queued_command"
+
+
+def entry_text(entry: dict[str, Any]) -> str:
+    """``_entry_text`` 的公开名（承载 prompt 正文的那部分文本；认 ``queued_command`` 附件）。"""
+    return _entry_text(entry)
+
+
+def entry_timestamp_epoch_seconds(entry: dict[str, Any]) -> float | None:
+    """``_entry_timestamp`` 的公开名（条目 ``timestamp`` → epoch 秒；缺失 / 不可解析为 None）。"""
+    return _entry_timestamp(entry)
+
+
 def classify_dispatch_trigger_presence(
     *,
     transcript_path: str | Path | None,

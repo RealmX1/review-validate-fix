@@ -38,6 +38,14 @@ host 身份词汇（守卫 `rg 'HOST_CLAUDE|HOST_CODEX|host_kind' core/ --glob '
   prompt」判定同时驱动再入预算复位、snooze 基线重置、round baseline 前移与 park 资格；
   合成回合的形态逐 host 不同（Claude Code 的后台任务完成通知是一条 ``<task-notification>``
   user message，Codex 的 Stop 续跑根本不触发 UPS），故识别归注入面，core 不写任何 host 字面量。
+- ``agent_turn_identifier_shared_by_hook_events_of_one_turn(hook_event)``——这条 hook 事件
+  属于哪个 agent 回合。同一回合内的 UPS / Stop（含 Stop 续跑、回合中途并入的排队消息）共享它，
+  空闲时新开的回合换新值。决策点「铸 token 之后 agent 是否复工」靠它认出「铸 token 的那个回合
+  又被续跑了」。字段名逐 host 不同（Claude Code ``prompt_id``、Codex ``turn_id``），故归注入面。
+- ``user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(event, prompt_text)``
+  ——整条 UPS prompt 恰好是**一段** host 粘贴包裹时返回包裹里的原文。UPS 只把「整条就是那一行」的
+  带外边界标记认作标记（开发者 prompt 里引用它不算，RVF-001），而 cline-kanban 的终端粘贴到 UPS
+  时已被 host 包过一层（Claude Code 的 ``<pasted_content id=…>``）；包裹形态逐 host 不同，故归注入面。
 
 ## 刻意**不**进 v1 的（避免 dead scaffolding / 提前 S10 工作）
 
@@ -147,6 +155,28 @@ class HostAdapter(Protocol):
         """
         ...
 
+    def agent_turn_identifier_shared_by_hook_events_of_one_turn(
+        self, hook_event: Mapping[str, Any]
+    ) -> str | None:
+        """这条 hook 事件（UPS 或 Stop）所属 agent 回合的标识；本 host 不提供时返回 None。
+
+        契约：同一回合内的全部 hook 事件共享同一个值——包括 Stop ``decision:block`` 之后的续跑 Stop、
+        回合中途并入的排队消息触发的 UPS；空闲时新开的回合必须换新值。只返回满足这条契约且**已取证**的
+        字段，拿不准就返回 None（调用方据此判「agent 复工」，误报会撤回一份本该送达的决策点）。
+        """
+        ...
+
+    def user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        """整条 prompt（忽略首尾空白）恰好是**一段**本 host 的粘贴包裹时，返回包裹里的原文；否则 None。
+
+        包裹之外还有开发者打的字、或一条里有多段粘贴 ⇒ None（那是开发者 prompt，不是一条独立的机器投递）。
+        本 host 不包裹粘贴、或包裹形态未取证 ⇒ 恒 None。误判方向的代价：漏剥只让一条机器投递的标记没被
+        认出（正文改由 Stop 侧对账补发）；多剥则可能把开发者的话当成标记，所以拿不准就返回 None。
+        """
+        ...
+
 
 def _self_check() -> None:
     """runtime_checkable 一致性自检：齐方法的 stub 通过 isinstance、缺方法的不通过。
@@ -179,6 +209,16 @@ def _self_check() -> None:
         ) -> str | None:
             return None
 
+        def agent_turn_identifier_shared_by_hook_events_of_one_turn(
+            self, hook_event: Mapping[str, Any]
+        ) -> str | None:
+            return None
+
+        def user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(
+            self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+        ) -> str | None:
+            return None
+
     class _MissingSkipMode:
         def host_display_name(self) -> str:
             return "Claude Code"
@@ -193,7 +233,7 @@ def _self_check() -> None:
     partial = _MissingSkipMode()
     assert isinstance(conforming, HostAdapter), "齐方法 stub 应满足 HostAdapter Protocol"
     assert not isinstance(partial, HostAdapter), "缺 detect_host_skip_mode 的 stub 不应满足"
-    # 顺带验证注入面的方法名集合就是这 7 个，防止悄悄增删。
+    # 顺带验证注入面的方法名集合就是这 9 个，防止悄悄增删。
     expected = {
         "host_display_name",
         "session_deep_link",
@@ -202,6 +242,8 @@ def _self_check() -> None:
         "parent_transcript_quoted_session_name",
         "stop_hook_agent_directive_channel",
         "host_synthesized_user_prompt_submit_turn_kind",
+        "agent_turn_identifier_shared_by_hook_events_of_one_turn",
+        "user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste",
     }
     actual = {name for name in dir(HostAdapter) if not name.startswith("_")}
     assert actual == expected, f"HostAdapter 注入面漂移：{actual} != {expected}"

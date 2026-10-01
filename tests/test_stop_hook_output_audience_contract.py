@@ -87,6 +87,16 @@ SANCTIONED_AGENT_DRIVING_KEY_CONSTRUCTORS: dict[tuple[str, str], str] = {
     ),
     (
         "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
+        "_apply_void_decision_point_boundary_marker_hard_neutralization",
+    ): (
+        "作废的带外决策点边界标记落地（token 已撤回 / 已决策，或标记到达时判定铸出之后 agent 已复工）："
+        "UPS 的 decision:block = 挡掉这次提交（prompt 抑制，空闲时不白开一个回合、回合中途并入时直接丢弃），"
+        "不是 Stop 的「驱动 agent 再跑一回合」。照 _apply_withdrawn_dispatch_hard_neutralization 三管齐下："
+        "additionalContext 只说「已作废、无需处理、手上有活就继续」，**不含决策正文**，挡不住时 agent 也不会"
+        "对着「未随附即为重复提交」那一行去猜或反问开发者。2026-10-02 取证：Claude Code 对排队消息的 block 生效。"
+    ),
+    (
+        "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_user_prompt_submit.py",
         "_render_hook_payload",
     ): "同上机制的出口端：把硬中和的键与 manual 决策点的 additionalContext 透传到 UPS stdout。",
     (

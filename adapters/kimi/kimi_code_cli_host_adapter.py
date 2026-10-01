@@ -14,6 +14,10 @@
 - ``stop_hook_agent_directive_channel`` → ``hookSpecificOutput.permissionDecision:"deny"``。
 - ``host_synthesized_user_prompt_submit_turn_kind`` → 恒 ``None``：尚无 Kimi 会合成 user 回合并触发
   UserPromptSubmit 的证据（未取证，不是已证否）。
+- ``agent_turn_identifier_shared_by_hook_events_of_one_turn`` → 恒 ``None``：未取证 Kimi hook 事件里
+  有没有「同回合共享、新回合换新」的回合标识字段。
+- ``user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste`` → 恒 ``None``：未取证 Kimi
+  是否把终端粘贴包一层再交给 UPS；按 Protocol 约定拿不准就不剥。
 
 ## 为什么这条通道不能选错（Kimi 与 Codex 的失败形态是相反的）
 
@@ -122,4 +126,16 @@ class KimiCodeCliHostAdapter:
         self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
     ) -> str | None:
         # 没有 Kimi 会合成 user 回合并触发 UserPromptSubmit 的证据；按 Protocol 约定无正向证据即 None。
+        return None
+
+    def agent_turn_identifier_shared_by_hook_events_of_one_turn(
+        self, hook_event: Mapping[str, Any]
+    ) -> str | None:
+        # 未取证 Kimi hook 事件里有没有满足「同回合共享、新回合换新」的字段；无正向证据即 None。
+        return None
+
+    def user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        # 未取证 Kimi 是否包裹终端粘贴；无正向证据即不剥。
         return None

@@ -20,6 +20,11 @@ Codex 的具体语义：
   同一 turn 内的一条 ``<hook_prompt hook_run_id="stop:…">`` user message，**不经过 UPS**。
   ``/goal`` 续跑是 developer 消息、Stop 侧另有 goal-mode 跳过，是否触发 UPS 未取证——拿不到正向
   证据前按 Protocol 的约定返回 None（误判成开发者 prompt 只是退回改动前的行为）。
+- ``agent_turn_identifier_shared_by_hook_events_of_one_turn`` → 事件的 ``turn_id``。取证同上一条：
+  Stop 续跑前后两次 Stop 共享同一个 ``turn_id``。UPS 事件是否带 ``turn_id``、回合中途 steer 进来的
+  消息是否沿用当前 ``turn_id`` **未取证**；不带就返回 None（无证据，不判复工）。
+- ``user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste`` → 恒 ``None``：没有 Codex
+  把终端粘贴包一层再交给 UPS 的证据（未取证，不是已证否）；按 Protocol 约定拿不准就不剥。
 
 装配由 ``host_adapter_resolver.resolve_host_adapter`` 按 ``detect_transcript_format``
 结果完成：本 bundle 或 ``ClaudeCodeHostAdapter`` 二选一注入 core。本 bundle **只认识
@@ -43,6 +48,9 @@ from session_label import (  # noqa: E402 — Codex rollout 首条 user message 
     parent_conversation_fallback_chars,
     single_line_excerpt,
 )
+
+CODEX_HOOK_EVENT_AGENT_TURN_IDENTIFIER_FIELD = "turn_id"
+"""Codex hook 事件里标识「这一回合」的字段（Stop 续跑前后共享，见模块 docstring）。"""
 
 
 class CodexHostAdapter:
@@ -78,6 +86,17 @@ class CodexHostAdapter:
         return STOP_HOOK_AGENT_DIRECTIVE_CHANNEL_BLOCKING_DECISION
 
     def host_synthesized_user_prompt_submit_turn_kind(
+        self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
+    ) -> str | None:
+        return None
+
+    def agent_turn_identifier_shared_by_hook_events_of_one_turn(
+        self, hook_event: Mapping[str, Any]
+    ) -> str | None:
+        value = hook_event.get(CODEX_HOOK_EVENT_AGENT_TURN_IDENTIFIER_FIELD)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def user_prompt_text_inside_host_paste_envelope_when_whole_prompt_is_one_paste(
         self, user_prompt_submit_event: Mapping[str, Any], prompt_text: str
     ) -> str | None:
         return None
