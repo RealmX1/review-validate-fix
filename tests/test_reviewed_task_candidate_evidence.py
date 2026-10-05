@@ -431,6 +431,60 @@ def test_uses_handoff_canonical_issue_count_instead_of_raw_reviewer_issue_count(
     assert evidence["review"]["conclusion"] == "fixes_applied_and_validated"
 
 
+def test_issues_submitted_to_kanban_backlog_count_as_completed_outcomes(tmp_path: Path) -> None:
+    """范围外问题只验证、不修、提交 backlog：它是已完成结论，计入 canonical 总数；计数与标签对不上仍拒绝。"""
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    reviewer_root = run_dir / "artifacts/reviewers"
+    result_path = reviewer_root / "reviewer-a" / "review-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["kind"] = "issues"
+    result["issues"] = [
+        {"path": "tracked.txt", "line": 1, "kind": "REAL", "severity": "medium", "message": "in-round bug"},
+        {"path": "tracked.txt", "line": 2, "kind": "REAL", "severity": "low", "message": "pre-existing bug",
+         "scope_relation": "outside_current_round_scope"},
+    ]
+    result.pop("audit_summary", None)
+    result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+    write_merge_dispositions_and_upsert_fix_issues(
+        tmp_path,
+        repo,
+        run_dir,
+        {
+            "dispositions": [
+                {"reviewer_id": "reviewer-a", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"},
+                {"reviewer_id": "reviewer-a", "index": 2, "disposition": "adopted", "issue_id": "RVF-002"},
+            ]
+        },
+        ["RVF-001", "RVF-002"],
+    )
+    handoff = run_dir / "artifacts/handoff.md"
+    body = (
+        "- handoff_status: COMPLETED\n- review_status: COMPLETED\n\n"
+        "## 本次 review\n\n共 2 条，1 真实修复 / 0 误报 / 1 转 backlog / 0 升级\n\n"
+        "## Issue 处理结果\n\n- **[fixed]** `tracked.txt:1` - in-round\n"
+    )
+    handoff.write_text(body, encoding="utf-8")
+    refused = subprocess.run(
+        [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode != 0
+    assert "does not match completed outcomes" in refused.stderr
+    handoff.write_text(
+        body + "- **[submitted_to_kanban_backlog]** `tracked.txt:2` - pre-existing\n", encoding="utf-8"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(WRITE_CANDIDATE_EVIDENCE), "--repo", str(repo), "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    evidence = json.loads(Path(json.loads(completed.stdout)["candidate_evidence_path"]).read_text())
+    assert evidence["review"]["canonical_issue_count"] == 2
+
+
 def test_integration_delta_evidence_archives_and_binds_the_contracted_parent(
     tmp_path: Path,
 ) -> None:

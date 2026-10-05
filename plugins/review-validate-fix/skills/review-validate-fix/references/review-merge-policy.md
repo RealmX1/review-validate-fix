@@ -51,7 +51,7 @@ harness 的 `health_command` **必须走与 `command` 相同的入口**（同一
 合并前先校验每个 reviewer 的输出：
 
 1. 用 `scripts/check_review_result.py "$RVF_REVIEW_RESULT"` 或等价解析器校验 canonical artifact。stdout/stderr 和 reviewer final prose 只作为 diagnostic，不作为 clean/issues/request 判定来源。
-2. artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、excluded path、clean/issues/request 混合状态时，该 reviewer 标记为 `CONTRACT_VIOLATION`。
+2. artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、clean/issues/request 混合状态时，该 reviewer 标记为 `CONTRACT_VIOLATION`。issue 落在 excluded path **不再**让整条腿作废（护栏而非闸门：那会触发换腿 / 重派，代价远大于一条 issue）：checker 只给 warning 并列出编号（`issue_indices_in_excluded_paths_one_based`），合并时这类 issue 只能 `dropped`（`rvf merge write` 强制）。
 3. 如果 artifact 是 `kind: request`，这不是完成态 review；主会话应满足、驳回、spawn 子任务或提供上下文后重试 reviewer。request 不得进入合并处置（`rvf merge write` 拒绝 request 腿）。
 4. 如果 reviewer 运行期间 `scripts/workspace_snapshot.py compare` 报告状态变化，标记为 `WORKSPACE_CHANGED_DURING_REVIEW`。这只是状态污染信号，不推断 reviewer 的意图，也不要自动 revert；测试缓存、报告、coverage、临时构建产物等可解释副作用不构成 review 契约违规。
 5. `CONTRACT_VIOLATION` 的 artifact 不得进入合格 merge。`WORKSPACE_CHANGED_DURING_REVIEW` 需要主会话先检查污染范围；如果只是可解释测试副作用，仍可保留 reviewer artifact；如果出现未授权源文件、lockfile、snapshot 或文档写入，应 fail-close 或询问用户。
@@ -75,7 +75,7 @@ EOF
 
 - `reviewer_id` / `index`：`rvf wait` 摘要里的腿名与 issue 编号。**index 从 1 起**（工件里记为 `reviewer_issue_index_base: 1`），指向该腿**当前 canonical** `review-result.json` 的 `issues[index-1]`。
 - `disposition`：`adopted`（成为该 fix-issue 的来源）/ `merged_into`（同根因，并入已被 adopted 的那条 fix-issue）/ `dropped`（必须带 `reason_code`）。每条 reviewer issue 恰好一条处置；每个 fix-issue 至少有一条 `adopted` 来源。
-- `reason_code`：`style_or_preference_only`、`generic_refactor_suggestion`、`not_traceable_to_current_diff`（这三类对应规则 6）、`outside_review_scope_protected_background_or_excluded`、`other_with_reason`（必须写 `reason`）。
+- `reason_code`：`style_or_preference_only`、`generic_refactor_suggestion`、`not_traceable_to_current_diff`（证据不足、无法复核；这三类对应规则 6）、`outside_review_scope_protected_background_or_excluded`（落在排除区，或落在其他会话**未提交**的背景 WIP 上）、`other_with_reason`（必须写 `reason`）。
 - `non_reviewer_fix_issue_sources`：主会话自审发现、不来自任何 reviewer 的 fix-issue（`origin: main_agent_self_review`）。reviewer 也报了的同一问题记 reviewer 的 `adopted`，不在这里重复登记（两者互斥）。
 - **只覆盖 canonical 结果，superseded 代际不覆盖**：reviewer 结果不是 append-only——`--redispatch-review-request-legs-only` 会把旧 canonical 轮转进 `superseded-review-result-artifacts/`。处置逐腿记下写入时刻 canonical `review-result.json` 的 sha256；之后 canonical 变了（重派、手改），`rvf merge check` 与 upsert 都以哈希不一致判处置过期，重新 `rvf merge write`。
 - **强制点**：`rvf fix prepare` 与 `rvf_fix_issue.py upsert` 共用的 `upsert_canonical_issue` 在处置缺失、结构不合法、过期或未覆盖该 `issue_id` 时拒绝；candidate evidence writer 在 reviewer 报过 issue 时要求全量 `rvf merge check` 通过（每个处置目标都已 upsert、每个 fix-issue 都有来源），并以处置覆盖的 fix-issue 数核对 handoff 的 canonical 计数。**全部 dropped 时 canonical 计数 0 合法**：走 clean path（handoff 写「共 0 条」），处置照写。
@@ -88,7 +88,8 @@ EOF
 3. 两边报同一根因或同一失败模式：合并为一个 fix-issue——一边 `adopted`、另一边 `merged_into` 同一个 `issue_id`。
 4. 同一文件相邻行、同一测试失败、同一 API contract 或同一状态机不变量导致的问题：优先分组为一个 fix-issue（其余条目 `merged_into` 它），并在描述里列出涉及的 path/line。
 5. 表面相似但修复方向不同的问题不要强行合并；各自 `adopted` 成不同的 fix-issue。
-6. 只保留 bug、回归、遗漏边界、安全问题、错误假设、未完成实现和死代码；风格偏好、泛泛重构建议和无法追溯到当前 diff 的问题一律 `dropped` 并选对应 `reason_code`。
+6. 只保留 bug、回归、遗漏边界、安全问题、错误假设、未完成实现和死代码；风格偏好、泛泛重构建议和证据不足无法复核的问题一律 `dropped` 并选对应 `reason_code`。
+7. **与本轮工作不紧密相关、但真实存在的问题不要丢弃**：reviewer 标了 `[范围外]`（`scope_relation: outside_current_round_scope`）、或你判断它与本轮改动无直接连带时，照常 `adopted` / `merged_into` 成 fix-issue。`rvf fix prepare` 按来源 reviewer 的标注把它预填为 `fix_issue_handling_mode: validate_only_then_submit_to_kanban_backlog`：validator 只验证、不修，属实即提交 Kanban backlog 作为新 task。你的判断与 reviewer 标注不一致时，在 canonical issue JSON 里显式写 `fix_issue_handling_mode` 与 `handling_mode_override_reason`。主会话自审发现的范围外问题同样登记为 `non_reviewer_fix_issue_sources` 并显式写 validate-only 模式。
 
 ## Request Handling
 

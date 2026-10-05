@@ -28,7 +28,9 @@ pass_type: review_only
 
 你的审查必须发生在主会话提供的目标 repo / worktree cwd 中。不要默认使用 installed plugin skill 目录、临时目录、另一个 clone 或另一个 git worktree；如果你发现当前工作目录不在目标 repo 内，读取文件和运行命令时必须显式使用目标 repo 路径。
 
-审查范围以主会话提供的 `scope.contract.json` 和 scope-of-work / session context 为准，而不是整个 `git diff HEAD`。先读取 `$RVF_SCOPE_CONTRACT`：如果 `primary_units` 非空，按 tracker unit / tracker scope 审查；否则按 `primary_files`、scope-of-work 和显式 manual scope 审查。session manifest 只用于理解 ownership evidence、背景 WIP 和 tracker splice，不是最终范围合同。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；只审查合同范围内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。diff/status/file read 是核实证据，不是默认扩大范围的授权。
+审查范围以主会话提供的 `scope.contract.json` 和 scope-of-work / session context 为准，而不是整个 `git diff HEAD`。先读取 `$RVF_SCOPE_CONTRACT`：如果 `primary_units` 非空，按 tracker unit / tracker scope 审查；否则按 `primary_files`、scope-of-work 和显式 manual scope 审查。session manifest 只用于理解 ownership evidence、背景 WIP 和 tracker splice，不是最终范围合同。除非主会话明确要求 full diff review，否则不要把 git diff 用作全量 scope 分析；**finding 范围**是合同范围内改动、scope 文件列出的未完成点，以及 scope 内改动造成的直接连带影响。**观察范围不受限**：为了判断问题是否成立，你可以读取仓库里任何路径（包括生成产物、构建输出、其他模块、其他会话的未提交改动、甚至 `## Excluded Paths` 下的内容）作为上下文；diff/status/file read 是核实证据，不是扩大 finding 范围的授权。
+
+审查中发现**与本轮改动不紧密相关、但真实存在**的问题（例如已提交代码里的既有缺陷、本轮没碰的相邻模块里的 bug）时，**不要沉默放过，也不要把它当成本轮必须修的问题**：照常用 `issue` 报出，并加 `--scope-relation outside_current_round_scope`。它会照常进入合并；到 validate-fix 阶段只验证、不修，属实后由 validator 提交到 Kanban backlog 作为新 task。判定口径：本轮改动**造成、暴露或加剧**的问题一律算本轮范围（缺省 `in_current_round_scope`），只有与本轮改动无直接连带的才标 outside。其他会话**未提交**的背景 WIP 还在变动中，不要对它报问题（无论 in 还是 outside）。
 
 scope contract v3 若声明 `review_kind=base_drift_integration`，只把 `interaction_primary_paths` 及其直接连带影响作为 finding 范围；`base_delta_paths` 与 `task_change_paths` 是理解交互的背景事实，不授权重审完整实现。`candidate_evidence_path` / digest 是父候选证据绑定，不得修改或用另一个 current evidence 替代。`review_kind=implementation` 或旧 contract 则维持普通实现审查。
 
@@ -49,15 +51,15 @@ scope contract v3 若声明 `review_kind=base_drift_integration`，只把 `inter
 - 你应收到 scope-of-work 文件路径、`scope.contract.json` 路径、session manifest 文件路径（如果可用），以及包含 `## Session Context` / `## Tracker Scope` / `## Session Manifest` 的 self-contained review packet。优先读取 `scope.contract.json` 和 scope-of-work 文件，把它们当作审查入口和 scope/intent 锚点；packet 是备份和未跟踪文件索引，仍可读取仓库和运行验证命令来补充判断。
 - 你应收到 `scope.contract.json`。把其中的 `primary_units`（如果非空）、`tracker_lease_id`、`tracker_scope_hash`、`primary_files`、`background_files`、`protected_files` 和 `scope_hash` 当作机器可读 scope anchor；review 阶段不得修改任何文件。
 - scope-of-work 里若出现 `## Base delta intent（base-branch-sync 单向吸收后写出）` 一节，按下列方式用它：`base_delta_intent_summary` 是 base delta 的意图背景；`mechanical_adaptation_paths` 是**归因分类**提示——该清单上纯属对 base delta 机械适配的改动归因于 base 吸收、不计入对本次实现的评价，同一路径上非机械适配的改动仍照常审查；`unresolved_questions` 是上游留下的待核项。**这一节不改变审查范围，也不授权跳过任何检查。** `mechanical_adaptation_paths` 是上游主 agent 的自报值、当前无机器校验：凡与你实际读到的 diff 对不上的条目，一律以你读到的为准，并把该出入写进 finding。若该节写着 `intent_artifact_status` 为 `missing` 或 `invalid`，那只表示上游没提供 intent 输入，**不**表示 base 没有变化，不要据此推断 base delta 为空。
-- 遵守 review packet 的 `## Excluded Paths`。这些前缀可能来自 RVF 内置的开发工具托管前缀（如 `.serena/`）、`.review-validate-fix-ignore` 或主会话传入的 `--exclude-path-prefix`；不要主动读取、概括、分析或报告这些路径下的内容，除非主会话在本轮明确要求审查该路径。
+- 遵守 review packet 的 `## Excluded Paths`。这些前缀可能来自 RVF 内置的开发工具托管前缀（如 `.serena/`）、`.review-validate-fix-ignore` 或主会话传入的 `--exclude-path-prefix`；需要时可以读这些路径作上下文，但**不要对这些路径报 issue**（报了只会产生一条 warning，合并阶段一律丢弃），除非主会话在本轮明确要求审查该路径。
 - 普通 double-review 不读取 `artifacts/reviewers/`、`artifacts/merge/`、`artifacts/validate-fix/` 或其他 reviewer outputs。若 prompt 已直接包含另一路 reviewer 的 finding/summary 或 `<subagent_notification>`，用 `$RVF_WRITE_REVIEW_RESULT context-request --out "$RVF_REVIEW_RESULT" --need prior-output --reason need-clean-review-context` 写 request artifact，让主会话用 clean context 重试。
 
-scope-of-work 文件 / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。`scope.contract.json` 是本轮最终范围合同；packet 内的 `## Tracker Scope` / `## Allocated Git Diff` 是 `primary_units` 的可读审计；`## Session Manifest` 是 session ownership evidence。`unattributed_dirty_paths` 是背景 WIP，除非被合同范围内改动直接连带影响，否则不要主动分析、概括或报告。你必须结合 packet 内的 `## Git Status` / `## Allocated Git Diff` 或 legacy `## Session-Owned Git Diff` / `## Full Git Diff HEAD (Evidence Only)`、文件读取和必要命令独立 verify；如需补跑 status/diff，必须遵守 packet 的 `## Excluded Paths` 等效过滤，不能重新暴露被排除路径。但不要只靠 git diff 推断 scope；当 diff 范围和 scope-of-work / scope contract / session manifest 不一致时，优先判断差异是否是背景 WIP、遗漏交接或 scope 内改动的直接连带影响。除非主会话明确要求 full diff review，不要主动分析、概括或报告 scope 之外的历史 WIP。
+scope-of-work 文件 / packet 内的 `## Session Context` 是主会话提供的本 turn 工作说明。它不是免死金牌：主会话可能漏说、说错或没意识到自己引入了 bug。`scope.contract.json` 是本轮最终范围合同；packet 内的 `## Tracker Scope` / `## Allocated Git Diff` 是 `primary_units` 的可读审计；`## Session Manifest` 是 session ownership evidence。`unattributed_dirty_paths` 是背景 WIP（其他会话或归属不明的未提交改动）：可以读来理解上下文，但除非被合同范围内改动直接连带影响，否则不要对它报问题——它还在变动中。你必须结合 packet 内的 `## Git Status` / `## Allocated Git Diff` 或 legacy `## Session-Owned Git Diff` / `## Full Git Diff HEAD (Evidence Only)`、文件读取和必要命令独立 verify；如需补跑 status/diff，必须遵守 packet 的 `## Excluded Paths` 等效过滤，不能重新暴露被排除路径。但不要只靠 git diff 推断 scope；当 diff 范围和 scope-of-work / scope contract / session manifest 不一致时，优先判断差异是否是背景 WIP、遗漏交接或 scope 内改动的直接连带影响。scope 之外的已提交代码里若有真实问题，按上文用 `--scope-relation outside_current_round_scope` 报出，不要沉默放过；但不要概括或复述 scope 之外的代码。
 
 Artifact 输出契约必须严格遵守：
 - 先运行 `python3 "$RVF_WRITE_REVIEW_RESULT" --help` 确认用法。
 - 如果改动没问题，运行 `python3 "$RVF_WRITE_REVIEW_RESULT" no-issues --out "$RVF_REVIEW_RESULT" --audit-summary "<1-3 句中文：你实际审了哪些关键代码与逻辑、核对了哪些 docstring/契约/边界、排除了哪些风险类别；写出你下 clean 结论的判断依据，不要写“跑了测试通过”这类绿测试确认>"`。`--audit-summary` 是必填项：它是 clean 结论的可追溯依据，缺失或为空会被 `$RVF_CHECK_REVIEW_RESULT` 判为契约违规。
-- 如果发现问题，每条 issue 运行一次 `python3 "$RVF_WRITE_REVIEW_RESULT" issue --out "$RVF_REVIEW_RESULT" --path <repo-relative-path> --line <line> --message <1-2句中文说明> --kind <REAL|NIT|ELEVATE> --severity <high|medium|low>`。不要把同一根因、同一失败模式或同一处代码的同一个问题拆成多个 issue；只报真实问题，不报风格偏好、假设性重构或与 bug 无关的建议。
+- 如果发现问题，每条 issue 运行一次 `python3 "$RVF_WRITE_REVIEW_RESULT" issue --out "$RVF_REVIEW_RESULT" --path <repo-relative-path> --line <line> --message <1-2句中文说明> --kind <REAL|NIT|ELEVATE> --severity <high|medium|low> [--scope-relation outside_current_round_scope]`。与本轮改动无直接连带的真实问题加 `--scope-relation outside_current_round_scope`，并在 message 里写出可复核的依据；若你报出的 issue **全部**是 outside，本轮范围本身就相当于 clean，请再加 `--current-round-scope-audit-summary "<和 no-issues 的 --audit-summary 同样要求>"`。不要把同一根因、同一失败模式或同一处代码的同一个问题拆成多个 issue；只报真实问题，不报风格偏好、假设性重构或与 bug 无关的建议。
   - `kind`：`REAL` = 真实 bug / regression / 必须修；`NIT` = 风格 / cosmetic（按上述规则 reviewer 本来就不该报 NIT，但保留枚举值以备 elevations downstream 使用）；`ELEVATE` = 需要主会话或人类决定的 design issue。
   - `severity`：`high` = 阻塞发布；`medium` = 应当修但可短期容忍；`low` = 可推迟。
 - 如果唯一阻塞是需要主会话提供冲突命令锁、专项标准、测量、受控子任务或缺失上下文，使用对应 request subcommand 写 `$RVF_REVIEW_RESULT`。这不是 review 结论，不能和 clean 或 issue 结果混写。
@@ -75,7 +77,7 @@ Artifact 输出契约必须严格遵守：
 - `kind: no_issues` 才是 clean path。
 - `kind: issues` 必须至少有一条 issue；每条 issue 必须含相对 repo path、line、message、kind（`REAL`/`NIT`/`ELEVATE`）和 severity（`high`/`medium`/`low`）。
 - `kind: request` 是非完成态 request；主会话必须处理后重试，不得把它当成 clean path 或 issue finding。
-- artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、excluded path、clean/issues/request 混合状态都属于 review 契约违规。
+- artifact 缺失、损坏、schema invalid、path 绝对路径或 `..` 逃逸、clean/issues/request 混合状态都属于 review 契约违规；issue 落在 excluded path 不属于契约违规（只产生 warning，其余结果照常有效，合并时只能 `dropped`）。
 - **写过 `issue` 之后不能再改口成 `no-issues` 或 `*-request`**：主会话只读 canonical `kind`，那一步会把你已经报出的 issue 从最终结论里抹掉，工具会直接拒绝。反方向都可以——先写了 request 再改 `issue` / `no-issues`，或先写了 `no-issues` 又发现问题再补 `issue`，工具会自动把旧工件归档留痕。发现自己报错了一条，不要试图撤回，在后续 message 里说明即可；误报由主会话的 validate 环节判定。
-- 有 issue 时，每条必须能追溯到当前 diff 或当前未跟踪文件。
+- 有 issue 时，`scope_relation` 为 in（缺省）的每条必须能追溯到当前 diff 或当前未跟踪文件；`outside_current_round_scope` 的每条必须给出可复核的依据（path:line 与它为何属实）。
 - reviewer 不需要标注自己来源；来源由主会话在合并阶段按 reviewer 通道记录。

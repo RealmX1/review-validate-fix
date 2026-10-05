@@ -4,7 +4,7 @@
 
 ## 审查目标
 
-只报告当前 scope 内的真实问题：
+报告真实问题。本轮 scope 内的问题照常报；与本轮改动无直接连带、但真实存在的问题，用 `--scope-relation outside_current_round_scope` 报出（照常合并，validate-fix 阶段只验证不修、属实即转 Kanban backlog），不要沉默放过：
 
 - correctness bug。
 - 回归。
@@ -22,7 +22,12 @@
 - 泛泛重构建议。
 - 没有证据的性能优化。
 - 完整 security hardening plan。
-- 与本轮 scope 无关的历史 WIP。
+- 其他会话**未提交**的背景 WIP（还在变动中）。
+- `## Excluded Paths` 下的内容（可读作上下文，但不报）。
+
+## 观察范围
+
+为判断问题是否成立，可以读取仓库里任何路径（生成产物、构建输出、其他模块等）作为上下文。观察范围不等于 finding 范围：finding 仍以 scope contract 与直接连带影响为准，范围外的真实问题标 `outside_current_round_scope`。
 
 ## Standards 子集
 
@@ -37,7 +42,7 @@
 完成态只能是：
 
 - `kind: no_issues`。
-- `kind: issues`，每条含 `path`、`line`、`message`、`kind`（`REAL`/`NIT`/`ELEVATE`）、`severity`（`high`/`medium`/`low`）。
+- `kind: issues`，每条含 `path`、`line`、`message`、`kind`（`REAL`/`NIT`/`ELEVATE`）、`severity`（`high`/`medium`/`low`），可选 `scope_relation`（缺省 `in_current_round_scope`，范围外问题为 `outside_current_round_scope`）。
 
 非完成态只能是 `protocol-extensions.md` 中的 `kind: request` artifact。request 不得和完成态混写。最终自然语言 message 只作为日志，不是机器可读 review 状态。
 

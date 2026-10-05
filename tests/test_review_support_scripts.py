@@ -2403,14 +2403,18 @@ def test_review_result_artifact_requests_and_scope_exclusions(tmp_path: Path) ->
         ],
         env=env,
     )
-    invalid = subprocess.run(
+    # 护栏而非闸门：排除区里的 issue 不再让整条腿作废，只记 warning，合并时只能 dropped。
+    warned = subprocess.run(
         [sys.executable, str(CHECK_REVIEW_RESULT), str(excluded), "--scope-contract", str(contract), "--json"],
         capture_output=True,
         text=True,
         check=False,
     )
-    assert invalid.returncode != 0
-    assert "excluded" in invalid.stdout
+    assert warned.returncode == 0
+    warned_payload = json.loads(warned.stdout)
+    assert warned_payload["valid"] is True
+    assert warned_payload["issue_indices_in_excluded_paths_one_based"] == [1]
+    assert any("excluded" in warning for warning in warned_payload["warnings"])
 
 
 def test_review_result_artifact_rejects_malformed_and_mixed_state(tmp_path: Path) -> None:
@@ -8804,6 +8808,12 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
     )
     cli.run_scope_exclude(token=tok, paths=["b.py"], reason="reformat", roots=roots, now=t0)
     cli.run_scope_include(token=tok, paths=["c.py"], reason="遗漏", roots=roots, now=t0)
+    # 模拟 prepare 把 c.py 归进 background（Bash mv 产生、transcript 里无 Write/Edit），
+    # 并把 b.py 放进 allowlist：定稿后 include 必须出 background（但不进 allowlist），exclude 必须出 allowlist。
+    stub_contract_path = tmp / "runs" / "run-1" / "artifacts" / "inputs" / "scope.contract.json"
+    stub_contract = json.loads(stub_contract_path.read_text(encoding="utf-8"))
+    stub_contract.update({"fix_allowlist": ["a.py", "b.py"], "background_files": ["c.py", "d.py"], "protected_files": ["c.py", "d.py"]})
+    stub_contract_path.write_text(json.dumps(stub_contract), encoding="utf-8")
 
     # ① dispatcher 失败：dispatch_failed、token 仍 acknowledged。
     def _failing_dispatcher(**kw):
@@ -8837,8 +8847,12 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
     assert contract["primary_files"] == ["a.py", "c.py"]
     assert "b.py" in contract["excluded_path_prefixes"]
     assert contract["scope_hash"] != "stub-old-hash"
-    # include 不进正式审查（fix_allowlist 不变），但 primary ∩ protected = ∅。
-    assert contract["fix_allowlist"] == ["a.py", "b.py"]
+    # include 的 c.py 移出 background/protected 但不进 fix_allowlist（正式审查只经 scope claim）；
+    # exclude 的 b.py 移出 fix_allowlist（否则 fixer 改它不算外扩）。primary ∩ protected = ∅。
+    assert contract["fix_allowlist"] == ["a.py"]
+    assert contract["background_files"] == ["d.py"] and contract["protected_files"] == ["d.py"]
+    assert contract["canonical_scope"]["fix_allowlist"] == ["a.py"]
+    assert contract["canonical_scope"]["background_files"] == ["d.py"]
     assert not set(contract["primary_files"]) & set(contract["protected_files"])
     # 回执报「正式审查覆盖 X/Y」，不再报 primary_files N。
     assert "正式审查覆盖 1/1 个候选路径" in ok.message and "primary_files" not in ok.message
@@ -13241,6 +13255,18 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "rvf_shortcut_results_summary_reads_canonical_legs_only",
             lambda: test_rvf_shortcut_results_summary_reads_canonical_legs_only(root / "rvf-shortcut-results"),
+        ),
+        (
+            "rvf_results_summary_marks_outside_scope_and_excluded_path_issues_without_invalidating_the_leg",
+            lambda: test_rvf_results_summary_marks_outside_scope_and_excluded_path_issues_without_invalidating_the_leg(
+                root / "rvf-results-outside-scope"
+            ),
+        ),
+        (
+            "rvf_backlog_submit_forwards_to_submission_script_and_renders_handoff_section",
+            lambda: test_rvf_backlog_submit_forwards_to_submission_script_and_renders_handoff_section(
+                root / "rvf-backlog-submit"
+            ),
         ),
         (
             "rvf_shortcut_wait_mode_and_default_duration_by_host",

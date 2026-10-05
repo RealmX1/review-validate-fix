@@ -2297,7 +2297,7 @@ def _run_scope_exception(
         # include 原先的回执让 agent 以为「补好了」，实际被补路径仍不在 fix_allowlist、仍在 protected（08ac4：11 次全中）。
         message += (
             " 注意：include 只把路径并进 primary_files（reviewer 提示与 land 的 stage 边界），**不进**正式审查"
-            f"（primary_units / fix_allowlist），fixer 也不能改它。本会话写的文件请改用 `{_rvf()} scope claim`。"
+            f"（primary_units / fix_allowlist），fixer 改它只能按 allowlist 外扩声明理由。本会话写的文件请改用 `{_rvf()} scope claim`。"
         )
     if newly_filed:
         message += f" 已跨阈值 {latest_issue.get('threshold')} 自动立本地 scope-issue。"
@@ -2580,7 +2580,11 @@ def finalize_scope_contract(overlay: Mapping[str, Any]) -> dict[str, Any]:
     ``primary_files`` = contract 原有的（prepare 按 tracker scope 定的，或 ``scope claim`` 改写过的）− 排除 ∪ include。
     原先直接改写成候选全集，于是候选里没进正式审查的路径同时出现在 primary 与 protected 两边，dispatch 回执的
     「primary_files N」也因此高估覆盖（08ac4：79 个路径同时在两边）。现在 include 进来的路径同时移出
-    protected / background，维持 ``primary ∩ protected = ∅``。"""
+    protected / background，维持 ``primary ∩ protected = ∅``。
+
+    ``fix_allowlist`` 是「正式审查覆盖」（与 tracker ``primary_units`` 同源，覆盖率 X/Y 与 dispatch 覆盖闸都按它算），
+    所以 include **不**并进它——要进正式审查走 ``scope claim``（它同时重分配 lease）；exclude 掉的路径则移出它，
+    否则 fixer 改它不算外扩、不会触发告警-确认。顶层字段与 ``canonical_scope`` 两处都写——fix stop 先读顶层。"""
     artifacts = overlay.get("prepare_artifacts")
     contract_path_raw = artifacts.get("scope_contract") if isinstance(artifacts, Mapping) else None
     if not isinstance(contract_path_raw, str) or not contract_path_raw:
@@ -2611,10 +2615,15 @@ def finalize_scope_contract(overlay: Mapping[str, Any]) -> dict[str, Any]:
 
     import prepare_review_run  # noqa: PLC0415 - 复用 canonical 序列化 + 版本
 
+    def _excluded_by_scope_adjustment(path: str) -> bool:
+        return any(path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in merged_excluded)
+
     background_files = [str(p) for p in (contract.get("background_files") or []) if str(p) not in effective_primary_set]
     protected_files = [str(p) for p in (contract.get("protected_files") or []) if str(p) not in effective_primary_set]
     canonical_issues = contract.get("canonical_issues") or []
-    fix_allowlist = [str(p) for p in (contract.get("fix_allowlist") or [])]
+    fix_allowlist = [
+        str(path) for path in (contract.get("fix_allowlist") or []) if not _excluded_by_scope_adjustment(str(path))
+    ]
     version = contract.get("version", prepare_review_run.SCOPE_CONTRACT_VERSION)
     prior_canonical_scope = contract.get("canonical_scope")
     canonical_scope = dict(prior_canonical_scope) if isinstance(prior_canonical_scope, Mapping) else {}
@@ -2634,6 +2643,7 @@ def finalize_scope_contract(overlay: Mapping[str, Any]) -> dict[str, Any]:
     contract["background_files"] = background_files
     contract["protected_files"] = protected_files
     contract["excluded_path_prefixes"] = merged_excluded
+    contract["fix_allowlist"] = fix_allowlist
     contract["scope_hash"] = new_hash
     contract["canonical_scope"] = canonical_scope
     _atomic_write_json(contract_path, contract)
@@ -2642,6 +2652,7 @@ def finalize_scope_contract(overlay: Mapping[str, Any]) -> dict[str, Any]:
         "scope_contract_path": str(contract_path),
         "primary_files": effective_primary_files,
         "excluded_path_prefixes": merged_excluded,
+        "fix_allowlist": fix_allowlist,
         "scope_hash": new_hash,
     }
 

@@ -412,6 +412,71 @@ def test_main_agent_self_review_finding_is_a_non_reviewer_source(tmp_path: Path)
     assert any("RVF-ORPHAN has no adopted reviewer source" in error for error in orphan.errors), orphan.errors
 
 
+def test_excluded_path_reviewer_issue_can_only_be_dropped(tmp_path: Path) -> None:
+    """Contract Gate 把排除区 issue 从「整腿作废」放宽成 warning 后，合并是唯一收口点：只能 dropped。"""
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["excluded_path_prefixes"] = ["vendor"]
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    vendor_issue = {"path": "vendor/lib.py", "line": 3, "kind": "REAL", "severity": "low", "message": "vendored bug"}
+    _set_reviewer_results(run_dir, {"reviewer-a": [vendor_issue], "reviewer-b": []})
+    adopted = _write_dispositions(
+        run_dir,
+        {"dispositions": [{"reviewer_id": "reviewer-a", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"}]},
+    )
+    assert adopted.returncode != 0
+    assert "excluded path prefix" in (adopted.stderr + adopted.stdout)
+    dropped = _write_dispositions(
+        run_dir,
+        {"dispositions": [{"reviewer_id": "reviewer-a", "index": 1, "disposition": "dropped",
+                           "reason_code": "outside_review_scope_protected_background_or_excluded"}]},
+    )
+    assert dropped.returncode == 0, dropped.stderr
+
+
+def test_outside_scope_reviewer_issue_prefills_validate_only_handling_mode_and_override_needs_reason(
+    tmp_path: Path,
+) -> None:
+    """范围外问题照常被采纳；upsert 按来源 reviewer 的 scope_relation 预填只验证模式，主会话改写须写理由。"""
+    repo = repository(tmp_path / "repo")
+    run_dir = create_completed_run(tmp_path, repo)
+    outside = {**_reviewer_issue("pre-existing bug", 2), "scope_relation": "outside_current_round_scope"}
+    _set_reviewer_results(run_dir, {"reviewer-a": [_reviewer_issue("in-round bug"), outside], "reviewer-b": []})
+    written = _write_dispositions(
+        run_dir,
+        {"dispositions": [
+            {"reviewer_id": "reviewer-a", "index": 1, "disposition": "adopted", "issue_id": "RVF-001"},
+            {"reviewer_id": "reviewer-a", "index": 2, "disposition": "adopted", "issue_id": "RVF-002"},
+        ]},
+    )
+    assert written.returncode == 0, written.stderr
+    assert _upsert(tmp_path, repo, run_dir, _canonical_issue_file(tmp_path, "RVF-001")).returncode == 0
+    assert _upsert(tmp_path, repo, run_dir, _canonical_issue_file(tmp_path, "RVF-002")).returncode == 0
+    mirrors = run_dir / "artifacts" / "fix-issues"
+    assert json.loads((mirrors / "RVF-001.json").read_text())["fix_issue_handling_mode"] == "validate_then_fix"
+    assert (
+        json.loads((mirrors / "RVF-002.json").read_text())["fix_issue_handling_mode"]
+        == "validate_only_then_submit_to_kanban_backlog"
+    )
+    overridden = _upsert(
+        tmp_path, repo, run_dir,
+        _canonical_issue_file(tmp_path, "RVF-002", fix_issue_handling_mode="validate_then_fix"),
+    )
+    assert overridden.returncode != 0
+    assert "handling_mode_override_reason" in overridden.stderr
+    justified = _upsert(
+        tmp_path, repo, run_dir,
+        _canonical_issue_file(
+            tmp_path, "RVF-002", fix_issue_handling_mode="validate_then_fix",
+            handling_mode_override_reason="其实是本轮改名暴露的回归",
+        ),
+    )
+    assert justified.returncode == 0, justified.stderr
+    assert json.loads((mirrors / "RVF-002.json").read_text())["fix_issue_handling_mode"] == "validate_then_fix"
+
+
 def test_upsert_refuses_run_id_that_differs_from_the_run_directory_whose_dispositions_were_checked(tmp_path: Path) -> None:
     """处置按 run_dir 校验放行：payload 的 run_id 或 --run-id 覆盖指向别的 run 时必须拒绝，
     否则记录落进另一个 run 的 ledger、当前 run 的因果与最终状态缺失。"""

@@ -1507,7 +1507,7 @@ CREATE TABLE IF NOT EXISTS rvf_issues (
   payload       TEXT NOT NULL,
   source_refs   TEXT NOT NULL,
   artifact_path TEXT,
-  state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+  state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded','submitted_to_kanban_backlog')),
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
   UNIQUE(run_id, issue_id)
@@ -1525,7 +1525,7 @@ CREATE TABLE IF NOT EXISTS rvf_fix_attempts (
   baseline_overlay_path  TEXT,
   baseline_commit        TEXT,
   fix_patch_path         TEXT,
-  status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+  status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict','validated_and_submitted_to_kanban_backlog')),
   result_payload         TEXT NOT NULL DEFAULT '{}',
   created_at             TEXT NOT NULL,
   updated_at             TEXT NOT NULL,
@@ -1883,7 +1883,7 @@ def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
           payload       TEXT NOT NULL,
           source_refs   TEXT NOT NULL,
           artifact_path TEXT,
-          state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded')),
+          state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded','submitted_to_kanban_backlog')),
           created_at    TEXT NOT NULL,
           updated_at    TEXT NOT NULL,
           UNIQUE(run_id, issue_id)
@@ -1901,7 +1901,7 @@ def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
           baseline_overlay_path  TEXT,
           baseline_commit        TEXT,
           fix_patch_path         TEXT,
-          status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict')),
+          status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict','validated_and_submitted_to_kanban_backlog')),
           result_payload         TEXT NOT NULL DEFAULT '{}',
           created_at             TEXT NOT NULL,
           updated_at             TEXT NOT NULL,
@@ -1944,6 +1944,106 @@ def _ensure_rvf_causality_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _rebuild_rvf_causality_tables_admitting_kanban_backlog_states(conn)
+
+
+RVF_ISSUE_STATE_SUBMITTED_TO_KANBAN_BACKLOG = "submitted_to_kanban_backlog"
+RVF_ATTEMPT_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG = "validated_and_submitted_to_kanban_backlog"
+
+
+def _rebuild_rvf_causality_tables_admitting_kanban_backlog_states(conn: sqlite3.Connection) -> bool:
+    """给既有库的 ``rvf_issues.state`` / ``rvf_fix_attempts.status`` CHECK 约束补上 Kanban backlog 两个取值。
+
+    范围外问题「只验证、不修、提交 backlog」要落成机器事实：issue 终态 ``submitted_to_kanban_backlog``、
+    attempt 终态 ``validated_and_submitted_to_kanban_backlog``。SQLite 改 CHECK 只能重建表；按建表 SQL
+    里有没有新取值自愈判断（与 ``_rebuild_units_without_legacy_tombstoned_review_state`` 同一模式），
+    重建期间关外键，否则 DROP 会级联删掉 patch 事件与因果链接。"""
+    issues_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='rvf_issues'"
+    ).fetchone()
+    attempts_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='rvf_fix_attempts'"
+    ).fetchone()
+    issues_sql = issues_sql_row["sql"] if issues_sql_row else ""
+    attempts_sql = attempts_sql_row["sql"] if attempts_sql_row else ""
+    issues_need_rebuild = bool(issues_sql) and f"'{RVF_ISSUE_STATE_SUBMITTED_TO_KANBAN_BACKLOG}'" not in issues_sql
+    attempts_need_rebuild = bool(attempts_sql) and (
+        f"'{RVF_ATTEMPT_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG}'" not in attempts_sql
+    )
+    if not issues_need_rebuild and not attempts_need_rebuild:
+        return False
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        script = ["BEGIN IMMEDIATE;"]
+        if issues_need_rebuild:
+            script.append(
+                """
+                CREATE TABLE rvf_issues_admitting_kanban_backlog_state (
+                  issue_key     TEXT PRIMARY KEY,
+                  repo_key      TEXT NOT NULL,
+                  run_id        TEXT NOT NULL,
+                  issue_id      TEXT NOT NULL,
+                  payload       TEXT NOT NULL,
+                  source_refs   TEXT NOT NULL,
+                  artifact_path TEXT,
+                  state         TEXT NOT NULL CHECK (state IN ('open','fixed','false_positive','elevated','failed','superseded','submitted_to_kanban_backlog')),
+                  created_at    TEXT NOT NULL,
+                  updated_at    TEXT NOT NULL,
+                  UNIQUE(run_id, issue_id)
+                );
+                INSERT INTO rvf_issues_admitting_kanban_backlog_state
+                  SELECT issue_key, repo_key, run_id, issue_id, payload, source_refs,
+                         artifact_path, state, created_at, updated_at
+                  FROM rvf_issues;
+                DROP TABLE rvf_issues;
+                ALTER TABLE rvf_issues_admitting_kanban_backlog_state RENAME TO rvf_issues;
+                CREATE INDEX IF NOT EXISTS idx_rvf_issues_run ON rvf_issues(run_id);
+                """
+            )
+        if attempts_need_rebuild:
+            script.append(
+                """
+                CREATE TABLE rvf_fix_attempts_admitting_kanban_backlog_status (
+                  attempt_id             TEXT PRIMARY KEY,
+                  issue_key              TEXT NOT NULL,
+                  repo_key               TEXT NOT NULL,
+                  run_id                 TEXT NOT NULL,
+                  issue_id               TEXT NOT NULL,
+                  worktree_path          TEXT NOT NULL,
+                  base_head              TEXT,
+                  baseline_overlay_path  TEXT,
+                  baseline_commit        TEXT,
+                  fix_patch_path         TEXT,
+                  status                 TEXT NOT NULL CHECK (status IN ('prepared','started','fixed','false_positive','elevated','failed','applied','merge_conflict','validated_and_submitted_to_kanban_backlog')),
+                  result_payload         TEXT NOT NULL DEFAULT '{}',
+                  created_at             TEXT NOT NULL,
+                  updated_at             TEXT NOT NULL,
+                  started_at             TEXT,
+                  stopped_at             TEXT,
+                  applied_at             TEXT,
+                  FOREIGN KEY(issue_key) REFERENCES rvf_issues(issue_key) ON DELETE CASCADE
+                );
+                INSERT INTO rvf_fix_attempts_admitting_kanban_backlog_status
+                  SELECT attempt_id, issue_key, repo_key, run_id, issue_id, worktree_path,
+                         base_head, baseline_overlay_path, baseline_commit, fix_patch_path,
+                         status, result_payload, created_at, updated_at, started_at, stopped_at, applied_at
+                  FROM rvf_fix_attempts;
+                DROP TABLE rvf_fix_attempts;
+                ALTER TABLE rvf_fix_attempts_admitting_kanban_backlog_status RENAME TO rvf_fix_attempts;
+                CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_run ON rvf_fix_attempts(run_id);
+                CREATE INDEX IF NOT EXISTS idx_rvf_fix_attempts_issue ON rvf_fix_attempts(issue_key);
+                """
+            )
+        script.append("COMMIT;")
+        conn.executescript("\n".join(script))
+    finally:
+        if foreign_keys:
+            conn.execute("PRAGMA foreign_keys = ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"tracker rvf causality migration left foreign key violations: {violations!r}")
+    return True
 
 
 def _migrate_schema_v3_to_v4(conn: sqlite3.Connection) -> None:
@@ -6790,6 +6890,16 @@ RVF_ATTEMPT_STATUSES = {
     "failed",
     "applied",
     "merge_conflict",
+    RVF_ATTEMPT_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG,
+}
+RVF_ISSUE_STATES = {
+    "open",
+    "fixed",
+    "false_positive",
+    "elevated",
+    "failed",
+    "superseded",
+    RVF_ISSUE_STATE_SUBMITTED_TO_KANBAN_BACKLOG,
 }
 
 
@@ -6832,7 +6942,7 @@ def rvf_issue_upsert(
 
     来源只由合并处置派生（``rvf_fix_issue.upsert_canonical_issue``）；只同步状态的调用方（fix attempt
     stop / apply 读的是已剥掉来源字段的镜像）必须传 None，否则会把来源清空。"""
-    if state not in {"open", "fixed", "false_positive", "elevated", "failed", "superseded"}:
+    if state not in RVF_ISSUE_STATES:
         raise ValueError("invalid RVF issue state")
     _repo, key, common_dir, directory, db_path, events_path = _rvf_store(repo, log_root_override)
     now_iso = now or utc_now()
@@ -6932,7 +7042,10 @@ def rvf_attempt_upsert(
             applied_at = existing["applied_at"] if existing is not None else None
             if status == "started" and started_at is None:
                 started_at = now_iso
-            if status in {"fixed", "false_positive", "elevated", "failed"} and stopped_at is None:
+            if status in {
+                "fixed", "false_positive", "elevated", "failed",
+                RVF_ATTEMPT_STATUS_VALIDATED_AND_SUBMITTED_TO_KANBAN_BACKLOG,
+            } and stopped_at is None:
                 stopped_at = now_iso
             if status == "applied" and applied_at is None:
                 applied_at = now_iso

@@ -88,7 +88,7 @@ rvf dispatch --token <decision-token> --strictness <light|standard|strict> [--ac
 - 处理未覆盖的路径：
   - 本会话写的，用 `scope claim` 认领。它会改写 contract（进 `fix_allowlist` / `primary_units` / `primary_files`，移出 protected），重分配 lease，并重渲 packet。路径已被别的会话以强证据持有时，要加 `--takeover-reason`。
   - 不该审的，用 `scope exclude` 排除。
-  - `scope include` 只进 `primary_files`，也就是 reviewer 提示与 land 的 stage 边界；**不进**正式审查，fixer 也不能改它。
+  - `scope include` 只进 `primary_files`，也就是 reviewer 提示与 land 的 stage 边界；**不进**正式审查，fixer 改它只能按 allowlist 外扩声明理由。
 - session-owned 口径下，还有未覆盖且你没表态的路径时，`dispatch` 会拦下（退出码 `11`）。确认就这样派发时加 `--accept-uncovered "<理由>"`。
 - 覆盖不全时，handoff 与两行摘要的 `Reviewers：` 行必须写出 X/Y 和接受的理由。
 
@@ -181,7 +181,8 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
 | 合并 | 读 `rvf wait` 打印的摘要，按 `references/review-merge-policy.md` 合并；有 issue 时 `rvf merge write` 记下每条 reviewer issue 的处置 | 去重、分组、丢弃理由、request 处置 |
 | 建 fix attempt | `rvf fix prepare <issue.json>…` | 怎么分验证包 |
 | 子代理收尾 | 子代理照抄派发参数块里的整行 `cd <attempt worktree> && rvf fix stop --attempt-id … --run-dir … --status …` | （子代理判断） |
-| 合回 | `rvf apply --all-stopped` | 冲突怎么处置 |
+| 合回 | `rvf apply --all-stopped` | 冲突怎么处置；停在「待确认」的越界修改核对后 `rvf apply --attempt-id <id> --confirm-acknowledged-protected-or-background-path-modification` |
+| 范围外问题转 backlog | validator 在 `rvf fix stop` 里提交；没有 validator 的场合（rvf-land 等）用 `rvf backlog submit --main-session-findings-file <json>` | 是否与本轮不紧密相关 |
 | 最终验证 | `rvf validate --name handoff-validation-NNN -- <argv…>` | 跑哪些 suite |
 | 看状态 | `rvf status` / `rvf results` / `rvf handoff` | 无 |
 
@@ -212,15 +213,17 @@ token 与 run 目录都可省——`rvf` 按「显式参数 > `RVF_RUN_DIR` > �
   它把上一轮 scope 里仍可审的 unit 并回本轮（已被真正审掉的不会复活），并从该 artifact 继承 `committed_baseline` / `committed_base_ref` 以恢复口径。结果里 `unioned_prior_scope_unit_ids` 与 events 里的 `scope_reallocated_after_lease_expiry` 是这次并集的证据；packet 的 `## Tracker Scope` 会标出承接自上一轮的那一段，reviewer 据此分辨两段的成熟度。
 - Reviewer 必须以 `scope.contract.json` 为最终范围合同；session manifest 只是 ownership evidence / tracker audit context。
 - scope contract v3 的 `review_kind=implementation` 仍审实现整体；`review_kind=base_drift_integration` 只审 `interaction_primary_paths` 所描述的 base/task 交互面，`base_delta_paths` 与 `task_change_paths` 是上下文事实，`candidate_evidence_path` / digest 是必须保持的父证据绑定。v1/v2 contract 继续按既有实现审查读取。
-- `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则只审查合同范围及其直接连带影响。
-- 每个 reviewer artifact 都经 `scripts/check_review_result.py` 校验（runner 逐腿执行、`rvf wait` 摘要同源复用）；artifact 缺失、schema invalid、excluded path、clean/issues/request 混写都不能当作合格结果。
+- `git diff HEAD` 是证据来源，不是默认 review scope。除非用户要求 full diff review，否则 finding 范围是合同范围及其直接连带影响；观察范围不受限（reviewer 可以读任何路径作上下文）。
+- **范围外问题不放跑、不当场修**：reviewer 发现与本轮改动不紧密相关、但真实存在的问题时，照常报 issue 并标 `--scope-relation outside_current_round_scope`（`rvf wait` 摘要显示 `[范围外]`）。合并时照常 adopted；`rvf fix prepare` 把它预填为 `validate_only_then_submit_to_kanban_backlog`，validator 只验证不修，属实即在 `rvf fix stop` 里提交到 Kanban backlog 作为新 task（卡片标题前缀 `[RVF 发现]`）。
+- 每个 reviewer artifact 都经 `scripts/check_review_result.py` 校验（runner 逐腿执行、`rvf wait` 摘要同源复用）；artifact 缺失、schema invalid、clean/issues/request 混写都不能当作合格结果；issue 落在 excluded path 只产生 warning、不使该腿失格，合并时只能 `dropped`。
 - 合并 reviewer artifact 时使用 `references/review-merge-policy.md`。
 
 ## Validate / Fix
 
 - `kind: no_issues` 进入 clean path。
 - **合并处置先于 fix**：任一腿 `kind: issues` 时，先用 `rvf merge write`（决定 JSON 走 stdin）把每条 reviewer issue 记成 `adopted` / `merged_into` / `dropped`（带 `reason_code`），主会话自审发现的 finding 登记为 `non_reviewer_fix_issue_sources`（`origin: main_agent_self_review`）；格式见 `references/review-merge-policy.md` 的 Merge Rules。`rvf fix prepare` 只接受被处置覆盖的 `issue_id`，`source_refs` 由处置派生，canonical issue JSON 不写任何来源字段。全部 dropped 时同样要写处置，然后走 clean path（handoff「共 0 条」，evidence 允许）。
-- `kind: issues` 进入 validate/fix；每条 issue 先验证，再通过 `rvf fix stop --status fixed|false_positive|elevated|failed`（即 `rvf_fix_attempt.py stop`）写入完成状态。
+- `kind: issues` 进入 validate/fix；每条 issue 先验证，再通过 `rvf fix stop --status fixed|false_positive|elevated|failed`（即 `rvf_fix_attempt.py stop`）写入完成状态；validate-only issue（范围外问题）用 `validated_and_submitted_to_kanban_backlog|false_positive|elevated|failed`，且 attempt 不得有任何改动（硬性）。
+- **修改越界是护栏而非闸门**：attempt worktree 已物化全部未提交改动（fixer 看到真实工作区）。allowlist 外的普通路径声明后照改；background / protected / 用户声明的排除区由 fixer 显式确认（`--acknowledged-protected-or-background-path-modification`）后 stop 接受，`rvf apply` 停在待确认并打印「内容自 baseline 未变 + 归属」核对，你接受就带 `--confirm-acknowledged-protected-or-background-path-modification` 合回、把依据写进 handoff「已确认的越界修改」，判断不了才 elevate。`.serena/` 等工具托管目录仍硬拒。
 - 默认 `full` 流程中，只要有可解析 issue list，主会话必须至少启动一个 `validate_fix` 子代理，除非平台没有子代理接口、用户明确要求本地执行，或只剩机械收尾。
 - 按根因、文件区域、测试路径或决策前提把 issue 分组；最终汇总要说明 validate/fix 分组和结果。
 - **fix 循环三步**：

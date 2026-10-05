@@ -317,10 +317,36 @@ def _non_empty_string(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def excluded_path_prefixes_for_run(run_dir: Path) -> tuple[str, ...]:
+    """本 run 冻结合同里的排除前缀（合同缺失 / 不可读 ⇒ 空，交给 Contract Gate 报合同错误）。"""
+    contract_path = run_dir / "artifacts" / "inputs" / "scope.contract.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ()
+    if not isinstance(contract, dict):
+        return ()
+    prefixes = contract.get("excluded_path_prefixes")
+    if prefixes is None and isinstance(contract.get("canonical_scope"), dict):
+        prefixes = contract["canonical_scope"].get("excluded_path_prefixes")
+    if not isinstance(prefixes, list):
+        return ()
+    return tuple(str(prefix) for prefix in prefixes if isinstance(prefix, str))
+
+
 def collect_merge_dispositions_structural_errors(
-    payload: Mapping[str, Any], legs: list[CanonicalReviewerLegResult], *, expected_run_id: str | None
+    payload: Mapping[str, Any],
+    legs: list[CanonicalReviewerLegResult],
+    *,
+    expected_run_id: str | None,
+    excluded_path_prefixes: tuple[str, ...] = (),
 ) -> list[str]:
-    """不依赖 fix-issue 是否已 upsert 的校验：schema、完整性、哈希一致、每条处置的字段、合并目标。"""
+    """不依赖 fix-issue 是否已 upsert 的校验：schema、完整性、哈希一致、每条处置的字段、合并目标。
+
+    排除区里的 reviewer issue 只能 ``dropped``：Contract Gate 已从「整腿作废」放宽为 warning
+    （护栏而非闸门），这里是放宽后唯一的收口点，防止排除区问题被采纳进修复。"""
+    import check_review_result  # noqa: PLC0415
+
     errors: list[str] = []
     if payload.get("schema") != MERGE_DISPOSITIONS_SCHEMA_NAME:
         errors.append(f"schema must be {MERGE_DISPOSITIONS_SCHEMA_NAME}")
@@ -394,6 +420,16 @@ def collect_merge_dispositions_structural_errors(
             errors.append(f"{where}: issue_sha256 does not match the current canonical reviewer issue")
         disposition = entry.get("disposition")
         issue_id = _non_empty_string(entry.get("issue_id"))
+        reviewer_issue_path = leg.issues[index - REVIEWER_ISSUE_INDEX_BASE].get("path")
+        if (
+            disposition != REVIEWER_ISSUE_DISPOSITION_DROPPED
+            and isinstance(reviewer_issue_path, str)
+            and check_review_result.is_excluded(reviewer_issue_path, list(excluded_path_prefixes))
+        ):
+            errors.append(
+                f"{where}: issue path {reviewer_issue_path} is under an excluded path prefix; it can only be "
+                "dropped (reason_code outside_review_scope_protected_background_or_excluded)"
+            )
         if disposition in (REVIEWER_ISSUE_DISPOSITION_ADOPTED, REVIEWER_ISSUE_DISPOSITION_MERGED_INTO):
             if issue_id is None:
                 errors.append(f"{where}: {disposition} requires issue_id")
@@ -588,7 +624,12 @@ def check_merge_dispositions(
         expected_run_id = run_id_for_run_directory(run_dir)
     except ValueError as exc:
         return MergeDispositionsCheckResult(payload, (*errors, str(exc)), (), ())
-    errors.extend(collect_merge_dispositions_structural_errors(payload, legs, expected_run_id=expected_run_id))
+    errors.extend(
+        collect_merge_dispositions_structural_errors(
+            payload, legs, expected_run_id=expected_run_id,
+            excluded_path_prefixes=excluded_path_prefixes_for_run(run_dir),
+        )
+    )
     reviewer_sourced, non_reviewer = _fix_issue_ids_by_source(payload)
     source_markers = reviewer_source_markers_for_legs(legs)
     if require_fix_issue_cross_reference:
@@ -750,7 +791,9 @@ def build_merge_dispositions_payload(run_dir: Path, decisions: Mapping[str, Any]
         "dispositions": dispositions,
         "non_reviewer_fix_issue_sources": non_reviewer,
     }
-    errors = collect_merge_dispositions_structural_errors(payload, legs, expected_run_id=run_id)
+    errors = collect_merge_dispositions_structural_errors(
+        payload, legs, expected_run_id=run_id, excluded_path_prefixes=excluded_path_prefixes_for_run(run_dir)
+    )
     if errors:
         raise MergeDispositionsCheckFailed(errors)
     return payload

@@ -15,6 +15,68 @@ import rvf_merge_dispositions  # noqa: E402
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
 
 
+# fix-issue 的处理模式：范围外问题照常被合并采纳，但到 validate-fix 阶段只验证、不修，
+# 验证属实后由 validator 提交到 Kanban backlog（rvf_out_of_scope_findings_kanban_backlog_submission）。
+FIX_ISSUE_HANDLING_MODE_VALIDATE_THEN_FIX = "validate_then_fix"
+FIX_ISSUE_HANDLING_MODE_VALIDATE_ONLY_THEN_SUBMIT_TO_KANBAN_BACKLOG = "validate_only_then_submit_to_kanban_backlog"
+FIX_ISSUE_HANDLING_MODES = (
+    FIX_ISSUE_HANDLING_MODE_VALIDATE_THEN_FIX,
+    FIX_ISSUE_HANDLING_MODE_VALIDATE_ONLY_THEN_SUBMIT_TO_KANBAN_BACKLOG,
+)
+REVIEWER_ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE = "outside_current_round_scope"
+
+
+def fix_issue_handling_mode(payload: dict[str, Any]) -> str:
+    value = payload.get("fix_issue_handling_mode")
+    return value if value in FIX_ISSUE_HANDLING_MODES else FIX_ISSUE_HANDLING_MODE_VALIDATE_THEN_FIX
+
+
+def reviewer_implied_fix_issue_handling_mode(run_dir: Path, source_refs: list[dict[str, Any]]) -> str | None:
+    """按来源 reviewer issue 的 ``scope_relation`` 推出处理模式；没有 reviewer 来源时返回 None。
+
+    全部来源都标 outside ⇒ 只验证不修；只要有一条来源认为属于本轮 ⇒ 正常验证并修复。"""
+    reviewer_refs = [
+        ref for ref in source_refs
+        if ref.get("source_origin") == rvf_merge_dispositions.FIX_ISSUE_SOURCE_REF_ORIGIN_REVIEWER_RESULT_ISSUE
+    ]
+    if not reviewer_refs:
+        return None
+    legs = {leg.reviewer_id: leg for leg in rvf_merge_dispositions.read_canonical_reviewer_leg_results(run_dir)}
+    relations: list[str] = []
+    for ref in reviewer_refs:
+        leg = legs.get(ref.get("reviewer_id"))
+        index = ref.get("index")
+        if leg is None or not isinstance(index, int) or not (1 <= index <= len(leg.issues)):
+            relations.append("in_current_round_scope")
+            continue
+        relations.append(str(leg.issues[index - 1].get("scope_relation") or "in_current_round_scope"))
+    if all(relation == REVIEWER_ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE for relation in relations):
+        return FIX_ISSUE_HANDLING_MODE_VALIDATE_ONLY_THEN_SUBMIT_TO_KANBAN_BACKLOG
+    return FIX_ISSUE_HANDLING_MODE_VALIDATE_THEN_FIX
+
+
+def resolve_fix_issue_handling_mode(
+    *, run_dir: Path, payload: dict[str, Any], source_refs: list[dict[str, Any]], issue_id: str
+) -> str:
+    """显式模式优先；它与 reviewer 标注推出的模式不一致时，必须写 ``handling_mode_override_reason``。"""
+    explicit = payload.get("fix_issue_handling_mode")
+    if explicit is not None and explicit not in FIX_ISSUE_HANDLING_MODES:
+        raise ValueError(
+            f"canonical issue {issue_id}: fix_issue_handling_mode must be one of {list(FIX_ISSUE_HANDLING_MODES)}"
+        )
+    implied = reviewer_implied_fix_issue_handling_mode(run_dir, source_refs)
+    if explicit is None:
+        return implied or FIX_ISSUE_HANDLING_MODE_VALIDATE_THEN_FIX
+    if implied is not None and explicit != implied:
+        reason = payload.get("handling_mode_override_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(
+                f"canonical issue {issue_id}: fix_issue_handling_mode={explicit} overrides the reviewer-implied "
+                f"{implied}; write handling_mode_override_reason explaining why"
+            )
+    return explicit
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -94,6 +156,9 @@ def upsert_canonical_issue(
         "issue_id": issue_id,
         "run_id": run_id,
     }
+    payload["fix_issue_handling_mode"] = resolve_fix_issue_handling_mode(
+        run_dir=run_dir, payload=payload, source_refs=source_refs, issue_id=issue_id
+    )
     leaks = rvf_merge_dispositions.fix_issue_payload_source_attribution_errors(
         payload, source_markers=source_markers, label=f"canonical issue {issue_id}"
     )
@@ -145,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     upsert.add_argument("--issue-file", required=True)
     upsert.add_argument(
         "--state",
-        choices=("open", "fixed", "false_positive", "elevated", "failed", "superseded"),
+        choices=tuple(sorted(reviewable_unit_diff_tracker.RVF_ISSUE_STATES)),
         default="open",
     )
     upsert.add_argument("--log-root", default=None)

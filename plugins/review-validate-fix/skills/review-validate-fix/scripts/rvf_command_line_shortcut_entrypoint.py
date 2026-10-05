@@ -18,7 +18,10 @@ token / 脚本绝对路径、``--help`` 摸索一个 PATH 上根本不存在的 
 * ``fix prepare <issue.json>…``：upsert + prepare + start 一步完成，输出可复制的子代理派发参数块
   （含带 ``cd`` / ``--attempt-id`` / ``--run-dir`` 的完整收尾命令），并按 attempt 登记 awaiting marker。
 * ``fix stop``：子代理在 attempt worktree 内收尾（原样转给 ``rvf_fix_attempt stop``）。
-* ``apply --all-stopped | --attempt-id …``：按创建顺序合回，遇冲突停下交给 agent。
+* ``apply --all-stopped | --attempt-id …``：按创建顺序合回，遇冲突停下交给 agent；fixer 显式确认过的越界
+  修改（他会话 WIP / 排除区）停在待确认，主会话核对后 ``--attempt-id … --confirm-acknowledged-protected-or-background-path-modification``。
+* ``backlog submit --main-session-findings-file …``：把与本轮无关的真实问题提交到 Kanban backlog（rvf-land 等
+  没有 validator 的场合；validator 的提交在 ``fix stop`` 里完成），缺 ``--run-dir`` 时补当前 run。
 * ``status``：当前 run 的上下文、派发状态、attempt 状态与 handoff 落点。
 * ``validate``：``validation_result_cache.py run``，自动补 ``--repo`` / ``--rvf-run-dir``；在 fix attempt
   worktree 里（或 Stop hook 被抑制的子进程里）只验证 cwd 所在 worktree、不写主 run。
@@ -666,6 +669,13 @@ def summarize_reviewer_legs_from_canonical_results(
                     "issues": classified.get("issues") or [],
                     "requests": classified.get("requests") or [],
                     "audit_summary": classified.get("audit_summary"),
+                    "outside_current_round_scope_issue_count": classified.get(
+                        "outside_current_round_scope_issue_count", 0
+                    ),
+                    "issue_indices_in_excluded_paths_one_based": classified.get(
+                        "issue_indices_in_excluded_paths_one_based"
+                    ) or [],
+                    "warnings": classified.get("warnings") or [],
                     "errors": classified.get("errors") or [],
                 }
             )
@@ -724,9 +734,14 @@ def evaluate_dual_review_establishment_from_canonical_legs(summary: dict[str, An
     return (not reasons, reasons)
 
 
-def _render_issue_line(index: int, issue: dict[str, Any]) -> str:
+def _render_issue_line(index: int, issue: dict[str, Any], *, in_excluded_path: bool = False) -> str:
+    markers = ""
+    if issue.get("scope_relation") == "outside_current_round_scope":
+        markers += "[范围外] "
+    if in_excluded_path:
+        markers += "[排除区·只能 dropped] "
     return (
-        f"      {index}. [{issue.get('severity')}/{issue.get('kind')}] "
+        f"      {index}. {markers}[{issue.get('severity')}/{issue.get('kind')}] "
         f"{issue.get('path')}:{issue.get('line')} — {issue.get('message')}"
     )
 
@@ -764,8 +779,19 @@ def render_reviewer_results_summary(
         kind = leg.get("kind")
         if kind == "issues":
             issues = leg.get("issues") or []
-            lines.append(f"{title}: kind=issues，{len(issues)} 条")
-            lines.extend(_render_issue_line(i, issue) for i, issue in enumerate(issues, 1) if isinstance(issue, dict))
+            outside_count = leg.get("outside_current_round_scope_issue_count") or 0
+            excluded_indices = set(leg.get("issue_indices_in_excluded_paths_one_based") or [])
+            lines.append(
+                f"{title}: kind=issues，{len(issues)} 条"
+                + (f"（其中范围外 {outside_count} 条）" if outside_count else "")
+            )
+            lines.extend(
+                _render_issue_line(i, issue, in_excluded_path=i in excluded_indices)
+                for i, issue in enumerate(issues, 1)
+                if isinstance(issue, dict)
+            )
+            if leg.get("audit_summary"):
+                lines.append(f"      本轮范围 audit_summary: {leg.get('audit_summary')}")
         elif kind == "no_issues":
             lines.append(f"{title}: kind=no_issues")
             lines.append(f"      audit_summary: {leg.get('audit_summary')}")
@@ -779,6 +805,8 @@ def render_reviewer_results_summary(
         else:
             errors = "; ".join(str(e) for e in (leg.get("errors") or [])) or "无 review-result.json"
             lines.append(f"{title}: 无合法结果（{errors}）")
+        for warning in leg.get("warnings") or []:
+            lines.append(f"      warning: {warning}")
         if leg.get("stderr_path"):
             lines.append(f"      stderr: {leg.get('stderr_path')}")
     status = summary.get("plan_status")
@@ -802,6 +830,11 @@ def render_reviewer_results_summary(
                 f"`{invocation} merge write{run_dir_argument}`（决定 JSON 走 stdin）写成 artifacts/merge/merge_dispositions.json；"
                 "没写或没覆盖到的 issue_id，fix prepare 会拒绝。全部 dropped 也要写，然后走 clean path。"
             )
+            if any((leg.get("outside_current_round_scope_issue_count") or 0) for leg in summary.get("legs") or []):
+                lines.append(
+                    "- 标 [范围外] 的 issue 照常 adopted / merged_into；fix prepare 会把它们预填为 "
+                    "validate_only_then_submit_to_kanban_backlog：validator 只验证、不修，属实就提交到 Kanban backlog。"
+                )
     elif status == "blocked_on_reviewer_request":
         lines.append(
             "- 判定：有腿返回 kind: request（待处理终态）。按 Contract Gate 满足或驳回后，"
@@ -1046,19 +1079,36 @@ def _scope_hash_for(scope_contract: Path | None) -> str | None:
     return None
 
 
+def _scope_contract_list(scope_contract: Path | None, key: str) -> list[str]:
+    contract = _read_json_object(scope_contract) if scope_contract else None
+    if not contract:
+        return []
+    value = contract.get(key)
+    if not isinstance(value, list) and isinstance(contract.get("canonical_scope"), dict):
+        value = contract["canonical_scope"].get(key)
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 FIX_STOP_STATUS_PLACEHOLDER = "<fixed|false_positive|elevated|failed>"
+# validate-only attempt（范围外问题：只验证、不修，属实即提交 Kanban backlog）的收尾状态占位。
+VALIDATE_ONLY_FIX_STOP_STATUS_PLACEHOLDER = "<validated_and_submitted_to_kanban_backlog|false_positive|elevated|failed>"
 
 
-def render_fix_attempt_subagent_stop_command(*, invocation: str, attempt_worktree: str, attempt_id: str, run_dir: str) -> str:
+def render_fix_attempt_subagent_stop_command(
+    *, invocation: str, attempt_worktree: str, attempt_id: str, run_dir: str, validate_only: bool = False
+) -> str:
     """子代理收尾命令的完整形态。
 
     不能靠 cwd 反推 attempt：Claude 子代理每次 Bash 调用都会重置 cwd（2.1.285 本体：「Agent threads
     always have their cwd reset between bash calls」），``rvf fix stop`` 单独跑时 cwd 已不在 attempt
     worktree 里。故一行里自带 ``cd`` 与显式 ``--attempt-id`` / ``--run-dir``，照抄即对。"""
-    return (
+    command = (
         f"cd {shlex.quote(attempt_worktree)} && {invocation} fix stop --attempt-id {shlex.quote(attempt_id)} "
-        f"--run-dir {shlex.quote(run_dir)} --status {FIX_STOP_STATUS_PLACEHOLDER}"
+        f"--run-dir {shlex.quote(run_dir)} --status "
     )
+    if validate_only:
+        return command + f"{VALIDATE_ONLY_FIX_STOP_STATUS_PLACEHOLDER} [--kanban-backlog-finding-file <finding.json>]"
+    return command + FIX_STOP_STATUS_PLACEHOLDER
 
 
 def _arm_fix_attempt_subagent_awaiting_marker_if_host_wakes_main_agent(
@@ -1122,9 +1172,12 @@ def run_fix_prepare(args: argparse.Namespace) -> int:
                 "scope_hash": scope_hash,
                 "fix_allowlist": attempt.get("fix_allowlist") or [],
                 "boundary_paths": attempt.get("boundary_paths") or [],
+                "fix_issue_handling_mode": attempt.get("fix_issue_handling_mode"),
                 "fix_stop_command": render_fix_attempt_subagent_stop_command(
                     invocation=invocation, attempt_worktree=str(attempt["worktree_path"]),
                     attempt_id=str(attempt["attempt_id"]), run_dir=str(run_dir),
+                    validate_only=attempt.get("fix_issue_handling_mode")
+                    == rvf_fix_issue.FIX_ISSUE_HANDLING_MODE_VALIDATE_ONLY_THEN_SUBMIT_TO_KANBAN_BACKLOG,
                 ),
                 "awaiting_dispatched_agent_marker_path": None,
             }
@@ -1156,7 +1209,25 @@ def run_fix_prepare(args: argparse.Namespace) -> int:
             print(f"scope_contract: {item['scope_contract']}")
             print(f"scope_hash: {item['scope_hash']}")
             print(f"fix_allowlist: {', '.join(item['fix_allowlist']) or '（空）'}")
-            print(f"收尾（整行照抄，--status 四选一）: `{item['fix_stop_command']}`")
+            if item["fix_issue_handling_mode"] == rvf_fix_issue.FIX_ISSUE_HANDLING_MODE_VALIDATE_ONLY_THEN_SUBMIT_TO_KANBAN_BACKLOG:
+                print(
+                    "handling_mode: validate_only_then_submit_to_kanban_backlog   ← 范围外问题：只验证、不修，"
+                    "不得改任何文件；属实就写 finding JSON 并以 validated_and_submitted_to_kanban_backlog 收尾"
+                )
+            else:
+                print(
+                    "修改规则: fix_allowlist 与 issue 路径内直接改；allowlist 外的普通路径 → --scope-expansion-path + "
+                    "--scope-expansion-reason；background / protected / 用户声明的排除区 → "
+                    "--acknowledged-protected-or-background-path-modification + 理由（apply 前主会话确认）；"
+                    ".serena/ 等工具托管目录不得改"
+                )
+            print(
+                "范围合同: protected/background "
+                f"{len(_scope_contract_list(scope_contract, 'background_files'))} 条，"
+                f"excluded 前缀 {', '.join(_scope_contract_list(scope_contract, 'excluded_path_prefixes')) or '（无）'}"
+                "（attempt worktree 已物化全部未提交改动，可读不可乱改）"
+            )
+            print(f"收尾（整行照抄）: `{item['fix_stop_command']}`")
         if prepared:
             print(
                 f"子代理全部结束后：`{invocation} apply --all-stopped"
@@ -1183,6 +1254,27 @@ def run_merge(rest: list[str]) -> int:
     return int(rvf_merge_dispositions.main([rest[0], *injected, *rest[1:]]))
 
 
+def run_backlog(rest: list[str]) -> int:
+    """``rvf backlog submit|retry-pending``：转给 ``rvf_out_of_scope_findings_kanban_backlog_submission``。
+
+    ``submit`` 缺 ``--run-dir`` 时尽量补当前 run（解析不出就不补：rvf-land 之后 run 可能已收尾）。"""
+    import rvf_out_of_scope_findings_kanban_backlog_submission as backlog_submission  # noqa: PLC0415
+
+    if not rest or _argv_asks_for_help(rest):
+        return int(backlog_submission.main(rest or ["--help"]))
+    injected: list[str] = []
+    if rest[0] == "submit" and _explicit_option_value_in_argv(rest, "--run-dir") is None:
+        try:
+            context = _require_run_context(None)
+            if context.run_dir is not None:
+                injected = ["--run-dir", str(context.run_dir)]
+                if context.repo and _explicit_option_value_in_argv(rest, "--repo") is None:
+                    injected.extend(["--repo", str(context.repo)])
+        except CurrentRunContextUnresolved:
+            injected = []
+    return int(backlog_submission.main([rest[0], *injected, *rest[1:]]))
+
+
 def run_fix_stop(rest: list[str]) -> int:
     import rvf_fix_attempt  # noqa: PLC0415
 
@@ -1207,10 +1299,18 @@ def _attempt_records(run_dir: Path) -> list[dict[str, Any]]:
 
 
 FIX_ATTEMPT_STATUSES_READY_TO_APPLY = frozenset({"fixed"})
-FIX_ATTEMPT_STATUSES_STOPPED_WITHOUT_PATCH = frozenset({"false_positive", "elevated", "failed"})
+FIX_ATTEMPT_STATUSES_STOPPED_WITHOUT_PATCH = frozenset(
+    {"false_positive", "elevated", "failed", "validated_and_submitted_to_kanban_backlog"}
+)
 FIX_ATTEMPT_STATUSES_NOT_YET_STOPPED = frozenset({"prepared", "started"})
 # apply 时写回 attempt.json 的冲突终态：该 attempt 的 patch **未**合回主 worktree。
-FIX_ATTEMPT_STATUSES_APPLY_CONFLICT_NOT_MERGED = frozenset({"merge_conflict", "scope_expansion_conflict"})
+FIX_ATTEMPT_STATUSES_APPLY_CONFLICT_NOT_MERGED = frozenset(
+    {
+        "merge_conflict",
+        "scope_expansion_conflict",
+        "requires_main_agent_confirmation_for_acknowledged_protected_or_background_path_modification",
+    }
+)
 
 
 def find_unresolved_apply_conflict_attempts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1253,6 +1353,9 @@ def run_apply(args: argparse.Namespace) -> int:
         try:
             outcome = rvf_fix_attempt.apply_fix_attempt(
                 run_dir=run_dir, attempt_id=record["attempt_id"], target_repo_override=context.repo,
+                confirm_acknowledged_protected_or_background_path_modification=bool(
+                    args.attempt_id and args.confirm_acknowledged_protected_or_background_path_modification
+                ),
             )
         except (OSError, ValueError, RuntimeError) as exc:
             outcome = {"attempt_id": record["attempt_id"], "status": "apply_error", "stderr": str(exc)}
@@ -1287,6 +1390,18 @@ def run_apply(args: argparse.Namespace) -> int:
             if outcome["status"] != "applied" and outcome.get("stderr"):
                 line += f" — {str(outcome['stderr']).strip()[:500]}"
             print(line)
+            for check in outcome.get("confirmation_checks") or []:
+                print(
+                    f"    · {check['path']}：自 attempt baseline 起未被改动="
+                    f"{'是' if check['unchanged_since_attempt_baseline'] else '否'}；归属={check['ownership']}"
+                )
+            if outcome["status"] == rvf_fix_attempt.FIX_ATTEMPT_APPLY_STATUS_REQUIRES_MAIN_AGENT_CONFIRMATION:
+                print(
+                    "    → fixer 已确认要改动上面的越界路径。核对理由与归属后，若接受："
+                    f"`{_rvf_invocation()} apply --attempt-id {outcome['attempt_id']} "
+                    "--confirm-acknowledged-protected-or-background-path-modification`，并把确认依据写进 handoff"
+                    "「已确认的越界修改」；判断不了才 elevate"
+                )
         for record in records:
             if record.get("status") in FIX_ATTEMPT_STATUSES_STOPPED_WITHOUT_PATCH:
                 print(f"- {record['attempt_id']}（issue {record.get('issue_id')}）: {record.get('status')}（无 patch，不合回）")
@@ -1377,6 +1492,25 @@ def run_handoff(args: argparse.Namespace) -> int:
     if coverage_line:
         print(f"- 审查覆盖（照抄进 handoff 的「审查覆盖」行；覆盖不全时两行摘要的 Reviewers 行也要带 X/Y）：{coverage_line}")
     print("- 模板：references/handoff-template.md；完成后最终回复第一行输出 `RVF_HANDOFF_FILE: <handoff_path>`。")
+    if context.run_dir is not None:
+        import rvf_out_of_scope_findings_kanban_backlog_submission as backlog_submission  # noqa: PLC0415
+
+        receipts = backlog_submission.read_submission_receipts_for_run(context.run_dir)
+        if receipts:
+            print("- `## 范围外问题（已提交 Kanban backlog）` 照抄下面几行：")
+            for line in backlog_submission.render_handoff_lines_for_submission_receipts(receipts):
+                print(f"  {line}")
+        validate_only_attempts_without_submission = [
+            record["attempt_id"]
+            for record in _attempt_records(context.run_dir)
+            if record.get("fix_issue_handling_mode") == "validate_only_then_submit_to_kanban_backlog"
+            and record.get("status") in FIX_ATTEMPT_STATUSES_NOT_YET_STOPPED
+        ]
+        if validate_only_attempts_without_submission:
+            print(
+                "- ⚠ 还有 validate-only attempt 没有收尾（范围外问题尚未验证 / 提交 backlog）："
+                + ", ".join(validate_only_attempts_without_submission)
+            )
     return EXIT_OK
 
 
@@ -1617,7 +1751,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description=(
             "RVF 执行段快捷入口。token / run 目录全部可推断。决策：start / scope / dispatch / decline / "
             "decline-dispatched-review（参数同 rvf_agent_decision_cli，--token 可省）；执行：wait / results / "
-            "redispatch-reviewers / merge write|check / fix prepare|stop / apply / status / validate / handoff。"
+            "redispatch-reviewers / merge write|check / fix prepare|stop / apply / backlog submit / status / validate / "
+            "handoff。"
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1656,6 +1791,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "merge", add_help=False,
         help="合并阶段处置：merge write（决定 JSON 走 stdin）/ merge check（自动补 --run-dir）",
     )
+    sub.add_parser(
+        "backlog", add_help=False,
+        help="范围外问题提交 Kanban backlog：backlog submit --main-session-findings-file <json> / backlog retry-pending",
+    )
 
     p_apply = sub.add_parser("apply", help="把已 stop 的 fixed attempt 合回主 worktree")
     group = p_apply.add_mutually_exclusive_group(required=True)
@@ -1663,6 +1802,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     group.add_argument("--attempt-id", action="append", default=None)
     p_apply.add_argument("--run-dir", default=None)
     p_apply.add_argument("--json", action="store_true")
+    p_apply.add_argument(
+        "--confirm-acknowledged-protected-or-background-path-modification",
+        action="store_true",
+        help="只配合 --attempt-id：核对 fixer 已确认的越界路径后放行合回",
+    )
 
     p_status = sub.add_parser("status", help="当前 run 的上下文、派发与 attempt 状态")
     p_status.add_argument("--run-dir", default=None)
@@ -1709,6 +1853,8 @@ def main(argv: list[str] | None = None) -> int:
         except CurrentRunContextUnresolved as exc:
             print(f"[rvf merge] {exc}", file=sys.stderr)
             return EXIT_CURRENT_RUN_CONTEXT_UNRESOLVED
+    if arguments and arguments[0] == "backlog":
+        return run_backlog(arguments[1:])
     args = parser.parse_args(arguments)
     try:
         if args.command == "wait":
