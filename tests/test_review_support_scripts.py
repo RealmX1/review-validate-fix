@@ -8566,7 +8566,9 @@ def _agent_cli_stub_prepare(tmp: Path, *, run_name: str = "run-1", primary_files
             json.dumps({
                 "version": 2, "run_id": run_name, "repo": repo, "scope_mode": "manual-all-uncommitted",
                 "primary_files": list(primary_files or []), "background_files": [], "protected_files": [],
-                "canonical_issues": [], "fix_allowlist": [], "excluded_path_prefixes": [], "scope_hash": "stub-old-hash",
+                # 与真实 prepare 同口径：fix_allowlist = primary（正式审查名单）。
+                "canonical_issues": [], "fix_allowlist": list(primary_files or []), "excluded_path_prefixes": [],
+                "scope_hash": "stub-old-hash",
             }),
             encoding="utf-8",
         )
@@ -8786,7 +8788,10 @@ def test_agent_cli_scope_issue_ledger_threshold_idempotent(tmp: Path) -> None:
 def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) -> None:
     """dispatch：scope 定稿写回 scope.contract.json（primary_files/excluded/重算 hash）+ 严格度终选
     读 preset + 派发（stub）+ token 终态 dispatched；dispatcher 失败 → dispatch_failed，token 仍
-    acknowledged 可重试。"""
+    acknowledged 可重试。
+
+    定稿后的 primary_files = prepare 定的正式名单 − 排除 ∪ include，**不再**改写成候选全集（08ac4：
+    候选里没进正式审查的路径原先同时出现在 primary 与 protected 两边，回执也因此高估覆盖）。"""
     cli = load_rvf_agent_decision_cli_module()
     dts = load_rvf_decision_token_store_module()
     roots = _agent_cli_roots(cli, tmp)
@@ -8797,11 +8802,14 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
         {"path": "b.py", "included_in_candidate_set": True},
     ]}
     tok = _mint_agent_decision_token(dts, roots, worktree=wt, candidate_summary=candidate_summary, now=t0)
-    cli.run_start(token=tok, reason="开审", roots=roots, now=t0, prepare_pipeline=_agent_cli_stub_prepare(tmp))
+    cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp, primary_files=["a.py", "b.py"]),
+    )
     cli.run_scope_exclude(token=tok, paths=["b.py"], reason="reformat", roots=roots, now=t0)
     cli.run_scope_include(token=tok, paths=["c.py"], reason="遗漏", roots=roots, now=t0)
     # 模拟 prepare 把 c.py 归进 background（Bash mv 产生、transcript 里无 Write/Edit），
-    # 并把 b.py 放进 allowlist：定稿后 include 必须进 allowlist、出 background，exclude 必须出 allowlist。
+    # 并把 b.py 放进 allowlist：定稿后 include 必须出 background（但不进 allowlist），exclude 必须出 allowlist。
     stub_contract_path = tmp / "runs" / "run-1" / "artifacts" / "inputs" / "scope.contract.json"
     stub_contract = json.loads(stub_contract_path.read_text(encoding="utf-8"))
     stub_contract.update({"fix_allowlist": ["a.py", "b.py"], "background_files": ["c.py", "d.py"], "protected_files": ["c.py", "d.py"]})
@@ -8839,11 +8847,62 @@ def test_agent_cli_dispatch_finalizes_scope_and_records_strictness(tmp: Path) ->
     assert contract["primary_files"] == ["a.py", "c.py"]
     assert "b.py" in contract["excluded_path_prefixes"]
     assert contract["scope_hash"] != "stub-old-hash"
-    # 净效果同步到修复侧：include 的 c.py 进 allowlist 并移出 background/protected；exclude 的 b.py 出 allowlist。
-    assert contract["fix_allowlist"] == ["a.py", "c.py"]
+    # include 的 c.py 移出 background/protected 但不进 fix_allowlist（正式审查只经 scope claim）；
+    # exclude 的 b.py 移出 fix_allowlist（否则 fixer 改它不算外扩）。primary ∩ protected = ∅。
+    assert contract["fix_allowlist"] == ["a.py"]
     assert contract["background_files"] == ["d.py"] and contract["protected_files"] == ["d.py"]
-    assert contract["canonical_scope"]["fix_allowlist"] == ["a.py", "c.py"]
+    assert contract["canonical_scope"]["fix_allowlist"] == ["a.py"]
     assert contract["canonical_scope"]["background_files"] == ["d.py"]
+    assert not set(contract["primary_files"]) & set(contract["protected_files"])
+    # 回执报「正式审查覆盖 X/Y」，不再报 primary_files N。
+    assert "正式审查覆盖 1/1 个候选路径" in ok.message and "primary_files" not in ok.message
+
+
+def test_agent_cli_dispatch_blocks_on_uncovered_candidates_until_claim_exclude_or_accept(tmp: Path) -> None:
+    """覆盖闸（08ac4）：session-owned 口径下，候选里有路径既没进正式审查、也没被认领 / 排除 / include，
+    dispatch 拦下（token 仍 acknowledged、contract 不被改写）；排除或 ``--accept-uncovered`` 之后放行，
+    接受理由落进 overlay 与回执。"""
+    cli = load_rvf_agent_decision_cli_module()
+    dts = load_rvf_decision_token_store_module()
+    roots = _agent_cli_roots(cli, tmp)
+    t0 = _fixed_utc(0)
+    wt = _agent_cli_worktree(tmp)
+    candidate_summary = {"candidates": [
+        {"path": "a.py", "included_in_candidate_set": True},
+        {"path": "bash_written.py", "included_in_candidate_set": True},
+        {"path": "other.py", "included_in_candidate_set": True},
+    ]}
+    tok = _mint_agent_decision_token(dts, roots, worktree=wt, candidate_summary=candidate_summary, now=t0)
+    start = cli.run_start(
+        token=tok, reason="开审", roots=roots, now=t0,
+        prepare_pipeline=_agent_cli_stub_prepare(tmp, primary_files=["a.py"]),
+    )
+    contract_path = Path(start.detail["prepare_artifacts"]["scope_contract"])
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    contract["scope_mode"] = "session-owned"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    def _ok_dispatcher(**kw):
+        return {"status": "ok"}
+
+    blocked = cli.run_dispatch(token=tok, strictness="light", roots=roots, now=t0, reviewer_dispatcher=_ok_dispatcher)
+    assert blocked.exit_code == cli.EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION, blocked.message
+    assert "正式审查覆盖 1/3 个候选路径" in blocked.message
+    assert dts.read_decision_token(tok, root=roots.token_root, now=t0).state == dts.STATE_ACKNOWLEDGED
+    assert json.loads(contract_path.read_text(encoding="utf-8"))["scope_hash"] == "stub-old-hash"
+    assert any("scope claim" in step for step in blocked.next_steps)
+
+    cli.run_scope_exclude(token=tok, paths=["other.py"], reason="别人的", roots=roots, now=t0)
+    still_blocked = cli.run_dispatch(token=tok, strictness="light", roots=roots, now=t0, reviewer_dispatcher=_ok_dispatcher)
+    assert still_blocked.exit_code == cli.EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION
+
+    ok = cli.run_dispatch(
+        token=tok, strictness="light", roots=roots, now=t0, reviewer_dispatcher=_ok_dispatcher,
+        accept_uncovered_reason="生成物，确认不审",
+    )
+    assert ok.exit_code == cli.EXIT_OK, ok.message
+    assert ok.detail["accepted_uncovered_candidate_paths"] == {"reason": "生成物，确认不审", "paths": ["bash_written.py"]}
+    assert "已显式接受 1 个候选路径本轮不审" in ok.message
 
 
 def test_agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff(tmp: Path) -> None:
@@ -13127,6 +13186,12 @@ def review_support_test_cases(root: Path) -> list[tuple[str, object]]:
         (
             "agent_cli_dispatch_finalizes_scope_and_records_strictness",
             lambda: test_agent_cli_dispatch_finalizes_scope_and_records_strictness(root / "agent-cli-dispatch"),
+        ),
+        (
+            "agent_cli_dispatch_blocks_on_uncovered_candidates_until_claim_exclude_or_accept",
+            lambda: test_agent_cli_dispatch_blocks_on_uncovered_candidates_until_claim_exclude_or_accept(
+                root / "agent-cli-dispatch-uncovered-gate"
+            ),
         ),
         (
             "agent_cli_start_arms_in_flight_receipt_and_returns_execution_handoff",

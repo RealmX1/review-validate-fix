@@ -34,7 +34,8 @@ DEFAULT_CLINE_KANBAN_WORKTREE_MODE = "branch"
 # 以及 check_review_output.py 已保留的同名标签一致。
 HANDOFF_FINAL_REPLY_STRUCTURE_INSTRUCTION = (
     "空一行后按固定结构分两行追加极短中文摘要："
-    "`Reviewers：<reviewers 检查了什么、发现几项或没问题>` 一行、"
+    "`Reviewers：<reviewers 检查了什么、发现几项或没问题>` 一行"
+    "（正式审查没覆盖全部候选时必须写「正式审了 X/Y 个候选文件」，与 start / dispatch 回执的数字一致）、"
     "`Validate/fixers：<validate/fixers 验证/修复/驳回/升级了什么>` 一行，"
     "每行各自一句、不要挤成一段"
 )

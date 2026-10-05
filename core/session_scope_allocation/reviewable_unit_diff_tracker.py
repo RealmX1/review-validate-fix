@@ -2880,6 +2880,28 @@ def register_claims(
                     "DELETE FROM session_units WHERE session_id=? AND unit_id=?",
                     (session_id, orphan_unit_id),
                 )
+                still_held_by_other_session = conn.execute(
+                    """
+                    SELECT 1 FROM session_units
+                     WHERE unit_id=? AND session_id<>? AND assignment_kind IN ('owned','takeover')
+                     LIMIT 1
+                    """,
+                    (orphan_unit_id, session_id),
+                ).fetchone()
+                if still_held_by_other_session is not None:
+                    # 本会话不再声明，但别的会话仍持有：只撤本会话这一行，不把单元全局 superseded / tombstone
+                    # （分层补判的弱证据会随改动时刻漂移，不能因此波及别的会话；08ac4 独立复核 M10）。
+                    _emit_event(
+                        events_path,
+                        {
+                            "event": "claim_dropped",
+                            "unit_id": orphan_unit_id,
+                            "session_id": session_id,
+                            "run_id": run_id,
+                            "reason": "session_no_longer_owns_but_other_session_still_holds_unit",
+                        },
+                    )
+                    continue
                 conn.execute(
                     "UPDATE units SET observed_state='superseded' WHERE unit_id=?",
                     (orphan_unit_id,),
@@ -3083,7 +3105,13 @@ def latest_transcript_watermark(
     repo: Path,
     session_id: str,
     log_root_override: Path | None = None,
+    exclude_run_id: str | None = None,
 ) -> dict[str, Any]:
+    """本会话已交给 review 的 transcript 行号上界（各 lease 的 ``transcript_max_line_number`` 取最大）。
+
+    ``exclude_run_id``：同一轮 run 在分配 lease 之后再重建 session-manifest（prepare、``rvf scope claim``）时，
+    不能被**本轮自己**的 lease 截断——否则本轮已归属的调用全落到水位线下，``register_claims`` 的孤儿清理会把
+    它们从 session_units 删掉（08ac4 端到端测试实测）。"""
     repo_resolved = repo.resolve()
     if _disabled():
         return {"status": "disabled", "transcript_max_line_number": None}
@@ -3118,8 +3146,9 @@ def latest_transcript_watermark(
              WHERE session_id=?
                AND state IN ('active','paused','completed')
                AND transcript_max_line_number IS NOT NULL
+               AND run_id <> ?
             """,
-            (session_id,),
+            (session_id, exclude_run_id or ""),
         ).fetchone()
         value = row["transcript_max_line_number"] if row is not None else None
         return {
@@ -3135,6 +3164,195 @@ def latest_transcript_watermark(
                 conn.close()
             except sqlite3.Error:
                 pass
+
+
+SESSION_PATH_CLAIMS_BY_AGENT_EXPLICIT_DECLARATION_TABLE = "session_path_claims_by_agent_explicit_declaration"
+# 认领时文件已被删除：内容哈希记成这个哨兵，删除状态不变就一直有效。
+CLAIMED_WORKTREE_FILE_ABSENT_CONTENT_SHA256 = "worktree_file_absent_at_claim_time"
+
+
+def _ensure_session_path_claims_by_agent_explicit_declaration_schema(conn: sqlite3.Connection) -> None:
+    """agent 用 ``rvf scope claim`` 显式认领的路径。
+
+    归属的分层补判（命令文本 / 时间窗）判不准时，最后由 agent 自己认领。``register_claims`` 每次都会清掉
+    本会话不再声明的单元（孤儿清理），所以认领必须单独落表，由 ``build_manifest`` 每次重新注入。
+    认领绑定当时的文件内容：内容变了就不再生效，免得审过、提交之后别的会话再改同一个文件时，
+    又被算到本会话头上。"""
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {SESSION_PATH_CLAIMS_BY_AGENT_EXPLICIT_DECLARATION_TABLE} (
+          session_id                            TEXT NOT NULL,
+          path                                  TEXT NOT NULL,
+          claimed_worktree_file_content_sha256  TEXT NOT NULL,
+          reason                                TEXT NOT NULL,
+          decision_token                        TEXT,
+          run_id                                TEXT,
+          claimed_at                            TEXT NOT NULL,
+          PRIMARY KEY (session_id, path)
+        )
+        """
+    )
+
+
+def worktree_file_content_sha256_for_agent_explicit_claim(repo: Path, path: str) -> str:
+    candidate = repo / path
+    try:
+        if candidate.is_symlink():
+            return hashlib.sha256(("symlink:" + os.readlink(candidate)).encode("utf-8")).hexdigest()
+        return hashlib.sha256(candidate.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return CLAIMED_WORKTREE_FILE_ABSENT_CONTENT_SHA256
+    except (IsADirectoryError, OSError):
+        return CLAIMED_WORKTREE_FILE_ABSENT_CONTENT_SHA256
+
+
+def record_session_path_claims_by_agent_explicit_declaration(
+    *,
+    repo: Path,
+    session_id: str,
+    paths: Iterable[str],
+    reason: str,
+    decision_token: str | None = None,
+    run_id: str | None = None,
+    log_root_override: Path | None = None,
+) -> dict[str, Any]:
+    repo_resolved = repo.resolve()
+    if _disabled():
+        return {"status": "disabled", "recorded_paths": []}
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None or is_bare_repo(repo_resolved):
+        return {"status": "unsupported_repo", "recorded_paths": []}
+    key = repo_key(common_dir)
+    base = log_root_override if log_root_override is not None else log_root()
+    directory = tracker_dir(base, key)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = _tracker_now_iso()
+    recorded: list[dict[str, str]] = []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _open_conn(directory / SQLITE_FILENAME)
+        with _begin_immediate(conn):
+            _ensure_session_path_claims_by_agent_explicit_declaration_schema(conn)
+            for path in sorted({str(path) for path in paths if str(path).strip()}):
+                content_sha256 = worktree_file_content_sha256_for_agent_explicit_claim(repo_resolved, path)
+                conn.execute(
+                    f"""
+                    INSERT INTO {SESSION_PATH_CLAIMS_BY_AGENT_EXPLICIT_DECLARATION_TABLE}
+                      (session_id, path, claimed_worktree_file_content_sha256, reason, decision_token, run_id, claimed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, path) DO UPDATE SET
+                      claimed_worktree_file_content_sha256=excluded.claimed_worktree_file_content_sha256,
+                      reason=excluded.reason,
+                      decision_token=excluded.decision_token,
+                      run_id=excluded.run_id,
+                      claimed_at=excluded.claimed_at
+                    """,
+                    (session_id, path, content_sha256, reason, decision_token, run_id, now),
+                )
+                recorded.append({"path": path, "claimed_worktree_file_content_sha256": content_sha256})
+        _emit_event(
+            directory / EVENTS_FILENAME,
+            {
+                "event": "session_path_claimed_by_agent_explicit_declaration",
+                "session_id": session_id,
+                "run_id": run_id,
+                "paths": [item["path"] for item in recorded],
+                "reason": reason,
+            },
+        )
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"status": "ok", "recorded_paths": recorded, "tracker_dir": str(directory)}
+
+
+def list_still_valid_session_path_claims_by_agent_explicit_declaration(
+    *,
+    repo: Path,
+    session_id: str,
+    log_root_override: Path | None = None,
+) -> set[str]:
+    """本会话认领过、且文件内容与认领时一致的路径。读不到 / 表不存在 → 空集。"""
+    repo_resolved = repo.resolve()
+    if _disabled() or not session_id:
+        return set()
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        return set()
+    base = log_root_override if log_root_override is not None else log_root()
+    db_path = tracker_dir(base, repo_key(common_dir)) / SQLITE_FILENAME
+    if not db_path.exists():
+        return set()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT path, claimed_worktree_file_content_sha256
+              FROM {SESSION_PATH_CLAIMS_BY_AGENT_EXPLICIT_DECLARATION_TABLE}
+             WHERE session_id=?
+            """,
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    finally:
+        if conn is not None:
+            conn.close()
+    return {
+        row["path"]
+        for row in rows
+        if worktree_file_content_sha256_for_agent_explicit_claim(repo_resolved, row["path"])
+        == row["claimed_worktree_file_content_sha256"]
+    }
+
+
+def dirty_paths_held_by_other_sessions_with_non_weak_evidence(
+    *,
+    repo: Path,
+    session_id: str | None,
+    weak_evidence_labels: Iterable[str],
+    log_root_override: Path | None = None,
+) -> set[str]:
+    """本 worktree 里被**别的**会话以非弱证据（写工具、命令文本、认领…）持有的脏路径。只读；读不到 → 空集。
+
+    session 归属分层补判的第 4 层（Kanban 单任务 worktree 默认认领）据此跳过「明摆着是别人写的」路径。"""
+    repo_resolved = repo.resolve()
+    if _disabled():
+        return set()
+    common_dir = git_common_dir(repo_resolved)
+    if common_dir is None:
+        return set()
+    base = log_root_override if log_root_override is not None else log_root()
+    db_path = tracker_dir(base, repo_key(common_dir)) / SQLITE_FILENAME
+    if not db_path.exists():
+        return set()
+    weak = sorted({str(label) for label in weak_evidence_labels})
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT u.path AS path
+              FROM units u
+              JOIN session_units su ON su.unit_id = u.unit_id
+             WHERE u.worktree_key = ?
+               AND u.is_tombstoned = 0
+               AND u.observed_state = 'dirty'
+               AND su.assignment_kind IN ('owned', 'takeover')
+               AND su.session_id <> ?
+               AND COALESCE(su.evidence, '') NOT IN ({",".join("?" for _ in weak) or "''"})
+            """,
+            (_worktree_key(str(repo_resolved)), session_id or "", *weak),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    finally:
+        if conn is not None:
+            conn.close()
+    return {row["path"] for row in rows}
 
 
 def list_conflicts(

@@ -56,6 +56,7 @@ from typing import Any, Callable, Mapping, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 上 sys.path，供 core.* / 兄弟脚本 import
 
+import agentic_initiation_review_scope_coverage_and_agent_explicit_path_claim as review_scope_coverage_and_claim  # noqa: E402
 import rvf_bootstrap_gate  # noqa: E402
 import rvf_decision_token_store as token_store  # noqa: E402
 import rvf_prep_file  # noqa: E402
@@ -117,6 +118,9 @@ EXIT_SCOPE_OF_WORK_STILL_STUB = 9
 # 也不是成功——是一次「没东西可审」的诚实回执。token 保持 acknowledged，agent 可以 decline，也可以
 # `--force-full-rescope` 显式要求重审一遍。
 EXIT_NO_UNREVIEWED_SCOPE = 10
+# dispatch 被覆盖闸拦下：session-owned 口径下有候选路径既没进正式审查、也没被认领 / 排除 / include。
+# token 仍在 acknowledged；认领、排除，或带 ``--accept-uncovered "<理由>"`` 重跑 dispatch（08ac4）。
+EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION = 11
 
 # ``default_prepare_pipeline`` 在「无未审单元」时的提前返回状态。刻意不复用 ``failed``：
 # 这一轮什么都没坏，只是没东西可审；混进 failed 会让 `--retry` 看起来像修复手段。
@@ -172,6 +176,7 @@ _KEY_FIELD_SEPARATOR = "\x1e"
 # scope 例外操作类型。
 SCOPE_OPERATION_EXCLUDE = "exclude"
 SCOPE_OPERATION_INCLUDE = "include"
+SCOPE_OPERATION_CLAIM = "claim"
 SCOPE_OPERATION_ANNOTATE = "annotate"
 
 
@@ -398,8 +403,14 @@ def record_scope_exception_and_maybe_file_issue(
                 "last_updated_at": _format_timestamp(now),
                 "note": (
                     f"同源（{worktree}）+ 同类型（scope {operation_type}）的 scope 例外已累计 "
-                    f"{count} 个不同路径（阈值 {threshold}）——疑似候选全集构造有系统性偏差，"
-                    "建议回访 signal / 收紧 ownership filter / 调整候选下界。R17：本地 ledger，不接外部 backend。"
+                    f"{count} 个不同路径（阈值 {threshold}）——"
+                    + (
+                        "疑似候选里本会话的改动没被归属（Bash / 子代理 / 改名 / HEAD 截断写入），"
+                        "回访 session-manifest 的 uncovered_dirty_paths_by_reason 与 attribution_evidence。"
+                        if operation_type in (SCOPE_OPERATION_INCLUDE, SCOPE_OPERATION_CLAIM)
+                        else "疑似候选全集纳入了不该审的路径，回访候选摘要的 ownership 过滤与候选下界。"
+                    )
+                    + "R17：本地 ledger，不接外部 backend。"
                 ),
             },
         )
@@ -471,6 +482,21 @@ def _initial_auto_scope_paths(
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
     return []
+
+
+def _review_scope_coverage_of_overlay(overlay: Mapping[str, Any]) -> dict[str, Any]:
+    """正式审查覆盖 X/Y（``fix_allowlist`` / 候选扣掉排除的），未覆盖的按原因分组。best-effort，不抛。"""
+    try:
+        contract, session_manifest = review_scope_coverage_and_claim.load_scope_contract_and_session_manifest_of_overlay(overlay)
+        return review_scope_coverage_and_claim.compute_review_scope_coverage_against_candidate_paths(
+            overlay=overlay, contract=contract, session_manifest=session_manifest
+        )
+    except Exception as exc:  # noqa: BLE001 - 覆盖率是回执增益，算不出就如实说未知
+        return {"formal_review_scope_known": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _render_review_scope_coverage_line(coverage: Mapping[str, Any], *, token: str) -> str:
+    return review_scope_coverage_and_claim.render_review_scope_coverage_summary_line(coverage, token=token, rvf_command=_rvf())
 
 
 def compute_effective_primary_files(overlay: Mapping[str, Any]) -> list[str]:
@@ -922,6 +948,8 @@ def allocate_agentic_initiation_tracker_review_scope(
             resolved_transcript.resolve(),
             committed_baseline=committed_baseline,
             committed_base_ref=committed_base_ref,
+            # Bash / 子代理 / mv·cp 写的文件按分层证据补判归属（08ac4）；只在 start 与 prepare 开启。
+            enable_layered_session_write_attribution=True,
         )
     except Exception as exc:  # noqa: BLE001 - manifest 失败降级，不阻断已接受的一轮
         return _degraded_tracker_scope_allocation(
@@ -1587,8 +1615,8 @@ def run_start(
     可 --retry。
 
     ``force_full_rescope``：显式覆盖「本会话名下没有未审单元就不开审」这道闸，按历史行为把整份
-    未提交 diff 当作本轮范围重审一遍。给的是**知情后仍要重审**的出口（例如工作是经 shell heredoc
-    写入的、tracker 归属看不见），不是默认路径。"""
+    未提交 diff 当作本轮范围重审一遍。给的是**知情后仍要重审**的出口（例如在非 Kanban 单任务 worktree
+    里经不透明脚本写入、分层归属也判不出的工作），不是默认路径。"""
     roots = roots or AgentDecisionRoots()
     now_dt = _coerce_now(now)
     prepare_pipeline = prepare_pipeline or default_prepare_pipeline
@@ -1950,7 +1978,7 @@ def run_start(
             next_steps=[
                 f'① 通常应当谢绝本轮：{_rvf()} decline --token {token} --decline-kind '
                 f'{token_store.DECLINE_KIND_STRUCTURAL_NOT_NEEDED} --reason "上一轮 RVF 产物，无未审单元"',
-                f"② 确知有 tracker 看不见的新工作（例如经 shell heredoc 写入的文件）而要重审："
+                f"② 确知有 tracker 看不见的新工作（例如在非 Kanban 单任务 worktree 里经不透明脚本写入、归属判不出的文件）而要重审："
                 f"{_rvf()} start --token {token} --retry --force-full-rescope --reason <重审理由>",
             ],
             detail={
@@ -2020,9 +2048,13 @@ def run_start(
         "annotations": {},
         "exclusions": [],
         "inclusions": [],
+        # agent 用 ``rvf scope claim`` 认领进正式审查的路径；认领时要用 transcript 重建 session-manifest。
+        "claims": [],
+        "transcript_path": transcript_path,
         "prepare_artifacts": dict(artifacts),
     }
     scope_artifact_path = write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+    review_scope_coverage = _review_scope_coverage_of_overlay(overlay)
 
     # ⑦ 在途凭证（INV-5）：接受之后的后续 Stop 不得把同一批改动重新征询一遍。就地接受没有
     #    UPS 事件，故必须由本命令自己 arm；``--retry`` 走同一路径，整份覆盖即幂等。
@@ -2073,18 +2105,20 @@ def run_start(
     )
 
     scope_mode_note = (
-        f"审查准备就绪（自动 scope {len(auto_scope_paths)} 路径；tracker scope 已分配，"
+        f"审查准备就绪（候选 {len(auto_scope_paths)} 路径；tracker scope 已分配，"
         f"lease={tracker_scope_allocation.get('tracker_lease_id')}、"
         f"{tracker_scope_allocation.get('tracker_unit_count')} 个可审单元）。"
         if not tracker_scope_degraded
         else (
-            f"审查准备就绪（自动 scope {len(auto_scope_paths)} 路径）。"
+            f"审查准备就绪（候选 {len(auto_scope_paths)} 路径）。"
             f"⚠ 本轮 scope 口径已降级（{tracker_scope_allocation.get('status')}）："
             f"{tracker_scope_allocation.get('degradation_reason')}"
             " 后果：本轮审完**无法**把这批单元标成 reviewed，同一批改动可能在下一次 Stop 再被提议一次；"
             "且范围可能含其他会话的背景改动，改文件前请以 scope contract 的 fix_allowlist 为准。"
         )
     )
+    # 如实报告正式审查覆盖了多少候选（08ac4：回执原先只报候选数，覆盖不全时 agent 多数不告诉用户）。
+    scope_mode_note += " " + _render_review_scope_coverage_line(review_scope_coverage, token=token)
     return CommandResult(
         command="start", status="ok", exit_code=EXIT_OK, token=token,
         token_state=token_store.STATE_ACKNOWLEDGED,
@@ -2104,6 +2138,7 @@ def run_start(
             "transcript_path": transcript_path,
             "transcript_path_source": transcript_path_source,
             "tracker_scope_allocation": dict(tracker_scope_allocation),
+            "review_scope_coverage": review_scope_coverage,
         },
     )
 
@@ -2145,7 +2180,10 @@ def _start_success_ordered_next_steps(
         f"① 用真实 reasoning 覆盖 scope-of-work `{scope_of_work_path}`（本轮改了什么、为什么、审时盯哪里；"
         f"删掉顶部单独成行的 `{rvf_dispatch_prompts.SCOPE_OF_WORK_STUB_MARKER}` 行），"
         f"然后 `{rvf} scope rerender-scope-of-work --token {token}`。",
-        f"②（可选）`{rvf} scope exclude|include --token {token} <path>… --reason \"<理由>\"` 微调自动 scope。",
+        f"② 看上面「正式审查覆盖 X/Y」：未覆盖里本会话写的，用 `{rvf} scope claim --token {token} <path>… "
+        f"--reason \"<理由>\"` 认领进正式审查（进 fix_allowlist / primary_units、移出 protected）；不该审的用 "
+        f"`{rvf} scope exclude --token {token} <path>… --reason \"<理由>\"`。"
+        "（`scope include` 只进 primary_files 与 land 的 stage 边界，**不进**正式审查与修复名单。）",
         f"③ `{rvf} dispatch --token {token} --strictness "
         f"{_suggested_strictness_tier_from_candidate_summary(candidate_summary)}`。",
         f"④ 等 reviewer：{_host_specific_reviewer_wait_step(run_dir)}",
@@ -2255,8 +2293,16 @@ def _run_scope_exception(
     latest_issue = issue_results[-1] if issue_results else {}
     newly_filed = any(r.get("newly_filed") for r in issue_results)
     message = f"scope {operation_type}：新增 {len(newly_added)} 路径（同键去重累计 {latest_issue.get('distinct_path_count', 0)}）。"
+    if operation_type == SCOPE_OPERATION_INCLUDE:
+        # include 原先的回执让 agent 以为「补好了」，实际被补路径仍不在 fix_allowlist、仍在 protected（08ac4：11 次全中）。
+        message += (
+            " 注意：include 只把路径并进 primary_files（reviewer 提示与 land 的 stage 边界），**不进**正式审查"
+            f"（primary_units / fix_allowlist），fixer 改它只能按 allowlist 外扩声明理由。本会话写的文件请改用 `{_rvf()} scope claim`。"
+        )
     if newly_filed:
         message += f" 已跨阈值 {latest_issue.get('threshold')} 自动立本地 scope-issue。"
+    coverage = _review_scope_coverage_of_overlay(overlay)
+    message += " " + _render_review_scope_coverage_line(coverage, token=token)
     return CommandResult(
         command=command, status="ok", exit_code=EXIT_OK, token=token, token_state=record.state,
         message=message,
@@ -2266,7 +2312,138 @@ def _run_scope_exception(
             "newly_added_paths": newly_added,
             "effective_primary_files": compute_effective_primary_files(overlay),
             "scope_issue": latest_issue,
+            "review_scope_coverage": coverage,
         },
+    )
+
+
+def run_scope_claim(
+    *,
+    token: str,
+    paths: Sequence[str],
+    reason: str,
+    takeover_reason: str | None = None,
+    roots: AgentDecisionRoots | None = None,
+    now: datetime | None = None,
+    issue_threshold: int = DEFAULT_SCOPE_EXCEPTION_ISSUE_THRESHOLD,
+) -> CommandResult:
+    """``scope claim``：把本会话写的路径认领进**正式审查**（primary_units / fix_allowlist / primary_files，
+    移出 protected / background），并重分配 lease、重渲 packet。仅 acknowledged 态（dispatch 之后拒绝）。
+
+    存在的理由（08ac4）：归属的分层补判仍判不准的路径（有争议 / 其他会话写的 / 对不上）只能由 agent 认领；
+    而 ``include`` 只进 stage 边界，补不进正式审查。"""
+    roots = roots or AgentDecisionRoots()
+    now_dt = _coerce_now(now)
+    try:
+        record, overlay = _load_overlay_for_scope(token, roots=roots, now=now_dt)
+    except TokenLoadError as exc:
+        return _token_error_result("scope claim", token, exc)
+
+    worktree = str(overlay.get("worktree") or record.payload.get("worktree") or "")
+    requested = list(dict.fromkeys(str(path) for path in paths))
+    held_by_other_sessions: set[str] = set()
+    try:
+        from core.session_scope_allocation.layered_session_write_attribution_for_unattributed_dirty_paths import (  # noqa: PLC0415
+            WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+        )
+        from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: PLC0415
+            dirty_paths_held_by_other_sessions_with_non_weak_evidence,
+        )
+
+        held_by_other_sessions = dirty_paths_held_by_other_sessions_with_non_weak_evidence(
+            repo=Path(str(overlay.get("repo") or worktree)).expanduser(),
+            session_id=overlay.get("session_id") if isinstance(overlay.get("session_id"), str) else None,
+            weak_evidence_labels=WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+        )
+    except Exception:  # noqa: BLE001 - 查不到就按「没有冲突」处理，认领由 agent 负责
+        held_by_other_sessions = set()
+    conflicting = [path for path in requested if path in held_by_other_sessions]
+    if conflicting and not (takeover_reason and takeover_reason.strip()):
+        return CommandResult(
+            command="scope claim", status="error", exit_code=EXIT_TOKEN_STATE, token=token, token_state=record.state,
+            message=(
+                f"{len(conflicting)} 个路径已被**别的会话**以强证据（写工具 / 命令文本 / 认领）持有，默认不让认领："
+                f"{', '.join(conflicting)}。确认是本会话的工作时加 `--takeover-reason \"<理由>\"` 重跑。"
+            ),
+            detail={"paths_held_by_other_sessions_with_strong_evidence": conflicting},
+        )
+
+    claim_result = review_scope_coverage_and_claim.claim_paths_into_formal_review_scope_of_prepared_run(
+        overlay=overlay,
+        token_payload=record.payload,
+        paths=requested,
+        reason=reason if not conflicting else f"{reason}（takeover：{takeover_reason}）",
+        token=token,
+        tracker_reviewer_id=AGENTIC_INITIATION_TRACKER_SCOPE_REVIEWER_ID,
+        tracker_lease_ttl_seconds=AGENTIC_INITIATION_TRACKER_SCOPE_LEASE_TTL_SECONDS,
+    )
+    if claim_result.get("status") != "claimed":
+        return CommandResult(
+            command="scope claim", status="error", exit_code=EXIT_TOKEN_STATE, token=token, token_state=record.state,
+            message=f"认领未生效（{claim_result.get('status')}）。",
+            detail={"claim": claim_result},
+        )
+
+    claims = list(overlay.get("claims") or [])
+    known = {str(entry.get("path")) for entry in claims if isinstance(entry, Mapping)}
+    for path in claim_result.get("claimed_paths") or []:
+        if path not in known:
+            claims.append({"path": path, "reason": reason, "at": _format_timestamp(now_dt), **(
+                {"takeover_reason": takeover_reason} if path in conflicting else {}
+            )})
+    overlay["claims"] = claims
+    overlay["updated_at"] = _format_timestamp(now_dt)
+    write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
+    for path in claim_result.get("claimed_paths") or []:
+        append_decision_telemetry(
+            token=token, event="scope_claim", worktree=worktree,
+            session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
+            detail={"path": path, "reason": reason, "takeover_reason": takeover_reason if path in conflicting else None},
+        )
+        record_scope_exception_and_maybe_file_issue(
+            worktree=worktree, operation_type=SCOPE_OPERATION_CLAIM, path=path, reason=reason,
+            token=token, now=now_dt, root=roots.scope_issue_ledger_root, threshold=issue_threshold,
+        )
+
+    coverage = _review_scope_coverage_of_overlay(overlay)
+    message = f"scope claim：{len(claim_result.get('claimed_paths_admitted_into_formal_review_scope') or [])} 个路径已认领进正式审查。"
+    if claim_result.get("rejected_paths_not_in_candidates_or_dirty"):
+        message += f" 拒绝（不在候选里、也不是脏文件）：{', '.join(claim_result['rejected_paths_not_in_candidates_or_dirty'])}。"
+    lease_state_after_claim = claim_result.get("tracker_lease_state_after_claim")
+    not_admitted = list(claim_result.get("claimed_paths_not_admitted_into_formal_review_scope") or [])
+    if lease_state_after_claim == (
+        review_scope_coverage_and_claim.TRACKER_LEASE_STATE_AFTER_CLAIM_PRIOR_LEASE_RELEASED_AND_REALLOCATION_FAILED_RUN_HAS_NO_LEASE
+    ):
+        message += (
+            f" ⚠ 旧 tracker lease 已释放、重新分配失败（{(claim_result.get('tracker_reallocation') or {}).get('status')}），"
+            "本轮已无 tracker lease：scope contract 已清空 lease 字段、退回按文件定范围，认领路径已进正式名单，"
+            "但审完整轮单元都无法标成 reviewed。"
+        )
+    elif (
+        lease_state_after_claim == review_scope_coverage_and_claim.TRACKER_LEASE_STATE_AFTER_CLAIM_REALLOCATION_SKIPPED_PRIOR_LEASE_KEPT
+        and not_admitted
+    ):
+        message += (
+            f" ⚠ 没能重新分配 tracker lease（{(claim_result.get('tracker_reallocation') or {}).get('skip_reason')}）："
+            "旧 lease 仍在，既有单元审完照常标 reviewed；但认领路径进不了这个 lease，没并进正式名单、仍未覆盖，"
+            f"dispatch 覆盖闸照拦：{', '.join(not_admitted)}。"
+        )
+    elif not claim_result.get("run_has_tracker_lease_after_claim"):
+        message += " ⚠ 本轮没有 tracker lease：认领只改了 scope contract，审完无法把这些单元标成 reviewed。"
+    elif not_admitted:
+        message += (
+            " ⚠ 这些路径没能进新的 tracker scope（可能在别的会话的在途 lease 里）："
+            f"{', '.join(not_admitted)}；没并进正式名单、仍未覆盖，dispatch 覆盖闸照拦。"
+        )
+    rerender = claim_result.get("packet_rerender") or {}
+    if rerender.get("status") != "rerendered":
+        message += f" ⚠ review packet 重渲失败：{rerender.get('error')}；reviewer 看到的 packet 还是认领前的。"
+    message += " " + _render_review_scope_coverage_line(coverage, token=token)
+    return CommandResult(
+        command="scope claim", status="ok", exit_code=EXIT_OK, token=token, token_state=record.state,
+        message=message,
+        next_steps=[f"{_rvf()} dispatch --token {token} --strictness <…>"],
+        detail={"claim": claim_result, "review_scope_coverage": coverage},
     )
 
 
@@ -2396,21 +2573,18 @@ def load_strictness_preset(tier: str, *, config_path: str | Path | None = None) 
     return presets[tier]
 
 
-def finalize_scope_contract(
-    overlay: Mapping[str, Any],
-    *,
-    effective_primary_files: list[str],
-) -> dict[str, Any]:
-    """scope 定稿：把 exclude/include 的净效果写回 prepare 产出的 scope.contract.json（改
-    ``primary_files`` / ``excluded_path_prefixes`` 并**重算 scope_hash**，复用 prepare 的
-    canonical 序列化以保证哈希一致）。best-effort：contract 缺失 / 不可读即跳过并返回状态。
+def finalize_scope_contract(overlay: Mapping[str, Any]) -> dict[str, Any]:
+    """scope 定稿：把 exclude/include 的净效果写回 prepare 产出的 scope.contract.json，并**重算 scope_hash**
+    （复用 prepare 的 canonical 序列化以保证哈希一致）。best-effort：contract 缺失 / 不可读即跳过并返回状态。
 
-    净效果必须同步到修复侧，否则 include 只对 reviewer 生效：
-    - ``fix_allowlist = (原值 ∪ effective_primary) − excluded``：include 进来的路径 fixer 能改，
-      exclude 掉的路径不再被当成 boundary 内（否则改它不算外扩、不会被拦）；
-    - ``background_files`` / ``protected_files`` 减去 effective_primary：同一路径不能既是
-      primary 又是 background（reviewer 拿到的合同会自相矛盾，fixer 改它会被当成越界）。
-    顶层字段与 ``canonical_scope`` 两处都写——fix stop 先读顶层。"""
+    ``primary_files`` = contract 原有的（prepare 按 tracker scope 定的，或 ``scope claim`` 改写过的）− 排除 ∪ include。
+    原先直接改写成候选全集，于是候选里没进正式审查的路径同时出现在 primary 与 protected 两边，dispatch 回执的
+    「primary_files N」也因此高估覆盖（08ac4：79 个路径同时在两边）。现在 include 进来的路径同时移出
+    protected / background，维持 ``primary ∩ protected = ∅``。
+
+    ``fix_allowlist`` 是「正式审查覆盖」（与 tracker ``primary_units`` 同源，覆盖率 X/Y 与 dispatch 覆盖闸都按它算），
+    所以 include **不**并进它——要进正式审查走 ``scope claim``（它同时重分配 lease）；exclude 掉的路径则移出它，
+    否则 fixer 改它不算外扩、不会触发告警-确认。顶层字段与 ``canonical_scope`` 两处都写——fix stop 先读顶层。"""
     artifacts = overlay.get("prepare_artifacts")
     contract_path_raw = artifacts.get("scope_contract") if isinstance(artifacts, Mapping) else None
     if not isinstance(contract_path_raw, str) or not contract_path_raw:
@@ -2426,27 +2600,29 @@ def finalize_scope_contract(
     excluded_paths = sorted(
         {str(e.get("path")) for e in (overlay.get("exclusions") or []) if isinstance(e, Mapping) and e.get("path")}
     )
+    included_paths = [
+        str(e.get("path")) for e in (overlay.get("inclusions") or []) if isinstance(e, Mapping) and e.get("path")
+    ]
     prior_excluded = [str(p) for p in (contract.get("excluded_path_prefixes") or [])]
     merged_excluded = list(dict.fromkeys([*prior_excluded, *excluded_paths]))
+    excluded_set = set(excluded_paths)
+    effective_primary_files = [
+        path
+        for path in dict.fromkeys([*(str(p) for p in (contract.get("primary_files") or [])), *included_paths])
+        if path not in excluded_set
+    ]
+    effective_primary_set = set(effective_primary_files)
 
     import prepare_review_run  # noqa: PLC0415 - 复用 canonical 序列化 + 版本
-
-    effective_primary_set = set(effective_primary_files)
 
     def _excluded_by_scope_adjustment(path: str) -> bool:
         return any(path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in merged_excluded)
 
-    background_files = [
-        str(p) for p in (contract.get("background_files") or []) if str(p) not in effective_primary_set
-    ]
-    protected_files = [
-        str(p) for p in (contract.get("protected_files") or []) if str(p) not in effective_primary_set
-    ]
+    background_files = [str(p) for p in (contract.get("background_files") or []) if str(p) not in effective_primary_set]
+    protected_files = [str(p) for p in (contract.get("protected_files") or []) if str(p) not in effective_primary_set]
     canonical_issues = contract.get("canonical_issues") or []
     fix_allowlist = [
-        path
-        for path in dict.fromkeys([*(str(p) for p in (contract.get("fix_allowlist") or [])), *effective_primary_files])
-        if not _excluded_by_scope_adjustment(path)
+        str(path) for path in (contract.get("fix_allowlist") or []) if not _excluded_by_scope_adjustment(str(path))
     ]
     version = contract.get("version", prepare_review_run.SCOPE_CONTRACT_VERSION)
     prior_canonical_scope = contract.get("canonical_scope")
@@ -2464,10 +2640,10 @@ def finalize_scope_contract(
     })
     new_hash = hashlib.sha256(prepare_review_run.canonical_json_bytes(canonical_scope)).hexdigest()
     contract["primary_files"] = effective_primary_files
-    contract["excluded_path_prefixes"] = merged_excluded
-    contract["fix_allowlist"] = fix_allowlist
     contract["background_files"] = background_files
     contract["protected_files"] = protected_files
+    contract["excluded_path_prefixes"] = merged_excluded
+    contract["fix_allowlist"] = fix_allowlist
     contract["scope_hash"] = new_hash
     contract["canonical_scope"] = canonical_scope
     _atomic_write_json(contract_path, contract)
@@ -2768,8 +2944,12 @@ def run_dispatch(
     reviewer_dispatcher: Callable[..., dict[str, Any]] | None = None,
     dry_run: bool = False,
     preset_config_path: str | Path | None = None,
+    accept_uncovered_reason: str | None = None,
 ) -> CommandResult:
-    """``dispatch`` 子命令：scope 定稿 → 严格度终选（读 preset）→ 派发 reviewer → mark_dispatched。"""
+    """``dispatch`` 子命令：scope-of-work 闸 → 覆盖闸 → scope 定稿 → 严格度终选（读 preset）→ 派发 reviewer → mark_dispatched。
+
+    覆盖闸（08ac4）：session-owned 口径下，候选里有路径既没进正式审查、也没被 agent 认领 / 排除 / include，
+    就拦下，要求 agent 认领、排除，或带 ``accept_uncovered_reason`` 显式接受不审。"""
     roots = roots or AgentDecisionRoots()
     now_dt = _coerce_now(now)
     reviewer_dispatcher = reviewer_dispatcher or default_reviewer_dispatcher
@@ -2792,9 +2972,6 @@ def run_dispatch(
             token_state=record.state, message=f"严格度 preset 读取失败：{exc}",
         )
 
-    # ① scope 定稿。
-    effective_primary_files = compute_effective_primary_files(overlay)
-    finalize = finalize_scope_contract(overlay, effective_primary_files=effective_primary_files)
     artifacts = overlay.get("prepare_artifacts") if isinstance(overlay.get("prepare_artifacts"), Mapping) else {}
 
     worktree = str(overlay.get("worktree") or record.payload.get("worktree") or "")
@@ -2817,6 +2994,44 @@ def run_dispatch(
             next_steps=_scope_of_work_gate_next_steps(stub_gate, token=token),
             detail=stub_gate,
         )
+
+    # ①b 覆盖闸：只在 session-owned 口径生效（manual-all-uncommitted 本来就全量审工作树）。
+    review_scope_coverage = _review_scope_coverage_of_overlay(overlay)
+    contract_for_gate, _manifest_for_gate = review_scope_coverage_and_claim.load_scope_contract_and_session_manifest_of_overlay(overlay)
+    uncovered_without_decision = list(review_scope_coverage.get("uncovered_candidate_paths_without_agent_decision") or [])
+    coverage_gate_applies = (
+        isinstance(contract_for_gate, Mapping) and contract_for_gate.get("scope_mode") == "session-owned"
+    )
+    if coverage_gate_applies and uncovered_without_decision and not (accept_uncovered_reason and accept_uncovered_reason.strip()):
+        append_decision_telemetry(
+            token=token, event="dispatch_blocked_on_uncovered_candidate_paths", worktree=worktree,
+            session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
+            detail={"review_scope_coverage": review_scope_coverage},
+        )
+        rvf = _rvf()
+        listed = uncovered_without_decision[:20]
+        return CommandResult(
+            command="dispatch",
+            status="uncovered_candidate_paths_need_agent_decision",
+            exit_code=EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION,
+            token=token,
+            token_state=record.state,
+            message=(
+                _render_review_scope_coverage_line(review_scope_coverage, token=token)
+                + f" 有 {len(uncovered_without_decision)} 个候选路径既没进正式审查、也没被认领或排除，先逐个表态再派发。"
+            ),
+            next_steps=[
+                f"本会话写的：`{rvf} scope claim --token {token} {' '.join(listed)} --reason \"<理由>\"`（可只列其中一部分）。",
+                f"不该审的：`{rvf} scope exclude --token {token} <path>… --reason \"<理由>\"`。",
+                f"确认就这样派发（这些路径本轮不审）：`{rvf} dispatch --token {token} --strictness {strictness} "
+                "--accept-uncovered \"<理由>\"`；理由会写进 handoff，两行摘要的 Reviewers 行也要带上 X/Y。",
+            ],
+            detail={"review_scope_coverage": review_scope_coverage},
+        )
+
+    # ①c scope 定稿（放在所有闸之后：被拦下的 dispatch 不该改写 contract）。
+    finalize = finalize_scope_contract(overlay)
+    effective_primary_files = list(finalize.get("primary_files") or compute_effective_primary_files(overlay))
     append_decision_telemetry(
         token=token, event="dispatch_scope_finalized", worktree=worktree,
         session_id=overlay.get("session_id"), now=now_dt, root=roots.telemetry_root,
@@ -2890,6 +3105,12 @@ def run_dispatch(
     overlay["dispatched_preset"] = dict(preset)
     overlay["dispatch_result"] = dispatch_result
     overlay["scope_finalize"] = finalize
+    overlay["review_scope_coverage_at_dispatch"] = review_scope_coverage
+    if accept_uncovered_reason and accept_uncovered_reason.strip():
+        overlay["accepted_uncovered_candidate_paths"] = {
+            "reason": accept_uncovered_reason.strip(),
+            "paths": uncovered_without_decision,
+        }
     overlay["updated_at"] = _format_timestamp(now_dt)
     write_scope_adjustment(overlay, token=token, root=roots.scope_adjustment_root)
 
@@ -2918,12 +3139,21 @@ def run_dispatch(
     return CommandResult(
         command="dispatch", status="ok", exit_code=EXIT_OK, token=token,
         token_state=dispatched.state,
-        message=f"已按 {strictness} 档派发 reviewer（primary_files {len(effective_primary_files)}，"
-        f"external target {preset.get('external_reviewer_count_target')}）。审查将就地进行。",
+        message=f"已按 {strictness} 档派发 reviewer（external target {preset.get('external_reviewer_count_target')}）。"
+        + _render_review_scope_coverage_line(review_scope_coverage, token=token)
+        + (
+            f" 已显式接受 {len(uncovered_without_decision)} 个候选路径本轮不审（理由：{accept_uncovered_reason.strip()}），"
+            "handoff 与两行摘要里要如实写出。"
+            if accept_uncovered_reason and accept_uncovered_reason.strip() and uncovered_without_decision
+            else ""
+        )
+        + " 审查将就地进行。",
         next_steps=next_steps,
         detail={
             "strictness": strictness, "preset": dict(preset),
             "effective_primary_files": effective_primary_files,
+            "review_scope_coverage": review_scope_coverage,
+            "accepted_uncovered_candidate_paths": overlay.get("accepted_uncovered_candidate_paths"),
             "scope_finalize": finalize,
             "dispatch_plan_path": dispatch_result.get("plan_path"),
             "dispatch_status_path": dispatch_status_path,
@@ -3778,11 +4008,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "本会话名下没有未审单元时仍强行开审（把整份未提交 diff 当本轮范围重审一遍）。"
             "默认不这么做：那一轮拿不到 lease，审完标不了 reviewed，同一批 diff 下次 Stop 会再被提议。"
-            "只在确知有 tracker 归属看不见的新工作（例如经 shell heredoc 写入的文件）时用"
+            "只在确知有 tracker 归属看不见的新工作（例如在非 Kanban 单任务 worktree 里经不透明脚本写入的文件）时用"
         ),
     )
 
-    p_scope = sub.add_parser("scope", help="改动自动 scope（annotate / exclude / include），仅 acknowledged 态")
+    p_scope = sub.add_parser("scope", help="改动自动 scope（annotate / exclude / include / claim），仅 acknowledged 态")
     scope_sub = p_scope.add_subparsers(dest="scope_action", required=True)
     p_ann = scope_sub.add_parser("annotate", help="批量给候选路径加注释")
     p_ann.add_argument("--token", required=True)
@@ -3792,10 +4022,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_exc.add_argument("--token", required=True)
     p_exc.add_argument("paths", nargs="+", help="要排除的路径（可多个）")
     p_exc.add_argument("--reason", required=True, help="排除理由")
-    p_inc = scope_sub.add_parser("include", help="把路径追加进自动 scope")
+    p_inc = scope_sub.add_parser(
+        "include",
+        help="把路径追加进 primary_files（reviewer 提示与 land 的 stage 边界）；不进正式审查，本会话写的用 claim",
+    )
     p_inc.add_argument("--token", required=True)
     p_inc.add_argument("paths", nargs="+", help="要追加的路径（可多个）")
     p_inc.add_argument("--reason", required=True, help="追加理由")
+    p_claim = scope_sub.add_parser(
+        "claim",
+        help=(
+            "把本会话写的路径认领进正式审查（primary_units / fix_allowlist / primary_files，移出 protected），"
+            "重分配 lease 并重渲 packet"
+        ),
+    )
+    p_claim.add_argument("--token", required=True)
+    p_claim.add_argument("paths", nargs="+", help="要认领的路径（须在候选里或是当前脏文件）")
+    p_claim.add_argument("--reason", required=True, help="为什么是本会话写的（例如「经 python 脚本写入」）")
+    p_claim.add_argument(
+        "--takeover-reason",
+        help="路径已被别的会话以强证据持有时必填：为什么仍是本会话的工作",
+    )
     p_rerender = scope_sub.add_parser(
         "rerender-scope-of-work",
         help=(
@@ -3809,6 +4056,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     p_disp.add_argument("--token", required=True)
     p_disp.add_argument("--strictness", required=True, choices=list(STRICTNESS_TIERS))
     p_disp.add_argument("--dry-run", action="store_true", help="dispatch_reviewers 走 --dry-run，不真拉起 reviewer")
+    p_disp.add_argument(
+        "--accept-uncovered",
+        dest="accept_uncovered_reason",
+        help="候选里仍有既没进正式审查、也没被认领 / 排除的路径时，显式接受本轮不审它们的理由（写进 overlay 与 handoff）",
+    )
 
     p_dec = sub.add_parser("decline", help="谢绝发起：理由持久化 + 按谢绝类型分流 + 终态 declined")
     p_dec.add_argument("--token", required=True)
@@ -3873,10 +4125,17 @@ def main(argv: list[str] | None = None) -> int:
             result = run_scope_exclude(token=args.token, paths=list(args.paths), reason=args.reason)
         elif args.scope_action == "rerender-scope-of-work":
             result = run_scope_rerender_scope_of_work(token=args.token)
+        elif args.scope_action == "claim":
+            result = run_scope_claim(
+                token=args.token, paths=list(args.paths), reason=args.reason, takeover_reason=args.takeover_reason
+            )
         else:  # include
             result = run_scope_include(token=args.token, paths=list(args.paths), reason=args.reason)
     elif args.command == "dispatch":
-        result = run_dispatch(token=args.token, strictness=args.strictness, dry_run=args.dry_run)
+        result = run_dispatch(
+            token=args.token, strictness=args.strictness, dry_run=args.dry_run,
+            accept_uncovered_reason=args.accept_uncovered_reason,
+        )
     elif args.command == "decline":
         result = run_decline(token=args.token, reason=args.reason, decline_kind=args.decline_kind)
     elif args.command == "decline-dispatched-review":
@@ -3914,7 +4173,8 @@ __all__ = [
     "compute_effective_primary_files", "load_strictness_preset", "finalize_scope_contract",
     "resolve_agent_initiation_backend", "default_launch_preflight", "default_provider_health_requirements",
     "run_start", "run_start_reopening_own_declined_decision_on_developer_verbal_request",
-    "find_newest_decision_token_of_session_on_worktree", "run_scope_annotate", "run_scope_exclude", "run_scope_include", "run_dispatch", "run_decline",
+    "find_newest_decision_token_of_session_on_worktree", "run_scope_annotate", "run_scope_exclude", "run_scope_include",
+    "run_scope_claim", "EXIT_UNCOVERED_CANDIDATE_PATHS_NEED_AGENT_DECISION", "run_dispatch", "run_decline",
     "run_decline_dispatched_review",
     "build_argument_parser", "main",
 ]

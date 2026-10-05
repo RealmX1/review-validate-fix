@@ -27,6 +27,18 @@ for _pyroot_candidate in (_pyroot_search_start, *_pyroot_search_start.parents):
             sys.path.insert(0, str(_pyroot_candidate))
         break
 from core.session_scope_allocation import reviewable_unit_diff_tracker  # noqa: E402
+from core.session_scope_allocation.committed_round_detection import (  # noqa: E402
+    _resolve_committed_round_base_ref,
+)
+from core.session_scope_allocation.layered_session_write_attribution_for_unattributed_dirty_paths import (  # noqa: E402
+    LAYERED_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+    WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+    attribute_unattributed_dirty_paths_with_layered_session_write_evidence,
+)
+from core.session_scope_allocation.shell_command_named_write_target_paths_extraction import (  # noqa: E402
+    analyze_shell_command_named_write_targets,
+    shell_command_runs_git_commit_inside_repository,
+)
 from core.transcript.patch_parsing import (  # noqa: E402
     synthesize_apply_patch_text_from_patch_apply_end,
 )
@@ -579,7 +591,12 @@ def has_timestamp_comparable_tool(record: dict[str, Any]) -> bool:
         return True
     if is_patch_apply_end_record(record):
         return True
-    return any(item.get("name") in CLAUDE_WRITE_TOOL_NAMES for item in claude_tool_uses(record))
+    payload = record.get("payload")
+    item = payload.get("item") if isinstance(payload, dict) and isinstance(payload.get("item"), dict) else None
+    if item is not None and item.get("type") in {"CommandExecution", "FileChange"}:
+        return True
+    # Claude Bash 也会写文件（08ac4 调查）：它和写工具一样带时间戳，可参与提交时刻截断。
+    return any(item.get("name") in CLAUDE_WRITE_TOOL_NAMES or item.get("name") == "Bash" for item in claude_tool_uses(record))
 
 
 def should_include_tool_record(
@@ -600,11 +617,91 @@ def should_include_tool_record(
     return True
 
 
+def latest_session_branch_commit_time_excluding_base_reachable_commits(
+    repo: Path, base_ref: str | None
+) -> tuple[str, datetime | None]:
+    """无 transcript 内提交可做截断时的回退时刻：HEAD 历史里**不在 base 上**的提交中最新的作者时间。
+
+    原先直接取 HEAD 的提交时刻。worktree 被 fast-forward 到 base 上别的任务的提交后，HEAD 时刻晚于本会话
+    所有未提交的写入，于是这些写入被整段判为 ignored（08ac4 调查的「第三种失明」，7 run / 32 文件）。
+    排除 base 可达提交后：
+    - 一个都不剩（分支没有自己的提交，只是被快进到 base）⇒ 不按提交时刻截断；
+    - 有剩下的 ⇒ 取它们的**作者**时间（rebase 会把提交者时间改成 rebase 那一刻，作者时间不变）。
+    base 不可安全排除时（解析不了、或当前分支就是 base 本身）维持原行为：HEAD 的提交时刻。"""
+    exclude_revs = reviewable_unit_diff_tracker._base_ref_exclude_revs(repo, base_ref)
+    if not exclude_revs:
+        return "head_commit_time", head_committed_at(repo)
+    try:
+        raw = str(run_git(repo, ["log", "--format=%aI", "-n", "200", "HEAD", *exclude_revs]))
+    except RuntimeError:
+        return "head_commit_time", head_committed_at(repo)
+    author_times = [
+        parsed
+        for parsed in (parse_record_timestamp({"timestamp": line.strip()}) for line in raw.splitlines() if line.strip())
+        if parsed is not None
+    ]
+    if not author_times:
+        return "no_session_branch_commit_after_excluding_base_reachable_commits", None
+    return "latest_session_branch_commit_author_time_excluding_base_reachable_commits", max(author_times)
+
+
+def _claude_tool_result_is_error_by_tool_use_id(records: list[dict[str, Any]]) -> dict[str, bool]:
+    results: dict[str, bool] = {}
+    for record in records:
+        message = record.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str):
+                results.setdefault(block["tool_use_id"], bool(block.get("is_error")))
+    return results
+
+
+def successful_repository_git_commit_line_numbers_from_shell_records(repo: Path, records: list[dict[str, Any]]) -> list[int]:
+    """Claude Bash 与新 Codex ``CommandExecution`` 里成功、且工作目录在本仓库内的 ``git commit`` /
+    ``rvf land commit`` 所在行。原先只识别旧 Codex ``exec_command``，Claude 会话因此从不按自己的提交截断。"""
+    line_numbers: list[int] = []
+    claude_is_error = _claude_tool_result_is_error_by_tool_use_id(records)
+    for record in records:
+        line = record.get("_line_number")
+        if not isinstance(line, int):
+            continue
+        for item in claude_tool_uses(record):
+            if item.get("name") != "Bash":
+                continue
+            tool_input = item.get("input") if isinstance(item.get("input"), dict) else {}
+            command = tool_input.get("command")
+            tool_use_id = item.get("id")
+            if not isinstance(command, str) or not isinstance(tool_use_id, str) or "commit" not in command:
+                continue
+            if claude_is_error.get(tool_use_id, True):
+                continue  # 没有结果或结果报错：提交没有成功落地
+            cwd = record.get("cwd") if isinstance(record.get("cwd"), str) else None
+            analysis = analyze_shell_command_named_write_targets(command, cwd)
+            if shell_command_runs_git_commit_inside_repository(analysis, repository_root=repo):
+                line_numbers.append(line)
+        payload = record.get("payload")
+        item = payload.get("item") if isinstance(payload, dict) and isinstance(payload.get("item"), dict) else None
+        if item is not None and item.get("type") == "CommandExecution" and item.get("exit_code") == 0:
+            command = item.get("command")
+            command_text = command[2] if isinstance(command, list) and len(command) >= 3 and command[1] in ("-lc", "-c") else (
+                " ".join(str(part) for part in command) if isinstance(command, list) else command
+            )
+            cwd = item.get("cwd")
+            cwd_text = cwd[len("file://"):] if isinstance(cwd, str) and cwd.startswith("file://") else cwd
+            if isinstance(command_text, str) and "commit" in command_text:
+                analysis = analyze_shell_command_named_write_targets(command_text, cwd_text if isinstance(cwd_text, str) else None)
+                if shell_command_runs_git_commit_inside_repository(analysis, repository_root=repo):
+                    line_numbers.append(line)
+    return line_numbers
+
+
 def ownership_baseline(
     repo: Path,
     records: list[dict[str, Any]],
     *,
     include_all: bool,
+    base_ref: str | None = None,
 ) -> tuple[dict[str, Any], int | None, datetime | None, list[str]]:
     head = head_commit(repo)
     committed_at = head_committed_at(repo)
@@ -646,6 +743,9 @@ def ownership_baseline(
         if is_git_commit_command(repo, cmd, resolved_workdir):
             line = record.get("_line_number")
             cutoff_line = int(line) if isinstance(line, int) else cutoff_line
+    shell_commit_lines = successful_repository_git_commit_line_numbers_from_shell_records(repo, records)
+    if shell_commit_lines:
+        cutoff_line = max(cutoff_line or 0, max(shell_commit_lines))
 
     if cutoff_line is not None:
         return (
@@ -666,19 +766,36 @@ def ownership_baseline(
     has_tool_timestamps = any(
         has_timestamp_comparable_tool(record) and parse_record_timestamp(record) is not None for record in records
     )
-    if committed_at is not None and has_tool_timestamps:
+    commit_time_mode, commit_time_cutoff = latest_session_branch_commit_time_excluding_base_reachable_commits(repo, base_ref)
+    if commit_time_cutoff is not None and has_tool_timestamps:
         return (
             {
-                "mode": "head_commit_time",
+                "mode": commit_time_mode,
                 "head": head,
-                "head_committed_at": committed_at.isoformat(),
+                "head_committed_at": committed_at.isoformat() if committed_at is not None else None,
                 "cutoff_line_number": None,
-                "cutoff_reason": "head_committed_at",
+                "cutoff_reason": "head_committed_at" if commit_time_mode == "head_commit_time" else commit_time_mode,
+                "cutoff_timestamp": commit_time_cutoff.isoformat(),
                 "included_tool_record_count": 0,
                 "ignored_tool_record_count": 0,
             },
             None,
-            committed_at,
+            commit_time_cutoff,
+            warnings,
+        )
+    if commit_time_mode == "no_session_branch_commit_after_excluding_base_reachable_commits" and has_tool_timestamps:
+        return (
+            {
+                "mode": commit_time_mode,
+                "head": head,
+                "head_committed_at": committed_at.isoformat() if committed_at is not None else None,
+                "cutoff_line_number": None,
+                "cutoff_reason": commit_time_mode,
+                "included_tool_record_count": 0,
+                "ignored_tool_record_count": 0,
+            },
+            None,
+            None,
             warnings,
         )
 
@@ -699,6 +816,26 @@ def ownership_baseline(
         None,
         warnings,
     )
+
+
+def _attribution_lower_bound_epoch_ms(
+    records: list[dict[str, Any]], *, cutoff_line_number: int | None, cutoff_timestamp: datetime | None
+) -> int | None:
+    """把主 transcript 的截断（行号或时刻）换算成时刻，供子代理 / 其它 transcript 文件里的调用比较。
+    子代理文件的行号与主 transcript 无关，只能按时间截断。"""
+    if cutoff_timestamp is not None:
+        return int(cutoff_timestamp.timestamp() * 1000)
+    if cutoff_line_number is None:
+        return None
+    latest: datetime | None = None
+    for record in records:
+        line_number = record.get("_line_number")
+        if not isinstance(line_number, int) or line_number > cutoff_line_number:
+            continue
+        stamp = parse_record_timestamp(record)
+        if stamp is not None and (latest is None or stamp > latest):
+            latest = stamp
+    return int(latest.timestamp() * 1000) if latest is not None else None
 
 
 def current_diff_hunks(repo: Path, path: str) -> list[CurrentHunk]:
@@ -928,14 +1065,24 @@ def build_manifest(
     include_all_transcript_ownership: bool = False,
     committed_baseline: str | None = None,
     committed_base_ref: str | None = None,
+    enable_layered_session_write_attribution: bool = False,
+    enable_file_change_time_window_attribution: bool = True,
 ) -> dict[str, Any]:
+    """``enable_layered_session_write_attribution``：主循环之后对仍无归属的脏路径做分层补判（子代理 / 命令文本 /
+    认领 / Kanban 单任务 worktree 默认认领）。只由 ``rvf start`` 与 prepare 显式开启——它要读子代理与同 worktree
+    其它会话的 transcript，遗留 Stop 路由不该付这份开销（08ac4 独立复核 M14）。"""
     root = git_root(repo)
     records = parse_jsonl(transcript)
     session_id = session_id_from_records(records)
+    try:
+        ownership_base_ref = committed_base_ref or _resolve_committed_round_base_ref(root)
+    except Exception:
+        ownership_base_ref = committed_base_ref
     baseline, cutoff_line_number, cutoff_timestamp, baseline_warnings = ownership_baseline(
         root,
         records,
         include_all=include_all_transcript_ownership,
+        base_ref=ownership_base_ref,
     )
     tracker_watermark: dict[str, Any] = {"status": "skipped"}
     tracker_cutoff_line: int | None = None
@@ -944,6 +1091,8 @@ def build_manifest(
             repo=root,
             session_id=session_id,
             log_root_override=tracker_log_root,
+            # 同一轮 run 分配 lease 之后重建 manifest（prepare / scope claim）时，不被本轮自己的 lease 截断。
+            exclude_run_id=tracker_run_id,
         )
         candidate_line = tracker_watermark.get("transcript_max_line_number")
         if isinstance(candidate_line, int):
@@ -1216,6 +1365,79 @@ def build_manifest(
                 ignored_tool_record_count += 1
         command_events.append(event)
 
+    # 分层补判：主循环之后仍无归属的脏路径，按「子代理写工具 → 命令文本 → agent 认领 → 时间窗」依次判定
+    # 是不是本会话写的（08ac4 调查报告 §5.5）。只做 path 级登记；永不让 build_manifest 失败。
+    layered_attribution_payload: dict[str, Any] = {"status": "disabled_by_caller"}
+    layered_attribution_evidence: list[dict[str, Any]] = []
+    uncovered_dirty_paths_by_reason: dict[str, list[dict[str, Any]]] = {}
+    if enable_layered_session_write_attribution:
+        already_owned_dirty_paths = {
+            owned_unit.path for owned_unit, _evidence in live_owned_units if owned_unit.path in dirty_set
+        } | (live_exec_paths & dirty_set)
+        unattributed_before_layers = dirty_set - already_owned_dirty_paths
+        attribution_lower_bound_epoch_ms = _attribution_lower_bound_epoch_ms(
+            records, cutoff_line_number=cutoff_line_number, cutoff_timestamp=cutoff_timestamp
+        )
+        # agent 用 ``rvf scope claim`` 认领过、内容未变的路径：每次重新注入，免得被 register_claims 的孤儿清理删掉。
+        agent_explicit_claim_paths: set[str] = set()
+        paths_held_by_other_sessions_with_strong_evidence: set[str] = set()
+        if tracker_enabled and session_id:
+            try:
+                agent_explicit_claim_paths = reviewable_unit_diff_tracker.list_still_valid_session_path_claims_by_agent_explicit_declaration(
+                    repo=root, session_id=session_id, log_root_override=tracker_log_root
+                )
+            except Exception:
+                agent_explicit_claim_paths = set()
+        if tracker_enabled:
+            try:
+                paths_held_by_other_sessions_with_strong_evidence = (
+                    reviewable_unit_diff_tracker.dirty_paths_held_by_other_sessions_with_non_weak_evidence(
+                        repo=root,
+                        session_id=session_id,
+                        weak_evidence_labels=WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+                        log_root_override=tracker_log_root,
+                    )
+                )
+            except Exception:
+                paths_held_by_other_sessions_with_strong_evidence = set()
+        try:
+            layered = attribute_unattributed_dirty_paths_with_layered_session_write_evidence(
+                repository_root=root,
+                main_transcript_path=transcript,
+                session_id=session_id,
+                unattributed_dirty_paths=unattributed_before_layers,
+                main_transcript_cutoff_line_number=cutoff_line_number,
+                attribution_lower_bound_epoch_ms=attribution_lower_bound_epoch_ms,
+                agent_explicit_claim_paths=agent_explicit_claim_paths,
+                paths_held_by_other_sessions_with_strong_evidence=paths_held_by_other_sessions_with_strong_evidence,
+                enable_time_window_layer=enable_file_change_time_window_attribution,
+            )
+        except Exception as exc:  # 补判是增益，失败时退回主循环的结果并说出来
+            layered_attribution_payload = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        else:
+            for item in layered.attributed:
+                live_owned_units.append(
+                    (
+                        reviewable_unit_diff_tracker.OwnedUnit(path=item.repository_relative_path, unit="path", hunk_anchor=None),
+                        item.evidence,
+                    )
+                )
+                owned_paths.add(item.repository_relative_path)
+                layered_attribution_evidence.append(item.to_dict())
+            included_tool_line_numbers.extend(layered.main_session_attributing_transcript_line_numbers)
+            uncovered_dirty_paths_by_reason = layered.uncovered_dirty_paths_by_reason
+            layered_attribution_payload = {
+                "status": "ok",
+                "unattributed_dirty_path_count_before_layers": len(unattributed_before_layers),
+                "attributed_path_count": len(layered.attributed),
+                "attribution_lower_bound_at": (
+                    datetime.fromtimestamp(attribution_lower_bound_epoch_ms / 1000, tz=timezone.utc).isoformat()
+                    if attribution_lower_bound_epoch_ms is not None
+                    else None
+                ),
+                **layered.diagnostics,
+            }
+
     seen_live_units: set[tuple[str, str, str]] = set()
     deduped_live_units: list[tuple[reviewable_unit_diff_tracker.OwnedUnit, str]] = []
     for owned_unit, evidence in live_owned_units:
@@ -1300,7 +1522,8 @@ def build_manifest(
         tracker_exec_only_paths = {
             owned_unit.path
             for owned_unit, evidence in deduped_live_units
-            if evidence in {"exec_command", "claude_write"} and owned_unit.path in owned_dirty_set
+            if (evidence in {"exec_command", "claude_write"} or evidence in LAYERED_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS)
+            and owned_unit.path in owned_dirty_set
         }
         register_session_id = session_id or (tracker_run_id or f"transcript-{transcript.name}")
         # tracker_units stays dirty-only: it feeds the diagnostic payload and
@@ -1390,6 +1613,15 @@ def build_manifest(
         "owned_committed_round_paths": committed_round_owned,
         "committed_round_baseline": committed_baseline,
         "unattributed_dirty_paths": unattributed_dirty,
+        # 主循环之后分层补判出的归属（子代理写工具 / 命令文本 / agent 认领 / 时间窗），逐条带证据。
+        "attribution_evidence": layered_attribution_evidence,
+        # 补判后仍判不准的脏路径，按原因分组：contested / written_by_other_agent_session /
+        # no_agent_session_tool_call_matches。agent 可用 ``rvf scope claim`` 认领。
+        "uncovered_dirty_paths_by_reason": {
+            reason: [entry for entry in entries if entry.get("path") in set(unattributed_dirty)]
+            for reason, entries in uncovered_dirty_paths_by_reason.items()
+        },
+        "layered_session_write_attribution": layered_attribution_payload,
         "apply_patch_operations": apply_patch_operations,
         "command_path_candidates": command_candidates,
         "command_events": command_events,
@@ -1453,6 +1685,12 @@ def main() -> int:
         help="Base branch ref (e.g. main) whose reachable commits are excluded from the "
         "committed-round window, so rebased/merged base-branch work is not mis-attributed.",
     )
+    parser.add_argument(
+        "--enable-layered-session-write-attribution",
+        action="store_true",
+        help="对主循环之后仍无归属的脏路径做分层补判（子代理写工具 / 命令文本 / agent 认领 / Kanban 单任务 "
+        "worktree 默认认领）。只由 rvf start 与 prepare 开启。",
+    )
     args = parser.parse_args()
 
     try:
@@ -1467,6 +1705,7 @@ def main() -> int:
             include_all_transcript_ownership=args.include_all_transcript_ownership,
             committed_baseline=args.committed_baseline,
             committed_base_ref=args.committed_base_ref,
+            enable_layered_session_write_attribution=args.enable_layered_session_write_attribution,
         )
     except Exception as exc:
         return fail(str(exc), 2)

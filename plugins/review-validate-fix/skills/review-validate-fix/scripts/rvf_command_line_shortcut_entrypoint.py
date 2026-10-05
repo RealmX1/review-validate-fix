@@ -1488,6 +1488,9 @@ def run_handoff(args: argparse.Namespace) -> int:
     print(f"[rvf handoff] run={context.run_id}")
     print(f"- handoff_path: {handoff_path}")
     print(f"- intent_artifact_status_file: {intent_status}（照抄其 status 填 `## 状态` 的 intent_artifact_status）")
+    coverage_line = _review_scope_coverage_line_for_run_context(context)
+    if coverage_line:
+        print(f"- 审查覆盖（照抄进 handoff 的「审查覆盖」行；覆盖不全时两行摘要的 Reviewers 行也要带 X/Y）：{coverage_line}")
     print("- 模板：references/handoff-template.md；完成后最终回复第一行输出 `RVF_HANDOFF_FILE: <handoff_path>`。")
     if context.run_dir is not None:
         import rvf_out_of_scope_findings_kanban_backlog_submission as backlog_submission  # noqa: PLC0415
@@ -1509,6 +1512,26 @@ def run_handoff(args: argparse.Namespace) -> int:
                 + ", ".join(validate_only_attempts_without_submission)
             )
     return EXIT_OK
+
+
+def _review_scope_coverage_line_for_run_context(context: Any) -> str | None:
+    """本轮「正式审查覆盖 X/Y」与 dispatch 时接受不审的理由（08ac4：覆盖不全时 handoff 与摘要须如实写出）。"""
+    token = getattr(context, "decision_token", None)
+    if not token:
+        return None
+    try:
+        cli = _load_decision_cli()
+        overlay = cli.read_scope_adjustment(token)
+        if not isinstance(overlay, Mapping):
+            return None
+        coverage = overlay.get("review_scope_coverage_at_dispatch") or cli._review_scope_coverage_of_overlay(overlay)
+        line = cli._render_review_scope_coverage_line(coverage, token=token)
+        accepted = overlay.get("accepted_uncovered_candidate_paths")
+        if isinstance(accepted, Mapping) and accepted.get("paths"):
+            line += f" dispatch 时显式接受 {len(accepted['paths'])} 个不审（理由：{accepted.get('reason')}）。"
+        return line
+    except Exception:  # noqa: BLE001 - 覆盖率只是提示，算不出就不打印
+        return None
 
 
 def _argv_before_double_dash(argv: Sequence[str]) -> list[str]:
