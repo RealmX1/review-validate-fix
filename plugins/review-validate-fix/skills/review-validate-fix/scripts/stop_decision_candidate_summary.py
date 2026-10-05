@@ -98,6 +98,9 @@ from core.session_scope_allocation.committed_round_detection import (  # noqa: E
     _resolve_committed_round_baseline,
 )
 from core.session_scope_allocation.session_change_manifest import dirty_paths  # noqa: E402
+from core.session_scope_allocation.layered_session_write_attribution_for_unattributed_dirty_paths import (  # noqa: E402
+    WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS,
+)
 from core.session_scope_allocation.reviewable_unit_diff_tracker import (  # noqa: E402
     SQLITE_FILENAME,
     _disabled as _tracker_disabled,
@@ -573,6 +576,9 @@ def _read_tracker_ownership(
     —— 这正确且安全（不误排除自己的工作）。ownership 作为 filter 的真正价值在未来 Orca 同
     worktree 多 agent 并发（Q4=a）。判定规则：路径的 owned/takeover 单元里含**当前 session** →
     session_owned；只含**其他 session** → other_session_owned（被过滤出候选）；否则 unattributed。
+
+    其他 session 只凭**弱证据**（时间窗：文件改动时刻恰好落在它的工具调用期间）登记的单元不算数：
+    弱证据够让那个会话把文件拿去审，不够把文件从本会话的横幅里拿掉（08ac4 报告 §5.5）。
     """
     db_path = _tracker_db_path(repo_path, log_root_override)
     if db_path is None:
@@ -584,7 +590,7 @@ def _read_tracker_ownership(
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT u.path AS path, su.session_id AS owner_session_id
+            SELECT u.path AS path, su.session_id AS owner_session_id, su.evidence AS owner_evidence
               FROM units u
               LEFT JOIN session_units su
                      ON su.unit_id = u.unit_id
@@ -603,7 +609,10 @@ def _read_tracker_ownership(
 
     owners_by_path: dict[str, set[str | None]] = {}
     for row in rows:
-        owners_by_path.setdefault(row["path"], set()).add(row["owner_session_id"])
+        owner = row["owner_session_id"]
+        if owner and owner != session_id and row["owner_evidence"] in WEAK_SESSION_WRITE_ATTRIBUTION_EVIDENCE_LABELS:
+            owner = None
+        owners_by_path.setdefault(row["path"], set()).add(owner)
 
     labels: dict[str, str] = {}
     for path, owners in owners_by_path.items():

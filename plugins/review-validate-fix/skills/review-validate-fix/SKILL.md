@@ -66,10 +66,31 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 ```
 rvf start --token <decision-token> [--transcript-path <session.jsonl>] --reason "<一句话理由>"
+rvf scope claim --token <decision-token> <path>… --reason "<理由>"   # 覆盖不全时：认领本会话写的
 rvf scope exclude|include|annotate --token <decision-token> …     # 可选
 rvf scope rerender-scope-of-work --token <decision-token>        # 覆盖 scope-of-work 之后
-rvf dispatch --token <decision-token> --strictness <light|standard|strict>
+rvf dispatch --token <decision-token> --strictness <light|standard|strict> [--accept-uncovered "<理由>"]
 ```
+
+**正式审查覆盖 X/Y。** `start`、`scope` 与 `dispatch` 的回执都会写「正式审查覆盖 X/Y 个候选路径」。
+
+- X 是进了 `fix_allowlist` / `primary_units` 的路径数，也就是 reviewer 必审、fixer 能改、审完能标 reviewed 的那一份。
+- 未覆盖的路径按原因分组：
+  - 有争议；
+  - 其他会话写的；
+  - 时间窗提示可能是你写的；
+  - 谁都对不上；
+  - 已 include、未进正式审查。
+- 归属规则：
+  - Bash、子代理、Serena 等 MCP 写工具写的文件，以及 `mv` / `cp` 的落点，都会按分层证据自动归属。
+  - Kanban 单任务 worktree 里，没有任何证据表明是别的会话写的改动，默认归本会话。
+  - 判不准的才留给你。
+- 处理未覆盖的路径：
+  - 本会话写的，用 `scope claim` 认领。它会改写 contract（进 `fix_allowlist` / `primary_units` / `primary_files`，移出 protected），重分配 lease，并重渲 packet。路径已被别的会话以强证据持有时，要加 `--takeover-reason`。
+  - 不该审的，用 `scope exclude` 排除。
+  - `scope include` 只进 `primary_files`，也就是 reviewer 提示与 land 的 stage 边界；**不进**正式审查，fixer 也不能改它。
+- session-owned 口径下，还有未覆盖且你没表态的路径时，`dispatch` 会拦下（退出码 `11`）。确认就这样派发时加 `--accept-uncovered "<理由>"`。
+- 覆盖不全时，handoff 与两行摘要的 `Reviewers：` 行必须写出 X/Y 和接受的理由。
 
 `rvf` 是部署装到 PATH 上的快捷入口（`~/.rvf/bin/rvf`，并链接到 `~/.local/bin/rvf`）。PATH 上找不到它时，横幅与回执会直接渲染它的绝对路径，照抄即可，不要 `--help` 摸索。
 
@@ -77,7 +98,7 @@ rvf dispatch --token <decision-token> --strictness <light|standard|strict>
 
 `dispatch` 之后由**你自己**在当前会话调用 `$review-validate-fix` skill，按本文件就地走 review → merge → validate/fix → handoff。不要新建 Kanban task，也不要 fork 新会话；上面那些路径就是本轮 run 的全部输入，**不需要重新 prepare**。
 
-`dispatch` 的退出码：`0` = 已派发（detached，接着按下面「Review」节等待）；`5` = 真派发失败，token 仍在 `acknowledged`，可修复后重试；`9` = scope-of-work 仍是 stub（先覆盖再 `rvf scope rerender-scope-of-work`）。`kind: request` 终态**不会**体现在 `dispatch` 的退出码上——detached 派发在 reviewer 跑完之前就返回了，它由 `rvf wait` 的摘要（`plan_status=blocked_on_reviewer_request`）报出。
+`dispatch` 的退出码：`0` = 已派发（detached，接着按下面「Review」节等待）；`5` = 真派发失败，token 仍在 `acknowledged`，可修复后重试；`9` = scope-of-work 仍是 stub（先覆盖再 `rvf scope rerender-scope-of-work`）；`11` = 候选里有既没进正式审查、也没被认领 / 排除的路径（`scope claim` / `scope exclude`，或带 `--accept-uncovered "<理由>"` 重跑）。`kind: request` 终态**不会**体现在 `dispatch` 的退出码上——detached 派发在 reviewer 跑完之前就返回了，它由 `rvf wait` 的摘要（`plan_status=blocked_on_reviewer_request`）报出。
 
 > 例外只有一个：操作者显式设置 `CODEX_RVF_FORK_MODE=kanban-followup` 时，Stop hook 仍走旧的终端投递（注入一条 `$review-validate-fix` 开头的祈使句）。那是保留的逃生口/兼容入口，不是默认路径。
 

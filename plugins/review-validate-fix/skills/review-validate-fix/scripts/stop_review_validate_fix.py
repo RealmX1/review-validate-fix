@@ -9182,7 +9182,7 @@ def _render_decision_point_unreviewed_estimate_lines(
     if unreviewed_added == 0 and unreviewed_deleted == 0:
         rendered.append(
             "      ⚠ 未审量为 0 —— 这批改动很可能就是上一轮 RVF 的产物。除非你确知有 tracker 看不见的"
-            "新工作（例如经 shell heredoc 写入的文件），否则这一轮通常应当 decline。"
+            "新工作（例如在非 Kanban 单任务 worktree 里经不透明脚本写入的文件），否则这一轮通常应当 decline。"
         )
     return rendered
 
@@ -9386,8 +9386,9 @@ def _render_decision_point_injection_prompt(
         f"--reason \"<一句话理由>\""
     )
     lines.append(
-        f"  自动 scope 微调（可选，仅 start 后 acknowledged 态）: "
-        f"{rvf} scope exclude --token {token} <path>... --reason \"<理由>\""
+        f"  自动 scope 微调（仅 start 后 acknowledged 态；start 回执会写「正式审查覆盖 X/Y」）: "
+        f"本会话写的未覆盖文件 {rvf} scope claim --token {token} <path>... --reason \"<理由>\"；"
+        f"不该审的 {rvf} scope exclude --token {token} <path>... --reason \"<理由>\""
     )
     lines.append(
         f"  定稿派发（选严格度档 light|standard|strict）: "

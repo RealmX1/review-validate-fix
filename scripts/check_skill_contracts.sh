@@ -544,6 +544,11 @@ repo_required_files=(
   "core/session_scope_allocation/review_highwater_marker.py"
   "core/session_scope_allocation/committed_round_detection.py"
   "core/session_scope_allocation/session_scope_gate_pure_helpers.py"
+  "core/session_scope_allocation/shell_command_named_write_target_paths_extraction.py"
+  "core/session_scope_allocation/agent_transcript_tool_call_time_windows_extraction.py"
+  "core/session_scope_allocation/agent_sessions_that_worked_in_same_worktree_discovery.py"
+  "core/session_scope_allocation/layered_session_write_attribution_for_unattributed_dirty_paths.py"
+  "tests/test_layered_session_write_attribution.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/review_reopen_marker.py"
   "plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_rescope.py"
   "core/run_ledger/run_ledger.py"
@@ -714,6 +719,11 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/session_scope_allocation/review_highwater_marker.py" \
   "$repo_root/core/session_scope_allocation/committed_round_detection.py" \
   "$repo_root/core/session_scope_allocation/session_scope_gate_pure_helpers.py" \
+  "$repo_root/core/session_scope_allocation/shell_command_named_write_target_paths_extraction.py" \
+  "$repo_root/core/session_scope_allocation/agent_transcript_tool_call_time_windows_extraction.py" \
+  "$repo_root/core/session_scope_allocation/agent_sessions_that_worked_in_same_worktree_discovery.py" \
+  "$repo_root/core/session_scope_allocation/layered_session_write_attribution_for_unattributed_dirty_paths.py" \
+  "$skill_dir/scripts/agentic_initiation_review_scope_coverage_and_agent_explicit_path_claim.py" \
   "$repo_root/core/provider_health/provider_health_guard.py" \
   "$repo_root/adapters/codex/codex_provider_login.py" \
   "$repo_root/adapters/codex/codex_host_adapter.py" \
@@ -780,6 +790,11 @@ run_step "tests: stop_hook_output_audience_contract" \
 run_step "tests: agentic_initiation_scope_of_work_contract" \
   python3 -m pytest -q \
     "$tests_dir/test_agentic_initiation_scope_of_work_contract.py"
+# session 归属分层补判（08ac4）：Bash / 子代理 / mv·cp 写的文件按「子代理写工具 → 命令文本 → agent 认领
+# → 时间窗」补判归属；fast-forward 到 base 后不再截掉更早的未提交写入。漏审曾占本会话改动的 68%。
+run_step "tests: layered_session_write_attribution" \
+  python3 -m pytest -q \
+    "$tests_dir/test_layered_session_write_attribution.py"
 run_step "tests: compact_path_tree_rendering" \
   python3 -m pytest -q \
     "$tests_dir/test_compact_path_tree_rendering.py"

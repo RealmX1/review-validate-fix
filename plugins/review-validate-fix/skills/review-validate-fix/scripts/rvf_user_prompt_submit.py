@@ -1166,7 +1166,8 @@ def _manual_decision_additional_context_text(
         lines.append(
             "用户在触发串里内联指定了 scope: "
             + ", ".join(inline_scope)
-            + "。start（acknowledged 态）后可用 `rvf scope include/exclude` 据此收窄。"
+            + "。start（acknowledged 态）后可用 `rvf scope include/exclude` 据此收窄；"
+            "本会话写的未覆盖文件用 `rvf scope claim` 认领进正式审查。"
         )
     return "\n".join(lines)
 

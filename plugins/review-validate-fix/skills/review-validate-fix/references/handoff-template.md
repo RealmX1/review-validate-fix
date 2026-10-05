@@ -5,9 +5,11 @@ Handoff 默认开启，但只适用于 `mode: full` 且 handoff 未关闭的完�
 ```text
 RVF_HANDOFF_FILE: <handoff.md 绝对路径>
 
-Reviewers：<极短说明 reviewers 检查了什么，发现了几项或没有问题>
+Reviewers：<极短说明 reviewers 检查了什么，发现了几项或没有问题；正式审查没覆盖全部候选时必须写「正式审了 X/Y 个候选文件」>
 Validate/fixers：<极短说明 validate/fixers 验证/修复/驳回/升级了什么>
 ```
+
+X/Y 与 `rvf start` / `rvf dispatch` 回执里的「正式审查覆盖 X/Y 个候选路径」一致。X 是进了 `fix_allowlist` / `primary_units` 的路径数。reviewer 工作树里能读到的文件不算审过；只经 `scope include` 进来、没进正式审查的文件，一律记为未审。
 
 不要在最终回复里重复 handoff 文件正文；摘要只服务快速确认，完整细节必须在 `handoff.md`。Stop hook 检测到 `RVF_HANDOFF_FILE` 后作为完成信号处理，run 结束时通过 terminal-notifier 发送一条 OS 系统通知（kanban 来源的通知点击后可打开对应 task）；不再自动用编辑器打开 handoff，也不要手动调用任何「打开 handoff」脚本。
 
@@ -28,7 +30,7 @@ Validate/fixers：<极短说明 validate/fixers 验证/修复/驳回/升级了�
 handoff 应尽量把接收方需要反复推断的信息写成稳定字段，降低 earlier-self 的解析成本。最终版 handoff 必须明确：
 
 - RVF worktree / target repo 是否可能不同于主会话 worktree。
-- reviewed scope paths：只列本次 RVF 审查和修复实际覆盖的路径。
+- reviewed scope paths：只列本次 RVF 正式审查覆盖的路径（scope contract 的 `fix_allowlist`，含 `scope claim` 认领的）；只经 `scope include` 进来的不算。
 - protected / background / cross-session paths：列出已发现但不得自动 stage/commit 的路径和原因。
 - accepted changes：列出应带回主会话 worktree 的变更类别。
 - rejected / not accepted changes：列出本次 RVF 明确移除、驳回或不应采纳的 suggestion / hunk。
@@ -86,6 +88,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 - session manifest: <路径或 unavailable>
 - review packet: <路径>
 - 主审查文件 / 范围: <列表>
+- 审查覆盖: 正式覆盖 <X>/<Y> 个候选路径（未覆盖 <Z> 个：<按原因分组，如 有争议 / 其他会话写的 / 谁都对不上 / 已 include 未进正式审查>；dispatch 时接受不审的理由：<`--accept-uncovered` 的理由，或「无」>）
 
 ## Handoff intake hints
 

@@ -1503,6 +1503,8 @@ def prepare_run(
             str(session_manifest_path),
             "--tracker-run-id",
             ledger.run_id,
+            # Bash / 子代理 / mv·cp 写的文件按分层证据补判归属（08ac4）；只在 start 与 prepare 开启。
+            "--enable-layered-session-write-attribution",
         ]
         if committed_baseline:
             manifest_cmd.extend(["--committed-baseline", committed_baseline])
