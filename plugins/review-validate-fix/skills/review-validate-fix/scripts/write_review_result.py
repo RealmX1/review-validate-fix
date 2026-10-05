@@ -28,6 +28,13 @@ SUBTASK_TYPES = {
 CONTEXT_NEEDS = {"file", "manifest", "packet", "prior-output", "test-result"}
 ISSUE_KINDS = {"REAL", "NIT", "ELEVATE"}
 ISSUE_SEVERITIES = {"high", "medium", "low"}
+# 与 check_review_result.ISSUE_SCOPE_RELATIONS 同一词表。
+ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE = "in_current_round_scope"
+ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE = "outside_current_round_scope"
+ISSUE_SCOPE_RELATIONS = {
+    ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE,
+    ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE,
+}
 
 
 def fail(message: str, code: int = 2) -> int:
@@ -140,6 +147,11 @@ def supersede_existing_result(out: Path, existing: dict[str, Any], new_kind: str
     os.replace(out, archive_path)
 
     payload = base_payload(new_kind)
+    # no_issues → issues：reviewer 先下了 clean 又补出问题时，原来的审计摘要仍是「本轮范围内
+    # 审了什么」的依据（尤其补的全是范围外问题时），不能随归档一起丢掉。
+    if new_kind == FINDING_BEARING_TERMINAL_KIND and isinstance(existing.get("audit_summary"), str):
+        if existing["audit_summary"].strip():
+            payload["audit_summary"] = existing["audit_summary"].strip()
     lineage = [
         entry
         for entry in (existing.get("superseded") or [])
@@ -220,8 +232,12 @@ def command_issue(args: argparse.Namespace) -> int:
         "kind": args.kind,
         "severity": args.severity,
     }
+    # 下划线键名直接写，不走 optional_fields（那里会把下划线转成连字符）。
+    issue["scope_relation"] = args.scope_relation
     issue.update(optional_fields(args, ("evidence_command", "confidence", "source")))
     payload.setdefault("issues", []).append(issue)
+    if args.current_round_scope_audit_summary and args.current_round_scope_audit_summary.strip():
+        payload["audit_summary"] = args.current_round_scope_audit_summary.strip()
     payload["requests"] = []
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_payload(out, payload)
@@ -363,6 +379,24 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=sorted(ISSUE_SEVERITIES),
         help="Issue severity: high (release blocker), medium (should fix soon), low (deferrable).",
+    )
+    issue.add_argument(
+        "--scope-relation",
+        choices=sorted(ISSUE_SCOPE_RELATIONS),
+        default=ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE,
+        help=(
+            "本条问题是否属于本轮范围。本轮改动造成、暴露或加剧的一律算 in_current_round_scope（缺省）；"
+            "与本轮改动无直接连带、但真实存在的问题（例如已提交代码里的既有缺陷）用 "
+            "outside_current_round_scope——它照常进入合并，到 validate-fix 阶段只验证不修、"
+            "由 validator 提交到 Kanban backlog。其他会话未提交的 WIP 不要报。"
+        ),
+    )
+    issue.add_argument(
+        "--current-round-scope-audit-summary",
+        help=(
+            "可选：1-3 句中文，说明本轮范围内实际审了什么、为何判定范围内没有问题。"
+            "当你报出的 issue 全部是 outside_current_round_scope 时应当写（等价于 no-issues 的 --audit-summary）。"
+        ),
     )
     issue.add_argument("--evidence-command", help="Optional command used as evidence.")
     issue.add_argument("--confidence", help="Optional confidence label.")

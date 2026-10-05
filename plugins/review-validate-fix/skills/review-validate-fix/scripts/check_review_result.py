@@ -28,6 +28,14 @@ SUBTASK_TYPES = {
 CONTEXT_NEEDS = {"file", "manifest", "packet", "prior-output", "test-result"}
 ISSUE_KINDS = {"REAL", "NIT", "ELEVATE"}
 ISSUE_SEVERITIES = {"high", "medium", "low"}
+# reviewer 对每条 issue 的「是否属于本轮范围」判定（缺省 = in）。outside 的 issue 照常通过
+# review、照常被合并采纳，到 validate-fix 阶段只验证不修、由 validator 提交到 Kanban backlog。
+ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE = "in_current_round_scope"
+ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE = "outside_current_round_scope"
+ISSUE_SCOPE_RELATIONS = {
+    ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE,
+    ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE,
+}
 
 
 def fail(errors: list[str], *, json_output: bool) -> int:
@@ -95,7 +103,20 @@ def excluded_path_prefixes_from_contract(contract: dict[str, Any], errors: list[
     return prefixes
 
 
-def validate_issue(issue: Any, index: int, errors: list[str], excluded_prefixes: list[str]) -> None:
+def issue_scope_relation(issue: dict[str, Any]) -> str:
+    """缺省按 in 处理：旧工件与没写该字段的 reviewer 维持「本轮范围内」语义。"""
+    value = issue.get("scope_relation")
+    return value if isinstance(value, str) and value else ISSUE_SCOPE_RELATION_IN_CURRENT_ROUND_SCOPE
+
+
+def validate_issue(
+    issue: Any,
+    index: int,
+    errors: list[str],
+    excluded_prefixes: list[str],
+    warnings: list[str],
+    issue_indices_in_excluded_paths_one_based: list[int],
+) -> None:
     if not isinstance(issue, dict):
         errors.append(f"issues[{index}] must be an object")
         return
@@ -107,7 +128,16 @@ def validate_issue(issue: Any, index: int, errors: list[str], excluded_prefixes:
     if not isinstance(path, str) or not is_relative_repo_path(path):
         errors.append(f"issues[{index}].path must be a relative repo path without '..'")
     elif is_excluded(path, excluded_prefixes):
-        errors.append(f"issues[{index}].path is excluded by scope contract")
+        # 护栏而非闸门：一条落在排除区的 issue 不再让整条 reviewer 腿作废（那会触发换腿 /
+        # 重派，代价远大于这一条 issue 本身）。只记 warning，合并时这类 issue 只能 dropped
+        # （由 rvf_merge_dispositions 强制）。
+        warnings.append(f"issues[{index}].path is excluded by scope contract; merge must drop it")
+        issue_indices_in_excluded_paths_one_based.append(index + 1)
+    scope_relation = issue.get("scope_relation")
+    if scope_relation is not None and scope_relation not in ISSUE_SCOPE_RELATIONS:
+        errors.append(
+            f"issues[{index}].scope_relation must be one of: {', '.join(sorted(ISSUE_SCOPE_RELATIONS))}"
+        )
     if not isinstance(line, int) or line < 1:
         errors.append(f"issues[{index}].line must be an integer >= 1")
     if not isinstance(message, str) or not message.strip():
@@ -217,8 +247,12 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
         errors.append("requests must be an array")
         requests = []
 
+    warnings: list[str] = []
+    issue_indices_in_excluded_paths_one_based: list[int] = []
     for index, issue in enumerate(issues):
-        validate_issue(issue, index, errors, excluded_prefixes)
+        validate_issue(
+            issue, index, errors, excluded_prefixes, warnings, issue_indices_in_excluded_paths_one_based
+        )
 
     request_types: list[str] = []
     for index, request in enumerate(requests):
@@ -239,22 +273,48 @@ def classify(path: Path, *, scope_contract: Path | None = None) -> dict[str, Any
             errors.append("issues result must include at least one issue")
         if requests:
             errors.append("issues result must not include requests")
+        all_issues_outside_current_round_scope = bool(issues) and all(
+            isinstance(issue, dict)
+            and issue_scope_relation(issue) == ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE
+            for issue in issues
+        )
+        audit_summary = payload.get("audit_summary")
+        if all_issues_outside_current_round_scope and not (
+            isinstance(audit_summary, str) and audit_summary.strip()
+        ):
+            # 全部是范围外问题时，本轮范围本身等于「clean」，需要和 no_issues 一样给出审计依据。
+            # 只给非致命 warning：做成硬校验会让整腿无效并触发重派，代价过高。
+            warnings.append(
+                "all issues are outside_current_round_scope but no current-round audit_summary was written; "
+                "pass --current-round-scope-audit-summary"
+            )
     elif kind == "request":
         if issues:
             errors.append("request result must not include issues")
         if not requests:
             errors.append("request result must include at least one request")
 
+    completed_issues = issues if not errors and kind == "issues" else []
     return {
         "valid": not errors,
         "kind": kind if not errors else "invalid",
         "issue_count": len(issues) if not errors and kind == "issues" else 0,
+        "outside_current_round_scope_issue_count": sum(
+            1
+            for issue in completed_issues
+            if isinstance(issue, dict)
+            and issue_scope_relation(issue) == ISSUE_SCOPE_RELATION_OUTSIDE_CURRENT_ROUND_SCOPE
+        ),
+        "issue_indices_in_excluded_paths_one_based": (
+            issue_indices_in_excluded_paths_one_based if completed_issues else []
+        ),
         "request_count": len(requests) if not errors and kind == "request" else 0,
         "request_types": sorted(set(request_types)) if not errors and kind == "request" else [],
         "lock_request_count": request_types.count("lock_request") if not errors and kind == "request" else 0,
-        "audit_summary": payload.get("audit_summary") if not errors and kind == "no_issues" else None,
+        "audit_summary": payload.get("audit_summary") if not errors and kind in {"no_issues", "issues"} else None,
         "issues": issues if not errors and kind == "issues" else [],
         "requests": requests if not errors and kind == "request" else [],
+        "warnings": warnings if not errors else [],
         "errors": errors,
     }
 
@@ -274,6 +334,8 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif result["valid"]:
         print(result["kind"])
+        for warning in result.get("warnings") or []:
+            print(f"warning: {warning}", file=sys.stderr)
     else:
         for error in result["errors"]:
             print(error, file=sys.stderr)

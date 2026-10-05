@@ -189,20 +189,30 @@ def completed_review(run_dir: Path, handoff_text: str) -> tuple[int, str]:
         raise ValueError("handoff and review must both be completed")
     if re.search(r"\[(?:elevated|failed)\]", handoff_text, re.IGNORECASE):
         raise ValueError("handoff contains unresolved elevated or failed outcomes")
+    # 「转 backlog」段可选：范围外问题照常被采纳成 fix-issue，到 validate-fix 阶段只验证不修、
+    # 属实即提交 Kanban backlog——它是已完成的结论（不是未解决），计入 canonical 总数。
     summary_match = re.search(
-        r"共\s*(\d+)\s*条\s*[，,]\s*(\d+)\s*真实修复\s*/\s*(\d+)\s*误报\s*/\s*(\d+)\s*升级",
+        r"共\s*(\d+)\s*条\s*[，,]\s*(\d+)\s*真实修复\s*/\s*(\d+)\s*误报\s*"
+        r"(?:/\s*(\d+)\s*转\s*backlog\s*)?/\s*(\d+)\s*升级",
         handoff_text,
+        re.IGNORECASE,
     )
     if summary_match is None:
         raise ValueError("handoff canonical issue summary is missing")
-    canonical_count, fixed_count, false_positive_count, elevated_count = map(int, summary_match.groups())
+    canonical_count, fixed_count, false_positive_count = map(int, summary_match.groups()[:3])
+    submitted_to_kanban_backlog_count = int(summary_match.group(4) or 0)
+    elevated_count = int(summary_match.group(5))
     fixed_outcomes = len(re.findall(r"\[fixed\]", handoff_text, re.IGNORECASE))
     false_positive_outcomes = len(re.findall(r"\[false_positive\]", handoff_text, re.IGNORECASE))
+    submitted_to_kanban_backlog_outcomes = len(
+        re.findall(r"\[submitted_to_kanban_backlog\]", handoff_text, re.IGNORECASE)
+    )
     if (
         elevated_count != 0
-        or fixed_count + false_positive_count != canonical_count
+        or fixed_count + false_positive_count + submitted_to_kanban_backlog_count != canonical_count
         or fixed_outcomes != fixed_count
         or false_positive_outcomes != false_positive_count
+        or submitted_to_kanban_backlog_outcomes != submitted_to_kanban_backlog_count
     ):
         raise ValueError("handoff canonical issue summary does not match completed outcomes")
     # reviewer 报过 issue（或主 agent 登记过非 reviewer 来源的 fix-issue）时，合并处置是 canonical 计数的

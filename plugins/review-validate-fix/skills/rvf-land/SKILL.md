@@ -55,6 +55,7 @@ RVF_HANDOFF
 - 核对 scoped diff 与 handoff 描述的 fixes / reviewed scope 自洽：没有缺失的修复、没有越界改动、没有与 handoff 冲突的状态。scope contract 的 background / protected 与 handoff 标注的 protected 路径不会被自动 stage。
 - handoff 表示 `no_issues`、或最终没有采纳任何 suggestion 时，只要 worktree 里的工作仍然有效，照样继续提交。
 - 仅当暴露出明确、范围内的小问题（future-self 漏改的一处、明显笔误）时，在 reviewed scope 或其直接 fallout 内做最小修正；不要借机扩大改动。补修正碰到 scope 外路径时，commit 加 `--extra-path`。
+- sanity-check 中发现**与本次工作不紧密相关、但真实存在**的问题：不要放过，也不要当场修。写一份 finding JSON（`{"findings": [{"title", "path", "line", "severity", "problem_statement", "evidence"}]}`），用 `rvf backlog submit --main-session-findings-file <finding.json> --run-dir <prepare 输出的 run_dir>` 提交到 Kanban backlog（卡片会标「未经 validator 验证」；Kanban 不可用时自动暂存、下次提交时重试，不阻断 land），并在最终汇报里列出卡片。
 - handoff 的 fix 无效、scope 不完整、或 worktree 状态与 handoff 严重冲突：停止并报告，不要 commit。
 - 定稿 commit message：在草稿上填好 conventional commit 标题（`fix(rvf): ...` 等）与中文 sanity-check 结论；**保留** `[[rvf-land-validation-summary]]` 这一行，commit 会把它替换成实际验证结果。
 

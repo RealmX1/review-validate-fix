@@ -2403,7 +2403,14 @@ def finalize_scope_contract(
 ) -> dict[str, Any]:
     """scope 定稿：把 exclude/include 的净效果写回 prepare 产出的 scope.contract.json（改
     ``primary_files`` / ``excluded_path_prefixes`` 并**重算 scope_hash**，复用 prepare 的
-    canonical 序列化以保证哈希一致）。best-effort：contract 缺失 / 不可读即跳过并返回状态。"""
+    canonical 序列化以保证哈希一致）。best-effort：contract 缺失 / 不可读即跳过并返回状态。
+
+    净效果必须同步到修复侧，否则 include 只对 reviewer 生效：
+    - ``fix_allowlist = (原值 ∪ effective_primary) − excluded``：include 进来的路径 fixer 能改，
+      exclude 掉的路径不再被当成 boundary 内（否则改它不算外扩、不会被拦）；
+    - ``background_files`` / ``protected_files`` 减去 effective_primary：同一路径不能既是
+      primary 又是 background（reviewer 拿到的合同会自相矛盾，fixer 改它会被当成越界）。
+    顶层字段与 ``canonical_scope`` 两处都写——fix stop 先读顶层。"""
     artifacts = overlay.get("prepare_artifacts")
     contract_path_raw = artifacts.get("scope_contract") if isinstance(artifacts, Mapping) else None
     if not isinstance(contract_path_raw, str) or not contract_path_raw:
@@ -2424,10 +2431,23 @@ def finalize_scope_contract(
 
     import prepare_review_run  # noqa: PLC0415 - 复用 canonical 序列化 + 版本
 
-    background_files = [str(p) for p in (contract.get("background_files") or [])]
-    protected_files = [str(p) for p in (contract.get("protected_files") or [])]
+    effective_primary_set = set(effective_primary_files)
+
+    def _excluded_by_scope_adjustment(path: str) -> bool:
+        return any(path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in merged_excluded)
+
+    background_files = [
+        str(p) for p in (contract.get("background_files") or []) if str(p) not in effective_primary_set
+    ]
+    protected_files = [
+        str(p) for p in (contract.get("protected_files") or []) if str(p) not in effective_primary_set
+    ]
     canonical_issues = contract.get("canonical_issues") or []
-    fix_allowlist = [str(p) for p in (contract.get("fix_allowlist") or [])]
+    fix_allowlist = [
+        path
+        for path in dict.fromkeys([*(str(p) for p in (contract.get("fix_allowlist") or [])), *effective_primary_files])
+        if not _excluded_by_scope_adjustment(path)
+    ]
     version = contract.get("version", prepare_review_run.SCOPE_CONTRACT_VERSION)
     prior_canonical_scope = contract.get("canonical_scope")
     canonical_scope = dict(prior_canonical_scope) if isinstance(prior_canonical_scope, Mapping) else {}
@@ -2445,6 +2465,9 @@ def finalize_scope_contract(
     new_hash = hashlib.sha256(prepare_review_run.canonical_json_bytes(canonical_scope)).hexdigest()
     contract["primary_files"] = effective_primary_files
     contract["excluded_path_prefixes"] = merged_excluded
+    contract["fix_allowlist"] = fix_allowlist
+    contract["background_files"] = background_files
+    contract["protected_files"] = protected_files
     contract["scope_hash"] = new_hash
     contract["canonical_scope"] = canonical_scope
     _atomic_write_json(contract_path, contract)
@@ -2453,6 +2476,7 @@ def finalize_scope_contract(
         "scope_contract_path": str(contract_path),
         "primary_files": effective_primary_files,
         "excluded_path_prefixes": merged_excluded,
+        "fix_allowlist": fix_allowlist,
         "scope_hash": new_hash,
     }
 

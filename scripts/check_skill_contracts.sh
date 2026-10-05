@@ -520,6 +520,7 @@ required_files=(
   "scripts/validation_result_cache.py"
   "scripts/write_reviewed_task_candidate_evidence.py"
   "scripts/rvf_merge_dispositions.py"
+  "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py"
   "scripts/workspace_snapshot.py"
   "scripts/stop_hook_dispatcher.py"
   "scripts/stop_hook_router.py"
@@ -605,6 +606,8 @@ repo_required_files=(
   "tests/test_kimi_host_adapter_and_transcript.py"
   "tests/test_agentic_initiation_scope_of_work_contract.py"
   "tests/test_reviewer_result_artifact_lifecycle.py"
+  "tests/test_rvf_fix_causality.py"
+  "tests/test_out_of_scope_findings_kanban_backlog_submission.py"
   "tests/test_codex_hook_trust_fingerprint.py"
   "scripts/codex_hook_trust_fingerprint.py"
   "tests/test_current_session_host_adapter_resolution.py"
@@ -679,6 +682,7 @@ run_step "python compile" python3 -m py_compile \
   "$skill_dir/scripts/prepare_review_run.py" \
   "$skill_dir/scripts/apply_worktree_bootstrap.py" \
   "$skill_dir/scripts/cline_kanban_client.py" \
+  "$skill_dir/scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py" \
   "$skill_dir/scripts/cancel_rvf_run.py" \
   "$skill_dir/scripts/rvf_command_line_shortcut_entrypoint.py" \
   "$repo_root/core/rvf_command_line_shortcut_shim_location.py" \
@@ -798,6 +802,18 @@ run_step "tests: rvf_land_validation_cache_and_candidate_evidence" \
 run_step "tests: reviewer_result_artifact_lifecycle" \
   python3 -m pytest -q \
     "$tests_dir/test_reviewer_result_artifact_lifecycle.py"
+# fix attempt 因果链：全量物化、越界修改的告警-确认放行、validate-only 只验证并提交 Kanban backlog、
+# apply 状态门与内容漂移冲突。此前这个文件不在任何 gate 里，测试会静默不跑。
+# 迁移用例在干净 HEAD 上就红（极简 v3 库缺 leases 表，backlog 任务 64943 跟踪），修好后删掉这条 -k 排除。
+run_step "tests: rvf_fix_causality" \
+  python3 -m pytest -q \
+    "$tests_dir/test_rvf_fix_causality.py" \
+    -k "not test_diff_tracker_creates_and_migrates_rvf_causality_tables"
+# 范围外问题提交 Kanban backlog：卡片标记、自包含（不 fork 父会话）、主仓 project path、跨 worktree
+# 指纹去重、Kanban 不可用时持久 pending 与重试、不替其他会话的未提交 WIP 提卡。
+run_step "tests: out_of_scope_findings_kanban_backlog_submission" \
+  python3 -m pytest -q \
+    "$tests_dir/test_out_of_scope_findings_kanban_backlog_submission.py"
 # Codex hook 信任指纹：改了 hook 命令不重新信任 ⇒ Codex 静默跳过该 hook（exec 下零警告），
 # deploy 却报告成功。核对只观测、不改 live config。
 run_step "tests: codex_hook_trust_fingerprint" \
@@ -1281,6 +1297,24 @@ require_literal "references/review-merge-policy.md" 'kind: request'
 # （CLI upsert 与 rvf fix prepare 共用），只卡 fix prepare 会被 CLI upsert 绕过。
 require_literal "references/review-merge-policy.md" 'rvf merge write'
 require_literal "references/review-merge-policy.md" 'reviewer_issue_index_base: 1'
+# 范围外问题不放跑、不当场修：照常通过 review、validator 只验证不修、属实即提交 Kanban backlog。
+require_literal "prompts/reviewer.md" 'outside_current_round_scope'
+require_literal "prompts/reviewer.md" '--current-round-scope-audit-summary'
+require_literal "references/review-standards/reviewer.md" 'outside_current_round_scope'
+require_literal "references/review-merge-policy.md" 'validate_only_then_submit_to_kanban_backlog'
+require_literal "references/review-merge-policy.md" 'issue_indices_in_excluded_paths_one_based'
+require_literal "prompts/validate-fix.md" 'validated_and_submitted_to_kanban_backlog'
+require_literal "prompts/validate-fix.md" '--kanban-backlog-finding-file'
+require_literal "prompts/validate-fix.md" '--acknowledged-protected-or-background-path-modification'
+require_literal "references/handoff-template.md" '<B> 转 backlog'
+require_literal "references/handoff-template.md" '## 范围外问题（已提交 Kanban backlog）'
+require_literal "references/handoff-template.md" '## 已确认的越界修改'
+require_literal "references/handoff-template.md" '[submitted_to_kanban_backlog]'
+require_literal "SKILL.md" 'rvf backlog submit'
+require_literal "SKILL.md" '--confirm-acknowledged-protected-or-background-path-modification'
+require_repo_literal "plugins/review-validate-fix/skills/rvf-land/SKILL.md" 'rvf backlog submit'
+require_literal "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py" 'INTEGRATION-POINT(kanban dedicated support agent finding-relation triage)'
+require_literal "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py" 'KANBAN_SUPPORT_AGENT_RELATION_TRIAGE_STATUS=not_triaged'
 require_literal "SKILL.md" 'rvf merge write'
 require_literal "prompts/validate-fix.md" 'main_agent_self_review'
 require_literal "scripts/rvf_fix_issue.py" 'rvf_merge_dispositions.resolve_fix_issue_source_refs_for_upsert(run_dir, issue_id)'

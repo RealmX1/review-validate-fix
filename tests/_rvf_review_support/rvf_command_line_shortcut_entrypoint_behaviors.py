@@ -41,6 +41,8 @@ __all__ = [
     "test_rvf_apply_orders_attempts_by_created_at_without_baseline_patch_mtime_fallback",
     "test_rvf_receipts_carry_explicit_run_dir_only_when_current_session_is_unresolvable",
     "test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no_polling_protocol",
+    "test_rvf_results_summary_marks_outside_scope_and_excluded_path_issues_without_invalidating_the_leg",
+    "test_rvf_backlog_submit_forwards_to_submission_script_and_renders_handoff_section",
 ]
 
 HOST_SESSION_ENVIRONMENT_VARIABLE_NAMES = (
@@ -1349,3 +1351,71 @@ def test_rvf_execution_segment_docs_teach_rvf_validate_background_timeout_and_no
     # M4：land 两步都经 `rvf land`。
     assert "rvf land prepare" in land_skill and "rvf land commit" in land_skill
     assert "<skill-scripts-dir>/rvf_land.py" not in land_skill
+
+
+def test_rvf_results_summary_marks_outside_scope_and_excluded_path_issues_without_invalidating_the_leg(
+    root: Path,
+) -> None:
+    """范围外 issue 照常进摘要并标 [范围外]；排除区 issue 只是 warning、腿仍有效、标「只能 dropped」。"""
+    run_dir = root / "run"
+    reviewers = run_dir / "artifacts" / "reviewers"
+    _write_json(run_dir / "artifacts" / "inputs" / "scope.contract.json", {"excluded_path_prefixes": ["vendor"]})
+    issues = [
+        {"path": "a.py", "line": 3, "kind": "REAL", "severity": "high", "message": "本轮回归"},
+        {"path": "b.py", "line": 9, "kind": "REAL", "severity": "low", "message": "既有缺陷",
+         "scope_relation": "outside_current_round_scope"},
+        {"path": "vendor/x.py", "line": 1, "kind": "REAL", "severity": "low", "message": "排除区"},
+    ]
+    legs = [
+        _write_reviewer_leg(reviewers, "cursor-cli", returncode=0,
+                            result={"schema_version": 1, "kind": "issues", "issues": issues, "requests": []}),
+        _write_reviewer_leg(reviewers, "kimi-code", returncode=0,
+                            result={"schema_version": 1, "kind": "no_issues", "issues": [], "requests": [],
+                                    "audit_summary": "审了 a.py"}),
+    ]
+    _write_json(reviewers / "reviewer-plan.json",
+                {"status": "completed", "effective_reviewer_count": 2, "reviewers": legs, "fallbacks": []})
+    environment = _isolated_environment(root, RVF_SCOPE_CONTRACT=str(run_dir / "artifacts" / "inputs" / "scope.contract.json"))
+    completed = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "results", "--run-dir", str(run_dir)],
+        cwd=root, env=environment, capture_output=True, text=True, check=False,
+    )
+    output = completed.stdout
+    assert "kind=issues，3 条（其中范围外 1 条）" in output, output
+    assert "2. [范围外] [low/REAL] b.py:9" in output, output
+    assert "3. [排除区·只能 dropped] [low/REAL] vendor/x.py:1" in output, output
+    assert "双评审成立" in output, output
+    assert "validate_only_then_submit_to_kanban_backlog" in output, output
+
+
+def test_rvf_backlog_submit_forwards_to_submission_script_and_renders_handoff_section(root: Path) -> None:
+    """``rvf backlog submit`` 原样转给提交脚本；卡片标「未经 validator 验证」，输出可贴进 handoff 的一节。"""
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i"],
+                   cwd=repo, check=True)
+    calls = root / "fake-kanban-calls.jsonl"
+    fake = root / "fake_kanban.py"
+    fake.write_text(
+        "import json, sys\n"
+        f"open({str(calls)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "print(json.dumps({'ok': True, 'task': {'id': 'landc'}}))\n",
+        encoding="utf-8",
+    )
+    findings = root / "findings.json"
+    _write_json(findings, {"findings": [{"title": "文档示例过期", "path": "README.md", "severity": "low",
+                                          "problem_statement": "README 的命令示例与当前 CLI 参数不一致。"}]})
+    environment = _isolated_environment(
+        root, CODEX_RVF_CLINE_KANBAN_TASK_CMD=f"{sys.executable} {fake}", CODEX_RVF_CLINE_KANBAN_BASE_REF="main"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(_entrypoint_script()), "backlog", "submit", "--repo", str(repo),
+         "--main-session-findings-file", str(findings)],
+        cwd=repo, env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "## 范围外问题（已提交 Kanban backlog）" in completed.stdout
+    assert "已建卡 `landc`" in completed.stdout
+    argv = json.loads(calls.read_text(encoding="utf-8").splitlines()[0])
+    assert "未经 validator 验证" in argv[argv.index("--prompt") + 1]

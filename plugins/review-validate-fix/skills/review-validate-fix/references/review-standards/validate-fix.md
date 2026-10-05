@@ -9,7 +9,9 @@
 3. 按相关 standards subset 验证 issue 是否真实。
 4. 不真实则不改文件，并用 `rvf_fix_attempt.py stop --status false_positive` 写入结果。
 5. 真实且可独立最小修复则改最少文件，并用 `rvf_fix_attempt.py stop --status fixed` 写入结果。
-6. 真实但需要用户决策、跨 scope 改动、多种等价方案或缺少测量，则用 `rvf_fix_attempt.py stop --status elevated --result-file <elevation-detail.json>` 写入结果。
+6. 真实但需要用户决策、多种等价方案或缺少测量，则用 `rvf_fix_attempt.py stop --status elevated --result-file <elevation-detail.json>` 写入结果。最小修复需要改 scope 外文件不是升级理由：按 `prompts/validate-fix.md` 的三档修改规则声明或确认后照改。
+7. validate-only issue（范围外问题）只验证、不改文件：属实用 `--status validated_and_submitted_to_kanban_backlog --kanban-backlog-finding-file <finding.json>`，不成立用 `--status false_positive`。
+8. 修复途中发现的其他无关真实问题不当场修，写进 `--kanban-backlog-finding-file` 一并提交到 Kanban backlog。
 
 ## 专项规则
 

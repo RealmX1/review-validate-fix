@@ -410,5 +410,101 @@ def test_detached_argv_forwards_the_request_only_redispatch_flag() -> None:
     assert "--redispatch-review-request-legs-only" in argv, argv
 
 
+CHECK_REVIEW_RESULT = SCRIPT_DIRECTORY / "check_review_result.py"
+
+
+def _check(out: Path, *extra: str) -> dict:
+    completed = subprocess.run(
+        [sys.executable, str(CHECK_REVIEW_RESULT), str(out), "--json", *extra],
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def test_issue_scope_relation_defaults_to_in_current_round_scope(tmp_path: Path) -> None:
+    """SCOPE-1：没写 --scope-relation 的 issue 维持「本轮范围内」语义，且字段落盘为下划线键名。"""
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    assert _write(run_dir, out, *_issue_arguments()).returncode == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["issues"][0]["scope_relation"] == "in_current_round_scope"
+    assert "scope-relation" not in payload["issues"][0]
+    checked = _check(out)
+    assert checked["valid"] is True
+    assert checked["outside_current_round_scope_issue_count"] == 0
+
+
+def test_outside_current_round_scope_issue_is_valid_and_counted(tmp_path: Path) -> None:
+    """SCOPE-2：范围外问题照常通过 review（合法 issues 腿），并被单独计数。"""
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    written = _write(
+        run_dir, out, *_issue_arguments(), "--scope-relation", "outside_current_round_scope",
+        "--current-round-scope-audit-summary", "本轮改动的两处分支与边界都核对过，范围内没有问题。",
+    )
+    assert written.returncode == 0, written.stderr
+    checked = _check(out)
+    assert checked["valid"] is True and checked["kind"] == "issues"
+    assert checked["outside_current_round_scope_issue_count"] == 1
+    assert checked["audit_summary"].startswith("本轮改动")
+    assert checked["warnings"] == []
+
+
+def test_invalid_scope_relation_is_rejected_by_writer_and_checker(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    rejected = _write(run_dir, out, *_issue_arguments(), "--scope-relation", "somewhere_else")
+    assert rejected.returncode != 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "schema_version": 1, "kind": "issues", "requests": [],
+        "issues": [{"path": "a.py", "line": 1, "message": "m", "kind": "REAL", "severity": "low",
+                    "scope_relation": "somewhere_else"}],
+    }), encoding="utf-8")
+    checked = _check(out)
+    assert checked["valid"] is False
+    assert any("scope_relation" in error for error in checked["errors"])
+
+
+def test_all_outside_issues_without_current_round_audit_summary_only_warns(tmp_path: Path) -> None:
+    """SCOPE-3：全部是范围外问题却没写本轮审计摘要 ⇒ 非致命 warning，腿仍然有效（不触发重派）。"""
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    assert _write(run_dir, out, *_issue_arguments(), "--scope-relation", "outside_current_round_scope").returncode == 0
+    checked = _check(out)
+    assert checked["valid"] is True
+    assert any("audit_summary" in warning for warning in checked["warnings"])
+
+
+def test_no_issues_to_issues_carries_the_audit_summary_forward(tmp_path: Path) -> None:
+    """SCOPE-4：先下 clean 再补出问题时，原审计摘要仍是「本轮范围内审了什么」的依据。"""
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    assert _write(run_dir, out, *_no_issues_arguments()).returncode == 0
+    assert _write(run_dir, out, *_issue_arguments(), "--scope-relation", "outside_current_round_scope").returncode == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["kind"] == "issues"
+    assert payload["audit_summary"] == "审完了，没发现问题。"
+    assert _check(out)["warnings"] == []
+
+
+def test_issue_in_excluded_path_warns_instead_of_invalidating_the_leg(tmp_path: Path) -> None:
+    """SCOPE-5：护栏而非闸门——排除区里的 issue 不再让整条腿作废，只记 warning 与 1 起的编号。"""
+    run_dir = tmp_path / "run"
+    out = run_dir / "artifacts" / "reviewers" / "alpha" / "review-result.json"
+    contract = tmp_path / "scope.contract.json"
+    contract.write_text(json.dumps({"excluded_path_prefixes": ["vendor"]}), encoding="utf-8")
+    assert _write(run_dir, out, *_issue_arguments()).returncode == 0
+    assert _write(
+        run_dir, out, "issue", "--path", "vendor/generated.py", "--line", "1",
+        "--message", "排除区里的问题", "--kind", "REAL", "--severity", "low",
+    ).returncode == 0
+    checked = _check(out, "--scope-contract", str(contract))
+    assert checked["valid"] is True and checked["kind"] == "issues"
+    assert checked["issue_indices_in_excluded_paths_one_based"] == [2]
+    assert any("excluded" in warning for warning in checked["warnings"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

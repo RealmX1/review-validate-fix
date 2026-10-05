@@ -20,7 +20,8 @@ Validate/fixers：<极短说明 validate/fixers 验证/修复/驳回/升级了�
 - Prepare/run 初始化后立即创建 `handoff.md`，至少写入 pending 状态、origin、run id、run dir、目标 repo、review scope / scope-of-work 文件路径、review packet / manifest 路径（若有）。如果 prompt 或环境提供 `RVF_PARENT_CONVERSATION_NAME` / `RVF_PARENT_CONVERSATION_REF`、`RVF_PARENT_CONVERSATION_NAME_SOURCE`、`RVF_PARENT_CODEX_URL`、`RVF_PARENT_TRANSCRIPT_PATH`、`RVF_ORIGIN_METADATA`，必须在文件顶部原样保留这些字段，方便从 handoff 反查原始 Codex chat。`RVF_PARENT_SESSION_ID` 只是稳定 id，不是 conversation name source；不得把它写进 `conversation name source`。带双引号的 conversation name 表示原始会话没有设置 name，当前值来自第一条 user prompt 的前缀。
 - Origin 区域内的 4 条 Kanban 行（`source Kanban task id` / `source Kanban attempt id` / `source Kanban task title at trigger` / `generated Kanban task`）只在 prompt 或环境真的提供 `RVF_PARENT_KANBAN_TASK_ID` 时出现；提供时必须直接渲染实际值，不要写 `unavailable`。当前 run 不是从 Cline Kanban task 派生时，整段 4 行连同标题一并省略，避免 Origin 区出现一片 `unavailable` 噪音。
 - Review 阶段后更新 reviewer 来源、review 状态、发现的问题或 `kind: no_issues`。
-- Merge 与 validate/fix 阶段后更新 canonical issue、Validate/fix 分组、每条 attempt 完成状态、真实修复 / 误报 / 升级。
+- Merge 与 validate/fix 阶段后更新 canonical issue、Validate/fix 分组、每条 attempt 完成状态、真实修复 / 误报 / 转 backlog / 升级。
+- 有范围外问题提交 Kanban backlog（validator 在 `rvf fix stop` 里提交、或 `rvf backlog submit`）时，照抄 `rvf handoff` 打印的条目更新「范围外问题（已提交 Kanban backlog）」；`rvf apply` 合回了主会话确认过的越界修改时，更新「已确认的越界修改」。
 - 最终阶段更新 repo delta、验证命令、继续指引、升级事项和 deterministic intake hints；最终回复只给文件路径和分行的 `Reviewers：` / `Validate/fixers：` 标签摘要。
 
 ## Deterministic intake hints
@@ -104,7 +105,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 
 ## 本次 review
 
-共 <N> 条，<V> 真实修复 / <F> 误报 / <E> 升级
+共 <N> 条，<V> 真实修复 / <F> 误报 / <B> 转 backlog / <E> 升级
 
 ## Validate/fix 分组
 
@@ -112,7 +113,7 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
   - 分组理由：<共享根因、同一文件区域、同一测试路径、同一决策前提，或“单独验证，因为...”>
   - 执行：<validate/fix 子代理名；若触发允许本地执行的窄例外，写“本地执行：<原因>”>
   - 结果：<fixed / false_positive / elevated / failed；来自 `rvf_fix_attempt.py stop` ledger>
-  - scope expansion：<无，或列出 allowlist 外实际修复路径 + `--scope-expansion-reason`；不得把 protected/background/excluded 路径写成已修复>
+  - scope expansion：<无，或列出 allowlist 外实际修复路径 + `--scope-expansion-reason`；protected/background/excluded 路径只有经 fixer 确认 + 主会话确认合回后才可写成已修复，并同时列进「已确认的越界修改」>
 
 ## Issue 处理结果
 
@@ -124,9 +125,21 @@ python3 plugins/review-validate-fix/skills/review-validate-fix/scripts/rvf_hando
 - **[false_positive]** `路径:行号` - <短标题>
   - 来源：<alternative-reviewer:<harness-id> / codex-mimic-reviewer-a / codex-mimic-reviewer-b（最后兜底，见 references/zero-external-reviewer-last-resort-in-harness-fallback.md） / user-supplied-skip-review / 多个来源>
   - 驳回：<1-2 句说明为何不成立>
+- **[submitted_to_kanban_backlog]** `路径:行号` - <短标题>
+  - 来源：<同上>
+  - 验证：<validator 如何确认属实；与本轮工作为何不紧密相关>
+  - Kanban 卡：<task id，或「待建卡（Kanban 不可用，已暂存）」>
 - **[elevated]** `路径:行号` - <短标题>
   - 来源：<alternative-reviewer:<harness-id> / codex-mimic-reviewer-a / codex-mimic-reviewer-b（最后兜底，见 references/zero-external-reviewer-last-resort-in-harness-fallback.md） / user-supplied-skip-review / 多个来源>
   - 升级原因：<1-2 句说明为何没法自主处理>
+
+## 范围外问题（已提交 Kanban backlog）
+
+<无则写「无」。否则照抄 `rvf handoff` 打印的条目：每张卡的 task id（或暂存路径）+ 标题 + 所含问题的 path:line；包括 validator 提交的、fixer 修复途中附带提交的、主会话直接提交的。>
+
+## 已确认的越界修改
+
+<无则写「无」。否则逐条：路径 + 归属（其他会话 WIP / 用户声明的排除区）+ fixer 的理由 + 主会话确认依据（内容自 attempt baseline 未变、为何可接受）。>
 
 ## 相对 fork 起点的 repo delta
 

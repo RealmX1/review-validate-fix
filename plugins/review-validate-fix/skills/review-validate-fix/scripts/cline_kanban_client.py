@@ -689,7 +689,10 @@ def create_task(
     start_in_plan_mode: bool,
     auto_review_enabled: bool,
     auto_review_mode: str,
+    preview_resolved_settings_without_creating_task: bool = False,
 ) -> dict[str, Any]:
+    """``preview_resolved_settings_without_creating_task=True`` 透传 ``kanban task create --preview``：
+    只解析生效设置、不建卡（CLI 文档声明只读），返回值里没有 task id。"""
     port = task_runtime_port(task_cmd=task_cmd, start_cmd=start_cmd)
     command = task_command(
         task_cmd,
@@ -715,6 +718,9 @@ def create_task(
         command.append("--start-in-plan-mode")
     if auto_review_enabled:
         command.extend(["--auto-review-enabled", "--auto-review-mode", auto_review_mode])
+    if preview_resolved_settings_without_creating_task:
+        command.append("--preview")
+        return parse_json_stdout(run_command(command, cwd=repo, env=runtime_env(port)))
     payload = parse_json_stdout(run_command(command, cwd=repo, env=runtime_env(port)))
     payload["task_id"] = normalize_task_id(payload)
     return payload

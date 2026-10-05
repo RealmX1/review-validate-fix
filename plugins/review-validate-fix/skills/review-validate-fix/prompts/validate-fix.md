@@ -12,13 +12,28 @@ pass_type: validate_fix
 1. 先读相关文件，验证 flag 的问题在当前代码里是否真的是一个问题。
 2. 是真问题且你能独立修好：实施最小化修复，用收尾命令（见下）以 `--status fixed` 收尾。
 3. 不是真问题：不要改任何文件，用收尾命令以 `--status false_positive` 收尾。
-4. 是真问题但你不应该或不能独立修：不要改任何文件，用收尾命令以 `--status elevated --result-file <elevation-detail.json>` 收尾。例如需要架构决策、存在多种等价修复需要开发者拍板、涉及权限或 scope 外改动、原始需求不明确。
+4. 是真问题但你不应该或不能独立修：不要改任何文件，用收尾命令以 `--status elevated --result-file <elevation-detail.json>` 收尾。elevate 只用于真正需要人拍板的情况：需要架构决策、存在多种等价修复需要开发者拍板、涉及权限、原始需求不明确。「最小修复要改 scope 外文件」本身**不是** elevate 的理由（见下方三档修改规则）。
+
+**validate-only 的 issue（参数块里 `handling_mode: validate_only_then_submit_to_kanban_backlog`）**：这是与本轮工作不紧密相关的范围外问题，按约定**只验证、不修**，不得改任何文件（`rvf fix stop` 会硬性拒绝有改动的 validate-only attempt）。
+- 不成立：`--status false_positive`。
+- 属实：写一份 finding JSON（schema 见下），以 `--status validated_and_submitted_to_kanban_backlog --kanban-backlog-finding-file <finding.json>` 收尾；stop 会把它提交到 Kanban backlog 作为新 task。
+- 你判断它其实属于本轮、应当场修：`--status elevated` 并写明理由，由主会话决定是否改成正常修复重新派发。
+
+**修复途中顺带发现的其他问题**：与你分配到的 issue 无关、或并非最小修复所必需的真实问题（相邻缺陷、可改进处），**不要当场修**，也不要丢掉——写进 finding JSON，收尾时加 `--kanban-backlog-finding-file <finding.json>` 一并提交到 Kanban backlog（任何 `--status` 都可带）。
+
+finding JSON：`{"findings": [{"title": "<一句话>", "path": "<仓内相对路径>", "line": <行号，可省>, "severity": "<high|medium|low>", "problem_statement": "<问题是什么、为何属实>", "evidence": "<复现命令或代码依据，可省>", "group_id": "<同根因多条合成一张卡时填，可省>"}]}`。
 
 只处理主会话分配给你的 issue。不要重新执行 double review，不要主动寻找未分配问题，不要生成 handoff.md，也不要输出 reviewer 来源审计。`pass_type: validate_fix` 不是 full mode；即使上下文提到 `$review-validate-fix` 或 research checkpoint，也只写 attempt 结果和必要的人类日志，不输出 `RVF_HANDOFF_FILE`。
 
-你应收到 `scope.contract.json` 路径和 `scope_hash`。读取合同，把 `fix_allowlist` 当作默认 owned region，而不是绝对修复上限。若最小真实修复必须修改 allowlist 外文件，可以在 attempt worktree 内修改，但完成时必须对每个外部路径传 `rvf fix stop --scope-expansion-path <path>`，并传 `--scope-expansion-reason <why this is the minimal correct fix>`。不得扩展到 `protected_files`、`background_files` 或 `excluded_path_prefixes`；这类情况必须升级为 `elevated`。allowlist 外 dirty changes、并行 agent 新增文件、reviewer liveness/probe artifacts、背景 WIP 或 protected files 都可能是预期存在的并行工作，不得清理、删除、格式化或顺手修复。
+你应收到 `scope.contract.json` 路径和 `scope_hash`。attempt worktree 已物化主工作区的**全部**未提交改动与 untracked 文件，你看到的就是真实工作区状态，可以读任何文件、跑任何测试来判断问题。修改权按三档（护栏而非闸门：越界不是失败，但必须显式声明）：
 
-如果主会话提供了 RVF fix attempt 信息，你必须只在 attempt worktree 中工作，不要回到主 RVF worktree 修改文件。你的 shell 每次调用都可能重置 cwd：读写文件一律用 attempt worktree 下的绝对路径，跑命令先 `cd <attempt worktree> && …`。attempt 在派发前已由主会话标为 started，你**不需要**再调 start；完成前照抄派发参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id <attempt_id> --run-dir <run_dir> --status <fixed|false_positive|elevated|failed>`（它就是 `rvf_fix_attempt.py stop`；`--status` 四选一，其余参数原样保留）。在 attempt worktree 里跑 `rvf validate` 只检查你自己的 attempt、不会写进主 run。attempt worktree 是本次 issue 的 patch ownership 边界；不要写 handoff，不要清理主 worktree，也不要处理未分配 issue。
+1. `fix_allowlist` 与 issue 自身路径：直接改。
+2. allowlist 外的普通路径：最小真实修复必须改时可以改，收尾时对每个路径传 `--scope-expansion-path <path>`，并传 `--scope-expansion-reason <why this is the minimal correct fix>`。
+3. `protected_files` / `background_files`（其他会话或归属不明的未提交改动）/ 用户声明的 `excluded_path_prefixes`：最小真实修复确实必须改时，收尾时对每个路径传 `--acknowledged-protected-or-background-path-modification <path>` 并写 `--scope-expansion-reason`；stop 会接受，主会话核对内容未被并发改动、归属可接受后才合回。issue 路径本身恰好落在这类路径上时同样要确认。`.serena/` 等开发工具托管目录不得改（硬拒）。
+
+allowlist 外 dirty changes、并行 agent 新增文件、reviewer liveness/probe artifacts、背景 WIP 或 protected files 都可能是预期存在的并行工作，不是最小修复所必需时不得清理、删除、格式化或顺手修复。
+
+如果主会话提供了 RVF fix attempt 信息，你必须只在 attempt worktree 中工作，不要回到主 RVF worktree 修改文件。你的 shell 每次调用都可能重置 cwd：读写文件一律用 attempt worktree 下的绝对路径，跑命令先 `cd <attempt worktree> && …`。attempt 在派发前已由主会话标为 started，你**不需要**再调 start；完成前照抄派发参数块里的整行收尾命令 `cd <attempt worktree> && rvf fix stop --attempt-id <attempt_id> --run-dir <run_dir> --status <fixed|false_positive|elevated|failed>`（它就是 `rvf_fix_attempt.py stop`；`--status` 四选一，其余参数原样保留；validate-only issue 的参数块给的是 `<validated_and_submitted_to_kanban_backlog|false_positive|elevated|failed>`）。在 attempt worktree 里跑 `rvf validate` 只检查你自己的 attempt、不会写进主 run。attempt worktree 是本次 issue 的 patch ownership 边界；不要写 handoff，不要清理主 worktree，也不要处理未分配 issue。
 
 按 issue 类型读取 RVF 定制 standards pack 的相关子集：`references/review-standards/validate-fix.md` 是默认标准；复杂度问题读取 `simplification-subset.md`，安全问题读取 `security-subset.md`，性能问题读取 `performance-subset.md`。这些 standards 只用于验证和最小修复，不允许你扩大 scope 或重新 review。
 
@@ -26,7 +41,7 @@ pass_type: validate_fix
 
 完成后最终回复只给一条简短人类日志，不能把该日志当作 canonical result。canonical result 是 `rvf_fix_attempt.py stop` 生成的 `result.json`、`fix.patch` 和 tracker ledger：
 
-`[fixed | false_positive | elevated | failed] <路径:行号> - <你做了什么 / 为何驳回 / 为何升级>`
+`[fixed | false_positive | elevated | failed | submitted_to_kanban_backlog] <路径:行号> - <你做了什么 / 为何驳回 / 为何升级 / 提交了哪张卡>`
 ```
 
 ## 子代理分配
