@@ -50,9 +50,10 @@ RVF_HANDOFF
 
 ### 2. 判断：sanity-check、必要时最小修正、定稿 commit message
 
-这是唯一需要你判断的一步，只基于 prepare 的输出；需要看被截断的 diff 时按它给出的命令补看。
+这是唯一需要你判断的一步，先基于 prepare 的输出；需要看被截断的 diff 时按它给出的命令补看。为最终的工作说明与计划完成情况，结合原始需求和当前已确认计划；上下文不足时补读 handoff 引用的 scope-of-work 或相关计划材料，不启动新的 review。
 
 - 核对 scoped diff 与 handoff 描述的 fixes / reviewed scope 自洽：没有缺失的修复、没有越界改动、没有与 handoff 冲突的状态。scope contract 的 background / protected 与 handoff 标注的 protected 路径不会被自动 stage。
+- 对照原始需求与当前已确认计划，判断已实现内容和剩余工作；reviewed scope、`no_issues`、验证通过或提交成功都不等于全部计划已实现。发现计划尚未完成时如实记录，不因此扩大本次 land 范围。
 - handoff 表示 `no_issues`、或最终没有采纳任何 suggestion 时，只要 worktree 里的工作仍然有效，照样继续提交。
 - 仅当暴露出明确、范围内的小问题（future-self 漏改的一处、明显笔误）时，在 reviewed scope 或其直接 fallout 内做最小修正；不要借机扩大改动。补修正碰到 scope 外路径时，commit 加 `--extra-path`。
 - sanity-check 中发现**与本次工作不紧密相关、但真实存在**的问题：不要放过，也不要当场修。写一份 finding JSON（`{"findings": [{"title", "path", "line", "severity", "problem_statement", "evidence"}]}`），用 `rvf backlog submit --main-session-findings-file <finding.json> --run-dir <prepare 输出的 run_dir>` 提交到 Kanban backlog（卡片会标「未经 validator 验证」；Kanban 不可用时自动暂存、下次提交时重试，不阻断 land），并在最终汇报里列出卡片。
@@ -100,6 +101,7 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 - 只调用该 skill 的公开入口，让它自动 inspect current candidate evidence；evidence 为 VERIFIED 时会进入窄化的 reviewed-candidate optimistic handback，absent/invalid 时由它按 fail-safe 规则降级或阻断。不要在 RVF 里硬编码个人 my-ai-setup 路径、CAS 脚本或重复完整状态机。
 - 如果用户没有明确要求后续 base 同步，本命令到 evidence 写入为止结束，不自动执行 base-branch-sync，只在最终输出中提示可手动运行。
 - 如果 base-branch-sync 自己的 preflight guard 阻断或需要冲突决策，按 `base-branch-sync` skill 的升级规则处理；不要在 rvf-land 阶段提前替它做风险放行。
+- 联合使用 base-branch-sync 时，land 完成只作进度更新，不提前输出下方最后两节；等同步完成或明确阻断后，合并双方汇报，再按最终状态输出最后两节。
 
 ## Failure Gates
 
@@ -115,12 +117,20 @@ commit 的退出码（prepare 的 0 / 10 / 11 / 12 / 13 见上表，commit 按�
 
 ## 输出
 
-最终回复使用中文，包含：
+最终回复使用中文，先汇报以下 land / 同步运行结果，再以「本次落地的工作」「计划完成情况」两节收尾：
 
-- sanity-check 结论：当前 worktree 改动与 handoff 是否自洽，采纳/未采纳了什么、原因。
-- 本次是否做了最小修正以及具体内容。
+- sanity-check 结论：当前 worktree 改动与 handoff 是否自洽。
 - 验证结果（commit JSON 的 `validation.mode` 与每条 outcome）。
 - commit hash 和 commit message 标题。
 - 封窗结果与 reviewed candidate evidence 的 status / path，或 fast handback 不可用的原因。
 - 仍然保留的 unrelated dirty 文件或风险。
 - base-branch-sync follow-up：说明是否检测到用户已明确请求；若已请求，报告后续 `base-branch-sync` 的执行结果；若未请求，提示用户可手动运行 `/base-branch-sync`（Claude Code）或 `$base-branch-sync`（Codex）。
+
+### 最后两节（必有，顺序固定）
+
+成功、无新增提交或阻断退出均适用。最终回复的最后两个 section 必须依次使用以下标题；land / base-branch-sync 的提交、验证、封窗、evidence、同步状态和保留 dirty 等运行结果放在两节之前。工作摘要与计划完成结论、具体剩余工作及阻碍分别由这两节承载，不在前置报告重复；两节之后不再追加收尾文字或其他 section。
+
+1. `## 本次落地的工作`：用短句说明本次工作实现的功能、修复或行为变化，包含采纳/未采纳项及原因和必要的 land 阶段最小修正；已有描述移到这里，避免重复。无新增提交时说明确认的已有工作；阻断时明确哪些已提交、哪些尚未落地，不把待提交内容写成已落地。
+2. `## 计划完成情况`：先明确「全部已实现」「尚未全部实现」或「无法确认是否全部实现」。未完成时列出具体剩余工作及阻碍；无法确认时指出缺少的计划或实现依据。实现、验证、同步和部署状态分别表述，是否仍需同步或部署以原任务要求为准。
+
+两节尽可能 terse：结论先行，只保留理解工作与剩余事项所需的信息。单项用一行短句，多项按需用勾选列表（`[x]` 已完成 / `[ ]` 待完成）或小表格（工作项 / 状态 / 剩余），流程关系可用简单箭头；状态同时用文字表达。可视化以更直观、更易读为准，不为装饰增加图表，也不为简短遗漏剩余工作、阻碍或不确定性。
