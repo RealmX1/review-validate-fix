@@ -1,20 +1,4 @@
 {
-  "_comment_model_pin_is_a_deliberate_departure": [
-    "这是五份模板里【唯一】pin 模型的一份，是刻意偏离既有惯例。理由：omp 是多 provider 的壳，",
-    "不 pin 时可能落到与 claude/cursor 腿相同的底层模型，而 SANTA 的价值全部来自模型分歧；",
-    "core/reviewer_harness_selection 对 harness 名字完全不可知，【它察觉不到「抽中的两腿其实是同一个",
-    "模型」】。在选腿层补上同底层模型互斥之前，这条 pin 是路径上唯一守得住异构性的地方。",
-    "",
-    "取值是实测的，不是照抄设计稿：`omp models openai-codex --json` 给出该 provider 下恰好 6 个模型，",
-    "gpt-5.6-sol 的 selector 是 openai-codex/gpt-5.6-sol，thinking 合法取值为",
-    "low / medium / high / xhigh / max。必须用【完全限定 selector】而不是裸 gpt-5.6-sol：",
-    "omp 的 --model 是模糊匹配，裸名会撞上另一 provider 的 gpt-5.6-sol-high / -low / -max。",
-    "",
-    "reasoning effort 是【独立 flag】 --thinking，不是 --model 的一部分。",
-    "",
-    "【连带后果】本腿与既有 codex 腿共用同一模型与同一 Codex 订阅账号：抽到 {codex, omp} 时双评审",
-    "实为同一模型评两遍，且该订阅额度耗尽会同时打掉两条腿。选腿层的同底层模型互斥是它的正解。"
-  ],
   "enabled": true,
   "label": "alternative-reviewer:oh-my-pi",
   "command": [
@@ -25,8 +9,6 @@
     "--no-session",
     "--no-extensions",
     "--auto-approve",
-    "--model",
-    "openai-codex/gpt-5.6-sol",
     "--thinking",
     "xhigh"
   ],
@@ -74,10 +56,8 @@
   "pre_run_health": true,
   "output_format": "oh_my_pi_json",
   "_comment_anthropic_api_key_is_deliberately_kept": [
-    "本份【刻意】不 unset ANTHROPIC_API_KEY，与其余四份不同：omp 可以合法地以 API key 走 Anthropic，",
-    "盲目 unset 可能把一个健康的 omp 判成不可用。上面的 --model pin 已经确定了实际后端。",
-    "PI_SMOL_MODEL / PI_SLOW_MODEL / PI_PLAN_MODEL 会替换掉子角色模型，PI_CODING_AGENT_DIR 会改",
-    "会话存储位置——都必须清掉，否则探针与评审跑的不是同一套配置。"
+    "不 unset ANTHROPIC_API_KEY；运行时先校验默认模型 provider 为 openai-codex，避免误选其他后端。",
+    "PI_SMOL_MODEL / PI_SLOW_MODEL / PI_PLAN_MODEL 会替换子角色，PI_CODING_AGENT_DIR 会改会话配置位置，必须清掉以使查询、健康检查与正式评审配置一致。"
   ],
   "env_unset": [
     "PI_SMOL_MODEL",
@@ -103,10 +83,15 @@
     "--no-session",
     "--no-extensions",
     "--auto-approve",
-    "--model",
-    "openai-codex/gpt-5.6-sol",
     "--thinking",
     "xhigh",
     "Reply with exactly: OK"
-  ]
+  ],
+  "_comment_default_model_source_and_provider_boundary": [
+    "正式评审与健康检查在运行时共同读取 omp config get modelRoles --json 的 default，不固定模型版本。",
+    "默认模型必须是明确限定 openai-codex 的单一 selector，以保持 Codex 订阅额度池身份与双评审互斥规则正确。",
+    "默认模型缺失、查询失败或 provider 不符时，本腿明确不可用，不静默回退到旧模型。",
+    "reasoning effort 仍由独立的 --thinking xhigh 指定。"
+  ],
+  "reviewer_model_selection_source": "oh_my_pi_default_model_role"
 }

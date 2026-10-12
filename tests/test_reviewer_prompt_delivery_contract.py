@@ -367,15 +367,67 @@ def test_kimi_dispatch_argv_omits_the_flags_that_conflict_with_prompt_mode() -> 
     assert command[command.index("--output-format") + 1] == "stream-json"
 
 
-def test_oh_my_pi_model_pin_is_fully_qualified_with_its_provider() -> None:
-    """裸 `gpt-5.6-sol` 会被 omp 的模糊匹配撞上另一 provider 的 gpt-5.6-sol-high/-low/-max。"""
+def test_oh_my_pi_default_change_updates_both_review_and_health_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """用户改 OMP 默认后，两条真实调用必须一起跟随，不再使用模板的旧模型。"""
     template = _shipped_template("oh-my-pi")
-    for argv in (template["command"], template["health_command"]):
-        model = argv[argv.index("--model") + 1]
-        assert model == "openai-codex/gpt-5.6-sol", model
-        assert "/" in model, "必须是完全限定 selector，否则模糊匹配会落到别的 provider"
-        # reasoning effort 是独立 flag，不是模型名的一部分。
-        assert argv[argv.index("--thinking") + 1] == "xhigh"
+    selectors = iter(("openai-codex/gpt-6.1-sol:xhigh", "openai-codex/gpt-5.6-sol:xhigh"))
+    def configured_default(argv, **kwargs):
+        assert argv == ["omp", "config", "get", "modelRoles", "--json"]
+        assert kwargs["cwd"] == tmp_path
+        assert kwargs["env"] == {"MODEL_CONFIG_TEST": "same-environment"}
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"key": "modelRoles", "value": {"default": next(selectors)}}))
+    monkeypatch.setattr(runner.subprocess, "run", configured_default)
+    for expected in ("openai-codex/gpt-6.1-sol:xhigh", "openai-codex/gpt-5.6-sol:xhigh"):
+        command, health = runner.resolve_oh_my_pi_default_model_commands(
+            template, template["command"], template["health_command"],
+            env={"MODEL_CONFIG_TEST": "same-environment"}, cwd=tmp_path, timeout=5,
+        )
+        for argv in (command, health):
+            assert argv[argv.index("--model") + 1] == expected
+            assert argv[argv.index("--thinking") + 1] == "xhigh"
+        runner.assert_health_command_shares_dispatch_flag_set(
+            command, health, prompt_flag=None, run_directory_grant_flag="--add-dir",
+        )
+
+
+@pytest.mark.parametrize("roles", [{}, {"default": "gpt-6.1-sol"}, {"default": "anthropic/claude-opus"}])
+def test_oh_my_pi_missing_or_unqualified_or_other_provider_default_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, roles: dict,
+) -> None:
+    """缺默认或 provider 身份不可信时，不能把该腿送入 Codex 额度池。"""
+    template = _shipped_template("oh-my-pi")
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0, json.dumps({"key": "modelRoles", "value": roles})))
+    with pytest.raises(ValueError, match="openai-codex"):
+        runner.resolve_oh_my_pi_default_model_commands(
+            template, template["command"], template["health_command"], env={}, cwd=tmp_path, timeout=5,
+        )
+
+
+def test_oh_my_pi_default_query_timeout_is_not_a_fallback_to_another_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    template = _shipped_template("oh-my-pi")
+    def timed_out(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+    monkeypatch.setattr(runner.subprocess, "run", timed_out)
+    with pytest.raises(ValueError, match="TimeoutExpired"):
+        runner.resolve_oh_my_pi_default_model_commands(
+            template, template["command"], template["health_command"], env={}, cwd=tmp_path, timeout=1,
+        )
+
+
+@pytest.mark.parametrize("returncode,stdout,error", [(7, "", "查询失败"), (0, "不是 JSON", "有效 JSON")])
+def test_oh_my_pi_default_query_failure_is_rejected_before_model_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, stdout: str, error: str,
+) -> None:
+    template = _shipped_template("oh-my-pi")
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], returncode, stdout))
+    with pytest.raises(ValueError, match=error):
+        runner.resolve_oh_my_pi_default_model_commands(
+            template, template["command"], template["health_command"], env={}, cwd=tmp_path, timeout=5,
+        )
 
 
 def test_every_shipped_template_grants_the_run_directory_when_it_needs_to() -> None:
@@ -468,6 +520,16 @@ def test_oh_my_pi_dry_run_reports_the_positional_file_reference_mode(
     tmp_path: Path,
 ) -> None:
     config = _shipped_template("oh-my-pi")
+    executable = tmp_path / "bin" / "omp"
+    executable.parent.mkdir(parents=True)
+    executable.write_text(
+        f"#!{sys.executable}\nimport json, sys\n"
+        "assert sys.argv[1:] == ['config', 'get', 'modelRoles', '--json'], 'dry-run 不应调用模型'\n"
+        "print(json.dumps({'key': 'modelRoles', 'value': {'default': 'openai-codex/gpt-6.1-sol:xhigh'}}))\n"
+    )
+    executable.chmod(0o755)
+    config["command"][0] = str(executable)
+    config["health_command"][0] = str(executable)
     completed, _ = _run_reviewer(tmp_path, config)
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -475,3 +537,4 @@ def test_oh_my_pi_dry_run_reports_the_positional_file_reference_mode(
     assert payload["command"][-1].startswith("@")
     assert payload["command"][-1].endswith(payload["prompt_file"])
     assert payload["prompt_chars"] > 0
+    assert payload["command"][payload["command"].index("--model") + 1] == "openai-codex/gpt-6.1-sol:xhigh"

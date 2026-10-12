@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -1322,6 +1323,7 @@ def run_health(
     timeout: int,
     *,
     emit_output: bool = True,
+    cwd: Path | None = None,
 ) -> int:
     try:
         completed = subprocess.run(
@@ -1330,6 +1332,7 @@ def run_health(
             capture_output=True,
             text=True,
             env=env,
+            cwd=cwd,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -1339,6 +1342,57 @@ def run_health(
     if emit_output:
         print(completed.stdout.strip())
     return 0
+
+
+def resolve_oh_my_pi_default_model_commands(
+    config: dict[str, Any],
+    command: list[str],
+    health_command: list[str] | None,
+    *,
+    env: dict[str, str],
+    cwd: Path,
+    timeout: int,
+) -> tuple[list[str], list[str] | None]:
+    source = config.get("reviewer_model_selection_source")
+    if source is None:
+        return command, health_command
+    if source != "oh_my_pi_default_model_role":
+        raise ValueError("未知 reviewer_model_selection_source")
+    if not is_oh_my_pi_print_command(command) or not health_command or not is_oh_my_pi_print_command(health_command):
+        raise ValueError("OMP 默认选模要求正式评审和健康检查都使用 omp")
+    if any(item == "--model" or item.startswith("--model=") for item in command + health_command):
+        raise ValueError("动态默认选模不能同时配置固定 --model")
+    try:
+        completed = subprocess.run(
+            [command[0], "config", "get", "modelRoles", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+            # 配置查询不发模型请求，为外层 probe 的真实健康检查保留预算。
+            timeout=min(timeout, 5),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"无法查询 OMP 默认模型: {type(exc).__name__}") from exc
+    if completed.returncode != 0:
+        raise ValueError(f"OMP 默认模型查询失败: exit {completed.returncode}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("OMP 默认模型查询未返回有效 JSON") from exc
+    roles = payload.get("value") if isinstance(payload, dict) and payload.get("key") == "modelRoles" else None
+    selector = roles.get("default") if isinstance(roles, dict) else None
+    # 完整 selector 固定 provider，保持注册表中的 Codex 订阅额度池身份真实。
+    if not isinstance(selector, str) or not re.fullmatch(
+        r"openai-codex/[A-Za-z0-9][A-Za-z0-9._-]*(?::(?:off|minimal|low|medium|high|xhigh|max|ultra|inherit))?",
+        selector,
+    ):
+        raise ValueError("OMP 默认模型必须明确指定 openai-codex 的单一模型；该评审腿不可用")
+    return (
+        [command[0], "--model", selector, *command[1:]],
+        [health_command[0], "--model", selector, *health_command[1:]],
+    )
 
 
 def _payload_length(payload: bytes | str | None) -> int:
@@ -2658,6 +2712,26 @@ def main() -> int:
             raise ValueError("pre_run_health must be a boolean")
         if pre_run_health and health_command is None:
             raise ValueError("pre_run_health requires health_command")
+        if args.repo and allow_repo_cwd:
+            model_selection_cwd = Path(args.repo).expanduser().resolve()
+        elif args.review_packet:
+            model_selection_cwd = Path(args.review_packet).expanduser().resolve().parent
+        elif args.preflight or args.health or args.check or args.print_label:
+            model_selection_cwd = Path.cwd()
+        else:
+            model_selection_cwd = SKILL_DIR
+        if not args.print_label:
+            command, health_command = resolve_oh_my_pi_default_model_commands(
+                config,
+                command,
+                health_command,
+                env=build_alternative_reviewer_subprocess_environment(env_unset, env_set),
+                cwd=model_selection_cwd,
+                timeout=health_timeout,
+            )
+        health_command_cwd = (
+            model_selection_cwd if config.get("reviewer_model_selection_source") else None
+        )
         health_command_ledger_metadata = (
             {"command": health_command}
             if user_local_config_override_summary.get("applied") is not True
@@ -2905,6 +2979,7 @@ def main() -> int:
             health_command,
             reviewer_support_subprocess_environment,
             health_timeout,
+            cwd=health_command_cwd,
         )
         ledger.event(
             phase="review",
@@ -2931,6 +3006,7 @@ def main() -> int:
             health_command,
             reviewer_support_subprocess_environment,
             health_timeout,
+            cwd=health_command_cwd,
         )
         ledger.event(
             phase="review",
@@ -3087,6 +3163,7 @@ def main() -> int:
             reviewer_support_subprocess_environment,
             health_timeout,
             emit_output=False,
+            cwd=health_command_cwd,
         )
         ledger.event(
             phase="review",

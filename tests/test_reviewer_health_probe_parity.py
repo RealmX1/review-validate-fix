@@ -185,6 +185,18 @@ def _check(config_payload: dict, tmp_path: Path) -> subprocess.CompletedProcess:
     config_path.write_text(json.dumps(config_payload), encoding="utf-8")
     isolated_home = tmp_path / "home"
     isolated_home.mkdir(parents=True, exist_ok=True)
+    if config_payload.get("reviewer_model_selection_source"):
+        executable = tmp_path / "bin" / "omp"
+        executable.parent.mkdir()
+        executable.write_text(
+            f"#!{sys.executable}\nimport json, sys\n"
+            "assert sys.argv[1:] == ['config', 'get', 'modelRoles', '--json'], 'check 不应调用模型'\n"
+            "print(json.dumps({'key': 'modelRoles', 'value': {'default': 'openai-codex/gpt-6.1-sol:xhigh'}}))\n"
+        )
+        executable.chmod(0o755)
+        config_payload["command"][0] = str(executable)
+        config_payload["health_command"][0] = str(executable)
+        config_path.write_text(json.dumps(config_payload), encoding="utf-8")
     environment = dict(os.environ)
     # user-local override 按 Path.home() 解析：不隔离就测不到出厂模板本身。
     environment["HOME"] = str(isolated_home)

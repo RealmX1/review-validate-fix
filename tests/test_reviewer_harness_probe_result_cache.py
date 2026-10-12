@@ -868,3 +868,21 @@ def test_failed_inner_health_is_cached_unavailable_on_the_short_ttl(
     assert counter.calls == 2, (
         "短 TTL 一过就该重新真跑；仍然命中说明这条 unavailable 被按长 TTL 缓存了"
     )
+
+
+def test_dynamic_default_model_reprobes_and_observes_failure_within_cache_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """动态默认变更后，旧可用缓存不能把已不可用的模型继续送进评审路由。"""
+    dispatch = _load_dispatch_reviewers()
+    registry, _ = _install_hermetic_probe_harness(dispatch, tmp_path, monkeypatch)
+    config_path = tmp_path / registry["harnesses"][HERMETIC_PROBE_HARNESS_ID]["config_path"]
+    config = json.loads(config_path.read_text())
+    config["reviewer_model_selection_source"] = "oh_my_pi_default_model_role"
+    config_path.write_text(json.dumps(config))
+    counter = _SpawnCounter()
+    state_root = tmp_path / "state"
+    assert _probe_once(dispatch, registry, counter, monkeypatch, state_root) == [HERMETIC_PROBE_HARNESS_ID]
+    counter.returncode = 2
+    assert _probe_once(dispatch, registry, counter, monkeypatch, state_root) == []
+    assert counter.calls == 2

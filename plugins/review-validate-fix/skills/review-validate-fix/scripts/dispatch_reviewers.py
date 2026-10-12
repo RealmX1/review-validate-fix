@@ -463,7 +463,7 @@ def probe_available(
         # 第一道：零成本否定。可执行文件都不在 PATH 上，真跑 probe 必然失败，没必要为
         # 一个注定的结论付一次模型调用。**这个方向是安全的**——「不在 PATH」只能证否、
         # 不能用来证真，所以它不构成 health parity gate 要防的那种廉价替代判据。
-        executable_path, override_path = _resolved_probe_execution_inputs(config_path)
+        executable_path, override_path, dynamic_model_requires_fresh_probe = _resolved_probe_execution_inputs(config_path)
         if executable_path is None:
             continue
 
@@ -476,10 +476,15 @@ def probe_available(
             probe_mode=probe_mode,
         )
         now_epoch_seconds = time.time()
-        cached_outcome = read_cached_probe_outcome(
-            harness_id,
-            probe_identity_digest=probe_identity_digest,
-            now_epoch_seconds=now_epoch_seconds,
+        # shortcut: 动态默认选模每次真探测，缓存身份能绑定实际被探测的默认模型后再恢复复用。
+        cached_outcome = (
+            None
+            if dynamic_model_requires_fresh_probe
+            else read_cached_probe_outcome(
+                harness_id,
+                probe_identity_digest=probe_identity_digest,
+                now_epoch_seconds=now_epoch_seconds,
+            )
         )
         if cached_outcome == PROBE_OUTCOME_AVAILABLE:
             available.append(harness_id)
@@ -523,12 +528,13 @@ def probe_available(
             if completed.returncode == 0
             else PROBE_OUTCOME_UNAVAILABLE
         )
-        write_probe_outcome(
-            harness_id,
-            probe_outcome,
-            probe_identity_digest=probe_identity_digest,
-            now_epoch_seconds=now_epoch_seconds,
-        )
+        if not dynamic_model_requires_fresh_probe:
+            write_probe_outcome(
+                harness_id,
+                probe_outcome,
+                probe_identity_digest=probe_identity_digest,
+                now_epoch_seconds=now_epoch_seconds,
+            )
         if probe_outcome == PROBE_OUTCOME_AVAILABLE:
             available.append(harness_id)
     return available
@@ -536,10 +542,10 @@ def probe_available(
 
 def _resolved_probe_execution_inputs(
     config_path: Path,
-) -> tuple[Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, bool]:
     """解析这一轮 probe 真正依赖的两个外部输入：可执行文件，以及 user-local override 文件。
 
-    返回 ``(executable_path, user_local_config_override_path)``。
+    返回 ``(executable_path, user_local_config_override_path, dynamic_model_requires_fresh_probe)``。
 
     ``executable_path`` 解析不出（config 读不动 / 没有 command / 命令不在 PATH）即代表这条腿
     不可用——这是**证否**用途，绝不用它来判「可用」。
@@ -553,16 +559,16 @@ def _resolved_probe_execution_inputs(
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None, None
+        return None, None, False
     command = payload.get("command")
     if not isinstance(command, list) or not command:
-        return None, None
+        return None, None, False
     executable_name = str(command[0]).strip()
     if not executable_name:
-        return None, None
+        return None, None, False
     resolved = shutil.which(executable_name)
     if not resolved:
-        return None, None
+        return None, None, False
 
     override_path: Path | None = None
     reviewer_label = payload.get("label")
@@ -571,7 +577,7 @@ def _resolved_probe_execution_inputs(
             override_path = user_local_alternative_reviewer_config_override_path(reviewer_label)
         except (OSError, ValueError):
             override_path = None
-    return Path(resolved), override_path
+    return Path(resolved), override_path, payload.get("reviewer_model_selection_source") is not None
 
 
 def invalidate_probe_result_cache_for_failed_dispatch(harness_id: str) -> bool:

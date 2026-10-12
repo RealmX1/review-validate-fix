@@ -1133,7 +1133,8 @@ forbid_literal "config/alternative-reviewer.kimi.json" '"--yolo"'
 forbid_literal "config/alternative-reviewer.kimi.json" '"--auto"'
 require_literal "config/alternative-reviewer.oh-my-pi.json" 'alternative-reviewer:oh-my-pi'
 require_literal "config/alternative-reviewer.oh-my-pi.json" 'oh_my_pi_json'
-require_literal "config/alternative-reviewer.oh-my-pi.json" 'openai-codex/gpt-5.6-sol'
+require_literal "config/alternative-reviewer.oh-my-pi.json" 'oh_my_pi_default_model_role'
+forbid_literal "config/alternative-reviewer.oh-my-pi.json" 'gpt-5.6-sol'
 require_literal "config/alternative-reviewer.oh-my-pi.json" '"xhigh"'
 # ⚠️ 上面这些 require_literal 是**整文件** grep，给不出「这个字面量在哪个字段」的保证——
 # 同一个串出现在 health_command 或注释里就会绿。字段级的强保证在
