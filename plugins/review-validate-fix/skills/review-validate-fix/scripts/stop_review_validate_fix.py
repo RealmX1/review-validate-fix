@@ -19,6 +19,10 @@ from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _rvf_pyroot  # noqa: E402,F401 — 把 pyroot 加入 sys.path，供 adapters.* import
+from codex_gui_without_kanban_task_stop_hook_policy import (  # noqa: E402
+    CODEX_GUI_WITHOUT_KANBAN_TASK_STOP_HOOK_DISABLED_REASON,
+    disabled_codex_gui_stop_hook_payload,
+)
 from adapters.codex.codex_gui_fork_app_server_bridge import (  # noqa: E402 — codex fork 执行缝（S9a 抽出）
     app_server_fork_requests,
     can_connect_app_server_socket,
@@ -12235,6 +12239,14 @@ def _decision_point_silent_stop(
 
 
 def evaluate_stop_event(event: dict[str, Any], ledger: RunLedger) -> StopDecision:
+    disabled_gui_payload = disabled_codex_gui_stop_hook_payload(event, ledger)
+    if disabled_gui_payload is not None:
+        return payload_decision(
+            disabled_gui_payload,
+            reason_code=CODEX_GUI_WITHOUT_KANBAN_TASK_STOP_HOOK_DISABLED_REASON,
+            cwd=event.get("cwd"),
+        )
+
     latest_user = latest_user_message_from_event(event)
     cwd_value = event.get("cwd")
     cwd = cwd_value if isinstance(cwd_value, str) and cwd_value else None
@@ -12691,6 +12703,7 @@ def emit_stop_hook_payload(
     ledger: RunLedger | None,
     reason_code: str,
     event: dict[str, Any] | None = None,
+    include_guardian_liveness_alarm: bool = True,
 ) -> None:
     """Stop hook 的**唯一**出口：受众翻译 → guardian 告警并入 → 留痕 → stdout。
 
@@ -12736,7 +12749,8 @@ def emit_stop_hook_payload(
         }
         audience = STOP_HOOK_OUTPUT_AUDIENCE_DEVELOPER_ONLY
 
-    payload = _apply_guardian_liveness_alarm(payload)
+    if include_guardian_liveness_alarm:
+        payload = _apply_guardian_liveness_alarm(payload)
 
     if ledger is not None:
         try:
@@ -12776,6 +12790,7 @@ def emit_developer_only_stop_hook_payload(
     host_adapter: Any,
     ledger: RunLedger | None,
     reason_code: str,
+    include_guardian_liveness_alarm: bool = True,
 ) -> None:
     """``developer_only`` 受众的便捷出口（失败 / 降级 / skip / 诊断一律走这条）。"""
     emit_stop_hook_payload(
@@ -12785,6 +12800,7 @@ def emit_developer_only_stop_hook_payload(
         host_adapter=host_adapter,
         ledger=ledger,
         reason_code=reason_code,
+        include_guardian_liveness_alarm=include_guardian_liveness_alarm,
     )
 
 
@@ -12796,6 +12812,17 @@ def main() -> int:
     host_adapter = resolve_current_session_host_adapter(event)
     latest_user = latest_user_message_from_event(event)
     ledger = start_stop_hook_ledger(event)
+    disabled_gui_payload = disabled_codex_gui_stop_hook_payload(event, ledger)
+    if disabled_gui_payload is not None:
+        # 此策略关闭整个自动生命周期；不扫其它 task、不写 guardian 心跳、
+        # 不并入 liveness 告警，也不因遗留 in-progress 状态唤醒 agent。
+        emit_developer_only_stop_hook_payload(
+            disabled_gui_payload, host_adapter=host_adapter, ledger=ledger,
+            reason_code=CODEX_GUI_WITHOUT_KANBAN_TASK_STOP_HOOK_DISABLED_REASON,
+            include_guardian_liveness_alarm=False,
+        )
+        return 0
+
     # S1b：与 backend 无关的跨 task stranded-pending 扫荡，必须早于 suppress/launch 分支——
     # 即便本次 Stop 自身被 suppress 或不 launch，也要让它把**别的** task 遗留的 stale pending
     # 浮现给用户（打破 flow-1-self-rising 自升循环）。整段 best-effort，永不抛、不改主流程结果。

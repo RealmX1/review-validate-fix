@@ -523,6 +523,7 @@ required_files=(
   "scripts/rvf_out_of_scope_findings_kanban_backlog_submission.py"
   "scripts/workspace_snapshot.py"
   "scripts/stop_hook_dispatcher.py"
+  "scripts/codex_gui_without_kanban_task_stop_hook_policy.py"
   "scripts/stop_hook_router.py"
   "scripts/stop_review_validate_fix.py"
   "scripts/discover_santa_alternative_agents.sh"
@@ -587,6 +588,7 @@ repo_required_files=(
   "scripts/rvf_local_deploy.py"
   "scripts/merge_rvf_state_roots.py"
   "tests/test_stop_hook_dispatcher.py"
+  "tests/test_codex_gui_without_kanban_task_stop_hook_policy.py"
   "tests/test_stop_review_validate_fix.py"
   "tests/test_install_to_codex.py"
   "tests/test_rvf_local_deploy_trampoline.py"
@@ -717,6 +719,7 @@ run_step "python compile" python3 -m py_compile \
   "$repo_root/core/session_scope_allocation/session_change_manifest.py" \
   "$skill_dir/scripts/workspace_snapshot.py" \
   "$skill_dir/scripts/stop_hook_dispatcher.py" \
+  "$skill_dir/scripts/codex_gui_without_kanban_task_stop_hook_policy.py" \
   "$skill_dir/scripts/stop_review_validate_fix.py" \
   "$repo_root/core/session_scope_allocation/reviewable_unit_diff_tracker.py" \
   "$repo_root/core/session_scope_allocation/round_baseline_marker.py" \
@@ -765,6 +768,9 @@ run_step "python compile" python3 -m py_compile \
   "$tests_dir/test_reviewer_harness_probe_result_cache.py"
 
 run_parallel_test_steps
+run_step "tests: codex_gui_without_kanban_task_stop_hook_policy" \
+  python3 -m pytest -q \
+    "$tests_dir/test_codex_gui_without_kanban_task_stop_hook_policy.py"
 run_step "tests: rvf_local_deploy" \
   python3 -m pytest -q \
     "$tests_dir/test_developer_local_main_installation.py" \

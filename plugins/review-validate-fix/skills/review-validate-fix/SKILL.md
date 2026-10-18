@@ -29,6 +29,8 @@ description: Use only when the user explicitly invokes $review-validate-fix, /re
 
 ### 统一发起协议：唯一的发起消息是**发起决策点横幅**
 
+**持续关闭策略**：没有对应 Kanban task 的 Codex GUI 会话不自动发起或续跑 RVF，直到用户明确要求恢复。该策略随源码部署，重启、redeploy、会话级 `RVF_STOP_HOOK: on` 和 stable/dev channel 切换均不解除。直接手动调用本 skill、`/review-validate-fix` 或 `:review-validate-fix` 继续可用；Stop 只为有效 handoff 静默记账、释放锁，不自动启动 analyze。Kanban task 内、Codex CLI 和其它宿主维持既有行为。
+
 自动 RVF 的发起**一律**先给你一份决策点正文，首行是 `=== REVIEW-VALIDATE-FIX 发起决策点：由你自主决定 start 或 decline ===`，正文含候选摘要 + `RVF_DECISION_TOKEN=<token>` + CLI 命令样例。是否发起由你决定，开发者已预先授权，不需要征询开发者：简析后用 `rvf start`（发起）或 `rvf decline`（谢绝）显式表态。**这条规则不分环境**——在不在 Cline Kanban task 内、Claude 还是 Codex，横幅的**正文与决策协议完全一致**。
 
 **谢绝必须选类型（`--decline-kind`），两类之后多久再问完全不同。** 判断标准是「这批改动将来要不要审」：

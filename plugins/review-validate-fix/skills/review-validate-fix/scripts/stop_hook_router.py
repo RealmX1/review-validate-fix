@@ -17,6 +17,7 @@ from core.run_ledger.run_ledger import RunLedger, start_run  # noqa: E402
 from core.rvf_user_local_data_paths import (  # noqa: E402
     resolved_rvf_session_hook_state_dir,
 )
+from codex_gui_without_kanban_task_stop_hook_policy import disabled_codex_gui_stop_hook_payload
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -511,6 +512,11 @@ def main() -> int:
                 channel_source=source,
             )
         return route_to_target(raw_input, channel=channel, target=target, ledger=ledger)
+
+    disabled_gui_payload = disabled_codex_gui_stop_hook_payload(event, ledger)
+    if disabled_gui_payload is not None:
+        emit(disabled_gui_payload)
+        return 0
 
     latest_user = latest_user_message_from_event(event)
     session_id = session_id_from_event(event)

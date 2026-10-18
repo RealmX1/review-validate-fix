@@ -21,6 +21,7 @@ from rvf_analyze_advisory import (
     surface_rvf_analyze_advisory,
 )
 from core.session_scope_allocation.session_change_manifest import build_manifest
+from codex_gui_without_kanban_task_stop_hook_policy import disabled_codex_gui_stop_hook_payload
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -1193,6 +1194,11 @@ def main() -> int:
         cwd=str(cwd) if isinstance(cwd, str) else None,
     )
     ledger.artifact("stop-event.json", event)
+    disabled_gui_payload = disabled_codex_gui_stop_hook_payload(event, ledger)
+    if disabled_gui_payload is not None:
+        emit(disabled_gui_payload)
+        return 0
+
     if suppress_requested():
         ledger.event(
             phase="dev-sync",

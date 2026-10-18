@@ -261,7 +261,7 @@ def write_codex_goal_transcript(
     path: Path,
     *,
     status: str | None = "active",
-    originator: str | None = "Codex Desktop",
+    originator: str | None = "codex-tui",
     cli_version: str | None = "0.130.0",
     subagent: bool = False,
     continuation: bool = True,

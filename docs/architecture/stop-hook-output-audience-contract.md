@@ -39,6 +39,12 @@ decision token 状态、以及目标会话 UserPromptSubmit 观测到 `RVF_DECIS
 
 ---
 
+### 0.2 无 Kanban task 的 Codex GUI 持续关闭策略
+
+`codex_gui_without_kanban_task_stop_hook_policy.py` 根据当前会话 rollout 的 `originator="Codex Desktop"` 与 event/env task 绑定判断。无绑定时，router、dispatcher 和 Stop 核心在自动流程之前退出，只产生 `developer_only` skip；不运行 dev sync、决策点铸造、在途续跑、跨 task 扫荡或 guardian 心跳。有效 handoff 仍复用 finalize 并清本会话与仓库的锁，但不启动后台 analyze。手动 UserPromptSubmit / CLI 入口保留。
+
+这是版本控制内的持续策略，没有 TTL；重启、redeploy、会话级 on 或 channel 切换都不能解除。只有用户明确要求恢复后才修改源码策略。GUI 身份未知时维持原行为，不把 `source="vscode"` 或 worktree 路径推断成 GUI 或 task 绑定。
+
 ## 1. Claude Code 的 Stop hook 有**三**条出口
 
 | 出口 | transcript 形态 | 驱动 agent 再跑一回合 | 开发者呈现 |

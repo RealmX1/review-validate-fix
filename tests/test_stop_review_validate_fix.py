@@ -169,7 +169,7 @@ def write_codex_goal_transcript(
     *,
     status: str | None = "active",
     session_id: str = "codex-goal-session",
-    originator: str | None = "Codex Desktop",
+    originator: str | None = "codex-tui",
     cli_version: str | None = "0.130.0",
     subagent: bool = False,
     continuation: bool = True,
